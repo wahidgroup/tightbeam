@@ -2,6 +2,22 @@
 //!
 //! They cover certificate creation, server fixtures, and validation helpers.
 
+// The queue and the payment harnesses share it, under their own gates.
+#[cfg(any(
+	all(feature = "full", feature = "tokio", feature = "transport-policy"),
+	all(
+		feature = "std",
+		feature = "tokio",
+		feature = "testing",
+		feature = "x509",
+		feature = "secp256k1",
+		feature = "signature",
+		feature = "colony",
+		feature = "transport-policy"
+	)
+))]
+pub mod dedup;
+
 #[cfg(feature = "colony")]
 pub mod hive;
 

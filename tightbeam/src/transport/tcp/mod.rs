@@ -35,11 +35,11 @@ pub mod r#async;
 #[cfg(feature = "tcp")]
 pub mod sync;
 
-/// The blocking TCP listener trait, which a networking backend implements to
-/// accept a stream and the address of its peer.
+/// The blocking TCP listener trait that a networking backend implements to
+/// accept a stream and its peer address.
 ///
-/// The house [`TcpListener`](sync::TcpListener) accepts on the backend and
-/// builds each transport from the stream the backend returns.
+/// The house [`TcpListener`](sync::TcpListener) builds each transport from the
+/// stream the backend accepts.
 ///
 /// # Examples
 ///
@@ -78,8 +78,7 @@ pub trait TcpListenerTrait: Send {
 	/// The error the listener reports, convertible into a [`TransportError`].
 	type Error: Into<TransportError>;
 
-	/// Accepts one connection, and returns its stream and the address of its
-	/// peer.
+	/// Accepts one connection and returns its stream and peer address.
 	///
 	/// # Errors
 	///
@@ -138,8 +137,28 @@ impl ProtocolStream for TcpStream {
 		Write::write_all(self, buf)
 	}
 
+	/// A send that a signal interrupts runs again, as `write_all` does.
+	fn write_some(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+		loop {
+			match Write::write(self, buf) {
+				Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+				sent => return sent,
+			}
+		}
+	}
+
 	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
 		Read::read_exact(self, buf)
+	}
+
+	/// A receive that a signal interrupts runs again, as `read_exact` does.
+	fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+		loop {
+			match Read::read(self, buf) {
+				Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+				received => return received,
+			}
+		}
 	}
 
 	fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Self::Error> {
@@ -206,9 +225,8 @@ impl TightBeamAddress for TightBeamSocketAddr {}
 /// Generates the transport implementation that the sync and the async TCP
 /// transports share.
 ///
-/// The macro defines the transport struct itself, its one constructor, and
-/// the shared trait impls. The struct definition is the single source of the
-/// field list.
+/// It defines the transport struct, the single source of the field list, with
+/// its one constructor and the shared trait impls.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! impl_tcp_common {
@@ -229,8 +247,8 @@ macro_rules! impl_tcp_common {
 			/// The instrumentation collector of this connection.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
-			/// The address of the peer that a listener accepted this connection
-			/// from, which the record of the acceptance names.
+			/// The peer address that a listener accepted this connection from,
+			/// which the acceptance record names.
 			#[cfg(feature = "instrument")]
 			pub(crate) accepted_from: Option<core::net::SocketAddr>,
 		}
@@ -239,11 +257,11 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
-			/// Builds a transport over `stream` from `config`.
+			/// Builds a transport over `stream` from `config`. It is the one
+			/// constructor.
 			///
-			/// This is the one constructor. The configuration's provisioning
-			/// already answered the dialer rule, so the session starts where
-			/// that provisioning says: `Provisioned` when it names a peer
+			/// The provisioning already answered the dialer rule, so the
+			/// session starts where it says: `Provisioned` when it names a peer
 			/// authority, and `Cleartext` only when it names cleartext.
 			pub fn new(stream: S, config: $crate::transport::EndpointConfig<P>) -> Self {
 				let $crate::transport::EndpointConfig {
@@ -291,9 +309,8 @@ macro_rules! impl_tcp_common {
 			}
 
 			/// Overrides the budget-grant policy that the server consults
-			/// between the client's transport offer and its accept. By
-			/// default, the server grants the ceiling of its local
-			/// configuration.
+			/// between the client's transport offer and its accept. The default
+			/// grants the ceiling of the local configuration.
 			#[must_use]
 			pub fn with_transport_authorizer(
 				mut self,
@@ -351,8 +368,11 @@ macro_rules! impl_tcp_common {
 				self.trace.as_ref().map($crate::trace::TraceCollector::share)
 			}
 
-			/// This connection, which a listener accepted from `peer`.
+			/// Returns this connection with `peer` as the address that a
+			/// listener accepted it from.
+			// The async expansion has its one caller in the tokio listener.
 			#[cfg(feature = "instrument")]
+			#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 			#[must_use]
 			pub(crate) fn accepted_from_peer(mut self, peer: core::net::SocketAddr) -> Self {
 				self.accepted_from = Some(peer);
@@ -404,8 +424,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		// This impl is the audit source of gate verdicts. One definition
-		// feeds every collector plane this transport serves.
+		// This impl is the one audit source of gate verdicts for every
+		// collector plane this transport serves.
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::GateAudit
 			for $transport<S, P>
 		where
@@ -422,17 +442,6 @@ macro_rules! impl_tcp_common {
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::state::sealed::Sealed
 			for $transport<S, P>
 		{
-		}
-
-		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
-			$crate::transport::state::ServerHandshakeSlot for $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
-			fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-				&mut self.server_handshake
-			}
 		}
 
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider + Send + Sync + 'static>
@@ -459,8 +468,8 @@ macro_rules! impl_tcp_common {
 				self.trace.as_ref()
 			}
 
-			// The inherent builder takes precedence in the path, so this
-			// forwards to it, the one setter of the trail.
+			// `Self::with_trace` resolves to the inherent builder ahead of this
+			// method, so the call forwards to the one setter of the trail.
 			#[cfg(feature = "instrument")]
 			fn with_trace(self, trace: TraceCollector) -> Self {
 				Self::with_trace(self, trace)

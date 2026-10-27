@@ -1,4 +1,4 @@
-// The macro modules sit in groups, by the features that each one needs.
+// The macro modules sit in groups by the features each one needs.
 
 // The feature-delegation macros are always available.
 pub mod cfg;
@@ -6,16 +6,19 @@ pub mod cfg;
 // The `From` and `TryFrom` generators are always available.
 mod from;
 
-// The generator of the audit names of a refusal lives here, and only the
-// records of a refused handshake read those names.
-#[cfg(all(
-	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-hpke")
+// The generator of the audit names of a refusal. The records of a refused
+// handshake and the refusals of a colony gateway read those names.
+#[cfg(any(
+	feature = "colony",
+	all(
+		feature = "instrument",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	)
 ))]
 pub(crate) mod names;
 
-// The case-table test macro compiles for test builds and for a consumer that
-// takes the testing surface deliberately.
+// The case-table test macro builds for tests and for a consumer that opts
+// into the testing surface.
 #[cfg(any(test, feature = "testing"))]
 pub mod cases;
 

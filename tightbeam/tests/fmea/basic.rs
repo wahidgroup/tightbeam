@@ -3,6 +3,7 @@
 use tightbeam::error::TightBeamError;
 use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
+use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{FaultModel, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
@@ -58,7 +59,7 @@ impl From<SensorFault> for TightBeamError {
 	}
 }
 
-fn create_test_config(scale: SeverityScale) -> FdrConfig {
+fn create_test_config(process: Process, scale: SeverityScale) -> FdrConfig {
 	let start_state = States::Idle;
 	let event = SENSOR_READ;
 	let probability_bps = tightbeam::bps!(5000);
@@ -68,11 +69,23 @@ fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	FdrConfig {
 		seeds: 5,
 		max_depth: 10,
-		specs: vec![SafetyProcess::process()],
+		specs: vec![process],
 		fault_model: Some(fault_model),
 		fmea_config: Some(FmeaConfig { severity_scale: scale, rpn_critical_threshold: 100, auto_generate: true }),
 		..Default::default()
 	}
+}
+
+/// The configuration that grades [`FmeaTestSpec`], explores [`SafetyProcess`]
+/// with FMEA on the severity `scale`, and verifies the FMEA report.
+fn fmea_scenario_config(scale: SeverityScale) -> Result<ScenarioConfig, Box<dyn std::error::Error>> {
+	let fdr = create_test_config(SafetyProcess::process()?, scale);
+	let hooks = TestHooks::on_pass(|context| {
+		verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
+	});
+
+	let builder = ScenarioConfig::builder().with_spec(FmeaTestSpec::latest()).with_fdr(fdr);
+	Ok(builder.with_hooks(hooks).build()?)
 }
 
 fn verify_fmea_report(verdict_opt: Option<&FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
@@ -86,13 +99,7 @@ fn verify_fmea_report(verdict_opt: Option<&FdrVerdict>) -> Result<(), Box<dyn st
 
 tb_scenario! {
 	name: test_fmea_mil_std,
-	config: ScenarioConfig::builder()
-		.with_spec(FmeaTestSpec::latest())
-		.with_fdr(create_test_config(SeverityScale::MilStd1629))
-		.with_hooks(TestHooks::on_pass(|context| {
-				verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
-			}))
-		.build(),
+	config: fmea_scenario_config(SeverityScale::MilStd1629),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(SENSOR_READ)?;
@@ -105,13 +112,7 @@ tb_scenario! {
 
 tb_scenario! {
 	name: test_fmea_iso26262,
-	config: ScenarioConfig::builder()
-		.with_spec(FmeaTestSpec::latest())
-		.with_fdr(create_test_config(SeverityScale::Iso26262))
-		.with_hooks(TestHooks::on_pass(|context| {
-				verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
-			}))
-		.build(),
+	config: fmea_scenario_config(SeverityScale::Iso26262),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(SENSOR_READ)?;

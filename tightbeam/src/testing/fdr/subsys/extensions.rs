@@ -1,7 +1,7 @@
 //! The FDR analysis of a [`ConsumedTrace`], as an extension trait.
 //!
 //! [`FdrTraceExt`] analyzes one execution trace for FDR. Its conversion of the
-//! trace to a process serves refinement checking alone, which compares
+//! trace to a process serves refinement checking alone, as
 //! `spec_process ⊑ trace_process`.
 
 use std::borrow::Cow;
@@ -15,33 +15,119 @@ use crate::testing::specs::csp::{intern, Action, Event, Observation, Process, St
 use crate::trace::{ConsumedTrace, InternalEvent};
 
 #[cfg(feature = "instrument")]
-use crate::urn::Urn;
+use crate::instrumentation::TbEvent;
 
-/// The state label of a trace before its gate decides.
-pub const INITIAL: &str = "initial";
-/// The state label of a trace after its gate accepts.
-pub const GATE_ACCEPT: &str = "gate_accept";
-/// The state label of a trace while its handler runs.
-pub const HANDLER: &str = "handler";
-/// The state label of a trace after its gate rejects.
-pub const GATE_REJECT: &str = "gate_reject";
-/// The state label of a trace after its response or its rejection.
-pub const TERMINAL: &str = "terminal";
-
-/// The events that a trace keeps when it converts to a CSP process for FDR.
+/// A state of the house request path.
 ///
-/// The mode selects the events of a [`ConsumedTrace`] that join the
-/// [`Process`] of FDR refinement checking, from the events that the trace
-/// captured under its [`TbInstrumentationConfig`].
+/// Each state accepts the events of [`Self::acceptance`] and can refuse the
+/// rest.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::fdr::RequestPathState;
+///
+/// assert!(RequestPathState::Handler.refuses("request"));
+/// assert!(!RequestPathState::Handler.refuses("response"));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RequestPathState {
+	/// The state of a request before its gate decides.
+	Initial,
+	/// The state of a request after its gate accepts it.
+	GateAccept,
+	/// The state of a request while its handler runs.
+	Handler,
+	/// The state of a request after its gate rejects it.
+	GateReject,
+	/// The state of a request after its response or its rejection.
+	Terminal,
+}
+
+impl RequestPathState {
+	/// The label of this state.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::RequestPathState;
+	///
+	/// assert_eq!(RequestPathState::GateAccept.as_str(), "gate_accept");
+	/// ```
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Initial => "initial",
+			Self::GateAccept => "gate_accept",
+			Self::Handler => "handler",
+			Self::GateReject => "gate_reject",
+			Self::Terminal => "terminal",
+		}
+	}
+
+	/// The events that this state accepts.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::{AcceptanceSet, RequestPathState};
+	/// use tightbeam::testing::specs::csp::Event;
+	///
+	/// let accepted = AcceptanceSet::from([Event("handler_exit"), Event("response")]);
+	/// assert_eq!(RequestPathState::Handler.acceptance(), accepted);
+	/// ```
+	pub fn acceptance(self) -> AcceptanceSet {
+		self.accepted().iter().copied().map(Event).collect()
+	}
+
+	/// Whether this state can refuse the event `event_label`.
+	///
+	/// A state can refuse each event outside [`Self::acceptance`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::RequestPathState;
+	///
+	/// assert!(RequestPathState::Initial.refuses("response"));
+	/// assert!(!RequestPathState::Initial.refuses("request"));
+	/// ```
+	pub fn refuses(self, event_label: impl AsRef<str>) -> bool {
+		let event_label = event_label.as_ref();
+		!self.accepted().contains(&event_label)
+	}
+
+	/// The labels of the events that this state accepts.
+	fn accepted(self) -> &'static [&'static str] {
+		const AFTER_ACCEPT: &[&str] = &[InternalEvent::HandlerEnter.label()];
+		const IN_HANDLER: &[&str] = &[InternalEvent::HandlerExit.label(), "response"];
+		match self {
+			Self::Initial => &["request"],
+			Self::GateAccept => AFTER_ACCEPT,
+			Self::Handler => IN_HANDLER,
+			Self::GateReject | Self::Terminal => &[],
+		}
+	}
+}
+
+/// The events of a [`ConsumedTrace`] that join its CSP [`Process`] for FDR
+/// refinement checking, out of the events it captured under its
+/// [`TbInstrumentationConfig`].
 ///
 /// - `FullInstrumentation` reads the hidden events, which a trace captures
 ///   when its [`TbInstrumentationConfig`] sets `enable_internal_detail`.
-/// - The two instrumentation modes read each assertion from its own record,
-///   `assert/label`, `assert/payload`, or `timing/wcet`, so each event enters
-///   once, in the order that the trace recorded it.
+/// - The two instrumentation modes read each event from its one record, in
+///   recorded order. An event that [`TraceCollector::event`] records enters as
+///   `assert/label`, `assert/payload`, or `timing/wcet`.
+/// - A record that the event API wrote, such as [`TraceCollector::emit_event`],
+///   carries [`TbEvent::FROM_EVENT_API`]. Such a record of another kind, or
+///   with no label, enters under its URN.
+/// - A record of another kind that the event API did not write stays out.
 /// - A sink that drops records also drops the assertions among them.
 ///
 /// [`TbInstrumentationConfig`]: crate::instrumentation::TbInstrumentationConfig
+/// [`TraceCollector::event`]: crate::trace::TraceCollector::event
+/// [`TraceCollector::emit_event`]: crate::trace::TraceCollector::emit_event
+/// [`TbEvent::FROM_EVENT_API`]: crate::instrumentation::TbEvent::FROM_EVENT_API
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceProcessMode {
 	/// The assertion events alone, which [`FdrTraceExt::to_process`] selects.
@@ -50,8 +136,8 @@ pub enum TraceProcessMode {
 	///
 	/// The observable events are `gate/accept`, `gate/reject`,
 	/// `transport/request-recv`, `transport/response-send`, and `assert/label`.
-	/// The mode suits a CSP spec that models the full protocol flow, gate
-	/// decisions included.
+	/// It suits a CSP spec that models the full protocol flow, gate decisions
+	/// included.
 	#[cfg(feature = "instrument")]
 	WithObservableInstrumentation,
 	/// The assertions and the observable and hidden instrumentation events.
@@ -74,17 +160,21 @@ impl TraceProcessMode {
 			#[cfg(feature = "instrument")]
 			Self::WithObservableInstrumentation | Self::FullInstrumentation => {
 				let records = trace.instrument_events.iter();
-				let selected = records.filter_map(|record| {
-					let kind = Record::of(&record.urn).filter(|kind| self.admits(*kind))?;
-					let label = intern(record.label.as_deref()?);
-					match kind {
-						Record::Hidden => Some(Action::hidden(label)),
-						Record::Observable | Record::Measured => Some(Action::observable(label)),
-					}
-				});
-
+				let selected = records.filter_map(|record| self.action_of(record));
 				selected.collect()
 			}
+		}
+	}
+
+	/// The action of `record` in the chain of this mode, or `None` for a
+	/// record that the mode leaves out.
+	#[cfg(feature = "instrument")]
+	fn action_of(self, record: &TbEvent) -> Option<Action> {
+		let kind = Record::of(record).filter(|kind| self.admits(*kind))?;
+		let name = kind.name_of(record)?;
+		match kind {
+			Record::Hidden => Some(Action::hidden(name)),
+			Record::Observable | Record::Measured | Record::Written => Some(Action::observable(name)),
 		}
 	}
 
@@ -119,15 +209,19 @@ enum Record {
 	Measured,
 	/// A hidden instrumentation event, an internal event or `process/hidden`.
 	Hidden,
+	/// A record of another kind that the event API wrote, which enters as an
+	/// observable event under its URN.
+	Written,
 }
 
 #[cfg(feature = "instrument")]
 impl Record {
-	/// The kind of a record of `urn`, or `None` for a record that the process
-	/// of a trace leaves out.
-	fn of(urn: &Urn<'static>) -> Option<Self> {
+	/// The kind of `record`, or `None` for a record that the process of a
+	/// trace leaves out.
+	fn of(record: &TbEvent) -> Option<Self> {
 		use crate::instrumentation::events;
 
+		let urn = &record.urn;
 		let observable = [
 			events::GATE_ACCEPT,
 			events::GATE_REJECT,
@@ -143,16 +237,32 @@ impl Record {
 		}
 
 		let hidden = InternalEvent::of(urn).is_some() || *urn == events::PROCESS_HIDDEN;
-		hidden.then_some(Self::Hidden)
+		if hidden {
+			return Some(Self::Hidden);
+		}
+
+		record.is_from_event_api().then_some(Self::Written)
+	}
+
+	/// The name of the action of `record`, a record of this kind.
+	///
+	/// A [`Self::Written`] record enters under its URN. A record of another
+	/// kind enters under its label, or under its URN when it has no label and
+	/// the event API wrote it. The URN renders for those records alone.
+	fn name_of(self, record: &TbEvent) -> Option<&'static str> {
+		let under_urn = || intern(record.urn.to_string());
+		match (self, record.label.as_deref()) {
+			(Self::Written, _) => Some(under_urn()),
+			(_, Some(label)) => Some(intern(label)),
+			(_, None) => record.is_from_event_api().then(under_urn),
+		}
 	}
 }
 
 /// An extension trait that adds FDR analysis to a [`ConsumedTrace`].
 ///
-/// Each method reads the trace alone. Layer 1 grades what the scenario body
-/// returned, in [`ScenarioConfig::verify`].
-///
-/// [`ScenarioConfig::verify`]: crate::testing::ScenarioConfig::verify
+/// Its methods read the trace alone. The acceptance and refusals of a state
+/// are queries of [`RequestPathState`].
 pub trait FdrTraceExt {
 	/// Whether the trace is valid, which requires a run whose gate accepted to
 	/// record an assertion or a response.
@@ -160,15 +270,6 @@ pub trait FdrTraceExt {
 
 	/// Whether the run ended in a valid terminal state.
 	fn terminated_in_valid_state(&self) -> bool;
-
-	/// The acceptance set at the state `state_label`, or `None` for a label
-	/// outside [`INITIAL`], [`GATE_ACCEPT`], [`HANDLER`], [`GATE_REJECT`], and
-	/// [`TERMINAL`].
-	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet>;
-
-	/// Whether the process can refuse the event `event_label` at the state
-	/// `state_label`.
-	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool;
 
 	/// The count of the assertions whose label is `label`.
 	fn assertion_count(&self, label: impl AsRef<str>) -> usize;
@@ -190,7 +291,6 @@ pub trait FdrTraceExt {
 	///
 	/// The process is a linear model of the execution trace, which refinement
 	/// checking compares as `spec_process ⊑ trace_process`.
-	///
 	/// [`Self::to_process_with_mode`] adds the instrumentation events under the
 	/// `instrument` feature.
 	fn to_process(&self) -> Process {
@@ -209,7 +309,7 @@ impl FdrTraceExt for ConsumedTrace {
 		// response. A run with no gate decision takes no gate, so it passes.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
 			&& self.assertions.is_empty()
-			&& self.response.is_none()
+			&& self.response().is_none()
 		{
 			return false;
 		}
@@ -221,7 +321,7 @@ impl FdrTraceExt for ConsumedTrace {
 		match self.gate_decision {
 			// An accepted run ends validly when the handler leaves a response
 			// or an assertion.
-			Some(TransitStatus::Ok) => self.response.is_some() || !self.assertions.is_empty(),
+			Some(TransitStatus::Ok) => self.response().is_some() || !self.assertions.is_empty(),
 			// A gate whose status is unknown leaves the run unterminated.
 			Some(TransitStatus::Unknown) => false,
 			// Every other status is a rejection, which is terminal.
@@ -229,46 +329,6 @@ impl FdrTraceExt for ConsumedTrace {
 			// A run that takes no gate passes, because the check reads the
 			// gate decision alone.
 			None => true,
-		}
-	}
-
-	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet> {
-		let state_label = state_label.as_ref();
-		// The state label alone decides the acceptance set, whatever events
-		// the trace recorded.
-		let mut acceptance = AcceptanceSet::new();
-		match state_label {
-			INITIAL => {
-				acceptance.insert(Event("request"));
-			}
-			GATE_ACCEPT => {
-				acceptance.insert(Event(InternalEvent::HandlerEnter.label()));
-			}
-			HANDLER => {
-				acceptance.insert(Event(InternalEvent::HandlerExit.label()));
-				acceptance.insert(Event("response"));
-			}
-			GATE_REJECT | TERMINAL => {
-				// A rejected or terminal state has an empty acceptance set.
-			}
-			_ => {
-				return None;
-			}
-		}
-
-		Some(acceptance)
-	}
-
-	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool {
-		let state_label = state_label.as_ref();
-		let event_label = event_label.as_ref();
-		// A state refuses each event outside its acceptance set.
-		if let Some(acceptance) = self.acceptance_at(state_label) {
-			!acceptance.iter().any(|e| e.0 == event_label)
-		} else {
-			// An unknown state label refuses every event, which is the
-			// conservative answer.
-			true
 		}
 	}
 
@@ -284,7 +344,7 @@ impl FdrTraceExt for ConsumedTrace {
 	fn project_to_observable(&self) -> Vec<String> {
 		self.instrument_events
 			.iter()
-			.filter(|e| Record::of(&e.urn) == Some(Record::Observable))
+			.filter(|e| Record::of(e) == Some(Record::Observable))
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
 	}
@@ -293,7 +353,7 @@ impl FdrTraceExt for ConsumedTrace {
 	fn project_to_hidden(&self) -> Vec<String> {
 		self.instrument_events
 			.iter()
-			.filter(|e| Record::of(&e.urn) == Some(Record::Hidden))
+			.filter(|e| Record::of(e) == Some(Record::Hidden))
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
 	}
@@ -329,8 +389,8 @@ impl FdrTraceExt for ConsumedTrace {
 		let mut hidden = HashSet::new();
 		let mut transitions = TransitionRelation::new();
 
-		let s_initial = State(INITIAL);
-		let s_terminal = State(TERMINAL);
+		let s_initial = State(RequestPathState::Initial.as_str());
+		let s_terminal = State(RequestPathState::Terminal.as_str());
 
 		states.insert(s_initial);
 
@@ -482,7 +542,6 @@ mod tests {
 	#[test]
 	fn a_rejected_run_ends_in_a_valid_state() {
 		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::PermissionDenied));
-
 		assert!(trace.terminated_in_valid_state(), "a rejection is terminal");
 	}
 
@@ -514,11 +573,61 @@ mod tests {
 		let collector = TraceCollector::new();
 		collector.emit_event_with_evidence(GATE_ACCEPT, "Ok", None)?;
 		collector.event(AFTER)?.emit();
+
 		let trace = consumed(&collector, None);
 
 		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
-		let (gate, after) = (GATE_ACCEPT.to_string(), AFTER.to_string());
-		assert_eq!(chain_of(&process), [gate.as_str(), "Ok", after.as_str()]);
+		let after = AFTER.to_string();
+		assert_eq!(chain_of(&process), ["Ok", after.as_str()]);
+		Ok(())
+	}
+
+	/// A dual-written event outside the observable kinds enters the chain once,
+	/// under the URN that its assertion names.
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_dual_written_event_enters_the_chain_under_its_urn() -> Result<(), TightBeamError> {
+		let collector = TraceCollector::new();
+		collector.emit_event_with_evidence(FIRST, "why", None)?;
+
+		let trace = consumed(&collector, None);
+
+		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
+		let first = FIRST.to_string();
+		assert_eq!(chain_of(&process), [first.as_str()]);
+		Ok(())
+	}
+
+	/// A record of another kind that the event API did not write stays out of
+	/// the chain, though the event API wrote a record of the same URN.
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_plain_record_of_a_written_event_stays_out_of_the_chain() -> Result<(), TightBeamError> {
+		let collector = TraceCollector::new();
+		collector.emit_event(FIRST)?;
+		collector.emit(FIRST, "plain");
+
+		let trace = consumed(&collector, None);
+
+		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
+		let first = FIRST.to_string();
+		assert_eq!(chain_of(&process), [first.as_str()]);
+		Ok(())
+	}
+
+	/// An observable record that the event API wrote with no label enters the
+	/// chain under its URN.
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn an_unlabelled_written_record_enters_the_chain_under_its_urn() -> Result<(), TightBeamError> {
+		let collector = TraceCollector::new();
+		collector.emit_event(GATE_ACCEPT)?;
+
+		let trace = consumed(&collector, None);
+
+		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
+		let accept = GATE_ACCEPT.to_string();
+		assert_eq!(chain_of(&process), [accept.as_str()]);
 		Ok(())
 	}
 }

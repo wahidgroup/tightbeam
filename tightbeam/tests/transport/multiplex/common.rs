@@ -1,7 +1,7 @@
 //! The fixtures of the multiplex transport tests.
 
 use core::error::Error;
-use core::future::{pending, poll_fn, Future, Pending};
+use core::future::{pending, poll_fn, ready, Future, Pending};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
@@ -79,7 +79,7 @@ pub fn client_stream_id(index: u32) -> u32 {
 	index * 2 + 1
 }
 
-/// Complete an HPKE handshake between a pinned client and an encrypted
+/// Completes an HPKE handshake between a pinned client and an encrypted
 /// server, with each side's optional mux offer.
 ///
 /// # Errors
@@ -139,8 +139,8 @@ pub struct MuxEndpointConfig {
 	pub renewal_deadline: Option<Duration>,
 }
 
-/// Apply the optional cancel budget and spawn the drivers, the shared tail of
-/// the encrypted and cleartext endpoint constructors.
+/// Applies the optional cancel budget and spawns the drivers, the shared
+/// tail of the encrypted and cleartext endpoint constructors.
 pub fn spawn_mux_tasks<R, W>(mut mux: MuxTransport<R, W>, cancel_budget: Option<u32>) -> (MuxEndpoint, MuxResponder)
 where
 	R: EnvelopeSource + Send + 'static,
@@ -156,7 +156,7 @@ where
 	(endpoint, responder)
 }
 
-/// Split a handshaken transport into a spawned mux endpoint for `role`, with
+/// Splits a handshaken transport into a spawned mux endpoint for `role`, with
 /// every override in `config` applied.
 ///
 /// # Errors
@@ -200,7 +200,7 @@ pub fn spawn_mux_endpoint_with(
 	Ok(endpoint_pair)
 }
 
-/// Spawn a mux endpoint for `role` with the default configuration.
+/// Spawns a mux endpoint for `role` with the default configuration.
 ///
 /// # Errors
 ///
@@ -212,7 +212,7 @@ pub fn spawn_mux_endpoint(
 	spawn_mux_endpoint_with(transport, role, MuxEndpointConfig::default())
 }
 
-/// Spawn a cleartext mux endpoint for `role` under explicit `settings`,
+/// Spawns a cleartext mux endpoint for `role` under explicit `settings`,
 /// because a cleartext transport negotiates none.
 ///
 /// # Errors
@@ -231,7 +231,7 @@ pub fn spawn_cleartext_mux_endpoint(
 	Ok(endpoint_pair)
 }
 
-/// Connect a cleartext client to a cleartext listener and return both
+/// Connects a cleartext client to a cleartext listener and returns both
 /// transports.
 ///
 /// # Errors
@@ -255,7 +255,7 @@ pub async fn establish_cleartext_transports(
 	Ok((client, server))
 }
 
-/// Accept one encrypted mux server as the server-side trace entrypoint.
+/// Accepts one encrypted mux server as the server-side trace entrypoint.
 ///
 /// The accepted connection carries the collector, and every downstream plane
 /// inherits it.
@@ -278,7 +278,7 @@ pub async fn accept_mux_server(
 	spawn_mux_endpoint(transport, MuxRole::Server)
 }
 
-/// Bind an encrypted listener and spawn a task that accepts one mux server
+/// Binds an encrypted listener and spawns a task that accepts one mux server
 /// and serves `handler` on it.
 ///
 /// # Errors
@@ -324,7 +324,7 @@ impl MuxClient {
 	}
 }
 
-/// Connect one encrypted mux client as the client-side trace entrypoint.
+/// Connects one encrypted mux client as the client-side trace entrypoint.
 ///
 /// The connection carries the collector, and every downstream plane inherits
 /// it.
@@ -361,7 +361,7 @@ pub struct ClientMuxServerRaw {
 	pub server_writer: SplitWriter,
 }
 
-/// Build a [`ClientMuxServerRaw`] from explicit client and server offers.
+/// Builds a [`ClientMuxServerRaw`] from explicit client and server offers.
 ///
 /// # Errors
 ///
@@ -379,7 +379,7 @@ pub async fn establish_client_mux_server_raw_with(
 	Ok(ClientMuxServerRaw { client: client_end, server_reader, server_writer })
 }
 
-/// Build a [`ClientMuxServerRaw`] where both sides offer `cap` streams.
+/// Builds a [`ClientMuxServerRaw`] where both sides offer `cap` streams.
 ///
 /// # Errors
 ///
@@ -391,8 +391,8 @@ pub async fn establish_client_mux_server_raw(
 	establish_client_mux_server_raw_with(mux_offer(cap), mux_offer(cap), trace).await
 }
 
-/// Emit `frame` from the muxed client, echo it from the raw server, and report
-/// whether the echo matched.
+/// Emits `frame` from the muxed client, echoes it from the raw server, and
+/// reports whether the echo matched.
 ///
 /// # Errors
 ///
@@ -419,7 +419,7 @@ pub struct ServerMuxClientRaw {
 	pub client_writer: SplitWriter,
 }
 
-/// Spawn the muxed server and split the client into raw halves.
+/// Spawns the muxed server and splits the client into raw halves.
 ///
 /// # Errors
 ///
@@ -435,7 +435,7 @@ pub fn split_server_mux_client_raw(
 	Ok(ServerMuxClientRaw { server: server_end, responder, client_reader, client_writer })
 }
 
-/// Build a [`ServerMuxClientRaw`] from explicit client and server offers.
+/// Builds a [`ServerMuxClientRaw`] from explicit client and server offers.
 ///
 /// # Errors
 ///
@@ -450,7 +450,7 @@ pub async fn establish_server_mux_client_raw_with(
 	split_server_mux_client_raw(client, server, server_config, trace)
 }
 
-/// Build a [`ServerMuxClientRaw`] where each side offers its own cap.
+/// Builds a [`ServerMuxClientRaw`] where each side offers its own cap.
 ///
 /// # Errors
 ///
@@ -474,8 +474,8 @@ pub struct MuxPair {
 	pub _server_serve: ServeTask,
 }
 
-/// Spawn both endpoints with their own configurations and start the server's
-/// immediate echo.
+/// Spawns both endpoints with their own configurations and starts the
+/// immediate echo of the server.
 ///
 /// # Errors
 ///
@@ -499,7 +499,7 @@ pub fn spawn_echo_pair_with(
 	})
 }
 
-/// Spawn an echo pair whose client takes the default configuration.
+/// Spawns an echo pair whose client takes the default configuration.
 ///
 /// # Errors
 ///
@@ -513,7 +513,7 @@ pub fn spawn_echo_pair(
 	spawn_echo_pair_with(client, server, MuxEndpointConfig::default(), server_config, trace)
 }
 
-/// Handshake both transports and spawn an echo pair over them.
+/// Runs the handshake of both transports and spawns an echo pair over them.
 ///
 /// # Errors
 ///
@@ -543,7 +543,7 @@ pub struct DrainedBody {
 	pub failure: Option<TransportError>,
 }
 
-/// Drain a stream body to its terminal outcome, and collect its chunks.
+/// Drains a stream body to its terminal outcome, and collects its chunks.
 pub async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 	let mut bytes = Vec::new();
 	let mut chunks = 0usize;
@@ -592,10 +592,10 @@ pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBo
 	}
 }
 
-/// Push a payload through a request sink as two chunks, and then close it.
+/// Pushes a payload through a request sink as two chunks, and then closes it.
 ///
-/// This is the smallest sequence that sends more than one data chunk before
-/// the empty `last`-flagged record of the close.
+/// It is the smallest sequence that sends more than one data chunk before the
+/// empty `last`-flagged record of the close.
 ///
 /// # Errors
 ///
@@ -644,7 +644,7 @@ pub fn gated_echo_handler(started: Arc<HandlerSignal>, release: Arc<Notify>) -> 
 	}
 }
 
-/// Serve [`gated_echo_handler`] on `responder`, and return its started and
+/// Serves [`gated_echo_handler`] on `responder`, and returns its started and
 /// release signals and the serve task.
 pub fn spawn_gated_echo(responder: MuxResponder) -> (Arc<HandlerSignal>, Arc<Notify>, ServeTask) {
 	let started = Arc::new(HandlerSignal::default());
@@ -665,7 +665,8 @@ pub struct GatedMuxContext {
 }
 
 impl GatedMuxContext {
-	/// Build fresh materials, an unraised signal, and an unsignalled notifier.
+	/// A context of fresh materials, an unraised signal, and an unsignalled
+	/// notifier.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
@@ -693,7 +694,7 @@ pub fn immediate_echo_handler() -> impl Fn(Arc<Frame>) -> core::future::Ready<Re
 	|frame| core::future::ready(echo_response(&frame))
 }
 
-/// Serve [`immediate_echo_handler`] on `responder`.
+/// Serves [`immediate_echo_handler`] on `responder`.
 pub fn spawn_immediate_echo(responder: MuxResponder) -> ServeTask {
 	tokio::spawn(responder.serve(immediate_echo_handler()))
 }
@@ -732,8 +733,8 @@ pub struct AbortContext {
 }
 
 impl AbortContext {
-	/// Build fresh materials, an unraised signal, an unsignalled notifier, and
-	/// zeroed counters.
+	/// A context of fresh materials, an unraised signal, an unsignalled
+	/// notifier, and zeroed counters.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
@@ -762,13 +763,13 @@ pub fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> H
 	}
 }
 
-/// Spawn an emit of `frame` on its own stream.
+/// Spawns an emit of `frame` on its own stream.
 pub fn spawn_emit(handle: &MuxHandle, frame: Frame) -> EmitTask {
 	let handle = handle.to_owned();
 	tokio::spawn(async move { handle.emit_on_stream(&frame).await })
 }
 
-/// Abort an in-flight emit, whose drop guard removes the pending stream and
+/// Aborts an in-flight emit, whose drop guard removes the pending stream and
 /// queues a `MuxCancel`.
 ///
 /// # Panics
@@ -785,7 +786,7 @@ pub async fn abort_emit(task: EmitTask) {
 	);
 }
 
-/// Read one single-chunk muxed open and decode its frame.
+/// Reads one single-chunk muxed open and decodes its frame.
 ///
 /// # Errors
 ///
@@ -802,7 +803,7 @@ pub async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u3
 	}
 }
 
-/// Read one single-chunk muxed open and return its stream ID.
+/// Reads one single-chunk muxed open and returns its stream ID.
 ///
 /// # Errors
 ///
@@ -812,7 +813,7 @@ pub async fn read_muxed_request_id<R: EnvelopeSource>(reader: &mut R) -> Result<
 	Ok(stream_id)
 }
 
-/// Read one single-chunk muxed open and require it on `expected_id`.
+/// Reads one single-chunk muxed open and requires it on `expected_id`.
 ///
 /// # Errors
 ///
@@ -841,7 +842,7 @@ pub fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportE
 	Ok(MuxOpenPackage::new(stream_id, true, MuxStreamKind::Unary, payload)?.into())
 }
 
-/// Write a single-chunk unary open on `stream_id`.
+/// Writes a single-chunk unary open on `stream_id`.
 ///
 /// # Errors
 ///
@@ -855,7 +856,7 @@ pub async fn write_muxed_request<W: EnvelopeSink>(
 	Ok(())
 }
 
-/// Write an `End` trailer on `stream_id` with `status` and `payload`.
+/// Writes an `End` trailer on `stream_id` with `status` and `payload`.
 ///
 /// # Errors
 ///
@@ -872,7 +873,7 @@ pub async fn write_muxed_end(
 	Ok(())
 }
 
-/// Answer `stream_id` with an Ok trailer that echoes `frame`.
+/// Answers `stream_id` with an Ok trailer that echoes `frame`.
 ///
 /// # Errors
 ///
@@ -886,7 +887,7 @@ pub async fn write_muxed_echo(
 	write_muxed_end(writer, stream_id, TransitStatus::Ok, payload).await
 }
 
-/// Write a GoAway at `last_stream_id` with `reason`.
+/// Writes a GoAway at `last_stream_id` with `reason`.
 ///
 /// # Errors
 ///
@@ -901,8 +902,8 @@ pub async fn write_goaway(
 	Ok(())
 }
 
-/// Write a muxed request and then its cancel, which is the Rapid Reset open
-/// and cancel pair.
+/// Writes a muxed request, then its cancel: the Rapid Reset open and cancel
+/// pair.
 ///
 /// # Errors
 ///
@@ -926,21 +927,22 @@ pub fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) -> bool {
 	)
 }
 
-/// Poll `shutdown` once so the handle sends a GoAway and the allocator halts,
-/// then return the pinned future for the caller to await the drain.
+/// Polls `shutdown` once so the handle sends a GoAway and the allocator halts,
+/// and then returns a future for the caller to await the drain.
+///
+/// A shutdown that the first poll completes hands its output to the returned
+/// future, which yields it at once.
 pub async fn kick_shutdown(
 	handle: &MuxHandle,
 ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
 	let mut shutdown_future = Box::pin(handle.shutdown());
-	poll_fn(|cx| {
-		// One poll sends the GoAway and halts the allocator. The caller awaits
-		// the drain on the returned future, so this poll's result goes unused.
-		let _ = shutdown_future.as_mut().poll(cx);
-		Poll::Ready(())
-	})
-	.await;
+	// One poll sends the GoAway and halts the allocator.
+	let first = poll_fn(|cx| Poll::Ready(shutdown_future.as_mut().poll(cx))).await;
 
-	shutdown_future
+	match first {
+		Poll::Ready(output) => Box::pin(ready(output)),
+		Poll::Pending => shutdown_future,
+	}
 }
 
 /// Whether `result` equals `expected`.
@@ -986,7 +988,7 @@ pub fn is_budget_exhausted(result: &Result<Option<Frame>, TransportError>) -> bo
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted)))
 }
 
-/// Append the continuation chunks of `stream_id` to `payload` until its
+/// Appends the continuation chunks of `stream_id` to `payload` until its
 /// `last` chunk.
 ///
 /// # Errors
@@ -1016,7 +1018,7 @@ pub async fn read_remaining_chunks(
 	}
 }
 
-/// Skip stream traffic until a GoAway arrives, and report whether it carries
+/// Skips stream traffic until a GoAway arrives, and reports whether it carries
 /// `reason`.
 ///
 /// # Errors
@@ -1177,7 +1179,7 @@ where
 	run_cancel_abuse_against(client_reader, client_writer, serve_task, cancel_budget).await
 }
 
-/// Run cancel abuse against a serving endpoint whose handlers park forever,
+/// Runs cancel abuse against a serving endpoint whose handlers park forever,
 /// so every cancel aborts a live handler. The responder path and the
 /// [`MuxAcceptor::serve`] path share it.
 ///
@@ -1238,7 +1240,8 @@ pub struct PingContext {
 }
 
 impl PingContext {
-	/// Build fresh materials, an unraised signal, and a cleared ack flag.
+	/// A context of fresh materials, an unraised signal, and a cleared ack
+	/// flag.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
@@ -1248,9 +1251,8 @@ impl PingContext {
 	}
 }
 
-/// Runs one case of a case table on a runtime of its own, and grades what the
-/// trace of the case recorded against `spec`, as `tb_scenario!` grades a
-/// scenario.
+/// Runs one case of a case table on its own runtime, and grades the trace of
+/// the case against `spec`, as `tb_scenario!` grades a scenario.
 ///
 /// `case` drives the endpoints with a share of the trace, and the grade takes
 /// the result of `case` beside the trace.

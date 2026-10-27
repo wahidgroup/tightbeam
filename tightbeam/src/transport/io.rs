@@ -19,8 +19,6 @@ use crate::encode;
 use crate::policy::TransitStatus;
 use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke", feature = "instrument"))]
-use crate::transport::error::ArrivalRefusal;
 use crate::transport::error::TransportError;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::TransportResult;
@@ -32,6 +30,8 @@ use crate::zeroize::Zeroizing;
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke", feature = "instrument"))]
+use crate::transport::error::ArrivalRefusal;
 #[cfg(host_clock)]
 use crate::utils::time::SystemClock;
 // Doc links name this import, so the docs build carries it.
@@ -41,24 +41,6 @@ use crate::transport::error::TransportFailure;
 use crate::transport::handshake::SessionPeer;
 #[cfg(feature = "instrument")]
 use crate::TightBeamError;
-
-#[cfg(all(
-	feature = "tokio",
-	feature = "std",
-	not(target_arch = "wasm32"),
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-mod deadline {
-	pub use tokio::time::timeout;
-}
-
-#[cfg(all(
-	feature = "tokio",
-	feature = "std",
-	not(target_arch = "wasm32"),
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-use deadline::*;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::state::{CollectStep, ServerHandshakeSlot};
@@ -76,10 +58,9 @@ use handshake::*;
 
 /// The receive side of a split envelope link.
 ///
-/// The trait decouples the
-/// [`MuxTransport`](crate::transport::multiplex::MuxTransport) router from the
-/// link's protection policy. An implementation over an encrypted link
-/// decrypts each record and enforces AEAD sequencing, while one over a
+/// It decouples the [`MuxTransport`](crate::transport::multiplex::MuxTransport)
+/// router from the link's protection policy. An implementation over an
+/// encrypted link decrypts each record and enforces AEAD sequencing. One over a
 /// cleartext link reads envelopes as they arrive.
 pub trait EnvelopeSource: MaybeSend {
 	/// Reads the next envelope from the link.
@@ -104,8 +85,7 @@ pub trait EnvelopeSource: MaybeSend {
 	/// boundary ([RFC 9846 § 4.7.3][rfc9846-4.7.3]).
 	///
 	/// The default fails closed, because a link without keys has no epoch to
-	/// switch. An epoch install on an unprotected link therefore returns an
-	/// error.
+	/// switch.
 	///
 	/// # Errors
 	///
@@ -146,8 +126,7 @@ pub trait EnvelopeSink: MaybeSend {
 	/// ([RFC 9846 § 4.7.3][rfc9846-4.7.3]).
 	///
 	/// The default fails closed, because a link without keys has no epoch to
-	/// switch. An epoch install on an unprotected link therefore returns an
-	/// error.
+	/// switch.
 	///
 	/// # Errors
 	///
@@ -255,10 +234,9 @@ pub trait MessageIO {
 	///
 	/// # Default
 	///
-	/// The default maps [`TransportError::ConnectionClosed`] to `Ok(None)`. A
-	/// protocol-specific implementation that detects its own EOF conditions,
-	/// such as `UnexpectedEof` for TCP, should override this method to map them
-	/// to `Ok(None)`.
+	/// The default maps [`TransportError::ConnectionClosed`] to `Ok(None)`. An
+	/// implementation that detects its own EOF conditions, such as
+	/// `UnexpectedEof` for TCP, should override it to map them to `Ok(None)`.
 	///
 	/// # Errors
 	///
@@ -508,7 +486,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		outcome
 	}
 
-	/// Runs the client handshake while the session is provisioned.
+	/// Runs the client handshake when the session is provisioned.
 	///
 	/// # Errors
 	///
@@ -563,9 +541,9 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidState);
 		}
 
-		// Step 2: Receive the server response. The read runs under the
-		// handshake ceiling, because the phase is handshaking, and the phase
-		// admits the response in cleartext alone.
+		// Step 2: Receive the server response. The handshaking phase holds the
+		// read to the handshake ceiling and admits the response in cleartext
+		// alone.
 		let mut response_wire_bytes = self.read_session_bytes().await?;
 		let limits = *self.limits();
 		let response_contents = self.session_state_mut().admit_arrival(&mut response_wire_bytes, &limits)?;
@@ -668,10 +646,11 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Deadline
 	///
-	/// The tokio runtime supplies the timer. The handshake deadline bounds all
-	/// the work on the unauthenticated path: the reads, and the authorizer and
-	/// observer hooks too. Under another runtime this method has no portable
-	/// timer, so the application that embeds the crate owns that deadline.
+	/// The handshake deadline binds by transport:
+	///
+	/// - The async transport bounds the reads, the writes, and the hooks with the tokio timer.
+	/// - The blocking transport bounds each read by the deadline, and runs the hooks unbounded.
+	/// - An async build without `tokio` has no timer, so the application owns the deadline.
 	///
 	/// # Errors
 	///
@@ -679,6 +658,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::DeadlineExceeded`] -- the handshake timed out.
+	/// - The errors of [`ServerHandshakeSlot::within_budget`].
 	/// - The orchestrator build failure, and the errors of
 	///   [`drive_server_handshake`](Self::drive_server_handshake).
 	/// - The injected error, when the runtime fault model injects a fault at
@@ -704,22 +684,13 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// A deadline that ends the handshake is its outcome, so the record of
 		// the outcome below files it.
-		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
-		let outcome = {
-			let now = self.clock().monotonic();
-			let policy = self.session_state().phase().read_policy(self.limits(), now);
-			match policy.remaining(now) {
-				Ok(Some(remaining)) => {
-					let bounded = timeout(remaining, self.drive_server_handshake(request)).await;
-					bounded.unwrap_or_else(|elapsed| Err(elapsed.into()))
-				}
-				Ok(None) => self.drive_server_handshake(request).await,
-				Err(expired) => Err(expired),
-			}
+		let now = self.clock().monotonic();
+		let policy = self.session_state().phase().read_policy(self.limits(), now);
+		let outcome = match policy.remaining(now) {
+			Ok(Some(remaining)) => Self::within_budget(remaining, self.drive_server_handshake(request)).await,
+			Ok(None) => self.drive_server_handshake(request).await,
+			Err(expired) => Err(expired),
 		};
-
-		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
-		let outcome = self.drive_server_handshake(request).await;
 
 		#[cfg(feature = "instrument")]
 		let outcome = self.emit_handshake_outcome(outcome);
@@ -1172,13 +1143,14 @@ mod tests {
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
 	}
 
-	/// An answer passes under the ceiling of its own mode, so the session
+	/// An answer reads under the ceiling of its own mode, so the session
 	/// refuses a cleartext answer past the cleartext ceiling, though it fits
 	/// the encrypted one.
 	#[tokio::test]
 	async fn a_cleartext_answer_past_its_ceiling_is_refused() -> crate::error::Result<()> {
 		let mut probe = StreamProbe::at(SessionPhase::Cleartext);
 		probe.limits.cleartext_envelope = UNDECODABLE_CLEARTEXT.len();
+
 		let response = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, None));
 		let answer = WireEnvelope::Cleartext(response).to_der()?;
 
@@ -1256,7 +1228,7 @@ mod tests {
 		recorded
 			.into_iter()
 			.filter(|record| record.urn == event)
-			.map(|record| (record.label, record.payload_hash))
+			.map(|record| (record.label.map(String::from), record.payload_hash))
 			.collect()
 	}
 

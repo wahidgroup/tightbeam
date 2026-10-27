@@ -44,8 +44,7 @@ pub enum CompressionError {
 	#[cfg(feature = "zstd")]
 	/// The zstd codec refused the frame, reported as its numeric code.
 	///
-	/// `zstd_safe::get_error_name` renders the code as zstd's own name for
-	/// the condition.
+	/// `zstd_safe::get_error_name` gives zstd's own name for the code.
 	#[error("ZSTD compression/decompression error: code {0}")]
 	ZSTD(usize),
 
@@ -92,9 +91,8 @@ impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Sen
 
 /// The errors collected from one operation.
 ///
-/// The rendering of the list is behavior of the collection, so the chain owns
-/// it through its `Display` impl. Every [`TightBeamError`] message therefore
-/// stays a single format string.
+/// The chain owns the rendering of the list through its `Display` impl, so
+/// every [`TightBeamError`] message stays a single format string.
 #[derive(Debug)]
 pub struct ErrorChain(Vec<TightBeamError>);
 
@@ -380,8 +378,8 @@ pub enum TightBeamError {
 	#[error("Work refused: {0:?}")]
 	WorkRefused(crate::policy::TransitStatus),
 
-	/// The channel closed because the receiving end was dropped before the
-	/// send.
+	/// The other end of a channel is gone: the receiving end dropped before a
+	/// send, or the sending end dropped before it sent.
 	#[error("Channel closed")]
 	ChannelClosed,
 
@@ -538,6 +536,8 @@ crate::impl_from!(crate::crypto::sign::elliptic_curve::Error => TightBeamError::
 crate::impl_from!(crate::testing::error::TestingError => TightBeamError::TestingError);
 #[cfg(feature = "std")]
 crate::impl_from!(std::sync::mpsc::RecvTimeoutError => TightBeamError::RecvTimeoutError discard);
+#[cfg(feature = "std")]
+crate::impl_from!(crate::runtime::ChannelClosed => TightBeamError::ChannelClosed discard);
 
 #[cfg(feature = "transport")]
 impl TightBeamError {
@@ -556,10 +556,9 @@ impl TightBeamError {
 
 	/// Returns whether this error is a fuzz iteration running out of input.
 	///
-	/// AFL feeds short inputs constantly. An iteration whose oracle ran out of
-	/// bytes before the process reached a terminal state exercised a prefix of
-	/// a run, so its trace is incomplete and its assertions describe events
-	/// the target was never given the input to reach.
+	/// AFL feeds short inputs constantly. An iteration whose oracle runs out of
+	/// bytes before a terminal state exercises only a prefix, so its trace is
+	/// incomplete and its assertions describe events its input never reached.
 	#[must_use]
 	pub fn is_fuzz_input_exhausted(&self) -> bool {
 		#[cfg(feature = "testing")]
@@ -580,9 +579,9 @@ impl TightBeamError {
 	///
 	/// - A failure that carries a transit status keeps it, apart from [`TransitStatus::Unavailable`].
 	/// - A carried `Unavailable` answers [`TransitStatus::Unknown`], because
-	///   the handler ran up to its failure. A peer reads `Unavailable` as a
-	///   refusal before any handler ran, which a gate answers, and a gateway
-	///   retries such a frame on another instance.
+	///   the handler ran until it failed. A peer reads `Unavailable` as a
+	///   gate's refusal before any handler ran, and a gateway retries that
+	///   frame on another instance.
 	/// - A kind or an operation that the endpoint leaves out answers [`TransitStatus::Unimplemented`].
 	/// - Any other failure answers [`TransitStatus::Internal`], so a peer
 	///   tells a failure apart from an accepted empty reply and the failure
@@ -681,6 +680,15 @@ mod tests {
 	fn unit_variants_have_no_source() {
 		let err = TightBeamError::InvalidBody;
 		assert!(core::error::Error::source(&err).is_none());
+	}
+
+	/// A runtime channel whose other end is gone converts into the channel
+	/// error of the crate, so `?` carries the fact under one name.
+	#[test]
+	fn a_closed_runtime_channel_converts_into_the_channel_error() -> Result<()> {
+		let converted = TightBeamError::from(crate::runtime::ChannelClosed);
+		assert!(matches!(converted, TightBeamError::ChannelClosed));
+		Ok(())
 	}
 
 	/// A protocol error converts into the transport error it names, and the

@@ -13,7 +13,8 @@
 
 // The shared test helpers.
 mod common;
-
+// The rules over the crate's own sources.
+mod tooling;
 // The job and pipeline tests.
 mod jobs;
 

@@ -1,5 +1,6 @@
 //! The integration test of rate-monotonic analysis (RMA) with FDR.
 
+use core::error::Error;
 use core::time::Duration;
 
 use tightbeam::testing::fdr::FdrConfig;
@@ -53,29 +54,34 @@ tb_assert_spec! {
 	}
 }
 
+/// The configuration that grades [`RmaAssertSpec`], checks the run against
+/// [`RmaSchedulableProcess`] in Layer 2 and Layer 3, and runs `hooks`.
+fn rma_config(hooks: TestHooks) -> Result<ScenarioConfig, Box<dyn Error>> {
+	let fdr = FdrConfig {
+		seeds: 2,
+		max_depth: 8,
+		max_internal_run: 4,
+		timeout_ms: 500,
+		specs: vec![RmaSchedulableProcess::process()?],
+		fail_fast: true,
+		..Default::default()
+	};
+
+	let builder = ScenarioConfig::builder().with_spec(RmaAssertSpec::latest());
+	let builder = builder.with_csp(RmaSchedulableProcess).with_fdr(fdr);
+	Ok(builder.with_hooks(hooks).build()?)
+}
+
 tb_scenario! {
 	name: test_rma_with_fdr,
-	config: ScenarioConfig::builder()
-		.with_spec(RmaAssertSpec::latest())
-		.with_csp(RmaSchedulableProcess)
-		.with_fdr(FdrConfig {
-			seeds: 2,
-			max_depth: 8,
-			max_internal_run: 4,
-			timeout_ms: 500,
-			specs: vec![RmaSchedulableProcess::process()],
-			fail_fast: true,
-			..Default::default()
-		})
-		.with_hooks(TestHooks::on_pass(|context| {
+	config: rma_config(TestHooks::on_pass(|context| {
 				assert!(context.assert_spec().is_some(), "Assert spec should be present");
 				assert!(context.process().is_some(), "Process should be present");
 
 				let constraints = context.timing_constraints().expect("the spec test declares timing constraints");
 				assert!(constraints.has_constraint(&Event::from(TASK1)), "Should have task1 constraint");
 				assert!(constraints.has_constraint(&Event::from(TASK2)), "Should have task2 constraint");
-			}))
-		.build(),
+			})),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(TASK1)?;

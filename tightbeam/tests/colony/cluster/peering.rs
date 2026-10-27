@@ -233,6 +233,7 @@ tb_scenario! {
 			let ad_reply = advertise_peer_signed(gateway, &gateway.key, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")])
 				.await?;
 			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+
 			let ad_reply = advertise_peer_signed(gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")])
 				.await?;
 			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
@@ -312,9 +313,8 @@ tb_scenario! {
 			start_cluster(&trace, peering_cluster_conf(&certs)).await
 		},
 		client: |ClusterEnv { context: certs, cluster, .. }| async move {
-			let foreign_ns =
-				ColonyNamespace::new("tightbeam", "other-realm").map_err(|_| TightBeamError::MissingResponse)?;
-			let foreign = foreign_ns.servlet("ping").map_err(|_| TightBeamError::MissingResponse)?;
+			let foreign_ns = ColonyNamespace::new("tightbeam", "other-realm")?;
+			let foreign = foreign_ns.servlet("ping")?;
 
 			let ad_reply = advertise_peer(&certs, &cluster, PEER_GATEWAY_ADDR, vec![foreign]).await?;
 			assert_eq!(ad_reply, TransitStatus::PermissionDenied, "the gateway refuses the advertisement");
@@ -396,9 +396,9 @@ tb_scenario! {
 			});
 
 			let frame = signed_control_frame(&certs, b"peer-advertise", request).await?;
-
 			let ad_reply = send_advertisement_frame(&certs, &cluster, frame.to_owned()).await?;
 			assert_eq!(ad_reply, TransitStatus::PermissionDenied, "the gateway refuses the advertisement");
+
 			let held = servlet_urn("ping").servlet_instance(locator.as_ref())?;
 			emit_servlet_update(
 				&mut client,
@@ -473,9 +473,9 @@ tb_assert_spec! {
 	}
 }
 
-// Unary cross-cluster forward: ping lives only on B. The client asks
-// A, A re-emits Work with the budget spent, B serves locally, and the
-// echo returns.
+// Unary cross-cluster forward: ping lives only on the advertiser. The client
+// asks the receiver, the receiver re-emits Work with the budget spent, the
+// advertiser serves locally, and the echo returns.
 tb_scenario! {
 	name: cluster_forwards_work_to_peer_gateway,
 	spec: ClusterPeerForwardEchoSpec,
@@ -507,8 +507,7 @@ tb_scenario! {
 }
 
 // Peer hops dial on `peer_trust`, so an importer with `hive_trust = None`
-// forwards when only `peer_trust` anchors the certificate of the peer
-// gateway.
+// forwards when only `peer_trust` anchors the peer gateway's certificate.
 tb_scenario! {
 	name: cluster_forwards_on_peer_trust_plane,
 	spec: ClusterPeerForwardEchoSpec,
@@ -698,10 +697,10 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
-			// Each forward reaches the dead peer, weakens the trail, and
+			// Each forward dials the dead peer, weakens the trail, and
 			// resolves to a refusal at the client.
-			let statuses = refused_pings(&mut client, &certs.key, b'f', CONTAINMENT_ABANDON_LIMIT).await?;
-			assert_eq!(statuses, [TransitStatus::Unavailable; CONTAINMENT_ABANDON_LIMIT as usize], "each forward to the dead peer is refused");
+			let statuses = refused_pings(&mut client, &certs.key, b'f', CONTAINMENT_ABANDON_LIMIT.get()).await?;
+			assert_eq!(statuses, [TransitStatus::Unavailable; CONTAINMENT_ABANDON_LIMIT.get() as usize], "each forward to the dead peer is refused");
 
 			// Once the trail reaches abandonment, selection drops it, so the
 			// peer-only type is Unavailable and the gateway attempts no
@@ -781,8 +780,8 @@ tb_scenario! {
 
 			// Fail the peer trail into abandonment before any local route.
 			// Every submission resolves to a refusal at the client.
-			let statuses = refused_pings(&mut client, &certs.key, b'x', CONTAINMENT_ABANDON_LIMIT).await?;
-			assert_eq!(statuses, [TransitStatus::Unavailable; CONTAINMENT_ABANDON_LIMIT as usize], "each forward to the dead peer is refused");
+			let statuses = refused_pings(&mut client, &certs.key, b'x', CONTAINMENT_ABANDON_LIMIT.get()).await?;
+			assert_eq!(statuses, [TransitStatus::Unavailable; CONTAINMENT_ABANDON_LIMIT.get() as usize], "each forward to the dead peer is refused");
 
 			// Heal the colony: a local ping hive joins after the bad nest
 			// reaches abandonment, which leaves one live route for the type.

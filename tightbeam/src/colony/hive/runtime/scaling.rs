@@ -9,13 +9,11 @@ use std::sync::{Arc, RwLock};
 
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{
-	HashMapRegistry, HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry,
-	ServletScaleConfig, SpawnerFn,
+	HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry, ServletScaleConfig, SpawnerFn,
 };
 use crate::colony::protocol::ServletChange;
-use crate::colony::TaskGroup;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
-use crate::runtime::rt;
+use crate::runtime::{rt, TaskGroup};
 use crate::trace::TraceCollector;
 use crate::transport::multiplex::MuxCapable;
 use crate::transport::state::EncryptedProtocolState;
@@ -26,9 +24,9 @@ use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 /// The shared handles that the hive auto-scaling loop runs on.
-pub struct ScalingLoop<P: Protocol> {
+pub struct ScalingLoop<P: Protocol, R: ServletRegistry> {
 	/// The registered servlet instances, keyed by instance URN bytes.
-	pub servlets: Arc<HashMapRegistry>,
+	pub servlets: Arc<R>,
 	/// The per-type spawners that a scale-up calls.
 	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	/// The hive-level trace collector, shared with each spawned servlet.
@@ -51,13 +49,14 @@ pub struct ScalingLoop<P: Protocol> {
 	pub tasks: TaskGroup,
 }
 
-impl<P> ScalingLoop<P>
+impl<P, R> ScalingLoop<P, R>
 where
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
 	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + Sync + 'static,
+	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Spawns the loop that evaluates each servlet type once per cooldown,
@@ -77,7 +76,7 @@ where
 
 		let config = Arc::new(config);
 		let link = hive_addr.map(|addr| {
-			ClusterLink::<P>::new(
+			ClusterLink::<P, R>::new(
 				Arc::clone(&servlets),
 				Arc::clone(&cluster_addrs),
 				addr,
@@ -85,6 +84,7 @@ where
 				Arc::clone(&trace),
 			)
 		});
+
 		let evaluation_period = config.scaling.cooldown;
 		let mut task = ScalingTask {
 			hive_urn: hive_addr.and_then(|addr| config.hive_urn(addr)).map(Arc::new),
@@ -135,9 +135,8 @@ where
 
 /// The instance count and the summed utilization of one servlet type.
 ///
-/// The two numbers are only meaningful together: a mean over the wrong
-/// count reads as a different load. One value carries both, so the division
-/// stays with the pair it divides.
+/// A mean over the wrong count reads as a different load, so one value
+/// carries both numbers and the division stays with the pair it divides.
 #[derive(Default)]
 struct TypeLoad {
 	instances: usize,
@@ -241,29 +240,29 @@ impl Cooldowns {
 
 /// The resolved handles of one live scaling loop.
 ///
-/// [`ScalingLoop`] names what the hive supplies. This names what the loop
-/// body works with once [`ScalingLoop::spawn`] derives the hive URN and binds
-/// the cluster link, so every scale decision reads one owner instead of a
-/// parameter bundle rebuilt per attempt.
-struct ScalingTask<P: Protocol> {
-	servlets: Arc<HashMapRegistry>,
+/// [`ScalingLoop`] names what the hive supplies. This type holds what the
+/// loop body works with once [`ScalingLoop::spawn`] derives the hive URN and
+/// binds the cluster link, so every scale decision reads one owner.
+struct ScalingTask<P: Protocol, R: ServletRegistry> {
+	servlets: Arc<R>,
 	trace: Arc<TraceCollector>,
 	utilization: Arc<AtomicU16>,
 	samples: LastSamples,
 	hive_context: Arc<HiveContextImpl<P>>,
-	link: Option<ClusterLink<P>>,
+	link: Option<ClusterLink<P, R>>,
 	hive_urn: Option<Arc<Urn<'static>>>,
 	config: Arc<HiveConfig>,
 	tasks: TaskGroup,
 }
 
-impl<P> ScalingTask<P>
+impl<P, R> ScalingTask<P, R>
 where
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
 	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + Sync + 'static,
+	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Whether local scaling must hold off.
@@ -331,6 +330,7 @@ where
 		if let Some(added) = placed.into_servlet_info() {
 			self.announce(ServletChange::Added(added));
 		}
+
 		cooldowns.stamp(type_key);
 	}
 
@@ -380,7 +380,7 @@ mod tests {
 	use super::*;
 	use crate::bps;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::hive::ServletBox;
+	use crate::colony::hive::{HashMapRegistry, ServletBox};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::tb_cases;
 	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
@@ -426,7 +426,6 @@ mod tests {
 	tb_cases! {
 		fn aggregate_utilization_means_across_all_instances((instances, utilization_sum, expected): (usize, u64, u16)) {
 			let load = TypeLoad { instances, utilization_sum };
-
 			assert_eq!(load.utilization().get(), expected);
 		}
 
@@ -481,7 +480,7 @@ mod tests {
 
 	/// A scaling task over a registry that holds one [`ReportingProbe`] of
 	/// [`echo_type`], which reports what `report` holds.
-	fn reporting_task(report: &Report) -> ScalingTask<TokioListener> {
+	fn reporting_task(report: &Report) -> ScalingTask<TokioListener, HashMapRegistry> {
 		let servlet_type = echo_type();
 		let key = servlet_type.instance_urn(b"127.0.0.1:7010");
 		let key = key.expect("the probe locator names an instance");

@@ -1,9 +1,7 @@
 //! Shared constants for the handshake, cryptography, accept loops, testing,
 //! and configuration.
 //!
-//! - **Handshake protocol.** Domain separation labels for cryptographic
-//!   operations. They are the canonical constants for every handshake
-//!   operation.
+//! - **Handshake protocol.** The canonical domain separation labels of every handshake operation.
 //! - **Cryptographic.** HKDF, key, and salt sizes, and the AES-GCM sizes and rekey limits.
 //! - **Accept loops.** The connection cap and retry delay of the servlet, hive, gateway, and `server!` loops.
 //! - **Testing and verification.** Generator constants and seeds for
@@ -31,8 +29,8 @@ pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 /// Domain label that leads the `kekid` of the receipt acknowledgement seal,
 /// ahead of the transcript hash.
 ///
-/// The label names the acknowledgement's key-encryption key in the `kekid`,
-/// so an opener of another purpose refuses the seal by its key identifier.
+/// The label names the acknowledgement's key-encryption key, so an opener of
+/// another purpose refuses the seal by its `kekid`.
 pub const TIGHTBEAM_ACK_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/ack/kekid/v1";
 
 /// KDF info label of the key that seals the closing of a handshake (HKDF):
@@ -251,10 +249,9 @@ pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
 /// Record limit per directional key before a rekey is required.
 ///
 /// It is the record limit at [`DEFAULT_MAX_ENCRYPTED_ENVELOPE`]: 2^20
-/// records of up to 256 KiB, which keeps the per-key volume inside the
-/// renewal volume. A session at a raised ceiling holds a lower limit. The
-/// limit keeps room for one renewal exchange up to a 2 GiB ceiling (128
-/// records) and loses it at 4 GiB (64 records).
+/// records of up to 256 KiB, inside the renewal volume. A raised ceiling
+/// lowers the limit. It keeps room for one renewal exchange up to a 2 GiB
+/// ceiling (128 records) and loses it at 4 GiB (64 records).
 ///
 /// # Enforcement
 ///
@@ -279,16 +276,16 @@ const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT > DEFAULT_REKEY_MIN_SPEND_RECOR
 /// The slack gives the three-leg exchange (request, ack, control) room to
 /// finish before the hard floor parks data.
 ///
-/// - If the exchange finishes in time, data resumes under the new epoch.
+/// - If the exchange finishes in time, data resumes under the next epoch.
 /// - Otherwise data parks until the install completes, or the renewal deadline triggers the GoAway drain.
 pub const DEFAULT_REKEY_RENEWAL_ALLOWANCE: u64 = 64;
 
 /// Minimum records a server must have received since the last epoch
 /// install before it accepts another `RekeyRequest`.
 ///
-/// The constant bounds rekey floods. Together with the one-exchange-in-flight
-/// rule, it caps how often a client can force the server through signature
-/// and settlement work. A violation is a protocol error.
+/// It bounds rekey floods. With the one-exchange-in-flight rule, it caps how
+/// often a client can force the server through signature and settlement
+/// work. A violation is a protocol error.
 ///
 /// # Sources
 ///
@@ -302,16 +299,16 @@ pub const DEFAULT_REKEY_MIN_SPEND_RECORDS: u64 = 4;
 ///
 /// The deadline bounds the c2s data park, which spans the Ack-to-Done window
 /// plus the hard floor. When a peer goes silent, expiry releases the park and
-/// converges on the GoAway drain path.
+/// takes the GoAway drain path.
 pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 
 /// Concurrent-connection cap of each accept loop, async or blocking.
 ///
-/// The servlet, hive, and gateway planes take it as their cap, and the
-/// `server!` macro takes it unless a `max_connections` policy names another.
+/// The servlet, hive, and gateway planes take it, and the `server!` macro
+/// takes it unless a `max_connections` policy names another.
 ///
-/// The loop pauses its accepts while this many connections are alive, so
-/// a connection flood waits in the listener backlog rather than pin unbounded
+/// The loop pauses its accepts while this many connections are alive, so a
+/// connection flood waits in the listener backlog rather than pin unbounded
 /// tasks and file descriptors.
 ///
 /// # Sources
@@ -319,13 +316,12 @@ pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 /// - CWE-400, uncontrolled resource consumption: <https://cwe.mitre.org/data/definitions/400.html>
 pub const DEFAULT_MAX_SERVER_CONNECTIONS: core::num::NonZeroUsize = match core::num::NonZeroUsize::new(1024) {
 	Some(cap) => cap,
-	None => core::num::NonZeroUsize::MIN,
+	None => panic!("the default connection cap takes one connection or more"),
 };
 
 /// Delay between accept retries after a failed accept.
 ///
-/// The delay spaces the retries far enough apart that a descriptor shortage
-/// has time to clear between attempts.
+/// It spaces the retries so a descriptor shortage can clear between them.
 pub const DEFAULT_ACCEPT_RETRY_DELAY: core::time::Duration = core::time::Duration::from_millis(50);
 
 /// Linear Congruential Generator (LCG) multiplier constant.
@@ -351,8 +347,7 @@ pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 ///
 /// # Properties
 ///
-/// - The increment must be odd for a full period.
-/// - It is co-prime with 2^64 because it is odd.
+/// - The increment is odd, as a full period requires, so it is co-prime with 2^64.
 /// - It pairs with [`LCG_MULTIPLIER`] for the properties listed there.
 /// - The same seed produces identical sequences on every platform.
 /// - The generator uses integer arithmetic only.
@@ -391,10 +386,9 @@ pub const SPLITMIX64_MIX_2: u64 = 0x94D049BB133111EB;
 
 /// Default seed of the random fault injection strategy, so a run repeats.
 ///
-/// The value `0xDEADBEEF` is a recognizable debug marker. Systems
-/// programming conventionally uses it for test, debug, or uninitialized
-/// state. Override it in production fault tests through
-/// `FaultModel::with_seed(custom_seed)`.
+/// The value `0xDEADBEEF` is the debug marker systems programming uses for
+/// test, debug, or uninitialized state. Override it in production fault tests
+/// through `FaultModel::with_seed(custom_seed)`.
 ///
 /// # Used by
 ///
@@ -404,9 +398,8 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 
 /// Default backpressure threshold in basis points (90% = 9000 bps).
 ///
-/// When aggregate utilization reaches this threshold, the hive signals
-/// `TransitStatus::ResourceExhausted` to the cluster, so the cluster should
-/// route work elsewhere.
+/// The hive signals `TransitStatus::ResourceExhausted` to the cluster at this
+/// aggregate utilization, and the cluster should route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 
 /// Utilization assumed for a servlet that reports none (50% = 5000 bps).
@@ -425,7 +418,7 @@ pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 ///
 /// - `Frame.metadata.order` is within this many milliseconds of the hive's own
 ///   clock, in both directions to tolerate skew.
-/// - The signature is new inside the window.
+/// - The signature is unseen inside the window.
 ///
 /// # Sources
 ///
@@ -492,9 +485,8 @@ pub const MIN_MUX_CHUNK_SIZE: u32 = 1024;
 ///   <https://datatracker.ietf.org/doc/html/rfc9113#section-4.2>
 pub const MAX_MUX_CHUNK_SIZE: u32 = 64 * 1024;
 
-/// Default per-chunk payload size advertised when none is configured.
-///
-/// The value is 16 KiB, the HTTP/2 default frame size.
+/// Default per-chunk payload size advertised when none is configured: 16 KiB,
+/// the HTTP/2 default frame size.
 ///
 /// # Sources
 ///
@@ -535,8 +527,7 @@ pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
 /// [`DEFAULT_REKEY_RECORD_LIMIT`].
 ///
 /// - Every data chunk debits at least one credit and consumes exactly one record.
-/// - Control envelopes (credit grants, cancels, pings, GoAway) pass outside the
-///   budget, and they consume AEAD records too.
+/// - Control envelopes (credit grants, cancels, pings, GoAway) spend AEAD records outside the budget.
 /// - The default grantor grants credit in batches, so control traffic stays at
 ///   `O(data chunks / window)` records, inside the other half.
 /// - The bound holds at the default ceiling. At a raised one the record limit can fall below the budget.
@@ -555,13 +546,12 @@ pub const DEFAULT_MAX_CLEARTEXT_ENVELOPE: usize = 128 * 1024;
 /// Default ceiling in bytes for an encoded encrypted envelope (256 KiB).
 ///
 /// A server refuses a frame whose declared content length exceeds this
-/// ceiling. It refuses before it reads the content, so the declared length
-/// bounds the allocation.
+/// ceiling before it reads the content, so the declared length bounds the
+/// allocation.
 ///
-/// - The refusal closes the connection.
-/// - The sender sees a reset instead of a typed error.
+/// - The refusal closes the connection, so the sender sees a reset and no typed error.
 /// - Clients therefore preflight outgoing encrypted envelopes against this ceiling.
-/// - When no explicit limit is set, the client fails locally with a typed `SizeExceeded`.
+/// - With no explicit limit set, the client fails locally with a typed `SizeExceeded`.
 ///
 /// # Sources
 ///
@@ -570,12 +560,10 @@ pub const DEFAULT_MAX_ENCRYPTED_ENVELOPE: usize = 256 * 1024;
 
 /// Default deadline for a single read or write on an established session.
 ///
-/// The handshake carries its own allowance. Once a session is established,
-/// a peer that stalls mid-frame holds the connection, its task, and
-/// its accept-loop permit for as long as it stays silent.
-///
-/// Every transport carries this deadline, including one that sets no
-/// explicit timeout, so an established session always has an expiry.
+/// The handshake carries its own allowance. On an established session, a peer
+/// that stalls mid-frame holds the connection, its task, and its accept-loop
+/// permit while it stays silent. Every transport carries this deadline, even
+/// one with no explicit timeout, so an established session always expires.
 ///
 /// # Sources
 ///
@@ -637,10 +625,9 @@ pub(crate) const MAX_CMS_SET_LEN: usize = 32;
 
 /// Default ceiling for decompressed message bodies (16 MiB).
 ///
-/// Compressed frame bodies arrive under the transport's envelope ceiling, and
-/// zstd can inflate a body under that ceiling past this one. A cap on the
-/// inflated size bounds the memory an attacker can force with a
-/// decompression bomb.
+/// A compressed frame body arrives under the transport's envelope ceiling,
+/// and zstd can inflate it past this one. The cap on the inflated size bounds
+/// the memory an attacker can force with a decompression bomb.
 ///
 /// Override it per inflator through `ZstdCompression::with_max_output`.
 ///
@@ -652,9 +639,8 @@ pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// Hard ceiling on the bytes one mux stream reassembles: a unary reassembly
 /// buffer, or the body that `StreamBody::into_bytes` collects.
 ///
-/// Credit grants may raise the chunk window, while accepted payload bytes
-/// stay within this bound. The value equals
-/// [`DEFAULT_MAX_DECOMPRESSED_LEN`].
+/// Credit grants may raise the chunk window, and accepted payload bytes stay
+/// within this bound, which equals [`DEFAULT_MAX_DECOMPRESSED_LEN`].
 ///
 /// # Sources
 ///
@@ -664,11 +650,10 @@ pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
 
 /// Reassembly bytes one connection may buffer across every open stream.
 ///
-/// [`MAX_MUX_REASSEMBLY_BYTES`] bounds a single stream. A peer that opens many
-/// streams multiplies it, so the connection carries this ceiling as well and
-/// every stream charges against it. A connection that reassembles concurrent
-/// streams in good faith stays inside four stream ceilings. Beyond that, the
-/// peer spends this endpoint's memory and makes no progress.
+/// [`MAX_MUX_REASSEMBLY_BYTES`] bounds one stream, and a peer that opens many
+/// streams multiplies it, so every stream also charges against this ceiling.
+/// Concurrent streams in good faith stay inside four stream ceilings. Past
+/// that, the peer spends this endpoint's memory and makes no progress.
 ///
 /// # Sources
 ///
@@ -678,12 +663,10 @@ pub const MAX_MUX_CONNECTION_REASSEMBLY_BYTES: usize = 4 * MAX_MUX_REASSEMBLY_BY
 
 /// Ceiling on servlet types carried in one peer advertisement.
 ///
-/// A peer gateway advertisement enumerates the servlet types its colony
-/// exports. The bound on the count refuses an oversized advertisement before
-/// it installs unbounded peer routes.
-///
-/// Gossip meshes apply the same control-message flood bound to their
-/// advertisement path.
+/// A peer gateway advertisement lists the servlet types its colony exports.
+/// The bound refuses an oversized advertisement before it installs unbounded
+/// peer routes. Gossip meshes apply the same control-message flood bound to
+/// their advertisement path.
 ///
 /// # Sources
 ///
@@ -715,9 +698,9 @@ pub const MAX_PEER_ROUTES: usize = 1024;
 /// Ceiling on distinct relay-trail buckets tracked in one servlet registry.
 ///
 /// Relay trails bucket per `(origin, relay)` pair, so a colony of `N`
-/// members can create up to `N * (N - 1)` buckets. The budget is separate
-/// from [`MAX_PEER_GATEWAYS`], because relay fan-in and direct-gateway
-/// admission each hold their own budget.
+/// members can create up to `N * (N - 1)` buckets. The budget is apart from
+/// [`MAX_PEER_GATEWAYS`], so relay fan-in and direct-gateway admission each
+/// hold their own.
 ///
 /// # Sources
 ///
@@ -727,9 +710,9 @@ pub const MAX_RELAY_BUCKETS: usize = 64;
 
 /// Ceiling on total live relay-trail routes tracked in one servlet registry.
 ///
-/// The ceiling is separate from [`MAX_PEER_ROUTES`] for the same reason that
-/// [`MAX_RELAY_BUCKETS`] is separate from [`MAX_PEER_GATEWAYS`]. A full relay
-/// plane must leave the direct-route budget untouched.
+/// The ceiling is apart from [`MAX_PEER_ROUTES`], as [`MAX_RELAY_BUCKETS`] is
+/// apart from [`MAX_PEER_GATEWAYS`], so a full relay plane leaves the
+/// direct-route budget untouched.
 ///
 /// # Sources
 ///
@@ -747,7 +730,7 @@ pub const MAX_RELAY_ROUTES: usize = 1024;
 ///   asserts its own reachability alone and a crafted large value clamps to the
 ///   same ceiling.
 /// - A relayed hop carries the explicit value, which every later gateway clamps again.
-/// - The sentinel is also the DER DEFAULT, so the common origin request omits the field from its encoding.
+/// - The sentinel is also the DER DEFAULT, so the common origin request omits the field.
 ///
 /// # Sources
 ///
@@ -757,17 +740,16 @@ pub const DEFAULT_HOP_BUDGET: u8 = u8::MAX;
 
 /// Default advertisement-rumor refresh interval in milliseconds.
 ///
-/// The advertise beat floods the local slate as an advertisement rumor only
-/// when the slate or the flood target set changed. One refresh on this
-/// interval lets late joiners and pruned witnesses relearn the origin.
-/// Bitcoin self-announces addresses the same way, on change and on a slow
-/// timer, well below one refresh per beat.
+/// The advertise beat floods the local slate as an advertisement rumor when
+/// the slate or the flood targets change, and once per interval, so late
+/// joiners and pruned witnesses relearn the origin. Bitcoin self-announces
+/// addresses the same way, on change and on a slow timer, well below one
+/// refresh per beat.
 ///
 /// # Contract
 ///
-/// The refresh MUST stay under the gossip freshness window
-/// ([`DEFAULT_GOSSIP_SEEN_TTL_MS`]) so a refreshed rumor always admits as
-/// fresh.
+/// The refresh MUST stay under [`DEFAULT_GOSSIP_SEEN_TTL_MS`], the gossip
+/// freshness window, so a refreshed rumor always admits as fresh.
 ///
 /// # Sources
 ///
@@ -777,12 +759,12 @@ pub const DEFAULT_AD_RUMOR_REFRESH_MS: u64 = 30_000;
 
 /// Default `max_hops` relay cap on a cluster gateway.
 ///
-/// The default allows one forward. A gateway relays a request to a peer at
-/// most once, and the peer serves locally only. Operators raise the cap to
-/// enable relay-trail fallback, which needs two forwards end to end.
+/// The default allows one forward: a gateway relays a request to a peer at
+/// most once, and the peer serves locally only. Raise the cap to enable
+/// relay-trail fallback, which needs two forwards end to end.
 ///
 /// The cap bounds the forwards one request can demand from this gateway,
-/// whatever budget the request carries.
+/// whatever budget it carries.
 ///
 /// # Sources
 ///
@@ -805,8 +787,7 @@ pub const MAX_GOSSIP_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Ceiling on the initial time-to-live an origin gossip may request.
 ///
 /// The time-to-live is the hop radius of a flood, so the cap bounds the basic
-/// reproduction number of a single rumor, whatever value a publisher
-/// requests.
+/// reproduction number of one rumor, whatever a publisher requests.
 ///
 /// # Sources
 ///
@@ -817,10 +798,8 @@ pub const MAX_GOSSIP_TTL: u8 = 8;
 /// Ceiling on distinct gossip rumors retained in one in-memory journal.
 ///
 /// The journal retains recent rumors for deduplication and anti-entropy
-/// reconciliation.
-///
-/// - The bound on the count keeps memory finite under a flood.
-/// - The journal fails closed once the ceiling is reached.
+/// reconciliation. The bound keeps its memory finite under a flood, and the
+/// journal fails closed at the ceiling.
 ///
 /// # Sources
 ///
@@ -830,9 +809,8 @@ pub const MAX_GOSSIP_LOG: usize = 4096;
 
 /// Ceiling on gossip rumors retained per signer in one in-memory journal.
 ///
-/// A partition of the journal per signer isolates retention per identity.
-/// One signer's distinct digests spend that signer's own retention, which
-/// leaves other signers' rumors recorded.
+/// The journal partitions retention per signer, so one signer's distinct
+/// digests spend its own retention and leave other signers' rumors recorded.
 ///
 /// # Sources
 ///
@@ -842,11 +820,11 @@ pub const MAX_GOSSIP_LOG_PER_SIGNER: usize = 256;
 
 /// Default gossip deduplication window in milliseconds.
 ///
-/// A rumor whose stated issue time lies within this window of the clock is
-/// fresh. The journal keeps its digest while it is fresh, so a replay counts
-/// as already seen, which is the recovered or immune state of the epidemic
-/// model. The window must exceed the time a flood takes to traverse the peer
-/// graph, so the journal suppresses even a late duplicate.
+/// A rumor is fresh while its stated issue time lies within this window of
+/// the clock. The journal keeps its digest while it is fresh, so a replay
+/// counts as seen: the recovered or immune state of the epidemic model. The
+/// window must exceed the time a flood takes to cross the peer graph, so the
+/// journal suppresses even a late duplicate.
 pub const DEFAULT_GOSSIP_SEEN_TTL_MS: u64 = 120_000;
 
 /// Default gossip retention window in milliseconds.
@@ -874,9 +852,8 @@ pub const DEFAULT_GOSSIP_RATE_BURST: u32 = 128;
 
 /// Default interval that restores one token to a signer's gossip bucket.
 ///
-/// Together with [`DEFAULT_GOSSIP_RATE_BURST`], this sets the sustained
-/// per-signer publish rate a gateway admits. The default rate is four rumors
-/// per second.
+/// With [`DEFAULT_GOSSIP_RATE_BURST`], it sets the sustained per-signer
+/// publish rate a gateway admits: four rumors per second by default.
 pub const DEFAULT_GOSSIP_RATE_REFILL_MS: u64 = 250;
 
 /// Ceiling on distinct signers tracked by one in-memory admission store.
@@ -939,9 +916,8 @@ pub const MAX_PEX_SAMPLE: usize = 8;
 
 /// Ceiling on unverified candidates probed per advertise beat.
 ///
-/// Feeler dials verify candidates before promotion. A bound on them per beat
-/// keeps discovery traffic a small constant beside the anchor and tried
-/// dials.
+/// Feeler dials verify candidates before promotion, and this bound keeps
+/// discovery traffic a small constant beside the anchor and tried dials.
 pub const PEER_PROBE_PER_BEAT: usize = 4;
 
 /// Wait before a candidate that failed one feeler probe is probed again.
@@ -969,8 +945,7 @@ pub const PEER_PROBE_BACKOFF_MAX_MS: u64 = 60_000;
 /// liveness clock.
 ///
 /// - The threshold tolerates a two-beat partition.
-/// - Eviction frees the prefix bucket slot for a live candidate.
-/// - Discovery refills the table.
+/// - Eviction frees the prefix bucket slot for a live candidate, and discovery refills the table.
 /// - Eviction is the fail-closed direction.
 pub const MAX_PEER_TRIED_FAILURES: usize = 3;
 

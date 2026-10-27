@@ -480,7 +480,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, frame).await?;
 			let work_response: ClusterWorkResponse = decode(response_frame.message())?;
-			check_refused_reply(&work_response)?;
+			check_refused_reply(&work_response);
 
 			let echo = submit_ping(&certs, &cluster).await?;
 			assert_eq!(echo.doubled, 42, "a well-formed request still routes");
@@ -699,10 +699,8 @@ impl RefusingPort {
 }
 
 /// Starts a gateway whose balancer tries `first` before any other instance,
-/// and registers one hive that serves `ping` at `first` and at `second`.
-///
-/// The gateway's hive pool offers `mux_offer`, and with none it stays
-/// single-flight.
+/// and registers one hive that serves `ping` at `first` and at `second`. The
+/// hive pool offers `mux_offer`, or stays single-flight with none.
 async fn gateway_trying_first(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
@@ -875,7 +873,7 @@ impl OversizedReplyRelay {
 	}
 
 	/// Forwards each DER element the servlet writes until its handler ran,
-	/// then writes the element's tag and [`OVERSIZED_LENGTH`] in its place.
+	/// and then writes the element's tag and [`OVERSIZED_LENGTH`] in its place.
 	async fn replies(
 		servlet: &mut OwnedReadHalf,
 		gateway: &mut OwnedWriteHalf,
@@ -1172,7 +1170,7 @@ tb_scenario! {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
 			let mut conf = peering_cluster_conf(&certs);
-			conf.pheromone.abandonment_limit = 1;
+			conf.pheromone.abandonment_limit = NonZeroU32::MIN;
 			conf.pheromone.evaporation_interval = Duration::from_millis(50);
 			start_cluster(&trace, conf).await
 		},

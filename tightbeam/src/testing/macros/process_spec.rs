@@ -1,9 +1,11 @@
 //! The [`tb_process_spec!`](crate::tb_process_spec!) macro, which defines a CSP
 //! process.
 
-/// Defines a CSP process with a declarative syntax.
+/// Defines a CSP process with a declarative syntax, as a unit struct that
+/// implements [`ProcessSpec`].
 ///
-/// Each state lists its transitions in three forms:
+/// Each state takes one definition, which lists its transitions in three
+/// forms. A state defined twice fails to compile.
 ///
 /// - `EVENT => STATE` is a plain transition.
 /// - `EVENT [ GUARD ] => STATE` is a transition that a timing guard enables.
@@ -15,13 +17,30 @@
 /// - A guard or a reset names its clock as an identifier that the `clocks: { CLOCK, ... }` block declares.
 /// - A bracket after an event is its guard, so an event that is an index expression takes parentheses.
 /// - The CSP trace check reads the event order alone, so it accepts a guarded event at any time.
-/// - A guard binds in FDR exploration alone, as [`ProcessBuilder::add_timed_transition`] states.
+/// - A guard binds in FDR exploration alone ([`ProcessBuilder::add_timed_transition`]).
 ///
-/// The `clocks:` and `timing` blocks and a guard need the `testing-timing`
-/// feature, and the `schedulability` block needs `testing-schedulability`.
-/// A build without the feature that a block needs fails to compile.
+/// The blocks follow these rules:
+///
+/// - The `timing` block holds any of `wcet:`, `jitter:`, and `deadline:`, in any order, with commas between.
+/// - A build without `testing-timing` fails to compile on a `clocks:` block, a `timing` block, or a guard.
+/// - A build without `testing-schedulability` fails to compile on a `schedulability` block.
+///
+/// # Errors
+///
+/// The struct's `process()` returns a [`ProcessBuildError`]:
+///
+/// - [`ProcessBuildError::MissingInitialState`] -- the `states` block names no state.
+/// - [`ProcessBuildError::UndeclaredClock`] -- a guard or a reset names a clock that `clocks:` lacks.
+/// - [`ProcessBuildError::ConflictingTiming`] -- the `timing` block gives one event two bounds that disagree.
+/// - [`ProcessBuildError::InvalidDeadline`] -- the slack of a `timing` deadline passes its duration.
 ///
 /// [`ProcessBuilder::add_timed_transition`]: crate::testing::specs::csp::ProcessBuilder::add_timed_transition
+/// [`ProcessSpec`]: crate::testing::specs::csp::ProcessSpec
+/// [`ProcessBuildError`]: crate::testing::specs::csp::ProcessBuildError
+/// [`ProcessBuildError::MissingInitialState`]: crate::testing::specs::csp::ProcessBuildError::MissingInitialState
+/// [`ProcessBuildError::UndeclaredClock`]: crate::testing::specs::csp::ProcessBuildError::UndeclaredClock
+/// [`ProcessBuildError::ConflictingTiming`]: crate::testing::specs::csp::ProcessBuildError::ConflictingTiming
+/// [`ProcessBuildError::InvalidDeadline`]: crate::testing::specs::csp::ProcessBuildError::InvalidDeadline
 ///
 /// # Examples
 ///
@@ -49,7 +68,7 @@
 ///     clocks: { wait }
 /// }
 ///
-/// let process = Exchange::process();
+/// let process = Exchange::process()?;
 /// assert_eq!(process.step(State("Busy"), &Event::from(REPLY)), [State("Idle")]);
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
@@ -134,19 +153,38 @@ macro_rules! tb_process_spec {
 		}
 
 		impl $name {
+			/// The process that this spec declares.
+			///
+			/// # Errors
+			///
+			/// - `ProcessBuildError::MissingInitialState` -- the spec names no state.
+			/// - `ProcessBuildError::UndeclaredClock` -- a guard or a reset names an undeclared clock.
+			/// - `ProcessBuildError::ConflictingTiming` -- the spec gives one event two bounds that disagree.
+			/// - `ProcessBuildError::InvalidDeadline` -- a deadline has a slack past its duration.
 			#[allow(clippy::vec_init_then_push)]
 			#[allow(dead_code)]
-			pub fn process() -> $crate::testing::specs::csp::Process {
+			pub fn process() -> ::core::result::Result<
+				$crate::testing::specs::csp::Process,
+				$crate::testing::specs::csp::ProcessBuildError,
+			> {
 				use $crate::testing::specs::csp::State;
+
+				// Each from state takes one definition, so its transitions sit
+				// in one place. A second definition is a duplicate variant,
+				// which fails to compile.
+				#[allow(dead_code, non_camel_case_types, clippy::enum_variant_names)]
+				enum FromStates {
+					$($from_state),*
+				}
 
 				let mut builder = $crate::testing::specs::csp::Process::builder(stringify!($name));
 
-				// The from states keep their source order.
-				let state_names = vec![$(stringify!($from_state)),*];
-
-				// The first from state is the initial state.
-				let initial = State(state_names[0]);
-				builder = builder.initial_state(initial);
+				// The first from state in source order is the initial state. A
+				// spec with no state leaves it unset, so its build refuses it.
+				let state_names: &[&'static str] = &[$(stringify!($from_state)),*];
+				if let ::core::option::Option::Some(initial) = state_names.first() {
+					builder = builder.initial_state(State(*initial));
+				}
 
 				// Every from state joins the process, even with no transition.
 				$(
@@ -206,10 +244,8 @@ macro_rules! tb_process_spec {
 					$crate::__tb_select_testing_timing! {
 						{
 							{
-								use $crate::builder::TypeBuilder as _;
 								use $crate::testing::specs::csp::Event;
-								use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
-								use $crate::testing::macros::DeadlineParams;
+								use $crate::testing::timing::TimingConstraints;
 								let mut timing_constraints = TimingConstraints::default();
 
 								$crate::tb_process_spec! {
@@ -252,18 +288,19 @@ macro_rules! tb_process_spec {
 					}
 				)?
 
-				builder.build().expect("Failed to build Process")
+				builder.build()
 			}
 		}
 
 		$crate::__tb_if_testing_csp! {
 			impl $crate::testing::specs::csp::ProcessSpec for $name {
-				fn validate_trace(&self, trace: &$crate::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
-					Self::process().validate_trace(trace)
-				}
-
-				fn to_process_cow(&self) -> std::borrow::Cow<'_, $crate::testing::specs::csp::Process> {
-					std::borrow::Cow::Owned(Self::process())
+				fn to_process_cow(
+					&self,
+				) -> ::core::result::Result<
+					::std::borrow::Cow<'_, $crate::testing::specs::csp::Process>,
+					$crate::testing::specs::composition::CompositionError,
+				> {
+					::core::result::Result::Ok(::std::borrow::Cow::Owned(Self::process()?))
 				}
 			}
 		}
@@ -323,30 +360,49 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// The `@parse_timing` arm reads the grouped `wcet`, `jitter`, and
-	// `deadline` blocks.
+	// The `@parse_timing` arms read the `wcet`, `jitter`, and `deadline`
+	// blocks one at a time, so each block may stand alone or follow another
+	// after a comma. `add` refuses only a bound that disagrees with the bound
+	// its event holds, so each refusal is a conflict of that event.
 	(@parse_timing
 		$constraints:ident,
-		$(wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? })?
-		$(, jitter: { $($jitter_event:expr => $jitter_constraint:expr),* $(,)? })?
-		$(, deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? })?
-		$(,)?
+		wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? }
+		$(, $($rest:tt)*)?
 	) => {
-		$($(
-			$constraints.add(
-				Event::from($wcet_event),
-				$crate::testing::timing::TimingConstraint::Wcet($wcet_constraint)
-			);
-		)*)?
+		$(
+			{
+				let event = Event::from($wcet_event);
+				let bound = $crate::testing::timing::TimingConstraint::Wcet($wcet_constraint);
+				$constraints
+					.add(event, bound)
+					.map_err(|_conflict| $crate::testing::specs::csp::ProcessBuildError::ConflictingTiming { event })?;
+			}
+		)*
 
-		$($(
-			$constraints.add(
-				Event::from($jitter_event),
-				$jitter_constraint
-			);
-		)*)?
+		$crate::tb_process_spec! { @parse_timing $constraints, $($($rest)*)? }
+	};
+	(@parse_timing
+		$constraints:ident,
+		jitter: { $($jitter_event:expr => $jitter_constraint:expr),* $(,)? }
+		$(, $($rest:tt)*)?
+	) => {
+		$(
+			{
+				let event = Event::from($jitter_event);
+				$constraints
+					.add(event, $jitter_constraint)
+					.map_err(|_conflict| $crate::testing::specs::csp::ProcessBuildError::ConflictingTiming { event })?;
+			}
+		)*
 
-		$($(
+		$crate::tb_process_spec! { @parse_timing $constraints, $($($rest)*)? }
+	};
+	(@parse_timing
+		$constraints:ident,
+		deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? }
+		$(, $($rest:tt)*)?
+	) => {
+		$(
 			$crate::tb_process_spec! {
 				@parse_deadline
 				$constraints,
@@ -354,7 +410,9 @@ macro_rules! tb_process_spec {
 				$deadline_end,
 				$deadline_params
 			}
-		)*)?
+		)*
+
+		$crate::tb_process_spec! { @parse_timing $constraints, $($($rest)*)? }
 	};
 
 	// The `@parse_deadline` arm builds one deadline from its `DeadlineParams`.
@@ -365,24 +423,33 @@ macro_rules! tb_process_spec {
 		$deadline_params:expr
 	) => {
 		{
+			use $crate::builder::TypeBuilder as _;
+			use $crate::testing::macros::DeadlineParams;
+			use $crate::testing::timing::DeadlineBuilder;
+
 			let params: DeadlineParams = $deadline_params;
+			let start = Event::from($deadline_start);
+			let end = Event::from($deadline_end);
 			let mut builder = DeadlineBuilder::default()
 				.with_duration(params.duration)
-				.with_start_event(Event::from($deadline_start))
-				.with_end_event(Event::from($deadline_end));
+				.with_start_event(start)
+				.with_end_event(end);
 
 			if let Some(slack) = params.min_slack {
 				builder = builder.with_min_slack(slack);
 			}
 
+			// The builder holds each part, so it refuses only a slack past the
+			// duration.
 			let deadline = builder
 				.build()
-				.expect("Failed to build deadline");
+				.map_err(|_slack| $crate::testing::specs::csp::ProcessBuildError::InvalidDeadline { start, end })?;
 			$constraints.add_deadline(deadline);
 		}
 	};
 
-	// An empty timing block leaves the constraints as they are.
+	// An empty timing block, or the end of one, leaves the constraints as
+	// they are.
 	(@parse_timing $constraints:ident,) => {};
 
 	// The `@parse_schedulability` arm sets the scheduler and the event periods.
@@ -619,7 +686,7 @@ mod tests {
 	use crate::urn::Urn;
 
 	#[cfg(feature = "testing-timing")]
-	use crate::testing::specs::csp::{Event, State, Successor};
+	use crate::testing::specs::csp::{Event, ProcessBuildError, State, Successor};
 	#[cfg(feature = "testing-timing")]
 	use crate::testing::timing::{TimedTransition, TimingGuard};
 
@@ -654,6 +721,70 @@ mod tests {
 		clocks: { clk }
 	}
 
+	#[cfg(feature = "testing-timing")]
+	crate::tb_process_spec! {
+		pub BoundsArmTwice,
+		events {
+			observable { ARM }
+			hidden { }
+		}
+		states {
+			S0 => { ARM => S1 }
+		}
+		terminal { S1 }
+		timing {
+			wcet: {
+				ARM => crate::wcet!(Duration::from_millis(5)),
+				ARM => crate::wcet!(Duration::from_millis(9))
+			}
+		}
+	}
+
+	#[cfg(feature = "testing-timing")]
+	crate::tb_process_spec! {
+		pub SlackPastItsDeadline,
+		events {
+			observable { ARM, FIRE }
+			hidden { }
+		}
+		states {
+			S0 => { ARM => S1 },
+			S1 => { FIRE => S2 }
+		}
+		terminal { S2 }
+		timing {
+			wcet: { ARM => crate::wcet!(Duration::from_millis(5)) },
+			deadline: {
+				ARM => FIRE, crate::testing::macros::DeadlineParams {
+					duration: Duration::from_millis(5),
+					min_slack: Some(Duration::from_millis(9)),
+				}
+			}
+		}
+	}
+
+	#[cfg(feature = "testing-timing")]
+	crate::tb_process_spec! {
+		pub DeadlineAlone,
+		events {
+			observable { ARM, FIRE }
+			hidden { }
+		}
+		states {
+			S0 => { ARM => S1 },
+			S1 => { FIRE => S2 }
+		}
+		terminal { S2 }
+		timing {
+			deadline: {
+				ARM => FIRE, crate::testing::macros::DeadlineParams {
+					duration: Duration::from_millis(5),
+					min_slack: None,
+				}
+			}
+		}
+	}
+
 	/// A trace that records each of `events` once, in order.
 	fn trace_of(events: &[Urn<'static>]) -> ConsumedTrace {
 		let mut trace = ConsumedTrace::new();
@@ -672,7 +803,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	fn timed_transition(from: &'static str, event: Urn<'static>) -> Result<TimedTransition, Box<dyn Error>> {
 		let key = (State(from), Event::from(event));
-		let mut table = GuardedProcess::process().timed_transitions.unwrap_or_default();
+		let mut table = GuardedProcess::process()?.timed_transitions.unwrap_or_default();
 
 		let transition = table.remove(&key).and_then(|transitions| transitions.into_iter().next());
 		transition.ok_or_else(|| "the guarded form recorded no timed transition".into())
@@ -687,15 +818,45 @@ mod tests {
 	#[test]
 	fn a_spec_accepts_a_trace_that_its_process_allows() -> Result<(), Box<dyn Error>> {
 		let trace = trace_of(&[ARM, FIRE]);
-		let result = PlainProcess.validate_trace(&trace);
+		let result = PlainProcess.validate_trace(&PlainProcess::process()?, &trace);
 		assert!(result.valid, "{:?}", result.violations);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_spec_that_bounds_an_event_twice_does_not_build() -> Result<(), Box<dyn Error>> {
+		let refused = BoundsArmTwice::process();
+		let conflict = ProcessBuildError::ConflictingTiming { event: Event::from(ARM) };
+		assert_eq!(refused.err(), Some(conflict));
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_spec_whose_deadline_slack_passes_its_duration_does_not_build() -> Result<(), Box<dyn Error>> {
+		let refused = SlackPastItsDeadline::process();
+		let invalid = ProcessBuildError::InvalidDeadline { start: Event::from(ARM), end: Event::from(FIRE) };
+		assert_eq!(refused.err(), Some(invalid));
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_timing_block_that_holds_a_deadline_alone_builds_the_deadline() -> Result<(), Box<dyn Error>> {
+		let process = DeadlineAlone::process()?;
+		let constraints = process.timing_constraints.unwrap_or_default();
+
+		let deadline = constraints.deadlines().first();
+		let window = deadline.map(|deadline| (deadline.start_event, deadline.end_event));
+		assert_eq!(window, Some((Event::from(ARM), Event::from(FIRE))));
 		Ok(())
 	}
 
 	#[test]
 	fn a_spec_rejects_an_event_that_its_state_does_not_enable() -> Result<(), Box<dyn Error>> {
 		let trace = trace_of(&[FIRE]);
-		let result = PlainProcess.validate_trace(&trace);
+		let result = PlainProcess.validate_trace(&PlainProcess::process()?, &trace);
 		assert!(!result.valid);
 		Ok(())
 	}
@@ -713,7 +874,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guard_allows_its_edge_at_its_bound() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process();
+		let process = GuardedProcess::process()?;
 		let readings = readings_after(Duration::from_millis(5));
 
 		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
@@ -724,7 +885,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guard_refuses_its_edge_past_its_bound() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process();
+		let process = GuardedProcess::process()?;
 		let readings = readings_after(Duration::from_micros(5_001));
 
 		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
@@ -743,7 +904,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guarded_transition_is_an_edge_of_the_process() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process();
+		let process = GuardedProcess::process()?;
 		assert_eq!(process.step(State("S0"), &Event::from(ARM)), [State("S1")]);
 		Ok(())
 	}
@@ -751,7 +912,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_declared_clock_starts_at_zero() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process();
+		let process = GuardedProcess::process()?;
 		let clocks = process.initial_clocks();
 		assert_eq!(clocks, HashMap::from([("clk".to_string(), Duration::ZERO)]));
 		Ok(())
@@ -760,7 +921,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_guard_allows_its_edge_when_a_run_starts() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process();
+		let process = GuardedProcess::process()?;
 		let readings = process.initial_clocks();
 
 		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();

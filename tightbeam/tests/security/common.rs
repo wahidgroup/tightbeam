@@ -1,9 +1,7 @@
-//! This module holds the helpers and fixtures that the integration tests for
-//! security threats share.
+//! The helpers and fixtures that the security threat integration tests share.
 //!
-//! The module gives one protocol-agnostic interface over the handshake
-//! backends (HPKE, CMS), so each threat test runs against every backend from
-//! one body.
+//! It gives one protocol-agnostic interface over the handshake backends (HPKE,
+//! CMS), so each threat test runs against every backend from one body.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -31,7 +29,7 @@ use tightbeam::{
 	},
 	der::{asn1::OctetString, asn1::OctetStringRef, Any, Decode, Encode},
 	prelude::TightBeamSocketAddr,
-	testing::error::{FdrConfigError, TestingError},
+	testing::error::TestingError,
 	transport::handshake::{
 		negotiation::{ProfilePolicy, SecurityOffer},
 		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProtocolKind,
@@ -153,23 +151,23 @@ pub struct CapturedHandshake {
 }
 
 impl CapturedHandshake {
-	/// Return the last client-to-server message, the common replay target.
+	/// The last client-to-server message, the common replay target.
 	pub fn final_client_message(&self) -> Option<&CapturedMessage> {
 		self.messages.iter().rev().find(|m| m.direction == Direction::ClientToServer)
 	}
 
-	/// Return every client-to-server message.
+	/// Every client-to-server message.
 	pub fn client_messages(&self) -> impl Iterator<Item = &CapturedMessage> {
 		self.messages.iter().filter(|m| m.direction == Direction::ClientToServer)
 	}
 
-	/// Return the reply, the one server-to-client message, which the server
+	/// The reply, the one server-to-client message, which the server
 	/// signs over the transcript of its client's opening.
 	pub fn server_reply(&self) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.direction == Direction::ServerToClient)
 	}
 
-	/// Return the message captured at `step`.
+	/// The message captured at `step`.
 	#[allow(dead_code)]
 	pub fn message_at(&self, step: usize) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.step == step)
@@ -191,7 +189,7 @@ pub enum Container {
 }
 
 impl Container {
-	/// Read `der` as a message in this container, and keep the bytes it
+	/// Reads `der` as a message in this container, and keeps the bytes it
 	/// arrived as.
 	fn message(self, der: &[u8]) -> Result<HandshakeMessage, TightBeamError> {
 		let message = match self {
@@ -228,11 +226,11 @@ pub trait HandshakeFlow: Send {
 	/// The ordered steps this protocol exchanges.
 	fn steps(&self) -> &'static [FlowStep];
 
-	/// Build the opening message, which the first step delivers.
+	/// Builds the opening message, which the first step delivers.
 	fn open(&mut self) -> FlowFuture<'_, Vec<u8>>;
 
-	/// Hand `msg` to the endpoint that receives step `index`, and return that
-	/// endpoint's answer, which is `None` when that endpoint ends the flow.
+	/// Hands `msg` to the endpoint that receives step `index`, and returns its
+	/// answer, which is `None` when that endpoint ends the flow.
 	fn advance<'a>(
 		&'a mut self,
 		index: usize,
@@ -246,10 +244,10 @@ pub trait HandshakeFlow: Send {
 /// backend states its sequence once and gets its capture from it.
 #[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
-	/// Return the backend kind for this session.
+	/// The backend kind of this session.
 	fn kind(&self) -> HandshakeBackendKind;
 
-	/// Run a complete handshake, and capture every message it exchanges.
+	/// Runs a complete handshake, and captures every message that it exchanges.
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
 }
 
@@ -312,7 +310,7 @@ impl HandshakeBackendKind {
 	/// The step of this backend's flow at `index`.
 	fn step(self, index: usize) -> Result<&'static FlowStep, TightBeamError> {
 		let step = self.steps().iter().find(|step| step.index == index);
-		step.ok_or_else(|| invalid_step_error("step is not part of this handshake flow"))
+		step.ok_or_else(|| invalid_step_error(index))
 	}
 
 	/// The handshake protocol that a transport of this backend runs.
@@ -346,7 +344,7 @@ impl HandshakeBackendKind {
 		Ok(config)
 	}
 
-	/// Bind a listener on a free local port that serves this backend under
+	/// Binds a listener on a free local port that serves this backend under
 	/// the default transport limits, beside its address.
 	///
 	/// # Errors
@@ -424,11 +422,11 @@ impl HandshakeBackendKind {
 		Ok(AttackStep::replace(slot, message))
 	}
 
-	/// Flip one byte of the signed content in this backend's server message.
+	/// Flips one byte of the signed content in this backend's server message.
 	///
-	/// The edit models a MITM attacker that changes the message in transit. It
-	/// goes through the decoded message and re-encodes it, so the result is
-	/// well-formed DER that only a transcript or signature check can refuse.
+	/// It models a MITM attacker that changes the message in transit. It edits
+	/// the decoded message and re-encodes it, so the result is well-formed DER
+	/// that only a transcript or signature check can refuse.
 	///
 	/// - HPKE tampers the server random of the `ServerHandshake` the reply signs.
 	/// - CMS tampers the first byte of the content the `ServerFinished` signs,
@@ -461,7 +459,7 @@ impl HandshakeBackendKind {
 	}
 }
 
-/// Copy `bytes` with the first byte inverted.
+/// Copies `bytes`, and inverts the first byte of the copy.
 fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	let mut flipped = bytes.to_vec();
 	let first = flipped
@@ -473,7 +471,7 @@ fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	Ok(flipped)
 }
 
-/// Bind a listener under `config` on a free loopback port, beside its
+/// Binds a listener under `config` on a free loopback port, beside its
 /// address.
 ///
 /// # Errors
@@ -492,9 +490,9 @@ use tightbeam::urn::Urn;
 
 /// A harness that spawns handshake sessions across every enabled backend.
 ///
-/// The harness can hold a [`TraceCollector`]. When it does, each spawn records
-/// the observable events of the path it takes, so a process spec orders the
-/// steps of the harness beside the events of the attack.
+/// When the harness holds a [`TraceCollector`], each spawn records the
+/// observable events of its path, so a process spec orders the harness steps
+/// beside the attack events.
 #[derive(Clone)]
 pub struct SecurityThreatHarness {
 	materials: ServerMaterials,
@@ -523,17 +521,17 @@ impl SecurityThreatHarness {
 	/// Observable CSP event: the harness selects the weak CMS backend.
 	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
-	/// Create a harness that records its spawn events into `trace`.
+	/// A harness that records its spawn events into `trace`.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
 		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
 	}
 
-	/// Return the server materials for test verification.
+	/// The server materials of the harness, for test verification.
 	pub fn materials(&self) -> &ServerMaterials {
 		&self.materials
 	}
 
-	/// Emit a spawn event when the harness holds a trace collector.
+	/// Emits a spawn event when the harness holds a trace collector.
 	fn emit(&self, event: Urn<'static>) -> Result<(), TightBeamError> {
 		if let Some(ref trace) = self.trace {
 			trace.event(event)?;
@@ -541,8 +539,8 @@ impl SecurityThreatHarness {
 		Ok(())
 	}
 
-	/// Spawn a protocol session of `kind`, where both endpoints run the default
-	/// security profile.
+	/// Spawns a protocol session of `kind`, where both endpoints run the
+	/// default security profile.
 	///
 	/// # Errors
 	///
@@ -554,7 +552,7 @@ impl SecurityThreatHarness {
 		self.spawn_with_profiles(kind, client_profiles, server_profiles)
 	}
 
-	/// Spawn a protocol session of `kind` with separate client and server
+	/// Spawns a protocol session of `kind` with separate client and server
 	/// profiles, which a cross-session downgrade test needs.
 	///
 	/// - The client offers `client_profiles`.
@@ -591,7 +589,7 @@ impl SecurityThreatHarness {
 		}
 	}
 
-	/// Start a live handshake of `kind` over the server materials of this
+	/// Starts a live handshake of `kind` over the server materials of this
 	/// harness, for the attack of a threat scenario. It records the spawn
 	/// events that [`Self::spawn`] records for `kind`.
 	///
@@ -615,14 +613,12 @@ impl SecurityThreatHarness {
 		}
 	}
 
-	/// Spawn a session of `kind` on the weak AES-128-GCM cipher, for a
+	/// Spawns a session of `kind` on the weak AES-128-GCM cipher, for a
 	/// downgrade test.
 	///
-	/// - [`Aes128CryptoProvider`] runs AES-128 at the cipher level, and also
-	///   names it in the profile descriptor OIDs.
-	/// - The session is deliberately weak. Its provider names
-	///   [`NoStrengthFloor`] as its floor, so the downgrade harness can capture
-	///   the messages of an AES-128 session.
+	/// - [`Aes128CryptoProvider`] runs AES-128 in the cipher and names it in the profile descriptor OIDs.
+	/// - The session is weak by design. Its provider names [`NoStrengthFloor`]
+	///   as its floor, so the downgrade harness can capture an AES-128 session.
 	///
 	/// # Errors
 	///
@@ -652,15 +648,12 @@ impl SecurityThreatHarness {
 	}
 }
 
-/// Create the error for an invalid injection step.
-fn invalid_step_error(msg: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "inject_at_step",
-		reason: msg,
-	}))
+/// The error for an injection step at `index` that the handshake flow lacks.
+fn invalid_step_error(index: usize) -> TightBeamError {
+	TightBeamError::TestingError(TestingError::UnknownFlowStep(index))
 }
 
-/// Return `payload` with `extra` appended, as a MITM attacker that adds data
+/// `payload` with `extra` appended, as a MITM attacker that adds data
 /// to a message sends it.
 #[allow(dead_code)]
 pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>) -> Vec<u8> {
@@ -672,7 +665,7 @@ pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>)
 	tampered
 }
 
-/// Return the first `keep_bytes` bytes of `payload`, as a MITM attacker that
+/// The first `keep_bytes` bytes of `payload`, as a MITM attacker that
 /// truncates a message sends it.
 #[allow(dead_code)]
 pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> Vec<u8> {
@@ -768,8 +761,8 @@ impl StaticKeyObserver {
 		Ok(Self { closing: closing.to_vec(), keks })
 	}
 
-	/// Open the closing under each candidate closing key, with the key
-	/// identifier the closing names, and report each outcome.
+	/// Opens the closing under each candidate closing key, with the key
+	/// identifier the closing names, and reports each outcome.
 	pub async fn closing_attempts(&self) -> Result<Vec<Result<SecretSlice<u8>, EnvelopeError>>, TightBeamError> {
 		let mut attempts = Vec::with_capacity(self.keks.len());
 		for kek in &self.keks {
@@ -935,7 +928,7 @@ pub struct Session<F: SessionFlow<P>, P: HandshakeProvider> {
 }
 
 impl<F: SessionFlow<P>, P: HandshakeProvider> Session<F, P> {
-	/// Create a session where the client offers `client_profiles` and the
+	/// A session where the client offers `client_profiles` and the
 	/// server runs `server_profiles`, each endpoint under the floor of `P`.
 	fn with_profiles(
 		materials: &ServerMaterials,

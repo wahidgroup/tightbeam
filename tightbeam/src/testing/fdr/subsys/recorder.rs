@@ -31,10 +31,9 @@ impl<'t> ExplorationRecorder<'t> {
 	/// The recorder of `trace`, or `None` when the settings of `trace` ask
 	/// for no exploration event.
 	///
-	/// This is the one reader of `sample_enabled_sets`, `sample_refusals`,
-	/// and `divergence_heuristics`, which
-	/// [`TraceCollector::exploration_asks`] lends apart from the other
-	/// settings.
+	/// It is the one reader of `sample_enabled_sets`, `sample_refusals`, and
+	/// `divergence_heuristics`, which [`TraceCollector::exploration_asks`]
+	/// lends apart from the other settings.
 	pub(crate) fn of(trace: &'t TraceCollector) -> Option<Self> {
 		let asks = trace.exploration_asks();
 		let recorder = Self {
@@ -50,10 +49,9 @@ impl<'t> ExplorationRecorder<'t> {
 
 	/// Records the asked events of one explored process.
 	///
-	/// The events of each state in `visited`, the states that the seeds
-	/// visited, come first, in the order of the state names. The divergence
-	/// events follow, one for each state in `divergences`, the divergences
-	/// that the seeds found, in the order of the state names.
+	/// The events of each state the seeds visited (`visited`) come first, in
+	/// the order of the state names. One event per state where a seed diverged
+	/// (`divergences`) follows, in the same order.
 	///
 	/// # Errors
 	///
@@ -268,7 +266,7 @@ mod tests {
 			.build()
 	}
 
-	/// A process that can stop at `Idle`, where it still offers `a`, and at
+	/// A process that can stop at `Idle`, which offers `a` as well, and at
 	/// `Done`, which `a` leads to.
 	fn accepting() -> Result<Process, ProcessBuildError> {
 		Process::builder("Accepting")
@@ -322,7 +320,7 @@ mod tests {
 
 		let events = trace.drain_events();
 		let named = events.into_iter().filter(|event| event.urn == urn);
-		let labels = named.filter_map(|event| event.label).collect();
+		let labels = named.filter_map(|event| event.label.map(String::from)).collect();
 		Ok(labels)
 	}
 
@@ -405,7 +403,6 @@ mod tests {
 		let settings = TbInstrumentationConfig { divergence_heuristics: false, ..every_flag() };
 
 		let labels = recorded(&process, FdrConfig::default(), settings, DIVERGENCE_DETECT)?;
-
 		assert!(labels.is_empty(), "the trace asked for no divergence, and recorded {labels:?}");
 		Ok(())
 	}

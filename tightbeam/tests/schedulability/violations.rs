@@ -1,8 +1,10 @@
 //! The tests of schedulability violations.
 
+use core::error::Error;
 use core::time::Duration;
 
 use tightbeam::testing::fdr::FdrConfig;
+use tightbeam::testing::specs::csp::{Process, ProcessBuildError};
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
@@ -11,7 +13,7 @@ pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:violations
 pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:violations/task2");
 
 // Every scenario in this file releases TASK1 once. Only the two-task
-// processes release TASK2, so it is not part of the shared contract.
+// processes release TASK2, so the shared contract names TASK1 alone.
 tb_assert_spec! {
 	pub SchedulabilityViolationSpec,
 	V(1,0,0): {
@@ -50,24 +52,30 @@ tb_process_spec! {
 	}
 }
 
+/// The configuration that grades [`SchedulabilityViolationSpec`], and expects
+/// Layer 3 to refuse the task set of `process`.
+fn violation_config(process: Result<Process, ProcessBuildError>) -> Result<ScenarioConfig, Box<dyn Error>> {
+	let fdr = FdrConfig {
+		seeds: 1,
+		max_depth: 10,
+		max_internal_run: 5,
+		timeout_ms: 1000,
+		specs: vec![process?],
+		fail_fast: false,
+		..Default::default()
+	};
+
+	let builder = ScenarioConfig::builder().with_spec(SchedulabilityViolationSpec::latest());
+	let builder = builder.with_fdr(fdr);
+	Ok(builder.with_expect(Expect::Violation(Layer::Refinement)).build()?)
+}
+
 // The RMA task set runs at utilization 1.05 against a bound of about 0.828,
 // so `Process::schedulability_violated` reports a miss and Layer 3 rejects the
 // run. The expectation is what grades that rejection.
 tb_scenario! {
 	name: test_rma_schedulability_violation_detected,
-	config: ScenarioConfig::builder()
-		.with_spec(SchedulabilityViolationSpec::latest())
-		.with_fdr(FdrConfig {
-			seeds: 1,
-			max_depth: 10,
-			max_internal_run: 5,
-			timeout_ms: 1000,
-			specs: vec![RmaNotSchedulableProcess::process()],
-			fail_fast: false,
-			..Default::default()
-		})
-		.with_expect(Expect::Violation(Layer::Refinement))
-		.build(),
+	config: violation_config(RmaNotSchedulableProcess::process()),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(TASK1)?;
@@ -108,19 +116,7 @@ tb_process_spec! {
 // rejects the run for the same reason under the other scheduler.
 tb_scenario! {
 	name: test_edf_schedulability_violation_detected,
-	config: ScenarioConfig::builder()
-		.with_spec(SchedulabilityViolationSpec::latest())
-		.with_fdr(FdrConfig {
-			seeds: 1,
-			max_depth: 10,
-			max_internal_run: 5,
-			timeout_ms: 1000,
-			specs: vec![EdfNotSchedulableProcess::process()],
-			fail_fast: false,
-			..Default::default()
-		})
-		.with_expect(Expect::Violation(Layer::Refinement))
-		.build(),
+	config: violation_config(EdfNotSchedulableProcess::process()),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(TASK1)?;
@@ -150,24 +146,11 @@ tb_process_spec! {
 	}
 }
 
-// A period without a WCET leaves the task set unanalysable, which Layer 3
-// reports as a miss, because a task set that cannot be analysed has not been
-// shown to meet its deadlines.
+// A period without a WCET leaves the task set unanalysable. Layer 3 reports a
+// miss, because an unanalysable task set is not shown to meet its deadlines.
 tb_scenario! {
 	name: test_missing_wcet_for_period_detected,
-	config: ScenarioConfig::builder()
-		.with_spec(SchedulabilityViolationSpec::latest())
-		.with_fdr(FdrConfig {
-			seeds: 1,
-			max_depth: 10,
-			max_internal_run: 5,
-			timeout_ms: 1000,
-			specs: vec![ProcessWithoutTiming::process()],
-			fail_fast: false,
-			..Default::default()
-		})
-		.with_expect(Expect::Violation(Layer::Refinement))
-		.build(),
+	config: violation_config(ProcessWithoutTiming::process()),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(TASK1)?;

@@ -44,7 +44,6 @@ use utils::restart_game;
 tb_assert_spec! {
 	/// The assertion spec of a chess run.
 	///
-	/// It checks the chess game behavior:
 	/// - The client sends at least one move, and the system processes each move it sends.
 	/// - Each move the server validates draws a server move in reply.
 	pub ChessAssertSpec,
@@ -322,10 +321,10 @@ tb_scenario! {
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
 						stats.game_ended_count += 1;
-					stats.game_restarted_count += 1;
+						stats.game_restarted_count += 1;
 
-					restart_game(&mut client_game_state, &mut order, trace)?;
-					if stats.game_restarted_count >= MAX_GAME_REPLAYS {
+						restart_game(&mut client_game_state, &mut order, trace)?;
+						if stats.game_restarted_count >= MAX_GAME_REPLAYS {
 							break;
 						}
 						// The loop plays another game.

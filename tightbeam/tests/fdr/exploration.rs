@@ -1,11 +1,11 @@
 //! An exploration engine that an outside crate brings, built through the
 //! public API of tightbeam alone.
 //!
-//! The engine walks each seed with [`DefaultExplorationEngine`] and keeps the
-//! states it visited in a set of its own, so the events of `explore_into` show
-//! that the explorer reads the visited states through [`ExplorationCore`]. A
-//! second engine reports every state of its process as visited, so its
-//! events show that a divergence event names a state where a seed diverged.
+//! The engine walks each seed with [`DefaultExplorationEngine`] and keeps its
+//! visited states in its own set, so the events of `explore_into` show that the
+//! explorer reads them through [`ExplorationCore`]. A second engine reports
+//! every state of its process as visited, so its events show that a divergence
+//! event names a state where a seed diverged.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -80,7 +80,7 @@ impl ExplorationCore for OutsideEngine<'_> {
 fn labels_of(trace: &TraceCollector, urn: Urn<'static>) -> Vec<String> {
 	let events = trace.drain_events();
 	let named = events.into_iter().filter(|event| event.urn == urn);
-	named.filter_map(|event| event.label).collect()
+	named.filter_map(|event| event.label.map(String::from)).collect()
 }
 
 /// A process that offers `go` at `Ready` and stops at `Done`.

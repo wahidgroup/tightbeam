@@ -1,6 +1,6 @@
-//! DTN Servlets: 4-Tier Architecture
+//! The DTN servlets of the four-tier architecture.
 //!
-//! The module defines one servlet per tier of the 4-tier DTN architecture:
+//! It defines one servlet per tier:
 //! - Mission Control receives telemetry, sends commands, and validates ACKs.
 //! - The Earth Relay Satellite forwards messages between Mission Control and the Mars Relay.
 //! - The Mars Relay Satellite forwards messages between the Earth Relay and the Rover.
@@ -13,9 +13,7 @@ use std::time::Duration;
 
 use tightbeam::{
 	colony::servlet::ServletContext,
-	compress::{Inflator, ZstdCompression},
 	crypto::sign::ecdsa::Secp256k1SigningKey,
-	decode,
 	prelude::*,
 	servlet,
 	trace::TraceCollector,
@@ -38,12 +36,11 @@ use crate::dtn::{
 	},
 	fault_manager::FaultManager,
 	frame_builder::FrameBuilderHelper,
-	jobs::{
-		BuildGapRecoveryFrame, CreateFrameRequest, EmitFrameToNetwork, FinalizeChainOutgoing, GapRecoveryContext,
-		PrepareGapRecoveryBuild,
-	},
-	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage},
-	ultimate::{gap_recovery_event, GapRecoveryStep},
+	intake::{ChainFrame, Intake, SignedFrame},
+	jobs::{BuildGapRecoveryFrame, CreateFrameRequest, EmitFrameToNetwork, GapRecoveryContext},
+	messages::{ChainMessage, EarthCommand, FrameRequest, FrameResponse, RelayMessage},
+	nodes::{DtnRole, PathSide},
+	ultimate::GapRecoveryStep,
 	workers::{
 		command_ack_handler::{CommandAckHandlerRequest, CommandAckHandlerWorker},
 		frame_request_handler::{FrameRequestAction, FrameRequestHandlerRequest, FrameRequestHandlerWorker},
@@ -57,54 +54,40 @@ use crate::dtn::{
 /// hop publishes once its servlet runs.
 pub type LateAddr = Arc<RwLock<Option<TightBeamSocketAddr>>>;
 
-/// A side of a node on the path from Mission Control to the Rover.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PathSide {
-	/// The side toward Mission Control.
-	Earth,
-	/// The side toward the Rover.
-	Mars,
-}
-
-impl PathSide {
-	/// Both sides, the Earth side first.
-	const BOTH: [Self; 2] = [Self::Earth, Self::Mars];
-
-	/// Returns the side across the node, where a frame from this side travels
-	/// on.
-	fn across(self) -> Self {
-		match self {
-			Self::Earth => Self::Mars,
-			Self::Mars => Self::Earth,
-		}
-	}
-}
-
 /// What a node does with one frame that its chain releases.
 enum Routed {
-	/// A chain frame that the node owes the sender: a frame response, or the
-	/// ACK of a command.
+	/// A chain frame that the node owes the sender: the ACK of a command.
 	Answer(Frame),
 	/// A stateless receipt for the sender, a frame outside the chain.
 	Receipt(Frame),
-	/// A chain frame that the next hop returned, which enters the chain of the
-	/// node.
+	/// A chain frame that the next hop returned, which enters the node's chain.
 	Returned(Frame),
 	/// Nothing goes back.
 	Nothing,
 }
 
+/// What a take keeps from the route of one released frame.
+enum Settled {
+	/// The reply that the take owes the sender of its arrival.
+	Reply(Frame),
+	/// A frame that the next hop returned, which enters the chain next.
+	Entering(ChainFrame),
+	/// The route of the frame is complete.
+	Done,
+}
+
 /// The behavior that every node on the DTN path shares.
 trait DtnNode: Sized + Send + Sync + 'static {
 	// Each servlet configuration implements these required methods.
-	fn node_name(&self) -> &str;
+	fn role(&self) -> DtnRole;
 	fn signing_key(&self) -> &Secp256k1SigningKey;
 	fn cipher(&self) -> &SharedCipher;
 	fn chain_processor(&self) -> &Arc<ChainProcessor>;
 	fn frame_builder(&self) -> &Arc<FrameBuilderHelper>;
 
-	/// Returns the signers of the peers on `side` of this node.
-	fn signers_on(&self, side: PathSide) -> Vec<&FrameSigner>;
+	/// Returns the signers of the peers on `side` of this node, each with the
+	/// role of its peer.
+	fn signers_on(&self, side: PathSide) -> Vec<(DtnRole, &FrameSigner)>;
 
 	/// Returns the next hop toward `side`: its pool, and its address once the
 	/// hop publishes it.
@@ -118,41 +101,43 @@ trait DtnNode: Sized + Send + Sync + 'static {
 		side: PathSide,
 	) -> Result<(&Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr), TightBeamError>;
 
-	/// Routes `frame`, which the chain of this node released, from `side`.
+	/// Routes `entry`, which the chain of this node released, from `side`.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the frame fails to open, a worker fails, or a send fails.
-	async fn route(&self, frame: Frame, side: PathSide, ctx: &ServletContext<Self>) -> Result<Routed, TightBeamError>;
+	/// - [`TightBeamError`] -- a worker fails, or a send fails.
+	async fn route(
+		&self,
+		entry: ChainFrame,
+		side: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Routed, TightBeamError>;
 
-	/// Returns the side of the peer whose signer verifies `frame`.
+	/// Checks `frame` against the signers of the peers of this node, the Earth
+	/// side first.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingSignature`] -- no signer of a peer verifies the frame.
-	fn side_of(&self, frame: &Frame) -> Result<PathSide, TightBeamError> {
-		let signed_on = |side: &PathSide| self.signers_on(*side).into_iter().any(|signer| frame.verify(signer).is_ok());
-		PathSide::BOTH
-			.into_iter()
-			.find(signed_on)
-			.ok_or(TightBeamError::MissingSignature)
+	fn signer_of(&self, frame: Frame) -> Result<SignedFrame, TightBeamError> {
+		let peers = PathSide::BOTH.into_iter().flat_map(|side| {
+			let signers = self.signers_on(side).into_iter();
+			signers.map(move |(role, signer)| (side, role, signer))
+		});
+
+		SignedFrame::check(frame, peers)
 	}
 
-	/// Decrypts the relay message of `frame`, or decodes it when the frame is
-	/// cleartext.
-	async fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
-		if frame.metadata().confidentiality().is_some() {
-			let zstd = ZstdCompression::default();
-			let inflator: Option<&(dyn Inflator + Sync)> = if frame.metadata().compactness().is_some() {
-				Some(&zstd)
-			} else {
-				None
-			};
-
-			frame.decrypt::<RelayMessage>(self.cipher(), inflator).await
-		} else {
-			decode(frame.message())
-		}
+	/// Opens `frame` as a frame of the chain, from the side of the peer whose
+	/// signer verifies it.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingSignature`] -- no signer of a peer verifies the frame.
+	/// - The errors of [`ChainFrame::open`].
+	async fn open_into_chain(&self, frame: Frame) -> Result<ChainFrame, TightBeamError> {
+		let signed = self.signer_of(frame)?;
+		ChainFrame::open(signed, self.cipher()).await
 	}
 
 	/// Sends `frame` to `addr` through the preconfigured `pool` and returns the
@@ -167,20 +152,35 @@ trait DtnNode: Sized + Send + Sync + 'static {
 		Ok(client.conn()?.emit(frame, None).await?)
 	}
 
+	/// Asks the hop on `side` for the frames after `current_head` up to the
+	/// frame of `missing_hash`, the gap that a frame from `side` shows, and
+	/// returns the frames of its answer in chain order.
+	///
+	/// - The frame request and its answer travel outside the chain, so the frames of the answer fill the gap.
+	/// - Each frame of the answer passes the signer check and the kind check of an arriving frame.
+	/// - A hop that holds none of the frames answers `None`, and the next
+	///   arrival that finds the buffer full asks again.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingConfiguration`] -- the node has no hop on `side`.
+	/// - [`TightBeamError::MissingSignature`] -- no signer of a peer verifies the answer or a frame of it.
+	/// - [`TightBeamError::InvalidBody`] -- a frame of the answer travels outside the chain.
+	/// - [`TightBeamError`] -- the request fails to build or send, or the answer fails to open.
 	async fn handle_chain_gap(
 		&self,
 		current_head: impl Into<Vec<u8>>,
 		missing_hash: impl Into<Vec<u8>>,
-		pool: &Arc<ConnectionPool<TokioListener>>,
-		upstream_addr: TightBeamSocketAddr,
-		trace: &TraceCollector,
-	) -> Result<(), TightBeamError> {
+		side: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Vec<ChainFrame>, TightBeamError> {
+		let trace = ctx.trace();
 		let current_head: Vec<u8> = current_head.into();
 		let missing_hash: Vec<u8> = missing_hash.into();
-		trace.event(gap_recovery_event(self.node_name(), GapRecoveryStep::GapDetected))?;
+		trace.event(GapRecoveryStep::GapDetected.event_on(self.role()))?;
 
-		let ctx = Arc::new(GapRecoveryContext {
-			chain_processor: Arc::clone(self.chain_processor()),
+		let (pool, upstream_addr) = self.hop_toward(side).await?;
+		let gap = Arc::new(GapRecoveryContext {
 			frame_builder: Arc::clone(self.frame_builder()),
 			signing_key: Arc::new(self.signing_key().to_owned()),
 			cipher: Arc::new(self.cipher().to_owned()),
@@ -188,141 +188,224 @@ trait DtnNode: Sized + Send + Sync + 'static {
 		});
 
 		let frame = CreateFrameRequest::run((current_head, missing_hash))
-			.map(|req| (req, Arc::clone(&ctx)))
-			.and_then(PrepareGapRecoveryBuild::run)
+			.map(|req| (req, Arc::clone(&gap)))
 			.and_then(BuildGapRecoveryFrame::run)
-			.map(|frame| (frame, Arc::clone(&ctx)))
-			.and_then(FinalizeChainOutgoing::run)
 			.run()?;
 
-		trace.event(gap_recovery_event(self.node_name(), GapRecoveryStep::SendFrameRequest))?;
+		trace.event(GapRecoveryStep::SendFrameRequest.event_on(self.role()))?;
 
-		EmitFrameToNetwork::run((frame, upstream_addr, ctx)).await?;
-		Ok(())
+		let frames = match EmitFrameToNetwork::run((frame, upstream_addr, gap)).await? {
+			Some(answer) => self.open_answer(answer, ctx).await?,
+			None => Vec::new(),
+		};
+
+		let mut answer = Vec::with_capacity(frames.len());
+		for frame in frames {
+			// Each frame of the answer keeps the side that its signer check
+			// finds, and routes by it once the chain releases it.
+			answer.push(self.open_into_chain(frame).await?);
+		}
+
+		Ok(answer)
 	}
 
-	/// Answers `request` from `side` with the frames that this node holds, or
-	/// cascades it to the hop across this node.
+	/// Answers `request`, which `requester` sent from `side` as its request
+	/// `order`, with the frames this node holds or the frames that a cascade to
+	/// the hop across brings back. It returns `None` when this node is an
+	/// origin that holds none of the frames, or when the hop across has no
+	/// answer.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::TransportError`] -- the request gate refuses a replayed or a stale request.
+	/// - [`TightBeamError`] -- the worker fails, or the cascade or the answer fails.
 	async fn answer_frame_request(
 		&self,
 		request: FrameRequest,
+		requester: DtnRole,
+		order: u64,
 		side: PathSide,
 		ctx: &ServletContext<Self>,
-	) -> Result<Routed, TightBeamError> {
-		// The frame request worker picks whether the node responds, cascades
-		// the request, or takes no action.
-		let node_name = self.node_name().to_string();
-		let worker_request = FrameRequestHandlerRequest { request: request.to_owned(), node_name };
+	) -> Result<Option<Frame>, TightBeamError> {
+		// The frame request worker admits the request through the request
+		// gate, then picks whether the node responds, cascades, or takes no
+		// action.
+		let worker_request =
+			FrameRequestHandlerRequest { request: request.to_owned(), node: self.role(), requester, order };
 		let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
-		match result.action {
-			FrameRequestAction::Respond(_) => {
-				let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
-				let response = FrameResponse { frames: result.missing_frames };
-				let response_frame = self.frame_builder().build_frame_response_frame(
-					response,
-					order,
-					prev_digest,
-					self.signing_key(),
-					self.cipher(),
-				)?;
-
-				Ok(Routed::Answer(response_frame))
-			}
-			FrameRequestAction::Cascade(_) => {
-				// The request goes on away from its requester.
-				let (cascade_pool, cascade_addr) = self.hop_toward(side.across()).await?;
-				let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
-				let cascade_frame = self.frame_builder().build_frame_request_frame(
-					request,
-					order,
-					prev_digest,
-					self.signing_key(),
-					self.cipher(),
-				)?;
-
-				self.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
-				Ok(Routed::Nothing)
-			}
+		let frames = match result.action {
+			FrameRequestAction::Respond(_) => Some(result.missing_frames),
+			// The request goes on away from its requester.
+			FrameRequestAction::Cascade(_) => self.cascade(request, side.across(), ctx).await?,
 			// An origin of the path ends each cascade.
-			FrameRequestAction::NoAction(_) => Ok(Routed::Nothing),
+			FrameRequestAction::NoAction(_) => None,
+		};
+
+		let answer = frames.map(|frames| {
+			let response = FrameResponse { frames };
+			let builder = self.frame_builder();
+			builder.build_frame_response_frame(response, self.signing_key(), self.cipher())
+		});
+
+		answer.transpose()
+	}
+
+	/// Sends `request` on to the hop toward `across`, and returns the frames
+	/// of its answer, or `None` when that hop has no answer.
+	async fn cascade(
+		&self,
+		request: FrameRequest,
+		across: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Option<Vec<Frame>>, TightBeamError> {
+		let (pool, addr) = self.hop_toward(across).await?;
+		let builder = self.frame_builder();
+		let frame = builder.build_frame_request_frame(request, self.signing_key(), self.cipher())?;
+		let Some(answer) = self.send_frame(pool, addr, frame).await? else {
+			return Ok(None);
+		};
+
+		self.open_answer(answer, ctx).await.map(Some)
+	}
+
+	/// Opens `answer`, the reply of a hop to a frame request, and returns its
+	/// frames.
+	///
+	/// The answer passes the signer check, and the response worker records it.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingSignature`] -- no signer of a peer verifies the answer.
+	/// - [`TightBeamError::InvalidBody`] -- the answer carries a message other than a frame response.
+	/// - [`TightBeamError`] -- the answer fails to open, or the worker fails.
+	async fn open_answer(&self, answer: Frame, ctx: &ServletContext<Self>) -> Result<Vec<Frame>, TightBeamError> {
+		let signed = self.signer_of(answer)?;
+		let Intake::Response(response) = Intake::open(signed, self.cipher()).await? else {
+			return Err(TightBeamError::InvalidBody);
+		};
+
+		let request = FrameResponseHandlerRequest { node: self.role() };
+		ctx.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
+
+		Ok(response.frames)
+	}
+
+	/// Takes `frame` from the peer that sent it, and returns the reply that
+	/// the node owes that peer.
+	///
+	/// The frame opens once. A frame request travels hop to hop outside the
+	/// chain, so the node answers it at once. A command, telemetry, or an ACK
+	/// enters the chain through [`DtnNode::take_into_chain`].
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingSignature`] -- no signer of a peer verifies the frame.
+	/// - [`TightBeamError::InvalidBody`] -- the frame is a frame response,
+	///   which comes back as the reply to a frame request alone.
+	/// - [`TightBeamError`] -- the frame fails to open, or the request gate,
+	///   the answer, the chain, or a route fails.
+	async fn take_in(&self, frame: Frame, ctx: &ServletContext<Self>) -> Result<Option<Frame>, TightBeamError> {
+		let signed = self.signer_of(frame)?;
+		let (side, signer) = (signed.side(), signed.role());
+		let order = signed.frame().metadata().order();
+		match Intake::open(signed, self.cipher()).await? {
+			Intake::Request(request) => self.answer_frame_request(request, signer, order, side, ctx).await,
+			Intake::Response(_) => Err(TightBeamError::InvalidBody),
+			Intake::Chain(entry) => self.take_into_chain(entry, ctx).await,
 		}
 	}
 
-	/// Takes in the frames of `response` through the frame response worker,
-	/// which validates the chain, and gives the sender of the frame at `order`
-	/// a receipt.
-	async fn take_frame_response(
-		&self,
-		response: FrameResponse,
-		order: u64,
-		ctx: &ServletContext<Self>,
-	) -> Result<Routed, TightBeamError> {
-		let request = FrameResponseHandlerRequest { response, node_name: self.node_name().to_string() };
-		ctx.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
-
-		Ok(Routed::Receipt(self.frame_builder().build_stateless_ack_frame(order)?))
-	}
-
-	/// Takes `frame` into the chain of this node and routes each frame that the
-	/// chain releases, in chain order, by the side of its own signer.
+	/// Takes `entry` into the chain, and routes each released frame by the side
+	/// of its signer check.
 	///
-	/// - The frame that arrives is the first frame that the chain releases, so its route gives the reply.
-	/// - A later frame waited in the buffer while its sender took `None`, so
-	///   an answer that it owes goes to the hop on its side, and the node drops
-	///   its receipt.
-	/// - A frame that a next hop returns enters the chain after them.
-	/// - A gap asks the hop on the side of the frame that shows it, which holds
-	///   the missing frame: that hop chained the frame onto it, or validated
-	///   the frame against its own chain before it sent the frame on.
+	/// A frame that a route sends or returns can release more frames, which
+	/// route next. The frames behind a failed route wait for the next take.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingSignature`] -- no signer of a peer verifies a frame.
-	/// - [`TightBeamError`] -- the chain refuses a frame, or a route fails.
-	async fn take_in(&self, frame: Frame, ctx: &ServletContext<Self>) -> Result<Option<Frame>, TightBeamError> {
-		let trace = ctx.trace();
+	/// - [`TightBeamError`] -- the chain refuses a frame, the gap recovery fails, or a route fails.
+	async fn take_into_chain(
+		&self,
+		entry: ChainFrame,
+		ctx: &ServletContext<Self>,
+	) -> Result<Option<Frame>, TightBeamError> {
+		let arrival = entry.order();
 		let mut reply = None;
-		let mut owes_reply = true;
-		let mut entering = VecDeque::from([frame]);
+		let mut entering = VecDeque::from([entry]);
 
 		while let Some(entry) = entering.pop_front() {
-			// 1. The signer names the side, so the node refuses a frame that no
-			// peer signed before its chain stores it.
-			let side = self.side_of(&entry)?;
+			// 1. Each frame opens through the signer check of its peer, which
+			// refuses a frame that no peer signed and names the side.
+			let side = entry.side();
+			let order = entry.order();
 
-			// 2. The chain persists and orders the frame, and releases each
-			// frame that follows its head in order.
-			let released = match self.chain_processor().process_incoming(&entry)? {
+			// 2. The chain orders the frame, and a gap answer fills its gap.
+			let released = match self.chain_processor().process_incoming(entry)? {
 				ProcessResult::Processed(released) => released,
-				ProcessResult::Buffered => Vec::new(),
-				ProcessResult::ChainGap { current_head, missing_hash } => {
-					let (pool, addr) = self.hop_toward(side).await?;
-					self.handle_chain_gap(current_head, missing_hash, pool, addr, &trace).await?;
+				ProcessResult::Duplicate if order == arrival => {
+					reply = Some(self.frame_builder().build_stateless_ack_frame(order)?);
 					Vec::new()
+				}
+				ProcessResult::Buffered | ProcessResult::Duplicate => Vec::new(),
+				ProcessResult::ChainGap { current_head, missing_hash } => {
+					let answer = self.handle_chain_gap(current_head, missing_hash, side, ctx).await?;
+					self.chain_processor().fill(answer)?
 				}
 			};
 
-			// 3. Each released frame routes by the side of its own signer.
-			for released_frame in released {
-				let released_side = self.side_of(&released_frame)?;
-				let routed = self.route(released_frame, released_side, ctx).await?;
-				match routed {
-					Routed::Answer(sender_reply) | Routed::Receipt(sender_reply) if owes_reply => {
-						reply = Some(sender_reply);
+			// 3. The frames that the chain took before this take route first.
+			let mut releasing = VecDeque::from(self.chain_processor().take_released()?);
+			releasing.extend(released);
+			while let Some(released_frame) = releasing.pop_front() {
+				let owes_reply = released_frame.order() == arrival;
+				let settled = match self.settle(released_frame, owes_reply, ctx).await {
+					Ok(settled) => settled,
+					Err(error) => {
+						self.chain_processor().keep_released(releasing)?;
+						return Err(error);
 					}
-					Routed::Answer(answer) => {
-						let (pool, addr) = self.hop_toward(released_side).await?;
-						self.send_frame(pool, addr, answer).await?;
-					}
-					Routed::Returned(returned) => entering.push_back(returned),
-					Routed::Receipt(_) | Routed::Nothing => {}
+				};
+				match settled {
+					Settled::Reply(sender_reply) => reply = Some(sender_reply),
+					Settled::Entering(returned) => entering.push_back(returned),
+					Settled::Done => {}
 				}
 
-				owes_reply = false;
+				releasing.extend(self.chain_processor().take_released()?);
 			}
 		}
 
 		Ok(reply)
+	}
+
+	/// Routes `released_frame` by the side that its signer check found, and
+	/// returns what the take keeps from the route.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the route, the send of an answer, or the open of a returned frame fails.
+	async fn settle(
+		&self,
+		released_frame: ChainFrame,
+		owes_reply: bool,
+		ctx: &ServletContext<Self>,
+	) -> Result<Settled, TightBeamError> {
+		let released_side = released_frame.side();
+		let routed = self.route(released_frame, released_side, ctx).await?;
+		match routed {
+			Routed::Answer(sender_reply) | Routed::Receipt(sender_reply) if owes_reply => {
+				Ok(Settled::Reply(sender_reply))
+			}
+			// A frame that waited sends its answer to the hop on its side.
+			Routed::Answer(answer) => {
+				let (pool, addr) = self.hop_toward(released_side).await?;
+				self.send_frame(pool, addr, answer).await?;
+				Ok(Settled::Done)
+			}
+			Routed::Returned(returned) => Ok(Settled::Entering(self.open_into_chain(returned).await?)),
+			Routed::Receipt(_) | Routed::Nothing => Ok(Settled::Done),
+		}
 	}
 }
 
@@ -360,8 +443,8 @@ servlet! {
 }
 
 impl DtnNode for MissionControlServletConfig {
-	fn node_name(&self) -> &str {
-		"mission_control"
+	fn role(&self) -> DtnRole {
+		DtnRole::MissionControl
 	}
 
 	fn signing_key(&self) -> &Secp256k1SigningKey {
@@ -380,10 +463,13 @@ impl DtnNode for MissionControlServletConfig {
 		&self.frame_builder
 	}
 
-	fn signers_on(&self, side: PathSide) -> Vec<&FrameSigner> {
+	fn signers_on(&self, side: PathSide) -> Vec<(DtnRole, &FrameSigner)> {
 		match side {
 			PathSide::Earth => Vec::new(),
-			PathSide::Mars => vec![&self.rover_signer, &self.earth_relay_signer],
+			PathSide::Mars => vec![
+				(DtnRole::Rover, &self.rover_signer),
+				(DtnRole::EarthRelay, &self.earth_relay_signer),
+			],
 		}
 	}
 
@@ -397,10 +483,15 @@ impl DtnNode for MissionControlServletConfig {
 		}
 	}
 
-	async fn route(&self, frame: Frame, side: PathSide, ctx: &ServletContext<Self>) -> Result<Routed, TightBeamError> {
-		let frame_order = frame.metadata().order();
-		match self.decrypt_relay_message(frame).await? {
-			RelayMessage::Telemetry(telemetry) => {
+	async fn route(
+		&self,
+		entry: ChainFrame,
+		_side: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Routed, TightBeamError> {
+		let frame_order = entry.order();
+		match entry.into_message() {
+			ChainMessage::Telemetry(telemetry) => {
 				// The telemetry worker analyzes the telemetry and decides on
 				// the next command.
 				let request = TelemetryHandlerRequest { telemetry };
@@ -430,15 +521,13 @@ impl DtnNode for MissionControlServletConfig {
 
 				Ok(Routed::Receipt(self.frame_builder.build_stateless_ack_frame(frame_order)?))
 			}
-			RelayMessage::CommandAck(ack) => {
+			ChainMessage::CommandAck(ack) => {
 				// The ACK worker records that Mission Control received the ACK.
 				let request = CommandAckHandlerRequest { ack };
 				ctx.relay::<CommandAckHandlerWorker>(Arc::new(request)).await??;
 				Ok(Routed::Receipt(self.frame_builder.build_stateless_ack_frame(frame_order)?))
 			}
-			RelayMessage::FrameRequest(request) => self.answer_frame_request(request, side, ctx).await,
-			RelayMessage::FrameResponse(response) => self.take_frame_response(response, frame_order, ctx).await,
-			RelayMessage::Command(_) => {
+			ChainMessage::Command(_) => {
 				// A command travels toward the Rover, so Mission Control
 				// refuses one.
 				Err(TightBeamError::InvalidBody)
@@ -473,21 +562,24 @@ servlet! {
 }
 
 impl EarthRelaySatelliteServletConfig {
-	/// Forwards `frame` from `side` to the hop across the relay.
+	/// Forwards `entry` from `side` to the hop across the relay.
 	///
 	/// A frame from Mission Control gets a receipt. A frame from the Mars side
 	/// goes on as fire-and-forget, so the Mars Relay gets `None` as its reply.
-	async fn forward(&self, frame: Frame, side: PathSide, trace: &TraceCollector) -> Result<Routed, TightBeamError> {
-		let frame_order = frame.metadata().order();
+	async fn forward(
+		&self,
+		entry: ChainFrame,
+		side: PathSide,
+		trace: &TraceCollector,
+	) -> Result<Routed, TightBeamError> {
+		let frame_order = entry.order();
 		match side {
 			PathSide::Earth => {
 				trace.event(EARTH_RELAY_RECEIVE_FROM_MC)?;
 				trace.event(EARTH_RELAY_FORWARD_TO_MARS)?;
 			}
 			PathSide::Mars => {
-				// The frame ID names the message type: `relay-telem-NNN` or
-				// `relay-ack-NNN`.
-				let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
+				let is_telemetry = matches!(entry.message(), ChainMessage::Telemetry(_));
 				if is_telemetry {
 					trace.event(EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS)?;
 					trace.event(EARTH_RELAY_FORWARD_TELEMETRY_TO_MC)?;
@@ -499,7 +591,7 @@ impl EarthRelaySatelliteServletConfig {
 		}
 
 		let (pool, addr) = self.hop_toward(side.across()).await?;
-		self.send_frame(pool, addr, frame).await?;
+		self.send_frame(pool, addr, entry.into_frame()).await?;
 
 		match side {
 			PathSide::Earth => Ok(Routed::Receipt(self.frame_builder.build_stateless_ack_frame(frame_order)?)),
@@ -509,8 +601,8 @@ impl EarthRelaySatelliteServletConfig {
 }
 
 impl DtnNode for EarthRelaySatelliteServletConfig {
-	fn node_name(&self) -> &str {
-		"earth_relay"
+	fn role(&self) -> DtnRole {
+		DtnRole::EarthRelay
 	}
 
 	fn signing_key(&self) -> &Secp256k1SigningKey {
@@ -529,10 +621,13 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 		&self.frame_builder
 	}
 
-	fn signers_on(&self, side: PathSide) -> Vec<&FrameSigner> {
+	fn signers_on(&self, side: PathSide) -> Vec<(DtnRole, &FrameSigner)> {
 		match side {
-			PathSide::Earth => vec![&self.mission_control_signer],
-			PathSide::Mars => vec![&self.mars_relay_signer, &self.rover_signer],
+			PathSide::Earth => vec![(DtnRole::MissionControl, &self.mission_control_signer)],
+			PathSide::Mars => vec![
+				(DtnRole::MarsRelay, &self.mars_relay_signer),
+				(DtnRole::Rover, &self.rover_signer),
+			],
 		}
 	}
 
@@ -546,13 +641,13 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 		}
 	}
 
-	async fn route(&self, frame: Frame, side: PathSide, ctx: &ServletContext<Self>) -> Result<Routed, TightBeamError> {
-		let frame_order = frame.metadata().order();
-		match self.decrypt_relay_message(frame.to_owned()).await? {
-			RelayMessage::FrameRequest(request) => self.answer_frame_request(request, side, ctx).await,
-			RelayMessage::FrameResponse(response) => self.take_frame_response(response, frame_order, ctx).await,
-			_ => self.forward(frame, side, &ctx.trace()).await,
-		}
+	async fn route(
+		&self,
+		entry: ChainFrame,
+		side: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Routed, TightBeamError> {
+		self.forward(entry, side, &ctx.trace()).await
 	}
 }
 
@@ -581,23 +676,25 @@ servlet! {
 }
 
 impl MarsRelaySatelliteServletConfig {
-	/// Forwards `frame` from `side` to the hop across the relay.
+	/// Forwards `entry` from `side` to the hop across the relay.
 	///
 	/// A frame from the Rover gets a receipt. The Rover answers a command from
-	/// the Earth side with its signed ACK, which enters the chain of this relay
-	/// and goes on to the Earth Relay, so the Earth Relay gets `None` as its
-	/// reply.
-	async fn forward(&self, frame: Frame, side: PathSide, trace: &TraceCollector) -> Result<Routed, TightBeamError> {
-		let frame_order = frame.metadata().order();
+	/// the Earth side with its signed ACK, which enters this relay's chain and
+	/// goes on to the Earth Relay. The Earth Relay gets `None` as its reply.
+	async fn forward(
+		&self,
+		entry: ChainFrame,
+		side: PathSide,
+		trace: &TraceCollector,
+	) -> Result<Routed, TightBeamError> {
+		let frame_order = entry.order();
 		match side {
 			PathSide::Earth => {
 				trace.event(MARS_RELAY_RECEIVE_FROM_EARTH)?;
 				trace.event(MARS_RELAY_FORWARD_TO_ROVER)?;
 			}
 			PathSide::Mars => {
-				// The frame ID names the message type: `relay-telem-NNN` or
-				// `relay-ack-NNN`.
-				let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
+				let is_telemetry = matches!(entry.message(), ChainMessage::Telemetry(_));
 				if is_telemetry {
 					trace.event(MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER)?;
 					trace.event(MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH)?;
@@ -609,7 +706,7 @@ impl MarsRelaySatelliteServletConfig {
 		}
 
 		let (pool, addr) = self.hop_toward(side.across()).await?;
-		let reply = self.send_frame(pool, addr, frame).await?;
+		let reply = self.send_frame(pool, addr, entry.into_frame()).await?;
 
 		match side {
 			PathSide::Earth => Ok(reply.map_or(Routed::Nothing, Routed::Returned)),
@@ -619,8 +716,8 @@ impl MarsRelaySatelliteServletConfig {
 }
 
 impl DtnNode for MarsRelaySatelliteServletConfig {
-	fn node_name(&self) -> &str {
-		"mars_relay"
+	fn role(&self) -> DtnRole {
+		DtnRole::MarsRelay
 	}
 
 	fn signing_key(&self) -> &Secp256k1SigningKey {
@@ -639,10 +736,13 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 		&self.frame_builder
 	}
 
-	fn signers_on(&self, side: PathSide) -> Vec<&FrameSigner> {
+	fn signers_on(&self, side: PathSide) -> Vec<(DtnRole, &FrameSigner)> {
 		match side {
-			PathSide::Earth => vec![&self.mission_control_signer, &self.earth_relay_signer],
-			PathSide::Mars => vec![&self.rover_signer],
+			PathSide::Earth => vec![
+				(DtnRole::MissionControl, &self.mission_control_signer),
+				(DtnRole::EarthRelay, &self.earth_relay_signer),
+			],
+			PathSide::Mars => vec![(DtnRole::Rover, &self.rover_signer)],
 		}
 	}
 
@@ -656,13 +756,13 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 		}
 	}
 
-	async fn route(&self, frame: Frame, side: PathSide, ctx: &ServletContext<Self>) -> Result<Routed, TightBeamError> {
-		let frame_order = frame.metadata().order();
-		match self.decrypt_relay_message(frame.to_owned()).await? {
-			RelayMessage::FrameRequest(request) => self.answer_frame_request(request, side, ctx).await,
-			RelayMessage::FrameResponse(response) => self.take_frame_response(response, frame_order, ctx).await,
-			_ => self.forward(frame, side, &ctx.trace()).await,
-		}
+	async fn route(
+		&self,
+		entry: ChainFrame,
+		side: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Routed, TightBeamError> {
+		self.forward(entry, side, &ctx.trace()).await
 	}
 }
 
@@ -691,8 +791,8 @@ servlet! {
 }
 
 impl DtnNode for RoverServletConfig {
-	fn node_name(&self) -> &str {
-		"rover"
+	fn role(&self) -> DtnRole {
+		DtnRole::Rover
 	}
 
 	fn signing_key(&self) -> &Secp256k1SigningKey {
@@ -711,9 +811,12 @@ impl DtnNode for RoverServletConfig {
 		&self.frame_builder
 	}
 
-	fn signers_on(&self, side: PathSide) -> Vec<&FrameSigner> {
+	fn signers_on(&self, side: PathSide) -> Vec<(DtnRole, &FrameSigner)> {
 		match side {
-			PathSide::Earth => vec![&self.mission_control_signer, &self.mars_relay_signer],
+			PathSide::Earth => vec![
+				(DtnRole::MissionControl, &self.mission_control_signer),
+				(DtnRole::MarsRelay, &self.mars_relay_signer),
+			],
 			PathSide::Mars => Vec::new(),
 		}
 	}
@@ -728,12 +831,17 @@ impl DtnNode for RoverServletConfig {
 		}
 	}
 
-	async fn route(&self, frame: Frame, side: PathSide, ctx: &ServletContext<Self>) -> Result<Routed, TightBeamError> {
-		// The ACK needs the order of the command after the decrypt consumes
-		// `frame`.
-		let command_order = frame.metadata().order();
-		match self.decrypt_relay_message(frame).await? {
-			RelayMessage::Command(command) => {
+	async fn route(
+		&self,
+		entry: ChainFrame,
+		_side: PathSide,
+		ctx: &ServletContext<Self>,
+	) -> Result<Routed, TightBeamError> {
+		// The ACK needs the order of the command, which the entry gives up
+		// with its message.
+		let command_order = entry.order();
+		match entry.into_message() {
+			ChainMessage::Command(command) => {
 				let request = RoverCommandHandlerRequest { command, max_rounds: self.max_rounds as u64 };
 				ctx.relay::<RoverCommandHandlerWorker>(Arc::new(request)).await??;
 
@@ -750,9 +858,7 @@ impl DtnNode for RoverServletConfig {
 
 				Ok(Routed::Answer(ack_frame))
 			}
-			RelayMessage::FrameRequest(request) => self.answer_frame_request(request, side, ctx).await,
-			RelayMessage::FrameResponse(response) => self.take_frame_response(response, command_order, ctx).await,
-			RelayMessage::Telemetry(_) | RelayMessage::CommandAck(_) => Ok(Routed::Nothing),
+			ChainMessage::Telemetry(_) | ChainMessage::CommandAck(_) => Ok(Routed::Nothing),
 		}
 	}
 }

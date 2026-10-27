@@ -47,7 +47,7 @@ use tightbeam::{
 	instrumentation::TbInstrumentationConfig,
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
-	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConfig},
+	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, specs::csp::Process, ScenarioConfig},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig},
 	transport::{tcp::r#async::TokioListener, GenericClient},
 	urn::Urn,
@@ -61,8 +61,8 @@ use crate::dtn::messages::RoverInstrument;
 
 /// The gap-recovery steps that servlets and workers share.
 ///
-/// Call sites with a dynamic `node_name` resolve through this enum to the URN
-/// constants of `dtn::events`, so event identity stays URN-only.
+/// Each step resolves, on the node of a [`DtnRole`], to a URN constant of
+/// `dtn::events`, so event identity stays URN-only.
 #[derive(Clone, Copy)]
 pub(crate) enum GapRecoveryStep {
 	GapDetected,
@@ -73,53 +73,55 @@ pub(crate) enum GapRecoveryStep {
 	CascadeFrameRequest,
 }
 
-/// Resolves the URN of a gap-recovery step on the named DTN node.
-pub(crate) fn gap_recovery_event(node: impl AsRef<str>, step: GapRecoveryStep) -> Urn<'static> {
-	let index = match node.as_ref() {
-		"mission_control" => 0,
-		"earth_relay" => 1,
-		"mars_relay" => 2,
-		_ => 3,
-	};
-	let table = match step {
-		GapRecoveryStep::GapDetected => [
-			MISSION_CONTROL_GAP_DETECTED,
-			EARTH_RELAY_GAP_DETECTED,
-			MARS_RELAY_GAP_DETECTED,
-			ROVER_GAP_DETECTED,
-		],
-		GapRecoveryStep::SendFrameRequest => [
-			MISSION_CONTROL_SEND_FRAME_REQUEST,
-			EARTH_RELAY_SEND_FRAME_REQUEST,
-			MARS_RELAY_SEND_FRAME_REQUEST,
-			ROVER_SEND_FRAME_REQUEST,
-		],
-		GapRecoveryStep::ReceiveFrameRequest => [
-			MISSION_CONTROL_RECEIVE_FRAME_REQUEST,
-			EARTH_RELAY_RECEIVE_FRAME_REQUEST,
-			MARS_RELAY_RECEIVE_FRAME_REQUEST,
-			ROVER_RECEIVE_FRAME_REQUEST,
-		],
-		GapRecoveryStep::SendFrameResponse => [
-			MISSION_CONTROL_SEND_FRAME_RESPONSE,
-			EARTH_RELAY_SEND_FRAME_RESPONSE,
-			MARS_RELAY_SEND_FRAME_RESPONSE,
-			ROVER_SEND_FRAME_RESPONSE,
-		],
-		GapRecoveryStep::ReceiveFrameResponse => [
-			MISSION_CONTROL_RECEIVE_FRAME_RESPONSE,
-			EARTH_RELAY_RECEIVE_FRAME_RESPONSE,
-			MARS_RELAY_RECEIVE_FRAME_RESPONSE,
-			ROVER_RECEIVE_FRAME_RESPONSE,
-		],
-		GapRecoveryStep::CascadeFrameRequest => [
-			MISSION_CONTROL_CASCADE_FRAME_REQUEST,
-			EARTH_RELAY_CASCADE_FRAME_REQUEST,
-			MARS_RELAY_CASCADE_FRAME_REQUEST,
-			ROVER_CASCADE_FRAME_REQUEST,
-		],
-	};
-	table[index].clone()
+impl GapRecoveryStep {
+	/// The URN of this step on the node of `role`.
+	pub(crate) fn event_on(self, role: DtnRole) -> Urn<'static> {
+		let [mission_control, earth_relay, mars_relay, rover] = match self {
+			GapRecoveryStep::GapDetected => [
+				MISSION_CONTROL_GAP_DETECTED,
+				EARTH_RELAY_GAP_DETECTED,
+				MARS_RELAY_GAP_DETECTED,
+				ROVER_GAP_DETECTED,
+			],
+			GapRecoveryStep::SendFrameRequest => [
+				MISSION_CONTROL_SEND_FRAME_REQUEST,
+				EARTH_RELAY_SEND_FRAME_REQUEST,
+				MARS_RELAY_SEND_FRAME_REQUEST,
+				ROVER_SEND_FRAME_REQUEST,
+			],
+			GapRecoveryStep::ReceiveFrameRequest => [
+				MISSION_CONTROL_RECEIVE_FRAME_REQUEST,
+				EARTH_RELAY_RECEIVE_FRAME_REQUEST,
+				MARS_RELAY_RECEIVE_FRAME_REQUEST,
+				ROVER_RECEIVE_FRAME_REQUEST,
+			],
+			GapRecoveryStep::SendFrameResponse => [
+				MISSION_CONTROL_SEND_FRAME_RESPONSE,
+				EARTH_RELAY_SEND_FRAME_RESPONSE,
+				MARS_RELAY_SEND_FRAME_RESPONSE,
+				ROVER_SEND_FRAME_RESPONSE,
+			],
+			GapRecoveryStep::ReceiveFrameResponse => [
+				MISSION_CONTROL_RECEIVE_FRAME_RESPONSE,
+				EARTH_RELAY_RECEIVE_FRAME_RESPONSE,
+				MARS_RELAY_RECEIVE_FRAME_RESPONSE,
+				ROVER_RECEIVE_FRAME_RESPONSE,
+			],
+			GapRecoveryStep::CascadeFrameRequest => [
+				MISSION_CONTROL_CASCADE_FRAME_REQUEST,
+				EARTH_RELAY_CASCADE_FRAME_REQUEST,
+				MARS_RELAY_CASCADE_FRAME_REQUEST,
+				ROVER_CASCADE_FRAME_REQUEST,
+			],
+		};
+
+		match role {
+			DtnRole::MissionControl => mission_control,
+			DtnRole::EarthRelay => earth_relay,
+			DtnRole::MarsRelay => mars_relay,
+			DtnRole::Rover => rover,
+		}
+	}
 }
 use crate::dtn::{
 	bms::BatteryManagementSystem,
@@ -433,7 +435,7 @@ tb_compose_spec! {
 	properties: {
 		deadlock_free: true,
 		livelock_free: true,
-		deterministic: false
+		deterministic: true
 	},
 	annotations {
 		description: "DTN data flows (telemetry and commands) - fully asynchronous"
@@ -451,7 +453,7 @@ tb_compose_spec! {
 	properties: {
 		deadlock_free: true,
 		livelock_free: true,
-		deterministic: false
+		deterministic: true
 	},
 	annotations {
 		description: "DTN system with independent interleaved telemetry, command, and lifecycle flows"
@@ -657,13 +659,13 @@ async fn await_completed_rounds(state: &RwLock<MissionState>, rounds: usize) -> 
 /// The framework's FDR runs in two modes:
 /// 1. CSP spec exploration: the framework explores the state space of `DtnComposedSystem`.
 /// 2. Trace refinement: the framework checks the runtime trace against the spec in `specs`.
-fn build_dtn_fdr_config_refinement() -> FdrConfig {
+fn build_dtn_fdr_config_refinement(process: Process) -> FdrConfig {
 	FdrConfig {
 		seeds: 2, // Each seed explores another interleaving of the CSP model.
 		max_depth: 10,
 		max_internal_run: 5,
 		timeout_ms: 15000,
-		specs: vec![DtnComposedSystem::process()], // It turns on trace refinement.
+		specs: vec![process], // It turns on trace refinement.
 		fail_fast: true,
 		scheduler_count: None,
 		process_count: None,
@@ -674,13 +676,20 @@ fn build_dtn_fdr_config_refinement() -> FdrConfig {
 	}
 }
 
+/// The configuration of the DTN scenario over `trace`. It grades the event
+/// counts, checks the run and the claims of [`DtnComposedSystem`], and refines
+/// the run against it.
+fn dtn_config(trace: TraceCollector) -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let fdr = build_dtn_fdr_config_refinement(DtnComposedSystem::process()?);
+	let builder = ScenarioConfig::builder()
+		.with_spec(DtnEventCountSpec::latest())
+		.with_csp(DtnComposedSystem);
+	Ok(builder.with_fdr(fdr).with_trace(trace).build()?)
+}
+
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	config: ScenarioConfig::builder()
-		.with_spec(DtnEventCountSpec::latest())
-		.with_csp(DtnComposedSystem)
-		.with_fdr(build_dtn_fdr_config_refinement())
-		.with_trace(TraceConfig::builder()
+	config: dtn_config(TraceConfig::builder()
 			.with_instrumentation(TbInstrumentationConfig {
 				enable_payloads: false,
 				enable_internal_detail: true,
@@ -696,8 +705,7 @@ tb_scenario! {
 			).with_default_level(LogLevel::Debug))
 			.build()
 			.into()
-		)
-		.build(),
+		),
 	environment Servlet {
 		context: DtnScenarioConfig::default(),
 		start: |env| async move {
@@ -843,6 +851,29 @@ tb_scenario! {
 			trace.event(MISSION_COMPLETE)?;
 
 			Ok(())
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use tightbeam::tb_cases;
+
+	use super::*;
+
+	// A gap-recovery step records the event of the node that it runs on.
+	tb_cases! {
+		fn a_gap_step_records_the_event_of_its_node((role, event): (DtnRole, Urn<'static>)) -> Result<(), TightBeamError> {
+			let trace = TraceCollector::new();
+			trace.event(GapRecoveryStep::GapDetected.event_on(role))?;
+			assert_eq!(trace.recorded(event), 1);
+			Ok(())
+		}
+		cases {
+			mission_control => (DtnRole::MissionControl, MISSION_CONTROL_GAP_DETECTED),
+			earth_relay => (DtnRole::EarthRelay, EARTH_RELAY_GAP_DETECTED),
+			mars_relay => (DtnRole::MarsRelay, MARS_RELAY_GAP_DETECTED),
+			rover => (DtnRole::Rover, ROVER_GAP_DETECTED),
 		}
 	}
 }

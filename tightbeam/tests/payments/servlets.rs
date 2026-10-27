@@ -11,8 +11,9 @@ use tightbeam::asn1::MessagePriority;
 use tightbeam::crypto::hpke::{HpkeMessage, HpkeSecp256k1Sha256Aes256Gcm, HpkeSecretKeyOps};
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::{compose, servlet};
+use tightbeam::{compose, servlet, Frame, TightBeamError};
 
 use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
@@ -47,8 +48,8 @@ use super::messages::{
 
 /// Calculates the message priority from the transaction amount.
 ///
-/// The function converts the amount to US cents with
-/// [`MonetaryAmount::to_usd_cents`] and then picks the priority:
+/// It converts the amount to US cents with [`MonetaryAmount::to_usd_cents`],
+/// then picks the priority:
 ///
 /// - A high-value amount over 100,000 cents gets [`MessagePriority::Expedited`].
 /// - An amount over 10,000 cents gets [`MessagePriority::LowLatency`].
@@ -65,6 +66,42 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 	}
 }
 
+impl CreditTransferTransaction {
+	/// Approves this transfer once the commitment of `frame` opens over it.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::InvalidBody`] -- the commitment of `frame` misses this transfer.
+	/// - [`TightBeamError`] -- the commitment fails to compute, or a trace record fails.
+	fn authorize(&self, frame: &Frame, trace: &TraceCollector) -> Result<TransactionStatus, TightBeamError> {
+		// The commitment binds the decrypted body to what the client sent.
+		let commitment_verified = frame.verify_commitment_of::<Sha3_256, _>(self, [])?;
+		trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], commitment_verified)?;
+		if !commitment_verified {
+			return Err(TightBeamError::InvalidBody);
+		}
+
+		match self.instructed_amount.currency.as_bytes() {
+			b"JPY" => trace.event_with(CURRENCY_JPY_PROCESSED, &[PAYMENT_TAG], ())?,
+			b"USD" => trace.event_with(CURRENCY_USD_PROCESSED, &[PAYMENT_TAG], ())?,
+			b"BHD" => trace.event_with(CURRENCY_BHD_PROCESSED, &[PAYMENT_TAG], ())?,
+			_ => trace.event_with(CURRENCY_OTHER_PROCESSED, &[PAYMENT_TAG], ())?,
+		};
+
+		let priority = to_priority(&self.instructed_amount);
+		if priority == MessagePriority::Expedited {
+			trace.event_with(HIGH_VALUE_EXPEDITED, &[PAYMENT_TAG], ())?;
+		}
+
+		let auth_code = format!("AUTH{:08X}", self.creation_datetime as u32).into_bytes();
+		let response = TransactionStatus::approved(self.payment_id.to_owned(), auth_code)?;
+
+		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], ())?;
+
+		Ok(response)
+	}
+}
+
 servlet! {
 	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = PaymentHarness>,
 	protocol: TokioListener,
@@ -72,38 +109,8 @@ servlet! {
 		let trace = &ctx.trace();
 		let harness: &PaymentHarness = ctx.env_config();
 
-		if let Some(cached) = harness.check_dedup_cache(&frame, trace)? {
-			return Ok(Some(compose! {
-				V2: id: frame.metadata().id(),
-					message: cached
-			}?));
-		}
-
-		// The message-integrity commitment must recompute over the decrypted
-		// transaction body, so this event proves cryptographic verification of
-		// what the client committed to, beyond the presence of a commitment.
-		let commitment_verified = frame.verify_commitment_of::<Sha3_256, _>(&req, [])?;
-		trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], commitment_verified)?;
-
-		match req.instructed_amount.currency.as_bytes() {
-			b"JPY" => trace.event_with(CURRENCY_JPY_PROCESSED, &[PAYMENT_TAG], ())?,
-			b"USD" => trace.event_with(CURRENCY_USD_PROCESSED, &[PAYMENT_TAG], ())?,
-			b"BHD" => trace.event_with(CURRENCY_BHD_PROCESSED, &[PAYMENT_TAG], ())?,
-			_ => trace.event_with(CURRENCY_OTHER_PROCESSED, &[PAYMENT_TAG], ())?,
-		};
-
-		let priority = to_priority(&req.instructed_amount);
-		if priority == MessagePriority::Expedited {
-			trace.event_with(HIGH_VALUE_EXPEDITED, &[PAYMENT_TAG], ())?;
-		}
-
-		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
-		let response = TransactionStatus::approved(req.payment_id.to_owned(), auth_code)?;
-
-		harness.dedup.cache_response(&frame, response.to_owned())?;
-
-		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], ())?;
-
+		// The harness answers a duplicate from its cache.
+		let response = harness.answer(&frame, trace, || req.authorize(&frame, trace))?;
 		Ok(Some(compose! {
 			V2: id: frame.metadata().id(),
 				message: response
@@ -119,27 +126,23 @@ servlet! {
 		let harness: &PaymentHarness = ctx.env_config();
 
 		// A capture links back to its authorization through `previous_frame`,
-		// and the chain of the harness records whether the link matches the
-		// authorization that the flow saw last.
-		if let Some(cached) = harness.check_dedup_cache(&frame, trace)? {
-			return Ok(Some(compose! {
-				V2: id: frame.metadata().id(),
-					message: cached
-			}?));
-		}
+		// and the harness refuses a capture whose link misses the
+		// authorization that the flow saw last. The harness answers a
+		// duplicate from its cache, so the servlet settles each capture once.
+		let response = harness.answer(&frame, trace, || {
+			let payment_id = PaymentIdentification::new(
+				b"CAPTURE",
+				req.original_end_to_end_id.as_bytes(),
+				format!("CAP{}", req.capture_datetime).as_bytes(),
+			)?;
 
-		let payment_id = PaymentIdentification::new(
-			b"CAPTURE",
-			req.original_end_to_end_id.as_bytes(),
-			format!("CAP{}", req.capture_datetime).as_bytes(),
-		)?;
+			let settlement_code = format!("SETTLE{:08X}", req.capture_datetime as u32).into_bytes();
+			let response = TransactionStatus::captured(payment_id, settlement_code)?;
 
-		let settlement_code = format!("SETTLE{:08X}", req.capture_datetime as u32).into_bytes();
-		let response = TransactionStatus::captured(payment_id, settlement_code)?;
+			trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], ())?;
 
-		harness.dedup.cache_response(&frame, response.to_owned())?;
-
-		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], ())?;
+			Ok(response)
+		})?;
 
 		Ok(Some(compose! {
 			V2: id: frame.metadata().id(),
@@ -200,6 +203,10 @@ servlet! {
 
 #[cfg(test)]
 mod tests {
+	use tightbeam::asn1::Version;
+	use tightbeam::builder::TypeBuilder;
+	use tightbeam::testing::TestMessage;
+
 	use super::*;
 
 	#[test]
@@ -225,5 +232,30 @@ mod tests {
 	fn priority_medium_value_high() {
 		let amount = MonetaryAmount::new(50_000, *b"USD"); // $500.00
 		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
+	}
+
+	/// A transfer of 100.00 USD to the creditor account `creditor`.
+	fn transfer(creditor: &[u8]) -> CreditTransferTransaction {
+		let payment_id = PaymentIdentification::new(b"INST", b"E2E", b"TXN").expect("short identifiers fit");
+		let amount = MonetaryAmount::new(10_000, *b"USD");
+		let transfer = CreditTransferTransaction::new(payment_id, amount, creditor, b"DEBTOR", None, 0);
+		transfer.expect("short account references fit")
+	}
+
+	/// A frame whose commitment opens over a test message alone.
+	fn frame_of_another_body() -> Frame {
+		let message = TestMessage::sample(None);
+		let frame = Version::V2.compose().with_id(b"txn").with_order(1).with_message(message);
+		let frame = frame.with_message_hasher::<Sha3_256>([]).build();
+		frame.expect("a hashed V2 frame builds")
+	}
+
+	/// A transfer that the commitment of its frame misses is refused.
+	#[test]
+	fn a_transfer_that_its_commitment_misses_is_refused() -> Result<(), TightBeamError> {
+		let trace = TraceCollector::default();
+		let refusal = transfer(b"CREDITOR").authorize(&frame_of_another_body(), &trace);
+		assert!(matches!(refusal, Err(TightBeamError::InvalidBody)));
+		Ok(())
 	}
 }

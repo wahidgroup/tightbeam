@@ -126,9 +126,8 @@ where
 	G: GatePolicy + Clone + 'static,
 {
 	let (listener, addr) = bind_pool_listener(materials).await?;
-	// The accept loop re-applies policies per connection, so the share
-	// and clone calls must stay expressions that give each accept a
-	// fresh value.
+	// The accept loop re-applies policies per connection, so the share and
+	// clone calls must stay expressions that give each accept a fresh value.
 	let acceptor = server! {
 		protocol TokioListener: listener,
 		policies: {
@@ -192,8 +191,8 @@ impl MuxService for MixedService {
 	}
 }
 
-/// The idle pruning of a test pool, which is the timeout and the clock that
-/// the pool judges it against.
+/// The idle pruning of a test pool: the timeout, and the clock the pool judges
+/// it against.
 struct IdlePrune {
 	timeout: Duration,
 	clock: Arc<dyn Clock>,
@@ -448,9 +447,8 @@ tb_scenario! {
 				Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
 			);
 
-			// Unary against the same service: the response future
-			// surfaces the refusal, and the connection goes on to serve
-			// the streaming kind.
+			// Unary against the same service: the response future surfaces the
+			// refusal, and the connection goes on to serve the streaming kind.
 			let unary_refused = matches!(
 				lease.emit(mux_frame("unserved"), None).await,
 				Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
@@ -829,7 +827,7 @@ tb_scenario! {
 
 			let recorded = trace.drain_events();
 			let refusals = recorded.into_iter().filter(|event| event.urn == events::POOL_FAILOVER_REFUSED);
-			let labels: Vec<_> = refusals.map(|event| event.label).collect();
+			let labels: Vec<_> = refusals.map(|event| event.label.map(String::from)).collect();
 			let not_pinned = Some(String::from("certificate-not-pinned"));
 			assert_eq!(labels, [not_pinned.clone(), not_pinned], "each refusal must name the refused pin");
 			Ok(())
@@ -977,7 +975,6 @@ tb_scenario! {
 			drop(first_lease);
 
 			let mut reused_lease = pool.connect(addr).await?;
-
 			let echoed = echo_roundtrip(&mut reused_lease, "mux-idle-reuse").await?;
 			assert!(echoed, "the reused exclusive lease must echo");
 			Ok(())

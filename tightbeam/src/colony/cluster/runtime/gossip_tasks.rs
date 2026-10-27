@@ -6,11 +6,10 @@
 //!
 //! # Planes
 //!
-//! - **Direct advertisement**: one signed frame goes to every beat target.
-//! - **Rumor flood**: the same signed frame, wrapped in a gossip rumor, reaches members beyond direct reach.
-//! - **Pipeline**: the gateway admits an inbound rumor, rate-limits it,
-//!   journals it, delivers it locally, and refloods it.
-//! - **Reconcile**: anti-entropy rounds repair the rumors a peer lacks and learn peer-exchange hints.
+//! - Direct advertisement: one signed frame goes to every beat target.
+//! - Rumor flood: the same signed frame, wrapped in a gossip rumor, reaches members beyond direct reach.
+//! - Pipeline: the gateway admits, rate-limits, journals, delivers locally, and refloods an inbound rumor.
+//! - Reconcile: anti-entropy rounds repair the rumors a peer lacks and learn peer-exchange hints.
 
 use core::num::NonZeroUsize;
 use core::str::from_utf8;
@@ -27,6 +26,7 @@ use crate::colony::cluster::runtime::advertise::{Advertiser, SignedAdvertisement
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, ColonyDigest, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::{FloodClient, HivePlane, PeerPlane};
 use crate::colony::cluster::runtime::refuse::Refusal;
+use crate::colony::cluster::runtime::verify::RequestAudit;
 use crate::colony::cluster::runtime::work::RouteChoice;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
 use crate::colony::cluster::servlet_registry::SlateChange;
@@ -39,7 +39,6 @@ use crate::colony::protocol::ReplyForm;
 use crate::colony::protocol::{
 	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, PeerGossip,
 };
-use crate::colony::TaskGroup;
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
 use crate::decode;
 use crate::encode;
@@ -55,7 +54,7 @@ use crate::instrumentation::events::{
 	CLUSTER_RECONCILE_FAILED, CLUSTER_RELAY_TRAIL_INSTALLED, CLUSTER_RELAY_TRAIL_REFUSED,
 };
 use crate::policy::TransitStatus;
-use crate::runtime::rt;
+use crate::runtime::{rt, TaskGroup};
 use crate::trace::TraceCollector;
 use crate::transport::Protocol;
 use crate::urn::Urn;
@@ -77,8 +76,8 @@ pub(crate) enum GossipOrigin {
 impl GossipOrigin {
 	/// The frame whose signer owns this rumor's rate and journal budget.
 	///
-	/// A relay hop signs the outer frame, so the origin's own signature
-	/// on the inner rumor is what a relayed invocation spends against.
+	/// A relay hop signs the outer frame, so a relayed rumor spends against
+	/// the origin's signature on the inner rumor.
 	fn attributed<'a>(self, frame: &'a Frame, rumor: &'a Frame) -> &'a Frame {
 		match self {
 			Self::Origin => frame,
@@ -121,11 +120,10 @@ struct MintedAdRumor {
 impl ServletRegistry {
 	/// The dial socket of a relay peer, from its live direct routes.
 	///
-	/// Only direct routes qualify, because a relay entry's dial address
-	/// belongs to a further relay while a direct route holds `relay_id`'s
-	/// own. [`None`] means the relay reached this gateway through another
-	/// hop, or the registry lock is poisoned. Either way the direct trail from
-	/// the rumor stands on its own.
+	/// Only direct routes qualify, because a relay entry dials a further relay
+	/// while a direct route dials `relay_id` itself. [`None`] means the relay
+	/// reached this gateway through another hop, or the registry lock is
+	/// poisoned, and the rumor's direct trail stands alone.
 	fn relay_dial_addr(&self, relay_id: impl AsRef<[u8]>) -> Option<PeerAddress> {
 		let relay_id = relay_id.as_ref();
 		let entries = self.peer_entries().ok()?;
@@ -141,11 +139,11 @@ impl<P: ColonyDialProtocol> ColonyConfig<P> {
 	/// Creates, signs, and digests one advertisement rumor for a beat.
 	///
 	/// The rumor wraps `advertisement`, the [`ColonyConfig::mint_ad_frame`]
-	/// frame that the beat dials out directly, so both copies carry one order.
-	/// The method extracts the digest and signer id for witness and reflood.
+	/// frame the beat dials out directly, so both copies carry one order. It
+	/// extracts the digest and signer id for the witness and the reflood.
 	///
-	/// It returns [`None`] on a local fault (key, codec, or journal input).
-	/// The caller records it, and a later beat re-publishes fresh.
+	/// It returns [`None`] on a local fault (key, codec, or journal input),
+	/// which the caller records. A later beat re-publishes fresh.
 	async fn mint_slate_rumor(&self, advertisement: &SignedAdvertisement) -> Option<MintedAdRumor> {
 		let ad_bytes = encode(advertisement.frame()).ok()?;
 
@@ -194,9 +192,9 @@ impl<P: Protocol> ColonyConfig<P> {
 impl ClusterConfig {
 	/// Whether `order` sits inside this colony's control freshness window.
 	///
-	/// The gossip journal deduplicates rumors by digest, so the rumor path
-	/// relies on it where a signed control frame passes a replay guard. This
-	/// bound makes the two paths admit the same orders.
+	/// The rumor path relies on the gossip journal's digest deduplication
+	/// where a signed control frame passes a replay guard. This bound makes the
+	/// two paths admit the same orders.
 	///
 	/// # Fail-closed
 	///
@@ -497,10 +495,9 @@ struct AdvertiseBeat<P: Protocol> {
 /// The gossip arm of the advertise beat and of the inbound pipeline:
 /// reconcile rounds, feeler probes, the slate rumor, refloods, and repairs.
 ///
-/// The beat and the inbound reflood both reach peers through this one
-/// owner, so a rumor leaves on the same plane either way. [`Self::new`]
-/// returns a beat only for a gateway that is in a flood, so every method
-/// here runs on a flood member.
+/// The beat and the inbound reflood both reach peers through it, so a rumor
+/// leaves on the same plane either way. [`Self::new`] returns one only for a
+/// gateway in a flood, so every method here runs on a flood member.
 struct FloodBeat<P: Protocol> {
 	config: ColonyConfig<P>,
 	peer_plane: PeerPlane<P>,
@@ -583,10 +580,10 @@ impl<P: ColonyDialProtocol> AdvertiseBeat<P> {
 	/// The advertised types that this gateway exports, capped at
 	/// [`MAX_ADVERTISED_TYPES`].
 	///
-	/// This is the single place that gathers advertised types, so one
-	/// export filter covers the direct ads and the rumor flood. The filter
-	/// asks the export scope per key each beat, so a live `ExportAllowlist`
-	/// stays aligned with enforcement.
+	/// It is the one place that gathers advertised types, so one export filter
+	/// covers the direct ads and the rumor flood. The filter asks the export
+	/// scope per key each beat, so a live `ExportAllowlist` stays aligned with
+	/// enforcement.
 	fn exported_slate(&self) -> Result<Vec<Urn<'static>>, ClusterError> {
 		let scope = ExportScope::from(&self.config.peer);
 		let local = self.servlet_registry.local_servlets()?;
@@ -642,11 +639,10 @@ impl<P: ColonyDialProtocol> AdvertiseBeat<P> {
 impl<P: ColonyDialProtocol> FloodBeat<P> {
 	/// Refloods a live rumor to the dial targets with a decremented TTL.
 	///
-	/// Targets are anchors plus verified tried peers. Each dial proves the
-	/// answer is a flood member in [`PeerPlane::connect_member`] before the
-	/// rumor leaves, so a configured peer outside the flood receives none
-	/// (CWE-668). Each target receives an owned clone of the signed frame
-	/// because emit consumes the frame.
+	/// The targets are the anchors plus the verified tried peers. Each dial
+	/// proves the answer is a flood member in [`PeerPlane::connect_member`]
+	/// before the rumor leaves, so a configured peer outside the flood
+	/// receives none (CWE-668).
 	///
 	/// # Re-encoding
 	///
@@ -754,21 +750,20 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 
 	/// Publishes the local slate as an origin-signed advertisement rumor.
 	///
-	/// The rumor wraps the identical signed frame that direct advertisement
-	/// dials out, so members beyond direct reach admit through the same
+	/// The rumor wraps the same signed frame that direct advertisement dials
+	/// out, so members beyond direct reach admit it through the same
 	/// signer-binds-to-address path once the flood relays it.
 	///
 	/// # Journal
 	///
 	/// - The beat witnesses the published digest for deduplication alone, so
 	///   the origin's own echo arrives as a duplicate.
-	/// - Retention serves repair and retry, which advertisements forgo. They
-	///   are ephemeral hints that re-publish keeps fresh, and the origin
-	///   already holds the slate it published.
-	/// - A journal that refuses the witness leaves this gateway able to
-	///   re-admit its own echo. The rumor is already created, so the beat
-	///   traces [`CLUSTER_GOSSIP_WITNESS_REFUSED`] and floods the live rumor
-	///   anyway.
+	/// - Advertisements forgo retention, which serves repair and retry. They
+	///   are ephemeral hints that re-publish keeps fresh, and the origin holds
+	///   the slate it published.
+	/// - A journal that refuses the witness lets this gateway admit its own
+	///   echo again. The rumor is already created, so the beat traces
+	///   [`CLUSTER_GOSSIP_WITNESS_REFUSED`] and floods it anyway.
 	///
 	/// # Failures
 	///
@@ -785,9 +780,8 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 			return Ok(false);
 		};
 
-		// The rumor is already live, so the beat records a refused witness and
-		// the flood goes ahead. The rumor states the instant of its creation,
-		// which is also the clock reading the witness prunes at.
+		// The rumor states its creation instant, which is also the clock
+		// reading the witness prunes at.
 		let journal = &self.config.gossip.journal;
 		let witnessed = journal.witness(&minted.signer_id, minted.digest, minted.minted_at, minted.minted_at);
 		if witnessed.is_err() {
@@ -808,8 +802,8 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 	///
 	/// A [`Round::Failed`] is peer-attributable, so the beat loops score it
 	/// toward eviction or probe discard. A local fault skips its own step, or
-	/// ends the beat as a [`LoopFault`] when it does not clear, which keeps
-	/// every score attributable to the peer alone.
+	/// ends the beat as a [`LoopFault`] when it does not clear, so every score
+	/// stays attributable to the peer alone.
 	///
 	/// # Round order
 	///
@@ -1221,8 +1215,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	/// - The servlet receives the origin-signed rumor frame unchanged, as it receives a work frame.
 	/// - The dial admits only the identity the servlet's registration names (CWE-346).
 	/// - The frame's message decodes as a [`GossipRumor`], and its signature
-	///   names the gateway that published the rumor, so a servlet that serves
-	///   many parties can tell them apart and verify each one.
+	///   names the publishing gateway, so a servlet that serves many parties
+	///   can tell them apart and verify each one.
 	/// - The task takes the claim before the round trip, and a guard owns it,
 	///   so the admission path and the reconcile beat never deliver one rumor
 	///   twice (CWE-362).
@@ -1237,8 +1231,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		};
 
 		// A claim taken before the round trip keeps the reconcile beat
-		// off this rumor. Every exit below drops the guard, which returns
-		// the rumor to the retry set.
+		// off this rumor. Each early exit below drops the guard, which
+		// returns the rumor to the retry set.
 		let Some(claim) = LocalClaimGuard::take(journal.as_ref(), &digest_value, self.config.clock.unix())? else {
 			return Ok(());
 		};
@@ -1313,7 +1307,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	) -> Result<Option<Frame>, TightBeamError> {
 		// The caller verifies the sender's signature on the outer frame before
 		// the run, so each refusal of the run names the sender.
-		let refusal = Refusal::to(&frame, &self.trace).by(&sender);
+		let audit = RequestAudit::proven(&self.trace);
+		let refusal = Refusal::to(&frame, &audit).by(&sender);
 		let relay_id = origin.relay(&sender);
 
 		let now = self.config.clock.unix();
@@ -1346,8 +1341,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 				return ReplyForm::Plain.reply(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
 			}
 			Ok(false) => {}
-			Err(_) => {
-				return refusal.gossip(TransitStatus::Unavailable);
+			Err(error) => {
+				return refusal.gossip_error(&error);
 			}
 		}
 
@@ -1358,8 +1353,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			Ok(false) => {
 				return refusal.gossip(TransitStatus::ResourceExhausted);
 			}
-			Err(_) => {
-				return refusal.gossip(TransitStatus::Unavailable);
+			Err(error) => {
+				return refusal.gossip_error(&error);
 			}
 		}
 
@@ -1374,8 +1369,8 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 				return ReplyForm::Plain.reply(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
 			}
 			Ok(Admission::New) => {}
-			Err(_) => {
-				return refusal.gossip(TransitStatus::Unavailable);
+			Err(error) => {
+				return refusal.gossip_error(&error);
 			}
 		}
 
@@ -1391,7 +1386,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		let has_targets = match self.config.peer.table.has_targets() {
 			Ok(has_targets) => has_targets,
 			Err(error) => {
-				return refusal.gossip_fault(LoopFault::Registry(error));
+				return refusal.gossip_error(&error);
 			}
 		};
 
@@ -1543,21 +1538,21 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	/// Applies one admitted peer-advertisement rumor to routing state.
 	///
 	/// The wrapped frame MUST verify on the peer trust plane, and the rumor
-	/// signer MUST match the inner advertisement signer. An advertisement
-	/// therefore travels only under the identity that authored it.
+	/// signer MUST match the inner advertisement signer. So an advertisement
+	/// travels only under its author's identity.
 	///
 	/// # Admission
 	///
-	/// A rumor follows the identical direct-ad path
-	/// ([`AdmittedPeerAd::admit`]): order freshness, flood membership, the dial
-	/// allowlist, the message checks, and the discovery hint.
+	/// A rumor follows the same direct-ad path ([`AdmittedPeerAd::admit`]):
+	/// order freshness, flood membership, the dial allowlist, the message
+	/// checks, and the discovery hint.
 	///
 	/// # Reconciliation
 	///
 	/// - Slate reconciliation installs a direct trail that dials the origin.
-	/// - When `max_hops` affords the two forwards a relay needs and the relay
-	///   peer's dial address is known, a relay trail installs beside the direct
-	///   trail as fallback. Only then can pheromone fail over to it (CWE-772).
+	/// - When `max_hops` affords a relay's two forwards and the relay's dial
+	///   address is known, a relay trail installs beside the direct trail as
+	///   fallback. Only then can pheromone fail over to it (CWE-772).
 	/// - Registry policy refuses a slate that collides with a local route, such
 	///   as this gateway's own echoed slate.
 	///
@@ -1769,9 +1764,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 					config.clock.sleep(interval).await;
 					delivery.retry_pending_local().await?;
 
-					// Beat targets are anchors plus verified tried peers.
-					// Probes are unverified candidates that wait for their
-					// feeler dial.
+					// The beat targets are the anchors plus the verified tried
+					// peers. The probes are unverified candidates that wait for
+					// their feeler dial.
 					let targets = config.peer.table.target_set()?;
 					let probes = config.peer.table.probe_sample(config.clock.unix())?;
 
@@ -1862,7 +1857,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 #[cfg(test)]
 mod tests {
-	use core::num::NonZeroUsize;
+	use core::num::{NonZeroU32, NonZeroUsize};
 
 	use super::*;
 	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
@@ -1905,7 +1900,6 @@ mod tests {
 		let mut ledger = PeerLedger::default();
 		ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
 		ledger.refuse_origin(b"origin-b", UnixMillis::new(60_000));
-
 		ledger.expire(UnixMillis::new(121_000), WINDOW);
 
 		let held: Vec<&[u8]> = ledger.refused_origins.keys().map(Vec::as_slice).collect();
@@ -1921,7 +1915,6 @@ mod tests {
 	fn ledger_reads_an_acknowledged_digest_wanted_again_as_a_drop() {
 		let mut ledger = PeerLedger::default();
 		ledger.ack(digest_of(1));
-
 		let signals = [
 			ledger.drop_signal([digest_of(2)]),
 			ledger.drop_signal([digest_of(1)]),
@@ -2333,8 +2326,8 @@ mod tests {
 		let clock = Arc::new(ManualClock::default());
 		let mut config = test_config();
 		config.clock = Arc::<ManualClock>::clone(&clock);
-		let config = ColonyConfig::<TokioListener>::new(config);
 
+		let config = ColonyConfig::<TokioListener>::new(config);
 		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
 
 		clock.advance(Duration::from_millis(1));
@@ -2525,7 +2518,13 @@ mod tests {
 
 	/// The advertisement of `peer` at `dial`, at `order`, whose slate names
 	/// `types`, each route abandoned after `limit` failures.
-	fn advertisement(peer: &[u8], dial: AdmittedDial, types: &[&[u8]], order: u64, limit: u32) -> AdmittedPeerAd {
+	fn advertisement(
+		peer: &[u8],
+		dial: AdmittedDial,
+		types: &[&[u8]],
+		order: u64,
+		limit: NonZeroU32,
+	) -> AdmittedPeerAd {
 		let route = |servlet_type: &&[u8]| {
 			let route = PeerRoute { peer_id: Arc::from(peer), servlet_type: Arc::from(*servlet_type), dial };
 			ServletEntry::peer(route, DEFAULT_INITIAL_PHEROMONE, limit)
@@ -2565,7 +2564,6 @@ mod tests {
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
 				let registry = empty_registry();
-
 				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
 				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
 				first.record_direct(&trace, b"gw")?;
@@ -2698,9 +2696,9 @@ mod tests {
 				let digest = journal_a_rumor(beat).await?;
 				let enrolled = *rotation.enrolled.addr();
 				let peer = dial(&enrolled.to_string());
-				beat.ledgers.with(peer, |ledger| ledger.ack(digest));
 
-				let slate = advertisement(b"gw", peer, &[b"ping"], 1, 1);
+				beat.ledgers.with(peer, |ledger| ledger.ack(digest));
+				let slate = advertisement(b"gw", peer, &[b"ping"], 1, NonZeroU32::MIN);
 				beat.servlet_registry.reconcile_peer_slate(slate, PeerCaps::default())?;
 
 				let round = beat.reconcile_round(enrolled, peer).await;
@@ -2732,8 +2730,8 @@ mod tests {
 				let rotation = SignerRotation::start(&trace).await;
 				let beat = &rotation.beat;
 				beat.config.peer.table.poison();
-				let enrolled = *rotation.enrolled.addr();
 
+				let enrolled = *rotation.enrolled.addr();
 				let round = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
 				assert_eq!(round.ok(), Some(Round::Settled));
 				Ok(())

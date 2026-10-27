@@ -1,3 +1,4 @@
+use core::num::NonZeroU32;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -17,7 +18,12 @@ pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
 /// The default initial pheromone level of a new entry.
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000;
 /// The default count of consecutive failures that abandons a route.
-pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
+///
+/// The compiler evaluates its value, so a limit of zero fails to compile.
+pub const DEFAULT_ABANDONMENT_LIMIT: NonZeroU32 = match NonZeroU32::new(5) {
+	Some(limit) => limit,
+	None => panic!("the default abandonment limit takes one failure or more"),
+};
 /// The default pheromone boost on a success (500 = 5% of the pheromone cap).
 pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
 /// The default weakening penalty. At 0, a failure only counts as a trial.
@@ -32,8 +38,9 @@ pub struct PheromoneConfig {
 	pub evaporation_interval: Duration,
 	/// The initial pheromone level of a new entry.
 	pub initial_pheromone: u64,
-	/// The count of consecutive failures that abandons an entry.
-	pub abandonment_limit: u32,
+	/// The count of consecutive failures that abandons an entry. It is at
+	/// least one, so every entry is live at its creation.
+	pub abandonment_limit: NonZeroU32,
 	/// The pheromone boost on a successful request.
 	pub reinforcement_boost: u64,
 	/// The pheromone penalty on a failed request.
@@ -43,10 +50,9 @@ pub struct PheromoneConfig {
 /// The local routes one hive registered, every one owned by that hive.
 ///
 /// [`ClusterConfig::servlet_slate`] is the one constructor. It stamps
-/// `hive_id` on each entry it builds and admits only a locator that names
-/// its own address. Every entry a registry receives through this type
-/// therefore names that hive as its owner and dials the address its identity
-/// claims, by construction (CWE-639).
+/// `hive_id` on each entry and admits only a locator that names its own
+/// address, so each entry names that hive as owner and dials the address its
+/// identity claims (CWE-639).
 pub(crate) struct HiveSlate {
 	hive_id: SharedId,
 	entries: Vec<ServletEntry>,
@@ -80,9 +86,8 @@ impl ClusterConfig {
 	/// - Each entry answers under the signer advertised beside it (CWE-346).
 	/// - Each entry starts on this colony's pheromone level and abandonment limit.
 	///
-	/// A servlet that advertises one address under the identity of another
-	/// redirects that identity's traffic, so the one constructor of a slate
-	/// checks the locator rule.
+	/// The locator rule stops a servlet that advertises one address under
+	/// another's identity from redirecting that identity's traffic.
 	///
 	/// # Errors
 	///
@@ -118,12 +123,12 @@ impl ClusterConfig {
 }
 
 impl PheromoneConfig {
-	/// Builds the peer-routed slate, where each entry keys by
+	/// Builds the peer-routed slate, each entry keyed by
 	/// `peer_hive_id NUL type`.
 	///
-	/// `dial` is the admitted gateway socket that every entry stores, so every
-	/// type this peer advertises resolves to the one gateway that owns it.
-	/// The entries share one rendering of that socket.
+	/// Every entry stores `dial`, the admitted gateway socket, so each type
+	/// this peer advertises resolves to the gateway that owns it. The entries
+	/// share one rendering of that socket.
 	pub(crate) fn peer_slate(
 		&self,
 		peer_hive_id: &SharedId,

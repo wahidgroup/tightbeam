@@ -1,4 +1,4 @@
-//! Shared fixtures for security threat integration tests.
+//! The shared fixtures of the security threat integration tests.
 
 #![allow(dead_code)]
 
@@ -19,7 +19,7 @@ use tightbeam::{
 	oids::{AES_128_GCM, AES_128_WRAP},
 	random::OsRng,
 	testing::{
-		error::{FdrConfigError, TestingError},
+		error::TestingError,
 		fixtures::{TestCertificate, TestKey},
 	},
 	x509::Certificate,
@@ -29,19 +29,16 @@ use tightbeam::{
 #[cfg(feature = "transport-cms")]
 use tightbeam::testing::TestCmsServer;
 
-/// Build the standard testing error that threat scenarios use to signal an
-/// observed insecure outcome, which becomes a spec `ModeMismatch`.
+/// Builds the testing error that a threat scenario returns for an insecure
+/// outcome, which becomes a spec `ModeMismatch`.
 pub fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "security_threat",
-		reason,
-	}))
+	TightBeamError::TestingError(TestingError::UnexpectedOutcome(reason))
 }
 
 /// The sealed closing with the middle byte of its encrypted content flipped.
-/// A flipped content byte is the one wire handle a MITM has on what the
-/// closing seals: the client Finished or the anonymous attributes, and the
-/// acknowledgement inside either.
+/// A flipped content byte is the one change on the wire that a MITM can make
+/// to what the closing seals: the client Finished or the anonymous
+/// attributes, and the acknowledgement inside either.
 pub fn flip_sealed_content(sealed_closing: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
 	let mut tampered = sealed_closing.to_owned();
 	let content = tampered.auth_encrypted_content_info.encrypted_content.as_ref();
@@ -195,14 +192,14 @@ pub fn default_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc::from(&TightbeamProfile)
 }
 
-/// The strong profile (AES-256-GCM) of a downgrade test, which is the profile
-/// the default provider runs.
+/// The strong profile (AES-256-GCM) of a downgrade test: the profile of the
+/// default provider.
 pub fn strong_security_profile() -> SecurityProfileDesc {
 	default_security_profile()
 }
 
-/// The weak profile (AES-128-GCM) of a downgrade test, which is the profile
-/// the AES-128 test provider runs.
+/// The weak profile (AES-128-GCM) of a downgrade test: the profile of the
+/// AES-128 test provider.
 pub fn weak_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
 		aead: Some(AES_128_GCM),
@@ -248,12 +245,13 @@ mod receipt_fixtures {
 	}
 
 	impl GrantingAuthorizer {
-		/// Grant without demanding a settlement answer.
+		/// An authorizer that grants the budgets with no settlement challenge.
 		pub fn challenge_free() -> Self {
 			Self { challenge: None }
 		}
 
-		/// Grant with the given settlement challenge attached.
+		/// An authorizer that grants the budgets with the settlement challenge
+		/// `challenge`.
 		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
 			let challenge = challenge.as_ref();
 			Ok(Self { challenge: Some(OctetString::new(challenge)?) })
@@ -288,7 +286,7 @@ mod receipt_fixtures {
 			})
 		}
 
-		/// Return the number of calls the `settle` hook has received so far.
+		/// The number of calls that the `settle` hook received so far.
 		pub fn settle_calls(&self) -> usize {
 			self.settle_calls.load(Ordering::SeqCst)
 		}
@@ -491,8 +489,8 @@ mod cms_pair {
 	use super::{ClientMaterials, ServerMaterials};
 
 	/// The configuration of a CMS client that presents `identity` and seals
-	/// to the CMS server of `materials`, whose two certificates the store of
-	/// their authority admits: the one it pins, and the one the reply
+	/// to the CMS server of `materials`. Their authority's store admits both
+	/// server certificates: the one the client pins and the one the reply
 	/// carries.
 	pub fn cms_client_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
 		materials: &ServerMaterials,
@@ -518,8 +516,8 @@ mod cms_pair {
 	/// A CMS client and server over the fixture server identity, beside the
 	/// certificate of the fresh identity that the client presents.
 	///
-	/// Each endpoint is held as its configuration, so a suite sets its offers
-	/// and hooks on it and then creates the handshake.
+	/// Each endpoint is a configuration, so a suite sets its offers and hooks,
+	/// then creates the handshake.
 	pub struct CmsHandshakePair {
 		/// The client configuration, which presents the fresh identity.
 		pub client: ClientConfig<Cms, DefaultCryptoProvider>,
@@ -529,7 +527,7 @@ mod cms_pair {
 		pub client_certificate: Arc<Certificate>,
 	}
 
-	/// Build the pair.
+	/// Builds a [`CmsHandshakePair`] over `materials`.
 	///
 	/// - The client offers `client_profiles`, pins the server certificate, and presents a fresh identity.
 	/// - The server runs `server_profiles` and authenticates its client under `peer_authentication`.
@@ -548,8 +546,8 @@ mod cms_pair {
 		client.security_offer = Some(SecurityOffer::new(client_profiles));
 
 		// The server learns the client certificate from the closing it opens,
-		// as it does in production. Seeding it here would test a
-		// server that already knows what the handshake is meant to establish.
+		// as in production. A seeded certificate would test a server that
+		// already knows what the handshake establishes.
 		let mut server = cms_server_config(materials, server_profiles);
 		server.peer_authentication = peer_authentication;
 
@@ -598,8 +596,8 @@ mod cms_fixtures {
 		pub server: Handshake<Server, Cms, DefaultCryptoProvider>,
 	}
 
-	/// Build the pair. The client presents a fresh identity, pins the server of
-	/// `materials`, and requests the `request` budgets.
+	/// Builds a [`CmsSessionPair`]. The client presents a fresh identity, pins
+	/// the server of `materials`, and requests the `request` budgets.
 	pub fn cms_mutual_budget_pair(
 		materials: &ServerMaterials,
 		request: MuxBudgets,

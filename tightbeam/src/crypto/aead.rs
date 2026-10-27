@@ -436,9 +436,8 @@ pub trait DecryptContent {
 	/// is `arrived`, in place, so `content` holds the plaintext once the
 	/// decryption returns.
 	///
-	/// This refuses an envelope that names an algorithm other than
-	/// [`Decryptor::algorithm_oid`] before any decryption, and a refused
-	/// decryption leaves `content` unchanged.
+	/// The check against [`Decryptor::algorithm_oid`] runs before any
+	/// decryption, and a refused decryption leaves `content` unchanged.
 	///
 	/// # Errors
 	///
@@ -620,8 +619,8 @@ impl SendCipher {
 	/// - [`TightBeamError::SerializationError`] -- the position attribute fails to encode.
 	/// - [`TightBeamError::EnvelopeError`] -- the envelope refuses to seal.
 	pub fn encrypt_next(&self, payload: impl Into<Vec<u8>>) -> TbResult<AuthEnvelopedData> {
-		// The failed update leaves the counter parked at the limit, so
-		// every subsequent call fails, which holds the sequence unique.
+		// A failed update leaves the counter at the limit, so every later call
+		// fails and the sequence stays unique.
 		let reserve = |value: u64| {
 			if value >= self.rekey_limit {
 				return None;
@@ -673,7 +672,11 @@ impl SendCipher {
 	/// # Errors
 	///
 	/// - The errors of [`Self::encrypt_next`] other than the record limit.
-	#[cfg(test)]
+	#[cfg(all(
+		test,
+		feature = "instrument",
+		any(feature = "tokio", feature = "transport-cms", feature = "transport-hpke")
+	))]
 	pub(crate) fn seal_at(&self, payload: impl Into<Vec<u8>>, sequence: u64) -> TbResult<AuthEnvelopedData> {
 		let attribute = RecordSequence { epoch: self.epoch, sequence }.attribute()?;
 		self.aead.seal(payload.into(), &self.key_identifier, attribute)
@@ -686,7 +689,11 @@ impl SendCipher {
 	///
 	/// - [`TightBeamError::SerializationError`] -- the attribute fails to encode.
 	/// - [`TightBeamError::EnvelopeError`] -- the envelope refuses to seal.
-	#[cfg(test)]
+	#[cfg(all(
+		test,
+		feature = "instrument",
+		any(feature = "tokio", feature = "transport-cms", feature = "transport-hpke")
+	))]
 	pub(crate) fn seal_with_position(&self, payload: impl Into<Vec<u8>>, position: Any) -> TbResult<AuthEnvelopedData> {
 		let values = SetOfVec::try_from([position])?;
 		let attribute = Attribute { oid: RECORD_SEQUENCE, values };
@@ -717,8 +724,8 @@ impl SendCipher {
 /// - A sequence number at or past [`DEFAULT_REKEY_RECORD_LIMIT`], which an honest [`SendCipher`] stays below.
 /// - A record that takes the bytes opened under this key past the renewal volume.
 ///
-/// RFC 9846 §5.5 sets its limit on the sender, and [`SendCipher`] holds it.
-/// The configurable rekey limit is a renewal-trigger threshold. Both refusals
+/// RFC 9846 §5.5 sets its limit on the sender, which [`SendCipher`] holds.
+/// The configurable rekey limit is a renewal trigger alone, and both refusals
 /// stay fixed whatever it is.
 ///
 /// # Envelope ceiling
@@ -837,9 +844,9 @@ impl RecvCipher {
 	/// Open `record`, the DER of one record's `AuthEnvelopedData`, in the
 	/// buffer it arrived in, and return the content it decrypted in place.
 	///
-	/// This checks the epoch and the sequence number the record carries before
-	/// the content key unwraps, and advances the sequence once the tag passes.
-	/// A refused record leaves the sequence unchanged.
+	/// It checks the record's epoch and sequence number before the content key
+	/// unwraps, and advances the sequence once the tag passes. A refused record
+	/// leaves the sequence unchanged.
 	///
 	/// # Errors
 	///
@@ -974,9 +981,8 @@ impl SessionKeys {
 	/// Bound the send cipher by the encrypted-envelope ceiling the session
 	/// runs under ([`SendCipher::with_envelope_ceiling`]).
 	///
-	/// The ceiling bounds the send cipher alone. The receive cipher counts the
-	/// bytes it opens, so its bound holds for whatever envelopes the peer
-	/// sends ([`RecvCipher`]).
+	/// The receive cipher counts the bytes it opens instead, so its bound holds
+	/// for whatever envelopes the peer sends ([`RecvCipher`]).
 	pub fn with_envelope_ceiling(mut self, encrypted_envelope: usize) -> Self {
 		self.send = self.send.with_envelope_ceiling(encrypted_envelope);
 		self
@@ -1632,8 +1638,8 @@ mod tests {
 
 	/// The sender's envelopes set the per-key volume, and each peer sets its
 	/// own ceiling. An honest sender at a lowered ceiling keeps the constant
-	/// record limit, and a receiver at the default ceiling and a receiver at a
-	/// raised one both accept the last record under that limit.
+	/// record limit, and receivers at the default and at a raised ceiling both
+	/// accept its last record under that limit.
 	#[test]
 	fn a_receiver_at_any_ceiling_accepts_an_honest_sender_up_to_the_constant() -> TbResult<()> {
 		let last_counter = DEFAULT_REKEY_RECORD_LIMIT - 1;

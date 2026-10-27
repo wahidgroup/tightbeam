@@ -22,6 +22,7 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::random::OsRng;
+use tightbeam::runtime::rt;
 use tightbeam::testing::{TestFrame, TestIdentity};
 use tightbeam::transport::client::ClientBuilder;
 use tightbeam::transport::handshake::HandshakeProvider;
@@ -45,19 +46,17 @@ async fn blocking_listener_under<P: HandshakeProvider>(
 	(listener, *addr)
 }
 
-/// A server under `P`, on a thread of its own, that accepts one connection
-/// on `listener` and answers the first frame it collects with that frame. A
-/// failure of the server panics its thread, so the client reads a closed
-/// connection.
+/// Echoes the first frame of one connection on `listener`, on its own thread.
+///
+/// [`rt::block_on`] drives it outside a runtime, as in the blocking `server!`
+/// forms. A failure panics the thread.
 pub(super) fn blocking_echo_one<L, P>(listener: TcpListener<L, P>)
 where
 	L: TcpListenerTrait<Stream = NetTcpStream, Error = IoError> + Send + 'static,
 	P: HandshakeProvider,
 {
 	thread::spawn(move || {
-		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-		let runtime = runtime.expect("a current-thread runtime builds");
-		let served = runtime.block_on(async move {
+		let served = rt::block_on(async move {
 			let mut transport = listener.accept()?;
 			let (frame, status) = transport.collect_message().await?;
 			transport.send_response(status, Some(Frame::clone(&frame))).await
@@ -101,7 +100,9 @@ pub(super) async fn blocking_exchange<P: HandshakeProvider>(
 ) -> Result<BlockingExchange, Box<dyn Error>> {
 	let certificate = server.certificate().to_owned();
 	let (listener, addr) = blocking_listener_under::<P>(server).await;
+
 	blocking_echo_one(listener);
+
 	let mut client = client_trusting::<P>(addr, &certificate);
 	let frame = TestFrame::v0(Some(id), None);
 

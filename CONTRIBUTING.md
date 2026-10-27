@@ -17,7 +17,7 @@ Use `make help` for the full command list. Apply fixes with `make lint fix=1`.
 Git hooks live in `.husky/`. [husky-rs](https://crates.io/crates/husky-rs) installs them and sets `core.hooksPath` the first time `cargo test` builds the dev-dependencies. Set `NO_HUSKY_HOOKS=1` to skip the installation, as CI does.
 
 - `commit-msg` enforces the commit header format (see [Title](#title))
-- `pre-push` runs `make lint-code` (rustfmt and clippy) and verifies commit signatures. CI runs the full `make lint`, which adds the rustdoc build, the spellcheck, and the check that the production imports among the `transport` modules hold no cycle. Contributors MUST sign each commit before a push.
+- `pre-push` runs `make lint` (rustfmt, clippy, the rustdoc build, and the spellcheck) and verifies commit signatures. CI runs the same `make lint`. Contributors MUST sign each commit before a push.
 
 ### Code Style
 
@@ -87,7 +87,7 @@ The scope is OPTIONAL, MUST be lowercase (`[a-z0-9/-]+`), and identifies the aff
 
 The description MUST:
 
-- Use imperative mood ("add" not "added" / "adds")
+- Use imperative mood ("add", not "added" or "adds")
 - Start with a lowercase letter or digit (not Sentence case)
 - NOT end with a period
 - Keep the full header under 100 characters
@@ -109,7 +109,7 @@ The PR body MUST contain these five sections, each with non-empty content:
 | --------------------- | ----------------------------------------------------------------------- |
 | `## Summary`          | WHY this change exists and WHAT it accomplishes                         |
 | `## Related Issues`   | Issue links (`Fixes #N`, `Closes #N`, `Refs #N`, or `None`)             |
-| `## Changes Made`     | Bullet list of user/system-visible changes                              |
+| `## Changes Made`     | A bullet list of the changes that a user or a system can see            |
 | `## Testing`          | How a reviewer verifies the change (commands, steps, expected outcomes) |
 | `## Breaking Changes` | Migration path for consumers, or `None`                                 |
 
@@ -170,7 +170,7 @@ Use `dry-run=1`, `allow-staged=1`, or `yank=1` as `make help` documents.
 
 A release bumps the workspace version, opens a release pull request, and on merge creates a signed `releases/v*` tag that publishes to crates.io (the release publishes `tightbeam-derive` first when its version is ahead of crates.io). Bump `tightbeam-derive`'s own package version in the same PR when the derive crate itself changes. The release workflow runs the deploy guard `check-yanked.sh`, which refuses yanked versions.
 
-To publish or yank `tightbeam-derive` without a workspace release, bump its version in a normal PR and run `make release-derive version=vX.Y.Z` (with `yank=1` / `dry-run=1` as needed). This pushes a signed `releases/derive/v*` tag that the release workflow verifies and publishes.
+To publish or yank `tightbeam-derive` without a workspace release, bump its version in a normal PR and run `make release-derive version=vX.Y.Z` (with `yank=1` or `dry-run=1` as needed). This pushes a signed `releases/derive/v*` tag that the release workflow verifies and publishes.
 
 ## tightbeam Improvement Proposals (TIPs)
 

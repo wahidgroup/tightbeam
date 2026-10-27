@@ -1,9 +1,9 @@
 //! The four nodes of the DTN path, and the Creation Methods that start each
 //! one over a chain of its own.
 //!
-//! [`DtnRole`] names the identity of a node: its certificate, its keys, its
-//! signer, and its pinning policy. [`DtnPath`] holds the parts that every node
-//! of one path shares and starts each servlet with its workers.
+//! - [`DtnRole`] names the identity of a node: its certificate, keys, signer, and pinning policy.
+//! - [`PathSide`] names the side of a node that a frame arrives from.
+//! - [`DtnPath`] holds what every node of one path shares, and starts each servlet with its workers.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -17,6 +17,7 @@ use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::{Certificate, CertificateSpec};
+use tightbeam::der::Enumerated;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -41,9 +42,8 @@ use crate::dtn::servlets::{
 use crate::dtn::storage::{FrameStore, StorageRoot};
 use crate::dtn::workers::{
 	CommandAckHandlerWorker, CommandExecutionWorker, FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig,
-	FrameResponseHandlerWorker, FrameResponseHandlerWorkerConfig, MissionControlTelemetryHandlerWorker,
-	MissionControlTelemetryHandlerWorkerConfig, RoverCommandHandlerWorker, RoverCommandHandlerWorkerConfig,
-	TelemetryBuilderWorker, TelemetryBuilderWorkerConfig,
+	FrameResponseHandlerWorker, MissionControlTelemetryHandlerWorker, MissionControlTelemetryHandlerWorkerConfig,
+	RoverCommandHandlerWorker, RoverCommandHandlerWorkerConfig, TelemetryBuilderWorker, TelemetryBuilderWorkerConfig,
 };
 
 /// The servlet configuration builder of a node that presents its certificate,
@@ -56,17 +56,18 @@ type NodeConfigBuilder<Env> = ServletConfigBuilder<
 	WithCertificate<DefaultCryptoProvider>,
 >;
 
-/// One node of the DTN path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One node of the DTN path, which encodes as an ENUMERATED.
+#[derive(Enumerated, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum DtnRole {
 	/// The command center on Earth.
-	MissionControl,
+	MissionControl = 0,
 	/// The relay satellite in orbit around Earth.
-	EarthRelay,
+	EarthRelay = 1,
 	/// The relay satellite in orbit around Mars.
-	MarsRelay,
+	MarsRelay = 2,
 	/// The rover on the surface of Mars.
-	Rover,
+	Rover = 3,
 }
 
 impl DtnRole {
@@ -175,7 +176,11 @@ impl DtnRole {
 
 	/// The servlet configuration of the node: its certificate, its key, and
 	/// the pinning of its peers, with `config` as its environment.
-	fn servlet_config<Env>(self, config: Env) -> Result<NodeConfigBuilder<Env>, TightBeamError> {
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the key or the certificate of the node fails to load.
+	pub fn servlet_config<Env>(self, config: Env) -> Result<NodeConfigBuilder<Env>, TightBeamError> {
 		let key = self.key().to_provider::<Secp256k1>()?;
 		let validators = vec![Arc::new(self.pinning()) as Arc<dyn CertificateValidation>];
 		let builder = ServletConfig::<TokioListener, RelayMessage>::builder()
@@ -185,6 +190,32 @@ impl DtnRole {
 		Ok(builder)
 	}
 }
+
+/// A side of a node on the path from Mission Control to the Rover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathSide {
+	/// The side toward Mission Control.
+	Earth,
+	/// The side toward the Rover.
+	Mars,
+}
+
+impl PathSide {
+	/// Both sides, the Earth side first.
+	pub const BOTH: [Self; 2] = [Self::Earth, Self::Mars];
+
+	/// Returns the side across the node, where a frame from this side travels
+	/// on.
+	pub fn across(self) -> Self {
+		match self {
+			Self::Earth => Self::Mars,
+			Self::Mars => Self::Earth,
+		}
+	}
+}
+
+/// The most frames that the order buffer of a node holds ahead of their turn.
+pub const ORDER_BUFFER_FRAMES: usize = 10;
 
 /// The chain of one node: its chain processor over a frame store of its own,
 /// and the frame builder that extends it.
@@ -204,7 +235,7 @@ impl NodeChain {
 		let processor = ChainProcessor::new(
 			Arc::new(RwLock::new(store)),
 			Arc::new(RwLock::new(MessageChainState::new(node))),
-			Arc::new(RwLock::new(OutOfOrderBuffer::new(10))),
+			Arc::new(RwLock::new(OutOfOrderBuffer::new(ORDER_BUFFER_FRAMES))),
 		);
 
 		Ok(Self::over(Arc::new(processor)))
@@ -261,10 +292,9 @@ impl DtnPath {
 		let frame_requests = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 			chain_processor: Arc::clone(&chain.processor),
 			can_cascade: false, // Mission Control is an origin of the path.
+			gate: Arc::default(),
 		});
-		let frame_responses = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
-			chain_processor: Arc::clone(&chain.processor),
-		});
+		let frame_responses = FrameResponseHandlerWorker::new(());
 		let servlet_config = role
 			.servlet_config(config)?
 			.with_worker(telemetry)
@@ -373,10 +403,10 @@ impl DtnPath {
 		let frame_requests = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 			chain_processor: Arc::clone(&chain.processor),
 			can_cascade: false, // The Rover is an origin of the path.
+			gate: Arc::default(),
 		});
-		let frame_responses = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
-			chain_processor: Arc::clone(&chain.processor),
-		});
+
+		let frame_responses = FrameResponseHandlerWorker::new(());
 		let servlet_config = role
 			.servlet_config(config)?
 			.with_worker(commands)
@@ -403,11 +433,10 @@ impl<Env> RelayWorkers for NodeConfigBuilder<Env> {
 		let frame_requests = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 			chain_processor: Arc::clone(&chain.processor),
 			can_cascade: true, // A relay cascades both ways.
-		});
-		let frame_responses = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
-			chain_processor: Arc::clone(&chain.processor),
+			gate: Arc::default(),
 		});
 
+		let frame_responses = FrameResponseHandlerWorker::new(());
 		self.with_worker(frame_requests).with_worker(frame_responses)
 	}
 }

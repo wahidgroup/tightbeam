@@ -3,10 +3,11 @@
 use super::common::*;
 use tightbeam::colony::cluster::ClusterHeartbeat;
 use tightbeam::crypto::x509::store::TrustVerification;
+use tightbeam::testing::TestFrame;
+use tightbeam::trace::AssertionValue;
+
 #[cfg(feature = "instrument")]
 use tightbeam::testing::fixtures::TestTrace;
-use tightbeam::testing::TestFrame;
-use tightbeam::trace::{AssertionLabel, AssertionValue, IntoEventLabel};
 
 tb_assert_spec! {
 	pub ClusterTeardownSpec,
@@ -19,8 +20,8 @@ tb_assert_spec! {
 	}
 }
 
-/// Records the teardown call and serves no traffic, because `stop_boxed` is
-/// the observable under test.
+/// A servlet that records its teardown call and serves no traffic, because
+/// `stop_boxed` is the observable under test.
 struct StopProbeServlet {
 	trace: TraceCollector,
 }
@@ -190,21 +191,9 @@ fn untrusted_hive_identity() -> (Arc<HiveTlsConfig>, Arc<dyn CertificateTrust>) 
 	(Arc::new(hive_tls), admits_hive)
 }
 
-// A refused RegisterHiveResponse must not enqueue the gateway: the
-// anti-entropy beat would otherwise keep calling a peer that already
-// rejected the hive, and scaling updates would fan out there too.
-//
-// The beat that does run proves the claim:
-//
-// - A second gateway admits the hive, and the hive's beat re-registers with the gateways it queued.
-// - The hive records each re-registration with the status of the gateway's
-//   answer, so the one `Ok` is the beat's footprint.
-// - The hive dials queued gateways in the order it queued them, so a
-//   refusing gateway that it wrongly queued would refuse again, and both the
-//   refusal count and the re-registration count pin that.
-// - The hive and the accepting gateway read the one clock the test advances,
-//   so the beat fires when the test says and the frames they sign for each
-//   other stay fresh.
+// A refused registration must not queue the gateway, or the hive's beat
+// calls a peer that refused it. A second gateway admits the hive, so its beat
+// re-registers once with `Ok`, and the refusal count stays at one.
 tb_scenario! {
 	name: cluster_refused_registration_does_not_queue_gateway,
 	spec: ClusterRefusedRegNotQueuedSpec,
@@ -367,7 +356,7 @@ tb_scenario! {
 			let response_frame = emit_frame(&mut client, refused_reg).await?;
 			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
-			// A clean registration lands, then a mismatched add must refuse.
+			// After a clean registration lands, a mismatched add must refuse.
 			let ok_reg = signed_control_frame(
 				&certs,
 				b"align-reg",
@@ -588,10 +577,9 @@ tb_process_spec! {
 	terminal { Evicted }
 }
 
-/// Polls until the gateway records an eviction or the attempts run out.
-///
-/// The eviction is the decision that empties the registry, so the wait
-/// ends on the decision itself, and the spec judges the count.
+/// Polls until the gateway records an eviction or the attempts run out. The
+/// eviction empties the registry, so the wait ends on that decision, and the
+/// spec judges the count.
 async fn wait_for_eviction(trace: &TraceCollector) {
 	let evicted = || trace.recorded(events::CLUSTER_HIVE_EVICTED) >= 1;
 	poll_until(50, Duration::from_millis(100), evicted).await;
@@ -840,18 +828,6 @@ tb_scenario! {
 	}
 }
 
-/// Drains the assertions of `trace`, and returns the value of each one that
-/// records `event`, in the order the trace recorded them.
-fn recorded_values(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<AssertionValue>> {
-	let label = AssertionLabel::Custom(event.into_label());
-	let drained = trace.drain_assertions().into_iter();
-
-	drained
-		.filter(|recorded| recorded.label == label)
-		.map(|recorded| recorded.value)
-		.collect()
-}
-
 /// A gateway whose leases lapse 10 ms after the last live beat, on a clock
 /// only the test moves. No count of failed beats evicts a hive, so a lease
 /// alone retires one.
@@ -891,6 +867,57 @@ async fn a_lease_sweep_names_the_count_each_retire_leaves() -> Result<(), TightB
 
 	let evicted = recorded_values(&trace, events::CLUSTER_HIVE_EVICTED);
 	assert_eq!(evicted, [Some(AssertionValue::U64(1)), Some(AssertionValue::U64(0))]);
+	Ok(())
+}
+
+/// A gateway that dials at most `max_concurrent` hives at once in each beat,
+/// beats every 100 ms, and evicts a hive at its first failed beat.
+fn capped_beat_conf(certs: &ClusterTestCerts, max_concurrent: NonZeroUsize) -> ClusterConfig {
+	let heartbeat = HeartbeatConfig::builder()
+		.with_interval(Duration::from_millis(100))
+		.with_max_failures(1)
+		.with_max_concurrent(max_concurrent)
+		.build();
+
+	ClusterConfig::builder(cluster_tls_config(certs))
+		.with_heartbeat_config(heartbeat)
+		.build()
+}
+
+/// The count of the hives that a gateway under a beat capped at one dial
+/// evicts within 5 s, from two hives at addresses where no party answers.
+async fn evictions_of_a_beat_capped_at_one_dial() -> Result<usize, TightBeamError> {
+	let certs = cluster_certs();
+	let trace = TraceCollector::default();
+	let cluster = start_cluster(&trace, capped_beat_conf(&certs, NonZeroUsize::MIN)).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+	register_signed_hive(&mut client, &certs.key, b"capped-a", b"127.0.0.1:1").await?;
+	register_signed_hive(&mut client, &certs.key, b"capped-b", b"127.0.0.1:2").await?;
+
+	poll_until(50, Duration::from_millis(100), || {
+		trace.recorded(events::CLUSTER_HIVE_EVICTED) >= 2
+	})
+	.await;
+	cluster.stop();
+
+	Ok(trace.recorded(events::CLUSTER_HIVE_EVICTED))
+}
+
+// A beat that dials one hive at a time reaches every hive of its cycle. No
+// party answers at either registered address, so each hive leaves at its
+// first beat (CWE-835).
+//
+// The gateway runs on a runtime of its own, with two workers, which the test
+// shuts down in the background. A beat that spins with no yield holds one
+// worker alone, so the poll fails at its own deadline and the run goes on.
+#[test]
+fn a_beat_capped_at_one_dial_reaches_every_hive() -> Result<(), TightBeamError> {
+	let mut builder = tokio::runtime::Builder::new_multi_thread();
+	let runtime = builder.worker_threads(2).enable_all().build()?;
+	let evicted = runtime.block_on(evictions_of_a_beat_capped_at_one_dial());
+	runtime.shutdown_background();
+
+	assert_eq!(evicted?, 2);
 	Ok(())
 }
 
@@ -1275,5 +1302,234 @@ async fn gateway_registration_records() -> Result<Vec<Urn<'static>>, TightBeamEr
 #[tokio::test]
 async fn a_gateway_files_a_registration_under_the_urn_of_its_event() -> Result<(), TightBeamError> {
 	assert_eq!(gateway_registration_records().await?, [events::CLUSTER_HIVE_REGISTERED]);
+	Ok(())
+}
+
+/// The count of strangers that fail the handshake of a gateway's colony
+/// plane, and the bound of the gateway's trace, in the test of that bound.
+#[cfg(feature = "instrument")]
+const REFUSED_STRANGERS: usize = 4;
+
+/// Dials `gateway` as `stranger`, whose certificate the client validator of
+/// the gateway leaves out, and sends one frame. The client trusts the
+/// certificate of `certs`, which the gateway presents.
+#[cfg(feature = "instrument")]
+async fn dial_as_stranger(
+	certs: &ClusterTestCerts,
+	stranger: &ClusterTestCerts,
+	gateway: &ClusterGateway,
+) -> Result<Frame, TightBeamError> {
+	let identity = signing_identity(stranger.cert.to_owned(), stranger.key.to_owned());
+	let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::clone(&certs.trust));
+	let client = builder.with_client_identity(identity).build();
+	let mut client = client.connect(gateway.addr().to_owned()).await?;
+
+	emit_frame(&mut client, TestFrame::v0(Some("stranger"), None)).await
+}
+
+/// What a gateway records after [`REFUSED_STRANGERS`] strangers fail the
+/// handshake of its colony plane and it then records an event of its own: its
+/// own events that its trace keeps, that trace's overflow latch, and the count
+/// of refused certificates on its connection trace. Each trace holds
+/// [`REFUSED_STRANGERS`] events.
+#[cfg(feature = "instrument")]
+async fn gateway_traces_after_refused_strangers() -> Result<(Vec<Urn<'static>>, bool, usize), TightBeamError> {
+	use tightbeam::instrumentation::TbInstrumentationConfig;
+	use tightbeam::trace::TraceConfig;
+
+	let config = TbInstrumentationConfig { max_events: REFUSED_STRANGERS as u32, ..Default::default() };
+	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	let certs = cluster_certs();
+	let stranger = cluster_certs();
+	let mut tls = cluster_tls_config(&certs);
+	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+	let mut conf = ClusterConfig::new(tls);
+	conf.heartbeat.interval = Duration::from_secs(3_600);
+	let gateway = start_cluster(&trace, conf).await?;
+	let connections = gateway.connection_trace();
+	// The start records into the trace, so a drain gives every slot to the
+	// strangers. A drain keeps the latch.
+	let _started = trace.drain_events();
+
+	for _ in 0..REFUSED_STRANGERS {
+		// The gateway refuses the certificate of the stranger, so the frame
+		// fails, and the test reads the refusal from the trace instead.
+		let _refused = dial_as_stranger(&certs, &stranger, &gateway).await;
+	}
+
+	// A wait that runs out leaves the connection trace short of the
+	// strangers, which the count of refused certificates then shows.
+	let refused = || connections.recorded(events::SESSION_CERT_REJECTED) >= REFUSED_STRANGERS;
+	poll_until(50, Duration::from_millis(100), refused).await;
+	trace.emit_event(events::CLUSTER_HIVE_EVICTED)?;
+	gateway.stop();
+
+	let kept = TestTrace::trail(&trace, &[events::CLUSTER_HIVE_EVICTED]);
+	Ok((kept, trace.overflowed(), connections.recorded(events::SESSION_CERT_REJECTED)))
+}
+
+/// Strangers that never authenticate record on a gateway's connection trace,
+/// so the gateway's own bounded trace keeps its next event and sets no
+/// overflow latch.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn refused_strangers_leave_the_trace_of_a_gateway_to_its_own_events() -> Result<(), TightBeamError> {
+	let recorded = gateway_traces_after_refused_strangers().await?;
+	assert_eq!(recorded, (vec![events::CLUSTER_HIVE_EVICTED], false, REFUSED_STRANGERS));
+	Ok(())
+}
+
+/// The count of work requests that a client with no certificate sends, and the
+/// bound of the gateway's trace, in the test of that bound.
+#[cfg(feature = "instrument")]
+const ANONYMOUS_REQUESTS: usize = 4;
+
+/// What a gateway keeps after [`ANONYMOUS_REQUESTS`] anonymous work requests
+/// for a type no hive serves, then one event of its own: its own events in the
+/// sink of its trace, the overflow latch, and the refused requests.
+#[cfg(feature = "instrument")]
+async fn gateway_traces_after_anonymous_work() -> Result<(Vec<Urn<'static>>, bool, usize), TightBeamError> {
+	use tightbeam::instrumentation::TbInstrumentationConfig;
+	use tightbeam::trace::TraceConfig;
+
+	let config = TbInstrumentationConfig { max_events: ANONYMOUS_REQUESTS as u32, ..Default::default() };
+	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	let certs = cluster_certs();
+	let mut conf = ClusterConfig::new(cluster_tls_config(&certs));
+	conf.heartbeat.interval = Duration::from_secs(3_600);
+	let gateway = start_cluster(&trace, conf).await?;
+	let connections = gateway.connection_trace();
+	// The start records into the trace, so a drain gives every slot to the
+	// requests. A drain keeps the latch.
+	let _started = trace.drain_events();
+
+	let mut client = connect_cluster(&certs, gateway.addr()).await?;
+	let work = TestFrame::v0(Some("anonymous"), Some("work"));
+	for _ in 0..ANONYMOUS_REQUESTS {
+		// No hive serves the type, so the gateway refuses each request.
+		let _refused = client.submit_work_to(servlet_urn("nobody"), &work).await;
+	}
+
+	trace.emit_event(events::CLUSTER_HIVE_EVICTED)?;
+	gateway.stop();
+
+	let kept = TestTrace::trail(&trace, &[events::CLUSTER_HIVE_EVICTED]);
+	Ok((kept, trace.overflowed(), connections.recorded(events::CLUSTER_WORK_UNAVAILABLE)))
+}
+
+/// Anonymous work leaves the bounded trace of a gateway to its own events.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn anonymous_work_leaves_the_trace_of_a_gateway_to_its_own_events() -> Result<(), TightBeamError> {
+	let recorded = gateway_traces_after_anonymous_work().await?;
+	assert_eq!(recorded, (vec![events::CLUSTER_HIVE_EVICTED], false, ANONYMOUS_REQUESTS));
+	Ok(())
+}
+
+/// The records of one work request for a type no hive serves, from a client
+/// whose certificate the gateway validates: the count in the sink of the
+/// gateway's trace, then the count in the sink of its connection trace.
+#[cfg(feature = "instrument")]
+async fn records_of_certified_work() -> Result<(usize, usize), TightBeamError> {
+	let trace = TraceCollector::new();
+	let certs = cluster_certs();
+	let mut tls = cluster_tls_config(&certs);
+	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+
+	let gateway = start_cluster(&trace, ClusterConfig::new(tls)).await?;
+	let connections = gateway.connection_trace();
+	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+	let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::clone(&certs.trust));
+	let client = builder.with_client_identity(identity).build();
+	let mut client = client.connect(gateway.addr().to_owned()).await?;
+
+	let work = TestFrame::v0(Some("certified"), Some("work"));
+	let _refused = client.submit_work_to(servlet_urn("nobody"), &work).await;
+	gateway.stop();
+
+	let unavailable = [events::CLUSTER_WORK_UNAVAILABLE];
+	let audited = TestTrace::trail(&trace, &unavailable).len();
+	let connected = TestTrace::trail(&connections, &unavailable).len();
+	Ok((audited, connected))
+}
+
+/// Work from a certified client records on the trace of the gateway.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn certified_work_records_on_the_trace_of_a_gateway() -> Result<(), TightBeamError> {
+	assert_eq!(records_of_certified_work().await?, (1, 0));
+	Ok(())
+}
+
+/// A sink that forwards each event, and names itself for each trace that
+/// splits from its own.
+#[cfg(feature = "instrument")]
+#[derive(Clone, Default)]
+struct Forwarded(Arc<Mutex<Vec<Urn<'static>>>>);
+
+#[cfg(feature = "instrument")]
+impl Forwarded {
+	/// The count of the forwarded events that record `event`.
+	fn count(&self, event: Urn<'static>) -> usize {
+		let seen = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		seen.iter().filter(|urn| **urn == event).count()
+	}
+}
+
+#[cfg(feature = "instrument")]
+impl tightbeam::instrumentation::EventSink for Forwarded {
+	fn emit(&self, event: tightbeam::instrumentation::TbEvent) {
+		let mut seen = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		seen.push(event.urn);
+	}
+
+	fn drain(&self) -> Vec<tightbeam::instrumentation::TbEvent> {
+		Vec::new()
+	}
+
+	fn overflowed(&self) -> bool {
+		false
+	}
+
+	fn sibling(&self) -> Option<Arc<dyn tightbeam::instrumentation::EventSink>> {
+		Some(Arc::new(self.clone()))
+	}
+}
+
+/// The refused certificates that reach the sink of a gateway's trace after
+/// [`REFUSED_STRANGERS`] strangers fail the handshake of its colony plane.
+#[cfg(feature = "instrument")]
+async fn forwarded_refusals_of_strangers() -> Result<usize, TightBeamError> {
+	use tightbeam::trace::{TraceConfig, TraceConfigBuilder};
+
+	let forwarded = Forwarded::default();
+	let config: TraceConfig = TraceConfigBuilder::default().with_sink(forwarded.clone()).build();
+	let trace = TraceCollector::from(config);
+	let certs = cluster_certs();
+	let stranger = cluster_certs();
+	let mut tls = cluster_tls_config(&certs);
+	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+
+	let gateway = start_cluster(&trace, ClusterConfig::new(tls)).await?;
+	let connections = gateway.connection_trace();
+
+	for _ in 0..REFUSED_STRANGERS {
+		// The gateway refuses the certificate of the stranger, so the frame
+		// fails, and the test reads the refusal from the sink instead.
+		let _refused = dial_as_stranger(&certs, &stranger, &gateway).await;
+	}
+
+	let refused = || connections.recorded(events::SESSION_CERT_REJECTED) >= REFUSED_STRANGERS;
+	poll_until(50, Duration::from_millis(100), refused).await;
+	gateway.stop();
+
+	Ok(forwarded.count(events::SESSION_CERT_REJECTED))
+}
+
+/// A refused handshake reaches the sink of a gateway's trace (CWE-778).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_refused_handshake_reaches_the_sink_of_the_trace_of_a_gateway() -> Result<(), TightBeamError> {
+	assert_eq!(forwarded_refusals_of_strangers().await?, REFUSED_STRANGERS);
 	Ok(())
 }

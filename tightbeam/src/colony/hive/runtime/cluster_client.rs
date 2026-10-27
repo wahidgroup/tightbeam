@@ -9,15 +9,14 @@ use core::time::Duration;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::builder::TypeBuilder;
-use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistry};
+use crate::colony::hive::{HiveConfig, ServletRegistry};
 use crate::colony::protocol::{
 	ClusterRequest, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse, ServletChange,
 };
-use crate::colony::TaskGroup;
 use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
-use crate::runtime::rt;
+use crate::runtime::{rt, TaskGroup};
 use crate::trace::{TraceCollector, TraceHandle};
 use crate::transport::accept::ConnectionTerms;
 use crate::transport::multiplex::MuxCapable;
@@ -31,15 +30,15 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// # Shared state
 ///
 /// Registration, the anti-entropy re-announce, and the scaling fan-out read
-/// the same slate, gateway list, control address, and configuration. One
-/// owner holds those four, so a caller names the operation and the link
-/// supplies the state.
+/// one slate, gateway list, control address, and configuration. The link
+/// holds all four, so a caller names the operation and the link supplies the
+/// state.
 ///
 /// # Poison recovery
 ///
-/// The gateway list changes by one push at a time, so a thread that
-/// panicked while it held the lock left a whole list behind it. The link
-/// therefore recovers a poisoned lock, and the announcements go on.
+/// The gateway list changes by one push at a time, so a thread that panicked
+/// under the lock left a whole list. The link recovers a poisoned lock, and
+/// the announcements go on.
 ///
 /// # Warning
 ///
@@ -48,8 +47,8 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// included. The default `BoundedMemorySink` drops each event past
 /// `max_events`, the hive's own included, so a long-lived hive needs an
 /// `EventSink` that forwards each event, or a reader that drains the trace.
-pub struct ClusterLink<P: Protocol> {
-	servlets: Arc<HashMapRegistry>,
+pub struct ClusterLink<P: Protocol, R: ServletRegistry> {
+	servlets: Arc<R>,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_addr: P::Address,
 	config: Arc<HiveConfig>,
@@ -60,7 +59,7 @@ pub struct ClusterLink<P: Protocol> {
 	terms: ConnectionTerms,
 }
 
-impl<P: Protocol> Clone for ClusterLink<P>
+impl<P: Protocol, R: ServletRegistry> Clone for ClusterLink<P, R>
 where
 	P::Address: Clone,
 {
@@ -76,19 +75,20 @@ where
 	}
 }
 
-impl<P> ClusterLink<P>
+impl<P, R> ClusterLink<P, R>
 where
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
 	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + 'static,
+	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Binds the hive's slate, control address, configuration, and trace to
 	/// its gateway list.
 	pub fn new(
-		servlets: Arc<HashMapRegistry>,
+		servlets: Arc<R>,
 		cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 		hive_addr: P::Address,
 		config: Arc<HiveConfig>,
@@ -100,14 +100,12 @@ where
 		Self { servlets, cluster_addrs, hive_addr, config, trace, terms }
 	}
 
-	/// Takes the read lock of the gateway list. It recovers a poisoned lock,
-	/// because every write under the guard leaves a whole list.
+	/// Takes the read lock of the gateway list, and recovers a poisoned lock.
 	fn addrs(&self) -> RwLockReadGuard<'_, Vec<P::Address>> {
 		self.cluster_addrs.read().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// Takes the write lock of the gateway list and recovers a poisoned lock
-	/// the same way.
+	/// Takes the write lock of the gateway list, and recovers a poisoned lock.
 	fn addrs_mut(&self) -> RwLockWriteGuard<'_, Vec<P::Address>> {
 		self.cluster_addrs.write().unwrap_or_else(PoisonError::into_inner)
 	}
@@ -249,10 +247,10 @@ where
 	/// The endpoint configuration of a cluster dial.
 	///
 	/// A hive dials the cluster, so [`DialableEncryption::new`] checks the
-	/// dialer rule here rather than at the first frame the dial writes. A hive
-	/// identity with no trust store would present that identity to whoever
-	/// answers the cluster address (CWE-295). A TLS-registered hive therefore
-	/// never falls back to cleartext for a scaling update (CWE-319).
+	/// dialer rule here, before the dial writes a frame. A hive identity with
+	/// no trust store would present itself to whoever answers the cluster
+	/// address (CWE-295). A TLS-registered hive never falls back to cleartext
+	/// for a scaling update (CWE-319).
 	fn endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let encryption = DialableEncryption::new(self.config.gateway_dial())?;
 		Ok(EndpointConfig::new(encryption, Arc::clone(&self.config.clock)))
@@ -267,7 +265,7 @@ where
 
 	/// Connects to `gateway` under `endpoint`, and sets the link's terms on
 	/// the transport before its handshake. Every dial of the link connects
-	/// here, and the transport takes the endpoint that the caller gives.
+	/// here.
 	async fn connect(
 		&self,
 		gateway: P::Address,

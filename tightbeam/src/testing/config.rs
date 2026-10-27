@@ -18,9 +18,13 @@ use crate::trace::ConsumedTrace;
 use crate::Errorizable;
 
 #[cfg(feature = "testing-fdr")]
+use crate::testing::error::FdrConfigError;
+#[cfg(feature = "testing-fdr")]
 use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig, FdrVerdict};
 #[cfg(feature = "testing-csp")]
-use crate::testing::specs::csp::ProcessSpec;
+use crate::testing::specs::composition::CompositionError;
+#[cfg(feature = "testing-csp")]
+use crate::testing::specs::csp::{Process, ProcessSpec};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::TimingConstraints;
 
@@ -46,7 +50,7 @@ impl Expect {
 
 /// Why [`ScenarioConfigBuilder::build`] or [`ScenarioConfig::guided_by`]
 /// refused a configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Errorizable)]
+#[derive(Clone, Debug, Eq, PartialEq, Errorizable)]
 pub enum ScenarioConfigError {
 	/// Nothing this configuration names can reject a run.
 	#[error("no configured verifier can reject a run, so the scenario cannot fail")]
@@ -60,6 +64,95 @@ pub enum ScenarioConfigError {
 	/// configuration names a process too.
 	#[error("a guided fuzz run names its CSP process in csp: alone, and this configuration names one too")]
 	CspNamedTwice,
+
+	/// The FDR configuration breaks a rule of [`FdrConfig::validate`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::FdrConfigError;
+	/// use tightbeam::testing::ScenarioConfigError;
+	///
+	/// let rule = FdrConfigError { field: "process_count", reason: "must be > 0" };
+	/// let refused = ScenarioConfigError::InvalidFdrConfig(rule);
+	/// let message = "the FDR configuration breaks a rule: Invalid FDR config field 'process_count': must be > 0";
+	/// assert_eq!(refused.to_string(), message);
+	/// ```
+	#[cfg(feature = "testing-fdr")]
+	#[error("the FDR configuration breaks a rule: {0}")]
+	InvalidFdrConfig(FdrConfigError),
+
+	/// The CSP spec of Layer 2 has a process that does not build, or a
+	/// property that it claims fails its check.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::composition::{CompositionError, CompositionProperty};
+	/// use tightbeam::testing::{ScenarioConfig, ScenarioConfigError};
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::{tb_compose_spec, tb_process_spec};
+	///
+	/// const PING: Urn<'static> = tightbeam::urn!("doc", "event:refused/ping");
+	/// const PONG: Urn<'static> = tightbeam::urn!("doc", "event:refused/pong");
+	///
+	/// tb_process_spec! {
+	///     pub Pings,
+	///     events { observable { PING } hidden { } }
+	///     states { P0 => { PING => P1 } }
+	///     terminal { P1 }
+	/// }
+	///
+	/// tb_process_spec! {
+	///     pub Pongs,
+	///     events { observable { PONG } hidden { } }
+	///     states { Q0 => { PONG => Q1 } }
+	///     terminal { Q1 }
+	/// }
+	///
+	/// // The interleaving reaches its terminal state on every path, so the
+	/// // claim that it deadlocks is false.
+	/// tb_compose_spec! {
+	///     pub ClaimsADeadlock,
+	///     processes: { Pings, Pongs },
+	///     composition: Interleaved,
+	///     properties: { deadlock_free: false }
+	/// }
+	///
+	/// let refused = ScenarioConfig::builder().with_csp(ClaimsADeadlock).build();
+	/// let holds = CompositionError::PropertyHolds { property: CompositionProperty::DeadlockFree };
+	/// assert_eq!(refused.err(), Some(ScenarioConfigError::CspRefused(holds)));
+	/// ```
+	#[cfg(feature = "testing-csp")]
+	#[error("the CSP spec of Layer 2 is refused: {0}")]
+	CspRefused(CompositionError),
+}
+
+/// The CSP spec of Layer 2, beside the process that it built.
+///
+/// [`Self::of`] builds the process and checks the spec's claims once, so each
+/// grade reads the one process.
+#[cfg(feature = "testing-csp")]
+#[derive(Clone)]
+struct CspLayer {
+	/// The spec, which checks each trace.
+	spec: Arc<dyn ProcessSpec + Send + Sync>,
+	/// The process of `spec`, which the trace check and FDR exploration walk.
+	process: Arc<Process>,
+}
+
+#[cfg(feature = "testing-csp")]
+impl CspLayer {
+	/// The layer of `spec`, whose process builds and whose claims hold.
+	///
+	/// # Errors
+	///
+	/// - The [`CompositionError`] of [`ProcessSpec::to_process_cow`] or of [`ProcessSpec::verify_claims`].
+	fn of(spec: Arc<dyn ProcessSpec + Send + Sync>) -> Result<Self, CompositionError> {
+		let process = Arc::new(spec.to_process_cow()?.into_owned());
+		spec.verify_claims()?;
+		Ok(Self { spec, process })
+	}
 }
 
 /// The configuration of a `tb_scenario!` test, whose fields sit behind `Arc`
@@ -72,7 +165,7 @@ pub struct ScenarioConfig {
 	expect: Expect,
 
 	#[cfg(feature = "testing-csp")]
-	csp: Option<Arc<dyn ProcessSpec + Send + Sync>>,
+	csp: Option<CspLayer>,
 	#[cfg(feature = "testing-fdr")]
 	fdr: Option<Arc<FdrConfig>>,
 }
@@ -92,18 +185,20 @@ impl ScenarioConfig {
 
 	#[cfg(feature = "testing-csp")]
 	pub fn csp(&self) -> Option<&Arc<dyn ProcessSpec + Send + Sync>> {
-		self.csp.as_ref()
+		self.csp.as_ref().map(|layer| &layer.spec)
 	}
 
 	/// The configuration of a guided fuzz run whose one CSP process is `csp`,
 	/// which both steers the oracle and grades the CSP layer.
 	///
 	/// `tb_scenario!` calls it with the process its `csp:` key names, so a
-	/// guided target names its process once.
+	/// guided target names its process once. It builds the process of `csp`
+	/// and checks its claims, as [`ScenarioConfigBuilder::build`] does.
 	///
 	/// # Errors
 	///
 	/// - [`ScenarioConfigError::CspNamedTwice`] -- this configuration names a process already.
+	/// - [`ScenarioConfigError::CspRefused`] -- the process of `csp` does not build, or a claim of it fails.
 	///
 	/// # Examples
 	///
@@ -148,7 +243,8 @@ impl ScenarioConfig {
 			return Err(ScenarioConfigError::CspNamedTwice);
 		}
 
-		self.csp = Some(Arc::new(csp));
+		let layer = CspLayer::of(Arc::new(csp)).map_err(ScenarioConfigError::CspRefused)?;
+		self.csp = Some(layer);
 		Ok(self)
 	}
 
@@ -172,9 +268,9 @@ impl ScenarioConfig {
 
 	/// Runs every verifier this configuration carries over a finished scenario.
 	///
-	/// The signature holds in every feature configuration, so a `tb_scenario!`
-	/// expansion states one call whatever the consumer selected. Layer 3
-	/// records its exploration events into a trace of its own, which
+	/// The signature holds in every feature set, so a `tb_scenario!` expansion
+	/// makes one call whatever the consumer selected. Layer 3 records its
+	/// exploration events into its own trace, which
 	/// [`ScenarioVerdict::exploration`] returns.
 	///
 	/// # Errors
@@ -219,7 +315,8 @@ impl ScenarioConfig {
 		}
 
 		#[cfg(feature = "testing-csp")]
-		let layer2: Option<CspValidationResult> = self.csp().map(|csp| ProcessSpec::validate_trace(csp.as_ref(), trace));
+		let layer2: Option<CspValidationResult> =
+			self.csp.as_ref().map(|layer| layer.spec.validate_trace(&layer.process, trace));
 		#[cfg(not(feature = "testing-csp"))]
 		let layer2: Option<CspValidationResult> = None;
 
@@ -235,10 +332,9 @@ impl ScenarioConfig {
 	/// Grades the scenario against its FDR configuration, or returns `None`
 	/// when it names none.
 	///
-	/// The verdict comes with the events that exploration recorded into a
-	/// trace of its own. That trace takes the instrumentation settings and the
-	/// clock of the scenario's trace, so the events of the model stay apart
-	/// from the events of the run.
+	/// The verdict comes with the events exploration recorded into its own
+	/// trace, apart from the events of the run. That trace takes the
+	/// instrumentation settings and the clock of the scenario's trace.
 	///
 	/// # Errors
 	///
@@ -263,7 +359,7 @@ impl ScenarioConfig {
 	/// With a CSP spec, the spec model answers deadlock and divergence freedom.
 	/// When the FDR configuration also names specs, the recorded trace answers
 	/// refinement against them, and the two verdicts merge. Without a CSP spec,
-	/// the function grades the trace alone.
+	/// it grades the trace alone.
 	///
 	/// # Errors
 	///
@@ -275,7 +371,7 @@ impl ScenarioConfig {
 		trace: &ConsumedTrace,
 		exploration: &TraceCollector,
 	) -> Result<FdrVerdict, TightBeamError> {
-		let Some(csp_spec) = self.csp() else {
+		let Some(layer) = self.csp.as_ref() else {
 			let trace_process = trace.to_process();
 			let trace_cfg = Arc::clone(fdr_cfg);
 			let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, trace_cfg);
@@ -283,11 +379,8 @@ impl ScenarioConfig {
 			return explorer.explore_into(exploration);
 		};
 
-		// The spec model answers deadlock and divergence freedom, and the specs
-		// of the FDR configuration grade the recorded trace alone.
-		let spec_process_cow = csp_spec.to_process_cow();
 		let model_cfg = Arc::clone(fdr_cfg);
-		let mut explorer = DefaultFdrExplorer::with_defaults(&spec_process_cow, model_cfg);
+		let mut explorer = DefaultFdrExplorer::with_defaults(&layer.process, model_cfg);
 		let verdict = explorer.explore_state_space_into(exploration)?;
 		if fdr_cfg.specs.is_empty() {
 			return Ok(verdict);
@@ -361,6 +454,66 @@ impl ScenarioConfigBuilder {
 		self
 	}
 
+	/// Sets the CSP spec of Layer 2, which replaces a spec that the builder
+	/// holds. [`Self::build`] checks `csp` once:
+	///
+	/// - It builds the process of `csp`, through [`ProcessSpec::to_process_cow`].
+	/// - It checks the claims of `csp`, through [`ProcessSpec::verify_claims`].
+	/// - A composition spec claims its `properties:` block and those of each operand composition.
+	/// - A process that does not build, or a false claim, refuses the configuration.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::{ScenarioConfig, ScenarioConfigError};
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::{tb_compose_spec, tb_process_spec};
+	///
+	/// const STALL: Urn<'static> = tightbeam::urn!("doc", "event:compose/stall");
+	/// const SEND: Urn<'static> = tightbeam::urn!("doc", "event:compose/send");
+	///
+	/// // `Stalls` stops in `S1`, which is not terminal.
+	/// tb_process_spec! {
+	///     pub Stalls,
+	///     events {
+	///         observable { STALL }
+	///         hidden { }
+	///     }
+	///     states {
+	///         S0 => { STALL => S1 }
+	///     }
+	/// }
+	///
+	/// tb_process_spec! {
+	///     pub Sends,
+	///     events {
+	///         observable { SEND }
+	///         hidden { }
+	///     }
+	///     states {
+	///         T0 => { SEND => T1 }
+	///     }
+	///     terminal { T1 }
+	/// }
+	///
+	/// // The interleaving claims deadlock freedom, and it deadlocks.
+	/// tb_compose_spec! {
+	///     pub StallsBesideSends,
+	///     processes: {
+	///         Stalls,
+	///         Sends
+	///     },
+	///     composition: Interleaved,
+	///     properties: {
+	///         deadlock_free: true,
+	///         livelock_free: true,
+	///         deterministic: true
+	///     }
+	/// }
+	///
+	/// let refused = ScenarioConfig::builder().with_csp(StallsBesideSends).build();
+	/// assert!(matches!(refused, Err(ScenarioConfigError::CspRefused(_))));
+	/// ```
 	#[cfg(feature = "testing-csp")]
 	pub fn with_csp<P: ProcessSpec + Send + Sync + 'static>(mut self, csp: P) -> Self {
 		self.csp = Some(Box::new(csp));
@@ -418,7 +571,16 @@ impl ScenarioConfigBuilder {
 	/// - [`ScenarioConfigError::ExpectViolationWithoutVerifier`] -- the
 	///   expectation names a layer that cannot reject this configuration, so
 	///   the rejection it waits for can never arrive.
+	/// - [`ScenarioConfigError::InvalidFdrConfig`] -- the FDR configuration
+	///   breaks a rule of [`FdrConfig::validate`].
+	/// - [`ScenarioConfigError::CspRefused`] -- the process of the CSP spec
+	///   does not build, or a property that the spec claims fails.
 	pub fn build(self) -> Result<ScenarioConfig, ScenarioConfigError> {
+		#[cfg(feature = "testing-fdr")]
+		if let Some(fdr) = &self.fdr {
+			fdr.validate().map_err(ScenarioConfigError::InvalidFdrConfig)?;
+		}
+
 		if !Layer::ALL.iter().any(|layer| self.can_reject_at(*layer)) {
 			return Err(ScenarioConfigError::NoEffectiveVerifier);
 		}
@@ -429,13 +591,18 @@ impl ScenarioConfigBuilder {
 			}
 		}
 
+		#[cfg(feature = "testing-csp")]
+		let csp = self.csp.map(|csp| CspLayer::of(Arc::from(csp))).transpose();
+		#[cfg(feature = "testing-csp")]
+		let csp = csp.map_err(ScenarioConfigError::CspRefused)?;
+
 		Ok(ScenarioConfig {
 			specs: Arc::new(self.specs),
 			trace: Arc::new(self.trace),
 			hooks: self.hooks.map(Arc::new),
 			expect: self.expect,
 			#[cfg(feature = "testing-csp")]
-			csp: self.csp.map(|csp| Arc::from(csp) as Arc<dyn ProcessSpec + Send + Sync>),
+			csp,
 			#[cfg(feature = "testing-fdr")]
 			fdr: self.fdr.map(Arc::new),
 		})
@@ -445,7 +612,7 @@ impl ScenarioConfigBuilder {
 /// What a hook observes: the recorded trace, the first assertion spec, and
 /// the [`ScenarioVerdict`] that every layer contributed to.
 ///
-/// The fields are private because [`HookContext::build`] grades the run once,
+/// Its fields are private, because [`HookContext::build`] grades the run once,
 /// through [`ScenarioResult::graded`], and an observer only reads it.
 pub struct HookContext {
 	/// The graded run, with its trace, its specs, its verdict, and its
@@ -556,9 +723,8 @@ pub type AcceptedObserver = Arc<dyn Fn(&HookContext) + Send + Sync>;
 
 /// Reads a scenario some layer rejected, with the violations it produced.
 ///
-/// The two observers take different arguments, so code that fills the slots
-/// in the wrong order fails to compile, where equal arguments would leave a
-/// hook that never runs.
+/// The two observers take different arguments, so code that swaps the slots
+/// fails to compile instead of leaving a hook that never runs.
 pub type RejectedObserver = Arc<dyn Fn(&HookContext, &Violations) + Send + Sync>;
 
 /// What a scenario runs after the harness grades it and before the harness
@@ -627,6 +793,25 @@ mod tests {
 		assert_eq!(refused.err(), Some(ScenarioConfigError::NoEffectiveVerifier));
 	}
 
+	#[cfg(feature = "testing-fault")]
+	#[test]
+	fn build_refuses_an_fdr_config_that_validate_refuses() -> Result<(), Box<dyn core::error::Error>> {
+		let fdr = FdrConfig { scheduler_count: Some(2), ..Default::default() };
+
+		let refused = ScenarioConfig::builder().with_fdr(fdr).build();
+
+		let refusal = refused.err();
+		let names_the_pair = matches!(
+			refusal,
+			Some(ScenarioConfigError::InvalidFdrConfig(FdrConfigError {
+				field: "scheduler_count/process_count",
+				..
+			}))
+		);
+		assert!(names_the_pair, "{refusal:?}");
+		Ok(())
+	}
+
 	#[test]
 	fn an_error_mode_spec_passes_a_body_that_errored() -> Result<(), Box<dyn core::error::Error>> {
 		let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
@@ -637,28 +822,26 @@ mod tests {
 
 	#[cfg(feature = "testing-csp")]
 	mod with_csp {
+		use core::sync::atomic::{AtomicUsize, Ordering};
 		use std::borrow::Cow;
 
 		use super::*;
+		use crate::testing::specs::composition::{CompositionError, CompositionSpec, DeadlockChecker};
 		use crate::testing::specs::csp::{CspValidationResult, Process, ProcessSpec, State};
 		use crate::trace::ConsumedTrace;
 
-		/// A CSP layer that accepts every trace. It exists to make
-		/// [`Layer::Csp`] a layer that the configuration runs.
+		/// A CSP layer that accepts every trace, so the configuration runs
+		/// [`Layer::Csp`].
 		struct AcceptsEveryTrace;
 
 		impl ProcessSpec for AcceptsEveryTrace {
-			fn validate_trace(&self, _trace: &ConsumedTrace) -> CspValidationResult {
+			fn validate_trace(&self, _process: &Process, _trace: &ConsumedTrace) -> CspValidationResult {
 				CspValidationResult { valid: true, violations: vec![] }
 			}
 
-			fn to_process_cow(&self) -> Cow<'_, Process> {
-				let process = Process::builder("accepts_every_trace")
-					.initial_state(State("start"))
-					.build()
-					.expect("single-state process builds");
-
-				Cow::Owned(process)
+			fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
+				let process = Process::builder("accepts_every_trace").initial_state(State("start")).build()?;
+				Ok(Cow::Owned(process))
 			}
 		}
 
@@ -678,7 +861,6 @@ mod tests {
 		#[test]
 		fn a_guided_run_takes_its_process_from_the_csp_key() -> Result<(), ScenarioConfigError> {
 			let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
-
 			let guided = config.guided_by(AcceptsEveryTrace)?;
 			assert!(guided.csp().is_some());
 			Ok(())
@@ -687,7 +869,6 @@ mod tests {
 		#[test]
 		fn a_guided_run_refuses_a_config_that_names_a_process() -> Result<(), ScenarioConfigError> {
 			let config = ScenarioConfig::builder().with_csp(AcceptsEveryTrace).build()?;
-
 			let refused = config.guided_by(AcceptsEveryTrace);
 			assert_eq!(refused.err(), Some(ScenarioConfigError::CspNamedTwice));
 			Ok(())
@@ -699,6 +880,102 @@ mod tests {
 			let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError))?;
 			let expected = SpecViolation::ExecutionFailed(format!("{:?}", TightBeamError::RecvTimeoutError));
 			assert_eq!(verdict.spec(), Some(&expected));
+			Ok(())
+		}
+
+		const STALL: Urn<'static> = crate::urn!("test", "event:config/stall");
+		const SEND: Urn<'static> = crate::urn!("test", "event:config/send");
+
+		// A process that stalls in `S1`, which is not terminal.
+		crate::tb_process_spec! {
+			pub Stalls,
+			events {
+				observable { STALL }
+				hidden { }
+			}
+			states {
+				S0 => { STALL => S1 }
+			}
+		}
+
+		crate::tb_process_spec! {
+			pub Sends,
+			events {
+				observable { SEND }
+				hidden { }
+			}
+			states {
+				T0 => { SEND => T1 }
+			}
+			terminal { T1 }
+		}
+
+		/// The interleaving of [`Stalls`] and [`Sends`], which claims deadlock
+		/// freedom and deadlocks once both processes take their one event. The
+		/// trait is implemented by hand, as a composition spec outside the
+		/// crate implements it.
+		struct StallsBesideSends;
+
+		impl CompositionSpec for StallsBesideSends {
+			fn process() -> Result<Process, CompositionError> {
+				Process::interleaved_parallel(&Stalls::process()?, &Sends::process()?)
+			}
+
+			fn verify_properties() -> Result<(), CompositionError> {
+				DeadlockChecker::check(&Self::process()?)?;
+				Ok(())
+			}
+		}
+
+		/// The count of the claim checks of [`CountsItsClaims`].
+		static CLAIM_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+		/// The interleaving of [`Sends`] with itself, whose claim check
+		/// counts each run in [`CLAIM_CHECKS`] and holds.
+		#[derive(Default)]
+		struct CountsItsClaims;
+
+		impl CompositionSpec for CountsItsClaims {
+			fn process() -> Result<Process, CompositionError> {
+				Process::interleaved_parallel(&Sends::process()?, &Sends::process()?)
+			}
+
+			fn verify_properties() -> Result<(), CompositionError> {
+				CLAIM_CHECKS.fetch_add(1, Ordering::Relaxed);
+				Ok(())
+			}
+		}
+
+		#[test]
+		fn a_scenario_decides_its_claims_once_for_every_grade() -> Result<(), Box<dyn core::error::Error>> {
+			let config = ScenarioConfig::builder().with_csp(CountsItsClaims).build()?;
+			config.verify(&ConsumedTrace::new(), Ok(()))?;
+			config.verify(&ConsumedTrace::new(), Ok(()))?;
+			assert_eq!(CLAIM_CHECKS.load(Ordering::Relaxed), 1);
+			Ok(())
+		}
+
+		#[test]
+		fn build_refuses_a_composition_whose_claimed_property_fails() -> Result<(), Box<dyn core::error::Error>> {
+			let refused = ScenarioConfig::builder().with_csp(StallsBesideSends).build();
+			let refuted = matches!(
+				refused,
+				Err(ScenarioConfigError::CspRefused(CompositionError::DeadlockDetected { .. }))
+			);
+			assert!(refuted, "{:?}", refused.err());
+			Ok(())
+		}
+
+		#[test]
+		fn a_guided_run_refuses_a_claim_that_fails() -> Result<(), Box<dyn core::error::Error>> {
+			let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
+
+			let refused = config.guided_by(StallsBesideSends);
+			let refuted = matches!(
+				refused,
+				Err(ScenarioConfigError::CspRefused(CompositionError::DeadlockDetected { .. }))
+			);
+			assert!(refuted, "{:?}", refused.err());
 			Ok(())
 		}
 	}
@@ -752,12 +1029,11 @@ mod tests {
 				.expect("the spinning process names its initial state")
 		}
 
-		/// The labels of the `urn` events in `trace`. The list is empty when
-		/// `trace` is `None`.
+		/// The labels of the `urn` events in `trace`, or none for `None`.
 		fn labels(trace: Option<&ConsumedTrace>, urn: Urn<'static>) -> Vec<String> {
 			let events = trace.into_iter().flat_map(|trace| trace.instrument_events.iter());
 			let named = events.filter(|event| event.urn == urn);
-			named.filter_map(|event| event.label.clone()).collect()
+			named.filter_map(|event| event.label.clone().map(String::from)).collect()
 		}
 
 		/// The URNs a [`ReceivingSink`] received, in order.
@@ -839,7 +1115,7 @@ mod tests {
 			let leaked: Vec<_> = urns.iter().filter(|urn| EXPLORATION_EVENTS.contains(urn)).collect();
 			let exploration = context.verdict().exploration();
 			let explored = exploration.map(|exploration| exploration.count_event_urn(DIVERGENCE_DETECT));
-			assert_eq!(explored, Some(1), "the exploration trace holds the divergence");
+			assert_eq!(explored.transpose()?, Some(1), "the exploration trace holds the divergence");
 			assert!(leaked.is_empty(), "the trace of the run received {leaked:?}");
 			Ok(())
 		}
@@ -852,9 +1128,8 @@ mod tests {
 			let config = builder.with_trace(trace).build()?;
 
 			let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
-
-			let overflowed = verdict.exploration().map(|exploration| exploration.overflowed);
-			assert_eq!(overflowed, Some(true), "the sink holds two events");
+			let complete = verdict.exploration().map(ConsumedTrace::is_complete);
+			assert_eq!(complete, Some(false), "the sink holds two events");
 			Ok(())
 		}
 	}

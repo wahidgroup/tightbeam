@@ -1,4 +1,5 @@
-//! Shared worker queue runtime used by [`worker!`](crate::worker).
+//! The worker queue runtime that every [`worker!`](crate::worker) expansion
+//! shares.
 //!
 //! The macro keeps the handler and the config binding of each named worker.
 //! Start, relay, kill, and `Drop` live here.
@@ -9,14 +10,14 @@ use std::sync::Arc;
 
 use crate::colony::worker::{WorkerKillFuture, WorkerPolicies, WorkerRelayError, WorkerRelayFuture, WorkerRequest};
 use crate::error::TightBeamError;
-use crate::runtime::rt;
+use crate::runtime::{rt, ChannelClosed};
 use crate::trace::TraceCollector;
 use crate::Message;
 
 /// Where one worker stands: before [`WorkerRuntime::start`] or after it.
 ///
 /// A started worker holds its queue sender, its run-loop handle, and its
-/// queue bound together, so none of the three exists without the others.
+/// queue bound, so the three exist only together.
 enum Phase<I, O>
 where
 	I: Message + Send + Sync + 'static,
@@ -27,11 +28,11 @@ where
 	Unstarted,
 	/// The queue is open and the run loop is spawned.
 	Started {
-		/// Sender side of the request queue.
+		/// The sender side of the request queue.
 		sender: rt::Sender<WorkerRequest<I, O>>,
-		/// Handle of the spawned run loop.
+		/// The join handle of the spawned run loop.
 		join: rt::JoinHandle,
-		/// Bound of the request queue.
+		/// The bound of the request queue.
 		queue: usize,
 	},
 }
@@ -45,8 +46,8 @@ where
 {
 	phase: Phase<I, O>,
 	config: Arc<C>,
-	/// The collector every relayed request records into. It is read in
-	/// both phases, so it lives beside the phase rather than inside it.
+	/// The collector every relayed request records into. Both phases read it,
+	/// so it sits beside the phase and not inside it.
 	trace: Arc<TraceCollector>,
 }
 
@@ -109,24 +110,26 @@ where
 			let (tx, rx) = rt::oneshot();
 
 			let request = WorkerRequest { message, respond_to: tx, trace };
-			rt::send(&sender, request).await.map_err(|_| WorkerRelayError::QueueClosed)?;
+			rt::send(&sender, request)
+				.await
+				.map_err(|ChannelClosed| WorkerRelayError::QueueClosed)?;
 
 			match rt::wait_response(rx).await {
 				Ok(Ok(output)) => Ok(output),
 				Ok(Err(status)) => Err(WorkerRelayError::Rejected(status)),
-				Err(()) => Err(WorkerRelayError::ResponseDropped),
+				Err(ChannelClosed) => Err(WorkerRelayError::ResponseDropped),
 			}
 		})
 	}
 
 	/// Close the queue and join the run loop.
 	///
-	/// Every `worker!`-generated `Worker::kill` calls this. Dropping the
-	/// sender ends the run loop's `recv` stream, so the join observes a clean
-	/// exit instead of aborting mid-message.
+	/// Every `worker!`-generated `Worker::kill` calls this. The dropped sender
+	/// ends the run loop's `recv` stream, so the join sees a clean exit and no
+	/// abort mid-message.
 	pub fn kill(mut self) -> WorkerKillFuture {
-		// `Drop` still runs on `self` after this, so the phase is replaced
-		// in place rather than moved out.
+		// `Drop` runs on `self` at the end of this method, so the phase is
+		// replaced in place rather than moved out.
 		let phase = mem::replace(&mut self.phase, Phase::Unstarted);
 
 		Box::pin(async move {
@@ -221,7 +224,6 @@ mod tests {
 
 		let capacity = runtime.queue_capacity();
 		let relayed = runtime.relay(ping()).await;
-
 		assert_eq!(capacity, 0);
 		assert!(matches!(relayed, Err(WorkerRelayError::QueueClosed)));
 		Ok(())
@@ -240,6 +242,21 @@ mod tests {
 		Ok(())
 	}
 
+	/// A relay whose handler ends before it answers reads the dropped answer
+	/// channel as a dropped response.
+	#[tokio::test]
+	async fn a_relay_whose_handler_panics_reads_a_dropped_response() -> Result<(), Box<dyn Error>> {
+		let policies = WorkerPolicies { receptor_gates: Vec::new() };
+		let trace = Arc::new(TraceCollector::new());
+		let handler =
+			|_message: Arc<TestMessage>, _trace, _config| async move { panic!("the handler ends unanswered") };
+
+		let runtime: WorkerRuntime<TestMessage, usize> = WorkerRuntime::new(()).start(trace, 8, policies, handler);
+		let relayed = runtime.relay(ping()).await;
+		assert!(matches!(relayed, Err(WorkerRelayError::ResponseDropped)));
+		Ok(())
+	}
+
 	#[tokio::test]
 	async fn a_second_start_keeps_the_first_queue() -> Result<(), Box<dyn Error>> {
 		let runtime = started(8);
@@ -247,7 +264,6 @@ mod tests {
 		let trace = Arc::new(TraceCollector::new());
 
 		let restarted = runtime.start(trace, 16, policies, |_message, _trace, _config| async move { 0 });
-
 		assert_eq!(restarted.queue_capacity(), 8);
 		restarted.kill().await?;
 		Ok(())

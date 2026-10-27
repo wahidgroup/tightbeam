@@ -1,34 +1,27 @@
-//! The cluster framework, whose gateways route work to registered hives.
+//! The cluster framework: gateways that route work to registered hives.
 //!
-//! A gateway keeps hive and servlet registries, selects routes, and
-//! forwards [`ClusterWorkRequest`] payloads.
+//! A gateway keeps hive and servlet registries, picks a route for each work
+//! request, and forwards the [`ClusterWorkRequest`] payload.
 //!
 //! # Work routing
 //!
 //! - Hives register at runtime and announce their servlet types.
-//! - Clients send work with a servlet type and a payload.
-//! - The gateway selects a route and forwards the payload.
+//! - Clients send work that names a servlet type and carries a payload.
+//! - The gateway picks a route and forwards the payload.
 //!
 //! # Peer federation
 //!
-//! Gateways advertise exported servlet types to peer gateways, honor relay
-//! budgets, and learn remote routes through gossip. The trust anchors live on
-//! [`ClusterTlsConfig::peer_trust`]. Every address a peer claims passes
-//! [`PeerConfig::admit_dial`], and the [`AdmittedDial`] it returns is the one
-//! form a claimed address takes on the way to a dial.
+//! Gateways advertise their exported servlet types to peer gateways, honor
+//! relay budgets, and learn remote routes through gossip.
 //!
-//! # Export boundary
-//!
-//! [`PeerConfig::exported_types`], [`ClusterConfig::export_grants`] (a list of
-//! [`export::ExportGrant`]), and [`ClusterConfig::export_gates`] (a list of
-//! [`export::ExportGate`]) govern what external peers may discover and reach.
-//! The enforcement order is the allowlist, then the grants, then the deny
-//! gates. See the [`export`] module.
+//! - The trust anchors are on [`ClusterTlsConfig::peer_trust`].
+//! - Every address a peer claims passes [`PeerConfig::admit_dial`]. Only the
+//!   [`AdmittedDial`] it returns reaches a dial.
 //!
 //! # Gossip
 //!
-//! Rumor floods across the colonies use the gossip subsystem ([`GossipConfig`],
-//! [`GossipJournal`]) for deduplication, retention, and anti-entropy repair.
+//! Rumors flood across colonies through the gossip subsystem ([`GossipConfig`],
+//! [`GossipJournal`]), which deduplicates, retains, and repairs them.
 //!
 //! [`ClusterWorkRequest`]: crate::colony::protocol::ClusterWorkRequest
 
@@ -107,21 +100,25 @@ use super::urn::{ColonyNamespace, ColonyResource};
 
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
-pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 10;
+// The compiler evaluates the match, so a cap of zero fails to compile here.
+pub(crate) const DEFAULT_MAX_CONCURRENT: NonZeroUsize = match NonZeroUsize::new(10) {
+	Some(max) => max,
+	None => panic!("the default heartbeat cap takes one dial or more"),
+};
 pub(crate) const DEFAULT_MAX_FAILURES: u32 = 3;
 
 /// The heartbeat cadence, eviction timeout, and failure tolerance.
 ///
-/// The heartbeat loop retries a failed heartbeat on the next `interval`
-/// cycle, and eviction counts against `max_failures` rather than a separate
-/// retry policy.
+/// A failed heartbeat retries on the next `interval`. Eviction counts against
+/// `max_failures`, with no separate retry policy.
 pub struct HeartbeatConfig {
 	/// The time between heartbeat cycles.
 	pub interval: Duration,
 	/// The age past which the hive registry evicts a silent hive.
 	pub timeout: Duration,
-	/// The cap on concurrent heartbeat dials in one cycle.
-	pub max_concurrent: usize,
+	/// The cap on concurrent heartbeat dials in one cycle. It is at least
+	/// one, so each cycle dials every hive in turn (CWE-835).
+	pub max_concurrent: NonZeroUsize,
 	/// The count of consecutive failures that unregisters a hive.
 	pub max_failures: u32,
 	/// The callback for each heartbeat result, for a monitor or a test.
@@ -174,9 +171,7 @@ pub struct HeartbeatEvent {
 }
 
 /// The callback the heartbeat loop calls after each heartbeat result.
-///
-/// The callback MUST be `Send + Sync` because the loop may invoke it from
-/// concurrent tasks.
+/// Concurrent tasks call it, so it is `Send + Sync`.
 pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 
 /// The TLS material for the gateway accept loop and the hive and peer dials.
@@ -186,49 +181,37 @@ pub struct ClusterTlsConfig {
 	/// [`Self::from_identity`]. The certificate is the server identity, and
 	/// outbound dials present it as the client certificate.
 	identity: SigningIdentity,
-	/// The key purpose of each role the identity serves.
-	/// [`Self::from_identity`] holds the identity's certificate to the signer
-	/// purpose, and the accept planes and the outbound dials hold it to the
-	/// server and client purposes.
+	/// The key purpose of each role the identity serves: signer, server, and
+	/// client.
 	key_purposes: KeyPurposes,
-	/// The server policy of every outbound dial on both planes. Every gateway
-	/// dial runs the HPKE flow, so each validator evaluates the signing
-	/// certificate that the dialed server's reply names.
+	/// The server policy of every outbound dial on both planes. Each validator
+	/// evaluates the signing certificate in the dialed server's HPKE reply.
 	///
-	/// The store alone admits each issuer and each root. A check of every
-	/// certificate, such as a denylist, belongs in the store's
+	/// The store alone admits issuers and roots. Put a check of every
+	/// certificate, such as a denylist, in the store's
 	/// [`RevocationChecker`](crate::crypto::x509::store::RevocationChecker).
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
 	/// The client-certificate validators for inbound mutual TLS.
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
-	/// The trust store for the hive plane.
-	///
-	/// The store fills three roles:
+	/// The trust store of the hive plane. It has three roles:
 	///
 	/// - Outbound dials to hives and servlets validate the server certificate against it.
-	/// - Hive-origin control frames (registration, spawn results) verify their signature against it.
-	/// - The export boundary classifies a caller as first-party when the store
-	///   holds the caller's public key and `peer_trust` does not (see
-	///   [`TrustPlanes`]).
+	/// - Hive control frames (registration, spawn results) verify their signature against it.
+	/// - The export boundary treats a caller as first-party when this store
+	///   holds its key and `peer_trust` does not ([`TrustPlanes`]).
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 	/// The trust anchor for peer-gateway advertisements and relayed gossip.
 	///
-	/// The store is separate from `hive_trust`, so a peer certificate cannot
-	/// register as a hive and a hive certificate cannot forge a peer ad.
-	/// Membership here wins over `hive_trust` on every plane, so a public key
-	/// held by both stores stays an external peer. `None` disables inbound
-	/// federation, and the gateway then refuses advertisements.
+	/// It is apart from `hive_trust`, so a peer cannot register as a hive and a
+	/// hive cannot forge a peer ad. It wins over `hive_trust` on every plane,
+	/// so a key in both stores stays an external peer. `None` disables inbound
+	/// federation, and the gateway refuses advertisements.
 	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 }
 
 impl ClusterTlsConfig {
 	/// Decode `certificate` and bind it to the key that proves it, under the
-	/// house provider.
-	///
-	/// One identity serves every plane: the colony and edge listeners present
-	/// it, and outbound hive and peer dials offer it as the client
-	/// certificate. This method decodes it once, so every plane shares the one
-	/// decoded certificate.
+	/// house provider. Every plane shares the one decoded certificate.
 	///
 	/// # Errors
 	///
@@ -236,23 +219,20 @@ impl ClusterTlsConfig {
 	///   DER that does not decode as a certificate.
 	/// - [`TightBeamError::CertificateValidationError`] -- the certificate
 	///   fails [`Self::from_identity`] under [`KeyPurposes::HOUSE`].
-	/// - [`TightBeamError`] -- the errors of [`SigningIdentity::new`], as their conversion names them.
+	/// - [`TightBeamError`] -- an error of [`SigningIdentity::new`].
 	pub fn new(certificate: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> Result<Self, TightBeamError> {
 		let identity = SigningIdentity::from_spec(certificate, key)?;
 		Ok(Self::from_identity(identity, KeyPurposes::HOUSE)?)
 	}
 
-	/// Serve every plane under `identity`, with the key purpose of each role
-	/// that `key_purposes` names. [`KeyPurposes::HOUSE`] holds the house
-	/// purposes.
+	/// Serve every plane under `identity`, with the key purposes that
+	/// `key_purposes` names ([`KeyPurposes::HOUSE`] for the house purposes).
 	///
-	/// - The identity signs this gateway's frames, so its certificate MUST
-	///   name `key_purposes.signer` or `anyExtendedKeyUsage`, or carry no
-	///   `extendedKeyUsage` (RFC 5280 §4.2.1.12).
-	///   [`CertificateExt::require_purpose`] applies this rule.
+	/// - The identity signs this gateway's frames, so its certificate MUST name
+	///   `key_purposes.signer` or `anyExtendedKeyUsage`, or carry no
+	///   `extendedKeyUsage` (RFC 5280 §4.2.1.12). [`CertificateExt::require_purpose`] checks it.
 	/// - The accept planes and the outbound dials hold the certificate to the
-	///   server and client purposes, as
-	///   [`TransportEncryptionConfig::with_key_purposes`] states.
+	///   server and client purposes ([`TransportEncryptionConfig::with_key_purposes`]).
 	///
 	/// # Errors
 	///
@@ -304,9 +284,7 @@ impl ClusterTlsConfig {
 		})
 	}
 
-	/// Replace the server policy of outbound dials, which evaluates the
-	/// signing certificate that the dialed server's HPKE reply names, as
-	/// [`Self::validators`] states.
+	/// Replace the server policy of outbound dials ([`Self::validators`]).
 	#[must_use]
 	pub fn with_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
 		self.validators = validators;
@@ -322,9 +300,9 @@ impl ClusterTlsConfig {
 
 	/// How the accept planes authenticate their clients.
 	///
-	/// [`PeerAuthentication::mutual`] decides what the validator list means,
-	/// so an empty list is server authentication only, and the gateway then
-	/// captures no client identity.
+	/// An empty validator list is server authentication alone, by the rule of
+	/// [`PeerAuthentication::mutual`], so the gateway captures no client
+	/// identity.
 	pub fn peer_authentication(&self) -> PeerAuthentication {
 		PeerAuthentication::mutual(self.client_validators.iter().map(Arc::clone))
 	}
@@ -349,36 +327,22 @@ impl ClusterTlsConfig {
 		self
 	}
 
-	/// The store that names a peer gateway this gateway dials.
-	///
-	/// - A dial to a peer verifies its handshake against it.
-	/// - The flood reads its members from it.
-	/// - [`TrustPlanes::peer_identity`] names a peer by it.
-	///
-	/// A configured peer plane keeps peer dials on `peer_trust`. A gateway with
-	/// no peer plane dials its peers on the hive pool, so `hive_trust` answers
-	/// for it, by the rule of [`TrustPlanes::peer_dial`]. [`Self::pools`]
-	/// builds the pools by the same rule.
+	/// The store that names a peer gateway this gateway dials: `peer_trust`, or
+	/// `hive_trust` for a gateway with no peer plane, by the rule of
+	/// [`TrustPlanes::peer_dial`]. [`Self::pools`] follows the same rule.
 	#[must_use]
 	pub(crate) fn peer_dial_trust(&self) -> Option<&dyn crate::crypto::x509::store::CertificateTrust> {
 		TrustPlanes::from(self).peer_dial()
 	}
 
-	/// The certificate and handshake key this gateway presents.
-	///
-	/// One identity serves the colony listener, the edge listener, and every
-	/// outbound hive and peer dial, so all of them read it here and agree.
+	/// The certificate and handshake key this gateway presents on the colony
+	/// listener, the edge listener, and every outbound hive and peer dial.
 	pub fn identity(&self) -> &SigningIdentity {
 		&self.identity
 	}
 
-	/// The encryption config the colony and edge listeners share.
-	///
-	/// Both planes present the same certificate and key, so an external edge
-	/// client pins the same gateway identity that hives already trust.
-	///
-	/// - The client validators are those of [`Self::peer_authentication`].
-	/// - The key purposes are the ones [`Self::from_identity`] installed.
+	/// The encryption config the colony and edge listeners share, so an edge
+	/// client pins the same gateway identity that hives trust.
 	pub(crate) fn accept_encryption<C: CryptoProvider>(&self) -> TransportEncryptionConfig<C> {
 		let encryption = TransportEncryptionConfig::new(self.identity.clone());
 		let validators = self.client_validators.iter().map(Arc::clone);
@@ -387,10 +351,8 @@ impl ClusterTlsConfig {
 		encryption.with_key_purposes(self.key_purposes)
 	}
 
-	/// Configures `builder` to dial under this identity: the pool presents the
-	/// identity as its client certificate, runs [`Self::validators`] as the
-	/// server policy, and holds both sides to the key purposes
-	/// [`Self::from_identity`] installed.
+	/// Configures `builder` to dial under this identity, with
+	/// [`Self::validators`] as the server policy.
 	pub(crate) fn outbound<P: Protocol>(&self, builder: ConnectionPoolBuilder<P>) -> ConnectionPoolBuilder<P> {
 		let validators = self.validators.iter().map(Arc::clone);
 		let builder = builder.with_client_identity(self.identity.clone());
@@ -427,108 +389,91 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// The peer-federation dial list, the advertise beat and address, and the
 /// policy that admits the dial addresses peers claim.
 ///
-/// The trust anchors stay on [`ClusterTlsConfig::peer_trust`]. Export
-/// discoverability and export enforcement share [`PeerConfig::exported_types`].
+/// The trust anchors are on [`ClusterTlsConfig::peer_trust`].
+/// [`PeerConfig::exported_types`] governs export discovery and enforcement.
 #[derive(Clone)]
 pub struct PeerConfig {
-	/// The peer gateway addresses this gateway dials to advertise exported
-	/// types.
+	/// The peer gateways this gateway dials to advertise exported types.
 	///
-	/// - Each gateway picks its own dial targets, so a federation graph may be partial or asymmetric.
-	/// - An empty list sets no anchor, so the beat advertises only to the learned peers its probes proved.
-	/// - Each beat snapshots the local servlet registry as the slate, so peers
-	///   learn the types this gateway serves at that beat.
+	/// - Each gateway picks its own targets, so a federation graph can be partial or asymmetric.
+	/// - An empty list sets no anchor, so the beat advertises only to learned peers its probes proved.
+	/// - Each beat sends a snapshot of the local servlet registry as the slate.
 	///
-	/// The field is private because [`PeerConfig::table`] derives its anchor
-	/// set from this list at build. Set it with
-	/// [`ClusterConfigBuilder::with_peers`], which parses each entry, and
-	/// read it with [`PeerConfig::peers`].
+	/// Private, because [`PeerConfig::table`] derives its anchors from it at
+	/// build. Set it with [`ClusterConfigBuilder::with_peers`], which parses
+	/// each entry.
 	peers: Vec<AdmittedDial>,
 	/// The cadence of the re-advertise beat, where `None` disables the beat.
 	pub advertise_interval: Option<Duration>,
-	/// The socket this gateway advertises as its own, when the operator set
+	/// The socket this gateway advertises as its own, when the operator sets
 	/// one.
 	///
-	/// - `None` advertises the bound address, which peers dial for a gateway bound to one interface.
-	/// - A gateway bound to the wildcard address sets this, because every peer refuses a claim of `0.0.0.0`.
+	/// - `None` advertises the bound address, which works for a gateway bound to one interface.
+	/// - A gateway bound to the wildcard address needs it, because every peer refuses `0.0.0.0`.
 	advertise_addr: Option<PeerAddress>,
-	/// Inbound peer ads may only claim dial addresses in this list.
+	/// The dial addresses that inbound peer ads may claim, or any parsed socket
+	/// for `None`.
 	///
-	/// - Entries are parsed sockets, so one address spelled two ways is one entry.
-	/// - `None` accepts any parseable socket.
-	/// - Peer-exchange hints pass the same gate before the table learns them,
-	///   so discovery dials addresses from the list alone.
+	/// - Entries are parsed sockets, so two spellings of one address are one entry.
+	/// - Peer-exchange hints pass the same gate, so discovery dials listed addresses alone.
 	///
-	/// The field is private so that every entry is a parsed socket. Set it with
-	/// [`ClusterConfigBuilder::with_peer_dial_allowlist`] and read it with
-	/// [`PeerConfig::peer_dial_allowlist`].
+	/// Private, so every entry is a parsed socket. Set it with
+	/// [`ClusterConfigBuilder::with_peer_dial_allowlist`].
 	peer_dial_allowlist: Option<Arc<HashSet<PeerAddress>>>,
-	/// The discovery table, which holds `peers` as un-evictable anchors beside
-	/// the bounded, prefix-bucketed learned peers.
+	/// The discovery table: `peers` as anchors that never evict, beside the
+	/// bounded, prefix-bucketed learned peers.
 	///
-	/// - The config builder rebuilds it, so the anchors always derive from
-	///   `peers` and the injected [`PeerStore`] rehydrates the learned peers
-	///   through the capped admission path.
-	/// - The field is private because the builder derives it. Read it with [`PeerConfig::table`].
+	/// Private, because the builder rebuilds it. The anchors derive from
+	/// `peers`, and the injected [`PeerStore`] reloads the learned peers
+	/// through the capped admission path.
 	table: Arc<PeerTable>,
 	/// The cap on the relay budget this gateway honors on inbound work and
-	/// routed stream opens.
-	///
-	/// The effective budget is `min(wire value, max_hops)`. An origin
-	/// request carries the sentinel budget, so the clamp also stamps the
-	/// origin with this cap.
+	/// routed stream opens. The effective budget is `min(wire value,
+	/// max_hops)`, and an origin request, which carries the sentinel budget,
+	/// takes this cap.
 	///
 	/// - The default [`DEFAULT_MAX_HOPS`] forwards at most once.
 	/// - `0` disables forwarding.
 	/// - `2` enables relay-trail fallback.
 	pub max_hops: u8,
-	/// The cap on the tried entries one signer may hold in the discovery
-	/// table, where `None` sets no cap.
+	/// The cap on the tried entries one signer may hold in the discovery table,
+	/// or no cap for `None`, the default.
 	///
-	/// - The prefix buckets bound a network position, and this bounds an identity (CWE-770).
-	/// - One enrolled certificate that answers at many addresses takes at most this many beat-target slots.
-	/// - It is off by default, and an implementor whose trust store admits
-	///   parties outside its control turns it on.
-	/// - A signer is one certificate, counted by fingerprint. A party that
-	///   enrolls more than one certificate holds this many entries under each.
-	/// - The field is private because the builder copies it into the table at
-	///   build, and the table reads that copy alone. Set it with
-	///   [`ClusterConfigBuilder::with_tried_per_signer`].
+	/// - One certificate that answers at many addresses takes at most this many beat targets.
+	/// - The prefix buckets bound a network position, and this cap bounds an identity (CWE-770).
+	/// - A signer is one certificate, counted by fingerprint, so a party with two
+	///   certificates holds this many entries under each.
+	/// - Turn it on when the trust store admits parties outside your control.
+	///
+	/// Private, because the builder copies it into the table, which reads that
+	/// copy alone. Set it with [`ClusterConfigBuilder::with_tried_per_signer`].
 	tried_per_signer: Option<NonZeroUsize>,
-	/// The advertisement-rumor refresh interval, as the operator configured it.
+	/// The advertisement-rumor refresh interval, as configured. The beat floods
+	/// the slate rumor on each change of the slate or the flood targets, and
+	/// once per interval.
 	///
-	/// The beat floods the slate rumor when the slate or the flood target set
-	/// changes, plus one refresh on this interval.
-	///
-	/// The field is private because the clamped value is the one every caller
-	/// wants. Set it with [`ClusterConfigBuilder::with_rumor_refresh`] and
-	/// read the effective interval with [`ClusterConfig::rumor_refresh`].
+	/// Private, because callers want the clamped value
+	/// ([`ClusterConfig::rumor_refresh`]). Set it with
+	/// [`ClusterConfigBuilder::with_rumor_refresh`].
 	rumor_refresh: Duration,
-	/// The servlet types that external peers may discover and reach.
+	/// The servlet types that external peers may discover and reach, or every
+	/// local type for `None`. `Some` restricts both planes of the export
+	/// boundary through an [`ExportAllowlist`]:
 	///
-	/// `None` exports every locally served type. `Some` restricts both
-	/// planes of the export boundary through an [`ExportAllowlist`]:
+	/// - Discovery: each advertise beat asks [`ExportAllowlist::allows_canonical`]
+	///   per local servlet key, so ads and rumors name exported types alone.
+	/// - Enforcement: unary work and routed stream opens ask
+	///   [`ExportAllowlist::contains`]. The gateway refuses external peers and
+	///   relayed requests on other targets, even when they guess the type name.
 	///
-	/// - **Discoverability**: each advertise beat asks
-	///   [`ExportAllowlist::allows_canonical`] per local servlet key,
-	///   so ads and rumors disclose exported types only.
-	/// - **Enforcement**: the gateway calls
-	///   [`ExportAllowlist::contains`] on unary Work and routed stream
-	///   opens. It refuses external peers and relayed requests on
-	///   unexported targets, even when they guess the type name.
-	///
-	/// Install a static list with
-	/// [`ClusterConfigBuilder::with_exported_types`] or a live handle
-	/// with [`ClusterConfigBuilder::with_export_allowlist`].
+	/// Set a static list with [`ClusterConfigBuilder::with_exported_types`], or
+	/// a live handle with [`ClusterConfigBuilder::with_export_allowlist`].
 	pub exported_types: Option<Arc<dyn ExportAllowlist>>,
 }
 
 impl PeerConfig {
-	/// The peer gateway addresses this plane dials to advertise exported
-	/// types.
-	///
-	/// These are the table's un-evictable anchors, admitted as operator
-	/// configuration.
+	/// The peer gateways this plane dials to advertise exported types: the
+	/// table's anchors, which never evict.
 	#[must_use]
 	pub fn peers(&self) -> &[AdmittedDial] {
 		&self.peers
@@ -603,18 +548,16 @@ pub struct ClusterConfig {
 	pub pheromone: PheromoneConfig,
 	/// The gate policies the gateway evaluates before it decodes a request.
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	/// The custom export gates, which the gateway evaluates where it knows the
-	/// servlet target.
-	///
-	/// All gates must pass, so they compose as an intersection with the allow
-	/// sources: the exported list, the grants, and the first-party origin rule.
+	/// The custom export gates, which the gateway evaluates once it knows the
+	/// servlet target. Every gate must pass, so the gates narrow what the allow
+	/// sources (the exported list, the grants, the first-party rule) admit.
 	pub export_gates: Vec<Arc<dyn ExportGate>>,
 	/// The positive export grants, which the gateway evaluates when the
 	/// built-in allowlist refuses a target.
 	///
-	/// The allow sources compose as a union: exported, granted, or first-party
-	/// origin. A deny gate overrides a grant. The advertised slate lists
-	/// exported types alone, so a granted type stays off it.
+	/// A target passes when it is exported, granted, or a first-party origin,
+	/// and a deny gate overrides a grant. The advertised slate lists exported
+	/// types alone, so a granted type stays off it.
 	pub export_grants: Vec<Arc<dyn ExportGrant>>,
 	/// The outbound connection pool settings for hive and peer dials. The
 	/// pools read [`ClusterConfig::clock`].
@@ -624,48 +567,40 @@ pub struct ClusterConfig {
 	/// The gateway refuses a stale or replayed registration or update frame
 	/// (CWE-294).
 	pub control_freshness_window: Duration,
-	/// The gateway bind address, which the gateway parses through the
-	/// protocol address `FromStr`.
-	///
-	/// `None` binds the protocol default. A stable address lets hives
-	/// re-register across gateway restarts on the same configuration.
+	/// The gateway bind address, parsed through the protocol address `FromStr`.
+	/// `None` binds the protocol default. A stable address lets hives register
+	/// again across gateway restarts.
 	pub bind_addr: Option<String>,
-	/// The bind address of the edge accept plane, which the gateway parses
-	/// through the edge address `FromStr`.
+	/// The bind address of the edge accept plane, parsed through the edge
+	/// address `FromStr`, or no edge plane for `None`.
 	///
-	/// - `None` disables the edge plane.
-	/// - `Some` binds a second listener with the same TLS material for external
-	///   clients, such as a browser transport.
-	/// - The edge listener admits `Work` frames only. It refuses control frames
-	///   with `PermissionDenied`, so an edge client can never join the colony
-	///   control plane.
+	/// - The edge listener serves external clients, such as a browser transport, with the same TLS material.
+	/// - It admits `Work` frames alone and refuses control frames with
+	///   `PermissionDenied`, so an edge client never joins the control plane.
 	/// - Hives register on `bind_addr` in either case.
 	pub edge_bind_addr: Option<String>,
-	/// The peer-federation dial list, advertise beat and address, and dial
-	/// policy.
+	/// The peer-federation dial list, the advertise beat and address, and the
+	/// dial policy.
 	pub peer: PeerConfig,
 	/// The gossip freshness, origin TTL, ingress, journal, and admission.
 	///
-	/// Startup clamps [`GossipConfig::seen_ttl`] to the journal's retention. A
-	/// journal keeps a digest while the issue time its rumor states lies inside
-	/// retention, so a wider window would re-admit a replay as new (CWE-294).
+	/// Startup clamps [`GossipConfig::seen_ttl`] to the journal's retention.
+	/// The journal keeps a digest only while its rumor's issue time lies inside
+	/// retention, so a wider window would admit a replay again (CWE-294).
 	pub gossip: GossipConfig,
 	/// The clock every freshness, replay, retention, and lease decision on
 	/// this gateway reads. It defaults to
 	/// [`SystemClock`](crate::utils::time::SystemClock).
 	pub clock: Arc<dyn Clock>,
-	/// The colony URN from the URI SAN of the gateway certificate.
-	///
-	/// `None` means the gateway is not a colony member, so it is in no flood
-	/// ([`ClusterConfig::flood`]):
+	/// The colony URN from the URI SAN of the gateway certificate. `None` means
+	/// the gateway is in no colony and no flood ([`ClusterConfig::flood`]):
 	///
 	/// - The gateway refuses peer ads and every gossip publish, relay, and reconcile.
 	/// - The advertise beat skips gossip reconciliation.
-	/// - Work and hive registration proceed without membership.
+	/// - Work and hive registration work without membership.
 	///
-	/// The field is private so membership stays bound to the certificate.
-	/// [`ClusterConfig::bind_colony_membership`] derives it, last at
-	/// startup, and [`ClusterConfig::colony_urn`] reads it.
+	/// Private, so membership stays bound to the certificate.
+	/// [`ClusterConfig::bind_colony_membership`] derives it at startup.
 	colony_urn: Option<Urn<'static>>,
 	/// The TLS material for the accept planes and the outbound dials.
 	pub tls: ClusterTlsConfig,
@@ -676,23 +611,20 @@ pub struct ClusterConfig {
 pub(crate) type ParsedAddressUpdate<'a> = (HiveSlate, Vec<&'a [u8]>);
 
 impl ClusterConfig {
-	/// The effective advertisement-rumor refresh interval.
+	/// The effective advertisement-rumor refresh interval: the configured
+	/// value, clamped to [`GossipConfig::seen_ttl`].
 	///
-	/// A refresh slower than the gossip freshness window would re-publish
-	/// rumors that peers refuse as stale, so this method clamps the configured
-	/// interval to [`GossipConfig::seen_ttl`]. The window itself narrows at
-	/// startup to the journal retention, so this method derives the interval
-	/// on each read and the two stay in agreement.
+	/// A slower refresh would publish rumors that peers refuse as stale. The
+	/// window narrows at startup to the journal retention, so the clamp runs
+	/// on each read.
 	#[must_use]
 	pub fn rumor_refresh(&self) -> Duration {
 		self.peer.rumor_refresh.min(self.gossip.seen_ttl)
 	}
 
 	/// Parse the hive identity, the added entries, and the removed instance
-	/// locators.
-	///
-	/// This method parses the delta whole, so the registry applies all of it
-	/// or none of it. It returns [`None`] in each case below:
+	/// locators, whole, so the registry applies all of the delta or none of it.
+	/// It returns [`None`] in each case below:
 	///
 	/// - The hive URN names no hive of this colony's namespace.
 	/// - An added or removed URN names no servlet instance of this namespace.
@@ -750,17 +682,10 @@ impl ClusterConfig {
 
 	/// Binds colony membership to the certificate this config holds.
 	///
-	/// # Caching
-	///
-	/// [`ClusterConfig::rumor_refresh`] derives on read, but this config caches
-	/// membership, because its derivation decodes the certificate's URI SAN
-	/// and every inbound gossip frame asks for it.
-	///
-	/// # Rebinding at startup
-	///
-	/// The certificate and the namespace stay writable until the gateway takes
-	/// the config, so a value derived from an earlier certificate would claim
-	/// the wrong colony. Startup binds it again for that reason.
+	/// The config caches membership, because every inbound gossip frame asks
+	/// and the derivation decodes the certificate's URI SAN. Startup binds it
+	/// again, because the certificate and the namespace stay writable until
+	/// the gateway takes the config.
 	pub(crate) fn bind_colony_membership(&mut self) {
 		self.colony_urn = self.namespace.cert_colony_urn(self.tls.identity().certificate());
 	}
@@ -789,10 +714,6 @@ impl core::fmt::Debug for ClusterConfig {
 }
 
 /// The trait a cluster gateway implements.
-///
-/// Gateways route work to registered hives by servlet type. Hives
-/// register at runtime, and the gateway learns servlet types from those
-/// registrations.
 pub trait Cluster: Sized + Send + Sync {
 	/// The protocol this gateway serves.
 	type Protocol: Protocol;
@@ -802,6 +723,9 @@ pub trait Cluster: Sized + Send + Sync {
 
 	/// Bind, spawn the accept and background loops, and return the gateway
 	/// that runs them.
+	///
+	/// `trace` files the gateway's audit records. Each connection records on
+	/// [`Cluster::connection_trace`].
 	///
 	/// # Errors
 	///
@@ -847,8 +771,52 @@ pub trait Cluster: Sized + Send + Sync {
 	/// - [`ClusterError::LockPoisoned`] -- the hive registry is poisoned.
 	fn hive_count(&self) -> Result<usize, ClusterError>;
 
-	/// The shared trace collector of this gateway.
+	/// The shared trace collector of this gateway, which files its audit
+	/// records.
 	fn trace(&self) -> Arc<TraceCollector>;
+
+	/// The trace of each connection of the colony and edge planes.
+	///
+	/// It holds each record that no proven peer or verified signature backs, in
+	/// the sink that [`sibling`] names. A test build shares the assertions of
+	/// [`trace`].
+	///
+	/// [`trace`]: Cluster::trace
+	/// [`sibling`]: crate::instrumentation::EventSink::sibling
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::{Cluster, ClusterConfig, ClusterTlsConfig};
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	/// use tightbeam::crypto::x509::CertificateSpec;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	///
+	/// tightbeam::cluster! {
+	///     Gateway,
+	///     protocol: TokioListener
+	/// }
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+	/// # runtime.block_on(async {
+	/// let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+	/// let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+	/// let tls = ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+	/// let gateway = Gateway::start(Arc::new(TraceCollector::new()), ClusterConfig::new(tls)).await?;
+	///
+	/// let connections = gateway.connection_trace();
+	/// assert!(connections.drain_events().is_empty());
+	/// gateway.stop();
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn connection_trace(&self) -> Arc<TraceCollector>;
 
 	/// Abort the accept and background tasks.
 	fn stop(self);
@@ -865,9 +833,8 @@ pub trait Cluster: Sized + Send + Sync {
 
 /// The heartbeat surface of a cluster gateway.
 ///
-/// The trait sits apart from [`Cluster`], so work-only consumers depend on
-/// the work surface alone. [`ClusterGateway`] implements both traits for every
-/// alias.
+/// It is apart from [`Cluster`], so a work-only consumer needs the work
+/// surface alone. [`ClusterGateway`] implements both.
 pub trait ClusterHeartbeat: Cluster {
 	/// The shared hive registry.
 	fn registry(&self) -> &Arc<HiveRegistry>;
@@ -878,10 +845,9 @@ pub trait ClusterHeartbeat: Cluster {
 	/// Send one signed heartbeat to the hive registered at `addr`, through the
 	/// connection pool.
 	///
-	/// The dial admits only the identity that signed the hive's registration,
-	/// so the command leaves only toward that identity (CWE-346). The
-	/// background loop, a `JoinSet` with bounded concurrency, lives in
-	/// [`ClusterGateway::start`] rather than on this trait.
+	/// The dial admits only the identity that signed the hive's registration
+	/// (CWE-346). The bounded background loop lives in
+	/// [`ClusterGateway::start`].
 	///
 	/// # Errors
 	///
@@ -949,9 +915,8 @@ mod tests {
 		SigningIdentity::new(certificate, provider).expect("the fixture key proves its certificate")
 	}
 
-	// The identity signs the gateway's frames, so `from_identity` holds it to
-	// the signer purpose (RFC 5280 §4.2.1.12). A certificate that names the
-	// signer purpose, any purpose, or no purpose installs.
+	// `from_identity` installs a certificate that names the signer purpose,
+	// any purpose, or none (RFC 5280 §4.2.1.12).
 	tb_cases! {
 		fn from_identity_admits_an_identity_for_the_signer(
 			purpose: Option<ObjectIdentifier>
@@ -1002,9 +967,8 @@ mod tests {
 	/// A client purpose of an implementor's own, outside the house purposes.
 	const OWN_CLIENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.13");
 
-	// An outbound pool checks the gateway's identity against the client
-	// purpose of its TLS config at the dial, before any handshake, so a dial
-	// under the implementor's own client purpose returns its lease.
+	// The outbound pool checks the client purpose at the dial, before any
+	// handshake, so a dial under an own client purpose returns its lease.
 	#[tokio::test]
 	async fn the_outbound_pool_takes_the_configured_key_purposes() -> Result<(), Box<dyn core::error::Error>> {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
@@ -1045,9 +1009,7 @@ mod tests {
 			(validators, requires_certificate): (Vec<Arc<dyn CertificateValidation>>, bool)
 		) {
 			let tls = test_tls_config().with_client_validators(validators);
-
 			let authentication = tls.peer_authentication();
-
 			assert_eq!(authentication.requires_certificate(), requires_certificate);
 		}
 		cases {
@@ -1176,13 +1138,11 @@ mod tests {
 	#[test]
 	fn cluster_config_refuses_a_peer_that_names_no_socket() {
 		let refusal = ClusterConfig::builder(test_tls_config()).with_peers(["not-an-address"]);
-
 		assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
 	}
 
-	// The builder parses the advertise address once, where the operator
-	// writes it, so the beat advertises the canonical socket and the builder
-	// refuses a typo at build rather than advertise it to every peer.
+	// The builder parses the advertise address once, so the beat advertises the
+	// canonical socket and a typo fails at build.
 	#[test]
 	fn with_advertise_addr_stores_the_canonical_socket() -> Result<(), ClusterError> {
 		let config = ClusterConfig::builder(test_tls_config())
@@ -1273,10 +1233,6 @@ mod tests {
 
 	/// The builder creates the ingress route key, so it refuses an unroutable
 	/// URN where the operator configures it.
-	///
-	/// Delivery reads the created key, so every ingress a gateway holds is
-	/// one a route can answer. A rumor therefore stays in the retry set only
-	/// for a fault that can clear.
 	#[test]
 	fn gossip_ingress_refuses_a_urn_no_route_can_answer() -> Result<(), ClusterError> {
 		let bare = servlet_urn("ping");

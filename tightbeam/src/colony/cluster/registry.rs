@@ -55,12 +55,11 @@ impl HiveEntry {
 
 /// The registered hives, keyed by control address.
 ///
-/// [`ServletRegistry`] owns every route and answers which servlet types a
-/// hive serves. A hive's address update changes that registry alone, so the
-/// one index every mutator keeps current is the one readers ask.
+/// A hive's address update changes [`ServletRegistry`] alone, so readers ask
+/// that registry, the one index every mutator keeps current.
 ///
-/// A signer check and the insert it guards run under a single guard
-/// (CWE-362, CWE-367).
+/// A signer check and the insert it guards run under one guard (CWE-362,
+/// CWE-367).
 #[derive(Default)]
 struct Members {
 	hives: HashMap<SharedId, HiveEntry>,
@@ -171,17 +170,17 @@ impl Members {
 ///
 /// # Lock order
 ///
-/// Each method takes this registry's one lock, runs registry code alone under
-/// the guard, and releases the guard before it returns. A call here is
-/// therefore the innermost acquisition of its caller. The membership view
-/// relies on that to touch this registry and [`ServletRegistry`] in sequence.
+/// Each method takes this registry's one lock, runs only registry code under
+/// the guard, and releases it before it returns. So a call here is its
+/// caller's innermost acquisition, and the membership view relies on that to
+/// touch this registry and [`ServletRegistry`] in sequence.
 ///
 /// # Poisoned lock
 ///
-/// A move under the member lock can leave a half-written table if the code
-/// under the guard panics, so every method propagates
-/// [`ClusterError::LockPoisoned`] rather than read around it. A poisoned
-/// std lock never clears, so the caller that sees it is the one that ends.
+/// A panic under the member lock can leave a half-written table, so every
+/// method propagates [`ClusterError::LockPoisoned`] rather than read around
+/// it. A poisoned std lock never clears, so the caller that sees it is the
+/// one that ends.
 pub struct HiveRegistry {
 	members: RwLock<Members>,
 	/// The silence after which the registry evicts a hive.
@@ -199,10 +198,9 @@ impl HiveRegistry {
 
 	/// Registers a hive and binds its control-plane signer.
 	///
-	/// Returns the registration that this call displaced, when the hive held
-	/// one. A caller that installs dependent state next needs it to put the
-	/// previous registration back if that install fails, so a caller that drops
-	/// it forfeits the rollback.
+	/// Returns the registration this call displaced, if any. A caller that next
+	/// installs dependent state needs it to put the previous registration back
+	/// if that install fails, so dropping it forfeits the rollback.
 	///
 	/// # Signer binding
 	///
@@ -246,11 +244,11 @@ impl HiveRegistry {
 	///
 	/// # Signer check
 	///
-	/// The restored entry passes the signer check of its registration under one
+	/// The restored entry passes its registration's signer check under one
 	/// guard, so this mutator keeps the binding that [`HiveRegistry::register`]
 	/// enforces (CWE-639). The check refuses only while another signer holds
-	/// the id, and a refusal leaves the table as it is, as a refused
-	/// registration does.
+	/// the id, and a refusal leaves the table as it is, as for a refused
+	/// registration.
 	///
 	/// # Errors
 	///
@@ -451,11 +449,10 @@ pub(crate) struct RetiredHive {
 
 /// The two registries one hive's membership spans.
 ///
-/// A hive's entry lives in [`HiveRegistry`] and its servlet routes live in
+/// A hive's entry is in [`HiveRegistry`] and its servlet routes are in
 /// [`ServletRegistry`]. The pair enters and leaves together, so admission and
-/// retirement are operations here rather than a sequence each caller repeats.
-/// A retirement of the hive entry alone would leave routes that point at a
-/// retired hive.
+/// retirement are operations here, not a sequence each caller repeats.
+/// Retiring the entry alone would leave routes to a retired hive.
 pub(crate) struct ColonyMembership<'a> {
 	hives: &'a HiveRegistry,
 	servlets: &'a ServletRegistry,
@@ -522,8 +519,8 @@ impl<'a> ColonyMembership<'a> {
 	/// Applies one hive's servlet address delta under its signer bind.
 	///
 	/// The signer check and the route write share the admission hold, so a
-	/// retirement that runs beside this update cannot lose the race and have
-	/// the routes it dropped reinstalled behind it (CWE-362, CWE-367).
+	/// concurrent retirement cannot have its dropped routes reinstalled behind
+	/// it (CWE-362, CWE-367).
 	///
 	/// # Errors
 	///
@@ -546,13 +543,11 @@ impl<'a> ColonyMembership<'a> {
 		self.servlets.apply_address_update(added, removed)
 	}
 
-	/// Counts one heartbeat failure for the hive at `hive_addr`, and retires
-	/// the hive with every route it owned once its count reaches
-	/// `max_failures`.
+	/// Counts one heartbeat failure for the hive at `hive_addr`, and retires it
+	/// with every route it owned once its count reaches `max_failures`.
 	///
-	/// The count, the retire, and the read of the hives that remain hold one
-	/// admission, so the count of a retire names the registry that the retire
-	/// left.
+	/// The count, the retire, and the read of the remaining hives hold one
+	/// admission, so a retire's count names the registry it left.
 	///
 	/// # Errors
 	///
@@ -916,12 +911,7 @@ mod tests {
 	/// lock is how these tests make `reconcile_by_hive` fail and reach the
 	/// rollback.
 	fn poison_routes(servlets: &ServletRegistry) {
-		let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-			let _held = servlets.routes.write().expect("the lock is live until this panic");
-			panic!("poison the route lock");
-		}));
-
-		assert!(refused.is_err());
+		servlets.poison_routes();
 		assert!(servlets.local_servlets().is_err());
 	}
 
@@ -941,7 +931,6 @@ mod tests {
 			colony
 				.membership()
 				.admit(request(b"hive-a", &["ping"]), test_signer(), slate(&hive_addr, "ping"));
-
 		assert!(refused.is_err());
 		assert_eq!(colony.hives.len()?, 1);
 		assert_eq!(colony.hives.signer_for(&hive_addr)?, Some(test_signer()));

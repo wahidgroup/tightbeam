@@ -30,6 +30,7 @@
 //! - [`handshake`] brings a client and a server orchestrator, which the TCP transport drives.
 //! - [`listener`] brings a blocking listener backend, which the house TCP listener serves.
 //! - [`mux`] brings a dispatch and a credit grantor, which the multiplexed transport runs.
+//! - [`registry`] brings the servlet registry a hive runs on, which hands back each registration it replaces.
 //! - [`restart`] brings a restart policy and a jitter strategy, which a transport and a house backoff run.
 //! - [`retry`] brings the retry policy of the scaling updates of a hive.
 
@@ -53,10 +54,12 @@ mod kem;
 mod listener;
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 mod mux;
+mod registry;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
 mod restart;
 mod retry;
 mod servlet;
+mod spec;
 mod trust;
 
 use std::sync::Arc;
@@ -620,7 +623,7 @@ fn outside_recipient(certificate: Certificate) -> KemRecipient<OutsideKem> {
 	KemRecipient::from_certificate(admitted).expect("the certificate names its recipient")
 }
 
-/// Run the three legs of `client` and `server` of flow `F` under the outside
+/// Runs the three legs of `client` and `server` of flow `F` under the outside
 /// provider `P`.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 async fn run_legs<P, F>(client: &mut Handshake<Client, F, P>, server: &mut Handshake<Server, F, P>)

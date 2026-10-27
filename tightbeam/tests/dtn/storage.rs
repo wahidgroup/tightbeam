@@ -1,6 +1,8 @@
 //! The frame storage and chain verification of the DTN tests.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
@@ -58,15 +60,66 @@ pub struct ChainVerdict {
 
 /// The filesystem frame storage of the DTN simulation.
 ///
-/// The store shows that tightbeam frames persist and load back across
-/// network delays without a custody transfer protocol.
+/// It shows that tightbeam frames persist and load back across network delays
+/// with no custody transfer protocol.
 ///
 /// Each frame is self-contained and chains to the previous frame through its
 /// `previous_frame` hash, so a receiver verifies the path end to end without
 /// trusting the intermediate hops.
 pub struct FrameStore {
 	storage_dir: PathBuf,
-	frames: HashMap<String, Frame>,
+	frames: HashMap<FrameKey, Frame>,
+}
+
+/// The place of a frame in a [`FrameStore`]: its chain position and its id.
+///
+/// Two frames of one id at two chain positions take two places, so neither
+/// overwrites the other.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FrameKey {
+	/// The order of the frame, its position in the chain.
+	order: u64,
+	/// The metadata ID of the frame.
+	id: Vec<u8>,
+}
+
+impl FrameKey {
+	/// The place of `frame`.
+	pub fn of(frame: &Frame) -> Self {
+		let order = frame.metadata().order();
+		let id = frame.metadata().id().to_owned();
+		Self { order, id }
+	}
+
+	/// The file name of the frame on disk. The id is in hex, so each id names
+	/// one file in the store.
+	pub fn file_name(&self) -> String {
+		let id: String = self.id.iter().map(|byte| format!("{byte:02x}")).collect();
+		format!("{}-{id}.frame", self.order)
+	}
+
+	/// The place that the stem of a file name on disk names, if it names one.
+	fn from_file_stem(stem: &str) -> Option<Self> {
+		let (order, id) = stem.split_once('-')?;
+		let order = order.parse().ok()?;
+		let pairs = id.as_bytes().chunks_exact(2);
+		if !pairs.remainder().is_empty() {
+			return None;
+		}
+
+		let id = pairs.map(Self::hex_byte).collect::<Option<Vec<u8>>>()?;
+		Some(Self { order, id })
+	}
+
+	/// The byte that two hex digits name.
+	fn hex_byte(pair: &[u8]) -> Option<u8> {
+		let digits = core::str::from_utf8(pair).ok()?;
+		if !digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+			return None;
+		}
+
+		u8::from_str_radix(digits, 16).ok()
+	}
 }
 
 impl FrameStore {
@@ -83,39 +136,78 @@ impl FrameStore {
 		Ok(Self { storage_dir, frames: HashMap::new() })
 	}
 
-	/// Writes `frame` to disk under its metadata ID, caches it in memory, and
-	/// returns the ID.
-	pub fn persist(&mut self, frame: &Frame) -> Result<String, TightBeamError> {
-		let frame_id = String::from_utf8_lossy(frame.metadata().id()).to_string();
-		let file_path = self.storage_dir.join(format!("{}.frame", frame_id));
+	/// Writes `frame` to disk under its [`FrameKey`], keeps it in the memory
+	/// cache, and returns the key.
+	pub fn persist(&mut self, frame: Frame) -> Result<FrameKey, TightBeamError> {
+		let key = FrameKey::of(&frame);
+		let file_path = self.storage_dir.join(key.file_name());
 		let frame_bytes = frame.to_der()?;
 
 		std::fs::write(&file_path, &frame_bytes).map_err(|e| {
 			TightBeamError::IoError(std::io::Error::new(e.kind(), format!("Failed to write frame: {}", e)))
 		})?;
 
-		self.frames.insert(frame_id.to_owned(), frame.to_owned());
-		Ok(frame_id)
+		self.frames.insert(key.to_owned(), frame);
+		Ok(key)
 	}
 
-	/// Retrieves the frame with `id` from the memory cache, or else from disk,
+	/// Retrieves the frame at `key` from the memory cache, or else from disk,
 	/// and caches a frame it reads from disk.
-	pub fn retrieve(&mut self, id: impl AsRef<str>) -> Result<Frame, TightBeamError> {
-		let id = id.as_ref();
-		if let Some(frame) = self.frames.get(id) {
-			return Ok(frame.to_owned());
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::IoError`] -- the store holds no frame at `key`, or its file fails to read.
+	/// - [`TightBeamError`] -- the file fails to decode as a frame.
+	pub fn retrieve(&mut self, key: &FrameKey) -> Result<Frame, TightBeamError> {
+		let frame = self.load(key)?.cloned();
+		frame.ok_or_else(|| TightBeamError::IoError(ErrorKind::NotFound.into()))
+	}
+
+	/// Whether the store holds `frame` itself at its chain position.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the file at the place of the frame fails to read or to decode.
+	pub fn holds(&mut self, frame: &Frame) -> Result<bool, TightBeamError> {
+		let stored = self.load(&FrameKey::of(frame))?;
+		Ok(stored == Some(frame))
+	}
+
+	/// Removes `frame` from disk and from the memory cache.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::IoError`] -- the file of the frame fails to delete.
+	pub fn remove(&mut self, frame: &Frame) -> Result<(), TightBeamError> {
+		let key = FrameKey::of(frame);
+		std::fs::remove_file(self.storage_dir.join(key.file_name()))?;
+		self.frames.remove(&key);
+
+		Ok(())
+	}
+
+	/// The frame at `key`, from the memory cache or else from disk, when the
+	/// store holds one. A frame that the store reads from disk enters the
+	/// cache.
+	fn load(&mut self, key: &FrameKey) -> Result<Option<&Frame>, TightBeamError> {
+		if self.frames.contains_key(key) {
+			return Ok(self.frames.get(key));
 		}
 
-		let file_path = self.storage_dir.join(format!("{}.frame", id));
-		let frame_bytes = std::fs::read(&file_path)?;
-		let frame = Frame::from_der(&frame_bytes)?;
+		let file_path = self.storage_dir.join(key.file_name());
+		let frame_bytes = match std::fs::read(&file_path) {
+			Ok(frame_bytes) => frame_bytes,
+			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(error.into()),
+		};
 
-		self.frames.insert(id.to_string(), frame.to_owned());
-		Ok(frame)
+		let frame = Frame::from_der(&frame_bytes)?;
+		let cached = self.frames.entry(key.to_owned()).or_insert(frame);
+		Ok(Some(&*cached))
 	}
 
-	/// Retrieves the frame whose SHA3-256 hash is `hash`. The search reads the
-	/// memory cache first, and then every frame on disk.
+	/// Retrieves the frame whose SHA3-256 hash is `hash`. It searches the
+	/// memory cache first, then every frame on disk.
 	pub fn retrieve_by_hash(&mut self, hash: impl AsRef<[u8]>) -> Result<Option<Frame>, TightBeamError> {
 		let hash = hash.as_ref();
 		let cached = self.frames.values().find_map(|frame| {
@@ -132,8 +224,8 @@ impl FrameStore {
 
 		self.list_frames()?
 			.into_iter()
-			.find_map(|id| {
-				self.retrieve(&id).ok().filter(|frame| {
+			.find_map(|key| {
+				self.retrieve(&key).ok().filter(|frame| {
 					frame
 						.to_der()
 						.ok()
@@ -149,17 +241,16 @@ impl FrameStore {
 	/// The `previous_frame` digest of each frame must match the SHA3-256 hash
 	/// of the DER of the previous frame, which proves integrity without a
 	/// trusted intermediary.
-	pub fn verify_chain(&self, frames: impl AsRef<[Frame]>) -> Result<ChainVerdict, TightBeamError> {
-		let frames = frames.as_ref();
+	pub fn verify_chain(&self, frames: &[impl Borrow<Frame>]) -> Result<ChainVerdict, TightBeamError> {
 		let broken_links: Vec<(usize, String)> = frames
 			.iter()
 			.enumerate()
 			.skip(1) // The first frame starts the chain.
 			.filter_map(|(i, frame)| {
-				let prev_frame = &frames[i - 1];
+				let prev_frame: &Frame = frames[i - 1].borrow();
 				let prev_hash = prev_frame.to_der().ok().map(|bytes| Sha3_256::digest(&bytes))?;
 
-				match frame.metadata().previous_frame() {
+				match frame.borrow().metadata().previous_frame() {
 					Some(digest_info) if verify_digest(prev_hash, digest_info) => None,
 					Some(_) => Some((i, "Hash mismatch".to_string())),
 					None => Some((i, "Missing previous_frame".to_string())),
@@ -171,13 +262,14 @@ impl FrameStore {
 		Ok(ChainVerdict { valid: broken_links.is_empty(), broken_links, verified_count })
 	}
 
-	/// Lists the ID of every frame on disk.
-	pub fn list_frames(&self) -> Result<Vec<String>, TightBeamError> {
+	/// Lists the key of every frame on disk.
+	pub fn list_frames(&self) -> Result<Vec<FrameKey>, TightBeamError> {
 		Ok(std::fs::read_dir(&self.storage_dir)?
 			.filter_map(Result::ok)
 			.filter_map(|entry| {
 				let path = entry.path();
-				(path.extension()?.to_str()? == "frame").then(|| path.file_stem()?.to_str().map(String::from))?
+				(path.extension()?.to_str()? == "frame")
+					.then(|| FrameKey::from_file_stem(path.file_stem()?.to_str()?))?
 			})
 			.collect())
 	}
@@ -243,7 +335,7 @@ impl Drop for StorageRoot {
 
 #[cfg(test)]
 mod tests {
-	use super::super::ordering::OutOfOrderBuffer;
+	use super::super::ordering::{Admission, OutOfOrderBuffer};
 	use super::*;
 	use tightbeam::compose;
 
@@ -251,7 +343,6 @@ mod tests {
 	fn frame_store_persist_retrieve() -> Result<(), TightBeamError> {
 		let root = StorageRoot::create()?;
 		let mut store = FrameStore::new(root.node("store"))?;
-
 		let payload = DtnPayload::new(b"test payload", "test", "test", 0)?;
 
 		let frame = compose! {
@@ -260,10 +351,10 @@ mod tests {
 			message: payload
 		}?;
 
-		let frame_id = store.persist(&frame)?;
-		assert_eq!(frame_id, "test-frame");
+		let frame_key = store.persist(frame)?;
+		assert_eq!(frame_key, FrameKey { order: 1, id: b"test-frame".to_vec() });
 
-		let retrieved = store.retrieve(&frame_id)?;
+		let retrieved = store.retrieve(&frame_key)?;
 		let retrieved_payload = DtnPayload::from_der(retrieved.message())?;
 		assert_eq!(retrieved_payload.content.as_bytes(), b"test payload");
 
@@ -272,9 +363,8 @@ mod tests {
 		Ok(())
 	}
 
-	// The tests of `dtn/delay_tolerant.rs` cover `FrameStore::verify_chain`.
-	// A unit test of a valid chain here needs `DigestInfo::try_from`, which
-	// the crate lacks.
+	// The tests of `dtn/delay_tolerant.rs` cover `FrameStore::verify_chain`, on
+	// a valid chain and on a chain with a wrong `previous_frame` hash.
 
 	#[test]
 	fn storage_ordering_consensus_integration() -> Result<(), TightBeamError> {
@@ -303,11 +393,11 @@ mod tests {
 			let frame = frames[idx].to_owned();
 
 			// 1. Persist the frame to storage.
-			store.persist(&frame)?;
+			store.persist(frame.to_owned())?;
 
 			// 2. Hand the frame to the order buffer, which holds it while it is out of order.
 			let frames_to_process = order_buffer.insert(frame)?;
-			if let Some(ordered_frames) = frames_to_process {
+			if let Admission::Released(ordered_frames) = frames_to_process {
 				// 3. Process the frames the buffer releases, in order.
 				for ordered_frame in ordered_frames {
 					processed_frames.push(ordered_frame);
@@ -333,6 +423,83 @@ mod tests {
 
 		store.clear()?;
 
+		Ok(())
+	}
+
+	/// The store keys each frame by its chain position as well as its id, so
+	/// two frames of one id at two positions both stay on disk.
+	#[test]
+	fn a_store_keeps_two_frames_of_one_id_at_two_positions() -> Result<(), TightBeamError> {
+		let root = StorageRoot::create()?;
+		let mut store = FrameStore::new(root.node("store"))?;
+		let first = compose! {
+			V0: id: "telemetry",
+				order: 1,
+				message: DtnPayload::new(b"first", "test", "test", 0)?
+		}?;
+		let second = compose! {
+			V0: id: "telemetry",
+				order: 2,
+				message: DtnPayload::new(b"second", "test", "test", 0)?
+		}?;
+
+		store.persist(first.to_owned())?;
+		store.persist(second)?;
+
+		let mut reopened = FrameStore::new(root.node("store"))?;
+		assert!(reopened.holds(&first)?);
+		Ok(())
+	}
+
+	/// A frame at `order` under `id` that carries a test payload.
+	fn frame_of(id: &[u8], order: u64) -> Frame {
+		let payload = DtnPayload::new(b"payload", "test", "test", 0).expect("a short payload fits");
+		let frame = compose! {
+			V0: id: id,
+				order: order,
+				message: payload
+		};
+
+		frame.expect("a V0 frame with an order composes")
+	}
+
+	/// A frame whose id holds a path separator stays inside the store.
+	#[test]
+	fn a_frame_id_with_a_path_separator_stays_in_the_store() -> Result<(), TightBeamError> {
+		let root = StorageRoot::create()?;
+		let mut store = FrameStore::new(root.node("store"))?;
+		let frame = frame_of(b"../escape", 1);
+
+		store.persist(frame.to_owned())?;
+
+		let mut reopened = FrameStore::new(root.node("store"))?;
+		assert!(reopened.holds(&frame)?);
+		Ok(())
+	}
+
+	/// Two ids that differ in invalid UTF-8 take two places in the store.
+	#[test]
+	fn two_ids_that_differ_in_invalid_utf8_take_two_places() -> Result<(), TightBeamError> {
+		let root = StorageRoot::create()?;
+		let mut store = FrameStore::new(root.node("store"))?;
+		let first = frame_of(&[0xff], 1);
+		store.persist(first.to_owned())?;
+		store.persist(frame_of(&[0xfe], 1))?;
+
+		let mut reopened = FrameStore::new(root.node("store"))?;
+		assert!(reopened.holds(&first)?);
+		Ok(())
+	}
+
+	/// A reopened store lists the key of each frame on disk.
+	#[test]
+	fn a_reopened_store_lists_the_key_of_each_frame() -> Result<(), TightBeamError> {
+		let root = StorageRoot::create()?;
+		let mut store = FrameStore::new(root.node("store"))?;
+		let key = store.persist(frame_of(b"telemetry", 1))?;
+
+		let reopened = FrameStore::new(root.node("store"))?;
+		assert_eq!(reopened.list_frames()?, [key]);
 		Ok(())
 	}
 }

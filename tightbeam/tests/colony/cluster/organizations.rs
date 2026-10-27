@@ -21,6 +21,8 @@ use tightbeam::utils::time::{Clock, ManualClock};
 #[cfg(feature = "testing-fdr")]
 use tightbeam::testing::fdr::FdrConfig;
 #[cfg(feature = "testing-fdr")]
+use tightbeam::testing::specs::csp::ProcessBuildError;
+#[cfg(feature = "testing-fdr")]
 use tightbeam::testing::{Expect, Layer};
 
 /// Two organizations and one drifter under a single transport trust store.
@@ -78,10 +80,10 @@ fn multi_org_ctx() -> MultiOrgCtx {
 	}
 }
 
-/// A live advertise beat races direct advertisements against slate rumors, so
-/// a rumor can land after a fresher advertisement and drop as stale. Scenarios
-/// built on this config inject their control-plane frames instead, which is
-/// what keeps their traces exact enough to refine a process.
+/// A member configuration with the advertise beat off. A live beat races
+/// direct advertisements against slate rumors, so a rumor can land after a
+/// fresher advertisement and drop as stale. Scenarios on it inject their
+/// control-plane frames, so each trace stays exact enough to refine a process.
 fn quiet_member_conf(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTrust>) -> ClusterConfig {
 	let mut conf = federation_conf(certs, peer_trust, vec![], 1);
 	conf.peer.advertise_interval = None;
@@ -130,33 +132,45 @@ tb_process_spec! {
 /// FDR bounds for the multi-organization control plane. The process has no
 /// hidden events, so `max_internal_run` guards against model regressions.
 #[cfg(feature = "testing-fdr")]
-fn multi_org_fdr() -> FdrConfig {
-	FdrConfig {
+fn multi_org_fdr() -> Result<FdrConfig, ProcessBuildError> {
+	Ok(FdrConfig {
 		seeds: 2,
 		max_depth: 16,
 		max_internal_run: 4,
 		timeout_ms: 5000,
-		specs: vec![MultiOrgControlPlane::process()],
+		specs: vec![MultiOrgControlPlane::process()?],
 		fail_fast: true,
 		..Default::default()
-	}
+	})
 }
 
 #[cfg(feature = "testing-fdr")]
-fn multi_org_config() -> Result<ScenarioConfig, ScenarioConfigError> {
-	ScenarioConfig::builder()
+fn multi_org_config() -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let builder = ScenarioConfig::builder()
 		.with_spec(ClusterMultiOrgBoundarySpec::latest())
-		.with_csp(MultiOrgControlPlane)
-		.with_fdr(multi_org_fdr())
-		.build()
+		.with_csp(MultiOrgControlPlane);
+
+	Ok(builder.with_fdr(multi_org_fdr()?).build()?)
 }
 
 #[cfg(not(feature = "testing-fdr"))]
-fn multi_org_config() -> Result<ScenarioConfig, ScenarioConfigError> {
-	ScenarioConfig::builder()
+fn multi_org_config() -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let builder = ScenarioConfig::builder()
 		.with_spec(ClusterMultiOrgBoundarySpec::latest())
-		.with_csp(MultiOrgControlPlane)
-		.build()
+		.with_csp(MultiOrgControlPlane);
+
+	Ok(builder.build()?)
+}
+
+/// The configuration that grades `spec`, refines the run against the
+/// multi-organization control plane, and expects `expect`.
+#[cfg(feature = "testing-fdr")]
+fn multi_org_model_config(
+	spec: &'static tightbeam::testing::macros::BuiltAssertSpec,
+	expect: Expect,
+) -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let builder = ScenarioConfig::builder().with_spec(spec).with_fdr(multi_org_fdr()?);
+	Ok(builder.with_expect(expect).build()?)
 }
 
 tb_scenario! {
@@ -208,9 +222,8 @@ tb_scenario! {
 
 			// The gateway admits the relay envelope, so only the inner realm
 			// admission can drop this one.
-			let foreign_ns =
-				ColonyNamespace::new("tightbeam", "other-realm").map_err(|_| TightBeamError::MissingResponse)?;
-			let foreign_type = foreign_ns.servlet("ping").map_err(|_| TightBeamError::MissingResponse)?;
+			let foreign_ns = ColonyNamespace::new("tightbeam", "other-realm")?;
+			let foreign_type = foreign_ns.servlet("ping")?;
 			let status = flood_ad_rumor(
 				&ctx.entry,
 				&ctx.rogue_key,
@@ -227,7 +240,6 @@ tb_scenario! {
 				"the entry gateway admits the relay envelope of the rogue advertisement"
 			);
 
-			// The in-organization route stays intact through every refusal.
 			assert_eq!(type_route_count(&gateway_entry, "ping"), 1, "the in-organization route survives every refusal");
 
 			gateway_entry.stop();
@@ -239,7 +251,7 @@ tb_scenario! {
 }
 
 /// Polls until gateways have learned `count` slate rumors, or five seconds
-/// pass. The spec judges the count, so the wait answers nothing.
+/// pass. The spec judges the count, so the wait leaves the verdict to the spec.
 async fn wait_for_learned_slates(trace: &TraceCollector, count: usize) {
 	let learned = || trace.recorded(events::CLUSTER_PEER_AD_LEARNED) >= count;
 	poll_until(50, Duration::from_millis(100), learned).await;
@@ -276,6 +288,7 @@ tb_scenario! {
 			let clock = Arc::new(ManualClock::default());
 			let mut neighbor_conf = federation_conf(&ctx.neighbor, Arc::clone(&ctx.peers_of_neighbor), vec![cluster.addr().to_string()], 1);
 			neighbor_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+
 			let gateway_neighbor = start_cluster(&trace, neighbor_conf).await?;
 
 			// The beat floods the slate rumor after it advertises, so the
@@ -437,10 +450,7 @@ tb_assert_spec! {
 #[cfg(feature = "testing-fdr")]
 tb_scenario! {
 	name: cluster_multi_org_control_plane_refines_model,
-	config: ScenarioConfig::builder()
-		.with_spec(ClusterMultiOrgModelSpec::latest())
-		.with_fdr(multi_org_fdr())
-		.build(),
+	config: multi_org_model_config(ClusterMultiOrgModelSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(events::CLUSTER_PEER_AD_LEARNED)?;
@@ -471,11 +481,7 @@ tb_assert_spec! {
 #[cfg(feature = "testing-fdr")]
 tb_scenario! {
 	name: cluster_multi_org_model_rejects_forward_before_learn,
-	config: ScenarioConfig::builder()
-		.with_spec(ClusterMultiOrgViolationSpec::latest())
-		.with_fdr(multi_org_fdr())
-		.with_expect(Expect::Violation(Layer::Refinement))
-		.build(),
+	config: multi_org_model_config(ClusterMultiOrgViolationSpec::latest(), Expect::Violation(Layer::Refinement)),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(events::CLUSTER_WORK_FORWARDED)?;

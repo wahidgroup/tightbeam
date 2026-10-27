@@ -7,6 +7,8 @@
 //!   cluster to a hive, and [`ClusterCommandResponse`] answers it.
 //! - [`ReplyShape`] decides the alternative and the priority of a command's reply.
 
+use core::fmt;
+
 use crate::asn1::Frame;
 use crate::builder::TypeBuilder;
 use crate::cms::signed_data::SignerIdentifier;
@@ -21,9 +23,9 @@ use crate::{Beamable, Message, MessagePriority, TightBeamError, Version};
 
 /// The work request envelope for cluster routing.
 ///
-/// Clients send this to the cluster gateway. The gateway selects a local
-/// servlet or peer gateway by `servlet_type`, then delivers the client
-/// frame in `payload` to the servlet byte-for-byte.
+/// Clients send it to the cluster gateway, which selects a local servlet or a
+/// peer gateway by `servlet_type` and delivers the client frame in `payload`
+/// to the servlet byte-for-byte.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkRequest {
 	/// The target servlet type URN, such as `urn:tightbeam::servlet:ping`.
@@ -35,8 +37,8 @@ pub struct ClusterWorkRequest {
 	/// integrity, and previous-frame linkage stay verifiable at the
 	/// servlet ([`Frame::verify`]).
 	pub payload: Vec<u8>,
-	/// The relay budget, which counts the gateway forwards this work may
-	/// still spend.
+	/// The relay budget: the count of gateway forwards that remain for this
+	/// work.
 	///
 	/// - A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel through
 	///   [`ClusterWorkRequest::new`], so gateway policy decides the budget.
@@ -159,9 +161,8 @@ impl ClusterWorkResponse {
 
 	/// Unwraps a gateway reply down to the servlet's response frame.
 	///
-	/// This is the inverse of [`ClusterWorkRequest::transport_frame`]: the
-	/// reply is the hop-local wrapper, and the servlet's own frame travels
-	/// inside it.
+	/// It is the inverse of [`ClusterWorkRequest::transport_frame`]: the reply
+	/// is the hop-local wrapper, with the servlet's own frame inside it.
 	///
 	/// # Errors
 	///
@@ -254,9 +255,8 @@ pub struct ServletAddressUpdate {
 /// One servlet instance that enters or leaves a hive's slate.
 ///
 /// The encoded update carries an instance under `added` and a bare URN under
-/// `removed`, so the direction picks which field the instance lands in. A
-/// variant names the direction, so that choice stays with the value it
-/// applies to.
+/// `removed`. A variant names the direction, so the choice of field stays
+/// with the value it applies to.
 pub(crate) enum ServletChange {
 	/// An instance that joined the slate, with the address that reaches it.
 	Added(ServletInfo),
@@ -326,7 +326,7 @@ pub enum GossipRumorKind {
 ///
 /// # Roles
 ///
-/// This one structure serves both gossip roles:
+/// It serves both gossip roles:
 ///
 /// - A publisher sends it as [`ClusterRequest::PublishGossip`] to request a flood.
 /// - The origin gateway that accepts it embeds the identical DER bytes as the
@@ -398,8 +398,8 @@ impl GossipResponse {
 	/// the rumor's origin.
 	///
 	/// A gateway signs every frame it relays, so on the reply to its own relay
-	/// `Unauthenticated` names the origin. This method is the one reading of
-	/// that status, which the reflood and the repair push both ask.
+	/// `Unauthenticated` names the origin. It is the one reading of that
+	/// status, which the reflood and the repair push both ask.
 	#[must_use]
 	pub(crate) fn refuses_origin(&self) -> bool {
 		self.status == TransitStatus::Unauthenticated
@@ -409,9 +409,9 @@ impl GossipResponse {
 /// A summary of the rumors a gateway retains, sent so a peer can pull the
 /// ones it lacks.
 ///
-/// This is the anti-entropy backstop to the best-effort flood. Reconciliation
-/// is a stateless, unordered set difference over content digests. A receiver
-/// drops a wrong-length entry rather than treat it as a digest (CWE-20).
+/// It is the anti-entropy backstop to the best-effort flood: a stateless,
+/// unordered set difference over content digests. A receiver drops an entry
+/// of the wrong length (CWE-20).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipReconciliation {
 	/// The content digests the sender retains.
@@ -422,7 +422,7 @@ wire_sequence!(GossipReconciliation { held: octets_seq });
 
 /// One peer shared over peer exchange, as an identity and where to dial it.
 ///
-/// A sharer only exchanges peers it verified itself, yet the entry is still an
+/// A sharer only exchanges peers it verified itself, yet the entry is an
 /// unverified hint to its receiver:
 ///
 /// - Admission is bounded per address prefix.
@@ -612,8 +612,8 @@ pub enum ManageShape {
 ///
 /// A sender decodes the response in the shape it asked in, so a refusal
 /// answered in another one reads as a malformed response and counts toward
-/// eviction. The shape is a property of the command body, so it lives here,
-/// once, for every refusal site.
+/// eviction. The shape is a property of the command body, so every refusal
+/// site reads it here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyShape {
 	/// Answer in the heartbeat alternative.
@@ -630,6 +630,27 @@ impl HiveManagement {
 			Self::Spawn(_) => ManageShape::Spawn,
 			Self::List(_) => ManageShape::List,
 			Self::Stop(_) => ManageShape::Stop,
+		}
+	}
+}
+
+/// The record of a command that a hive carried out: the name of the command
+/// and the instance it changed, which render its label as
+/// `<command>/<instance>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AcceptedRecord<'a> {
+	/// The name of the command, such as `Spawn`.
+	name: &'static str,
+	/// The instance that the command changed. The record of a spawn whose
+	/// answer names no instance renders the name of the command alone.
+	instance: Option<&'a Urn<'static>>,
+}
+
+impl fmt::Display for AcceptedRecord<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self.instance {
+			Some(instance) => write!(f, "{}/{instance}", self.name),
+			None => f.write_str(self.name),
 		}
 	}
 }
@@ -661,15 +682,33 @@ impl ClusterCommand {
 	pub(crate) fn yields_to_load(&self) -> bool {
 		self.reply_shape().yields_to_load()
 	}
+
+	/// The record of this command once the hive carries it out and answers it
+	/// with `response`.
+	///
+	/// A spawn names the instance `response` names, a stop names its own, and a
+	/// command that reads the hive has no record.
+	pub(crate) fn accepted<'a>(&'a self, response: &'a ClusterCommandResponse) -> Option<AcceptedRecord<'a>> {
+		match self {
+			Self::Manage(HiveManagement::Spawn(_)) => {
+				let instance = response.spawned();
+				Some(AcceptedRecord { name: "Spawn", instance })
+			}
+			Self::Manage(HiveManagement::Stop(stop)) => {
+				let instance = Some(&stop.servlet_id);
+				Some(AcceptedRecord { name: "Stop", instance })
+			}
+			Self::Heartbeat(_) | Self::Manage(HiveManagement::List(_)) => None,
+		}
+	}
 }
 
 impl ReplyShape {
 	/// The shape a reply to `body` must use.
 	///
 	/// A body that does not decode as a command has no shape of its own, so
-	/// its reply uses the stop alternative. That alternative carries only a
-	/// status, which is the one thing a refusal of an unreadable command can
-	/// report.
+	/// its reply uses the stop alternative. It carries only a status, the one
+	/// thing a refusal of an unreadable command can report.
 	#[must_use]
 	pub fn of(body: Option<&ClusterCommand>) -> Self {
 		body.map_or(Self::Manage(ManageShape::Stop), ClusterCommand::reply_shape)
@@ -678,8 +717,8 @@ impl ReplyShape {
 	/// Whether a command answered in this shape yields to load.
 	///
 	/// A liveness command, the heartbeat, survives drain and backpressure,
-	/// and its reply leads the queue, so a health check answered under load
-	/// still reports. A management command yields to both.
+	/// and its reply leads the queue, so a health check reports even under
+	/// load. A management command yields to both.
 	fn yields_to_load(self) -> bool {
 		match self {
 			Self::Heartbeat => false,
@@ -690,8 +729,8 @@ impl ReplyShape {
 	/// The form a reply in this shape travels in.
 	///
 	/// The reply to a command that survives load travels at
-	/// [`MessagePriority::NetworkControl`]. The reply to a command that yields
-	/// to load travels at the default priority.
+	/// [`MessagePriority::NetworkControl`], and the reply to one that yields
+	/// at the default priority.
 	fn form(self) -> ReplyForm {
 		if self.yields_to_load() {
 			ReplyForm::Plain
@@ -761,7 +800,7 @@ impl ReplyForm {
 	}
 }
 
-/// The parameters of a request that spawns a new servlet.
+/// The parameters of a request that spawns one servlet instance.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletParams {
 	/// The type URN of the servlet to spawn, such as
@@ -820,8 +859,8 @@ pub struct StopServletResult {
 }
 
 impl HiveManagementOutcome {
-	/// Creates an `Ok` spawn result that names the new servlet's address and
-	/// instance URN.
+	/// Creates an `Ok` spawn result that names the spawned servlet's address
+	/// and instance URN.
 	///
 	/// # Examples
 	///
@@ -908,7 +947,6 @@ impl HiveManagementOutcome {
 
 /// The status that a cluster reports in a heartbeat.
 ///
-/// A cluster reports its operational status to its hives in each heartbeat.
 /// A hive may use it to adjust its behavior, such as a lower capacity while
 /// the cluster drains.
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1050,7 +1088,7 @@ impl ClusterCommandResponse {
 
 	/// Refuses a command with `status` in the alternative that `shape` names.
 	///
-	/// This is the one refusal constructor, so a refusal answers in the
+	/// It is the one refusal constructor, so a refusal answers in the
 	/// alternative its sender decodes. A heartbeat refusal reports no
 	/// capacity, and a management refusal is
 	/// [`HiveManagementOutcome::refusal`] in its own alternative.
@@ -1071,15 +1109,25 @@ impl ClusterCommandResponse {
 			ReplyShape::Manage(manage) => Self::Manage(HiveManagementOutcome::refusal(manage, status)),
 		}
 	}
+
+	/// The instance that this response names as spawned, for the answer to a
+	/// spawn.
+	pub(crate) fn spawned(&self) -> Option<&Urn<'static>> {
+		let Self::Manage(HiveManagementOutcome::Spawn(spawned)) = self else {
+			return None;
+		};
+
+		spawned.servlet_id.as_ref()
+	}
 }
 
 /// The issue time a colony frame states.
 ///
 /// The frame layer leaves `metadata.order` protocol-opaque. Colony control
 /// frames, rumors, and advertisements all put their issue time there as unix
-/// milliseconds (§5.7.1 permits a time-based order). This trait is the one
-/// place that reads it, so every freshness and replay decision compares the
-/// same instant.
+/// milliseconds (§5.7.1 permits a time-based order). It is the one place
+/// that reads it, so every freshness and replay decision compares the same
+/// instant.
 pub(crate) trait IssuedAt {
 	/// The issue time this frame states.
 	fn issued_at(&self) -> UnixMillis;
@@ -1130,7 +1178,7 @@ mod tests {
 		Frame::v0(b"work-1", vec![0x02, 0x01, 0x2A])
 	}
 
-	/// A frame whose body is `command` as the wire spells it.
+	/// A frame whose body is the DER encoding of `command`.
 	fn command_frame(command: &ClusterCommand) -> Frame {
 		let body = encode(command).expect("a cluster command encodes");
 
@@ -1157,9 +1205,7 @@ mod tests {
 	#[test]
 	fn choice_of_reads_the_one_command_a_frame_carries() {
 		let frame = command_frame(&ClusterCommand::Heartbeat(healthy()));
-
 		let choice = ClusterCommand::choice_of(&frame);
-
 		assert_eq!(choice, Some(ClusterCommand::Heartbeat(healthy())));
 	}
 
@@ -1171,16 +1217,13 @@ mod tests {
 		let frame = Frame::v0(b"command-1", two);
 
 		let choice = ClusterCommand::choice_of(&frame);
-
 		assert_eq!(choice, None);
 	}
 
 	#[test]
 	fn choice_of_refuses_a_body_that_is_no_command() {
 		let frame = work_frame();
-
 		let choice = ClusterCommand::choice_of(&frame);
-
 		assert_eq!(choice, None);
 	}
 
@@ -1569,7 +1612,7 @@ mod tests {
 	}
 
 	/// A heartbeat reply travels on a V2 frame at network-control priority,
-	/// so a health check answered under load still leads the queue.
+	/// so a health check answered under load leads the queue.
 	#[test]
 	fn a_heartbeat_reply_travels_at_network_control_priority() -> Result<()> {
 		let response = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0);

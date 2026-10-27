@@ -4,16 +4,13 @@
 //! it. [`Hop`] holds that pair, so a hop fixes the plane of its payload once,
 //! at construction.
 //!
-//! - A servlet hop dials through [`HivePlane::servlet`], which binds the hop
-//!   to the signer the servlet's registration names.
-//! - A heartbeat dials through [`HivePlane::hive`], which binds the hop to the
-//!   signer of the hive's registration.
+//! - A servlet hop dials through [`HivePlane::servlet`], which binds it to the signer its registration names.
+//! - A heartbeat dials through [`HivePlane::hive`], which binds it to the signer of the hive's registration.
 //! - A peer hop dials through [`PeerPlane::hop`], which binds the hop to the gateway its route names.
 //! - A gossip dial goes through [`PeerPlane::connect_member`], which proves the answer is a flood member.
-//! - A direct advertisement goes through [`PeerPlane::advertiser`], which
-//!   hands out the one unbound dial, so its client talks to whichever gateway
-//!   answers. Its connection stays pooled only when that gateway is a flood
-//!   member.
+//! - A direct advertisement goes through [`PeerPlane::advertiser`], the one
+//!   unbound dial, so its client talks to whichever gateway answers. Its
+//!   connection stays pooled only when that gateway is a flood member.
 
 use std::sync::Arc;
 
@@ -89,14 +86,14 @@ impl<P: Protocol> HivePlane<P> {
 /// An advertisement binds its signer to the socket it claims. The pool is
 /// private, and the plane offers three ways to it:
 ///
-/// - [`Self::hop`] carries a route and holds the gateway that answers to it
-///   before any frame leaves. A forward dials this way, so it reaches only
-///   the gateway its route names (CWE-668).
-/// - [`Self::connect_member`] holds an address and proves the answer is a
-///   flood member before any frame leaves. A reconcile round and a rumor
-///   flood dial this way, so gossip stays inside the flood (CWE-668).
-/// - [`Self::advertiser`] hands out the one unbound dial, so its client talks
-///   to whichever gateway answers. A direct advertisement dials this way.
+/// - [`Self::hop`] carries a route and holds the answer to the gateway it
+///   names before any frame leaves. A forward dials this way, so it reaches
+///   only that gateway (CWE-668).
+/// - [`Self::connect_member`] proves the answer at an address is a flood
+///   member before any frame leaves. A reconcile round and a rumor flood dial
+///   this way, so gossip stays inside the flood (CWE-668).
+/// - [`Self::advertiser`] hands out the one unbound dial, which a direct
+///   advertisement uses, so its client talks to whichever gateway answers.
 pub(crate) struct PeerPlane<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
 	config: ColonyConfig<P>,
@@ -189,15 +186,12 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 	/// Connects to `address` and returns the client once the gateway that
 	/// answered proved it belongs to this gateway's flood.
 	///
-	/// A reconcile round and a rumor flood dial this way, so gossip bytes
-	/// leave only toward a flood member (CWE-668).
-	///
 	/// - A cold connection defers its handshake to the first emit, so the
 	///   handshake completes here, before the caller can send anything.
-	/// - `None` means a gateway outside the flood answered. That is an answer
-	///   about the address, where an `Err` is a failed dial.
-	/// - The method asks for the proof on every call, so a pooled connection
-	///   to a gateway the trust store has since dropped yields `None`.
+	/// - `None` means a gateway outside the flood answered, an answer about
+	///   the address, where an `Err` is a failed dial.
+	/// - It asks for the proof on every call, so a pooled connection to a
+	///   gateway the trust store has since dropped yields `None`.
 	/// - An answer outside the flood takes its connection out of the pool, so a
 	///   later dial of the address meets the party that answers it then.
 	///
@@ -533,11 +527,11 @@ mod tests {
 		Ok(())
 	}
 
-	// A gateway records on its own trace the gate verdict of each request its
-	// colony plane answers.
+	// A gateway records on its connection trace the gate verdict of each
+	// request its colony plane answers, and its own trace records none.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
-	async fn a_gateway_records_the_gate_verdicts_of_its_colony_plane_on_its_own_trace() -> TestResult {
+	async fn a_gateway_records_the_gate_verdicts_of_its_colony_plane_on_its_connection_trace() -> TestResult {
 		use crate::instrumentation::events;
 		use crate::testing::fixtures::TestTrace;
 
@@ -546,8 +540,10 @@ mod tests {
 		let advertiser = dialer.peers().advertiser();
 		advertiser.advertise(*dialer.member.addr(), &advertisement).await?;
 
-		let verdicts = TestTrace::trail(&dialer.member.trace(), &[events::GATE_ACCEPT, events::GATE_REJECT]);
-		assert_eq!(verdicts, [events::GATE_ACCEPT]);
+		let kept = [events::GATE_ACCEPT, events::GATE_REJECT];
+		let own = TestTrace::trail(&dialer.member.trace(), &kept);
+		let connections = TestTrace::trail(&dialer.member.connection_trace(), &kept);
+		assert_eq!((own, connections), (vec![], vec![events::GATE_ACCEPT]));
 		Ok(())
 	}
 

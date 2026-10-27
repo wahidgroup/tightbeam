@@ -137,6 +137,17 @@ tb_cases! {
 	}
 }
 
+/// A shutdown with no stream in flight ends on the poll that sends its
+/// GoAway, so the future that `kick_shutdown` returns yields the output of
+/// that poll.
+#[tokio::test]
+async fn a_shutdown_that_ends_on_its_first_poll_yields_its_output() -> Result<(), TightBeamError> {
+	let link = establish_client_mux_server_raw(4, TraceCollector::new()).await?;
+	let shutdown = kick_shutdown(&link.client.handle).await;
+	shutdown.await?;
+	Ok(())
+}
+
 async fn run_peer_reason_case(reason: GoAwayReason, trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let mut link = establish_client_mux_server_raw(4, trace).await?;
 
@@ -178,7 +189,7 @@ tb_cases! {
 	}
 }
 
-/// Write `count` requests from the raw client, one per stream, and report
+/// Writes `count` requests from the raw client, one per stream, and reports
 /// whether each draws its own response, beside the ID of the last stream.
 ///
 /// # Errors
@@ -322,9 +333,9 @@ tb_assert_spec! {
 	}
 }
 
-// The cancel budget must also reach the responder on the
-// `MuxAcceptor::serve` path the servlet macro runs, because
-// `mux_cancel_budget_boundary` covers only the hand-assembled spawn path.
+// The cancel budget must also reach the responder on the `MuxAcceptor::serve`
+// path the servlet macro runs, because `mux_cancel_budget_boundary` covers only
+// the hand-assembled spawn path.
 tb_scenario! {
 	name: mux_serve_applies_cancel_budget,
 	spec: MuxServeCancelBudgetSpec,

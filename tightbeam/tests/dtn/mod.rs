@@ -1,8 +1,7 @@
 //! The Delay-Tolerant Networking (DTN) tests.
 //!
-//! These tests show that tightbeam provides delay tolerance without the
-//! traditional DTN infrastructure, such as custody transfer and the Bundle
-//! Protocol.
+//! They show that tightbeam gives delay tolerance without the traditional DTN
+//! infrastructure, such as custody transfer and the Bundle Protocol.
 //!
 //! ## Traditional DTN Architecture
 //!
@@ -10,11 +9,11 @@
 //! - **Custody Transfer Protocol**: Hop-by-hop acknowledgments with trusted intermediaries.
 //! - **Bundle Protocol**: A complex protocol stack for store-and-forward.
 //! - **Persistent Storage**: Each hop stores bundles until the next hop is available.
-//! - **Trusted Nodes**: Each relay must be trusted to handle custody.
+//! - **Trusted Nodes**: Each relay must be trusted to take custody.
 //!
 //! ## Tightbeam DTN Approach
 //!
-//! Tightbeam reaches delay tolerance through these parts of its design:
+//! Tightbeam reaches delay tolerance through its design:
 //! - **Cryptographic Chain**: The `previous_frame` hash chain gives end-to-end verification.
 //! - **Self-Verifying Messages**: The destination verifies each message itself, with no custody transfer.
 //! - **No Trusted Intermediaries**: Relays stay untrusted, and cryptography proves integrity.
@@ -48,6 +47,7 @@ pub mod fault_manager;
 pub mod fault_matrix;
 pub mod faults;
 pub mod frame_builder;
+pub mod intake;
 pub mod jobs;
 pub mod messages;
 pub mod nodes;

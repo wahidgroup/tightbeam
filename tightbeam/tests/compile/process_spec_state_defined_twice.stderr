@@ -1,0 +1,14 @@
+error[E0428]: the name `Idle` is defined multiple times
+  --> tests/compile/process_spec_state_defined_twice.rs:8:1
+   |
+ 8 | / tb_process_spec! {
+ 9 | |     pub Pings,
+10 | |     events {
+11 | |         observable { PING }
+...  |
+18 | |     terminal { Done }
+19 | | }
+   | |_^ `Idle` redefined here
+   |
+   = note: `Idle` must be defined only once in the type namespace of this enum
+   = note: this error originates in the macro `$crate::tb_process_spec` which comes from the expansion of the macro `tb_process_spec` (in Nightly builds, run with -Z macro-backtrace for more info)

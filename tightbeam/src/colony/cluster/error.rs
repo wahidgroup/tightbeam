@@ -34,15 +34,14 @@ pub enum ClusterError {
 	#[error("No hives available for servlet type: {:#?}")]
 	NoHivesAvailable(Vec<u8>),
 
-	/// The gateway could not connect to the selected hive, servlet, or peer
-	/// gateway, because the dial or the handshake failed, or a peer route met
-	/// a gateway with no peer plane.
+	/// The dial or the handshake to the selected hive, servlet, or peer gateway
+	/// failed, or a peer route met a gateway with no peer plane.
 	#[error("Connect failed")]
 	ConnectFailed,
 
 	/// The party that answered a bound dial presented no certificate, or one
-	/// its route or its registration does not name, so the gateway ended the
-	/// dial before it sent any frame to that party.
+	/// that its route or registration does not name. The gateway ended the dial
+	/// before it sent that party a frame.
 	#[error("Peer identity mismatch")]
 	PeerMismatch,
 
@@ -60,6 +59,13 @@ pub enum ClusterError {
 	#[error("Frame error: {0}")]
 	#[from]
 	Frame(TightBeamError),
+
+	/// A signature that this gateway made fails to verify under its own
+	/// signing certificate, so its key backend signs with a key that its
+	/// identity does not certify.
+	#[error("Own signature refused: {0}")]
+	#[source]
+	OwnSignatureRefused(TightBeamError),
 
 	/// The response decoded but did not carry the expected field.
 	#[error("Malformed response")]
@@ -104,9 +110,8 @@ pub enum ClusterError {
 	#[error("Peer advertisement is stale")]
 	StalePeerAd,
 
-	/// The gossip journal refused a record because the journal reached its
-	/// capacity, or the record's signer reached its cap for records of that
-	/// kind.
+	/// The gossip journal refused a record: the journal is at capacity, or the
+	/// record's signer is at its cap for that record kind.
 	#[error("Gossip journal at capacity")]
 	GossipJournalAtCapacity,
 
@@ -126,13 +131,11 @@ impl From<AddrParseError> for ClusterError {
 }
 
 impl ClusterError {
-	/// The status a refused hive registration or address update answers
-	/// with.
+	/// The status a refused hive registration or address update answers with.
 	///
-	/// A poisoned registry is this gateway's fault, so the gateway tells the
-	/// hive it is unavailable rather than that the hive lacks the right to
-	/// register. Every other refusal is a claim the gateway judged and
-	/// denied.
+	/// A poisoned registry is this gateway's fault, so it answers `Unavailable`
+	/// and not a denial of the hive's right to register. Every other refusal is
+	/// a claim the gateway judged and denied.
 	#[must_use]
 	pub(crate) fn transit_status(&self) -> TransitStatus {
 		match self {
@@ -147,8 +150,8 @@ impl ClusterError {
 	/// - A fault that [`Self::proves_undelivered`] answers [`TransitStatus::Unavailable`].
 	/// - Any other fault answers [`TransitStatus::Unknown`], because the frame may have run.
 	///
-	/// A gateway that forwards to this one therefore reads `Unavailable` as a
-	/// frame that never ran, and retries it on another route.
+	/// An upstream gateway reads `Unavailable` as a frame that never ran, and
+	/// retries it on another route.
 	#[must_use]
 	pub(crate) fn forward_status(&self) -> TransitStatus {
 		let answered = match self {
@@ -207,6 +210,7 @@ impl ClusterError {
 			| Self::NoResponse
 			| Self::Transport(_)
 			| Self::Frame(_)
+			| Self::OwnSignatureRefused(_)
 			| Self::MalformedResponse
 			| Self::RegistrationFailed
 			| Self::InvalidAddress(_)
@@ -216,6 +220,44 @@ impl ClusterError {
 			| Self::GossipJournalAtCapacity
 			| Self::GossipJournalUnavailable
 			| Self::OversizedReconcileReply => false,
+		}
+	}
+
+	crate::macros::names::refusal_names! {
+		[
+			/// The label of an [`TransitStatus::Unavailable`] refusal for this
+			/// error, a fault of the gateway's own: `Unavailable/` and the
+			/// error's stable kebab-case name.
+			///
+			/// The name leaves out the error's fields, so one fault reads as
+			/// one label whatever it names.
+			#[must_use]
+			fn unavailable_label = "Unavailable/";
+		]
+		{
+			Self::LockPoisoned => "lock-poisoned",
+			Self::InvalidPeerAddress => "invalid-peer-address",
+			Self::AdvertiseAddressRequired => "advertise-address-required",
+			Self::UnknownServletType(_) => "unknown-servlet-type",
+			Self::NoHivesAvailable(_) => "no-hives-available",
+			Self::ConnectFailed => "connect-failed",
+			Self::PeerMismatch => "peer-mismatch",
+			Self::NoResponse => "no-response",
+			Self::Transport(_) => "transport",
+			Self::Frame(_) => "frame",
+			Self::OwnSignatureRefused(_) => "own-signature-refused",
+			Self::MalformedResponse => "malformed-response",
+			Self::RegistrationFailed => "registration-failed",
+			Self::InvalidAddress(_) => "invalid-address",
+			Self::ServletNotOwned => "servlet-not-owned",
+			Self::ServletNotFound => "servlet-not-found",
+			Self::SignerMismatch => "signer-mismatch",
+			Self::PeerSlateConflict => "peer-slate-conflict",
+			Self::PeerCapExceeded => "peer-cap-exceeded",
+			Self::StalePeerAd => "stale-peer-ad",
+			Self::GossipJournalAtCapacity => "gossip-journal-at-capacity",
+			Self::GossipJournalUnavailable => "gossip-journal-unavailable",
+			Self::OversizedReconcileReply => "oversized-reconcile-reply",
 		}
 	}
 }

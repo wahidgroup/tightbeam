@@ -53,6 +53,17 @@ use crate::utils::time::Clock;
 use crate::zeroize::Zeroizing;
 use crate::Frame;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+mod handshake_imports {
+	pub use core::future::Future;
+	pub use core::time::Duration;
+
+	pub use crate::transport::state::ServerHandshakeSlot;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use handshake_imports::*;
+
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-hpke")
@@ -167,9 +178,9 @@ impl From<TcpStream> for TokioStream {
 /// # Provider
 ///
 /// In a type position, `TokioListener` alone names the house provider,
-/// [`DefaultCryptoProvider`]. In an expression, the compiler infers the
-/// provider `P` from the calls, so a call names `P` where no other type names
-/// it, in one of these shapes:
+/// [`DefaultCryptoProvider`]. In an expression, the compiler infers `P` from
+/// the calls, so a call names `P` where no other type names it, in one of these
+/// shapes:
 ///
 /// - `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)`, for a listener a `server!` block serves,
 /// - `<TokioListener as EncryptedProtocol>::bind_with(addr, config)`, for a listener bound through the trait,
@@ -227,8 +238,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	}
 
 	/// Accepts one connection as a transport built from this listener's
-	/// configuration, which names the address it accepted the connection
-	/// from.
+	/// configuration, and returns it with the address of the peer.
 	///
 	/// # Errors
 	///
@@ -307,9 +317,8 @@ where
 {
 	/// Reports whether the underlying stream appears connected.
 	///
-	/// External protocols need this liveness hook to implement
-	/// [`PersistentConnection`] for pooled connections, and the stream itself
-	/// stays private.
+	/// An external protocol implements [`PersistentConnection`] for pooled
+	/// connections through this hook, because the stream stays private.
 	pub fn is_alive(&self) -> bool {
 		AsyncProtocolStream::is_alive(&self.stream)
 	}
@@ -385,10 +394,10 @@ where
 	///
 	/// # Role
 	///
-	/// The caller passes the endpoint role that it assembles. Unlike the
-	/// [`MuxConnector`] and [`MuxAcceptor`] pool traits, this method works for
-	/// either role without the policy plane, so WebSocket transports, native
-	/// and wasm, assemble the same way.
+	/// The caller passes the role it assembles. Unlike the [`MuxConnector`] and
+	/// [`MuxAcceptor`] pool traits, this method serves either role without the
+	/// policy plane, so native and wasm WebSocket transports assemble the same
+	/// way.
 	///
 	/// # Errors
 	///
@@ -535,8 +544,8 @@ impl SplitRecv {
 		}
 	}
 
-	/// The receive cipher of an encrypted half, or `None` for a cleartext
-	/// half, under which an arrival admits.
+	/// The receive cipher of an encrypted half, under which the half admits an
+	/// arrival, or `None` for a cleartext half.
 	const fn cipher(&self) -> Option<&RecvCipher> {
 		match self {
 			Self::Cleartext => None,
@@ -854,8 +863,8 @@ where
 	///   [`TransportReader`] and its send key into the [`TransportWriter`].
 	///   Directional keys make this a transfer of ownership, so the halves
 	///   share no mutable cryptographic state.
-	/// - A transport that names cleartext splits into cleartext halves, which carry
-	///   NO confidentiality, integrity, replay, or deletion protection.
+	/// - A transport that names cleartext splits into cleartext halves, which
+	///   carry NO confidentiality, integrity, replay, or deletion protection.
 	///
 	/// The operation deadline carries onto both halves and bounds every read
 	/// and write, as on the unsplit path. A peer that goes idle, or sends a
@@ -974,6 +983,41 @@ where
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl<S: AsyncProtocolStream, P: CryptoProvider> ServerHandshakeSlot for TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
+		&mut self.server_handshake
+	}
+
+	/// Bounds `operation` with the tokio timer, as the reads and writes are.
+	///
+	/// A thread with no runtime has no timer, so the call fails closed.
+	/// A build without `tokio` runs `operation` unbounded.
+	async fn within_budget<T, F>(budget: Duration, operation: F) -> TransportResult<T>
+	where
+		F: Future<Output = TransportResult<T>>,
+	{
+		#[cfg(feature = "tokio")]
+		{
+			if tokio::runtime::Handle::try_current().is_err() {
+				return Err(TransportError::OperationFailed(TransportFailure::FailedPrecondition));
+			}
+
+			let bounded = timeout(budget, operation).await;
+			bounded.unwrap_or_else(|elapsed| Err(elapsed.into()))
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		{
+			let _unbounded = budget;
+			operation.await
+		}
+	}
+}
+
 /// This impl covers every provider `P`, so a call names `P` where no other
 /// type names it, as [`TokioListener`] shows under `# Provider`.
 impl<S: AsyncProtocolStream, P: HandshakeProvider> MessageCollector for TcpTransport<S, P>
@@ -1071,6 +1115,7 @@ mod tests {
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 	use crate::policy::TransitStatus;
 	use crate::prelude::TightBeamSocketAddr;
+	use crate::runtime::ParkingExecutor;
 	use crate::testing::*;
 	use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
@@ -1109,10 +1154,8 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	use crate::transport::state::SessionState;
 
-	/// Serves one single-flight request.
-	///
-	/// The function collects the request, applies `reply` to an accepted
-	/// frame, and answers with the gate's status.
+	/// Serves one single-flight request. It applies `reply` to an accepted
+	/// frame and answers with the gate's status.
 	async fn respond_with<T, F>(transport: &mut T, reply: F) -> TransportResult<()>
 	where
 		T: MessageCollector + Send,
@@ -1305,7 +1348,7 @@ mod tests {
 		}
 
 		/// A frame stream that stays pending on every read and write, as with a
-		/// peer that has stalled.
+		/// stalled peer.
 		struct StalledStream;
 
 		impl AsyncReadStream for StalledStream {
@@ -1351,7 +1394,7 @@ mod tests {
 		}
 
 		/// A split half sets its deadline one operation timeout past the
-		/// reading of its connection clock, so a stalled peer ends the read
+		/// reading of its connection clock, so a read from a stalled peer ends
 		/// once that timeout has passed on the runtime's timer, and no later.
 		#[tokio::test(start_paused = true)]
 		async fn a_split_reader_waits_out_exactly_the_operation_timeout() -> Result<(), TightBeamError> {
@@ -1475,9 +1518,8 @@ mod tests {
 			use crate::testing::TestCertificate;
 			use crate::trace::TraceConfig;
 
-			/// A traced half records the envelope it refuses, by the name of
-			/// the failure and by the canonical key of the peer of its
-			/// session.
+			/// A traced half records the envelope it refuses by the failure's
+			/// name and by the canonical key of its session peer.
 			#[tokio::test]
 			async fn a_traced_half_records_the_envelope_it_refuses() -> Result<(), Box<dyn std::error::Error>> {
 				let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
@@ -1543,7 +1585,7 @@ mod tests {
 				recorded
 					.into_iter()
 					.filter(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED)
-					.map(|event| event.label)
+					.map(|event| event.label.map(String::from))
 					.collect()
 			}
 
@@ -1682,8 +1724,8 @@ mod tests {
 		let identity = TestIdentity::insecure_fixed();
 
 		// Without a trust store, the dialer rule builds the client only when it
-		// names cleartext. The handshake that the test drives over that client
-		// must refuse to run blind all the same.
+		// names cleartext. The handshake the test drives over that client must
+		// still refuse to run blind.
 		let allow_cleartext = trust_store.is_none();
 		let encryption = EncryptionConfig {
 			trust_store,
@@ -1867,7 +1909,7 @@ mod tests {
 
 	/// An HPKE client whose store holds the root alone admits a server whose
 	/// signing certificate an intermediate issued, because the endpoint's trust
-	/// validates the path the reply presents to that root (RFC 5280 §6.1).
+	/// validates the path the reply presents to that root (RFC 5280 § 6.1).
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
 	async fn an_hpke_client_of_the_root_alone_admits_an_intermediate() -> Result<(), Box<dyn std::error::Error>> {
@@ -2024,6 +2066,43 @@ mod tests {
 		let driven = transport.perform_server_handshake(message).await;
 		let refused = matches!(driven, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)));
 		assert!(refused);
+		Ok(())
+	}
+
+	/// The async budget refuses a thread outside any runtime.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_budget_on_a_thread_outside_a_runtime_is_refused() -> TransportResult<()> {
+		let operation = async { Ok(7) };
+		let budget = Duration::from_secs(1);
+		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
+		let outcome = ParkingExecutor::on_current_thread().block_on(bounded);
+
+		let refused = matches!(
+			outcome,
+			Err(TransportError::OperationFailed(TransportFailure::FailedPrecondition))
+		);
+		assert!(refused);
+		Ok(())
+	}
+
+	/// The async budget ends an operation that outlasts it, on the tokio timer.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test(start_paused = true)]
+	async fn a_budget_ends_an_operation_that_outlasts_it() -> TransportResult<()> {
+		let operation = async {
+			tokio::time::sleep(Duration::from_secs(2)).await;
+			Ok(7)
+		};
+		let budget = Duration::from_secs(1);
+		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
+		let outcome = bounded.await;
+
+		let expired = matches!(
+			outcome,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		);
+		assert!(expired);
 		Ok(())
 	}
 

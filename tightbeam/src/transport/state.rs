@@ -1,8 +1,8 @@
 //! Session state and provisioning for the encrypted transports.
 //!
-//! The module holds the phase table a session moves through, the provisioning
-//! an endpoint starts from, and the sealed traits that give each transport
-//! its state accessors apart from I/O.
+//! It holds the phase table a session moves through, the provisioning an
+//! endpoint starts from, and the sealed traits that give each transport its
+//! state accessors apart from I/O.
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -87,23 +87,22 @@ pub enum SessionPhase {
 	Provisioned,
 	/// A handshake is in flight, and its deadline counts from `initiated_at`.
 	Handshaking {
-		/// The instant the handshake began, on the endpoint's clock. The
-		/// handshake deadline counts from it.
+		/// The instant the handshake began, on the endpoint's clock.
 		initiated_at: MonotonicInstant,
 	},
-	/// The handshake is complete. The phase carries everything it agreed, so a
-	/// session's keys travel with the terms that go with them, and a move out
-	/// of this phase drops all of them together.
+	/// The handshake is complete. The phase carries everything it agreed, so
+	/// the keys travel with their terms, and a move out of this phase drops
+	/// them all.
 	Encrypted(Box<EstablishedSession>),
 }
 
 impl SessionPhase {
 	/// Returns the start phase of an endpoint provisioned with `encryption`,
-	/// which is also the phase it returns to when its session breaks.
+	/// and the phase it returns to when its session breaks.
 	///
 	/// It is the one place that pairs provisioning with a phase. An endpoint
-	/// that holds encryption material starts in `Provisioned`, because
-	/// `Cleartext` would write application data in the clear (CWE-311).
+	/// with encryption material starts in `Provisioned`, because `Cleartext`
+	/// would write application data in the clear (CWE-311).
 	fn start_for<P: CryptoProvider>(encryption: &EncryptionConfig<P>) -> Self {
 		if encryption.is_provisioned() {
 			return Self::Provisioned;
@@ -164,8 +163,7 @@ impl SessionPhase {
 	///
 	/// - A read while a handshake is pending faces an unauthenticated peer. It
 	///   admits `handshake_wire` and must finish by the handshake deadline,
-	///   counted from the instant the first round recorded, or from `now`
-	///   before the first round.
+	///   counted from the first round, or from `now` before it.
 	/// - Any other read admits the larger envelope ceiling and must finish
 	///   within `operation_timeout` of `now`.
 	/// - A deadline past every instant the clock can read never arrives, so the policy holds `None`.
@@ -197,7 +195,7 @@ impl SessionPhase {
 		}
 
 		let started = self.initiated_at().unwrap_or(now);
-		let deadline = started.checked_add(limits.handshake_timeout);
+		let deadline = IoDeadline(started.checked_add(limits.handshake_timeout));
 
 		ReadPolicy { cap: limits.handshake_wire, deadline }
 	}
@@ -212,7 +210,7 @@ impl SessionPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadPolicy {
 	cap: usize,
-	deadline: Option<MonotonicInstant>,
+	deadline: IoDeadline,
 }
 
 impl ReadPolicy {
@@ -224,7 +222,7 @@ impl ReadPolicy {
 	/// exists only once its session is established.
 	#[must_use]
 	pub fn established(cap: usize, limits: &TransportLimits, now: MonotonicInstant) -> Self {
-		let deadline = now.checked_add(limits.operation_timeout);
+		let deadline = IoDeadline(now.checked_add(limits.operation_timeout));
 		Self { cap, deadline }
 	}
 
@@ -238,7 +236,7 @@ impl ReadPolicy {
 	/// it.
 	#[must_use]
 	pub const fn deadline(&self) -> Option<MonotonicInstant> {
-		self.deadline
+		self.deadline.0
 	}
 
 	/// The budget left at `now`, or `None` when no deadline bounds the read.
@@ -253,7 +251,25 @@ impl ReadPolicy {
 	///   [`TransportFailure::DeadlineExceeded`] -- `now` is at or past the
 	///   deadline.
 	pub fn remaining(&self, now: MonotonicInstant) -> TransportResult<Option<Duration>> {
-		let Some(deadline) = self.deadline else {
+		self.deadline.remaining(now)
+	}
+}
+
+/// The instant one read or write must finish by, or `None` when nothing
+/// bounds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IoDeadline(pub(crate) Option<MonotonicInstant>);
+
+impl IoDeadline {
+	/// The budget left at `now`, or `None` when nothing bounds the I/O.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- `now` is at or past the
+	///   deadline.
+	pub(crate) fn remaining(self, now: MonotonicInstant) -> TransportResult<Option<Duration>> {
+		let Some(deadline) = self.0 else {
 			return Ok(None);
 		};
 
@@ -292,10 +308,10 @@ pub(crate) enum SessionEvent {
 /// A session's phase, the provisioning it starts from, and its negotiation
 /// input.
 ///
-/// All three are private and one constructor sets them together, so the phase
-/// an endpoint starts in, and returns to on a reset, always follows from the
-/// provisioning it holds. Every move afterwards consults the transition table,
-/// so a session only ever sits in a phase that the table names.
+/// All three are private, and one constructor sets them together, so the phase
+/// an endpoint starts in and returns to on a reset follows from its
+/// provisioning. Every later move consults the transition table, so a session
+/// sits only in a phase the table names.
 pub struct SessionState<P: CryptoProvider> {
 	encryption: DialableEncryption<P>,
 	negotiation: Negotiation,
@@ -395,9 +411,9 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// cipher by `encrypted_envelope`, this endpoint's encrypted-envelope
 	/// ceiling (RFC 9846 § 5.5). The receive cipher counts the bytes it opens.
 	///
-	/// The terms enter the phase together, so a session that reports itself
-	/// encrypted always carries the terms it runs under and a per-key volume
-	/// inside the AES-GCM bound at that ceiling.
+	/// The terms enter the phase together, so an encrypted session always
+	/// carries its terms and a per-key volume inside the AES-GCM bound at that
+	/// ceiling.
 	#[must_use]
 	pub fn install_session(&mut self, session: EstablishedSession, encrypted_envelope: usize) -> bool {
 		let bounded = session.with_envelope_ceiling(encrypted_envelope);
@@ -405,10 +421,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	}
 
 	/// Drops any session and returns to the phase this endpoint's provisioning
-	/// starts in.
-	///
-	/// This is the circuit breaker. It reads the destination from the
-	/// provisioning this state holds, so the provisioning alone decides it.
+	/// starts in. This is the circuit breaker, and the provisioning alone
+	/// decides the destination.
 	pub fn reset(&mut self) {
 		// The table admits the breaker from every phase, and the session it
 		// drops is spent, so the replaced phase carries nothing a caller could
@@ -486,9 +500,9 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// step of the inbound collector.
 	///
 	/// While a handshake is pending, the one cleartext this session admits is
-	/// a handshake container, which goes to the server's dispatcher. Any other
-	/// envelope then is application traffic that arrived unsealed, so it trips
-	/// the circuit breaker. Every other phase hands the envelope on.
+	/// a handshake container, for the server's dispatcher. Any other envelope
+	/// then is unsealed application traffic, so it trips the circuit breaker.
+	/// Every other phase hands the envelope on.
 	///
 	/// # Errors
 	///
@@ -514,11 +528,11 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Detaches the established session and returns this state to its start.
 	///
 	/// A caller that splits the endpoint into halves uses it. The halves take
-	/// the keys, and the state they leave behind holds none. Only the async
-	/// transport splits, so the method exists where that transport does.
+	/// the keys, and the state left behind holds none. Only the async transport
+	/// splits, so the method exists where that transport does.
 	///
-	/// It leaves a session that holds no keys where it is, so a handshake in
-	/// flight keeps the instant its deadline counts from.
+	/// A session with no keys stays where it is, so a handshake in flight keeps
+	/// the instant its deadline counts from.
 	#[cfg(any(feature = "tokio", feature = "async-transport"))]
 	pub(crate) fn take_established(&mut self) -> Option<Box<EstablishedSession>> {
 		if !self.phase.requires_encryption() {
@@ -533,10 +547,9 @@ impl<P: CryptoProvider> SessionState<P> {
 
 	/// Replaces the budget-grant policy a server consults.
 	///
-	/// This setter and the ones below change negotiation input and leave the
-	/// peer authority and the identities alone, so the phase this state starts
-	/// in and the answer of [`DialableEncryption::new`] are independent of
-	/// them.
+	/// This setter and the ones below change negotiation input alone, not the
+	/// peer authority or the identities, so they change neither the start phase
+	/// nor the answer of [`DialableEncryption::new`].
 	#[cfg(all(
 		any(feature = "tcp", feature = "async-transport"),
 		any(feature = "transport-cms", feature = "transport-hpke")
@@ -567,8 +580,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Replaces the handshake protocol a provisioned endpoint runs.
 	///
 	/// The protocol decides how a handshake runs, and provisioning decides
-	/// whether one is expected, so the phase this state starts in is
-	/// independent of the protocol.
+	/// whether one is expected, so the start phase is independent of the
+	/// protocol.
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	pub(crate) fn select_handshake(&mut self, kind: HandshakeProtocolKind) {
 		self.negotiation.select_handshake(kind);
@@ -816,9 +829,9 @@ impl<P: CryptoProvider> ServerIdentities<P> {
 
 /// The provisioning an endpoint holds before any handshake runs.
 ///
-/// A builder decides the provisioning once, when it builds the endpoint, so
-/// it travels as one value. A transport supplies it through a single
-/// accessor, so a caller gets every field in one call.
+/// A builder decides it once, when it builds the endpoint, so it travels as one
+/// value. A transport supplies it through a single accessor, so a caller gets
+/// every field in one call.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct EncryptionConfig<P: CryptoProvider> {
@@ -834,9 +847,8 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// certificate, which the CMS handshake needs before the server speaks.
 	#[cfg(feature = "transport-cms")]
 	pub(crate) cms_server: Option<ProvisionedTrust>,
-	/// The server policy each client handshake of this endpoint runs on the
-	/// identity certificate of its server, under either flow, or `None` for a
-	/// client that sets none.
+	/// The server policy each client handshake runs on its server's identity
+	/// certificate, under either flow, or `None` for a client that sets none.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) server_policy: Option<ValidatorChain>,
 	/// The identity this endpoint presents as a client for mutual
@@ -1028,6 +1040,40 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// It is `None` before the first client message arrives, and again once
 	/// the handshake completes and the endpoint installs its terms.
 	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
+
+	/// Runs `operation` within `budget`, the time left to the handshake.
+	///
+	/// Each transport states in its impl how the budget binds.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the budget ran out.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- no timer can bind it.
+	/// - The errors of `operation`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::net::TcpStream;
+	/// use std::time::Duration;
+	///
+	/// use tightbeam::runtime::rt;
+	/// use tightbeam::transport::state::ServerHandshakeSlot;
+	/// use tightbeam::transport::tcp::sync::TcpTransport;
+	///
+	/// let operation = async { Ok(7) };
+	/// let budget = Duration::from_secs(1);
+	/// let bounded = <TcpTransport<TcpStream> as ServerHandshakeSlot>::within_budget(budget, operation);
+	///
+	/// assert_eq!(rt::block_on(bounded)?, 7);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[allow(async_fn_in_trait)]
+	async fn within_budget<T, F>(budget: Duration, operation: F) -> TransportResult<T>
+	where
+		F: core::future::Future<Output = TransportResult<T>>;
 }
 
 /// The state accessors of an encrypted transport, separate from I/O.
@@ -1133,9 +1179,8 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	/// Attaches `trace` as the production instrumentation collector of this
 	/// transport, the trail [`Self::to_trace_ref`] reads.
 	///
-	/// An accept loop that owns a collector attaches it to each transport it
-	/// accepts, so the events of the connection reach the collector of the
-	/// owner.
+	/// An accept loop attaches its collector to each transport it accepts, so
+	/// the events of the connection reach the owner's collector.
 	///
 	/// # Examples
 	///
@@ -1154,9 +1199,8 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	where
 		Self: Sized;
 
-	/// The address of the peer that a listener accepted this endpoint from,
-	/// which the record of the acceptance names, or `None` for an endpoint
-	/// that a listener did not accept.
+	/// The peer address that a listener accepted this endpoint from, which the
+	/// acceptance record names, or `None` for an endpoint no listener accepted.
 	///
 	/// # Examples
 	///
@@ -1330,8 +1374,7 @@ mod tests {
 	}
 
 	/// A provisioned session writes nothing in the clear after a reset from
-	/// any phase, even a reset that a caller triggers through the public
-	/// `reset` method.
+	/// any phase, even a reset through the public `reset` method.
 	#[test]
 	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
 		let mut state = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
@@ -1412,8 +1455,8 @@ mod tests {
 	}
 
 	/// A handshake read admits the handshake ceiling and counts its deadline
-	/// from the instant the first round recorded, so a later reading gets the
-	/// remainder of the one allowance.
+	/// from the first round, so a later reading gets what is left of the one
+	/// allowance.
 	#[test]
 	fn a_handshake_read_counts_from_the_first_round() -> TransportResult<()> {
 		let clock = ManualClock::default();

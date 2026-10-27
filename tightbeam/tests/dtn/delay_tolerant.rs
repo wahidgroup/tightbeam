@@ -4,8 +4,8 @@
 //!
 //! ## Test Scenario: Earth to Mars Through a Relay
 //!
-//! This test simulates interplanetary communication with:
-//! - **Hop delays** of 100 ms on a paused clock, which stand in for the light-time delays
+//! The test simulates interplanetary links with:
+//! - **Hop delays** of 100 ms on a paused clock, in place of light-time delays
 //! - **Filesystem persistence** at each hop to survive delays
 //! - **Cryptographic chain verification** at each hop and at the final destination
 //!
@@ -65,12 +65,12 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 		message: payload.to_owned()
 	}?;
 
-	earth_store.persist(&frame1)?;
+	let frame1_key = earth_store.persist(frame1)?;
 
 	delays.simulate_hop("Earth", "Relay").await?;
 
 	// The relay reads frame 1 from the store of Earth and verifies it.
-	let relay_frame1 = earth_store.retrieve("earth-msg-001")?;
+	let relay_frame1 = earth_store.retrieve(&frame1_key)?;
 
 	let relay_chain = vec![relay_frame1.to_owned()];
 	let relay_verdict = relay_store.verify_chain(&relay_chain)?;
@@ -94,13 +94,13 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 		message: relay_payload
 	}?;
 
-	relay_store.persist(&frame2)?;
+	let frame2_key = relay_store.persist(frame2)?;
 
 	delays.simulate_hop("Relay", "Mars").await?;
 
 	// Mars reads the forwarded frame from the store of the relay and verifies
 	// the full chain.
-	let mars_frame1 = relay_store.retrieve("relay-fwd-001")?;
+	let mars_frame1 = relay_store.retrieve(&frame2_key)?;
 	let full_chain = vec![relay_frame1, mars_frame1.to_owned()];
 	let mars_verdict = mars_store.verify_chain(&full_chain)?;
 	assert!(mars_verdict.valid, "Chain verification failed at Mars");
@@ -175,8 +175,8 @@ async fn dtn_comparison_traditional_vs_tightbeam() -> Result<(), TightBeamError>
 		message: earth_payload(b"Demonstrating tightbeam's DTN capabilities")
 	}?;
 
-	let frame_id = store.persist(&frame)?;
-	let retrieved = store.retrieve(&frame_id)?;
+	let frame_key = store.persist(frame.to_owned())?;
+	let retrieved = store.retrieve(&frame_key)?;
 	assert_eq!(retrieved.message(), frame.message());
 
 	store.clear()?;

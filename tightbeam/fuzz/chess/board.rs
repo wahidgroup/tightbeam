@@ -17,8 +17,7 @@ use super::state::ChessGameState;
 
 /// The chess match state and the game lifecycle on the server.
 ///
-/// The server keeps the authoritative board and reads only the move of a
-/// request.
+/// The server keeps the authoritative board and reads only a request's move.
 #[derive(Default, Clone)]
 pub(crate) struct ChessMatchManager {
 	game_state: Arc<Mutex<ChessGameState>>,
@@ -94,14 +93,14 @@ impl ChessMatchManager {
 			let server_move = match game_state.to_random_valid_move(is_server_turn, move_count) {
 				Some(mv) => mv,
 				None => {
-					// The check above leaves a valid move, so this arm is a
-					// guard that reports the game status.
+					// The check above leaves a valid move, so this guard arm
+					// reports the game status.
 					return Ok(game_state.determine_game_status(is_server_turn));
 				}
 			};
 
-			// `apply_move` empties the source square, so the lookup of the
-			// piece that moves runs before the move.
+			// `apply_move` empties the source square, so the piece lookup runs
+			// first.
 			let server_piece = game_state.piece_kind_at(server_move.from_row, server_move.from_col);
 			game_state.apply_move(&server_move);
 
@@ -236,15 +235,15 @@ servlet! {
 		let move_count = message.metadata().order();
 		let game_status = match config.manager.process_move(&move_req, move_count, trace) {
 			Ok(status) => status,
-		Err(_e) => {
-			return invalid_move(Arc::clone(trace), message_id, move_count);
-		}
-	};
+			Err(_e) => {
+				return invalid_move(Arc::clone(trace), message_id, move_count);
+			}
+		};
 
-	let matrix = match config.manager.game_state_matrix() {
-		Ok(m) => m,
-		Err(_) => {
-			return invalid_move(Arc::clone(trace), message_id, move_count);
+		let matrix = match config.manager.game_state_matrix() {
+			Ok(m) => m,
+			Err(_) => {
+				return invalid_move(Arc::clone(trace), message_id, move_count);
 			}
 		};
 
@@ -275,10 +274,9 @@ mod tests {
 
 	/// The server's reply records the kind of the piece it moves.
 	///
-	/// The server plays the move at index `order % count` of its list of legal
-	/// moves, and the list for Black holds its pawns ahead of its back row. At
-	/// order 1 that is the pawn move from a7 to a5, the one pawn move of the
-	/// exchange.
+	/// The server plays its legal move at index `order % count`, and Black's
+	/// list holds its pawns ahead of its back row. At order 1 that is the pawn
+	/// move from a7 to a5, the one pawn move of the exchange.
 	#[test]
 	fn the_server_move_records_its_piece_kind() -> Result<(), ChessMoveError> {
 		let manager = ChessMatchManager::default();

@@ -39,6 +39,32 @@ enum NssMode<'a> {
 	Direct(Cow<'a, str>),
 	/// The building closure that `with_spec()` stores.
 	Spec(Box<SpecBuilderFn<'a>>),
+	/// The caller set both a direct NSS and a spec, which `build()` refuses.
+	Conflicting,
+}
+
+impl<'a> NssMode<'a> {
+	/// Returns the mode after a `with_nss()` call that sets `nss`.
+	///
+	/// A later direct NSS replaces an earlier one, and a direct NSS beside a
+	/// spec is a conflict.
+	fn direct(self, nss: Cow<'a, str>) -> Self {
+		match self {
+			Self::Unset | Self::Direct(_) => Self::Direct(nss),
+			Self::Spec(_) | Self::Conflicting => Self::Conflicting,
+		}
+	}
+
+	/// Returns the mode after a `with_spec()` call that stores `spec`.
+	///
+	/// A later spec replaces an earlier one, and a spec beside a direct NSS
+	/// is a conflict.
+	fn spec(self, spec: Box<SpecBuilderFn<'a>>) -> Self {
+		match self {
+			Self::Unset | Self::Spec(_) => Self::Spec(spec),
+			Self::Direct(_) | Self::Conflicting => Self::Conflicting,
+		}
+	}
 }
 
 impl<'a> UrnBuilder<'a> {
@@ -106,17 +132,19 @@ impl<'a> UrnBuilder<'a> {
 
 	/// Sets the NSS directly.
 	///
-	/// The builder holds one NSS mode, so this call replaces the spec that an
-	/// earlier `with_spec()` set.
+	/// A later call replaces the NSS of an earlier one. A builder that also
+	/// holds a spec, from `with_spec()` or from [`UrnBuilder::from`], refuses
+	/// to build.
 	pub fn with_nss(mut self, nss: impl Into<Cow<'a, str>>) -> Self {
-		self.nss_mode = NssMode::Direct(nss.into());
+		let mode = core::mem::take(&mut self.nss_mode);
+		self.nss_mode = mode.direct(nss.into());
 		self
 	}
 
 	/// Configures a spec for the validation and the NSS construction.
 	///
-	/// The builder holds one NSS mode, so this call replaces the NSS that an
-	/// earlier `with_nss()` set.
+	/// A later call replaces the spec of an earlier one. A builder that also
+	/// holds a direct NSS from `with_nss()` refuses to build.
 	pub fn with_spec<S: UrnSpec>(mut self) -> Self {
 		// The closure defers the work of the spec to `build()`.
 		let spec_builder = move |builder: &mut UrnBuilder<'a>| -> Result<Cow<'static, str>, UrnValidationError> {
@@ -126,7 +154,8 @@ impl<'a> UrnBuilder<'a> {
 			S::build_nss(builder as &dyn UrnComponents<'a>)
 		};
 
-		self.nss_mode = NssMode::Spec(Box::new(spec_builder));
+		let mode = core::mem::take(&mut self.nss_mode);
+		self.nss_mode = mode.spec(Box::new(spec_builder));
 		self
 	}
 }
@@ -134,9 +163,8 @@ impl<'a> UrnBuilder<'a> {
 impl<'a, S: UrnSpec> From<S> for UrnBuilder<'a> {
 	/// Creates a URN builder from a spec type.
 	///
-	/// The builder takes the NID (Namespace Identifier) of the spec and applies
-	/// the spec's validation and NSS building logic. The builder is ready to
-	/// use, because this call applies `with_spec::<S>()` itself.
+	/// The builder takes the NID of the spec and applies `with_spec::<S>()`
+	/// itself, so it is ready to use.
 	#[inline]
 	fn from(_: S) -> Self {
 		let mut builder = UrnBuilder::default().with_spec::<S>();
@@ -151,19 +179,20 @@ impl<'a> UrnBuilder<'a> {
 	/// The NSS comes from one of three modes:
 	/// - `with_nss()` provides the NSS string directly.
 	/// - `with_spec()` validates the components and constructs the NSS from them.
-	/// - The default joins the components in lexicographic key order.
+	/// - With neither call, the default joins the components in lexicographic key order.
 	///
-	/// `with_nss()` and `with_spec()` are mutually exclusive, so the later call
-	/// replaces the earlier. With neither call, the default mode applies.
+	/// A builder that holds both `with_nss()` and `with_spec()` refuses to
+	/// build.
 	///
 	/// # RFC 8141 Compliance
 	///
-	/// This method produces a URN in the format `urn:<NID>:<NSS>` where:
+	/// The URN has the format `urn:<NID>:<NSS>`, where:
 	/// - The NID has 2-32 characters of letters, digits, and hyphens, starts
 	///   with a letter, and ends with a letter or digit.
 	/// - The selected mode constructs the NSS.
 	///
 	/// # Errors
+	///
 	/// - [`UrnValidationError::RequiredFieldMissing`] -- the NID is missing,
 	///   the NSS is empty, or the default mode has no components.
 	/// - [`UrnValidationError::InvalidNidLength`] -- the NID is not 2-32 characters long.
@@ -171,18 +200,20 @@ impl<'a> UrnBuilder<'a> {
 	/// - [`UrnValidationError::InvalidNidCharacters`] -- the NID holds a
 	///   character other than a letter, a digit, or a hyphen, or it ends with a
 	///   hyphen.
+	/// - [`UrnValidationError::ConflictingNssModes`] -- the builder holds both a direct NSS and a spec.
 	/// - Any error of the spec's `validate` or `build_nss`, in the `with_spec()` mode.
 	pub fn build(mut self) -> Result<Urn<'a>, UrnValidationError> {
-		// A spec's own validation runs before assembly and may compare the
-		// NID, so a malformed NID is reported first with its own error.
+		// A spec's own validation runs before assembly and may compare the NID,
+		// so the builder reports a malformed NID first, with its own error.
 		let nid_ref = self.nid.as_ref().ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
 		Urn::validate_nid(nid_ref)?;
 
-		// Take the mode out so the Spec closure can borrow the builder. The
-		// match is exhaustive, so every mode has a case.
+		// The mode moves out first, so the spec closure can borrow the
+		// builder.
 		let nss = match core::mem::replace(&mut self.nss_mode, NssMode::Unset) {
 			NssMode::Spec(builder_fn) => builder_fn(&mut self)?,
 			NssMode::Direct(nss) => nss,
+			NssMode::Conflicting => return Err(UrnValidationError::ConflictingNssModes),
 			NssMode::Unset => {
 				// A `HashMap` iterates in no fixed order, so the sorted keys
 				// make the NSS deterministic.
@@ -386,8 +417,8 @@ mod tests {
 	}
 
 	// The builder assembles its `Urn` through the one checked constructor, so
-	// it refuses an NSS that the constructors refuse. Each row is one way the
-	// builder can end up holding an empty NSS.
+	// it refuses an empty NSS as the constructors do. Each row is one way to
+	// reach an empty NSS.
 	#[test]
 	fn the_builder_refuses_an_empty_nss() {
 		let direct = UrnBuilder::default().with_nid("test").with_nss("").build();
@@ -411,5 +442,31 @@ mod tests {
 	fn the_builder_names_a_malformed_nid_before_an_empty_nss() {
 		let result = UrnBuilder::default().with_nid("9bad").with_nss("").build();
 		assert!(matches!(result, Err(UrnValidationError::InvalidNidStart)), "got {result:?}");
+	}
+
+	/// A builder of the [`TestUrnSpec`] NID that holds components the spec
+	/// accepts, and no NSS mode.
+	fn component_builder() -> UrnBuilder<'static> {
+		UrnBuilder::default()
+			.with_nid(TestUrnSpec::NID)
+			.set("category", "instrumentation")
+			.set("type", "trace")
+			.set("id", "abc-123")
+	}
+
+	// A builder that holds both a direct NSS and a spec refuses to build,
+	// whichever of the two calls came first.
+	crate::tb_cases! {
+		fn a_builder_that_holds_an_nss_and_a_spec_refuses_to_build(builder: fn() -> UrnBuilder<'static>)
+			-> Result<(), UrnValidationError>
+		{
+			let built = builder().build();
+			assert!(matches!(built, Err(UrnValidationError::ConflictingNssModes)), "got {built:?}");
+			Ok(())
+		}
+		cases {
+			spec_then_nss => || component_builder().with_spec::<TestUrnSpec>().with_nss("direct"),
+			nss_then_spec => || component_builder().with_nss("direct").with_spec::<TestUrnSpec>(),
+		}
 	}
 }

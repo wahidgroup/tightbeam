@@ -2,11 +2,9 @@
 set -e
 
 # Installed via husky-rs (core.hooksPath = .husky).
-# The hook runs rustfmt and clippy alone. CI runs the full `make lint`, which
-# adds the rustdoc build and the spellcheck.
-# Redirect stdin so make/npm cannot consume the ref list git feeds this hook.
-if ! make lint-code </dev/null; then
-	echo "ERROR: make lint-code failed; push aborted."
+# The hook runs `make lint`, the same check CI runs.
+if ! make lint </dev/null; then
+	echo "ERROR: make lint failed; push aborted."
 	exit 1
 fi
 

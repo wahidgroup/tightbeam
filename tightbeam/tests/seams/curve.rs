@@ -518,7 +518,7 @@ impl RngCore for PublishedDraw {
 impl CryptoRng for PublishedDraw {}
 
 /// The certificate of the point `point` on the curve `curve`, cut from the
-/// placeholder-signed house certificate of a fresh secp256k1 key, whose key
+/// self-signed house certificate of a fresh secp256k1 key, whose key
 /// identifier sets it apart from every other certificate of a test. A trust
 /// that pins it compares it whole.
 fn certificate_of(curve: ObjectIdentifier, point: &[u8]) -> Certificate {
@@ -882,7 +882,7 @@ mod renewal {
 		Ok(RenewingSession { handle, _tasks: [client_reader, server_reader], _serving: serving })
 	}
 
-	/// Emit [`EMITS`] frames on `handle`, each on a stream of its own.
+	/// Emits [`EMITS`] frames on `handle`, each on a stream of its own.
 	async fn emit_series(handle: &MuxHandle) -> TransportResult<()> {
 		for index in 0..EMITS {
 			let label = format!("renewal-{index}");

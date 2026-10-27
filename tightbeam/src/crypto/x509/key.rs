@@ -380,9 +380,9 @@ impl<'a> KeyIdentity<'a> {
 
 	/// Lend the canonical DER of this identity to `view`.
 	///
-	/// This method writes the DER on the stack when it fits [`INLINE_SIZE`]
-	/// octets, so a lookup of a named-curve key stays on the stack. A
-	/// longer canonical form goes on the heap.
+	/// It writes the DER on the stack when it fits [`INLINE_SIZE`] octets, so a
+	/// lookup of a named-curve key stays on the stack. A longer canonical form
+	/// goes on the heap.
 	///
 	/// # Errors
 	///
@@ -504,6 +504,18 @@ impl CanonicalKey {
 	#[must_use]
 	pub fn as_der(&self) -> &[u8] {
 		&self.0
+	}
+
+	/// Whether this is the canonical form of the key that `spki` holds, read
+	/// under [`KeyCurves::HOUSE`] as [`Self::of`] reads it. The canonical DER
+	/// of `spki` goes on the stack, as a lookup of [`KeyIndex`] writes it.
+	#[cfg(feature = "colony")]
+	pub(crate) fn is_key_of(&self, spki: &SubjectPublicKeyInfoOwned) -> bool {
+		let identity = KeyIdentity::of(spki, KeyCurves::HOUSE);
+		let matched = identity.lend(|der| der == self.as_der());
+		// A key whose canonical form the encoder refuses is no key of a
+		// canonical form, so it matches none.
+		matched.unwrap_or(false)
 	}
 }
 
@@ -645,11 +657,10 @@ impl PartialOrd for IndexedKey {
 
 /// Why a list of keys, each the DER of a SubjectPublicKeyInfo, is refused.
 ///
-/// A pin list and a peer list each read their entries through one parse, so
-/// both refuse the same entries. Each variant names the entry by its position
-/// in the list, so the operator can find it. A list that holds a key no
-/// certificate can match would let the peer it meant to name pass a deny
-/// list, so the whole list is refused.
+/// A pin list and a peer list read their entries through one parse, so both
+/// refuse the same entries. Each variant names the entry by its position, so
+/// the operator can find it. A key no certificate can match would let the
+/// peer it meant to name pass a deny list, so the whole list is refused.
 #[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyListError {
 	/// The entry is no SubjectPublicKeyInfo DER, or its canonical form
@@ -926,7 +937,6 @@ mod tests {
 	#[test]
 	fn the_canonical_form_of_an_uncompressed_point_is_its_compressed_der() -> Result<(), Error> {
 		let expected = compressed().to_der()?;
-
 		let canonical = CanonicalKey::of(&uncompressed())?;
 		assert_eq!(canonical.as_der(), expected.as_slice());
 		Ok(())
@@ -981,7 +991,6 @@ mod tests {
 	#[test]
 	fn a_permissive_first_decoder_reads_an_alias_as_its_point() -> Result<(), Error> {
 		let expected = compressed().to_der()?;
-
 		let canonical = PERMISSIVE_FIRST.canonical(&off_curve_alias())?;
 		assert_eq!(canonical.as_der(), expected.as_slice());
 		Ok(())
@@ -1052,7 +1061,6 @@ mod tests {
 	#[test]
 	fn the_canonical_form_of_the_rfc6979_p521_key_is_its_compressed_form() -> Result<(), Error> {
 		let expected = with_point(CURVE_NIST_P521, &TestKey::RFC6979_P521_COMPRESSED).to_der()?;
-
 		let canonical = CanonicalKey::of(&with_point(CURVE_NIST_P521, &TestKey::RFC6979_P521_UNCOMPRESSED))?;
 		assert_eq!(canonical.as_der(), expected.as_slice());
 		Ok(())
@@ -1093,8 +1101,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// A key whose canonical form exceeds the inline bound keeps its whole DER
-	/// as its canonical form.
+	/// A key whose canonical form exceeds the inline bound keeps its whole DER.
 	#[test]
 	fn a_key_past_the_inline_bound_keeps_its_der() -> Result<(), Error> {
 		let long = long_key();
@@ -1196,7 +1203,6 @@ mod tests {
 	#[test]
 	fn a_list_of_the_negation_holds_no_point_of_the_key() -> Result<(), KeyListError> {
 		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&negated())])?;
-
 		assert!(!list.holds(&uncompressed()));
 		Ok(())
 	}
@@ -1206,7 +1212,6 @@ mod tests {
 	#[test]
 	fn a_list_holds_its_point_in_the_other_form() -> Result<(), KeyListError> {
 		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&compressed())])?;
-
 		assert!(list.holds(&uncompressed()));
 		Ok(())
 	}
@@ -1236,7 +1241,6 @@ mod tests {
 	fn a_list_holds_a_key_of_another_algorithm_by_its_bits() -> Result<(), KeyListError> {
 		let ed25519 = under(ID_ED_25519);
 		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&ed25519)])?;
-
 		assert!(list.holds(&ed25519));
 		Ok(())
 	}

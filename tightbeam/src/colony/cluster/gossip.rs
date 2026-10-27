@@ -2,8 +2,8 @@
 //!
 //! Gateways flood origin-signed rumors across the colonies of one namespace
 //! and deliver admitted rumors locally under the operator's ingress policy.
-//! A gateway forwards a rumor while hop time-to-live remains on the outer
-//! relay frame.
+//! A gateway forwards a rumor while its outer relay frame has hop
+//! time-to-live left.
 //!
 //! # Flood scope
 //!
@@ -15,8 +15,8 @@
 //!
 //! A rumor is an origin-signed [`Frame`]. The origin gateway signs it once,
 //! and later hops and anti-entropy repair carry those same signed bytes.
-//! The hop radius lives in the OUTER relay frame's `metadata.lifetime` rather
-//! than in the content digest.
+//! The hop radius is in the OUTER relay frame's `metadata.lifetime`, outside
+//! the content digest.
 //!
 //! # Admission path
 //!
@@ -52,16 +52,16 @@ use crate::TightBeamError;
 /// The content digest of a gossip rumor, under the digest of the colony's
 /// provider.
 ///
-/// Every gateway of a colony runs one provider, so every gateway derives the
-/// same digest for the same rumor, and the digest is as wide as the output of
-/// that provider's digest. [`VerifiedRumor::gossip_digest`] computes one, and
-/// [`GossipDigest::read`] reads one that a peer sent.
+/// Every gateway of a colony runs one provider, so each derives the same
+/// digest for a rumor, as wide as that provider's digest output.
+/// [`VerifiedRumor::gossip_digest`] computes one, and [`GossipDigest::read`]
+/// reads one that a peer sent.
 ///
 /// # Width
 ///
-/// The digest sits inline at its width, from 32 to 64 octets, the widths of
-/// the digests a handshake runs. It is [`Copy`], so the gateway admits,
-/// journals, and compares a rumor's digest on the stack.
+/// The digest is inline at its width, 32 to 64 octets, the widths of the
+/// handshake digests. It is [`Copy`], so the gateway admits, journals, and
+/// compares a rumor's digest on the stack.
 ///
 /// # Examples
 ///
@@ -82,9 +82,9 @@ impl GossipDigest {
 	/// Read `bytes` as a digest under `D`, or [`None`] for an entry of
 	/// another width, which names no rumor (CWE-20).
 	///
-	/// A durable [`GossipJournal`] keeps the [`Self::as_bytes`] of each digest
-	/// and restores the digest through this method. `D` is then the digest of
-	/// the colony's provider: for a gateway of protocol `P`,
+	/// A durable [`GossipJournal`] stores [`Self::as_bytes`] and restores each
+	/// digest here, with `D` the digest of the colony's provider. For a gateway
+	/// of protocol `P`, that is
 	/// `<<P as Protocol>::CryptoProvider as DigestProvider>::Digest`.
 	///
 	/// # Examples
@@ -151,8 +151,8 @@ pub enum Admission {
 /// A rumor frame beside the origin signature that verified over it.
 ///
 /// Only a verification makes one: the parse that verified the rumor on a
-/// trust plane, or the gateway's check of a rumor it signed itself. The
-/// digest of a rumor therefore covers the signature of that same rumor.
+/// trust plane, or the gateway's check of its own rumor. So a rumor's digest
+/// covers that rumor's own signature.
 pub struct VerifiedRumor {
 	frame: Frame,
 	signature: VerifiedSignature,
@@ -209,15 +209,17 @@ impl ClusterTlsConfig {
 	/// Verify `frame`, which this gateway signed, against its own
 	/// certificate, and pair it with its signature.
 	///
-	/// A rumor this gateway originates needs its own verified signature,
-	/// which its digest covers, whether or not a trust plane holds this
-	/// gateway's certificate.
+	/// A rumor this gateway originates needs a verified signature for its
+	/// digest to cover, whether or not a trust plane holds this gateway's
+	/// certificate.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the frame carries no signature, or the signature fails to verify.
-	pub(crate) fn verify_own(&self, frame: Frame) -> Result<VerifiedRumor, TightBeamError> {
-		let signature = frame.verify_under(self.identity.signing_certificate(), self.identity.policy())?;
+	/// - [`ClusterError::OwnSignatureRefused`] -- the frame carries no
+	///   signature, or the signature fails to verify.
+	pub(crate) fn verify_own(&self, frame: Frame) -> Result<VerifiedRumor, ClusterError> {
+		let verified = frame.verify_under(self.identity.signing_certificate(), self.identity.policy());
+		let signature = verified.map_err(ClusterError::OwnSignatureRefused)?;
 		Ok(VerifiedRumor::new(frame, signature))
 	}
 }
@@ -226,12 +228,10 @@ impl ClusterTlsConfig {
 /// colony's digest.
 ///
 /// Reconciliation is a set difference over content digests, and both sides
-/// of a round read their entries by this one rule:
+/// of a round read entries by one rule:
 ///
-/// - An entry whose width differs from the output of the colony's digest
-///   names no rumor, so the list drops it (CWE-20).
-/// - A repeated entry appears once, so a peer cannot multiply the reply or the
-///   repair pushes with repeated entries (CWE-770).
+/// - An entry of a width other than the colony's digest names no rumor, so the list drops it (CWE-20).
+/// - A repeated entry appears once, so a peer cannot multiply the reply or the repair pushes (CWE-770).
 ///
 /// [`Self::against`] builds the list a replier sends, and [`Self::read`] reads
 /// the list a requester receives.
@@ -362,10 +362,10 @@ impl AdmittedGossip {
 	/// Admits one verified rumor, or fails closed with
 	/// [`TransitStatus::PermissionDenied`].
 	///
-	/// `ttl` is the hop radius left in the OUTER `metadata.lifetime`.
-	/// Freshness takes the rumor's `metadata.order` as the signed issue time,
-	/// and the `seen` window judges it at `now`. A gateway passes the window of
-	/// its gossip configuration, the one its anti-entropy repair judges by.
+	/// `ttl` is the hop radius left in the OUTER `metadata.lifetime`. The
+	/// `seen` window judges the rumor's `metadata.order`, its signed issue
+	/// time, at `now`. A gateway passes its gossip configuration's window,
+	/// which its anti-entropy repair also judges by.
 	///
 	/// # Refusal
 	///
@@ -473,8 +473,7 @@ impl GossipRumorKind {
 	///
 	/// - The journal retains an application rumor for anti-entropy repair and delivery retry.
 	/// - The journal witnesses an advertisement rumor for deduplication alone,
-	///   which keeps retention and repair bandwidth for the rumors that use
-	///   them.
+	///   so retention and repair bandwidth go to the rumors that use them.
 	/// - Either entry keeps the issue time `rumor` states, the instant its admission judged fresh.
 	///
 	/// # Errors
@@ -521,9 +520,9 @@ impl GossipRumorKind {
 	/// Retry the local delivery of `rumor`, which the journal retained under
 	/// `digest` and which waits for its ingress.
 	///
-	/// The journal retains the application kind, so a retry delivers a rumor
-	/// of that kind. The journal keeps only the digest of an advertisement
-	/// rumor, so its retry completes at once.
+	/// The journal retains application rumors, so a retry delivers one. It
+	/// keeps only an advertisement rumor's digest, so that retry completes at
+	/// once.
 	///
 	/// # Errors
 	///
@@ -555,9 +554,9 @@ impl GossipRumorKind {
 
 /// The per-signer rate admission that gates the gossip pipeline.
 ///
-/// The gateway consults it after signature verification and before journal
-/// record or reflood, so the gateway refuses an over-limit signer before it
-/// grows retained state or amplifies traffic (CWE-770).
+/// The gateway asks it after signature verification and before the journal
+/// record or the reflood, so it refuses an over-limit signer before that
+/// signer grows retained state or amplifies traffic (CWE-770).
 ///
 /// # Default
 ///
@@ -690,26 +689,24 @@ impl GossipAdmission for TokenBucketAdmission {
 ///
 /// # Digest width
 ///
-/// Every digest a gateway hands its journal has the width of the colony
-/// digest, the digest of the gateway's provider, which is fixed for the life
-/// of the gateway. A durable backend stores the [`GossipDigest::as_bytes`] of
-/// each one and restores it with [`GossipDigest::read`] under that digest.
+/// Every digest a gateway hands its journal is as wide as the colony digest,
+/// the digest of the gateway's provider, fixed for the gateway's life. A
+/// durable backend stores each [`GossipDigest::as_bytes`] and restores it with
+/// [`GossipDigest::read`] under that digest.
 ///
 /// # Retention
 ///
-/// A journal keeps each entry while the issue time its rumor states lies
-/// inside [`GossipJournal::retention`] of the clock, by the rule of
-/// [`FreshnessWindow::admits`]. Admission judges that same instant, so every
-/// fresh rumor has its digest, and its replay reads as a duplicate
-/// (CWE-294).
+/// A journal keeps each entry while its rumor's issue time lies inside
+/// [`GossipJournal::retention`] of the clock, by the rule of
+/// [`FreshnessWindow::admits`]. Admission judges the same instant, so every
+/// fresh rumor has its digest and its replay reads as a duplicate (CWE-294).
 pub trait GossipJournal: Send + Sync {
 	/// Deduplicate and retain one origin-signed rumor in a single step.
 	///
-	/// The journal retains the rumor unchanged so anti-entropy repair can
-	/// forward identical origin-signed bytes, and keeps it while `issued_at`,
-	/// the issue time the rumor states, lies inside retention of `now`.
-	/// Returns [`Admission::New`] when the journal records an unseen digest,
-	/// and [`Admission::Duplicate`] when it already holds the digest.
+	/// The journal keeps the rumor unchanged, so anti-entropy repair forwards
+	/// the same origin-signed bytes, while `issued_at`, the rumor's issue time,
+	/// lies inside retention of `now`. Returns [`Admission::New`] for an unseen
+	/// digest and [`Admission::Duplicate`] for a held one.
 	///
 	/// # Errors
 	///
@@ -738,10 +735,9 @@ pub trait GossipJournal: Send + Sync {
 	/// - MUST NOT appear in [`GossipJournal::held_digests`],
 	///   [`GossipJournal::fetch`], or [`GossipJournal::pending_local`].
 	///
-	/// The journal keeps the witnessed digest while `issued_at`, the issue
-	/// time its rumor states, lies inside retention of `now`. Returns
-	/// [`Admission::New`] when the journal witnesses an unseen digest, or
-	/// [`Admission::Duplicate`] when it already holds the digest.
+	/// The journal keeps it while `issued_at`, its rumor's issue time, lies
+	/// inside retention of `now`. Returns [`Admission::New`] for an unseen
+	/// digest and [`Admission::Duplicate`] for a held one.
 	///
 	/// # Errors
 	///
@@ -760,8 +756,8 @@ pub trait GossipJournal: Send + Sync {
 	/// The gateway probes before rate admission, so a duplicate keeps its
 	/// signer's token. Relay echoes are normal and MUST NOT drain the bucket.
 	///
-	/// The probe is advisory, so [`GossipJournal::record`] and
-	/// [`GossipJournal::witness`] remain the atomic deduplication steps for a
+	/// The probe is advisory. [`GossipJournal::record`] and
+	/// [`GossipJournal::witness`] stay the atomic deduplication steps for a
 	/// race past it.
 	///
 	/// # Errors
@@ -822,10 +818,10 @@ pub trait GossipJournal: Send + Sync {
 
 	/// The retention horizon of this journal.
 	///
-	/// The gateway clamps admission freshness (`seen_ttl`) to this horizon
-	/// at start, because a rumor whose issue time lies outside retention has
-	/// no digest left to deduplicate against. A wider window would re-admit a
-	/// replayed rumor as new (CWE-294).
+	/// At start, the gateway clamps admission freshness (`seen_ttl`) to it,
+	/// because a rumor whose issue time lies outside retention has no digest
+	/// left to deduplicate against. A wider window would admit a replay again
+	/// (CWE-294).
 	fn retention(&self) -> Duration;
 }
 
@@ -862,15 +858,15 @@ pub enum LocalClaim {
 
 /// One local delivery in progress, whose claim this guard releases on drop.
 ///
-/// A claim a caller takes by hand leaks when its delivery future drops: a
-/// cancelled task or a disconnected caller leaves the rumor claimed by no
-/// live task, and no retry ever offers it again. A guard that owns the claim
-/// removes that path, because a dropped future drops the guard.
+/// A claim taken by hand leaks when its delivery future drops: a cancelled
+/// task or a disconnected caller leaves the rumor claimed by no live task,
+/// and no retry offers it again. The guard owns the claim, and a dropped
+/// future drops the guard.
 ///
 /// # Exits
 ///
 /// - The drop of the guard releases the claim, so the rumor returns to the retry set.
-/// - [`Self::ack`] retires the entry instead, and is the only exit that takes the rumor out of the retry set.
+/// - [`Self::ack`] retires the entry instead, the one exit that takes the rumor out of the retry set.
 pub struct LocalClaimGuard<'a> {
 	journal: &'a dyn GossipJournal,
 	digest: &'a GossipDigest,
@@ -907,9 +903,9 @@ impl<'a> LocalClaimGuard<'a> {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError`] -- the journal's own fault. The guard releases the
-	///   claim to the retry set on the way out, so the retry beat offers an
-	///   unrecorded delivery again rather than strand it.
+	/// - [`ClusterError`] -- the journal's own fault. The guard then releases
+	///   the claim to the retry set, so the retry beat offers the unrecorded
+	///   delivery again.
 	pub fn ack(mut self) -> Result<(), ClusterError> {
 		self.journal.ack_local(self.digest)?;
 		self.retries = false;
@@ -952,16 +948,16 @@ enum LocalDelivery {
 /// # Capacity
 ///
 /// Per-signer capacity bounds retained and witnessed entries separately,
-/// so a signer that fills one kind keeps its budget for the other kind.
+/// so a signer that fills one kind keeps its budget for the other.
 /// Signers and kinds share the global cap, which bounds memory alone and
 /// fills first come, first served.
 ///
 /// # Retention
 ///
-/// Each entry keeps the issue time its rumor states. Retention prunes on
-/// every record, witness, and read, and drops an entry once that instant
-/// lies outside the window in either clock direction, so a read returns only
-/// the rumors inside the window.
+/// Each entry keeps its rumor's issue time. Retention prunes on every record,
+/// witness, and read, and drops an entry once that instant lies outside the
+/// window in either clock direction, so a read returns only rumors inside the
+/// window.
 pub struct MemoryGossipJournal {
 	entries: Mutex<HashMap<GossipDigest, JournalEntry>>,
 	retention: Duration,
@@ -971,9 +967,9 @@ pub struct MemoryGossipJournal {
 
 /// The two capacity bounds a journal holds.
 ///
-/// Both are counts of journal entries, and a positional pair would let a
-/// caller swap them and give every signer the whole log, so the call site
-/// binds each one by name (CWE-770).
+/// Both count journal entries. A positional pair would let a caller swap them
+/// and give every signer the whole log, so the call site names each one
+/// (CWE-770).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalLimits {
 	/// The cap on retained rumors and witnessed digests the journal holds in
@@ -1012,10 +1008,10 @@ impl MemoryGossipJournal {
 
 	/// The count of retained rumors pending or claimed for local delivery.
 	///
-	/// Zero means the delivery of every retained rumor is complete.
-	/// [`GossipJournal::pending_local`] leaves out a claimed rumor, which is in
-	/// flight and leaves the retry set before its delivery ends, so a
-	/// convergence assertion reads this count instead.
+	/// Zero means every retained rumor's delivery is complete.
+	/// [`GossipJournal::pending_local`] leaves out a claimed rumor, in flight
+	/// and off the retry set before its delivery ends, so a convergence
+	/// assertion reads this count instead.
 	///
 	/// # Errors
 	///
@@ -1064,23 +1060,20 @@ pub struct GossipConfig {
 	pub ttl: u8,
 	/// The route key that this gateway delivers admitted rumors to.
 	///
-	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a
-	///   configured ingress always names a servlet type this colony can route.
-	/// - Local delivery is a policy of the gateway that receives the rumor, rather than a part of the rumor.
-	/// - The servlet receives the origin-signed rumor frame. Its message
-	///   decodes as a [`GossipRumor`], and its signature names the gateway that
-	///   published it.
-	/// - `None` journals and refloods only, and marks the record delivered so
-	///   it stays out of the pending retry set.
+	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a configured
+	///   ingress always names a servlet type this colony can route.
+	/// - Local delivery is a policy of the receiving gateway, not part of the rumor.
+	/// - The servlet receives the origin-signed rumor frame. Its message decodes
+	///   as a [`GossipRumor`], and its signature names the publishing gateway.
+	/// - `None` only journals and refloods, and marks the record delivered, out of the pending retry set.
 	///
 	/// [`ColonyNamespace::servlet_type_key`]: crate::colony::urn::ColonyNamespace::servlet_type_key
 	///
 	/// # Export boundary
 	///
-	/// The ingress sink sits outside the export boundary. Peer trust and the
-	/// origin signature already gate which gateways may flood a rumor, and
-	/// the operator chooses the delivery type, so delivery bypasses the export
-	/// allowlist.
+	/// The ingress sink is outside the export boundary. Peer trust and the
+	/// origin signature gate which gateways may flood a rumor, and the operator
+	/// picks the delivery type, so delivery bypasses the export allowlist.
 	///
 	/// Every trusted colony delivers through this type, so an operator who
 	/// restricts exports should treat it as a channel for the whole flood.
@@ -1108,8 +1101,8 @@ impl GossipConfig {
 	/// each side of the clock.
 	///
 	/// Admission and anti-entropy repair both judge through it. A journal
-	/// retains for its own horizon, which can reach past this window, so a
-	/// fetch can return a rumor past its issue window.
+	/// retains to its own horizon, which can reach past this window, so a
+	/// fetch can return a rumor past it.
 	pub(crate) fn seen_window(&self) -> FreshnessWindow {
 		FreshnessWindow::new(self.seen_ttl)
 	}
@@ -1133,9 +1126,9 @@ impl MemoryGossipJournal {
 	///
 	/// # Per-signer budget
 	///
-	/// The per-signer budget counts only entries of the kind of `body`, so a
-	/// signer's witnessed advertisement digests and its retained application
-	/// rumors each fill a budget of their own.
+	/// It counts only entries of `body`'s kind, so a signer's witnessed
+	/// advertisement digests and its retained application rumors each fill
+	/// their own budget.
 	fn admit(
 		&self,
 		signer: impl AsRef<[u8]>,

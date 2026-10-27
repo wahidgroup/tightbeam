@@ -1,28 +1,32 @@
 //! The contracts of spec-driven testing.
 //!
-//! This module defines the `TBSpec` trait and the verification algorithm of
-//! pure spec-driven CBVOC testing. A spec describes the expected behavior
-//! declaratively, and the framework verifies each trace against it.
+//! The [`TBSpec`] trait holds the verification algorithm of spec-driven CBVOC
+//! testing. A spec describes the expected behavior declaratively, and the
+//! framework verifies each trace against it.
 
-use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
+use super::error::{AssertionViolationDetail, EventOrderViolationDetail, GateDecisionMismatch, SpecViolation};
 use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::testing::assertions::AssertionContract;
-use crate::trace::{ConsumedTrace, ExecutionMode};
+use crate::trace::{AssertionLabel, ConsumedTrace, ExecutionMode, IntoEventLabel, Presence};
+use crate::urn::Urn;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
-use super::error::EventOrderViolationDetail;
+use super::error::EventCountMismatchDetail;
 #[cfg(feature = "policy")]
 use crate::policy::TransitStatus;
 #[cfg(feature = "instrument")]
-use crate::urn::Urn;
+use crate::testing::macros::Cardinality;
+#[cfg(feature = "instrument")]
+use crate::trace::EventRecordTruncated;
 
 /// A spec, which declares the expected behavior of a test.
 ///
 /// An implementor declares:
 /// - The execution mode: accept, reject, or error.
-/// - The required phase sequence.
-/// - The required assertion contracts.
+/// - The instrumentation events that the trace must record in order.
+/// - The required count of each event.
+/// - The required assertion contracts, and the order of their labels.
 /// - The expected gate decision.
 /// - The response constraints.
 ///
@@ -41,12 +45,98 @@ pub trait TBSpec {
 		&[]
 	}
 
+	/// The counts that the instrumentation events of the trace must meet,
+	/// under the `instrument` feature.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events;
+	/// use tightbeam::testing::specs::TBSpec;
+	/// use tightbeam::{exactly, tb_assert_spec};
+	///
+	/// tb_assert_spec! {
+	///     pub AcceptsOnce,
+	///     V(1,0,0): {
+	///         mode: Accept,
+	///         assertions: [],
+	///         event_counts: [ (events::GATE_ACCEPT, exactly!(1)) ]
+	///     }
+	/// }
+	///
+	/// let counts = AcceptsOnce::latest().required_event_counts();
+	/// assert_eq!(counts.len(), 1);
+	/// assert_eq!(counts[0].kind, events::GATE_ACCEPT);
+	/// ```
+	#[cfg(feature = "instrument")]
+	fn required_event_counts(&self) -> &[EventCountContract] {
+		&[]
+	}
+
 	/// The assertion contracts that the trace must meet, each with its
 	/// cardinality.
 	fn required_assertions(&self) -> &[AssertionContract];
 
+	/// The assertion labels that the trace must record in this order. Other
+	/// assertions may come between them.
+	///
+	/// The default holds no label, so it admits every trace.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::exactly;
+	/// use tightbeam::testing::macros::AssertSpecBuilder;
+	/// use tightbeam::testing::specs::TBSpec;
+	/// use tightbeam::trace::ExecutionMode;
+	/// use tightbeam::urn::Urn;
+	///
+	/// const OPEN: Urn<'static> = tightbeam::urn!("doc", "event:order/open");
+	/// const CLOSE: Urn<'static> = tightbeam::urn!("doc", "event:order/close");
+	///
+	/// let builder = AssertSpecBuilder::new("OpensFirst", ExecutionMode::Accept);
+	/// let builder = builder.assertion(OPEN, Vec::new(), exactly!(1))?;
+	/// let builder = builder.assertion(CLOSE, Vec::new(), exactly!(1))?;
+	/// let spec = builder.ordering([OPEN, CLOSE])?.build();
+	///
+	/// let order: Vec<_> = spec.required_assertion_order().urns().collect();
+	/// assert_eq!(order, [&OPEN, &CLOSE]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn required_assertion_order(&self) -> &AssertionOrderContract {
+		&UNORDERED
+	}
+
 	/// The expected gate decision. `None` accepts any decision.
 	fn expected_gate_decision(&self) -> Option<TransitStatus> {
+		None
+	}
+
+	/// Whether the run must produce a response. `None` accepts a run with a
+	/// response or without one.
+	///
+	/// A response constraint refuses a run that reported no exchange
+	/// ([`SpecViolation::ResponseUnreported`]).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::tb_assert_spec;
+	/// use tightbeam::testing::specs::{ResponseContract, TBSpec};
+	/// use tightbeam::trace::Presence;
+	///
+	/// tb_assert_spec! {
+	///     pub Replies,
+	///     V(1,0,0): {
+	///         mode: Accept,
+	///         response: Present,
+	///         assertions: []
+	///     }
+	/// }
+	///
+	/// assert_eq!(Replies::latest().expected_response(), Some(ResponseContract::new(Presence::Present)));
+	/// ```
+	fn expected_response(&self) -> Option<ResponseContract> {
 		None
 	}
 
@@ -59,16 +149,26 @@ pub trait TBSpec {
 
 	/// Whether this spec can reject a trace on anything but its mode.
 	///
-	/// A spec that names no assertion, no gate decision, no required event,
-	/// and no task set constrains only the execution mode, which every
-	/// completed run satisfies. A scenario built from it cannot fail.
+	/// A spec that constrains only the execution mode passes every completed
+	/// run. Each of these constraints counts:
+	///
+	/// - An assertion contract, or an assertion order.
+	/// - A gate decision.
+	/// - A required event, or an event count, under the `instrument` feature.
+	/// - A task set, under the `testing-timing` feature.
+	///
+	/// A response constraint stays off the list, because the client closure of
+	/// a scenario reports the exchange that it reads.
 	fn can_reject(&self) -> bool {
-		if !self.required_assertions().is_empty() || self.expected_gate_decision().is_some() {
+		if !self.required_assertions().is_empty()
+			|| !self.required_assertion_order().is_empty()
+			|| self.expected_gate_decision().is_some()
+		{
 			return true;
 		}
 
 		#[cfg(feature = "instrument")]
-		if !self.required_events().is_empty() {
+		if !self.required_events().is_empty() || !self.required_event_counts().is_empty() {
 			return true;
 		}
 
@@ -92,16 +192,34 @@ pub trait TBSpec {
 
 	/// Verifies a captured trace against the spec contract.
 	///
-	/// `execution` is what the scenario body returned, which is the one
-	/// source of the run's error mode.
+	/// `execution` is what the scenario body returned, the one source of the
+	/// run's error mode.
 	///
 	/// The verification runs these checks in order:
 	/// 1. The execution mode matches the spec.
 	/// 2. The gate decision matches, when the spec constrains it.
 	/// 3. Every assertion contract holds.
-	/// 4. The required events occur in order, under the `instrument` feature.
-	/// 5. The custom response validation passes.
-	/// 6. The custom trace validation passes.
+	/// 4. The ordered assertion labels occur in their order.
+	/// 5. The required events occur in order, under the `instrument` feature.
+	/// 6. Every event count holds, under the `instrument` feature.
+	/// 7. The response is present or absent, when the spec constrains it.
+	/// 8. The custom response validation passes.
+	/// 9. The custom trace validation passes.
+	///
+	/// # Errors
+	///
+	/// - [`SpecViolation::ModeMismatch`] -- the run ended in another execution mode.
+	/// - [`SpecViolation::GateDecisionMismatch`] -- the gate decided otherwise.
+	/// - [`SpecViolation::AssertionViolation`] -- the trace breaks an assertion contract.
+	/// - [`SpecViolation::AssertionOrderViolation`] -- the trace lacks an ordered label in its order.
+	/// - [`SpecViolation::EventOrderViolation`] -- the trace lacks a required event in its order.
+	/// - [`SpecViolation::EventRecordTruncated`] -- the spec counts events, and the record misses events.
+	/// - [`SpecViolation::EventCountMismatch`] -- the count of an event falls outside its cardinality.
+	/// - [`SpecViolation::ResponseUnreported`] -- the spec constrains the response of a run with no exchange.
+	/// - [`SpecViolation::ResponseUnexpectedAbsence`] -- the spec requires a response that the trace lacks.
+	/// - [`SpecViolation::ResponseUnexpectedPresence`] -- the spec forbids the response that the trace holds.
+	/// - [`SpecViolation::ResponseValidationFailed`] -- the response fails [`Self::validate_response`].
+	/// - The error of [`Self::validate_trace`].
 	fn verify(&self, trace: &ConsumedTrace, execution: &Result<(), TightBeamError>) -> Result<(), SpecViolation> {
 		// 1. Verify the execution mode.
 		let actual_mode = ExecutionMode::of(execution, trace);
@@ -135,37 +253,349 @@ pub trait TBSpec {
 			}
 		}
 
-		// 4. Verify the required event order under the `instrument` feature.
+		// 4. Verify the required assertion order.
+		self.required_assertion_order().check(trace)?;
+
+		// 5. Verify the required event order under the `instrument` feature.
 		#[cfg(feature = "instrument")]
 		{
 			let required_kinds = self.required_events();
-			if !required_kinds.is_empty() {
-				let mut idx = 0;
-				for ev in trace.instrument_events.iter() {
-					if idx < required_kinds.len() && ev.urn == required_kinds[idx] {
-						idx += 1;
-					}
-				}
-				if idx != required_kinds.len() {
-					return Err(SpecViolation::EventOrderViolation(EventOrderViolationDetail {
-						expected_kind: required_kinds[idx].clone(),
-						position: idx,
-					}));
-				}
+			let missing =
+				first_missing_in_order(required_kinds, &trace.instrument_events, |event, kind| event.urn == *kind);
+			if let Some((position, expected)) = missing {
+				let detail = EventOrderViolationDetail { expected_kind: expected.clone(), position };
+				return Err(SpecViolation::EventOrderViolation(detail));
 			}
 		}
 
-		// 5. Run the custom response validation.
-		if let Some(ref response) = trace.response {
+		// 6. Verify every event count under the `instrument` feature.
+		#[cfg(feature = "instrument")]
+		for contract in self.required_event_counts() {
+			contract.check(trace)?;
+		}
+
+		// 7. Verify the response presence when the spec constrains it.
+		if let Some(response) = self.expected_response() {
+			response.check(trace)?;
+		}
+
+		// 8. Run the custom response validation.
+		if let Some(response) = trace.response() {
 			if !self.validate_response(response) {
 				return Err(SpecViolation::ResponseValidationFailed);
 			}
 		}
 
-		// 6. Run the custom trace validation.
+		// 9. Run the custom trace validation.
 		self.validate_trace(trace)?;
 
 		Ok(())
+	}
+}
+
+/// The first item of `required` that `recorded` lacks in order, with its index
+/// among `required`, or `None` when `recorded` holds every one in order.
+///
+/// `matches` decides whether a recorded item is the one the order waits for.
+/// Other recorded items may come between two of them.
+fn first_missing_in_order<T, R>(
+	required: &[R],
+	recorded: impl IntoIterator<Item = T>,
+	matches: impl Fn(&T, &R) -> bool,
+) -> Option<(usize, &R)> {
+	let mut waiting = required.iter().enumerate().peekable();
+	for item in recorded {
+		if waiting.peek().is_some_and(|(_, wanted)| matches(&item, wanted)) {
+			waiting.next();
+		}
+	}
+
+	waiting.next()
+}
+
+/// The order in which a spec requires the trace to record its assertion
+/// labels.
+///
+/// The contract converts each URN to its [`AssertionLabel`] once, when it
+/// takes the URN, so a check compares the labels in place. Other assertions
+/// may come between two ordered labels.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::specs::{AssertionOrderContract, EventOrderViolationDetail, SpecViolation};
+/// use tightbeam::trace::{ConsumedTrace, TraceCollector};
+/// use tightbeam::urn::Urn;
+///
+/// const OPEN: Urn<'static> = tightbeam::urn!("doc", "event:order/open");
+/// const CLOSE: Urn<'static> = tightbeam::urn!("doc", "event:order/close");
+///
+/// let collector = TraceCollector::new();
+/// collector.event(CLOSE)?;
+/// collector.event(OPEN)?;
+///
+/// let mut trace = ConsumedTrace::new();
+/// trace.populate_from_collector(&collector);
+///
+/// let order: AssertionOrderContract = [OPEN, CLOSE].into_iter().collect();
+/// let detail = EventOrderViolationDetail { expected_kind: CLOSE, position: 1 };
+/// assert_eq!(order.check(&trace), Err(SpecViolation::AssertionOrderViolation(detail)));
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AssertionOrderContract {
+	/// Each ordered URN with the label that it converts to, in order.
+	labels: Vec<(Urn<'static>, AssertionLabel)>,
+}
+
+/// The order contract with no label, which every trace meets: the default of
+/// [`TBSpec::required_assertion_order`].
+static UNORDERED: AssertionOrderContract = AssertionOrderContract { labels: Vec::new() };
+
+impl AssertionOrderContract {
+	/// The URNs of the contract, in the order the trace must record them.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::AssertionOrderContract;
+	/// use tightbeam::urn::Urn;
+	///
+	/// const OPEN: Urn<'static> = tightbeam::urn!("doc", "event:order/open");
+	///
+	/// let order: AssertionOrderContract = [OPEN].into_iter().collect();
+	/// assert_eq!(order.urns().collect::<Vec<_>>(), [&OPEN]);
+	/// ```
+	pub fn urns(&self) -> impl ExactSizeIterator<Item = &Urn<'static>> {
+		self.labels.iter().map(|(urn, _)| urn)
+	}
+
+	/// Whether the contract holds no label, so that it admits every trace.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::AssertionOrderContract;
+	///
+	/// assert!(AssertionOrderContract::default().is_empty());
+	/// ```
+	pub fn is_empty(&self) -> bool {
+		self.labels.is_empty()
+	}
+
+	/// The text of each label of the contract, in order.
+	pub(crate) fn labels(&self) -> impl ExactSizeIterator<Item = &str> {
+		self.labels.iter().map(|(_, AssertionLabel::Custom(label))| label.as_ref())
+	}
+
+	/// Checks that the assertions of `trace` record each label in its order.
+	///
+	/// # Errors
+	///
+	/// - [`SpecViolation::AssertionOrderViolation`] -- the trace lacks an ordered label in its order.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::AssertionOrderContract;
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector};
+	/// use tightbeam::urn::Urn;
+	///
+	/// const OPEN: Urn<'static> = tightbeam::urn!("doc", "event:order/open");
+	/// const CLOSE: Urn<'static> = tightbeam::urn!("doc", "event:order/close");
+	///
+	/// let collector = TraceCollector::new();
+	/// collector.event(OPEN)?;
+	/// collector.event(CLOSE)?;
+	///
+	/// let mut trace = ConsumedTrace::new();
+	/// trace.populate_from_collector(&collector);
+	///
+	/// let order: AssertionOrderContract = [OPEN, CLOSE].into_iter().collect();
+	/// assert_eq!(order.check(&trace), Ok(()));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn check(&self, trace: &ConsumedTrace) -> Result<(), SpecViolation> {
+		let unordered = first_missing_in_order(&self.labels, &trace.assertions, |assertion, (_, label)| {
+			assertion.label.matches(label)
+		});
+		if let Some((position, (expected, _))) = unordered {
+			let detail = EventOrderViolationDetail { expected_kind: expected.clone(), position };
+			return Err(SpecViolation::AssertionOrderViolation(detail));
+		}
+
+		Ok(())
+	}
+}
+
+impl Extend<Urn<'static>> for AssertionOrderContract {
+	fn extend<I: IntoIterator<Item = Urn<'static>>>(&mut self, urns: I) {
+		let labelled = urns.into_iter().map(|urn| {
+			let label = AssertionLabel::Custom((&urn).into_label());
+			(urn, label)
+		});
+		self.labels.extend(labelled);
+	}
+}
+
+impl FromIterator<Urn<'static>> for AssertionOrderContract {
+	fn from_iter<I: IntoIterator<Item = Urn<'static>>>(urns: I) -> Self {
+		let mut contract = Self::default();
+		contract.extend(urns);
+		contract
+	}
+}
+
+/// Whether a spec requires the run to produce a response.
+///
+/// The contract reads the frames that the exchanges of the run report, so a
+/// run that reported no exchange meets no response contract.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::specs::{ResponseContract, SpecViolation};
+/// use tightbeam::testing::TestFrame;
+/// use tightbeam::trace::{ConsumedTrace, Presence};
+///
+/// let silent = ResponseContract::new(Presence::Absent);
+/// let mut trace = ConsumedTrace::new();
+/// assert_eq!(silent.check(&trace), Err(SpecViolation::ResponseUnreported));
+///
+/// trace.record_rejected(TestFrame::v0(None, Some("request")));
+/// assert_eq!(silent.check(&trace), Ok(()));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResponseContract {
+	/// Whether the client of the run must receive a response.
+	pub presence: Presence,
+}
+
+impl ResponseContract {
+	/// The contract that the client of the run receives a response for
+	/// [`Presence::Present`], or none for [`Presence::Absent`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::ResponseContract;
+	/// use tightbeam::trace::Presence;
+	///
+	/// assert_eq!(ResponseContract::new(Presence::Present).presence, Presence::Present);
+	/// ```
+	pub const fn new(presence: Presence) -> Self {
+		Self { presence }
+	}
+
+	/// Checks the response presence of `trace` against the contract.
+	///
+	/// # Errors
+	///
+	/// - [`SpecViolation::ResponseUnreported`] -- the run reported no exchange.
+	/// - [`SpecViolation::ResponseUnexpectedAbsence`] -- the trace lacks the required response.
+	/// - [`SpecViolation::ResponseUnexpectedPresence`] -- the trace holds a forbidden response.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::{ResponseContract, SpecViolation};
+	/// use tightbeam::testing::TestFrame;
+	/// use tightbeam::trace::{ConsumedTrace, Presence};
+	///
+	/// let mut trace = ConsumedTrace::new();
+	/// trace.record_accepted(TestFrame::v0(None, Some("request")), None);
+	///
+	/// let replies = ResponseContract::new(Presence::Present);
+	/// assert_eq!(replies.check(&trace), Err(SpecViolation::ResponseUnexpectedAbsence));
+	/// ```
+	pub fn check(&self, trace: &ConsumedTrace) -> Result<(), SpecViolation> {
+		let actual = trace.response_presence().ok_or(SpecViolation::ResponseUnreported)?;
+		match (self.presence, actual) {
+			(Presence::Present, Presence::Absent) => Err(SpecViolation::ResponseUnexpectedAbsence),
+			(Presence::Absent, Presence::Present) => Err(SpecViolation::ResponseUnexpectedPresence),
+			(Presence::Present, Presence::Present) | (Presence::Absent, Presence::Absent) => Ok(()),
+		}
+	}
+}
+
+/// A count that a spec places on one instrumentation event.
+///
+/// The contract counts the events of its kind in the instrumentation record
+/// of a trace: the events a run emits through the event API, such as
+/// [`TraceCollector::emit_event`].
+///
+/// [`TraceCollector::emit_event`]: crate::trace::TraceCollector::emit_event
+#[cfg(feature = "instrument")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventCountContract {
+	/// The event URN that the contract counts.
+	pub kind: Urn<'static>,
+	/// The count of `kind` events that satisfies the contract.
+	pub cardinality: Cardinality,
+}
+
+#[cfg(feature = "instrument")]
+impl EventCountContract {
+	/// The contract that the trace records `kind` a number of times that
+	/// `cardinality` admits.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events;
+	/// use tightbeam::testing::specs::EventCountContract;
+	/// use tightbeam::{absent, exactly};
+	///
+	/// let never = EventCountContract::new(events::GATE_REJECT, absent!());
+	/// assert_eq!(never.kind, events::GATE_REJECT);
+	/// assert_ne!(never.cardinality, exactly!(1));
+	/// ```
+	pub const fn new(kind: Urn<'static>, cardinality: Cardinality) -> Self {
+		Self { kind, cardinality }
+	}
+
+	/// Checks the count of `kind` in the instrumentation record of `trace`.
+	///
+	/// A record that misses events ([`ConsumedTrace::is_complete`]) holds fewer
+	/// events than the run emitted, so it decides no count.
+	///
+	/// # Errors
+	///
+	/// - [`SpecViolation::EventRecordTruncated`] -- the record of the trace misses events.
+	/// - [`SpecViolation::EventCountMismatch`] -- the count of `kind` falls outside `cardinality`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::exactly;
+	/// use tightbeam::instrumentation::{events, TbInstrumentationConfig};
+	/// use tightbeam::testing::specs::{EventCountContract, SpecViolation};
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+	///
+	/// let config = TraceConfig::with_instrumentation(TbInstrumentationConfig::default());
+	/// let collector = TraceCollector::from(config);
+	/// collector.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// let mut trace = ConsumedTrace::new();
+	/// trace.populate_from_collector(&collector);
+	///
+	/// let once = EventCountContract::new(events::GATE_ACCEPT, exactly!(1));
+	/// let twice = EventCountContract::new(events::GATE_ACCEPT, exactly!(2));
+	/// assert_eq!(once.check(&trace), Ok(()));
+	/// assert!(matches!(twice.check(&trace), Err(SpecViolation::EventCountMismatch(_))));
+	/// ```
+	pub fn check(&self, trace: &ConsumedTrace) -> Result<(), SpecViolation> {
+		let counted = trace.count_event_urn(self.kind.clone());
+		let actual = counted.map_err(|EventRecordTruncated| SpecViolation::EventRecordTruncated)?;
+		if self.cardinality.is_satisfied_by(actual) {
+			return Ok(());
+		}
+
+		Err(SpecViolation::EventCountMismatch(EventCountMismatchDetail {
+			kind: self.kind.clone(),
+			expected: self.cardinality,
+			actual,
+		}))
 	}
 }
 
@@ -176,12 +606,23 @@ mod tests {
 	use super::TBSpec;
 	use crate::error::TightBeamError;
 	use crate::testing::assertions::{Assertion, AssertionLabel};
-	use crate::testing::specs::SpecViolation;
-	use crate::trace::{ConsumedTrace, IntoEventLabel};
+	use crate::testing::macros::{AssertSpecBuilder, BuiltAssertSpec};
+	use crate::testing::specs::{EventOrderViolationDetail, SpecViolation};
+	use crate::testing::TestFrame;
+	use crate::trace::{ConsumedTrace, ExecutionMode, IntoEventLabel};
 	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec};
 
+	#[cfg(feature = "instrument")]
+	use crate::instrumentation::{events, TbInstrumentationConfig};
+	#[cfg(feature = "instrument")]
+	use crate::testing::specs::EventCountMismatchDetail;
+	#[cfg(feature = "instrument")]
+	use crate::trace::{TraceCollector, TraceConfig};
+
 	const STEP: Urn<'static> = crate::urn!("test", "event:assert/step");
+	const FIRST: Urn<'static> = crate::urn!("test", "event:assert/first");
+	const SECOND: Urn<'static> = crate::urn!("test", "event:assert/second");
 
 	tb_assert_spec! {
 		pub OneStepSpec,
@@ -193,6 +634,46 @@ mod tests {
 		}
 	}
 
+	tb_assert_spec! {
+		pub RepliesSpec,
+		V(1,0,0): {
+			mode: Accept,
+			response: Present,
+			assertions: []
+		}
+	}
+
+	tb_assert_spec! {
+		pub SilentSpec,
+		V(1,0,0): {
+			mode: Accept,
+			response: Absent,
+			assertions: []
+		}
+	}
+
+	#[cfg(feature = "instrument")]
+	tb_assert_spec! {
+		pub RejectsAfterAcceptSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [],
+			events: [events::GATE_ACCEPT, events::GATE_REJECT]
+		}
+	}
+
+	#[cfg(feature = "instrument")]
+	tb_assert_spec! {
+		pub AcceptsOnceSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [],
+			event_counts: [
+				(events::GATE_ACCEPT, exactly!(1))
+			]
+		}
+	}
+
 	/// A trace that records `STEP` `count` times.
 	fn steps(count: usize) -> ConsumedTrace {
 		let mut trace = ConsumedTrace::new();
@@ -200,7 +681,54 @@ mod tests {
 		let recorded = (0..count).map(|seq| Assertion::new(seq, label.clone(), Vec::new(), None));
 
 		trace.assertions.extend(recorded);
+		trace
+	}
 
+	/// A trace that records each label of `labels` once, in that order.
+	fn recorded(labels: &[Urn<'static>]) -> ConsumedTrace {
+		let mut trace = ConsumedTrace::new();
+		let assertions = labels.iter().enumerate().map(|(seq, label)| {
+			let label = AssertionLabel::Custom(label.clone().into_label());
+			Assertion::new(seq, label, Vec::new(), None)
+		});
+
+		trace.assertions.extend(assertions);
+		trace
+	}
+
+	/// A spec that requires `FIRST` and then `SECOND`, once each.
+	fn first_then_second() -> BuiltAssertSpec {
+		let builder = AssertSpecBuilder::new("FirstThenSecond", ExecutionMode::Accept);
+		let builder = builder.assertion(FIRST, Vec::new(), exactly!(1)).expect("FIRST is a new label");
+		let builder = builder
+			.assertion(SECOND, Vec::new(), exactly!(1))
+			.expect("SECOND is a new label");
+		builder.ordering([FIRST, SECOND]).expect("the spec holds both labels").build()
+	}
+
+	/// A trace whose run reported one accepted request, answered with a
+	/// response frame when `answered` holds.
+	fn exchanged(answered: bool) -> ConsumedTrace {
+		let request = TestFrame::v0(None, Some("request"));
+		let response = answered.then(|| TestFrame::v0(None, Some("reply")));
+
+		let mut trace = ConsumedTrace::new();
+		trace.record_accepted(request, response);
+		trace
+	}
+
+	/// A trace whose instrumentation record holds `count` gate acceptances,
+	/// drained from a sink that holds `max_events` events.
+	#[cfg(feature = "instrument")]
+	fn accepted(count: usize, max_events: u32) -> ConsumedTrace {
+		let config = TbInstrumentationConfig { max_events, ..Default::default() };
+		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+		for _ in 0..count {
+			collector.emit(events::GATE_ACCEPT, "Ok");
+		}
+
+		let mut trace = ConsumedTrace::new();
+		trace.populate_from_collector(&collector);
 		trace
 	}
 
@@ -225,6 +753,115 @@ mod tests {
 		let trace = steps(0);
 		let verdict = OneStepSpec::latest().verify(&trace, &Ok(()));
 		assert!(matches!(verdict, Err(SpecViolation::AssertionViolation(_))));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_that_records_its_ordered_labels_in_order_verifies() -> Result<(), Box<dyn Error>> {
+		let trace = recorded(&[FIRST, SECOND]);
+		let verdict = first_then_second().verify(&trace, &Ok(()));
+		assert_eq!(verdict, Ok(()));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_that_records_its_ordered_labels_out_of_order_is_refused() -> Result<(), Box<dyn Error>> {
+		let trace = recorded(&[SECOND, FIRST]);
+		let verdict = first_then_second().verify(&trace, &Ok(()));
+
+		let detail = EventOrderViolationDetail { expected_kind: SECOND, position: 1 };
+		assert_eq!(verdict, Err(SpecViolation::AssertionOrderViolation(detail)));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_with_the_response_its_spec_requires_verifies() -> Result<(), Box<dyn Error>> {
+		let trace = exchanged(true);
+		let verdict = RepliesSpec::latest().verify(&trace, &Ok(()));
+		assert_eq!(verdict, Ok(()));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_without_the_response_its_spec_requires_is_refused() -> Result<(), Box<dyn Error>> {
+		let trace = exchanged(false);
+		let verdict = RepliesSpec::latest().verify(&trace, &Ok(()));
+		assert_eq!(verdict, Err(SpecViolation::ResponseUnexpectedAbsence));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_with_a_response_its_spec_forbids_is_refused() -> Result<(), Box<dyn Error>> {
+		let trace = exchanged(true);
+		let verdict = SilentSpec::latest().verify(&trace, &Ok(()));
+		assert_eq!(verdict, Err(SpecViolation::ResponseUnexpectedPresence));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_that_reports_no_exchange_meets_no_spec_that_forbids_a_response() -> Result<(), Box<dyn Error>> {
+		let verdict = SilentSpec::latest().verify(&ConsumedTrace::new(), &Ok(()));
+		assert_eq!(verdict, Err(SpecViolation::ResponseUnreported));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_that_reports_no_exchange_meets_no_spec_that_requires_a_response() -> Result<(), Box<dyn Error>> {
+		let verdict = RepliesSpec::latest().verify(&ConsumedTrace::new(), &Ok(()));
+		assert_eq!(verdict, Err(SpecViolation::ResponseUnreported));
+		Ok(())
+	}
+
+	#[test]
+	fn a_spec_that_constrains_only_the_response_cannot_reject() -> Result<(), Box<dyn Error>> {
+		assert!(!SilentSpec::latest().can_reject());
+		Ok(())
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_run_that_meets_its_event_count_verifies() -> Result<(), Box<dyn Error>> {
+		let trace = accepted(1, 1024);
+		let verdict = AcceptsOnceSpec::latest().verify(&trace, &Ok(()));
+		assert_eq!(verdict, Ok(()));
+		Ok(())
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_run_whose_event_count_breaks_its_spec_is_refused() -> Result<(), Box<dyn Error>> {
+		let trace = accepted(2, 1024);
+		let verdict = AcceptsOnceSpec::latest().verify(&trace, &Ok(()));
+
+		let detail = EventCountMismatchDetail { kind: events::GATE_ACCEPT, expected: exactly!(1), actual: 2 };
+		assert_eq!(verdict, Err(SpecViolation::EventCountMismatch(detail)));
+		Ok(())
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_truncated_record_decides_no_event_count() -> Result<(), Box<dyn Error>> {
+		let trace = accepted(2, 1);
+		let verdict = AcceptsOnceSpec::latest().verify(&trace, &Ok(()));
+		assert_eq!(verdict, Err(SpecViolation::EventRecordTruncated));
+		Ok(())
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_run_that_lacks_a_required_event_in_order_is_refused() -> Result<(), Box<dyn Error>> {
+		let trace = accepted(1, 1024);
+		let verdict = RejectsAfterAcceptSpec::latest().verify(&trace, &Ok(()));
+
+		let detail = EventOrderViolationDetail { expected_kind: events::GATE_REJECT, position: 1 };
+		assert_eq!(verdict, Err(SpecViolation::EventOrderViolation(detail)));
+		Ok(())
+	}
+
+	#[cfg(feature = "instrument")]
+	#[test]
+	fn a_spec_that_counts_only_an_event_can_reject() -> Result<(), Box<dyn Error>> {
+		assert!(AcceptsOnceSpec::latest().can_reject());
 		Ok(())
 	}
 }

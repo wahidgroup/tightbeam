@@ -1,16 +1,16 @@
 //! The timing checks of FDR exploration.
 //!
-//! The module adds checks to [`TimingConstraints`] that FDR exploration calls
-//! on each branch, so exploration prunes a trace that violates a timing
-//! constraint before the trace grows. It adds to [`Process`] the divergence of
-//! a state at the clocks of a branch, which a guard can block.
+//! It adds to [`TimingConstraints`] the checks FDR exploration runs on each
+//! branch, so exploration prunes a trace that violates a timing constraint
+//! before the trace grows. It adds to [`Process`] the divergence of a state at
+//! the clocks of a branch, which a guard can block.
 
 use core::time::Duration;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::testing::fdr::verdict::Trace;
 use crate::testing::specs::csp::{Action, Event, Process, State};
-use crate::testing::timing::{TimingConstraint, TimingConstraints};
+use crate::testing::timing::{saturating_nanos, PathWcet, TimingConstraint, TimingConstraints};
 
 #[cfg(feature = "testing-schedulability")]
 use crate::testing::schedulability::SchedulabilityError;
@@ -32,8 +32,8 @@ impl TimingConstraints {
 
 	/// The WCET that `event` adds to the elapsed time of a path.
 	///
-	/// An event with no WCET constraint, or with a jitter or a deadline
-	/// constraint, adds [`Duration::ZERO`].
+	/// An event with no WCET constraint, or with a jitter constraint, adds
+	/// [`Duration::ZERO`].
 	pub(crate) fn wcet_of(&self, event: &Event) -> Duration {
 		let Some(TimingConstraint::Wcet(wcet_config)) = self.get(event) else {
 			return Duration::ZERO;
@@ -45,7 +45,8 @@ impl TimingConstraints {
 	/// Whether the time from the start event to the end event of a deadline
 	/// exceeds its duration.
 	///
-	/// A deadline holds while `event_times` lacks one of its two events.
+	/// A deadline holds while `event_times` lacks one of its two events, or
+	/// times its end before its start.
 	fn deadline_violated(&self, event_times: impl AsRef<[(Event, Duration)]>) -> bool {
 		let event_times = event_times.as_ref();
 		self.deadlines().iter().any(|deadline| {
@@ -58,7 +59,8 @@ impl TimingConstraints {
 				.find(|(event, _)| *event == deadline.end_event)
 				.map(|(_, time)| *time);
 
-			matches!((start, end), (Some(start), Some(end)) if end - start > deadline.duration)
+			let latency = start.zip(end).and_then(|(start, end)| end.checked_sub(start));
+			latency.is_some_and(|latency| deadline.excess(saturating_nanos(latency)).is_some())
 		})
 	}
 
@@ -67,12 +69,9 @@ impl TimingConstraints {
 	/// A path matches only a trace of its exact event sequence, so its limit
 	/// binds that trace alone.
 	fn path_wcet_violated(&self, trace: &Trace, elapsed_time: Duration) -> bool {
-		self.path_wcets().iter().any(|path_wcet| {
-			let matched =
-				trace.len() == path_wcet.path.len() && trace.iter().zip(path_wcet.path.iter()).all(|(a, b)| a == b);
-
-			matched && elapsed_time > path_wcet.max_duration
-		})
+		let elapsed_ns = saturating_nanos(elapsed_time);
+		let exceeds = |path_wcet: &PathWcet| path_wcet.excess(trace, elapsed_ns).is_some();
+		self.path_wcets().iter().any(exceeds)
 	}
 }
 
@@ -86,9 +85,9 @@ impl Process {
 	///
 	/// - A hidden event takes no time, so the clocks change along a run only
 	///   where an edge resets them, and each guard reads them at its edge.
-	/// - The run takes the hidden actions in the order of [`Process::enabled`],
-	///   and it ends at the first point that it reaches a second time, so its
-	///   last event closes a cycle.
+	/// - The run takes the hidden actions in the order of [`Process::enabled`]
+	///   and ends at the first point it reaches twice, so its last event closes
+	///   a cycle.
 	///
 	/// A guard can block an edge that [`Process::divergent_states`] counts,
 	/// so a state that it marks can answer `None` here.
@@ -289,6 +288,22 @@ mod tests {
 				path_wcet_ms: Some(100),
 				expected_violation: true,
 			},
+			past_the_end_of_the_path => TimingViolationTestCase {
+				trace_events: &["start", "process", "end", "end"],
+				elapsed_time_ms: 150,
+				event_times_ms: &[("start", 50), ("process", 100), ("end", 150)],
+				deadline_ms: None,
+				path_wcet_ms: Some(100),
+				expected_violation: false,
+			},
+			end_before_its_start => TimingViolationTestCase {
+				trace_events: &["end", "start"],
+				elapsed_time_ms: 50,
+				event_times_ms: &[("end", 0), ("start", 50)],
+				deadline_ms: Some(100),
+				path_wcet_ms: None,
+				expected_violation: false,
+			},
 			within_the_deadline_and_the_path_wcet => TimingViolationTestCase {
 				trace_events: &["start", "process", "end"],
 				elapsed_time_ms: 50,
@@ -316,7 +331,8 @@ mod tests {
 		let mut constraints = TimingConstraints::default();
 		let duration = Duration::from_millis(100);
 		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
-		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
+
+		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config))?;
 
 		assert_eq!(constraints.wcet_of(&Event("process")), duration);
 		Ok(())

@@ -1,7 +1,9 @@
-//! Frame building helper for DTN messages
+//! The frame builder of the DTN nodes.
 //!
-//! Encapsulates frame building logic with chain support and compression
+//! [`FrameBuilderHelper`] signs, encrypts, and compresses each relay message
+//! frame, and links a frame of the chain to the frame before it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tightbeam::{
@@ -24,12 +26,17 @@ use crate::dtn::{
 	messages::{CommandAck, EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverTelemetry, StatelessAck},
 };
 
-/// Helper for building frames with chain support and compression
+/// The frame builder of one DTN node, bound to the chain processor of that
+/// node.
 pub struct FrameBuilderHelper {
 	pub chain_processor: Arc<ChainProcessor>,
+	/// The order of the next frame request of the node, which numbers its
+	/// requests from 1 for the request gate of each hop.
+	next_request: AtomicU64,
 }
 
-/// Macro to apply common builder patterns (hashers, cipher, signer, compression, previous_hash)
+/// Sets the hashers, the compression, the cipher, and the signer of a relay
+/// frame, and its `previous_frame` hash when the frame has a predecessor.
 macro_rules! apply_common_builder_patterns {
 	($builder:expr, $previous_digest:expr, $signing_key:expr, $cipher:expr) => {{
 		let mut builder = $builder
@@ -39,7 +46,7 @@ macro_rules! apply_common_builder_patterns {
 			.with_encryptor($cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>(tightbeam::testing::TestIdentity::certified($signing_key.to_owned()));
 
-		// Set previous_frame if not the first frame
+		// Only a frame with a predecessor carries a `previous_frame` hash.
 		if let Some(digest) = $previous_digest {
 			builder = builder.with_previous_hash(digest);
 		}
@@ -49,60 +56,63 @@ macro_rules! apply_common_builder_patterns {
 }
 
 impl FrameBuilderHelper {
-	/// Create a new FrameBuilderHelper
+	/// A builder over `chain_processor`, whose first frame request takes
+	/// order 1.
 	pub fn new(chain_processor: Arc<ChainProcessor>) -> Self {
-		Self { chain_processor }
+		Self { chain_processor, next_request: AtomicU64::new(1) }
 	}
 
-	/// Apply common builder patterns (hashers, cipher, signer, compression, previous_hash)
-	/// and finalize the frame
+	/// Records `frame` as the head of the chain of this node through
+	/// [`ChainProcessor::finalize_outgoing`], and returns it.
 	fn finalize_frame(&self, frame: Frame) -> Result<Frame, TightBeamError> {
-		// Finalize outgoing frame
 		self.chain_processor.finalize_outgoing(&frame)?;
 		Ok(frame)
 	}
 
-	/// Build a frame request for missing frames (chain gap recovery)
+	/// Builds a frame request for the missing frames of a gap.
+	///
+	/// The request travels hop to hop outside the chain, so this node's chain
+	/// stays as it was. Its order is this node's next request order, which the
+	/// hop's request gate checks.
 	pub fn build_frame_request_frame(
 		&self,
 		request: FrameRequest,
-		next_order: u64,
-		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
 		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let relay_message = RelayMessage::FrameRequest(request);
+		let order = self.next_request.fetch_add(1, Ordering::Relaxed);
 		let builder = FrameBuilder::from(Version::V3)
-			.with_id(format!("frame-req-{:03}", next_order))
-			.with_order(next_order)
+			.with_id("frame-req")
+			.with_order(order)
 			.with_message(relay_message);
 
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
+		let builder = apply_common_builder_patterns!(builder, None::<DigestInfo>, signing_key, cipher);
+		builder.build()
 	}
 
-	/// Build a frame response with missing frames (chain gap recovery)
+	/// Builds the answer to a frame request, which carries the missing frames
+	/// of a gap.
+	///
+	/// The answer travels back to the requester outside the chain. Its frames
+	/// fill the gap, and this node's chain stays as it was.
 	pub fn build_frame_response_frame(
 		&self,
 		response: FrameResponse,
-		next_order: u64,
-		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
 		cipher: &SharedCipher,
 	) -> Result<Frame, TightBeamError> {
 		let relay_message = RelayMessage::FrameResponse(response);
 		let builder = FrameBuilder::from(Version::V3)
-			.with_id(format!("frame-resp-{:03}", next_order))
-			.with_order(next_order)
+			.with_id("frame-resp")
 			.with_message(relay_message);
 
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
+		let builder = apply_common_builder_patterns!(builder, None::<DigestInfo>, signing_key, cipher);
+		builder.build()
 	}
 
-	/// Build a relay message frame (for async Earth-initiated commands)
+	/// Builds the chain frame of `command`, which Earth sends, and records it
+	/// in the chain of this node.
 	pub fn build_relay_command_frame(
 		&self,
 		command: EarthCommand,
@@ -123,7 +133,8 @@ impl FrameBuilderHelper {
 		self.finalize_frame(frame)
 	}
 
-	/// Build a relay ACK frame (Rover acknowledges command)
+	/// Builds the chain frame of the Rover's ACK of the command at
+	/// `command_order`, and records it in the chain of this node.
 	pub fn build_relay_ack_frame(
 		&self,
 		command_order: u64,
@@ -144,7 +155,8 @@ impl FrameBuilderHelper {
 		self.finalize_frame(frame)
 	}
 
-	/// Build a relay telemetry frame (Rover sends telemetry)
+	/// Builds the chain frame of the Rover's `telemetry`, with `fault_matrix`
+	/// as its matrix, and records it in the chain of this node.
 	pub fn build_relay_telemetry_frame(
 		&self,
 		telemetry: RoverTelemetry,
@@ -167,11 +179,11 @@ impl FrameBuilderHelper {
 		self.finalize_frame(frame)
 	}
 
-	/// Build a stateless ACK frame (metadata-only, not added to chain)
-	/// Used for immediate acknowledgment responses at relay nodes
+	/// Builds the stateless ACK of the frame at `ack_for_order`, which a relay
+	/// sends back at once, outside the chain.
 	pub fn build_stateless_ack_frame(&self, ack_for_order: u64) -> Result<Frame, TightBeamError> {
-		// Metadata-only frame with minimal message body
-		// Not added to chain (no order, no previous_hash)
+		// The ACK carries one flag and no order or `previous_frame`, so it
+		// stays outside the chain.
 		let ack = StatelessAck { ack: true };
 		let frame = FrameBuilder::from(Version::V3)
 			.with_id(format!("stateless-ack-{}", ack_for_order))

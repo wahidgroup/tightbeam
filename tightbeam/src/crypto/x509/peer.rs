@@ -422,8 +422,8 @@ mod tests {
 	/// The house purpose of a frame signer.
 	const SIGNER: ObjectIdentifier = KeyPurposes::HOUSE.signer;
 
-	/// A placeholder-signed certificate of the fixed test key, whose
-	/// `keyUsage` carries `digitalSignature` and `keyAgreement`.
+	/// A self-signed certificate of the fixed test key, whose `keyUsage`
+	/// carries `digitalSignature` and `keyAgreement`.
 	fn both_uses() -> Certificate {
 		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 	}

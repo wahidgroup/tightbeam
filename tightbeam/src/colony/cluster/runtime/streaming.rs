@@ -2,15 +2,15 @@
 //! a local servlet or a peer gateway, then relays the bodies and the reply.
 //!
 //! The gateway is a [`MuxService`]: a streamed or duplex open carries a
-//! gRPC-style route the same way unary work carries `servlet_type`.
-//! Selection reuses [`ServletRegistry::select_route`], so streaming and unary
-//! share one pheromone-weighted routing decision.
+//! gRPC-style route as unary work carries `servlet_type`. Route selection
+//! reuses [`ServletRegistry::select_route`], so streaming and unary share one
+//! pheromone-weighted decision.
 //!
 //! - A `Local` route dials the servlet on the hive plane.
 //! - A `Peer` route re-emits the stream to the peer gateway on the peer plane
 //!   with [`StreamRoute::relayed_to`] and the relay budget decremented.
 //!
-//! A stream whose budget is spent therefore reaches a local servlet only.
+//! So a stream whose budget is spent reaches a local servlet only.
 //!
 //! [`ServletRegistry::select_route`]: crate::colony::cluster::ServletRegistry::select_route
 //! [`MuxService`]: crate::transport::multiplex::MuxService
@@ -21,10 +21,12 @@ use futures::future::try_join;
 
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
+use crate::colony::cluster::runtime::verify::RequestAudit;
 use crate::colony::cluster::runtime::work::RouteChoice;
 use crate::colony::cluster::HopBudget;
 use crate::instrumentation::events::CLUSTER_WORK_FORWARDED;
 use crate::policy::TransitStatus;
+use crate::trace::TraceCollector;
 use crate::transport::error::TransportError;
 use crate::transport::multiplex::{ReplySink, StreamBody, StreamRoute};
 use crate::transport::PooledClient;
@@ -42,9 +44,9 @@ struct SplicePlan {
 
 impl SplicePlan {
 	/// Dial this plan's route, on `hive` for a local route and on `peers` for
-	/// a peer route: the shared connect step of both splices. A failed dial
-	/// refuses as `Unavailable`, and so does a hop that a party other than the
-	/// route's answers, which the plane records.
+	/// a peer route, the connect step both splices share. A failed dial refuses
+	/// as `Unavailable`, as does a hop that another party answers, which the
+	/// plane records.
 	async fn dial<P: ColonyDialProtocol>(
 		&self,
 		hive: &HivePlane<P>,
@@ -70,21 +72,22 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace refused the event of a refusal.
+	/// - [`TightBeamError`] -- `trace` refused the event of a refusal.
 	fn plan_splice(
 		&self,
 		target: &Urn<'static>,
 		budget: HopBudget,
 		exclude: Option<&[u8]>,
+		trace: &TraceCollector,
 	) -> Result<Result<SplicePlan, TransitStatus>, TightBeamError> {
 		let Some(type_key) = self.config.namespace.servlet_type_key(target) else {
-			let status = self.refuse_work(TransitStatus::PermissionDenied)?;
+			let status = self.refuse_work(TransitStatus::PermissionDenied, trace)?;
 			return Ok(Err(status));
 		};
 
 		let selected = self.servlet_registry.select_route(&self.config, &type_key, budget, exclude);
 		let Some(choice) = selected else {
-			self.record_no_trail(exclude)?;
+			self.record_no_trail(exclude, trace)?;
 
 			return Ok(Err(TransitStatus::Unavailable));
 		};
@@ -94,17 +97,17 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		Ok(planned)
 	}
 
-	/// Plan and dial the splice route, with one bounded retry on a failed
-	/// dial. The failed trail weakens immediately, and the next-best trail
-	/// other than the failed route key gets a single chance. A retry at the
-	/// dial step is safe because the splice reads the body only after a dial
-	/// succeeds.
+	/// Plan and dial the splice route, with one retry on a failed dial. The
+	/// failed trail weakens at once, and the next-best other trail gets one
+	/// chance. A retry at the dial step is safe, because the splice reads the
+	/// body only after a dial succeeds.
 	async fn connect_splice(
 		&self,
 		target: &Urn<'static>,
 		budget: HopBudget,
+		trace: &TraceCollector,
 	) -> Result<(SplicePlan, PooledClient<P>), TightBeamError> {
-		let plan = self.plan_splice(target, budget, None)?.map_err(TransitStatus::refusal)?;
+		let plan = self.plan_splice(target, budget, None, trace)?.map_err(TransitStatus::refusal)?;
 		let dial_status = match plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
 			Ok(client) => {
 				return Ok((plan, client));
@@ -113,17 +116,17 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		};
 
 		let registry = &self.servlet_registry;
-		registry.work_trail_weaken(&plan.choice.route_key, dial_status, &self.config, &self.trace)?;
+		registry.work_trail_weaken(&plan.choice.route_key, dial_status, &self.config, trace)?;
 
 		// With no alternative trail, the caller gets the original dial failure.
-		let Ok(retry_plan) = self.plan_splice(target, budget, Some(&plan.choice.route_key))? else {
+		let Ok(retry_plan) = self.plan_splice(target, budget, Some(&plan.choice.route_key), trace)? else {
 			return Err(dial_status.refusal());
 		};
 
 		match retry_plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
 			Ok(client) => Ok((retry_plan, client)),
 			Err(status) => {
-				registry.work_trail_weaken(&retry_plan.choice.route_key, status, &self.config, &self.trace)?;
+				registry.work_trail_weaken(&retry_plan.choice.route_key, status, &self.config, trace)?;
 				Err(status.refusal())
 			}
 		}
@@ -132,32 +135,32 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Reinforce or weaken the chosen trail by the splice outcome, the
 	/// same feedback unary work applies. `failure` is the status of a splice
 	/// that failed, and a peer splice that answered also fires
-	/// [`CLUSTER_WORK_FORWARDED`].
+	/// [`CLUSTER_WORK_FORWARDED`]. Each record goes on `trace`.
 	fn record_outcome(
 		&self,
 		failure: Option<TransitStatus>,
 		route_key: &Arc<[u8]>,
 		is_peer: bool,
+		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
 		let registry = &self.servlet_registry;
 		if let Some(status) = failure {
-			return registry.work_trail_weaken(route_key, status, &self.config, &self.trace);
+			return registry.work_trail_weaken(route_key, status, &self.config, trace);
 		}
 
 		if is_peer {
-			let trace = &self.trace;
 			trace.emit_marker(CLUSTER_WORK_FORWARDED)?;
 		}
 
-		registry.work_trail_ok(route_key, &self.config, &self.trace)
+		registry.work_trail_ok(route_key, &self.config, trace)
 	}
 
 	/// Splice a streamed request: relay the client body to the route, then
 	/// answer with the route's unary reply.
 	///
 	/// Returns the servlet's reply frame unchanged, because the stream reply is
-	/// the servlet's own frame end to end. Unary work, by contrast, wraps its
-	/// reply in a `ClusterWorkResponse` envelope.
+	/// the servlet's own frame end to end. Unary work wraps its reply in a
+	/// `ClusterWorkResponse` envelope.
 	///
 	/// # Errors
 	///
@@ -170,8 +173,10 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		body: StreamBody,
 		target: Urn<'static>,
 		budget: HopBudget,
+		audit: &RequestAudit,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let (plan, client) = self.connect_splice(&target, budget).await?;
+		let trace = audit.unproven();
+		let (plan, client) = self.connect_splice(&target, budget, trace).await?;
 		// The route moves into the Open, so only the key and the peer flag
 		// outlive it for the outcome feedback.
 		let is_peer = plan.choice.is_peer();
@@ -188,7 +193,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		.await;
 
 		let failure = reply.as_ref().err().map(TightBeamError::failure_status);
-		self.record_outcome(failure, &route_key, is_peer)?;
+		self.record_outcome(failure, &route_key, is_peer, trace)?;
 
 		reply
 	}
@@ -215,8 +220,10 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		mut reply: ReplySink,
 		target: Urn<'static>,
 		budget: HopBudget,
+		audit: &RequestAudit,
 	) -> Result<(), TightBeamError> {
-		let (plan, client) = self.connect_splice(&target, budget).await?;
+		let trace = audit.unproven();
+		let (plan, client) = self.connect_splice(&target, budget, trace).await?;
 		// The route moves into the Open, so only the key and the peer flag
 		// outlive it for the outcome feedback.
 		let is_peer = plan.choice.is_peer();
@@ -238,7 +245,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		.await;
 
 		let failure = spliced.as_ref().err().map(TightBeamError::failure_status);
-		self.record_outcome(failure, &route_key, is_peer)?;
+		self.record_outcome(failure, &route_key, is_peer, trace)?;
 
 		spliced
 	}

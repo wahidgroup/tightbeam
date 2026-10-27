@@ -32,11 +32,11 @@ pub enum InsertRefusal {
 
 /// One hive's servlet instances together with the routes that reach them.
 ///
-/// An instance exists in the registry and in the routing context. This view
-/// binds the two, so an insert or a removal touches both in one fixed order
-/// and a route names only a live instance. The two sit behind separate
-/// locks, so the pair is eventually consistent: each step commits on its own
-/// lock and stays committed whatever a later step does.
+/// An instance exists in the registry and in the routing context. An insert
+/// or a removal through this view touches both in one fixed order, so a route
+/// names only a live instance. The two sit behind separate locks, so the pair
+/// is eventually consistent: each step commits on its own lock and stays
+/// committed whatever a later step does.
 pub struct HiveInstances<'a, R: ServletRegistry, P: Protocol> {
 	servlets: &'a R,
 	routes: &'a HiveContextImpl<P>,
@@ -51,10 +51,14 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	/// Registers one servlet and the route that reaches it.
 	///
 	/// Returns where the servlet sits, which callers notify the cluster with.
-	/// A servlet that names no signer gets no route, because a sibling's dial
-	/// admits a servlet's answer by that signer alone (CWE-346). A refused
-	/// registration stops its servlet through [`ServletBox::stop_boxed`],
-	/// whichever step refused it.
+	///
+	/// - A servlet that names no signer gets no route, because a sibling's
+	///   dial admits a servlet's answer by that signer alone (CWE-346).
+	/// - A refused registration stops its servlet through
+	///   [`ServletBox::stop_boxed`], whichever step refused it.
+	/// - A registration that replaces an instance the registry holds retires
+	///   that instance as [`Self::remove`] does, before the route of the
+	///   replacement lands: its route leaves, then its servlet stops.
 	///
 	/// [`ServletBox::stop_boxed`]: crate::colony::hive::ServletBox::stop_boxed
 	///
@@ -78,9 +82,20 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 
 		// The registry takes the instance first, so a route exists only for a
 		// registered instance.
-		self.servlets
+		let replaced = self
+			.servlets
 			.insert(key_bytes, registration)
 			.map_err(|refused| InsertRefusal::Registry(refused.stop_servlet()))?;
+		// A replaced instance shares its key, its type, and its address with
+		// its replacement, so the slate entry of that address stands. Its route
+		// leaves, and its servlet stops as the replaced value drops.
+		if let Some(replaced) = replaced {
+			replaced.retire(|registration| {
+				let address = registration.servlet.addr_bytes();
+				self.leave(&route_key, &registration.servlet_type, &address);
+			});
+		}
+
 		if let Some(signer) = &placement.signer {
 			let address = Arc::clone(&placement.address);
 			self.routes.add_route(route_key, address, Arc::clone(signer), &type_key);
@@ -97,19 +112,26 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	pub fn remove(&self, key: impl AsRef<[u8]>) -> Option<(Urn<'static>, Arc<[u8]>)> {
 		let key = key.as_ref();
 
-		// 1. The registry gives the instance up, so no new registration lands on the key while it leaves.
+		// 1. The registry gives the instance up first, so a registration that
+		//    lands on the key while it leaves replaces nothing.
 		let ServletRegistration { servlet, servlet_type, .. } = self.servlets.remove(key)?;
-		let removed_type = servlet_type.canonical_bytes();
 		let removed_addr = servlet.addr_bytes();
 
 		// 2. The route leaves before the servlet stops, so a sibling call in
 		//    this window resolves another instance or no route.
-		self.routes.remove_route(key, &servlet_type, &removed_type, &removed_addr);
+		self.leave(key, &servlet_type, &removed_addr);
 
 		// 3. The servlet stops once nothing routes to it.
 		servlet.stop_boxed();
 
 		Some((servlet_type, removed_addr))
+	}
+
+	/// Takes the route of the instance of `servlet_type` at `address` under
+	/// `key` away, ahead of the stop of its servlet.
+	fn leave(&self, key: &[u8], servlet_type: &Urn<'static>, address: &Arc<[u8]>) {
+		let removed_type = servlet_type.canonical_bytes();
+		self.routes.remove_route(key, servlet_type, &removed_type, address);
 	}
 }
 
@@ -120,7 +142,7 @@ mod tests {
 
 	use super::*;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::hive::{HashMapRegistry, HiveContext, ServletBox, SpawnerFn};
+	use crate::colony::hive::{HashMapRegistry, HiveContext, ReplacedServlet, ServletBox, SpawnerFn};
 	use crate::colony::protocol::ServletInfo;
 	use crate::colony::urn::ColonyNamespace;
 	use crate::router::RouterError;
@@ -131,9 +153,8 @@ mod tests {
 
 	/// A [`ServletBox`] whose stop is observable.
 	///
-	/// The shipped servlet runtime stops when it aborts its accept task,
-	/// which leaves a test nothing to read, so only a double can prove that
-	/// the hive called the stop. This probe records the call.
+	/// The shipped servlet runtime stops by aborting its accept task, which
+	/// leaves a test nothing to read, so this probe records the call.
 	struct StopProbe {
 		stopped: Arc<AtomicBool>,
 		signer: Option<SignerIdentifier>,
@@ -183,10 +204,9 @@ mod tests {
 	/// A [`ServletRegistry`] that refuses every insert.
 	///
 	/// The shipped registry takes every registration, so only a double reaches
-	/// the refusal arm of the trait contract that a consumer registry may
-	/// reach. It refuses with [`TightBeamError::NonceExhausted`], which nothing
-	/// else on the insert path produces, so the test can tell that refusal
-	/// from any other failure.
+	/// the trait's refusal arm, which a consumer registry may reach. It refuses
+	/// with [`TightBeamError::NonceExhausted`], which nothing else on the
+	/// insert path produces, so the test can tell that refusal apart.
 	#[derive(Default)]
 	struct RefusingRegistry;
 
@@ -195,7 +215,7 @@ mod tests {
 			&self,
 			_key: impl Into<Vec<u8>>,
 			registration: ServletRegistration,
-		) -> Result<(), Box<RefusedRegistration>> {
+		) -> Result<Option<ReplacedServlet>, Box<RefusedRegistration>> {
 			Err(Box::new(RefusedRegistration {
 				error: TightBeamError::NonceExhausted,
 				registration,
@@ -308,20 +328,38 @@ mod tests {
 		Ok(())
 	}
 
-	/// A registration under a key the registry holds replaces the one there,
-	/// and the replaced servlet stops the one way the trait names.
+	/// The map registry hands back the registration it replaces as a value
+	/// whose drop stops the servlet, so a caller that drops it leaves no
+	/// servlet running.
+	#[test]
+	fn a_replaced_registration_that_its_caller_drops_stops_its_servlet() -> Result<(), Box<dyn Error>> {
+		let servlet_type = ColonyNamespace::default().servlet("echo")?;
+		let servlets = HashMapRegistry::default();
+		let replaced = Arc::new(AtomicBool::new(false));
+		let first = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type.clone(), &replaced, None));
+		first.map_err(|refused| refused.stop_servlet())?;
+
+		let second = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type, &Arc::default(), None));
+		drop(second.map_err(|refused| refused.stop_servlet())?);
+
+		assert!(replaced.load(Ordering::SeqCst));
+		Ok(())
+	}
+
+	/// A registration of an instance the hive holds replaces it, and the
+	/// replaced servlet stops the one way the trait names.
 	#[test]
 	fn a_replaced_registration_stops_its_servlet() -> Result<(), Box<dyn Error>> {
 		let servlet_type = ColonyNamespace::default().servlet("echo")?;
 		let servlets = HashMapRegistry::default();
+		let routes = routes();
+		let instances = HiveInstances::new(&servlets, &routes);
 		let replaced = Arc::new(AtomicBool::new(false));
 		let replacing = Arc::new(AtomicBool::new(false));
 
-		let first = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type.clone(), &replaced, None));
-		first.map_err(|refused| refused.stop_servlet())?;
+		instances.insert(probe_registration(servlet_type.clone(), &replaced, None))?;
+		instances.insert(probe_registration(servlet_type, &replacing, None))?;
 
-		let second = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type, &replacing, None));
-		second.map_err(|refused| refused.stop_servlet())?;
 		assert!(replaced.load(Ordering::SeqCst));
 		assert!(!replacing.load(Ordering::SeqCst));
 		assert_eq!(servlets.count(), 1);

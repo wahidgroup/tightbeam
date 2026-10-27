@@ -51,11 +51,10 @@ type Sha3Fingerprint = Fingerprint<Sha3_256>;
 
 /// A revocation status check for the certificates of a certification path.
 ///
-/// Path validation consults it once per certificate, which satisfies the
-/// revocation step of RFC 5280 §6.1.3(a)(3). The built-in store also consults
-/// it over the path of each certificate a lookup answers with, at each frame
-/// and each plane check. The shipped implementations are [`NoRevocation`] and
-/// [`StaticRevocationList`].
+/// Path validation consults it once per certificate, as the revocation step
+/// of RFC 5280 §6.1.3(a)(3). The built-in store also consults it over the path
+/// of each certificate a lookup answers with, at each frame and each plane
+/// check. The crate ships [`NoRevocation`] and [`StaticRevocationList`].
 ///
 /// # Fail closed
 ///
@@ -234,7 +233,7 @@ pub enum TrustVerification<'a> {
 ///
 /// It extends [`CertificateValidation`] with trust-based operations.
 /// [`CertificateTrustStore`] is the built-in store and needs `std`, so a
-/// no_std consumer supplies its own implementation of this trait.
+/// no_std consumer implements this trait itself.
 ///
 /// # Contract
 ///
@@ -302,10 +301,10 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 	/// Returns the certificate this store holds for `cert`'s public key.
 	///
-	/// The lookup key is the SubjectPublicKeyInfo, resolved through
-	/// [`Self::find_by_public_key`]. A rotated certificate for an enrolled key
-	/// therefore resolves to the enrolled one, which is the certificate a
-	/// signature by that key verifies against.
+	/// It looks up the SubjectPublicKeyInfo through
+	/// [`Self::find_by_public_key`], so a rotated certificate for an enrolled
+	/// key resolves to the enrolled one, the certificate a signature by that
+	/// key verifies against.
 	fn enrolled_certificate(&self, cert: &Certificate) -> Option<&Certificate> {
 		self.find_by_public_key(&cert.tbs_certificate.subject_public_key_info)
 	}
@@ -565,8 +564,8 @@ pub trait TrustBuilder: Sized {
 
 	/// Add a certificate chain after structural validation.
 	///
-	/// The builder validates expiry and issuer and subject chaining, then adds
-	/// every certificate in the chain to the trust store.
+	/// It checks expiry and issuer and subject chaining, then adds every
+	/// certificate of the chain to the trust store.
 	///
 	/// # Errors
 	///
@@ -746,20 +745,58 @@ impl<'a> IssuerWalk<'a> {
 		Self { held, current: start, anchor: fingerprint, authority, visited }
 	}
 
+	/// Starts a walk among `held` from `start`, the first certificate of a
+	/// presented path, whose fingerprint is `fingerprint`. `policy` verifies
+	/// the signature of a self-issued `start`.
+	///
+	/// The authority of `start` ranks the candidates under its issuer name
+	/// alone, so the walk reads it where it ranks one:
+	///
+	/// - A `start` that `held` holds takes the identifiers that the builder decoded at enrolment.
+	/// - Another `start` reads its own when `held` holds a certificate under its issuer name.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`KeyIdentifiers::authority_of`].
+	fn presented(
+		held: &'a HashMap<Sha3Fingerprint, HeldCertificate>,
+		start: &'a Certificate,
+		fingerprint: Sha3Fingerprint,
+		policy: &dyn VerificationPolicy,
+	) -> Result<Self, CertificateValidationError> {
+		if let Some(enrolled) = held.get(&fingerprint) {
+			let authority = enrolled.identifiers.authority.as_deref();
+			return Ok(Self::new(held, start, fingerprint, authority));
+		}
+
+		let mut walk = Self::new(held, start, fingerprint, None);
+		let ranked = walk.named().next().is_some();
+		if ranked {
+			walk.authority = KeyIdentifiers::authority_of(start, policy)?;
+		}
+
+		Ok(walk)
+	}
+
 	/// Returns the fingerprint of the certificate the walk reached last, which
 	/// is the anchor of the path once the walk ends.
 	fn anchor(&self) -> Sha3Fingerprint {
 		self.anchor
 	}
 
-	/// Returns the certificate held under the issuer name of the current
-	/// certificate that ranks first, beside its fingerprint
-	/// (RFC 5280 §6.1.3(a)(4)).
-	fn issuer(&self) -> Option<(&'a Sha3Fingerprint, &'a HeldCertificate)> {
-		let issuer = &self.current.tbs_certificate.issuer;
+	/// Returns the certificates held under the issuer name of the current
+	/// certificate, each beside its fingerprint (RFC 5280 §6.1.3(a)(4)).
+	fn named(&self) -> impl Iterator<Item = (&'a Sha3Fingerprint, &'a HeldCertificate)> + 'a {
+		let current: &'a Certificate = self.current;
+		let issuer = &current.tbs_certificate.issuer;
 		let candidates = self.held.iter();
-		let named = candidates.filter(|(_, held)| held.certificate.tbs_certificate.subject == *issuer);
-		named.max_by_key(|&(fingerprint, held)| {
+		candidates.filter(move |(_, held)| held.certificate.tbs_certificate.subject == *issuer)
+	}
+
+	/// Returns the certificate of [`Self::named`] that ranks first, beside its
+	/// fingerprint.
+	fn issuer(&self) -> Option<(&'a Sha3Fingerprint, &'a HeldCertificate)> {
+		self.named().max_by_key(|&(fingerprint, held)| {
 			let itself = *fingerprint == self.anchor;
 			(held.identifiers.priority(self.authority), itself)
 		})
@@ -837,16 +874,16 @@ enum IssuerPriority {
 
 #[cfg(feature = "std")]
 impl KeyIdentifiers {
-	/// Decode the key identifiers of `cert`, which the store holds.
+	/// Decode the key identifiers of `cert`, which the store holds, with
+	/// `policy` as the verifier of a self-issued certificate.
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::EncodingError`] -- a key identifier extension fails to decode.
-	/// - [`CertificateValidationError::DuplicateExtension`] -- a key identifier extension repeats.
-	fn of(cert: &Certificate) -> Result<Self, CertificateValidationError> {
+	/// - The errors of [`Self::authority_of`].
+	fn of(cert: &Certificate, policy: &dyn VerificationPolicy) -> Result<Self, CertificateValidationError> {
 		let subject = cert.extension::<SubjectKeyIdentifierRef<'_>>()?;
 		let subject = subject.map(|subject| Arc::<[u8]>::from(subject.0.as_bytes()));
-		let authority = Self::authority_of(cert)?;
+		let authority = Self::authority_of(cert, policy)?;
 		// A self-signed certificate names its own key identifier for its
 		// authority, and the two then share one allocation.
 		let shared = subject.as_ref().filter(|_| authority == subject.as_deref());
@@ -855,16 +892,24 @@ impl KeyIdentifiers {
 	}
 
 	/// Returns the key identifier of the authority whose key signed `cert`,
-	/// read in place: the `keyIdentifier` of its `authorityKeyIdentifier`. A
-	/// self-signed certificate may omit it (RFC 5280 §4.2.1.1), so when the
-	/// issuer of `cert` is its subject, its own `subjectKeyIdentifier` names
-	/// that key, and that extension decodes only then.
+	/// read in place.
+	///
+	/// - The `keyIdentifier` of its `authorityKeyIdentifier` names that key.
+	/// - A self-signed certificate may omit that identifier
+	///   (RFC 5280 §4.2.1.1). When the issuer of `cert` is its subject, its
+	///   own `subjectKeyIdentifier` names that key once its own key verifies
+	///   its signature under `policy`. That extension decodes only then, and
+	///   the signature counts only for a `cert` that carries it.
 	///
 	/// # Errors
 	///
 	/// - [`CertificateValidationError::EncodingError`] -- a key identifier extension fails to decode.
 	/// - [`CertificateValidationError::DuplicateExtension`] -- a key identifier extension repeats.
-	fn authority_of(cert: &Certificate) -> Result<Option<&[u8]>, CertificateValidationError> {
+	/// - The errors of [`Self::signs_itself`].
+	fn authority_of<'c>(
+		cert: &'c Certificate,
+		policy: &dyn VerificationPolicy,
+	) -> Result<Option<&'c [u8]>, CertificateValidationError> {
 		let stated = cert.extension::<AuthorityKeyIdentifierRef<'_>>()?;
 		if let Some(key_identifier) = stated.and_then(|stated| stated.key_identifier) {
 			return Ok(Some(key_identifier.as_bytes()));
@@ -874,9 +919,32 @@ impl KeyIdentifiers {
 		if tbs.subject != tbs.issuer {
 			return Ok(None);
 		}
+		let Some(own) = cert.extension::<SubjectKeyIdentifierRef<'_>>()? else {
+			return Ok(None);
+		};
+		if !Self::signs_itself(cert, policy)? {
+			return Ok(None);
+		}
 
-		let own = cert.extension::<SubjectKeyIdentifierRef<'_>>()?;
-		Ok(own.map(|own| own.0.as_bytes()))
+		Ok(Some(own.0.as_bytes()))
+	}
+
+	/// Returns whether the key of `cert` verifies the signature of `cert`
+	/// under `policy`, which makes a self-issued certificate a self-signed
+	/// one (RFC 5280 §3.2).
+	///
+	/// Each refusal of `policy` answers `false`, because a signature that the
+	/// key of `cert` does not verify makes `cert` self-issued alone.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the key or the `tbsCertificate` fails to encode.
+	fn signs_itself(cert: &Certificate, policy: &dyn VerificationPolicy) -> Result<bool, CertificateValidationError> {
+		let public_key_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
+		let message = cert.tbs_certificate.to_der()?;
+		let algorithm = &cert.signature_algorithm.oid;
+		let verified = policy.verify_signature(algorithm, &public_key_der, &message, cert.signature.raw_bytes());
+		Ok(verified.is_ok())
 	}
 
 	/// Returns the rank of a candidate of these identifiers as the issuer of a
@@ -964,11 +1032,10 @@ impl CertificateTrustStore {
 	///
 	/// # Stricter than RFC 5280
 	///
-	/// The routine is deliberately stricter than RFC 5280 in six fail-closed
-	/// ways. TightBeam runs a closed, self-managed PKI, so the interop these
-	/// rules exist for (legacy web roots, cross-signing, cross-vendor DN
-	/// encoding variance) never applies, and a refusal of it removes attack
-	/// surface:
+	/// The routine is stricter than RFC 5280 in six fail-closed ways. TightBeam
+	/// runs a closed, self-managed PKI, so the interop these rules exist for
+	/// (legacy web roots, cross-signing, cross-vendor DN encoding variance)
+	/// never applies, and a refusal of it removes attack surface:
 	///
 	/// - §6.1.4(k) applies to every issuer and not only to v3 issuers, so the
 	///   routine refuses v1/v2 CA certificates outright. The RFC permits the
@@ -1157,10 +1224,9 @@ impl CertificateTrustStore {
 		let start = presented.next().ok_or(CertificateValidationError::EmptyChain)?;
 		let fingerprint = Sha3Fingerprint::from_certificate(start)?;
 
-		// The authority identifier of `start` reads in place here, and the
-		// builder decoded those of the held certificates.
-		let authority = KeyIdentifiers::authority_of(start)?;
-		let mut walk = IssuerWalk::new(&self.certificates, start, fingerprint, authority);
+		// The walk reads the authority identifier of `start` where it ranks a
+		// candidate, and the builder decoded those of the held certificates.
+		let mut walk = IssuerWalk::presented(&self.certificates, start, fingerprint, self.policy.as_ref())?;
 		let mut path: Vec<&Certificate> = walk.by_ref().map(|issuer| issuer.certificate.as_ref()).collect();
 		let anchor = walk.anchor();
 
@@ -1205,8 +1271,7 @@ impl CertificateTrust for CertificateTrustStore {
 	/// a held certificate names the anchor above it.
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
 		// RFC 5280 §6.1.1: the walk ends at a configured trust anchor, or the
-		// chain fails. Every entry point shares this walk and its one path
-		// validation, so the entry points agree.
+		// chain fails.
 		let anchor = self.validate_to_anchor(chain.iter())?;
 		self.held(&anchor)
 	}
@@ -1378,7 +1443,7 @@ impl CertificateTrustBuilder {
 		let fp = Sha3Fingerprint::from_certificate(&cert)?;
 
 		let spki = &cert.tbs_certificate.subject_public_key_info;
-		let identifiers = KeyIdentifiers::of(&cert)?;
+		let identifiers = KeyIdentifiers::of(&cert, self.policy.as_ref())?;
 		let skid = identifiers.subject.as_ref();
 		let skid_holder = skid.and_then(|skid| self.skid_index.get(skid));
 		if let (Some(skid), Some(holder)) = (skid, skid_holder) {
@@ -1494,13 +1559,15 @@ impl Debug for CertificateTrustBuilder {
 
 #[cfg(test)]
 mod tests {
+	use core::sync::atomic::{AtomicUsize, Ordering};
+
 	use super::*;
 	use crate::crypto::k256::sha2::{Sha256, Sha384};
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, SigningKey};
-	use crate::crypto::sign::{CmsSigner, SignedContent, SigningIdentity};
+	use crate::crypto::sign::{CanonicalSigner, CmsSigner, SignatureEncoding, SignedContent, SigningIdentity};
 	use crate::crypto::x509::error::CertificateValidationError::PublicKeyCollision;
-	use crate::der::asn1::{ObjectIdentifier, OctetString};
+	use crate::der::asn1::{BitString, ObjectIdentifier, OctetString};
 	use crate::der::oid::AssociatedOid;
 	use crate::der::Decode;
 	use crate::oids::CURVE_NIST_P256;
@@ -1756,6 +1823,138 @@ mod tests {
 		Ok(())
 	}
 
+	/// Returns a self-issued certificate of the name `Rollover CA` for the key
+	/// of `subject_key`, which `issuer_key` signs, with no
+	/// `authorityKeyIdentifier`.
+	fn self_issued_without_authority(
+		issuer_key: &Secp256k1SigningKey,
+		subject_key: &Secp256k1SigningKey,
+	) -> Result<Certificate, Box<dyn std::error::Error>> {
+		let usage = KeyUsage(KeyUsages::KeyCertSign.into());
+		let issued = TestCertificate::issued(issuer_key, "Rollover CA", subject_key, "Rollover CA", 7, usage)?;
+		let mut certificate = TestCertificate::without_extension(issued, AuthorityKeyIdentifier::OID);
+
+		let tbs = certificate.tbs_certificate.to_der()?;
+		let signature: Secp256k1Signature = issuer_key.sign_canonical::<Sha3_256>(&tbs)?;
+		certificate.signature = BitString::new(0, signature.to_vec())?;
+		Ok(certificate)
+	}
+
+	/// A self-issued certificate that another key signs is no self-signed
+	/// one, so an absent `authorityKeyIdentifier` names no authority
+	/// (RFC 5280 §4.2.1.1).
+	#[test]
+	fn a_self_issued_certificate_that_another_key_signs_names_no_authority() -> TestResult {
+		let subject_key = SigningKey::from_bytes(&[4u8; 32].into())?;
+		let issuer_key = SigningKey::from_bytes(&[5u8; 32].into())?;
+		let certificate = self_issued_without_authority(&issuer_key, &subject_key)?;
+
+		let authority = KeyIdentifiers::authority_of(&certificate, &Secp256k1Policy::default())?;
+		assert_eq!(authority, None);
+		Ok(())
+	}
+
+	/// The self-signed fixture verifies under its own key, so its own
+	/// `subjectKeyIdentifier` names its authority (RFC 5280 §4.2.1.1).
+	#[test]
+	fn the_self_signed_fixture_names_its_own_key_for_its_authority() -> TestResult {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let own = certificate.extension::<SubjectKeyIdentifierRef<'_>>()?;
+		let own = own.ok_or("the fixture carries its key identifier")?;
+
+		let authority = KeyIdentifiers::authority_of(&certificate, &Secp256k1Policy::default())?;
+		assert_eq!(authority, Some(own.0.as_bytes()));
+		Ok(())
+	}
+
+	/// A [`VerificationPolicy`] that counts the signature checks it runs and
+	/// lets [`Secp256k1Policy`] decide each one, because the count of checks a
+	/// trust path spends is the cost these tests pin.
+	#[derive(Debug, Default)]
+	struct CountingPolicy {
+		checks: Arc<AtomicUsize>,
+	}
+
+	impl VerificationPolicy for CountingPolicy {
+		fn verify_signature(
+			&self,
+			algorithm_oid: &ObjectIdentifier,
+			public_key_der: &[u8],
+			message: &[u8],
+			signature: &[u8],
+		) -> Result<VerifiedSignature, CertificateValidationError> {
+			self.checks.fetch_add(1, Ordering::SeqCst);
+			Secp256k1Policy::default().verify_signature(algorithm_oid, public_key_der, message, signature)
+		}
+
+		fn digest(
+			&self,
+			signature_oid: &ObjectIdentifier,
+			digest_oid: &ObjectIdentifier,
+			content: &[u8],
+		) -> Result<Vec<u8>, CertificateValidationError> {
+			Secp256k1Policy::default().digest(signature_oid, digest_oid, content)
+		}
+	}
+
+	/// The key of the authority `Held Root`, which [`checks_to_answer`] holds.
+	fn held_root_key() -> Secp256k1SigningKey {
+		SigningKey::from_bytes(&[7u8; 32].into()).expect("a small nonzero scalar is a key")
+	}
+
+	/// The key of each certificate the store of [`checks_to_answer`] does not
+	/// hold.
+	fn stranger_key() -> Secp256k1SigningKey {
+		SigningKey::from_bytes(&[9u8; 32].into()).expect("a small nonzero scalar is a key")
+	}
+
+	/// Returns whether a store that holds the authority `Held Root` trusts the
+	/// chain of `presented` alone, beside the count of the signature checks
+	/// that its answer spends.
+	fn checks_to_answer(presented: Certificate) -> (bool, usize) {
+		let held = TestCertificate::authority(&held_root_key(), "Held Root").expect("the authority issues");
+		let checks = Arc::new(AtomicUsize::new(0));
+		let policy = CountingPolicy { checks: Arc::clone(&checks) };
+		let builder = CertificateTrustBuilder::from(policy).with_certificate(held);
+		let store = builder.expect("the authority enrols").build();
+		checks.store(0, Ordering::SeqCst);
+
+		let trusted = store.verify_chain(&[presented]).is_ok();
+		(trusted, checks.load(Ordering::SeqCst))
+	}
+
+	/// A path that starts at a root the store holds reads the key identifiers
+	/// that the store decoded at enrolment, so the walk spends no check on the
+	/// signature of that root.
+	#[test]
+	fn a_held_root_presented_first_spends_no_check_on_its_own_signature() -> TestResult {
+		let held = TestCertificate::authority(&held_root_key(), "Held Root")?;
+		assert_eq!(checks_to_answer(held), (true, 0));
+		Ok(())
+	}
+
+	/// The authority of a certificate ranks the candidates under its issuer
+	/// name, so a self-issued certificate under a name the store does not hold
+	/// is refused with no check of its signature.
+	#[test]
+	fn a_self_issued_stranger_under_a_name_the_store_lacks_spends_no_check() -> TestResult {
+		let stranger = TestCertificate::authority(&stranger_key(), "Stranger Root")?;
+		assert_eq!(checks_to_answer(stranger), (false, 0));
+		Ok(())
+	}
+
+	/// A self-issued certificate with no `subjectKeyIdentifier` names no
+	/// authority whatever its signature, so the walk spends no check on that
+	/// signature (RFC 5280 §4.2.1.1).
+	#[test]
+	fn a_self_issued_certificate_with_no_key_identifier_spends_no_check() -> TestResult {
+		let named = TestCertificate::authority(&stranger_key(), "Held Root")?;
+		let unnamed = TestCertificate::without_extension(named, SubjectKeyIdentifier::OID);
+		let unnamed = TestCertificate::signed_by(unnamed, &stranger_key());
+		assert_eq!(checks_to_answer(unnamed), (false, 0));
+		Ok(())
+	}
+
 	/// Returns the RFC 7093 §2 method 3 key identifier of the key of
 	/// `certificate`: the leftmost 160 bits of the SHA-512 hash of its
 	/// `subjectPublicKey` value. The fixtures derive theirs by method 1.
@@ -1849,7 +2048,6 @@ mod tests {
 			-> TestResult
 		{
 			let chain = TestCertificate::insecure_fixed_chain()?;
-
 			let mut root = chain.root.to_owned();
 			root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(ca, key_cert_sign, path_len));
 
@@ -1872,7 +2070,6 @@ mod tests {
 	#[test]
 	fn evaluate_enforces_path_len_constraint() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-
 		let mut root = chain.root.to_owned();
 		root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, Some(0)));
 
@@ -2071,6 +2268,7 @@ mod tests {
 		let chain = TestCertificate::insecure_fixed_chain().expect("the fixed chain builds");
 		let revocation = StaticRevocationList::<D>::default().with_certificate(&chain.leaf);
 		let revocation = revocation.expect("the leaf has a fingerprint");
+
 		let store = build_store_with_revocation(&chain, revocation).expect("the store holds the root");
 		store.verify_chain(&[chain.root, chain.intermediate, chain.leaf])
 	}
@@ -2447,6 +2645,7 @@ mod tests {
 		let key = TestKey::insecure_fixed_signing();
 		let mut first = TestCertificate::self_signed(&key);
 		first.tbs_certificate.issuer = Name::from_str("CN=held")?;
+
 		let mut second = TestCertificate::self_signed(&key);
 		second.tbs_certificate.extensions = None;
 		second.tbs_certificate.serial_number = SerialNumber::new(&[0x2a])?;
@@ -2513,11 +2712,11 @@ mod tests {
 		Ok(())
 	}
 
-	/// Returns a store that holds the fixed self-signed test certificate,
-	/// whose one key identifier extension is its `subjectKeyIdentifier`,
+	/// Returns a store that holds a self-signed test authority of the fixed
+	/// key, whose one key identifier extension is its `subjectKeyIdentifier`,
 	/// beside the certificate's fingerprint.
 	fn self_signed_store() -> Result<(CertificateTrustStore, Sha3Fingerprint), Box<dyn std::error::Error>> {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let certificate = TestCertificate::authority(&TestKey::insecure_fixed_signing(), "Self-Signed CA")?;
 		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
 		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
 		Ok((builder.with_certificate(certificate)?.build(), fingerprint))
@@ -2529,8 +2728,8 @@ mod tests {
 	#[test]
 	fn the_sid_index_shares_the_key_identifier_of_its_certificate() -> TestResult {
 		let (store, fingerprint) = self_signed_store()?;
-
 		let held = store.certificates.get(&fingerprint).ok_or("a held certificate")?;
+
 		let subject = held.identifiers.subject.as_ref().ok_or("a key identifier")?;
 		let indexed = store.skid_index.keys().next().ok_or("an index entry")?;
 		assert!(Arc::ptr_eq(subject, indexed));
@@ -2543,8 +2742,8 @@ mod tests {
 	#[test]
 	fn a_self_signed_certificate_shares_its_key_identifier_with_its_authority() -> TestResult {
 		let (store, fingerprint) = self_signed_store()?;
-
 		let held = store.certificates.get(&fingerprint).ok_or("a held certificate")?;
+
 		let subject = held.identifiers.subject.as_ref().ok_or("a key identifier")?;
 		let authority = held.identifiers.authority.as_ref().ok_or("an authority identifier")?;
 		assert!(Arc::ptr_eq(subject, authority));

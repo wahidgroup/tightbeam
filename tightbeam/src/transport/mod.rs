@@ -121,15 +121,15 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 
 	/// The one place a server's configuration becomes provisioning.
 	///
-	/// The conversion runs [`DialableEncryption::new`], the one guard of every
-	/// provisioning, which admits the identity for the server purpose once. A
-	/// server presents a certificate, which answers for the peer, so the dialer
-	/// rule holds for every configuration of this shape. [`EndpointConfig`]
-	/// carries `limits` beside this value, outside provisioning.
+	/// [`DialableEncryption::new`] admits the identity for the server purpose
+	/// once. A server presents a certificate, which answers for the peer, so
+	/// every configuration of this shape holds the dialer rule.
+	/// [`EndpointConfig`] carries `limits` beside this value, outside
+	/// provisioning.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError`] -- the errors of [`DialableEncryption::new`].
+	/// - [`TransportError`] -- an error of [`DialableEncryption::new`].
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let encryption = EncryptionConfig {
 			server_identity: Some(config.identity),
@@ -147,9 +147,9 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 /// its negotiation input, the ceilings it enforces, and the clock it measures
 /// against.
 ///
-/// Listeners, clients, and pools each build one of these, and every transport
+/// Listeners, clients, and pools each build one, and every transport
 /// constructor takes it whole, so every transport holds all four. A clone
-/// copies `Arc` handles, so it shares each certificate with the original.
+/// shares each certificate with the original through its `Arc` handles.
 pub struct EndpointConfig<P: CryptoProvider> {
 	pub(crate) encryption: DialableEncryption<P>,
 	pub(crate) negotiation: Negotiation,
@@ -246,7 +246,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig
 
 	/// # Errors
 	///
-	/// - [`TransportError`] -- the errors of the [`DialableEncryption`] conversion.
+	/// - [`TransportError`] -- an error of the [`DialableEncryption`] conversion.
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let limits = config.limits;
 		let encryption = DialableEncryption::try_from(config)?;
@@ -272,14 +272,13 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 
 	/// Names the validators that authenticate the client.
 	///
-	/// `validators` accepts any iterator of shared [`CertificateValidation`]
-	/// values. A non-empty set demands mutual authentication, and it replaces
-	/// any set named before.
+	/// A non-empty set demands mutual authentication, and it replaces any set
+	/// named before.
 	///
 	/// # Empty set
 	///
-	/// [`PeerAuthentication::mutual`] decides that an empty set demands
-	/// nothing, so an empty set leaves the endpoint as it is, and an
+	/// An empty set demands nothing, by the rule of
+	/// [`PeerAuthentication::mutual`], so it leaves the endpoint as it is. An
 	/// endpoint that demands mutual authentication keeps that demand.
 	#[must_use]
 	pub fn with_client_validators(
@@ -326,11 +325,10 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 #[cfg(feature = "transport-cms")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// Pairs the signing identity this endpoint presents with `key_agreement`,
-	/// the identity the CMS opening seals to, once, as a
-	/// [`CmsIdentityPair`].
+	/// the identity the CMS opening seals to, once, as a [`CmsIdentityPair`].
 	///
-	/// A server of the CMS flow needs the pair, and a server of the HPKE flow
-	/// signs with the signing identity alone.
+	/// A CMS server needs the pair. An HPKE server signs with the signing
+	/// identity alone.
 	///
 	/// # Errors
 	///
@@ -376,24 +374,22 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn the_bind_cleartext_arms_of_the_server_macro_bind() -> TransportResult<()> {
 		use crate::asn1::Frame;
-		use crate::trace::TraceCollector;
 		use crate::transport::tcp::r#async::TokioListener;
 
 		let addr = <TokioListener as Protocol>::default_bind_address()?;
-		let trace = TraceCollector::new();
 
 		let plain = crate::server! {
 			protocol TokioListener: bind_cleartext addr,
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
 		};
-		let traced = crate::server! {
+		let capped = crate::server! {
 			protocol TokioListener: bind_cleartext addr,
-			policies: { with_trace: [ trace.share() ] },
+			policies: { max_connections: [ 4 ] },
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
 		};
 
 		plain.abort();
-		traced.abort();
+		capped.abort();
 		Ok(())
 	}
 
@@ -421,8 +417,7 @@ mod tests {
 				let tx = Arc::clone(&tx);
 				async move {
 					// The receiver lives for the whole test, so a refused send
-					// surfaces as the missing message the assertion below
-					// reads.
+					// surfaces as a missing message at the assertion.
 					let _ = tx.send(message);
 					Ok(None)
 				}
@@ -526,13 +521,12 @@ mod tests {
 		));
 	}
 
-	/// The encrypted ceiling measures the sealed wire form instead of the
-	/// plaintext.
+	/// The encrypted ceiling measures the sealed wire form, not the plaintext.
 	///
-	/// Even with a ceiling of exactly the plaintext length, the builder must
-	/// refuse the payload. The AEAD tag, the nonce, and the `WireEnvelope`
-	/// wrapper all come after the encode, so a measurement before them would
-	/// let an oversized envelope reach the peer as a connection reset.
+	/// The builder refuses a payload under a ceiling of exactly the plaintext
+	/// length. The AEAD tag, the nonce, and the `WireEnvelope` wrapper come
+	/// after the encode, so a measurement before them would let an oversized
+	/// envelope reach the peer as a connection reset.
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
 		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};

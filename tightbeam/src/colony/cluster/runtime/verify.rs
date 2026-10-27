@@ -10,14 +10,14 @@
 //!
 //! [`ClusterConfig::evaluate_gates`] runs the configured [`GatePolicy`]
 //! instances before the gateway decodes the request envelope. Stream opens
-//! carry no request frame, so they pass `None` for the frame argument.
+//! carry no request frame, so they pass `None` for it.
 //!
 //! # Export boundary
 //!
 //! [`ColonyConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the
 //! gateway resolves the servlet target: the allowlist, then the grants, then
 //! the deny gates. [`HopBudget::is_relayed`] supplies the `relayed` flag. The
-//! verdict algebra and the posture warnings live in
+//! verdict algebra and the posture warnings are in
 //! [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
@@ -28,6 +28,8 @@
 //!
 //! [`GatewayReplayGuard`]: super::freshness::GatewayReplayGuard
 //! [`HopBudget::is_relayed`]: crate::colony::cluster::HopBudget::is_relayed
+
+use std::sync::Arc;
 
 use crate::colony::cluster::export::{ExportDecision, ExportPolicy, Party, TrustPlanes};
 use crate::colony::cluster::peer::ColonyCertificate;
@@ -60,34 +62,61 @@ struct ExportAudit<'a> {
 }
 
 impl ExportAudit<'_> {
-	/// The route of the request in the audit label: `relayed` for a request
-	/// that a peer relayed, and `direct` for an origin request.
-	fn route(&self) -> &'static str {
-		if self.relayed {
-			"relayed"
-		} else {
-			"direct"
-		}
-	}
-
 	/// Emit `outcome` for this caller, answered with `status`.
 	///
-	/// - The assertion value is the `relayed` flag.
-	/// - The label is `<status>/<route>`, such as `Ok/relayed`, because the
-	///   sink keeps the label and drops the value.
-	/// - The payload is the fingerprint of the caller's certificate under the
-	///   colony's digest `D`, where mutual TLS captured one.
+	/// The value is the `relayed` flag, and the payload is the fingerprint of
+	/// the caller's certificate under `D`. Only a kept record computes it.
 	fn record<D: Digest>(&self, outcome: Urn<'static>, status: TransitStatus) -> Result<(), TightBeamError> {
+		let label = self.label(status);
 		let caller = self.session.peer_certificate();
-		let fingerprint = caller.and_then(ColonyCertificate::fingerprint_id::<D>);
-		let evidence = fingerprint.as_deref();
-		let label = format!("{}/{}", status.as_str(), self.route());
+		let evidence = || caller.and_then(ColonyCertificate::fingerprint_id::<D>);
 		let trace = self.trace;
-		trace.emit_event_with_value_and_evidence(outcome, label, self.relayed, evidence)?;
+		trace.emit_event_with_value_and_rendered_evidence(outcome, label, self.relayed, evidence)?;
 
 		Ok(())
 	}
 }
+
+/// Writes [`ExportAudit::label`] from one list of the statuses.
+///
+/// Each label is a constant, and a missing status fails to compile.
+macro_rules! export_labels {
+	($($status:ident),+ $(,)?) => {
+		impl ExportAudit<'_> {
+			/// The label of a verdict with `status`, such as `Ok/relayed`.
+			///
+			/// The sink keeps the label alone, so the label names the route.
+			const fn label(&self, status: TransitStatus) -> &'static str {
+				match (status, self.relayed) {
+					$(
+						(TransitStatus::$status, false) => concat!(stringify!($status), "/direct"),
+						(TransitStatus::$status, true) => concat!(stringify!($status), "/relayed"),
+					)+
+				}
+			}
+		}
+	};
+}
+
+export_labels!(
+	Ok,
+	Cancelled,
+	Unknown,
+	InvalidArgument,
+	DeadlineExceeded,
+	NotFound,
+	AlreadyExists,
+	PermissionDenied,
+	ResourceExhausted,
+	FailedPrecondition,
+	Aborted,
+	OutOfRange,
+	Unimplemented,
+	Internal,
+	Unavailable,
+	DataLoss,
+	Unauthenticated,
+);
 
 /// The owned slate key that each [`VerifiedControlFrame`] carries.
 ///
@@ -108,6 +137,49 @@ impl VerifiedSignerId {
 	#[must_use]
 	pub(crate) fn into_shared(self) -> SharedId {
 		self.0
+	}
+}
+
+/// The traces that the records of one request go on.
+///
+/// A record goes on the audit trace once a proven peer or a verified signature
+/// proves its origin, and on the connection trace before that (CWE-778).
+pub(crate) struct RequestAudit {
+	/// The audit trace of the gateway.
+	audit: Arc<TraceCollector>,
+	/// The trace of a record that no verified frame signature backs.
+	unproven: Arc<TraceCollector>,
+}
+
+impl RequestAudit {
+	/// The audit of a request on `session`, over `audit` and `connections`.
+	pub(crate) fn of(audit: &Arc<TraceCollector>, connections: &Arc<TraceCollector>, session: &SessionContext) -> Self {
+		let proven = session.proven_peer().is_some();
+		let unproven = if proven {
+			audit
+		} else {
+			connections
+		};
+
+		Self { audit: Arc::clone(audit), unproven: Arc::clone(unproven) }
+	}
+
+	/// The audit of a request whose sender the caller verified, on `audit`.
+	pub(crate) fn proven(audit: &Arc<TraceCollector>) -> Self {
+		Self { audit: Arc::clone(audit), unproven: Arc::clone(audit) }
+	}
+
+	/// The trace of a record that no verified frame signature backs.
+	pub(crate) fn unproven(&self) -> &TraceCollector {
+		&self.unproven
+	}
+
+	/// The trace of a record that the verified signature of `signer` backs.
+	pub(crate) fn signed(&self, signer: Option<&VerifiedSignerId>) -> &TraceCollector {
+		match signer {
+			Some(_) => &self.audit,
+			None => &self.unproven,
+		}
 	}
 }
 
@@ -157,12 +229,13 @@ impl VerifyRefusal {
 	/// is the edge of a subnet and no fault of the relay.
 	///
 	/// - [`Self::UnknownSigner`] drops the rumor and spends one token of the
-	///   relay's own rate bucket, so a relay that sends rumors under made-up
-	///   origins is bounded by the budget its own rumors draw on (CWE-770).
+	///   relay's own rate bucket, so made-up origins cost a relay the budget
+	///   of its own rumors (CWE-770).
 	/// - With a token it answers [`TransitStatus::Unauthenticated`], which
-	///   tells the relay to stop its offers of that origin here. With the
-	///   bucket empty it answers [`TransitStatus::ResourceExhausted`]. A
-	///   backend fault of the admission answers [`TransitStatus::Unavailable`].
+	///   tells the relay to stop offering that origin here, and with the bucket
+	///   empty [`TransitStatus::ResourceExhausted`]. An admission backend fault
+	///   is this gateway's own and returns as [`LoopFault::Registry`] with its
+	///   cause.
 	/// - Every other refusal marks a rumor the relay should have refused, so the gateway scores the relay.
 	/// - `frame` is the relay's own signed frame, whose signer keys that
 	///   bucket. A frame that names no signer has no bucket to spend, so the
@@ -170,7 +243,7 @@ impl VerifyRefusal {
 	///
 	/// # Errors
 	///
-	/// - [`LoopFault::Registry`] -- the route registry is poisoned.
+	/// - [`LoopFault::Registry`] -- the route registry is poisoned, or the rate admission faulted.
 	/// - [`LoopFault::Runtime`] -- the trace refused the event.
 	pub(crate) fn settle_origin<P: Protocol>(
 		self,
@@ -190,7 +263,7 @@ impl VerifyRefusal {
 						Ok(TransitStatus::Unauthenticated)
 					}
 					Ok(false) => Ok(TransitStatus::ResourceExhausted),
-					Err(_) => Ok(TransitStatus::Unavailable),
+					Err(error) => Err(LoopFault::Registry(error)),
 				}
 			}
 			(Self::UnknownSigner, None)
@@ -342,8 +415,8 @@ impl<P: Protocol> ColonyConfig<P> {
 
 	/// Enforce the export boundary on a resolved servlet target.
 	///
-	/// The verdict algebra lives in [`ExportPolicy`], read from the live
-	/// configuration so enforcement stays aligned with the advertise filter.
+	/// The verdict algebra is in [`ExportPolicy`], read from the live
+	/// configuration, so enforcement stays aligned with the advertise filter.
 	/// This wrapper adds the audit plane.
 	///
 	/// 1. Run [`ExportPolicy::verdict`] (the allowlist, the grants, then the deny gates).
@@ -459,7 +532,6 @@ mod tests {
 			.expect("the test certificate must decode"),
 		);
 		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("ping")])));
-
 		config
 	}
 
@@ -832,9 +904,101 @@ mod tests {
 	/// records the digest of each payload.
 	#[cfg(feature = "instrument")]
 	mod audit {
+		use core::cell::Cell;
+
 		use super::*;
 		use crate::instrumentation::{TbEvent, TbInstrumentationConfig};
 		use crate::trace::TraceConfig;
+
+		std::thread_local! {
+			/// The digests that [`CountingDigest`] starts on this thread.
+			static DIGESTS: Cell<usize> = const { Cell::new(0) };
+		}
+
+		/// A SHA3-256 that counts each digest it starts.
+		#[derive(Clone)]
+		struct CountingDigest(Sha3_256);
+
+		impl Default for CountingDigest {
+			fn default() -> Self {
+				DIGESTS.with(|digests| digests.set(digests.get().saturating_add(1)));
+				Self(Sha3_256::default())
+			}
+		}
+
+		impl digest::OutputSizeUser for CountingDigest {
+			type OutputSize = <Sha3_256 as digest::OutputSizeUser>::OutputSize;
+		}
+
+		impl digest::Update for CountingDigest {
+			fn update(&mut self, data: &[u8]) {
+				digest::Update::update(&mut self.0, data);
+			}
+		}
+
+		impl digest::FixedOutput for CountingDigest {
+			fn finalize_into(self, out: &mut digest::Output<Self>) {
+				digest::FixedOutput::finalize_into(self.0, out);
+			}
+		}
+
+		impl digest::HashMarker for CountingDigest {}
+
+		/// The count of digests that one export refusal of a certified caller
+		/// starts on a trace that holds `max_events` events.
+		fn fingerprints_of_a_refusal(max_events: u32) -> Result<usize, TightBeamError> {
+			let config = TbInstrumentationConfig { enable_payloads: true, max_events, ..Default::default() };
+			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			let session = SessionContext::for_peer(Arc::new(TestCertificate::self_signed(&peer_key())));
+			let audit = ExportAudit { trace: &trace, session: &session, relayed: false };
+			let before = DIGESTS.with(Cell::get);
+
+			audit.record::<CountingDigest>(CLUSTER_EXPORT_REFUSED, TransitStatus::PermissionDenied)?;
+
+			Ok(DIGESTS.with(Cell::get).saturating_sub(before))
+		}
+
+		/// A record that the sink drops computes no fingerprint of its caller.
+		#[test]
+		fn a_dropped_export_record_computes_no_fingerprint() -> Result<(), TightBeamError> {
+			assert_eq!(fingerprints_of_a_refusal(0)?, 0);
+			Ok(())
+		}
+
+		/// A kept record computes the fingerprint of its caller once.
+		#[test]
+		fn a_kept_export_record_computes_one_fingerprint() -> Result<(), TightBeamError> {
+			assert_eq!(fingerprints_of_a_refusal(u32::MAX)?, 1);
+			Ok(())
+		}
+
+		// An export label names its status as `TransitStatus::as_str` names it.
+		tb_cases! {
+			fn an_export_label_names_its_status_as_the_status_does(status: TransitStatus) {
+				let (trace, session) = (TraceCollector::default(), SessionContext::default());
+				let audit = ExportAudit { trace: &trace, session: &session, relayed: true };
+				assert_eq!(audit.label(status), format!("{}/relayed", status.as_str()));
+			}
+			cases {
+				ok => TransitStatus::Ok,
+				cancelled => TransitStatus::Cancelled,
+				unknown => TransitStatus::Unknown,
+				invalid_argument => TransitStatus::InvalidArgument,
+				deadline_exceeded => TransitStatus::DeadlineExceeded,
+				not_found => TransitStatus::NotFound,
+				already_exists => TransitStatus::AlreadyExists,
+				permission_denied => TransitStatus::PermissionDenied,
+				resource_exhausted => TransitStatus::ResourceExhausted,
+				failed_precondition => TransitStatus::FailedPrecondition,
+				aborted => TransitStatus::Aborted,
+				out_of_range => TransitStatus::OutOfRange,
+				unimplemented => TransitStatus::Unimplemented,
+				internal => TransitStatus::Internal,
+				unavailable => TransitStatus::Unavailable,
+				data_loss => TransitStatus::DataLoss,
+				unauthenticated => TransitStatus::Unauthenticated,
+			}
+		}
 
 		/// The records of [`CLUSTER_EXPORT_REFUSED`] that a house gateway
 		/// leaves when it refuses "ledger" to `session`.
@@ -871,7 +1035,7 @@ mod tests {
 		tb_cases! {
 			fn a_refusal_names_its_status_and_route((relayed, expected): (bool, &str)) -> Result<(), TightBeamError> {
 				let records = refusal_records(&SessionContext::default(), relayed)?;
-				let labels: Vec<Option<String>> = records.into_iter().map(|record| record.label).collect();
+				let labels: Vec<Option<String>> = records.into_iter().map(|record| record.label.map(String::from)).collect();
 				assert_eq!(labels, [Some(String::from(expected))]);
 				Ok(())
 			}
@@ -889,13 +1053,15 @@ mod tests {
 			use crate::instrumentation::events::CLUSTER_GOSSIP_REFUSED;
 
 			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			let trace = Arc::new(TraceCollector::from(TraceConfig::with_instrumentation(config)));
+			let connections = Arc::new(TraceCollector::new());
 			let frame = signed_control_frame(&peer_key());
 			let gateway = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
 			let signer = gateway.verify_peer(&frame).map(|verified| verified.fingerprint());
 			let signer = signer.map_err(|_| TightBeamError::MissingSignature)?;
 
-			let refusal = Refusal::to(&frame, &trace).by(&signer);
+			let audit = RequestAudit::of(&trace, &connections, &SessionContext::default());
+			let refusal = Refusal::to(&frame, &audit).by(&signer);
 			refusal.gossip(TransitStatus::PermissionDenied)?;
 
 			let expected: [u8; 32] = Sha3_256::digest(signer.as_shared().as_ref()).into();

@@ -1,8 +1,11 @@
-//! These tests run the sync `server!` accept loop on `std`, without `tokio`.
+//! These tests run the sync `server!` accept loop and the thread spawn of
+//! `runtime::rt` on `std`, without `tokio`.
 
+use std::error::Error;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -137,8 +140,8 @@ fn sync_server_bind_applies_policies() -> TransportResult<()> {
 	Ok(())
 }
 
-/// The `protocol .. bind_cleartext` arm binds before it returns and serves the
-/// echo loop on a thread of its own.
+/// The `protocol .. bind_cleartext` arm binds before it returns. It serves the
+/// echo loop on its own thread and returns the result of that spawn.
 #[test]
 fn sync_server_protocol_bind_echoes() -> TransportResult<()> {
 	let addr = NetTcpListener::bind("127.0.0.1:0")?.local_addr()?;
@@ -146,7 +149,7 @@ fn sync_server_protocol_bind_echoes() -> TransportResult<()> {
 	server! {
 		protocol TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 		handle: |frame: Frame| async move { Ok(Some(frame)) }
-	};
+	}?;
 
 	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol-bind");
 	assert_eq!(echoed, Some(frame), "protocol bind server! loop should echo the frame");
@@ -165,7 +168,7 @@ fn sync_server_protocol_bind_applies_policies() -> TransportResult<()> {
 		protocol TcpListener<NetTcpListener>: bind_cleartext TightBeamSocketAddr(addr),
 		policies: { with_trace: [ audit.share() ] },
 		handle: |frame: Frame| async move { Ok(Some(frame)) }
-	};
+	}?;
 
 	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol-bind-audit");
 	assert_eq!(echoed, Some(frame), "audited protocol bind exchange should still echo");
@@ -173,9 +176,95 @@ fn sync_server_protocol_bind_applies_policies() -> TransportResult<()> {
 	Ok(())
 }
 
-/// Returns the handler events that one call to a blocking `server!` records
-/// on the trail of its connection, in order, under a trace whose config sets
-/// `enable_internal_detail` to `detail`.
+/// A cleartext listener on a free port of the loopback address, with that
+/// address.
+fn cleartext_listener() -> TransportResult<(TcpListener<NetTcpListener, DefaultCryptoProvider>, SocketAddr)> {
+	let listener = NetTcpListener::bind("127.0.0.1:0")?;
+	let addr = listener.local_addr()?;
+	Ok((TcpListener::from_listener_cleartext(listener), addr))
+}
+
+/// The `protocol` arm serves the listener it takes on its own thread and
+/// returns the result of that spawn.
+#[test]
+fn sync_server_protocol_echoes() -> TransportResult<()> {
+	let (server, addr) = cleartext_listener()?;
+
+	server! {
+		protocol TcpListener<NetTcpListener>: server,
+		handle: |frame: Frame| async move { Ok(Some(frame)) }
+	}?;
+
+	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol");
+	assert_eq!(echoed, Some(frame), "protocol server! loop should echo the frame");
+	Ok(())
+}
+
+/// The `protocol` arm with policies applies them to every transport that the
+/// listener it takes accepts.
+#[test]
+fn sync_server_protocol_applies_policies() -> TransportResult<()> {
+	let (server, addr) = cleartext_listener()?;
+	let trace = TraceCollector::new();
+	let audit = trace.share();
+
+	server! {
+		protocol TcpListener<NetTcpListener>: server,
+		policies: { with_trace: [ audit.share() ] },
+		handle: |frame: Frame| async move { Ok(Some(frame)) }
+	}?;
+
+	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol-audit");
+	assert_eq!(echoed, Some(frame), "audited protocol exchange should still echo");
+	assert_eq!(gate_accepts(&trace), 1, "one accepted frame should record one GATE_ACCEPT");
+	Ok(())
+}
+
+/// The `protocol` arm with channels drops both, because only the tokio loop
+/// reports through them. It serves the echo loop on its own thread.
+#[test]
+fn sync_server_protocol_channels_echoes() -> TransportResult<()> {
+	let (server, addr) = cleartext_listener()?;
+	let (errors, _error_reports) = rt::channel::<TransportError>(1);
+	let (oks, _ok_reports) = rt::channel::<()>(1);
+
+	server! {
+		protocol TcpListener<NetTcpListener>: server,
+		channels: { error: errors, ok: oks },
+		handle: |frame: Frame| async move { Ok(Some(frame)) }
+	}?;
+
+	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol-channels");
+	assert_eq!(echoed, Some(frame), "protocol server! loop with channels should echo the frame");
+	Ok(())
+}
+
+/// The `protocol` arm with channels and policies applies the policies to every
+/// transport that the listener it takes accepts.
+#[test]
+fn sync_server_protocol_channels_applies_policies() -> TransportResult<()> {
+	let (server, addr) = cleartext_listener()?;
+	let (errors, _error_reports) = rt::channel::<TransportError>(1);
+	let (oks, _ok_reports) = rt::channel::<()>(1);
+	let trace = TraceCollector::new();
+	let audit = trace.share();
+
+	server! {
+		protocol TcpListener<NetTcpListener>: server,
+		channels: { error: errors, ok: oks },
+		policies: { with_trace: [ audit.share() ] },
+		handle: |frame: Frame| async move { Ok(Some(frame)) }
+	}?;
+
+	let (frame, echoed) = echo(NetTcpStream::connect(addr)?, "sync-protocol-channels-audit");
+	assert_eq!(echoed, Some(frame), "audited protocol exchange with channels should still echo");
+	assert_eq!(gate_accepts(&trace), 1, "one accepted frame should record one GATE_ACCEPT");
+	Ok(())
+}
+
+/// Returns the handler events, in order, that one blocking `server!` call
+/// records on its connection's trail, with `enable_internal_detail` set to
+/// `detail`.
 fn blocking_handler_span(detail: bool) -> TransportResult<Vec<Urn<'static>>> {
 	let listener = NetTcpListener::bind("127.0.0.1:0")?;
 	let addr = listener.local_addr()?;
@@ -220,7 +309,7 @@ struct FailingOnceListener {
 }
 
 impl FailingOnceListener {
-	/// Serves `listener` in the clear, after one failed accept.
+	/// Wraps `listener` as a cleartext listener whose first accept fails.
 	fn over(listener: NetTcpListener) -> Self {
 		let listener = TcpListener::from_listener_cleartext(listener);
 		Self { listener, failed: AtomicBool::new(false) }
@@ -258,8 +347,8 @@ fn sync_server_serves_after_a_failed_accept() -> TransportResult<()> {
 }
 
 /// With `max_connections: [ 1 ]` the loop serves one connection at a time, so
-/// a second connection waits in the listener backlog, unanswered, while the
-/// first one lives. The first connection gets its echo, so the loop serves.
+/// a second one waits unanswered in the backlog while the first lives. The
+/// first gets its echo, so the loop serves.
 #[test]
 fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 	let listener = NetTcpListener::bind("127.0.0.1:0")?;
@@ -298,5 +387,22 @@ fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 		timed_out,
 		"the connection past the cap must time out unanswered, got {starved:?}"
 	);
+	Ok(())
+}
+
+/// The std runtime runs a spawned closure on a thread of its own, and the join
+/// of its handle waits for the closure to end.
+#[test]
+fn the_std_runtime_spawns_a_closure_on_a_thread_of_its_own() -> Result<(), Box<dyn Error>> {
+	let caller = thread::current().id();
+	let (sender, receiver) = mpsc::channel();
+
+	let handle = rt::spawn(move || {
+		// The receiver lives until the test reads it, so the send lands.
+		let _sent = sender.send(thread::current().id());
+	})?;
+	rt::join(handle)?;
+
+	assert_ne!(receiver.recv()?, caller);
 	Ok(())
 }

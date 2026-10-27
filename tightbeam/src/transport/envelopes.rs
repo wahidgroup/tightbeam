@@ -100,11 +100,10 @@ pub struct ResponsePackage {
 impl ResponsePackage {
 	/// The result that this response hands its caller.
 	///
-	/// A non-[`TransitStatus::Ok`] status is the error, so a caller reads
-	/// the frame only where the responder reported success.
-	///
-	/// The frame moves out of its `Arc` where this is the last holder, and
-	/// copies only where another holder on the inbound path shares it.
+	/// A non-[`TransitStatus::Ok`] status is the error, so a caller reads the
+	/// frame only where the responder reported success. The frame moves out of
+	/// its `Arc` where this is the last holder, and copies only where another
+	/// holder on the inbound path shares it.
 	///
 	/// # Errors
 	///
@@ -328,7 +327,7 @@ macro_rules! mux_chunk_package {
 		}
 
 		impl $name {
-			/// Build a chunk package.
+			/// Builds a chunk package.
 			///
 			/// # Errors
 			///
@@ -356,12 +355,12 @@ macro_rules! mux_chunk_package {
 	};
 }
 
-/// The interaction shape of a mux stream, which the call that opens the
-/// stream stamps on the Open record.
+/// The interaction shape of a mux stream, which the opening call stamps on the
+/// Open record.
 ///
-/// It tells the responder whether the body reassembles into one [`Frame`]
-/// and which reply shape the initiator awaits, so dispatch reads the shape
-/// from the record.
+/// It tells the responder whether the body reassembles into one [`Frame`] and
+/// which reply shape the initiator awaits, so dispatch reads the shape from
+/// the record.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -410,7 +409,7 @@ pub struct MuxOpenPackage {
 	/// The relay budget, with the same contract as the unary `hops_remaining`
 	/// field.
 	///
-	/// - The value is the number of gateway forwards left to the stream, and each hop decrements it.
+	/// - The value is the gateway forwards left to the stream, and each hop decrements it.
 	/// - The origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel, and every
 	///   gateway clamps to its own `max_hops`.
 	/// - A gateway serves a `0` open locally and never re-forwards it.
@@ -428,7 +427,7 @@ fn default_hop_budget() -> u8 {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxOpenPackage {
-	/// Build an unrouted open with the origin hop budget.
+	/// Builds an unrouted open with the origin hop budget.
 	///
 	/// # Errors
 	///
@@ -438,7 +437,7 @@ impl MuxOpenPackage {
 		Ok(Self { stream_id, last, kind, payload, target: None, hops_remaining: DEFAULT_HOP_BUDGET })
 	}
 
-	/// Stamp a grpc-style route and relay budget on this open.
+	/// Stamps a grpc-style route and a relay budget on this open.
 	///
 	/// A `None` target with the default budget reproduces an unrouted local
 	/// open, so the routed and unrouted paths share one DER shape.
@@ -474,9 +473,8 @@ impl MuxOpenPackage {
 		self.target.as_ref()
 	}
 
-	/// The relay budget left on this open, which is the number of gateway
-	/// forwards it may spend. A gateway serves a `0` open locally and never
-	/// re-forwards it.
+	/// The relay budget left on this open: the gateway forwards it may spend.
+	/// A gateway serves a `0` open locally and never re-forwards it.
 	pub fn hops_remaining(&self) -> u8 {
 		self.hops_remaining
 	}
@@ -488,7 +486,7 @@ mux_chunk_package! {
 	///
 	/// See [`MuxOpenPackage`] for the stream grammar.
 	MuxDataPackage,
-	last: "Whether this is the sender's final chunk on the stream"
+	last: "Whether this is the sender's final chunk on the stream."
 }
 
 /// The responder trailer that ends a stream, with the status and the final
@@ -508,7 +506,7 @@ pub struct MuxEndPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxEndPackage {
-	/// Build a trailer with `status` and the final `payload` chunk.
+	/// Builds a trailer with `status` and the final `payload` chunk.
 	///
 	/// # Errors
 	///
@@ -674,7 +672,7 @@ pub struct MuxRekeyRequestPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyRequestPackage {
-	/// Build a request that carries `client_random` and `client_ephemeral` in
+	/// Builds a request that carries `client_random` and `client_ephemeral` in
 	/// the compressed SEC 1 form, at the width of that form on the curve `C`
 	/// (SEC 1 v2.0 §2.3.3).
 	///
@@ -725,9 +723,9 @@ impl MuxRekeyRequestPackage {
 /// the server's rekey ephemeral, and the server-signed epoch receipt.
 ///
 /// `epoch_receipt` is DER-optional for a future keys-only renewal in the TLS
-/// KeyUpdate shape ([RFC 9846 § 4.7.3][rfc9846-4.7.3]). On a budget-bearing
-/// session its absence is a protocol violation, because a receipt is
-/// required if and only if budgets are present.
+/// KeyUpdate shape ([RFC 9846 § 4.7.3][rfc9846-4.7.3]). A receipt is required
+/// if and only if budgets are present, so its absence on a budget-bearing
+/// session is a protocol violation.
 ///
 /// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 #[cfg(feature = "transport-multiplex")]
@@ -740,7 +738,7 @@ pub struct MuxRekeyResponsePackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyResponsePackage {
-	/// Build a response that carries `server_random`, `server_ephemeral` in
+	/// Builds a response that carries `server_random`, `server_ephemeral` in
 	/// the compressed SEC 1 form, at the width of that form on the curve `C`
 	/// (SEC 1 v2.0 §2.3.3), and the optional `epoch_receipt`.
 	///
@@ -1043,7 +1041,7 @@ impl<'a> ArrivingEnvelope<'a> {
 		}
 	}
 
-	/// Decode the transport envelope of a cleartext arrival, and keep the
+	/// Decodes the transport envelope of a cleartext arrival, and keeps the
 	/// record of an encrypted one in place.
 	///
 	/// # Errors
@@ -1058,7 +1056,7 @@ impl<'a> ArrivingEnvelope<'a> {
 }
 
 impl WireEnvelope {
-	/// Read `wire`, the DER of one wire envelope. A cleartext envelope
+	/// Reads `wire`, the DER of one wire envelope. A cleartext envelope
 	/// decodes, and the record of an encrypted one stays in `wire`, so its
 	/// content opens in the buffer it arrived in.
 	///
@@ -1069,8 +1067,8 @@ impl WireEnvelope {
 		Self::admit(wire)?.arrive()
 	}
 
-	/// Read the outer header of `wire`, the DER of one wire envelope, and lend
-	/// the contents of its arm undecoded.
+	/// Reads the outer header of `wire`, the DER of one wire envelope, and
+	/// lends the contents of its arm undecoded.
 	///
 	/// # Errors
 	///
@@ -1186,7 +1184,7 @@ impl TryFrom<TransportEnvelope> for HandshakeMessage {
 }
 
 impl TransportEnvelope {
-	/// Create a request envelope that carries `msg`.
+	/// Creates a request envelope that carries `msg`.
 	pub fn new_request(msg: Frame) -> Self {
 		Self::Request(RequestPackage { message: Arc::new(msg) })
 	}
@@ -1276,16 +1274,15 @@ mod tests {
 	fn test_length_validation_request() -> Result<(), Box<dyn Error>> {
 		let original = RequestPackage::new(TestFrame::v0(None, None));
 		let mut encoded = original.to_der()?;
+		assert!(encoded.len() > 10, "the encoding holds the length octets it corrupts");
 
 		// Corrupt one byte near the start of the encoding, which holds the
 		// length octets of the nested sequences.
-		if encoded.len() > 10 {
-			let corrupt_pos = 5;
-			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
+		let corrupt_pos = 5;
+		encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
 
-			let result = RequestPackage::from_der(&encoded);
-			assert!(result.is_err(), "Should fail with corrupted length");
-		}
+		let result = RequestPackage::from_der(&encoded);
+		assert!(result.is_err(), "Should fail with corrupted length");
 
 		Ok(())
 	}
@@ -1297,13 +1294,12 @@ mod tests {
 
 		// Corrupt one byte of the length field.
 		let mut encoded = original.to_der()?;
-		if encoded.len() > 10 {
-			let corrupt_pos = 8;
-			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
+		assert!(encoded.len() > 10, "the encoding holds the length octets it corrupts");
+		let corrupt_pos = 8;
+		encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
 
-			let result = ResponsePackage::from_der(&encoded);
-			assert!(result.is_err(), "Should fail with corrupted length");
-		}
+		let result = ResponsePackage::from_der(&encoded);
+		assert!(result.is_err(), "Should fail with corrupted length");
 
 		Ok(())
 	}

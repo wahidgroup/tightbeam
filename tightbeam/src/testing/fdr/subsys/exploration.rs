@@ -1,9 +1,9 @@
 //! The exploration subsystem of FDR.
 //!
-//! The module holds the exploration engine and the functions of the FDR
-//! exploration loop. They walk the state space of a process once per seed, and
-//! they check each state they visit for divergence and deadlock. The module
-//! adds to [`Process`] the divergence of a state on a branch of the walk.
+//! It holds the exploration engine and the functions of the FDR exploration
+//! loop. They walk the state space of a process once per seed and check each
+//! state they visit for divergence and deadlock. The module also adds to
+//! [`Process`] the divergence of a state on a branch of the walk.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -100,8 +100,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 	///
 	/// `visited` receives each state the seed visits. `timing_pruned` counts
 	/// the branches dropped for deadline or path WCET violations, so the
-	/// verdict reports the model-level timing violations that exploration
-	/// pruned.
+	/// verdict reports the model-level timing violations exploration pruned.
 	fn walk_into(&self, seed: u64, visited: &mut HashSet<State>, timing_pruned: &mut usize) -> SeedResult {
 		let process = self.process;
 		let config = &self.config;
@@ -260,8 +259,7 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 	}
 
 	/// Walks the seeds in parallel on the `rayon` pool, then adds what each
-	/// walk found to the engine and records its result, in the order of the
-	/// seeds.
+	/// walk found to the engine and records its result, in seed order.
 	#[cfg(feature = "rayon")]
 	fn explore_seeds(&mut self, seeds: Range<u64>) -> &[(u64, SeedResult)] {
 		use rayon::prelude::*;
@@ -333,8 +331,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 	/// Selects the action that exploration takes from `actions`, under
 	/// `testing-fault`.
 	///
-	/// It applies the policy of `select_action_helper` to the candidates that
-	/// remain once each injected fault removes the event that it fails.
+	/// It applies the policy of `select_action_helper` to the candidates left
+	/// after each injected fault removes the event it fails.
 	#[cfg(feature = "testing-fault")]
 	fn select_action_helper_from<'b>(
 		rng: &mut SeededRng,
@@ -385,19 +383,20 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 	/// Executes a transition and queues the next states.
 	///
-	/// Exploration drops the branches that violate a deadline or a path WCET
-	/// constraint, and each drop increments `timing_pruned`, so the
-	/// verdict records that a path violated timing.
+	/// It drops each branch that violates a deadline or path WCET constraint
+	/// and counts the drop in `timing_pruned`, so the verdict records that a
+	/// path violated timing.
 	fn execute_transition_helper(
 		process: &Process,
 		state: &ExplorationState,
 		action: &Action,
 		queue: &mut VecDeque<ExplorationState>,
+		#[cfg_attr(
+			not(feature = "testing-timing"),
+			expect(unused_variables, reason = "only the timing checks prune a branch")
+		)]
 		timing_pruned: &mut usize,
 	) {
-		#[cfg(not(feature = "testing-timing"))]
-		let _ = &timing_pruned;
-
 		// Each edge that the clocks allow is a branch, which resets the clocks
 		// that the edge names.
 		#[cfg(feature = "testing-timing")]

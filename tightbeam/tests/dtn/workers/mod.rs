@@ -1,7 +1,8 @@
-//! Worker implementations for DTN test components
+//! The workers of the DTN test components.
 //!
-//! Message-type workers: One worker per RelayMessage variant.
-//! Workers handle business logic, servlets handle frame operations.
+//! Each variant of [`RelayMessage`](crate::dtn::messages::RelayMessage) has a
+//! worker. The workers hold the mission logic, and the servlets hold the frame
+//! operations.
 
 pub mod command_ack_handler;
 pub mod command_execution;
@@ -15,7 +16,7 @@ pub mod telemetry_builder;
 pub use command_ack_handler::CommandAckHandlerWorker;
 pub use command_execution::CommandExecutionWorker;
 pub use frame_request_handler::{FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig};
-pub use frame_response_handler::{FrameResponseHandlerWorker, FrameResponseHandlerWorkerConfig};
+pub use frame_response_handler::FrameResponseHandlerWorker;
 pub use mission_control_telemetry_handler::{
 	MissionControlTelemetryHandlerWorker, MissionControlTelemetryHandlerWorkerConfig,
 };

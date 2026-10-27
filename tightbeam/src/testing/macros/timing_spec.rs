@@ -1,55 +1,39 @@
 //! The timing-constraint macros of `tb_process_spec!` and `tb_assert_spec!`.
 //!
-//! Each macro builds one `testing::timing` value from a duration that a spec
-//! writes inline, so a spec states `wcet!(Duration::from_millis(10))` where
-//! the builder call would otherwise run to four lines.
+//! Each macro builds one `testing::timing` value from an inline duration, so a
+//! spec writes `wcet!(Duration::from_millis(10))` in place of a four-line
+//! builder call.
 
 /// Builds the [`WcetConfig`](crate::testing::timing::WcetConfig) of one event
 /// from a duration `d`, with an optional percentile and analyzer in either
 /// order. The event comes from the key in grouped syntax.
 /// - `wcet!(d)` bounds every run of the event.
 /// - `wcet!(d, percentile: Percentile::P99)` bounds the 99th percentile of the runs.
-/// - `wcet!(d, analyzer: my_analyzer)` sets the analyzer of a percentile check.
+/// - `wcet!(d, analyzer: my_analyzer)` fails to compile, because an analyzer computes a percentile.
 /// - `wcet!(d, percentile: Percentile::P99, analyzer: my_analyzer)` sets both.
 /// - `wcet!(d, analyzer: my_analyzer, percentile: Percentile::P99)` sets both in the other order.
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! wcet {
 	// The `@builder` arms build the config, one arm for each set of options.
-	(@builder $dur:expr) => {{
-		use $crate::builder::TypeBuilder as _;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
-	(@builder $dur:expr, percentile: $p:expr) => {{
-		use $crate::builder::TypeBuilder as _;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_percentile($p)
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
-	(@builder $dur:expr, analyzer: $a:expr) => {{
-		use $crate::builder::TypeBuilder as _;
-		use std::sync::Arc;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_analyzer($a)
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
-	(@builder $dur:expr, percentile: $p:expr, analyzer: $a:expr) => {{
-		use $crate::builder::TypeBuilder as _;
-		use std::sync::Arc;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_percentile($p)
-			.with_analyzer($a)
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
+	(@builder $dur:expr) => {
+		$crate::testing::timing::WcetConfig { duration: $dur, percentile: None }
+	};
+	(@builder $dur:expr, percentile: $p:expr) => {
+		$crate::testing::timing::WcetConfig {
+			duration: $dur,
+			percentile: Some($crate::testing::timing::WcetPercentile { percentile: $p, analyzer: None }),
+		}
+	};
+	(@builder $dur:expr, percentile: $p:expr, analyzer: $a:expr) => {
+		$crate::testing::timing::WcetConfig {
+			duration: $dur,
+			percentile: Some($crate::testing::timing::WcetPercentile {
+				percentile: $p,
+				analyzer: Some(::std::sync::Arc::new($a)),
+			}),
+		}
+	};
 
 	// The public arms put the options in one order for the `@builder` arms.
 	($dur:expr) => {
@@ -59,7 +43,7 @@ macro_rules! wcet {
 		$crate::wcet!(@builder $dur, percentile: $p)
 	};
 	($dur:expr, analyzer: $a:expr) => {
-		$crate::wcet!(@builder $dur, analyzer: $a)
+		::core::compile_error!("`wcet!` takes an analyzer with a percentile: add `percentile: ...`")
 	};
 	($dur:expr, percentile: $p:expr, analyzer: $a:expr) => {
 		$crate::wcet!(@builder $dur, percentile: $p, analyzer: $a)
@@ -88,29 +72,10 @@ pub struct DeadlineParams {
 macro_rules! deadline {
 	// These two arms match a call in any delimiter, braces included.
 	(duration: $dur:expr, slack: $slack:expr) => {
-		$crate::testing::macros::DeadlineParams {
-			duration: $dur,
-			min_slack: Some($slack),
-		}
+		$crate::testing::macros::DeadlineParams { duration: $dur, min_slack: Some($slack) }
 	};
 	(duration: $dur:expr) => {
-		$crate::testing::macros::DeadlineParams {
-			duration: $dur,
-			min_slack: None,
-		}
-	};
-	// The two arms above match a braces call first, so these two never match.
-	{ duration: $dur:expr, slack: $slack:expr } => {
-		$crate::testing::macros::DeadlineParams {
-			duration: $dur,
-			min_slack: Some($slack),
-		}
-	};
-	{ duration: $dur:expr } => {
-		$crate::testing::macros::DeadlineParams {
-			duration: $dur,
-			min_slack: None,
-		}
+		$crate::testing::macros::DeadlineParams { duration: $dur, min_slack: None }
 	};
 }
 
@@ -123,10 +88,15 @@ macro_rules! deadline {
 /// - `guard!(x > d)` builds `ClockGreaterThan`.
 /// - `guard!(x >= d)` builds `ClockGreaterEqual`.
 /// - `guard!(x == d)` builds `ClockEquals`.
-/// - `guard!((lo) <= x <= (hi))` builds `ClockInRange`, and each bound is a parenthesized expression.
+/// - `guard!(lo <= x <= hi)` builds `ClockInRange`, and each bound is one token tree, such as `lo` or `(lo)`.
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! guard {
+	// The range form comes first, because the `<=` form reads an identifier
+	// lower bound as its clock. Each range bound is one token tree.
+	($min_dur:tt <= $clock:ident <= $max_dur:tt) => {
+		$crate::testing::timing::TimingGuard::ClockInRange(stringify!($clock).to_string(), $min_dur, $max_dur)
+	};
 	($clock:ident < $dur:expr) => {
 		$crate::testing::timing::TimingGuard::ClockLessThan(stringify!($clock).to_string(), $dur)
 	};
@@ -141,10 +111,6 @@ macro_rules! guard {
 	};
 	($clock:ident == $dur:expr) => {
 		$crate::testing::timing::TimingGuard::ClockEquals(stringify!($clock).to_string(), $dur)
-	};
-	// Each range bound is one token tree, such as a parenthesized expression.
-	($min_dur:tt <= $clock:ident <= $max_dur:tt) => {
-		$crate::testing::timing::TimingGuard::ClockInRange(stringify!($clock).to_string(), $min_dur, $max_dur)
 	};
 }
 
@@ -163,4 +129,43 @@ macro_rules! jitter {
 		use std::sync::Arc;
 		$crate::testing::timing::TimingConstraint::Jitter($dur, Some(Arc::new($calc)))
 	}};
+}
+
+#[cfg(all(test, feature = "testing-timing"))]
+mod tests {
+	use core::time::Duration;
+
+	use crate::testing::timing::{DefaultStatisticalAnalyzer, Percentile, TimingGuard};
+
+	#[test]
+	fn a_range_guard_takes_identifier_bounds() -> Result<(), Box<dyn core::error::Error>> {
+		let lower = Duration::from_millis(5);
+		let upper = Duration::from_millis(10);
+
+		let guard = crate::guard!(lower <= clock <= upper);
+		assert_eq!(guard, TimingGuard::ClockInRange("clock".to_string(), lower, upper));
+		Ok(())
+	}
+
+	#[test]
+	fn a_wcet_holds_its_analyzer_under_its_percentile() -> Result<(), Box<dyn core::error::Error>> {
+		let duration = Duration::from_millis(10);
+		let wcet = crate::wcet!(duration, analyzer: DefaultStatisticalAnalyzer, percentile: Percentile::P99);
+
+		let percentile = wcet.percentile.ok_or("the bound holds a percentile")?;
+		assert_eq!(percentile.percentile, Percentile::P99);
+		assert!(percentile.analyzer.is_some());
+		Ok(())
+	}
+
+	#[test]
+	fn a_deadline_in_braces_keeps_its_slack() -> Result<(), Box<dyn core::error::Error>> {
+		let duration = Duration::from_millis(100);
+		let slack = Duration::from_millis(5);
+
+		let params = crate::deadline! { duration: duration, slack: slack };
+		assert_eq!(params.duration, duration);
+		assert_eq!(params.min_slack, Some(slack));
+		Ok(())
+	}
 }

@@ -1,24 +1,5 @@
-//! This test binary counts the allocations of the reads that the handshake
-//! and a key index make in place, under a counting allocator.
-//!
-//! - A lookup writes the canonical form of a key on the stack when that form
-//!   fits the stack buffer, which holds every named-curve key up to P-521.
-//! - A `sid` of the key-identifier form names a certificate by the extension
-//!   value as the certificate holds it.
-//! - The built-in store finds a canonical key, the form a session holds of its peer, in its key index.
-//! - The built-in store validates a presented path from where its parts sit.
-//! - A signed `SignerInfo` encodes in place, as its inner value does.
-//! - A gossip rumor digest sits on the stack, so a rumor admits and a peer's
-//!   digest reads with no allocation for the digest.
-//! - A want list borrows the advertised entries it drops.
-//! - With the internal events off, the typed delivery of a servlet allocates what its inflate allocates.
-//! - With the internal events off, a single-flight turn that answers an admitted frame allocates nothing.
-//! - A record that a full sink drops allocates the assertion of the testing layer alone.
-//! - FDR exploration of a process with no hidden event allocates the same at any hidden run bound.
-//! - A state with no hidden step answers its stability and its divergence with no allocation.
-//!
-//! Only an allocation count shows these bounds, so the counting allocator
-//! lives in this test binary alone.
+//! Allocation bounds of hot paths. Only an allocation count shows them, so
+//! the counting allocator lives in this test binary alone.
 
 // Tests are exempt from the zero-panic index and arithmetic lints (workspace
 // lints): an index out of range fails its test at its location.
@@ -57,7 +38,7 @@ use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
 use tightbeam::testing::fixtures::{TestCertificate, TestKey, TestRumor, TestSigner};
 use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 use tightbeam::testing::{TestFrame, TestMessage};
-use tightbeam::trace::{TraceCollector, TraceConfig};
+use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
 use tightbeam::transport::EndpointConfig;
 use tightbeam::utils::time::UnixMillis;
@@ -136,7 +117,7 @@ fn a_lookup_of_the_house_key_allocates_nothing() {
 	assert_eq!(lookup_of(&house_key()), (true, 0));
 }
 
-/// A lookup of the P-256 key of RFC 6979 §A.2.5 writes its canonical form on
+/// A lookup of the P-256 key of RFC 6979 § A.2.5 writes its canonical form on
 /// the stack.
 #[test]
 fn a_lookup_of_the_rfc6979_p256_key_allocates_nothing() {
@@ -144,7 +125,7 @@ fn a_lookup_of_the_rfc6979_p256_key_allocates_nothing() {
 	assert_eq!(lookup_of(&spki), (true, 0));
 }
 
-/// A lookup of the P-521 key of RFC 6979 §A.2.7, the widest named prime
+/// A lookup of the P-521 key of RFC 6979 § A.2.7, the widest named prime
 /// curve, writes its canonical form on the stack.
 #[test]
 fn a_lookup_of_the_rfc6979_p521_key_allocates_nothing() {
@@ -159,9 +140,8 @@ fn a_lookup_past_the_stack_bound_allocates() {
 	assert!(matches!(lookup, (true, allocations) if allocations > 0));
 }
 
-/// Whether a store of the house certificate of the fixed key finds the
-/// canonical form of that key, beside the count of the allocations that the
-/// lookup makes.
+/// Whether a store of the fixed key's house certificate finds the canonical
+/// form of that key, beside the count of allocations the lookup makes.
 fn canonical_lookup_on_the_house_store() -> (bool, usize) {
 	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 	let key = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info);
@@ -176,8 +156,7 @@ fn canonical_lookup_on_the_house_store() -> (bool, usize) {
 }
 
 /// The house store finds the canonical key a session holds in its key index
-/// with no decode, so the lookup of a session classification allocates
-/// nothing.
+/// with no decode, so a session classification lookup allocates nothing.
 #[test]
 fn a_canonical_key_lookup_on_the_house_store_allocates_nothing() {
 	assert_eq!(canonical_lookup_on_the_house_store(), (true, 0));
@@ -197,7 +176,7 @@ fn naming_of_the_house_certificate() -> (bool, usize) {
 }
 
 /// A `sid` of the key-identifier form names a house certificate by the
-/// extension value the certificate holds, read in place (RFC 5652 §5.3).
+/// extension value the certificate holds, read in place (RFC 5652 § 5.3).
 #[test]
 fn a_key_identifier_names_its_certificate_with_no_allocation() {
 	assert_eq!(naming_of_the_house_certificate(), (true, 0));
@@ -225,17 +204,16 @@ fn validations_of_the_fixed_path() -> (usize, usize) {
 	(between - before, after - between)
 }
 
-/// The built-in store validates a presented path from where its issuers and
-/// its leaf sit, so it allocates what one chain allocates, and no copy of a
-/// certificate.
+/// The built-in store validates a presented path where its issuers and leaf
+/// sit, so it allocates what one chain allocates and copies no certificate.
 #[test]
 fn a_presented_path_validates_with_the_allocations_of_one_chain() {
 	let (whole, presented) = validations_of_the_fixed_path();
 	assert_eq!(presented, whole);
 }
 
-/// The counts of the allocations that the DER of the fixed signer structure
-/// makes, through its `Signed` wrapper and as its inner `SignerInfo`.
+/// The counts of the allocations that the DER encoding of the fixed signer
+/// structure makes, through its `Signed` wrapper and as its inner `SignerInfo`.
 fn encodings_of_the_fixed_signer() -> (usize, usize) {
 	let signed = TestSigner::info();
 	let before = ALLOCATIONS.with(Cell::get);
@@ -275,9 +253,9 @@ fn a_rumor_digest_reads_with_no_allocation() {
 	assert_eq!(allocations_of_a_digest_read(), 0);
 }
 
-/// The counts of the allocations that the admission of the fixed rumor makes,
-/// and that the two steps of it that own a buffer make: the decode of its body
-/// and the encoding of its to-be-signed frame.
+/// The allocation counts of the fixed rumor's admission and of its two steps
+/// that own a buffer: the decode of its body and the encoding of its
+/// to-be-signed frame.
 fn admissions_of_the_fixed_rumor() -> (usize, usize) {
 	let rumor = TestRumor::verified(TestRumor::application(1_000, [1, 2, 3]));
 	let frame = rumor.frame();
@@ -313,8 +291,7 @@ fn digest_of(index: u32) -> GossipDigest {
 }
 
 /// Whether a want list against 4,096 advertised entries that the replier
-/// holds in full wants nothing, beside the count of the allocations that the
-/// list makes.
+/// holds in full wants nothing, beside the count of allocations the list makes.
 fn want_list_against_held_entries() -> (bool, usize) {
 	let held: Vec<GossipDigest> = (0..4_096).map(digest_of).collect();
 	let advertised: Vec<Vec<u8>> = held.iter().map(|digest| digest.as_bytes().to_vec()).collect();
@@ -348,9 +325,9 @@ fn compressed_frame() -> Result<Frame, TightBeamError> {
 	compose! { V0: id: "detail-off", order: 1u64, message: message, compactness: ZstdCompression::default() }
 }
 
-/// The counts of the allocations that the inflate of a compressed frame makes,
-/// by itself and through the typed delivery of a servlet whose trace config
-/// leaves `enable_internal_detail` off.
+/// The allocation counts of a compressed frame's inflate, alone and through
+/// the typed delivery of a servlet whose trace config leaves
+/// `enable_internal_detail` off.
 fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
 	let inflator: Arc<dyn Inflator + Send + Sync> = Arc::new(CopyInflator);
 	let ctx = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), HashMap::new(), None);
@@ -390,9 +367,9 @@ fn a_typed_delivery_with_the_detail_off_allocates_what_its_inflate_allocates() -
 /// `enable_internal_detail` off.
 async fn loopback_transport() -> Result<TcpTransport<TokioStream>, TightBeamError> {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+
 	let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
 	let config = EndpointConfig::<DefaultCryptoProvider>::cleartext();
-
 	Ok(TcpTransport::new(TokioStream::from(stream), config).with_trace(TraceCollector::new()))
 }
 
@@ -430,9 +407,8 @@ fn a_single_flight_turn_with_the_detail_off_allocates_nothing() -> Result<(), Ti
 	Ok(())
 }
 
-/// The counts of the allocations that a record with evidence and a bare
-/// assertion each make on a trace whose sink holds no event, after one
-/// warm-up record of each.
+/// The allocation counts of a record with evidence and of a bare assertion on
+/// a trace whose sink holds no event, after one warm-up record of each.
 fn records_on_a_full_sink() -> Result<(usize, usize), TightBeamError> {
 	let config = TbInstrumentationConfig { max_events: 0, ..Default::default() };
 	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
@@ -493,6 +469,7 @@ fn allocations_of_one_seed(process: &Process, bound: usize) -> usize {
 #[test]
 fn a_process_with_no_hidden_event_allocates_the_same_at_any_hidden_run_bound() -> Result<(), ProcessBuildError> {
 	let process = ring()?;
+
 	let at_zero = allocations_of_one_seed(&process, 0);
 	let at_thirty_two = allocations_of_one_seed(&process, 32);
 	assert_eq!(at_zero, at_thirty_two);
@@ -504,11 +481,10 @@ fn a_process_with_no_hidden_event_allocates_the_same_at_any_hidden_run_bound() -
 #[test]
 fn a_process_with_no_hidden_event_computes_its_divergent_states_with_no_allocation() -> Result<(), ProcessBuildError> {
 	let process = ring()?;
-
 	let before = ALLOCATIONS.with(Cell::get);
+
 	let divergent = process.divergent_states();
 	let after = ALLOCATIONS.with(Cell::get);
-
 	assert_eq!((divergent.contains(State("S0")), after - before), (false, 0));
 	Ok(())
 }
@@ -544,4 +520,45 @@ fn answers_at_a_state_with_no_hidden_step() -> Result<(bool, bool, usize), Proce
 fn a_state_with_no_hidden_step_answers_with_no_allocation() -> Result<(), ProcessBuildError> {
 	assert_eq!(answers_at_a_state_with_no_hidden_step()?, (true, true, 0));
 	Ok(())
+}
+
+/// The allocation count of the conversion of a trace into a process, when the
+/// trace holds one gate acceptance and `extra` records the chain leaves out.
+fn chain_with_records_left_out(extra: u32) -> usize {
+	use tightbeam::instrumentation::TbEvent;
+	use tightbeam::testing::fdr::TraceProcessMode;
+
+	const PLAIN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:allocations/plain");
+
+	let record = |seq, urn| TbEvent {
+		seq,
+		urn,
+		label: Some("Ok".into()),
+		payload_hash: None,
+		duration_ns: None,
+		timestamp_ns: None,
+		flags: 0,
+		extras: None,
+	};
+
+	let left_out = (1..=extra).map(|seq| record(seq, PLAIN));
+	let mut trace = ConsumedTrace::new();
+	trace.instrument_events = core::iter::once(record(0, events::GATE_ACCEPT)).chain(left_out).collect();
+
+	// The first conversion interns the names of the chain, which the intern
+	// pool keeps, so the count reads the second.
+	let mode = TraceProcessMode::WithObservableInstrumentation;
+	drop(trace.to_process_with_mode(mode));
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let process = trace.to_process_with_mode(mode);
+	let after = ALLOCATIONS.with(Cell::get);
+
+	drop(process);
+	after.saturating_sub(before)
+}
+
+#[test]
+fn a_record_that_the_chain_leaves_out_renders_nothing() {
+	assert_eq!(chain_with_records_left_out(3), chain_with_records_left_out(0));
 }

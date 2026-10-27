@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::colony::cluster::FreshnessWindow;
-use crate::colony::protocol::{ClusterCommand, ClusterCommandResponse, IssuedAt, ReplyShape};
+use crate::colony::protocol::{AcceptedRecord, ClusterCommand, ClusterCommandResponse, IssuedAt, ReplyShape};
 use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
 use crate::crypto::x509::{CanonicalKey, KeyCurves, KeyList, KeyListError};
 use crate::der::Encode;
-use crate::instrumentation::events::HIVE_COMMAND_REFUSED;
+use crate::instrumentation::events::{HIVE_COMMAND_ACCEPTED, HIVE_COMMAND_REFUSED};
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
 use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
@@ -25,8 +25,7 @@ use crate::{Frame, TightBeamError};
 
 /// The states of one signer's circuit in a [`ClusterCircuitBreaker`].
 ///
-/// The breaker follows the standard circuit breaker pattern, which halts
-/// communication with a signer after repeated authentication failures.
+/// The breaker follows the standard circuit breaker pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CircuitState {
@@ -34,37 +33,34 @@ pub enum CircuitState {
 	Closed = 0,
 	/// The circuit has tripped and rejects every request.
 	Open = 1,
-	/// The circuit has let one probe request through to test recovery, and
-	/// refuses every other request until the probe's outcome closes or
-	/// reopens it. A probe with no recorded outcome expires one cooldown after
-	/// it went out.
+	/// The circuit let one probe through to test recovery, and refuses every
+	/// other request until the probe's outcome closes or reopens it. A probe
+	/// with no outcome expires one cooldown after it went out.
 	HalfOpen = 2,
 }
 
 /// A circuit breaker for cluster authentication failures.
 ///
-/// It trips after consecutive authentication failures, which halts cluster
+/// It trips after consecutive authentication failures and halts cluster
 /// communication with that signer. After a cooldown, the next request moves
-/// it to half-open as a probe, as [`CircuitState::HalfOpen`] states. The
-/// breaker measures the cooldown on the monotonic reading of its clock, so a
-/// step of the system time neither shortens nor stretches it.
+/// it to half-open as a probe ([`CircuitState::HalfOpen`]). The cooldown runs
+/// on the monotonic reading of its clock, so a step of the system time
+/// neither shortens nor stretches it.
 ///
 /// # Failures that count
 ///
-/// Only failures attributable to a *known* signer count toward the threshold
-/// (see [`ClusterSecurityGate`]), so unauthenticated frames cannot sever the
+/// Only failures of a *known* signer count toward the threshold
+/// ([`ClusterSecurityGate`]), so unauthenticated frames cannot sever the
 /// control plane between a hive and its legitimate cluster (CWE-645).
 ///
 /// # Thread Safety
 ///
-/// Per-signer circuits live under one mutex, so the transition from open to
-/// half-open happens under the lock and exactly one caller performs it per
-/// cooldown expiry.
+/// Per-signer circuits live under one mutex, so exactly one caller moves a
+/// circuit from open to half-open per cooldown expiry.
 pub struct ClusterCircuitBreaker {
 	/// The per-signer circuits, one row for each signer with a failure history.
-	///
 	/// A poisoned lock answers every signer as open, so the breaker fails
-	/// closed the way the replay guard does.
+	/// closed as the replay guard does.
 	signers: Mutex<HashMap<CanonicalKey, SignerCircuit>>,
 	/// The count of consecutive failures that trips a signer's circuit.
 	failure_threshold: u8,
@@ -76,10 +72,9 @@ pub struct ClusterCircuitBreaker {
 
 /// Where one signer's circuit stands.
 ///
-/// An open circuit carries the instant it opened, so every open circuit has
-/// a start for its cooldown. A half-open circuit carries the instant its
-/// probe went out, so a probe with no recorded outcome expires on the same
-/// cooldown.
+/// An open circuit carries the instant it opened, the start of its cooldown.
+/// A half-open circuit carries the instant its probe went out, so a probe
+/// with no outcome expires on the same cooldown.
 #[derive(Clone, Copy)]
 enum Position {
 	Closed,
@@ -107,9 +102,9 @@ struct SignerCircuit {
 impl SignerCircuit {
 	const CLOSED: Self = Self { position: Position::Closed, failures: 0 };
 
-	/// Returns whether this circuit is closed with no failures. Such a circuit
-	/// carries no history, so [`ClusterCircuitBreaker::prune`] drops its row
-	/// and the map stays bounded by the signers that have a failure history.
+	/// Returns whether this circuit is closed with no failures. It then carries
+	/// no history, so [`ClusterCircuitBreaker::prune`] drops its row, and the
+	/// map holds only signers with a failure history.
 	const fn is_quiescent(&self) -> bool {
 		matches!(self.position, Position::Closed) && self.failures == 0
 	}
@@ -155,7 +150,7 @@ impl ClusterCircuitBreaker {
 					return false;
 				}
 
-				// The lock serialises concurrent callers at the same cooldown
+				// The lock serializes concurrent callers at the same cooldown
 				// expiry, so exactly one of them sends the probe.
 				circuit.position = Position::HalfOpen(self.clock.monotonic());
 
@@ -166,11 +161,10 @@ impl ClusterCircuitBreaker {
 
 	/// Returns whether the breaker would admit the next request from `signer`.
 	///
-	/// The check is read-only. A cooldown that has expired reports `true` and
-	/// leaves the one probe for [`ClusterCircuitBreaker::admit_request`] to
-	/// spend. A verdict that consumed the probe would leave the circuit
-	/// half-open with no outcome recorded, and half-open refuses every later
-	/// request until the probe expires.
+	/// The check is read-only. An expired cooldown reports `true` and leaves
+	/// the one probe for [`ClusterCircuitBreaker::admit_request`] to spend. A
+	/// verdict that spent the probe would leave the circuit half-open with no
+	/// outcome, and half-open refuses every request until the probe expires.
 	#[must_use]
 	pub fn would_allow(&self, signer: ProvenPeer<'_>) -> bool {
 		let Ok(signers) = self.signers.lock() else {
@@ -263,11 +257,10 @@ type SignerPartitions = HashMap<Arc<[u8]>, HashMap<VerifiedSignature, UnixMillis
 
 /// The recorded signatures, partitioned by signer and indexed by signature.
 ///
-/// The partitions hold the per-signer capacity. The index answers "have I
-/// seen this signature" in one lookup, so admission costs the same whether
-/// the colony has one trusted signer or a thousand. Each key is a
-/// [`VerifiedSignature`], so a signature and its `(r, n - s)` twin are one
-/// key.
+/// The partitions hold the per-signer capacity. The index finds a signature
+/// in one lookup, so admission costs the same for one trusted signer or a
+/// thousand. Each key is a [`VerifiedSignature`], so a signature and its
+/// `(r, n - s)` twin are one key.
 #[derive(Default)]
 struct SeenSignatures {
 	partitions: SignerPartitions,
@@ -278,8 +271,8 @@ impl SeenSignatures {
 	/// Returns whether `signature` is recorded and the instant its frame states
 	/// lies inside the window.
 	///
-	/// The check is read-only, so a verdict can ask it and a later admission
-	/// sees the same records. The check borrows the signer from the index.
+	/// It is read-only, so a verdict can ask it and a later admission sees the
+	/// same records. It borrows the signer from the index.
 	fn is_live(&self, signature: &VerifiedSignature, now: UnixMillis, window: FreshnessWindow) -> bool {
 		self.owner
 			.get(signature)
@@ -288,12 +281,11 @@ impl SeenSignatures {
 			.is_some_and(|at| window.admits(*at, now))
 	}
 
-	/// Returns whether `signature` is recorded and the instant its frame states
-	/// lies inside the window, for an admission that is about to record it.
+	/// Returns what [`Self::is_live`] returns, for an admission that is about
+	/// to record `signature`.
 	///
-	/// The check drops a record it finds past the window, so an expired
-	/// signature returns its capacity on the next admission. The check
-	/// borrows the signer from the index.
+	/// It drops a record past the window, so an expired signature returns its
+	/// capacity on the next admission.
 	fn is_live_replay(&mut self, signature: &VerifiedSignature, now: UnixMillis, window: FreshnessWindow) -> bool {
 		if !self.owner.contains_key(signature) {
 			return false;
@@ -363,16 +355,14 @@ impl SeenSignatures {
 
 /// A bounded freshness and replay window for signed cluster commands.
 ///
-/// The guard accepts a command when its `Frame.metadata.order` lies within
-/// the window of the hive clock, in either direction to tolerate skew, and
-/// the guard holds no live record of its signature.
+/// It accepts a command when its `Frame.metadata.order` lies within the
+/// window of the hive clock, in either direction to tolerate skew, and it
+/// holds no live record of the signature.
 ///
 /// - The guard tracks signatures per signer, so a signer that saturates its partition blocks only itself.
-/// - Each record keeps the order its frame states, so it lives exactly as
-///   long as its frame is fresh (CWE-294).
-/// - Each insert of a signer prunes that signer's entries whose order is more
-///   than the window away from the clock, so [`REPLAY_GUARD_CAPACITY`] per
-///   trusted signer bounds the memory.
+/// - Each record keeps its frame's order, so it lives exactly as long as its frame is fresh (CWE-294).
+/// - Each insert prunes that signer's entries more than the window from the
+///   clock, so [`REPLAY_GUARD_CAPACITY`] per trusted signer bounds the memory.
 pub struct ReplayGuard {
 	seen: Mutex<SeenSignatures>,
 	window: FreshnessWindow,
@@ -394,10 +384,9 @@ impl ReplayGuard {
 	/// Returns whether the guard holds a record of `signature` within the
 	/// window.
 	///
-	/// The check is read-only. A verdict asks it, and the admission that
-	/// follows spends the slot with [`ReplayGuard::check_and_insert`]. A
-	/// poisoned lock answers `true`, so a verdict fails closed the way an
-	/// admission does.
+	/// It is read-only. A verdict asks it, and the admission that follows
+	/// spends the slot with [`ReplayGuard::check_and_insert`]. A poisoned lock
+	/// answers `true`, so a verdict fails closed as an admission does.
 	#[must_use]
 	pub fn is_replay(&self, signature: &VerifiedSignature, now: UnixMillis) -> bool {
 		let Ok(seen) = self.seen.lock() else {
@@ -414,8 +403,7 @@ impl ReplayGuard {
 	///   freshness judges, so it lives exactly as long as the frame is fresh,
 	///   also when that order leads the clock (CWE-294).
 	/// - It returns `true` for a new signature, which it records.
-	/// - It returns `false` for a replay, and it fails closed when the
-	///   signer's partition is at capacity or the lock is poisoned.
+	/// - It returns `false` for a replay, and fails closed on a full partition or a poisoned lock.
 	///
 	/// # Examples
 	///
@@ -473,11 +461,11 @@ impl ReplayGuard {
 
 	/// Removes a recorded signature, so the sender may retry the frame.
 	///
-	/// The guard records the signature before the guarded operation runs.
-	/// When that operation fails, the caller must release the record, or the
-	/// guard rejects a legitimate retry of the same signed frame as a replay
-	/// until the window expires. A poisoned guard admits nothing, so it holds
-	/// no slot to release.
+	/// The guard records the signature before the guarded operation runs. When
+	/// that operation fails, the caller must release the record, or the guard
+	/// refuses a legitimate retry of the frame as a replay until the window
+	/// expires. A poisoned guard admits nothing, so it holds no slot to
+	/// release.
 	pub fn forget(&self, signature: &VerifiedSignature) {
 		let Ok(mut seen) = self.seen.lock() else {
 			return;
@@ -489,8 +477,8 @@ impl ReplayGuard {
 
 /// The gate policy for certificate-based cluster command security.
 ///
-/// The gate enforces nonrepudiation, integrity, freshness, and replay rules
-/// on cluster commands through certificate-based trust verification.
+/// It enforces nonrepudiation, integrity, freshness, and replay rules on
+/// cluster commands.
 ///
 /// # Security Flow
 ///
@@ -500,21 +488,25 @@ impl ReplayGuard {
 ///    while its circuit is open (`PermissionDenied`). Neither is counted.
 /// 4. Look up the signer certificate in the trust store (unknown signer: `PermissionDenied`, not counted).
 /// 5. Verify the signature with the certificate's public key (invalid: `PermissionDenied`, **counted**).
-/// 6. Check `Frame.metadata.order` freshness (stale: `PermissionDenied`, not counted).
-/// 7. Refuse a signature already seen inside the window (replay: `PermissionDenied`, not counted).
-/// 8. On success, take the breaker's cooldown probe and record the success, which resets the breaker.
+/// 6. Bind the verified signer to the handshake-proven peer (another key: `PermissionDenied`, not counted).
+/// 7. Check `Frame.metadata.order` freshness (stale: `PermissionDenied`, not counted).
+/// 8. Refuse a signature already seen inside the window (replay: `PermissionDenied`, not counted).
+/// 9. On success, take the breaker's cooldown probe and record the success, which resets the breaker.
 ///
-/// Only step 5 counts toward the circuit breaker, and it counts against
-/// the [`ProvenPeer`] the transport handshake established, so one member's
-/// failures gate that member alone (CWE-645). Steps 6 and 7 stay uncounted,
-/// because a replayed capture carries a valid signature.
+/// Only step 5 counts toward the circuit breaker, against the [`ProvenPeer`]
+/// of the transport handshake, so one member's failures gate that member
+/// alone (CWE-645). Steps 6 to 8 stay uncounted, because a relayed or a
+/// replayed capture carries a valid signature.
+///
+/// Step 6 makes the peer of each admitted command its signer, so the record
+/// of the command names the party that signed it (CWE-778).
 ///
 /// # Breaker key
 ///
 /// - The gate reads the breaker before it checks the signature, so the
 ///   breaker keys on the handshake-proven peer.
-/// - [`ProvenPeer`] is the only key the breaker accepts, so a caller who copies
-///   a trusted `SignerIdentifier` spends its own budget (CWE-345).
+/// - [`ProvenPeer`] is the only key the breaker accepts, so a caller who
+///   copies a trusted `SignerIdentifier` spends its own budget (CWE-345).
 /// - An unauthenticated transport offers no such key. One row shared by every
 ///   anonymous caller would let a single bad signature deny the rest, so this
 ///   plane requires a proven peer (CWE-645).
@@ -550,9 +542,8 @@ pub struct GateLimits {
 /// A cluster command this gate has authenticated and decoded.
 ///
 /// The body is the command the admission decoded, so a dispatcher matches
-/// its alternative on that one decode. `signature` is the signature the
-/// trust store verified, and `replay_guard` holds the slot that signature
-/// spent.
+/// its alternative on that one decode. `signature` is the one the trust store
+/// verified, and `replay_guard` holds the slot it spent.
 pub(crate) struct AdmittedCommand {
 	body: ClusterCommand,
 	frame: Frame,
@@ -571,13 +562,26 @@ impl AdmittedCommand {
 		&self.frame
 	}
 
-	/// Answers this command with `response` in the shape its body names.
+	/// Answers this command, which the hive carried out, with `response` in
+	/// the shape its body names.
+	///
+	/// A spawn or a stop changes a servlet, so its record goes on `audit`
+	/// ahead of the reply, as [`ClusterCommand::accepted`] names it.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
-	pub(crate) fn reply(&self, response: ClusterCommandResponse) -> Result<Option<Frame>, TightBeamError> {
+	/// - The injected error, when the runtime fault model injects a fault at the acceptance event.
+	pub(crate) fn reply(
+		&self,
+		response: ClusterCommandResponse,
+		audit: &CommandAudit<'_>,
+	) -> Result<Option<Frame>, TightBeamError> {
+		if let Some(record) = self.body.accepted(&response) {
+			audit.accepted(&record)?;
+		}
+
 		self.body.reply_shape().reply(self.frame.metadata().id(), response)
 	}
 
@@ -599,7 +603,7 @@ impl AdmittedCommand {
 	pub(crate) fn refuse(
 		&self,
 		refusal: CommandRefusal,
-		audit: &RefusalAudit<'_>,
+		audit: &CommandAudit<'_>,
 	) -> Result<Option<Frame>, TightBeamError> {
 		if refusal.releases_replay() {
 			self.forget_replay();
@@ -607,7 +611,7 @@ impl AdmittedCommand {
 
 		let status = refusal.status();
 		let reply = self.body.reply_shape().refuse(self.frame.metadata().id(), status)?;
-		audit.record(refusal.name(), status)?;
+		audit.refused(refusal.name(), status)?;
 
 		Ok(reply)
 	}
@@ -622,9 +626,8 @@ impl AdmittedCommand {
 /// Why the control plane refused a command the gate had admitted.
 ///
 /// Each variant knows whether the hive could answer a retry of the same
-/// signed frame differently, which is the one fact
-/// [`AdmittedCommand::refuse`] needs to decide the replay slot. The
-/// mapping lives here, so a handler names its refusal and this type
+/// signed frame differently, the one fact [`AdmittedCommand::refuse`] needs
+/// to decide the replay slot. A handler names its refusal, and this type
 /// decides the slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandRefusal {
@@ -722,29 +725,38 @@ impl AdmitRefusal {
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
 	/// - The injected error, when the runtime fault model injects a fault at the refusal event.
-	pub(crate) fn reply(&self, audit: &RefusalAudit<'_>) -> Result<Option<Frame>, TightBeamError> {
+	pub(crate) fn reply(&self, audit: &CommandAudit<'_>) -> Result<Option<Frame>, TightBeamError> {
 		let status = self.status();
 		let reply = self.shape.refuse(self.frame.metadata().id(), status)?;
-		audit.record(status.as_str(), status)?;
+		audit.refused(status.as_str(), status)?;
 
 		Ok(reply)
 	}
 }
 
-/// The trail that the refusals of one cluster command leave: the hive's
-/// trace, and the session of the peer that sent the command.
+/// The trail that one cluster command leaves: the trace its records go on,
+/// and the session of the peer that sent the command.
 ///
-/// [`AdmittedCommand::refuse`] and [`AdmitRefusal::reply`] take it, so a
-/// refusal reply leaves the hive with its [`HIVE_COMMAND_REFUSED`] event.
-pub(crate) struct RefusalAudit<'a> {
+/// - [`AdmittedCommand::refuse`] and [`AdmitRefusal::reply`] take it, so a
+///   refusal reply leaves the hive with its [`HIVE_COMMAND_REFUSED`] event.
+/// - [`AdmittedCommand::reply`] takes it, so a spawn or a stop that the hive
+///   carries out leaves its [`HIVE_COMMAND_ACCEPTED`] event.
+pub(crate) struct CommandAudit<'a> {
 	trace: &'a TraceCollector,
 	session: &'a SessionContext,
 }
 
-impl<'a> RefusalAudit<'a> {
-	/// Binds the refusals of one command to `trace`, and names the peer of
-	/// `session` as the party each refusal answers.
-	pub(crate) fn new(trace: &'a TraceCollector, session: &'a SessionContext) -> Self {
+impl<'a> CommandAudit<'a> {
+	/// Binds the records of one command to `trace` for a proven peer, and to
+	/// `connections` otherwise (CWE-778). Each record names the session's peer.
+	pub(crate) fn new(trace: &'a TraceCollector, connections: &'a TraceCollector, session: &'a SessionContext) -> Self {
+		let proven = session.proven_peer().is_some();
+		let trace = if proven {
+			trace
+		} else {
+			connections
+		};
+
 		Self { trace, session }
 	}
 
@@ -755,10 +767,30 @@ impl<'a> RefusalAudit<'a> {
 	/// # Errors
 	///
 	/// - The injected error, when the runtime fault model injects a fault at the event.
-	fn record(&self, label: &str, status: TransitStatus) -> Result<(), TightBeamError> {
-		let peer = self.session.peer_key().map(CanonicalKey::as_der);
+	fn refused(&self, label: &'static str, status: TransitStatus) -> Result<(), TightBeamError> {
+		let peer = self.peer();
 		self.trace
 			.emit_event_with_value_and_evidence(HIVE_COMMAND_REFUSED, label, status, peer)
+	}
+
+	/// Records [`HIVE_COMMAND_ACCEPTED`] for a command that the hive carried
+	/// out, under the label of `record`, with the canonical key of the peer
+	/// as its payload. The gate bound that peer to the verified signer of the
+	/// command at admission.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the event.
+	fn accepted(&self, record: &AcceptedRecord<'_>) -> Result<(), TightBeamError> {
+		let peer = self.peer();
+		self.trace
+			.emit_rendered_event(HIVE_COMMAND_ACCEPTED, || record.to_string(), (), || peer)
+	}
+
+	/// Returns the canonical key of the peer, in DER, as the payload of each
+	/// record.
+	fn peer(&self) -> Option<&[u8]> {
+		self.session.peer_key().map(CanonicalKey::as_der)
 	}
 }
 
@@ -775,8 +807,8 @@ struct Authenticated<'a> {
 /// Why [`ClusterSecurityGate::inspect`] refused a frame.
 ///
 /// A bad signature is the one refusal an admission counts against the
-/// breaker, so it is a variant rather than a status: the verdict reports
-/// it and records nothing, while the admission records it once.
+/// breaker, so it has its own variant. The verdict reports it and records
+/// nothing, and the admission records it once.
 enum InspectRefusal {
 	/// The gate refused the frame before, or independently of, the signature
 	/// check.
@@ -799,9 +831,8 @@ impl ClusterSecurityGate {
 	/// Creates a security gate that trusts the certificates in `trust_store`
 	/// and enforces `limits` on `clock`.
 	///
-	/// The gate builds its own circuit breaker on that clock and judges
-	/// freshness against the same clock, so the cooldown and the freshness
-	/// window read one clock.
+	/// Its circuit breaker and its freshness check both run on `clock`, so the
+	/// cooldown and the freshness window read one clock.
 	pub fn new(trust_store: Arc<dyn CertificateTrust>, limits: GateLimits, clock: Arc<dyn Clock>) -> Self {
 		let GateLimits { failure_threshold, cooldown, freshness_window } = limits;
 		let circuit_breaker = ClusterCircuitBreaker::new(failure_threshold, cooldown, Arc::clone(&clock));
@@ -812,10 +843,9 @@ impl ClusterSecurityGate {
 
 	/// Judges `frame` with read-only checks.
 	///
-	/// The verdict covers the signer, the peer's circuit, freshness, and
-	/// replay. The gate therefore refuses a captured frame here, because its
-	/// signature is already recorded, and the question leaves every record as
-	/// it stands.
+	/// The verdict covers the signer and its binding to the peer, the peer's
+	/// circuit, freshness, and replay. It refuses a captured frame, whose
+	/// signature is already recorded, and changes no record.
 	///
 	/// # Left to the admission
 	///
@@ -857,7 +887,7 @@ impl ClusterSecurityGate {
 
 		// The verified signature is the replay key, in its canonical form, so
 		// a capture with `s` flipped to `n - s` keys the slot it already spent.
-		let signature = match self.trust_store.verify_frame(frame) {
+		let (signer, signature) = match self.trust_store.verify_frame(frame) {
 			TrustVerification::MissingSignature => {
 				return Err(InspectRefusal::Plain(TransitStatus::Unauthenticated));
 			}
@@ -865,8 +895,16 @@ impl ClusterSecurityGate {
 				return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 			}
 			TrustVerification::Invalid => return Err(InspectRefusal::BadSignature),
-			TrustVerification::Verified(_, signature) => signature,
+			TrustVerification::Verified(signer, signature) => (signer, signature),
 		};
+
+		// The gate binds the signer it verified to the peer the handshake
+		// proved, so the record of an admitted command names the party that
+		// signed it (CWE-778).
+		let signer_key = &signer.certificate().tbs_certificate.subject_public_key_info;
+		if !breaker_key.as_key().is_key_of(signer_key) {
+			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
+		}
 
 		// The gate checks freshness and replay here, so a verdict refuses a
 		// captured frame (CWE-294). `admit` spends the slot itself.
@@ -883,10 +921,9 @@ impl ClusterSecurityGate {
 	/// Authenticates `frame`, decodes its cluster command once, and spends
 	/// the admission.
 	///
-	/// This step consumes the admission: it takes the breaker's cooldown
-	/// probe, records an auth failure or a success against it, and spends the
-	/// replay slot for the signature. The control plane calls it exactly once
-	/// per frame.
+	/// It takes the breaker's cooldown probe, records an auth failure or a
+	/// success, and spends the signature's replay slot. The control plane
+	/// calls it exactly once per frame.
 	pub(crate) fn admit(&self, frame: Frame, session: &SessionContext) -> Result<AdmittedCommand, Box<AdmitRefusal>> {
 		// The body decodes once. A CHOICE names exactly one alternative, so a
 		// body that names none or more than one decodes to `None`, which the
@@ -942,15 +979,15 @@ impl GatePolicy for ClusterSecurityGate {
 	/// Returns whether the gate would admit this frame, by a check that leaves
 	/// the admission unspent.
 	///
-	/// Even so, the check refuses a captured frame, because the guard already
-	/// recorded the signature it carries (CWE-294).
+	/// Even so, it refuses a captured frame, because the guard already recorded
+	/// its signature (CWE-294).
 	///
 	/// # Command-query separation
 	///
-	/// A verdict must not consume what it judges. A transport that gates on
-	/// this and then hands the frame to the control plane would otherwise see
-	/// its own admission refused as a replay, and would burn the breaker's
-	/// cooldown probe on a question rather than an answer.
+	/// A verdict must not consume what it judges. Otherwise a transport that
+	/// gates on this and then hands the frame to the control plane would see
+	/// its own admission refused as a replay, and would spend the breaker's
+	/// cooldown probe on a question.
 	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let Some(frame) = frame else {
 			return TransitStatus::Unauthenticated;
@@ -1009,19 +1046,16 @@ impl BackpressureGate {
 	/// Returns the verdict on whether the hive takes work at the current
 	/// utilization.
 	///
-	/// It reads [`Self::report`], which holds the one comparison of
-	/// utilization against the threshold. The gate answers requests with it,
-	/// and the heartbeat reports the same verdict, so the capacity a hive
-	/// reports matches the work it admits.
+	/// It reads [`Self::report`], the one comparison of utilization against
+	/// the threshold. The gate and the heartbeat both answer with it, so the
+	/// capacity a hive reports matches the work it admits.
 	#[must_use]
 	pub fn status(&self) -> TransitStatus {
 		self.report().status
 	}
 
-	/// Returns the utilization and the verdict that describes it.
-	///
-	/// Both come from one load, so the capacity a heartbeat reports agrees
-	/// with the status beside it.
+	/// Returns the utilization and the verdict that describes it, from one
+	/// load.
 	#[must_use]
 	pub fn report(&self) -> BackpressureReport {
 		let utilization = self.current_utilization();
@@ -1345,8 +1379,8 @@ mod tests {
 	fn fill_replay_partition(gate: &ClusterSecurityGate, signer: impl AsRef<[u8]>, now: UnixMillis) {
 		let signer = signer.as_ref();
 		let guard = gate.replay_guard.as_ref();
-		let filled = (0..REPLAY_GUARD_CAPACITY).all(|index| guard.check_and_insert(signer, &accepted(index), now, now));
 
+		let filled = (0..REPLAY_GUARD_CAPACITY).all(|index| guard.check_and_insert(signer, &accepted(index), now, now));
 		assert!(filled, "the partition takes every filler up to capacity");
 	}
 
@@ -1362,7 +1396,6 @@ mod tests {
 		let breaker = breaker();
 		breaker.record_auth_failure(signer());
 		breaker.record_auth_failure(signer());
-
 		assert_eq!(breaker.state(signer()), CircuitState::Closed);
 
 		breaker.record_auth_failure(signer());
@@ -1470,7 +1503,6 @@ mod tests {
 	fn breaker_reset_clears_state() {
 		let breaker = breaker_on(&manual_clock(), 1);
 		breaker.record_auth_failure(signer());
-
 		assert!(breaker.is_open(signer()));
 
 		breaker.reset(signer());
@@ -1548,7 +1580,7 @@ mod tests {
 	}
 
 	fn work_frame(priority: Option<MessagePriority>) -> Result<Frame, TightBeamError> {
-		// Priority is a V2+ metadata field, so the frame is V2.
+		// Priority is a metadata field of V2 or later, so the frame is V2.
 		let mut builder = Version::V2
 			.compose()
 			.with_id(b"work")
@@ -1742,11 +1774,11 @@ mod tests {
 	fn the_breaker_counts_one_point_in_either_form_as_one_peer() {
 		let uncompressed = SessionContext::for_peer(Arc::new(listed_peer()));
 		let compressed = compressed_session();
+
 		let breaker = breaker();
 		breaker.record_auth_failure(proven(&uncompressed));
 		breaker.record_auth_failure(proven(&uncompressed));
 		breaker.record_auth_failure(proven(&uncompressed));
-
 		assert!(breaker.is_open(proven(&compressed)));
 	}
 
@@ -1891,8 +1923,8 @@ mod tests {
 		Ok(signed)
 	}
 
-	/// A gate that verifies a frame and a session that proves its peer,
-	/// which is the arrangement every admission test asks its question under.
+	/// A gate that verifies a frame and a session that proves its peer, the
+	/// setup of every admission test.
 	///
 	/// The gate and the frame's issue time read one clock, so the frame is
 	/// fresh until the test moves that clock.
@@ -1943,6 +1975,28 @@ mod tests {
 		Ok(())
 	}
 
+	/// The gate refuses a command that a trusted member signs and another
+	/// peer delivers. It binds the signer it verifies to the peer the
+	/// handshake proved, so the record of each command it admits names the
+	/// party that signed it (CWE-778).
+	#[tokio::test]
+	async fn a_command_that_another_peer_delivers_is_refused() -> Result<(), TightBeamError> {
+		let clock = manual_clock();
+		let identity = TestIdentity::insecure_fixed();
+		let certificate = identity.certificate().clone();
+		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+			.with_certificate(certificate)?
+			.build();
+
+		let gate = ClusterSecurityGate::new(Arc::new(store), limits(), erased(&clock));
+		let courier = SessionContext::for_peer(Arc::new(unlisted_peer()));
+		let signed = signed_heartbeat(&clock, &identity).await?;
+
+		let refused = gate.admit(signed, &courier).err().map(|refusal| refusal.status());
+		assert_eq!(refused, Some(TransitStatus::PermissionDenied));
+		Ok(())
+	}
+
 	/// A captured command replayed with its signature's `s` flipped to
 	/// `n - s` verifies under a real trust store (SEC 1 v2.0 §4.1.4), to the
 	/// value its original verifies to. The gate refuses it as a replay, not as
@@ -1990,16 +2044,17 @@ mod tests {
 		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(certificate.clone())?
 			.build();
+
 		let gate = ClusterSecurityGate::new(Arc::new(store), limits(), erased(&clock));
 		let sender = SessionContext::for_peer(Arc::new(certificate));
 		let order = clock.unix().saturating_add(Duration::from_millis(59_000));
 		let signed = signed_heartbeat_at(order, &identity).await?;
-
 		let admitted = gate.admit(signed.to_owned(), &sender).is_ok();
+
 		clock.advance(Duration::from_millis(61_000));
+
 		let fresh = gate.replay_guard.is_fresh(order, clock.unix());
 		let replayed = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
-
 		assert!(admitted);
 		assert!(fresh);
 		assert_eq!(replayed, Some(TransitStatus::PermissionDenied));
@@ -2008,8 +2063,8 @@ mod tests {
 
 	/// A verdict leaves a tripped breaker's one cooldown probe for the
 	/// admission to take. A question that spent it would park the circuit
-	/// half-open with no outcome recorded, and half-open refuses every
-	/// request that follows until the probe expires.
+	/// half-open with no outcome, refusing every request until the probe
+	/// expires.
 	#[tokio::test]
 	async fn a_gate_verdict_does_not_take_the_breakers_cooldown_probe() -> Result<(), TightBeamError> {
 		let VerifiedGate { gate, sender, signed, .. } = verified_gate_with(instant_cooldown()).await?;
@@ -2032,8 +2087,8 @@ mod tests {
 	/// A refused admission leaves the breaker as it found it.
 	///
 	/// The cooldown probe admits exactly one request. A path that spends it
-	/// and then refuses parks the circuit half-open with no outcome recorded,
-	/// and half-open refuses everything that follows until the probe expires.
+	/// and then refuses would park the circuit half-open with no outcome,
+	/// refusing everything until the probe expires.
 	#[tokio::test]
 	async fn a_refused_admission_does_not_strand_the_breaker_half_open() -> Result<(), TightBeamError> {
 		let VerifiedGate { gate, sender, signed, clock } = verified_gate_with(instant_cooldown()).await?;
@@ -2062,9 +2117,11 @@ mod tests {
 		let VerifiedGate { gate, sender, clock, .. } = verified_gate().await?;
 		let peer_key = peer_key(&sender);
 		let breaker_key = || ProvenPeer::for_test(&peer_key);
+
 		gate.circuit_breaker.record_auth_failure(breaker_key());
 		gate.circuit_breaker.record_auth_failure(breaker_key());
 		gate.circuit_breaker.record_auth_failure(breaker_key());
+
 		assert!(!gate.circuit_breaker.would_allow(breaker_key()));
 
 		clock.advance(COOLDOWN);
@@ -2105,7 +2162,6 @@ mod tests {
 			gate.admit(signed.to_owned(), &sender).err().map(|refusal| refusal.status()),
 			gate.admit(signed.to_owned(), &sender).err().map(|refusal| refusal.status()),
 		];
-
 		assert_eq!(refusals, [Some(TransitStatus::PermissionDenied); 3]);
 		assert!(gate.circuit_breaker.is_open(ProvenPeer::for_test(&sender_key)));
 		assert!(!gate.circuit_breaker.is_open(ProvenPeer::for_test(&signer_key)));
@@ -2168,14 +2224,13 @@ mod tests {
 	/// signed frame again.
 	#[tokio::test]
 	async fn a_transient_refusal_admits_the_same_frame_again() -> Result<(), TightBeamError> {
+		let trace = TraceCollector::default();
 		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
 		let admitted = gate
 			.admit(signed.to_owned(), &sender)
 			.ok()
 			.ok_or(TightBeamError::MissingResponse)?;
-		let trace = TraceCollector::default();
-
-		admitted.refuse(CommandRefusal::Backpressure, &RefusalAudit::new(&trace, &sender))?;
+		admitted.refuse(CommandRefusal::Backpressure, &CommandAudit::new(&trace, &trace, &sender))?;
 
 		assert!(gate.admit(signed, &sender).is_ok());
 		Ok(())
@@ -2185,32 +2240,47 @@ mod tests {
 	/// signed frame as a replay.
 	#[tokio::test]
 	async fn a_permanent_refusal_refuses_the_same_frame_as_a_replay() -> Result<(), TightBeamError> {
+		let trace = TraceCollector::default();
 		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
 		let admitted = gate
 			.admit(signed.to_owned(), &sender)
 			.ok()
 			.ok_or(TightBeamError::MissingResponse)?;
-		let trace = TraceCollector::default();
-
-		admitted.refuse(CommandRefusal::Draining, &RefusalAudit::new(&trace, &sender))?;
+		admitted.refuse(CommandRefusal::Draining, &CommandAudit::new(&trace, &trace, &sender))?;
 
 		let replay = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
 		assert_eq!(replay, Some(TransitStatus::PermissionDenied));
 		Ok(())
 	}
 
-	/// A refusal of an admitted command leaves the hive with its refusal event
-	/// on the trace of the audit.
+	/// A refusal of an admitted command records on the trace of the hive alone.
 	#[cfg(feature = "testing")]
 	#[tokio::test]
 	async fn a_refusal_records_its_event_on_the_trace_of_its_audit() -> Result<(), TightBeamError> {
 		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
 		let admitted = gate.admit(signed, &sender).ok().ok_or(TightBeamError::MissingResponse)?;
-		let trace = TraceCollector::default();
+		let (trace, connections) = (TraceCollector::default(), TraceCollector::default());
 
-		admitted.refuse(CommandRefusal::Draining, &RefusalAudit::new(&trace, &sender))?;
+		admitted.refuse(CommandRefusal::Draining, &CommandAudit::new(&trace, &connections, &sender))?;
 
-		assert_eq!(trace.recorded(HIVE_COMMAND_REFUSED), 1);
+		let recorded = (trace.recorded(HIVE_COMMAND_REFUSED), connections.recorded(HIVE_COMMAND_REFUSED));
+		assert_eq!(recorded, (1, 0));
+		Ok(())
+	}
+
+	/// A refusal of an unproven peer records on the connection trace alone.
+	#[cfg(feature = "testing")]
+	#[test]
+	fn a_refusal_of_an_unproven_peer_records_on_the_connection_trace() -> Result<(), TightBeamError> {
+		let (trace, connections) = (TraceCollector::default(), TraceCollector::default());
+		let session = SessionContext::default();
+		let frame = TestFrame::v0(None, Some("command"));
+
+		let audit = CommandAudit::new(&trace, &connections, &session);
+		AdmitRefusal::denied(frame, TransitStatus::PermissionDenied).reply(&audit)?;
+
+		let recorded = (trace.recorded(HIVE_COMMAND_REFUSED), connections.recorded(HIVE_COMMAND_REFUSED));
+		assert_eq!(recorded, (0, 1));
 		Ok(())
 	}
 }

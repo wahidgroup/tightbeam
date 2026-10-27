@@ -1,10 +1,10 @@
 //! The scenarios that forward a stream or a duplex across the gateway splice.
 //!
-//! The stream-echo servlet lives only in cluster B. A client opens a routed
-//! stream against cluster A ([`PooledClient::open_stream_to`] or
-//! [`PooledClient::open_duplex_to`]), and A splices it to B's gateway with
-//! the hop budget spent. B then serves it locally. A cancel of the client
-//! stream propagates across the splice to the servlet.
+//! The stream-echo servlet lives in cluster B alone. A client opens a routed
+//! stream on cluster A ([`PooledClient::open_stream_to`] or
+//! [`PooledClient::open_duplex_to`]). A splices it to B's gateway with the hop
+//! budget spent, and B serves it locally. A cancel of the client stream
+//! crosses the splice to the servlet.
 
 use tightbeam::transport::{PooledClient, Protocol, TransportError};
 use tightbeam::{compose, servlet};
@@ -13,9 +13,9 @@ use super::common::*;
 use crate::common::security::expectation_failure;
 
 servlet! {
-	/// A servlet with streaming and duplex arms only. The stream arm reports
-	/// the collected body length, and the duplex arm echoes every request
-	/// chunk back through the reply sink.
+	/// A servlet with stream and duplex arms alone. The stream arm reports the
+	/// body length, and the duplex arm echoes each request chunk to the reply
+	/// sink.
 	pub StreamEchoServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
 	stream: |body, ctx| async move {
@@ -94,8 +94,8 @@ pub async fn pooled_cluster_client(
 }
 
 /// Starts two peered gateways and registers the stream-echo hive in the
-/// exporter, the preamble that the forward and cancel scenarios share. It
-/// returns the importer, which the client dials, and then the exporter.
+/// exporter, for the forward and cancel scenarios. It returns the importer,
+/// which the client dials, then the exporter.
 async fn start_spliced_clusters(
 	trace: &TraceCollector,
 	certs: &Arc<ClusterTestCerts>,
@@ -126,9 +126,9 @@ tb_assert_spec! {
 	}
 }
 
-// A stream forwards across the splice that the module doc describes: the
-// importer splices the routed open to the exporter, whose hive alone hosts
-// stream-echo, and the servlet's reply frame relays back unchanged.
+// A stream crosses the splice. The importer splices the routed open to the
+// exporter, whose hive alone hosts stream-echo, and the servlet's reply frame
+// relays back unchanged.
 tb_scenario! {
 	name: cluster_forwards_streaming_to_peer_gateway,
 	spec: ClusterStreamForwardSpec,
@@ -137,7 +137,6 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: certs }| start_stream_hive(trace, certs),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (importer, exporter) = start_spliced_clusters(&trace, &certs, &hive).await?;
-
 			let client = pooled_cluster_client(&trace, &certs, importer.addr()).await?;
 
 			let (mut sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
@@ -170,9 +169,9 @@ tb_assert_spec! {
 	}
 }
 
-// Duplex cross-cluster forward: both directions relay concurrently
-// across the splice. Request chunks reach the exporter's servlet as
-// the client pushes them, and its echoes arrive before the request closes.
+// A duplex crosses the splice with both directions live at once. Request
+// chunks reach the exporter's servlet as the client pushes them, and the
+// echoes arrive before the request closes.
 tb_scenario! {
 	name: cluster_forwards_duplex_to_peer_gateway,
 	spec: ClusterDuplexForwardSpec,
@@ -181,7 +180,6 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: certs }| start_stream_hive(trace, certs),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let (importer, exporter) = start_spliced_clusters(&trace, &certs, &hive).await?;
-
 			let client = pooled_cluster_client(&trace, &certs, importer.addr()).await?;
 
 			let (mut sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
@@ -217,9 +215,9 @@ tb_assert_spec! {
 	}
 }
 
-// Gate policies cover stream opens: the reject-all policy that denies
-// unary work also refuses routed streaming and duplex opens before the
-// gateway consults any route, so mux streams cannot bypass `with_gate_policy`.
+// Gate policies cover stream opens. The reject-all policy that denies unary
+// work also refuses routed stream and duplex opens before any route lookup, so
+// mux streams cannot bypass `with_gate_policy`.
 tb_scenario! {
 	name: cluster_policy_gate_blocks_streams,
 	spec: ClusterStreamGateSpec,
@@ -269,17 +267,16 @@ tb_assert_spec! {
 /// The wire status that a refused open carries, or `None` for a served open
 /// or a failure with no wire status.
 ///
-/// A test that only asks whether the open failed passes on any refusal,
-/// including the `Unimplemented` that a plane with no route gives. Each
-/// scenario checks the status it expects, such as the `PermissionDenied`
-/// that the edge policy names.
+/// A bare failure check passes on any refusal, even the `Unimplemented` of a
+/// plane with no route. Each scenario checks the status it expects instead,
+/// such as the edge policy's `PermissionDenied`.
 fn refusal_status<T>(outcome: Result<T, TransportError>) -> Option<TransitStatus> {
 	outcome.err().and_then(|error| error.transit_status())
 }
 
-// The edge accept plane admits Work frames only. With a live stream servlet
-// registered on the colony plane, mux streaming and duplex opens on the edge
-// address fail closed, and without the plane's refusal they would splice.
+// The edge accept plane admits Work frames alone. A stream servlet is live on
+// the colony plane, so mux stream and duplex opens on the edge address would
+// splice without the plane's refusal. Both fail closed.
 tb_scenario! {
 	name: cluster_edge_plane_refuses_streams,
 	spec: ClusterEdgePlaneStreamRefuseSpec,
@@ -329,9 +326,9 @@ tb_assert_spec! {
 	}
 }
 
-// A splice must target a servlet type, as unary work must: the gateway
-// refuses an instance-narrowed stream or duplex open before it selects a
-// route, so no open bypasses the load balancer, and no dial runs.
+// A splice must target a servlet type, as unary work must. The gateway
+// refuses an instance-narrowed stream or duplex open before route selection,
+// so no open bypasses the load balancer and no dial runs.
 tb_scenario! {
 	name: cluster_refuses_instance_addressed_stream_opens,
 	spec: ClusterSpliceInstanceTargetSpec,
@@ -418,12 +415,12 @@ tb_assert_spec! {
 	}
 }
 
-// The cancel ends the splice on the importer and then on the exporter. Each
-// gateway records the end of its splice as a failed forward, so two records
-// prove that the cancel crossed both hops. The servlet's duplex handler then
-// fails too, and each of the three handlers on the path records `Internal`.
-// The client waits for every record before any teardown, so a shutdown cannot
-// satisfy the spec by accident.
+// The cancel ends the splice on the importer, then on the exporter. Each
+// gateway records its splice end as a failed forward, so two records prove the
+// cancel crossed both hops. The servlet's duplex handler then fails, and each
+// of the three handlers on the path records `Internal`. The client waits for
+// every record before teardown, so a shutdown cannot satisfy the spec by
+// accident.
 tb_scenario! {
 	name: cluster_duplex_cancel_propagates_to_peer,
 	spec: ClusterDuplexCancelSpec,

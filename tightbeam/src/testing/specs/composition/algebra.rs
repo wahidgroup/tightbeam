@@ -1,6 +1,6 @@
 //! CSP process algebra operations.
 //!
-//! This module implements these operators of CSP theory on [`Process`]:
+//! It implements these CSP operators on [`Process`]:
 //! - Hiding: `P \ A`.
 //! - Renaming: `P [[ old <- new ]]`.
 //! - Sequential composition: `P ; Q`.
@@ -106,8 +106,8 @@ impl ProcessBuilder {
 
 	/// Adds prefixed copies of both operands: the states, alphabets,
 	/// transitions, terminals, and choice points of `p` under `P_` and of `q`
-	/// under `Q_`. Both choice operators build on these copies, and they
-	/// differ only in how their initial state connects to them.
+	/// under `Q_`. Both choice operators build on these copies and differ only
+	/// in how their initial state connects to them.
 	fn prefixed_operands(self, p: &Process, q: &Process) -> Self {
 		self.copy_states(p, |state| State::prefixed(state, "P"))
 			.copy_states(q, |state| State::prefixed(state, "Q"))
@@ -319,8 +319,7 @@ impl Schedule {
 		entries
 	}
 
-	/// Adds `period` for `event`, or keeps the period held when the two are
-	/// equal.
+	/// Adds `period` for `event`, or keeps the held one when the two are equal.
 	///
 	/// # Errors
 	///
@@ -368,15 +367,15 @@ impl Process {
 
 	/// Renaming: `P [[ old <- new ]]`.
 	///
-	/// The method renames events through `mapping`. Every occurrence of an old
-	/// event, in both alphabets and in every transition, becomes its new event.
+	/// Every occurrence of an old event of `mapping`, in both alphabets and in
+	/// every transition, becomes its new event.
 	///
 	/// ## Parameters
 	/// - `mapping`: the new event for each old event.
 	///
 	/// The timing constraints and the schedulability periods follow their
-	/// events. A mapping may take two events to one, and their timing then
-	/// becomes one when it agrees.
+	/// events. When a mapping takes two events to one, their timing merges if
+	/// it agrees.
 	///
 	/// # Errors
 	///
@@ -402,8 +401,7 @@ impl Process {
 
 	/// Sequential composition: `P ; Q`.
 	///
-	/// When `P` reaches a terminal state, `Q` starts, so the terminal states of
-	/// `P` connect to the initial state of `Q`.
+	/// When `P` reaches a terminal state, `Q` starts.
 	///
 	/// ## State Space
 	/// `S = S_P ∪ S_Q`, where the states of `Q` carry the prefix `Q_`. Only the
@@ -446,8 +444,8 @@ impl Process {
 	///
 	/// The environment chooses with the first observable event. A hidden event
 	/// of either operand moves that operand alone, and the choice stays open,
-	/// as the firing rules of external choice state (A.W. Roscoe, *The Theory
-	/// and Practice of Concurrency*, 2005 revision).
+	/// by the firing rules of external choice (A.W. Roscoe, *The Theory and
+	/// Practice of Concurrency*, 2005 revision).
 	///
 	/// ## State Space
 	/// - An open state pairs two states that `P` and `Q` reach by hidden events alone.
@@ -517,9 +515,8 @@ impl Process {
 }
 
 impl State {
-	/// Creates a renamed copy of a state under an operand prefix. The
-	/// composition operators use it to keep the state spaces of their operands
-	/// disjoint.
+	/// Creates a renamed copy of a state under an operand prefix, so the
+	/// composition operators keep the state spaces of their operands disjoint.
 	pub fn prefixed(s: &State, prefix: impl AsRef<str>) -> State {
 		let prefix = prefix.as_ref();
 		State(intern(format!("{}_{}", prefix, s.0)))
@@ -690,7 +687,6 @@ mod tests {
 		let guarded = guarded_process(bound.clone())?;
 
 		let copy = guarded.hide(HashSet::new());
-
 		assert_eq!(guards_of(&copy, State("s0")), [Some(bound)]);
 		Ok(())
 	}
@@ -702,7 +698,6 @@ mod tests {
 		let guarded = guarded_process(bound.clone())?;
 
 		let choice = Process::external_choice(&guarded, &simple_process())?;
-
 		assert_eq!(guards_of(&choice, choice.initial), [Some(bound)]);
 		Ok(())
 	}
@@ -750,25 +745,30 @@ mod tests {
 	/// A process in which each event of `wcets` takes `s0` to the terminal
 	/// `s1`, and the WCET of each is its milliseconds.
 	#[cfg(feature = "testing-timing")]
-	fn timed(name: &'static str, wcets: &[(&'static str, u64)]) -> Process {
+	fn timed(
+		name: &'static str,
+		wcets: &[(&'static str, u64)],
+	) -> Result<Process, crate::testing::error::TestingError> {
 		let mut constraints = TimingConstraints::default();
 		let builder = Process::builder(name).initial_state(State("s0")).add_terminal(State("s1"));
-		let builder = wcets.iter().fold(builder, |builder, &(event, millis)| {
+		let builder = wcets.iter().try_fold(builder, |builder, &(event, millis)| {
 			let duration = Duration::from_millis(millis);
 			let wcet = WcetConfigBuilder::default()
 				.with_duration(duration)
 				.build()
 				.expect("a WCET with a duration builds");
-			constraints.add(Event(event), TimingConstraint::Wcet(wcet));
-			builder
+			constraints.add(Event(event), TimingConstraint::Wcet(wcet))?;
+			let builder = builder
 				.add_observable(Event(event))
-				.add_transition(State("s0"), Event(event), State("s1"))
-		});
+				.add_transition(State("s0"), Event(event), State("s1"));
+			Ok::<_, crate::testing::error::TestingError>(builder)
+		})?;
 
-		builder
+		let process = builder
 			.timing_constraints(constraints)
 			.build()
-			.expect("a process with an initial state builds")
+			.expect("a process with an initial state builds");
+		Ok(process)
 	}
 
 	/// Whether `process` holds a timing constraint on `event`.
@@ -841,7 +841,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn hiding_keeps_the_timing_constraints() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("T", &[("a", 10)]);
+		let process = timed("T", &[("a", 10)])?;
 		let copy = process.hide(HashSet::from([Event("a")]));
 		assert!(constrains(&copy, "a"));
 		Ok(())
@@ -850,7 +850,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn renaming_moves_a_constraint_to_the_new_event() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("T", &[("a", 10)]);
+		let process = timed("T", &[("a", 10)])?;
 		let renamed = process.rename(HashMap::from([(Event("a"), Event("x"))]))?;
 		assert!(constrains(&renamed, "x"));
 		Ok(())
@@ -859,7 +859,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn renaming_two_differently_constrained_events_to_one_is_refused() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("T", &[("a", 10), ("b", 20)]);
+		let process = timed("T", &[("a", 10), ("b", 20)])?;
 		let mapping = HashMap::from([(Event("a"), Event("x")), (Event("b"), Event("x"))]);
 
 		let refused = process.rename(mapping);
@@ -873,7 +873,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_sequential_composition_holds_the_timing_of_both() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::sequential(&timed("P", &[("a", 10)]), &timed("Q", &[("b", 20)]))?;
+		let composed = Process::sequential(&timed("P", &[("a", 10)])?, &timed("Q", &[("b", 20)])?)?;
 		assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
 		Ok(())
 	}
@@ -881,7 +881,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn an_external_choice_holds_the_timing_of_both() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::external_choice(&timed("P", &[("a", 10)]), &timed("Q", &[("b", 20)]))?;
+		let composed = Process::external_choice(&timed("P", &[("a", 10)])?, &timed("Q", &[("b", 20)])?)?;
 		assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
 		Ok(())
 	}
@@ -889,7 +889,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn an_internal_choice_holds_the_timing_of_both() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::internal_choice(&timed("P", &[("a", 10)]), &timed("Q", &[("b", 20)]))?;
+		let composed = Process::internal_choice(&timed("P", &[("a", 10)])?, &timed("Q", &[("b", 20)])?)?;
 		assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
 		Ok(())
 	}
@@ -897,7 +897,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_composition_keeps_one_copy_of_an_agreeing_constraint() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("P", &[("a", 10)]);
+		let process = timed("P", &[("a", 10)])?;
 		let composed = Process::sequential(&process, &process)?;
 		assert!(constrains(&composed, "a"));
 		Ok(())
@@ -906,7 +906,7 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	#[test]
 	fn a_composition_refuses_constraints_that_do_not_agree() -> Result<(), Box<dyn core::error::Error>> {
-		let refused = Process::sequential(&timed("P", &[("a", 10)]), &timed("Q", &[("a", 20)]));
+		let refused = Process::sequential(&timed("P", &[("a", 10)])?, &timed("Q", &[("a", 20)])?);
 		assert!(matches!(
 			refused,
 			Err(CompositionError::ConflictingTiming { event: Event("a") })

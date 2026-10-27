@@ -1,7 +1,5 @@
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
-use crate::cms::content_info::CmsVersion;
-use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::Sha3_256;
 use crate::error::Result;
 use crate::testing::{TestKey, TestMessage, TestSigner};
@@ -55,7 +53,6 @@ mod tbs_encoding {
 		let frame = TestFrame::with_integrity();
 		let mut unsigned = frame.clone();
 		unsigned.nonrepudiation = None;
-
 		assert_eq!(frame.to_tbs()?, crate::encode(&unsigned)?);
 		Ok(())
 	}
@@ -63,10 +60,10 @@ mod tbs_encoding {
 	#[test]
 	fn tbs_matches_derived_encoding_without_integrity() -> Result<()> {
 		let message = TestMessage::sample(None);
+
 		let frame = compose! { V0: id: "tbs-basic", order: 1u64, message: message }?;
 		let mut unsigned = frame.clone();
 		unsigned.nonrepudiation = None;
-
 		assert_eq!(frame.to_tbs()?, crate::encode(&unsigned)?);
 		Ok(())
 	}
@@ -75,6 +72,8 @@ mod tbs_encoding {
 #[cfg(all(feature = "secp256k1", feature = "tokio"))]
 mod sign {
 	use super::*;
+	use crate::cms::content_info::CmsVersion;
+	use crate::cms::signed_data::SignerIdentifier;
 	use crate::crypto::hash::Digest;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
@@ -110,6 +109,7 @@ mod sign {
 	async fn a_frame_signature_whose_digest_its_algorithm_does_not_name_is_refused() -> Result<()> {
 		let mut frame = unsigned_frame(Version::V1)?;
 		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
+
 		let signer_info = frame.nonrepudiation().ok_or(TightBeamError::MissingSignatureInfo)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_512, parameters: None };
 		let mismatched = SignerInfo { digest_alg, ..signer_info.as_ref().clone() };
@@ -128,7 +128,6 @@ mod sign {
 	#[tokio::test]
 	async fn a_frame_signature_is_version_3_under_a_key_identifier() -> Result<()> {
 		let mut frame = unsigned_frame(Version::V1)?;
-
 		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
 
 		let signer_info = frame.nonrepudiation().ok_or(TightBeamError::MissingSignatureInfo)?;
@@ -160,6 +159,7 @@ mod sign {
 	async fn a_frame_signature_protects_its_algorithms() -> Result<()> {
 		let mut frame = unsigned_frame(Version::V1)?;
 		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
+
 		let signer_info = frame.nonrepudiation().ok_or(TightBeamError::MissingSignatureInfo)?;
 		let value = TestAttributes::value(signer_info, ATTR_CMS_ALGORITHM_PROTECTION);
 		assert_eq!(value.to_der()?, TestAttributes::ALGORITHM_PROTECTION);

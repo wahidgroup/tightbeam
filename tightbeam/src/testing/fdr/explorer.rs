@@ -38,9 +38,9 @@ pub trait ExplorationCore {
 	/// Explores the schedule of each seed in `seeds`, records each result, and
 	/// returns each seed with its result, in the order of the seeds.
 	///
-	/// - The explorer runs every seed of a process through this method and reads the results it returns.
-	/// - The default calls [`Self::explore_seed`] and then [`Self::add_seed_result`] once for each seed.
-	/// - The call returns the results it recorded, the last entries of [`Self::seed_results`].
+	/// - The explorer runs every seed of a process through it and reads the results it returns.
+	/// - The default calls [`Self::explore_seed`], then [`Self::add_seed_result`], once per seed.
+	/// - The results it returns are the last entries of [`Self::seed_results`].
 	/// - [`DefaultExplorationEngine`](super::DefaultExplorationEngine)
 	///   overrides it to run the seeds in parallel in a build with `rayon`.
 	///
@@ -139,8 +139,7 @@ pub trait ExplorationCore {
 	/// [`Self::seed_results`].
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult);
 
-	/// Each seed with the result that the engine recorded for it, in the order
-	/// of the records.
+	/// Each seed with the result the engine recorded for it, in record order.
 	///
 	/// # Examples
 	///
@@ -180,7 +179,7 @@ pub trait ExplorationCore {
 	/// The default reads [`Process::failure_refusals`], the one home of the
 	/// rule. The walk of
 	/// [`DefaultExplorationEngine`](super::DefaultExplorationEngine) records
-	/// each failure of a seed through this method.
+	/// each failure of a seed through it.
 	///
 	/// # Examples
 	///
@@ -211,9 +210,8 @@ pub trait ExplorationCore {
 /// The outcome of one refinement check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RefinementOutcome<W> {
-	/// Refinement holds for everything that the check explored. `complete` is
-	/// false when a timeout or a resource bound cut the explored sets short,
-	/// so the claim holds only within the bounds.
+	/// Refinement holds for everything the check explored. When `complete` is
+	/// false, the claim holds only within the bounds.
 	Holds {
 		/// Whether the check computed each of its sets in full, before a
 		/// timeout or a resource limit.
@@ -313,11 +311,9 @@ pub trait RefinementChecker {
 
 /// A memoization cache of the trace, failure, and divergence sets.
 ///
-/// The refinement checker computes each set of a process once for each depth
-/// bound, and reads it from the cache for each later refinement check.
-///
-/// Each entry keys on a [`CacheKey`], the structure of a process and the depth
-/// bound of its search.
+/// The refinement checker computes each set of a process once per depth bound
+/// and reads it from the cache for each later check. Each entry keys on a
+/// [`CacheKey`], the structure of a process and the depth bound of its search.
 pub trait MemoizationCache {
 	/// The cached traces under `key`, and whether the set is complete, or
 	/// `None` when the cache holds none.
@@ -348,8 +344,8 @@ pub trait MemoizationCache {
 ///   states, the accepting states, the choice points, the two alphabets, and
 ///   the transitions.
 /// - Two keys are equal only when both parts are equal, so a set of one depth
-///   never answers a search at another, and a hash collision never serves
-///   the set of another process.
+///   never answers a search at another, and a hash collision never serves the
+///   set of another process.
 /// - The name stays out of the key, because the algebra operators (`hide`,
 ///   `rename`) give one name to processes of different structure.
 ///
@@ -603,13 +599,23 @@ impl SeededRng {
 
 	/// An item of `items` that the next draw picks, or `None` when `items` is
 	/// empty.
+	///
+	/// The pick reads the high 32 bits of the draw. The low bits of an LCG
+	/// with a power-of-two modulus repeat with a short period, and the lowest
+	/// bit alternates, so a pick from the low bits alternates between two
+	/// items whatever the seed.
+	///
+	/// # Sources
+	///
+	/// - Knuth, *The Art of Computer Programming*, Vol. 2 (3rd Ed., 1997), § 3.2.1.1 "Choice of modulus"
 	pub fn choose<'a, T>(&mut self, items: &'a (impl AsRef<[T]> + ?Sized)) -> Option<&'a T> {
 		let items = items.as_ref();
 		if items.is_empty() {
 			None
 		} else {
-			let index = (self.get_next() as usize) % items.len();
-			Some(&items[index])
+			let high_bits = self.get_next() >> 32;
+			let index = usize::try_from(high_bits).ok()?.checked_rem(items.len())?;
+			items.get(index)
 		}
 	}
 }
@@ -648,6 +654,18 @@ mod tests {
 
 			assert!(rng.choose(&items).is_some());
 			assert!(rng.choose(&Vec::<i32>::new()).is_none());
+		}
+
+		#[test]
+		fn a_two_way_choice_can_pick_one_item_twice() -> Result<(), Box<dyn core::error::Error>> {
+			let mut rng = SeededRng::new(7);
+			let sides = [0, 1];
+
+			let first = rng.choose(&sides);
+			let second = rng.choose(&sides);
+
+			assert_eq!(first, second, "the high bits of seed 7 pick one side twice");
+			Ok(())
 		}
 	}
 

@@ -1,5 +1,6 @@
 //! The integration tests of EDF schedulability.
 
+use core::error::Error;
 use core::time::Duration;
 
 use tightbeam::testing::fdr::FdrConfig;
@@ -56,20 +57,26 @@ tb_assert_spec! {
 	}
 }
 
+/// The configuration that grades [`EdfAssertSpec`], and refines the run
+/// against [`EdfSchedulableProcess`].
+fn edf_config() -> Result<ScenarioConfig, Box<dyn Error>> {
+	let fdr = FdrConfig {
+		seeds: 2,
+		max_depth: 8,
+		max_internal_run: 4,
+		timeout_ms: 500,
+		specs: vec![EdfSchedulableProcess::process()?],
+		fail_fast: true,
+		..Default::default()
+	};
+
+	let builder = ScenarioConfig::builder().with_spec(EdfAssertSpec::latest());
+	Ok(builder.with_fdr(fdr).build()?)
+}
+
 tb_scenario! {
 	name: test_edf_with_fdr,
-	config: ScenarioConfig::builder()
-		.with_spec(EdfAssertSpec::latest())
-		.with_fdr(FdrConfig {
-			seeds: 2,
-			max_depth: 8,
-			max_internal_run: 4,
-			timeout_ms: 500,
-			specs: vec![EdfSchedulableProcess::process()],
-			fail_fast: true,
-			..Default::default()
-		})
-		.build(),
+	config: edf_config(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(TASK1)?;

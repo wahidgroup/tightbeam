@@ -4,15 +4,16 @@ use core::fmt::{Display, Formatter};
 
 use crate::error::ReceivedExpectedError;
 use crate::testing::assertions::AssertionLabel;
+use crate::testing::macros::Cardinality;
 use crate::testing::specs::lts::CspViolation;
 use crate::testing::specs::Layer;
 use crate::trace::ExecutionMode;
+use crate::Errorizable;
 
 #[cfg(feature = "policy")]
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulabilityResult};
-use crate::Errorizable;
 
 /// The gate decision that a spec expects, and the one the trace recorded.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,13 +48,14 @@ pub struct EventOrderViolationDetail {
 	pub position: usize,
 }
 
-/// An event kind, with the count that a spec expects and the actual count.
+/// An event kind, with the cardinality that a spec expects of its count and
+/// the actual count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventCountMismatchDetail {
 	/// The event kind that the spec counts.
 	pub kind: crate::urn::Urn<'static>,
-	/// The count that the spec expects.
-	pub expected: usize,
+	/// The cardinality that the spec expects of the count.
+	pub expected: Cardinality,
 	/// The count that the trace holds.
 	pub actual: usize,
 }
@@ -70,6 +72,30 @@ pub enum SpecViolation {
 	/// A spec requires a response, and the trace holds none.
 	#[error("Response absent but spec requires it")]
 	ResponseUnexpectedAbsence,
+	/// A spec constrains the response, and the run reported no exchange, so
+	/// the trace holds no evidence of the response.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::tb_assert_spec;
+	/// use tightbeam::testing::specs::{SpecViolation, TBSpec};
+	/// use tightbeam::trace::ConsumedTrace;
+	///
+	/// tb_assert_spec! {
+	///     pub Silent,
+	///     V(1,0,0): {
+	///         mode: Accept,
+	///         response: Absent,
+	///         assertions: []
+	///     }
+	/// }
+	///
+	/// let verdict = Silent::latest().verify(&ConsumedTrace::new(), &Ok(()));
+	/// assert_eq!(verdict, Err(SpecViolation::ResponseUnreported));
+	/// ```
+	#[error("Response unreported: the run reported no exchange, so the spec decides no response")]
+	ResponseUnreported,
 	/// The response fails the response validation of the spec.
 	#[error("Response validation failed")]
 	ResponseValidationFailed,
@@ -82,12 +108,53 @@ pub enum SpecViolation {
 	/// The trace breaks the cardinality of an assertion contract.
 	#[error("Assertion contract violated: {0:?}")]
 	AssertionViolation(AssertionViolationDetail),
+	/// The trace lacks the ordered assertion labels of a spec in their order.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::{EventOrderViolationDetail, SpecViolation};
+	///
+	/// const CLOSE: tightbeam::urn::Urn<'static> = tightbeam::urn!("doc", "event:order/close");
+	///
+	/// let detail = EventOrderViolationDetail { expected_kind: CLOSE, position: 1 };
+	/// let refused = SpecViolation::AssertionOrderViolation(detail);
+	/// assert!(refused.to_string().starts_with("Assertion order violation"));
+	/// ```
+	#[error("Assertion order violation: {0:?}")]
+	AssertionOrderViolation(EventOrderViolationDetail),
 	/// The trace lacks the required instrumentation events in their order.
 	#[error("Event order violation: {0:?}")]
 	EventOrderViolation(EventOrderViolationDetail),
-	/// The count of an event kind differs from the count a spec expects.
+	/// The count of an event kind falls outside the cardinality a spec expects.
 	#[error("Event count mismatch: {0:?}")]
 	EventCountMismatch(EventCountMismatchDetail),
+	/// The spec counts events, and the instrumentation record of the trace
+	/// misses events ([`ConsumedTrace::is_complete`]), so it decides no count.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::exactly;
+	/// use tightbeam::instrumentation::{events, TbInstrumentationConfig};
+	/// use tightbeam::testing::specs::{EventCountContract, SpecViolation};
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+	///
+	/// let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
+	/// let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	/// collector.emit(events::GATE_ACCEPT, "Ok");
+	/// collector.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// let mut trace = ConsumedTrace::new();
+	/// trace.populate_from_collector(&collector);
+	///
+	/// let twice = EventCountContract::new(events::GATE_ACCEPT, exactly!(2));
+	/// assert_eq!(twice.check(&trace), Err(SpecViolation::EventRecordTruncated));
+	/// ```
+	///
+	/// [`ConsumedTrace::is_complete`]: crate::trace::ConsumedTrace::is_complete
+	#[error("Event record truncated: the record misses events, so no event count is decided")]
+	EventRecordTruncated,
 	/// The trace violates the CSP process of Layer 2.
 	#[error("CSP process violation: {0:?}")]
 	CspProcessViolation(Vec<CspViolation>),
@@ -100,9 +167,8 @@ pub enum SpecViolation {
 	/// The refinement check of Layer 3 stopped before it decided.
 	///
 	/// Exploration stopped on a bound or a timeout, so the layer neither
-	/// refuted the run nor cleared it. The bounds are on the verdict itself,
-	/// reachable through
-	/// [`ScenarioVerdict::fdr`](crate::testing::ScenarioVerdict::fdr).
+	/// refuted the run nor cleared it. The bounds are on the verdict itself
+	/// ([`ScenarioVerdict::fdr`](crate::testing::ScenarioVerdict::fdr)).
 	#[error("Refinement check did not conclude within its exploration bounds")]
 	RefinementInconclusive,
 	/// The layer that the scenario expects a violation from accepted the run.
@@ -121,9 +187,9 @@ pub enum SpecViolation {
 
 /// Every layer that rejected one scenario.
 ///
-/// A value of this type exists only where at least one layer rejected the
-/// run, so a caller that holds one knows the scenario failed and can read
-/// each rejection in layer order through [`Violations::iter`].
+/// A value exists only when at least one layer rejected the run, so its holder
+/// knows the scenario failed. [`Violations::iter`] reads each rejection in
+/// layer order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Violations {
 	found: Vec<SpecViolation>,
@@ -132,8 +198,8 @@ pub struct Violations {
 impl Violations {
 	/// Takes the rejections a grading collected, when it collected any.
 	///
-	/// `None` reports that every layer accepted the run, which is what keeps
-	/// a `Violations` non-empty by construction.
+	/// `None` reports that every layer accepted the run, so a `Violations` is
+	/// never empty.
 	pub(crate) fn collected(found: impl IntoIterator<Item = SpecViolation>) -> Option<Self> {
 		let found: Vec<SpecViolation> = found.into_iter().collect();
 		if found.is_empty() {

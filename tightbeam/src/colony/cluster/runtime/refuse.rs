@@ -1,11 +1,12 @@
 //! The refusal replies to gossip and peer-ad control frames.
 //!
-//! A refusal answers one inbound frame and records it against the same
-//! collector that saw the frame arrive. [`Refusal`] holds that pair, so
-//! the reply and its trace event always name the same frame.
+//! [`Refusal`] binds one inbound frame to the audit of its request, so the
+//! reply and its record name the same frame.
 
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
+use crate::colony::cluster::runtime::verify::RequestAudit;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
+use crate::colony::cluster::ClusterError;
 use crate::colony::protocol::{GossipResponse, GossipWant, PeerAdvertisementResponse, ReplyForm};
 use crate::crypto::sign::VerifiedSignature;
 use crate::instrumentation::events::{CLUSTER_GOSSIP_REFUSED, CLUSTER_PEER_ADVERTISE_REFUSED};
@@ -14,36 +15,42 @@ use crate::trace::TraceCollector;
 use crate::Frame;
 use crate::TightBeamError;
 
-/// One inbound control frame, the collector that saw it arrive, and the
-/// signer that the frame's verification proved.
+/// One inbound control frame, the audit of its request, and the signer that
+/// the frame's verification proved.
 #[derive(Clone, Copy)]
 pub(crate) struct Refusal<'f> {
 	frame: &'f Frame,
-	trace: &'f TraceCollector,
+	audit: &'f RequestAudit,
 	/// The signer whose signature verified on the frame's plane, or `None`
 	/// for a refusal before the verification passed. A record names this
 	/// signer alone, so it never names a party that the frame only claims
-	/// (CWE-345).
+	/// (CWE-345). A named signer puts the record on the audit trace.
 	signer: Option<&'f VerifiedSignerId>,
 }
 
 impl<'f> Refusal<'f> {
-	/// Binds a refusal of `frame` to the collector that saw it arrive. The
-	/// refusal names no signer until [`Self::by`] names the verified one.
-	pub(crate) fn to(frame: &'f Frame, trace: &'f TraceCollector) -> Self {
-		Self { frame, trace, signer: None }
+	/// Binds a refusal of `frame` to `audit`. The refusal names no signer until
+	/// [`Self::by`] names the verified one.
+	pub(crate) fn to(frame: &'f Frame, audit: &'f RequestAudit) -> Self {
+		Self { frame, audit, signer: None }
 	}
 
 	/// Names `signer`, whose signature verified on the frame's plane, as the
-	/// party that the record of this refusal names.
+	/// party behind this refusal.
 	pub(crate) fn by(self, signer: &'f VerifiedSignerId) -> Self {
 		Self { signer: Some(signer), ..self }
 	}
 
 	/// Answers a gossip rumor with `status`.
 	pub(crate) fn gossip(self, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		self.trace_gossip(status)?;
-		ReplyForm::Plain.reply(self.frame.metadata().id(), GossipResponse { status })
+		self.gossip_for(Cause::status(status))
+	}
+
+	/// Answers a gossip rumor with the status of `cause`, and records the
+	/// refusal under its label.
+	fn gossip_for(self, cause: Cause) -> Result<Option<Frame>, TightBeamError> {
+		self.trace_gossip(cause)?;
+		ReplyForm::Plain.reply(self.frame.metadata().id(), GossipResponse { status: cause.status })
 	}
 
 	/// Answers a gossip rumor after the gateway scores its relay, a step that
@@ -78,17 +85,24 @@ impl<'f> Refusal<'f> {
 		}
 	}
 
-	/// Answers a gossip rumor that met a fault of this gateway's own.
+	/// Answers a gossip rumor that met `fault`.
 	///
-	/// A poisoned registry, table, or journal is this gateway's fault, so it
-	/// answers [`TransitStatus::Unavailable`] in place of a verdict on the
-	/// rumor. A runtime fault, such as the trace's own refusal, propagates
-	/// unchanged.
+	/// - A local fault answers as [`Self::gossip_error`] does, by the split of [`LoopFault::local`].
+	/// - A runtime fault, such as the trace's own refusal, propagates unchanged.
 	pub(crate) fn gossip_fault(self, fault: LoopFault) -> Result<Option<Frame>, TightBeamError> {
-		match fault {
-			LoopFault::Registry(_) => self.gossip(TransitStatus::Unavailable),
-			LoopFault::Runtime(error) => Err(error),
-		}
+		let error = fault.local()?;
+		self.gossip_error(&error)
+	}
+
+	/// Answers a gossip rumor that met `error`, a fault of this gateway's own,
+	/// with [`TransitStatus::Unavailable`] in place of a verdict on the rumor.
+	///
+	/// - The fault is a poisoned or failed registry, table, journal, or rate
+	///   admission, or a failed local step, such as the build or the signature
+	///   of a rumor.
+	/// - The record of the refusal names the fault by its [`ClusterError::unavailable_label`].
+	pub(crate) fn gossip_error(self, error: &ClusterError) -> Result<Option<Frame>, TightBeamError> {
+		self.gossip_for(Cause::fault(error))
 	}
 
 	/// Answers a reconcile request with an empty want set and an empty
@@ -97,23 +111,44 @@ impl<'f> Refusal<'f> {
 	/// The reply carries no status, so `status` names the cause of the
 	/// refusal on its trace event alone.
 	pub(crate) fn reconcile(self, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		self.trace_gossip(status)?;
+		self.reconcile_for(Cause::status(status))
+	}
+
+	/// Answers a reconcile request that met `error`, a fault of this
+	/// gateway's own, as [`Self::reconcile`] answers it with
+	/// [`TransitStatus::Unavailable`]. The record names the fault by its
+	/// [`ClusterError::unavailable_label`].
+	pub(crate) fn reconcile_fault(self, error: &ClusterError) -> Result<Option<Frame>, TightBeamError> {
+		self.reconcile_for(Cause::fault(error))
+	}
+
+	/// Answers a reconcile request as [`Self::reconcile`] does, and records
+	/// the refusal for `cause`.
+	fn reconcile_for(self, cause: Cause) -> Result<Option<Frame>, TightBeamError> {
+		self.trace_gossip(cause)?;
 		ReplyForm::Plain.reply(self.frame.metadata().id(), GossipWant { want: Vec::new(), pex: Vec::new() })
 	}
 
 	/// Answers a peer advertisement with `status`.
 	pub(crate) fn peer_ad(self, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
-		let trace = self.trace;
-		trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ADVERTISE_REFUSED, status.as_str(), status, None)?;
+		self.peer_ad_for(Cause::status(status))
+	}
+
+	/// Answers a peer advertisement with the status of `cause`, and records
+	/// the refusal under its label.
+	fn peer_ad_for(self, cause: Cause) -> Result<Option<Frame>, TightBeamError> {
+		let Cause { label, status } = cause;
+		let trace = self.trace();
+		trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ADVERTISE_REFUSED, label, status, None)?;
 		ReplyForm::Plain.reply(self.frame.metadata().id(), PeerAdvertisementResponse { status })
 	}
 
 	/// Answers a peer advertisement with `status` and frees the freshness slot
 	/// its verified `signature` spent.
 	///
-	/// A refused advertisement leaves the routes as they are. A release of its
+	/// A refused advertisement leaves the routes as they are. Releasing its
 	/// signature keeps the peer's one admission for a frame this gateway
-	/// accepts, and a hold would spend that admission on a refusal (CWE-645).
+	/// accepts, where a hold would spend it on a refusal (CWE-645).
 	pub(crate) fn peer_ad_release(
 		self,
 		replay_guard: &GatewayReplayGuard,
@@ -124,17 +159,66 @@ impl<'f> Refusal<'f> {
 		self.peer_ad(status)
 	}
 
-	/// Records the refusal with its `status`, attributed to the verified
-	/// signer when the refusal names one.
-	fn trace_gossip(self, status: TransitStatus) -> Result<(), TightBeamError> {
+	/// Answers a peer advertisement that met `error`, a fault of this
+	/// gateway's own, with [`TransitStatus::Unavailable`], and frees the
+	/// freshness slot its verified `signature` spent, as
+	/// [`Self::peer_ad_release`] does.
+	///
+	/// The record names the fault by its [`ClusterError::unavailable_label`].
+	pub(crate) fn peer_ad_fault_release(
+		self,
+		replay_guard: &GatewayReplayGuard,
+		signature: &VerifiedSignature,
+		error: &ClusterError,
+	) -> Result<Option<Frame>, TightBeamError> {
+		replay_guard.release(signature);
+		self.peer_ad_for(Cause::fault(error))
+	}
+
+	/// The trace that the record of this refusal goes on.
+	fn trace(&self) -> &'f TraceCollector {
+		self.audit.signed(self.signer)
+	}
+
+	/// Records the refusal for `cause`, attributed to the verified signer when
+	/// the refusal names one.
+	fn trace_gossip(self, cause: Cause) -> Result<(), TightBeamError> {
+		let Cause { label, status } = cause;
 		let signer = self.signer.map(|signer| signer.as_shared().as_ref());
-		let trace = self.trace;
-		trace.emit_event_with_value_and_evidence(CLUSTER_GOSSIP_REFUSED, status.as_str(), status, signer)
+		let trace = self.trace();
+		trace.emit_event_with_value_and_evidence(CLUSTER_GOSSIP_REFUSED, label, status, signer)
+	}
+}
+
+/// What a refusal answers and what its record names: the status of the reply
+/// and the label of the record, which the two constructors pair.
+#[derive(Clone, Copy)]
+struct Cause {
+	/// The label of the record of the refusal.
+	label: &'static str,
+	/// The status that the reply carries.
+	status: TransitStatus,
+}
+
+impl Cause {
+	/// The cause of a refusal with `status`, whose record takes the name of
+	/// that status.
+	fn status(status: TransitStatus) -> Self {
+		Self { label: status.as_str(), status }
+	}
+
+	/// The cause of a refusal that `error`, a fault of this gateway's own,
+	/// draws: the reply answers [`TransitStatus::Unavailable`], and the record
+	/// names the fault by its [`ClusterError::unavailable_label`].
+	fn fault(error: &ClusterError) -> Self {
+		Self { label: error.unavailable_label(), status: TransitStatus::Unavailable }
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::*;
 	use crate::testing::{SetupEnv, TestRumor};
 	use crate::{exactly, tb_assert_spec, tb_scenario};
@@ -158,8 +242,9 @@ mod tests {
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
 				let frame = TestRumor::application(1_000, [1, 2, 3]);
-				Refusal::to(&frame, &trace).gossip(TransitStatus::ResourceExhausted)?;
-				Refusal::to(&frame, &trace).peer_ad(TransitStatus::PermissionDenied)?;
+				let audit = RequestAudit::proven(&Arc::new(trace));
+				Refusal::to(&frame, &audit).gossip(TransitStatus::ResourceExhausted)?;
+				Refusal::to(&frame, &audit).peer_ad(TransitStatus::PermissionDenied)?;
 				Ok(())
 			}
 		}
@@ -183,7 +268,8 @@ mod tests {
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
 				let frame = TestRumor::application(1_000, [1, 2, 3]);
-				Refusal::to(&frame, &trace).reconcile(TransitStatus::InvalidArgument)?;
+				let audit = RequestAudit::proven(&Arc::new(trace));
+				Refusal::to(&frame, &audit).reconcile(TransitStatus::InvalidArgument)?;
 				Ok(())
 			}
 		}
@@ -216,10 +302,44 @@ mod tests {
 		// party that the frame only claims (CWE-345).
 		#[test]
 		fn an_unverified_refusal_names_no_signer() -> Result<(), TightBeamError> {
-			let trace = payload_trace();
+			let trace = Arc::new(payload_trace());
 			let frame = TestRumor::application(1_000, [1, 2, 3]);
-			Refusal::to(&frame, &trace).gossip(TransitStatus::PermissionDenied)?;
+			Refusal::to(&frame, &RequestAudit::proven(&trace)).gossip(TransitStatus::PermissionDenied)?;
 			assert_eq!(refused_payloads(&trace), [None]);
+			Ok(())
+		}
+
+		/// The label of each [`CLUSTER_GOSSIP_REFUSED`] that `trace` holds.
+		fn refused_labels(trace: &TraceCollector) -> Vec<Option<String>> {
+			let recorded = trace.drain_events().into_iter();
+			let refused = recorded.filter(|record| record.urn == CLUSTER_GOSSIP_REFUSED);
+			refused.map(|record| record.label.as_deref().map(String::from)).collect()
+		}
+
+		// The gateway refuses a rumor that meets a fault of its own and names
+		// the fault in the record, so the trail tells a failed journal from a
+		// failed rate admission (CWE-778).
+		#[test]
+		fn a_gossip_refusal_of_a_fault_names_the_fault() -> Result<(), TightBeamError> {
+			let trace = Arc::new(TraceCollector::default());
+			let frame = TestRumor::application(1_000, [1, 2, 3]);
+			let fault = LoopFault::Registry(ClusterError::GossipJournalUnavailable);
+
+			Refusal::to(&frame, &RequestAudit::proven(&trace)).gossip_fault(fault)?;
+
+			let expected = [Some(String::from("Unavailable/gossip-journal-unavailable"))];
+			assert_eq!(refused_labels(&trace), expected);
+			Ok(())
+		}
+
+		// The gateway refuses a reconcile round that meets a fault of its own
+		// and names the fault in the record.
+		#[test]
+		fn a_reconcile_refusal_of_a_fault_names_the_fault() -> Result<(), TightBeamError> {
+			let trace = Arc::new(TraceCollector::default());
+			let frame = TestRumor::application(1_000, [1, 2, 3]);
+			Refusal::to(&frame, &RequestAudit::proven(&trace)).reconcile_fault(&ClusterError::LockPoisoned)?;
+			assert_eq!(refused_labels(&trace), [Some(String::from("Unavailable/lock-poisoned"))]);
 			Ok(())
 		}
 	}

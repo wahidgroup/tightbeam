@@ -5,8 +5,8 @@ use crate::{Errorizable, TightBeamError};
 
 /// The errors a hive returns.
 ///
-/// Each failure mode is its own variant rather than a string payload, so a
-/// caller can branch on it. A wrapper variant keeps its cause chain through
+/// Each failure mode is its own variant, so a caller can branch on it. A
+/// wrapper variant keeps its cause chain through
 /// [`core::error::Error::source`].
 #[derive(Errorizable, Debug)]
 pub enum HiveError {
@@ -49,6 +49,10 @@ pub enum HiveError {
 	/// trusted keys configured.
 	#[error("No trusted keys configured")]
 	NoTrustedKeys,
+
+	/// A hive got a servlet registry that already holds a registration.
+	#[error("The servlet registry already holds a registration")]
+	OccupiedRegistry,
 }
 
 impl<T> From<std::sync::PoisonError<T>> for HiveError {

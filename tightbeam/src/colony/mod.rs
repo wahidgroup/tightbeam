@@ -23,9 +23,7 @@ pub mod cluster;
 pub mod hive;
 pub mod protocol;
 pub mod servlet;
-mod task_group;
 pub mod urn;
 pub mod worker;
 
 pub use client::SubmitWork;
-pub(crate) use task_group::TaskGroup;

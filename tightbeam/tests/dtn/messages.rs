@@ -1,6 +1,6 @@
 //! The DTN message types of the Mars rover communication tests.
 //!
-//! The module defines the message structures of these flows:
+//! It defines the messages of these flows:
 //! - Rover telemetry from the APXS, ChemCam, and Mastcam instruments.
 //! - Command and control from Earth.
 //! - Consensus validation of the message chain.
@@ -15,10 +15,9 @@ use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Encode, Enumerated, Sequence};
 use tightbeam::{Beamable, TightBeamError};
 
-// The stateless acknowledgment carries metadata alone.
+// A relay sends the stateless acknowledgment outside the chain.
 
-/// A stateless acknowledgment: a minimal message body that stays outside the
-/// message chain.
+/// A stateless acknowledgment: a minimal body outside the message chain.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct StatelessAck {
 	/// Whether the acknowledgment arrived, which is always `true`.
@@ -154,7 +153,7 @@ impl RoverCommand {
 			RoverCommand::TakePhoto { direction, resolution } => {
 				let mut params = Vec::new();
 				params.extend_from_slice(direction.as_bytes());
-				params.push(0); // Separator
+				params.push(0); // A zero byte ends the direction.
 				params.extend_from_slice(&resolution.to_be_bytes());
 				params
 			}
@@ -236,12 +235,24 @@ pub enum RelayMessage {
 	/// An acknowledgment from the rover to Earth.
 	#[asn1(context_specific = "2", constructed = "true")]
 	CommandAck(CommandAck),
-	/// A frame request from Earth.
+	/// A frame request from a node whose chain shows a gap.
 	#[asn1(context_specific = "3", constructed = "true")]
 	FrameRequest(FrameRequest),
 	/// A frame response that carries the missing frames.
 	#[asn1(context_specific = "4", constructed = "true")]
 	FrameResponse(FrameResponse),
+}
+
+/// A relay message that takes a place in the chain of each node it crosses: a
+/// command, telemetry, or an ACK.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChainMessage {
+	/// A command from Earth that travels toward the rover.
+	Command(EarthCommand),
+	/// Telemetry from the rover that travels toward Earth.
+	Telemetry(RoverTelemetry),
+	/// An acknowledgment from the rover to Earth.
+	CommandAck(CommandAck),
 }
 
 // Each node keeps a message chain, and the nodes reach consensus on it.
@@ -258,9 +269,12 @@ pub struct MessageChainState {
 }
 
 impl MessageChainState {
+	/// The head of a chain that holds no frame.
+	pub const EMPTY_HEAD: [u8; 32] = [0u8; 32];
+
 	pub fn new(node_id: impl Into<String>) -> Self {
 		let node_id: String = node_id.into();
-		Self { last_hash: [0u8; 32], sequence: 0, node_id }
+		Self { last_hash: Self::EMPTY_HEAD, sequence: 0, node_id }
 	}
 
 	/// Sets the chain head to `new_hash` and advances the sequence by one.
@@ -269,7 +283,7 @@ impl MessageChainState {
 	#[allow(dead_code)]
 	pub fn update(&mut self, new_hash: [u8; 32]) {
 		self.last_hash = new_hash;
-		self.sequence += 1;
+		self.sequence = self.sequence.saturating_add(1);
 	}
 
 	/// Validates `frame` against the chain state.
@@ -278,7 +292,8 @@ impl MessageChainState {
 	/// 1. The frame order is the next sequence number.
 	/// 2. When the sequence is past 0, the `previous_frame` hash of the frame matches `last_hash`.
 	pub fn validate_frame(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		if frame.metadata().order() != self.sequence + 1 {
+		// At the last order `checked_add` gives `None`, so the check fails.
+		if Some(frame.metadata().order()) != self.sequence.checked_add(1) {
 			return Ok(false);
 		}
 
@@ -298,8 +313,8 @@ impl MessageChainState {
 
 	/// Advances the chain state to `frame`.
 	///
-	/// The chain head becomes the SHA3-256 hash of the DER encoding of the
-	/// frame, and the sequence becomes the order of the frame.
+	/// The chain head becomes the SHA3-256 hash of the frame's DER, and the
+	/// sequence becomes its order.
 	pub fn update_with_frame(&mut self, frame: &Frame) -> Result<(), TightBeamError> {
 		let frame_bytes = frame.to_der()?;
 		let frame_hash = Sha3_256::digest(&frame_bytes);
@@ -308,6 +323,21 @@ impl MessageChainState {
 		self.sequence = frame.metadata().order();
 
 		Ok(())
+	}
+
+	/// Advances the chain state to `frame` when the frame extends it, and
+	/// reports whether it does.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the frame fails to encode for its hash.
+	pub fn extend(&mut self, frame: &Frame) -> Result<bool, TightBeamError> {
+		if !self.validate_frame(frame)? {
+			return Ok(false);
+		}
+
+		self.update_with_frame(frame)?;
+		Ok(true)
 	}
 }
 
@@ -467,5 +497,26 @@ mod tests {
 			),
 			next_command => (tags_of(&sample_next_command()), vec![Tag::Integer, Tag::OctetString, Tag::Enumerated]),
 		}
+	}
+
+	/// A chain at the last order refuses each next frame.
+	#[test]
+	fn a_chain_at_the_last_order_refuses_a_frame() -> Result<(), TightBeamError> {
+		let mut chain = MessageChainState::new("node");
+		chain.sequence = u64::MAX;
+
+		let frame = tightbeam::compose! { V0: id: "frame-1", order: 1, message: sample_payload() }?;
+		assert!(!chain.validate_frame(&frame)?);
+		Ok(())
+	}
+
+	/// An update at the last order leaves the sequence there.
+	#[test]
+	fn an_update_at_the_last_order_leaves_the_sequence_there() -> Result<(), TightBeamError> {
+		let mut chain = MessageChainState::new("node");
+		chain.sequence = u64::MAX;
+		chain.update([1; 32]);
+		assert_eq!(chain.sequence, u64::MAX);
+		Ok(())
 	}
 }

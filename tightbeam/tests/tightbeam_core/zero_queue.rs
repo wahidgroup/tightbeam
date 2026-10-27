@@ -1,6 +1,6 @@
 use core::time::Duration;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
@@ -9,18 +9,22 @@ use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 use tightbeam::prelude::*;
+use tightbeam::testing::FaultModel;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::RestartLinearBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::ClientBuilder;
 use tightbeam::transport::ConnectionBuilder;
+use tightbeam::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{exactly, servlet, tb_assert_spec, tb_scenario};
 use tightbeam::{utils, Frame, TightBeamError, Version};
 
-use tightbeam::urn::Urn;
+use crate::common::dedup::{ChainState, DedupBook, HarnessEvents};
 
+pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-broken");
 pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-valid");
+pub(crate) const DEDUP_CACHE_HIT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-cache-hit");
 pub(crate) const DEDUP_KEPT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-kept");
 pub(crate) const DEDUP_SKIPPED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-skipped");
 pub(crate) const LAG_TIP: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/lag-tip");
@@ -105,61 +109,16 @@ impl WorkChain {
 	}
 }
 
-#[derive(Default)]
-struct ChainState {
-	state: Mutex<ChainInner>,
-}
+/// The events of the queue harness.
+struct QueueEvents;
 
-#[derive(Default)]
-struct ChainInner {
-	last_order: Option<u64>,
-	last_digest: Option<DigestInfo>,
-}
-
-impl ChainState {
-	/// Records `frame` as the next link of the chain, and returns whether it
-	/// links to the tip.
-	fn record(&self, frame: &Frame, trace: &TraceCollector) -> Result<bool, TightBeamError> {
-		let mut guard = self.state.lock().expect("chain state mutex not poisoned");
-		let parent = frame.metadata().previous_frame();
-		let prev_ok = guard.last_digest.as_ref() == parent;
-
-		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata().order() > prev);
-		let valid = prev_ok && order_ok;
-
-		trace.event_with(CHAIN_VALID, &[QUEUE_TAG], valid)?;
-
-		if valid {
-			guard.last_order = Some(frame.metadata().order());
-			let digest = utils::digest::<Sha3_256>(frame.message())?;
-			guard.last_digest = Some(digest);
-
-			trace.event_with(LAG_TIP, &[QUEUE_TAG], ())?;
-		}
-
-		Ok(valid)
-	}
-}
-
-#[derive(Default)]
-struct DedupBook {
-	seen: Mutex<BTreeSet<(Vec<u8>, u64)>>,
-}
-
-impl DedupBook {
-	fn record(&self, frame: &Frame, trace: &TraceCollector) -> Result<bool, TightBeamError> {
-		let key = (frame.metadata().id().to_owned(), frame.metadata().order());
-		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
-
-		let inserted = guard.insert(key);
-		if inserted {
-			trace.event_with(DEDUP_KEPT, &[QUEUE_TAG], ())?;
-		} else {
-			trace.event_with(DEDUP_SKIPPED, &[QUEUE_TAG], ())?;
-		}
-
-		Ok(inserted)
-	}
+impl HarnessEvents for QueueEvents {
+	const TAG: &'static str = QUEUE_TAG;
+	const DEDUP_KEPT: Urn<'static> = DEDUP_KEPT;
+	const DEDUP_SKIPPED: Urn<'static> = DEDUP_SKIPPED;
+	const DEDUP_CACHE_HIT: Urn<'static> = DEDUP_CACHE_HIT;
+	const CHAIN_VALID: Urn<'static> = CHAIN_VALID;
+	const CHAIN_BROKEN: Urn<'static> = CHAIN_BROKEN;
 }
 
 #[derive(Default)]
@@ -204,7 +163,8 @@ struct BackPressureStats {
 
 impl BackPressureStats {
 	fn mark_throttled(&self, order: u64) -> bool {
-		let mut guard = self.throttled.lock().expect("throttle mutex not poisoned");
+		// An insert leaves the set whole, so a poisoned lock holds a whole set.
+		let mut guard = self.throttled.lock().unwrap_or_else(PoisonError::into_inner);
 		if guard.contains(&order) {
 			false
 		} else {
@@ -246,23 +206,36 @@ impl GatePolicy for AdaptiveGate {
 /// shares.
 #[derive(Default)]
 struct QueueHarness {
-	chain: ChainState,
-	dedup: DedupBook,
+	chain: ChainState<QueueEvents>,
+	dedup: DedupBook<QueueEvents, ()>,
 	priority: PriorityLedger,
 }
 
 impl QueueHarness {
+	/// Serves `frame` once. The book and the chain keep it once the ledger
+	/// assigns its worker.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::InvalidMetadata`] -- the frame breaks the chain, or differs from the kept frame.
+	/// - [`TightBeamError`] -- a lock is poisoned, or a trace record fails.
 	fn handle(&self, frame: &Frame, trace: &TraceCollector) -> Result<(), TightBeamError> {
-		if !self.dedup.record(frame, trace)? {
-			return Ok(());
-		}
+		// The lock of the book comes before the lock of the chain.
+		let serve = || self.serve(frame, trace);
+		self.dedup.answer(frame, trace, || self.chain.record(frame, trace, serve))
+	}
 
-		self.chain.record(frame, trace)?;
-
+	/// Assigns `frame` its worker, and records that its response is ready.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- a trace record fails.
+	fn serve(&self, frame: &Frame, trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let worker = self.priority.assign(frame, trace)?;
 
 		trace.event_with(WORKER_COMMIT, &[QUEUE_TAG], worker as u64)?;
 		trace.event_with(RESPONSE_READY, &[QUEUE_TAG], frame.metadata().order())?;
+		trace.event_with(LAG_TIP, &[QUEUE_TAG], ())?;
 		Ok(())
 	}
 }
@@ -291,7 +264,8 @@ tb_assert_spec! {
 			(events::GATE_REJECT, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
 			(DEDUP_KEPT, exactly!(3)),
 			(DEDUP_SKIPPED, exactly!(1)),
-			(CHAIN_VALID, exactly!(3), equals!(true)),
+			(CHAIN_VALID, exactly!(3)),
+			(CHAIN_BROKEN, exactly!(0)),
 			(LAG_TIP, exactly!(3)),
 			(PRIORITY_RESPECTED, exactly!(3), equals!(true)),
 			(WORKER_FAN_OUT_0, exactly!(2), equals!(0u8), tags: [WORKER_0_TAG]),
@@ -310,7 +284,6 @@ tb_scenario! {
 			let trace = Arc::new(env.trace);
 			let stats = Arc::new(BackPressureStats::default());
 			let adaptive_gate = AdaptiveGate::new(stats);
-
 			let servlet_conf = ServletConfig::<TokioListener, WorkOrder>::builder()
 				.with_config(Arc::new(QueueHarness::default()))
 				.with_collector_gate(adaptive_gate)
@@ -353,21 +326,75 @@ tb_scenario! {
 	}
 }
 
-/// A chain refuses a frame that links to a parent other than its tip, though
-/// the order of the frame follows the tip.
-#[test]
-fn a_frame_linked_to_another_parent_breaks_the_chain() -> Result<(), TightBeamError> {
-	let trace = TraceCollector::default();
-	let chain = ChainState::default();
+/// The first frame of one chain, and the second frame of another chain, which
+/// follows the first in order and links to a parent other than it.
+fn first_and_linked_to_theirs() -> (Frame, Frame) {
 	let mut ours = WorkChain::new(WorkId::new("queue-free::ours"));
 	let mut theirs = WorkChain::new(WorkId::new("queue-free::theirs"));
 	let first = ours.next(b"first", MessagePriority::Standard);
+
 	theirs.next(b"their-first", MessagePriority::Standard);
+
 	let linked_to_theirs = theirs.next(b"second", MessagePriority::Standard);
-	chain.record(&first, &trace)?;
 
-	let valid = chain.record(&linked_to_theirs, &trace)?;
+	(first, linked_to_theirs)
+}
 
-	assert!(!valid, "the chain admitted a frame that links to another parent");
+/// The first two frames of one chain.
+fn two_links() -> (Frame, Frame) {
+	let mut chain = WorkChain::new(WorkId::new("queue-free::links"));
+
+	let first = chain.next(b"first", MessagePriority::Standard);
+	let second = chain.next(b"second", MessagePriority::Standard);
+	(first, second)
+}
+
+/// A resend of a frame that breaks the chain meets the chain again.
+#[test]
+fn a_resent_frame_that_breaks_the_chain_meets_the_chain_again() -> Result<(), TightBeamError> {
+	let trace = TraceCollector::default();
+	let harness = QueueHarness::default();
+	let (first, linked_to_theirs) = first_and_linked_to_theirs();
+
+	harness.handle(&first, &trace)?;
+
+	let refusal = harness.handle(&linked_to_theirs, &trace);
+	let resend = harness.handle(&linked_to_theirs, &trace);
+	assert!(refusal.is_err());
+	assert!(matches!(resend, Err(TightBeamError::InvalidMetadata)));
+	assert_eq!(trace.recorded(CHAIN_BROKEN), 2);
+	Ok(())
+}
+
+/// A frame that breaks the chain is refused, and gets no worker.
+#[test]
+fn a_frame_that_breaks_the_chain_gets_no_worker() -> Result<(), TightBeamError> {
+	let trace = TraceCollector::default();
+	let harness = QueueHarness::default();
+	let (first, linked_to_theirs) = first_and_linked_to_theirs();
+
+	harness.handle(&first, &trace)?;
+
+	let refusal = harness.handle(&linked_to_theirs, &trace);
+	assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
+	assert_eq!(trace.recorded(RESPONSE_READY), 1);
+	Ok(())
+}
+
+/// A frame whose worker assignment fails is served on its resend.
+#[test]
+fn a_frame_whose_worker_assignment_fails_is_served_on_its_resend() -> Result<(), TightBeamError> {
+	let fault = || TightBeamError::ChannelClosed;
+	let model = FaultModel::default().with_event_fault(PRIORITY_RESPECTED, fault, tightbeam::bps!(5000));
+	let trace = TraceCollector::new().with_fault_model(model);
+	let harness = QueueHarness::default();
+	let (first, second) = two_links();
+
+	harness.handle(&first, &trace)?;
+
+	let failed = harness.handle(&second, &trace);
+	harness.handle(&second, &trace)?;
+	assert!(matches!(failed, Err(TightBeamError::ChannelClosed)));
+	assert_eq!(trace.recorded(RESPONSE_READY), 2);
 	Ok(())
 }

@@ -1,47 +1,23 @@
-//! Frame response handler worker - handles FrameResponse messages
+//! The frame response handler worker, which records the answer to a frame
+//! request of its node.
 //!
-//! Business logic: Process recovered frames and validate chain integrity.
-
-use std::sync::Arc;
+//! The node keeps the answer, and takes each frame of it into its chain.
 
 use tightbeam::{der::Sequence, worker, Beamable, TightBeamError};
 
-use crate::dtn::{
-	chain_processor::ChainProcessor,
-	messages::FrameResponse,
-	ultimate::{gap_recovery_event, GapRecoveryStep},
-};
+use crate::dtn::{nodes::DtnRole, ultimate::GapRecoveryStep};
 
-/// Frame response handler request
+/// The request to the frame response handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameResponseHandlerRequest {
-	pub response: FrameResponse,
-	pub node_name: String,
-}
-
-/// Frame response handler response (empty - worker does all the work)
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-pub struct FrameResponseHandlerResponse {
-	pub frames_processed: u32,
+	/// The node that asked for the frames.
+	pub node: DtnRole,
 }
 
 worker! {
-	name: FrameResponseHandlerWorker<FrameResponseHandlerRequest, Result<FrameResponseHandlerResponse, TightBeamError>>,
-	config: {
-		chain_processor: Arc<ChainProcessor>,
-	},
-	handle: |request, trace, config| async move {
-		trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::ReceiveFrameResponse))?;
-
-		// Business logic: Process recovered frames through chain processor
-		let mut count = 0u32;
-		for frame in &request.response.frames {
-			config.chain_processor.process_incoming(frame)?;
-			count += 1;
-		}
-
-		Ok(FrameResponseHandlerResponse {
-			frames_processed: count,
-		})
+	name: FrameResponseHandlerWorker<FrameResponseHandlerRequest, Result<(), TightBeamError>>,
+	handle: |request, trace| async move {
+		trace.event(GapRecoveryStep::ReceiveFrameResponse.event_on(request.node))?;
+		Ok(())
 	}
 }

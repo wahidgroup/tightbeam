@@ -20,9 +20,13 @@ pub(crate) use handle::TraceHandle;
 
 #[cfg(any(test, feature = "testing"))]
 pub use assertion::{Assertion, AssertionLabel};
+#[cfg(all(feature = "instrument", any(test, feature = "testing")))]
+pub use collector::EventRecordTruncated;
 #[cfg(any(test, feature = "testing"))]
-pub use collector::{ConsumedTrace, ExecutionMode};
+pub use collector::{ConsumedTrace, Exchange, ExecutionMode};
 
+#[cfg(feature = "logging")]
+pub use collector::TraceStateShared;
 #[cfg(feature = "logging")]
 pub use logging::{
 	LogBackend, LogError, LogFilter, LogLevel, LogRecord, LoggerConfig, MultiplexBackend, StdoutBackend,

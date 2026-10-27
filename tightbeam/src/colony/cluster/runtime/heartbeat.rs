@@ -68,9 +68,9 @@ impl<P: ColonyDialProtocol> HiveBeat<P> {
 	pub(crate) async fn send(self, hive: &HiveEntry) -> Result<HeartbeatResult, ClusterError> {
 		let cmd = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 
-		// Priority is a V2+ metadata field. A V1 frame that composes it fails
-		// at build time, so every heartbeat would count as a send failure.
-		// `metadata.order` is the command freshness binding (CWE-294).
+		// Priority is a metadata field of V2 or later. A V1 frame that composes
+		// it fails at build time, so every heartbeat would count as a send
+		// failure. `metadata.order` is the command freshness binding (CWE-294).
 		let builder = FrameBuilder::from(Version::V2)
 			.with_id(b"heartbeat")
 			.with_order(self.config.clock.unix().get())
@@ -94,10 +94,9 @@ impl<P: ColonyDialProtocol> HiveBeat<P> {
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Dials one hive and settles the answer against its address.
 	///
-	/// A dial fault is this hive's answer and settles as a failed beat, so
-	/// every other hive in the interval settles as well, and the next interval
-	/// retries this one. A registry fault returns to the loop, which ends on
-	/// it.
+	/// A dial fault is this hive's answer and settles as a failed beat, so the
+	/// other hives of the interval still settle and the next interval retries
+	/// this one. A registry fault returns to the loop, which ends on it.
 	async fn beat_hive(self, hive: HiveEntry) -> Result<(), LoopFault> {
 		let result = HiveBeat::new(&self.config, &self.hive_plane).send(&hive).await;
 		self.settle_heartbeat(hive.address, result)
@@ -110,7 +109,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	///   [`CLUSTER_HEARTBEAT_FAILED`]. The membership retires the hive with
 	///   its servlet routes at the configured `max_failures`, and the gateway
 	///   traces the retirement as [`CLUSTER_HIVE_EVICTED`] with the count of
-	///   hives that it left.
+	///   hives left.
 	/// - The configured heartbeat callback fires for both outcomes.
 	///
 	/// # Errors
@@ -184,10 +183,10 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 	/// Runs the periodic heartbeat over every registered hive.
 	///
-	/// A poisoned registry lock never clears, so it ends the beat, and the
-	/// beat records it as [`CLUSTER_LOOP_POISONED`]. The loop reads the
-	/// settlement of every beat task, the ones it drains for a concurrency
-	/// slot among them, so a registry fault inside one beat ends the loop too.
+	/// A poisoned registry lock never clears, so it ends the beat, which
+	/// records it as [`CLUSTER_LOOP_POISONED`]. The loop reads every beat
+	/// task's settlement, including those it drains for a concurrency slot, so
+	/// a registry fault inside one beat ends the loop too.
 	///
 	/// [`CLUSTER_LOOP_POISONED`]: crate::instrumentation::events::CLUSTER_LOOP_POISONED
 	pub(crate) fn spawn_heartbeat(self) -> rt::JoinHandle {
@@ -198,7 +197,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			let beat: Result<(), LoopFault> = async {
 				loop {
 					let hives = registry.all_hives()?;
-					let max_concurrent = config.heartbeat.max_concurrent;
+					let max_concurrent = config.heartbeat.max_concurrent.get();
 					let mut set = tokio::task::JoinSet::new();
 
 					for hive in hives {

@@ -1,13 +1,17 @@
 //! The timing constraints that a CSP process states on its events.
 
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::deadline::Deadline;
-use super::jitter::JitterCalculator;
+use super::jitter::{JitterCalculator, MinMaxJitter};
 use super::path::PathWcet;
+use super::saturating_nanos;
 use super::wcet::WcetConfig;
+use crate::testing::error::TestingError;
 use crate::testing::specs::csp::Event;
 
 #[cfg(feature = "testing-timing")]
@@ -19,35 +23,65 @@ pub enum TimingConstraint {
 	/// A worst-case execution time (WCET) bound, under the analysis that its
 	/// configuration selects.
 	Wcet(WcetConfig),
-	/// An end-to-end deadline between two events.
-	Deadline(Deadline),
 	/// A maximum jitter, with an optional calculator that measures it.
 	Jitter(Duration, Option<Arc<dyn JitterCalculator>>),
 }
 
 impl TimingConstraint {
-	/// Whether this constraint and `other` state one bound under one
-	/// analysis.
+	/// Whether this constraint and `other` state one bound under one analysis.
 	///
 	/// An analyzer or a jitter calculator is a trait object with no equality
 	/// of its own, so two of them agree only when they are one instance.
 	pub(crate) fn agrees_with(&self, other: &Self) -> bool {
 		match (self, other) {
-			(Self::Wcet(mine), Self::Wcet(theirs)) => {
-				let same_bound = mine.duration == theirs.duration && mine.percentile == theirs.percentile;
-				same_bound && same_instance(&mine.analyzer, &theirs.analyzer)
-			}
+			(Self::Wcet(mine), Self::Wcet(theirs)) => mine.agrees_with(theirs),
 			(Self::Jitter(mine, my_calculator), Self::Jitter(theirs, their_calculator)) => {
 				mine == theirs && same_instance(my_calculator, their_calculator)
 			}
-			(Self::Deadline(mine), Self::Deadline(theirs)) => mine == theirs,
 			_ => false,
 		}
+	}
+
+	/// The bound of this constraint in nanoseconds, saturated at `u64::MAX`.
+	pub(crate) fn bound_ns(&self) -> u64 {
+		match self {
+			Self::Wcet(wcet) => wcet.bound_ns(),
+			Self::Jitter(max_jitter, _) => saturating_nanos(*max_jitter),
+		}
+	}
+
+	/// The measure of the samples `durations` of `event`, in nanoseconds,
+	/// when it exceeds this constraint, or `None` when the samples hold it.
+	///
+	/// A WCET bound measures the samples by its [`WcetConfig`]. A jitter bound
+	/// measures their spread with its calculator, or with [`MinMaxJitter`] when
+	/// it names none. A single sample has no spread, and a set with nothing to
+	/// measure holds the bound.
+	///
+	/// # Errors
+	///
+	/// - [`TestingError::WcetAnalysisFailed`] -- the analyzer of a WCET percentile fails on `durations`.
+	/// - [`TestingError::WcetPercentileMissing`] -- the analyzer of a WCET percentile gives no value for it.
+	/// - [`TestingError::JitterCalculationFailed`] -- the calculator of a jitter bound fails on `durations`.
+	pub(crate) fn excess(&self, event: Event, durations: &[u64]) -> Result<Option<u64>, TestingError> {
+		let measure = match self {
+			Self::Wcet(wcet) => wcet.measure(event, durations)?,
+			Self::Jitter(_, _) if durations.len() < 2 => None,
+			Self::Jitter(_, calculator) => {
+				let calculator = calculator.as_deref().unwrap_or(&MinMaxJitter);
+				let jitter = calculator.calculate(durations);
+				let jitter =
+					jitter.map_err(|cause| TestingError::JitterCalculationFailed { event, cause: Box::new(cause) })?;
+				Some(jitter)
+			}
+		};
+
+		Ok(measure.filter(|measure| *measure > self.bound_ns()))
 	}
 }
 
 /// Whether `mine` and `theirs` hold one instance, or both hold none.
-fn same_instance<T: ?Sized>(mine: &Option<Arc<T>>, theirs: &Option<Arc<T>>) -> bool {
+pub(super) fn same_instance<T: ?Sized>(mine: &Option<Arc<T>>, theirs: &Option<Arc<T>>) -> bool {
 	match (mine, theirs) {
 		(Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
 		(None, None) => true,
@@ -67,12 +101,36 @@ pub struct TimingConstraints {
 }
 
 impl TimingConstraints {
-	/// Adds a WCET or jitter constraint on `event`, and skips a deadline
-	/// constraint, which [`Self::add_deadline`] adds.
-	pub fn add(&mut self, event: Event, constraint: TimingConstraint) {
-		if !matches!(constraint, TimingConstraint::Deadline(_)) {
-			self.constraints.insert(event, constraint);
-		}
+	/// Adds a WCET or jitter constraint on `event`, or keeps the one that
+	/// `event` holds when the two agree.
+	///
+	/// # Errors
+	///
+	/// - [`TestingError::ConflictingTimingConstraint`] -- `event` holds a
+	///   constraint that disagrees with `constraint`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::builder::TypeBuilder;
+	/// use tightbeam::testing::error::TestingError;
+	/// use tightbeam::testing::specs::csp::Event;
+	/// use tightbeam::testing::timing::{TimingConstraint, TimingConstraints, WcetConfigBuilder};
+	///
+	/// let wcet = WcetConfigBuilder::default().with_duration(Duration::from_millis(10)).build()?;
+	/// let mut constraints = TimingConstraints::default();
+	/// constraints.add(Event("send"), TimingConstraint::Wcet(wcet))?;
+	///
+	/// let jitter = TimingConstraint::Jitter(Duration::from_millis(2), None);
+	/// let refused = constraints.add(Event("send"), jitter);
+	/// assert!(matches!(refused, Err(TestingError::ConflictingTimingConstraint(Event("send")))));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn add(&mut self, event: Event, constraint: TimingConstraint) -> Result<(), TestingError> {
+		let admitted = self.admit(event, Cow::Owned(constraint));
+		admitted.map_err(TestingError::ConflictingTimingConstraint)
 	}
 
 	/// Adds a deadline constraint between a pair of events.
@@ -124,14 +182,14 @@ impl TimingConstraints {
 		entries.sort_unstable_by_key(|(event, _)| **event);
 
 		for (event, constraint) in entries {
-			joined.admit(*event, constraint)?;
+			joined.admit(*event, Cow::Borrowed(constraint))?;
 		}
 
 		for deadline in &other.deadlines {
-			joined.admit_deadline(deadline.clone());
+			joined.admit_deadline(Cow::Borrowed(deadline));
 		}
 		for path_wcet in &other.path_wcets {
-			joined.admit_path_wcet(path_wcet.clone());
+			joined.admit_path_wcet(Cow::Borrowed(path_wcet));
 		}
 
 		Ok(joined)
@@ -139,75 +197,78 @@ impl TimingConstraints {
 
 	/// These constraints with each event mapped through `rename`.
 	///
-	/// A rename may map two events to one, and the two constraints then
-	/// become one when they agree.
+	/// When a rename maps two events to one, their constraints merge if they
+	/// agree.
 	///
 	/// # Errors
 	///
-	/// - The first renamed event, in the name order of the events it renames,
-	///   that two constraints which do not agree map to.
+	/// - The first renamed event, in the name order of the source events, that
+	///   two disagreeing constraints map to.
 	pub(crate) fn renamed<R>(&self, rename: R) -> Result<Self, Event>
 	where
 		R: Fn(Event) -> Event,
 	{
 		let mut renamed = Self::default();
+
 		let mut entries: Vec<(&Event, &TimingConstraint)> = self.constraints.iter().collect();
 		entries.sort_unstable_by_key(|(event, _)| **event);
-
 		for (event, constraint) in entries {
-			renamed.admit(rename(*event), constraint)?;
+			renamed.admit(rename(*event), Cow::Borrowed(constraint))?;
 		}
 
 		for deadline in &self.deadlines {
 			let start_event = rename(deadline.start_event);
 			let end_event = rename(deadline.end_event);
-			renamed.admit_deadline(Deadline { start_event, end_event, ..deadline.clone() });
+			renamed.admit_deadline(Cow::Owned(Deadline { start_event, end_event, ..deadline.clone() }));
 		}
 		for path_wcet in &self.path_wcets {
 			let path = path_wcet.path.iter().map(|event| rename(*event));
-			renamed.admit_path_wcet(PathWcet::new(path, path_wcet.max_duration));
+			renamed.admit_path_wcet(Cow::Owned(PathWcet::new(path, path_wcet.max_duration)));
 		}
 
 		Ok(renamed)
 	}
 
 	/// Adds `constraint` on `event`, or keeps the one held when the two
-	/// agree.
+	/// agree. A borrowed constraint is copied only when the set takes it.
 	///
 	/// # Errors
 	///
 	/// - `event`, when it holds a constraint that does not agree with `constraint`.
-	fn admit(&mut self, event: Event, constraint: &TimingConstraint) -> Result<(), Event> {
-		match self.constraints.get(&event) {
-			Some(held) if held.agrees_with(constraint) => Ok(()),
-			Some(_) => Err(event),
-			None => {
-				self.constraints.insert(event, constraint.clone());
+	fn admit(&mut self, event: Event, constraint: Cow<'_, TimingConstraint>) -> Result<(), Event> {
+		match self.constraints.entry(event) {
+			Entry::Occupied(held) if held.get().agrees_with(&constraint) => Ok(()),
+			Entry::Occupied(_) => Err(event),
+			Entry::Vacant(slot) => {
+				slot.insert(constraint.into_owned());
 				Ok(())
 			}
 		}
 	}
 
 	/// Adds `deadline` unless the set holds an equal deadline.
-	fn admit_deadline(&mut self, deadline: Deadline) {
+	fn admit_deadline(&mut self, deadline: Cow<'_, Deadline>) {
 		if !self.deadlines.contains(&deadline) {
-			self.deadlines.push(deadline);
+			self.deadlines.push(deadline.into_owned());
 		}
 	}
 
 	/// Adds `path_wcet` unless the set holds an equal path WCET.
-	fn admit_path_wcet(&mut self, path_wcet: PathWcet) {
+	fn admit_path_wcet(&mut self, path_wcet: Cow<'_, PathWcet>) {
 		if !self.path_wcets.contains(&path_wcet) {
-			self.path_wcets.push(path_wcet);
+			self.path_wcets.push(path_wcet.into_owned());
 		}
 	}
 
-	/// Converts the WCET constraints to a task set for schedulability
-	/// analysis.
+	/// Converts the WCET constraints to a task set for schedulability analysis.
 	///
 	/// `periods` maps each event to its period, because a timing constraint
-	/// states no period. A WCET event with no period fails with
-	/// `SchedulabilityError::MissingPeriod`.
+	/// states no period. Each task takes the rate-monotonic priority of its
+	/// period (a `None` [`Task::priority`]).
+	///
+	/// # Errors
+	///
+	/// - [`SchedulabilityError::MissingPeriod`] -- a WCET event has no period in `periods`.
 	#[cfg(feature = "testing-timing")]
 	pub fn to_task_set(
 		&self,
@@ -229,26 +290,85 @@ impl TimingConstraints {
 					.iter()
 					.find(|d| &d.start_event == event || &d.end_event == event)
 					.map(|d| d.duration)
-					.unwrap_or(*period); // Default: deadline = period
-
-				// Rate monotonic analysis (RMA) ranks a task by its period, so
-				// a shorter period is a higher priority.
-				let priority = if matches!(scheduler, SchedulerType::RateMonotonic) {
-					Some(period.as_nanos() as u32) // Use period as priority (lower = higher priority)
-				} else {
-					None
-				};
+					.unwrap_or(*period); // With no deadline, the task deadline is its period.
 
 				tasks.push(Task {
 					id: event.0.to_string(),
 					period: *period,
 					deadline,
 					wcet: wcet_config.duration,
-					priority,
+					priority: None,
 				});
 			}
 		}
 
 		Ok(TaskSet { tasks, scheduler })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::builder::TypeBuilder;
+	use crate::testing::schedulability::ResponseTime;
+	use crate::testing::timing::{
+		DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer, WcetConfigBuilder, WcetPercentile,
+	};
+
+	/// A WCET bound of `millis` milliseconds.
+	fn wcet_of(millis: u64) -> WcetConfig {
+		let duration = Duration::from_millis(millis);
+		let wcet = WcetConfigBuilder::default().with_duration(duration).build();
+		wcet.expect("a WCET with a duration builds")
+	}
+
+	/// A P99 WCET bound of 10 ms under an analyzer of its own.
+	fn p99_wcet_under_its_own_analyzer() -> TimingConstraint {
+		let analyzer: Arc<dyn StatisticalAnalyzer> = Arc::new(DefaultStatisticalAnalyzer);
+		let percentile = Some(WcetPercentile { percentile: Percentile::P99, analyzer: Some(analyzer) });
+		TimingConstraint::Wcet(WcetConfig { duration: Duration::from_millis(10), percentile })
+	}
+
+	#[test]
+	fn two_wcet_bounds_under_two_analyzers_disagree() -> Result<(), Box<dyn core::error::Error>> {
+		let mut constraints = TimingConstraints::default();
+		constraints.add(Event("process"), p99_wcet_under_its_own_analyzer())?;
+
+		let refused = constraints.add(Event("process"), p99_wcet_under_its_own_analyzer());
+		let disagrees = matches!(refused, Err(TestingError::ConflictingTimingConstraint(Event("process"))));
+		assert!(disagrees);
+		Ok(())
+	}
+
+	#[test]
+	fn add_refuses_a_constraint_that_disagrees_with_the_one_held() -> Result<(), Box<dyn core::error::Error>> {
+		let mut constraints = TimingConstraints::default();
+		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_of(10)))?;
+
+		let refused = constraints.add(Event("process"), TimingConstraint::Jitter(Duration::from_millis(5), None));
+		let disagrees = matches!(refused, Err(TestingError::ConflictingTimingConstraint(Event("process"))));
+		assert!(disagrees);
+		Ok(())
+	}
+
+	// The task of the 4 s period runs first: R = 1 s, and the other task
+	// takes R = 2 + ⌈3/4⌉ * 1 = 3 s. The order of the 5 s period first gives
+	// 2 s and 3 s.
+	#[test]
+	fn a_task_set_keeps_the_rate_order_of_periods_past_four_seconds() -> Result<(), Box<dyn core::error::Error>> {
+		let mut constraints = TimingConstraints::default();
+		constraints.add(Event("fast"), TimingConstraint::Wcet(wcet_of(1_000)))?;
+		constraints.add(Event("slow"), TimingConstraint::Wcet(wcet_of(2_000)))?;
+
+		let periods = HashMap::from([(Event("fast"), Duration::from_secs(4)), (Event("slow"), Duration::from_secs(5))]);
+		let task_set = constraints.to_task_set(&periods, SchedulerType::RateMonotonic)?;
+		let response_times = task_set.response_time_analysis()?;
+
+		let named = response_times.iter().map(|time| (time.task.id.as_str(), time.response_time));
+		let named: Vec<_> = named.collect();
+		let one_second = ResponseTime::Converged(Duration::from_secs(1));
+		let three_seconds = ResponseTime::Converged(Duration::from_secs(3));
+		assert_eq!(named, [("fast", one_second), ("slow", three_seconds)]);
+		Ok(())
 	}
 }

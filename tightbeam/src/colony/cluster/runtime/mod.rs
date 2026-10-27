@@ -6,7 +6,7 @@
 //! unary control frames to dispatch and splices streamed or duplex opens by
 //! servlet target.
 //!
-//! Each surface a request reaches has a sibling module of its own: dispatch,
+//! Each surface a request reaches has its own sibling module: dispatch,
 //! registration, work, streaming, gossip, and heartbeat.
 
 mod advertise;
@@ -21,13 +21,14 @@ mod refuse;
 mod registration;
 mod streaming;
 mod verify;
+mod work;
 
-#[cfg(test)]
-pub(crate) use bounds::ColonyDigest;
 pub(crate) use bounds::{ColonyConfig, ColonyDialProtocol};
 pub use freshness::FreshnessWindow;
 pub(crate) use verify::{VerifiedControlFrame, VerifiedSignerId};
-mod work;
+
+#[cfg(test)]
+pub(crate) use bounds::ColonyDigest;
 
 use core::future::Future;
 use core::time::Duration;
@@ -37,6 +38,7 @@ use self::bounds::{GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeC
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
 use self::hop::{HivePlane, PeerPlane};
+use self::verify::RequestAudit;
 use crate::colony::cluster::export::ExportScope;
 use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
@@ -44,12 +46,11 @@ use crate::colony::cluster::{
 	ServletRegistry, SharedId,
 };
 use crate::colony::protocol::HeartbeatResult;
-use crate::colony::TaskGroup;
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::crypto::x509::CanonicalKey;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::{SessionContext, TransitStatus};
-use crate::runtime::rt;
+use crate::runtime::{rt, TaskGroup};
 use crate::trace::{TraceCollector, TraceHandle};
 use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::multiplex::{CallContext, MuxCapable, MuxService, ReplySink, StreamBody};
@@ -80,13 +81,30 @@ pub(crate) enum LoopFault {
 }
 
 impl LoopFault {
+	/// Splits this fault into the local fault that a request refuses, returned
+	/// as `Ok`, and the runtime fault that ends the request.
+	///
+	/// A request that meets a local fault answers
+	/// [`TransitStatus::Unavailable`], and a runtime fault passes up to the
+	/// caller unchanged.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the runtime fault: the trace refused an event, or a task did not join.
+	pub(crate) fn local(self) -> Result<ClusterError, TightBeamError> {
+		match self {
+			Self::Registry(error) => Ok(error),
+			Self::Runtime(error) => Err(error),
+		}
+	}
+
 	/// Records a registry fault on `trace`, the one observer a detached loop
 	/// has.
 	///
 	/// A runtime fault ends the loop silently. The trace already holds its own
 	/// refusal, and a task that did not join leaves no record.
 	pub(crate) fn record(self, trace: &TraceCollector) {
-		let Self::Registry(error) = self else {
+		let Ok(error) = self.local() else {
 			return;
 		};
 
@@ -112,9 +130,8 @@ impl From<ClusterError> for LoopFault {
 impl ClusterConfig {
 	/// Emits each export-posture warning once, when the gateway starts.
 	///
-	/// Two configurations weaken the organization edge without an explicit
-	/// operator choice at request time, so the gateway surfaces each
-	/// condition once for audit.
+	/// Two configurations weaken the organization edge with no explicit
+	/// operator choice at request time, so the gateway surfaces each for audit.
 	///
 	/// # Warnings
 	///
@@ -127,7 +144,7 @@ impl ClusterConfig {
 	/// # Sources
 	///
 	/// - NIST SP 800-53 Rev. 5 CM-6, configuration settings:
-	///   <https://csrc.nist.gov/projects/risk-management/sp800-53-controls/release-search#/control?version=5.1&number=CM-6>
+	///   <https://doi.org/10.6028/NIST.SP.800-53r5>
 	fn warn_export_posture(&self, trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let federation_active = self.tls.peer_trust.is_some() || !self.peer.peers.is_empty();
 		if ExportScope::from(&self.peer).is_unbounded() {
@@ -158,9 +175,9 @@ impl ClusterConfig {
 ///
 /// The gateway runs the digest of its provider, the
 /// [`DigestProvider::Digest`] of [`Protocol::CryptoProvider`]. It names each
-/// gateway by the fingerprint of its certificate under that digest, and it
-/// digests each rumor and frame witness under it. Every gateway of a colony
-/// runs one provider, so each one names a peer and digests a rumor alike.
+/// gateway by its certificate's fingerprint under that digest, and digests
+/// each rumor and frame witness under it. Every gateway of a colony runs one
+/// provider, so all of them name a peer and digest a rumor alike.
 ///
 /// [`DigestProvider::Digest`]: crate::crypto::profiles::DigestProvider::Digest
 ///
@@ -193,6 +210,9 @@ where
 	addr: P::Address,
 	edge_addr: Option<E::Address>,
 	trace: Arc<TraceCollector>,
+	/// The trace that each connection of the colony and edge planes records
+	/// on, which [`Cluster::connection_trace`] returns.
+	connections: Arc<TraceCollector>,
 }
 
 impl<P, E> ClusterGateway<P, E>
@@ -273,6 +293,9 @@ where
 
 		let replay_guard_for_server = GatewayReplayGuard::new(control_window, Arc::clone(&config.clock));
 		let tasks = TaskGroup::default();
+
+		// Records that no credential backs stay off the audit trace (CWE-778).
+		let connections = Arc::new(trace.connections());
 		let ctx = GatewayRuntimeCtx {
 			registry: Arc::clone(&registry),
 			servlet_registry: Arc::clone(&servlet_registry),
@@ -281,6 +304,7 @@ where
 			hive_plane: hive_plane.clone(),
 			peer_plane,
 			trace: Arc::clone(&trace),
+			connections: Arc::clone(&connections),
 			replay_guard: replay_guard_for_server,
 			tasks: tasks.clone(),
 			ledgers: Arc::default(),
@@ -317,7 +341,8 @@ where
 
 		// The edge plane serves [`EdgeMuxService`], whose only route is work
 		// submission.
-		let edge_handle = edge_listener.map(|edge_listener| ctx.clone().serve_edge::<E::Listener>(edge_listener));
+		let serve_edge = |edge_listener| ctx.clone().serve_edge::<E::Listener>(edge_listener);
+		let edge_handle = edge_listener.map(serve_edge);
 
 		tasks.adopt(ctx.clone().spawn_heartbeat());
 
@@ -343,6 +368,7 @@ where
 			addr,
 			edge_addr,
 			trace,
+			connections,
 		})
 	}
 
@@ -368,7 +394,6 @@ where
 	fn peer_routes(&self) -> Result<Vec<PeerRouteInfo>, ClusterError> {
 		let entries = self.servlet_registry.peer_entries()?;
 		let routes = entries.iter().filter_map(|entry| entry.peer_route_info()).collect();
-
 		Ok(routes)
 	}
 
@@ -378,6 +403,10 @@ where
 
 	fn trace(&self) -> Arc<TraceCollector> {
 		Arc::clone(&self.trace)
+	}
+
+	fn connection_trace(&self) -> Arc<TraceCollector> {
+		Arc::clone(&self.connections)
 	}
 
 	fn stop(mut self) {
@@ -490,8 +519,9 @@ where
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
 		async move {
-			let (target, budget) = ctx.guard_stream_open(&cx)?;
-			ctx.splice_streaming(body, target, budget).await
+			let audit = ctx.audit(cx.session());
+			let (target, budget) = ctx.guard_stream_open(&cx, &audit)?;
+			ctx.splice_streaming(body, target, budget, &audit).await
 		}
 	}
 
@@ -503,8 +533,9 @@ where
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
 		async move {
-			let (target, budget) = ctx.guard_stream_open(&cx)?;
-			ctx.splice_duplex(body, reply, target, budget).await
+			let audit = ctx.audit(cx.session());
+			let (target, budget) = ctx.guard_stream_open(&cx, &audit)?;
+			ctx.splice_duplex(body, reply, target, budget, &audit).await
 		}
 	}
 }
@@ -551,17 +582,18 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// [`CLUSTER_EDGE_REFUSED`].
 	///
 	/// - `call` names the kind of the call: `unary`, `streaming`, or `duplex`.
-	/// - `session` names who called, by the canonical key that the handshake
-	///   of the session proved. A frame's signer is a claim that the edge
-	///   plane does not verify, so the record never names it (CWE-345).
+	/// - `session` names the caller by the canonical key its handshake proved.
+	///   A frame's signer is a claim the edge plane does not verify, so the
+	///   record never names it (CWE-345).
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
-	fn refuse_edge_call(&self, call: &str, session: &SessionContext) -> Result<TransitStatus, TightBeamError> {
+	fn refuse_edge_call(&self, call: &'static str, session: &SessionContext) -> Result<TransitStatus, TightBeamError> {
 		let status = TransitStatus::PermissionDenied;
 		let caller = session.peer_key().map(CanonicalKey::as_der);
-		let trace = &self.trace;
+		let audit = self.audit(session);
+		let trace = audit.unproven();
 		trace.emit_event_with_value_and_evidence(CLUSTER_EDGE_REFUSED, call, status, caller)?;
 
 		Ok(status)
@@ -570,7 +602,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// Refuses a stream that the edge plane opened, through
 	/// [`Self::refuse_edge_call`], and returns the failure that ends the
 	/// stream: the refusal, or the fault of a trace that refused the event.
-	fn refuse_edge_open(&self, call: &str, cx: &CallContext) -> TightBeamError {
+	fn refuse_edge_open(&self, call: &'static str, cx: &CallContext) -> TightBeamError {
 		let refused = self.refuse_edge_call(call, cx.session());
 		refused.map_or_else(|fault| fault, TransitStatus::refusal)
 	}
@@ -586,8 +618,13 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	///
 	/// An unrouted open names no servlet type, so it fails with
 	/// `Unimplemented`.
-	fn guard_stream_open(&self, cx: &CallContext) -> Result<(Urn<'static>, HopBudget), TightBeamError> {
-		let gate_status = self.config.evaluate_gates(None, cx.session(), &self.trace)?;
+	fn guard_stream_open(
+		&self,
+		cx: &CallContext,
+		audit: &RequestAudit,
+	) -> Result<(Urn<'static>, HopBudget), TightBeamError> {
+		let trace = audit.unproven();
+		let gate_status = self.config.evaluate_gates(None, cx.session(), trace)?;
 		if gate_status != TransitStatus::Ok {
 			return Err(gate_status.refusal());
 		}
@@ -600,7 +637,6 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		let is_relayed = budget.is_relayed();
 		let session = cx.session();
 		let config = &self.config;
-		let trace = &self.trace;
 
 		let export_status = config.evaluate_export_gates(&target, session, is_relayed, trace)?;
 		if export_status != TransitStatus::Ok {
@@ -615,7 +651,7 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 	/// Serves the colony accept plane through [`GatewayMuxService`].
 	///
 	/// `L` is the bound listener, which feeds the service over the colony pool
-	/// protocol `P`.
+	/// protocol `P`. Each connection records on the connection trace.
 	pub(crate) fn serve_colony<L>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
@@ -630,7 +666,8 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 	/// Serves an edge accept plane through [`EdgeMuxService`].
 	///
 	/// The service type restricts the plane to work submission, so the type
-	/// alone tells dispatch which plane a request arrived on.
+	/// alone tells dispatch which plane a request arrived on. Each connection
+	/// records on the connection trace.
 	pub(crate) fn serve_edge<L>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
@@ -642,27 +679,25 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		Self::accept_into(listener, terms, clock, service)
 	}
 
-	/// The terms that the gateway sets on each connection it serves: its own
-	/// trace, and the mux offer of its pool config.
+	/// The terms that the gateway sets on each connection it serves: the
+	/// connection trace, and the mux offer of its pool config.
 	fn connection_terms(&self) -> ConnectionTerms {
 		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
-		let trace = TraceHandle::new(Arc::clone(&self.trace));
+		let trace = TraceHandle::new(Arc::clone(&self.connections));
 		ConnectionTerms::new(trace, mux_offer)
 	}
 
 	/// Accepts on `listener` and dispatches every connection through `service`.
 	///
-	/// Each admitted transport takes `terms`, the gateway's trace and mux
+	/// Each admitted transport takes `terms`, the connection trace and the mux
 	/// offer, before its handshake. Accept retries wait on `clock`, the
 	/// gateway's own.
 	///
 	/// # Warning
 	///
-	/// The trace records every connection, a peer that never authenticates
-	/// included. The default `BoundedMemorySink` drops each event past
-	/// `max_events`, the gateway's own refusals included, so a long-lived
-	/// gateway needs an `EventSink` that forwards each event, or a reader that
-	/// drains the trace.
+	/// The connection trace records each peer, including one that never
+	/// authenticates. Give the gateway's trace an `EventSink` that forwards
+	/// through `EventSink::sibling`, or drain the connection trace.
 	fn accept_into<L, S>(listener: L, terms: ConnectionTerms, clock: Arc<dyn Clock>, service: S) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
@@ -670,7 +705,6 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		S: MuxService + Send + Sync + 'static,
 	{
 		let service = Arc::new(service);
-
 		let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, clock);
 		rt::spawn(plane.accept_owned(listener, terms, move |transport: L::Transport| {
 			let service = Arc::clone(&service);
@@ -702,6 +736,58 @@ mod tests {
 
 		let accept = tls.accept_encryption::<DefaultCryptoProvider>();
 		assert_eq!(accept.key_purposes, configured);
+		Ok(())
+	}
+
+	// A runtime fault passes up to the caller of a request, so the request
+	// ends with the fault the trace observed, and a request refuses a local
+	// fault alone.
+	#[test]
+	fn a_runtime_fault_passes_up_and_a_local_fault_refuses() -> Result<(), TightBeamError> {
+		let runtime = LoopFault::Runtime(TightBeamError::ChannelClosed).local();
+		let local = LoopFault::Registry(ClusterError::LockPoisoned).local();
+		assert!(matches!(runtime, Err(TightBeamError::ChannelClosed)));
+		assert!(matches!(local, Ok(ClusterError::LockPoisoned)));
+		Ok(())
+	}
+
+	/// An anonymous stream gate refusal records on the connection trace.
+	#[cfg(feature = "testing")]
+	#[test]
+	fn an_anonymous_stream_gate_refusal_records_on_the_connection_trace() -> Result<(), TightBeamError> {
+		use crate::colony::cluster::CertificateSpec;
+		use crate::colony::urn::ColonyNamespace;
+		use crate::instrumentation::events::CLUSTER_GATE_BLOCKED;
+		use crate::policy::GatePolicy;
+		use crate::transport::multiplex::StreamRoute;
+		use crate::transport::TokioListener;
+
+		/// A gate policy that refuses every request.
+		struct RefuseAll;
+
+		impl GatePolicy for RefuseAll {
+			fn evaluate(&self, _frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+				TransitStatus::PermissionDenied
+			}
+		}
+
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+		let mut config = ClusterConfig::new(ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)))?);
+		config.policies.push(Arc::new(RefuseAll));
+
+		let (trace, connections) = (Arc::new(TraceCollector::new()), Arc::new(TraceCollector::new()));
+		let gateway = GatewayRuntimeCtx::<TokioListener>::for_test(config, &trace, &connections);
+		let target = ColonyNamespace::default().servlet("ping")?;
+		let cx = CallContext::new(SessionContext::default(), StreamRoute::to(target));
+		let audit = gateway.audit(cx.session());
+
+		// The open fails, and the test reads the record of its refusal.
+		let _refused = gateway.guard_stream_open(&cx, &audit);
+
+		let audited = trace.recorded(&CLUSTER_GATE_BLOCKED);
+		let connected = connections.recorded(&CLUSTER_GATE_BLOCKED);
+		assert_eq!((audited, connected), (0, 1));
 		Ok(())
 	}
 }

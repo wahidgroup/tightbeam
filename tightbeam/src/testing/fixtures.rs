@@ -26,6 +26,7 @@ mod aead {
 	pub use crate::crypto::key::Aes256GcmKeyProvider;
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub use crate::crypto::profiles::DefaultCryptoProvider;
+	pub use crate::runtime::rt;
 }
 
 #[cfg(any(
@@ -94,7 +95,7 @@ mod cms_server {
 #[cfg(feature = "transport-cms")]
 use cms_server::*;
 
-/// A simple message that the tests encode and send.
+/// A message of one text field that the tests encode and send.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 pub struct TestMessage {
 	/// The text the message carries.
@@ -196,8 +197,8 @@ mod instrumented {
 #[cfg(feature = "instrument")]
 use instrumented::*;
 
-/// Returns the fixed test validity window, which runs from the epoch through a
-/// far-future UtcTime.
+/// The fixed test validity window, from the epoch through Unix time
+/// 2,000,000,000 (2033-05-18), both as UtcTime.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_validity() -> TbResult<Validity> {
 	let not_before = Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(0))?);
@@ -284,7 +285,7 @@ fn test_end_entity_key_usage() -> Extension {
 /// `issuer_key` under `issuer`, with a real signature and `serial` as its
 /// serial number.
 ///
-/// The key identifier extensions come first, ahead of `extensions`.
+/// The key identifier extensions come ahead of `extensions`.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn issue_test_certificate(
 	issuer_key: &SigningKey,
@@ -315,17 +316,20 @@ fn issue_test_certificate(
 	sign_test_certificate(tbs, &algorithm, issuer_key)
 }
 
-/// Builds the shared body of the placeholder-signed test certificate fixtures,
-/// with an empty subject and issuer, a fixed serial, and caller-chosen
-/// extensions.
+/// Builds the shared body of the self-signed test certificate fixtures, with
+/// an empty subject and issuer, a fixed serial, and caller-chosen extensions.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option<Vec<Extension>>) -> Certificate {
 	test_certificate_named(signing_key, RdnSequence::default(), extensions)
 }
 
-/// Builds a placeholder-signed test certificate with `name` as both the subject
-/// and the issuer, a fixed serial, its key identifier, the end-entity
-/// `keyUsage`, and caller-chosen extensions after them.
+/// Builds a test certificate that `signing_key` signs, with `name` as both
+/// the subject and the issuer, a fixed serial, its key identifier, the
+/// end-entity `keyUsage`, and caller-chosen extensions after them.
+///
+/// Its own key verifies its signature, so it is self-signed
+/// (RFC 5280 §3.2), and its own key identifier names its authority
+/// (RFC 5280 §4.2.1.1).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named(
 	signing_key: &SigningKey,
@@ -340,7 +344,6 @@ fn test_certificate_named(
 	let algorithm = test_signature_algorithm();
 	let validity = test_validity().expect("fixed test validity window is valid");
 	let serial_number = SerialNumber::new(&[1]).expect("single-byte serial is valid");
-	let signature = BitString::new(0, vec![0; 64]).expect("64-byte placeholder is a valid BitString");
 
 	let tbs_certificate = TbsCertificate {
 		version: X509Version::V3,
@@ -355,7 +358,8 @@ fn test_certificate_named(
 		extensions: Some(all_extensions),
 	};
 
-	Certificate { tbs_certificate, signature_algorithm: algorithm, signature }
+	let signed = sign_test_certificate(tbs_certificate, &algorithm, signing_key);
+	signed.expect("the test key signs the certificate")
 }
 
 /// Wraps a DER-encodable extension value in a critical `Extension` (RFC 5280
@@ -449,11 +453,11 @@ fn sign_test_certificate(
 	Ok(certificate)
 }
 
-/// A generic builder test macro.
+/// Generates a `#[test]` function that checks one builder.
 ///
-/// The macro works like `test_case!` for builders. It builds a base builder
-/// from `version`, runs the `setup` closure on it, and passes both the input
-/// message and the result of `setup` to the assertions.
+/// The test builds a `builder_type` from `version`, runs `setup` on it with
+/// the message, and passes a copy of the message and the result of `setup` to
+/// `assertions`.
 ///
 /// The `message` parameter supports two forms:
 ///
@@ -564,10 +568,10 @@ where
 	}
 }
 
-/// An async test macro with worker setup.
+/// Generates an async test that runs its assertions against a live worker.
 ///
-/// The macro starts a worker, passes it to the assertions block, and shuts
-/// the worker down afterwards.
+/// The test starts a worker from the value that `setup` returns, passes it to
+/// the assertions block, and shuts the worker down afterwards.
 #[macro_export]
 macro_rules! test_worker {
 	(
@@ -601,22 +605,22 @@ macro_rules! test_worker {
 pub struct TestFrame;
 
 impl TestFrame {
-	/// The message of `frame`, decrypted with `decryptor`, inflated by
-	/// `inflator` when the body is compressed, and decoded as `T`. The open
-	/// runs on a current-thread runtime, so a synchronous test reads it.
+	/// The message of `frame`, opened with `decryptor` and decoded as `T`.
+	///
+	/// `inflator` inflates a compressed body. [`rt::block_on`] drives the open,
+	/// so a synchronous test reads it on any thread.
 	///
 	/// # Errors
 	///
 	/// - The errors of [`Frame::decrypt`].
-	#[cfg(all(feature = "aead", feature = "tokio"))]
+	#[cfg(feature = "aead")]
 	pub fn decrypted<T: Message>(
 		frame: Frame,
 		decryptor: &(impl crate::crypto::aead::Decryptor + ?Sized),
 		inflator: Option<&(dyn crate::core::Inflator + Sync)>,
 	) -> crate::error::Result<T> {
-		let runtime = tokio::runtime::Builder::new_current_thread().build();
-		let runtime = runtime.expect("a current-thread runtime builds");
-		runtime.block_on(frame.decrypt::<T>(decryptor, inflator))
+		let opened = frame.decrypt::<T>(decryptor, inflator);
+		rt::block_on(opened)
 	}
 
 	/// A V0 frame of [`TestMessage::sample`] with `content`, under `id`.
@@ -709,7 +713,7 @@ impl TestFrame {
 	///
 	/// ECDSA verifies both values (SEC 1 v2.0 §4.1.4), so a test models a
 	/// relay that rewrites a captured signature this way. The flipped
-	/// `SignerInfo` enters through the DER decoder, as it would off the wire.
+	/// `SignerInfo` enters through the DER decoder, as a received one would.
 	#[cfg(all(feature = "secp256k1", feature = "signature"))]
 	pub fn with_flipped_s(frame: &Frame) -> Frame {
 		use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Signature};
@@ -961,6 +965,30 @@ impl TestKey {
 pub struct TestCertificate;
 
 impl TestCertificate {
+	/// Builds an end-entity certificate of `signing_key` with an empty subject
+	/// and issuer. `signing_key` signs it, so its own key verifies its
+	/// signature (RFC 5280 §3.2).
+	///
+	/// It carries its own key identifier and no `authorityKeyIdentifier`,
+	/// which a self-signed certificate may omit (RFC 5280 §4.2.1.1).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::policy::{Secp256k1Policy, VerificationPolicy};
+	/// use tightbeam::der::Encode;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let tbs = &certificate.tbs_certificate;
+	/// let key = tbs.subject_public_key_info.to_der()?;
+	/// let message = tbs.to_der()?;
+	/// let signature = certificate.signature.raw_bytes();
+	///
+	/// let algorithm = &certificate.signature_algorithm.oid;
+	/// Secp256k1Policy::default().verify_signature(algorithm, &key, &message, signature)?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn self_signed(signing_key: &SigningKey) -> Certificate {
 		test_certificate_with_extensions(signing_key, None)
@@ -970,8 +998,8 @@ impl TestCertificate {
 	/// URI Subject Alternative Name entry (RFC 5280 §4.2.1.6).
 	///
 	/// The subject stays empty, because identity claims such as colony
-	/// membership bind to the SAN and not to the subject. With an empty subject
-	/// the SAN MUST be critical (RFC 5280 §4.2.1.6), which `test_extension`
+	/// membership bind to the SAN, not the subject. With an empty subject the
+	/// SAN MUST be critical (RFC 5280 §4.2.1.6), which `test_extension`
 	/// provides.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn with_uri_sans(signing_key: &SigningKey, uris: &[&str]) -> Certificate {
@@ -1144,8 +1172,8 @@ impl TestCertificate {
 		certificate
 	}
 
-	/// `certificate` with its key under the named curve `curve`, the point
-	/// kept. Its signature then fails to verify, so it serves a reader of keys
+	/// `certificate` with its key under the named curve `curve` and the same
+	/// point. Its signature then fails to verify, so it serves a reader of keys
 	/// alone.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn with_named_curve(mut certificate: Certificate, curve: ObjectIdentifier) -> Certificate {
@@ -1241,9 +1269,9 @@ impl TestCertificate {
 	}
 
 	/// Two certificates that lead a walk from a certificate `intermediate`
-	/// issued back into itself: the first carries the subject of
-	/// `intermediate` and names the second as its issuer, which names the
-	/// first.
+	/// issued back into itself. The first carries the subject of
+	/// `intermediate` and names the second as its issuer, and the second names
+	/// the first.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn looping_issuers(intermediate: &Certificate) -> [Certificate; 2] {
 		let looping = test_cn_name("Looping issuer").expect("a test common name satisfies PrintableString");
@@ -1352,8 +1380,7 @@ impl TestCertificate {
 
 	/// Creates an expired test certificate for the validation tests.
 	///
-	/// This certificate from ssl.com expired on August 17, 2019, so it
-	/// exercises the expiry validation logic.
+	/// It is an ssl.com certificate that expired on August 17, 2019.
 	#[cfg(feature = "x509")]
 	pub fn expired() -> Certificate {
 		crate::pem! {"
@@ -1405,7 +1432,7 @@ pub struct TestSigner;
 
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
 impl TestSigner {
-	/// A `SignerInfo` the CMS signer built over placeholder content.
+	/// A `SignerInfo` that the CMS signer builds over placeholder content.
 	pub fn info() -> crate::crypto::sign::Signed<crate::SignerInfo> {
 		use crate::crypto::sign::{CmsSigner, SignedContent};
 
@@ -1629,8 +1656,8 @@ pub struct TestIdentity;
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 impl TestIdentity {
-	/// The identity of `key` under the placeholder-signed
-	/// [`TestCertificate::self_signed`] certificate.
+	/// The identity of `key` under the [`TestCertificate::self_signed`]
+	/// certificate.
 	pub fn of(key: &SigningKey) -> SigningIdentity {
 		let certificate = TestCertificate::self_signed(key);
 		TestIdentity::presenting(certificate, key)
@@ -1651,8 +1678,8 @@ impl TestIdentity {
 		TestIdentity::of(&TestKey::insecure_fixed_signing())
 	}
 
-	/// `key` beside the placeholder-signed [`TestCertificate::self_signed`]
-	/// certificate, for a builder that signs in place.
+	/// `key` beside the [`TestCertificate::self_signed`] certificate, for a
+	/// builder that signs in place.
 	pub fn certified(key: SigningKey) -> CertifiedKey<SigningKey> {
 		let certificate = TestCertificate::self_signed(&key);
 		CertifiedKey::new(&certificate, key).expect("the test key matches its certificate")
@@ -1835,6 +1862,30 @@ mod tests {
 	fn a_test_frame_carries_the_id_its_caller_names() {
 		let frame = TestFrame::v0(None, Some("named-id"));
 		assert_eq!(frame.metadata().id(), b"named-id");
+	}
+
+	/// A sealed frame opens through [`TestFrame::decrypted`] inside an async
+	/// test, on a thread that a tokio runtime drives.
+	#[cfg(all(
+		feature = "aes-gcm",
+		feature = "signature",
+		feature = "kdf",
+		feature = "ecdh",
+		feature = "tokio"
+	))]
+	#[tokio::test]
+	async fn a_sealed_frame_opens_inside_a_runtime() -> TbResult<()> {
+		use crate::builder::frame::FrameBuilder;
+		use crate::builder::TypeBuilder;
+
+		let (_, cipher) = TestKey::insecure_fixed_cipher();
+		let builder = FrameBuilder::<TestMessage>::from(Version::V1).with_message(TestMessage::sample(None));
+		let frame = builder.with_id("sealed").with_order(1).with_encryptor(cipher).build()?;
+
+		let (_, key) = TestKey::insecure_fixed_cipher();
+		let opened = TestFrame::decrypted::<TestMessage>(frame, &key, None)?;
+		assert_eq!(opened, TestMessage::sample(None));
+		Ok(())
 	}
 
 	test_builder! {

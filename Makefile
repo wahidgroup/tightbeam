@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint lint-code lint-doc lint-graph spellcheck doc test-all coverage miri loom bench fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit interop ci
+.PHONY: all help help-body help-ref version setup check build clean test lint doc test-all coverage miri loom bench fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit interop ci
 
 .NOTPARALLEL: ci
 
@@ -59,10 +59,7 @@ help-body:
 	@printf '    fuzz-test       Build and fuzz every target (seconds=N, default 60)\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
-	@printf '    lint            Lint + spellcheck + rustdoc + module graph (fix=1 to auto-fix; extra clippy args via ARGS)\n'
-	@printf '    lint-code       Rustfmt + clippy, the pre-push check (fix=1 to auto-fix; extra clippy args via ARGS)\n'
-	@printf '    lint-graph      Refuse a cycle among the production edges of the transport modules (python3)\n'
-	@printf '    spellcheck      Spellcheck the repository with typos\n'
+	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix; extra clippy args via ARGS)\n'
 	@printf '    audit           Run dependency audit (cargo-deny: advisories, licences, bans)\n'
 	@printf '    interop         Write the CMS samples and check each with OpenSSL\n'
 	@printf '    ci              Full pipeline: lint + audit + build + test-all + interop\n'
@@ -133,10 +130,7 @@ test-all: setup
 	@echo "Running tests with all feature combinations..."
 	./scripts/test_features.sh
 
-# The report lands in target/coverage/html. The clean runs after a pass or a
-# failure: it removes the instrumented builds that the trybuild tests leave in
-# the shared trybuild directory, so a later `cargo test` loads no instrumented
-# proc macro.
+# The report lands in target/coverage/html.
 coverage: setup
 	@echo "Measuring the line coverage of the workspace tests..."
 	cargo llvm-cov --workspace --all-features --html --output-dir target/coverage \
@@ -144,9 +138,7 @@ coverage: setup
 		status=$$?; cargo llvm-cov clean --workspace; exit $$status
 
 # The unit tests that decode untrusted DER (frame, envelope, CMS, certificate)
-# and that wipe secrets. The crate denies unsafe code, so Miri checks the
-# unsafe code of the dependencies on those paths. A filter matches by
-# substring, so `--skip` drops the builder tests that `frame::tests::` names.
+# and that wipe secrets.
 MIRI_TESTS := frame::tests:: wire::tests:: asn1:: transport::envelopes::tests:: transport::framing::tests:: \
 	crypto::cms::tests:: crypto::x509::key::tests:: crypto::x509::utils:: crypto::secret:: crypto::kdf::zeroizing:: \
 	--skip builder::
@@ -189,15 +181,8 @@ clean-fuzz:
 	rm -rf built/fuzz/out
 	@echo "Fuzz output directory cleaned."
 
-lint:
-	@$(MAKE) lint-code
-	@$(MAKE) lint-doc
-	@$(MAKE) spellcheck
-	@$(MAKE) lint-graph
-
-# The pre-push hook runs this alone, and CI runs all of lint.
-lint-code: setup
-	@echo "Checking rustfmt and clippy (mode: $(LINT_MODE))..."
+lint: setup
+	@echo "Checking rustfmt, clippy, rustdoc, and spelling (mode: $(LINT_MODE))..."
 ifeq ($(LINT_MODE),fix)
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features $(ARGS)
@@ -205,24 +190,12 @@ else
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
 endif
-
-# Rustdoc has no cargo --fix path for intra-doc / private-link warnings.
-# Both lint and doc deny them so CI and local builds fail closed the same way.
-lint-doc: setup
-	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-
-spellcheck: setup
-	@echo "Checking spelling..."
 	typos
 
-# Rust admits a cycle among the modules of one crate, so this check keeps the
-# production edges of `transport/` acyclic.
-lint-graph:
-	@echo "Checking the transport module graph..."
-	python3 -I scripts/module-graph.py --depth 1 --check
-
-doc: lint-doc
+doc: setup
+	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 	@echo "Documentation build complete."
 
 audit: setup

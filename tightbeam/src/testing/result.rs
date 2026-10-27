@@ -1,9 +1,9 @@
 //! The verdict of each verification layer, and the result of a finished
 //! scenario.
 //!
-//! Layer 1 grades the trace and the body's own result against the assertion
-//! specs, Layer 2 grades the trace against the CSP process, and Layer 3 grades
-//! it against the refinement model.
+//! - Layer 1 grades the trace and the body's own result against the assertion specs.
+//! - Layer 2 grades the trace against the CSP process.
+//! - Layer 3 grades the trace against the refinement model.
 
 use core::fmt::{Display, Formatter};
 
@@ -29,9 +29,9 @@ enum Reported {
 
 /// What each verification layer decided about one scenario.
 ///
-/// [`ScenarioVerdict::outcome`] is the one decider of a scenario's pass or
-/// fail. It grades every layer together, so every call site reads the same
-/// answer. A layer that the configuration skipped counts as accepted.
+/// [`ScenarioVerdict::outcome`] alone decides whether a scenario passes. It
+/// grades every layer together, so every call site reads one answer. A layer
+/// that the configuration skipped counts as accepted.
 #[derive(Debug)]
 pub struct ScenarioVerdict {
 	layer1: Result<(), SpecViolation>,
@@ -47,14 +47,12 @@ pub struct ScenarioVerdict {
 pub(crate) struct Layer3 {
 	/// What the FDR model decided.
 	verdict: FdrVerdict,
-	/// The events that the exploration recorded, apart from the trace of the
-	/// run.
+	/// The events that the exploration recorded, apart from the run's trace.
 	exploration: ConsumedTrace,
 }
 
 impl Layer3 {
-	/// Pairs the verdict of Layer 3 with the events that its exploration
-	/// recorded.
+	/// Pairs the Layer 3 verdict with the events that its exploration recorded.
 	pub(crate) fn new(verdict: FdrVerdict, exploration: ConsumedTrace) -> Self {
 		Self { verdict, exploration }
 	}
@@ -105,10 +103,10 @@ impl ScenarioVerdict {
 	/// The exploration events of Layer 3, when the configuration named an FDR
 	/// model.
 	///
-	/// - A trace of their own holds the events, apart from the trace of the run.
-	/// - The scenario's trace sets the instrumentation settings, and
-	///   `FdrExplorer::explore_into` records the events they ask for.
-	/// - The `overflowed` field of the trace reads `true` when its sink dropped events.
+	/// - The events sit in a trace of their own, apart from the trace of the run.
+	/// - The instrumentation settings of the scenario's trace pick the events
+	///   that `FdrExplorer::explore_into` records.
+	/// - [`ConsumedTrace::is_complete`] reads `false` when the sink dropped events.
 	///
 	/// # Examples
 	///
@@ -135,7 +133,7 @@ impl ScenarioVerdict {
 	/// let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
 	/// let exploration = verdict.exploration();
 	/// let samples = exploration.map(|exploration| exploration.count_event_urn(ENABLED_SET_SAMPLE));
-	/// assert_eq!(samples, Some(2));
+	/// assert_eq!(samples.transpose()?, Some(2));
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	pub fn exploration(&self) -> Option<&ConsumedTrace> {
@@ -145,7 +143,7 @@ impl ScenarioVerdict {
 
 	/// Grades the scenario against what it expected.
 	///
-	/// [`Expect::Pass`] holds when every layer accepted.
+	/// [`Expect::Pass`] holds when every layer accepts.
 	/// [`Expect::Violation`] holds when the named layer rejects and every other
 	/// accepts, so a negative test fails both on a missing rejection and on one
 	/// from a different layer. A layer that could not decide meets no
@@ -233,9 +231,9 @@ impl ScenarioResult {
 	/// Grades a finished run under `config`.
 	///
 	/// [`ScenarioConfig::verify`] grades `trace` and the body's own result.
-	/// The result holds the trace, the assertion specs of `config`, and the
-	/// expectation that [`ScenarioResult::outcome`] measures the verdict
-	/// against, so each getter answers from the one run it graded.
+	/// The result keeps the trace, the assertion specs of `config`, and the
+	/// expectation of [`ScenarioResult::outcome`], so each getter answers from
+	/// the one graded run.
 	///
 	/// # Errors
 	///

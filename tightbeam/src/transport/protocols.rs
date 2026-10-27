@@ -1,5 +1,4 @@
-//! Protocol traits that define what a transport protocol is and what it can
-//! do.
+//! The traits that define a transport protocol and what it can do.
 
 use core::future::Future;
 use core::time::Duration;
@@ -10,7 +9,9 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::crypto::profiles::CryptoProvider;
 use crate::transport::error::TransportError;
+use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 use crate::utils::marker::MaybeSend;
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
@@ -18,11 +19,7 @@ use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
 
-use crate::crypto::profiles::CryptoProvider;
-use crate::transport::{EndpointConfig, TransportEncryptionConfig};
-
-/// Marker trait for a protocol address, which an application may represent
-/// the way it wishes.
+/// Marker trait for a protocol address, in any form the application picks.
 pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 
 /// Blocking byte stream that a protocol reads from and writes to.
@@ -37,6 +34,32 @@ pub trait ProtocolStream: Send {
 	/// The stream's own error when the write fails.
 	fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error>;
 
+	/// Write from `buf` the bytes that one send takes, and return their count.
+	///
+	/// The blocking transport arms the timeout before each call, so a peer that
+	/// reads slowly cannot stretch a write.
+	///
+	/// # Errors
+	///
+	/// The stream's own error when the write fails or its timeout runs out.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::net::{TcpListener, TcpStream};
+	///
+	/// use tightbeam::transport::ProtocolStream;
+	///
+	/// let listener = TcpListener::bind("127.0.0.1:0")?;
+	/// let mut stream = TcpStream::connect(listener.local_addr()?)?;
+	/// let _accepted = listener.accept()?;
+	///
+	/// let sent = stream.write_some(b"hi")?;
+	/// assert_eq!(sent, 2);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn write_some(&mut self, buf: &[u8]) -> Result<usize, Self::Error>;
+
 	/// Fill `buf` exactly from the stream.
 	///
 	/// # Errors
@@ -44,13 +67,41 @@ pub trait ProtocolStream: Send {
 	/// The stream's own error when the read fails or the stream ends early.
 	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error>;
 
+	/// Read into `buf` the bytes of one receive, and return their count.
+	///
+	/// A count of 0 means the stream ended. The blocking transport arms the
+	/// timeout before each call, so a dripping peer cannot stretch a read.
+	///
+	/// # Errors
+	///
+	/// The stream's own error when the read fails or its timeout runs out.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::net::{TcpListener, TcpStream};
+	///
+	/// use tightbeam::transport::ProtocolStream;
+	///
+	/// let listener = TcpListener::bind("127.0.0.1:0")?;
+	/// let mut peer = TcpStream::connect(listener.local_addr()?)?;
+	/// let (mut stream, _) = listener.accept()?;
+	/// peer.write_all(b"hi")?;
+	///
+	/// let mut buf = [0u8; 8];
+	/// let received = stream.read_some(&mut buf)?;
+	/// assert_eq!(received, 2);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
+
 	/// Arm the read and write deadline for every later operation on the
 	/// stream, or clear it with `None`.
 	///
-	/// The blocking transport arms its handshake and operation deadlines
-	/// through this method and treats `Ok` as armed, so a stream that
-	/// cannot bound its I/O MUST return an error instead of succeeding with
-	/// no deadline. Every stream states its own answer.
+	/// The blocking transport arms its handshake and operation deadlines here
+	/// and treats `Ok` as armed. A stream that cannot bound its I/O MUST return
+	/// an error, not succeed with no deadline. Every stream states its own
+	/// answer.
 	///
 	/// # Errors
 	///
@@ -83,13 +134,12 @@ pub trait Protocol {
 	/// The protocol's error when it cannot form a default address.
 	fn default_bind_address() -> Result<Self::Address, Self::Error>;
 
-	/// Bind a cleartext listener to `addr`, returning the listener and the
-	/// address it actually bound.
+	/// Bind a cleartext listener to `addr`, and return the listener and the
+	/// address it bound.
 	///
 	/// Accepted transports carry no confidentiality, integrity, or peer
-	/// authentication (CWE-319), so the name says it. A protocol that binds
-	/// with transport encryption does it through
-	/// [`EncryptedProtocol::bind_with`].
+	/// authentication (CWE-319), so the name says it. An encrypted bind goes
+	/// through [`EncryptedProtocol::bind_with`].
 	///
 	/// # Errors
 	///
@@ -107,9 +157,8 @@ pub trait Protocol {
 
 	/// Build a transport over `stream` from `config`.
 	///
-	/// The configuration carries provisioning that already answered the
-	/// dialer rule, so every transport this protocol builds either holds a
-	/// peer authority or was named cleartext.
+	/// The provisioning in `config` already answered the dialer rule, so each
+	/// transport holds a peer authority or was named cleartext.
 	fn create_transport(stream: Self::Stream, config: EndpointConfig<Self::CryptoProvider>) -> Self::Transport;
 }
 
@@ -206,8 +255,8 @@ pub trait AsyncProtocolStream: MaybeSend + Unpin {
 	fn is_alive(&self) -> bool;
 }
 
-/// A stream that can be decomposed into independently owned read and write
-/// halves, enabling concurrent reader and writer tasks over one connection.
+/// A stream that splits into independently owned read and write halves, for
+/// concurrent reader and writer tasks over one connection.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait SplittableStream: AsyncProtocolStream {
 	/// Read half, which reports the stream's own error type.
@@ -253,11 +302,10 @@ pub trait AsyncByteWrite: MaybeSend + Unpin {
 
 /// Full-duplex async byte-level transport.
 ///
-/// Byte-oriented transports implement this, plus the half traits, and receive
-/// the frame-oriented traits through the blanket impls below. Message-delimited
-/// transports implement [`AsyncProtocolStream`] directly instead. Trait
-/// coherence makes the two paths mutually exclusive, so a byte transport cannot
-/// supply its own framing.
+/// A byte-oriented transport implements this and the half traits, and the
+/// blanket impls below give it the frame-oriented traits. A message-delimited
+/// transport implements [`AsyncProtocolStream`] directly. Trait coherence keeps
+/// the two paths apart, so a byte transport cannot supply its own framing.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait AsyncByteStream: AsyncByteRead + AsyncByteWrite {
 	/// Report whether the underlying transport still appears connected.
@@ -305,10 +353,10 @@ impl<T: AsyncByteStream> AsyncProtocolStream for T {
 
 /// Read one DER-framed envelope from any async byte reader.
 ///
-/// This is the single async framing-recovery path, which classifies the
-/// length, enforces canonical encoding, and checks the cap before it
-/// allocates. The blanket frame-trait impls apply it, so no byte-level
-/// transport can diverge on wire framing.
+/// This single async framing-recovery path classifies the length, enforces
+/// canonical encoding, and checks the cap before it allocates. The blanket
+/// frame-trait impls apply it, so no byte-level transport can diverge on wire
+/// framing.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 async fn read_der_frame<R>(stream: &mut R, cap: usize) -> TransportResult<Vec<u8>>
 where
@@ -353,8 +401,8 @@ where
 
 /// Protocol that supports persistent connections, or keep-alive.
 ///
-/// A protocol opts in to connection reuse through this trait, so a TLS-style
-/// handshake runs once per connection lifecycle instead of once per message.
+/// A protocol opts in to connection reuse here, so a TLS-style handshake runs
+/// once per connection, not once per message.
 pub trait PersistentConnection: Protocol {
 	/// Whether the underlying transport is still connected.
 	///
@@ -379,7 +427,7 @@ mod tests {
 
 	/// Byte-level fixture that replays a scripted wire image. It implements
 	/// only the byte traits, so the blanket impls recover every frame below.
-	/// Exhaustion surfaces as `UnexpectedEof`, matching real byte transports.
+	/// Exhaustion surfaces as `UnexpectedEof`, as on a real byte transport.
 	struct ScriptedBytes {
 		data: Vec<u8>,
 		pos: usize,
@@ -465,7 +513,7 @@ mod tests {
 			result,
 			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
 		));
-		// Only the header was consumed: the cap fired before any content
+		// The read took only the header, so the cap fired before any content
 		// allocation or read.
 		assert_eq!(stream.pos, 4);
 	}

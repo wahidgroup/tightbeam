@@ -42,23 +42,22 @@ use self::server_runtime::rt::{ErrorSender, OkSender};
 #[doc(hidden)]
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send>>;
 
-/// A connection-scoped handler, which receives the session's authenticated
-/// peer context beside each frame.
+/// A connection-scoped handler that receives the session's authenticated peer
+/// context beside each frame.
 ///
-/// The wrapped closure arrives through [`SharedHandler::from`] or
-/// [`SharedHandler::from_context_blind`], so every value of this type
-/// carries a closure one of those two conversions accepted.
+/// Every value wraps a closure that [`SharedHandler::from`] or
+/// [`SharedHandler::from_context_blind`] accepted.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct SharedHandler(Arc<dyn Fn(Frame, SessionContext) -> HandlerFuture + Send + Sync>);
 
 impl SharedHandler {
 	/// Wraps a context-blind handler (`handle: move |frame| ...`), which the
-	/// shared handler invokes with the frame alone.
+	/// shared handler calls with the frame alone.
 	///
-	/// The session-aware shape reaches the same type through
-	/// [`SharedHandler::from`]. Rust resolves one blanket `From<F>` impl per
-	/// target type, so the second closure shape takes a named conversion.
+	/// The session-aware shape takes [`SharedHandler::from`]. Rust resolves
+	/// one blanket `From<F>` impl per target type, so the second shape takes a
+	/// named conversion.
 	pub fn from_context_blind<F, Fut>(handler: F) -> Self
 	where
 		F: Fn(Frame) -> Fut + Send + Sync + 'static,
@@ -137,8 +136,8 @@ impl MuxService for SharedHandlerService {
 }
 
 /// Reports a service failure to the error channel and returns the opaque
-/// `Internal` failure in its place, so the original error goes to the
-/// application and the peer sees `Internal`.
+/// `Internal` failure in its place, so the application gets the original
+/// error and the peer sees `Internal`.
 ///
 /// - With no error channel, the original error returns unchanged.
 /// - A default that refuses its kind returns its refusal unreported, which the peer reads as `Unimplemented`.
@@ -221,10 +220,9 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 /// Records the acceptance of `transport` on its audit trail, and reports a
 /// fault that the trace injects at that record to `errors`.
 ///
-/// The returned future resolves to [`ControlFlow::Break`] when the fault ends
-/// the connection, so each path that serves an accepted connection records it
-/// the same way. The record runs at the call, so the future holds `errors`
-/// alone.
+/// The future resolves to [`ControlFlow::Break`] when the fault ends the
+/// connection, so every path that serves a connection records it the same
+/// way. The record runs at the call, so the future holds `errors` alone.
 #[cfg(feature = "tokio")]
 fn record_acceptance<'e, T: ConnectionAudit>(
 	transport: &T,
@@ -253,10 +251,9 @@ fn record_acceptance<'e, T: ConnectionAudit>(
 /// - When the peer negotiated multiplexing, the mux takes over and the service routes every stream kind.
 /// - Otherwise a single-flight unary loop serves the connection.
 ///
-/// A fault the trace injects at the record of the acceptance goes to the
-/// error channel and ends the connection. The function is generic over the
-/// accepted transport ([`AcceptedConnection`]), so every protocol's
-/// connections serve identically.
+/// A fault the trace injects at the acceptance record goes to the error
+/// channel and ends the connection. It is generic over the accepted transport
+/// ([`AcceptedConnection`]), so every protocol serves the same way.
 #[cfg(pooled_mux)]
 #[doc(hidden)]
 pub async fn serve_connection_service<T, S>(
@@ -316,10 +313,10 @@ pub async fn serve_connection_service<T, S>(
 
 /// Serves one accepted connection with a closure-form handler.
 ///
-/// When the mux plane is compiled in, [`serve_connection_service`] runs
-/// over the unary-only adapter. Otherwise the single-flight loop runs alone,
-/// after the connection's audit trail records the acceptance as
-/// `CONNECTION_ACCEPTED`, so each path records it once.
+/// With the mux plane compiled in, [`serve_connection_service`] runs over the
+/// unary-only adapter. Otherwise the single-flight loop runs alone, after the
+/// audit trail records `CONNECTION_ACCEPTED`, so each path records the
+/// acceptance once.
 #[cfg(feature = "tokio")]
 #[doc(hidden)]
 pub async fn serve_connection<T>(
@@ -351,9 +348,9 @@ pub async fn serve_connection<T>(
 /// The single-flight request and response loop over one connection.
 ///
 /// Each turn collects a frame, answers it through
-/// [`SingleFlightAnswer::of`], and sends the reply. The error of a failed
-/// handler goes to the channel, and so does a collect or send failure, which
-/// also ends the loop.
+/// [`SingleFlightAnswer::of`], and sends the reply. A failed handler's error
+/// goes to the channel. A collect or send failure goes there too and ends the
+/// loop.
 #[cfg(feature = "tokio")]
 async fn serve_single_flight<T, F, Fut>(
 	mut transport: T,
@@ -412,9 +409,9 @@ async fn serve_single_flight<T, F, Fut>(
 /// The answer that one single-flight turn sends for a frame it collected, and
 /// the error of a handler that failed.
 ///
-/// The async loop and the blocking `server!` loop answer each frame through
+/// The async loop and the blocking `server!` loop both answer through
 /// [`SingleFlightAnswer::of`], the one home of a turn's decisions. The
-/// blocking loop expands in the caller's crate, so the type is public and
+/// blocking loop expands in the caller's crate, so the type is public but
 /// hidden from the documented surface.
 #[cfg(feature = "std")]
 #[doc(hidden)]
@@ -423,35 +420,33 @@ pub struct SingleFlightAnswer {
 	pub status: TransitStatus,
 	/// The frame that the turn sends with the status.
 	pub response: Option<Frame>,
-	/// The error of a handler that failed, which the turn answers with
-	/// [`TransitStatus::Internal`], or the fault that the trace injects at the
+	/// The error of a failed handler, which the turn answers with
+	/// [`TransitStatus::Internal`], or the fault the trace injects at the
 	/// record of that failure.
 	pub failure: Option<TightBeamError>,
 }
 
 #[cfg(feature = "std")]
 impl SingleFlightAnswer {
-	/// Answers `collected`, a frame and the status that a single-flight
-	/// connection collected it under.
+	/// Answers `collected`, a frame and the status a single-flight connection
+	/// collected it under.
 	///
-	/// - An admitted frame runs through `respond`, in the handler span of the
-	///   audit trail of `transport`, with the session that `session` holds.
-	///   The first admitted frame captures that session, because the lazy
-	///   handshake is complete by then.
-	/// - A handler that fails with an error of its own answers
-	///   [`TransitStatus::Internal`], so the peer can tell it apart from an
-	///   accepted empty reply, and the answer keeps its error. The audit trail
-	///   of `transport` records the failure as `HANDLER_FAILED`, and a fault
-	///   the trace injects at that record takes the place of the error of the
-	///   handler.
-	/// - A fault the trace injects at the span of the handler answers
-	///   `Internal`, and the answer keeps the fault.
+	/// - An admitted frame runs through `respond` in the handler span of the
+	///   `transport` audit trail, with the session `session` holds. The first
+	///   admitted frame captures that session, because the lazy handshake is
+	///   complete by then.
+	/// - A handler that fails with its own error answers
+	///   [`TransitStatus::Internal`], which the peer can tell apart from an
+	///   accepted empty reply, and the answer keeps the error. The audit trail
+	///   records the failure as `HANDLER_FAILED`, and a fault the trace injects
+	///   at that record replaces the handler's error.
+	/// - A fault the trace injects at the handler span answers `Internal`, and the answer keeps the fault.
 	/// - A service default that refuses the unary kind answers
 	///   [`TransitStatus::Unimplemented`], with no error.
 	/// - A refused frame answers its own status.
 	///
 	/// The handler future stays pinned in the turn, so the span wraps it by
-	/// reference and the turn moves it no further.
+	/// reference and never moves it.
 	pub async fn of<T, F, Fut>(
 		transport: &mut T,
 		session: &mut Option<SessionContext>,
@@ -527,7 +522,7 @@ macro_rules! __tightbeam_server_protocol_handle {
 macro_rules! __tightbeam_server_protocol_handle {
 	($protocol:path, $listener:expr, $handler:expr) => {{
 		let __listener = $listener;
-		::std::thread::spawn(move || {
+		$crate::macros::server::server_runtime::rt::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __listener, $handler,)
 		})
 	}};
@@ -564,7 +559,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {{
 		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind_cleartext($addr))?;
 		let __server = <$protocol>::from(listener);
-		::std::thread::spawn(move || {
+		$crate::macros::server::server_runtime::rt::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
 		})
 	}};
@@ -601,7 +596,7 @@ macro_rules! __tightbeam_server_protocol_policies_handle {
 macro_rules! __tightbeam_server_protocol_policies_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
 		let __listener = $listener;
-		::std::thread::spawn(move || {
+		$crate::macros::server::server_runtime::rt::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
 		})
 	}};
@@ -702,7 +697,7 @@ macro_rules! __tightbeam_server_protocol_channels_handle {
 		// Only the tokio loop reports through channels, so the sync expansion
 		// evaluates both inputs and drops them.
 		let _ = ($error_tx, $ok_tx);
-		::std::thread::spawn(move || {
+		$crate::macros::server::server_runtime::rt::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __listener, $handler,)
 		})
 	}};
@@ -745,7 +740,7 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 		// Only the tokio loop reports through channels, so the sync expansion
 		// evaluates both inputs and drops them.
 		let _ = ($error_tx, $ok_tx);
-		::std::thread::spawn(move || {
+		$crate::macros::server::server_runtime::rt::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
 		})
 	}};
@@ -787,7 +782,7 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
 		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind_cleartext($addr))?;
 		let __server = <$protocol>::from(listener);
-		::std::thread::spawn(move || {
+		$crate::macros::server::server_runtime::rt::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
 		})
 	}};
@@ -829,8 +824,8 @@ macro_rules! __tightbeam_server_protocol_service_handle {
 
 /// The runtime extensions of the `server!` expansion.
 ///
-/// The module re-exports the unified runtime and adds the channel functions
-/// that the expansion calls.
+/// It re-exports the unified runtime and adds the channel functions the
+/// expansion calls.
 #[cfg(any(feature = "tokio", feature = "std"))]
 #[doc(hidden)]
 pub mod server_runtime {
@@ -838,12 +833,11 @@ pub mod server_runtime {
 	pub mod rt {
 		pub use crate::runtime::rt::*;
 		/// The accept-loop connection plane of the async `server!` expansion,
-		/// which serves the expansion and sits outside the documented surface.
+		/// outside the documented surface.
 		#[cfg(feature = "tokio")]
 		pub use crate::transport::accept::AcceptPlane;
 		/// The accept-loop connection plane of the blocking `server!`
-		/// expansion, which serves the expansion and sits outside the
-		/// documented surface.
+		/// expansion, outside the documented surface.
 		pub use crate::transport::accept::BlockingAcceptPlane;
 
 		use crate::transport::error::TransportError;
@@ -876,15 +870,29 @@ pub mod server_runtime {
 /// # Policies
 ///
 /// - `name: [ expr, .. ]` calls `name(expr)` on every accepted transport.
-/// - The accept loop evaluates each expression once per accepted
-///   connection, so every connection receives its own value.
+/// - The accept loop evaluates each expression once per connection, so every connection gets its own value.
 /// - An expression that shares one value across connections clones it, as
 ///   `with_trace: [ trace.share() ]` does.
-/// - `max_connections: [ n ]` sets the cap of live connections instead, in
-///   the async and the blocking accept loop alike. Its list holds one
-///   expression, and a list of another length fails to compile. A literal
-///   cap of zero fails to compile, and a cap that is no literal is a
-///   [`NonZeroUsize`](core::num::NonZeroUsize).
+/// - `max_connections: [ n ]` instead sets the live-connection cap of the
+///   async and the blocking accept loop alike. Its list holds one expression,
+///   or the build fails. A literal cap of zero fails to compile, and a cap
+///   that is no literal is a [`NonZeroUsize`](core::num::NonZeroUsize).
+///
+/// # Protocol forms
+///
+/// A `protocol` form serves its listener apart from the caller and returns at
+/// once.
+///
+/// - With `tokio`, it returns the [`JoinHandle`](crate::runtime::rt::JoinHandle) of the task that serves.
+/// - With `std` and no `tokio`, it returns the [`io::Result`](std::io::Result)
+///   of the std `runtime::rt::spawn`, which spawns through
+///   [`thread::Builder::spawn`](std::thread::Builder::spawn): the serving
+///   thread's handle, or the error of a system that refuses the thread.
+///
+/// # Blocking forms
+///
+/// A form without `protocol` runs its handler on a thread outside any runtime.
+/// A handler that awaits a tokio timer or socket needs a `protocol` form.
 #[macro_export]
 macro_rules! server {
 	(@apply_policy $transport:ident, $policy_name:ident, [ $( $policy_expr:expr ),* $(,)? ]) => {{
@@ -905,9 +913,8 @@ macro_rules! server {
 	(@extract_max_connections) => {
 		$crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS
 	};
-	// A literal cap becomes a `NonZeroUsize` constant, which the compiler
-	// evaluates as it checks the expansion, so a cap of zero fails to compile
-	// here.
+	// A literal cap becomes a `NonZeroUsize` constant that the compiler
+	// evaluates, so a cap of zero fails to compile here.
 	(@extract_max_connections max_connections: [ $cap:literal $(,)? ] $(, $rest_name:ident: [ $( $rest_expr:expr ),* $(,)? ])* $(,)?) => {{
 		const CAP: ::core::num::NonZeroUsize = match ::core::num::NonZeroUsize::new($cap) {
 			::core::option::Option::Some(cap) => cap,
@@ -934,8 +941,8 @@ macro_rules! server {
 	}};
 
 	// This arm serves the listener through a `BlockingAcceptPlane`. The sync
-	// path reports to the peer alone, so the loop drops each failure, and an
-	// operator who needs to see errors runs the tokio path.
+	// path reports to the peer alone, so the loop drops each failure. An
+	// operator who needs the errors runs the tokio path.
 	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		#[allow(unused_imports)]
 		use $crate::transport::MessageCollector;
@@ -956,37 +963,39 @@ macro_rules! server {
 				let __handler_clone = ::core::clone::Clone::clone(&$handler);
 				move || {
 					let mut __transport = __transport;
-					// The session context fills after the first collected
-					// frame, because the lazy handshake is complete by
-					// then.
-					let mut __session_slot = ::core::option::Option::None;
-					loop {
-						let __collected = match $crate::macros::server::server_runtime::rt::block_on(__transport.collect_message()) {
-							Ok(result) => result,
-							Err(_err) => {
-								break;
-							}
-						};
+					// One executor that fits this thread drives every turn.
+					$crate::macros::server::server_runtime::rt::block_on(async move {
+						// The session context fills after the first collected
+						// frame, because the lazy handshake is complete by
+						// then.
+						let mut __session_slot = ::core::option::Option::None;
+						loop {
+							let __collected = match __transport.collect_message().await {
+								Ok(result) => result,
+								Err(_err) => {
+									break;
+								}
+							};
 
-						let __answer = $crate::macros::server::SingleFlightAnswer::of(
-							&mut __transport,
-							&mut __session_slot,
-							__collected,
-							|frame, session| __handler_clone.call(frame, session),
-						);
-						// The loop has no error channel, so it drops the
-						// error of a failed handler, and the `Internal`
-						// answer tells the peer.
-						let $crate::macros::server::SingleFlightAnswer { status, response, .. } =
-							$crate::macros::server::server_runtime::rt::block_on(__answer);
+							let __answer = $crate::macros::server::SingleFlightAnswer::of(
+								&mut __transport,
+								&mut __session_slot,
+								__collected,
+								|frame, session| __handler_clone.call(frame, session),
+							);
+							// The loop has no error channel, so it drops the
+							// error of a failed handler, and the `Internal`
+							// answer tells the peer.
+							let $crate::macros::server::SingleFlightAnswer { status, response, .. } = __answer.await;
 
-						match $crate::macros::server::server_runtime::rt::block_on(__transport.send_response(status, response)) {
-							Ok(()) => continue,
-							Err(_err) => {
-								break;
+							match __transport.send_response(status, response).await {
+								Ok(()) => continue,
+								Err(_err) => {
+									break;
+								}
 							}
 						}
-					}
+					});
 				}
 			},
 		);
@@ -1264,20 +1273,34 @@ macro_rules! server {
 mod tests {
 	use core::future::ready;
 	use core::sync::atomic::{AtomicBool, Ordering};
+	#[cfg(feature = "instrument")]
+	use std::borrow::Cow;
+	#[cfg(feature = "tcp")]
+	use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 
 	use tokio::net::{TcpListener, TcpStream};
 
 	use super::*;
 	use crate::testing::TestFrame;
 	use crate::transport::tcp::r#async::{TcpTransport, TokioStream};
-	use crate::transport::{EndpointConfig, TransportError, TransportResult};
+	use crate::transport::{EndpointConfig, TransportResult};
 
+	#[cfg(feature = "tcp")]
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	#[cfg(feature = "instrument")]
 	use crate::instrumentation::events;
-	#[cfg(feature = "testing-fault")]
+	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
 	use crate::testing::fdr::FaultModel;
 	#[cfg(feature = "instrument")]
 	use crate::trace::TraceCollector;
+	#[cfg(feature = "tcp")]
+	use crate::transport::handshake::HandshakeProvider;
+	#[cfg(feature = "tcp")]
+	use crate::transport::tcp::sync::{TcpListener as BlockingListener, TcpTransport as BlockingTransport};
+	#[cfg(feature = "tcp")]
+	use crate::transport::MessageEmitter;
+	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
+	use crate::transport::TransportError;
 	#[cfg(feature = "instrument")]
 	use crate::urn::Urn;
 
@@ -1292,8 +1315,8 @@ mod tests {
 	}
 
 	/// Runs one turn over `transport` on a frame collected under `status` with
-	/// a handler that fails, and returns the answer of the turn and whether
-	/// the handler ran.
+	/// a handler that fails, and returns the turn's answer and whether the
+	/// handler ran.
 	async fn failing_turn_over(
 		mut transport: TcpTransport<TokioStream>,
 		status: TransitStatus,
@@ -1348,8 +1371,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A service default that refuses its kind is no failure of a handler, so
-	/// the report passes it through unchanged and sends no report.
+	/// A service default that refuses its kind is no handler failure, so the
+	/// report passes it through unchanged and sends no report.
 	#[cfg(pooled_mux)]
 	#[tokio::test]
 	async fn a_refused_kind_passes_the_report_unreported() {
@@ -1359,10 +1382,10 @@ mod tests {
 		assert!(reports.try_recv().is_err());
 	}
 
-	/// The labels of the records of `event` that `trace` holds, in the order
-	/// it recorded them.
+	/// The labels of the `event` records that `trace` holds, in the order it
+	/// recorded them.
 	#[cfg(feature = "instrument")]
-	fn labels(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<String>> {
+	fn labels(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<Cow<'static, str>>> {
 		let records = trace.drain_events();
 		records
 			.into_iter()
@@ -1371,20 +1394,20 @@ mod tests {
 			.collect()
 	}
 
-	/// A turn records the failure of its handler on the audit trail of its
-	/// connection, labelled with the `Internal` answer.
+	/// A turn records its handler's failure on its connection's audit trail,
+	/// labelled with the `Internal` answer.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
 	async fn a_turn_records_the_failure_of_its_handler() -> TransportResult<()> {
 		let (_listener, transport) = loopback_transport().await?;
 		let trace = TraceCollector::new();
 		failing_turn_over(transport.with_trace(trace.share()), TransitStatus::Ok).await;
-		assert_eq!(labels(&trace, events::HANDLER_FAILED), [Some("Internal".to_owned())]);
+		assert_eq!(labels(&trace, events::HANDLER_FAILED), [Some("Internal".into())]);
 		Ok(())
 	}
 
-	/// A fault the trace injects at the record of a failed handler takes the
-	/// place of the error of the handler, so the turn reports the fault.
+	/// A fault the trace injects at the record of a failed handler replaces the
+	/// handler's error, so the turn reports the fault.
 	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
 	#[tokio::test]
 	async fn a_fault_at_the_record_of_a_failed_handler_takes_its_place() -> TransportResult<()> {
@@ -1434,8 +1457,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The record of an acceptance names the peer by the address that the
-	/// listener accepted the connection from, as its payload.
+	/// The payload of an acceptance record names the peer by the address the
+	/// listener accepted the connection from.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
 	async fn a_served_connection_names_the_peer_it_accepted() -> TransportResult<()> {
@@ -1460,6 +1483,72 @@ mod tests {
 		let accepted = recorded.into_iter().filter(|event| event.urn == events::CONNECTION_ACCEPTED);
 		let evidence: Vec<_> = accepted.map(|event| event.payload_hash).collect();
 		assert_eq!(evidence, [Some(expected)]);
+		Ok(())
+	}
+
+	/// Serves `listener` with the blocking `server!` form on a std thread
+	/// outside a tokio runtime, and answers each frame with itself.
+	#[cfg(feature = "tcp")]
+	fn serve_blocking<P: HandshakeProvider>(listener: BlockingListener<NetTcpListener, P>) {
+		std::thread::spawn(move || {
+			crate::server! {
+				BlockingListener<NetTcpListener, P>: listener,
+				handle: |frame: Frame| async move { Ok(Some(frame)) }
+			}
+		});
+	}
+
+	/// A loopback socket on a free port, and the address it binds.
+	#[cfg(feature = "tcp")]
+	fn loopback_socket() -> (NetTcpListener, SocketAddr) {
+		let socket = NetTcpListener::bind("127.0.0.1:0").expect("a loopback port binds");
+		let addr = socket.local_addr().expect("a bound socket has an address");
+		(socket, addr)
+	}
+
+	/// A blocking `server!` form serves a cleartext connection on the threads
+	/// of its accept plane, which run outside a tokio runtime.
+	#[cfg(feature = "tcp")]
+	#[tokio::test]
+	async fn a_blocking_server_serves_in_the_clear_with_no_runtime() -> TransportResult<()> {
+		let (socket, addr) = loopback_socket();
+		serve_blocking(BlockingListener::<_, DefaultCryptoProvider>::from_listener_cleartext(socket));
+
+		let stream = NetTcpStream::connect(addr)?;
+		let mut client = BlockingTransport::new(stream, EndpointConfig::<DefaultCryptoProvider>::cleartext());
+		let frame = TestFrame::v0(Some("blocking-clear"), None);
+
+		let echoed = client.emit(frame.clone(), None).await?;
+		assert_eq!(echoed, Some(frame));
+		Ok(())
+	}
+
+	/// A blocking `server!` form completes the server handshake on the
+	/// threads of its accept plane, which run outside a tokio runtime, and
+	/// serves the frame that follows it.
+	#[cfg(all(feature = "tcp", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_blocking_server_runs_the_handshake_with_no_runtime() -> Result<(), Box<dyn core::error::Error>> {
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+		use crate::testing::TestIdentity;
+		use crate::transport::client::ClientBuilder;
+		use crate::transport::TransportEncryptionConfig;
+
+		let (socket, addr) = loopback_socket();
+		let identity = TestIdentity::insecure_fixed();
+		let trust = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let trust = trust.with_certificate(identity.certificate().to_owned())?.build();
+		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
+
+		serve_blocking(BlockingListener::from_listener_with(socket, config)?);
+
+		let client = ClientBuilder::<BlockingListener<NetTcpListener>>::builder().with_trust_store(Arc::new(trust));
+		let mut client = client.adopt(NetTcpStream::connect(addr)?)?.into_transport();
+		let frame = TestFrame::v0(Some("blocking-sealed"), None);
+
+		let echoed = client.emit(frame.clone(), None).await?;
+		assert_eq!(echoed, Some(frame));
 		Ok(())
 	}
 }

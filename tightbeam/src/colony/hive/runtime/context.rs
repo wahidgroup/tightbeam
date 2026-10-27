@@ -7,7 +7,7 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::{ColonyDialProtocol, DialTarget};
 use crate::colony::hive::{
-	CallFuture, DuplexOpenFuture, HashMapRegistry, HiveContext, ServletRegistry, StreamOpenFuture, StreamResponseFuture,
+	CallFuture, DuplexOpenFuture, HiveContext, ServletRegistry, StreamOpenFuture, StreamResponseFuture,
 };
 use crate::router::RouterError;
 use crate::trace::TraceCollector;
@@ -58,15 +58,15 @@ type SiblingMap = HashMap<Vec<u8>, Sibling>;
 ///
 /// The index derives from the instances, so both live behind one lock and
 /// under one owner. A reader sees an index that names only addresses the
-/// instance map holds, and every caller takes the same single lock, which
-/// rules out a lock-order deadlock between two callers (CWE-362).
+/// instance map holds, and with one lock no two callers can deadlock on lock
+/// order (CWE-362).
 ///
 /// # Poison recovery
 ///
 /// Every write under the lock is a `HashMap` insert or remove, which
-/// completes or aborts the process, so a thread that panicked while it held
-/// the guard left whole maps behind it. The owner therefore recovers a
-/// poisoned lock, and the routes stay in service.
+/// completes or aborts the process, so a thread that panicked under the guard
+/// left whole maps. The owner recovers a poisoned lock, and the routes stay in
+/// service.
 #[derive(Default)]
 struct Routes {
 	instances: SiblingMap,
@@ -225,14 +225,12 @@ impl<P: Protocol> HiveContextImpl<P> {
 		self.established.set(plane).map_err(|_| TightBeamError::AlreadyEstablished)
 	}
 
-	/// Takes the write lock of the routes. It recovers a poisoned lock,
-	/// because every write under the guard leaves whole maps.
+	/// Takes the write lock of the routes, and recovers a poisoned lock.
 	fn routes_mut(&self) -> RwLockWriteGuard<'_, Routes> {
 		self.routes.write().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// Takes the read lock of the routes and recovers a poisoned lock the
-	/// same way.
+	/// Takes the read lock of the routes, and recovers a poisoned lock.
 	fn routes(&self) -> RwLockReadGuard<'_, Routes> {
 		self.routes.read().unwrap_or_else(PoisonError::into_inner)
 	}
@@ -304,9 +302,9 @@ impl<P: Protocol> HiveContextImpl<P> {
 	/// Adds a route to every instance already in `servlets` that names a
 	/// signer.
 	///
-	/// Registration fills the registry before the hive starts, so the
-	/// routes catch up in one pass at start rather than per registration.
-	pub(crate) fn seed_routes(&self, servlets: &HashMapRegistry) {
+	/// Registration fills the registry before the hive starts, so the routes
+	/// catch up in one pass at start.
+	pub(crate) fn seed_routes(&self, servlets: &impl ServletRegistry) {
 		servlets.for_each(|key, reg| {
 			// A sibling's dial admits a servlet's answer by its signer alone,
 			// so a servlet that names none gets no route (CWE-346).
@@ -329,7 +327,6 @@ impl<P: Protocol> HiveContextImpl<P> {
 	fn sibling(&self, servlet_type: &Urn<'_>) -> Result<Sibling, TightBeamError> {
 		let type_key = servlet_type.canonical_bytes();
 		let routed = self.routes().resolve(&type_key);
-
 		routed.ok_or(TightBeamError::RouterError(RouterError::UnknownRoute))
 	}
 }
@@ -378,7 +375,7 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::hive::{ServletBox, ServletRegistration, SpawnerFn};
+	use crate::colony::hive::{HashMapRegistry, ServletBox, ServletRegistration, SpawnerFn};
 	use crate::colony::protocol::ServletInfo;
 	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;

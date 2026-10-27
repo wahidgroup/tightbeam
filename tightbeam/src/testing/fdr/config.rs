@@ -1,12 +1,12 @@
-//! Configuration types for FDR refinement checking.
+//! The configuration types of FDR refinement checking.
 //!
-//! The module holds the configuration structures and the result types that
-//! the FDR exploration engine uses.
+//! It holds the configuration structures and the result types of the FDR
+//! exploration engine.
 
 #[cfg(feature = "testing-fault")]
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use crate::testing::error::TestingError;
+use crate::testing::error::FdrConfigError;
 use crate::testing::specs::csp::Process;
 
 #[cfg(feature = "testing-fault")]
@@ -16,7 +16,7 @@ use crate::testing::fdr::SeededRng;
 #[cfg(feature = "testing-fmea")]
 use crate::testing::fmea::FmeaConfig;
 #[cfg(feature = "testing-fault")]
-use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, testing::error::FdrConfigError, utils::BasisPoints};
+use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, utils::BasisPoints};
 
 /// The scheduling model of the processes in an FDR exploration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub enum SchedulerModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectionStrategy {
 	/// Deterministic fault injection, which counts the records of each event,
-	/// so its injections are predictable and repeat from run to run.
+	/// so its injections repeat from run to run.
 	Deterministic,
 	/// Random fault injection from a seeded RNG, which injects by probability
 	/// and repeats under the same seed.
@@ -78,9 +78,8 @@ impl StrategyDraw {
 	/// - The generator draws one value per record and reads it through
 	///   [`FaultInjection::should_inject`], as FDR exploration does.
 	///
-	/// `label` stays the `Cow` that the count keys on, so a static label clones
-	/// as a pointer copy, as `TraceCollector::check_runtime_fault_injection`
-	/// states.
+	/// `label` stays the `Cow` the count keys on, so a static label clones as a
+	/// pointer copy, as `TraceCollector::check_runtime_fault_injection` states.
 	#[allow(clippy::ptr_arg)]
 	pub(crate) fn injects(&mut self, label: &Cow<'static, str>, injection: &FaultInjection) -> bool {
 		let probability = u64::from(injection.probability_bps.get());
@@ -113,7 +112,7 @@ enum InjectionKey<'a> {
 pub(crate) struct FaultInjection {
 	pub(crate) error_factory: Arc<dyn Fn() -> TightBeamError + Send + Sync>,
 	/// The injection probability in basis points (0 to 10000, where 10000 is
-	/// 100%), a range that the `BasisPoints` type holds by construction.
+	/// 100%), a range `BasisPoints` holds by construction.
 	pub(crate) probability_bps: BasisPoints,
 }
 
@@ -201,11 +200,9 @@ impl FaultModel {
 	/// Injects a fault at a process state and an event, typed through the
 	/// `ProcessState` and `ProcessEvent` traits.
 	///
-	/// The fault fires at that (process state, event) pair with the probability
-	/// `probability_bps` in basis points (0 to 10000, where 10000 is 100%).
-	///
-	/// The traits validate the pair at compile time when the enums come from
-	/// the `tb_process_spec!` macro.
+	/// The fault fires at that pair with the probability `probability_bps`, in
+	/// basis points (0 to 10000, where 10000 is 100%). The traits validate the
+	/// pair at compile time when the enums come from `tb_process_spec!`.
 	pub fn with_fault<S, E, F, Err>(self, state: S, event: E, error_fn: F, probability_bps: BasisPoints) -> Self
 	where
 		S: ProcessState,
@@ -220,9 +217,8 @@ impl FaultModel {
 	/// Injects a fault at each runtime record of `event`, in every process
 	/// state, with the probability `probability_bps` in basis points.
 	///
-	/// A collector injects the fault once [`TraceCollector::with_fault_model`]
-	/// installs the model, and its [`TraceCollector::event`] then returns the
-	/// error of `error_fn`.
+	/// Once [`TraceCollector::with_fault_model`] installs the model, the
+	/// collector's [`TraceCollector::event`] returns the error of `error_fn`.
 	///
 	/// [`TraceCollector::with_fault_model`]: crate::trace::TraceCollector::with_fault_model
 	/// [`TraceCollector::event`]: crate::trace::TraceCollector::event
@@ -299,7 +295,7 @@ impl FaultModel {
 
 /// The FDR configuration for refinement checking and multi-seed exploration.
 ///
-/// The configuration supports two modes:
+/// It supports two modes:
 /// 1. Single-process exploration: verify the properties of one process.
 /// 2. Refinement checking: verify Spec ⊑ Impl (traces, failures, divergences).
 #[derive(Debug, Clone)]
@@ -311,25 +307,24 @@ pub struct FdrConfig {
 	/// refinement checks follow before they cut it off.
 	pub max_depth: usize,
 
-	/// The most hidden events in one run that exploration takes. A longer
-	/// run is a divergence, and so is a run of hidden events that reaches a
-	/// cycle of hidden events, whatever its length.
+	/// The most hidden events exploration takes in one run. A longer run is a
+	/// divergence, and so is a hidden run of any length that reaches a cycle of
+	/// hidden events.
 	pub max_internal_run: usize,
 
 	/// The time budget, in milliseconds, of each search that the refinement
 	/// checker runs: the trace, failure, and divergence searches of a process,
-	/// and the search of a spec for the traces of the impl. A search that
-	/// spends it stops with an incomplete answer.
+	/// and the search of a spec for the traces of the implementation. A search
+	/// that spends it stops with an incomplete answer.
 	pub timeout_ms: u64,
 
-	/// The specification processes for refinement checking. When the list
-	/// holds a process, the explorer checks spec ⊑ subject for each spec.
+	/// The specification processes for refinement checking. The explorer
+	/// checks spec ⊑ subject for each one.
 	pub specs: Vec<Process>,
 
-	/// Whether each refinement pass stops at its first violation (fast-fail
-	/// mode). When true (the default), a pass returns at the first
-	/// counterexample. When false, a pass checks every spec, and the verdict
-	/// keeps the witness of the last violation.
+	/// Whether each refinement pass returns at its first counterexample
+	/// (fast-fail mode, the default). When false, a pass checks every spec, and
+	/// the verdict keeps the witness of the last violation.
 	pub fail_fast: bool,
 
 	/// The number of schedulers (m) of the resource constraint model, where m
@@ -345,11 +340,14 @@ pub struct FdrConfig {
 	#[cfg(feature = "testing-fault")]
 	pub process_count: Option<u32>,
 
-	/// The scheduler model, cooperative or preemptive.
+	/// The scheduler model, cooperative or preemptive, of the schedulers
+	/// that `scheduler_count` names. A model needs `scheduler_count` and
+	/// `process_count`, and [`FdrConfig::validate_scheduler_model`] reads it.
+	#[cfg(feature = "testing-fault")]
 	pub scheduler_model: Option<SchedulerModel>,
 
-	/// The fault injection model. When set, it turns on CSP state-driven fault
-	/// injection during FDR exploration.
+	/// The fault injection model, which turns on CSP state-driven fault
+	/// injection in FDR exploration.
 	#[cfg(feature = "testing-fault")]
 	pub fault_model: Option<FaultModel>,
 
@@ -367,6 +365,7 @@ impl Default for FdrConfig {
 			timeout_ms: 5000,
 			specs: Vec::new(),
 			fail_fast: true,
+			#[cfg(feature = "testing-fault")]
 			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
 			scheduler_count: None,
@@ -388,36 +387,35 @@ impl FdrConfig {
 	/// - `scheduler_count` and `process_count` must both be `Some(_)` or both be `None`.
 	/// - When set, `scheduler_count` must not exceed `process_count`.
 	/// - When set, `scheduler_count` and `process_count` must each be above 0.
+	/// - A `scheduler_model` needs `scheduler_count` and `process_count`,
+	///   because it models how the schedulers run the processes.
 	///
 	/// ## Errors
-	/// - [`TestingError::InvalidFdrConfig`] -- the first rule above that fails,
-	///   which its `field` and `reason` name.
+	/// - [`FdrConfigError`] -- the first rule above that fails, which its `field` and `reason` name.
 	#[cfg(feature = "testing-fault")]
-	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
+	pub fn validate_scheduler_model(&self) -> Result<(), FdrConfigError> {
 		match (self.scheduler_count, self.process_count) {
+			(None, None) if self.scheduler_model.is_some() => Err(FdrConfigError {
+				field: "scheduler_model",
+				reason: "needs scheduler_count and process_count, the schedulers and the processes it models",
+			}),
 			(None, None) => Ok(()), // Scheduler modeling is off and valid.
-			(Some(_), None) | (None, Some(_)) => Err(TestingError::InvalidFdrConfig(FdrConfigError {
+			(Some(_), None) | (None, Some(_)) => Err(FdrConfigError {
 				field: "scheduler_count/process_count",
 				reason: "both must be set or both be None for resource constraint modeling",
-			})),
+			}),
 			(Some(scheduler_count), Some(process_count)) => {
 				if scheduler_count > process_count {
-					return Err(TestingError::InvalidFdrConfig(FdrConfigError {
+					return Err(FdrConfigError {
 						field: "scheduler_count",
 						reason: "cannot exceed process_count (would make resource modeling meaningless)",
-					}));
+					});
 				}
 				if scheduler_count == 0 {
-					return Err(TestingError::InvalidFdrConfig(FdrConfigError {
-						field: "scheduler_count",
-						reason: "must be > 0",
-					}));
+					return Err(FdrConfigError { field: "scheduler_count", reason: "must be > 0" });
 				}
 				if process_count == 0 {
-					return Err(TestingError::InvalidFdrConfig(FdrConfigError {
-						field: "process_count",
-						reason: "must be > 0",
-					}));
+					return Err(FdrConfigError { field: "process_count", reason: "must be > 0" });
 				}
 				Ok(())
 			}
@@ -426,17 +424,21 @@ impl FdrConfig {
 
 	/// Validates every constraint of the configuration.
 	///
-	/// The scheduler model holds the only constraints, so this returns the
+	/// The scheduler model holds the only constraints, so it returns the
 	/// result of [`FdrConfig::validate_scheduler_model`].
+	///
+	/// # Errors
+	///
+	/// - [`FdrConfigError`] -- the first rule of [`FdrConfig::validate_scheduler_model`] that fails.
 	#[cfg(feature = "testing-fault")]
-	pub fn validate(&self) -> Result<(), TestingError> {
+	pub fn validate(&self) -> Result<(), FdrConfigError> {
 		self.validate_scheduler_model()
 	}
 
 	/// Validates every constraint of the configuration. Every configuration
 	/// passes when the `testing-fault` feature is off.
 	#[cfg(not(feature = "testing-fault"))]
-	pub fn validate(&self) -> Result<(), TestingError> {
+	pub fn validate(&self) -> Result<(), FdrConfigError> {
 		Ok(())
 	}
 }
@@ -667,5 +669,14 @@ mod tests {
 
 		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
 		assert!(!config_refinement.specs.is_empty());
+	}
+
+	#[cfg(feature = "testing-fault")]
+	#[test]
+	fn validate_refuses_a_scheduler_model_with_no_schedulers() -> Result<(), Box<dyn core::error::Error>> {
+		let config = FdrConfig { scheduler_model: Some(SchedulerModel::Cooperative), ..FdrConfig::default() };
+		let refused = config.validate();
+		assert!(matches!(refused, Err(FdrConfigError { field: "scheduler_model", .. })));
+		Ok(())
 	}
 }

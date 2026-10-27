@@ -1,8 +1,7 @@
 //! Each constant here names one tightbeam instrumentation event by its URN.
 //!
-//! The single system-wide inventory assigns one URN per emit site or event
-//! kind. Domain-scoped NSS segments keep identities distinct across
-//! subsystems.
+//! The single system-wide inventory holds one URN per emit site or event kind,
+//! and domain-scoped NSS segments keep identities distinct across subsystems.
 //!
 //! # Format
 //!
@@ -10,8 +9,8 @@
 //!
 //! # Fields
 //!
-//! An emit site attaches up to three fields to an event, and the doc of a
-//! constant names the fields its emit sites attach:
+//! An emit site attaches up to three fields, and the doc of each constant
+//! names the ones its emit sites attach:
 //!
 //! - The label names why the event fired, such as the name of a refusal status.
 //! - The value is what a spec asserts with `equals!`, such as a status, a count, or a code.
@@ -29,13 +28,12 @@
 //!   records its value for a spec, and an `instrument` build files the label,
 //!   the payload hash, and the trace clock stamp in the audit sink.
 //! - Under `instrument`, a transport, a pool, or a server plane files the event
-//!   in the audit sink, and a `testing` build also records its value for a
-//!   spec.
+//!   in the audit sink. A `testing` build also records its value for a spec.
 //!
 //! # Organization
 //!
-//! Short section headers group related constants by plane. Each constant
-//! name states its event, so a section header names the plane alone.
+//! Section comments group the constants by plane. Each constant name states its
+//! event, so a section comment names the plane alone.
 //!
 //! [`enable_payloads`]: super::TbInstrumentationConfig::enable_payloads
 
@@ -53,10 +51,10 @@ pub const ERROR: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:core/error");
 pub const TRACE_CLOCK_ORIGIN: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:trace/clock-origin");
 
 // Gate events
-/// Marks one inbound call that a collector gate admits, after the
-/// [`POLICY_EVAL`] of its evaluation. The mux responder and the cleartext and
-/// encrypted single-flight collectors record it on the connection's audit
-/// trail. It fires under `instrument`.
+/// Marks one inbound call that a collector gate admits, after its
+/// [`POLICY_EVAL`]. The mux responder and the cleartext and encrypted
+/// single-flight collectors record it on the connection's audit trail, under
+/// `instrument`.
 ///
 /// - The label is `Ok`, the name of the status.
 /// - The value is `Ok`, the normalized `TransitStatus` of the verdict.
@@ -68,10 +66,10 @@ pub const TRACE_CLOCK_ORIGIN: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:t
 /// assert_eq!(GATE_ACCEPT.to_string(), "urn:tightbeam:event:gate/accept");
 /// ```
 pub const GATE_ACCEPT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:gate/accept");
-/// Marks one inbound call that a collector gate refuses, after the
-/// [`POLICY_EVAL`] of its evaluation. The mux responder and the cleartext and
-/// encrypted single-flight collectors record it on the connection's audit
-/// trail. It fires under `instrument`.
+/// Marks one inbound call that a collector gate refuses, after its
+/// [`POLICY_EVAL`]. The mux responder and the cleartext and encrypted
+/// single-flight collectors record it on the connection's audit trail, under
+/// `instrument`.
 ///
 /// - The label is the name of the status in the value.
 /// - The value is the normalized `TransitStatus` of the verdict, so a gate
@@ -88,9 +86,9 @@ pub const GATE_REJECT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:gate/rej
 // Transport events
 pub const REQUEST_RECV: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:transport/request-recv");
 pub const RESPONSE_SEND: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:transport/response-send");
-/// Marks an inbound envelope that the transport refuses at its read step. A
-/// session read, the reader half of a split connection, and the read of an
-/// answer by a client each record it. It fires under `instrument`.
+/// Marks an inbound envelope that the transport refuses at its read step: a
+/// session read, the reader half of a split connection, or a client's read of
+/// an answer. It fires under `instrument`.
 ///
 /// - The label and the value name the failure:
 ///   - `SizeExceeded`: the envelope passes the size ceiling of its mode.
@@ -114,10 +112,10 @@ pub const RESPONSE_SEND: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:transp
 /// assert_eq!(TRANSPORT_ENVELOPE_REFUSED.to_string(), "urn:tightbeam:event:transport/envelope-refused");
 /// ```
 pub const TRANSPORT_ENVELOPE_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:transport/envelope-refused");
-/// Marks an outbound envelope that the send cipher refuses because its key
-/// reached its record limit, so the session needs a rekey before it sends
-/// again. The writer half of a split connection and a session that seals a
-/// message each record it. It fires under `instrument`.
+/// Marks an outbound envelope that the send cipher refuses at the record limit
+/// of its key, so the session must rekey before it sends again. The writer half
+/// of a split connection and a session that seals a message record it, under
+/// `instrument`.
 ///
 /// - The label is `send`, the direction of the cipher.
 /// - The value is the record limit of the key, as a `u64`.
@@ -130,15 +128,15 @@ pub const TRANSPORT_ENVELOPE_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, 
 pub const TRANSPORT_REKEY_REQUIRED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:transport/rekey-required");
 
 // Connection lifecycle events
-/// Marks one connection that a server accepts, at the first step of its
-/// service, ahead of the negotiation of multiplexing. A connection that an
-/// async `server!`, a servlet, a hive, or a gateway serves records it on its
-/// audit trail. It fires under `instrument`.
+/// Marks a connection that a server accepts, at the first step of its service
+/// and ahead of the mux negotiation. An async `server!`, a servlet, a hive, or
+/// a gateway records it on the connection's audit trail, under `instrument`.
 ///
 /// - The payload is the address that the listener accepted the connection from.
 /// - Each bare connect records one event before its first byte, so a flood of
 ///   them fills the bounded sink of a trace that names no sink of its own.
 ///   Give a server trace a sink that drains it.
+/// - A hive and a gateway record it on their connection traces, apart from their audit records.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CONNECTION_ACCEPTED;
@@ -146,9 +144,8 @@ pub const TRANSPORT_REKEY_REQUIRED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "e
 /// assert_eq!(CONNECTION_ACCEPTED.to_string(), "urn:tightbeam:event:connection/accepted");
 /// ```
 pub const CONNECTION_ACCEPTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:connection/accepted");
-/// Marks the end of the reader of a multiplexed connection, after it routes
-/// its last envelope and before the pending streams observe the failure. It
-/// fires under `instrument`.
+/// Marks the end of a mux connection's reader, after it routes its last
+/// envelope and before the pending streams see the failure, under `instrument`.
 ///
 /// - The label names why the reader stopped:
 ///   - `invalid-message`: the reader refused what the peer sent, such as an
@@ -170,11 +167,10 @@ pub const ASSERT_LABEL: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:assert/
 pub const ASSERT_PAYLOAD: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:assert/payload");
 
 // Handler events
-/// Marks the entry into the application handler of one call that a
-/// collector gate admitted, on a connection that an async or a blocking
-/// `server!`, a servlet, a hive, or a gateway serves. The connection's audit
-/// trail records it, with the label `handler_enter`, when its config sets
-/// [`enable_internal_detail`].
+/// Marks the entry into the application handler of a call that a collector gate
+/// admitted, under an async or a blocking `server!`, a servlet, a hive, or a
+/// gateway. The connection's audit trail records it, with the label
+/// `handler_enter`, when its config sets [`enable_internal_detail`].
 ///
 /// - A call that runs to its end closes at [`HANDLER_EXIT`].
 /// - A call that the peer cancels on a mux stream closes at [`MUX_STREAM_CANCELLED`].
@@ -188,10 +184,10 @@ pub const ASSERT_PAYLOAD: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:asser
 /// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const HANDLER_ENTER: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:handler/enter");
 /// Marks the exit from the application handler of one call that a collector
-/// gate admitted, whatever the handler returned, on a connection that an async
-/// or a blocking `server!`, a servlet, a hive, or a gateway serves. The
-/// connection's audit trail records it, with the label `handler_exit`, when
-/// its config sets [`enable_internal_detail`].
+/// gate admitted, whatever the handler returned, under an async or a blocking
+/// `server!`, a servlet, a hive, or a gateway. The connection's audit trail
+/// records it, with the label `handler_exit`, when its config sets
+/// [`enable_internal_detail`].
 ///
 /// - The exit closes each call that runs to its end.
 /// - A call that the peer cancels on a mux stream closes at [`MUX_STREAM_CANCELLED`] in place of its exit.
@@ -205,10 +201,10 @@ pub const HANDLER_ENTER: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:handle
 ///
 /// [`enable_internal_detail`]: super::TbInstrumentationConfig::enable_internal_detail
 pub const HANDLER_EXIT: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:handler/exit");
-/// Marks one call whose application handler ran and returned an error of its
-/// own, at the step where the plane maps the error to the status that the
-/// caller reads. The mux planes and the single-flight turn of a `server!`
-/// record it on the connection's audit trail.
+/// Marks one call whose application handler returned an error of its own,
+/// where the plane maps the error to the status the caller reads. The mux
+/// planes and the single-flight turn of a `server!` record it on the
+/// connection's audit trail.
 ///
 /// - The label is the name of the status in the value.
 /// - The value is the `TransitStatus` that the call answers, such as
@@ -436,8 +432,7 @@ pub const POOL_FAILOVER: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:pool/f
 /// Marks a failover of a pooled lease that another peer answered, so the
 /// failover ends before the frame leaves. A failover lands only on the
 /// certificate that the lease pinned. This event follows the [`POOL_FAILOVER`]
-/// of the attempt, ahead of the `CertificateNotPinned` error. It fires under
-/// `instrument`.
+/// of the attempt and fires under `instrument`.
 ///
 /// - The label is `certificate-not-pinned`, the name of the refusal.
 /// - The payload is the certificate that answered the failover, when it encodes.
@@ -454,10 +449,9 @@ pub const POOL_RELEASED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:pool/r
 
 // Session/handshake receipt lifecycle events
 /// Marks a handshake that establishes its session, when the endpoint reaches
-/// the encrypted phase. A server that runs more than one round records it
-/// once, at the round that completes the session. The endpoint records it on
-/// its own trace. It fires under `instrument`, in a build with `transport-cms`
-/// or `transport-hpke`.
+/// the encrypted phase, on the endpoint's own trace. A server of more than one
+/// round records it once, at the round that completes the session. It fires
+/// under `instrument`, in a build with `transport-cms` or `transport-hpke`.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::SESSION_HANDSHAKE_COMPLETE;
@@ -586,6 +580,19 @@ pub const HIVE_ESTABLISHED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hiv
 /// assert_eq!(HIVE_REREGISTERED.to_string(), "urn:tightbeam:event:hive/reregistered");
 /// ```
 pub const HIVE_REREGISTERED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hive/reregistered");
+/// Marks a spawn or a stop of a servlet that a hive carries out for a cluster
+/// command, ahead of the reply. It fires under `colony`.
+///
+/// - The label names the command and the instance it changed, as `Spawn/<instance>` or `Stop/<instance>`.
+/// - The payload is the canonical key of the verified signer of the command,
+///   which the gate binds to the peer of the session at admission.
+///
+/// ```
+/// use tightbeam::instrumentation::events::HIVE_COMMAND_ACCEPTED;
+///
+/// assert_eq!(HIVE_COMMAND_ACCEPTED.to_string(), "urn:tightbeam:event:hive/command-accepted");
+/// ```
+pub const HIVE_COMMAND_ACCEPTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hive/command-accepted");
 /// Marks a cluster command that a hive refuses, as the refusal reply leaves.
 /// It fires under `colony`.
 ///
@@ -605,9 +612,9 @@ pub const HIVE_COMMAND_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 // Cluster gateway events
 /// Marks a request or a stream open that a collector gate of the gateway
 /// refuses, before the gateway decodes the request envelope. The first policy
-/// that refuses decides, and the value is its normalized verdict, the status
-/// that the caller reads. The label is the name of the status in the value. It
-/// fires under `colony`.
+/// that refuses decides. The value is its normalized verdict, the status the
+/// caller reads, and the label is the name of that status. It fires under
+/// `colony`.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_GATE_BLOCKED;
@@ -840,9 +847,8 @@ pub const CLUSTER_EXPORT_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "eve
 pub const CLUSTER_EXPORT_GRANTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/export-granted");
 /// Marks a federated gateway with no export list, which serves and advertises
 /// each local servlet type to its external peers. A gateway federates when it
-/// holds a peer trust or a list of peers. It records the event once, when it
-/// starts, after the check of the address it advertises. It fires under
-/// `colony`.
+/// holds a peer trust or a list of peers. It records the event once at start,
+/// after the check of the address it advertises, under `colony`.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_EXPORT_UNBOUNDED;
@@ -852,10 +858,9 @@ pub const CLUSTER_EXPORT_GRANTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "eve
 pub const CLUSTER_EXPORT_UNBOUNDED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/export-unbounded");
 /// Marks a gateway with an export list whose sessions capture no client
 /// identity, because its peer authentication requires no certificate or it
-/// holds no hive trust. Each session is then anonymous, so an unexported
-/// target is unreachable from the origin plane too. It fires under `colony`.
-///
-/// - The gateway records the event once, when it starts, after the check of the address it advertises.
+/// holds no hive trust. Each session is then anonymous, so an unexported target
+/// is unreachable from the origin plane too. It fires once at start, after the
+/// check of the address it advertises, under `colony`.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_EXPORT_IDENTITY_UNAVAILABLE;
@@ -949,9 +954,15 @@ pub const CLUSTER_PEER_EVICTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 /// ```
 pub const CLUSTER_PEER_EXPELLED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-expelled");
 /// Marks a direct peer advertisement that the gateway refuses, as the refusal
-/// reply leaves. The value is the status that the advertiser reads, and the
-/// label is the name of that status. It fires under `colony`, for one of these
-/// causes:
+/// reply leaves. It fires under `colony`.
+///
+/// - The label is the name of the status in the value. A refusal that a fault
+///   of the gateway's own causes, such as a poisoned peer table or route lock,
+///   takes `Unavailable/` and the kebab-case name of the fault, such as
+///   `Unavailable/lock-poisoned`.
+/// - The value is the status that the advertiser reads.
+///
+/// The gateway refuses an advertisement for one of these causes:
 ///
 /// - The frame fails to verify on the peer trust plane, or fails its freshness check.
 /// - The advertisement fails its admission.
@@ -1074,9 +1085,9 @@ pub const CLUSTER_RELAY_TRAIL_PRUNED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, 
 
 // Cluster gossip events
 /// Marks a rumor that the gossip pipeline of the gateway admits, ahead of its
-/// reflood and its `Ok` reply. It fires once the journal admits the rumor as
-/// new, the kind of the rumor consumes it, and the gateway reads its flood
-/// targets. It fires under `colony`.
+/// reflood and its `Ok` reply. It fires under `colony`, once the journal
+/// admits the rumor as new, the kind of the rumor consumes it, and the
+/// gateway reads its flood targets.
 ///
 /// - The label is the kind of the rumor: `application` or `peer-advertisement`.
 /// - The value is the hop TTL that the rumor arrived with, as a `u64`.
@@ -1091,14 +1102,12 @@ pub const CLUSTER_RELAY_TRAIL_PRUNED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, 
 /// ```
 pub const CLUSTER_GOSSIP_ADMITTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-admitted");
 /// Marks a rumor of the application kind that the gateway delivers to its
-/// local ingress servlet. It fires once the servlet answered the delivery and
-/// the journal acknowledged the local delivery. It fires under `colony`.
+/// local ingress servlet. It fires under `colony`, once the servlet answered
+/// the delivery and the journal acknowledged it.
 ///
 /// - A delivery on the admission path fires ahead of the [`CLUSTER_GOSSIP_ADMITTED`] of the rumor.
 /// - The beat retries the delivery of a rumor whose ingress registered after
 ///   its admission, or whose delivery hit a transient fault.
-/// - [`CLUSTER_GOSSIP_ADMITTED`] marks the admission of a rumor of each kind,
-///   and this event marks the local delivery of an application rumor alone.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_GOSSIP_DELIVERED;
@@ -1119,7 +1128,10 @@ pub const CLUSTER_GOSSIP_DUPLICATE: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "e
 /// Marks a gossip rumor, a published rumor, or a reconcile request that the
 /// gateway refuses, as the refusal reply leaves. It fires under `colony`.
 ///
-/// - The label is the name of the status in the value.
+/// - The label is the name of the status in the value. A refusal that a fault
+///   of the gateway's own causes, such as a failed journal or rate admission,
+///   takes `Unavailable/` and the kebab-case name of the fault, such as
+///   `Unavailable/lock-poisoned`.
 /// - The value is the `TransitStatus` of the refusal, such as
 ///   `ResourceExhausted` for a sender past its rate limit.
 /// - The payload is the fingerprint of the frame's signer, for a refusal
@@ -1228,9 +1240,9 @@ pub const CLUSTER_GOSSIP_WITNESS_REFUSED: Urn<'static> =
 /// ```
 pub const CLUSTER_GOSSIP_REPAIR_PUSHED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-repair-pushed");
 /// Marks a reconcile request from a flood member that the gateway answers,
-/// ahead of the reply. It fires once the request passes the membership check,
-/// the freshness check, and the bound on its held digests, and the gateway
-/// draws its peer-exchange sample. It fires under `colony`.
+/// ahead of the reply. It fires under `colony`, once the request passes the
+/// membership check, the freshness check, and the bound on its held digests,
+/// and the gateway draws its peer-exchange sample.
 ///
 /// - The value is the count of digests that the reply wants, as a `u64`.
 /// - The payload is the requester's fingerprint.

@@ -104,8 +104,7 @@ impl<D: OutputSizeUser> Fingerprint<D> {
 impl<D: Digest> Fingerprint<D> {
 	/// Digest the certificate DER and bind the result to `D`.
 	///
-	/// The encoder writes the DER into the digest as it goes, so the encoding
-	/// of the certificate streams through the digest.
+	/// The encoder streams the certificate DER into the digest as it writes.
 	///
 	/// # Errors
 	///
@@ -230,12 +229,12 @@ macro_rules! pem {
 /// The certificate checks this crate runs before it trusts a peer.
 ///
 /// The `x509-cert` crate defines `Certificate`, so the checks are trait
-/// methods, and a caller still calls each check on the certificate itself.
+/// methods that a caller calls on the certificate itself.
 pub trait CertificateExt {
 	/// Validate certificate expiry (`not_before <= now <= not_after`).
 	///
-	/// The method implements the validity-period check of RFC 5280 §6.1.3(a)(2)
-	/// over the `Validity` field (§4.1.2.5). It covers temporal validity only.
+	/// It runs the validity-period check of RFC 5280 §6.1.3(a)(2) over the
+	/// `Validity` field (§4.1.2.5) and covers temporal validity alone.
 	/// Signature and trust chains belong to the
 	/// [`CertificateValidation`](super::policy::CertificateValidation) trait.
 	///
@@ -255,10 +254,9 @@ pub trait CertificateExt {
 
 	/// Validate expiry against a caller-supplied Unix timestamp.
 	///
-	/// This method runs the same comparison as
-	/// [`CertificateExt::validate_expiry`], with `now_unix` in place of the
-	/// local clock. A path that already knows the time, such as receipt
-	/// verification, uses this so the two cannot diverge.
+	/// It runs the comparison of [`CertificateExt::validate_expiry`] with
+	/// `now_unix` in place of the local clock. A path that already knows the
+	/// time, such as receipt verification, uses it so the two cannot diverge.
 	///
 	/// # Errors
 	///
@@ -286,11 +284,10 @@ pub trait CertificateExt {
 
 	/// Decode a typed X.509 extension by its associated OID, if present.
 	///
-	/// The method locates the extension (RFC 5280 §4.2) whose `extnID` matches
-	/// the requested type's [`AssociatedOid`] and decodes its `extnValue`. It
-	/// returns `Ok(None)` when the certificate carries no such extension. A
-	/// type that borrows, such as one over `OctetStringRef`, reads the value
-	/// in place.
+	/// It decodes the `extnValue` of the extension (RFC 5280 §4.2) whose
+	/// `extnID` is the [`AssociatedOid`] of `T`, or returns `Ok(None)` when the
+	/// certificate carries none. A type that borrows, such as one over
+	/// `OctetStringRef`, reads the value in place.
 	///
 	/// # Errors
 	///
@@ -329,8 +326,8 @@ pub trait CertificateExt {
 
 	/// Whether `sid` names this certificate: a `subjectKeyIdentifier` form by
 	/// the value of this certificate's extension, an issuer-and-serial form
-	/// by its issuer and serial number (RFC 5652 §5.3). The method compares
-	/// the extension value in place.
+	/// by its issuer and serial number (RFC 5652 §5.3). It compares the
+	/// extension value in place.
 	///
 	/// # Errors
 	///
@@ -791,8 +788,8 @@ mod tests {
 		use crate::testing::TestKey;
 		use crate::x509::Certificate;
 
-		/// A placeholder-signed certificate of the fixed test key, whose
-		/// `keyUsage` carries `digitalSignature` and `keyAgreement`.
+		/// A self-signed certificate of the fixed test key, whose `keyUsage`
+		/// carries `digitalSignature` and `keyAgreement`.
 		fn both_uses() -> Certificate {
 			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
@@ -901,7 +898,7 @@ mod tests {
 			));
 		}
 
-		/// The key agreement use refuses a certificate whose `keyUsage`
+		/// The key-agreement use refuses a certificate whose `keyUsage`
 		/// carries `digitalSignature` alone.
 		#[test]
 		fn a_signing_certificate_is_refused_for_key_agreement() {

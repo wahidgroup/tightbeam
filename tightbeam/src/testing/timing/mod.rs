@@ -1,8 +1,10 @@
-//! Timing and real-time verification module
+//! The timing verification of real-time systems.
 //!
-//! Provides WCET (Worst-Case Execution Time) verification and deadline checking
-//! for real-time systems. Integrates with CSP process specifications and
-//! instrumentation events.
+//! It verifies the WCET (worst-case execution time) bounds and deadlines of
+//! real-time systems, with CSP process specifications and instrumentation
+//! events.
+
+use std::time::Duration;
 
 mod constraints;
 #[cfg(feature = "testing-timing")]
@@ -29,4 +31,10 @@ pub use statistics::{
 };
 pub use verification::TimingVerificationResult;
 pub use violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
-pub use wcet::{WcetConfig, WcetConfigBuilder};
+pub use wcet::{WcetConfig, WcetConfigBuilder, WcetPercentile};
+
+/// The nanoseconds of `duration`, saturated at `u64::MAX`, the one form in
+/// which every timing bound compares with a measure.
+pub(crate) fn saturating_nanos(duration: Duration) -> u64 {
+	u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}

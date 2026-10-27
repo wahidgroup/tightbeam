@@ -1,14 +1,14 @@
 //! Layer 2: CSP (Communicating Sequential Processes).
 //!
-//! This module implements CSP-style process algebra for tightbeam testing. It
-//! follows Hoare's theory:
+//! It implements CSP process algebra for tightbeam testing, after Hoare's
+//! theory:
 //!
 //! - Processes communicate through events (message passing).
 //! - Observable events are visible, and hidden events (τ) are internal.
 //! - A nondeterministic choice lets one event lead to more than one state.
 //! - A labeled transition system (LTS) represents the behavior of a process.
 //!
-//! The module requires the `testing-csp` feature.
+//! It requires the `testing-csp` feature.
 //!
 //! # Sources
 //!
@@ -25,6 +25,7 @@ use core::time::Duration;
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
 use crate::testing::assertions::AssertionLabel;
+use crate::testing::specs::composition::CompositionError;
 use crate::trace::ConsumedTrace;
 use crate::urn::Urn;
 
@@ -40,8 +41,8 @@ pub use super::lts::{Action, Alphabet, CspValidationResult, CspViolation, Event,
 ///
 /// The engine keys [`State`] and [`Event`] on `&'static str` so both stay
 /// `Copy`. A name built at runtime (a product state, a decoded event, or an
-/// owned assertion label) must therefore become `'static`. The pool
-/// deduplicates the names, so each distinct name leaks once (CWE-401).
+/// owned assertion label) must become `'static`. The pool deduplicates the
+/// names, so each distinct name leaks once (CWE-401).
 static INTERN_POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 /// Promotes a runtime string to `&'static str` through [`INTERN_POOL`].
@@ -205,15 +206,14 @@ pub struct Process {
 	/// The human-readable name of the process.
 	pub name: &'static str,
 
-	/// What this process is evidence of. The code that builds the process sets
-	/// this field.
+	/// What this process is evidence of, which the code that builds it sets.
 	pub observation: Observation,
 
 	/// Whether a run that records no event in this alphabet is a violation.
 	///
 	/// A trace that takes no transition satisfies every process, so the
 	/// check would hold whatever the run did. A process requires progress,
-	/// and [`ProcessBuilder::permits_no_progress`] lifts that rule for a
+	/// unless [`ProcessBuilder::permits_no_progress`] lifts the rule for a
 	/// process that models a run with no event.
 	pub requires_progress: bool,
 
@@ -261,7 +261,7 @@ pub struct Process {
 }
 
 /// The parts of a process that a search of its traces, failures, and
-/// divergences reads, as [`Process::search_structure`] states them.
+/// divergences reads ([`Process::search_structure`]).
 ///
 /// - Each part is in sorted order, so two processes with equal parts have equal structures.
 /// - The name stays out, because the algebra operators (`hide`, `rename`) give
@@ -345,8 +345,7 @@ impl Process {
 
 	/// The states that `event` takes `state` to.
 	///
-	/// A timed transition takes `state` to its target whatever the clocks
-	/// read.
+	/// A timed transition takes `state` to its target whatever the clocks read.
 	pub fn step(&self, state: State, event: &Event) -> Vec<State> {
 		let untimed = self.transitions.targets(state, event).unwrap_or_default();
 
@@ -488,12 +487,10 @@ impl Process {
 		self.choice.contains(&state)
 	}
 
-	/// Whether `state` is stable, which means that it enables no hidden
-	/// action.
+	/// Whether `state` is stable: it enables no hidden action.
 	///
-	/// The hidden actions of [`Self::enabled`] are the events of the hidden
-	/// alphabet that have an edge from `state`, so the answer reads that
-	/// alphabet in place, with no allocation.
+	/// It checks each event of the hidden alphabet for an edge from `state`,
+	/// as the hidden actions of [`Self::enabled`] do, with no allocation.
 	///
 	/// # Examples
 	///
@@ -518,8 +515,8 @@ impl Process {
 		!self.hidden.iter().any(has_step)
 	}
 
-	/// The observable events that `state` offers, which are the events of the
-	/// observable actions of [`Self::enabled`].
+	/// The observable events that `state` offers: the events of the observable
+	/// actions of [`Self::enabled`].
 	///
 	/// # Examples
 	///
@@ -644,10 +641,7 @@ impl Process {
 	}
 
 	/// Builds the [`TaskSet`] of the timing constraints and the schedulability
-	/// periods.
-	///
-	/// A process that declares no schedulability block has no task set, so
-	/// the call returns `Ok(None)`.
+	/// periods, or `Ok(None)` for a process with no schedulability block.
 	///
 	/// # Errors
 	///
@@ -708,13 +702,12 @@ impl Process {
 	}
 }
 
-/// The states of a process that can diverge, as [`Process::divergent_states`]
-/// computes them.
+/// The states of a process that can diverge ([`Process::divergent_states`]).
 ///
-/// Each divergent state holds one hidden step to a divergent state, toward a
-/// cycle of hidden events or along one. A run that takes these steps
-/// from a divergent state stays among the divergent states, so it reaches a
-/// state it passed, and that run is the witness of the divergence.
+/// Each divergent state holds one hidden step to a divergent state, toward or
+/// along a cycle of hidden events. A run of these steps stays among the
+/// divergent states, so it reaches a state it passed. That run is the witness
+/// of the divergence.
 ///
 /// # Examples
 ///
@@ -864,8 +857,7 @@ impl HiddenGraph {
 		graph
 	}
 
-	/// The index of `state` in `states`, which `state` joins on its first
-	/// visit.
+	/// The index of `state` in `states`, which `state` joins at first visit.
 	fn index_of(&mut self, index: &mut HashMap<State, usize>, state: State) -> usize {
 		let next = self.states.len();
 		let at = *index.entry(state).or_insert(next);
@@ -952,11 +944,10 @@ impl HiddenGraph {
 	}
 }
 
-/// Tarjan's search for the strongly connected components of a
-/// [`HiddenGraph`].
+/// Tarjan's search for the strongly connected components of a [`HiddenGraph`].
 ///
-/// The depth-first search holds each state it descends into, with the next of
-/// its steps to try, on a stack of its own, so the call stack keeps one depth
+/// The depth-first search keeps each state it descends into, with its next
+/// step to try, on a stack of its own, so the call stack keeps one depth
 /// however long a run of hidden steps grows.
 struct Tarjan {
 	/// The order in which the search reached each state, once it has.
@@ -1086,17 +1077,67 @@ impl Tarjan {
 }
 
 /// A CSP process specification that checks a recorded trace.
+///
+/// When a scenario builds its configuration, it builds the process of its spec
+/// once ([`Self::to_process_cow`]) and checks the claims of the spec once
+/// ([`Self::verify_claims`]). Each grade then checks the trace of the run
+/// against that one process.
 pub trait ProcessSpec {
-	/// Checks `trace` against this process specification, and returns each
+	/// Checks `trace` against `process`, the process that
+	/// [`Self::to_process_cow`] built for this spec, and returns each
 	/// violation.
-	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult;
+	///
+	/// The default checks `trace` against `process` alone. A spec that checks
+	/// a trace by rules of its own overrides it.
+	fn validate_trace(&self, process: &Process, trace: &ConsumedTrace) -> CspValidationResult {
+		process.validate_trace(trace)
+	}
 
-	/// Returns the [`Process`] that FDR exploration walks.
+	/// Returns the [`Process`] of this spec, which the trace check and FDR
+	/// exploration walk.
 	///
 	/// The result is a `Cow` because a process comes from one of two sources:
 	/// - A [`Process`] lends itself as a borrowed process.
-	/// - A [`CompositionSpec`](super::composition::CompositionSpec) ZST builds an owned process.
-	fn to_process_cow(&self) -> Cow<'_, Process>;
+	/// - A spec type, such as a [`CompositionSpec`] ZST, builds an owned process.
+	///
+	/// # Errors
+	///
+	/// - The [`CompositionError`] of a process that does not build, such as an alphabet outside its operands.
+	///
+	/// [`CompositionSpec`]: super::composition::CompositionSpec
+	fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError>;
+
+	/// Checks the properties that this spec claims of its process.
+	///
+	/// The default holds, as for a spec with no claim. A [`CompositionSpec`]
+	/// checks the claims of its `properties:` block and of each operand
+	/// ([`CompositionSpec::verify_properties`]).
+	///
+	/// # Errors
+	///
+	/// - The [`CompositionError`] of a claim that the process breaks.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, ProcessSpec, State};
+	///
+	/// let ping = Process::builder("Ping")
+	///     .initial_state(State("idle"))
+	///     .add_observable(Event("ping"))
+	///     .add_transition(State("idle"), Event("ping"), State("done"))
+	///     .add_terminal(State("done"))
+	///     .build()?;
+	///
+	/// assert!(ping.verify_claims().is_ok());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`CompositionSpec`]: super::composition::CompositionSpec
+	/// [`CompositionSpec::verify_properties`]: super::composition::CompositionSpec::verify_properties
+	fn verify_claims(&self) -> Result<(), CompositionError> {
+		Ok(())
+	}
 }
 
 impl Process {
@@ -1233,16 +1274,17 @@ impl Process {
 }
 
 impl ProcessSpec for Process {
-	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
-		self.validate_trace(trace)
-	}
-
-	fn to_process_cow(&self) -> Cow<'_, Process> {
-		Cow::Borrowed(self)
+	fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
+		Ok(Cow::Borrowed(self))
 	}
 }
 
-/// An error that [`ProcessBuilder::build`] returns for a [`Process`].
+/// An error that a [`Process`] does not build with.
+///
+/// [`ProcessBuilder::build`] returns the structural ones. The process of a
+/// [`tb_process_spec!`](crate::tb_process_spec!) also returns the timing
+/// ones, for a `timing` block whose bounds disagree or whose deadline does
+/// not build.
 #[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum ProcessBuildError {
 	/// No call to [`ProcessBuilder::initial_state`] set the initial state.
@@ -1255,6 +1297,68 @@ pub enum ProcessBuildError {
 	UndeclaredClock {
 		/// The name of the undeclared clock.
 		clock: String,
+	},
+
+	/// A process spec states two timing bounds for `event` that do not agree.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::testing::specs::csp::{Event, ProcessBuildError};
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::{tb_process_spec, wcet};
+	///
+	/// const STEP: Urn<'static> = tightbeam::urn!("doc", "event:bound/step");
+	///
+	/// tb_process_spec! {
+	///     pub BoundTwice,
+	///     events {
+	///         observable { STEP }
+	///         hidden { }
+	///     }
+	///     states {
+	///         S0 => { STEP => S1 }
+	///     }
+	///     terminal { S1 }
+	///     timing {
+	///         wcet: {
+	///             STEP => wcet!(Duration::from_millis(5)),
+	///             STEP => wcet!(Duration::from_millis(9))
+	///         }
+	///     }
+	/// }
+	///
+	/// let refused = BoundTwice::process();
+	/// assert_eq!(refused.err(), Some(ProcessBuildError::ConflictingTiming { event: Event::from(STEP) }));
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	#[error("the spec states two timing bounds for the event {event} that do not agree")]
+	ConflictingTiming {
+		/// The event of the two bounds.
+		event: Event,
+	},
+
+	/// A process spec states a deadline from `start` to `end` that does not
+	/// build, because its minimum slack exceeds its duration.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, ProcessBuildError};
+	///
+	/// let refused = ProcessBuildError::InvalidDeadline { start: Event("open"), end: Event("close") };
+	/// let message = "the deadline from open to close does not build, as its slack exceeds its duration";
+	/// assert_eq!(refused.to_string(), message);
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	#[error("the deadline from {start} to {end} does not build, as its slack exceeds its duration")]
+	InvalidDeadline {
+		/// The event that starts the deadline.
+		start: Event,
+		/// The event that ends the deadline.
+		end: Event,
 	},
 }
 
@@ -1370,7 +1474,7 @@ impl ProcessBuilder {
 	///
 	/// [`Self::build`] refuses a guard or a reset that names a clock with no
 	/// declaration, so a misspelt clock name fails the build. A run starts
-	/// each clock at zero, as [`Process::initial_clocks`] states.
+	/// each clock at zero ([`Process::initial_clocks`]).
 	///
 	/// # Examples
 	///
@@ -1405,7 +1509,7 @@ impl ProcessBuilder {
 	/// - [`Process::enabled`] and [`Process::step`] offer `event` at `from` whatever the clocks read.
 	/// - The CSP trace check and the refinement checks ignore the clocks and accept the event at any time.
 	/// - FDR exploration takes the transition only when the clocks satisfy the guard.
-	/// - Exploration starts each clock at zero, as [`Process::initial_clocks`] states.
+	/// - Exploration starts each clock at zero ([`Process::initial_clocks`]).
 	///
 	/// Each clock that `guard` or `reset_clocks` names needs a [`Self::clock`]
 	/// declaration, or [`Self::build`] refuses the process.
@@ -1519,22 +1623,29 @@ impl ProcessBuilder {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use core::sync::atomic::{AtomicBool, Ordering};
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use std::sync::Arc;
 
 	use super::*;
 	use crate::testing::assertions::Assertion;
-	use crate::testing::TestMessage;
-	use crate::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestHooks};
-	use crate::transport::tcp::r#async::TokioListener;
-	use crate::transport::tcp::TightBeamSocketAddr;
-	use crate::transport::EndpointConfig;
-	use crate::transport::MessageEmitter;
-	use crate::transport::Protocol;
+	use crate::testing::{ScenarioConfig, SetupEnv};
 	use crate::urn::Urn;
+	use crate::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
+	use crate::servlet;
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::testing::TestMessage;
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::testing::{ClientEnv, TestHooks};
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::transport::tcp::r#async::TokioListener;
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::transport::tcp::TightBeamSocketAddr;
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::transport::{EndpointConfig, MessageEmitter, Protocol};
 
 	#[cfg(feature = "testing-timing")]
 	const ARM: Urn<'static> = crate::urn!("test", "event:csp/arm");
@@ -1924,7 +2035,7 @@ mod tests {
 	// `tb_process_spec!` builds the handshake process, and each numbered step
 	// checks one part of the LTS it yields.
 	#[test]
-	fn test_csp_process_spec_structure() {
+	fn test_csp_process_spec_structure() -> Result<(), ProcessBuildError> {
 		// The process is a model of the handshake state machine.
 		tb_process_spec! {
 			pub ComprehensiveHandshake,
@@ -1948,7 +2059,7 @@ mod tests {
 			annotations { description: "Comprehensive handshake with queued or direct send" }
 		}
 
-		let proc = ComprehensiveHandshake::process();
+		let proc = ComprehensiveHandshake::process()?;
 
 		// 1. The name, the description, and the initial state.
 		assert_eq!(proc.name, "ComprehensiveHandshake");
@@ -1988,7 +2099,7 @@ mod tests {
 
 		// 6. The nondeterministic choice points (⊓).
 		assert_eq!(proc.choice.len(), 1);
-		assert!(proc.is_choice(State("S1"))); // S1 chooses serialize or queue
+		assert!(proc.is_choice(State("S1"))); // S1 chooses serialize or queue.
 
 		// 7. The observable transitions of the transition relation.
 		let s0_start = proc.step(State("S0"), &Event("start"));
@@ -2124,6 +2235,8 @@ mod tests {
 				assert_eq!(action.alphabet, Alphabet::Hidden);
 			}
 		}
+
+		Ok(())
 	}
 
 	const STEP1: Urn<'static> = crate::urn!("test", "event:csp/step1");
@@ -2287,9 +2400,7 @@ mod tests {
 			server: |SetupEnv { trace, .. }| async move {
 				let servlet = TestServletForScenario::start(Arc::new(trace), crate::colony::servlet::ServletConfig::cleartext()).await?;
 				let addr = servlet.addr().to_owned();
-				let server_handle = tokio::spawn(async move {
-					let _ = servlet.join().await;
-				});
+				let server_handle = tokio::spawn(servlet.join());
 
 				Ok((server_handle, addr))
 			},
