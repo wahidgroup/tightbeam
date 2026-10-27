@@ -3,7 +3,7 @@
 //! Each check walks the process and returns an error of its own:
 //! - [`DeadlockChecker`] finds a reachable state that enables no action and is not terminal.
 //! - [`LivelockChecker`] finds a reachable state that can diverge.
-//! - [`DeterminismChecker`] finds a state where one event leads to more than one state.
+//! - [`DeterminismChecker`] finds a hidden action, or a state where one event leads to more than one state.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -127,36 +127,23 @@ impl std::error::Error for LivelockError {}
 pub struct DeterminismChecker;
 
 impl DeterminismChecker {
-	/// Checks that each event of each state leads to one state at most.
-	///
-	/// A process is nondeterministic when one of its states has an event that
-	/// leads to more than one state.
-	///
-	/// - The check reads every state of the process, reachable or not.
-	/// - It reads the states in name order and the events of each state in
-	///   the order of [`Process::enabled`], so each run names the same witness.
+	/// Checks that the process is structurally deterministic, by the rule of
+	/// [`Process::determinism_witness`]: no state enables a hidden action, and
+	/// each event of each state leads to one state at most.
 	///
 	/// # Errors
 	///
-	/// - [`NonDeterminismError`] -- a state has an event that leads to more
-	///   than one state, and the error names the first such pair.
+	/// - [`NonDeterminismError`] -- the process has a witness, which the error names with its targets.
 	pub fn check(process: &Process) -> Result<(), NonDeterminismError> {
-		let mut states: Vec<State> = process.states.iter().copied().collect();
-		states.sort_unstable();
+		let Some((state, event)) = process.determinism_witness() else {
+			return Ok(());
+		};
 
-		for state in states {
-			for action in process.enabled(state) {
-				let mut targets = process.step(state, &action.event);
-				targets.sort_unstable();
-				targets.dedup();
+		let mut targets = process.step(state, &event);
+		targets.sort_unstable();
+		targets.dedup();
 
-				if targets.len() > 1 {
-					return Err(NonDeterminismError { state, event: action.event, targets });
-				}
-			}
-		}
-
-		Ok(())
+		Err(NonDeterminismError { state, event, targets })
 	}
 }
 
@@ -164,9 +151,9 @@ impl DeterminismChecker {
 /// and the states the event leads to.
 #[derive(Debug, Clone)]
 pub struct NonDeterminismError {
-	/// The state where the event leads to more than one state.
+	/// The state of the witness.
 	pub state: State,
-	/// The event that leads to more than one state.
+	/// The hidden event, or the event that leads to more than one state.
 	pub event: Event,
 	/// Every state that the event leads to from `state`, sorted by name.
 	pub targets: Vec<State>,
@@ -176,11 +163,8 @@ impl std::fmt::Display for NonDeterminismError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(
 			f,
-			"Non-determinism at state {}: event {} leads to {} states: {:?}",
-			self.state,
-			self.event,
-			self.targets.len(),
-			self.targets
+			"Non-determinism at state {}: event {} is hidden or branches, and leads to {:?}",
+			self.state, self.event, self.targets
 		)
 	}
 }

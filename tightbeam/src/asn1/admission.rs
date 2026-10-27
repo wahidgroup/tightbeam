@@ -1,34 +1,30 @@
-//! The admission walk, which checks the DER a peer sent before a typed decode
+//! The admission walk: it checks the DER a peer sent before a typed decode
 //! reads it.
 //!
-//! The pinned `der` 0.7 decoder sorts each `SET OF` it decodes with an
-//! insertion sort, so a set that arrives in descending order costs compares
-//! quadratic in its length, before any cap, signature, or tag runs (CWE-407).
+//! `der` 0.7 insertion-sorts each `SET OF` it decodes, so a set that arrives
+//! in descending order costs quadratic compares before any cap, signature, or
+//! tag runs (CWE-407).
 //!
 //! # Owners
 //!
-//! Each owner below runs [`DerAdmission::admit`] on the DER it decodes, and
-//! each decoder of peer DER reads every SET it holds through one of them:
+//! Each decoder of peer DER reads every SET it holds through one owner, which
+//! runs [`DerAdmission::admit`] on the DER it decodes:
 //!
-//! - [`WireDer`](crate::asn1::WireDer), under the CMS rules: each handshake
-//!   container, the frame envelope, and the sealed acknowledgement of a
-//!   receipt.
-//! - [`Signed`](crate::frame::Signed), under the CMS rules: each signer
-//!   structure, the client Finished among them.
-//! - `AuthEnvelopedData::decode_detached`, under the CMS rules: each session record.
-//! - The opened closing of an anonymous client, under the CMS rules: its attribute set.
-//! - [`decode`](crate::decode), under rule A: each message body.
-//! - [`CleartextFrame::decode`](crate::router::CleartextFrame::decode) walks
-//!   the body of a routed frame under [`DerAdmission::SetOrder`] before its
-//!   typed decode.
-//! - `CertificateExt::extension`, under rule A: each extension value.
+//! | Owner | Rules | What it reads |
+//! | --- | --- | --- |
+//! | [`WireDer`] | CMS | Each handshake container, the frame envelope, and a receipt's sealed acknowledgement |
+//! | [`Signed`](crate::frame::Signed) | CMS | Each signer structure, the client Finished among them |
+//! | `AuthEnvelopedData::decode_detached` | CMS | Each session record |
+//! | The opened closing of an anonymous client | CMS | Its attribute set |
+//! | [`decode`](crate::decode) | A | Each message body |
+//! | [`CleartextFrame::decode`] | A ([`DerAdmission::SetOrder`]) | The body of a routed frame |
+//! | `CertificateExt::extension` | A | Each extension value |
 //!
-//! A decoder of a schema that holds no SET of its own runs no walk:
-//!
-//! - `Frame`, `Metadata`, and `TransportEnvelope` hold each of their SETs
-//!   inside a [`Signed`](crate::frame::Signed) or a
-//!   [`WireDer`](crate::asn1::WireDer).
-//! - `ClientHello`, `ServerHandshake`, `OpeningContent`, and `SessionReceipt` hold none.
+//! A schema with no SET of its own runs no walk. `Frame`, `Metadata`, and
+//! `TransportEnvelope` hold their SETs inside a
+//! [`Signed`](crate::frame::Signed) or a [`WireDer`](crate::asn1::WireDer).
+//! `ClientHello`, `ServerHandshake`, `OpeningContent`, and `SessionReceipt`
+//! hold none.
 //!
 //! # Arrangement
 //!
@@ -36,22 +32,30 @@
 //! order with [`DerAdmission::arrange`], and the IMPLICIT SET OF fields that
 //! only its schema names with [`DerAdmission::arrange_fields`].
 //!
+//! # Arrival
+//!
+//! Each reader of peer CMS below holds its decoded value to the octets it
+//! arrived as with [`DerAdmission::arrived_as`]:
+//!
+//! - [`WireDer`](crate::asn1::WireDer): each handshake container and the frame envelope.
+//! - [`Signed`](crate::frame::Signed): each signer structure.
+//! - `AuthEnvelopedData::decode_detached`: each session record.
+//! - The view of an envelope that an open reads its attributes through.
+//!
 //! # Rules
 //!
-//! - Rule A refuses a universal SET whose elements are not in ascending DER
-//!   order, or that holds one encoding twice.
+//! - Rule A refuses a universal SET whose elements are out of ascending DER order, or repeat.
 //! - Rule B, at the CMS owners, refuses a universal SET or a constructed
 //!   context-specific element of more than [`MAX_CMS_SET_LEN`] elements.
 //!
-//! X.690 § 11.6 orders the elements of a SET OF by their encodings, and
-//! `der`'s own decode of a `SET OF` refuses two equal ones. Where `der`
-//! orders a type as DER does, the sort swaps no element of an admitted set,
-//! so it reads the set in linear time.
+//! X.690 § 11.6 orders a SET OF by its encodings, and `der` refuses two equal
+//! ones. Where `der` orders a type as DER does, its sort moves no element of
+//! an admitted set, so it runs in linear time.
 //!
 //! `der` orders a CHOICE of CMS, such as a `SignerInfo` or a `RecipientInfo`,
-//! in another order, and only the schema tells an IMPLICIT SET, such as
+//! another way, and only the schema tells an IMPLICIT SET, such as
 //! `certificates`, from an IMPLICIT SEQUENCE. Rule B bounds the sort of either
-//! set by its length instead.
+//! by its length instead.
 //!
 //! # Scope
 //!
@@ -62,28 +66,65 @@
 //!
 //! # Cost
 //!
-//! The walk is one loop, and it holds a fixed amount of state at any depth. It
-//! reads each header once in document order, and once more when it checks the
-//! elements of the constructed element that holds it.
+//! The walk is one loop with fixed state at any depth. It reads each header
+//! once in document order, and once more when it checks its parent's elements.
 //!
-//! A comparison of rule A stops at the first octet that differs, so it reads
-//! at most the octets of the shorter element. The comparisons of a value of
-//! `n` octets therefore read `O(n log n)` octets in the worst case, against
-//! the `O(n²)` compares of the sort they guard.
+//! A rule A comparison stops at the first octet that differs, so the
+//! comparisons of a value of `n` octets read `O(n log n)` octets at worst,
+//! against the `O(n²)` compares of the sort they guard.
 //!
 //! # Sources
 //!
-//! - ITU-T X.690 (02/2021) § 10.3, set components, and § 11.6, set-of components:
+//! - ITU-T X.690 (02/2021) § 8.9.2, sequence components, § 10.3, set
+//!   components, § 11.5, components of a default value, and § 11.6, set-of
+//!   components:
 //!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
+//! - CWE-20, improper input validation: <https://cwe.mitre.org/data/definitions/20.html>
 //! - CWE-407, inefficient algorithmic complexity: <https://cwe.mitre.org/data/definitions/407.html>
+//!
+//! [`WireDer`]: crate::asn1::WireDer
+//! [`CleartextFrame::decode`]: crate::router::CleartextFrame::decode
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use core::cmp::Ordering;
 
 use crate::constants::MAX_CMS_SET_LEN;
-use crate::der::{Decode, ErrorKind, Header, Reader, Result as DerResult, SliceReader, Tag};
+use crate::der::{
+	Decode, EncodeValue, ErrorKind, Header, Reader, Result as DerResult, SliceReader, SliceWriter, Tag, Tagged, Writer,
+};
+
+/// A wire value of the crate, the encoding that its house sender writes, and
+/// the hold of an arrival to that encoding.
+///
+/// The provided encoder writes the `der` encoding, which is DER for a type
+/// whose every SET `der` orders as DER does. A type whose SET `der` orders
+/// otherwise, such as a `SignedData`, writes its own.
+pub(crate) trait Canonical: EncodeValue + Tagged {
+	/// Write the contents octets of this value, after its tag and length, as
+	/// its house sender writes them.
+	///
+	/// # Errors
+	///
+	/// - The encode error of the value.
+	fn encode_canonical(&self, writer: &mut impl Writer) -> DerResult<()> {
+		self.encode_value(writer)
+	}
+
+	/// Whether `arrived`, the contents octets that this value decoded from,
+	/// are the encoding that [`Self::encode_canonical`] writes. Rule A
+	/// admitted `arrived` before the decode.
+	///
+	/// The provided hold streams that encoding against `arrived`.
+	///
+	/// # Errors
+	///
+	/// - The encode error of the value.
+	fn is_encoded_as(&self, arrived: &[u8]) -> DerResult<bool> {
+		Comparing::is_written_by(arrived, |writer| self.encode_canonical(writer))
+	}
+}
 
 /// The rules an owner of peer DER applies before its typed decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +204,26 @@ impl DerAdmission {
 		Ok(())
 	}
 
+	/// Hold `value` to `arrived`, the contents octets it decoded from, so a
+	/// value decodes only from its DER (X.690 § 8.9.2, § 11.5).
+	///
+	/// - `der` 0.7 skips a context-specific element whose number is below the
+	///   one a field looks for, so a decoded value can name less than it
+	///   arrived as.
+	/// - The compare is the [`Canonical::is_encoded_as`] of the type of `value`.
+	///
+	/// # Errors
+	///
+	/// - [`ErrorKind::Noncanonical`] -- `arrived` is another encoding than the canonical one of `value`.
+	/// - The encode error of `value`.
+	pub(crate) fn arrived_as(value: &impl Canonical, arrived: &[u8]) -> DerResult<()> {
+		if !value.is_encoded_as(arrived)? {
+			return Err(value.tag().non_canonical_error());
+		}
+
+		Ok(())
+	}
+
 	/// Put the elements of every universal SET of `der` in the DER order that
 	/// rule A admits, in place.
 	///
@@ -208,6 +269,31 @@ impl DerAdmission {
 		Ok(())
 	}
 
+	/// Write the contents octets of `value` to `writer` in DER order: every
+	/// universal SET, as [`Self::arrange`] puts it, and the elements of each
+	/// field whose tag is one of `sets`, as [`Self::arrange_fields`] puts them.
+	///
+	/// The contents pass through one buffer of their length.
+	///
+	/// # Errors
+	///
+	/// - The encode error of `value`.
+	/// - The errors of [`Self::arrange`].
+	pub(crate) fn write_arranged(value: &impl EncodeValue, sets: &[Tag], writer: &mut impl Writer) -> DerResult<()> {
+		let contents_len = usize::try_from(value.value_len()?)?;
+		let mut contents = vec![0u8; contents_len];
+
+		let mut contents_writer = SliceWriter::new(&mut contents);
+		value.encode_value(&mut contents_writer)?;
+
+		let written = contents_writer.finish()?.len();
+		contents.truncate(written);
+
+		Self::arrange(&mut contents)?;
+		Self::arrange_fields(&mut contents, sets)?;
+		writer.write(&contents)
+	}
+
 	/// Sort the elements of each universal SET of `der` once, in document
 	/// order, and report whether an element moved.
 	///
@@ -232,6 +318,7 @@ impl DerAdmission {
 			} else {
 				len
 			};
+
 			at = at.checked_add(step).ok_or(ErrorKind::Overflow)?;
 		}
 
@@ -331,6 +418,42 @@ impl<'a> Iterator for Run<'a> {
 	}
 }
 
+/// A [`Writer`] that compares the octets an encoder writes with the octets
+/// it expects, run by run, and holds no copy of them.
+pub(crate) struct Comparing<'a> {
+	/// The expected octets the encoder has yet to write, or `None` once a run
+	/// differs from them.
+	rest: Option<&'a [u8]>,
+}
+
+impl<'a> Comparing<'a> {
+	/// Whether `encode` writes exactly `expected`, compared as it writes.
+	///
+	/// # Errors
+	///
+	/// - The error of `encode`.
+	pub(crate) fn is_written_by(
+		expected: &'a [u8],
+		encode: impl FnOnce(&mut Self) -> DerResult<()>,
+	) -> DerResult<bool> {
+		let mut comparing = Self { rest: Some(expected) };
+		encode(&mut comparing)?;
+		Ok(comparing.is_spent())
+	}
+
+	/// Whether the encoder wrote exactly the expected octets.
+	fn is_spent(&self) -> bool {
+		self.rest.is_some_and(<[u8]>::is_empty)
+	}
+}
+
+impl Writer for Comparing<'_> {
+	fn write(&mut self, slice: &[u8]) -> DerResult<()> {
+		self.rest = self.rest.and_then(|rest| rest.strip_prefix(slice));
+		Ok(())
+	}
+}
+
 /// The DER the owner tests of the walk build.
 #[cfg(test)]
 pub(crate) mod fixtures {
@@ -375,6 +498,7 @@ pub(crate) mod fixtures {
 mod tests {
 	use super::fixtures::{descending_set, tlv};
 	use super::*;
+	use crate::der::asn1::OctetString;
 	use crate::der::TagNumber;
 
 	/// The error kind `admit` returns for `der` under `rules`.
@@ -494,5 +618,38 @@ mod tests {
 		let overrun = [0x30, 0x03, 0x30, 0x05, 0x05, 0x00, 0x05, 0x00];
 		let past_parent = ErrorKind::Length { tag: Tag::Sequence };
 		assert_eq!(refusal(DerAdmission::SetOrder, &overrun), Some(past_parent));
+	}
+
+	/// An OCTET STRING is its contents octets in DER.
+	impl Canonical for OctetString {}
+
+	/// The kind of the refusal that holds `value` to `arrived`, or `None` when
+	/// the hold admits it.
+	fn arrival_refusal(value: &[u8], arrived: &[u8]) -> Option<ErrorKind> {
+		let value = OctetString::new(value).expect("a test OCTET STRING fits a DER length");
+		DerAdmission::arrived_as(&value, arrived).err().map(|error| error.kind())
+	}
+
+	/// The refusal of an arrival in another encoding than its value's.
+	const NONCANONICAL: Option<ErrorKind> = Some(ErrorKind::Noncanonical { tag: Tag::OctetString });
+
+	#[test]
+	fn an_arrival_equal_to_the_canonical_encoding_is_admitted() {
+		assert_eq!(arrival_refusal(b"abc", b"abc"), None);
+	}
+
+	#[test]
+	fn an_arrival_that_differs_in_its_last_octet_is_refused() {
+		assert_eq!(arrival_refusal(b"abc", b"abx"), NONCANONICAL);
+	}
+
+	#[test]
+	fn an_arrival_that_runs_past_the_canonical_encoding_is_refused() {
+		assert_eq!(arrival_refusal(b"abc", b"abc\x00"), NONCANONICAL);
+	}
+
+	#[test]
+	fn an_arrival_that_ends_short_of_the_canonical_encoding_is_refused() {
+		assert_eq!(arrival_refusal(b"abc", b"ab"), NONCANONICAL);
 	}
 }

@@ -8,7 +8,7 @@ use core::ops::{Range, RangeInclusive};
 
 use aead::{AeadCore, AeadInPlace, Key, KeyInit, Nonce, Tag};
 
-use crate::asn1::admission::DerAdmission;
+use crate::asn1::admission::{Canonical, DerAdmission};
 use crate::asn1::GcmParametersRef;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfo, RecipientInfos};
@@ -274,10 +274,10 @@ impl AuthEnvelopedData {
 	/// Opens the content, which must be of type `content_type`, with `opener`
 	/// under the algorithms of `P`, in the buffer the ciphertext arrived in.
 	///
-	/// `arrived` is the encoding `self` decoded from. This checks every field
-	/// before the content key unwraps, so a refused envelope costs the
+	/// `arrived` is the encoding `self` decoded from. The open checks every
+	/// field before the content key unwraps, so a refused envelope costs the
 	/// opener's key no operation. A content that returns has passed its tag,
-	/// so the authenticated attributes it arrived with passed it too.
+	/// and so have the authenticated attributes it arrived with.
 	///
 	/// # Errors
 	///
@@ -496,15 +496,19 @@ impl AuthEnvelopedData {
 
 	/// The associated data of an open of this envelope, whose encoding is
 	/// `arrived`, of type `expected`, as [`Self::aad_as_arrived`] admits it.
-	/// It reads the attributes from `arrived` in place.
+	/// It reads the attributes from `arrived` in place, through a view that
+	/// it holds to the octets of `arrived`.
 	///
 	/// # Errors
 	///
-	/// - [`EnvelopeError::Encoding`] -- `arrived` is no DER `AuthEnvelopedData`.
+	/// - [`EnvelopeError::Encoding`] -- `arrived` is no DER
+	///   `AuthEnvelopedData`, or it carries an element its fields do not name.
 	/// - The errors of [`Self::aad_as_arrived`].
 	pub(super) fn associated_data(&self, arrived: &[u8], expected: ObjectIdentifier) -> Result<Vec<u8>, EnvelopeError> {
-		let arrived = ArrivedEnvelopeRef::from_der(arrived)?;
-		self.aad_as_arrived(expected, arrived.auth_attrs)
+		let view = ArrivedEnvelopeRef::from_der(arrived)?;
+		let fields = AnyRef::from_der(arrived)?.value();
+		DerAdmission::arrived_as(&view, fields)?;
+		self.aad_as_arrived(expected, view.auth_attrs)
 	}
 
 	/// What an open of this envelope under the cipher `A` reads, once its
@@ -535,8 +539,8 @@ impl AuthEnvelopedData {
 	/// # Errors
 	///
 	/// - [`EnvelopeError::Encoding`] -- `record` is no DER `AuthEnvelopedData`
-	///   that the admission walk admits, or it carries `originatorInfo` or
-	///   `unauthAttrs`.
+	///   that the admission walk admits, it carries an element its fields do
+	///   not name, or it carries `originatorInfo` or `unauthAttrs`.
 	/// - [`EnvelopeError::RecipientKind`] -- `record` carries another number of recipients than one.
 	/// - [`EnvelopeError::MissingContent`] -- the envelope carries no encrypted content.
 	/// - The errors of [`Self::aad_as_arrived`].
@@ -562,6 +566,8 @@ impl AuthEnvelopedData {
 	) -> Result<(Self, Vec<u8>, Range<usize>), EnvelopeError> {
 		DerAdmission::Cms.admit(arrived)?;
 		let decoded = ArrivedEnvelope::from_der(arrived)?;
+		let fields = AnyRef::from_der(arrived)?.value();
+		DerAdmission::arrived_as(&decoded, fields)?;
 		// The sender of a record leaves both fields out, and the tag covers
 		// neither, so this refuses an envelope that carries one before any key
 		// runs.
@@ -913,6 +919,15 @@ struct ArrivedEnvelopeRef<'a> {
 	)]
 	unauth_attrs: Option<AnyRef<'a>>,
 }
+
+/// The recipients and the attributes of the view are the octets they arrived
+/// as, and `der` 0.7 writes each other field in DER, so it writes the DER of
+/// the view.
+impl Canonical for ArrivedEnvelope<'_> {}
+
+/// Each field of the view is its element as it arrived, so `der` writes the
+/// octets it decoded.
+impl Canonical for ArrivedEnvelopeRef<'_> {}
 
 /// The `EncryptedContentInfo` (RFC 5652 §6.1), with the encrypted content
 /// borrowed from the buffer it arrived in.

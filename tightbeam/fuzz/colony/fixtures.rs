@@ -12,8 +12,8 @@ use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::{CanonicalKey, Certificate, CertificateSpec};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{CanonicalKey, Certificate, CertificateSpec, KeyCurves};
 use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::urn::Urn;
@@ -95,7 +95,7 @@ pub(crate) fn colony_identity(
 }
 
 fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let mut builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())

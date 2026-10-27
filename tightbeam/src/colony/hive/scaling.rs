@@ -28,10 +28,11 @@ pub enum ScaleConfigRefusal {
 
 /// The scaling configuration of one servlet type.
 ///
-/// The fields are read-only because their legal values depend on each
-/// other. Bounds that exclude every instance count, and thresholds that
-/// overlap, describe a scaler that oscillates. [`Self::new`] checks those
-/// pairs in one place, so a config that exists is one the scaler can act on.
+/// The fields are read-only, because their legal values depend on each
+/// other. Bounds that exclude every instance count leave the scaler no count
+/// to hold, and thresholds that overlap make it oscillate. [`Self::new`]
+/// checks those pairs in one place, so a config that exists is one the
+/// scaler can act on.
 #[derive(Debug, Clone, Copy)]
 pub struct ServletScaleConfig {
 	min_instances: usize,
@@ -49,8 +50,7 @@ impl ServletScaleConfig {
 	/// after a scale-down. Set them with [`Self::with_cooldowns`].
 	///
 	/// The bounds and the thresholds stay positional, because a transposed
-	/// pair fails the checks below and the mistake is loud. A swapped cooldown
-	/// pair passes every check, so [`ScaleCooldowns`] names the cooldowns.
+	/// pair fails the checks below and the mistake is loud.
 	///
 	/// # Errors
 	///
@@ -82,8 +82,8 @@ impl ServletScaleConfig {
 
 	/// Replace the cooldowns that follow each scaling action.
 	///
-	/// The pair carries names because a swap of two positional durations
-	/// passes every check.
+	/// [`ScaleCooldowns`] names the pair, because a swap of two positional
+	/// durations passes every check.
 	#[must_use]
 	pub fn with_cooldowns(mut self, cooldowns: ScaleCooldowns) -> Self {
 		self.scale_up_cooldown = cooldowns.after_scale_up;
@@ -101,6 +101,48 @@ impl ServletScaleConfig {
 	#[must_use]
 	pub fn max_instances(&self) -> usize {
 		self.max_instances
+	}
+
+	/// Whether a type that holds `current` instances admits one more, which
+	/// [`Self::max_instances`] bounds.
+	///
+	/// The scaler and the hive's instance set both read it, so a spawn from
+	/// either path stops at the same bound (CWE-770).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::hive::ServletScaleConfig;
+	///
+	/// let config = ServletScaleConfig::new(1, 2, tightbeam::bps!(8000), tightbeam::bps!(2000))?;
+	/// assert!(config.admits_instance(1));
+	/// assert!(!config.admits_instance(2));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub const fn admits_instance(&self, current: usize) -> bool {
+		current < self.max_instances
+	}
+
+	/// Whether a type that holds `current` instances spares one, which
+	/// [`Self::min_instances`] bounds.
+	///
+	/// The scaler and the hive's instance set both read it, so a stop from
+	/// either path stops at the same floor.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::hive::ServletScaleConfig;
+	///
+	/// let config = ServletScaleConfig::new(1, 2, tightbeam::bps!(8000), tightbeam::bps!(2000))?;
+	/// assert!(config.spares_instance(2));
+	/// assert!(!config.spares_instance(1));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub const fn spares_instance(&self, current: usize) -> bool {
+		current > self.min_instances
 	}
 
 	/// The utilization above which the scaler spawns one more instance.
@@ -152,9 +194,9 @@ impl Default for ScaleCooldowns {
 impl ServletScaleConfig {
 	/// The bounds and thresholds a servlet scales on when none are set.
 	///
-	/// The const block builds it through [`Self::new`], so a default that
-	/// fails the pair checks fails to compile rather than ship as a second,
-	/// unchecked home for these values.
+	/// It builds through [`Self::new`] in a const, so a default that fails
+	/// the pair checks fails to compile, and the values have no unchecked
+	/// second home.
 	pub const DEFAULT: Self = match Self::new(1, 10, crate::bps!(8000), crate::bps!(2000)) {
 		Ok(config) => config,
 		Err(_) => panic!("the default scale config must satisfy its own checks"),
@@ -201,9 +243,9 @@ impl ScalingMetrics {
 		let utilization = self.utilization.get();
 		let up_threshold = self.config.scale_up_threshold().get();
 		let down_threshold = self.config.scale_down_threshold().get();
-		if utilization > up_threshold && self.current_instances < self.config.max_instances() {
+		if utilization > up_threshold && self.config.admits_instance(self.current_instances) {
 			ScalingDecision::ScaleUp
-		} else if utilization < down_threshold && self.current_instances > self.config.min_instances() {
+		} else if utilization < down_threshold && self.config.spares_instance(self.current_instances) {
 			ScalingDecision::ScaleDown
 		} else {
 			ScalingDecision::Hold
@@ -214,6 +256,7 @@ impl ScalingMetrics {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::tb_cases;
 
 	#[test]
 	fn an_inverted_instance_range_is_refused() {
@@ -273,5 +316,31 @@ mod tests {
 		assert_eq!(config.min_instances(), 1);
 		assert_eq!(config.max_instances(), 4);
 		Ok(())
+	}
+
+	/// A reading of `utilization` basis points over `current_instances` of a
+	/// type bounded to one to two instances.
+	fn reading(utilization: BasisPoints, current_instances: usize) -> ScalingMetrics {
+		let servlet_type = crate::urn!("tightbeam", "servlet:echo");
+		let config = ServletScaleConfig::new(1, 2, crate::bps!(8000), crate::bps!(2000));
+		let config = config.expect("one to two instances is a legal range");
+		ScalingMetrics { servlet_type, utilization, current_instances, config }
+	}
+
+	/// A reading's load and instance count, and the decision it calls for.
+	type DecisionRow = (BasisPoints, usize, ScalingDecision);
+
+	// A loaded type scales up below its bound and holds at it, and an idle
+	// type scales down above its floor and holds at it.
+	tb_cases! {
+		fn a_scale_stops_at_the_instance_bounds((utilization, current, expected): DecisionRow) {
+			assert_eq!(reading(utilization, current).decide(), expected);
+		}
+		cases {
+			loaded_below_the_bound_scales_up => (crate::bps!(9000), 1, ScalingDecision::ScaleUp),
+			loaded_at_the_bound_holds => (crate::bps!(9000), 2, ScalingDecision::Hold),
+			idle_above_the_floor_scales_down => (crate::bps!(1000), 2, ScalingDecision::ScaleDown),
+			idle_at_the_floor_holds => (crate::bps!(1000), 1, ScalingDecision::Hold),
+		}
 	}
 }

@@ -1,7 +1,7 @@
 //! Shared test utilities for handshake protocol tests.
 //!
-//! The module holds the fixtures, the functions, and the data structures that
-//! every handshake test module shares, so each setup has one home.
+//! It holds the fixtures, functions, and data structures that every handshake
+//! test module shares, so each setup has one home.
 #![allow(unused)]
 
 #[cfg(not(feature = "std"))]
@@ -465,8 +465,8 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 }
 
 /// A fresh server ephemeral public key as the compressed SEC 1 point the
-/// `ServerHandshake` carries. The function discards the private half, so a
-/// client that completes against it derives keys nobody else holds.
+/// `ServerHandshake` carries. It discards the private half, so a client that
+/// completes against it derives keys nobody else holds.
 #[cfg(feature = "transport-hpke")]
 pub fn create_test_server_ephemeral() -> Sec1CompressedPoint<Secp256k1> {
 	let public_key = SecretKey::random(&mut OsRng).public_key();
@@ -902,7 +902,7 @@ pub fn create_test_signed_data(content: impl AsRef<[u8]>) -> SignedData {
 
 /// Create test key pairs for cryptographic operations.
 ///
-/// The function returns a tuple with these parts, in order:
+/// It returns a tuple of these parts, in order:
 ///
 /// 1. the sender private key,
 /// 2. the sender SPKI,
@@ -1050,6 +1050,7 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		_response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move { Ok(()) })
 	}

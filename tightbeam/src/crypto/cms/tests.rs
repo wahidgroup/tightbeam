@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use crate::asn1::admission::DerAdmission;
+use crate::asn1::WireDer;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{
 	KekIdentifier, KekRecipientInfo, OtherRecipientInfo, RecipientIdentifier, RecipientInfo, RecipientInfos,
@@ -858,7 +860,6 @@ async fn an_aes_icv_length_other_than_16_is_refused() {
 #[tokio::test]
 async fn a_mac_of_another_length_than_16_is_refused() -> Result<(), crate::der::Error> {
 	let envelope = AuthEnvelopedData { mac: OctetString::new([0x00u8; 12])?, ..kek_sealed() };
-
 	let refused = opened(envelope, &kek_opener(), DATA).await;
 	assert!(matches!(refused, Err(EnvelopeError::TagLength(_))));
 	Ok(())
@@ -867,7 +868,6 @@ async fn a_mac_of_another_length_than_16_is_refused() -> Result<(), crate::der::
 #[tokio::test]
 async fn an_envelope_without_a_content_type_attribute_is_refused() {
 	let envelope = with_auth_attrs(kek_sealed(), vec![marker_attribute()]);
-
 	let refused = opened(envelope, &kek_opener(), DATA).await;
 	assert!(matches!(refused, Err(EnvelopeError::ContentTypeAttribute)));
 }
@@ -919,6 +919,62 @@ async fn an_envelope_with_two_recipients_is_refused() -> Result<(), crate::der::
 
 	let refused = opened(envelope, &kek_opener(), DATA).await;
 	assert!(matches!(refused, Err(EnvelopeError::RecipientKind)));
+	Ok(())
+}
+
+/// Two KEK recipients of one length, built from the recipient of
+/// [`kek_sealed_from_seed`], which two orders sort apart:
+///
+/// - In the order of X.690 § 11.6, the first comes first, at its identifier.
+/// - In the order of `der` 0.7, the first comes second. It reads each
+///   encoding as a SEQUENCE OF INTEGER (`ValueOrd for RecipientInfo`, `cms`
+///   0.2.3), whose length grows with each octet of `0x80` or above, and the
+///   wrapped key of the first holds more of them.
+fn recipients_of_two_orders() -> Result<[RecipientInfo; 2], crate::der::Error> {
+	let sealed = kek_sealed_from_seed().kek_recipient();
+	let wrapped_len = sealed.encrypted_key.as_bytes().len();
+	let named = |identifier: &[u8]| -> Result<KekIdentifier, crate::der::Error> {
+		Ok(KekIdentifier { kek_identifier: OctetString::new(identifier)?, ..sealed.kek_id.clone() })
+	};
+
+	let encrypted_key = OctetString::new(vec![0xff; wrapped_len])?;
+	let first = KekRecipientInfo { kek_id: named(b"tb/test/kek/v1")?, encrypted_key, ..sealed.clone() };
+	let encrypted_key = OctetString::new(vec![0x00; wrapped_len])?;
+	let second = KekRecipientInfo { kek_id: named(b"tb/test/kek/v2")?, encrypted_key, ..sealed };
+	Ok([RecipientInfo::Kekri(first), RecipientInfo::Kekri(second)])
+}
+
+/// [`kek_sealed_from_seed`] with the recipients of
+/// [`recipients_of_two_orders`], as `der` 0.7 writes it.
+fn envelope_of_two_recipients() -> Result<AuthEnvelopedData, crate::der::Error> {
+	Ok(kek_sealed_from_seed().with_recipients(recipients_of_two_orders()?))
+}
+
+/// The DER of [`envelope_of_two_recipients`], its recipients in the order of
+/// their octets (X.690 § 11.6), as a sender of another implementation writes
+/// it.
+fn two_recipients_in_der() -> Result<Vec<u8>, crate::der::Error> {
+	let mut der = envelope_of_two_recipients()?.to_der()?;
+	DerAdmission::arrange(&mut der)?;
+	Ok(der)
+}
+
+/// `der` 0.7 writes the two recipients in another order than their DER, so
+/// the decode of their DER reaches the arranged hold.
+#[test]
+fn der_writes_the_two_recipients_in_another_order_than_their_der() -> Result<(), crate::der::Error> {
+	let written = envelope_of_two_recipients()?.to_der()?;
+	assert_ne!(written, two_recipients_in_der()?);
+	Ok(())
+}
+
+/// The decode of an envelope of two recipients in DER admits it, though
+/// `der` 0.7 sorts its recipients in another order.
+#[test]
+fn an_envelope_of_two_recipients_in_der_is_admitted_at_its_decode() -> Result<(), crate::der::Error> {
+	let arrived = two_recipients_in_der()?;
+	let admitted = WireDer::<AuthEnvelopedData>::try_from(arrived.as_slice())?;
+	assert_eq!(admitted.der(), arrived);
 	Ok(())
 }
 
@@ -1300,6 +1356,7 @@ fn bare_key() -> (BareKemKey<HouseKem>, Vec<u8>) {
 	let key = Secp256k1SigningKey::random(&mut OsRng);
 	let backend = backend_of(&key);
 	let spki = backend.to_public_key_bytes().expect("the house backend encodes its key");
+
 	let bare = BareKemKey::new(PublicKey::from(key.verifying_key()), backend);
 	(bare.expect("the backend holds the key"), spki)
 }

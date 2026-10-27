@@ -33,6 +33,7 @@ use crate::der::Error as DerDecodeError;
 use crate::der::Sequence;
 use crate::transport::handshake::receipt::SessionReceipt;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
+use crate::x509::Certificate;
 use crate::Beamable;
 use crate::Errorizable;
 use elliptic_curve::FieldBytesSize;
@@ -172,6 +173,11 @@ pub struct TransportOffer {
 	pub requested_budgets: Option<MuxBudgets>,
 	/// Opaque settlement token that the transcript binds and the server's
 	/// [`TransportAuthorizer`] consumes. TightBeam treats it as opaque bytes.
+	///
+	/// It travels in the cleartext opening of the client, so it is public data
+	/// and never a secret. A replay of it by another client is the
+	/// application's to refuse in [`TransportAuthorizer::settle`], which
+	/// receives the certificate of the client that spends it (CWE-294).
 	#[asn1(optional = "true")]
 	pub authorization: Option<OctetString>,
 }
@@ -312,7 +318,7 @@ impl MuxSettings {
 	/// # Contract
 	///
 	/// Both endpoints MUST configure the same `cap`, or enforcement diverges.
-	/// This call clamps the cap to [`MAX_MUX_STREAM_CAP`].
+	/// It clamps the cap to [`MAX_MUX_STREAM_CAP`].
 	pub fn symmetric(cap: u32) -> Self {
 		let cap = clamp_stream_cap(cap);
 		Self {
@@ -482,8 +488,8 @@ impl<'a> TransportNegotiation<'a> {
 	/// # Budgets
 	///
 	/// When an authorizer is present, its grant replaces the local-config
-	/// budget. This method still clamps the grant to the componentwise minimum
-	/// with the client's request before the accept and the receipt bind it.
+	/// budget. It still clamps the grant to the componentwise minimum with the
+	/// client's request before the accept and the receipt bind it.
 	///
 	/// # Errors
 	///
@@ -621,9 +627,11 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 
 	/// Settle the countersigned receipt when the client's closing arrives.
 	///
-	/// The handshake calls this hook with the receipt body and the client's
-	/// ancillary response after the countersignature verifies. The session
-	/// activates only on `Ok`.
+	/// The handshake calls this hook after the countersignature verifies, with
+	/// the receipt body, the client's ancillary response, and `client`, the
+	/// certificate the countersignature verified under. The session activates
+	/// only on `Ok`, so an authorizer that binds a token to the client it
+	/// issued the token to refuses any other `client` here (CWE-294).
 	///
 	/// # Default
 	///
@@ -638,6 +646,7 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 		&'a self,
 		receipt: &'a SessionReceipt,
 		_response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if receipt.ancillary.is_some() {
@@ -1252,6 +1261,7 @@ mod tests {
 		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 	};
+	use crate::testing::{TestCertificate, TestKey};
 
 	fn sample_profile(id: u8) -> SecurityProfileDesc {
 		let key_wrap = match id {
@@ -1673,11 +1683,16 @@ mod tests {
 		})
 	}
 
+	/// The certificate of the client a settlement test names.
+	fn settling_client() -> Certificate {
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+	}
+
 	#[tokio::test]
 	async fn test_default_settle_accepts_challenge_free_receipt() -> Result<(), DerDecodeError> {
 		let authorizer = FixedAuthorizer::budgets(Ok(None));
 		let receipt = settle_receipt(None)?;
-		assert_eq!(authorizer.settle(&receipt, None).await, Ok(()));
+		assert_eq!(authorizer.settle(&receipt, None, &settling_client()).await, Ok(()));
 		Ok(())
 	}
 
@@ -1685,7 +1700,7 @@ mod tests {
 	async fn test_default_settle_refuses_challenge_bearing_receipt() -> Result<(), DerDecodeError> {
 		let authorizer = FixedAuthorizer::budgets(Ok(None));
 		let receipt = settle_receipt(Some(OctetString::new(b"invoice".as_slice())?))?;
-		let settled = authorizer.settle(&receipt, None).await;
+		let settled = authorizer.settle(&receipt, None, &settling_client()).await;
 		assert_eq!(settled, Err(AuthorizationRefusal { code: SETTLEMENT_UNSUPPORTED_CODE }));
 		Ok(())
 	}

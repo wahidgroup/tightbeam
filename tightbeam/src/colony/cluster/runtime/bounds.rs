@@ -149,8 +149,8 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// The two registries one hive's membership spans.
 	///
-	/// Admission and retirement move both, so they run here rather than as
-	/// a sequence each call site repeats.
+	/// Admission and retirement move both, so they run on the returned
+	/// `ColonyMembership` and not at each call site.
 	pub(crate) fn membership(&self) -> ColonyMembership<'_> {
 		ColonyMembership::new(&self.registry, &self.servlet_registry, &self.admission)
 	}
@@ -189,9 +189,8 @@ pub(crate) type ColonyDigest<P> = <<P as Protocol>::CryptoProvider as DigestProv
 /// names the colony digest.
 ///
 /// Each operation that names a gateway, or digests a rumor or a frame
-/// witness, is a method here under [`ColonyDigest`] of `P`, so a gateway names
-/// its peers and digests its rumors under one digest. The configuration is
-/// shared, and this type dereferences to it.
+/// witness, is a method here under [`ColonyDigest`] of `P`, so all of them
+/// use one digest. It shares the configuration and dereferences to it.
 pub(crate) struct ColonyConfig<P> {
 	config: Arc<ClusterConfig>,
 	protocol: PhantomData<fn() -> P>,
@@ -243,7 +242,8 @@ pub(crate) mod fixtures {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::runtime::TaskGroup;
 	use crate::testing::{TestCertificate, TestKey};
 	use crate::trace::TraceCollector;
@@ -255,7 +255,8 @@ pub(crate) mod fixtures {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let colony = ColonyNamespace::default().colony("main").expect("a literal colony name");
 		let certificate = TestCertificate::with_uri_sans(&key, &[&colony.to_string()]);
-		let enrolled = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate.clone());
+		let enrolled = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let enrolled = enrolled.with_certificate(certificate.clone());
 		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the member enrolls").build());
 		let spec = CertificateSpec::Built(Box::new(certificate));
 		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));

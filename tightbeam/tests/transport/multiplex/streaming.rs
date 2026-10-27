@@ -25,24 +25,25 @@ use tightbeam::TightBeamError;
 use super::common::*;
 use crate::transport::support::{await_ok, await_within_deadline, HandlerSignal};
 
-/// Returns a client endpoint and a server responder over freshly established
+/// Returns a client endpoint, a server responder, and the server endpoint
+/// whose drivers keep the connection running, over freshly established
 /// chunked transports, the setup every streaming scenario shares.
 async fn streaming_endpoints(
 	trace: &TraceCollector,
 	server_offer: TransportOffer,
-) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
+) -> Result<(MuxEndpoint, MuxResponder, MuxEndpoint), TightBeamError> {
 	let (client, server) = establish_transports(Some(chunked_offer(4)), Some(server_offer)).await?;
 	let (client_end, _) = spawn_mux_endpoint(client.with_trace(trace.share()), MuxRole::Client)?;
-	let (_, responder) = spawn_mux_endpoint(server.with_trace(trace.share()), MuxRole::Server)?;
+	let (server_end, responder) = spawn_mux_endpoint(server.with_trace(trace.share()), MuxRole::Server)?;
 
-	Ok((client_end, responder))
+	Ok((client_end, responder, server_end))
 }
 
 /// A streamed request pushes its chunks to a streaming handler and awaits the
 /// unary response.
 #[tokio::test]
 async fn mux_open_stream_pushes_chunks_and_awaits_response() -> Result<(), TightBeamError> {
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
 	let chunks_seen = Arc::new(AtomicUsize::new(0));
 	let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
 
@@ -61,7 +62,7 @@ async fn mux_open_stream_pushes_chunks_and_awaits_response() -> Result<(), Tight
 /// A duplex stream receives its reply as a streamed body.
 #[tokio::test]
 async fn mux_open_duplex_receives_streamed_reply() -> Result<(), TightBeamError> {
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
 	let handler_chunks = Arc::new(AtomicUsize::new(0));
 	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
 
@@ -103,7 +104,7 @@ tb_scenario! {
 	spec: MuxUnaryKindVsDuplexSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let (client_end, responder) = streaming_endpoints(&trace, chunked_offer(4)).await?;
+			let (client_end, responder, _server_end) = streaming_endpoints(&trace, chunked_offer(4)).await?;
 			let chunks_streamed = Arc::new(AtomicUsize::new(0));
 			let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(Arc::clone(&chunks_streamed))));
 
@@ -132,7 +133,7 @@ tb_scenario! {
 	spec: MuxUnaryKindVsStreamingSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let (client_end, responder) = streaming_endpoints(&trace, chunked_offer(4)).await?;
+			let (client_end, responder, _server_end) = streaming_endpoints(&trace, chunked_offer(4)).await?;
 			let chunks_seen = Arc::new(AtomicUsize::new(0));
 			let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
 
@@ -179,7 +180,7 @@ fn hanging_streaming_handler(
 /// its handler.
 #[tokio::test]
 async fn mux_streaming_cancel_discards_inflight_body() -> Result<(), TightBeamError> {
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
 	let started = Arc::new(HandlerSignal::default());
 	let unwound = Arc::new(HandlerSignal::default());
 	let handler = hanging_streaming_handler(Arc::clone(&started), Arc::clone(&unwound));
@@ -205,7 +206,7 @@ async fn mux_streaming_cancel_discards_inflight_body() -> Result<(), TightBeamEr
 /// fails with `Cancelled` instead of a wait on a trailer that never arrives.
 #[tokio::test]
 async fn mux_duplex_sink_drop_fails_reply_body() -> Result<(), TightBeamError> {
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
 	let handler_chunks = Arc::new(AtomicUsize::new(0));
 	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
 
@@ -252,7 +253,7 @@ fn gated_streaming_echo(started: Arc<HandlerSignal>, release: Arc<Notify>) -> im
 #[tokio::test]
 async fn mux_streaming_slow_consumer_stalls_then_resumes() -> Result<(), TightBeamError> {
 	let server_offer = chunked_offer(4).with_initial_stream_credit(1);
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), server_offer).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), server_offer).await?;
 	let started = Arc::new(HandlerSignal::default());
 	let release = Arc::new(Notify::new());
 	let handler = gated_streaming_echo(Arc::clone(&started), Arc::clone(&release));
@@ -277,6 +278,7 @@ async fn mux_streaming_slow_consumer_stalls_then_resumes() -> Result<(), TightBe
 	assert!(stalled, "the push must stall while the consumer holds its body");
 
 	release.notify_one();
+
 	let echoed = await_ok(transfer, "stalled transfer must not panic").await?;
 	let finished = is_echo(echoed, &frame);
 	assert!(finished, "the stalled transfer must finish once the consumer drains");
@@ -305,6 +307,7 @@ async fn exchange_pings(mut sink: RequestSink, mut reply: StreamBody) -> Result<
 	}
 
 	sink.close_with(b"ping-final").await?;
+
 	let pong = reply.chunk().await?;
 	matched &= pong.as_deref() == Some(&b"ping-final"[..]);
 
@@ -317,15 +320,15 @@ async fn exchange_pings(mut sink: RequestSink, mut reply: StreamBody) -> Result<
 /// held-back record, and `close_with` flags the final chunk itself.
 #[tokio::test]
 async fn mux_duplex_ping_pong_awaits_reply_between_pushes() -> Result<(), TightBeamError> {
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
 	let handler_chunks = Arc::new(AtomicUsize::new(0));
 	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
 
 	let (sink, reply) = client_end.handle.open_duplex()?;
 	let exchange = exchange_pings(sink, reply);
 	let progressed = await_within_deadline(exchange, "a chunk-for-chunk exchange must progress with eager pushes");
-	let (matched, ended_clean) = progressed.await??;
 
+	let (matched, ended_clean) = progressed.await??;
 	assert!(matched, "each duplex reply must match its push");
 	assert!(ended_clean, "the duplex reply must end on its Ok trailer");
 	Ok(())
@@ -335,7 +338,7 @@ async fn mux_duplex_ping_pong_awaits_reply_between_pushes() -> Result<(), TightB
 /// request chunk, and `into_frame` reassembles the chunked reply.
 #[tokio::test]
 async fn mux_duplex_reply_collects_into_frame() -> Result<(), TightBeamError> {
-	let (client_end, responder) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
 	let handler_chunks = Arc::new(AtomicUsize::new(0));
 	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
 

@@ -5,14 +5,16 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::{select, Either};
 use tokio::sync::Notify;
 
 use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand, CommandAudit, CommandRefusal};
-use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances, InsertRefusal};
-use crate::colony::hive::{BackpressureGate, ClusterSecurityGate, ServletRegistration, ServletRegistry, SpawnerFn};
+use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances};
+use crate::colony::hive::{
+	BackpressureGate, ClusterSecurityGate, HiveScalingConfig, ServletRegistration, ServletRegistry, SpawnerFn,
+};
 use crate::colony::protocol::{
 	ClusterCommand, ClusterCommandResponse, HiveManagement, HiveManagementOutcome, SpawnServletParams,
 	StopServletParams,
@@ -127,6 +129,10 @@ pub struct HiveControlCtx<P: Protocol, R: ServletRegistry> {
 	pub backpressure: BackpressureGate,
 	/// The drain state. A draining hive refuses all commands but the heartbeat.
 	pub drain: DrainMode,
+	/// The instance set's admission lock, which the scaling loop shares.
+	pub admission: Arc<Mutex<()>>,
+	/// The instance bounds of each servlet type, which a spawn and a stop keep.
+	pub scaling: HiveScalingConfig,
 	/// The count of commands in flight, which a drain waits on to reach zero.
 	pub in_flight: InFlight,
 	/// The intra-hive routing context, which [`HiveInstances`] updates as it
@@ -214,9 +220,8 @@ where
 		let audit = CommandAudit::new(&ctx.trace, &ctx.connections, &session);
 
 		// Security admission runs before drain, so drain state answers
-		// authenticated peers only. A refusal answers in the alternative the
-		// sender decodes, because a mismatched shape counts as
-		// `ClusterError::MalformedResponse` and can evict the hive.
+		// authenticated peers only. A refusal answers in the shape the sender
+		// decodes, because a mismatched shape can evict the hive.
 		let admitted = match ctx.admit(frame, &session) {
 			Ok(admitted) => admitted,
 			Err(refusal) => return refusal.reply(&audit),
@@ -257,6 +262,14 @@ where
 }
 
 impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
+	/// The hive's instance set, which a spawn and a stop move under its
+	/// admission lock.
+	fn instances(&self) -> HiveInstances<'_, R, P> {
+		let servlets = self.servlets.as_ref();
+		let routes = &self.hive_context;
+		HiveInstances::new(servlets, routes, &self.admission, &self.drain, &self.scaling)
+	}
+
 	fn admit(&self, frame: Frame, session: &SessionContext) -> Result<AdmittedCommand, Box<AdmitRefusal>> {
 		let Some(gate) = &self.security else {
 			return Err(AdmitRefusal::denied(frame, TransitStatus::PermissionDenied));
@@ -268,7 +281,6 @@ impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
 	/// Whether the backpressure gate refuses `admitted` at the present load.
 	fn under_backpressure(&self, admitted: &AdmittedCommand, session: &SessionContext) -> bool {
 		let verdict = GatePolicy::evaluate(&self.backpressure, Some(admitted.frame()), session);
-
 		verdict == TransitStatus::ResourceExhausted
 	}
 
@@ -307,11 +319,9 @@ impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
 		};
 
 		let registration = ServletRegistration { servlet: new_servlet, spawner: Arc::clone(spawner), servlet_type };
-		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		let placed = match instances.insert(registration) {
+		let placed = match self.instances().insert(registration) {
 			Ok(placed) => placed,
-			Err(InsertRefusal::Unnameable(_)) => return admitted.refuse(CommandRefusal::UnnameableInstance, audit),
-			Err(InsertRefusal::Registry(_)) => return admitted.refuse(CommandRefusal::RegistryFault, audit),
+			Err(refusal) => return admitted.refuse(CommandRefusal::from(refusal), audit),
 		};
 
 		// The manage response owns its address bytes, so this copy is needed.
@@ -340,9 +350,8 @@ impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
 		P: Protocol,
 	{
 		let id_bytes = stop.servlet_id.canonical_bytes();
-		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		if instances.remove(&id_bytes).is_none() {
-			return admitted.refuse(CommandRefusal::UnknownInstance, audit);
+		if let Err(refusal) = self.instances().remove(&id_bytes) {
+			return admitted.refuse(CommandRefusal::from(refusal), audit);
 		}
 
 		let response = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());

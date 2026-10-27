@@ -26,8 +26,8 @@ use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
-use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{CertificateSpec, KeyCurves};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
@@ -212,6 +212,7 @@ fn mux_pool_with_idle_timeout(
 		config.idle_timeout = Some(timeout);
 		builder = builder.with_clock(clock);
 	}
+
 	let pool = Arc::new(
 		builder
 			.with_config(config)
@@ -219,7 +220,6 @@ fn mux_pool_with_idle_timeout(
 			.with_trace(trace.share())
 			.build(),
 	);
-
 	Ok(pool)
 }
 
@@ -238,6 +238,7 @@ async fn echo_roundtrip(
 ) -> Result<bool, TightBeamError> {
 	let label = label.as_ref();
 	let frame = mux_frame(label);
+
 	let reply = client.emit(frame.to_owned(), None).await?;
 	Ok(reply == Some(frame))
 }
@@ -303,8 +304,8 @@ tb_scenario! {
 			let (mut sink, response) = lease.open_stream()?;
 			sink.push(b"abcd").await?;
 			sink.close_with(b"efgh").await?;
-			let reply = response.await?;
 
+			let reply = response.await?;
 			assert_eq!(
 				reply.map(|frame| frame.message().to_owned()),
 				Some(mux_frame("8").message().to_owned()),
@@ -339,14 +340,11 @@ tb_scenario! {
 			let (mut sink, mut body) = lease.open_duplex()?;
 
 			sink.push(b"ping").await?;
-
 			let first = body.chunk().await?;
-
 			sink.close_with(b"pong").await?;
 
 			let second = body.chunk().await?;
 			let terminal = body.chunk().await?;
-
 			assert_eq!(first.as_deref(), Some(b"ping".as_ref()), "the duplex must echo the first chunk");
 			assert_eq!(second.as_deref(), Some(b"pong".as_ref()), "the duplex must echo the closing chunk");
 			assert!(terminal.is_none(), "the duplex must end after its last echo");
@@ -395,10 +393,10 @@ tb_scenario! {
 				duplex_sink.push(b"ping").await?;
 				let echoed = duplex_body.chunk().await?;
 				duplex_sink.close().await?;
+
 				let terminal = duplex_body.chunk().await?;
 				Ok::<_, TransportError>((echoed, terminal))
 			};
-
 			let (unary_reply, stream_reply, duplex_reply) =
 				tokio::join!(unary_lease.emit(unary_frame.to_owned(), None), streaming, duplex);
 
@@ -505,7 +503,6 @@ async fn mux_lease_conn_reports_invalid_state() -> Result<(), TightBeamError> {
 
 	let mut lease = pool.connect(addr).await?;
 	let conn = lease.conn();
-
 	assert!(
 		matches!(conn, Err(TransportError::InvalidState)),
 		"a mux lease must refuse conn() with InvalidState"
@@ -631,7 +628,7 @@ impl IdentityFlipContext {
 	/// A pool that trusts both identities, as a peer trust store that holds
 	/// two peers' certificates does.
 	fn pool_trusting_both(&self, trace: &TraceCollector) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
-		let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let trust_store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(Certificate::clone(&self.gate.materials.certificate))?
 			.with_certificate(self.second.certificate().clone())?
 			.build();
@@ -784,17 +781,17 @@ tb_assert_spec! {
 	}
 }
 
-// A lease pins the identity of the handshake on its connection. The cap-full
-// connection fails an emit over to a fresh dial, which another trusted
-// identity answers, so the emit fails and the frame stays with the caller.
+// A lease pins the identity of its handshake. The cap-full connection fails
+// an emit over to a fresh dial that another trusted identity answers, so the
+// emit fails and the frame stays with the caller.
 //
 // - The second emit fails over onto the pooled connection of the other
-//   identity, so the pool counts two failovers, two refusals, and two reuses
-//   against two dials.
-// - The server of the second identity records a gate verdict per frame it
-//   collects, so zero verdicts mean it collected none.
-// - The three handshakes are the two pool dials and the server of the second
-//   identity, the one server that holds the trace.
+//   identity, so the pool counts two failovers, refusals, and reuses against
+//   two dials.
+// - The second server records a gate verdict per frame it collects, so zero
+//   verdicts mean it collected none.
+// - The three handshakes are the two pool dials and the second server, the
+//   one server that holds the trace.
 tb_scenario! {
 	name: pooled_mux_failover_refuses_another_identity,
 	spec: MuxFailoverIdentitySpec,
@@ -811,7 +808,6 @@ tb_scenario! {
 
 			let refused = pinned_lease.emit(mux_frame("mux-after-pin"), None).await;
 			let refused_again = pinned_lease.emit(mux_frame("mux-after-refusal"), None).await;
-
 			assert!(pinned_first, "the lease must pin the certificate of the first identity");
 			assert!(
 				matches!(refused, Err(TransportError::InvalidCertificate(CertificateValidationError::CertificateNotPinned))),
@@ -1050,7 +1046,6 @@ async fn start_manual_mux_echo_server(
 	ctx: &Arc<ManualContext>,
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
 	let (listener, addr) = bind_pool_listener(&ctx.materials).await?;
-
 	let acceptor_ctx = Arc::clone(ctx);
 	let acceptor = tokio::spawn(async move {
 		while let Ok((transport, _)) = listener.accept().await {
@@ -1137,6 +1132,42 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// Serves the first connection on `listener` as a multiplexed server that
+/// holds its writer and its responder, so the server never closes the
+/// connection, and returns once its reader reads the close of the client.
+async fn serve_until_the_client_closes(listener: TokioListener) -> Result<(), TransportError> {
+	let (transport, _) = listener.accept().await?;
+	let mut transport = transport.with_mux_offer(Some(mux_offer(4)));
+	let negotiated = transport.negotiate_mux().await?;
+	let settings = negotiated.ok_or(TransportError::InvalidState)?;
+
+	let (reader, writer) = transport.into_split()?;
+	let mux = MuxTransport::new(reader, writer, MuxRole::Server, settings);
+	let (_handle, reader_driver, _writer_driver, _responder) = mux.into_parts();
+
+	// The reader ends on the close of the client, and either answer of the
+	// drive is that close.
+	let _closed = reader_driver.drive().await;
+	Ok(())
+}
+
+/// A dropped pool ends the driver tasks of each multiplexed connection it
+/// held, so the peer reads the close (CWE-772).
+#[tokio::test]
+async fn dropping_a_pool_ends_its_multiplexed_connections() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let (listener, addr) = bind_pool_listener(&materials).await?;
+	let served = tokio::spawn(serve_until_the_client_closes(listener));
+	let pool = mux_pool(&materials, Some(mux_offer(4)), 1, &TraceCollector::new())?;
+
+	drop(pool.connect(addr).await?);
+	drop(pool);
+
+	let ended = await_within_deadline(served, "the peer of the dropped pool must read its close").await?;
+	assert!(ended.is_ok_and(|served| served.is_ok()));
+	Ok(())
 }
 
 /// A server that offers multiplexing serves a single-flight client through its
@@ -1581,6 +1612,7 @@ impl TransportAuthorizer for MeteredAuthorizer {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if response == Some(self.expected_response.as_bytes()) {

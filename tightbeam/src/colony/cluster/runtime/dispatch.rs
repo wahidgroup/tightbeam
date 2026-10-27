@@ -36,10 +36,8 @@ enum RequestAdmission {
 }
 
 impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
-	/// Route one unary gateway request from the gates through its handler.
-	///
-	/// Gate policies run first, and export gates run on the work arm only,
-	/// once the decoded envelope names the servlet target.
+	/// Route one unary gateway request from the gates through its handler, in
+	/// the evaluation order of the module.
 	///
 	/// - `frame`: the unary control frame of the call, before the gates run
 	/// - `session`: the identity facts of the caller's connection
@@ -98,7 +96,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 	/// Gate and decode one unary control frame.
 	///
-	/// This is the one parse of the request envelope. A refused gate and an
+	/// It is the one parse of the request envelope. A refused gate and an
 	/// undecodable envelope both give the status the caller replies with.
 	fn admit_request(
 		&self,
@@ -160,7 +158,8 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::encode;
 	use crate::instrumentation::events::{
 		CLUSTER_EDGE_REFUSED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED, CLUSTER_GOSSIP_REFUSED,
@@ -253,7 +252,9 @@ mod tests {
 	fn hive_trusting_config() -> ClusterConfig {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let certificate = TestCertificate::self_signed(&key);
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate);
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let builder = builder.with_certificate(certificate);
+
 		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(builder.expect("the hive enrolls").build());
 		ClusterConfig::new(house_tls().with_hive_trust(hive_trust))
 	}
@@ -325,6 +326,7 @@ mod tests {
 	async fn an_anonymous_export_refusal_records_on_the_connection_trace() -> Result<(), TightBeamError> {
 		let mut config = ClusterConfig::new(house_tls());
 		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("other")])));
+
 		let audited = Audited::of(config);
 		let records = audited.records(work_for("ping")?, SessionContext::default(), CLUSTER_EXPORT_REFUSED);
 		assert_eq!(records.await?, (0, 1));

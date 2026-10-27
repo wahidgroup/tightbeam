@@ -101,7 +101,7 @@ macro_rules! cert {
 		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
 	}};
 
-	// Root CA certificate with an explicit pathLenConstraint (RFC 5280 §4.2.1.9).
+	// A root CA certificate that sets pathLenConstraint (RFC 5280 §4.2.1.9).
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -125,7 +125,7 @@ macro_rules! cert {
 		)
 	}};
 
-	// Root CA certificate (requires subject_public_key)
+	// A root CA certificate with an unbounded path length.
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -148,7 +148,7 @@ macro_rules! cert {
 		)
 	}};
 
-	// Root CA certificate (no SPKI provided -> clearer error)
+	// A root CA certificate with no `subject_public_key:` is a compile error.
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -163,9 +163,9 @@ macro_rules! cert {
 		);
 	}};
 
-	// Leaf certificate. `key_usage:` replaces the default `keyUsage` of
-	// `digitalSignature | nonRepudiation`, such as with `digitalSignature |
-	// keyAgreement` for a certificate a KEM encapsulates to.
+	// A leaf certificate. `key_usage:` replaces the default `keyUsage`, as
+	// `digitalSignature | keyAgreement` does for a certificate a KEM
+	// encapsulates to.
 	(
 		profile: Leaf,
 		subject: $subject:expr,
@@ -193,7 +193,7 @@ macro_rules! cert {
 		)
 	}};
 
-	// SubCA certificate
+	// A subordinate CA certificate, with an optional pathLenConstraint.
 	(
 		profile: SubCA,
 		subject: $subject:expr,
@@ -241,17 +241,26 @@ macro_rules! cert {
 	};
 }
 
-/// Create an X.509 Certificate Signing Request using the builder pattern
+/// Builds a PKCS #10 certificate signing request (RFC 2986) for `subject`,
+/// signed by `signer`.
+///
+/// The request carries a secp256k1 ECDSA signature in DER form. Each entry of
+/// `extensions:` goes into the extensionRequest attribute of the request
+/// (RFC 2985 §5.4.2).
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+/// use tightbeam::crypto::sign::Sha3Signer;
 /// use tightbeam::csr;
 ///
-/// let csr = csr!(
-///     subject: "CN=example.com",
-///     signer: &signing_key
-/// )?;
+/// let signing_key = Secp256k1SigningKey::from_bytes(&[7; 32].into())?;
+/// let signer = Sha3Signer::from(&signing_key);
+///
+/// let request = csr!(subject: "CN=example.com", signer: &signer)?;
+/// assert_eq!(request.info.subject.to_string(), "CN=example.com");
+/// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[cfg(feature = "x509")]
 #[macro_export]
@@ -263,9 +272,8 @@ macro_rules! csr {
 	) => {{
 		use core::str::FromStr;
 
-		use $crate::crypto::x509::builder::RequestBuilder;
+		use $crate::crypto::x509::builder::{Builder, RequestBuilder};
 		use $crate::crypto::x509::name::Name;
-		use $crate::der::Encode;
 
 		let subject = Name::from_str($subject)?;
 		let mut builder = RequestBuilder::new(subject, $signer)?;
@@ -276,7 +284,7 @@ macro_rules! csr {
 			)*
 		)?
 
-		builder.build::<$crate::crypto::sign::Signer>()
+		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
 	}};
 }
 
@@ -288,8 +296,9 @@ mod tests {
 	use crate::crypto::x509::ext::pkix::{
 		AuthorityKeyIdentifier, BasicConstraints, KeyUsage, KeyUsages, SubjectKeyIdentifier,
 	};
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
+	use crate::crypto::x509::KeyCurves;
 	use crate::der::asn1::OctetString;
 	use crate::der::Encode;
 	use crate::spki::SubjectPublicKeyInfoOwned;
@@ -440,7 +449,7 @@ mod tests {
 	fn a_cert_macro_chain_validates_under_the_secp256k1_policy() -> TestResult {
 		let (root_key, root_certificate) = root(1)?;
 		let leaf = leaf_of(&root_key)?;
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(root_certificate.clone())?
 			.build();
 

@@ -12,26 +12,29 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
 
+use tightbeam::asn1::{AuthEnvelopedData, WireDer};
 use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest, WantList};
 use tightbeam::colony::protocol::GossipRumor;
 use tightbeam::colony::servlet::ServletContext;
 use tightbeam::compress::ZstdCompression;
 use tightbeam::core::Inflator;
+use tightbeam::crypto::cms::Recipient;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::utils::CertificateExt;
-use tightbeam::crypto::x509::{CanonicalKey, KeyIndex};
+use tightbeam::crypto::x509::{CanonicalKey, KeyCurves, KeyIndex};
 use tightbeam::decode;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
-use tightbeam::der::Encode;
+use tightbeam::der::{Decode, Encode};
 use tightbeam::instrumentation::{events, TbInstrumentationConfig};
 use tightbeam::macros::server::SingleFlightAnswer;
-use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521};
+use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521, DATA};
 use tightbeam::policy::TransitStatus;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
@@ -41,6 +44,7 @@ use tightbeam::testing::{TestFrame, TestMessage};
 use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
 use tightbeam::transport::EndpointConfig;
+use tightbeam::urn::{UrnSpecBuilder, UrnValidationError};
 use tightbeam::utils::time::UnixMillis;
 use tightbeam::{compose, Frame, TightBeamError};
 
@@ -146,7 +150,8 @@ fn canonical_lookup_on_the_house_store() -> (bool, usize) {
 	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 	let key = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info);
 	let key = key.expect("a house key has a canonical form");
-	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate);
+	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	let builder = builder.with_certificate(certificate);
 	let store = builder.expect("the fixed certificate enrols").build();
 
 	let before = ALLOCATIONS.with(Cell::get);
@@ -186,7 +191,7 @@ fn a_key_identifier_names_its_certificate_with_no_allocation() {
 /// validates the fixed path, as one chain and as a presented path.
 fn validations_of_the_fixed_path() -> (usize, usize) {
 	let chain = TestCertificate::insecure_fixed_chain().expect("the fixed test chain issues");
-	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	let builder = builder.with_certificate(chain.root);
 	let store = builder.expect("the root is within its validity period").build();
 	let whole = [chain.intermediate.to_owned(), chain.leaf.to_owned()];
@@ -561,4 +566,69 @@ fn chain_with_records_left_out(extra: u32) -> usize {
 #[test]
 fn a_record_that_the_chain_leaves_out_renders_nothing() {
 	assert_eq!(chain_with_records_left_out(3), chain_with_records_left_out(0));
+}
+
+/// The DER of a frame envelope: a content sealed to one KEK recipient.
+fn sealed_envelope() -> Result<Vec<u8>, Box<dyn Error>> {
+	let key = [0x5au8; 32];
+	let kek = Kek::try_from(key.as_slice())?;
+	let recipient: Recipient<'_, DefaultCryptoProvider> = Recipient::Kek { kek, key_identifier: b"allocations" };
+	let sealed = AuthEnvelopedData::seal(recipient, DATA, b"content".to_vec(), [], None)?;
+	Ok(sealed.to_der()?)
+}
+
+/// The counts of the allocations that the decode of a frame envelope makes
+/// through its `WireDer`, which holds the value to its arrival, and through a
+/// plain decode beside the one copy of its bytes that a `WireDer` keeps.
+fn decodes_of_a_frame_envelope() -> Result<(usize, usize), Box<dyn Error>> {
+	let arrived = sealed_envelope()?;
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let held = WireDer::<AuthEnvelopedData>::try_from(arrived.as_slice());
+	let between = ALLOCATIONS.with(Cell::get);
+	let decoded = AuthEnvelopedData::from_der(&arrived);
+	let kept = arrived.to_vec();
+	let after = ALLOCATIONS.with(Cell::get);
+
+	held?;
+	decoded?;
+	drop(kept);
+	Ok((between - before, after - between))
+}
+
+/// The hold of a frame envelope streams its encoding against its arrival, so
+/// its decode allocates what a plain decode and the kept copy allocate.
+#[test]
+fn a_frame_envelope_holds_its_arrival_with_no_allocation() -> Result<(), Box<dyn Error>> {
+	let (held, decoded) = decodes_of_a_frame_envelope()?;
+	assert_eq!(held, decoded);
+	Ok(())
+}
+
+/// The counts of the allocations that two specs of the fields `kind` and `id`
+/// make as each reads the NSS `trace/abc`: one that joins the fields at `/`,
+/// and one whose format places the `/`.
+fn reads_of_one_nss() -> Result<(usize, usize), UrnValidationError> {
+	let spec = UrnSpecBuilder::from("example").field_required("kind").field_required("id");
+	let joined = spec.clone().field_nss_separator("id", "/");
+	let formatted = spec.nss_format("{}/{}");
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let joined_read = joined.parse_nss("trace/abc");
+	let between = ALLOCATIONS.with(Cell::get);
+	let formatted_read = formatted.parse_nss("trace/abc");
+	let after = ALLOCATIONS.with(Cell::get);
+
+	joined_read?;
+	formatted_read?;
+	Ok((between - before, after - between))
+}
+
+/// A join format reads each separator from the fields of its spec, so it
+/// reads an NSS with the allocations of a custom format of the same values.
+#[test]
+fn a_joined_nss_reads_with_the_allocations_of_a_formatted_one() -> Result<(), UrnValidationError> {
+	let (joined, formatted) = reads_of_one_nss()?;
+	assert_eq!(joined, formatted);
+	Ok(())
 }

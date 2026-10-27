@@ -9,7 +9,9 @@ use std::sync::Arc;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::{HiveContext, ServletBox};
 use crate::colony::servlet::serve::ContextService;
-use crate::colony::servlet::{RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox};
+use crate::colony::servlet::{
+	RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, UtilizationGauge, WorkerBox,
+};
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
@@ -24,6 +26,7 @@ use crate::transport::policy::{CollectorGateConfig, PolicyConfig};
 use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
+use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 use crate::crypto::profiles::CryptoProvider;
@@ -42,6 +45,8 @@ pub(crate) struct ServletRuntimeParts<Env> {
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
+	/// The gauge the hive reads as this servlet's utilization, if one is set.
+	pub(crate) utilization: Option<Box<dyn UtilizationGauge>>,
 	/// The accept loop paces its retries on this clock.
 	pub(crate) clock: Arc<dyn Clock>,
 }
@@ -56,6 +61,8 @@ pub struct ServletRuntime<P: Protocol> {
 	addr_bytes: Arc<[u8]>,
 	/// The signer of the certificate the listener presents, recorded at start.
 	signer: Option<SignerIdentifier>,
+	/// The gauge that [`ServletBox::utilization`] reads, if the config set one.
+	utilization: Option<Box<dyn UtilizationGauge>>,
 	trace_handle: TraceHandle,
 }
 
@@ -125,6 +132,7 @@ where
 			message_decryptor,
 			message_inflator,
 			workers,
+			utilization,
 			clock,
 		} = parts;
 
@@ -155,12 +163,12 @@ where
 			let service = Arc::clone(&service);
 			async move { serve_connection_service(transport, service, None, None).await }
 		};
-		let accept_loop = plane.accept_owned(listener, terms, serve);
 
-		let server_handle = rt::spawn(accept_loop);
+		let accept_loop = plane.accept_owned(listener, terms, serve);
+		let server_handle = Some(rt::spawn(accept_loop));
 		let addr_bytes: Arc<[u8]> = Arc::from(addr.clone().into());
 
-		let runtime = Self { server_handle: Some(server_handle), addr, addr_bytes, signer, trace_handle };
+		let runtime = Self { server_handle, addr, addr_bytes, signer, utilization, trace_handle };
 		Ok(runtime)
 	}
 }
@@ -247,6 +255,14 @@ where
 
 	fn signer(&self) -> Option<&SignerIdentifier> {
 		self.signer.as_ref()
+	}
+
+	/// Reads the gauge that [`ServletConfigBuilder::with_utilization`]
+	/// installed, and reports no sample for a servlet with no gauge.
+	///
+	/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
+	fn utilization(&self) -> Option<BasisPoints> {
+		self.utilization.as_ref().map(|gauge| gauge.utilization())
 	}
 }
 

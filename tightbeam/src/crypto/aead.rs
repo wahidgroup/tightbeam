@@ -1122,6 +1122,7 @@ mod tests {
 		let mut second = first.clone();
 		let last = second.last_mut().expect("a recipient ends with its wrapped key");
 		*last ^= 0x01;
+
 		let mut both = [first, second];
 		both.sort();
 
@@ -1134,6 +1135,20 @@ mod tests {
 	fn with_originator_info(record: &[u8]) -> Vec<u8> {
 		let (version, rest) = fields_of(record).split_at(3);
 		tlv(DerTag::Sequence, &[version, &[0xa0, 0x00], rest].concat())
+	}
+
+	/// Returns `record` with a stray `[0] { NULL }` between its
+	/// `authEncryptedContentInfo` and its `[1] authAttrs`, where RFC 5083 §2.1
+	/// places no field.
+	fn with_stray_before_attributes(record: &[u8]) -> Vec<u8> {
+		let mut reader = SliceReader::new(fields_of(record)).expect("a record fits a DER length");
+		let mut fields = Vec::new();
+		while !reader.is_finished() {
+			fields.push(reader.tlv_bytes().expect("a record is a run of DER elements"));
+		}
+
+		fields.insert(3, &[0xa0, 0x02, 0x05, 0x00]);
+		tlv(DerTag::Sequence, &fields.concat())
 	}
 
 	/// Returns `record` with its tag changed in its last octet, the last of
@@ -1205,6 +1220,7 @@ mod tests {
 		let attributes = attributes.into_vec();
 		let rest = attributes.into_iter().filter(|attribute| attribute.oid != RECORD_SEQUENCE);
 		let attributes = SetOfVec::try_from(rest.chain([attribute]).collect::<Vec<_>>());
+
 		envelope.auth_attrs = Some(attributes.expect("distinct attributes are a SET"));
 		envelope.to_der().expect("the record encodes")
 	}
@@ -1239,10 +1255,10 @@ mod tests {
 	#[test]
 	fn a_record_carries_its_epoch_and_sequence_in_its_authenticated_attributes() {
 		let sender = test_sender(3);
+
 		// The first record takes sequence 0, so the second carries 1.
 		let _first = record_of(&sender);
 		let second = record_of(&sender);
-
 		assert_eq!(position_of(&second), RecordSequence { epoch: 3, sequence: 1 });
 	}
 
@@ -1261,7 +1277,6 @@ mod tests {
 	fn a_record_declares_id_data() -> TbResult<()> {
 		let sender = test_sender(0);
 		let record = sender.encrypt_next(PLAINTEXT)?;
-
 		assert_eq!(TestAttributes::declared_content_types(&record), (ID_DATA, ID_DATA));
 		Ok(())
 	}
@@ -1379,6 +1394,19 @@ mod tests {
 		let refused = test_receiver(0).open(&mut record);
 		let originator_tag = DerTag::ContextSpecific { constructed: true, number: TagNumber::N0 };
 		assert_eq!(encoding_refusal(refused), Some(ErrorKind::Value { tag: originator_tag }));
+	}
+
+	/// `der` skips a context-specific element whose number is below the one
+	/// it looks for, so the receiver holds the decoded record to its arrival
+	/// and refuses a stray `[0]` before `authAttrs`, even under a tag that
+	/// passes (X.690 § 8.9.2).
+	#[test]
+	fn a_record_with_a_stray_context_tag_is_refused() {
+		let mut record = with_stray_before_attributes(&record_of(&test_sender(0)));
+
+		let refused = test_receiver(0).open(&mut record);
+		let noncanonical = ErrorKind::Noncanonical { tag: DerTag::Sequence };
+		assert_eq!(encoding_refusal(refused), Some(noncanonical));
 	}
 
 	/// Each record draws its own content key, and AES key wrap is

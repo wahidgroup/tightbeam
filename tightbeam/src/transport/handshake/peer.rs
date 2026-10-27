@@ -111,8 +111,8 @@ mod chain {
 
 	impl ValidatorChain {
 		/// The chain of `validators`, or `None` for an empty set, which names
-		/// no check to run. This is the one definition of that rule, for the
-		/// policy of a client and the policy of a server alike.
+		/// no check to run. It is the one definition of that rule, for client
+		/// and server policies alike.
 		pub(crate) fn new(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Option<Self> {
 			let validators = validators.into_iter().collect::<Arc<[_]>>();
 			if validators.is_empty() {
@@ -196,12 +196,9 @@ mod chain {
 }
 
 impl PeerAuthentication {
-	/// Build mutual authentication against `validators`.
-	///
-	/// An empty set names no check to run, so it yields [`Self::Anonymous`].
-	/// `ValidatorChain::new` is the one definition of that rule, so a caller
-	/// that holds a possibly empty collection passes it here and lets this
-	/// method decide.
+	/// Build mutual authentication against `validators`, or [`Self::Anonymous`]
+	/// for an empty set, by the rule of `ValidatorChain::new`. A caller with a
+	/// possibly empty collection passes it here.
 	pub fn mutual(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
 		ValidatorChain::new(validators).map_or(Self::Anonymous, Self::Mutual)
 	}
@@ -223,9 +220,8 @@ impl PeerAuthentication {
 	///   validator run before the Finished. Each validator reads the
 	///   certificate beside the issuers the Finished presents, through
 	///   [`CertificateValidation::evaluate_presented`].
-	/// - This method verifies the Finished whenever the client offers a
-	///   certificate, so an anonymous server also refuses a certificate the
-	///   client cannot prove.
+	/// - It verifies the Finished whenever the client offers a certificate, so
+	///   an anonymous server also refuses a certificate the client cannot prove.
 	///
 	/// # Errors
 	///
@@ -730,9 +726,9 @@ impl ProvisionedTrust {
 	/// Trust in the server whose key-agreement certificate is
 	/// `key_agreement`, as `store` authenticates it.
 	///
-	/// This constructor admits the certificate against the store once, and
-	/// each handshake admits it again, because its validity period and the
-	/// store's verdict change after construction.
+	/// It admits the certificate against the store once, and each handshake
+	/// admits it again, because its validity period and the store's verdict
+	/// change after construction.
 	///
 	/// # Errors
 	///
@@ -743,8 +739,8 @@ impl ProvisionedTrust {
 		store: Arc<dyn CertificateTrust>,
 	) -> Result<Self, HandshakeError> {
 		let key_agreement = key_agreement.into();
-		// The admission here refuses a certificate the store refuses, and each
-		// handshake admits it again, so its leaf and anchor drop here.
+		// Each handshake admits the certificate again, so its leaf and anchor
+		// drop here.
 		key_agreement.admit(store.as_ref())?;
 		Ok(Self { key_agreement, store })
 	}
@@ -845,10 +841,10 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 		ProvisionedKeyAgreement::new(admitted, anchor, admission.policy)
 	}
 
-	/// Admit the server the reply names: its signing certificate for signing
-	/// under the server's purpose, with the path the reply presents validated
-	/// to an anchor of the store (RFC 5280 §6.1), then the pair it makes with
-	/// the key-agreement certificate the opening sealed to, which the server
+	/// Admit the server the reply names. Its signing certificate passes for
+	/// signing under the server's purpose, its presented path validated to an
+	/// anchor of the store (RFC 5280 §6.1). It then pairs with the
+	/// key-agreement certificate that the opening sealed to and the server
 	/// policy admitted.
 	///
 	/// # Errors
@@ -914,8 +910,8 @@ impl LearnedTrust {
 	///
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::{KeyCurves, KeyPurposes};
 	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
 	/// use tightbeam::transport::handshake::{ClientConfig, Hpke, HpkeClientSettings, LearnedTrust};
 	///
@@ -925,7 +921,7 @@ impl LearnedTrust {
 	///
 	/// // The store holds the root alone, and each reply presents the path
 	/// // below it.
-	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	/// let store = builder.with_certificate(root)?.build();
 	/// let settings = HpkeClientSettings::new(LearnedTrust::anchored(Arc::new(store)));
 	/// let _config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
@@ -1118,8 +1114,8 @@ mod tests {
 			CertificateNotPinned, CertificateRevoked, Expired,
 		};
 		use crate::crypto::x509::ext::pkix::AuthorityKeyIdentifier;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, StaticRevocationList, TrustBuilder};
-		use crate::crypto::x509::ErasedSigning;
+		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, StaticRevocationList, TrustBuilder};
+		use crate::crypto::x509::{ErasedSigning, KeyCurves};
 		use crate::der::asn1::{BitString, ObjectIdentifier};
 		use crate::der::oid::AssociatedOid;
 		use crate::der::Any;
@@ -1196,7 +1192,7 @@ mod tests {
 
 		/// The built-in store that holds `trusted`.
 		fn store_holding(trusted: impl IntoIterator<Item = Certificate>) -> Arc<dyn CertificateTrust> {
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 			let builder = trusted.into_iter().try_fold(builder, TrustBuilder::with_certificate);
 			Arc::new(builder.expect("the store takes valid test certificates").build())
 		}

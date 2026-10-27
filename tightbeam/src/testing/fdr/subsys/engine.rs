@@ -1,7 +1,7 @@
 //! The engine subsystem of FDR.
 //!
-//! This module holds [`FdrExplorer`], which runs exploration and refinement
-//! checks through subsystems that a caller can replace.
+//! [`FdrExplorer`] runs exploration and refinement checks through subsystems
+//! that a caller can replace.
 
 use core::convert::Infallible;
 use std::cell::RefCell;
@@ -106,8 +106,7 @@ where
 {
 	/// An explorer of `process` under `config` with the given subsystems.
 	///
-	/// The refinement checker owns the cache, which it receives at its
-	/// construction.
+	/// The refinement checker receives its cache at its own construction.
 	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R) -> Self {
 		Self {
 			process,
@@ -401,8 +400,7 @@ where
 	/// divergences they found.
 	///
 	/// - The verdict describes the spec runs that this mode judges, and the subject's engine stays empty.
-	/// - Each spec runs on a [`DefaultExplorationEngine`] of its own, because
-	///   the engine `E` explores the subject alone.
+	/// - Each spec runs on an engine of its own, which [`ExplorationCore::for_process`] of `E` builds.
 	/// - `states_visited` counts the distinct states of each spec.
 	/// - The loop covers every spec, because a fault run of `specs[0]` alone would leave the rest untested.
 	#[cfg(feature = "testing-fault")]
@@ -416,7 +414,7 @@ where
 
 		let config = Arc::clone(&self.config);
 		for spec_process in &config.specs {
-			let mut engine = DefaultExplorationEngine::new(spec_process, Arc::clone(&config));
+			let mut engine = self.explorer.for_process(spec_process);
 			let mut found = FoundDivergences::kept_when(record.is_some());
 			let seeds = 0..u64::from(config.seeds);
 			for (seed, result) in engine.explore_seeds(seeds) {
@@ -457,27 +455,11 @@ where
 		}
 	}
 
-	/// Records whether the process is structurally deterministic.
-	///
-	/// A process with no hidden action and no multi-target `(state, event)`
-	/// transition is deterministic in CSP (Roscoe 2010, §10.5). External choice
-	/// is deterministic, so the check passes it.
+	/// Records whether the subject is structurally deterministic, by the rule
+	/// of [`Process::determinism_witness`].
 	fn check_determinism(&mut self) {
-		let mut states: Vec<State> = self.process.states.iter().copied().collect();
-		states.sort_unstable_by_key(|state| state.0);
-
-		let mut witness = None;
-		'states: for state in states {
-			for action in self.process.enabled(state) {
-				if action.is_hidden() || self.process.step(state, &action.event).len() > 1 {
-					witness = Some((state, action.event));
-					break 'states;
-				}
-			}
-		}
-
-		self.verdict.is_deterministic = witness.is_none();
-		self.verdict.determinism_witness = witness;
+		let witness = self.process.determinism_witness();
+		self.verdict.record_determinism(witness);
 	}
 
 	/// Checks `spec ⊑ process` in the models that the subject admits.
@@ -616,6 +598,7 @@ mod tests {
 
 	use super::Decision;
 	use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+	use crate::testing::specs::composition::DeterminismChecker;
 	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 	use crate::trace::TraceCollector;
 
@@ -1082,6 +1065,21 @@ mod tests {
 		let verdict = explorer.explore();
 		let statistics = (verdict.states_visited, verdict.traces_explored, verdict.seeds_completed);
 		assert_eq!(statistics, (2, 4, 4), "the spec visits `S0` and `S1` on each of four seeds");
+		Ok(())
+	}
+
+	#[test]
+	fn a_hidden_action_is_one_determinism_witness_for_the_explorer_and_the_composition_claim(
+	) -> Result<(), ProcessBuildError> {
+		let subject = hidden_chain()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		let refused = DeterminismChecker::check(&subject).err();
+		let claimed = refused.map(|refused| (refused.state, refused.event));
+
+		let hidden_t = Some((State("S0"), Event("t")));
+		assert_eq!((verdict.determinism_witness, claimed), (hidden_t, hidden_t));
 		Ok(())
 	}
 }

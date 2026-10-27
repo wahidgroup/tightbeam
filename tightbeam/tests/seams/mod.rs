@@ -1,38 +1,38 @@
-//! This module builds each seam an outside crate fills as such a crate must
-//! build it, through the public API of tightbeam alone.
+//! Each seam an outside crate fills, built as that crate must build it,
+//! through the public API of tightbeam alone.
 //!
-//! The outside crate writes these parts itself:
+//! The outside provider writes its own parts, and takes the house AES-128 key
+//! wrap through [`KeyWrapProvider`]:
 //!
-//! - a signature, ECDSA over secp256k1 under `ecdsa-with-SHA3-512`, whose
-//!   canonical form refuses a high `s`, as a [`SigningProvider`],
-//! - a KDF, HKDF over SHA3-512 under an identifier of its own arc, as a [`KdfProvider`],
-//! - a KEM, the DHKEM over secp256k1 under a KEM identifier of its own, through [`RecipientKem`],
-//! - a signing backend, as a [`SigningKeyProvider`],
-//! - a key-agreement backend that runs its own scalar product, as a [`DiffieHellman`] backend,
-//! - an AEAD, AES-128-GCM under a cipher type of its own, as a [`ContentEncryption`], and
-//! - a key wrap that brings `wrap` and `unwrap` alone, as a [`KeyWrapAlgorithm`].
+//! | Part | Seam |
+//! | --- | --- |
+//! | ECDSA over secp256k1 under `ecdsa-with-SHA3-512`, which refuses a high `s` | [`SigningProvider`] |
+//! | HKDF over SHA3-512 under an identifier of its own arc | [`KdfProvider`] |
+//! | The DHKEM over secp256k1 under a KEM identifier of its own | [`RecipientKem`] |
+//! | A signing backend | [`SigningKeyProvider`] |
+//! | A key-agreement backend that runs its own scalar product | [`DiffieHellman`] |
+//! | AES-128-GCM under a cipher type of its own | [`ContentEncryption`] |
+//! | A key wrap with `wrap` and `unwrap` alone | [`KeyWrapAlgorithm`] |
 //!
-//! The outside provider selects one house type through [`KeyWrapProvider`]:
-//! the AES-128 key wrap.
-//!
-//! These suites run under it:
+//! These suites run under the outside provider:
 //!
 //! - [`hpke`] and [`cms`] run both handshakes, under a provider that names no HPKE suite.
 //! - [`kem`] brings a KEM whose private-key operation is not Diffie-Hellman.
-//! - [`curves`] brings the decoder of a curve, which refuses its off-curve encodings at each reader of keys.
-//! - [`colony`] runs two gateways, a hive, and its servlet, which each sign and verify under the provider.
-//! - [`floor`] holds the strength floor of a provider at the TCP transport, and refuses a mixed pair.
+//! - [`curves`] brings a curve decoder, which refuses its off-curve encodings at each key reader.
+//! - [`colony`] runs two gateways, a hive, and its servlet, which each sign and verify under it.
+//! - [`floor`] holds its strength floor at the TCP transport, and refuses a mixed pair.
 //! - [`blocking`] runs a handshake and one exchange over the blocking TCP transport.
 //! - [`curve`] brings providers on P-256, P-384, and P-521, which run both handshakes and a renewal.
 //!
-//! Other suites bring a part of the transport or of the colony:
+//! These suites bring one part of the transport or the colony:
 //!
-//! - [`handshake`] brings a client and a server orchestrator, which the TCP transport drives.
-//! - [`listener`] brings a blocking listener backend, which the house TCP listener serves.
-//! - [`mux`] brings a dispatch and a credit grantor, which the multiplexed transport runs.
-//! - [`registry`] brings the servlet registry a hive runs on, which hands back each registration it replaces.
-//! - [`restart`] brings a restart policy and a jitter strategy, which a transport and a house backoff run.
-//! - [`retry`] brings the retry policy of the scaling updates of a hive.
+//! - [`handshake`]: a client and a server orchestrator, which the TCP transport drives.
+//! - [`listener`]: a blocking listener backend, which the house TCP listener serves.
+//! - [`mux`]: a dispatch and a credit grantor, which the multiplexed transport runs.
+//! - [`registry`]: the hive's servlet registry, which hands back each registration it replaces.
+//! - [`restart`]: a restart policy and a jitter strategy, which a transport and a house backoff run.
+//! - [`retry`]: the retry policy of a hive's scaling updates.
+//! - [`urn`]: a URN spec with components of its own, which `Urn::verify` reads a URN through.
 
 #[cfg(all(feature = "transport-hpke", feature = "tcp"))]
 mod blocking;
@@ -61,6 +61,7 @@ mod retry;
 mod servlet;
 mod spec;
 mod trust;
+mod urn;
 
 use std::sync::Arc;
 

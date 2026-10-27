@@ -3,18 +3,8 @@
 //! [`TransportError`] is the error every transport operation returns.
 //! [`TransportFailure`] names why an operation failed, and its peer-refusal
 //! variants map to and from the wire [`TransitStatus`].
-use crate::asn1::Frame;
-use crate::crypto::x509::error::CertificateValidationError;
-use crate::error::TightBeamError;
-use crate::policy::TransitStatus;
-#[cfg(all(
-	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-hpke")
-))]
-use crate::transport::handshake::HandshakeAudit;
-use crate::transport::handshake::SessionPeer;
-use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
-
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
@@ -26,9 +16,19 @@ use std::net::AddrParseError;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use crate::asn1::Frame;
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::error::TightBeamError;
+use crate::policy::TransitStatus;
+use crate::transport::handshake::SessionPeer;
+use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 use crate::Errorizable;
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
+
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::transport::handshake::HandshakeAudit;
 
 /// The result type of transport operations.
 pub type Result<T> = core::result::Result<T, TransportError>;
@@ -234,7 +234,6 @@ impl From<TightBeamError> for TransportError {
 			// The receive side hits this only when the peer overran the
 			// per-key volume bound. The session is unusable either way.
 			TightBeamError::RekeyRequired => TransportError::OperationFailed(TransportFailure::RekeyRequired),
-			// A poisoned lock is a fault of this endpoint alone.
 			#[cfg(feature = "std")]
 			TightBeamError::LockPoisoned => TransportError::OperationFailed(TransportFailure::Internal),
 			_ => TransportError::InvalidMessage,
@@ -242,9 +241,8 @@ impl From<TightBeamError> for TransportError {
 	}
 }
 
-// The variant that names a kind or an operation that an endpoint leaves out
-// is the transport's, so the transport answers whether a crate error carries
-// it.
+// `NotServed` is the transport's variant, so the transport answers whether a
+// crate error carries it.
 #[cfg(feature = "std")]
 impl TightBeamError {
 	/// Whether this error is [`TransportError::NotServed`], the refusal of a
@@ -584,7 +582,6 @@ impl TransportError {
 	///   budget, an unencodable frame, a missing encryptor, or a failed nonce
 	///   generation.
 	/// - A peer's [`TransportFailure::Unavailable`], which a peer answers before its handler runs.
-	#[cfg(feature = "colony")]
 	#[must_use]
 	pub(crate) fn proves_unsent(&self) -> bool {
 		matches!(
@@ -680,27 +677,39 @@ impl TransportError {
 		}
 	}
 
-	/// Report whether the error means the connection is dead, which drives
-	/// auto-reconnect.
+	/// Report whether this error leaves the stream of an exchange unsound, so
+	/// the caller discards the connection and establishes a new one.
 	///
-	/// A `true` result tells the caller to discard the underlying connection
-	/// and establish a new one.
+	/// It is the complement of the faults that prove the frame never left, so
+	/// every other error ends the stream: a close, a deadline, an I/O failure,
+	/// a handshake failure, and a decode or size refusal of an answer.
+	///
+	/// # Domain
+	///
+	/// The predicate reads the error that one exchange of a transport returns,
+	/// as [`MessageEmitter::perform_send_receive`] hands it back, before any
+	/// status the peer answered becomes an error. An error that a
+	/// [`TransitStatus`] builds after a whole exchange, such as the peer's
+	/// `Unavailable`, is outside it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::{TransportError, TransportFailure};
+	///
+	/// // A deadline after the write leaves an answer on its way.
+	/// let expired = TransportError::OperationFailed(TransportFailure::DeadlineExceeded);
+	/// assert!(expired.is_connection_error());
+	///
+	/// // A missing encryptor refuses before the write.
+	/// let unsent = TransportError::OperationFailed(TransportFailure::EncryptorUnavailable);
+	/// assert!(!unsent.is_connection_error());
+	/// ```
+	///
+	/// [`MessageEmitter::perform_send_receive`]: crate::transport::MessageEmitter::perform_send_receive
+	#[must_use]
 	pub fn is_connection_error(&self) -> bool {
-		matches!(
-			self,
-			TransportError::ConnectionClosed
-				| TransportError::ConnectionFailed
-				| TransportError::OperationFailed(TransportFailure::DeadlineExceeded)
-		) || {
-			#[cfg(feature = "std")]
-			{
-				matches!(self, TransportError::IoError(_))
-			}
-			#[cfg(not(feature = "std"))]
-			{
-				false
-			}
-		}
+		!self.proves_unsent()
 	}
 }
 
@@ -933,6 +942,31 @@ mod tests {
 		assert!(!displayed.contains(body_bytes));
 		assert!(!debugged.contains(body));
 		assert!(!debugged.contains(body_bytes));
+	}
+
+	// An error of one exchange ends the stream unless it proves the frame never
+	// left, so a decode or size refusal of an answer ends it too.
+	crate::tb_cases! {
+		fn is_connection_error_of((error, expected): (TransportError, bool)) -> Result<()> {
+			assert_eq!(error.is_connection_error(), expected);
+			Ok(())
+		}
+		cases {
+			a_close_ends_the_stream => (TransportError::ConnectionClosed, true),
+			a_deadline_ends_the_stream => (TransportError::OperationFailed(TransportFailure::DeadlineExceeded), true),
+			an_undecodable_answer_ends_the_stream => (TransportError::InvalidMessage, true),
+			an_answer_past_its_ceiling_ends_the_stream => (
+				TransportError::OperationFailed(TransportFailure::SizeExceeded),
+				true
+			),
+			a_malformed_answer_ends_the_stream => (TransportError::DerError(der::Error::from(der::ErrorKind::Failed)), true),
+			a_failed_nonce_keeps_the_stream => (TransportError::SendFailed, false),
+			a_missing_encryptor_keeps_the_stream => (
+				TransportError::OperationFailed(TransportFailure::EncryptorUnavailable),
+				false
+			),
+			a_spent_budget_keeps_the_stream => (TransportError::OperationFailed(TransportFailure::BudgetExhausted), false),
+		}
 	}
 
 	#[test]

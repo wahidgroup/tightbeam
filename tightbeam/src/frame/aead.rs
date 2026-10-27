@@ -58,8 +58,8 @@ impl Frame {
 	/// Decrypt, decompress when needed, and decode the message body into a
 	/// typed message `T`.
 	///
-	/// The method combines [`Frame::decrypt_in_place`] and [`crate::decode`].
-	/// A compressed body requires an `inflator`.
+	/// It combines [`Frame::decrypt_in_place`] and [`crate::decode`]. A
+	/// compressed body requires an `inflator`.
 	///
 	/// # Errors
 	///
@@ -86,7 +86,7 @@ impl Frame {
 	/// # Verify first
 	///
 	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted body,
-	/// and this method leaves them untouched. Verify them *before* the call
+	/// and the decrypt leaves them untouched. Verify them *before* the call
 	/// ([`Frame::verify_frame_integrity`], [`Frame::verify`]), because they
 	/// fail on the cleartext. The message commitment in `metadata.integrity`
 	/// is the check that survives decryption ([`Frame::verify_commitment_of`]).
@@ -140,7 +140,7 @@ impl Frame {
 	///
 	/// Use it when an [`EncryptingKeyProvider`], such as an HSM or a KMS, holds
 	/// the key-encryption key. On any error the frame is unchanged. On success
-	/// the method stores:
+	/// it stores:
 	///
 	/// - The envelope in the `confidentiality` field, its recipient named by the provider's key identifier.
 	/// - The encrypted bytes in the `message` field, detached from the envelope (RFC 5652 §6.1).
@@ -171,7 +171,7 @@ impl Frame {
 	///
 	/// Use it when an [`EncryptingKeyProvider`], such as an HSM or a KMS, holds
 	/// the key-encryption key. On any error the frame is unchanged. On success
-	/// the method:
+	/// it:
 	///
 	/// 1. holds the envelope of the `confidentiality` field to the provider's key and the AEAD of `P`,
 	/// 2. decrypts the message bytes in place with the content key the provider decrypts, and
@@ -235,12 +235,15 @@ mod tests {
 
 	mod decrypt_in_place {
 		use super::*;
+		use crate::asn1::admission::fixtures::tlv;
+		use crate::asn1::{AuthEnvelopedData, WireDer};
 		use crate::cms::compressed_data::CompressedData;
 		use crate::cms::content_info::CmsVersion;
 		use crate::cms::signed_data::EncapsulatedContentInfo;
 		use crate::crypto::cms::EnvelopeError;
 		use crate::crypto::key::{Aes256GcmKeyProvider, KeyError};
 		use crate::crypto::secret::ToInsecure;
+		use crate::der::{AnyRef, Decode, ErrorKind, Tag};
 		use crate::error::ReceivedExpectedError;
 		use crate::oids::{COMPRESSION_ZSTD, DATA};
 		use crate::spki::AlgorithmIdentifier;
@@ -308,6 +311,22 @@ mod tests {
 			let metadata = frame.metadata();
 			let envelope = metadata.confidentiality().ok_or(TightBeamError::MissingEncryptionInfo)?;
 			assert!(envelope.auth_encrypted_content_info.encrypted_content.is_none());
+			Ok(())
+		}
+
+		/// The metadata of a frame reads its envelope through the `WireDer`
+		/// decode, which holds the envelope to its arrival, so it refuses a
+		/// stray `[1]` after `mac`, which `der` skips (X.690 § 8.9.2).
+		#[test]
+		fn a_frame_envelope_with_a_stray_context_tag_is_refused() -> Result<()> {
+			let frame = encrypted_frame()?;
+			let sealed = frame.metadata.confidentiality.as_ref();
+			let sealed = sealed.ok_or(TightBeamError::MissingEncryptionInfo)?;
+			let fields = AnyRef::from_der(sealed.der())?.value();
+			let stray = tlv(Tag::Sequence, &[fields, &[0xa1, 0x02, 0x05, 0x00]].concat());
+
+			let refused = WireDer::<AuthEnvelopedData>::from_der(&stray).map_err(|error| error.kind());
+			assert_eq!(refused, Err(ErrorKind::Noncanonical { tag: Tag::Sequence }));
 			Ok(())
 		}
 

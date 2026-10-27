@@ -62,9 +62,8 @@ where
 		let (outbound_sender, outbound_receiver) = mpsc::channel(outbound_capacity);
 		let (inbound_sender, inbound_receiver) = mpsc::channel(inbound_capacity);
 
-		// Instrumentation inherits the connection collector that the halves
-		// carried across the split, so the mux plane records into the collector
-		// of its connection.
+		// The mux plane records into the connection collector that the halves
+		// carried across the split.
 		#[cfg(not(feature = "instrument"))]
 		let shared = MuxShared::new(role, &settings);
 		#[cfg(feature = "instrument")]
@@ -210,27 +209,26 @@ where
 	/// Spawn both drivers on the runtime and hand back the live plane.
 	///
 	/// Driver failures resolve pending streams through the shared state
-	/// (`fail_all_pending`), so the tasks are fire-and-forget. The reader task
-	/// doubles as the connection's liveness witness
-	/// ([`SpawnedMux::reader_task`]), and the writer task ends on its own when
-	/// the connection dies.
+	/// (`fail_all_pending`). [`SpawnedMux::drivers`] owns both tasks: the
+	/// reader doubles as the connection's liveness witness, and the drop of
+	/// the drivers ends the connection.
 	pub fn spawn(self) -> SpawnedMux {
 		let (handle, reader_driver, writer_driver, responder) = self.into_parts();
-		let reader_task = rt::spawn(async move {
+		let reader = rt::spawn(async move {
 			// A reader failure has already resolved every pending stream
 			// through the shared state, so the task has nowhere else to
 			// report it.
 			let _ = reader_driver.drive().await;
 		});
 
-		rt::spawn(async move {
+		let writer = rt::spawn(async move {
 			// A writer failure ends the connection, and the reader task is
 			// the liveness witness, so the writer task has nothing left to
 			// report.
 			let _ = writer_driver.drive().await;
 		});
 
-		SpawnedMux { handle, responder, reader_task }
+		SpawnedMux { handle, responder, drivers: MuxDrivers { reader, writer } }
 	}
 
 	/// Apply the optional cancel budget, then spawn both drivers through
@@ -254,7 +252,70 @@ pub struct SpawnedMux {
 	pub handle: MuxHandle,
 	/// Server-side dispatcher for peer-initiated streams.
 	pub responder: MuxResponder,
-	/// The reader driver's task, which finishes when the connection dies, so
-	/// holders use it as the connection's liveness witness.
-	pub reader_task: rt::JoinHandle,
+	/// The two driver tasks of the connection. Their drop ends the
+	/// connection, so a holder keeps them for as long as it emits or serves.
+	pub drivers: MuxDrivers,
+}
+
+/// The reader and the writer task of one multiplexed connection.
+///
+/// The drop of the value aborts both tasks, so the connection ends with the
+/// owner that holds the drivers (CWE-772).
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::transport::multiplex::SpawnedMux;
+///
+/// /// Whether the connection of `spawned` died.
+/// fn died(spawned: &SpawnedMux) -> bool {
+///     spawned.drivers.is_finished()
+/// }
+/// ```
+#[cfg(feature = "tokio")]
+pub struct MuxDrivers {
+	reader: rt::JoinHandle,
+	writer: rt::JoinHandle,
+}
+
+#[cfg(feature = "tokio")]
+impl MuxDrivers {
+	/// Whether the reader of the connection ended, which witnesses that the
+	/// connection died.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::multiplex::MuxDrivers;
+	///
+	/// /// Whether a pool must evict the connection that `drivers` runs.
+	/// fn evicts(drivers: &MuxDrivers) -> bool {
+	///     drivers.is_finished()
+	/// }
+	/// ```
+	#[must_use]
+	pub fn is_finished(&self) -> bool {
+		self.reader.is_finished()
+	}
+
+	/// Waits for the writer to end, and then ends the reader with the drop.
+	///
+	/// [`MuxHandle::close`] queues the close that the writer ends on, so every
+	/// envelope queued before it reaches the peer first. The writer bounds
+	/// each write by its operation deadline.
+	#[cfg(pooled_mux)]
+	pub(crate) async fn finish(mut self) {
+		// A writer that panicked has ended all the same, so its join outcome
+		// carries nothing that the close acts on.
+		let _ended = (&mut self.writer).await;
+	}
+}
+
+/// The drop aborts both tasks through the runtime seam.
+#[cfg(feature = "tokio")]
+impl Drop for MuxDrivers {
+	fn drop(&mut self) {
+		rt::abort(&self.reader);
+		rt::abort(&self.writer);
+	}
 }

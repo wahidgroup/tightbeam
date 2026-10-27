@@ -159,7 +159,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		// 2. Build the path the reply's signer presents, parsed from the bytes
 		//    it arrived as, for the trust to admit, and bind the `certificates`
 		//    field as it arrived after the content, then seal.
-		let presented = CmsSigner::signer_path(reply.value(), reply.der())?;
+		let presented = CmsSigner::signer_path(&reply)?;
 		let (server, certificates) = presented.ok_or(HandshakeError::MissingServerCertificate)?;
 		transcript.append(certificates)?;
 		let transcript_hash = transcript.seal::<P::Digest>()?;
@@ -192,9 +192,8 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		transcript_hash: &TranscriptHash,
 	) -> Result<ReplyVerified, HandshakeError> {
 		// The transcript hash is a signed attribute, so a signer that saw
-		// another transcript fails the attribute set. The hash is fresh for
-		// each handshake, so the verified signature is the key of no ledger
-		// and drops here.
+		// another transcript fails. The hash is fresh for each handshake, so
+		// the verified signature keys no ledger and drops here.
 		let content = CmsSigner::content(reply, HANDSHAKE_REPLY_CONTENT)?;
 		let signed = SignedContent::new(HANDSHAKE_REPLY_CONTENT, content).with_attribute(transcript_hash.attribute()?);
 		CmsSigner::verify_sole_signer::<P>(reply, server, signed).map(drop)?;
@@ -277,11 +276,9 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		let ClientHello { client_random, client_ephemeral, security_offer, transport_offer } =
 			ClientHello::from_der(octets.as_bytes())?;
 
-		// 3. Read `R` at the compressed width of the curve, and parse it. A
-		//    point of another width or form, and a malformed, off-curve, or
-		//    identity point, fail here, ahead of any negotiation. The
-		//    comparison with the client's static key waits for the identity,
-		//    which opens at the closing.
+		// 3. Parse `R` at the compressed width, so a point of another width or
+		//    form, malformed, off-curve, or the identity fails before any
+		//    negotiation. The static-key check waits for the closing identity.
 		let client_random = client_random.to_32_byte_array()?;
 		let client_point = client_ephemeral.to_compressed_point::<P::Curve>()?;
 		let client_ephemeral = PeerPoint::parse(client_point)?;
@@ -317,10 +314,9 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		};
 		let content = handshake.to_der()?;
 
-		// 2. Bind the content and the `certificates` field after the hello,
-		//    and seal. The transcript covers the certificate the reply's `sid`
-		//    names and each issuer the reply presents, as TLS 1.3 signs over
-		//    its Certificate, in the DER its identity encoded once.
+		// 2. Bind the content and the `certificates` field after the hello, and
+		//    seal, as TLS 1.3 signs over its Certificate. The field is the DER
+		//    the identity encoded once.
 		let presented = identity.presented();
 		opened.transcript.append(&content)?;
 		opened.transcript.append(presented.field())?;
@@ -343,9 +339,9 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		let HpkeReplyDraft { content, signer, certificates } = draft;
 
 		// 1. Complete the `SignerInfo`, with the session receipt as an unsigned
-		//    attribute. The artifact has two owners by design: this step
-		//    encodes one copy into the message, and the issued receipt absorbs
-		//    the client SignerInfo at settlement.
+		//    attribute. The artifact has two owners: the message holds one
+		//    copy, and the issued receipt absorbs the client SignerInfo at
+		//    settlement.
 		let receipt = artifact.map(HandshakeAttribute::encode).transpose()?;
 		let receipt = receipt.map(Attribute::try_from).transpose()?;
 		let unsigned_attrs = receipt.map(|receipt| Attributes::try_from(vec![receipt])).transpose()?;
@@ -831,8 +827,8 @@ mod tests {
 	}
 
 	/// A certificate demand flipped after the server signed its reply changes
-	/// the signed content, so the signature fails. An on-path party therefore
-	/// cannot talk an anonymous client past a server that demands an identity.
+	/// the signed content, so the signature fails. An on-path party cannot talk
+	/// an anonymous client past a server that demands an identity.
 	#[tokio::test]
 	async fn a_flipped_certificate_demand_fails_the_reply_signature() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
@@ -883,10 +879,10 @@ mod tests {
 		Ok(())
 	}
 
-	/// The client refuses a reply whose certificate carries its RDN values in
-	/// an order other than DER's, which would decode to the same value, as it
-	/// arrives under its `[3]` envelope, before it binds a byte of it
-	/// (X.690 §11.6, CWE-345).
+	/// The client refuses a reply whose certificate carries its RDN values out
+	/// of DER order, which would decode to the same value. The refusal comes at
+	/// the `[3]` envelope, before the client binds a byte of it (X.690 §11.6,
+	/// CWE-345).
 	#[tokio::test]
 	async fn a_reply_whose_certificate_bytes_were_reordered_is_refused() {
 		let mut server = create_test_certificate();

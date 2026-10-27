@@ -15,8 +15,8 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1SigningKey};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::{Certificate, CertificateSpec};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{Certificate, CertificateSpec, KeyCurves};
 use tightbeam::der::Enumerated;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::trace::TraceCollector;
@@ -134,7 +134,7 @@ impl DtnRole {
 	/// A trust store that admits the certificate of this node alone.
 	pub fn trust_store(self) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 		let certificate = Certificate::try_from(self.certificate())?;
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		Ok(Arc::new(builder.with_certificate(certificate)?.build()))
 	}
 

@@ -61,9 +61,10 @@ impl Drop for QueueSlot {
 /// no lock. [`Self::utilization`] reads it against the target latency that
 /// [`Self::new`] sets.
 ///
-/// A servlet can embed one to implement [`Servlet::utilization`].
+/// [`ServletConfigBuilder::with_utilization`] installs one as the gauge of a
+/// servlet.
 ///
-/// [`Servlet::utilization`]: crate::colony::servlet::Servlet::utilization
+/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
 #[derive(Debug)]
 pub struct LatencyTracker {
 	/// The average in microseconds, held as a `u64` in one atomic word.
@@ -172,14 +173,16 @@ impl Default for UtilizationWeights {
 	}
 }
 
-/// Latency and queue gauge that a servlet reports to the hive.
+/// A latency and queue gauge that a servlet reports to the hive.
 ///
-/// It wraps a [`LatencyTracker`] that records request latencies, and
-/// [`Self::with_queue`] adds the queue depth of a [`ServletMetrics`] to the
-/// reading. A servlet embeds one and returns `Some(reporter.utilization())`
-/// from [`ServletBox::utilization`].
+/// It reads a [`LatencyTracker`], plus the queue depth of a [`ServletMetrics`]
+/// with [`Self::with_queue`]. [`ServletConfigBuilder::with_utilization`]
+/// installs it on a servlet, and a hand-written [`ServletBox`] returns
+/// `Some(reporter.utilization())` from [`ServletBox::utilization`].
 ///
+/// [`ServletBox`]: crate::colony::hive::ServletBox
 /// [`ServletBox::utilization`]: crate::colony::hive::ServletBox::utilization
+/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
 ///
 /// # Example
 ///
@@ -241,8 +244,7 @@ impl UtilizationReporter {
 	/// zero reads as a queue utilization of zero.
 	///
 	/// # Arguments
-	/// - `weights`: the smoothing factor and the latency share. The names keep
-	///   a caller from swapping the two basis-point values.
+	/// - `weights`: the smoothing factor and the latency share.
 	/// - `target_us`: the target latency in microseconds, which reads as 100% utilization.
 	/// - `queue`: the shared queue metrics to read.
 	/// - `capacity`: the queue depth that reads as 100% queue utilization.
@@ -272,7 +274,6 @@ impl UtilizationReporter {
 	/// utilization alone.
 	pub fn utilization(&self) -> BasisPoints {
 		let latency_util = self.tracker.utilization().get() as u32;
-
 		let Some(ref queue) = self.queue else {
 			return self.tracker.utilization();
 		};
@@ -289,8 +290,8 @@ impl UtilizationReporter {
 		let queue_weight = 10000u32.saturating_sub(latency_weight);
 		let latency_part = latency_weight.saturating_mul(latency_util);
 		let queue_part = queue_weight.saturating_mul(queue_util);
-		let combined = latency_part.saturating_add(queue_part) / 10000;
 
+		let combined = latency_part.saturating_add(queue_part) / 10000;
 		BasisPoints::saturating_from(combined)
 	}
 
@@ -314,6 +315,62 @@ impl Default for UtilizationReporter {
 	/// Uses an alpha of 20%, a target latency of 100 ms, and no queue metrics.
 	fn default() -> Self {
 		Self::new(crate::bps!(2000), 100_000)
+	}
+}
+
+/// A gauge of the load of a servlet, which the hive reads as the servlet's
+/// utilization when it scales.
+///
+/// [`ServletConfigBuilder::with_utilization`] installs a gauge on a servlet,
+/// and the runtime of the servlet answers [`ServletBox::utilization`] from it.
+/// [`LatencyTracker`] and [`UtilizationReporter`] are the house gauges, and an
+/// outside crate implements its own.
+///
+/// [`ServletBox::utilization`]: crate::colony::hive::ServletBox::utilization
+/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::servlet::UtilizationGauge;
+/// use tightbeam::utils::BasisPoints;
+///
+/// /// A gauge that reads one fixed load.
+/// struct Fixed(BasisPoints);
+///
+/// impl UtilizationGauge for Fixed {
+///     fn utilization(&self) -> BasisPoints {
+///         self.0
+///     }
+/// }
+///
+/// let gauge = Fixed(tightbeam::bps!(5000));
+/// assert_eq!(gauge.utilization(), tightbeam::bps!(5000));
+/// ```
+pub trait UtilizationGauge: Send + Sync {
+	/// Reads the current load in basis points, from 0 to 10000.
+	fn utilization(&self) -> BasisPoints;
+}
+
+impl UtilizationGauge for LatencyTracker {
+	fn utilization(&self) -> BasisPoints {
+		LatencyTracker::utilization(self)
+	}
+}
+
+impl UtilizationGauge for UtilizationReporter {
+	fn utilization(&self) -> BasisPoints {
+		UtilizationReporter::utilization(self)
+	}
+}
+
+/// A gauge that a servlet's handlers also hold, behind the shared handle the
+/// servlet was given.
+pub(crate) struct SharedGauge<G: ?Sized>(pub(crate) Arc<G>);
+
+impl<G: UtilizationGauge + ?Sized> UtilizationGauge for SharedGauge<G> {
+	fn utilization(&self) -> BasisPoints {
+		self.0.utilization()
 	}
 }
 

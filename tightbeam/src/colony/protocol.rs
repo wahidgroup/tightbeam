@@ -32,10 +32,10 @@ pub struct ClusterWorkRequest {
 	pub servlet_type: Urn<'static>,
 	/// The DER bytes of the client's complete end-to-end [`Frame`].
 	///
-	/// The frame's `message` is the servlet's typed input. Gateways
-	/// forward these bytes unmodified, so the client's signature,
-	/// integrity, and previous-frame linkage stay verifiable at the
-	/// servlet ([`Frame::verify`]).
+	/// The frame's `message` is the servlet's typed input. Gateways forward
+	/// these bytes unmodified, so the client's signature, integrity, and
+	/// previous-frame linkage stay verifiable at the servlet
+	/// ([`Frame::verify`]).
 	pub payload: Vec<u8>,
 	/// The relay budget: the count of gateway forwards that remain for this
 	/// work.
@@ -77,10 +77,9 @@ impl ClusterWorkRequest {
 
 	/// Wraps `work` in the hop-local transport frame the gateway expects.
 	///
-	/// The wrapper serves routing only. It reuses the work frame's id
-	/// for correlation and carries the encoded [`ClusterRequest::Work`]
-	/// envelope as its message, so the client's own frame travels inside
-	/// unmodified.
+	/// The wrapper serves routing alone. It reuses the work frame's id for
+	/// correlation, and its message is the encoded [`ClusterRequest::Work`]
+	/// envelope, so the client's own frame travels inside unmodified.
 	///
 	/// # Errors
 	///
@@ -199,8 +198,8 @@ pub enum ClusterRequest {
 	AdvertisePeer(PeerAdvertisement),
 	/// A relayed, origin-signed rumor frame from a peer gateway [context 4].
 	///
-	/// The frame is boxed because a nested [`Frame`] is far larger than the
-	/// other variants. The box leaves the DER encoding as it is.
+	/// Boxed, because a nested [`Frame`] is far larger than the other
+	/// variants. The box leaves the DER encoding as it is.
 	#[asn1(context_specific = "4", constructed = "true")]
 	Gossip(Box<Frame>),
 	/// An origin gossip rumor from a local publisher [context 5].
@@ -283,14 +282,12 @@ pub struct ServletAddressUpdateResponse {
 
 /// A peer gateway's advertisement of the servlet types its colony exports.
 ///
-/// A gateway sends it to a peer gateway, so the colony that receives it
-/// learns which types the peer serves and forwards work there. It carries
-/// type URNs alone, and peers reach the gateway at `gateway_addr`, one
-/// address for the whole peer colony.
+/// The colony that receives it learns which types the peer serves and
+/// forwards work there. It carries type URNs alone, and `gateway_addr` is the
+/// one address for the whole peer colony.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
-	/// The address that peers dial to reach the gateway that sends this
-	/// advertisement.
+	/// The address peers dial to reach the sending gateway.
 	pub gateway_addr: Vec<u8>,
 	/// The servlet type URNs that the sender's colony exports.
 	pub advertised_types: Vec<Urn<'static>>,
@@ -316,41 +313,37 @@ pub enum GossipRumorKind {
 	#[default]
 	Application = 0,
 	/// The bytes of an origin-signed peer advertisement frame, which the
-	/// gateway that receives the rumor applies to its peer routing state for
-	/// transitive discovery.
+	/// receiver applies to its peer routing state for transitive discovery.
 	PeerAdvertisement = 1,
 }
 
-/// The signed content of one gossip rumor: its opaque payload and the kind
+/// The signed content of one gossip rumor: an opaque payload, and the kind
 /// that names how a gateway consumes it.
 ///
 /// # Roles
 ///
-/// It serves both gossip roles:
-///
-/// - A publisher sends it as [`ClusterRequest::PublishGossip`] to request a flood.
-/// - The origin gateway that accepts it embeds the identical DER bytes as the
-///   `message` of a rumor [`Frame`] it signs with its cluster key, so the
-///   payload is bound under the origin signature at every later hop. The
-///   signature covers the version, the metadata, and the message (§5.7.5).
+/// - A publisher sends it as [`ClusterRequest::PublishGossip`] to ask for a flood.
+/// - The origin gateway embeds the same DER as the `message` of a rumor
+///   [`Frame`] it signs with its cluster key. That signature covers the
+///   version, the metadata, and the message (§5.7.5), so it binds the payload
+///   at every later hop.
 ///
 /// # Scope
 ///
-/// Flood scope is the namespace: a rumor travels between the gateways that
+/// The flood scope is the namespace: a rumor travels between gateways that
 /// peer trust admits and whose certificates carry a colony URN of it. The
-/// rumor names no destination and its bytes carry no scope, because unsigned
-/// scope bytes would be weaker than the certificate binding (CWE-345).
+/// rumor names no destination and carries no scope bytes, which, unsigned,
+/// would be weaker than the certificate binding (CWE-345).
 ///
-/// Local delivery follows the policy of the receiver: the optional ingress
-/// servlet receives the origin-signed frame that carries this body.
+/// Local delivery is the receiver's policy: its optional ingress servlet
+/// receives the origin-signed frame.
 ///
 /// # Frame fields
 ///
 /// - The rumor frame's `metadata.id` is the rumor identity, and its
-///   `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
-///   a time-based order). The origin gateway copies both from the publish
-///   frame.
-/// - Hop state such as the flood radius that remains MUST stay outside the
+///   `metadata.order` the issue time in Unix milliseconds (§5.7.1 permits a
+///   time-based order). The origin gateway copies both from the publish frame.
+/// - Hop state, such as the remaining flood radius, MUST stay outside the
 ///   rumor frame. It travels in the `metadata.lifetime` of the outer relay
 ///   frame, which each relay rebuilds and re-signs.
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -358,8 +351,8 @@ pub struct GossipRumor {
 	/// The opaque payload: an application payload for the ingress policy, or
 	/// the bytes of a peer advertisement frame, as `kind` names.
 	pub payload: Vec<u8>,
-	/// How the gateway that receives the rumor consumes `payload`. The common
-	/// application kind is the DER DEFAULT, so the encoding omits it.
+	/// How the receiver consumes `payload`. The common application kind is the
+	/// DER DEFAULT, so the encoding omits it.
 	pub kind: GossipRumorKind,
 }
 
@@ -399,7 +392,7 @@ impl GossipResponse {
 	///
 	/// A gateway signs every frame it relays, so on the reply to its own relay
 	/// `Unauthenticated` names the origin. It is the one reading of that
-	/// status, which the reflood and the repair push both ask.
+	/// status, for the reflood and the repair push.
 	#[must_use]
 	pub(crate) fn refuses_origin(&self) -> bool {
 		self.status == TransitStatus::Unauthenticated
@@ -676,9 +669,9 @@ impl ClusterCommand {
 
 	/// Whether a hive under drain or backpressure refuses this command.
 	///
-	/// The reply shape of the command decides it, and the priority of the
-	/// reply reads the same answer, so a command that survives load is the
-	/// command whose reply leads the queue.
+	/// The reply shape decides it, and the reply priority reads the same
+	/// answer, so a command that survives load is one whose reply leads the
+	/// queue.
 	pub(crate) fn yields_to_load(&self) -> bool {
 		self.reply_shape().yields_to_load()
 	}
@@ -1065,6 +1058,41 @@ pub struct HeartbeatResult {
 	pub utilization: BasisPoints,
 	/// The number of active servlet instances.
 	pub active_servlets: u32,
+}
+
+impl HeartbeatResult {
+	/// The utilization of a hive that answered alive.
+	///
+	/// A hive at capacity answers `ResourceExhausted` and stays alive, because
+	/// it still serves the work it holds.
+	///
+	/// # Errors
+	///
+	/// - [`TransitStatus`] -- the status of a hive that answered any status but `Ok` or `ResourceExhausted`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::protocol::HeartbeatResult;
+	/// use tightbeam::policy::TransitStatus;
+	/// use tightbeam::utils::BasisPoints;
+	///
+	/// let full = HeartbeatResult {
+	///     status: TransitStatus::ResourceExhausted,
+	///     utilization: BasisPoints::MAX,
+	///     active_servlets: 2,
+	/// };
+	/// assert_eq!(full.liveness(), Ok(BasisPoints::MAX));
+	///
+	/// let refused = HeartbeatResult { status: TransitStatus::PermissionDenied, ..full };
+	/// assert_eq!(refused.liveness(), Err(TransitStatus::PermissionDenied));
+	/// ```
+	pub fn liveness(&self) -> Result<BasisPoints, TransitStatus> {
+		match self.status {
+			TransitStatus::Ok | TransitStatus::ResourceExhausted => Ok(self.utilization),
+			status => Err(status),
+		}
+	}
 }
 
 impl ClusterCommandResponse {
@@ -1633,5 +1661,23 @@ mod tests {
 		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
 		assert_eq!(reply.metadata().priority(), None);
 		Ok(())
+	}
+
+	/// The utilization of a live hive, or the status of a failed beat.
+	type Liveness = core::result::Result<BasisPoints, TransitStatus>;
+
+	// A hive that answers `Ok` or `ResourceExhausted` is alive at the
+	// utilization it reports, and any other status fails the beat with that
+	// status.
+	tb_cases! {
+		fn a_heartbeat_answer_is_alive_by_its_status((status, expected): (TransitStatus, Liveness)) {
+			let answer = HeartbeatResult { status, utilization: crate::bps!(4000), active_servlets: 1 };
+			assert_eq!(answer.liveness(), expected);
+		}
+		cases {
+			healthy => (TransitStatus::Ok, Ok(crate::bps!(4000))),
+			at_capacity => (TransitStatus::ResourceExhausted, Ok(crate::bps!(4000))),
+			refused => (TransitStatus::Unavailable, Err(TransitStatus::Unavailable)),
+		}
 	}
 }

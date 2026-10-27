@@ -287,8 +287,9 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
+	use crate::crypto::x509::KeyCurves;
 	#[cfg(feature = "testing")]
 	use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
 	use crate::testing::TestCertificate;
@@ -365,7 +366,7 @@ mod tests {
 			let stranger = identity(4, "Stranger Gateway", &[]);
 			let dialing = identity(5, "Dialing Gateway", &[&colony]);
 
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 			let builder = builder.with_certificate(member.0.clone()).expect("the store admits it");
 			let builder = builder.with_certificate(stranger.0.clone()).expect("the store admits it");
 			let hive_trust: Arc<dyn CertificateTrust> = Arc::new(builder.build());

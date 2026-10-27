@@ -1,6 +1,12 @@
 //! The traits that define a transport protocol and what it can do.
 
+#[cfg(feature = "tokio")]
+use core::future::poll_fn;
 use core::future::Future;
+#[cfg(feature = "tokio")]
+use core::pin::pin;
+#[cfg(feature = "tokio")]
+use core::task::Poll;
 use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
@@ -11,13 +17,14 @@ use alloc::vec::Vec;
 
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::error::TransportError;
-use crate::transport::{EndpointConfig, TransportEncryptionConfig};
+use crate::transport::{EndpointConfig, TransportEncryptionConfig, TransportResult};
 use crate::utils::marker::MaybeSend;
+
+#[cfg(feature = "tokio")]
+use crate::transport::error::TransportFailure;
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::TransportResult;
 
 /// Marker trait for a protocol address, in any form the application picks.
 pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
@@ -155,11 +162,103 @@ pub trait Protocol {
 	/// The protocol's error when the connection fails.
 	fn connect(addr: Self::Address) -> impl Future<Output = Result<Self::Stream, Self::Error>> + Send;
 
+	/// Connect to `addr` within `budget`.
+	///
+	/// Every house dial connects here, with the operation timeout of its
+	/// endpoint:
+	///
+	/// - The default calls [`Self::connect`], and under `tokio` the dial races
+	///   it against a sleep of `budget` on the clock of the endpoint, which
+	///   ends an async connect that no peer answers.
+	/// - A blocking connect holds its thread from its first poll, so a race
+	///   cannot pre-empt it. A protocol whose connect blocks MUST override this
+	///   method and bound the connect itself, as the house blocking TCP does
+	///   with `TcpStream::connect_timeout`.
+	///
+	/// # Errors
+	///
+	/// The protocol's error when the connection fails or `budget` runs out.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	/// use std::net::TcpListener as NetTcpListener;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::runtime::rt;
+	/// use tightbeam::transport::tcp::sync::TcpListener;
+	/// use tightbeam::transport::tcp::TightBeamSocketAddr;
+	/// use tightbeam::transport::Protocol;
+	///
+	/// type Blocking = TcpListener<NetTcpListener, DefaultCryptoProvider>;
+	///
+	/// let listener = NetTcpListener::bind("127.0.0.1:0")?;
+	/// let addr = TightBeamSocketAddr(listener.local_addr()?);
+	/// let _stream = rt::block_on(Blocking::connect_within(addr, Duration::from_secs(1)))?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn connect_within(
+		addr: Self::Address,
+		budget: Duration,
+	) -> impl Future<Output = Result<Self::Stream, Self::Error>> + Send {
+		// The dial races the default against its clock under `tokio`, so the
+		// budget rests with the dial.
+		let _budget = budget;
+		Self::connect(addr)
+	}
+
 	/// Build a transport over `stream` from `config`.
 	///
 	/// The provisioning in `config` already answered the dialer rule, so each
 	/// transport holds a peer authority or was named cleartext.
 	fn create_transport(stream: Self::Stream, config: EndpointConfig<Self::CryptoProvider>) -> Self::Transport;
+}
+
+/// The dial sits beside [`Protocol`], the seam it connects through, so the
+/// owner of the clock and the limits bounds every connect of the crate.
+impl<P: CryptoProvider> EndpointConfig<P> {
+	/// Connects to `addr` over `Pr` within the operation timeout of this
+	/// endpoint.
+	///
+	/// - The protocol bounds its own connect through [`Protocol::connect_within`].
+	/// - Under `tokio`, the dial also races the connect, polled first, against
+	///   a sleep of the timeout on the clock of this endpoint, so a connect
+	///   that no peer answers ends at the timeout.
+	/// - A build without `tokio` runs no race, because the house sleep parks the thread there.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the timeout passed before
+	///   the connect ended.
+	/// - The error of the protocol, when its connect fails.
+	pub(crate) async fn dial<Pr>(&self, addr: Pr::Address) -> TransportResult<Pr::Stream>
+	where
+		Pr: Protocol<CryptoProvider = P>,
+	{
+		let budget = self.limits.operation_timeout;
+		let connecting = Pr::connect_within(addr, budget);
+
+		#[cfg(feature = "tokio")]
+		{
+			let mut connecting = pin!(connecting);
+			let mut deadline = self.clock.sleep(budget);
+			let raced = poll_fn(|context| match connecting.as_mut().poll(context) {
+				Poll::Ready(connected) => Poll::Ready(Some(connected)),
+				Poll::Pending => deadline.as_mut().poll(context).map(|()| None),
+			});
+
+			let expired = TransportError::OperationFailed(TransportFailure::DeadlineExceeded);
+			let connected = raced.await.ok_or(expired)?;
+			connected.map_err(Into::into)
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		{
+			connecting.await.map_err(Into::into)
+		}
+	}
 }
 
 /// Protocol whose listeners bind with transport encryption.
@@ -353,7 +452,7 @@ impl<T: AsyncByteStream> AsyncProtocolStream for T {
 
 /// Read one DER-framed envelope from any async byte reader.
 ///
-/// This single async framing-recovery path classifies the length, enforces
+/// It is the one async framing path: it classifies the length, enforces
 /// canonical encoding, and checks the cap before it allocates. The blanket
 /// frame-trait impls apply it, so no byte-level transport can diverge on wire
 /// framing.
@@ -404,11 +503,13 @@ where
 /// A protocol opts in to connection reuse here, so a TLS-style handshake runs
 /// once per connection, not once per message.
 pub trait PersistentConnection: Protocol {
-	/// Whether the underlying transport is still connected.
+	/// Whether a pool may lease the transport again: the connection is open,
+	/// and its session is sound.
 	///
-	/// Returns `false` on EOF, a socket error, or an explicit close. A protocol
-	/// should use a lightweight check, such as a peek, that neither blocks nor
-	/// allocates.
+	/// Returns `false` on EOF, a socket error, or an explicit close, and on a
+	/// session whose last exchange broke or never settled, as a caller that
+	/// dropped its emit leaves it. A protocol should use a lightweight check,
+	/// such as a peek, that neither blocks nor allocates.
 	fn is_connected(transport: &Self::Transport) -> bool;
 
 	/// Attempt a best-effort graceful close.

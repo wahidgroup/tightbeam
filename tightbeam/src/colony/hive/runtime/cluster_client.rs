@@ -43,10 +43,10 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// # Warning
 ///
 /// Each transport the link dials records into the hive's trace, so the trace
-/// holds the session of each dial, a session that the gateway fails
-/// included. The default `BoundedMemorySink` drops each event past
-/// `max_events`, the hive's own included, so a long-lived hive needs an
-/// `EventSink` that forwards each event, or a reader that drains the trace.
+/// holds the session of each dial, also one the gateway fails. The default
+/// `BoundedMemorySink` drops each event past `max_events`, the hive's own
+/// included, so a long-lived hive needs an `EventSink` that forwards each
+/// event, or a reader that drains the trace.
 pub struct ClusterLink<P: Protocol, R: ServletRegistry> {
 	servlets: Arc<R>,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
@@ -263,15 +263,15 @@ where
 		Ok(transport)
 	}
 
-	/// Connects to `gateway` under `endpoint`, and sets the link's terms on
-	/// the transport before its handshake. Every dial of the link connects
-	/// here.
+	/// Connects to `gateway` under `endpoint`, within its operation timeout,
+	/// and sets the link's terms on the transport before its handshake. Every
+	/// dial of the link connects here.
 	async fn connect(
 		&self,
 		gateway: P::Address,
 		endpoint: EndpointConfig<P::CryptoProvider>,
-	) -> Result<P::Transport, P::Error> {
-		let stream = P::connect(gateway).await?;
+	) -> TransportResult<P::Transport> {
+		let stream = endpoint.dial::<P>(gateway).await?;
 		let transport = P::create_transport(stream, endpoint);
 		Ok(self.terms.apply(transport))
 	}

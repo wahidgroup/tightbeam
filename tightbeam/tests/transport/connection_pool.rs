@@ -4,6 +4,7 @@
 //! - Connection pool reuse across three acquire and release cycles
 //! - Per-destination pool isolation
 //! - Sequential access through one shared pool (`pool_concurrent_access`)
+//! - A lease whose exchange failed or was dropped leaves the pool, so the next lease dials fresh
 //!
 //! The basic connection keep-alive tests live in `connection_reuse.rs`.
 
@@ -26,6 +27,9 @@ use std::{
 	time::Duration,
 };
 
+use tokio::net::TcpListener;
+use tokio::sync::Notify;
+
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::{
 	colony::servlet::ServletConfig,
@@ -36,7 +40,11 @@ use tightbeam::{
 	servlet, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, ScenarioConfigError, SetupEnv, TestFrame},
 	trace::TraceCollector,
-	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
+	transport::{
+		error::{TransportError, TransportFailure},
+		tcp::r#async::{TcpTransport, TokioListener, TokioStream},
+		ConnectionBuilder, ConnectionPool, EndpointConfig, MessageCollector, PoolConfig, TransportLimits,
+	},
 	Beamable, Frame,
 };
 
@@ -49,8 +57,8 @@ use tightbeam::{
 		sign::ecdsa::Secp256k1,
 		x509::{
 			policy::CertificateValidation,
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			Certificate,
+			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
+			Certificate, KeyCurves,
 		},
 	},
 	error::TightBeamError,
@@ -69,7 +77,7 @@ struct TestMessage {
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(server_cert)?
 			.build(),
 	))
@@ -350,8 +358,6 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 ))]
 #[tokio::test]
 async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::error::Error>> {
-	use tightbeam::transport::error::{TransportError, TransportFailure};
-
 	let count = Arc::new(AtomicUsize::new(0));
 	let servlet = start_pool_echo_servlet(TraceCollector::default(), Arc::clone(&count)).await?;
 	let addr = servlet.addr().to_owned();
@@ -376,8 +382,8 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	drop(client);
 
 	// The builder refuses with `MessageNotSent(frame, SizeExceeded)`, and the
-	// retry layer strips the frame once the restart policy declines. The public
-	// emit surface therefore reports `OperationFailed(SizeExceeded)`.
+	// retry layer strips the frame once the restart policy declines, so the
+	// public emit surface reports `OperationFailed(SizeExceeded)`.
 	let over_cap = "x".repeat(263_000);
 	let msg = TestFrame::v0(Some(&over_cap), None);
 	let mut client = pool.connect(addr).await?;
@@ -469,4 +475,173 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+// Scenario: a lease whose exchange broke, or whose emit was dropped, leaves
+// the pool, so the next lease reads the answer to its own request.
+
+/// The operation timeout of a pool whose first exchange runs past it.
+const LEASE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How the echo server of these cases serves the first connection it accepts.
+enum FirstConnection {
+	/// It echoes the first request once the test releases its late answer,
+	/// and then every later request at once.
+	AnswersLate,
+	/// It reads the first request and closes the connection before it
+	/// answers.
+	Closes,
+}
+
+/// The two signals of the late answer on the first connection.
+struct LateAnswer {
+	/// The test fires it once it observed the client give up the exchange, so
+	/// the answer cannot arrive inside the deadline of the client.
+	release: Arc<Notify>,
+	/// The server raises it once the late answer is out.
+	answered: Arc<Notify>,
+}
+
+impl LateAnswer {
+	fn new() -> Self {
+		Self { release: Arc::new(Notify::new()), answered: Arc::new(Notify::new()) }
+	}
+
+	/// The same two signals, for the other end.
+	fn share(&self) -> Self {
+		Self { release: Arc::clone(&self.release), answered: Arc::clone(&self.answered) }
+	}
+
+	/// Releases the late answer and waits until the server sent it.
+	async fn release_and_await(&self) {
+		self.release.notify_one();
+		self.answered.notified().await;
+	}
+}
+
+/// Echoes each request that arrives on `transport`, until the connection
+/// ends.
+async fn echo_each(mut transport: TcpTransport<TokioStream>) {
+	while let Ok((request, status)) = transport.collect_message().await {
+		let answer = Some(Frame::clone(&request));
+		if transport.send_response(status, answer).await.is_err() {
+			return;
+		}
+	}
+}
+
+/// Serves the first connection of the echo server as `first` says. A late
+/// answer waits for its release, and raises `answered` once it is out.
+async fn serve_first(mut transport: TcpTransport<TokioStream>, first: FirstConnection, late: LateAnswer) {
+	let Ok((request, status)) = transport.collect_message().await else {
+		return;
+	};
+
+	if let FirstConnection::Closes = first {
+		return;
+	}
+
+	late.release.notified().await;
+	let answer = transport.send_response(status, Some(Frame::clone(&request))).await;
+	late.answered.notify_one();
+	if answer.is_ok() {
+		echo_each(transport).await;
+	}
+}
+
+/// Starts a cleartext echo server on a loopback port, which serves its first
+/// connection as `first` says and echoes on every later one. It returns the
+/// address beside the signals of the late answer.
+async fn start_echo_server(first: FirstConnection) -> (TightBeamSocketAddr, LateAnswer) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("a loopback port binds");
+	let addr = TightBeamSocketAddr(listener.local_addr().expect("a bound listener has an address"));
+	let late = LateAnswer::new();
+	let served = late.share();
+
+	tokio::spawn(async move {
+		let mut first = Some((first, served));
+		while let Ok((stream, _)) = listener.accept().await {
+			let transport = TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext());
+			match first.take() {
+				Some((first, served)) => tokio::spawn(serve_first(transport, first, served)),
+				None => tokio::spawn(echo_each(transport)),
+			};
+		}
+	});
+
+	(addr, late)
+}
+
+/// A cleartext pool whose connections run each exchange under
+/// `operation_timeout`.
+fn cleartext_pool(operation_timeout: Duration) -> Arc<ConnectionPool<TokioListener>> {
+	let builder = ConnectionPool::<TokioListener>::builder().allow_cleartext();
+	Arc::new(builder.with_timeout(operation_timeout).build())
+}
+
+/// An exchange that runs past its deadline fails its connection, so the pool
+/// discards it, and the next lease reads the answer to its own request on a
+/// fresh dial (CWE-672).
+#[tokio::test]
+async fn a_timed_out_lease_leaves_the_pool_and_the_next_lease_dials_fresh() -> Result<(), Box<dyn std::error::Error>> {
+	let (addr, late) = start_echo_server(FirstConnection::AnswersLate).await;
+	let pool = cleartext_pool(LEASE_TIMEOUT);
+	let mut first = pool.connect(addr).await?;
+	let timed_out = first.emit(TestFrame::v0(Some("request-one"), None), None).await;
+
+	drop(first);
+
+	late.release_and_await().await;
+
+	let request = TestFrame::v0(Some("request-two"), None);
+	let mut second = pool.connect(addr).await?;
+	let answer = second.emit(request.clone(), None).await?;
+	assert!(matches!(
+		timed_out,
+		Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+	));
+	assert_eq!(answer, Some(request));
+	Ok(())
+}
+
+/// An exchange that meets the close of its peer fails its connection, so the
+/// pool discards it, and the next lease dials fresh.
+#[tokio::test]
+async fn a_connection_the_peer_closed_is_not_leased_twice() -> Result<(), Box<dyn std::error::Error>> {
+	let (addr, _late) = start_echo_server(FirstConnection::Closes).await;
+	let pool = cleartext_pool(TransportLimits::default().operation_timeout);
+	let mut first = pool.connect(addr).await?;
+	let closed = first.emit(TestFrame::v0(Some("request-one"), None), None).await;
+
+	drop(first);
+
+	let request = TestFrame::v0(Some("request-two"), None);
+	let mut second = pool.connect(addr).await?;
+	let answer = second.emit(request.clone(), None).await?;
+	assert!(matches!(closed, Err(TransportError::ConnectionClosed)));
+	assert_eq!(answer, Some(request));
+	Ok(())
+}
+
+/// A caller that drops an emit before its answer leaves the exchange in
+/// flight, so the pool discards the connection, and the next lease reads the
+/// answer to its own request on a fresh dial.
+#[tokio::test]
+async fn a_lease_whose_emit_was_dropped_mid_exchange_is_not_leased_again() -> Result<(), Box<dyn std::error::Error>> {
+	let (addr, late) = start_echo_server(FirstConnection::AnswersLate).await;
+	let pool = cleartext_pool(TransportLimits::default().operation_timeout);
+	let mut first = pool.connect(addr).await?;
+	let emit = first.emit(TestFrame::v0(Some("request-one"), None), None);
+	let abandoned = tokio::time::timeout(LEASE_TIMEOUT, emit).await;
+
+	drop(first);
+
+	late.release_and_await().await;
+
+	let request = TestFrame::v0(Some("request-two"), None);
+	let mut second = pool.connect(addr).await?;
+	let answer = second.emit(request.clone(), None).await?;
+	assert!(abandoned.is_err());
+	assert_eq!(answer, Some(request));
+	Ok(())
 }

@@ -1299,7 +1299,9 @@ The built-in store, `PublicKeyPinning`, `PeerListGate`, and `KeyIndex` read a ke
 
 - A point of a named curve outside the binary-field curves of SEC 2 and ANSI X9.62, in the compressed (`0x02`, `0x03`) or the uncompressed (`0x04`) SEC 1 form, reads as a point ([SEC 1][secg-sec1] v2.0 §2.3.3), so its two forms are one key and its negation is another key.
 - Every other key reads as its bits: an encoding that a decoder of its curve refuses ([SEC 1][secg-sec1] v2.0 §2.3.4), a malformed point or a form that [RFC 5480][rfc5480] §2.2 refuses, an `id-ecPublicKey` key with no named curve, a key on a binary-field curve of SEC 2 or ANSI X9.62, and a key of another algorithm.
-- `KeyCurves::HOUSE`, the default of each reader, holds the decoder of secp256k1 in a build with the `secp256k1` feature, which the `transport` feature enables. A session reads its peer's key under it, and the hive's circuit breaker keys on that key.
+- `KeyCurves::HOUSE` holds the decoder of secp256k1 in a build with the `secp256k1` feature, which the `transport` feature enables:
+  - It is the default of `PublicKeyPinning`, `PeerListGate`, and `KeyIndex`. Each built-in store states its own curves.
+  - A session reads its peer's key under it, and the hive's circuit breaker keys on that key.
 - An outside crate brings its curve as a `CurvePoints` decoder. [docs/handshake.md](docs/handshake.md#key-identity) states the whole rule.
 
 A store resolves a `SignerInfo` by its `sid`:
@@ -1313,7 +1315,7 @@ Every certificate the crate creates (`cert!` and the test fixtures) carries a su
 
 ```rust,ignore
 let cert = Certificate::try_from(CERT_PEM)?;
-let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+let trust_store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
     .with_certificate(cert)?
     .build();
 ```
@@ -1321,12 +1323,15 @@ let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
 **Adding a certificate chain:**
 
 ```rust,ignore
-let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+let trust_store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
     .with_chain(vec![root_cert, intermediate_cert, leaf_cert])?
     .build();
 ```
 
-`CertificateTrustBuilder::new(policy, curves)` builds a store that reads each key under another `KeyCurves`.
+`CertificateTrustBuilder::new(policy, curves, revocation)` is the one constructor, so every store states the `KeyCurves` it reads each key under and its `RevocationChecker`:
+
+- `NoRevocation` is the waiver of a closed PKI with short-lived certificates.
+- `StaticRevocationList` is a denylist that the operator pushes, by fingerprint or by issuer and serial number.
 
 #### Signing Identities
 
@@ -2253,7 +2258,11 @@ either:     Cancel(code)  Credit(limit)
 
 **Session budgets** (optional, encrypted sessions only): The handshake MAY grant each direction a volume of data. When a budget runs out, the emit fails with `BudgetExhausted` and the connection drains.
 
-**Session authorization**: A server-side `TransportAuthorizer` reads the offer's opaque `authorization` token. It grants budgets, attaches a settlement challenge, or refuses the session. It runs before authentication, so keep it cheap.
+**Session authorization**: A server-side `TransportAuthorizer` reads the offer's opaque `authorization` token:
+
+- It grants budgets, attaches a settlement challenge, or refuses the session.
+- It runs before authentication, so keep it cheap.
+- The token travels in the clear. `settle` receives the certificate of the client that spends it, so an authorizer can refuse a token that another client replays.
 
 **Session receipts**: Every metered session produces a receipt that both peers sign, as CMS `SignedData` ([RFC 5652 §5][rfc5652-5]). The receipt binds the handshake transcript, the budgets, and the settlement answer, and it carries the certificate of each signer. A third party therefore verifies the agreement from the receipt alone: `StoredReceipt::certificate` returns each certificate, and the verifier admits each against its own trust before `StoredReceipt::verify`. Budgets REQUIRE mutual authentication. Read the receipt with `session_receipt()`.
 
@@ -4794,12 +4803,9 @@ fdr: FdrConfig {
 	timeout_ms: 5000,        // Time budget of each refinement search
 	specs: vec![],           // Processes for refinement checking (empty = exploration mode)
 	fail_fast: true,         // Stop on first violation (default: true)
-	expect_failure: false,   // Expect refinement to fail (default: false)
 
-	// Optional scheduler/resource modeling (feature `testing-fault`)
-	scheduler_count: None,   // Number of schedulers (m)
-	process_count: None,     // Number of concurrent processes (n)
-	scheduler_model: None,   // Cooperative / Preemptive model, when enabled
+	// Optional resource-constraint model (feature `testing-fault`)
+	scheduler: None,         // Some(SchedulerConstraint::new(model, counts)?)
 
 	// Optional fault/FMEA configuration (features `testing-fault`, `testing-fmea`)
 	fault_model: None,
@@ -4817,9 +4823,9 @@ fdr: FdrConfig {
   - The search of a spec for the traces of the subject.
 - `specs`: Specification processes for refinement checking (empty vector = exploration mode)
 - `fail_fast`: Stop on first refinement violation (default: true)
-- `expect_failure`: Expect refinement to fail for negative tests (default: false)
-- `scheduler_count` / `process_count` (feature `testing-fault`): Optional resource-modeling parameters where `scheduler_count ≤ process_count`. When set, refinement explores traces under constrained scheduler availability (§12.5.4).
-- `scheduler_model` (feature `testing-fault`): Chooses between cooperative and preemptive scheduler models for refinement.
+- `scheduler` (feature `testing-fault`): An optional `SchedulerConstraint`, m schedulers that run n processes under a cooperative or preemptive model:
+  - `SchedulerConstraint::new(model, SchedulerCounts { schedulers, processes })` builds it.
+  - It refuses more schedulers than processes, so every constraint holds `schedulers ≤ processes`.
 - `fault_model` (feature `testing-fault`): Enables CSP state-driven fault injection during FDR exploration (e.g., link drops, node failures).
 - `fmea_config` (feature `testing-fmea`): Configures Failure Modes and Effects Analysis integrated with refinement runs.
 
@@ -4875,7 +4881,7 @@ tb_scenario! {
 			timeout_ms: 500,
 			specs: vec![SimpleProcess::process()],
 			fail_fast: true,
-			expect_failure: false,
+			..FdrConfig::default()
 		})
 		.build(),
 	environment Bare {
@@ -5359,7 +5365,7 @@ tb_scenario! {
 			timeout_ms: 5000,
 			specs: vec![ClientServerProcess::process()],
 			fail_fast: true,
-			expect_failure: false,
+			..FdrConfig::default()
 		})
 		.with_hooks(TestHooks {
 			on_pass: Some(Arc::new(|_context| {

@@ -270,9 +270,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 
 		// 4. Seal the content to the admitted server's key-agreement key, with
 		//    each offer as an authenticated attribute. The client certificate
-		//    travels only in the sealed Finished. The opening keeps the pinned
-		//    certificate for the reply, and the recipient drops when this call
-		//    returns.
+		//    travels only in the sealed Finished.
 		let mut offers = Vec::new();
 		if let Some(offer) = parts.security_offer {
 			offers.push(Attribute::try_from(HandshakeAttribute::encode(offer)?)?);
@@ -327,15 +325,13 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		let receipt = received_artifact.map(|received| received.into_parts().0);
 
 		// 3. Build the path the Finished's signer presents, parsed from the bytes it arrived as.
-		let presented = CmsSigner::signer_path(finished, reply.der())?;
+		let presented = CmsSigner::signer_path(&reply)?;
 		let (signing, certificates) = presented.ok_or(HandshakeError::MissingServerCertificate)?;
 
 		// 4. Append the received encodings and seal the transcript. A tampered
-		//    attribute diverges the hashes and fails the signature (CWE-345),
-		//    and a reordered `SET OF` cannot normalize back to the signed form.
-		//    The `certificates` field binds as it arrived, so a certificate
-		//    swapped for another of the same key or the same subject fails the
-		//    signature too (RFC 9846 §4.5.2).
+		//    attribute, a reordered `SET OF`, or a certificate swapped for one
+		//    of the same key or subject diverges the hashes and fails the
+		//    signature (CWE-345, RFC 9846 §4.5.2).
 		let legs = ServerFinishedLegs {
 			security_accept: security_accept_bytes,
 			transport_accept: transport_accept_bytes,
@@ -461,11 +457,10 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 		Box::pin(async move {
 			let CmsSealed { opening, transcript } = sealed;
 
-			// 1. Open the content under the key of the server's key-agreement
-			//    certificate. The opener refuses another recipient kind,
-			//    another `ukm` purpose, and an algorithm outside the profile
-			//    before the backend runs, and the tag before any byte of the
-			//    content is read.
+			// 1. Open the content under the server's key-agreement key. The
+			//    opener refuses another recipient kind, `ukm` purpose, or an
+			//    algorithm outside the profile before the backend runs, and
+			//    checks the tag before it reads a byte of the content.
 			let opener = Opener::Kem { identity: identity.key_agreement(), ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
 			let (arrived, opening) = opening.into_parts();
 			let content = opening.open::<P>(arrived, &opener, HANDSHAKE_OPENING_CONTENT).await?;
@@ -947,18 +942,6 @@ mod tests {
 		let head = head.expect("the attributes end the encoding");
 
 		[head, second.as_slice(), first.as_slice()].concat()
-	}
-
-	/// The opening a server reads from `der` sent inside a transport envelope,
-	/// decoded the way the transport decodes it.
-	fn received_through_envelope(der: &[u8]) -> WireDer<AuthEnvelopedData> {
-		let sent = WireDer::<AuthEnvelopedData>::try_from(der).expect("the opening decodes");
-		let envelope = TransportEnvelope::AuthEnvelopedData(Box::new(sent));
-		let wire = envelope.to_der().expect("the envelope encodes");
-		let received = TransportEnvelope::from_der(&wire).expect("the envelope decodes");
-
-		let message = HandshakeMessage::try_from(received).expect("the envelope carries a handshake container");
-		message.auth_enveloped().expect("the container is the opening")
 	}
 
 	/// A server that holds `identity` under `peer_authentication`, with the
@@ -1477,30 +1460,19 @@ mod tests {
 		Ok(())
 	}
 
-	/// An opening whose unauthenticated SET OF arrives out of DER order
-	/// decodes to the same value, and the server binds the bytes that arrived
-	/// in the envelope rather than a sorted re-encoding.
-	#[tokio::test]
-	async fn the_transcript_binds_the_opening_as_it_arrived() -> Result<(), Box<dyn Error>> {
-		let identity = create_test_server();
-		let (mut server, server_certificate) = server_with(&identity, PeerAuthentication::Anonymous);
+	/// An opening whose unauthenticated SET OF arrives out of DER order is not
+	/// the DER of the value it decodes to, so the decode refuses it before a
+	/// server reads it (X.690 § 11.6).
+	#[test]
+	fn an_opening_whose_attributes_arrive_out_of_der_order_is_refused() {
+		let (_, server_certificate) = anonymous_server();
 		let attrs = [marker_attribute(1), marker_attribute(2)];
 		let sealed = with_unauth_attrs(build_test_opening(&server_certificate, &TEST_BASE_SECRET, []), attrs);
 		let sent = misordered_der(&sealed);
-		let received = received_through_envelope(&sent);
-		assert_ne!(received.value().to_der()?, sent);
 
-		let message = HandshakeMessage::AuthEnvelopedData(Box::new(received));
-		let server_finished = server.reply(message).await?.signed()?;
-
-		let accept = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(create_default_test_profile()))?;
-		let ephemeral = server_finished.value().find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL)?;
-		let ephemeral = ephemeral.ok_or("the server Finished carries its ephemeral")?.received_bytes()?;
-		let certificates = certificates_field([identity.signing.certificate.to_owned()]);
-
-		let expected = Transcript::digest::<Sha3_256>([sent, accept, ephemeral, certificates].concat())?;
-		assert_eq!(signed_transcript(server_finished.value()), expected);
-		Ok(())
+		let refused = WireDer::<AuthEnvelopedData>::try_from(sent.as_slice());
+		let noncanonical = ErrorKind::Noncanonical { tag: Tag::Sequence };
+		assert_eq!(refused.map_err(|error| error.kind()), Err(noncanonical));
 	}
 
 	/// An agreement key whose x-coordinate lies off the curve is refused at

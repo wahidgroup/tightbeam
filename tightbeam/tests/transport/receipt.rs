@@ -19,7 +19,7 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::Signed;
 use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::{OctetString, SetOfVec};
-use tightbeam::der::{Decode, Encode};
+use tightbeam::der::{AnyRef, Decode, Encode, Reader, SliceReader, Tag, TagNumber, Tagged};
 use tightbeam::exactly;
 use tightbeam::oids::RECEIPT_ANSWER;
 use tightbeam::tb_assert_spec;
@@ -46,7 +46,7 @@ use tightbeam::instrumentation::events;
 
 use crate::common::security::{
 	expectation_failure, ClientMaterials, GrantingAuthorizer, PayingApprover as AnsweringApprover, RecordingObserver,
-	ServerMaterials,
+	ServerMaterials, SettleSpyAuthorizer,
 };
 use crate::transport::support::{
 	bind_encrypted_listener, bind_mutual_listener, connect_mutual_client, connect_pinned_client,
@@ -117,6 +117,7 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			let expected = self.accept_settlement && response == Some(self.expected_response.as_bytes());
@@ -193,10 +194,42 @@ async fn establish_settled_session(trace: &TraceCollector) -> Result<MutualTrans
 	establish_settled_session_observed(None, trace).await
 }
 
-/// `artifact` as a third party reads it back from storage.
+/// The `[0]` tag of the `certificates` of a `SignedData`.
+const CERTIFICATES: Tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
+
+/// `artifact` as a third party reads it back from its DER.
+///
+/// `tightbeam::encode` puts each universal SET in DER order. The
+/// `certificates`, an IMPLICIT SET OF that only the schema names, go in DER
+/// order here, as the signers write them (X.690 § 11.6).
 fn stored_artifact(artifact: &SignedData) -> Result<Signed<SignedData>, TightBeamError> {
-	let der = tightbeam::encode(artifact)?;
+	let encoded = tightbeam::encode(artifact)?;
+	let mut fields = SliceReader::new(AnyRef::from_der(&encoded)?.value())?;
+	let mut arranged = Vec::new();
+	while !fields.is_finished() {
+		let field = AnyRef::from_der(fields.tlv_bytes()?)?;
+		arranged.push(in_der_order(field)?);
+	}
+
+	let der = Any::new(Tag::Sequence, arranged.concat())?.to_der()?;
 	Ok(Signed::<SignedData>::from_der(&der)?)
+}
+
+/// The DER of `field`, with the elements of a `certificates` field in DER
+/// order.
+fn in_der_order(field: AnyRef<'_>) -> Result<Vec<u8>, TightBeamError> {
+	if field.tag() != CERTIFICATES {
+		return Ok(field.to_der()?);
+	}
+
+	let mut reader = SliceReader::new(field.value())?;
+	let mut elements = Vec::new();
+	while !reader.is_finished() {
+		elements.push(reader.tlv_bytes()?);
+	}
+
+	elements.sort_unstable();
+	Ok(Any::new(CERTIFICATES, elements.concat())?.to_der()?)
 }
 
 /// Whether a third party verifies `artifact` through [`StoredReceipt::verify`]
@@ -449,6 +482,23 @@ tb_scenario! {
 	}
 }
 
+/// The settle hook receives the certificate of the client that countersigned
+/// the receipt, so an authorizer can refuse a token that another client
+/// spends (CWE-294).
+#[tokio::test]
+async fn settle_receives_the_certificate_of_the_client_that_spends_the_token() -> Result<(), TightBeamError> {
+	let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
+	let hooks = MutualSessionHooks {
+		authorizer: Some(Arc::clone(&authorizer) as Arc<dyn TransportAuthorizer>),
+		approver: Some(Arc::new(PayingApprover::paying()?)),
+		..MutualSessionHooks::default()
+	};
+
+	let session = establish_mutual_transports(budget_offer(), server_offer(), hooks).await?;
+	assert_eq!(authorizer.settled_clients(), [Certificate::clone(&session.client_certificate)]);
+	Ok(())
+}
+
 /// A third party verifies both signatures of a settled receipt offline.
 #[tokio::test]
 async fn receipt_third_party_verifiable() -> Result<(), TightBeamError> {
@@ -463,8 +513,8 @@ async fn receipt_third_party_verifiable() -> Result<(), TightBeamError> {
 	Ok(())
 }
 
-// A third party refuses an artifact that a tamper altered, whichever signed
-// field, signature, or countersigned answer the tamper altered.
+// A third party refuses an artifact whose signed field, signature, or
+// countersigned answer a tamper altered.
 tightbeam::tb_cases! {
 	fn a_tampered_artifact_fails_offline_verification(tamper: Tamper) -> Result<(), TightBeamError> {
 		let settled = settled_artifact();
@@ -748,8 +798,8 @@ tb_scenario! {
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
 			client = with_budget_offer(client).with_trace(trace.share());
-			let client_result = client.perform_client_handshake().await;
 
+			let client_result = client.perform_client_handshake().await;
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
 			let client_failed_closed = matches!(
 				client_result,
@@ -777,8 +827,7 @@ tb_assert_spec! {
 
 // Budgets need mutual authentication: a server with no client validators
 // cannot verify a countersignature, and a client with no identity cannot
-// countersign. The refusing endpoint of each sub-case carries the trace, so
-// each records one identity refusal.
+// countersign. The refusing endpoint of each case records one refusal.
 tb_scenario! {
 	name: receipt_budgets_require_mutual_auth,
 	spec: ReceiptMutualAuthSpec,
@@ -803,8 +852,8 @@ tb_scenario! {
 
 			let mut client = connect_pinned_client(addr, &materials.certificate).await?;
 			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?));
-			let client_result = client.perform_client_handshake().await;
 
+			let client_result = client.perform_client_handshake().await;
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
 			let server_refused = matches!(
 				server_result,

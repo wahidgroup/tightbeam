@@ -119,6 +119,12 @@ impl Protocol for TcpListener {
 		TcpStream::connect(addr.0)
 	}
 
+	/// Connects within `budget` through `TcpStream::connect_timeout`, because a
+	/// blocking connect holds its thread, so no race of the dial pre-empts it.
+	async fn connect_within(addr: Self::Address, budget: Duration) -> Result<Self::Stream, Self::Error> {
+		TcpStream::connect_timeout(&addr.0, budget)
+	}
+
 	fn create_transport(
 		stream: Self::Stream,
 		config: crate::transport::EndpointConfig<Self::CryptoProvider>,

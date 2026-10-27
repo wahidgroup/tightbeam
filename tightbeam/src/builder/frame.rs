@@ -186,6 +186,8 @@ pub struct FrameBuilder<T: Message> {
 	#[cfg(feature = "aead")]
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
 	#[cfg(feature = "digest")]
+	commitment: Option<Digestor>,
+	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
 	#[cfg(feature = "signature")]
 	signer: Option<SignerFn>,
@@ -205,6 +207,8 @@ impl<T: Message> From<Version> for FrameBuilder<T> {
 			encryptor: None,
 			#[cfg(feature = "aead")]
 			rng: None,
+			#[cfg(feature = "digest")]
+			commitment: None,
 			#[cfg(feature = "digest")]
 			witness: None,
 			#[cfg(feature = "signature")]
@@ -314,7 +318,7 @@ impl<T: Message> FrameBuilder<T> {
 		}
 
 		#[cfg(feature = "digest")]
-		if T::MUST_HAVE_MESSAGE_INTEGRITY && !self.metadata_builder.has_integrity() {
+		if T::MUST_HAVE_MESSAGE_INTEGRITY && self.commitment.is_none() {
 			return Err(TightBeamError::MissingProtection {
 				marker: "MUST_HAVE_MESSAGE_INTEGRITY",
 				call: "with_message_hasher",
@@ -392,7 +396,7 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "digest")]
 impl<T: Message> FrameBuilder<T> {
-	/// Commit to the message body with the digest algorithm `D`.
+	/// Commit to the body the frame carries with the digest algorithm `D`.
 	///
 	/// The commitment goes in the metadata integrity field. A salt of at least
 	/// [`MIN_SALT_SIZE`] bytes hides the body, and an empty salt commits in
@@ -402,7 +406,6 @@ impl<T: Message> FrameBuilder<T> {
 	///
 	/// - [`TightBeamError::InvalidSaltLength`] when a non-empty salt is too short to hide the body.
 	/// - [`TightBeamError::UnexpectedAlgorithm`] when `D` is not the digest the message profile names.
-	/// - [`TightBeamError::InvalidBody`] when no message is set.
 	///
 	/// [`MIN_SALT_SIZE`]: crate::constants::MIN_SALT_SIZE
 	pub fn with_message_hasher<D>(mut self, salt: impl AsRef<[u8]>) -> Self
@@ -421,22 +424,6 @@ impl<T: Message> FrameBuilder<T> {
 			return self;
 		}
 
-		let message = match self.message.as_ref() {
-			Some(m) => m,
-			None => {
-				self.errors.push(TightBeamError::InvalidBody);
-				return self;
-			}
-		};
-
-		let encoded = match crate::encode(message) {
-			Ok(e) => e,
-			Err(e) => {
-				self.errors.push(e);
-				return self;
-			}
-		};
-
 		let salt = match CommitmentSalt::parse(salt) {
 			Ok(salt) => salt,
 			Err(e) => {
@@ -445,14 +432,7 @@ impl<T: Message> FrameBuilder<T> {
 			}
 		};
 
-		match salt.commit::<D>(&encoded) {
-			Ok(hash_info) => {
-				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
-			}
-			Err(e) => {
-				self.errors.push(e);
-			}
-		}
+		self.commitment = Some(Box::new(move |body: &[u8]| salt.commit::<D>(body)));
 		self
 	}
 
@@ -484,11 +464,10 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "signature")]
 impl<T: Message> FrameBuilder<T> {
-	/// Set the signer that signs the frame: a key beside the certificate
-	/// that names it.
+	/// Set the signer that signs the frame under the algorithm `S`: a key
+	/// beside the certificate that names it.
 	///
-	/// It captures the signer and its algorithm `S`. [`FrameBuilder::build`]
-	/// signs the whole message structure through the CMS signer, so the
+	/// [`FrameBuilder::build`] signs through the CMS signer, so the
 	/// `SignerInfo` carries the signed attributes and names the certificate
 	/// (RFC 5652 §5.3).
 	pub fn with_signer<S, X>(mut self, signer: CertifiedKey<X>) -> Self
@@ -544,7 +523,7 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 
 		let version = self.version;
 		let message = self.message.ok_or(TightBeamError::InvalidBody)?;
-		let metadata_builder = self.metadata_builder;
+		let metadata_builder = Self::ensure_order_set(self.metadata_builder)?;
 
 		// The content type and the random source bind at the build, so each
 		// applies whatever its order against the encryptor.
@@ -560,14 +539,22 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 			})
 		});
 
-		FrameBuilder::build_impl(
-			version,
+		// 1-3. Encode, commit to, compress, and encrypt the message bytes.
+		let (message_bytes, metadata_builder) = Self::build_message_bytes(
 			message,
 			metadata_builder,
+			#[cfg(feature = "digest")]
+			self.commitment,
 			#[cfg(feature = "compress")]
 			self.compressor,
 			#[cfg(feature = "aead")]
 			encryptor,
+		)?;
+
+		Self::build_impl(
+			version,
+			message_bytes,
+			metadata_builder,
 			#[cfg(feature = "digest")]
 			self.witness,
 			#[cfg(feature = "signature")]
@@ -577,29 +564,15 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 }
 
 impl<T: Message> FrameBuilder<T> {
-	/// Run the build stages in order after [`FrameBuilder::build`] validates
-	/// the message.
+	/// Run the build stages that follow the message bytes, in order, after
+	/// [`FrameBuilder::build`] validates the message and builds its bytes.
 	fn build_impl(
 		version: Version,
-		message: T,
-		mut metadata_builder: MetadataBuilder,
-		#[cfg(feature = "compress")] compressor: Option<Box<dyn Compressor>>,
-		#[cfg(feature = "aead")] encryptor: Option<EncryptorFn>,
+		message_bytes: Vec<u8>,
+		metadata_builder: MetadataBuilder,
 		#[cfg(feature = "digest")] witness: Option<Digestor>,
 		#[cfg(feature = "signature")] signer: Option<SignerFn>,
 	) -> Result<Frame> {
-		metadata_builder = Self::ensure_order_set(metadata_builder)?;
-
-		// 1-3. Encode, compress, and encrypt the message bytes.
-		let (message_bytes, metadata_builder) = Self::build_message_bytes(
-			message,
-			metadata_builder,
-			#[cfg(feature = "compress")]
-			compressor,
-			#[cfg(feature = "aead")]
-			encryptor,
-		)?;
-
 		// 4. Build the optional witness. FI covers only the version and the
 		// metadata, so the message stays outside it.
 		let metadata = metadata_builder.build()?;
@@ -641,19 +614,28 @@ impl<T: Message> FrameBuilder<T> {
 		Ok(metadata_builder)
 	}
 
-	/// Encode the message, then compress and encrypt it when configured.
+	/// Encode the message, then commit to, compress, and encrypt it when
+	/// configured.
 	fn build_message_bytes(
 		message: T,
 		metadata_builder: MetadataBuilder,
+		#[cfg(feature = "digest")] commitment: Option<Digestor>,
 		#[cfg(feature = "compress")] compressor: Option<Box<dyn Compressor>>,
 		#[cfg(feature = "aead")] encryptor: Option<EncryptorFn>,
 	) -> Result<(Vec<u8>, MetadataBuilder)> {
-		// Only the compression and encryption stages reassign the builder.
-		#[cfg(any(feature = "compress", feature = "aead"))]
+		// Only the commitment, compression, and encryption stages reassign the
+		// builder.
+		#[cfg(any(feature = "digest", feature = "compress", feature = "aead"))]
 		let mut metadata_builder = metadata_builder;
 
-		// 1. Encode the message in ASN.1.
+		// 1. Encode the message in ASN.1, and commit to that one encoding when
+		// a commitment is set.
 		let bytes = crate::encode(&message)?;
+		#[cfg(feature = "digest")]
+		if let Some(commit) = commitment {
+			let integrity = commit(&bytes)?;
+			metadata_builder = metadata_builder.with_integrity_info(integrity);
+		}
 
 		// 2. Compress the bytes when a compressor is set.
 		#[cfg(feature = "compress")]
@@ -951,6 +933,25 @@ mod tests {
 		}
 	}
 
+	/// The commitment runs over the body the frame carries, so a message set
+	/// after the hasher is the one it commits to.
+	#[test]
+	#[cfg(feature = "sha3")]
+	fn a_frame_commits_to_the_body_it_carries() -> Result<()> {
+		use crate::crypto::hash::Sha3_256;
+
+		let carried = TestMessage::sample(Some("carried"));
+		let frame = FrameBuilder::<TestMessage>::from(Version::V1)
+			.with_id("commitment")
+			.with_order(1)
+			.with_message(TestMessage::sample(Some("replaced")))
+			.with_message_hasher::<Sha3_256>([])
+			.with_message(carried.clone())
+			.build()?;
+		assert!(frame.verify_commitment_of::<Sha3_256, _>(&carried, [])?);
+		Ok(())
+	}
+
 	#[test]
 	#[cfg(feature = "sha3")]
 	fn test_missing_message() {
@@ -962,8 +963,11 @@ mod tests {
 		assert!(result.is_err());
 	}
 
-	// A hash call before the message is set defers an `InvalidBody` error. A
-	// single deferred error surfaces bare, outside a one-element `Sequence`.
+	/// A salt too short to hide the body, which a hash call defers as an
+	/// `InvalidSaltLength` error.
+	const SHORT_SALT: [u8; 1] = [0x5a];
+
+	// A single deferred error surfaces bare, outside a one-element `Sequence`.
 	#[test]
 	#[cfg(feature = "sha3")]
 	fn test_single_deferred_error_surfaces_bare() {
@@ -971,10 +975,10 @@ mod tests {
 		let result = FrameBuilder::from(Version::V0)
 			.with_id("error-test")
 			.with_order(1696521600)
-			.with_message_hasher::<Sha3_256>([])
 			.with_message(message)
+			.with_message_hasher::<Sha3_256>(SHORT_SALT)
 			.build();
-		assert!(matches!(result, Err(TightBeamError::InvalidBody)));
+		assert!(matches!(result, Err(TightBeamError::InvalidSaltLength(_))));
 	}
 
 	#[test]
@@ -984,9 +988,9 @@ mod tests {
 		let result = FrameBuilder::from(Version::V0)
 			.with_id("error-test")
 			.with_order(1696521600)
-			.with_message_hasher::<Sha3_256>([])
-			.with_message_hasher::<Sha3_256>([])
 			.with_message(message)
+			.with_message_hasher::<Sha3_256>(SHORT_SALT)
+			.with_message_hasher::<Sha3_256>(SHORT_SALT)
 			.build();
 		assert!(matches!(result, Err(TightBeamError::Sequence(ref errors)) if errors.len() == 2));
 	}
@@ -1019,7 +1023,6 @@ mod tests {
 			.with_order(1)
 			.with_message(message)
 			.build();
-
 		built.expect_err("the fixture's markers require a protection it was not given")
 	}
 

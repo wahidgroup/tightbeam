@@ -1530,14 +1530,15 @@ mod tests {
 	#[tokio::test]
 	async fn a_blocking_server_runs_the_handshake_with_no_runtime() -> Result<(), Box<dyn core::error::Error>> {
 		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+		use crate::crypto::x509::KeyCurves;
 		use crate::testing::TestIdentity;
 		use crate::transport::client::ClientBuilder;
 		use crate::transport::TransportEncryptionConfig;
 
 		let (socket, addr) = loopback_socket();
 		let identity = TestIdentity::insecure_fixed();
-		let trust = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		let trust = trust.with_certificate(identity.certificate().to_owned())?.build();
 		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
 

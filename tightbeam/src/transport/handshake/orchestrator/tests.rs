@@ -27,8 +27,9 @@ use crate::crypto::x509::error::CertificateValidationError::{
 use crate::crypto::x509::policy::{
 	CertificateValidation, DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning,
 };
-use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use crate::crypto::x509::utils::Skid;
+use crate::crypto::x509::KeyCurves;
 use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
 use crate::oids::{AES_128_GCM, SESSION_RECEIPT};
@@ -697,7 +698,6 @@ fn chained_pair<F: TestFlow>() -> (ChainedTestServer, TestClient<F>, TestServer<
 /// certificate (RFC 5652 §5.1).
 async fn a_reply_carries_the_intermediate_its_server_presents<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (chained, mut client, mut server) = chained_pair::<F>();
-
 	let reply = server.reply(client.start()?).await?;
 	assert!(presented_certificates(&reply).contains(&chained.intermediate));
 	Ok(())
@@ -773,7 +773,8 @@ fn root_anchored_mutual<F: TestFlow>(
 	let server_identity = create_test_server();
 	let client = F::client_presenting(&server_identity, identity);
 
-	let store = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(chain.root.to_owned());
+	let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	let store = store.with_certificate(chain.root.to_owned());
 	let store = store.expect("the root is within its validity period").build();
 	let mut server = F::server(&server_identity);
 	server.peer_authentication = mutual_with(store);

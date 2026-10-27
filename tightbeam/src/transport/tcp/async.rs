@@ -42,7 +42,7 @@ use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::policy::RestartPolicy;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
-use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SessionPhase};
+use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SettledExchange};
 use crate::transport::EncryptedMessageIO;
 use crate::transport::ResponsePackage;
 use crate::transport::{
@@ -72,6 +72,7 @@ mod mux_imports {
 	pub use crate::policy::SessionContext;
 	pub use crate::transport::handshake::negotiation::MuxSettings;
 	pub use crate::transport::handshake::negotiation::TransportOffer;
+	pub use crate::transport::state::SessionPhase;
 	pub use crate::utils::marker::MaybeSend;
 	pub use crate::x509::Certificate;
 }
@@ -182,10 +183,10 @@ impl From<TcpStream> for TokioStream {
 /// the calls, so a call names `P` where no other type names it, in one of these
 /// shapes:
 ///
-/// - `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)`, for a listener a `server!` block serves,
-/// - `<TokioListener as EncryptedProtocol>::bind_with(addr, config)`, for a listener bound through the trait,
-/// - `TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity)`, for a server configuration, and
-/// - `EncryptionConfig::<DefaultCryptoProvider>::unconfigured()`, for a provisioning built field by field.
+/// - `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)` for a listener a `server!` block serves.
+/// - `<TokioListener as EncryptedProtocol>::bind_with(addr, config)` for a listener bound through the trait.
+/// - `TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity)` for a server configuration.
+/// - `EncryptionConfig::<DefaultCryptoProvider>::unconfigured()` for a provisioning built field by field.
 #[cfg(feature = "tokio")]
 pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
@@ -875,22 +876,16 @@ where
 	///
 	/// - [`TransportError::InvalidState`] -- the session is provisioned for
 	///   encryption and its handshake has not completed.
+	/// - [`TransportError::ConnectionFailed`] -- an exchange broke the session.
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
 		// The split takes the session apart, so the reader keeps its peer for
 		// the record of a refused envelope.
 		#[cfg(feature = "instrument")]
 		let peer = self.state.session_peer().cloned();
 
-		let (recv_mode, send_mode) = match self.state.phase() {
-			SessionPhase::Cleartext => (SplitRecv::Cleartext, SplitSend::Cleartext),
-			SessionPhase::Encrypted(_) => {
-				let session = self.state.take_established().ok_or(TransportError::InvalidState)?;
-				let (send_key, recv_key) = session.into_keys().into_parts();
-				(SplitRecv::Encrypted(recv_key), SplitSend::Encrypted(send_key))
-			}
-			SessionPhase::Provisioned | SessionPhase::Handshaking { .. } => {
-				return Err(TransportError::InvalidState);
-			}
+		let (recv_mode, send_mode) = match self.state.take_split_keys()? {
+			Some((send_key, recv_key)) => (SplitRecv::Encrypted(recv_key), SplitSend::Encrypted(send_key)),
+			None => (SplitRecv::Cleartext, SplitSend::Cleartext),
 		};
 
 		let limits = self.limits;
@@ -1065,31 +1060,39 @@ where
 
 	/// Completes the handshake, then runs one emit cycle under the operation
 	/// deadline.
+	///
+	/// The handshake and the cycle run as one settled exchange of the
+	/// session, so a broken exchange fails the session, and a dropped one
+	/// leaves the mark of the exchange in flight set.
 	async fn perform_send_receive(
 		&mut self,
 		message: Frame,
 	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
-		self.ensure_handshake_complete().await?;
+		self.settled_exchange(async move |transport: &mut Self| {
+			transport.ensure_handshake_complete().await?;
 
-		#[cfg(feature = "tokio")]
-		{
-			match timeout(self.limits.operation_timeout, async { self.perform_emit_cycle(message).await }).await {
-				Ok(result) => result,
-				Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
+			#[cfg(feature = "tokio")]
+			{
+				let budget = transport.limits.operation_timeout;
+				match timeout(budget, transport.perform_emit_cycle(message)).await {
+					Ok(result) => result,
+					Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
+				}
 			}
-		}
 
-		#[cfg(not(feature = "tokio"))]
-		{
-			self.perform_emit_cycle(message).await
-		}
+			#[cfg(not(feature = "tokio"))]
+			{
+				transport.perform_emit_cycle(message).await
+			}
+		})
+		.await
 	}
 }
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		transport.is_alive() && transport.session_state().phase().is_writable()
+		transport.is_alive() && transport.session_state().is_leasable()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
@@ -1112,7 +1115,8 @@ mod tests {
 	use super::*;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::policy::TransitStatus;
 	use crate::prelude::TightBeamSocketAddr;
 	use crate::runtime::ParkingExecutor;
@@ -1152,7 +1156,7 @@ mod tests {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::ValidatorChain;
 	#[cfg(feature = "instrument")]
-	use crate::transport::state::SessionState;
+	use crate::transport::state::{SessionPhase, SessionState};
 
 	/// Serves one single-flight request. It applies `reply` to an accepted
 	/// frame and answers with the gate's status.
@@ -1400,6 +1404,7 @@ mod tests {
 		async fn a_split_reader_waits_out_exactly_the_operation_timeout() -> Result<(), TightBeamError> {
 			let clock = Arc::new(ManualClock::default());
 			clock.advance(Duration::from_secs(3600));
+
 			let limits = one_second_deadline();
 			let mut reader = TransportReader {
 				stream: StalledStream,
@@ -1411,8 +1416,8 @@ mod tests {
 				#[cfg(feature = "instrument")]
 				peer: None,
 			};
-			let started = tokio::time::Instant::now();
 
+			let started = tokio::time::Instant::now();
 			let outcome = tokio::time::timeout(limits.operation_timeout * 2, reader.read_envelope()).await;
 			let expired = matches!(
 				outcome,
@@ -1666,7 +1671,7 @@ mod tests {
 
 	#[cfg(feature = "transport-cms")]
 	fn empty_trust_store() -> Arc<dyn CertificateTrust> {
-		let trust = CertificateTrustBuilder::from(Secp256k1Policy::default()).build();
+		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation).build();
 		Arc::new(trust)
 	}
 
@@ -1919,7 +1924,7 @@ mod tests {
 		let (listener, server_addr) = bind_encrypted(config).await?;
 		let _server = spawn_accept_handle_request(listener);
 
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		let store = builder.with_certificate(root)?.build();
 		let client_stream = TcpStream::connect(server_addr).await?;
 		let mut transport = trusting_client(client_stream, Arc::new(store));

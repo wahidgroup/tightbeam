@@ -14,6 +14,8 @@ compile_error!(
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::time::Duration;
+
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
@@ -122,10 +124,9 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 	/// The one place a server's configuration becomes provisioning.
 	///
 	/// [`DialableEncryption::new`] admits the identity for the server purpose
-	/// once. A server presents a certificate, which answers for the peer, so
-	/// every configuration of this shape holds the dialer rule.
-	/// [`EndpointConfig`] carries `limits` beside this value, outside
-	/// provisioning.
+	/// once. A server presents a certificate that answers for the peer, so
+	/// every such configuration holds the dialer rule. `limits` stay outside
+	/// provisioning, beside this value on [`EndpointConfig`].
 	///
 	/// # Errors
 	///
@@ -202,6 +203,18 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 	#[must_use]
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.clock = clock;
+		self
+	}
+
+	/// Replaces the operation timeout of this endpoint when `timeout` is set,
+	/// so a dial and every transport built from this configuration run under
+	/// it.
+	#[must_use]
+	pub(crate) fn with_operation_timeout(mut self, timeout: Option<Duration>) -> Self {
+		if let Some(timeout) = timeout {
+			self.limits.operation_timeout = timeout;
+		}
+
 		self
 	}
 

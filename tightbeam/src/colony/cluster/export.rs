@@ -31,11 +31,10 @@
 //!
 //! # Grants
 //!
-//! [`ExportGrant`] opens one unexported target to selected caller
-//! identities. Configure grants through
-//! [`ClusterConfigBuilder::with_export_grant`]. Allow sources compose as
-//! union: exported, granted, or first-party origin. Deny gates still override
-//! a grant.
+//! [`ExportGrant`] opens one unexported target to selected caller identities.
+//! Configure grants through [`ClusterConfigBuilder::with_export_grant`]. Allow
+//! sources compose as union: exported, granted, or first-party origin. Deny
+//! gates still override a grant.
 //!
 //! # Custom gates
 //!
@@ -75,9 +74,8 @@ use crate::urn::Urn;
 
 /// A live export allowlist that discoverability and enforcement share.
 ///
-/// Install it through [`ClusterConfigBuilder::with_export_allowlist`], or
-/// install a static list through
-/// [`ClusterConfigBuilder::with_exported_types`]. `None` on
+/// Install it through [`ClusterConfigBuilder::with_export_allowlist`], or a
+/// static list through [`ClusterConfigBuilder::with_exported_types`]. `None` on
 /// [`PeerConfig::exported_types`](super::PeerConfig) exports every type the
 /// gateway serves locally.
 ///
@@ -104,10 +102,9 @@ pub trait ExportAllowlist: Send + Sync {
 
 	/// Whether a canonical registry type key is exported.
 	///
-	/// The provided method parses `key` and delegates to
-	/// [`ExportAllowlist::contains`], so the two views always agree.
-	/// The built-in lists override it with a cached-set lookup that
-	/// borrows `key`. It answers `false` for a key that fails to parse.
+	/// The default parses `key` and asks [`ExportAllowlist::contains`], so the
+	/// two views agree, and answers `false` for a key that fails to parse. The
+	/// built-in lists override it with a cached-set lookup that borrows `key`.
 	fn allows_canonical(&self, key: &[u8]) -> bool {
 		let Ok(canonical) = from_utf8(key) else {
 			return false;
@@ -299,9 +296,9 @@ impl ExportAllowlist for DynamicExportList {
 
 /// A custom export gate for servlet targets that cross the gateway.
 ///
-/// Every configured gate must answer [`TransitStatus::Ok`], so gates
-/// compose as intersection with the allow sources (exported list, grants,
-/// and the first-party origin rule).
+/// Every configured gate must answer [`TransitStatus::Ok`], so the gates
+/// narrow what the allow sources (the exported list, the grants, the
+/// first-party origin rule) admit.
 ///
 /// # Call sites
 ///
@@ -333,19 +330,16 @@ pub trait ExportGate: Send + Sync {
 
 /// A positive grant that widens the export boundary for selected callers.
 ///
-/// A grant adds one allow source beside the exported list and the
-/// first-party origin rule. Allow sources compose as union, so a grant
-/// may only widen access to the granted target. Every configured
-/// [`ExportGate`] still evaluates afterward, so a deny gate overrides
-/// any grant.
+/// A grant is one allow source beside the exported list and the first-party
+/// origin rule, so it may only widen access to its target. Every
+/// [`ExportGate`] still runs afterward, so a deny gate overrides any grant.
 ///
 /// # Subject rule
 ///
-/// The session identity is the adjacent authenticated principal. On a
-/// relayed request that principal is the peer gateway that relayed it, not
-/// the original caller. A grant that matches a relayed request therefore
-/// expresses federation-level trust in that relay gateway. Conservative
-/// grants test `!relayed`.
+/// The session identity is the adjacent authenticated principal. On a relayed
+/// request it is the peer gateway that relayed the request, not the original
+/// caller, so a grant that matches a relayed request trusts that relay
+/// gateway. A conservative grant tests `!relayed`.
 ///
 /// # Discoverability
 ///
@@ -438,16 +432,13 @@ impl ExportPolicy<'_> {
 	/// Decides the boundary verdict on a resolved servlet target, after
 	/// [`GatePolicy`](crate::policy::GatePolicy) has evaluated.
 	///
-	/// The allow sources compose as union, and the steps run in order:
+	/// The steps run in order:
 	///
 	/// 1. The built-in allowlist answers.
 	/// 2. When it refuses, any configured grant may still allow the target.
 	/// 3. Every deny gate then evaluates, so a deny gate overrides a grant. A
 	///    gate verdict of [`TransitStatus::Unknown`] normalizes to
 	///    [`TransitStatus::Internal`] before it reaches the wire.
-	///
-	/// [`ExportDecision::Granted`] reports a grant as the allow source that
-	/// decided, and only when the full verdict passes.
 	pub(crate) fn verdict(
 		&self,
 		target: &Urn<'_>,
@@ -475,21 +466,13 @@ impl ExportPolicy<'_> {
 		Ok(decision)
 	}
 
-	/// The built-in allowlist verdict on a resolved servlet target.
+	/// The built-in allowlist verdict on a resolved servlet target, by the
+	/// rules of the module's Allowlist section. A first-party session is one
+	/// that [`TrustPlanes::classify_session`] places by its key.
 	///
 	/// The verdict asks the export scope, which reads the live allowlist on
 	/// each request, so the enforcement plane and the advertise filter stay
 	/// aligned. [`Self::verdict`] applies grants after this step refuses.
-	///
-	/// The rules apply in order:
-	///
-	/// 1. An exported target passes for everyone. With no export list, every target is exported.
-	/// 2. An unexported relayed request is refused. The hop marker is
-	///    unauthenticated defense in depth, and the identity rule below holds
-	///    against a forged budget.
-	/// 3. An unexported origin request passes only for a first-party session,
-	///    which [`TrustPlanes::classify_session`] places by its key.
-	/// 4. Any other unexported request is refused.
 	fn allowlist(&self, target: &Urn<'_>, session: &SessionContext, relayed: bool) -> TransitStatus {
 		if self.scope.exports(target) {
 			return TransitStatus::Ok;
@@ -504,10 +487,9 @@ impl ExportPolicy<'_> {
 		TransitStatus::PermissionDenied
 	}
 
-	/// Whether any configured grant allows `session` to reach `target`.
-	///
-	/// Grants compose as union, so the first match decides. An empty grant
-	/// list allows nothing, which keeps the boundary fail-closed.
+	/// Whether any configured grant allows `session` to reach `target`. The
+	/// first match decides, and an empty grant list allows nothing, so the
+	/// boundary stays fail-closed.
 	fn granted(&self, target: &Urn<'_>, session: &SessionContext, relayed: bool) -> bool {
 		self.grants.iter().any(|grant| grant.grants(target, session, relayed))
 	}
@@ -522,8 +504,7 @@ impl ExportPolicy<'_> {
 pub enum Party {
 	/// A member of the hive plane and not the peer plane.
 	FirstParty,
-	/// A member of the peer plane. Peer membership wins over hive
-	/// membership, so a certificate held by both stores lands here.
+	/// A member of the peer plane, whatever its hive membership.
 	Peer,
 	/// The caller is anonymous (`None`), or neither plane trusts it.
 	Untrusted,
@@ -568,13 +549,11 @@ impl<'a> From<&'a super::ClusterTlsConfig> for TrustPlanes<'a> {
 }
 
 impl<'a> TrustPlanes<'a> {
-	/// Pairs a hive-plane and a peer-plane trust store.
+	/// Pairs a hive-plane and a peer-plane trust store, for a caller that holds
+	/// the two stores directly, such as a test harness.
 	///
-	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig), as
-	/// the enforcement path does, where one is available. This constructor
-	/// serves callers that hold the two stores directly, such as a test
-	/// harness. Pass planes through [`TrustPlaneStores`], so a caller cannot
-	/// swap hive and peer by position.
+	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig) where
+	/// one is available, as the enforcement path does.
 	#[must_use]
 	pub fn new(stores: TrustPlaneStores<'a>) -> Self {
 		Self { hive: stores.hive, peer: stores.peer }
@@ -687,7 +666,8 @@ mod tests {
 	use super::*;
 	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::testing::{TestCertificate, TestKey};
 	use std::panic::{catch_unwind, AssertUnwindSafe};
 	use std::sync::Arc;
@@ -711,7 +691,7 @@ mod tests {
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();

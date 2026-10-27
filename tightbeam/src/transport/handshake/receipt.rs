@@ -618,9 +618,8 @@ impl fmt::Debug for SessionOutcome {
 /// budget-bearing session whose receipt exchange concludes.
 ///
 /// The hook sees every ending: activated, authorizer-refused, and
-/// countersignature missing or invalid. Observation is a record: the hook
-/// runs after the verdict is final, because [`TransportAuthorizer`] already
-/// decided, so it has no veto.
+/// countersignature missing or invalid. It runs after [`TransportAuthorizer`]
+/// made the verdict final, so it records and has no veto.
 ///
 /// # Contract
 ///
@@ -635,11 +634,10 @@ pub trait SessionObserver: MaybeSend + MaybeSync {
 
 /// The canonical form of a settlement answer: zero bytes means no answer.
 ///
-/// An absent [`RECEIPT_ANSWER`] attribute and an empty one carry the same
-/// meaning. Every boundary where an answer enters the lifecycle normalizes
-/// through this function, at approval and at recovery from a received
-/// `SignerInfo`. Without it, the two endpoints of one exchange could retain
-/// receipts that diverge for the same signature.
+/// An absent [`RECEIPT_ANSWER`] attribute and an empty one mean the same. An
+/// answer normalizes here wherever it enters the lifecycle: at approval and at
+/// recovery from a received `SignerInfo`. Otherwise the two endpoints of one
+/// exchange could keep receipts that diverge for the same signature.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn normalize_answer<T>(answer: Option<T>) -> Option<T>
 where
@@ -650,33 +648,85 @@ where
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl SessionOutcome {
-	/// Reports this outcome to `observer`, then resolves its verdict.
+	/// Reports this outcome to `observer`, then maps its verdict to what the
+	/// endpoint keeps.
 	///
-	/// It returns the [`StoredReceipt`] when the verdict is
-	/// [`SessionVerdict::Activated`]. Every concluded receipt exchange reaches
-	/// the observer before any abort, because a refused or forged
-	/// acknowledgement is the strongest evidence of a disputed agreement.
+	/// - A verified countersignature settles into the dual-signed
+	///   [`StoredReceipt`], beside the refusal code when the authorizer refused
+	///   settlement.
+	/// - Every concluded receipt exchange reaches the observer before any
+	///   abort, because a refused or forged acknowledgement is the strongest
+	///   evidence of a disputed agreement.
 	///
 	/// # Errors
 	///
-	/// Every verdict other than [`SessionVerdict::Activated`] aborts with the
-	/// error that matches it.
-	///
-	/// - [`HandshakeError::SettlementRejected`] -- the authorizer refused settlement.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the countersignature failed verification.
 	/// - [`HandshakeError::CountersignatureMissing`] -- the client returned no countersignature.
-	/// - [`HandshakeError`] -- an activated artifact fails to parse as a [`StoredReceipt`].
-	pub(crate) async fn record(self, observer: Option<&dyn SessionObserver>) -> Result<StoredReceipt, HandshakeError> {
+	/// - [`HandshakeError`] -- a countersigned artifact fails to parse as a [`StoredReceipt`].
+	pub(crate) async fn record(self, observer: Option<&dyn SessionObserver>) -> Result<Settled, HandshakeError> {
 		if let Some(observer) = observer {
 			observer.on_outcome(&self).await;
 		}
 
 		let SessionOutcome { artifact, verdict, .. } = self;
 		match verdict {
-			SessionVerdict::Activated => StoredReceipt::try_from(artifact),
-			SessionVerdict::SettlementRejected { code } => Err(HandshakeError::SettlementRejected { code }),
+			SessionVerdict::Activated => Ok(Settled::Activated(StoredReceipt::try_from(artifact)?)),
+			SessionVerdict::SettlementRejected { code } => {
+				let receipt = StoredReceipt::try_from(artifact)?;
+				Ok(Settled::Rejected { receipt, code })
+			}
 			SessionVerdict::CountersignatureInvalid => Err(HandshakeError::SignatureVerificationFailed),
 			SessionVerdict::CountersignatureMissing => Err(HandshakeError::CountersignatureMissing),
+		}
+	}
+}
+
+/// What a receipt exchange with a verified countersignature leaves the
+/// endpoint to keep: the dual-signed receipt, and the refusal code when the
+/// authorizer refused settlement.
+///
+/// [`SessionOutcome::record`] maps a verdict to it once, and each role reads
+/// it through its own reader:
+///
+/// - The handshake activates a session through [`Self::activated`].
+/// - The rekey installs the next epoch through [`Self::installable`], under
+///   either variant, because the chain already advanced on both endpoints.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) enum Settled {
+	/// The authorizer settled, so the session activates under the receipt.
+	Activated(StoredReceipt),
+	/// The authorizer refused settlement with `code`.
+	Rejected {
+		/// The dual-signed receipt, which both endpoints hold. Its one reader
+		/// is the rekey.
+		#[cfg_attr(not(mux_rekey), allow(dead_code))]
+		receipt: StoredReceipt,
+		/// The application code of the refusal.
+		code: u32,
+	},
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl Settled {
+	/// The receipt of a session that activates.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::SettlementRejected`] -- the authorizer refused settlement with its code.
+	pub(crate) fn activated(self) -> Result<StoredReceipt, HandshakeError> {
+		match self {
+			Self::Activated(receipt) => Ok(receipt),
+			Self::Rejected { code, .. } => Err(HandshakeError::SettlementRejected { code }),
+		}
+	}
+
+	/// The receipt that a rekey installs, beside the refusal code when the
+	/// authorizer refused settlement.
+	#[cfg(mux_rekey)]
+	pub(crate) fn installable(self) -> (StoredReceipt, Option<u32>) {
+		match self {
+			Self::Activated(receipt) => (receipt, None),
+			Self::Rejected { receipt, code } => (receipt, Some(code)),
 		}
 	}
 }
@@ -934,6 +984,7 @@ impl SessionReceipt {
 	///   so the attempt reaches the observer as evidence.
 	/// - With no authorizer installed, the session activates once the signature verifies.
 	/// - A verified countersignature returns beside `certificate`, which its `sid` names.
+	/// - The authorizer settles with `certificate`, so it reads the client that spends the token.
 	pub(crate) async fn settle_ack<P>(
 		&self,
 		ack: Option<Signed<SignerInfo>>,
@@ -966,7 +1017,8 @@ impl SessionReceipt {
 		};
 
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
-		let settlement = authorizer.settle(self, answer_bytes).await;
+		let client = certificate.certificate();
+		let settlement = authorizer.settle(self, answer_bytes, client).await;
 		match settlement {
 			Ok(()) => Ok((SessionVerdict::Activated, answer, countersigner)),
 			Err(refusal) => Ok((SessionVerdict::SettlementRejected { code: refusal.code }, answer, countersigner)),

@@ -10,10 +10,10 @@ use core::pin::Pin;
 use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::colony::hive::runtime::control::{InFlight, Settled};
-use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, ScalingLoop};
+use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, HiveInstances, ScalingLoop};
 use crate::colony::hive::{
 	HashMapRegistry, Hive, HiveConfig, HiveContext, HiveError, ServletBox, ServletRegistration, ServletRegistry,
 	SpawnerFn, SpawnerTable,
@@ -43,10 +43,9 @@ use crate::transport::state::EncryptedProtocolState;
 
 /// The accept plane a cluster reaches this hive on.
 ///
-/// The hive binds it only under the TLS identity that signs registrations.
-/// A cluster refuses an unsigned hive, so only a hive with an identity
-/// publishes this address, and an unauthenticated control listener would
-/// answer only an attacker (CWE-306).
+/// The hive binds it only under the TLS identity that signs registrations. A
+/// cluster refuses an unsigned hive, so an unauthenticated control listener
+/// would answer only an attacker (CWE-306).
 struct ControlPlane<P: Protocol> {
 	/// The accept loop, which [`Hive::join`] awaits.
 	handle: rt::JoinHandle,
@@ -91,10 +90,7 @@ impl<P: Protocol> Lifecycle<P> {
 /// - The hive control plane refuses each command that yields to load.
 /// - [`Hive::is_draining`] reports the flag.
 ///
-/// The hive drain aborts the scaling loop and the re-announce loop through the
-/// runtime's [`TaskGroup`] before it waits on commands in flight.
-///
-/// Drain is terminal. A runtime that has entered it stays in it.
+/// Drain is terminal: a runtime that enters it never leaves it.
 #[derive(Clone, Default)]
 pub struct DrainMode(Arc<AtomicBool>);
 
@@ -126,6 +122,9 @@ pub struct HiveRuntime<P: Protocol, R: ServletRegistry = HashMapRegistry> {
 	tasks: TaskGroup,
 	utilization: Arc<AtomicU16>,
 	drain: DrainMode,
+	/// The admission lock of the instance set, which the control plane and
+	/// the scaling loop share.
+	admission: Arc<Mutex<()>>,
 	/// The count of commands in flight, which a drain waits to see at zero.
 	in_flight: InFlight,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
@@ -199,15 +198,16 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 			tasks: TaskGroup::default(),
 			utilization: Arc::new(AtomicU16::new(0)),
 			drain: DrainMode::default(),
+			admission: Arc::default(),
 			in_flight: InFlight::default(),
 			cluster_addrs: Arc::new(RwLock::new(Vec::new())),
 			hive_context,
 		})
 	}
 
-	/// Aborts the hive's tasks and its control plane, and stops every
-	/// registered servlet. Both `stop` and `Drop` run it, so a dropped hive
-	/// leaks no servlet.
+	/// Aborts the hive's tasks and its control plane, then drains the
+	/// instance set and stops every registered servlet. Both `stop` and `Drop`
+	/// run it, so a dropped hive leaks no servlet.
 	fn release(&mut self) {
 		self.tasks.abort_all();
 		if let Lifecycle::Established { control } = &mut self.lifecycle {
@@ -216,10 +216,15 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 			}
 		}
 
-		self.servlets
-			.drain_all()
-			.into_iter()
-			.for_each(|(_, reg)| reg.servlet.stop_boxed());
+		let released = self.instances().drain_all();
+		released.into_iter().for_each(|reg| reg.servlet.stop_boxed());
+	}
+
+	/// The hive's instance set, which a drain empties under its lock.
+	fn instances(&self) -> HiveInstances<'_, R, P> {
+		let servlets = self.servlets.as_ref();
+		let routes = &self.hive_context;
+		HiveInstances::new(servlets, routes, &self.admission, &self.drain, &self.config.scaling)
 	}
 
 	fn build_control_ctx(&self, connections: &Arc<TraceCollector>) -> HiveControlCtx<P, R> {
@@ -229,6 +234,8 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 			trace: Arc::clone(&self.trace),
 			connections: Arc::clone(connections),
 			drain: self.drain.clone(),
+			admission: Arc::clone(&self.admission),
+			scaling: self.config.scaling.clone(),
 			in_flight: self.in_flight.clone(),
 			hive_context: Arc::clone(&self.hive_context),
 			backpressure: BackpressureGate::new(
@@ -239,18 +246,14 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 		}
 	}
 
-	/// Builds the pool the hive's servlets call their siblings on, which reads
-	/// `config` and records its dials and the sessions they open into `trace`.
+	/// Builds the pool that the hive's servlets call their siblings on, from
+	/// `config`. Each dial records its session on `trace`, a failed one too.
 	///
 	/// # Warning
 	///
-	/// The trace holds the session of each sibling dial, a session that the
-	/// sibling fails included. The default `BoundedMemorySink` drops each
-	/// event past `max_events`, the hive's own included, so a long-lived hive
-	/// needs an `EventSink` that forwards each event, or a reader that drains
-	/// the trace.
-	// The `instrument` build alone attaches a trace to a pool, so that build
-	// alone reads `trace`.
+	/// The default `BoundedMemorySink` drops events past `max_events`, the
+	/// hive's own among them, so a long-lived hive needs a forwarding
+	/// `EventSink` or a reader that drains the trace.
 	#[cfg_attr(not(feature = "instrument"), allow(unused_variables))]
 	fn servlet_pool(config: &HiveConfig, trace: &TraceCollector) -> Arc<ConnectionPool<P>> {
 		let builder = ConnectionPoolBuilder::new(config.pool.clone(), Arc::clone(&config.clock));
@@ -468,6 +471,8 @@ where
 				utilization: Arc::clone(&self.utilization),
 				cluster_addrs: Arc::clone(&self.cluster_addrs),
 				hive_context: Arc::clone(&self.hive_context),
+				admission: Arc::clone(&self.admission),
+				drain: self.drain.clone(),
 				hive_addr,
 				config: self.config.clone(),
 				tasks: self.tasks.clone(),
@@ -549,13 +554,12 @@ where
 		let drain_timeout = self.config.control.drain_timeout;
 		let settled = self.in_flight.settle(self.config.clock.as_ref(), drain_timeout).await;
 
-		// Either outcome ends drained, so a caller that awaited this call
-		// holds a hive with no running servlets.
+		// Either outcome ends drained, so the caller holds a hive with no
+		// running servlets. A spawn in flight finds the drain state under the
+		// admission lock and registers nothing after this sweep.
 		let (Settled::Idle | Settled::TimedOut) = settled;
-		self.servlets
-			.drain_all()
-			.into_iter()
-			.for_each(|(_, reg)| reg.servlet.stop_boxed());
+		let drained = self.instances().drain_all();
+		drained.into_iter().for_each(|reg| reg.servlet.stop_boxed());
 
 		// The emptied slate goes out at once, so gateways retire this hive's
 		// routes ahead of the heartbeat that would eventually miss.

@@ -12,7 +12,7 @@ use alloc::{
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 
-use crate::urn::{UrnComponents, UrnValidationError};
+use crate::urn::{UrnBuilder, UrnComponents, UrnValidationError};
 
 /// A validation pattern for a field value.
 ///
@@ -312,6 +312,174 @@ impl UrnSpecBuilder {
 		}
 	}
 
+	/// Reads `nss` back into the components [`Self::build_nss`] builds it
+	/// from, each borrowed from `nss`.
+	///
+	/// It reads the grammar that [`Self::build_nss`] writes, over the same
+	/// fields and format:
+	///
+	/// - A join format splits `nss` at the separator of each field after the first.
+	/// - A custom format reads each value up to the literal after its placeholder.
+	/// - Each field in order takes the next value, and a required field always takes it.
+	/// - An optional field takes the next value when a value remains for each
+	///   later required field and, under a join format, when its own separator
+	///   comes before the value.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::RequiredFieldMissing`] -- `nss` holds no value for a required field.
+	/// - [`UrnValidationError::NssMismatch`] -- `nss` holds a value that no
+	///   field takes, a value after a separator that is not its field's, or no
+	///   literal of the custom format where the format places it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::urn::{UrnComponents, UrnSpecBuilder, UrnValidationError};
+	///
+	/// let spec = UrnSpecBuilder::from("example").field_required("kind").field_required("id");
+	/// let spec = spec.field_nss_separator("id", "/");
+	/// let components = spec.parse_nss("trace/abc-123")?;
+	///
+	/// assert_eq!(components.get_component("kind").map(|kind| kind.as_ref()), Some("trace"));
+	/// assert_eq!(components.get_component("id").map(|id| id.as_ref()), Some("abc-123"));
+	/// # Ok::<(), UrnValidationError>(())
+	/// ```
+	pub fn parse_nss<'a>(&self, nss: &'a str) -> Result<UrnBuilder<'a>, UrnValidationError> {
+		match &self.nss_format {
+			NssFormat::Join(default_separator) => {
+				let values = self.joined_values(default_separator, nss);
+				self.components_of(values, Some(*default_separator))
+			}
+			NssFormat::Custom(format) => {
+				let values = Self::placeholder_values(format, nss)?;
+				self.components_of(values, None)
+			}
+		}
+	}
+
+	/// The values of `nss`, which the join format of `default_separator`
+	/// built, each beside the separator before it, in order.
+	fn joined_values<'a>(&self, default_separator: &'static str, nss: &'a str) -> Vec<NssValue<'a>> {
+		let mut values = Vec::new();
+		let mut before = None;
+		let mut start = 0usize;
+		for (at, _) in nss.char_indices() {
+			if at < start {
+				continue;
+			}
+
+			let tail = nss.get(at..).unwrap_or_default();
+			let Some(separator) = self.separator_at(default_separator, tail) else {
+				continue;
+			};
+
+			// Each index is a character boundary of `nss`, and so is the end
+			// of a separator that starts at one.
+			let value = nss.get(start..at).unwrap_or_default();
+			values.push(NssValue { separator: before, value });
+			before = Some(separator);
+			start = at.saturating_add(separator.len());
+		}
+
+		let last = nss.get(start..).unwrap_or_default();
+		values.push(NssValue { separator: before, value: last });
+		values
+	}
+
+	/// The longest separator that `tail` starts with, among the separators of
+	/// the fields after the first under the join format of `default_separator`.
+	///
+	/// The separator of a field goes between it and the value before it, so
+	/// the separators of the fields after the first split the NSS, and the
+	/// longest of two that start at one place splits it there.
+	fn separator_at(&self, default_separator: &'static str, tail: &str) -> Option<&'static str> {
+		let later_fields = self.fields.iter().skip(1);
+		let separators = later_fields.map(|field| field.nss_separator.unwrap_or(default_separator));
+		let starting = separators.filter(|separator| !separator.is_empty() && tail.starts_with(*separator));
+		starting.max_by_key(|separator| separator.len())
+	}
+
+	/// The values of `nss` at the placeholders of `format`, in order.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::NssMismatch`] -- `nss` lacks a literal of `format` where the format places it.
+	fn placeholder_values<'a>(format: &str, nss: &'a str) -> Result<Vec<NssValue<'a>>, UrnValidationError> {
+		let mut literals = format.split("{}");
+		let lead = literals.next().unwrap_or_default();
+		let mut rest = nss.strip_prefix(lead).ok_or(UrnValidationError::NssMismatch)?;
+
+		// The last literal closes the NSS, and each other one ends the value
+		// before it where it first occurs.
+		let mut literals = literals.peekable();
+		let mut values = Vec::new();
+		while let Some(literal) = literals.next() {
+			let is_last = literals.peek().is_none();
+			let split = if is_last {
+				rest.strip_suffix(literal).map(|value| (value, ""))
+			} else {
+				rest.split_once(literal)
+			};
+
+			let (value, after) = split.ok_or(UrnValidationError::NssMismatch)?;
+			values.push(NssValue { separator: None, value });
+			rest = after;
+		}
+
+		// A format of literals alone matches the NSS equal to it.
+		if !rest.is_empty() {
+			return Err(UrnValidationError::NssMismatch);
+		}
+
+		Ok(values)
+	}
+
+	/// The components that `values`, read from an NSS in order, give the
+	/// fields of this spec, as [`Self::parse_nss`] states. `default_separator`
+	/// is the separator of a join format, or `None` for a custom format.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::parse_nss`].
+	fn components_of<'a>(
+		&self,
+		values: Vec<NssValue<'a>>,
+		default_separator: Option<&'static str>,
+	) -> Result<UrnBuilder<'a>, UrnValidationError> {
+		let mut remaining = values.len();
+		let mut later_required = self.fields.iter().filter(|field| field.required).count();
+		let mut values = values.into_iter().peekable();
+
+		let mut components = UrnBuilder::default().with_nid(self.nid);
+		for field in &self.fields {
+			if field.required {
+				later_required = later_required.saturating_sub(1);
+			}
+
+			let separator = default_separator.map(|default| field.nss_separator.unwrap_or(default));
+			let fits = values.peek().is_some_and(|value| value.follows(separator));
+			let takes = field.required || (fits && remaining > later_required);
+			if !takes {
+				continue;
+			}
+
+			let value = values.next().ok_or(UrnValidationError::RequiredFieldMissing(field.name))?;
+			if !value.follows(separator) {
+				return Err(UrnValidationError::NssMismatch);
+			}
+
+			components.set_component(field.name, Cow::Borrowed(value.value));
+			remaining = remaining.saturating_sub(1);
+		}
+
+		if values.next().is_some() {
+			return Err(UrnValidationError::NssMismatch);
+		}
+
+		Ok(components)
+	}
+
 	/// The NID of this spec.
 	pub fn nid(&self) -> &'static str {
 		self.nid
@@ -320,6 +488,29 @@ impl UrnSpecBuilder {
 	/// The field configurations, in order.
 	pub fn fields(&self) -> &[FieldConfig] {
 		&self.fields
+	}
+}
+
+/// One value of an NSS as it arrived, beside the separator before it.
+struct NssValue<'a> {
+	/// The separator before the value under a join format, or `None` for the
+	/// first value and for each value of a custom format.
+	separator: Option<&'static str>,
+	/// The value, borrowed from the NSS.
+	value: &'a str,
+}
+
+impl NssValue<'_> {
+	/// Whether this value fills a field that `separator` goes before, or that
+	/// a custom format places when `separator` is `None`.
+	///
+	/// The first value of a join and every value of a custom format fill any
+	/// field, and each later value of a join fills a field of its separator.
+	fn follows(&self, separator: Option<&str>) -> bool {
+		match self.separator {
+			None => true,
+			Some(before) => separator == Some(before),
+		}
 	}
 }
 
@@ -673,9 +864,95 @@ mod tests {
 	fn a_custom_format_keeps_its_leading_literal() -> Result<(), UrnValidationError> {
 		let spec = UrnSpecBuilder::from("test").field_required("field1").nss_format("lead-{}");
 		let builder = UrnBuilder::default().set("field1", "value1");
-
 		assert_eq!(spec.build_nss(&builder)?, "lead-value1");
 		Ok(())
+	}
+
+	/// A join spec of a required field, a required field after `/`, and an
+	/// optional field.
+	fn join_spec() -> UrnSpecBuilder {
+		let spec = UrnSpecBuilder::from("test").field_required("kind").field_required("id");
+		spec.field_nss_separator("id", "/").field_optional("tag")
+	}
+
+	/// The value that `components` holds for `key`.
+	fn value_of<'b>(components: &'b UrnBuilder<'_>, key: &'static str) -> Option<&'b str> {
+		components.get(key).map(|value| value.as_ref())
+	}
+
+	#[test]
+	fn a_join_nss_reads_back_into_its_components() -> Result<(), UrnValidationError> {
+		let components = join_spec().parse_nss("trace/abc-123")?;
+		assert_eq!(value_of(&components, "kind"), Some("trace"));
+		assert_eq!(value_of(&components, "id"), Some("abc-123"));
+		assert_eq!(value_of(&components, "tag"), None);
+		Ok(())
+	}
+
+	#[test]
+	fn a_custom_nss_reads_back_into_its_components() -> Result<(), UrnValidationError> {
+		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
+		let spec = spec.field_optional("c").nss_format("{}:{}/{}");
+		let components = spec.parse_nss("value1:value2/value3")?;
+		assert_eq!(value_of(&components, "a"), Some("value1"));
+		assert_eq!(value_of(&components, "b"), Some("value2"));
+		assert_eq!(value_of(&components, "c"), Some("value3"));
+		Ok(())
+	}
+
+	/// An optional field before a required one leaves it the one value.
+	#[test]
+	fn an_optional_field_leaves_a_value_for_a_later_required_field() -> Result<(), UrnValidationError> {
+		let spec = UrnSpecBuilder::from("test").field_optional("region").field_required("host");
+		let components = spec.parse_nss("h1")?;
+		assert_eq!(value_of(&components, "region"), None);
+		assert_eq!(value_of(&components, "host"), Some("h1"));
+		Ok(())
+	}
+
+	/// Of two optional fields beside one spare value, the first in field
+	/// order takes it.
+	#[test]
+	fn the_first_of_two_optional_fields_takes_the_spare_value() -> Result<(), UrnValidationError> {
+		let spec = UrnSpecBuilder::from("test").field_optional("region").field_optional("zone");
+		let components = spec.field_required("host").parse_nss("eu:h1")?;
+		assert_eq!(value_of(&components, "region"), Some("eu"));
+		assert_eq!(value_of(&components, "zone"), None);
+		assert_eq!(value_of(&components, "host"), Some("h1"));
+		Ok(())
+	}
+
+	/// An optional field takes no value that follows the separator of
+	/// another field.
+	#[test]
+	fn an_optional_field_takes_no_value_after_another_fields_separator() -> Result<(), UrnValidationError> {
+		let spec = UrnSpecBuilder::from("test").field_required("kind").field_optional("tag");
+		let spec = spec.field_nss_separator("tag", ".").field_required("id");
+		let spec = spec.field_nss_separator("id", "/");
+		let components = spec.parse_nss("trace/abc")?;
+		assert_eq!(value_of(&components, "tag"), None);
+		assert_eq!(value_of(&components, "id"), Some("abc"));
+		Ok(())
+	}
+
+	#[test]
+	fn a_value_that_no_field_takes_is_refused() {
+		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
+		assert!(matches!(spec.parse_nss("x:y:z"), Err(UrnValidationError::NssMismatch)));
+	}
+
+	#[test]
+	fn an_nss_short_of_a_required_field_is_refused() {
+		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
+		let refused = spec.parse_nss("x");
+		assert!(matches!(refused, Err(UrnValidationError::RequiredFieldMissing("b"))));
+	}
+
+	#[test]
+	fn a_custom_nss_without_a_literal_of_its_format_is_refused() {
+		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
+		let spec = spec.nss_format("{}/{}");
+		assert!(matches!(spec.parse_nss("x:y"), Err(UrnValidationError::NssMismatch)));
 	}
 
 	#[test]

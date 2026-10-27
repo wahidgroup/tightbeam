@@ -24,9 +24,17 @@ pub struct TransportLimits {
 	pub encrypted_envelope: usize,
 	/// The ceiling in bytes of one handshake-phase message on the wire.
 	pub handshake_wire: usize,
-	/// The deadline of a single read or write on the transport.
+	/// The deadline of a dial, and of a single read or write on the transport.
+	///
+	/// The blocking transport arms it on its stream, and the async transport
+	/// arms it under `tokio`. An async build without `tokio` has no timer, so
+	/// the application owns the deadline there.
 	pub operation_timeout: Duration,
 	/// The deadline of the whole handshake exchange.
+	///
+	/// It binds as [`Self::operation_timeout`] does: the blocking transport
+	/// arms it on its stream, and the async transport arms it under `tokio`.
+	/// An async build without `tokio` leaves it to the application.
 	pub handshake_timeout: Duration,
 }
 

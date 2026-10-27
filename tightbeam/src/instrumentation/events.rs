@@ -625,7 +625,8 @@ pub const CLUSTER_GATE_BLOCKED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 /// Marks a hive registration that the gateway admits. The membership step
 /// installs the hive entry and its servlet slate, or replaces the rows of a
 /// hive that registers again. The value is the count of hives in the registry
-/// after the install. It fires under `colony`.
+/// after the install, and the payload is the fingerprint of the signer whose
+/// signature the gateway verified. It fires under `colony`.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_HIVE_REGISTERED;
@@ -635,11 +636,12 @@ pub const CLUSTER_GATE_BLOCKED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 pub const CLUSTER_HIVE_REGISTERED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/hive-registered");
 /// Marks a hive registration that the gateway refuses, as the refusal reply
 /// leaves. The value is the status that the hive reads, and the label is the
-/// name of that status. It fires under `colony`, for one of these causes:
+/// name of that status. A refusal after the signature verifies carries the
+/// fingerprint of the signer as its payload. It fires under `colony`, for one
+/// of these causes:
 ///
 /// - The frame fails its signature or its freshness check.
 /// - The hive address names no hive identity, or the protocol cannot dial it.
-/// - The frame names no signer.
 /// - A servlet address breaks the locator rule of the slate.
 /// - The membership step fails.
 ///
@@ -651,7 +653,9 @@ pub const CLUSTER_HIVE_REGISTERED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "ev
 pub const CLUSTER_REGISTER_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/register-refused");
 /// Marks a servlet address update that the gateway applies for a registered
 /// hive. The membership step binds the frame's signer to the hive and writes
-/// the added and the removed routes in one step. It fires under `colony`.
+/// the added and the removed routes in one step. The payload is the
+/// fingerprint of the signer whose signature the gateway verified. It fires
+/// under `colony`.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_UPDATE_ACCEPTED;
@@ -660,12 +664,12 @@ pub const CLUSTER_REGISTER_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "e
 /// ```
 pub const CLUSTER_UPDATE_ACCEPTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/update-accepted");
 /// Marks a servlet address update that the gateway refuses, as the refusal
-/// reply leaves. The label is the name of the status that the hive reads. It
-/// fires under `colony`, for one of these causes:
+/// reply leaves. The label is the name of the status that the hive reads. A
+/// refusal after the signature verifies carries the fingerprint of the signer
+/// as its payload. It fires under `colony`, for one of these causes:
 ///
 /// - The frame fails its signature or its freshness check.
 /// - The update does not parse.
-/// - The frame names no signer.
 /// - The membership step refuses the signer or the routes.
 ///
 /// ```

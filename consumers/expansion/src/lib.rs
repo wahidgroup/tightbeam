@@ -7,6 +7,10 @@
 //! [`EventOrderViolationDetail`] breaks the `narrow` build, and so does a
 //! `#[cfg]` on `ScenarioVerdict::exploration`, which the observer reads.
 
+// The crate declares `narrow` and `wide` alone, so a tightbeam feature gate
+// that a macro body leaks into it is a denied `unexpected_cfgs`.
+#![deny(unexpected_cfgs)]
+
 use tightbeam::testing::specs::{EventOrderViolationDetail, SpecViolation};
 use tightbeam::testing::TestHooks;
 
@@ -82,6 +86,13 @@ pub fn observing_hooks() -> TestHooks {
 
 #[cfg(test)]
 mod tests {
+	use core::str::FromStr;
+
+	use tightbeam::crypto::policy::{Secp256k1Policy, VerificationPolicy};
+	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use tightbeam::crypto::sign::Sha3Signer;
+	use tightbeam::crypto::x509::name::Name;
+	use tightbeam::der::Encode;
 	use tightbeam::testing::env::SetupEnv;
 	use tightbeam::testing::specs::SpecViolation;
 	use tightbeam::testing::ScenarioConfig;
@@ -143,5 +154,19 @@ mod tests {
 	fn both_violation_payloads_are_nameable_under_this_selection() {
 		let csp = SpecViolation::CspProcessViolation(Vec::new());
 		assert_eq!(layer_of(&csp), "csp: 0 violation(s)");
+	}
+
+	#[test]
+	fn a_csr_expansion_signs_the_subject_it_names() -> Result<(), Box<dyn core::error::Error>> {
+		let signing_key = Secp256k1SigningKey::from_bytes(&[7; 32].into())?;
+		let signer = Sha3Signer::from(&signing_key);
+		let request = tightbeam::csr!(subject: "CN=consumer", signer: &signer)?;
+		let public_key = request.info.public_key.to_der()?;
+
+		let message = request.info.to_der()?;
+		let signature = request.signature.raw_bytes();
+		Secp256k1Policy::default().verify_signature(&request.algorithm.oid, &public_key, &message, signature)?;
+		assert_eq!(request.info.subject, Name::from_str("CN=consumer")?);
+		Ok(())
 	}
 }

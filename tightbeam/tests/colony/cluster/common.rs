@@ -13,29 +13,25 @@
 //!
 //! # Trust planes
 //!
-//! Use the layout that matches the scenario:
+//! The hive plane refuses a signer that `peer_trust` also holds, so each
+//! layout keeps the two apart:
 //!
-//! - Shared [`cluster_certs`] with overlapping `peer_trust`: register and
-//!   sign hive control frames with [`hive_plane_certs`] and
-//!   [`split_hive_trust`], because peer membership wins on the hive plane.
-//! - Distinct [`member_identity`] federation or organization topologies: put
-//!   the full combined store on `hive_trust`, and leave the gateway's own
-//!   certificate out of its `peer_trust`.
-//! - Distinct [`colony_identity`] flood topologies: put each gateway's own
-//!   certificate in its `peer_trust`, so an echo of its own rumor verifies,
-//!   and sign publishes with [`hive_plane_certs`] under [`split_hive_trust`].
-//! - Export-boundary scenarios: use the per-organization split planes in
-//!   `exports.rs`, where `hive_trust` holds the gateway's own organization and
-//!   `peer_trust` holds the external peer.
+//! - Shared [`cluster_certs`] in `peer_trust`: hive frames sign with
+//!   [`hive_plane_certs`] under [`split_hive_trust`].
+//! - [`member_identity`] federations and organizations: `hive_trust` holds
+//!   the combined store, and `peer_trust` leaves out the gateway itself.
+//! - [`colony_identity`] floods: `peer_trust` holds each gateway's own
+//!   certificate, so the echo of its rumor verifies, and publishes sign with
+//!   [`hive_plane_certs`] under [`split_hive_trust`].
+//! - Export boundaries: `exports.rs` puts the gateway's own organization on
+//!   `hive_trust` and the external peer on `peer_trust`.
 //!
 //! # Work probes
 //!
 //! - [`submit_ping`] drives the public `SubmitWork` client surface end to end.
-//! - [`emit_typed_work`] submits the same signed ping frame
-//!   ([`signed_work_frame`]) under a caller-chosen type URN.
-//! - [`work_refusal_status`] resolves a [`TightBeamError::WorkRefused`]
-//!   refusal back to its transit status for denial scenarios.
-//! - [`emit_relayed_ping_work`] alone composes the wire envelope itself, as a hop-exhaustion probe.
+//! - [`emit_typed_work`] submits the signed ping frame ([`signed_work_frame`]) under a chosen type URN.
+//! - [`work_refusal_status`] reads the transit status of a [`TightBeamError::WorkRefused`].
+//! - [`emit_relayed_ping_work`] alone builds its own wire envelope, as a hop-exhaustion probe.
 
 // Sibling scenario modules consume these re-exports through
 // `use super::common::*`.
@@ -43,12 +39,58 @@ pub use core::num::{NonZeroU32, NonZeroUsize};
 pub use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use core::time::Duration;
 pub use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr};
 pub use std::sync::{Arc, Mutex};
+
+pub use tightbeam::builder::TypeBuilder;
+pub use tightbeam::cms::signed_data::SignerIdentifier;
+pub use tightbeam::colony::cluster::{
+	Admission, AdmittedDial, Cluster, ClusterConfig, ClusterError, ClusterTlsConfig, GossipAdmission, GossipConfig,
+	GossipDigest, GossipJournal, HeartbeatConfig, InstanceMetrics, LoadBalancer, LocalClaim, MemoryGossipJournal,
+	PeerAddress, PeerHint, PeerTable, RoundRobin, StochasticForager, TokenBucketAdmission,
+};
+pub use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
+pub use tightbeam::colony::protocol::{
+	ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, GossipReconciliation, GossipResponse, GossipRumor,
+	GossipWant, PeerAdvertisement, PeerAdvertisementResponse, RegisterHiveRequest, RegisterHiveResponse,
+	ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo,
+};
+pub use tightbeam::colony::servlet::{ServletConfig, ServletConfigBuilder, WithCertificate};
+pub use tightbeam::colony::urn::{ColonyNamespace, ServletTypeKey};
+pub use tightbeam::colony::SubmitWork;
+pub use tightbeam::constants::{
+	DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, DEFAULT_GOSSIP_RETENTION_MS, MAX_ADVERTISED_TYPES, MAX_GOSSIP_PAYLOAD_BYTES,
+	MAX_GOSSIP_TTL, MAX_PEER_BUCKET,
+};
+pub use tightbeam::crypto::key::Secp256k1KeyProvider;
+pub use tightbeam::crypto::policy::Secp256k1Policy;
+pub use tightbeam::crypto::profiles::DefaultCryptoProvider;
+pub use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+pub use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+pub use tightbeam::crypto::x509::{Certificate, CertificateSpec, KeyCurves};
+pub use tightbeam::der::Sequence;
+pub use tightbeam::instrumentation::events;
+pub use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
+pub use tightbeam::testing::{ClusterEnv, HiveEnv, ScenarioConfig, SetupEnv, TestIdentity, TestKey};
+pub use tightbeam::trace::TraceCollector;
+pub use tightbeam::transport::handshake::negotiation::TransportOffer;
+pub use tightbeam::transport::tcp::r#async::TokioListener;
+pub use tightbeam::transport::{ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig};
+pub use tightbeam::urn::Urn;
+pub use tightbeam::utils::time::{Clock, ManualClock, UnixMillis};
+pub use tightbeam::{
+	absent, at_least, at_most, decode, encode, exactly, tb_assert_spec, tb_process_spec, tb_scenario, Beamable, Frame,
+	TightBeamError, Version,
+};
+
+pub(crate) use super::events::*;
+pub use crate::common::hive::scenario_hive_config;
+pub use crate::common::poll::poll_until;
+pub use crate::common::x509::{combined_trust, combined_validator, signing_identity, GatewayCerts};
+
+use std::net::{Ipv4Addr, SocketAddr};
 
 use tokio::net::TcpSocket;
 
-pub use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::crypto::policy::VerificationPolicy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::CertificateValidation;
@@ -57,62 +99,18 @@ use tightbeam::crypto::x509::{ErasedSigning, KeyPurposes, PeerCertificate, Signi
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::TestCertificate;
 use tightbeam::trace::{AssertionLabel, AssertionValue, IntoEventLabel};
-pub use tightbeam::{
-	absent, at_least, at_most,
-	builder::TypeBuilder,
-	colony::{
-		cluster::{
-			Admission, AdmittedDial, Cluster, ClusterConfig, ClusterError, ClusterTlsConfig, GossipAdmission,
-			GossipConfig, GossipDigest, GossipJournal, HeartbeatConfig, InstanceMetrics, LoadBalancer, LocalClaim,
-			MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, RoundRobin, StochasticForager, TokenBucketAdmission,
-		},
-		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
-		protocol::{
-			ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, GossipReconciliation, GossipResponse, GossipRumor,
-			GossipWant, PeerAdvertisement, PeerAdvertisementResponse, RegisterHiveRequest, RegisterHiveResponse,
-			ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo,
-		},
-		servlet::{ServletConfig, ServletConfigBuilder, WithCertificate},
-		urn::{ColonyNamespace, ServletTypeKey},
-		SubmitWork,
-	},
-	constants::{
-		DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, DEFAULT_GOSSIP_RETENTION_MS, MAX_ADVERTISED_TYPES,
-		MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL, MAX_PEER_BUCKET,
-	},
-	crypto::{
-		key::Secp256k1KeyProvider,
-		policy::Secp256k1Policy,
-		profiles::DefaultCryptoProvider,
-		sign::ecdsa::Secp256k1SigningKey,
-		x509::{
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			Certificate, CertificateSpec,
-		},
-	},
-	decode,
-	der::Sequence,
-	encode, exactly,
-	instrumentation::events,
-	policy::{GatePolicy, SessionContext, TransitStatus},
-	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ClusterEnv, HiveEnv, ScenarioConfig, SetupEnv, TestIdentity, TestKey},
-	trace::TraceCollector,
-	transport::{
-		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
-		ConnectionPool, GenericClient, PoolConfig,
-	},
-	urn::Urn,
-	utils::time::{Clock, ManualClock, UnixMillis},
-	Beamable, Frame, TightBeamError, Version,
-};
 use tightbeam::{cluster, compose, hive, servlet};
 
-pub(crate) use super::events::*;
-pub use crate::common::hive::scenario_hive_config;
-pub use crate::common::poll::poll_until;
+#[cfg(feature = "instrument")]
+use tightbeam::crypto::hash::{Digest, Sha3_256};
+#[cfg(feature = "instrument")]
+use tightbeam::crypto::x509::utils::Fingerprint;
+#[cfg(feature = "instrument")]
+use tightbeam::instrumentation::TbInstrumentationConfig;
+#[cfg(feature = "instrument")]
+use tightbeam::trace::TraceConfig;
+
 use crate::common::security::expectation_failure;
-pub use crate::common::x509::{combined_trust, combined_validator, signing_identity, GatewayCerts};
 
 /// The address that the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
@@ -148,9 +146,8 @@ pub fn cluster_certs() -> ClusterTestCerts {
 /// A fresh gateway identity in `colony`: a random key and a certificate that
 /// carries the colony URN as a URI SAN.
 ///
-/// A multi-gateway topology takes one of these per gateway. The gateways of a
-/// [`cluster_certs`] scenario share one signing key, so they resolve to one
-/// signer fingerprint, and no check can tell a relay from an origin.
+/// A multi-gateway topology takes one of these per gateway, because the
+/// gateways of a [`cluster_certs`] scenario share one signer fingerprint.
 pub fn colony_identity(cn: impl AsRef<str>, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
 	let cn = cn.as_ref();
 	use tightbeam::random::OsRng;
@@ -472,11 +469,37 @@ impl GatePolicy for RejectAllPolicy {
 pub fn recorded_values(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<AssertionValue>> {
 	let label = AssertionLabel::Custom(event.into_label());
 	let drained = trace.drain_assertions().into_iter();
-
 	drained
 		.filter(|recorded| recorded.label == label)
 		.map(|recorded| recorded.value)
 		.collect()
+}
+
+/// A trace that keeps the digest of each event's payload.
+#[cfg(feature = "instrument")]
+pub fn payload_trace() -> TraceCollector {
+	let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
+	TraceCollector::from(TraceConfig::with_instrumentation(config))
+}
+
+/// The digest of each payload that `trace` recorded for `event`, in the order
+/// the trace recorded them.
+#[cfg(feature = "instrument")]
+pub fn payload_digests(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<[u8; 32]>> {
+	let recorded = trace.drain_events().into_iter();
+	recorded
+		.filter(|record| record.urn == event)
+		.map(|record| record.payload_hash)
+		.collect()
+}
+
+/// The payload digest of a record that names the signer of `certificate`:
+/// the digest of its fingerprint under the colony digest.
+#[cfg(feature = "instrument")]
+pub fn signer_digest(certificate: &Certificate) -> [u8; 32] {
+	let fingerprint = Fingerprint::<Sha3_256>::from_certificate(certificate);
+	let fingerprint = fingerprint.expect("a fixture certificate encodes");
+	Sha3_256::digest(fingerprint.as_slice()).into()
 }
 
 /// Checks a refused work reply: it carries no payload.
@@ -511,8 +534,8 @@ pub fn probe_signing_key() -> Secp256k1SigningKey {
 ///
 /// Every fixture certificate of a key carries that key's identifier, so the
 /// self-signed one is the signer any frame of `key` names. A verified
-/// signature proves byte fidelity end to end, and the function adapts
-/// [`Frame::verify`] to a boolean for trace events.
+/// signature proves byte fidelity end to end. It adapts [`Frame::verify`] to
+/// a boolean for trace events.
 pub fn frame_signature_verifies(frame: &Frame, key: &Secp256k1SigningKey) -> bool {
 	let certificate = TestCertificate::self_signed(key);
 	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
@@ -692,8 +715,7 @@ pub fn servlet_info_mismatched(
 /// advertisement, or the attempts run out.
 ///
 /// A slate rumor can install the routes first, so it also waits for
-/// [`wait_for_direct_advertisement`]. The polls live here, so scenarios stay
-/// assertion-focused.
+/// [`wait_for_direct_advertisement`].
 pub async fn wait_for_peer_types(
 	trace: &TraceCollector,
 	cluster: &ClusterGateway,
@@ -921,8 +943,7 @@ pub fn decode_ping_echo(frame: &Frame) -> Result<PingResponse, TightBeamError> {
 /// Resolves a work submission that a denial scenario expects the gateway to
 /// refuse into the refusal's transit status.
 ///
-/// A successful submission or a non-refusal error fails the scenario. The
-/// branching lives here, so scenarios stay assertion-focused.
+/// A successful submission or a non-refusal error fails the scenario.
 pub fn work_refusal_status(result: Result<Frame, TightBeamError>) -> Result<TransitStatus, TightBeamError> {
 	match result {
 		Err(TightBeamError::WorkRefused(status)) => Ok(status),

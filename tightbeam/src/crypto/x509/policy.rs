@@ -35,9 +35,9 @@ pub trait CertificateValidation: Send + Sync {
 	/// - [`CertificateValidationError`] -- `cert` fails a check of this policy.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError>;
 
-	/// Validate `leaf`, the certificate a peer presents, beside `issuers`,
-	/// the issuers above it that the peer presents, the top first, so each
-	/// issues the one after it and the last issues `leaf`.
+	/// Validate `leaf`, the certificate a peer presents, beside the `issuers`
+	/// it presents above it. They run from the top down, so each issues the
+	/// next and the last issues `leaf`.
 	///
 	/// A mutual server admits its client here, with the issuers its client
 	/// Finished presents (RFC 5652 §5.1):
@@ -45,6 +45,7 @@ pub trait CertificateValidation: Send + Sync {
 	/// - The default runs [`Self::evaluate`] on `leaf` alone.
 	/// - [`CertificateTrustStore`] overrides it, and validates the path of
 	///   `leaf` under `issuers` to one of its trust anchors (RFC 5280 §6.1).
+	/// - `ChainValidator` overrides it, and runs it on each validator it holds.
 	///
 	/// # Errors
 	///
@@ -55,7 +56,8 @@ pub trait CertificateValidation: Send + Sync {
 	/// ```
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::x509::policy::CertificateValidation;
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyCurves;
 	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
 	///
 	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +67,7 @@ pub trait CertificateValidation: Send + Sync {
 	///
 	/// // The store holds the root alone, and the peer presents the
 	/// // intermediate beside its certificate.
-	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	/// let store = builder.with_certificate(root)?.build();
 	/// store.evaluate_presented(&[intermediate], &leaf)?;
 	/// # Ok(())
@@ -85,11 +87,8 @@ pub trait CertificateValidation: Send + Sync {
 	}
 }
 
-/// A certificate validation strategy that also verifies the cryptographic
-/// signature of the certificate.
-///
-/// It extends [`CertificateValidation`] with a check of the certificate's
-/// signature under a verification policy the caller supplies.
+/// A certificate validation strategy that also verifies the signature of the
+/// certificate, under a verification policy the caller supplies.
 pub trait SignatureVerification: CertificateValidation {
 	/// Validate `cert` in full, with a check of its signature under the
 	/// issuer's public key through `policy`.
@@ -116,8 +115,7 @@ pub trait SignatureVerification: CertificateValidation {
 
 /// A validator that checks certificate expiry alone.
 ///
-/// Its one check is that the certificate is within its validity period, so a
-/// signature check belongs to a [`SignatureVerification`] validator.
+/// A signature check belongs to a [`SignatureVerification`] validator.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExpiryValidator;
 
@@ -426,8 +424,8 @@ where
 	}
 }
 
-/// A validator that trusts a certificate when the certificate is itself a
-/// configured trust anchor (direct trust, RFC 5280 §6.1.1).
+/// A validator that trusts a certificate when it is itself a configured trust
+/// anchor (direct trust, RFC 5280 §6.1.1).
 ///
 /// It checks the presented certificate alone. Path building, name chaining,
 /// and the `basicConstraints` and `keyUsage` checks of RFC 5280 §6.1 belong
@@ -478,11 +476,9 @@ impl CertificateValidation for DirectTrustValidator {
 		cert.ensure_unique_extensions()?;
 		cert.ensure_critical_extensions_processed()?;
 
-		// RFC 5280 §6.1.1 direct trust: the presented certificate must itself
-		// be a configured trust anchor, a path of one certificate. An empty
-		// anchor set therefore trusts nothing, so the validator fails closed
-		// and never degrades to an expiry-only check (CWE-1188, insecure
-		// default). `ExpiryValidator` is the deliberate expiry-only check.
+		// RFC 5280 §6.1.1 direct trust is a path of one certificate. An empty
+		// anchor set fails closed and never degrades to the expiry-only check
+		// of `ExpiryValidator` (CWE-1188, insecure default).
 		let cert_der = cert.to_der()?;
 		for anchor in &self.trust_chain {
 			if anchor.to_der()? == cert_der {
@@ -535,8 +531,8 @@ impl SignatureVerification for DirectTrustValidator {
 /// A validator that chains other validators.
 ///
 /// The validators run in order, and the certificate passes only when every
-/// one of them succeeds. The chain runs [`CertificateValidation::evaluate`]
-/// alone, so signature verification belongs to a [`SignatureVerification`]
+/// one of them succeeds. The chain runs each check it is asked on each
+/// validator. Signature verification belongs to a [`SignatureVerification`]
 /// validator outside it.
 #[cfg(feature = "std")]
 #[derive(Default)]
@@ -560,6 +556,17 @@ impl ChainValidator {
 impl CertificateValidation for ChainValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		self.validators.iter().try_for_each(|v| v.evaluate(cert))
+	}
+
+	/// Each validator runs its own `evaluate_presented` on `leaf` beside
+	/// `issuers`, so a store in the chain validates the path the peer
+	/// presents.
+	fn evaluate_presented(
+		&self,
+		issuers: &[Certificate],
+		leaf: &Certificate,
+	) -> Result<(), CertificateValidationError> {
+		self.validators.iter().try_for_each(|v| v.evaluate_presented(issuers, leaf))
 	}
 }
 
@@ -616,6 +623,29 @@ mod tests {
 
 			let refused = FingerprintPinning::new([pin]).evaluate(&other);
 			assert!(matches!(refused, Err(CertificateValidationError::CertificateNotPinned)));
+			Ok(())
+		}
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	mod chain {
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::policy::{CertificateValidation, ChainValidator, ExpiryValidator};
+		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+		use crate::crypto::x509::KeyCurves;
+		use crate::testing::fixtures::{TestCertificate, TestCertificateChain};
+
+		/// A chain that holds a store of the root alone admits a leaf beside
+		/// the intermediate it presents, so the chain hands each validator the
+		/// presented issuers.
+		#[test]
+		fn a_chained_store_admits_a_client_beside_its_presented_issuers() -> Result<(), Box<dyn core::error::Error>> {
+			let TestCertificateChain { root, intermediate, leaf, .. } = TestCertificate::insecure_fixed_chain()?;
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+			let store = builder.with_certificate(root)?.build();
+			let chain = ChainValidator::default().add(ExpiryValidator).add(store);
+
+			chain.evaluate_presented(&[intermediate], &leaf)?;
 			Ok(())
 		}
 	}

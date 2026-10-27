@@ -37,7 +37,7 @@ use crate::transport::ConnectionBuilder;
 use crate::utils::time::SystemClock;
 
 use crate::transport::policy::{
-	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction, TimeoutConfig,
+	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction,
 };
 
 #[derive(Default)]
@@ -98,11 +98,22 @@ impl ClientPolicies {
 		self
 	}
 
+	/// Sets the operation timeout, which caps a connect and each I/O wait.
+	///
+	/// [`ClientBuilder`] writes it into the [`TransportLimits`] of the
+	/// endpoint before the dial, so the dial and the transport both run under
+	/// it.
+	///
+	/// [`TransportLimits`]: crate::transport::TransportLimits
 	pub fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
 		self
 	}
 
+	/// Applies the restart policy and the gates to `transport`.
+	///
+	/// The transport keeps the limits of its endpoint, where [`ClientBuilder`]
+	/// wrote the timeout of [`Self::with_timeout`] before the dial.
 	pub fn apply<P>(self, mut transport: P::Transport) -> P::Transport
 	where
 		P: Protocol,
@@ -116,9 +127,6 @@ impl ClientPolicies {
 		}
 		for g in self.collector_gates.into_iter() {
 			transport = transport.with_collector_gate(g);
-		}
-		if let Some(timeout) = self.timeout {
-			transport = transport.with_timeout(timeout);
 		}
 		transport
 	}
@@ -219,11 +227,13 @@ impl<P: Protocol> ClientBuilder<P> {
 	///
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyCurves;
 	/// use tightbeam::transport::client::{ClientBuilder, ConnectionBuilder};
 	/// use tightbeam::transport::tcp::r#async::TokioListener;
 	///
-	/// let store = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
+	/// let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	/// let store = Arc::new(trust.build());
 	/// let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(store);
 	///
 	/// // The policy narrows which server the store admits.
@@ -257,7 +267,7 @@ impl<P: Protocol> ClientBuilder<P> {
 	}
 
 	/// Collects everything the transport is built from, once the dialer rule
-	/// has answered.
+	/// has answered, with `timeout` as its operation timeout when it is set.
 	///
 	/// # Errors
 	///
@@ -270,9 +280,11 @@ impl<P: Protocol> ClientBuilder<P> {
 		encryption: EncryptionConfig<P::CryptoProvider>,
 		negotiation: Negotiation,
 		clock: Arc<dyn Clock>,
+		timeout: Option<Duration>,
 	) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let encryption = DialableEncryption::new(encryption)?;
-		Ok(EndpointConfig::new(encryption, clock).with_negotiation(negotiation))
+		let endpoint = EndpointConfig::new(encryption, clock).with_negotiation(negotiation);
+		Ok(endpoint.with_operation_timeout(timeout))
 	}
 }
 
@@ -294,9 +306,9 @@ where
 	///   sets a server policy and holds no trust in a server, whether or not it
 	///   names cleartext.
 	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
 		let destination = addr.into();
-		let stream = P::connect(destination).await.map_err(|e| e.into())?;
+		let stream = endpoint.dial::<P>(destination).await?;
 
 		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);
@@ -315,7 +327,7 @@ where
 	///   [`Self::allow_cleartext`], or it sets a server policy and holds no
 	///   trust in a server, whether or not it names cleartext.
 	pub fn adopt(self, stream: P::Stream) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
 
 		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);

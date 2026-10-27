@@ -26,6 +26,41 @@ use crate::testing::fdr::config::InjectedFaultRecord;
 /// finds the deadlocks and divergences that each seed reaches, and keeps the
 /// results.
 pub trait ExplorationCore {
+	/// The engine that [`Self::for_process`] builds for a process that lives
+	/// for `'p`.
+	type ForProcess<'p>: ExplorationCore;
+
+	/// The engine of `process` under the configuration of this engine, before
+	/// its first seed.
+	///
+	/// [`FdrExplorer`](super::FdrExplorer) runs each spec of a fault run on
+	/// the engine `for_process` builds, so every exploration of a run goes
+	/// through the kind of engine that the explorer holds.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let subject = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	/// let spec = Process::builder("Idle").initial_state(State("I0")).add_terminal(State("I0")).build()?;
+	///
+	/// let engine = DefaultExplorationEngine::new(&subject, Arc::new(FdrConfig::default()));
+	/// let mut spec_engine = engine.for_process(&spec);
+	/// spec_engine.explore_seeds(0..1);
+	/// assert_eq!(spec_engine.visited_states().len(), 1);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn for_process<'p>(&self, process: &'p Process) -> Self::ForProcess<'p>;
+
 	/// The process under exploration.
 	fn process(&self) -> &Process;
 
@@ -165,10 +200,8 @@ pub trait ExplorationCore {
 	/// ```
 	fn seed_results(&self) -> &[(u64, SeedResult)];
 
-	/// The number of exploration branches pruned for timing violations.
-	///
-	/// Timed exploration drops each branch that fails a WCET, deadline, or path
-	/// WCET constraint.
+	/// The number of exploration branches that timed exploration dropped for a
+	/// failed WCET, deadline, or path WCET constraint.
 	fn timing_pruned(&self) -> usize {
 		0
 	}

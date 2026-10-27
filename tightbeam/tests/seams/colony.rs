@@ -40,9 +40,9 @@ use tightbeam::crypto::hash::Sha3_512;
 use tightbeam::crypto::k256::ecdsa::SigningKey;
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::utils::Fingerprint;
-use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::crypto::x509::{KeyCurves, KeyPurposes};
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::random::OsRng;
@@ -210,7 +210,8 @@ impl OutsideColony {
 /// A store under the outside policy that anchors the certificate of each of
 /// `parties`.
 fn outside_trust(parties: &[&Party]) -> Arc<dyn CertificateTrust> {
-	let builder = CertificateTrustBuilder::from(ProviderPolicy::<OutsideProvider>::default());
+	let policy = ProviderPolicy::<OutsideProvider>::default();
+	let builder = CertificateTrustBuilder::new(policy, KeyCurves::HOUSE, NoRevocation);
 	let anchor = |builder: CertificateTrustBuilder, party: &&Party| builder.with_certificate(party.certificate.clone());
 	let builder = parties.iter().try_fold(builder, anchor);
 	Arc::new(builder.expect("an outside certificate anchors").build())

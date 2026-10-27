@@ -81,9 +81,8 @@ const LUCKY_NUMBER: &str = "123";
 /// tickets, that is exactly the number of draws.
 const DRAW_CREDITS: u64 = 10;
 
-/// The client-view settings the lottery negotiation lands on: both
-/// sides offer `mux(1)` with 1 KiB chunks and the house grants the
-/// requested draw budget.
+/// The client-view settings the lottery negotiation lands on: both sides offer
+/// `mux(1)` with 1 KiB chunks, and the house grants the requested draw budget.
 fn lottery_settings() -> MuxSettings {
 	let mut settings = MuxSettings::symmetric(1);
 	settings.send_chunk_size = 1024;
@@ -93,9 +92,8 @@ fn lottery_settings() -> MuxSettings {
 }
 
 /// The draws served against the initial invoice before the budget watermark
-/// opens a renewal, which is a top-up invoice, for the rest. The value comes
-/// from `MuxSettings::usable_send_budget`, the public watermark math that the
-/// mux enforces.
+/// opens a renewal, a top-up invoice, for the rest. The value is
+/// `MuxSettings::usable_send_budget`, the watermark math the mux enforces.
 fn prepaid_draws() -> u64 {
 	lottery_settings().usable_send_budget().unwrap_or_default()
 }
@@ -179,6 +177,7 @@ impl TransportAuthorizer for LotteryHouse {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if response == Some(self.expected_payment.as_bytes()) {

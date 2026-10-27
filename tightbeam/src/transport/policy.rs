@@ -55,6 +55,10 @@ where
 	Self: Sized,
 {
 	/// Set the deadline for a single read or write.
+	///
+	/// The blocking transport arms it on its stream, and the async transport
+	/// arms it under `tokio`. An async build without `tokio` has no timer, so
+	/// the application owns the deadline there.
 	fn with_timeout(self, timeout: core::time::Duration) -> Self;
 }
 
@@ -66,12 +70,11 @@ pub trait PolicyConfig: RestartConfig + EmitterGateConfig + CollectorGateConfig 
 
 impl<T> PolicyConfig for T where T: RestartConfig + EmitterGateConfig + CollectorGateConfig + TimeoutConfig {}
 
-/// The core retry policy, which provides the attempt limit and the delay
-/// calculation.
+/// The core retry policy: the attempt limit and the delay of each attempt.
 ///
-/// It stays independent of any transport, so a caller that retries an
-/// operation of its own, such as a hive that retries its scaling updates,
-/// reads the attempt limit and each delay from it.
+/// It is apart from any transport, so a caller that retries its own
+/// operation, such as a hive's scaling updates, reads the attempt limit and
+/// each delay from it.
 ///
 /// # Examples
 ///

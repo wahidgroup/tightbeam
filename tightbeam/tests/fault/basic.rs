@@ -190,9 +190,7 @@ fn build_deterministic_config(process: Process) -> FdrConfig {
 		timeout_ms: 2000,
 		specs: vec![process],
 		fail_fast: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
+		scheduler: None,
 		fault_model: Some(fault_model),
 		#[cfg(feature = "testing-fmea")]
 		fmea_config: None,
@@ -252,9 +250,7 @@ fn build_probabilistic_config(process: Process) -> FdrConfig {
 		timeout_ms: 5000,
 		specs: vec![process],
 		fail_fast: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
+		scheduler: None,
 		fault_model: Some(fault_model),
 		#[cfg(feature = "testing-fmea")]
 		fmea_config: None,
@@ -264,11 +260,9 @@ fn build_probabilistic_config(process: Process) -> FdrConfig {
 tb_scenario! {
 	name: test_probabilistic_fault_injection,
 	config: fault_config(ProbabilisticSpec::latest(), build_probabilistic_config, TestHooks::on_pass(|context| {
-				// At 5% over 100 seeds, the run expects about 5 faults, and
-				// the central 95% interval of Bin(100, 0.05) is 1 to 10. A
-				// seed can inject more than one fault, so the interval is a
-				// guide and not an exact bound. The seeded generator gives
-				// the same count on every run.
+				// At 5% over 100 seeds, 1 to 10 faults is the 95% interval
+				// of Bin(100, 0.05). A seed can inject more than one, so it
+				// is a guide. The seeded generator repeats the count.
 				let counts = faults_and_seeds(context);
 				assert!(matches!(counts, Some((1..=10, _))), "{counts:?}");
 			})),
@@ -324,9 +318,7 @@ fn build_multi_fault_config(process: Process) -> FdrConfig {
 		timeout_ms: 3000,
 		specs: vec![process],
 		fail_fast: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
+		scheduler: None,
 		fault_model: Some(fault_model),
 		#[cfg(feature = "testing-fmea")]
 		fmea_config: None,
@@ -408,9 +400,7 @@ fn build_coverage_config(process: Process) -> FdrConfig {
 		timeout_ms: 5000,
 		specs: vec![process],
 		fail_fast: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
+		scheduler: None,
 		fault_model: Some(fault_model),
 		#[cfg(feature = "testing-fmea")]
 		fmea_config: None,

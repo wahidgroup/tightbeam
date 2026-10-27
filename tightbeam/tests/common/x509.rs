@@ -21,7 +21,8 @@ use tightbeam::{
 		},
 		x509::{
 			policy::CertificateValidation,
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
+			KeyCurves,
 		},
 	},
 	error::Result,
@@ -103,7 +104,7 @@ impl GatewayCerts {
 		let subject = subject.as_ref();
 		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::from(Secp256k1Policy::default())
+			CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
@@ -114,9 +115,8 @@ impl GatewayCerts {
 	/// Generate a colony-member gateway identity on a fresh key.
 	///
 	/// The certificate carries `colony_urn` as a URI Subject Alternative Name
-	/// (RFC 5280 section 4.2.1.6) with an empty subject, so membership
-	/// provably binds to the SAN alone. Colony membership gates gossip and
-	/// peer federation. Each call draws its own key.
+	/// (RFC 5280 section 4.2.1.6) with an empty subject, so membership binds
+	/// to the SAN alone. Colony membership gates gossip and peer federation.
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
 		let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
 		let cert = TestCertificate::with_uri_sans(&raw, &[&colony_urn.to_string()]);
@@ -128,7 +128,7 @@ impl GatewayCerts {
 
 /// A trust builder that anchors every certificate of `certs`.
 fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let mut builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())
@@ -138,9 +138,8 @@ fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
 	builder
 }
 
-/// A trust store that anchors every certificate of `certs`.
-///
-/// The multi-peer federation and split-plane export tests use it.
+/// A trust store that anchors every certificate of `certs`, for the multi-peer
+/// federation and split-plane export tests.
 pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
 	Arc::new(combined_trust_builder(certs).build())
 }
@@ -221,6 +220,7 @@ impl MutualAuthServer {
 		let socket_addr = "127.0.0.1:0"
 			.parse()
 			.map_err(|e| TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+
 		let bind_addr = TightBeamSocketAddr(socket_addr);
 		let (listener, addr) = TokioListener::bind_with(bind_addr, server_config).await?;
 		let (tx, rx) = tokio::sync::mpsc::channel(8);

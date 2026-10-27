@@ -245,6 +245,13 @@ impl<'a> DefaultExplorationEngine<'a> {
 }
 
 impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
+	type ForProcess<'p> = DefaultExplorationEngine<'p>;
+
+	fn for_process<'p>(&self, process: &'p Process) -> DefaultExplorationEngine<'p> {
+		let config = Arc::clone(&self.config);
+		DefaultExplorationEngine::new(process, config)
+	}
+
 	fn process(&self) -> &Process {
 		self.process
 	}

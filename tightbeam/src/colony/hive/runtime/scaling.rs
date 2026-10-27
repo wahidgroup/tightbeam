@@ -5,9 +5,9 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
+use crate::colony::hive::runtime::{ClusterLink, DrainMode, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{
 	HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry, ServletScaleConfig, SpawnerFn,
 };
@@ -37,6 +37,11 @@ pub struct ScalingLoop<P: Protocol, R: ServletRegistry> {
 	pub cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	/// The intra-hive route maps, updated when instances appear or leave.
 	pub hive_context: Arc<HiveContextImpl<P>>,
+	/// The admission lock of the hive's instance set, which the control
+	/// plane shares.
+	pub admission: Arc<Mutex<()>>,
+	/// The drain state, which a scale-up reads as it inserts its instance.
+	pub drain: DrainMode,
 	/// The hive control-plane address that the hive URN derives from.
 	///
 	/// It is [`None`] for a hive with no control plane, which scales its own
@@ -69,6 +74,8 @@ where
 			utilization,
 			cluster_addrs,
 			hive_context,
+			admission,
+			drain,
 			hive_addr,
 			config,
 			tasks,
@@ -93,6 +100,8 @@ where
 			utilization,
 			samples: LastSamples::default(),
 			hive_context,
+			admission,
+			drain,
 			link,
 			config,
 			tasks,
@@ -249,6 +258,8 @@ struct ScalingTask<P: Protocol, R: ServletRegistry> {
 	utilization: Arc<AtomicU16>,
 	samples: LastSamples,
 	hive_context: Arc<HiveContextImpl<P>>,
+	admission: Arc<Mutex<()>>,
+	drain: DrainMode,
 	link: Option<ClusterLink<P, R>>,
 	hive_urn: Option<Arc<Urn<'static>>>,
 	config: Arc<HiveConfig>,
@@ -273,6 +284,13 @@ where
 	/// empties.
 	fn scale_blocked(&self) -> bool {
 		self.hive_urn.is_none() && self.link.as_ref().is_some_and(|link| link.has_gateways())
+	}
+
+	/// The hive's instance set, which a scale moves under its admission lock.
+	fn instances(&self) -> HiveInstances<'_, R, P> {
+		let servlets = self.servlets.as_ref();
+		let routes = &self.hive_context;
+		HiveInstances::new(servlets, routes, &self.admission, &self.drain, &self.config.scaling)
 	}
 
 	/// Counts the instances of one servlet type and sums their utilization.
@@ -318,10 +336,10 @@ where
 			servlet_type: servlet_type.clone(),
 		};
 
-		// The registry takes the instance before the announcement, because
-		// the notify failure path reconciles from the registry.
-		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		let Ok(placed) = instances.insert(registration) else {
+		// The registry takes the instance before the announcement, because the
+		// notify failure path reconciles from the registry. A refused insert
+		// stops its servlet, and the next evaluation decides again.
+		let Ok(placed) = self.instances().insert(registration) else {
 			return;
 		};
 
@@ -342,17 +360,18 @@ where
 		}
 
 		let type_prefix = servlet_type.type_prefix_bytes();
-		// `HashMap` order is unspecified, so scale-down picks any instance.
+		// The registry states no key order, so scale-down picks any instance.
 		let Some(key) = self.servlets.keys().into_iter().rfind(|k| k.starts_with(&type_prefix)) else {
 			return;
 		};
 
-		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		let Some((_removed_type, addr)) = instances.remove(&key) else {
+		// A refused removal leaves the instance in place, and the next
+		// evaluation decides again.
+		let Ok(removed) = self.instances().remove(&key) else {
 			return;
 		};
 
-		let Ok(instance) = servlet_type.instance_urn(addr.as_ref()) else {
+		let Ok(instance) = removed.servlet_type.instance_urn(removed.address.as_ref()) else {
 			return;
 		};
 
@@ -409,9 +428,7 @@ mod tests {
 		fn a_cooldown_runs_on_the_hive_clock((advance, active): (Duration, bool)) {
 			let clock = manual_clock();
 			let cooldowns = stamped_cooldowns(&clock);
-
 			clock.advance(advance);
-
 			assert_eq!(cooldowns.active(b"echo", COOLDOWN), active);
 		}
 
@@ -443,7 +460,6 @@ mod tests {
 	#[test]
 	fn a_mean_past_the_u16_range_reads_as_saturation() {
 		let load = TypeLoad { instances: 2, utilization_sum: 131_072 };
-
 		assert_eq!(load.utilization(), BasisPoints::MAX);
 	}
 
@@ -498,6 +514,8 @@ mod tests {
 			utilization: Arc::new(AtomicU16::new(0)),
 			samples: LastSamples::default(),
 			hive_context: Arc::new(HiveContextImpl::new(pool)),
+			admission: Arc::default(),
+			drain: DrainMode::default(),
 			link: None,
 			hive_urn: None,
 			config: Arc::new(HiveConfig::default()),

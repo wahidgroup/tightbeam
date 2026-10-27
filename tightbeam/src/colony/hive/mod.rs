@@ -51,22 +51,19 @@ use crate::{Frame, TightBeamError};
 use crate::crypto::x509::store::CertificateTrust;
 
 /// The spawner that a hive calls to add one servlet instance on a scale-up.
-///
-/// It receives the hive's trace collector and resolves to another running
-/// instance of its servlet type.
+/// It takes the hive's trace collector and resolves to a new running instance
+/// of its servlet type.
 pub type SpawnerFn = Arc<
 	dyn Fn(Arc<TraceCollector>) -> Pin<Box<dyn Future<Output = Result<Box<dyn ServletBox>, TightBeamError>> + Send>>
 		+ Send
 		+ Sync,
 >;
 
-/// A type-erased servlet that a hive stores and controls.
-///
-/// A hive holds servlets of different types in one collection through it, so
-/// a servlet implements it to register with a hive.
+/// A type-erased servlet that a hive stores and controls. A servlet implements
+/// it to register, so one hive collection holds servlets of many types.
 pub trait ServletBox: Send + Sync {
-	/// Returns the servlet's bound address as shared bytes, which the servlet
-	/// encodes once when it starts.
+	/// Returns the servlet's bound address as shared bytes, encoded once at
+	/// start.
 	fn addr_bytes(&self) -> Arc<[u8]>;
 
 	/// Stops the servlet and consumes the boxed instance.
@@ -119,19 +116,22 @@ pub trait ServletBox: Send + Sync {
 
 	/// Returns the servlet's current utilization, from 0 to 10000 basis points.
 	///
-	/// The scaling task reads this sample. The default returns [`None`], an
-	/// unreported sample, which the task replaces with the instance's last
-	/// sample or [`UNKNOWN_SERVLET_UTILIZATION_BPS`].
+	/// The scaling task reads it. The default returns [`None`], an unreported
+	/// sample, and the task then takes the instance's last sample or
+	/// [`UNKNOWN_SERVLET_UTILIZATION_BPS`]. A [`ServletRuntime`], so also a
+	/// `servlet!` servlet, answers from the gauge of
+	/// [`ServletConfigBuilder::with_utilization`].
 	///
+	/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
+	/// [`ServletRuntime`]: crate::colony::servlet::ServletRuntime
 	/// [`UNKNOWN_SERVLET_UTILIZATION_BPS`]: crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
 
-	/// Returns whether the servlet is healthy and responsive.
-	///
-	/// An implementation may check its internal state or its connectivity.
-	/// The default returns `true`.
+	/// Returns whether the servlet is healthy and responsive, `true` by
+	/// default. An implementation may check its internal state or its
+	/// connectivity.
 	fn is_healthy(&self) -> bool {
 		true
 	}
@@ -162,12 +162,9 @@ impl ServletRegistration {
 		Ok(ServletPlacement { instance, address, signer })
 	}
 
-	/// Returns the slate entry of this registration: the instance, the address
-	/// that reaches it, and the signer of the certificate it presents.
-	///
-	/// It returns [`None`] for an address that is not a valid instance locator,
-	/// or for a servlet that names no signer, as
-	/// [`ServletPlacement::into_servlet_info`] states.
+	/// Returns the slate entry of this registration, or [`None`] for an address
+	/// that is not a valid instance locator or a servlet that names no signer
+	/// ([`ServletPlacement::into_servlet_info`]).
 	pub(crate) fn servlet_info(&self) -> Option<ServletInfo> {
 		self.placement().ok()?.into_servlet_info()
 	}
@@ -199,10 +196,9 @@ impl ServletPlacement {
 	}
 }
 
-/// A registration a [`ServletRegistry`] refused, handed back to its caller.
-///
-/// The registration travels with the error, so the caller holds the servlet
-/// and stops it the one way [`ServletBox::stop_boxed`] names.
+/// A registration a [`ServletRegistry`] refused, handed back to its caller
+/// with the error, so the caller can stop its servlet through
+/// [`ServletBox::stop_boxed`].
 pub struct RefusedRegistration {
 	/// Why the registry refused the insert.
 	pub error: TightBeamError,
@@ -212,10 +208,9 @@ pub struct RefusedRegistration {
 }
 
 impl RefusedRegistration {
-	/// Stops the servlet of the refused registration and returns the refusal.
-	///
-	/// Every refused registration ends here, so the servlet stops the one
-	/// way [`ServletBox::stop_boxed`] names rather than through its drop.
+	/// Stops the servlet of the refused registration through
+	/// [`ServletBox::stop_boxed`], not through its drop, and returns the
+	/// refusal.
 	pub fn stop_servlet(self) -> TightBeamError {
 		self.registration.servlet.stop_boxed();
 		self.error
@@ -225,9 +220,9 @@ impl RefusedRegistration {
 /// A registration that a [`ServletRegistry`] gave up for a newer one under
 /// its key.
 ///
-/// A stop or a drain of the hive reaches only the servlets its registry
-/// holds, so this value stops its servlet through [`ServletBox::stop_boxed`]
-/// as it drops, whichever caller holds it.
+/// A hive's stop or drain reaches only the servlets its registry holds, so
+/// this value stops its servlet through [`ServletBox::stop_boxed`] when it
+/// drops, whichever caller holds it.
 ///
 /// # Examples
 ///
@@ -270,29 +265,27 @@ impl RefusedRegistration {
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 pub struct ReplacedServlet {
-	/// The registration that the registry gave up. It is present until the
-	/// drop takes it to stop its servlet.
+	/// The registration that the registry gave up, present until `retire` or
+	/// the drop takes it.
 	registration: Option<ServletRegistration>,
 }
 
 impl ReplacedServlet {
 	/// Holds `registration`, which a registry gave up for a newer one, until
-	/// this value drops and stops its servlet.
-	///
-	/// A [`ServletRegistry`] returns its replaced registration through it, as
-	/// the [`ReplacedServlet`] example shows.
+	/// this value drops and stops its servlet. A [`ServletRegistry`] returns
+	/// its replaced registration through it ([`ReplacedServlet`] example).
 	#[must_use]
 	pub fn new(registration: ServletRegistration) -> Self {
 		Self { registration: Some(registration) }
 	}
 
-	/// Runs `leave` on the registration, then stops its servlet as this value
-	/// drops, so a caller that takes the route of the servlet away in `leave`
-	/// stops the servlet once nothing routes to it.
-	pub(crate) fn retire(self, leave: impl FnOnce(&ServletRegistration)) {
-		if let Some(registration) = &self.registration {
-			leave(registration);
-		}
+	/// Runs `leave` on the registration, then hands its servlet to the caller.
+	/// A caller that removes the servlet's route in `leave` then stops the
+	/// servlet once nothing routes to it.
+	pub(crate) fn retire(mut self, leave: impl FnOnce(&ServletRegistration)) -> Option<Box<dyn ServletBox>> {
+		let registration = self.registration.take()?;
+		leave(&registration);
+		Some(registration.servlet)
 	}
 }
 
@@ -314,11 +307,7 @@ impl Drop for ReplacedServlet {
 /// - [`HiveRuntime::with_registry`] takes a registry that the caller built.
 pub trait ServletRegistry: Send + Sync {
 	/// Stores `registration` under `key`, and returns the registration it
-	/// replaces.
-	///
-	/// - A registration under a key the registry already holds replaces the one there.
-	/// - The replaced registration comes back as a [`ReplacedServlet`], which
-	///   stops its servlet through [`ServletBox::stop_boxed`] as it drops.
+	/// replaces there as a [`ReplacedServlet`].
 	///
 	/// # Errors
 	///
@@ -344,6 +333,61 @@ pub trait ServletRegistry: Send + Sync {
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration);
 
+	/// Returns the type URN of the registration under `key`, if there is one.
+	///
+	/// The default walks every registration through [`Self::for_each`]. A
+	/// registry that reads one key directly overrides it, as
+	/// [`HashMapRegistry`] does.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::cms::signed_data::SignerIdentifier;
+	/// use tightbeam::colony::hive::{HashMapRegistry, ServletBox, ServletRegistration, ServletRegistry, SpawnerFn};
+	/// use tightbeam::colony::urn::ColonyNamespace;
+	/// use tightbeam::TightBeamError;
+	///
+	/// /// A servlet that serves no traffic.
+	/// struct Idle;
+	///
+	/// impl ServletBox for Idle {
+	///     fn addr_bytes(&self) -> Arc<[u8]> {
+	///         Arc::from(b"127.0.0.1:7000".as_slice())
+	///     }
+	///
+	///     fn stop_boxed(self: Box<Self>) {}
+	///
+	///     fn signer(&self) -> Option<&SignerIdentifier> {
+	///         None
+	///     }
+	/// }
+	///
+	/// let servlet_type = ColonyNamespace::default().servlet("echo")?;
+	/// let spawner: SpawnerFn = Arc::new(|_| Box::pin(async { Err(TightBeamError::NotEstablished) }));
+	/// let servlet = Box::new(Idle);
+	/// let registration = ServletRegistration { servlet, spawner, servlet_type: servlet_type.clone() };
+	/// let registry = HashMapRegistry::default();
+	/// let inserted = registry.insert(b"echo-1".to_vec(), registration);
+	/// let _replaced = inserted.map_err(|refused| refused.stop_servlet())?;
+	///
+	/// assert_eq!(registry.servlet_type(b"echo-1"), Some(servlet_type));
+	/// assert_eq!(registry.servlet_type(b"echo-2"), None);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn servlet_type(&self, key: impl AsRef<[u8]>) -> Option<Urn<'static>> {
+		let key = key.as_ref();
+		let mut servlet_type = None;
+		self.for_each(|held, registration| {
+			if held.as_slice() == key {
+				servlet_type = Some(registration.servlet_type.clone());
+			}
+		});
+
+		servlet_type
+	}
+
 	/// Returns the current servlet slate, one entry per registered instance.
 	///
 	/// It skips a registration whose address is not a valid instance locator
@@ -351,7 +395,6 @@ pub trait ServletRegistry: Send + Sync {
 	fn slate(&self) -> Vec<ServletInfo> {
 		let mut list = Vec::new();
 		self.for_each(|_key, reg| list.extend(reg.servlet_info()));
-
 		list
 	}
 
@@ -373,16 +416,13 @@ pub trait ServletRegistry: Send + Sync {
 /// The spawner table of a [`ServletRegistry`], which a hive builds once as
 /// it establishes.
 pub(crate) trait SpawnerTable: ServletRegistry {
-	/// Returns the spawner of every registered servlet type.
-	///
-	/// Instances of one type share a spawner, so the map holds one entry per
-	/// type.
+	/// Returns the spawner of every registered servlet type. Instances of one
+	/// type share a spawner, so the map holds one entry per type.
 	fn spawners(&self) -> HashMap<Urn<'static>, SpawnerFn> {
 		let mut spawners = HashMap::new();
 		self.for_each(|_key, reg| {
 			spawners.insert(reg.servlet_type.clone(), Arc::clone(&reg.spawner));
 		});
-
 		spawners
 	}
 }
@@ -423,7 +463,6 @@ impl ServletRegistry for HashMapRegistry {
 	) -> Result<Option<ReplacedServlet>, Box<RefusedRegistration>> {
 		let key: Vec<u8> = key.into();
 		let replaced = self.map().insert(key, registration);
-
 		Ok(replaced.map(ReplacedServlet::new))
 	}
 
@@ -448,6 +487,12 @@ impl ServletRegistry for HashMapRegistry {
 			.iter()
 			.filter(|(k, _)| k.starts_with(prefix))
 			.for_each(|(k, v)| f(k, v));
+	}
+
+	/// Reads the one entry under `key` from the map.
+	fn servlet_type(&self, key: impl AsRef<[u8]>) -> Option<Urn<'static>> {
+		let key = key.as_ref();
+		self.map().get(key).map(|registration| registration.servlet_type.clone())
 	}
 
 	fn count(&self) -> usize {
@@ -512,8 +557,8 @@ pub trait Hive: Sized + Send + Sync {
 	///
 	/// - `servlet_type` routes the servlet inside the hive and across the
 	///   cluster. Create it with [`ColonyNamespace::servlet`].
-	/// - The spawner enables auto-scaling: when the hive needs more instances
-	///   of this type, it calls the spawner with a trace collector.
+	/// - The hive calls the spawner, with a trace collector, when auto-scaling
+	///   needs another instance of this type.
 	/// - A servlet whose type and address name an instance the hive holds
 	///   replaces that instance, and the replaced servlet stops through
 	///   [`ServletBox::stop_boxed`].
@@ -633,11 +678,10 @@ pub trait Hive: Sized + Send + Sync {
 
 	/// Drains the in-flight commands of the hive, then stops its servlets.
 	///
-	/// The hive refuses every later command except the heartbeat and stops its
-	/// background beats. It waits until no command is in flight, so an idle
-	/// hive drains at once, with the configured drain timeout on the hive clock
-	/// as the backstop. Then the registered servlets stop, and the hive
-	/// announces its emptied slate so gateways retire its routes.
+	/// The hive refuses every later command but the heartbeat, and stops its
+	/// background beats. It waits until no command is in flight, or until the
+	/// drain timeout on the hive clock. Then the servlets stop, and the hive
+	/// announces its empty slate so gateways retire its routes.
 	///
 	/// # Errors
 	///
@@ -648,15 +692,12 @@ pub trait Hive: Sized + Send + Sync {
 	fn is_draining(&self) -> bool;
 }
 
-/// The TLS material of the identity the hive presents on its control plane
-/// and to gateways.
+/// The TLS identity the hive presents on its control plane and to gateways.
 ///
-/// [`HiveConfig`] holds it in an `Arc`, because its validators are trait
-/// objects.
+/// [`HiveConfig`] holds it in an `Arc`, because it is not `Clone`.
 #[non_exhaustive]
 pub struct HiveTlsConfig {
-	/// The certificate and handshake key this hive presents, from
-	/// [`Self::new`] or [`Self::from_identity`].
+	/// The certificate and handshake key the hive presents.
 	identity: SigningIdentity,
 	/// The key purpose of each role the identity serves: signer, server, and
 	/// client.
@@ -669,10 +710,9 @@ impl HiveTlsConfig {
 	/// Decodes `certificate`, binds it to the key that proves it, and installs
 	/// the identity under [`KeyPurposes::HOUSE`].
 	///
-	/// A hive presents one identity to dial a gateway and to accept on its own
-	/// control plane, and signs its registrations with it. One decode here
-	/// gives those roles one certificate, which every control-plane event
-	/// reads.
+	/// A hive dials gateways, accepts on its control plane, and signs its
+	/// registrations under this one identity, so every role and every
+	/// control-plane event reads one decoded certificate.
 	///
 	/// # Errors
 	///
@@ -786,11 +826,10 @@ pub type CallFuture<'a> = Pin<Box<dyn Future<Output = Result<Frame, TightBeamErr
 
 /// The unary reply future of a streamed intra-hive call.
 ///
-/// It resolves once the sibling servlet answers the stream's trailer, to the
-/// servlet's complete trailer reply [`Frame`], the shape that
-/// [`HiveContext::call`] and the cluster plane's `open_stream_to` guarantee. A
-/// servlet that answers with no frame resolves to
-/// [`TightBeamError::MissingResponse`].
+/// It resolves, once the sibling servlet answers the stream's trailer, to the
+/// servlet's complete reply [`Frame`], as [`HiveContext::call`] and the
+/// cluster plane's `open_stream_to` do. A servlet that answers with no frame
+/// resolves to [`TightBeamError::MissingResponse`].
 pub type StreamResponseFuture = Pin<Box<dyn Future<Output = Result<Frame, TightBeamError>> + Send>>;
 
 /// The future of a streamed intra-hive call's producer half: the
@@ -805,14 +844,13 @@ pub type DuplexOpenFuture<'a> =
 
 /// The context that servlets in one hive call each other through.
 ///
-/// A call through it skips the cluster, which suits a pattern such as a
-/// KeyManager servlet that serves encryption and decryption to its siblings.
+/// A call through it skips the cluster. It suits, for example, a KeyManager
+/// servlet that encrypts and decrypts for its siblings.
 ///
 /// # Envelopes
 ///
-/// Every verb preserves the envelope: the caller's complete [`Frame`] travels
-/// to the sibling unmodified, and the sibling's complete reply frame travels
-/// back unmodified.
+/// Every verb carries the caller's complete [`Frame`] to the sibling, and the
+/// sibling's complete reply frame back, unmodified.
 ///
 /// Callers compose their own envelope with [`compose!`](crate::compose!), sign
 /// it when the sibling is signature-gated, and verify or decode the reply
@@ -882,9 +920,7 @@ pub trait HiveContext: Send + Sync {
 	///
 	/// - The context emits the frame as-is, so a `nonrepudiation` signature
 	///   that the caller applied stays verifiable at the servlet.
-	/// - The reply is the servlet's complete envelope. Verify it with
-	///   [`Frame::verify`] before you trust the message body.
-	/// - A servlet that answers with no frame resolves to [`TightBeamError::MissingResponse`].
+	/// - Verify the reply with [`Frame::verify`] before you trust its message body.
 	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a>;
 
 	/// Opens a request stream to a sibling servlet.
@@ -926,10 +962,8 @@ pub struct HiveScalingConfig {
 }
 
 impl HiveScalingConfig {
-	/// Returns the scaling thresholds that apply to `servlet_type`.
-	///
-	/// A type with no entry in [`Self::overrides`] scales on
-	/// [`Self::default_scale`].
+	/// Returns the scaling thresholds of `servlet_type`: its entry in
+	/// [`Self::overrides`], or [`Self::default_scale`].
 	pub(crate) fn scale_config(&self, servlet_type: &Urn<'_>) -> ServletScaleConfig {
 		self.overrides.get(servlet_type).copied().unwrap_or(self.default_scale)
 	}
@@ -953,22 +987,18 @@ pub struct HiveControlConfig {
 	/// The longest wait of a drain for in-flight commands, after which the
 	/// registered servlets stop.
 	pub drain_timeout: Duration,
-	/// The anti-entropy interval of the servlet slate re-announce.
-	///
-	/// Every interval the hive re-announces its full servlet slate, freshly
-	/// signed, to every gateway it has registered with. [`None`] disables
-	/// the beat.
+	/// The anti-entropy interval at which the hive re-announces its full
+	/// servlet slate, freshly signed, to every gateway it registered with.
+	/// [`None`] disables the beat.
 	pub reregister_interval: Option<Duration>,
 	/// The count of consecutive authentication failures that opens the
 	/// cluster circuit breaker.
 	pub circuit_breaker_threshold: u8,
 	/// The time the circuit breaker stays open before a half-open probe.
 	pub circuit_breaker_cooldown: Duration,
-	/// The freshness window for signed cluster commands.
-	///
-	/// The hive rejects a command whose `Frame.metadata.order` is outside this
-	/// window, or whose signature it already saw inside it. See
-	/// [`ReplayGuard`].
+	/// The freshness window for signed cluster commands. The hive rejects a
+	/// command whose `Frame.metadata.order` is outside this window, or whose
+	/// signature it already saw inside it ([`ReplayGuard`]).
 	pub command_freshness_window: Duration,
 	/// The retry policy for the fan-out of scaling updates to gateways.
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
@@ -1048,10 +1078,9 @@ impl HiveConfig {
 	/// Returns the encryption config of the control plane, or [`None`] when
 	/// the hive binds no control plane.
 	///
-	/// A hive with a [`Self::trust_store`] authenticates each cluster command
-	/// against the peer its handshake proves, so the plane demands a client
-	/// certificate that the store validates, beside the
-	/// [`HiveTlsConfig::validators`].
+	/// With a [`Self::trust_store`], each cluster command authenticates against
+	/// the peer its handshake proves, so the plane demands a client certificate
+	/// that the store validates, beside the [`HiveTlsConfig::validators`].
 	pub(crate) fn control_encryption<C: CryptoProvider>(&self) -> Option<TransportEncryptionConfig<C>> {
 		let hive_tls = self.hive_tls.as_ref()?;
 		let trust_store = self.trust_store.as_ref().map(Arc::clone);
@@ -1140,8 +1169,8 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::crypto::x509::CertificateSpec;
+	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::{CertificateSpec, KeyCurves};
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 	use crate::tb_cases;
@@ -1281,7 +1310,7 @@ mod tests {
 	#[test]
 	fn a_hive_that_authenticates_commands_demands_a_client_certificate() -> Result<(), TightBeamError> {
 		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), KeyPurposes::HOUSE)?;
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		let store: Arc<dyn CertificateTrust> = Arc::new(builder.build());
 		let config = HiveConfig { trust_store: Some(store), hive_tls: Some(Arc::new(tls)), ..Default::default() };
 

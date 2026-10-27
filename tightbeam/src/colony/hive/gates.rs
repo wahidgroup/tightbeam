@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::colony::cluster::FreshnessWindow;
+use crate::colony::hive::runtime::{InsertRefusal, RemoveRefusal};
 use crate::colony::protocol::{AcceptedRecord, ClusterCommand, ClusterCommandResponse, IssuedAt, ReplyShape};
 use crate::crypto::sign::VerifiedSignature;
 use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
@@ -41,22 +42,20 @@ pub enum CircuitState {
 
 /// A circuit breaker for cluster authentication failures.
 ///
-/// It trips after consecutive authentication failures and halts cluster
-/// communication with that signer. After a cooldown, the next request moves
-/// it to half-open as a probe ([`CircuitState::HalfOpen`]). The cooldown runs
-/// on the monotonic reading of its clock, so a step of the system time
-/// neither shortens nor stretches it.
+/// Consecutive failures of one signer trip its circuit, which halts cluster
+/// traffic with it. After a cooldown, the next request is a half-open probe
+/// ([`CircuitState::HalfOpen`]). The cooldown runs on the monotonic clock, so
+/// a step of the system time neither shortens nor stretches it.
 ///
 /// # Failures that count
 ///
-/// Only failures of a *known* signer count toward the threshold
-/// ([`ClusterSecurityGate`]), so unauthenticated frames cannot sever the
-/// control plane between a hive and its legitimate cluster (CWE-645).
+/// Only failures of a *known* signer count ([`ClusterSecurityGate`]), so
+/// unauthenticated frames cannot cut a hive off from its cluster (CWE-645).
 ///
 /// # Thread Safety
 ///
-/// Per-signer circuits live under one mutex, so exactly one caller moves a
-/// circuit from open to half-open per cooldown expiry.
+/// One mutex holds every circuit, so one caller alone moves a circuit to
+/// half-open per cooldown expiry.
 pub struct ClusterCircuitBreaker {
 	/// The per-signer circuits, one row for each signer with a failure history.
 	/// A poisoned lock answers every signer as open, so the breaker fails
@@ -103,8 +102,7 @@ impl SignerCircuit {
 	const CLOSED: Self = Self { position: Position::Closed, failures: 0 };
 
 	/// Returns whether this circuit is closed with no failures. It then carries
-	/// no history, so [`ClusterCircuitBreaker::prune`] drops its row, and the
-	/// map holds only signers with a failure history.
+	/// no history, so [`ClusterCircuitBreaker::prune`] drops its row.
 	const fn is_quiescent(&self) -> bool {
 		matches!(self.position, Position::Closed) && self.failures == 0
 	}
@@ -330,6 +328,7 @@ impl SeenSignatures {
 		let shared = held.unwrap_or_else(|| Arc::from(signer));
 		let partition = self.partitions.entry(Arc::clone(&shared)).or_default();
 		partition.insert(signature.clone(), order);
+
 		self.owner.insert(signature.clone(), shared);
 	}
 
@@ -399,9 +398,9 @@ impl ReplayGuard {
 	/// Records `signature` for `signer`, whose frame states `order`, when it
 	/// is unseen within the window.
 	///
-	/// - The record keeps `order` (`Frame.metadata.order`), the instant
-	///   freshness judges, so it lives exactly as long as the frame is fresh,
-	///   also when that order leads the clock (CWE-294).
+	/// - The record keeps `order` (`Frame.metadata.order`), so it lives exactly
+	///   as long as the frame is fresh, even when `order` leads the clock
+	///   (CWE-294).
 	/// - It returns `true` for a new signature, which it records.
 	/// - It returns `false` for a replay, and fails closed on a full partition or a poisoned lock.
 	///
@@ -463,9 +462,8 @@ impl ReplayGuard {
 	///
 	/// The guard records the signature before the guarded operation runs. When
 	/// that operation fails, the caller must release the record, or the guard
-	/// refuses a legitimate retry of the frame as a replay until the window
-	/// expires. A poisoned guard admits nothing, so it holds no slot to
-	/// release.
+	/// refuses a legitimate retry as a replay until the window expires. A
+	/// poisoned guard admits nothing, so it holds no slot to release.
 	pub fn forget(&self, signature: &VerifiedSignature) {
 		let Ok(mut seen) = self.seen.lock() else {
 			return;
@@ -475,41 +473,37 @@ impl ReplayGuard {
 	}
 }
 
-/// The gate policy for certificate-based cluster command security.
-///
-/// It enforces nonrepudiation, integrity, freshness, and replay rules on
-/// cluster commands.
+/// The gate that admits a signed cluster command: nonrepudiation, integrity,
+/// freshness, and replay.
 ///
 /// # Security Flow
 ///
-/// 1. Require a nonrepudiation signature (missing: `Unauthenticated`, not counted).
-/// 2. Require frame integrity (missing: `Unauthenticated`, not counted).
-/// 3. Require a handshake-proven peer (missing: `Unauthenticated`), and refuse
-///    while its circuit is open (`PermissionDenied`). Neither is counted.
-/// 4. Look up the signer certificate in the trust store (unknown signer: `PermissionDenied`, not counted).
-/// 5. Verify the signature with the certificate's public key (invalid: `PermissionDenied`, **counted**).
-/// 6. Bind the verified signer to the handshake-proven peer (another key: `PermissionDenied`, not counted).
-/// 7. Check `Frame.metadata.order` freshness (stale: `PermissionDenied`, not counted).
-/// 8. Refuse a signature already seen inside the window (replay: `PermissionDenied`, not counted).
-/// 9. On success, take the breaker's cooldown probe and record the success, which resets the breaker.
+/// | Step | Check | Refusal |
+/// | --- | --- | --- |
+/// | 1 | The frame carries a nonrepudiation signature | `Unauthenticated` |
+/// | 2 | The frame carries its integrity | `Unauthenticated` |
+/// | 3 | The handshake proved a peer, whose circuit is closed | `Unauthenticated`, or `PermissionDenied` while open |
+/// | 4 | The trust store holds the signer certificate | `PermissionDenied` |
+/// | 5 | The signature verifies under that certificate | `PermissionDenied`, **counted** |
+/// | 6 | The verified signer is the handshake-proven peer | `PermissionDenied` |
+/// | 7 | `Frame.metadata.order` is fresh | `PermissionDenied` |
+/// | 8 | The signature is new inside the window | `PermissionDenied` |
 ///
-/// Only step 5 counts toward the circuit breaker, against the [`ProvenPeer`]
-/// of the transport handshake, so one member's failures gate that member
-/// alone (CWE-645). Steps 6 to 8 stay uncounted, because a relayed or a
-/// replayed capture carries a valid signature.
+/// On success the gate takes the breaker's cooldown probe and records the
+/// success, which resets the breaker.
 ///
-/// Step 6 makes the peer of each admitted command its signer, so the record
-/// of the command names the party that signed it (CWE-778).
+/// - Only step 5 counts, against the [`ProvenPeer`], so one member's failures gate it alone (CWE-645).
+/// - Steps 6 to 8 stay uncounted, because a relayed or replayed capture carries a valid signature.
+/// - Step 6 makes the peer of each admitted command its signer, so its record names that party (CWE-778).
 ///
 /// # Breaker key
 ///
-/// - The gate reads the breaker before it checks the signature, so the
-///   breaker keys on the handshake-proven peer.
-/// - [`ProvenPeer`] is the only key the breaker accepts, so a caller who
-///   copies a trusted `SignerIdentifier` spends its own budget (CWE-345).
-/// - An unauthenticated transport offers no such key. One row shared by every
-///   anonymous caller would let a single bad signature deny the rest, so this
-///   plane requires a proven peer (CWE-645).
+/// - The gate reads the breaker before the signature, so the breaker keys on the handshake-proven peer.
+/// - [`ProvenPeer`] is its only key, so a caller who copies a trusted
+///   `SignerIdentifier` spends its own budget (CWE-345).
+/// - An unauthenticated transport offers no key. One row for every anonymous
+///   caller would let one bad signature deny the rest, so this plane requires
+///   a proven peer (CWE-645).
 pub struct ClusterSecurityGate {
 	/// The breaker that counts authentication failures, on this gate's clock.
 	circuit_breaker: ClusterCircuitBreaker,
@@ -626,15 +620,19 @@ impl AdmittedCommand {
 /// Why the control plane refused a command the gate had admitted.
 ///
 /// Each variant knows whether the hive could answer a retry of the same
-/// signed frame differently, the one fact [`AdmittedCommand::refuse`] needs
-/// to decide the replay slot. A handler names its refusal, and this type
-/// decides the slot.
+/// signed frame differently, so a handler names its refusal and this type
+/// decides the replay slot for [`AdmittedCommand::refuse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandRefusal {
 	/// The hive is draining, which ends with the hive gone.
 	Draining,
 	/// The hive is at capacity, which clears as work completes.
 	Backpressure,
+	/// The servlet type holds the most instances its bounds admit, which
+	/// clears as an instance stops.
+	AtCapacity,
+	/// The servlet type holds the fewest instances its bounds admit.
+	BelowFloor,
 	/// The hive holds no spawner for the requested servlet type.
 	UnknownServletType,
 	/// The spawner ran and produced no servlet.
@@ -653,6 +651,8 @@ impl CommandRefusal {
 		match self {
 			Self::Draining => "Draining",
 			Self::Backpressure => "Backpressure",
+			Self::AtCapacity => "AtCapacity",
+			Self::BelowFloor => "BelowFloor",
 			Self::UnknownServletType => "UnknownServletType",
 			Self::SpawnFailed => "SpawnFailed",
 			Self::UnnameableInstance => "UnnameableInstance",
@@ -665,7 +665,8 @@ impl CommandRefusal {
 	pub(crate) fn status(self) -> TransitStatus {
 		match self {
 			Self::Draining | Self::SpawnFailed | Self::RegistryFault => TransitStatus::Unavailable,
-			Self::Backpressure => TransitStatus::ResourceExhausted,
+			Self::Backpressure | Self::AtCapacity => TransitStatus::ResourceExhausted,
+			Self::BelowFloor => TransitStatus::FailedPrecondition,
 			Self::UnknownServletType | Self::UnnameableInstance | Self::UnknownInstance => {
 				TransitStatus::PermissionDenied
 			}
@@ -675,13 +676,42 @@ impl CommandRefusal {
 	/// Returns whether the hive could answer a retry of the same signed frame
 	/// differently.
 	///
-	/// A drain is terminal, a servlet type or instance the hive does not
-	/// have stays absent, and a servlet that names itself badly does so on
-	/// every spawn, so those refusals keep the slot spent.
+	/// A refusal that a retry meets again keeps the slot spent:
+	///
+	/// - A drain is terminal.
+	/// - A servlet type or instance the hive does not have stays absent.
+	/// - A servlet that names itself badly does so on every spawn.
+	/// - A stop at the floor stops nothing however often it repeats.
 	pub(crate) fn releases_replay(self) -> bool {
 		match self {
-			Self::Backpressure | Self::SpawnFailed | Self::RegistryFault => true,
-			Self::Draining | Self::UnknownServletType | Self::UnnameableInstance | Self::UnknownInstance => false,
+			Self::Backpressure | Self::AtCapacity | Self::SpawnFailed | Self::RegistryFault => true,
+			Self::Draining
+			| Self::BelowFloor
+			| Self::UnknownServletType
+			| Self::UnnameableInstance
+			| Self::UnknownInstance => false,
+		}
+	}
+}
+
+impl From<InsertRefusal> for CommandRefusal {
+	/// The refusal that answers a spawn the instance set turned away.
+	fn from(refusal: InsertRefusal) -> Self {
+		match refusal {
+			InsertRefusal::Draining => Self::Draining,
+			InsertRefusal::AtCapacity => Self::AtCapacity,
+			InsertRefusal::Unnameable(_) => Self::UnnameableInstance,
+			InsertRefusal::Registry(_) => Self::RegistryFault,
+		}
+	}
+}
+
+impl From<RemoveRefusal> for CommandRefusal {
+	/// The refusal that answers a stop the instance set turned away.
+	fn from(refusal: RemoveRefusal) -> Self {
+		match refusal {
+			RemoveRefusal::Absent => Self::UnknownInstance,
+			RemoveRefusal::AtFloor => Self::BelowFloor,
 		}
 	}
 }
@@ -829,10 +859,8 @@ impl InspectRefusal {
 
 impl ClusterSecurityGate {
 	/// Creates a security gate that trusts the certificates in `trust_store`
-	/// and enforces `limits` on `clock`.
-	///
-	/// Its circuit breaker and its freshness check both run on `clock`, so the
-	/// cooldown and the freshness window read one clock.
+	/// and enforces `limits` on `clock`. The breaker's cooldown and the
+	/// freshness window both read `clock`.
 	pub fn new(trust_store: Arc<dyn CertificateTrust>, limits: GateLimits, clock: Arc<dyn Clock>) -> Self {
 		let GateLimits { failure_threshold, cooldown, freshness_window } = limits;
 		let circuit_breaker = ClusterCircuitBreaker::new(failure_threshold, cooldown, Arc::clone(&clock));
@@ -1188,7 +1216,7 @@ mod tests {
 	use crate::crypto::sign::{PrehashVerifier, SigningIdentity};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::CertificateValidation;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::oid::db::rfc5912::ID_EC_DH;
@@ -1411,9 +1439,7 @@ mod tests {
 			let clock = manual_clock();
 			let breaker = breaker_on(&clock, 1);
 			breaker.record_auth_failure(signer());
-
 			clock.advance(advance);
-
 			assert_eq!(breaker.admit_request(signer()), admitted);
 		}
 		cases {
@@ -1430,7 +1456,6 @@ mod tests {
 		let breaker = breaker_on(&clock, 1);
 		breaker.record_auth_failure(signer());
 		clock.advance(COOLDOWN);
-
 		assert!(breaker.admit_request(signer()));
 		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
 	}
@@ -1452,9 +1477,7 @@ mod tests {
 		fn breaker_half_open_admits_one_probe_per_cooldown((advance, admitted): (Duration, bool)) {
 			let clock = manual_clock();
 			let breaker = probing_breaker(&clock);
-
 			clock.advance(advance);
-
 			assert_eq!(breaker.admit_request(signer()), admitted);
 		}
 		cases {
@@ -1477,7 +1500,6 @@ mod tests {
 	fn breaker_probe_success_closes() {
 		let breaker = ClusterCircuitBreaker::new(1, Duration::ZERO, erased(&manual_clock()));
 		breaker.record_auth_failure(signer());
-
 		assert!(breaker.admit_request(signer()));
 		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
 
@@ -1490,7 +1512,6 @@ mod tests {
 	fn breaker_probe_failure_reopens() {
 		let breaker = ClusterCircuitBreaker::new(1, Duration::ZERO, erased(&manual_clock()));
 		breaker.record_auth_failure(signer());
-
 		assert!(breaker.admit_request(signer()));
 		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
 
@@ -1984,7 +2005,7 @@ mod tests {
 		let clock = manual_clock();
 		let identity = TestIdentity::insecure_fixed();
 		let certificate = identity.certificate().clone();
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(certificate)?
 			.build();
 
@@ -2006,7 +2027,7 @@ mod tests {
 		let clock = manual_clock();
 		let identity = TestIdentity::insecure_fixed();
 		let certificate = identity.certificate().clone();
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(certificate.clone())?
 			.build();
 
@@ -2041,7 +2062,7 @@ mod tests {
 		let clock = manual_clock();
 		let identity = TestIdentity::insecure_fixed();
 		let certificate = identity.certificate().clone();
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(certificate.clone())?
 			.build();
 
@@ -2212,6 +2233,8 @@ mod tests {
 		cases {
 			draining => (CommandRefusal::Draining, false),
 			backpressure => (CommandRefusal::Backpressure, true),
+			at_capacity => (CommandRefusal::AtCapacity, true),
+			below_floor => (CommandRefusal::BelowFloor, false),
 			unknown_servlet_type => (CommandRefusal::UnknownServletType, false),
 			spawn_failed => (CommandRefusal::SpawnFailed, true),
 			unnameable_instance => (CommandRefusal::UnnameableInstance, false),

@@ -560,29 +560,14 @@ tb_scenario! {
 	}
 }
 
-/// The digest of each payload that `trace` recorded for `event`, in the order
-/// the trace recorded them.
-#[cfg(feature = "instrument")]
-fn payload_digests(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<[u8; 32]>> {
-	let recorded = trace.drain_events().into_iter();
-	recorded
-		.filter(|record| record.urn == event)
-		.map(|record| record.payload_hash)
-		.collect()
-}
-
 // The edge plane names the caller of a refused unary call by the key that its
 // session proved. Two refusals on one session name one caller, though each
 // frame claims a signer of its own (CWE-345).
 #[cfg(feature = "instrument")]
 #[tokio::test]
 async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Result<(), TightBeamError> {
-	use tightbeam::instrumentation::TbInstrumentationConfig;
-	use tightbeam::trace::TraceConfig;
-
 	let certs = cluster_certs();
-	let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	let trace = payload_trace();
 	let mut tls = cluster_tls_config(&certs);
 	tls.client_validators = vec![combined_validator(&[&certs.cert])];
 

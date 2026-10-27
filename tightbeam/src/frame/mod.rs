@@ -37,7 +37,7 @@ mod signature;
 
 #[cfg(feature = "digest")]
 pub(crate) use scaffold::FrameIntegrityScaffold;
-#[cfg(feature = "signature")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use signed::ArrivedCertificates;
 pub use signed::Signed;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -400,9 +400,9 @@ impl Frame {
 	/// DER encoding of the `SignerIdentifier` this frame claims.
 	///
 	/// Per-signer budgets, replay slots, refusal journals, and gossip
-	/// attribution all key on the signer, so they key on these bytes and
-	/// agree on what one signer is. It returns [`None`] when the frame carries
-	/// no signature or the identifier fails to encode.
+	/// attribution all key on these bytes, so they agree on what one signer
+	/// is. It returns [`None`] when the frame carries no signature or the
+	/// identifier fails to encode.
 	#[must_use]
 	pub fn signer_id(&self) -> Option<Vec<u8>> {
 		let signer_info = self.nonrepudiation.as_ref()?;

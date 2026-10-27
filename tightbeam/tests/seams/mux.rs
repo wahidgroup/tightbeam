@@ -16,7 +16,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::testing::TestMessage;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::{
-	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxRole, MuxTransport, SpawnedMux, StreamId,
+	BufferedGrantor, CreditGrantor, MuxDispatch, MuxDrivers, MuxHandle, MuxRole, MuxTransport, SpawnedMux, StreamId,
 };
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{EndpointConfig, ResponsePackage, TransportError, TransportFailure, TransportResult};
@@ -75,10 +75,10 @@ impl CreditGrantor for OneAhead {
 }
 
 /// The client end of a connection whose server runs [`OutsideDispatch`],
-/// with the tasks that keep both ends running.
+/// with the drivers and the task that keep both ends running.
 struct Served {
 	handle: MuxHandle,
-	_tasks: [JoinHandle<()>; 2],
+	_drivers: [MuxDrivers; 2],
 	_serving: JoinHandle<TransportResult<()>>,
 }
 
@@ -97,14 +97,14 @@ async fn serve_outside_dispatch_under(settings: MuxSettings, grantor: Arc<dyn Cr
 	let (server, _) = joined.expect("the listener accepts the client");
 
 	let (reader, writer) = client.into_split().expect("a cleartext transport splits");
-	let SpawnedMux { handle, reader_task: client_reader, .. } =
+	let SpawnedMux { handle, drivers: client_drivers, .. } =
 		MuxTransport::new(reader, writer, MuxRole::Client, settings).spawn();
 	let (reader, writer) = server.into_split().expect("a cleartext transport splits");
 	let server = MuxTransport::new(reader, writer, MuxRole::Server, settings).with_credit_grantor(grantor);
-	let SpawnedMux { responder, reader_task: server_reader, .. } = server.spawn();
+	let SpawnedMux { responder, drivers: server_drivers, .. } = server.spawn();
 	let serving = tokio::spawn(responder.serve_with(OutsideDispatch));
 
-	Served { handle, _tasks: [client_reader, server_reader], _serving: serving }
+	Served { handle, _drivers: [client_drivers, server_drivers], _serving: serving }
 }
 
 /// Serve [`OutsideDispatch`] as [`serve_outside_dispatch_under`] does, under

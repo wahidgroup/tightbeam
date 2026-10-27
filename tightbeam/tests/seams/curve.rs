@@ -793,14 +793,17 @@ mod renewal {
 	use tightbeam::crypto::policy::Secp256k1Policy;
 	use tightbeam::crypto::sign::SigningIdentity;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
-	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use tightbeam::crypto::x509::KeyCurves;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::prelude::TightBeamSocketAddr;
 	use tightbeam::testing::TestFrame;
 	use tightbeam::transport::client::{ClientBuilder, ConnectionBuilder};
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportOffer};
 	use tightbeam::transport::handshake::HandshakeProvider;
-	use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxDispatch, MuxHandle, MuxRole, SpawnedMux};
+	use tightbeam::transport::multiplex::{
+		MuxAcceptor, MuxConnector, MuxDispatch, MuxDrivers, MuxHandle, MuxRole, SpawnedMux,
+	};
 	use tightbeam::transport::tcp::r#async::{TokioListener, TokioStream};
 	use tightbeam::transport::{EncryptedProtocol, ResponsePackage, TransportEncryptionConfig, TransportResult};
 	use tightbeam::Frame;
@@ -830,11 +833,11 @@ mod renewal {
 		}
 	}
 
-	/// The client end of a session that renews its epoch, with the tasks that
-	/// run both ends.
+	/// The client end of a session that renews its epoch, with the drivers
+	/// and the task that run both ends.
 	struct RenewingSession {
 		handle: MuxHandle,
-		_tasks: [JoinHandle<()>; 2],
+		_drivers: [MuxDrivers; 2],
 		_serving: JoinHandle<TransportResult<()>>,
 	}
 
@@ -867,7 +870,8 @@ mod renewal {
 			transport.into_mux(MuxRole::Server)
 		});
 
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(server_certificate)?;
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let store = store.with_certificate(server_certificate)?;
 		let builder = ClientBuilder::<TokioListener<P>>::builder().with_trust_store(Arc::new(store.build()));
 		let builder = builder.with_client_identity(client_identity);
 		let stream = TcpStream::connect(*addr).await?;
@@ -875,11 +879,11 @@ mod renewal {
 		let mut client = client.with_mux_offer(Some(renewing_offer()));
 		MuxConnector::complete_client_handshake(&mut client).await?;
 
-		let SpawnedMux { handle, reader_task: client_reader, .. } = client.into_mux(MuxRole::Client)?.spawn();
+		let SpawnedMux { handle, drivers: client_drivers, .. } = client.into_mux(MuxRole::Client)?.spawn();
 		let server = accepting.await??;
-		let SpawnedMux { responder, reader_task: server_reader, .. } = server.spawn();
+		let SpawnedMux { responder, drivers: server_drivers, .. } = server.spawn();
 		let serving = tokio::spawn(responder.serve_with(EchoDispatch));
-		Ok(RenewingSession { handle, _tasks: [client_reader, server_reader], _serving: serving })
+		Ok(RenewingSession { handle, _drivers: [client_drivers, server_drivers], _serving: serving })
 	}
 
 	/// Emits [`EMITS`] frames on `handle`, each on a stream of its own.

@@ -9,17 +9,14 @@
 //! The servlet, hive, and gateway planes also set the trace and the mux offer
 //! of their owner on each connection here.
 
-#[cfg(feature = "tokio")]
-use core::future::Future;
 use core::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
+#[cfg(feature = "tokio")]
+use core::future::Future;
+
 use crate::constants::DEFAULT_ACCEPT_RETRY_DELAY;
-#[cfg(feature = "tokio")]
-use crate::transport::protocols::AsyncListenerTrait;
-#[cfg(feature = "tokio")]
-use crate::utils::time::Clock;
 
 #[cfg(feature = "colony")]
 use crate::trace::TraceHandle;
@@ -27,8 +24,12 @@ use crate::trace::TraceHandle;
 use crate::transport::handshake::negotiation::TransportOffer;
 #[cfg(feature = "colony")]
 use crate::transport::multiplex::MuxCapable;
+#[cfg(feature = "tokio")]
+use crate::transport::protocols::AsyncListenerTrait;
 #[cfg(feature = "colony")]
 use crate::transport::state::EncryptedProtocolState;
+#[cfg(feature = "tokio")]
+use crate::utils::time::Clock;
 
 /// A plane that accepts connections under a fixed cap and owns what it admits.
 ///
@@ -121,9 +122,6 @@ impl AcceptPlane {
 
 	/// Accepts as [`AcceptPlane::accept_on`] does, and sets `terms` on each
 	/// admitted transport before `handler` runs it.
-	///
-	/// The servlet, hive, and gateway planes accept here, so each connection
-	/// they serve carries the trace and the mux offer of its owner.
 	#[cfg(feature = "colony")]
 	pub(crate) fn accept_owned<L, F, Fut>(
 		self,
@@ -343,10 +341,10 @@ impl Drop for Permit {
 /// The terms that an owner sets on each connection it serves: its trace, and
 /// its mux offer.
 ///
-/// The terms hold the handle of the owner's trace, so each connection records
-/// into the trace that the handle holds when the connection starts. The trace
-/// goes on before the handshake, so the trace records the handshake of every
-/// connection, a peer that never authenticates included.
+/// They hold the handle of the owner's trace, so each connection records into
+/// the trace the handle holds when the connection starts. The trace goes on
+/// before the handshake, so it records the handshake of every connection, a
+/// peer that never authenticates included.
 #[cfg(feature = "colony")]
 #[derive(Clone)]
 pub(crate) struct ConnectionTerms {
@@ -392,6 +390,21 @@ mod tests {
 
 	use super::*;
 	use crate::utils::time::ManualClock;
+
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	use crate::crypto::profiles::DefaultCryptoProvider;
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	use crate::transport::handshake::negotiation::MuxSettings;
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	use crate::transport::multiplex::{MuxAcceptor, MuxRole, MuxService, MuxTransport};
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	use crate::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	use crate::transport::{EndpointConfig, TransportResult};
+
+	/// How long the peer of an ended connection has to read its close.
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	const CLOSE_GUARD: Duration = Duration::from_secs(5);
 
 	/// A plane of one slot, on a clock that the test moves.
 	fn plane() -> AcceptPlane {
@@ -452,5 +465,57 @@ mod tests {
 		tokio::time::advance(Duration::from_secs(60)).await;
 		tokio::task::yield_now().await;
 		assert!(!FINISHED.load(Ordering::SeqCst));
+	}
+
+	/// A service that refuses every kind of stream through the defaults of its
+	/// trait.
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	struct Refusing;
+
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	impl MuxService for Refusing {}
+
+	/// The client and the server transport of one cleartext loopback
+	/// connection.
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	async fn cleartext_pair() -> (TcpTransport<TokioStream>, TcpTransport<TokioStream>) {
+		let bound = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await;
+		let listener = bound.expect("a loopback port binds");
+		let addr = listener.local_addr().expect("a bound listener has an address");
+		let connected = tokio::net::TcpStream::connect(addr).await;
+		let stream = connected.expect("the client reaches the listener");
+		let (server, _) = listener.accept().await.expect("the listener accepts the client");
+
+		let client = TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext());
+		(client, server)
+	}
+
+	/// A handler of the plane holds the drivers of the multiplexed connection
+	/// it serves, so the drop of the plane ends the connection, and its peer
+	/// reads the close (CWE-772).
+	#[cfg(all(pooled_mux, feature = "tcp"))]
+	#[tokio::test]
+	async fn dropping_the_plane_ends_a_multiplexed_connection() -> TransportResult<()> {
+		let (client, server) = cleartext_pair().await;
+		let settings = MuxSettings::symmetric(4);
+
+		let mut plane = plane();
+		serve_on_free_slot(&mut plane, async move {
+			// The drop of the plane ends the serve, so its outcome has no
+			// reader.
+			let _ended = server.serve(settings, Refusing, None).await;
+		})
+		.await;
+
+		let (reader, writer) = client.into_split()?;
+		let client = MuxTransport::new(reader, writer, MuxRole::Client, settings);
+		let (_handle, client_reader, _client_writer, _responder) = client.into_parts();
+		tokio::task::yield_now().await;
+
+		drop(plane);
+
+		let closed = tokio::time::timeout(CLOSE_GUARD, client_reader.drive()).await;
+		assert!(closed.is_ok());
+		Ok(())
 	}
 }

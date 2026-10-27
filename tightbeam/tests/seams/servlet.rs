@@ -3,6 +3,9 @@
 //!
 //! A hive carries that signer in its registration, and the gateway's dial of
 //! the servlet admits only the certificate it names (CWE-346).
+//!
+//! An outside crate also writes the [`UtilizationGauge`] of a `servlet!`
+//! servlet here, which the hive reads when it scales the servlet.
 
 #![cfg(all(
 	feature = "std",
@@ -14,13 +17,14 @@
 	feature = "colony"
 ))]
 
+use core::time::Duration;
 use std::sync::Arc;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig};
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
-use tightbeam::colony::servlet::ServletConfig;
+use tightbeam::colony::servlet::{ServletConfig, UtilizationGauge};
 use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::SubmitWork;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
@@ -33,8 +37,11 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, Protocol};
 use tightbeam::urn::Urn;
+use tightbeam::utils::time::{Clock, ManualClock};
+use tightbeam::utils::BasisPoints;
 use tightbeam::{cluster, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
 
+use crate::common::poll::poll_until;
 use crate::common::security::{random_signing_key, test_certificate};
 use crate::common::x509::GatewayCerts;
 
@@ -102,7 +109,6 @@ fn echo_urn() -> Urn<'static> {
 pub(super) fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256k1KeyProvider>) {
 	let spec = CertificateSpec::Built(Box::new(certs.cert.to_owned()));
 	let provider = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
-
 	(spec, provider)
 }
 
@@ -110,7 +116,6 @@ pub(super) fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256
 pub(super) fn seam_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
 	let (spec, provider) = identity_of(certs);
 	let tls = ClusterTlsConfig::new(spec, provider).expect("the seam certificate decodes");
-
 	ClusterConfig::new(tls.with_hive_trust(Some(Arc::clone(&certs.trust))))
 }
 
@@ -126,6 +131,7 @@ async fn start_outside_hive(
 		.with_certificate(spec, provider, vec![])?
 		.with_config(Arc::new(()))
 		.build();
+
 	let inner = SeamEchoServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 	let servlet = OutsideServlet { inner, signer: named.clone() };
 
@@ -248,4 +254,64 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// The scaling cadence of the gauged hive, on its manual clock.
+const SCALING_PERIOD: Duration = Duration::from_secs(5);
+
+/// The polls of the wait for the hive to scale up.
+const SCALE_POLLS: u32 = 100;
+
+/// The interval between two polls.
+const SCALE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A gauge that an outside crate writes: it reads full load, so the hive
+/// scales up the servlet that holds it.
+struct FullLoad;
+
+impl UtilizationGauge for FullLoad {
+	fn utilization(&self) -> BasisPoints {
+		BasisPoints::MAX
+	}
+}
+
+/// The type URN the gauged servlet registers under.
+fn gauged_urn() -> Urn<'static> {
+	let urn = ColonyNamespace::default().servlet("gauged-echo");
+	urn.expect("test names satisfy the mint grammar")
+}
+
+/// Starts a hive on `clock` with no control plane, whose one `servlet!`
+/// servlet holds the outside [`FullLoad`] gauge behind the erased handle.
+async fn start_gauged_hive(clock: &Arc<ManualClock>) -> Result<SeamHive, TightBeamError> {
+	let gauge: Arc<dyn UtilizationGauge> = Arc::new(FullLoad);
+	let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_utilization(gauge);
+	let servlet_conf = builder.allow_cleartext().build();
+	let servlet = SeamEchoServlet::start(Arc::new(TraceCollector::new()), servlet_conf).await?;
+
+	let mut conf = HiveConfig { clock: Arc::clone(clock) as Arc<dyn Clock>, ..Default::default() };
+	conf.scaling.cooldown = SCALING_PERIOD;
+
+	let mut hive = SeamHive::new(Some(conf))?;
+	hive.register(gauged_urn(), servlet, |t| SeamEchoServlet::start(t, ServletConfig::cleartext()))?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
+	Ok(hive)
+}
+
+/// A hive scales up the `servlet!` servlet whose outside gauge reads full
+/// load. Each poll moves the hive clock one scaling period.
+#[tokio::test]
+async fn a_hive_scales_up_a_servlet_on_its_outside_gauge() -> Result<(), TightBeamError> {
+	let clock = Arc::new(ManualClock::default());
+	let hive = start_gauged_hive(&clock).await?;
+	let scaled_up = poll_until(SCALE_POLLS, SCALE_POLL_INTERVAL, || {
+		clock.advance(SCALING_PERIOD);
+		hive.servlet_addresses().len() > 1
+	})
+	.await;
+
+	hive.stop();
+
+	assert!(scaled_up);
+	Ok(())
 }

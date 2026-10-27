@@ -870,15 +870,15 @@ pub trait ClusterHeartbeat: Cluster {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::protocol::{ClusterWorkResponse, RegisterHiveRequest, ServletInfo};
+	use crate::colony::protocol::{ClusterWorkResponse, ServletInfo};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
 	use crate::crypto::x509::policy::ExpiryValidator;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 	use crate::policy::TransitStatus;
@@ -887,7 +887,6 @@ mod tests {
 	use crate::transport::client::ConnectionPool;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::TokioListener;
-	use crate::utils::time::ManualClock;
 
 	fn test_tls_config() -> ClusterTlsConfig {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
@@ -974,7 +973,8 @@ mod tests {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let certificate = TestCertificate::self_signed(&key);
 		let certificate = TestCertificate::with_key_purposes(certificate, [OWN_CLIENT, KeyPurposes::HOUSE.signer]);
-		let trust = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate.clone())?;
+		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let trust = trust.with_certificate(certificate.clone())?;
 		let trust: Arc<dyn CertificateTrust> = Arc::new(trust.build());
 		let identity = SigningIdentity::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
 		let tls = ClusterTlsConfig::from_identity(identity, KeyPurposes { client: OWN_CLIENT, ..KeyPurposes::HOUSE })?;
@@ -1018,37 +1018,11 @@ mod tests {
 		}
 	}
 
-	fn test_registry() -> HiveRegistry {
-		HiveRegistry::new(Duration::from_secs(15), Arc::new(ManualClock::default()))
-	}
-
 	fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> crate::urn::Urn<'static> {
 		let name = name.as_ref();
 		ColonyNamespace::default()
 			.servlet(name)
 			.expect("test names satisfy the mint grammar")
-	}
-
-	/// The signer every fixture registration binds. Registration always
-	/// names one, so the tests name one too.
-	fn test_signer() -> Arc<SignerIdentifier> {
-		Arc::new(ServletInfo::fixture_signer())
-	}
-
-	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
-		let addr = addr.as_ref();
-		RegisterHiveRequest {
-			hive_addr: addr.to_vec(),
-			metadata: None,
-			servlet_addresses: servlets
-				.iter()
-				.map(|s| ServletInfo {
-					servlet_id: servlet_urn(s),
-					address: addr.to_vec(),
-					signer: ServletInfo::fixture_signer(),
-				})
-				.collect(),
-		}
 	}
 
 	/// The instance URN of servlet type `name` at `addr`.
@@ -1072,14 +1046,6 @@ mod tests {
 
 		let refused = config.servlet_slate(&[mismatched], &hive_addr);
 		assert!(matches!(refused, Err(ClusterError::InvalidAddress(address)) if address == b"127.0.0.1:9002"));
-	}
-
-	fn request_with_meta(addr: impl AsRef<[u8]>, servlets: &[&str], meta: impl AsRef<[u8]>) -> RegisterHiveRequest {
-		let addr = addr.as_ref();
-		let meta = meta.as_ref();
-		let mut request = request(addr, servlets);
-		request.metadata = Some(meta.to_vec());
-		request
 	}
 
 	#[test]
@@ -1180,55 +1146,6 @@ mod tests {
 		let response = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
 		assert_eq!(response.status, TransitStatus::PermissionDenied);
 		assert!(response.payload.is_none());
-	}
-
-	#[test]
-	fn registry_register_and_lookup() -> Result<(), ClusterError> {
-		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]), test_signer())?;
-
-		let hives = registry.all_hives()?;
-		assert_eq!(hives.len(), 1);
-		assert_eq!(hives[0].address.as_ref(), b"127.0.0.1:8080");
-		Ok(())
-	}
-
-	#[test]
-	fn registry_unregister() -> Result<(), ClusterError> {
-		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
-		assert_eq!(registry.len()?, 1);
-		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
-		assert_eq!(registry.len()?, 0);
-		Ok(())
-	}
-
-	#[test]
-	fn registry_update_utilization() -> Result<(), ClusterError> {
-		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
-		assert!(registry.update_utilization(b"127.0.0.1:8080", crate::bps!(5000))?);
-
-		let hives = registry.all_hives()?;
-		assert_eq!(hives.len(), 1);
-		assert_eq!(hives[0].utilization.get(), 5000);
-		Ok(())
-	}
-
-	#[test]
-	fn registry_all_hives() -> Result<(), ClusterError> {
-		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping"]), test_signer())?;
-		registry.register(request_with_meta(b"hive2", &["calc"], b"metadata"), test_signer())?;
-
-		let all = registry.all_hives()?;
-		assert_eq!(all.len(), 2);
-
-		let addrs: Vec<_> = all.iter().map(|e| e.address.as_ref()).collect();
-		assert!(addrs.contains(&b"hive1".as_slice()));
-		assert!(addrs.contains(&b"hive2".as_slice()));
-
-		Ok(())
 	}
 
 	/// The builder creates the ingress route key, so it refuses an unroutable

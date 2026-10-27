@@ -265,6 +265,14 @@ impl FdrVerdict {
 		]
 	}
 
+	/// Records `witness`, the first witness against structural determinism,
+	/// and that the process is deterministic when there is none.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn record_determinism(&mut self, witness: Option<(State, Event)>) {
+		self.is_deterministic = witness.is_none();
+		self.determinism_witness = witness;
+	}
+
 	/// This verdict with what a second pass decided about refinement.
 	///
 	/// A scenario that names both a CSP process and FDR specs explores twice.

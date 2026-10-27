@@ -28,12 +28,12 @@ use crate::testing::assertions::AssertionLabel;
 use crate::testing::specs::composition::CompositionError;
 use crate::trace::ConsumedTrace;
 use crate::urn::Urn;
+use crate::Errorizable;
 
 #[cfg(feature = "testing-schedulability")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
-use crate::Errorizable;
 
 pub use super::lts::{Action, Alphabet, CspValidationResult, CspViolation, Event, State};
 
@@ -198,15 +198,15 @@ impl Observation {
 /// - The nondeterministic choice points.
 /// - The timing constraints for real-time verification, when the process has them.
 ///
-/// The type is `#[non_exhaustive]` because [`ProcessBuilder`] is the only
-/// construction that establishes the invariants between the fields.
+/// It is `#[non_exhaustive]`, because [`ProcessBuilder`] alone establishes the
+/// invariants between the fields.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Process {
 	/// The human-readable name of the process.
 	pub name: &'static str,
 
-	/// What this process is evidence of, which the code that builds it sets.
+	/// What this process is evidence of, as the code that builds it sets it.
 	pub observation: Observation,
 
 	/// Whether a run that records no event in this alphabet is a violation.
@@ -383,6 +383,50 @@ impl Process {
 		actions
 	}
 
+	/// The first state and event that refute structural determinism, or
+	/// `None` when the process is structurally deterministic.
+	///
+	/// A process with no hidden action and no `(state, event)` pair of more
+	/// than one target state is deterministic in CSP (Roscoe 2010, §10.5).
+	/// External choice is deterministic, so it names no witness.
+	///
+	/// - The walk reads every state of the process, reachable or not.
+	/// - It reads the states in name order and the actions of each state in
+	///   the order of [`Self::enabled`], so each run names the same witness.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Settles")
+	///     .initial_state(State("S0"))
+	///     .add_hidden(Event("tau"))
+	///     .add_transition(State("S0"), Event("tau"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.determinism_witness(), Some((State("S0"), Event("tau"))));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn determinism_witness(&self) -> Option<(State, Event)> {
+		let mut states: Vec<State> = self.states.iter().copied().collect();
+		states.sort_unstable();
+		for state in states {
+			for action in self.enabled(state) {
+				let mut targets = self.step(state, &action.event);
+				targets.sort_unstable();
+				targets.dedup();
+
+				if action.is_hidden() || targets.len() > 1 {
+					return Some((state, action.event));
+				}
+			}
+		}
+
+		None
+	}
+
 	/// Whether `event` takes `state` to a state, whatever the clocks read.
 	fn has_edge(&self, state: State, event: &Event) -> bool {
 		#[cfg(feature = "testing-timing")]
@@ -398,7 +442,6 @@ impl Process {
 	pub(crate) fn timed_edges(&self, state: State, event: &Event) -> &[TimedTransition] {
 		let table = self.timed_transitions.as_ref();
 		let edges = table.and_then(|table| table.get(&(state, *event)));
-
 		edges.map(Vec::as_slice).unwrap_or_default()
 	}
 
@@ -438,7 +481,6 @@ impl Process {
 	pub fn initial_clocks(&self) -> HashMap<String, Duration> {
 		let edges = self.timed_transitions.iter().flat_map(HashMap::values).flatten();
 		let named = edges.flat_map(TimedTransition::clocks);
-
 		named.map(|clock| (clock.to_string(), Duration::ZERO)).collect()
 	}
 
@@ -473,7 +515,6 @@ impl Process {
 	pub(crate) fn enabled_under(&self, state: State, clocks: &HashMap<String, Duration>) -> Vec<Action> {
 		let mut actions = self.enabled(state);
 		actions.retain(|action| self.successors(state, &action.event, clocks).next().is_some());
-
 		actions
 	}
 
@@ -657,7 +698,6 @@ impl Process {
 		};
 
 		let task_set = timing.to_task_set(periods, *scheduler)?;
-
 		Ok(Some(task_set))
 	}
 }
@@ -838,6 +878,7 @@ impl HiddenGraph {
 	fn of(process: &Process) -> Self {
 		let mut states: Vec<State> = process.states.iter().copied().collect();
 		states.sort_unstable();
+
 		let mut index: HashMap<State, usize> = states.iter().copied().zip(0..).collect();
 		let mut graph = Self { states, steps: Vec::new() };
 
@@ -988,6 +1029,7 @@ impl Tarjan {
 		}
 
 		self.reach(root);
+
 		let mut calls = vec![(root, 0usize)];
 		while let Some(&(state, next)) = calls.last() {
 			let step = graph.steps.get(state).and_then(|steps| steps.get(next));
@@ -1412,8 +1454,7 @@ impl ProcessBuilder {
 	/// Accepts a run that records no event in this process's alphabet.
 	///
 	/// Use it only for a process whose modelled behavior is to do nothing.
-	/// Every other process rejects such a run, because a trace that takes no
-	/// transition satisfies every process.
+	/// Every other process rejects such a run ([`Process::requires_progress`]).
 	pub fn permits_no_progress(mut self) -> Self {
 		self.requires_progress = false;
 		self
@@ -2036,7 +2077,6 @@ mod tests {
 	// checks one part of the LTS it yields.
 	#[test]
 	fn test_csp_process_spec_structure() -> Result<(), ProcessBuildError> {
-		// The process is a model of the handshake state machine.
 		tb_process_spec! {
 			pub ComprehensiveHandshake,
 			events {

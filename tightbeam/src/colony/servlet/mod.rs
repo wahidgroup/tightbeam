@@ -5,9 +5,8 @@
 //!
 //! 1. Build handlers with [`ServletHandlers`] (or implement [`ServletService`]).
 //! 2. Call [`ServletRuntime::start`] with a [`ServletConfig`].
-//! 3. For call sites that need [`Servlet`], pass a [`RuntimeServletConf`],
-//!    which bundles the config and the handlers, into [`Servlet::start`] on
-//!    [`ServletRuntime`].
+//! 3. Where a call site needs [`Servlet`], pass a [`RuntimeServletConf`] (the
+//!    config and the handlers) to [`Servlet::start`] on [`ServletRuntime`].
 //!
 //! Typed unary delivery without `servlet!` goes through
 //! [`ServletHandlers::on_typed_unary`] or
@@ -26,4 +25,6 @@ pub use config::{AcceptState, Cleartext, NoAcceptState, ServletConfig, ServletCo
 pub use context::{ServletContext, WorkerBox, WorkerBoxStartFuture};
 pub use runtime::ServletRuntime;
 pub use service::{RuntimeServletConf, Servlet, ServletConf, ServletFuture, ServletHandlers, ServletService};
-pub use tracking::{LatencyTracker, QueueSlot, ServletMetrics, UtilizationReporter, UtilizationWeights};
+pub use tracking::{
+	LatencyTracker, QueueSlot, ServletMetrics, UtilizationGauge, UtilizationReporter, UtilizationWeights,
+};

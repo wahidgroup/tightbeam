@@ -1,5 +1,5 @@
-//! HTTP/2-style multiplexing, which runs concurrent request/response streams
-//! over a single connection.
+//! HTTP/2-style multiplexing: concurrent request/response streams over one
+//! connection.
 //!
 //! A [`MuxTransport`] takes [`MuxSettings`] and the halves that
 //! [`TcpTransport::into_split`](crate::transport::TcpTransport::into_split)
@@ -56,13 +56,13 @@ use std::sync::Arc;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use futures::future::ready;
 
-#[cfg(feature = "tokio")]
-pub use router::SpawnedMux;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use router::{
 	BufferedGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver, ReplySink, RequestSink,
 	StreamBody,
 };
+#[cfg(feature = "tokio")]
+pub use router::{MuxDrivers, SpawnedMux};
 #[cfg(pooled_mux)]
 pub use service::{CallContext, MuxService};
 
@@ -149,9 +149,9 @@ impl IntoMuxOffer for Option<&Arc<TransportOffer>> {
 /// budget. The target is a servlet [`Urn`], which names the handler of a
 /// stream as `:path` names the target of an HTTP request.
 ///
-/// - Initiators stamp a route through the typed [`MuxHandle::open_stream_to`]
-///   and [`MuxHandle::open_duplex_to`] entry points, which name a servlet type
-///   URN the same way a unary routed call names its target.
+/// - Initiators stamp a route through [`MuxHandle::open_stream_to`] and
+///   [`MuxHandle::open_duplex_to`], which name a servlet type URN as a unary
+///   routed call names its target.
 /// - A served handler reads the route it received through [`CallContext`].
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,9 +193,7 @@ impl StreamRoute {
 	/// Builds a route to a servlet type with a given remaining relay budget.
 	///
 	/// A gateway stamps this route when it re-emits a client stream to a peer
-	/// gateway with the budget decremented. A gateway serves an open with a
-	/// `0` budget locally, so the relay of that open ends there. An origin open
-	/// uses [`Self::to`].
+	/// gateway with the budget decremented. An origin open uses [`Self::to`].
 	#[cfg(feature = "colony")]
 	pub fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
 		// The sentinel encodes an origin open. A relayed route must stay
@@ -220,9 +218,9 @@ impl StreamRoute {
 		self.target.as_ref()
 	}
 
-	/// Returns the relay budget left on this open, which is the number of
-	/// gateway forwards that the stream has left to spend. A gateway serves a
-	/// stream at `0` locally, so its relay ends there.
+	/// Returns the relay budget left on this open: the gateway forwards the
+	/// stream has left. A gateway serves a stream at `0` locally, so its relay
+	/// ends there.
 	pub fn hops_remaining(&self) -> u8 {
 		self.hops_remaining
 	}
@@ -269,23 +267,20 @@ impl StreamId {
 /// [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
-	/// The ID is unused, so the stream is exempt from the concurrency cap.
+	/// The ID is unused.
 	Idle,
-	/// Both sides may send. The stream counts toward the concurrency cap.
+	/// Both sides may send.
 	Open,
-	/// The local side has closed its send half, and the stream counts toward
-	/// the concurrency cap.
+	/// The local side has closed its send half.
 	HalfClosedLocal,
-	/// The remote side has closed its send half, and the stream counts toward
-	/// the concurrency cap.
+	/// The remote side has closed its send half.
 	HalfClosedRemote,
-	/// The stream is fully closed, so it is exempt from the concurrency cap.
+	/// The stream is fully closed.
 	Closed,
 }
 
-/// The endpoint role on a multiplexed connection, which fixes whether its
-/// stream IDs are odd or even. A client allocates odd IDs and a server
-/// allocates even IDs, by the HTTP/2 convention.
+/// The endpoint role on a multiplexed connection, which fixes the parity of
+/// its stream IDs by the HTTP/2 convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxRole {
 	/// The handshake initiator, which allocates odd stream IDs.
@@ -356,9 +351,9 @@ impl MuxRole {
 /// A protocol that runs concurrent request/response streams over one
 /// connection.
 ///
-/// The cap and cancel contracts match those of [`MuxHandle`]. This trait lets
-/// a caller stay generic over the concrete handle type. The one cancel surface
-/// is a drop of the emit future, which cancels its stream.
+/// It lets a caller stay generic over the handle type, under the cap and
+/// cancel contracts of [`MuxHandle`]. The one cancel surface is a drop of the
+/// emit future.
 pub trait MultiplexedProtocol {
 	/// Returns the peer-advertised cap on concurrent locally-initiated streams
 	/// (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`).
@@ -568,6 +563,10 @@ pub trait MuxAcceptor: MuxCapable {
 	/// - A fault the trace injects at the verdict of the gate, or at the entry
 	///   of a handler, closes its stream as `Internal`.
 	///
+	/// The drivers live as long as the call, so a call that its owner drops
+	/// ends the connection at once. A call that ends closes the writer behind
+	/// the envelopes the responder queued, a GoAway among them.
+	///
 	/// # Arguments
 	///
 	/// - `cancel_budget` overrides the CVE-2023-44487 cancel-abuse default when it is set.
@@ -622,9 +621,13 @@ pub trait MuxAcceptor: MuxCapable {
 			let snapshot = self.session_context();
 			let (gate, (reader, writer)) = self.into_gated_halves()?;
 			let mux = MuxTransport::assemble(reader, writer, ACCEPTOR_ROLE, settings, rekey);
-			let SpawnedMux { handle, responder, reader_task: _reader_task } = mux.spawn_with(cancel_budget);
+			let SpawnedMux { handle, responder, drivers } = mux.spawn_with(cancel_budget);
+			let closer = handle.clone();
 
-			responder.serve_with(GatedService::new(service, gate, snapshot, handle)).await
+			let served = responder.serve_with(GatedService::new(service, gate, snapshot, handle)).await;
+			closer.close().await;
+			drivers.finish().await;
+			served
 		}
 	}
 }
@@ -632,9 +635,8 @@ pub trait MuxAcceptor: MuxCapable {
 /// The streaming extension of [`MultiplexedProtocol`], which adds chunked
 /// request bodies and duplex replies over individual mux streams.
 ///
-/// The extension is a separate trait because the concrete sink and body types
-/// live in the router plane, and so that a unary caller depends on the base
-/// trait alone.
+/// It is a separate trait because the sink and body types live in the router
+/// plane, and so a unary caller needs the base trait alone.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait StreamingProtocol: MultiplexedProtocol {
 	/// Opens a streamed request. The caller pushes chunks through the sink and

@@ -18,8 +18,6 @@ use crate::trace::ConsumedTrace;
 use crate::Errorizable;
 
 #[cfg(feature = "testing-fdr")]
-use crate::testing::error::FdrConfigError;
-#[cfg(feature = "testing-fdr")]
 use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig, FdrVerdict};
 #[cfg(feature = "testing-csp")]
 use crate::testing::specs::composition::CompositionError;
@@ -64,23 +62,6 @@ pub enum ScenarioConfigError {
 	/// configuration names a process too.
 	#[error("a guided fuzz run names its CSP process in csp: alone, and this configuration names one too")]
 	CspNamedTwice,
-
-	/// The FDR configuration breaks a rule of [`FdrConfig::validate`].
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use tightbeam::testing::error::FdrConfigError;
-	/// use tightbeam::testing::ScenarioConfigError;
-	///
-	/// let rule = FdrConfigError { field: "process_count", reason: "must be > 0" };
-	/// let refused = ScenarioConfigError::InvalidFdrConfig(rule);
-	/// let message = "the FDR configuration breaks a rule: Invalid FDR config field 'process_count': must be > 0";
-	/// assert_eq!(refused.to_string(), message);
-	/// ```
-	#[cfg(feature = "testing-fdr")]
-	#[error("the FDR configuration breaks a rule: {0}")]
-	InvalidFdrConfig(FdrConfigError),
 
 	/// The CSP spec of Layer 2 has a process that does not build, or a
 	/// property that it claims fails its check.
@@ -546,8 +527,8 @@ impl ScenarioConfigBuilder {
 	/// Whether `layer` can produce a rejection in this configuration.
 	///
 	/// A layer rejects only through a verifier, and the assertion layer rejects
-	/// only through a spec that grades something. This is the one predicate
-	/// that both the effective-verifier check and the expectation check ask.
+	/// only through a spec that grades something. It is the one predicate that
+	/// the effective-verifier check and the expectation check both ask.
 	fn can_reject_at(&self, layer: Layer) -> bool {
 		match layer {
 			Layer::Assertion => self.specs.iter().any(|spec| spec.can_reject()),
@@ -571,16 +552,9 @@ impl ScenarioConfigBuilder {
 	/// - [`ScenarioConfigError::ExpectViolationWithoutVerifier`] -- the
 	///   expectation names a layer that cannot reject this configuration, so
 	///   the rejection it waits for can never arrive.
-	/// - [`ScenarioConfigError::InvalidFdrConfig`] -- the FDR configuration
-	///   breaks a rule of [`FdrConfig::validate`].
 	/// - [`ScenarioConfigError::CspRefused`] -- the process of the CSP spec
 	///   does not build, or a property that the spec claims fails.
 	pub fn build(self) -> Result<ScenarioConfig, ScenarioConfigError> {
-		#[cfg(feature = "testing-fdr")]
-		if let Some(fdr) = &self.fdr {
-			fdr.validate().map_err(ScenarioConfigError::InvalidFdrConfig)?;
-		}
-
 		if !Layer::ALL.iter().any(|layer| self.can_reject_at(*layer)) {
 			return Err(ScenarioConfigError::NoEffectiveVerifier);
 		}
@@ -618,8 +592,7 @@ pub struct HookContext {
 	/// The graded run, with its trace, its specs, its verdict, and its
 	/// expectation.
 	result: ScenarioResult,
-	/// The outcome of `result`, read once, so the observer and the harness read
-	/// the same answer.
+	/// The outcome of `result`, read once ([`Self::outcome`]).
 	outcome: Result<(), Violations>,
 
 	#[cfg(feature = "testing-csp")]
@@ -791,25 +764,6 @@ mod tests {
 	fn build_refuses_zero_effective_verifiers() {
 		let refused = ScenarioConfig::builder().build();
 		assert_eq!(refused.err(), Some(ScenarioConfigError::NoEffectiveVerifier));
-	}
-
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn build_refuses_an_fdr_config_that_validate_refuses() -> Result<(), Box<dyn core::error::Error>> {
-		let fdr = FdrConfig { scheduler_count: Some(2), ..Default::default() };
-
-		let refused = ScenarioConfig::builder().with_fdr(fdr).build();
-
-		let refusal = refused.err();
-		let names_the_pair = matches!(
-			refusal,
-			Some(ScenarioConfigError::InvalidFdrConfig(FdrConfigError {
-				field: "scheduler_count/process_count",
-				..
-			}))
-		);
-		assert!(names_the_pair, "{refusal:?}");
-		Ok(())
 	}
 
 	#[test]

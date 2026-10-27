@@ -1,20 +1,19 @@
 use core::cell::Cell;
-#[cfg(feature = "instrument")]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::fmt;
 use core::time::Duration;
-
 use std::borrow::Cow;
 use std::sync::Arc;
-#[cfg(feature = "instrument")]
-use std::sync::{Once, RwLock};
 
-use core::fmt;
+#[cfg(feature = "instrument")]
+use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(any(test, feature = "testing", feature = "testing-fault"))]
 use std::sync::Mutex;
 #[cfg(feature = "testing-fault")]
 use std::sync::OnceLock;
 #[cfg(any(test, feature = "testing", feature = "instrument"))]
 use std::sync::PoisonError;
+#[cfg(feature = "instrument")]
+use std::sync::{Once, RwLock};
 
 use crate::trace::{AssertionValue, TraceConfigBuilder};
 use crate::urn::Urn;
@@ -72,10 +71,9 @@ impl IntoEventLabel for &Urn<'_> {
 /// in [`events`] and to its label, the name the event taxonomy gives the step.
 ///
 /// [`enable_internal_detail`]: crate::instrumentation::TbInstrumentationConfig::enable_internal_detail
-// The emit sites sit in the transport, the mux, and the servlet, and `colony`
-// turns on all of them. A build without `colony` leaves out some sites, and a
-// build without `instrument` reads the labels alone, so some variants and the
-// reader have no caller there.
+// `colony` turns on the emit sites in the transport, the mux, and the servlet.
+// A build without it leaves out some sites, and one without `instrument` reads
+// the labels alone, so some variants and the reader have no caller there.
 #[cfg(any(feature = "instrument", feature = "testing-fdr"))]
 #[cfg_attr(not(all(feature = "colony", feature = "instrument")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +247,9 @@ pub struct EventBuilder<'a, V: Into<EventValue> = ()> {
 	instrumented: bool,
 	#[cfg(feature = "logging")]
 	log_level: Option<super::logging::LogLevel>,
+	/// The component that the log record of the event names.
+	#[cfg(feature = "logging")]
+	component: Option<Cow<'static, str>>,
 	emitted: Cell<bool>,
 }
 
@@ -272,6 +273,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 			instrumented: true,
 			#[cfg(feature = "logging")]
 			log_level: None,
+			#[cfg(feature = "logging")]
+			component: None,
 			emitted: Cell::new(false),
 		}
 	}
@@ -288,10 +291,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 		self
 	}
 
-	/// Sets the log level for this event.
-	///
-	/// With a log level set, the event also goes to the log backend, when the
-	/// collector has one and its filter admits the level.
+	/// Sets the log level of this event, so the event also goes to the log
+	/// backend when the collector has one and its filter admits the level.
 	#[cfg(feature = "logging")]
 	pub fn with_log_level(mut self, level: super::logging::LogLevel) -> Self {
 		self.log_level = Some(level);
@@ -300,6 +301,39 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 	#[cfg(not(feature = "logging"))]
 	pub fn with_log_level(self, _level: ()) -> Self {
+		self
+	}
+
+	/// Names the component of this event. The log record of the event carries
+	/// it, and the logger's filter reads the level against the override of
+	/// that component.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector};
+	/// use tightbeam::urn::Urn;
+	///
+	/// const LOGIN: Urn<'static> = tightbeam::urn!("doc", "event:security/login");
+	///
+	/// let filter = LogFilter::new(LogLevel::Warning).with_component("security", LogLevel::Debug);
+	/// let trace = TraceCollector::default().with_logger(LoggerConfig::new(StdoutBackend, filter))?;
+	///
+	/// // The override of `security` admits this debug record.
+	/// let login = trace.event(LOGIN)?.with_component("security");
+	/// login.with_log_level(LogLevel::Debug).emit();
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[cfg(feature = "logging")]
+	pub fn with_component(mut self, component: impl Into<Cow<'static, str>>) -> Self {
+		self.component = Some(component.into());
+		self
+	}
+
+	/// Names the component of this event, which a build with `logging`
+	/// carries to the log record of the event.
+	#[cfg(not(feature = "logging"))]
+	pub fn with_component(self, _component: impl Into<Cow<'static, str>>) -> Self {
 		self
 	}
 
@@ -320,28 +354,25 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 		// The log backend reads the label before the label moves out below.
 		#[cfg(feature = "logging")]
 		if let Some(logger_config) = &self.collector.state.logger_config {
-			let effective_level = self.log_level.or(logger_config.default_level);
-			if let Some(level) = effective_level {
-				if logger_config.filter.should_log(level, None) {
-					let label_str = match &self.label {
-						Cow::Borrowed(s) => *s,
-						Cow::Owned(s) => s.as_str(),
-					};
+			let component = self.component.as_deref();
+			if let Some(level) = logger_config.admit(self.log_level, component) {
+				let label_str = match &self.label {
+					Cow::Borrowed(s) => *s,
+					Cow::Owned(s) => s.as_str(),
+				};
 
-					let record = LogRecord {
-						level,
-						timestamp: self.collector.log_timestamp(),
-						component: None, // TODO: Extract from tags
-						message: label_str,
-						metadata: None, // TODO: Extract from value
-					};
+				let record = LogRecord {
+					level,
+					timestamp: self.collector.log_timestamp(),
+					component,
+					message: label_str,
+					metadata: None,
+				};
 
-					// The trace is the evidence and the log is a convenience,
-					// so the event reaches the trace even when the backend
-					// refuses the log record. The outcome of the log write
-					// stops here, because `emit` and the drop return `()`.
-					let _unlogged = logger_config.backend.emit(&record);
-				}
+				// The trace is the evidence and the log a convenience, so a
+				// refused log record still leaves the event on the trace. The
+				// log outcome stops here, because `emit` and drop return `()`.
+				let _unlogged = logger_config.backend.emit(&record);
 			}
 		}
 
@@ -593,9 +624,8 @@ impl TraceClock {
 	/// - `emit` then receives the nanoseconds on the clock since the origin, or `None` with no clock adopted.
 	///
 	/// An adoption takes the write lock, so it lands before the origin record
-	/// or after the event. Each other event on the origin waits for its
-	/// record, so every event counts from an origin the trace recorded before
-	/// it.
+	/// or after the event. Each other event on the origin waits for that
+	/// record, so every event counts from an origin the trace already recorded.
 	fn stamp(&self, record: impl FnOnce(u128), emit: impl FnOnce(Option<u64>)) {
 		let guard = self.origin.read().unwrap_or_else(PoisonError::into_inner);
 		let Some(origin) = guard.as_ref() else {
@@ -1113,8 +1143,7 @@ impl TraceCollector {
 
 	/// Writes one event to the sink. `label` renders its label, and runs only
 	/// when the sink retains the event. `evidence` renders its payload, and
-	/// runs only when the sink retains the event and the config keeps
-	/// payloads. A dropped event renders nothing.
+	/// runs only when the sink retains the event and the config keeps payloads.
 	#[cfg(feature = "instrument")]
 	fn emit_internal<E: AsRef<[u8]>>(
 		&self,
@@ -1140,10 +1169,9 @@ impl TraceCollector {
 		timestamp_ns: Option<u64>,
 		flags: u32,
 	) {
-		// The sink owns retention. An event that a bounded sink drops takes a
-		// sequence number too, so gaps in `seq` show where truncation
-		// occurred. The write asks the sink before it builds the event, so a
-		// dropped event costs no allocation.
+		// A dropped event takes a sequence number too, so gaps in `seq` show
+		// where truncation occurred. The write asks the sink before it builds
+		// the event, so a dropped event costs no allocation.
 		let seq = self.next_seq();
 		let sink = &self.state.sink.0;
 		if !sink.retains() {
@@ -1359,7 +1387,7 @@ impl TraceCollector {
 	/// payload in hand.
 	///
 	/// The trace runs `evidence` only when its sink retains the event and its
-	/// config keeps payloads, so a dropped payload renders nothing.
+	/// config keeps payloads.
 	///
 	/// # Errors
 	///
@@ -1382,8 +1410,7 @@ impl TraceCollector {
 	/// Dual-writes `event` with `value`, and with the label that `label`
 	/// renders, as [`Self::emit_event_with_value`] writes a label in hand.
 	///
-	/// The trace runs `label` only when its sink retains the event, so a
-	/// dropped record renders no label.
+	/// The trace runs `label` only when its sink retains the event.
 	///
 	/// # Errors
 	///
@@ -1903,9 +1930,8 @@ impl ConsumedTrace {
 	/// Records that the peer of the run accepted `request` and answered with
 	/// `response`, or with no frame when `response` is `None`.
 	///
-	/// Each frame slot keeps the first frame that an exchange gives it, so the
-	/// response of a run with more than one exchange is the first response
-	/// that arrived.
+	/// Each frame slot keeps its first frame, so the response of a run with
+	/// more than one exchange is the first that arrived.
 	///
 	/// # Examples
 	///

@@ -21,7 +21,7 @@ use crate::transport::client::{ConnectionBuilder, GenericClient};
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::handshake::HandshakeProtocolKind;
-use crate::transport::policy::{PolicyConfig, TimeoutConfig};
+use crate::transport::policy::PolicyConfig;
 use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
 use crate::transport::MessageCollector;
@@ -68,7 +68,8 @@ pooled_mux! {
 	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
 	use crate::transport::multiplex::{
-		MuxCapable, MuxConnector, MuxHandle, MuxTransport, RequestSink, SpawnedMux, StreamBody, CONNECTOR_ROLE,
+		MuxCapable, MuxConnector, MuxDrivers, MuxHandle, MuxTransport, RequestSink, SpawnedMux, StreamBody,
+		CONNECTOR_ROLE,
 	};
 
 	#[cfg(feature = "colony")]
@@ -245,10 +246,10 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Provisions the trust in the CMS server, which the caller builds once
-	/// over its pinned key-agreement certificate and every pooled connection
-	/// shares. The opening seals to it, and the trust's store admits the
-	/// signing certificate the reply carries.
+	/// Provisions the trust in the CMS server. The caller builds it once over
+	/// its pinned key-agreement certificate, and every pooled connection
+	/// shares it. The opening seals to it, and its store admits the signing
+	/// certificate the reply carries.
 	#[cfg(feature = "transport-cms")]
 	pub fn with_cms_server(mut self, trust: ProvisionedTrust) -> Self {
 		self.tls.set_cms_server(trust);
@@ -275,11 +276,13 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	///
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyCurves;
 	/// use tightbeam::transport::client::{ConnectionBuilder, ConnectionPool};
 	/// use tightbeam::transport::tcp::r#async::TokioListener;
 	///
-	/// let store = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
+	/// let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	/// let store = Arc::new(trust.build());
 	/// let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
 	///
 	/// // Every pooled dial runs the policy on the server the store admits.
@@ -396,9 +399,9 @@ pooled_mux! {
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
-		/// The reader driver task that witnesses that the entry is live. It
-		/// ends when the connection dies.
-		reader_task: rt::JoinHandle,
+		/// The driver tasks of the connection. Their reader witnesses that the
+		/// entry is live, and their drop ends the connection.
+		drivers: MuxDrivers,
 		/// The shared activity stamp that the idle prune reads for this entry.
 		///
 		/// Each lease updates it outside the pool lock. An entry with pending
@@ -421,6 +424,9 @@ struct DestinationPool<P: Protocol> {
 	/// The multiplexed connections, which every caller shares.
 	#[cfg(pooled_mux)]
 	mux: Vec<MuxEntry>,
+	/// The drivers of the multiplexed connections that left the pool.
+	#[cfg(pooled_mux)]
+	draining: DrainingShelf,
 }
 
 #[cfg(feature = "std")]
@@ -430,6 +436,42 @@ impl<P: Protocol> Default for DestinationPool<P> {
 			available: VecDeque::new(),
 			#[cfg(pooled_mux)]
 			mux: Vec::new(),
+			#[cfg(pooled_mux)]
+			draining: DrainingShelf::default(),
+		}
+	}
+}
+
+pooled_mux! {
+	/// The drivers of the multiplexed connections that left the pool of one
+	/// destination and still drain the streams of their leases
+	/// (RFC 9113 § 6.8).
+	///
+	/// [`Self::shelve`] is the one way onto the shelf, so the shelf holds at
+	/// most the connection cap of the pool, though a peer keeps a connection
+	/// open past its GoAway. The drop of the pool ends the rest.
+	#[derive(Default)]
+	struct DrainingShelf {
+		drivers: VecDeque<MuxDrivers>,
+	}
+
+	impl DrainingShelf {
+		/// Shelves `drivers` under `cap`.
+		///
+		/// The finished drivers leave first. While the shelf is full, its
+		/// oldest drivers leave, and their drop aborts both of their tasks,
+		/// which closes a connection that its peer never closed (CWE-400).
+		fn shelve(&mut self, drivers: MuxDrivers, cap: usize) {
+			self.drivers.retain(|held| !held.is_finished());
+			while self.drivers.len() >= cap {
+				let Some(oldest) = self.drivers.pop_front() else {
+					break;
+				};
+
+				drop(oldest);
+			}
+
+			self.drivers.push_back(drivers);
 		}
 	}
 }
@@ -468,8 +510,8 @@ pub struct ConnectionPool<P: Protocol> {
 	tls: PoolProvisioning<P::CryptoProvider>,
 	/// The negotiation input every dial from this pool starts with.
 	negotiation: Negotiation,
-	/// The production instrumentation collector, which is the single
-	/// client-side entry point.
+	/// The production instrumentation collector, the single client-side entry
+	/// point.
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 }
@@ -487,8 +529,8 @@ impl<P: Protocol> ConnectionPool<P> {
 	}
 
 	/// Returns the endpoint that one dial from this pool starts from: the
-	/// shared provisioning, the negotiation input, the pool's clock, and its
-	/// instrumentation collector.
+	/// shared provisioning, the negotiation input, the pool's timeout, the
+	/// pool's clock, and its instrumentation collector.
 	///
 	/// A dial builds the endpoint before it opens a socket, so a pool whose
 	/// provisioning the dialer rule refuses never connects.
@@ -505,6 +547,7 @@ impl<P: Protocol> ConnectionPool<P> {
 	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let endpoint = self.tls.endpoint(&self.clock)?;
 		let endpoint = endpoint.with_negotiation(self.negotiation.clone());
+		let endpoint = endpoint.with_operation_timeout(self.timeout);
 
 		#[cfg(feature = "instrument")]
 		let endpoint = match self.trace.as_ref() {
@@ -706,32 +749,30 @@ where
 		// pool lock (`MuxEntry::last_used`).
 		#[cfg(pooled_mux)]
 		{
-			let live_before = dest_pool.mux.len();
-			dest_pool.mux.retain(|entry| {
-				if entry.handle.has_pending_streams() {
-					return true;
-				}
+			let idle_past = |entry: &mut MuxEntry| {
+				let idle = now.saturating_duration_since(entry.last_used.at());
+				!entry.handle.has_pending_streams() && idle >= timeout
+			};
 
-				let last_used = entry.last_used.at();
-				let expired = now.saturating_duration_since(last_used) >= timeout;
-				if expired {
-					// GoAway precedes the close (RFC 9113 § 6.8), so the
-					// reader task ends on its EOF. A concurrent stream sees
-					// `Draining`, or `ConnectionClosed` once the reader ends.
-					let handle = entry.handle.clone();
-					rt::spawn(async move {
-						// The drain runs detached from the prune that spawned
-						// it. Its only failure is `ConnectionClosed`, which
-						// names a connection that is already closed.
-						let _ = handle.shutdown().await;
-					});
-				}
+			let cap = self.config.max_connections;
+			let mut pruned: usize = 0;
+			for entry in dest_pool.mux.extract_if(.., idle_past) {
+				// GoAway precedes the close (RFC 9113 § 6.8), so the reader
+				// task ends on its EOF. A concurrent stream sees `Draining`,
+				// or `ConnectionClosed` once the reader ends.
+				let MuxEntry { handle, drivers, .. } = entry;
+				rt::spawn(async move {
+					// The drain runs detached from the prune that spawned it.
+					// Its only failure is `ConnectionClosed`, which names a
+					// connection that is already closed.
+					let _ = handle.shutdown().await;
+				});
 
-				!expired
-			});
+				dest_pool.draining.shelve(drivers, cap);
+				pruned = pruned.saturating_add(1);
+			}
 
 			// A pruned idle connection leaves the live set.
-			let pruned = live_before.saturating_sub(dest_pool.mux.len());
 			self.retire(pruned, events::POOL_PRUNED_IDLE)?;
 		}
 		Ok(())
@@ -749,12 +790,8 @@ where
 
 		let endpoint = self.dial_endpoint()?;
 		let mut reservation = self.reserve_slot(addr)?;
-		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
-
-		let mut transport = P::create_transport(stream, endpoint);
-		if let Some(timeout) = self.timeout {
-			transport = transport.with_timeout(timeout);
-		}
+		let stream = endpoint.dial::<P>(addr.clone()).await?;
+		let transport = P::create_transport(stream, endpoint);
 
 		#[cfg(feature = "instrument")]
 		self.emit_event(events::POOL_DIAL)?;
@@ -870,11 +907,8 @@ pooled_mux! {
 			let endpoint = self.dial_endpoint()?;
 			let mut reservation = self.reserve_slot(&addr)?;
 
-			let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
-			let mut transport = P::create_transport(stream, endpoint);
-			if let Some(timeout) = self.timeout {
-				transport = transport.with_timeout(timeout);
-			}
+			let stream = endpoint.dial::<P>(addr.clone()).await?;
+			let transport = P::create_transport(stream, endpoint);
 
 			// Mux requires the negotiation result before first use, so the
 			// handshake runs eagerly instead of on first emit.
@@ -887,8 +921,6 @@ pooled_mux! {
 			let settings = match transport.negotiated_mux() {
 				Some(settings) => settings,
 				None => {
-					// The peer declined the mux offer, so the connection
-					// pools as an exclusive lease instead.
 					#[cfg(feature = "instrument")]
 					self.emit_event(events::POOL_MUX_DECLINED)?;
 
@@ -907,7 +939,7 @@ pooled_mux! {
 			let rekey = transport.take_rekey()?;
 			let (reader, writer) = transport.into_envelope_halves()?;
 			let mux = MuxTransport::assemble(reader, writer, CONNECTOR_ROLE, settings, rekey);
-			let SpawnedMux { handle, responder, reader_task } = mux.spawn();
+			let SpawnedMux { handle, responder, drivers } = mux.spawn();
 
 			// A pool endpoint serves only the streams it opens, so the drop of
 			// the responder refuses every peer-initiated stream.
@@ -917,15 +949,9 @@ pooled_mux! {
 			let last_used = Arc::new(ActivityStamp::new(Arc::clone(&self.clock)));
 
 			{
-				// A failed lock must not leak the spawned drivers, so abort the
-				// reader, which closes the connection and ends the writer.
-				let mut pools = match self.write_pools() {
-					Ok(pools) => pools,
-					Err(err) => {
-						rt::abort(&reader_task);
-						return Err(err);
-					}
-				};
+				// A failed lock returns before the entry holds the drivers, and
+				// their drop then ends the connection.
+				let mut pools = self.write_pools()?;
 
 				// The handle clone shares the one connection, so the pool
 				// entry and the lease co-own it.
@@ -933,7 +959,7 @@ pooled_mux! {
 				dest_pool.mux.push(MuxEntry {
 					id,
 					handle: handle.clone(),
-					reader_task,
+					drivers,
 					last_used: Arc::clone(&last_used),
 					peer_certificate: peer_certificate.clone(),
 				});
@@ -964,7 +990,9 @@ pooled_mux! {
 
 			// Every dead entry leaves the pool before the pool retires it.
 			let live_before = dest_pool.mux.len();
-			dest_pool.mux.retain(|entry| !entry.reader_task.is_finished());
+
+			dest_pool.mux.retain(|entry| !entry.drivers.is_finished());
+
 			let evicted = live_before.saturating_sub(dest_pool.mux.len());
 			self.retire(evicted, events::POOL_EVICTED)?;
 
@@ -999,6 +1027,9 @@ pooled_mux! {
 		/// [`TransportError::Draining`]. The next connect re-establishes the
 		/// connection, and a poisoned pool map skips the eviction.
 		///
+		/// The drivers of the entry move to the draining shelf, so the leases
+		/// that still hold its handle finish their streams.
+		///
 		/// # Errors
 		///
 		/// - [`TransportError`] -- the error the runtime fault model injects at
@@ -1009,12 +1040,14 @@ pooled_mux! {
 				Err(_) => return Ok(()),
 			};
 			if let Some(dest_pool) = pools.get_mut(addr) {
-				let live_before = dest_pool.mux.len();
-
-				dest_pool.mux.retain(|entry| entry.id != id);
+				let cap = self.config.max_connections;
+				let mut evicted: usize = 0;
+				for entry in dest_pool.mux.extract_if(.., |entry| entry.id == id) {
+					dest_pool.draining.shelve(entry.drivers, cap);
+					evicted = evicted.saturating_add(1);
+				}
 
 				// An evicted mux connection leaves the live set.
-				let evicted = live_before.saturating_sub(dest_pool.mux.len());
 				self.retire(evicted, events::POOL_EVICTED)?;
 			}
 			Ok(())
@@ -1382,10 +1415,10 @@ pooled_mux! {
 		/// Fails over on cap exhaustion through the acquisition funnel, pooled
 		/// headroom before a fresh dial, and retries there once.
 		///
-		/// A caller may have judged the peer this lease pinned, and a fresh
-		/// dial of the same address pins whoever answers it. The failover
-		/// therefore lands on the certificate the lease pinned, or it ends
-		/// before the frame leaves (CWE-367).
+		/// A caller may have judged the peer this lease pinned, but a fresh
+		/// dial of the same address pins whoever answers. The failover lands on
+		/// the pinned certificate, or it ends before the frame leaves
+		/// (CWE-367).
 		///
 		/// # Errors
 		///
@@ -1661,7 +1694,7 @@ mod tests {
 			let pools = pool.pools.read().expect("the pool map is unpoisoned");
 			pools.get(addr).is_some_and(|dest_pool| {
 				let held = &dest_pool.mux;
-				!held.is_empty() && held.iter().all(|entry| entry.reader_task.is_finished())
+				!held.is_empty() && held.iter().all(|entry| entry.drivers.is_finished())
 			})
 		}
 
@@ -1759,6 +1792,84 @@ mod tests {
 			let discarded = lease.discard();
 			assert!(matches!(discarded, Err(TransportError::InvalidAddress)));
 			assert!(connects_fresh(&pool, addr, &trace).await?);
+			Ok(())
+		}
+	}
+
+	/// A destination whose peer keeps each connection open past its GoAway
+	/// holds no more drivers on its draining shelf than its connection cap
+	/// (CWE-400).
+	#[cfg(all(pooled_mux, feature = "transport-cms", feature = "testing"))]
+	mod draining {
+		use super::*;
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::testing::TestCmsServer;
+		use crate::transport::multiplex::MuxAcceptor;
+		use crate::transport::tcp::TightBeamSocketAddr;
+		use crate::transport::{EncryptedProtocol, TokioListener, TransportEncryptionConfig};
+		use crate::utils::time::ManualClock;
+
+		/// The idle timeout of the pool, which the test clock passes at once.
+		const IDLE: Duration = Duration::from_secs(1);
+
+		/// A multiplexed pool of one connection on `clock`, whose idle
+		/// connections leave at [`IDLE`], beside the address of a test server
+		/// that holds each connection open once its mux negotiation ends.
+		async fn holding_pool(clock: &Arc<ManualClock>) -> (Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr) {
+			let server = TestCmsServer::generate("Holding Server");
+			let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
+			let bind = TightBeamSocketAddr("127.0.0.1:0".parse().expect("a loopback address parses"));
+			let (listener, addr) = TokioListener::bind_with(bind, config).await.expect("the test server binds");
+			tokio::spawn(async move {
+				let mut held = Vec::new();
+				while let Ok((transport, _)) = listener.accept().await {
+					let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(4)));
+					// The connection stays open whatever the negotiation
+					// answered, as a peer that never closes after its GoAway.
+					let _negotiated = transport.negotiate_mux().await;
+					held.push(transport);
+				}
+			});
+
+			let store: Arc<dyn CertificateTrust> = Arc::new(server.store());
+			let offer = Some(Arc::new(TransportOffer::mux(4)));
+			let config = PoolConfig { idle_timeout: Some(IDLE), max_connections: 1, mux_offer: offer };
+			let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
+			let pool = builder
+				.with_clock(Arc::clone(clock) as Arc<dyn Clock>)
+				.with_config(config)
+				.build();
+			(Arc::new(pool), addr)
+		}
+
+		/// Leases a connection to `addr` and idles it past [`IDLE`], so the
+		/// next lease prunes it onto the shelf.
+		async fn idle_one(
+			pool: &Arc<ConnectionPool<TokioListener>>,
+			addr: TightBeamSocketAddr,
+			clock: &ManualClock,
+		) -> TransportResult<()> {
+			drop(pool.connect(addr).await?);
+			clock.advance(IDLE);
+			Ok(())
+		}
+
+		/// The drivers the draining shelf of `addr` holds.
+		fn shelved(pool: &ConnectionPool<TokioListener>, addr: &TightBeamSocketAddr) -> usize {
+			let pools = pool.pools.read().expect("the pool map is unpoisoned");
+			pools.get(addr).map_or(0, |dest_pool| dest_pool.draining.drivers.len())
+		}
+
+		#[tokio::test]
+		async fn the_draining_shelf_holds_no_more_than_the_connection_cap() -> TransportResult<()> {
+			let clock = Arc::new(ManualClock::default());
+			let (pool, addr) = holding_pool(&clock).await;
+			idle_one(&pool, addr, &clock).await?;
+			idle_one(&pool, addr, &clock).await?;
+			idle_one(&pool, addr, &clock).await?;
+
+			let _live = pool.connect(addr).await?;
+			assert_eq!(shelved(&pool, &addr), 1);
 			Ok(())
 		}
 	}

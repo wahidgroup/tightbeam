@@ -22,8 +22,8 @@ use tokio::net::TcpStream;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::error::CertificateValidationError;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{KeyCurves, KeyPurposes};
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::TestFrame;
@@ -77,7 +77,7 @@ fn own_purpose_materials() -> (ServerMaterials, ClientMaterials) {
 
 /// A store that trusts each of `certificates` by itself.
 fn pinning_store(certificates: &[&Certificate]) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let mut builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	for certificate in certificates {
 		builder = builder.with_certificate((*certificate).to_owned())?;
 	}
@@ -161,8 +161,8 @@ async fn a_pool_of_own_purposes_is_refused_under_the_house_purposes() -> Result<
 		.with_trust_store(pinning_store(&[&materials.certificate])?)
 		.with_client_identity(client_materials.identity())
 		.build();
-	let pool = Arc::new(pool);
 
+	let pool = Arc::new(pool);
 	let refusal = pool.connect(TightBeamSocketAddr(listener.local_addr()?)).await;
 	assert!(matches!(
 		refusal,
@@ -190,10 +190,10 @@ async fn a_pooled_session_under_its_own_purposes_round_trips() -> Result<(), Tig
 		.with_client_identity(client_materials.identity())
 		.with_key_purposes(OWN_PURPOSES)
 		.build();
+
 	let pool = Arc::new(pool);
 	let mut pooled = pool.connect(TightBeamSocketAddr(addr)).await?;
 	let reply = pooled.conn()?.emit(TestFrame::v0(Some("own-purposes"), None), None).await?;
-
 	await_ok(server, "the pooled server task must not panic").await?;
 	assert!(reply.is_some());
 	Ok(())

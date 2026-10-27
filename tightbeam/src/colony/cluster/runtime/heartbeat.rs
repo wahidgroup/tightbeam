@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
-use crate::colony::cluster::registry::FailureCount;
+use crate::colony::cluster::registry::{BeatOutcome, FailureCount};
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::HivePlane;
 use crate::colony::cluster::runtime::LoopFault;
@@ -22,7 +22,6 @@ use crate::decode;
 use crate::instrumentation::events::{
 	CLUSTER_HEARTBEAT_FAILED, CLUSTER_HIVE_EVICTED, CLUSTER_PEER_ROUTES_WITHDRAWN, CLUSTER_RELAY_TRAIL_PRUNED,
 };
-use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::transport::Protocol;
 use crate::TightBeamError;
@@ -105,11 +104,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Settles one heartbeat outcome against the registries.
 	///
 	/// - A live answer refreshes the hive's lease and utilization.
-	/// - A dead or refused answer counts one failure and traces it as
-	///   [`CLUSTER_HEARTBEAT_FAILED`]. The membership retires the hive with
-	///   its servlet routes at the configured `max_failures`, and the gateway
-	///   traces the retirement as [`CLUSTER_HIVE_EVICTED`] with the count of
-	///   hives left.
+	/// - A dead or refused answer counts one failure and traces it as [`CLUSTER_HEARTBEAT_FAILED`].
 	/// - The configured heartbeat callback fires for both outcomes.
 	///
 	/// # Errors
@@ -121,35 +116,28 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		hive_addr: Arc<[u8]>,
 		result: Result<HeartbeatResult, ClusterError>,
 	) -> Result<(), LoopFault> {
-		// A live answer carries the hive's utilization. A failure carries the
-		// status the hive answered, or the status that a dial or an exchange
-		// fault forwards as.
-		let verdict = match &result {
-			Ok(hb) => match hb.status {
-				TransitStatus::Ok | TransitStatus::ResourceExhausted => Ok(hb.utilization),
-				status => Err(status),
-			},
+		// A dial or an exchange fault fails the beat with the status it
+		// forwards as.
+		let answer = match &result {
+			Ok(heartbeat) => heartbeat.liveness(),
 			Err(error) => Err(error.forward_status()),
 		};
 
-		self.report_heartbeat(&hive_addr, &result, verdict.is_ok());
+		self.report_heartbeat(&hive_addr, &result, answer.is_ok());
 
-		match verdict {
-			Ok(utilization) => {
-				self.registry.touch(&hive_addr, utilization)?;
-			}
-			Err(status) => {
-				let max_failures = self.config.heartbeat.max_failures;
-				let counted = self.membership().count_failure(&hive_addr, max_failures)?;
-				let trace = &self.trace;
-				let label = status.as_str();
-				let evidence = Some(hive_addr.as_ref());
-				trace.emit_event_with_value_and_evidence(CLUSTER_HEARTBEAT_FAILED, label, status, evidence)?;
+		let max_failures = self.config.heartbeat.max_failures;
+		let outcome = self.membership().settle_beat(&hive_addr, answer, max_failures)?;
+		let BeatOutcome::Failed { status, failures } = outcome else {
+			return Ok(());
+		};
 
-				if let FailureCount::Retired { remaining } = counted {
-					trace.emit_event_with_value_and_evidence(CLUSTER_HIVE_EVICTED, "", remaining, evidence)?;
-				}
-			}
+		let trace = &self.trace;
+		let label = status.as_str();
+		let evidence = Some(hive_addr.as_ref());
+		trace.emit_event_with_value_and_evidence(CLUSTER_HEARTBEAT_FAILED, label, status, evidence)?;
+
+		if let FailureCount::Retired { remaining } = failures {
+			trace.emit_event_with_value_and_evidence(CLUSTER_HIVE_EVICTED, "", remaining, evidence)?;
 		}
 
 		Ok(())

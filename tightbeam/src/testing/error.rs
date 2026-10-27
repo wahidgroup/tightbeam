@@ -13,7 +13,9 @@ pub type Result<T> = core::result::Result<T, TestingError>;
 /// breaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FdrConfigError {
+	/// The field that breaks the rule.
 	pub field: &'static str,
+	/// The rule that the field breaks.
 	pub reason: &'static str,
 }
 
@@ -22,6 +24,8 @@ impl core::fmt::Display for FdrConfigError {
 		write!(f, "Invalid FDR config field '{}': {}", self.field, self.reason)
 	}
 }
+
+impl core::error::Error for FdrConfigError {}
 
 /// The details of a schedulability violation: the task, a message, and the
 /// utilization or the deadline miss that the check measured.
