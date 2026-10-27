@@ -1,139 +1,51 @@
-//! Client-side cluster scenario event markers.
+//! The event markers that the test doubles of the cluster scenarios record.
 //!
-//! These URNs record facts that only the client observes, such as a client
-//! send completing or a probe firing. Gateway decisions are asserted through
-//! the built-in `tightbeam` events the cluster fires on the scenario trace.
+//! A scenario asserts a gateway decision through the production events of
+//! `tightbeam::instrumentation::events`, and a value that it reads on its own
+//! task with an `assert!`. A marker here records a fact that a test double
+//! observes on a task of its own, where the verdict of the scenario reads the
+//! trace:
 //!
-//! # Export boundary
+//! - A servlet that a frame or a stream reached.
+//! - A field of a frame that a probe servlet read.
+//! - A slate that the gateway offered a balancer.
+//! - A servlet that its hive stopped.
 //!
-//! The markers from [`EXPORT_HIDDEN_ROUTES`] through [`EXPORT_GRANT_ECHOED`]
-//! pair with the `CLUSTER_EXPORT_*` events, grants included, in the servlet
-//! export scenarios.
+//! Each marker records an observation of a test double, in the `test`
+//! namespace, under the name of what it records.
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
-pub(crate) const REGISTRATION_SENT: Urn<'static> = tightbeam::urn!("test", "event:cluster/registration-sent");
-pub(crate) const REJECTED_HEARTBEAT_DECODED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/rejected-heartbeat-decoded");
+/// The probe servlet of the teardown scenario records it when its hive stops
+/// it.
 pub(crate) const SERVLET_STOPPED: Urn<'static> = tightbeam::urn!("test", "event:cluster/servlet-stopped");
-pub(crate) const WORK_SENT: Urn<'static> = tightbeam::urn!("test", "event:cluster/work-sent");
-pub(crate) const WORK_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cluster/work-echoed");
+/// The recording balancer records it for each slate that the gateway offers
+/// it, with the width of the slate as its value.
 pub(crate) const BALANCER_OFFERED: Urn<'static> = tightbeam::urn!("test", "event:cluster/balancer-offered");
-pub(crate) const TOPOLOGY_REGISTER_STATUS: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/topology-register-status");
-pub(crate) const TOPOLOGY_ADD_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/topology-add-status");
-pub(crate) const TOPOLOGY_ROUTE_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/topology-route-status");
-pub(crate) const MULTI_REGISTER_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/multi-register-status");
-pub(crate) const PEER_ADVERTISE_SENT: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-advertise-sent");
-pub(crate) const PEER_AD_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-ad-status");
-pub(crate) const PEER_ROUTES_AFTER: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-routes-after");
-pub(crate) const PEER_ROUTES_AFTER_INSTALLS: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-routes-after-installs");
-pub(crate) const PEER_ROUTES_AFTER_WITHDRAWAL: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-routes-after-withdrawal");
-pub(crate) const PEER_PING_LIVE_AFTER_WITHDRAWAL: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-ping-live-after-withdrawal");
-pub(crate) const GOSSIP_PUBLISH_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-publish-status");
-pub(crate) const GOSSIP_CONVERGED: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-converged");
-pub(crate) const GOSSIP_CLAMP_LEAKED: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-clamp-leaked");
-pub(crate) const WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/work-status");
-pub(crate) const WORK_PAYLOAD: Urn<'static> = tightbeam::urn!("test", "event:cluster/work-payload");
-pub(crate) const REGISTER_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/register-status");
-pub(crate) const EDGE_CONTROL_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/edge-control-status");
-pub(crate) const REGISTRY_HIVES: Urn<'static> = tightbeam::urn!("test", "event:cluster/registry-hives");
-pub(crate) const REGISTER_ASSIGNED_ID: Urn<'static> = tightbeam::urn!("test", "event:cluster/register-assigned-id");
-pub(crate) const REGISTRY_EMPTIED: Urn<'static> = tightbeam::urn!("test", "event:cluster/registry-emptied");
-pub(crate) const OWNER_UPDATE_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/owner-update-status");
-pub(crate) const BEAT_REREGISTERED: Urn<'static> = tightbeam::urn!("test", "event:cluster/beat-reregistered");
-pub(crate) const LOCAL_SERVLETS_AFTER_INSTALLS: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/local-servlets-after-installs");
-pub(crate) const PEER_ROUTE_EXPOSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-route-exposed");
-pub(crate) const PEER_SLATE_MATCHES: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-slate-matches");
-pub(crate) const PEER_PING_TYPE_LEARNED: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-ping-type-learned");
-pub(crate) const BALANCER_SPREAD: Urn<'static> = tightbeam::urn!("test", "event:cluster/balancer-spread");
-pub(crate) const GOSSIP_PENDING_BEFORE_REGISTER: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-pending-before-register");
-pub(crate) const JOURNAL_RECORDS: Urn<'static> = tightbeam::urn!("test", "event:cluster/journal-records");
-pub(crate) const JOURNAL_ACKS: Urn<'static> = tightbeam::urn!("test", "event:cluster/journal-acks");
-pub(crate) const GOSSIP_LIMITED_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-limited-status");
-pub(crate) const GOSSIP_RELAY_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-relay-status");
-pub(crate) const GOSSIP_ROUTES_AFTER_SCORING: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-routes-after-scoring");
-pub(crate) const GOSSIP_GREY_HOLE_CONTAINED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-grey-hole-contained");
-pub(crate) const GOSSIP_RECONCILE_MEMBER_WANT: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-reconcile-member-want");
-pub(crate) const GOSSIP_RECONCILE_FOREIGN_WANT: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-reconcile-foreign-want");
-pub(crate) const GOSSIP_RECONCILE_STRANGER_WANT: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-reconcile-stranger-want");
-pub(crate) const GOSSIP_REPLAY_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-replay-status");
-pub(crate) const GOSSIP_HELD_NO_INGRESS: Urn<'static> = tightbeam::urn!("test", "event:cluster/gossip-held-no-ingress");
-pub(crate) const GOSSIP_PENDING_NO_INGRESS: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/gossip-pending-no-ingress");
-pub(crate) const PEER_TABLE_FLOOD_ADMITTED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-table-flood-admitted");
-pub(crate) const PEER_TABLE_ANCHOR_RETAINED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-table-anchor-retained");
-pub(crate) const PEER_TABLE_TARGETS_BOUNDED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-table-targets-bounded");
-pub(crate) const PEER_PROBE_HINTS_ADMITTED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-probe-hints-admitted");
-pub(crate) const PEER_PROBE_MEMBER_PROMOTED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-probe-member-promoted");
-pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-probe-foreign-refused");
-pub(crate) const PEER_HINT_LEARNED_ON_REFUSE: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-hint-learned-on-refuse");
-pub(crate) const WILDCARD_START_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-start-refused");
-pub(crate) const WILDCARD_PORT_RELEASED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-port-released");
-pub(crate) const PEER_ROUTE_DIALS_ADVERTISED_ADDR: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-route-dials-advertised-addr");
-pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-abuse-candidate-discarded");
-pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-evict-member-promoted");
-pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-evict-target-dropped");
-pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-local-fault-member-promoted");
-pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/peer-local-fault-member-retained");
+/// The stream servlet records it when a routed stream reaches its handler.
 pub(crate) const STREAM_SERVLET_HANDLED: Urn<'static> = tightbeam::urn!("test", "event:cluster/stream-servlet-handled");
-pub(crate) const STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cluster/stream-echoed");
+/// The stream servlet records it when a routed duplex stream reaches its
+/// handler.
 pub(crate) const DUPLEX_SERVLET_HANDLED: Urn<'static> = tightbeam::urn!("test", "event:cluster/duplex-servlet-handled");
-pub(crate) const DUPLEX_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cluster/duplex-echoed");
-pub(crate) const DUPLEX_LIVE_BEFORE_CANCEL: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/duplex-live-before-cancel");
-pub(crate) const DUPLEX_CANCEL_PROPAGATED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/duplex-cancel-propagated");
-pub(crate) const SERVLET_DUPLEX_CANCELLED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/servlet-duplex-cancelled");
-pub(crate) const STREAM_GATE_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/stream-gate-refused");
-pub(crate) const DUPLEX_GATE_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/duplex-gate-refused");
-pub(crate) const EDGE_STREAM_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/edge-stream-refused");
-pub(crate) const EDGE_DUPLEX_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/edge-duplex-refused");
-pub(crate) const EDGE_START_FAILED: Urn<'static> = tightbeam::urn!("test", "event:cluster/edge-start-failed");
-pub(crate) const STREAM_BUDGET_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/stream-budget-refused");
-pub(crate) const RELAY_ROUTES_INSTALLED: Urn<'static> = tightbeam::urn!("test", "event:cluster/relay-routes-installed");
-pub(crate) const RELAY_TRUE_ADDR_RESTORED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/relay-true-addr-restored");
-pub(crate) const EXPORT_HIDDEN_ROUTES: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-hidden-routes");
-pub(crate) const EXPORT_DENIED_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-denied-status");
-pub(crate) const EXPORT_LOCAL_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-local-echoed");
-pub(crate) const EXPORT_PEER_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-peer-echoed");
-pub(crate) const EXPORT_STREAM_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-stream-refused");
-pub(crate) const EXPORT_DUPLEX_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-duplex-refused");
-pub(crate) const EXPORT_ANON_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-anon-refused");
-pub(crate) const EXPORT_GRANT_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cluster/export-grant-echoed");
-pub(crate) const CLIENT_WORK_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:cluster/client-work-signed");
-pub(crate) const CLIENT_WORK_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/client-work-previous");
+/// The first instance of a two-instance type records it when a frame reaches
+/// its handler.
+pub(crate) const FIRST_INSTANCE_RECEIVED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/first-instance-received");
+/// The draining sibling records it when a frame reaches its handler.
+pub(crate) const SIBLING_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:cluster/sibling-received");
+/// The probe servlet records whether the frame it received carries the id of
+/// the client, as `1` or `0`.
 pub(crate) const PROBE_FRAME_CLIENT_ID: Urn<'static> = tightbeam::urn!("test", "event:cluster/probe-frame-client-id");
+/// The probe servlet records whether the frame it received carries a
+/// signature, as `1` or `0`.
 pub(crate) const PROBE_FRAME_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:cluster/probe-frame-signed");
+/// The probe servlet records whether the frame it received names a previous
+/// frame, as `1` or `0`.
 pub(crate) const PROBE_FRAME_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/probe-frame-previous");
-pub(crate) const CLIENT_GOT_SERVLET_ID: Urn<'static> = tightbeam::urn!("test", "event:cluster/client-got-servlet-id");
-pub(crate) const CLIENT_GOT_SERVLET_SIGNED: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/client-got-servlet-signed");
+/// The probe servlet records whether the signature of the client verifies
+/// over the bytes it received, as `1` or `0`.
 pub(crate) const PROBE_FRAME_SIG_VALID: Urn<'static> = tightbeam::urn!("test", "event:cluster/probe-frame-sig-valid");
-pub(crate) const CLIENT_GOT_SERVLET_SIG_VALID: Urn<'static> =
-	tightbeam::urn!("test", "event:cluster/client-got-servlet-sig-valid");
+/// The gossip ingress servlet records whether the key of the origin gateway
+/// signed the rumor frame it received.
+pub(crate) const GOSSIP_INGRESS_SIGNED_BY_GATEWAY: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/gossip-ingress-signed-by-gateway");

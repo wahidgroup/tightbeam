@@ -11,44 +11,34 @@ use std::sync::Arc;
 
 use super::GenericClient;
 use crate::asn1::Frame;
-use crate::transport::error::TransportFailure;
-use crate::transport::{MessageCollector, Protocol, TransportResult};
-
-#[cfg(feature = "policy")]
+use crate::crypto::x509::store::CertificateTrust;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
+use crate::transport::error::TransportFailure;
+use crate::transport::handshake::HandshakeProtocolKind;
+use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
+use crate::transport::EndpointConfig;
+use crate::transport::MessageEmitter;
+use crate::transport::{MessageCollector, Protocol, TransportResult};
+use crate::utils::time::Clock;
+
+#[cfg(feature = "std")]
+use crate::crypto::sign::SigningIdentity;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::policy::CertificateValidation;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::KeyPurposes;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::ProvisionedTrust;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ValidatorChain;
 #[cfg(feature = "std")]
 use crate::transport::ConnectionBuilder;
-#[cfg(feature = "transport-policy")]
-use crate::transport::MessageEmitter;
+#[cfg(host_clock)]
+use crate::utils::time::SystemClock;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::transport::handshake::HandshakeProtocolKind;
-	pub use crate::transport::state::{DialableEncryption, EncryptionConfig};
-	pub use crate::transport::EndpointConfig;
-	pub use crate::utils::time::Clock;
-	pub use crate::x509::Certificate;
-
-	#[cfg(feature = "std")]
-	pub use crate::transport::state::ClientIdentity;
-	#[cfg(host_clock)]
-	pub use crate::utils::time::SystemClock;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
-
-#[cfg(feature = "transport-policy")]
-mod policy {
-	pub use crate::transport::policy::{
-		CollectorGateConfig, CoreRetryPolicy, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy,
-		RetryAction, TimeoutConfig,
-	};
-}
-
-#[cfg(feature = "transport-policy")]
-use policy::*;
+use crate::transport::policy::{
+	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction, TimeoutConfig,
+};
 
 #[derive(Default)]
 pub struct ClientPolicies {
@@ -58,17 +48,11 @@ pub struct ClientPolicies {
 	timeout: Option<Duration>,
 }
 
-pub struct DynRestart(pub Box<dyn RestartPolicy + Send + Sync>);
-
-impl CoreRetryPolicy for DynRestart {
-	fn max_attempts(&self) -> usize {
-		self.0.max_attempts()
-	}
-
-	fn delay_ms(&self, attempt: usize) -> u64 {
-		self.0.delay_ms(attempt)
-	}
-}
+/// A restart policy the client policies hold behind one box.
+pub struct DynRestart(
+	/// The policy every restart decision delegates to.
+	pub Box<dyn RestartPolicy + Send + Sync>,
+);
 
 impl RestartPolicy for DynRestart {
 	fn evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction {
@@ -76,7 +60,11 @@ impl RestartPolicy for DynRestart {
 	}
 }
 
-pub struct DynGate(pub Arc<dyn GatePolicy + Send + Sync>);
+/// A gate policy the client policies hold behind one shared pointer.
+pub struct DynGate(
+	/// The policy every gate decision delegates to.
+	pub Arc<dyn GatePolicy + Send + Sync>,
+);
 impl GatePolicy for DynGate {
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		self.0.evaluate(message, session)
@@ -138,11 +126,12 @@ impl ClientPolicies {
 
 pub struct ClientBuilder<P: Protocol> {
 	policies: ClientPolicies,
-	/// Provisioning this builder accumulates, handed to the transport whole.
-	#[cfg(feature = "x509")]
+	/// The provisioning this builder gathers and hands to the transport whole.
 	encryption: EncryptionConfig<P::CryptoProvider>,
+	/// The negotiation input this builder accumulates, which the transport
+	/// starts with.
+	negotiation: Negotiation,
 	/// The clock the transport measures deadlines and backoff against.
-	#[cfg(feature = "x509")]
 	clock: Arc<dyn Clock>,
 	_ph: PhantomData<P>,
 }
@@ -156,11 +145,11 @@ impl<P: Protocol> ClientBuilder<P> {
 
 	/// A builder whose transport measures deadlines and backoff against
 	/// `clock`.
-	#[cfg(feature = "x509")]
 	pub fn on_clock(clock: Arc<dyn Clock>) -> Self {
 		Self {
 			policies: ClientPolicies::default(),
 			encryption: EncryptionConfig::unconfigured(),
+			negotiation: Negotiation::default(),
 			clock,
 			_ph: PhantomData,
 		}
@@ -195,77 +184,104 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	#[cfg(feature = "x509")]
 	pub fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
 		self.encryption.trust_store = Some(store);
 		self
 	}
 
-	/// Provision the expected server certificate chain, ordered root to
-	/// leaf, for key-transport handshakes (CMS).
-	#[cfg(feature = "x509")]
-	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
-		self.encryption.server_certificate_chain = Some(chain.into());
+	/// Provisions the trust in the CMS server, built once over its pinned
+	/// key-agreement certificate: the opening seals to it, and the trust's
+	/// store admits the signing certificate the reply carries.
+	#[cfg(feature = "transport-cms")]
+	pub fn with_cms_server(mut self, trust: ProvisionedTrust) -> Self {
+		self.encryption.cms_server = Some(trust);
 		self
 	}
 
-	/// Select the handshake protocol used when encryption is enabled.
-	#[cfg(feature = "x509")]
-	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
-		self.encryption.handshake_protocol = kind;
+	/// Sets the key purpose of each role: the purpose the server's
+	/// certificates carry, and the purpose the client identity carries. The
+	/// default is [`KeyPurposes::HOUSE`].
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_key_purposes(mut self, key_purposes: KeyPurposes) -> Self {
+		self.encryption.key_purposes = key_purposes;
 		self
 	}
 
-	/// Replace the domain-separation tag of the ECIES key exchange.
+	/// Sets the server policy, which every validator of `validators` runs on
+	/// the identity certificate of the server under either flow, as
+	/// [`ClientConfig::with_server_policy`] states. An empty set sets no
+	/// policy.
 	///
-	/// The ECIES handshake binds this tag into the associated data of the
-	/// encrypted key exchange, so an ECIES session completes only when both
-	/// endpoints hold the same tag. The CMS handshake and session records do
-	/// not read it.
-	#[cfg(feature = "x509")]
-	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
-		self.encryption.aad_domain_tag = tag;
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::transport::client::{ClientBuilder, ConnectionBuilder};
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	///
+	/// let store = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
+	/// let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(store);
+	///
+	/// // The policy narrows which server the store admits.
+	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	/// let _builder = builder.with_server_policy([expiry]);
+	/// ```
+	///
+	/// [`ClientConfig::with_server_policy`]: crate::transport::handshake::ClientConfig::with_server_policy
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_server_policy(mut self, validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
+		self.encryption.server_policy = ValidatorChain::new(validators);
 		self
 	}
 
-	/// Run this client without authenticating the server.
+	/// Selects the handshake protocol that runs when encryption is enabled.
+	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
+		self.negotiation.select_handshake(kind);
+		self
+	}
+
+	/// Runs this client with no authentication of the server.
 	///
 	/// A client with no trust store verifies nobody, so [`Self::connect`] and
 	/// [`Self::adopt`] refuse it until this names that as the intent. Frames
-	/// then travel in the clear and any peer answering the address is
-	/// accepted, which suits a loopback fixture or a link a lower layer
-	/// already secures.
-	#[cfg(feature = "x509")]
+	/// then travel in the clear, and the client accepts any peer that answers
+	/// the address, which suits a loopback fixture or a link that a lower
+	/// layer already secures.
 	pub fn allow_cleartext(mut self) -> Self {
 		self.encryption.allow_cleartext = true;
 		self
 	}
 
-	/// Everything the transport is built from, once the dialer rule has
-	/// answered.
+	/// Collects everything the transport is built from, once the dialer rule
+	/// has answered.
 	///
 	/// # Errors
 	///
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
-	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
-	///   so it would have accepted any peer.
-	#[cfg(feature = "x509")]
+	///   the client holds no trust store and did not call
+	///   [`Self::allow_cleartext`], so it would have accepted any peer, or it
+	///   sets a server policy and holds no trust in a server, whether or not it
+	///   names cleartext.
 	fn endpoint(
 		encryption: EncryptionConfig<P::CryptoProvider>,
+		negotiation: Negotiation,
 		clock: Arc<dyn Clock>,
 	) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let encryption = DialableEncryption::new(encryption)?;
-		Ok(EndpointConfig::new(encryption, clock))
+		Ok(EndpointConfig::new(encryption, clock).with_negotiation(negotiation))
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<P: Protocol + Send> ClientBuilder<P>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
 	P::Address: Send,
 {
-	/// Connect and configure the client.
+	/// Connects and configures the client.
 	///
 	/// The dialer rule answers before the connection opens, so a refused
 	/// client never reaches the address.
@@ -273,10 +289,12 @@ where
 	/// # Errors
 	///
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
-	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
-	///   so it would have accepted any peer.
+	///   the client holds no trust store and did not call
+	///   [`Self::allow_cleartext`], so it would have accepted any peer, or it
+	///   sets a server policy and holds no trust in a server, whether or not it
+	///   names cleartext.
 	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.clock)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock)?;
 		let destination = addr.into();
 		let stream = P::connect(destination).await.map_err(|e| e.into())?;
 
@@ -285,18 +303,19 @@ where
 		Ok(GenericClient::from_transport(configured))
 	}
 
-	/// Configure a client over a stream the caller already opened.
+	/// Configures a client over a stream that the caller already opened.
 	///
 	/// The stream answers the same dialer rule as [`Self::connect`], so a
-	/// client adopted this way is no less authenticated than one this builder
-	/// dialed.
+	/// client adopted this way is as authenticated as one this builder dialed.
 	///
 	/// # Errors
 	///
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
-	///   the client holds no trust store and did not call [`Self::allow_cleartext`].
+	///   the client holds no trust store and did not call
+	///   [`Self::allow_cleartext`], or it sets a server policy and holds no
+	///   trust in a server, whether or not it names cleartext.
 	pub fn adopt(self, stream: P::Stream) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.clock)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock)?;
 
 		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);
@@ -304,7 +323,10 @@ where
 	}
 }
 
-#[cfg(all(feature = "std", feature = "x509"))]
+#[cfg(feature = "std")]
+impl<P: Protocol> super::sealed::Sealed for ClientBuilder<P> {}
+
+#[cfg(feature = "std")]
 impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
@@ -322,8 +344,8 @@ where
 		self
 	}
 
-	fn with_client_identity(mut self, identity: ClientIdentity<P::CryptoProvider>) -> Self {
-		identity.install(&mut self.encryption);
+	fn with_client_identity(mut self, identity: SigningIdentity) -> Self {
+		self.encryption.client_identity = Some(identity);
 		self
 	}
 
@@ -338,13 +360,7 @@ impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
 	}
 }
 
-#[cfg(all(
-	test,
-	feature = "x509",
-	feature = "tokio",
-	feature = "std",
-	not(target_arch = "wasm32")
-))]
+#[cfg(all(test, feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
 mod tests {
 	use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -353,6 +369,9 @@ mod tests {
 	use crate::transport::error::TransportError;
 	use crate::transport::tcp::r#async::{TokioListener, TokioStream};
 	use crate::transport::tcp::TightBeamSocketAddr;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::crypto::x509::policy::ExpiryValidator;
 
 	/// Port 1 on loopback, where a connection attempt fails fast. The refusal
 	/// under test is reached before the dial, so the first case never leaves
@@ -386,7 +405,7 @@ mod tests {
 	/// path reaches the wire without it.
 	#[tokio::test]
 	async fn an_adopted_stream_without_a_peer_authority_is_refused() -> TransportResult<()> {
-		let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
+		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 		let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
 
 		let refused = ClientBuilder::<TokioListener>::builder().adopt(TokioStream::from(stream));
@@ -394,8 +413,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// Naming cleartext is what lets the same client through, so it reaches
-	/// the address and fails there instead.
+	/// A client that names cleartext passes the same rule, so it reaches the
+	/// address and fails there instead.
 	#[tokio::test]
 	async fn naming_cleartext_admits_the_same_client() {
 		let admitted = ClientBuilder::<TokioListener>::builder()
@@ -403,5 +422,33 @@ mod tests {
 			.connect(UNREACHABLE)
 			.await;
 		assert!(!matches!(admitted, Err(TransportError::PeerAuthenticationUnconfigured)));
+	}
+
+	/// The policy that admits every certificate within its validity period.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn expiry_policy() -> [Arc<dyn CertificateValidation>; 1] {
+		[Arc::new(ExpiryValidator)]
+	}
+
+	/// A server policy narrows which server a trust admits and names no peer
+	/// authority, so a client with a policy alone is refused before it
+	/// opens a connection (CWE-295).
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_server_policy_alone_is_refused_before_it_dials() {
+		let builder = ClientBuilder::<TokioListener>::builder().with_server_policy(expiry_policy());
+		let refused = builder.connect(UNREACHABLE).await;
+		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+	}
+
+	/// A cleartext dial checks no server, so a client that names cleartext
+	/// beside a server policy and no trust is refused before it opens a
+	/// connection (CWE-295).
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_server_policy_with_cleartext_is_refused_before_it_dials() {
+		let builder = ClientBuilder::<TokioListener>::builder().with_server_policy(expiry_policy());
+		let refused = builder.allow_cleartext().connect(UNREACHABLE).await;
+		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
 	}
 }

@@ -1,8 +1,8 @@
-//! One expansion per public macro arm, compiled from outside the crate.
+//! Expansions of public macro arms, compiled from outside the crate.
 //!
-//! A `#[cfg(feature = "...")]` written inside a `macro_rules!` body is read in
-//! the crate that invokes the macro. Every arm below therefore expands here,
-//! where tightbeam's feature names do not exist, so a leaked gate is a
+//! The crate that invokes a `macro_rules!` macro reads each
+//! `#[cfg(feature = "...")]` in its body. The arms below expand here, where
+//! tightbeam's feature names do not exist, so a leaked gate is an
 //! `unexpected_cfgs` denial and a broken arm is a compile error.
 
 use der::Sequence;
@@ -42,10 +42,9 @@ pub fn compose_arm() -> tightbeam::error::Result<tightbeam::Frame> {
 	}
 }
 
-/// Every `client!` form, and every option it takes.
+/// Both sync `client!` forms, with each top-level option they take.
 ///
-/// Never called: the point is that each arm expands and type-checks outside
-/// this crate, which is where a leaked `#[cfg(feature = ...)]` would bite.
+/// Nothing calls it, because the body only has to expand and type-check.
 #[allow(dead_code)]
 async fn client_arms(
 	addr: tightbeam::transport::tcp::TightBeamSocketAddr,
@@ -80,15 +79,15 @@ mod tests {
 
 	/// A CSP process that refuses every trace.
 	///
-	/// The scenario runner must turn that refusal into a failure. A runner that
-	/// dropped the verdict, or a process whose alphabet is never reached, would
-	/// leave this test green with nothing checked, so the assertion is that it
-	/// panics.
+	/// The scenario runner must turn the refusal into a panic. A runner that
+	/// drops the verdict, or skips a process whose alphabet the trace never
+	/// reaches, ends with no panic and fails the test.
 	struct AlwaysInvalidSpec;
 
 	impl tightbeam::testing::specs::csp::ProcessSpec for AlwaysInvalidSpec {
 		fn validate_trace(
 			&self,
+			_process: &tightbeam::testing::specs::csp::Process,
 			_trace: &tightbeam::trace::ConsumedTrace,
 		) -> tightbeam::testing::specs::csp::CspValidationResult {
 			use tightbeam::testing::specs::csp::{CspViolation, Event, State};
@@ -99,16 +98,19 @@ mod tests {
 			}
 		}
 
-		fn to_process_cow(&self) -> std::borrow::Cow<'_, tightbeam::testing::specs::csp::Process> {
+		fn to_process_cow(
+			&self,
+		) -> Result<
+			std::borrow::Cow<'_, tightbeam::testing::specs::csp::Process>,
+			tightbeam::testing::specs::composition::CompositionError,
+		> {
 			use tightbeam::testing::specs::csp::{Process, State};
 
-			std::borrow::Cow::Owned(
-				Process::builder("always-invalid")
-					.initial_state(State("s0"))
-					.add_state(State("s0"))
-					.build()
-					.expect("the initial state is set above"),
-			)
+			let process = Process::builder("always-invalid")
+				.initial_state(State("s0"))
+				.add_state(State("s0"))
+				.build()?;
+			Ok(std::borrow::Cow::Owned(process))
 		}
 	}
 

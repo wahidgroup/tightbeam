@@ -1,7 +1,10 @@
-//! Frame request handler worker - handles FrameRequest messages
+//! The frame request handler worker, which answers a [`FrameRequest`] for its
+//! node.
 //!
-//! Business logic: Check if we have the requested frames, decide to respond or cascade.
-//! Returns frames and action for servlet to execute.
+//! It admits the request through its node's request gate, checks whether the
+//! node holds the requested frames, then responds with them or cascades the
+//! request upstream. It returns the frames and the action for the servlet to
+//! execute.
 
 use std::sync::Arc;
 
@@ -11,33 +14,38 @@ use tightbeam::{
 };
 
 use crate::dtn::{
-	chain_processor::ChainProcessor,
-	messages::FrameRequest,
-	ultimate::{gap_recovery_event, GapRecoveryStep},
+	chain_processor::ChainProcessor, messages::FrameRequest, nodes::DtnRole, ordering::RequestGate,
+	ultimate::GapRecoveryStep,
 };
 
-/// Frame request handler request
+/// The request to the frame request handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequestHandlerRequest {
 	pub request: FrameRequest,
-	pub node_name: String,
+	/// The node that answers the request.
+	pub node: DtnRole,
+	/// The peer whose signer verifies the frame of the request.
+	pub requester: DtnRole,
+	/// The order of the frame of the request, the request order of the
+	/// requester.
+	pub order: u64,
 }
 
-/// Action to take after processing frame request
+/// The action that the servlet executes for a frame request.
 #[derive(Beamable, Choice, Clone, Debug, PartialEq)]
 pub enum FrameRequestAction {
-	/// Respond with frames
+	/// The node responds with the frames that it holds.
 	#[asn1(context_specific = "0")]
 	Respond(u8),
-	/// Cascade upstream
+	/// The node cascades the request upstream.
 	#[asn1(context_specific = "1")]
 	Cascade(u8),
-	/// No action
+	/// The node takes no action, because it is the origin.
 	#[asn1(context_specific = "2")]
 	NoAction(u8),
 }
 
-/// Frame request handler response
+/// The response of the frame request handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequestHandlerResponse {
 	pub action: FrameRequestAction,
@@ -49,32 +57,35 @@ worker! {
 	config: {
 		chain_processor: Arc<ChainProcessor>,
 		can_cascade: bool,
+		gate: Arc<RequestGate>,
 	},
 	handle: |request, trace, config| async move {
-		trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::ReceiveFrameRequest))?;
+		// The gate refuses a replayed or a stale request before the node
+		// reads its store.
+		config.gate.admit(request.requester, request.order)?;
+		trace.event(GapRecoveryStep::ReceiveFrameRequest.event_on(request.node))?;
 
-		// Check if we have the requested frames
 		let missing_frames = config.chain_processor.request_missing_frames(
-			request.request.requester_head,
-			request.request.last_received_hash,
+			&request.request.requester_head,
+			&request.request.last_received_hash,
 		)?;
 
 		if !missing_frames.is_empty() {
-			// We have frames - respond
-			trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::SendFrameResponse))?;
+			// This node holds the frames, so it responds with them.
+			trace.event(GapRecoveryStep::SendFrameResponse.event_on(request.node))?;
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::Respond(0),
 				missing_frames,
 			})
 		} else if config.can_cascade {
-			// We don't have frames - cascade upstream
-			trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::CascadeFrameRequest))?;
+			// This node holds none of the frames, so it cascades upstream.
+			trace.event(GapRecoveryStep::CascadeFrameRequest.event_on(request.node))?;
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::Cascade(0),
 				missing_frames: vec![],
 			})
 		} else {
-			// Can't cascade (we're the origin)
+			// The origin has no upstream to cascade to.
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::NoAction(0),
 				missing_frames: vec![],

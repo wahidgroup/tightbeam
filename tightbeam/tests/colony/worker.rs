@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tightbeam::colony::worker::Worker;
 use tightbeam::der::Sequence;
 use tightbeam::testing::{ScenarioConfig, WorkerEnv};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
 

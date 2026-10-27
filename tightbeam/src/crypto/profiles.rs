@@ -1,22 +1,16 @@
-//! Security profiles and the cryptographic providers that run them, bound
-//! through associated types.
+//! The security profiles and the cryptographic providers that run them,
+//! bound through associated types.
 
-#[cfg(all(
-	not(feature = "std"),
-	any(
-		feature = "digest",
-		feature = "kdf",
-		all(feature = "aead", feature = "transport")
-	)
-))]
+#[cfg(all(not(feature = "std"), any(feature = "digest", feature = "signature")))]
 use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "aead"))]
 use alloc::vec::Vec;
+#[cfg(feature = "aead")]
+use core::fmt;
 
-use crate::constants::TIGHTBEAM_UKM_PREFIX;
 use crate::der::asn1::ObjectIdentifier;
-use crate::der::Sequence;
-use crate::oids::AES_256_WRAP;
+use crate::der::TagNumber;
+use crate::wire::wire_sequence;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::AeadAlgorithm;
@@ -24,18 +18,42 @@ use crate::crypto::aead::AeadAlgorithm;
 use crate::crypto::aead::Aes256Gcm;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 use crate::crypto::aead::Aes256GcmOid;
+#[cfg(feature = "aead")]
+use crate::crypto::common::generic_array::{ArrayLength, GenericArray};
+#[cfg(all(
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh",
+	feature = "digest"
+))]
+use crate::crypto::common::typenum::IsGreaterOrEqual;
+#[cfg(feature = "aead")]
+use crate::crypto::common::typenum::{IsLess, NonZero, Unsigned, B1, U16, U24, U32, U65536};
 #[cfg(feature = "digest")]
-use crate::crypto::hash::Digest;
+use crate::crypto::common::BlockSizeUser;
+#[cfg(all(
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh",
+	feature = "digest"
+))]
+use crate::crypto::common::KeySizeUser;
 #[cfg(all(feature = "digest", feature = "sha3"))]
 use crate::crypto::hash::Sha3_256;
+#[cfg(feature = "digest")]
+use crate::crypto::hash::{CoreProxy, Digest, HashCore};
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
+#[cfg(feature = "aead")]
+use crate::crypto::key::KeyError;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::Secp256k1Signature;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
+use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{LowSEncoding, PrehashVerifier, Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
+use crate::crypto::sign::{CanonicalForm, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding};
 #[cfg(any(
 	feature = "digest",
 	feature = "aead",
@@ -44,87 +62,108 @@ use crate::crypto::sign::{LowSEncoding, PrehashVerifier, Signatory, SignatureAlg
 	feature = "ecdh"
 ))]
 use crate::der::oid::AssociatedOid;
+#[cfg(feature = "aead")]
+use crate::oids::{AES_128_WRAP, AES_192_WRAP, AES_256_WRAP};
 #[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
 use crate::spki::AlgorithmIdentifierOwned;
-#[cfg(feature = "transport")]
-use crate::transport::handshake::HandshakeError;
 use crate::Beamable;
-use crate::Errorizable;
 #[cfg(feature = "ecdh")]
 use elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "kem")]
 use kem::{Decapsulator, EncappedKey, Encapsulator};
-/// Generate the AES key-wrap closure for one KEK size.
-///
-/// The AES-128, AES-192, and AES-256 variants share this body.
-#[cfg(all(feature = "aead", feature = "transport"))]
-macro_rules! impl_key_wrapper {
-	($err:ty, $cipher:ty, $n:expr) => {
-		Box::new(|cek: &[u8], kek: &[u8; $n]| {
-			if cek.len() < 16 || cek.len() % 8 != 0 {
-				return Err(<$err>::from(HandshakeError::InvalidKeySize {
-					expected: 16,
-					received: cek.len(),
-				}));
+/// A one-shot closure that verifies a signature over the given bytes against
+/// a [`SignerInfo`](crate::SignerInfo).
+#[cfg(feature = "signature")]
+pub type SignatureVerifier<E = crate::TightBeamError> =
+	Box<dyn FnOnce(&[u8], &crate::SignerInfo) -> core::result::Result<(), E>>;
+
+/// A one-shot closure that digests the given bytes into a
+/// [`DigestInfo`](crate::DigestInfo).
+#[cfg(feature = "digest")]
+pub type Digestor<E = crate::TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
+
+/// Implements [`KeyWrapAlgorithm`] for one house AES key wrap: its OID, its
+/// key-encryption key size, and its cipher.
+#[cfg(feature = "aead")]
+macro_rules! impl_aes_key_wrap {
+	($wrap:ty, $oid:expr, $cipher:ty, $size:ty) => {
+		impl AssociatedOid for $wrap {
+			const OID: ObjectIdentifier = $oid;
+		}
+
+		impl KeyWrapAlgorithm for $wrap {
+			type Oid = Self;
+			type KekSize = $size;
+
+			fn wrap(kek: &Kek<'_, Self>, key: &[u8]) -> Result<Vec<u8>, KeyError> {
+				if key.len() < 16 || key.len() % 8 != 0 {
+					return Err(KeyError::WrapLength((key.len(), 16).into()));
+				}
+
+				let wrapped = crate::crypto::aead::aes_kw::Kek::<$cipher>::new(kek.as_array()).wrap_vec(key);
+				wrapped.map_err(KeyError::WrapFailed)
 			}
 
-			crate::crypto::aead::aes_kw::Kek::<$cipher>::from(*kek)
-				.wrap_vec(cek)
-				.map_err(|error| <$err>::from(HandshakeError::AesKeyWrap(error)))
-		})
+			fn unwrap(kek: &Kek<'_, Self>, wrapped: &[u8]) -> Result<crate::ZeroizingBytes, KeyError> {
+				let mut key = crate::ZeroizingBytes::default();
+				key.resize(wrapped.len().saturating_sub(8), 0);
+				Self::unwrap_into(kek, wrapped, &mut key)?;
+				Ok(key)
+			}
+
+			fn unwrap_into(kek: &Kek<'_, Self>, wrapped: &[u8], out: &mut [u8]) -> Result<(), KeyError> {
+				if wrapped.len() < 24 || wrapped.len() % 8 != 0 {
+					return Err(KeyError::WrapLength((wrapped.len(), 24).into()));
+				}
+
+				// A wrapped key of n + 1 blocks holds a key of n blocks
+				// (RFC 3394 §2.2.2), so `out` must have that size before the
+				// key schedule runs.
+				let key_len = wrapped.len().saturating_sub(8);
+				if out.len() != key_len {
+					return Err(KeyError::WrapLength((out.len(), key_len).into()));
+				}
+
+				let unwrapped = crate::crypto::aead::aes_kw::Kek::<$cipher>::new(kek.as_array()).unwrap(wrapped, out);
+				unwrapped.map_err(KeyError::WrapFailed)
+			}
+		}
 	};
 }
 
-/// Generate the AES key-unwrap closure for one KEK size.
+/// The negotiation descriptor that holds only the OIDs of a security profile.
 ///
-/// The AES-128, AES-192, and AES-256 variants share this body.
-#[cfg(all(feature = "aead", feature = "transport"))]
-macro_rules! impl_key_unwrapper {
-	($err:ty, $cipher:ty, $n:expr) => {
-		Box::new(|wrapped_cek: &[u8], kek: &[u8; $n]| {
-			if wrapped_cek.len() < 24 || wrapped_cek.len() % 8 != 0 {
-				return Err(<$err>::from(HandshakeError::InvalidKeySize {
-					expected: 24,
-					received: wrapped_cek.len(),
-				}));
-			}
-
-			crate::crypto::aead::aes_kw::Kek::<$cipher>::from(*kek)
-				.unwrap_vec(wrapped_cek)
-				.map_err(|error| <$err>::from(HandshakeError::AesKeyWrap(error)))
-		})
-	};
-}
-
-/// Negotiation descriptor that holds only the OID set of a security profile.
+/// Every field is an `Option`, and `None` means that the side that built it
+/// has the feature of the algorithm disabled, which is `aead` for `key_wrap`.
 ///
-/// Every field is an `Option`, and `None` always means that the algorithm is
-/// not part of this profile because the feature is disabled on the producing
-/// side. Each field carries its own context tag, so an absent algorithm
-/// cannot shift the next OID into its place on decode.
+/// Each field carries its own context tag, so every OID decodes into its own
+/// field even when an earlier algorithm is absent.
 ///
 /// The AEAD OID names the cipher, and the cipher type fixes the key length.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence, Beamable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Beamable)]
 pub struct SecurityProfileDesc {
-	/// OID of the digest algorithm that the profile negotiates.
-	#[asn1(context_specific = "0", optional = "true")]
+	/// The OID of the digest algorithm that the profile negotiates.
 	pub digest: Option<ObjectIdentifier>,
-	/// OID of the AEAD algorithm that the profile negotiates.
-	#[asn1(context_specific = "1", optional = "true")]
+	/// The OID of the AEAD algorithm that the profile negotiates.
 	pub aead: Option<ObjectIdentifier>,
-	/// OID of the signature algorithm that the profile negotiates.
-	#[asn1(context_specific = "2", optional = "true")]
+	/// The OID of the signature algorithm that the profile negotiates.
 	pub signature: Option<ObjectIdentifier>,
-	/// OID of the key derivation function that the profile negotiates.
-	#[asn1(context_specific = "3", optional = "true")]
+	/// The OID of the key derivation function that the profile negotiates.
 	pub kdf: Option<ObjectIdentifier>,
-	/// OID of the elliptic curve for key agreement.
-	#[asn1(context_specific = "4", optional = "true")]
+	/// The OID of the elliptic curve for key agreement.
 	pub curve: Option<ObjectIdentifier>,
-	/// OID of the key-wrap algorithm that the profile negotiates.
-	#[asn1(context_specific = "5", optional = "true")]
+	/// The OID of the key-wrap algorithm that the profile negotiates.
 	pub key_wrap: Option<ObjectIdentifier>,
 }
+
+wire_sequence!(SecurityProfileDesc {
+	digest: ctx(TagNumber::N0),
+	aead: ctx(TagNumber::N1),
+	signature: ctx(TagNumber::N2),
+	kdf: ctx(TagNumber::N3),
+	curve: ctx(TagNumber::N4),
+	key_wrap: ctx(TagNumber::N5),
+});
 
 impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 	fn from(_p: &P) -> Self {
@@ -149,66 +188,167 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 			curve: Some(<P::Curve as AssociatedOid>::OID),
 			#[cfg(not(feature = "ecdh"))]
 			curve: None,
-			key_wrap: P::KEY_WRAP_OID,
+			#[cfg(feature = "aead")]
+			key_wrap: Some(<P::KeyWrapOid as AssociatedOid>::OID),
+			#[cfg(not(feature = "aead"))]
+			key_wrap: None,
 		}
 	}
 }
 
-/// Metadata trait that declares only the algorithm identifiers (OIDs) of a
+/// The strength of a runnable profile, as a [`ProfileStrengthPolicy`]
+/// judges it.
+///
+/// The sizes come from the provider's types, so a policy judges the
+/// algorithms the session runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ProfileStrength {
+	/// The descriptor of the runnable profile.
+	pub descriptor: SecurityProfileDesc,
+	/// The key length in bytes of the provider's AEAD cipher.
+	pub aead_key_bytes: usize,
+	/// The output length in bytes of the provider's digest.
+	pub digest_bytes: usize,
+	/// The field width in bytes of the provider's key-agreement curve, which
+	/// bounds the strength of every session key.
+	pub curve_field_bytes: usize,
+}
+
+/// The minimum-strength filter that a handshake endpoint applies to profiles.
+///
+/// The policy blocks downgrade (CWE-757), so an endpoint refuses a mutually
+/// supported weak profile unless the policy admits it.
+pub trait ProfileStrengthPolicy {
+	/// Returns `true` when `strength` meets the policy floor.
+	fn meets_floor(&self, strength: &ProfileStrength) -> bool;
+}
+
+/// The strength floor that [`CryptoProvider::strength_floor`] names unless a
+/// provider overrides it.
+///
+/// # Requires
+///
+/// - The AEAD key size is at least 256 bits.
+/// - The digest output is at least 256 bits.
+/// - The field of the key-agreement curve is at least 256 bits, so P-192 and P-224 fall below the floor.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::profiles::{DefaultCryptoProvider, DefaultStrengthFloor, ProfileStrengthPolicy};
+/// use tightbeam::transport::handshake::negotiation::RunnableProfile;
+///
+/// // The house profile runs AES-256-GCM, SHA3-256, and secp256k1.
+/// let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+/// assert!(DefaultStrengthFloor.meets_floor(&strength));
+/// ```
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultStrengthFloor;
+
+/// The minimum length in bytes of the AEAD key, the digest output, and the
+/// curve field, 256 bits each.
+const DEFAULT_FLOOR_BYTES: usize = 32;
+
+impl ProfileStrengthPolicy for DefaultStrengthFloor {
+	fn meets_floor(&self, strength: &ProfileStrength) -> bool {
+		let aead_ok = strength.aead_key_bytes >= DEFAULT_FLOOR_BYTES;
+		let digest_ok = strength.digest_bytes >= DEFAULT_FLOOR_BYTES;
+		let curve_ok = strength.curve_field_bytes >= DEFAULT_FLOOR_BYTES;
+		aead_ok && digest_ok && curve_ok
+	}
+}
+
+/// The strength policy that admits every profile.
+///
+/// This policy is the explicit opt-out of the minimum-strength floor. A
+/// provider whose profile falls below [`DefaultStrengthFloor`] names this
+/// policy from [`CryptoProvider::strength_floor`], and so does a
+/// downgrade-attack test. Any other provider SHOULD keep
+/// [`DefaultStrengthFloor`].
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::profiles::{DefaultCryptoProvider, NoStrengthFloor, ProfileStrengthPolicy};
+/// use tightbeam::transport::handshake::negotiation::RunnableProfile;
+///
+/// let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+/// assert!(NoStrengthFloor.meets_floor(&strength));
+/// ```
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoStrengthFloor;
+
+impl ProfileStrengthPolicy for NoStrengthFloor {
+	fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
+		true
+	}
+}
+
+/// The metadata trait that declares only the algorithm identifiers (OIDs) of a
 /// negotiated security profile. Concrete key types and implementations live
-/// on `CryptoProvider`.
+/// on [`CryptoProvider`].
 ///
 /// # Rationale
 ///
-/// - Peers negotiate over a compact descriptor of the hash, AEAD, signature, key-wrap, KDF, and curve OIDs.
-/// - The trait decouples the compile-time algorithm implementation
-///   (`CryptoProvider`) from the protocol-visible identifiers
-///   (`SecurityProfile`).
-/// - A later dynamic dispatch or plugin loader can use the trait without a change to the wire format.
-/// - Peers must negotiate the KDF and the curve to interoperate: - Different
-///   KDFs produce different keys from the same inputs. - The curve choice
-///   affects ECDH operations. For example, Ed25519 signatures typically pair
-///   with X25519 for ECDH.
+/// - Peers negotiate over a compact [`SecurityProfileDesc`] of the hash,
+///   AEAD, signature, key-wrap, KDF, and curve OIDs.
+/// - The trait separates the identifiers a peer sees from the algorithm
+///   types of [`CryptoProvider`] that run them at compile time.
+/// - A dynamic dispatch or a plugin loader can use the trait with no change to the wire format.
+/// - Peers must negotiate the KDF and the curve to interoperate. Two different
+///   KDFs derive different keys from the same inputs, and the curve fixes the
+///   group the ECDH runs in. Ed25519 signatures, for example, pair with X25519
+///   for ECDH.
 pub trait SecurityProfile {
-	/// Digest algorithm. A [`CryptoProvider`] for this profile MUST use this
-	/// type as its digest.
+	/// The negotiated digest algorithm. A [`CryptoProvider`] for this profile
+	/// MUST use this type as its digest.
 	#[cfg(feature = "digest")]
 	type Digest: AssociatedOid;
-	/// AEAD algorithm identifier. A [`CryptoProvider`] for this profile MUST
-	/// use a cipher that names this identifier.
+	/// The negotiated AEAD algorithm identifier. A [`CryptoProvider`] for this
+	/// profile MUST use a cipher that names this identifier.
 	#[cfg(feature = "aead")]
 	type AeadOid: AssociatedOid;
-	/// Signature algorithm. A [`CryptoProvider`] for this profile MUST use
-	/// this type as its signature.
+	/// The negotiated signature algorithm. A [`CryptoProvider`] for this
+	/// profile MUST use this type as its signature.
 	#[cfg(feature = "signature")]
 	type SignatureAlg: SignatureAlgorithmIdentifier;
-	/// Key derivation function. A [`CryptoProvider`] for this profile MUST
-	/// use this type as its KDF.
+	/// The negotiated key derivation function. A [`CryptoProvider`] for this
+	/// profile MUST use this type as its KDF.
 	#[cfg(feature = "kdf")]
 	type Kdf: AssociatedOid;
-	/// Elliptic curve for key agreement. A [`CryptoProvider`] for this
-	/// profile MUST use this type as its curve.
+	/// The negotiated elliptic curve for key agreement. A [`CryptoProvider`]
+	/// for this profile MUST use this type as its curve.
 	#[cfg(feature = "ecdh")]
 	type Curve: AssociatedOid;
-
-	/// Key-wrap algorithm, or [`None`] when the profile wraps no keys.
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
+	/// The negotiated key-wrap algorithm identifier. A [`CryptoProvider`] for
+	/// this profile MUST use a key wrap that names this identifier.
+	#[cfg(feature = "aead")]
+	type KeyWrapOid: AssociatedOid;
 }
 
-/// Provider role for digest operations.
+/// The provider role for digest operations.
 ///
 /// The role isolates digest operations from the full provider, so a bound
-/// names only the digest and a test can target the digest alone.
+/// names only the digest and a test can target the digest alone. The digest
+/// names its block size, the length HMAC pads its key to.
 #[cfg(feature = "digest")]
 pub trait DigestProvider {
-	type Digest: Digest + AssociatedOid + Default + Send + Sync;
+	/// The digest algorithm. The keyed hashes of the key schedule drive its
+	/// core ([`HashCore`]) with a buffer of their own.
+	///
+	/// The contract of the core is to wipe its state on drop: an HMAC over
+	/// the core holds the key XOR `ipad` in that state (RFC 2104 § 2,
+	/// NIST SP 800-56C Rev. 2 § 5.1). The house SHA3 cores keep that contract,
+	/// and [`crate::crypto::hash`] asserts it at compile time.
+	type Digest: Digest + AssociatedOid + BlockSizeUser + CoreProxy<Core: HashCore> + Clone + Default + Send + Sync;
 
 	fn to_digest_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: <Self::Digest as AssociatedOid>::OID, parameters: None }
 	}
 
-	/// Convert this provider into a Digestor function.
-	fn as_digestor<E>(&self) -> crate::helpers::Digestor<E>
+	/// A one-shot [`Digestor`] that digests its input under [`Self::Digest`].
+	fn as_digestor<E>(&self) -> Digestor<E>
 	where
 		E: From<crate::TightBeamError>,
 	{
@@ -216,105 +356,284 @@ pub trait DigestProvider {
 	}
 }
 
-/// Provider role for AEAD encryption and decryption.
+/// The provider role for AEAD encryption and decryption.
 ///
 /// The role separates AEAD operations from the other crypto primitives. The
 /// cipher type names its own algorithm identifier through [`AeadAlgorithm`].
 #[cfg(feature = "aead")]
 pub trait AeadProvider {
-	/// AEAD cipher, which names the algorithm identifier and key length the
-	/// profile negotiates.
+	/// The AEAD cipher, which names the algorithm identifier and the key length
+	/// the profile negotiates.
 	type AeadCipher: AeadAlgorithm + Send + Sync;
 
 	fn to_aead_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		let oid = <<Self::AeadCipher as AeadAlgorithm>::Oid as AssociatedOid>::OID;
 		AlgorithmIdentifierOwned { oid, parameters: None }
 	}
+}
 
-	/// Convert this provider into a `KeyWrapper` function for a 16-byte AES-128
-	/// KEK.
-	#[cfg(feature = "transport")]
-	#[allow(clippy::type_complexity)]
-	fn as_key_wrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
-	where
-		E: From<HandshakeError>,
-	{
-		impl_key_wrapper!(E, aes::Aes128, 16)
-	}
+/// A key-wrap algorithm: its identifier type, the size of its
+/// key-encryption key, and its wrap and unwrap of a content key (RFC 3394,
+/// RFC 3565). An implementor brings its own wrap with an implementation of
+/// this trait, and names it through [`KeyWrapProvider`].
+#[cfg(feature = "aead")]
+pub trait KeyWrapAlgorithm {
+	/// The identifier type of the wrap, which a profile names.
+	type Oid: AssociatedOid;
 
-	/// Convert this provider into a `KeyWrapper` function for a 24-byte AES-192
-	/// KEK.
-	#[cfg(feature = "transport")]
-	#[allow(clippy::type_complexity)]
-	fn as_key_wrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
-	where
-		E: From<HandshakeError>,
-	{
-		impl_key_wrapper!(E, aes::Aes192, 24)
-	}
+	/// The size in octets of the key-encryption key, as a `typenum` number in
+	/// `1..=65535`, the range of `kekLength` (RFC 9629 §3). [`CryptoProvider`]
+	/// requires it to be at least the key size of its AEAD, because the KEK
+	/// must be at least as long as the content key it wraps (RFC 3565 §2.3.2).
+	/// A [`Kek`] of this wrap holds a key of this size.
+	type KekSize: ArrayLength<u8> + NonZero + IsLess<U65536, Output = B1>;
 
-	/// Convert this provider into a `KeyWrapper` function for a 32-byte AES-256
-	/// KEK.
-	#[cfg(feature = "transport")]
-	#[allow(clippy::type_complexity)]
-	fn as_key_wrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
-	where
-		E: From<HandshakeError>,
-	{
-		impl_key_wrapper!(E, aes::Aes256, 32)
-	}
-
-	/// Convert this provider into a `KeyUnwrapper` function for a 16-byte
-	/// AES-128 KEK.
+	/// Wrap `key` under `kek`.
 	///
-	/// A recipient uses it to unwrap (decrypt) a wrapped content-encryption
-	/// key.
-	#[cfg(feature = "transport")]
-	#[allow(clippy::type_complexity)]
-	fn as_key_unwrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
-	where
-		E: From<HandshakeError>,
-	{
-		impl_key_unwrapper!(E, aes::Aes128, 16)
-	}
-
-	/// Convert this provider into a `KeyUnwrapper` function for a 24-byte
-	/// AES-192 KEK.
+	/// # Errors
 	///
-	/// A recipient uses it to unwrap (decrypt) a wrapped content-encryption
-	/// key.
-	#[cfg(feature = "transport")]
-	#[allow(clippy::type_complexity)]
-	fn as_key_unwrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
-	where
-		E: From<HandshakeError>,
-	{
-		impl_key_unwrapper!(E, aes::Aes192, 24)
-	}
-
-	/// Convert this provider into a `KeyUnwrapper` function for a 32-byte
-	/// AES-256 KEK.
+	/// - [`KeyError::WrapLength`] -- `key` is shorter than two 64-bit blocks or
+	///   is not a whole number of them.
+	/// - [`KeyError::WrapFailed`] -- the wrap refused the key.
 	///
-	/// A recipient uses it to unwrap (decrypt) a wrapped content-encryption
-	/// key.
-	#[cfg(feature = "transport")]
-	#[allow(clippy::type_complexity)]
-	fn as_key_unwrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
-	where
-		E: From<HandshakeError>,
-	{
-		impl_key_unwrapper!(E, aes::Aes256, 32)
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::{Aes128Wrap, Kek, KeyWrapAlgorithm};
+	///
+	/// // RFC 3394 §4.1: 128 bits of key data under a 128-bit KEK.
+	/// let kek = 0x000102030405060708090a0b0c0d0e0f_u128.to_be_bytes();
+	/// let kek = Kek::<Aes128Wrap>::try_from(kek.as_slice())?;
+	/// let key_data = 0x00112233445566778899aabbccddeeff_u128.to_be_bytes();
+	///
+	/// let wrapped = Aes128Wrap::wrap(&kek, &key_data)?;
+	/// let expected = [0x1fa68b0a8112b447_u64, 0xaef34bd8fb5a7b82, 0x9d3e862371d2cfe5].map(u64::to_be_bytes);
+	/// assert_eq!(wrapped, expected.concat());
+	/// # Ok::<(), tightbeam::crypto::key::KeyError>(())
+	/// ```
+	fn wrap(kek: &Kek<'_, Self>, key: &[u8]) -> Result<Vec<u8>, KeyError>;
+
+	/// Unwrap `wrapped` under `kek`. The integrity check of the unwrap refuses
+	/// a key wrapped under another KEK or altered in flight (RFC 3394 §2.2.3).
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::WrapLength`] -- `wrapped` is shorter than three 64-bit
+	///   blocks or is not a whole number of them.
+	/// - [`KeyError::WrapFailed`] -- `wrapped` fails the integrity check.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::{Aes128Wrap, Kek, KeyWrapAlgorithm};
+	///
+	/// // RFC 3394 §4.1: the wrapped key unwraps to 128 bits of key data.
+	/// let kek = 0x000102030405060708090a0b0c0d0e0f_u128.to_be_bytes();
+	/// let kek = Kek::<Aes128Wrap>::try_from(kek.as_slice())?;
+	/// let wrapped = [0x1fa68b0a8112b447_u64, 0xaef34bd8fb5a7b82, 0x9d3e862371d2cfe5].map(u64::to_be_bytes);
+	///
+	/// let key_data = Aes128Wrap::unwrap(&kek, &wrapped.concat())?;
+	/// assert_eq!(key_data.as_slice(), 0x00112233445566778899aabbccddeeff_u128.to_be_bytes());
+	/// # Ok::<(), tightbeam::crypto::key::KeyError>(())
+	/// ```
+	fn unwrap(kek: &Kek<'_, Self>, wrapped: &[u8]) -> Result<crate::ZeroizingBytes, KeyError>;
+
+	/// Unwrap `wrapped` under `kek` into `out`, which takes the unwrapped key
+	/// whole, so a caller unwraps a content key onto its own stack.
+	///
+	/// The default unwraps through [`Self::unwrap`] and copies the key into
+	/// `out`. The house AES wraps unwrap into `out` directly.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::unwrap`].
+	/// - [`KeyError::WrapLength`] -- `out` differs in size from the unwrapped key.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::{Aes128Wrap, Kek, KeyWrapAlgorithm};
+	///
+	/// let kek = 0x000102030405060708090a0b0c0d0e0f_u128.to_be_bytes();
+	/// let kek = Kek::<Aes128Wrap>::try_from(kek.as_slice())?;
+	/// let wrapped = [0x1fa68b0a8112b447_u64, 0xaef34bd8fb5a7b82, 0x9d3e862371d2cfe5].map(u64::to_be_bytes);
+	///
+	/// // RFC 3394 §4.1: the buffer takes the 128 bits of key data whole.
+	/// let mut key_data = [0u8; 16];
+	/// Aes128Wrap::unwrap_into(&kek, &wrapped.concat(), &mut key_data)?;
+	/// assert_eq!(key_data, 0x00112233445566778899aabbccddeeff_u128.to_be_bytes());
+	/// # Ok::<(), tightbeam::crypto::key::KeyError>(())
+	/// ```
+	fn unwrap_into(kek: &Kek<'_, Self>, wrapped: &[u8], out: &mut [u8]) -> Result<(), KeyError> {
+		let key = Self::unwrap(kek, wrapped)?;
+		if key.len() != out.len() {
+			return Err(KeyError::WrapLength((out.len(), key.len()).into()));
+		}
+
+		out.iter_mut().zip(key.iter()).for_each(|(slot, octet)| *slot = *octet);
+		Ok(())
 	}
 }
 
-/// Provider role for signature generation and verification.
+/// A key-encryption key (KEK) of [`KeyWrapAlgorithm::KekSize`] octets for the
+/// key wrap `W`, borrowed from the buffer that holds it.
 ///
-/// The role isolates signing operations, so a type that only signs carries
+/// [`TryFrom`] on a slice is its one length check, and [`From`] on an array
+/// of [`KeyWrapAlgorithm::KekSize`] octets needs none, so each wrap and unwrap
+/// under `W` receives a key of its size, and the length rule has one home.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::profiles::{Aes256Wrap, Kek, KeyWrapAlgorithm};
+///
+/// // AES-256 key wrap takes a 32-octet key and refuses a 16-octet one.
+/// let key = [0x42u8; 32];
+/// let kek = Kek::<Aes256Wrap>::try_from(key.as_slice())?;
+/// assert!(Kek::<Aes256Wrap>::try_from(&key[..16]).is_err());
+///
+/// let wrapped = Aes256Wrap::wrap(&kek, &[0x11; 16])?;
+/// let unwrapped = Aes256Wrap::unwrap(&kek, &wrapped)?;
+/// assert_eq!(unwrapped.as_slice(), [0x11; 16].as_slice());
+/// # Ok::<(), tightbeam::crypto::key::KeyError>(())
+/// ```
+#[cfg(feature = "aead")]
+pub struct Kek<'a, W: KeyWrapAlgorithm + ?Sized> {
+	/// The key, of the size of the wrap.
+	key: &'a GenericArray<u8, W::KekSize>,
+}
+
+#[cfg(feature = "aead")]
+impl<'a, W: KeyWrapAlgorithm + ?Sized> Kek<'a, W> {
+	/// The octets of the key, which an implementation of `W` builds its key
+	/// schedule from.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::{Aes128Wrap, Kek};
+	///
+	/// // The array holds the 16 octets of the key of AES-128 key wrap.
+	/// let key = [0x42u8; 16];
+	/// let kek = Kek::<Aes128Wrap>::try_from(key.as_slice())?;
+	/// assert_eq!(kek.as_array().as_slice(), key.as_slice());
+	/// # Ok::<(), tightbeam::crypto::key::KeyError>(())
+	/// ```
+	#[must_use]
+	pub const fn as_array(&self) -> &'a GenericArray<u8, W::KekSize> {
+		self.key
+	}
+}
+
+/// A key whose array type holds the size of the wrap, so it needs no check.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::common::generic_array::GenericArray;
+/// use tightbeam::crypto::profiles::{Aes256Wrap, Kek, KeyWrapAlgorithm};
+///
+/// // A holder of a typed array lends it with no length check to fail.
+/// let key = GenericArray::from([0x42u8; 32]);
+/// let kek = Kek::<Aes256Wrap>::from(&key);
+///
+/// let wrapped = Aes256Wrap::wrap(&kek, &[0x11; 16])?;
+/// assert_eq!(wrapped.len(), 24);
+/// # Ok::<(), tightbeam::crypto::key::KeyError>(())
+/// ```
+#[cfg(feature = "aead")]
+impl<'a, W: KeyWrapAlgorithm + ?Sized> From<&'a GenericArray<u8, W::KekSize>> for Kek<'a, W> {
+	fn from(key: &'a GenericArray<u8, W::KekSize>) -> Self {
+		Self { key }
+	}
+}
+
+/// The one length check of a key-encryption key.
+#[cfg(feature = "aead")]
+impl<'a, W: KeyWrapAlgorithm + ?Sized> TryFrom<&'a [u8]> for Kek<'a, W> {
+	type Error = KeyError;
+
+	/// The key that `key` holds.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::KekLength`] -- the length of `key` differs from [`KeyWrapAlgorithm::KekSize`].
+	fn try_from(key: &'a [u8]) -> Result<Self, KeyError> {
+		let expected = <W::KekSize as Unsigned>::USIZE;
+		if key.len() != expected {
+			return Err(KeyError::KekLength((key.len(), expected).into()));
+		}
+
+		// The check above refuses every other length, so the length that
+		// `from_slice` asserts holds here.
+		Ok(Self::from(GenericArray::from_slice(key)))
+	}
+}
+
+/// A copy borrows the same key.
+#[cfg(feature = "aead")]
+impl<W: KeyWrapAlgorithm + ?Sized> Clone for Kek<'_, W> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+#[cfg(feature = "aead")]
+impl<W: KeyWrapAlgorithm + ?Sized> Copy for Kek<'_, W> {}
+
+/// The key stays out of the output.
+#[cfg(feature = "aead")]
+impl<W: KeyWrapAlgorithm + ?Sized> fmt::Debug for Kek<'_, W> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Kek").finish_non_exhaustive()
+	}
+}
+
+/// The provider role for the key wrap of a content key.
+///
+/// The role names the wrap an envelope's recipient uses, and the wrap names
+/// the identifier the profile negotiates.
+#[cfg(feature = "aead")]
+pub trait KeyWrapProvider {
+	/// The key wrap, which names the identifier the profile negotiates.
+	type KeyWrap: KeyWrapAlgorithm;
+}
+
+/// AES-128 key wrap, `id-aes128-wrap` (RFC 3565 §2.3.2).
+#[cfg(feature = "aead")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Aes128Wrap;
+
+/// AES-192 key wrap, `id-aes192-wrap` (RFC 3565 §2.3.2).
+#[cfg(feature = "aead")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Aes192Wrap;
+
+/// AES-256 key wrap, `id-aes256-wrap` (RFC 3565 §2.3.2), the house wrap.
+#[cfg(feature = "aead")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Aes256Wrap;
+
+#[cfg(feature = "aead")]
+impl_aes_key_wrap!(Aes128Wrap, AES_128_WRAP, aes::Aes128, U16);
+#[cfg(feature = "aead")]
+impl_aes_key_wrap!(Aes192Wrap, AES_192_WRAP, aes::Aes192, U24);
+#[cfg(feature = "aead")]
+impl_aes_key_wrap!(Aes256Wrap, AES_256_WRAP, aes::Aes256, U32);
+
+/// The provider role for signature generation and verification.
+///
+/// The role isolates signature operations, so a type that only signs carries
 /// fewer generic bounds.
+///
+/// The signature type parses its own encoding alone and names its canonical
+/// form, which is DER `ECDSA-Sig-Value` with a low `s` for ECDSA.
 #[cfg(feature = "signature")]
 pub trait SigningProvider {
-	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + LowSEncoding + Send + Sync;
-	type SigningKey: Signatory<Self::Signature>;
+	/// The signature, which names its algorithm identifier and its canonical
+	/// form.
+	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + CanonicalForm + Send + Sync;
+	/// The public key that verifies a [`Self::Signature`] over a prehash.
 	type VerifyingKey: PrehashVerifier<Self::Signature> + Send + Sync;
 
 	fn to_signature_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
@@ -325,56 +644,64 @@ pub trait SigningProvider {
 	}
 }
 
-/// Provider role for key derivation.
+/// The provider role for key derivation.
 ///
 /// The role separates KDF operations such as HKDF, so trait bounds stay
 /// narrow. The KDF type names the algorithm identifier a peer negotiates for
 /// it.
 #[cfg(feature = "kdf")]
 pub trait KdfProvider {
-	/// Key derivation function, which names the algorithm identifier the
+	/// The key derivation function, which names the algorithm identifier the
 	/// profile negotiates.
 	type Kdf: KdfFunction + AssociatedOid;
 }
 
-/// Provider role for elliptic curve operations.
+/// The provider role for elliptic curve operations.
 ///
 /// The role isolates curve-specific operations such as ECDH and key
 /// generation. The curve type names the algorithm identifier a peer
 /// negotiates for it.
 #[cfg(feature = "ecdh")]
 pub trait CurveProvider {
-	/// Elliptic curve for key agreement, which names the algorithm identifier
-	/// the profile negotiates.
+	/// The elliptic curve for key agreement, which names the algorithm
+	/// identifier the profile negotiates.
 	type Curve: Curve + CurveArithmetic + AssociatedOid;
-	/// ECIES wire message for this curve. A handshake holds one across an
-	/// await, so it crosses threads.
-	#[cfg(feature = "ecies")]
-	type EciesMessage: crate::crypto::ecies::EciesMessageOps + Send + Sync + 'static;
 }
 
-/// Provider role for Key Encapsulation Mechanism (KEM) operations.
+/// The provider role for Key Encapsulation Mechanism (KEM) operations.
 ///
 /// The role supports post-quantum and hybrid key agreement through the
 /// RustCrypto `kem` traits. An application can supply a KEM implementation
 /// for a hybrid classical and post-quantum protocol such as PQXDH.
 #[cfg(feature = "kem")]
 pub trait KemProvider {
+	/// The encapsulated key that [`Self::Kem`] sends to its recipient.
 	type EncappedKey: EncappedKey;
+	/// The KEM, which encapsulates a shared secret into a
+	/// [`Self::EncappedKey`] and decapsulates it.
 	type Kem: Encapsulator<Self::EncappedKey> + Decapsulator<Self::EncappedKey> + Send + Sync;
 }
 
-/// Binds concrete implementations to the metadata in a `SecurityProfile`.
+/// Binds concrete implementations to the metadata in a [`SecurityProfile`].
 ///
 /// This trait composes every provider role trait. A component can bound on
 /// the role traits it uses, such as `SigningProvider + DigestProvider`, and so
-/// avoid the trait bound complexity of the full `CryptoProvider`.
+/// avoid the full set of bounds that `CryptoProvider` carries.
 ///
 /// # Profile binding
 ///
 /// Each role's algorithm type MUST be the type its profile names. The bounds
 /// enforce this, so a provider that runs one algorithm while its profile
-/// negotiates another does not compile.
+/// negotiates another does not compile. The KEK of the key wrap is at least as
+/// long as the AEAD key (RFC 3565 §2.3.2), so a provider that pairs
+/// [`Aes128Wrap`] with AES-256-GCM does not compile either.
+///
+/// # Open roles
+///
+/// Every role is open: an implementor names its own type for any role, such
+/// as a [`ContentEncryption`](crate::crypto::cms::ContentEncryption) cipher, a
+/// [`KeyWrapAlgorithm`], or a KEM, and every layer that takes the provider
+/// runs and requires that type.
 #[cfg(all(
 	feature = "digest",
 	feature = "aead",
@@ -383,24 +710,74 @@ pub trait KemProvider {
 	feature = "ecdh"
 ))]
 pub trait CryptoProvider:
-	Default + Copy + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider
+	Default
+	+ Copy
+	+ DigestProvider
+	+ AeadProvider
+	+ KeyWrapProvider<KeyWrap: KeyWrapAlgorithm<KekSize: IsGreaterOrEqual<AeadKeySize<Self>, Output = B1>>>
+	+ SigningProvider
+	+ KdfProvider
+	+ CurveProvider
 {
-	/// The profile this provider runs. Each algorithm it names is the type the
-	/// matching role above uses.
+	/// The profile this provider runs. Each algorithm it names is the type its
+	/// role above uses.
 	type Profile: SecurityProfile<
 			Digest = Self::Digest,
 			AeadOid = <Self::AeadCipher as AeadAlgorithm>::Oid,
 			SignatureAlg = Self::Signature,
 			Kdf = Self::Kdf,
 			Curve = Self::Curve,
+			KeyWrapOid = <Self::KeyWrap as KeyWrapAlgorithm>::Oid,
 		> + Default;
+
+	/// The KEM a `KEMRecipientInfo` of this provider encapsulates under. It
+	/// names its own identifier, so an implementor brings its own KEM.
+	#[cfg(all(feature = "hpke", feature = "signature"))]
+	type Kem: crate::crypto::cms::RecipientKem;
 
 	/// Return the profile this provider runs.
 	fn profile(&self) -> &Self::Profile;
+
+	/// The strength floor every handshake of this provider holds its profile
+	/// to, on each endpoint that runs the provider.
+	///
+	/// - The default is [`DefaultStrengthFloor`]: an AEAD key, a digest
+	///   output, and a curve field of 256 bits or more.
+	/// - A provider whose AEAD key, digest output, or curve field is shorter
+	///   runs a handshake only under a floor that admits its profile, such as
+	///   [`NoStrengthFloor`], so it names that floor here (CWE-757).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, ProfileStrengthPolicy};
+	/// use tightbeam::transport::handshake::negotiation::RunnableProfile;
+	///
+	/// // The house provider keeps the default floor, which its profile meets.
+	/// let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+	/// assert!(DefaultCryptoProvider::strength_floor().meets_floor(&strength));
+	/// ```
+	fn strength_floor() -> &'static (dyn ProfileStrengthPolicy + Send + Sync) {
+		&DefaultStrengthFloor
+	}
 }
 
+/// The key size of the AEAD of the provider `P`, as a `typenum` number.
+///
+/// [`CryptoProvider`] holds the KEK size of its key wrap at or above this
+/// size, because the KEK must be at least as long as the content key it wraps
+/// (RFC 3565 §2.3.2).
+#[cfg(all(
+	feature = "digest",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+pub type AeadKeySize<P> = <<P as AeadProvider>::AeadCipher as KeySizeUser>::KeySize;
+
 /// The profile [`DefaultCryptoProvider`] runs: SHA3-256, AES-256-GCM, ECDSA
-/// over secp256k1, HKDF-SHA3-256, and AES-256 key wrap.
+/// and ECDH over secp256k1, HKDF-SHA3-256, and AES-256 key wrap.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TightbeamProfile;
 
@@ -415,10 +792,12 @@ impl SecurityProfile for TightbeamProfile {
 	type Kdf = HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
 	type Curve = k256::Secp256k1;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
+	#[cfg(feature = "aead")]
+	type KeyWrapOid = Aes256Wrap;
 }
 
+/// The house provider, which runs [`TightbeamProfile`] and keeps the
+/// [`DefaultStrengthFloor`].
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultCryptoProvider {
@@ -436,9 +815,13 @@ impl AeadProvider for DefaultCryptoProvider {
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl KeyWrapProvider for DefaultCryptoProvider {
+	type KeyWrap = Aes256Wrap;
+}
+
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl SigningProvider for DefaultCryptoProvider {
 	type Signature = Secp256k1Signature;
-	type SigningKey = Secp256k1SigningKey;
 	type VerifyingKey = Secp256k1VerifyingKey;
 }
 
@@ -450,102 +833,16 @@ impl KdfProvider for DefaultCryptoProvider {
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
-	#[cfg(feature = "ecies")]
-	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CryptoProvider for DefaultCryptoProvider {
 	type Profile = TightbeamProfile;
+	#[cfg(all(feature = "hpke", feature = "signature"))]
+	type Kem = crate::crypto::hpke::DhKemSecp256k1;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
-	}
-}
-
-#[derive(Errorizable, Debug, Clone)]
-#[allow(unused_variables)]
-pub enum UkmBuilderError {
-	#[error("Duplicate tag: {tag}")]
-	DuplicateTag { tag: u8 },
-	#[error("Extension too large (tag {tag} len {len})")]
-	ExtensionTooLarge { tag: u8, len: usize },
-}
-
-pub type UkmResult<T> = ::core::result::Result<T, UkmBuilderError>;
-
-/// Named client/server nonces for [`UkmBuilder::new`].
-///
-/// Named fields prevent swapping the two same-typed `[u8; 32]` nonces at
-/// the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UkmNonces {
-	/// Client contribution to the UKM nonce pair.
-	pub client: [u8; 32],
-	/// Server contribution to the UKM nonce pair.
-	pub server: [u8; 32],
-}
-
-#[derive(Debug, Default)]
-pub struct UkmBuilder {
-	client: [u8; 32],
-	server: [u8; 32],
-	extensions: Vec<(u8, Vec<u8>)>,
-}
-
-impl UkmBuilder {
-	/// Start a UKM builder from the client and server nonces.
-	///
-	/// The builder takes [`UkmNonces`] so the client and server contributions
-	/// cannot be swapped by position.
-	pub fn new(nonces: UkmNonces) -> Self {
-		Self { client: nonces.client, server: nonces.server, extensions: Vec::new() }
-	}
-
-	/// Add a tagged extension and return the builder.
-	///
-	/// [`UkmBuilder::add_extension`] lists the errors.
-	pub fn with_extension(mut self, tag: u8, data: impl AsRef<[u8]>) -> UkmResult<Self> {
-		self.add_extension(tag, data)?;
-		Ok(self)
-	}
-
-	/// Add a tagged extension, which the UKM encodes as `tag | len(2) | data`.
-	///
-	/// # Errors
-	///
-	/// - [`UkmBuilderError::DuplicateTag`] -- the builder already holds `tag`.
-	/// - [`UkmBuilderError::ExtensionTooLarge`] -- `data` is longer than `u16::MAX` bytes.
-	pub fn add_extension(&mut self, tag: u8, data: impl AsRef<[u8]>) -> UkmResult<()> {
-		let data = data.as_ref();
-		if self.extensions.iter().any(|(t, _)| *t == tag) {
-			return Err(UkmBuilderError::DuplicateTag { tag });
-		}
-		if data.len() > u16::MAX as usize {
-			return Err(UkmBuilderError::ExtensionTooLarge { tag, len: data.len() });
-		}
-
-		self.extensions.push((tag, data.to_vec()));
-		Ok(())
-	}
-
-	pub fn finalize(self) -> Vec<u8> {
-		// The output layout is:
-		// TIGHTBEAM_UKM_PREFIX || client || server || [ tag | len(2) | data ]*
-		let ext_cap: usize = self.extensions.iter().map(|(_, d)| 1 + 2 + d.len()).sum();
-		let mut out = Vec::with_capacity(TIGHTBEAM_UKM_PREFIX.len() + 64 + ext_cap);
-		out.extend_from_slice(TIGHTBEAM_UKM_PREFIX);
-		out.extend_from_slice(&self.client);
-		out.extend_from_slice(&self.server);
-
-		for (tag, data) in self.extensions.into_iter() {
-			out.push(tag);
-			let len = data.len() as u16;
-			out.extend_from_slice(&len.to_be_bytes());
-			out.extend_from_slice(&data);
-		}
-
-		out
 	}
 }
 
@@ -553,121 +850,33 @@ impl UkmBuilder {
 mod tests {
 	use super::*;
 	use crate::constants::{
-		TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_KARI_KDF_INFO,
-		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_UKM_PREFIX,
+		TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
+		TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_FRAME_UKM_LABEL,
+		TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+		TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 	};
 
 	/// Guard the domain constants against accidental change.
 	///
 	/// A failure means that a domain constant changed, which invalidates every
-	/// existing derived key and signature.
+	/// key and signature derived under the old value.
 	#[test]
 	fn test_domain_constants_stable() {
-		assert_eq!(TIGHTBEAM_KARI_KDF_INFO, b"tb/kari/kdf/v1");
+		assert_eq!(TIGHTBEAM_OPENING_UKM_LABEL, b"tb/handshake/opening/ukm/v1");
 		assert_eq!(TIGHTBEAM_SESSION_KDF_INFO, b"tb/session/kdf/v1");
 		assert_eq!(TIGHTBEAM_SERVER_FINISHED_DOMAIN, b"tb/handshake/finished/server/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
-		assert_eq!(TIGHTBEAM_ACK_AAD_DOMAIN, b"tb/handshake/ack/aad/v1");
-		assert_eq!(TIGHTBEAM_UKM_PREFIX, b"tb/kari/ukm/v1|");
+		assert_eq!(TIGHTBEAM_ACK_KEY_ID_DOMAIN, b"tb/handshake/ack/kekid/v1");
+		assert_eq!(TIGHTBEAM_FRAME_UKM_LABEL, b"tb/frame/ukm/v1");
+		assert_eq!(TIGHTBEAM_RECORD_KEY_ID_DOMAIN, b"tb/session/record/kekid/v1");
+		assert_eq!(TIGHTBEAM_CLOSING_KDF_INFO, b"tb/session/kdf/closing/v1");
+		assert_eq!(TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1");
+		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1");
+		assert_eq!(TIGHTBEAM_SERVER_FINISHED_KEY_INFO, b"tb/handshake/finished/server/mac/v1");
 	}
 
-	fn nonce(val: u8) -> [u8; 32] {
-		let mut n = [val; 32];
-		n[0] = val;
-		n
-	}
-
-	#[test]
-	fn ukm_basic_deterministic() {
-		let c = nonce(0xAA);
-		let s = nonce(0xBB);
-		let ukm1 = UkmBuilder::new(UkmNonces { client: c, server: s }).finalize();
-		let ukm2 = UkmBuilder::new(UkmNonces { client: c, server: s }).finalize();
-		assert_eq!(ukm1, ukm2);
-		assert!(ukm1.starts_with(TIGHTBEAM_UKM_PREFIX));
-		assert_eq!(ukm1.len(), TIGHTBEAM_UKM_PREFIX.len() + 64);
-	}
-
-	/// Named nonce fields keep client and server bytes in wire order.
-	#[test]
-	fn ukm_nonces_named_fields_preserve_order() {
-		let client = nonce(0x11);
-		let server = nonce(0x22);
-		let ukm = UkmBuilder::new(UkmNonces { client, server }).finalize();
-		let body = &ukm[TIGHTBEAM_UKM_PREFIX.len()..];
-		assert_eq!(&body[..32], &client);
-		assert_eq!(&body[32..64], &server);
-	}
-
-	#[test]
-	fn ukm_extension_accepts_byte_slices() -> Result<(), Box<dyn std::error::Error>> {
-		let owned = vec![1u8, 2, 3];
-		let ukm = UkmBuilder::new(UkmNonces { client: nonce(7), server: nonce(8) })
-			.with_extension(0x10, owned.as_slice())?
-			.finalize();
-
-		let tail = &ukm[TIGHTBEAM_UKM_PREFIX.len() + 64..];
-		assert_eq!(tail[0], 0x10);
-		assert_eq!(&tail[1..3], &(3u16.to_be_bytes()));
-		assert_eq!(&tail[3..6], &[1, 2, 3]);
-		Ok(())
-	}
-
-	#[test]
-	fn ukm_extension_encoding() -> Result<(), Box<dyn std::error::Error>> {
-		let c = nonce(1);
-		let s = nonce(2);
-		let ukm = UkmBuilder::new(UkmNonces { client: c, server: s })
-			.with_extension(0x01, b"hello")?
-			.with_extension(0x02, b"world")?
-			.finalize();
-
-		// The length is prefix + nonces + (tag+len+data)*2, which is
-		// prefix + 64 + (1+2+5)*2 = prefix + 64 + 16.
-		assert_eq!(ukm.len(), TIGHTBEAM_UKM_PREFIX.len() + 64 + 16);
-
-		let tail = &ukm[TIGHTBEAM_UKM_PREFIX.len() + 64..];
-		assert_eq!(tail[0], 0x01);
-		assert_eq!(&tail[1..3], &(5u16.to_be_bytes()));
-		assert_eq!(&tail[3..8], b"hello");
-		assert_eq!(tail[8], 0x02);
-		assert_eq!(&tail[9..11], &(5u16.to_be_bytes()));
-		assert_eq!(&tail[11..16], b"world");
-		Ok(())
-	}
-
-	#[test]
-	fn ukm_duplicate_tag_error() -> Result<(), Box<dyn std::error::Error>> {
-		let c = nonce(3);
-		let s = nonce(4);
-
-		let mut b = UkmBuilder::new(UkmNonces { client: c, server: s });
-		assert!(b.add_extension(0x01, b"a").is_ok());
-		assert!(matches!(
-			b.add_extension(0x01, b"b"),
-			Err(UkmBuilderError::DuplicateTag { tag: 0x01 })
-		));
-
-		Ok(())
-	}
-
-	#[test]
-	fn ukm_extension_too_large_error() -> Result<(), Box<dyn std::error::Error>> {
-		let c = nonce(5);
-		let s = nonce(6);
-
-		let mut b = UkmBuilder::new(UkmNonces { client: c, server: s });
-		let big = vec![0u8; (u16::MAX as usize) + 1];
-		assert!(matches!(
-			b.add_extension(0x02, &big),
-			Err(UkmBuilderError::ExtensionTooLarge { tag: 0x02, len }) if len == big.len()
-		));
-
-		Ok(())
-	}
-
-	/// Each optional field carries its own tag, so an absent algorithm does not
-	/// shift the next OID into its place.
+	/// Each optional field carries its own tag, so every OID decodes into its
+	/// own field when an algorithm before it is absent.
 	#[test]
 	fn a_profile_with_absent_algorithms_round_trips() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::der::{Decode, Encode};
@@ -698,21 +907,20 @@ mod tests {
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
 			type Kdf = crate::crypto::kdf::HkdfSha3_256;
 			type Curve = k256::Secp256k1;
-
-			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
+			type KeyWrapOid = Aes256Wrap;
 		}
 
 		let desc = SecurityProfileDesc::from(&Aes128Profile);
 		assert_eq!(desc.aead, Some(crate::crypto::aead::Aes128GcmOid::OID));
 	}
 
-	// The KDF and curve types carry the identifiers peers already negotiate,
-	// so the default descriptor keeps its wire values.
+	// The KDF and curve types carry the identifiers that peers negotiate, so
+	// the default descriptor names `HKDF_SHA3_256` and `CURVE_SECP256K1`.
 	#[cfg(all(feature = "kdf", feature = "ecdh"))]
 	#[test]
 	fn the_default_profile_negotiates_its_kdf_and_curve_identifiers() {
 		let desc = SecurityProfileDesc::from(&TightbeamProfile);
-		assert_eq!(desc.kdf, Some(crate::oids::HASH_SHA3_256));
+		assert_eq!(desc.kdf, Some(crate::oids::HKDF_SHA3_256));
 		assert_eq!(desc.curve, Some(crate::oids::CURVE_SECP256K1));
 	}
 }

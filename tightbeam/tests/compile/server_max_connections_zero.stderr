@@ -1,0 +1,12 @@
+error[E0080]: evaluation panicked: `max_connections` takes a cap of one or more
+  --> tests/compile/server_max_connections_zero.rs:8:16
+   |
+ 8 |       let _server = server! {
+   |  ___________________^
+ 9 | |         protocol TokioListener: listener,
+10 | |         policies: { max_connections: [ 0 ] },
+11 | |         handle: move |frame: Frame| async move { Ok(Some(frame)) }
+12 | |     };
+   | |_____^ evaluation of `serve::{closure#0}::CAP` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `server` (in Nightly builds, run with -Z macro-backtrace for more info)

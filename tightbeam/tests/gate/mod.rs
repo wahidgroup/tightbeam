@@ -6,7 +6,7 @@
 
 use tightbeam::testing::{Expect, Layer, ScenarioConfig};
 use tightbeam::trace::{ConsumedTrace, ExecutionMode};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario};
 
 const STEP: Urn<'static> = tightbeam::urn!("test", "event:gate/step");

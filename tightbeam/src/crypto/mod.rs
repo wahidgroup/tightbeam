@@ -32,12 +32,14 @@ pub mod secret;
 
 #[cfg(feature = "aead")]
 pub mod aead;
+#[cfg(feature = "x509")]
+pub mod cms;
 #[cfg(feature = "digest")]
 pub mod commitment;
-#[cfg(feature = "ecies")]
-pub mod ecies;
 #[cfg(any(feature = "digest", feature = "sha3"))]
 pub mod hash;
+#[cfg(feature = "hpke")]
+pub mod hpke;
 #[cfg(feature = "kdf")]
 pub mod kdf;
 #[cfg(feature = "signature")]

@@ -1,127 +1,132 @@
-//! DTN message types for Mars rover communication
+//! The DTN message types of the Mars rover communication tests.
 //!
-//! Defines realistic message structures for:
-//! - Rover telemetry (APXS, ChemCam, Mastcam instruments)
-//! - Earth command & control
-//! - Message chain consensus validation
-//! - Stateless/Stateful ACKs
+//! It defines the messages of these flows:
+//! - Rover telemetry from the APXS, ChemCam, and Mastcam instruments.
+//! - Command and control from Earth.
+//! - Consensus validation of the message chain.
+//! - Stateless and stateful acknowledgments.
 
 use std::convert::TryFrom;
 use std::fmt;
 
 use tightbeam::asn1::{Choice, Frame, MessagePriority};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
+use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Encode, Enumerated, Sequence};
 use tightbeam::{Beamable, TightBeamError};
 
-// ============================================================================
-// Stateless ACK (metadata-only)
-// ============================================================================
+// A relay sends the stateless acknowledgment outside the chain.
 
-/// Stateless acknowledgment (minimal message body, not added to chain)
+/// A stateless acknowledgment: a minimal body outside the message chain.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct StatelessAck {
-	/// Acknowledgment received (always true)
+	/// Whether the acknowledgment arrived, which is always `true`.
 	pub ack: bool,
 }
 
-// ============================================================================
-// Rover Telemetry Messages
-// ============================================================================
+// The rover sends these telemetry messages.
 
-/// Rover telemetry message with instrument data
+/// A rover telemetry message that carries instrument data.
 #[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct RoverTelemetry {
-	/// Instrument that generated this data (0=APXS, 1=ChemCam, 2=Mastcam)
+	/// The instrument that produced this data: 0 is APXS, 1 is ChemCam, and 2
+	/// is Mastcam.
 	pub instrument: u8,
-	/// Instrument-specific data payload
-	pub data: Vec<u8>,
-	/// Mission elapsed time when data was collected
+	/// The data payload, in the format of its instrument.
+	pub data: OctetString,
+	/// The mission elapsed time in milliseconds at which the instrument
+	/// collected the data.
 	pub mission_time_ms: u64,
-	/// Battery charge percentage (0-100)
+	/// The battery charge as a percentage from 0 to 100.
 	pub battery_percent: u8,
-	/// Ambient temperature in Celsius
+	/// The ambient temperature in degrees Celsius.
 	pub temperature_c: i8,
 }
 
 impl RoverTelemetry {
-	/// Create telemetry with typed instrument
+	/// Creates a telemetry message from a typed instrument.
+	///
+	/// # Errors
+	///
+	/// - [`tightbeam::der::Error`] -- `data` is longer than an OCTET STRING holds.
 	pub fn new(
 		instrument: RoverInstrument,
 		data: impl Into<Vec<u8>>,
 		mission_time_ms: u64,
 		battery_percent: u8,
 		temperature_c: i8,
-	) -> Self {
-		let data: Vec<u8> = data.into();
-		Self {
+	) -> tightbeam::der::Result<Self> {
+		Ok(Self {
 			instrument: instrument as u8,
-			data,
+			data: OctetString::new(data)?,
 			mission_time_ms,
 			battery_percent,
 			temperature_c,
-		}
+		})
 	}
 }
 
-/// Mars rover science instruments (encoded as u8)
+/// The science instruments of the Mars rover, each encoded as a `u8`.
 #[derive(Enumerated, Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
 pub enum RoverInstrument {
-	/// Alpha Particle X-ray Spectrometer (soil composition)
+	/// The Alpha Particle X-ray Spectrometer, which measures soil composition.
 	Apxs = 0,
-	/// Chemistry Camera (laser spectrometer)
+	/// The Chemistry Camera, a laser spectrometer.
 	ChemCam = 1,
-	/// Mast Camera (imaging)
+	/// The Mast Camera, which takes images.
 	Mastcam = 2,
 }
 
-// ============================================================================
-// Earth Command & Control Messages
-// ============================================================================
+// Earth sends these command and control messages.
 
-/// Command from Earth to rover
+/// A command from Earth to the rover.
 #[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct EarthCommand {
-	/// Command type (0=CollectSample, 1=ProbeLocation, 2=TakePhoto, 3=Standby)
+	/// The command type: 0 is `CollectSample`, 1 is `ProbeLocation`, 2 is
+	/// `TakePhoto`, and 3 is `Standby`.
 	pub command_type: u8,
-	/// Command-specific parameters
-	pub parameters: Vec<u8>,
-	/// Command priority
+	/// The parameters, in the format of the command type.
+	pub parameters: OctetString,
+	/// The priority of the command.
 	pub priority: MessagePriority,
-	/// Mission time when command was issued
+	/// The mission time in milliseconds at which Earth issues the command.
 	pub mission_time_ms: u64,
 }
 
-/// Acknowledgment of command receipt
+/// An acknowledgment that the rover received a command.
 #[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct CommandAck {
-	/// Frame order of command being acknowledged
+	/// The frame order of the command that this message acknowledges.
 	pub command_order: u64,
 }
 
 impl EarthCommand {
-	/// Create command from typed RoverCommand
-	pub fn new(command: RoverCommand, priority: MessagePriority, mission_time_ms: u64) -> Self {
-		Self {
+	/// Creates a command from a typed [`RoverCommand`].
+	///
+	/// # Errors
+	///
+	/// - [`tightbeam::der::Error`] -- the parameters of `command` are longer than an OCTET STRING holds.
+	pub fn new(command: RoverCommand, priority: MessagePriority, mission_time_ms: u64) -> tightbeam::der::Result<Self> {
+		Ok(Self {
 			command_type: command.command_type(),
-			parameters: command.encode_parameters(),
+			parameters: OctetString::new(command.encode_parameters())?,
 			priority,
 			mission_time_ms,
-		}
+		})
 	}
 }
 
-/// Rover command types (encoded as u8 + parameters)
+/// The rover command types, each encoded as a `u8` and its parameters.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub enum RoverCommand {
-	/// Collect soil/rock sample at location
+	/// Collects a soil or rock sample at a location.
 	CollectSample { location: String },
-	/// Probe specified coordinates
+	/// Probes the given coordinates.
 	ProbeLocation { x: i32, y: i32 },
-	/// Take photo in direction with resolution
+	/// Takes a photo in a direction at a resolution.
 	TakePhoto { direction: String, resolution: u16 },
-	/// Enter standby mode (for low power situations)
+	/// Enters standby mode, for a low power situation.
 	#[default]
 	Standby,
 }
@@ -148,7 +153,7 @@ impl RoverCommand {
 			RoverCommand::TakePhoto { direction, resolution } => {
 				let mut params = Vec::new();
 				params.extend_from_slice(direction.as_bytes());
-				params.push(0); // Separator
+				params.push(0); // A zero byte ends the direction.
 				params.extend_from_slice(&resolution.to_be_bytes());
 				params
 			}
@@ -183,116 +188,161 @@ impl fmt::Display for RoverCommand {
 	}
 }
 
-// ============================================================================
-// Relay & Network Messages
-// ============================================================================
+// The relay servlet accepts these relay and network messages.
 
-/// Request for missing frames (Chain Gap recovery)
+/// A request for missing frames, which recovers a gap in the chain.
 #[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequest {
-	/// Hash of the last successfully received frame (chain head)
-	pub requester_head: [u8; 32],
-	/// Hash of the frame we received that indicated a gap
-	pub last_received_hash: [u8; 32],
+	/// The hash of the last frame received intact, which is the chain head.
+	pub requester_head: OctetString,
+	/// The hash of the received frame that revealed the gap.
+	pub last_received_hash: OctetString,
 }
 
-/// Response containing missing frames
+impl FrameRequest {
+	/// A request for the frames between `requester_head` and
+	/// `last_received_hash`.
+	///
+	/// # Errors
+	///
+	/// - [`tightbeam::der::Error`] -- a hash is longer than an OCTET STRING holds.
+	pub fn new(
+		requester_head: impl Into<Vec<u8>>,
+		last_received_hash: impl Into<Vec<u8>>,
+	) -> tightbeam::der::Result<Self> {
+		Ok(Self {
+			requester_head: OctetString::new(requester_head)?,
+			last_received_hash: OctetString::new(last_received_hash)?,
+		})
+	}
+}
+
+/// A response that carries the missing frames.
 #[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct FrameResponse {
 	pub frames: Vec<Frame>,
 }
 
-/// Message types that Relay servlet can handle (from Earth or Rover)
+/// The message types that the relay servlet accepts from Earth or the rover.
 #[derive(Beamable, Choice, Clone, Debug, PartialEq)]
 pub enum RelayMessage {
-	/// Command from Earth to be forwarded to Rover
+	/// A command from Earth that the relay forwards to the rover.
 	#[asn1(context_specific = "0", constructed = "true")]
 	Command(EarthCommand),
-	/// Telemetry from Rover to be forwarded to Earth
+	/// Telemetry from the rover that the relay forwards to Earth.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Telemetry(RoverTelemetry),
-	/// Acknowledgment from Rover to Earth
+	/// An acknowledgment from the rover to Earth.
 	#[asn1(context_specific = "2", constructed = "true")]
 	CommandAck(CommandAck),
-	/// Frame request from Earth
+	/// A frame request from a node whose chain shows a gap.
 	#[asn1(context_specific = "3", constructed = "true")]
 	FrameRequest(FrameRequest),
-	/// Frame response with missing frames
+	/// A frame response that carries the missing frames.
 	#[asn1(context_specific = "4", constructed = "true")]
 	FrameResponse(FrameResponse),
 }
 
-// ============================================================================
-// Message Chain Consensus
-// ============================================================================
+/// A relay message that takes a place in the chain of each node it crosses: a
+/// command, telemetry, or an ACK.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChainMessage {
+	/// A command from Earth that travels toward the rover.
+	Command(EarthCommand),
+	/// Telemetry from the rover that travels toward Earth.
+	Telemetry(RoverTelemetry),
+	/// An acknowledgment from the rover to Earth.
+	CommandAck(CommandAck),
+}
 
-/// Message chain state for a single node
+// Each node keeps a message chain, and the nodes reach consensus on it.
+
+/// The message chain state of one node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MessageChainState {
-	/// Hash of last message in chain
+	/// The hash of the last message in the chain.
 	pub last_hash: [u8; 32],
-	/// Sequence number
+	/// The sequence number of the last message in the chain.
 	pub sequence: u64,
-	/// Node identifier
+	/// The identifier of the node.
 	pub node_id: String,
 }
 
 impl MessageChainState {
+	/// The head of a chain that holds no frame.
+	pub const EMPTY_HEAD: [u8; 32] = [0u8; 32];
+
 	pub fn new(node_id: impl Into<String>) -> Self {
 		let node_id: String = node_id.into();
-		Self { last_hash: [0u8; 32], sequence: 0, node_id }
+		Self { last_hash: Self::EMPTY_HEAD, sequence: 0, node_id }
 	}
 
-	/// Update chain state with a new hash manually
-	/// NOTE: Available for manual chain state manipulation in test scenarios
+	/// Sets the chain head to `new_hash` and advances the sequence by one.
+	/// Test scenarios may call it to set the chain state by hand, so it can go
+	/// unused.
 	#[allow(dead_code)]
 	pub fn update(&mut self, new_hash: [u8; 32]) {
 		self.last_hash = new_hash;
-		self.sequence += 1;
+		self.sequence = self.sequence.saturating_add(1);
 	}
 
-	/// Validate frame against chain state
+	/// Validates `frame` against the chain state.
 	///
-	/// Checks:
-	/// 1. Frame order matches expected sequence
-	/// 2. Frame's previous_frame hash matches our last_hash (if sequence > 0)
+	/// The checks run in order:
+	/// 1. The frame order is the next sequence number.
+	/// 2. When the sequence is past 0, the `previous_frame` hash of the frame matches `last_hash`.
 	pub fn validate_frame(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		// Check sequence order
-		if frame.metadata().order() != self.sequence + 1 {
+		// At the last order `checked_add` gives `None`, so the check fails.
+		if Some(frame.metadata().order()) != self.sequence.checked_add(1) {
 			return Ok(false);
 		}
 
-		// For first frame (sequence 0), no previous hash to check
+		// The first frame, at sequence 0, has no previous hash.
 		if self.sequence == 0 {
 			return Ok(true);
 		}
 
-		// Verify previous_frame hash matches
 		if let Some(digest_info) = frame.metadata().previous_frame() {
 			let expected_hash = digest_info.digest.as_bytes();
 			Ok(expected_hash == self.last_hash.as_slice())
 		} else {
-			// Missing previous_frame when we expect one
+			// A frame past the first one must carry a `previous_frame` hash.
 			Ok(false)
 		}
 	}
 
-	/// Update chain state with new frame
+	/// Advances the chain state to `frame`.
 	///
-	/// Computes the frame's hash and updates the chain state
+	/// The chain head becomes the SHA3-256 hash of the frame's DER, and the
+	/// sequence becomes its order.
 	pub fn update_with_frame(&mut self, frame: &Frame) -> Result<(), TightBeamError> {
 		let frame_bytes = frame.to_der()?;
 		let frame_hash = Sha3_256::digest(&frame_bytes);
 
-		// Copy hash into our buffer
 		self.last_hash.copy_from_slice(&frame_hash);
 		self.sequence = frame.metadata().order();
 
 		Ok(())
 	}
+
+	/// Advances the chain state to `frame` when the frame extends it, and
+	/// reports whether it does.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the frame fails to encode for its hash.
+	pub fn extend(&mut self, frame: &Frame) -> Result<bool, TightBeamError> {
+		if !self.validate_frame(frame)? {
+			return Ok(false);
+		}
+
+		self.update_with_frame(frame)?;
+		Ok(true)
+	}
 }
 
-/// Consensus validator for 2/3 agreement on message chains
+/// A consensus validator that needs two of the three nodes to agree on the
+/// message chain.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConsensusValidator {
 	pub rover_state: MessageChainState,
@@ -301,8 +351,9 @@ pub struct ConsensusValidator {
 }
 
 impl ConsensusValidator {
-	/// Validate that at least 2/3 nodes agree on chain state
-	/// NOTE: Available for Byzantine fault tolerance validation in distributed scenarios
+	/// Whether at least two of the three nodes hold `new_hash` as their chain
+	/// head. Distributed scenarios may call it to check Byzantine fault
+	/// tolerance, so it can go unused.
 	#[allow(dead_code)]
 	pub fn validate(&self, new_hash: &[u8; 32]) -> bool {
 		let mut agreements = 0;
@@ -318,8 +369,8 @@ impl ConsensusValidator {
 		agreements >= 2
 	}
 
-	/// Get the number of nodes that agree on a hash
-	/// NOTE: Available for consensus quorum analysis
+	/// The number of nodes whose chain head is `hash`. Quorum analysis may call
+	/// it, so it can go unused.
 	#[allow(dead_code)]
 	pub fn agreement_count(&self, hash: &[u8; 32]) -> usize {
 		let mut count = 0;
@@ -343,5 +394,129 @@ impl Default for ConsensusValidator {
 			earth_state: MessageChainState::new("earth".to_string()),
 			relay_state: MessageChainState::new("relay".to_string()),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use tightbeam::der::{asn1::Any, Decode, Encode, Tag, Tagged};
+	use tightbeam::tb_cases;
+
+	use super::*;
+	use crate::dtn::storage::DtnPayload;
+	use crate::dtn::workers::messages::{InstrumentSelection, TelemetryBuildRequest};
+	use crate::dtn::workers::mission_control_telemetry_handler::NextCommand;
+
+	/// The tags of the fields of the SEQUENCE that `message` encodes to.
+	fn tags_of(message: &impl Encode) -> Vec<Tag> {
+		let encoding = message.to_der().expect("a DTN message encodes");
+		let fields = Vec::<Any>::from_der(&encoding).expect("a DTN message is a SEQUENCE");
+		fields.iter().map(Any::tag).collect()
+	}
+
+	/// `bytes` as an OCTET STRING.
+	fn octets(bytes: &[u8]) -> OctetString {
+		OctetString::new(bytes).expect("a short value fits an OCTET STRING")
+	}
+
+	/// A sample telemetry reading of the APXS.
+	fn sample_telemetry() -> RoverTelemetry {
+		RoverTelemetry::new(RoverInstrument::Apxs, b"STATUS:OK", 1, 85, -20).expect("a short reading fits")
+	}
+
+	/// A sample command that takes parameters.
+	fn sample_command() -> EarthCommand {
+		let command = RoverCommand::ProbeLocation { x: 100, y: 200 };
+		EarthCommand::new(command, MessagePriority::Standard, 1).expect("two coordinates fit")
+	}
+
+	/// A sample request for the frames past a gap.
+	fn sample_frame_request() -> FrameRequest {
+		FrameRequest::new([1; 32], [2; 32]).expect("two hashes fit")
+	}
+
+	/// A sample payload of the multi-hop tests.
+	fn sample_payload() -> DtnPayload {
+		DtnPayload::new(b"payload", "Earth", "Mars", 0).expect("a short payload fits")
+	}
+
+	/// A sample instrument selection with its sample data.
+	fn sample_selection() -> InstrumentSelection {
+		InstrumentSelection {
+			instrument: RoverInstrument::ChemCam,
+			instrument_name: "ChemCam".to_string(),
+			sample_data: octets(&[1, 2, 3]),
+		}
+	}
+
+	/// A sample request to build a telemetry reading.
+	fn sample_build_request() -> TelemetryBuildRequest {
+		TelemetryBuildRequest {
+			instrument: RoverInstrument::Mastcam,
+			data: octets(&[1, 2, 3]),
+			mission_time_ms: 1,
+		}
+	}
+
+	/// A sample next command of Mission Control.
+	fn sample_next_command() -> NextCommand {
+		NextCommand {
+			command: 1,
+			parameters: octets(&[0, 0, 0, 100]),
+			priority: MessagePriority::Standard,
+		}
+	}
+
+	// Each byte field of a DTN message encodes as an OCTET STRING, so the tags
+	// of a message's fields are its schema.
+	tb_cases! {
+		fn a_message_encodes_its_bytes_as_octet_strings((tags, schema): (Vec<Tag>, Vec<Tag>)) {
+			assert_eq!(tags, schema);
+		}
+		cases {
+			rover_telemetry => (
+				tags_of(&sample_telemetry()),
+				vec![Tag::Integer, Tag::OctetString, Tag::Integer, Tag::Integer, Tag::Integer],
+			),
+			earth_command => (
+				tags_of(&sample_command()),
+				vec![Tag::Integer, Tag::OctetString, Tag::Enumerated, Tag::Integer],
+			),
+			frame_request => (tags_of(&sample_frame_request()), vec![Tag::OctetString, Tag::OctetString]),
+			dtn_payload => (
+				tags_of(&sample_payload()),
+				vec![Tag::OctetString, Tag::Utf8String, Tag::Utf8String, Tag::Integer],
+			),
+			instrument_selection => (
+				tags_of(&sample_selection()),
+				vec![Tag::Enumerated, Tag::Utf8String, Tag::OctetString],
+			),
+			telemetry_build_request => (
+				tags_of(&sample_build_request()),
+				vec![Tag::Enumerated, Tag::OctetString, Tag::Integer],
+			),
+			next_command => (tags_of(&sample_next_command()), vec![Tag::Integer, Tag::OctetString, Tag::Enumerated]),
+		}
+	}
+
+	/// A chain at the last order refuses each next frame.
+	#[test]
+	fn a_chain_at_the_last_order_refuses_a_frame() -> Result<(), TightBeamError> {
+		let mut chain = MessageChainState::new("node");
+		chain.sequence = u64::MAX;
+
+		let frame = tightbeam::compose! { V0: id: "frame-1", order: 1, message: sample_payload() }?;
+		assert!(!chain.validate_frame(&frame)?);
+		Ok(())
+	}
+
+	/// An update at the last order leaves the sequence there.
+	#[test]
+	fn an_update_at_the_last_order_leaves_the_sequence_there() -> Result<(), TightBeamError> {
+		let mut chain = MessageChainState::new("node");
+		chain.sequence = u64::MAX;
+		chain.update([1; 32]);
+		assert_eq!(chain.sequence, u64::MAX);
+		Ok(())
 	}
 }

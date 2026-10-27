@@ -11,8 +11,8 @@ use crate::{cms::signed_data::EncapsulatedContentInfo, error::CompressionResult,
 
 #[cfg(feature = "zstd")]
 use crate::{
-	cms::content_info::CmsVersion, constants::DEFAULT_MAX_DECOMPRESSED_LEN, error::CompressionError,
-	oids::COMPRESSION_CONTENT, spki::AlgorithmIdentifierOwned,
+	cms::content_info::CmsVersion, constants::DEFAULT_MAX_DECOMPRESSED_LEN, error::CompressionError, oids::DATA,
+	spki::AlgorithmIdentifierOwned,
 };
 
 pub use crate::core::Inflator;
@@ -55,8 +55,9 @@ pub trait Compressor {
 	/// [`CompressedData`] metadata.
 	///
 	/// `content_info` names the encapsulated content. When it is `None`, the
-	/// implementation picks its own default, which is [`COMPRESSION_CONTENT`]
-	/// for [`ZstdCompression`].
+	/// implementation picks its own default, which is `id-data` for
+	/// [`ZstdCompression`], the type of the frame body it compresses (RFC 3274
+	/// §1.1).
 	///
 	/// # Errors
 	///
@@ -109,7 +110,8 @@ impl ZstdCompression {
 	/// libzstd sizes its stream buffers from the declared window before it
 	/// produces any output, and admits up to 128 MiB by default.
 	fn window_log_max(&self) -> u32 {
-		let ceil_log2 = usize::BITS - self.max_output.saturating_sub(1).leading_zeros();
+		let window = self.max_output.checked_next_power_of_two();
+		let ceil_log2 = window.map_or(usize::BITS, usize::trailing_zeros);
 		ceil_log2.clamp(ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX)
 	}
 }
@@ -126,7 +128,7 @@ impl Compressor for ZstdCompression {
 
 		let compression_alg = AlgorithmIdentifierOwned::from(self);
 		let encap_content_info =
-			content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: COMPRESSION_CONTENT, econtent: None });
+			content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: DATA, econtent: None });
 		let compressed_data = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
 
 		Ok((output, compressed_data))
@@ -150,11 +152,12 @@ impl Inflator for ZstdCompression {
 		loop {
 			let consumed = input.pos;
 			let produced = out.len();
-			if produced >= ceiling {
+			let room = ceiling.saturating_sub(produced);
+			if room == 0 {
 				return Err(CompressionError::OutputLimitExceeded(self.max_output).into());
 			}
 			if out.capacity() == produced {
-				out.reserve(RESERVE_HINT.min(ceiling - produced));
+				out.reserve(RESERVE_HINT.min(room));
 			}
 
 			let remaining = {
@@ -185,7 +188,7 @@ impl Inflator for ZstdCompression {
 		// Octets past the frame belong to a second container, such as a
 		// skippable frame or a seekable-format seek table.
 		if input.pos != data.len() {
-			return Err(CompressionError::TrailingBytes(data.len() - input.pos).into());
+			return Err(CompressionError::TrailingBytes(data.len().abs_diff(input.pos)).into());
 		}
 
 		Ok(out)
@@ -216,6 +219,40 @@ mod tests {
 		let data = vec![0u8; len];
 		let (compressed, _) = ZstdCompression::default().compress(&data, None)?;
 		Ok(compressed)
+	}
+
+	/// The frame body is opaque data, so its `CompressedData` names `id-data`,
+	/// `1.2.840.113549.1.7.1` (RFC 5652 §4), as the type of the content it
+	/// compresses (RFC 3274 §1.1).
+	#[test]
+	fn a_compressed_body_declares_id_data() -> Result<()> {
+		let (_, compressed_data) = ZstdCompression::default().compress(b"frame body", None)?;
+		let declared = compressed_data.encap_content_info.econtent_type;
+		assert_eq!(declared, crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1"));
+		Ok(())
+	}
+
+	#[test]
+	fn compress_then_decompress_round_trips() -> Result<()> {
+		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+		let big_repeat = vec![b'a'; 16 * 1024];
+		let cases: Vec<&[u8]> = vec![
+			b"",
+			b"a",
+			b"hello world",
+			b"The quick brown fox jumps over the lazy dog",
+			&patterned,
+			&big_repeat,
+		];
+
+		let compressor = ZstdCompression::default();
+		for &data in &cases {
+			let (compressed, _info) = compressor.compress(data, None)?;
+			let decompressed = compressor.decompress(&compressed)?;
+			assert_eq!(decompressed, data);
+		}
+
+		Ok(())
 	}
 
 	#[test]

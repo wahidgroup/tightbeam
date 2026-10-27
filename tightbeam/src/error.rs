@@ -14,7 +14,7 @@ pub type Result<T> = core::result::Result<T, TightBeamError>;
 #[cfg(feature = "compress")]
 pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 
-/// Error indicating a mismatch between received and expected values.
+/// An error that reports a mismatch between a received and an expected value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ReceivedExpectedError<Received, Expected> {
 	/// The value that arrived.
@@ -44,8 +44,7 @@ pub enum CompressionError {
 	#[cfg(feature = "zstd")]
 	/// The zstd codec refused the frame, reported as its numeric code.
 	///
-	/// `zstd_safe::get_error_name` renders the code as zstd's own name for
-	/// the condition.
+	/// `zstd_safe::get_error_name` gives zstd's own name for the code.
 	#[error("ZSTD compression/decompression error: code {0}")]
 	ZSTD(usize),
 
@@ -83,35 +82,34 @@ pub enum CompressionError {
 	OutputLimitExceeded(usize),
 }
 
-/// Trait for injected faults in testing.
+/// An error that a test injects as a fault.
 #[cfg(feature = "testing-fault")]
 pub trait InjectedError: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
 #[cfg(feature = "testing-fault")]
 impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
-/// Several errors collected from one operation.
+/// The errors collected from one operation.
 ///
-/// Rendering the list is behavior of the collection, so the chain owns it
-/// through its `Display` impl. Every [`TightBeamError`] message therefore
-/// stays a single format string.
+/// The chain owns the rendering of the list through its `Display` impl, so
+/// every [`TightBeamError`] message stays a single format string.
 #[derive(Debug)]
 pub struct ErrorChain(Vec<TightBeamError>);
 
 impl ErrorChain {
-	/// The collected errors, in the order they were reported.
+	/// Returns the collected errors, in the order they were reported.
 	#[must_use]
 	pub fn as_slice(&self) -> &[TightBeamError] {
 		&self.0
 	}
 
-	/// How many errors the chain holds.
+	/// Returns the number of errors the chain holds.
 	#[must_use]
 	pub fn len(&self) -> usize {
 		self.0.len()
 	}
 
-	/// Whether the chain holds no error.
+	/// Returns whether the chain holds no error.
 	#[must_use]
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()
@@ -172,8 +170,8 @@ pub enum TightBeamError {
 
 	/// A cluster gateway reported an error.
 	///
-	/// The error is boxed because a cluster error can carry a frame error in
-	/// turn. `From<ClusterError>` boxes a cluster error into this variant.
+	/// `From<ClusterError>` boxes a cluster error into this variant, because a
+	/// cluster error can carry a frame error in turn.
 	#[cfg(feature = "colony")]
 	#[error("Cluster error: {0}")]
 	#[source]
@@ -248,7 +246,7 @@ pub enum TightBeamError {
 	/// URN validation failed.
 	#[error("URN validation error: {0}")]
 	#[source]
-	UrnValidationError(crate::utils::urn::UrnValidationError),
+	UrnValidationError(crate::urn::UrnValidationError),
 
 	/// Encryption or decryption failed.
 	#[cfg(feature = "aead")]
@@ -262,17 +260,30 @@ pub enum TightBeamError {
 	#[source]
 	InvalidKeyLength(crypto_common::InvalidLength),
 
-	/// An ECIES operation failed.
-	#[cfg(feature = "ecies")]
-	#[error("ECIES error: {0}")]
+	/// An HPKE operation failed.
+	#[cfg(feature = "hpke")]
+	#[error("HPKE error: {0}")]
 	#[source]
-	EciesError(crate::crypto::ecies::EciesError),
+	HpkeError(crate::crypto::hpke::HpkeError),
+
+	/// An authenticated envelope failed to seal, or refused to open.
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	#[error("Authenticated envelope error: {0}")]
+	#[source]
+	EnvelopeError(crate::crypto::cms::EnvelopeError),
 
 	/// Certificate validation failed.
 	#[cfg(feature = "x509")]
 	#[error("Certificate validation error: {0}")]
 	#[source]
 	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
+
+	/// A key list, such as a pin list or a peer list, refused an entry it
+	/// was built from.
+	#[cfg(feature = "x509")]
+	#[error("Key list error: {0}")]
+	#[source]
+	KeyListError(crate::crypto::x509::KeyListError),
 
 	/// Key derivation failed.
 	#[cfg(feature = "kdf")]
@@ -298,7 +309,7 @@ pub enum TightBeamError {
 	#[source]
 	SpkiError(crate::spki::Error),
 
-	/// Building an X.509 certificate failed.
+	/// The X.509 certificate builder failed.
 	#[cfg(feature = "builder")]
 	#[error("X.509 builder error: {0}")]
 	#[source]
@@ -313,6 +324,14 @@ pub enum TightBeamError {
 	#[cfg(feature = "signature")]
 	#[error("Signature encoding error")]
 	SignatureEncodingError,
+
+	/// A CMS signature or `SignedData` breaks a rule of the CMS signer: its
+	/// signer, version, signed attributes, `digestAlgorithms`, or content, or
+	/// a key that differs from its certificate or has no supported algorithm.
+	#[cfg(feature = "signature")]
+	#[error("CMS signer error: {0}")]
+	#[source]
+	Signer(crate::crypto::sign::SignerError),
 
 	/// The metadata is invalid.
 	#[error("Invalid metadata")]
@@ -342,11 +361,10 @@ pub enum TightBeamError {
 	#[error("Missing feature: {0}")]
 	MissingFeature(&'static str),
 
-	/// A message type's marker requires a protection the builder was not
-	/// given.
+	/// A message type's marker requires a protection that the builder lacks.
 	///
-	/// `marker` names the [`Message`](crate::core::Message) constant and
-	/// `call` the builder method that satisfies it.
+	/// `marker` names the [`Message`](crate::core::Message) constant, and
+	/// `call` names the builder method that satisfies it.
 	#[error("{marker} requires {call} before build")]
 	MissingProtection { marker: &'static str, call: &'static str },
 
@@ -360,8 +378,8 @@ pub enum TightBeamError {
 	#[error("Work refused: {0:?}")]
 	WorkRefused(crate::policy::TransitStatus),
 
-	/// The channel closed because the receiving end was dropped before the
-	/// send.
+	/// The other end of a channel is gone: the receiving end dropped before a
+	/// send, or the sending end dropped before it sent.
 	#[error("Channel closed")]
 	ChannelClosed,
 
@@ -380,31 +398,31 @@ pub enum TightBeamError {
 	#[error("Missing encryption info")]
 	MissingEncryptionInfo,
 
-	/// The AEAD nonce length does not match the nonce size of the cipher.
-	#[cfg(feature = "aead")]
-	#[error("Invalid AEAD nonce length: {0}")]
-	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
-
 	/// The commitment salt is shorter than the hiding floor.
 	#[cfg(feature = "digest")]
 	#[error("Invalid commitment salt length: {0}")]
 	InvalidSaltLength(ReceivedExpectedError<usize, usize>),
 
-	/// The send-direction AEAD counter nonce space is exhausted.
+	/// The send-direction record sequence space is exhausted.
 	#[cfg(feature = "aead")]
-	#[error("AEAD counter nonce space exhausted")]
+	#[error("Record sequence space exhausted")]
 	NonceExhausted,
 
-	/// The send-direction AEAD record limit is reached (RFC 9846 § 5.5).
+	/// The record limit of one directional key is reached (RFC 9846 § 5.5).
 	#[cfg(feature = "aead")]
-	#[error("AEAD record limit reached: reestablish the session to rekey")]
+	#[error("Record limit reached: reestablish the session to rekey")]
 	RekeyRequired,
 
-	/// The received AEAD counter nonce is not the exact next in sequence, which
-	/// signals a replay, a reorder, or a deletion.
+	/// A received record carries another sequence number than the exact
+	/// next, which signals a replay, a reorder, or a deletion.
 	#[cfg(feature = "aead")]
-	#[error("Out-of-sequence AEAD nonce: {0}")]
+	#[error("Out-of-sequence record: {0}")]
 	NonceReplayed(ReceivedExpectedError<u64, u64>),
+
+	/// A received record carries another epoch than the key that opens it.
+	#[cfg(feature = "aead")]
+	#[error("Record of another epoch: {0}")]
+	RecordEpoch(ReceivedExpectedError<u32, u32>),
 
 	/// The integrity info is missing.
 	#[cfg(feature = "digest")]
@@ -443,7 +461,7 @@ pub enum TightBeamError {
 	#[error("Task join failed")]
 	JoinError,
 
-	/// Several errors were collected together.
+	/// One operation collected the errors that the chain holds.
 	#[error("Multiple errors occurred: {0}")]
 	Sequence(ErrorChain),
 
@@ -455,7 +473,7 @@ pub enum TightBeamError {
 
 crate::impl_from!(der::Error => TightBeamError::SerializationError);
 crate::impl_from!(crate::matrix::MatrixError => TightBeamError::MatrixError);
-crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnValidationError);
+crate::impl_from!(crate::urn::UrnValidationError => TightBeamError::UrnValidationError);
 
 #[cfg(feature = "std")]
 crate::impl_from!(std::string::FromUtf8Error => TightBeamError::IoError via |err| std::io::Error::new(std::io::ErrorKind::InvalidData, err));
@@ -493,6 +511,8 @@ crate::impl_from!(rand_core::Error => TightBeamError::OsRngError);
 #[cfg(feature = "x509")]
 crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => TightBeamError::CertificateValidationError);
 #[cfg(feature = "x509")]
+crate::impl_from!(crate::crypto::x509::KeyListError => TightBeamError::KeyListError);
+#[cfg(feature = "x509")]
 crate::impl_from!(spki::Error => TightBeamError::SpkiError);
 #[cfg(feature = "builder")]
 crate::impl_from!(x509_cert::builder::Error => TightBeamError::X509BuilderError);
@@ -504,8 +524,10 @@ crate::impl_from!(std::io::Error => CompressionError::IO);
 crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
 #[cfg(feature = "aead")]
 crate::impl_from!(crypto_common::InvalidLength => TightBeamError::InvalidKeyLength);
-#[cfg(feature = "ecies")]
-crate::impl_from!(crate::crypto::ecies::EciesError => TightBeamError::EciesError);
+#[cfg(feature = "hpke")]
+crate::impl_from!(crate::crypto::hpke::HpkeError => TightBeamError::HpkeError);
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+crate::impl_from!(crate::crypto::cms::EnvelopeError => TightBeamError::EnvelopeError);
 #[cfg(feature = "signature")]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);
 #[cfg(feature = "signature")]
@@ -514,15 +536,29 @@ crate::impl_from!(crate::crypto::sign::elliptic_curve::Error => TightBeamError::
 crate::impl_from!(crate::testing::error::TestingError => TightBeamError::TestingError);
 #[cfg(feature = "std")]
 crate::impl_from!(std::sync::mpsc::RecvTimeoutError => TightBeamError::RecvTimeoutError discard);
+#[cfg(feature = "std")]
+crate::impl_from!(crate::runtime::ChannelClosed => TightBeamError::ChannelClosed discard);
 
 #[cfg(feature = "transport")]
 impl TightBeamError {
-	/// Whether this error is a fuzz iteration running out of input.
+	/// Wraps a protocol error as this crate's transport error.
 	///
-	/// AFL feeds short inputs constantly. An iteration whose oracle ran out of
-	/// bytes before the process reached a terminal state exercised a prefix of
-	/// a run, so its trace is incomplete and its assertions describe events
-	/// the target was never given the input to reach.
+	/// A protocol reports its own error type, bound to convert into
+	/// [`TransportError`], so the cluster and servlet bind sites map through
+	/// this one constructor.
+	///
+	/// [`TransportError`]: crate::transport::error::TransportError
+	#[must_use]
+	pub fn transport(error: impl Into<crate::transport::error::TransportError>) -> Self {
+		let transport = error.into();
+		Self::TransportError(transport)
+	}
+
+	/// Returns whether this error is a fuzz iteration running out of input.
+	///
+	/// AFL feeds short inputs constantly. An iteration whose oracle runs out of
+	/// bytes before a terminal state exercises only a prefix, so its trace is
+	/// incomplete and its assertions describe events its input never reached.
 	#[must_use]
 	pub fn is_fuzz_input_exhausted(&self) -> bool {
 		#[cfg(feature = "testing")]
@@ -539,40 +575,68 @@ impl TightBeamError {
 		}
 	}
 
-	/// Terminal status a service failure answers a peer with.
+	/// Returns the terminal status that a service failure answers a peer with.
 	///
-	/// A failure already carrying a transit status keeps it. Anything else
-	/// answers [`TransitStatus::Internal`], so a peer tells a failure apart
-	/// from an accepted empty reply and the failure stays attributable.
+	/// - A failure that carries a transit status keeps it, apart from [`TransitStatus::Unavailable`].
+	/// - A carried `Unavailable` answers [`TransitStatus::Unknown`], because
+	///   the handler ran until it failed. A peer reads `Unavailable` as a
+	///   gate's refusal before any handler ran, and a gateway retries that
+	///   frame on another instance.
+	/// - A kind or an operation that the endpoint leaves out answers [`TransitStatus::Unimplemented`].
+	/// - Any other failure answers [`TransitStatus::Internal`], so a peer
+	///   tells a failure apart from an accepted empty reply and the failure
+	///   stays attributable.
 	///
 	/// [`TransitStatus::Internal`]: crate::policy::TransitStatus::Internal
+	/// [`TransitStatus::Unavailable`]: crate::policy::TransitStatus::Unavailable
+	/// [`TransitStatus::Unimplemented`]: crate::policy::TransitStatus::Unimplemented
+	/// [`TransitStatus::Unknown`]: crate::policy::TransitStatus::Unknown
 	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {
 		use crate::policy::TransitStatus;
 
-		if let TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(failure)) = self {
-			return TransitStatus::try_from(*failure).unwrap_or(TransitStatus::Internal);
-		}
+		let TightBeamError::TransportError(error) = self else {
+			return TransitStatus::Internal;
+		};
 
-		TransitStatus::Internal
+		error.failure_status()
 	}
 
-	/// The refusal behind every [`MuxService`] default.
+	/// Returns the refusal behind every [`MuxService`] default: the kind or
+	/// the operation that a call names is not served, which a peer reads as
+	/// `Unimplemented`.
 	///
-	/// [`MuxService`]: crate::transport::serve::MuxService
+	/// [`MuxService`]: crate::transport::multiplex::MuxService
 	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn unimplemented() -> Self {
-		use crate::policy::TransitStatus;
-		use crate::transport::TransportError;
-
-		TransportError::from(TransitStatus::Unimplemented).into()
+		crate::transport::TransportError::NotServed.into()
 	}
 }
 
-// A generic source type cannot go through impl_from!, so the unit-variant
-// conversion is written out.
+/// The signer's encoding, key, certificate, signature, and algorithm failures
+/// map to the variants this enum names for them, so a caller matches one
+/// variant per cause whichever path it took.
+#[cfg(feature = "signature")]
+impl From<crate::crypto::sign::SignerError> for TightBeamError {
+	fn from(err: crate::crypto::sign::SignerError) -> Self {
+		use crate::crypto::sign::SignerError;
+
+		match err {
+			SignerError::Encoding(err) => TightBeamError::SerializationError(err),
+			SignerError::PublicKey(err) => TightBeamError::SpkiError(err),
+			SignerError::Key(err) => TightBeamError::KeyError(err),
+			SignerError::Certificate(err) => TightBeamError::CertificateValidationError(err),
+			SignerError::Signature(err) => TightBeamError::SignatureError(err),
+			SignerError::UnexpectedAlgorithm(algorithms) => TightBeamError::UnexpectedAlgorithm(algorithms),
+			other => TightBeamError::Signer(other),
+		}
+	}
+}
+
+// A generic source type cannot go through `impl_from!`, so this impl writes
+// the unit-variant conversion out.
 #[cfg(feature = "std")]
 impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
@@ -583,6 +647,10 @@ impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 #[cfg(all(test, feature = "std"))]
 mod tests {
 	use super::*;
+	#[cfg(feature = "x509")]
+	use crate::crypto::x509::{policy::PublicKeyPinning, KeyListError};
+	#[cfg(pooled_mux)]
+	use crate::policy::TransitStatus;
 
 	#[test]
 	fn source_annotated_wrappers_expose_their_cause() {
@@ -612,5 +680,63 @@ mod tests {
 	fn unit_variants_have_no_source() {
 		let err = TightBeamError::InvalidBody;
 		assert!(core::error::Error::source(&err).is_none());
+	}
+
+	/// A runtime channel whose other end is gone converts into the channel
+	/// error of the crate, so `?` carries the fact under one name.
+	#[test]
+	fn a_closed_runtime_channel_converts_into_the_channel_error() -> Result<()> {
+		let converted = TightBeamError::from(crate::runtime::ChannelClosed);
+		assert!(matches!(converted, TightBeamError::ChannelClosed));
+		Ok(())
+	}
+
+	/// A protocol error converts into the transport error it names, and the
+	/// crate error carries the converted error.
+	#[cfg(all(feature = "transport", feature = "policy"))]
+	#[test]
+	fn transport_wraps_the_converted_protocol_error() {
+		use crate::policy::TransitStatus;
+		use crate::transport::error::TransportError;
+
+		let err = TightBeamError::transport(TransitStatus::Unimplemented);
+		let carries_the_failure = matches!(err, TightBeamError::TransportError(TransportError::OperationFailed(_)));
+		assert!(carries_the_failure);
+	}
+
+	/// A pin list's refusal reaches the crate error under its own name, so a
+	/// caller propagates it with `?` wherever `x509` builds.
+	#[cfg(feature = "x509")]
+	#[test]
+	fn a_key_list_refusal_propagates_under_its_own_name() {
+		fn pinned(pins: &[&[u8]]) -> Result<PublicKeyPinning> {
+			Ok(PublicKeyPinning::new(pins)?)
+		}
+
+		let refused = pinned(&[b"no SubjectPublicKeyInfo"]);
+
+		let expected = KeyListError::Unreadable { index: 0 };
+		let unreadable = matches!(refused, Err(TightBeamError::KeyListError(found)) if found == expected);
+		assert!(unreadable);
+	}
+
+	// A handler's failure keeps the status it carries, apart from
+	// `Unavailable`, which a peer reads as a refusal before any handler ran.
+	// A failure that carries no status answers `Internal`.
+	#[cfg(pooled_mux)]
+	crate::tb_cases! {
+		fn failure_status_of((failure, expected): (TightBeamError, TransitStatus)) {
+			let status = failure.failure_status();
+			assert_eq!(status, expected);
+		}
+
+		cases {
+			a_carried_unavailable_is_unknown => (TransitStatus::Unavailable.refusal(), TransitStatus::Unknown),
+			a_carried_refusal_keeps_its_status => (
+				TransitStatus::PermissionDenied.refusal(),
+				TransitStatus::PermissionDenied
+			),
+			a_failure_with_no_status_is_internal => (TightBeamError::InvalidBody, TransitStatus::Internal),
+		}
 	}
 }

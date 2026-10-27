@@ -1,0 +1,12 @@
+error: `max_connections` takes one cap: `max_connections: [ n ]`
+  --> tests/compile/server_max_connections_two_caps.rs:8:16
+   |
+ 8 |       let _server = server! {
+   |  ___________________^
+ 9 | |         protocol TokioListener: listener,
+10 | |         policies: { max_connections: [ 1, 2 ] },
+11 | |         handle: move |frame: Frame| async move { Ok(Some(frame)) }
+12 | |     };
+   | |_____^
+   |
+   = note: this error originates in the macro `$crate::server` which comes from the expansion of the macro `server` (in Nightly builds, run with -Z macro-backtrace for more info)

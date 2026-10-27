@@ -1,22 +1,20 @@
 //! Client-side submission of cluster work.
 //!
-//! The unary work plane is request-reply. The client nests its complete
-//! end-to-end [`Frame`] in a [`ClusterWorkRequest`], the gateway delivers
-//! those bytes to the servlet unmodified, and the servlet's complete
-//! response frame comes back the same way. [`SubmitWork`] hides the
-//! hop-local transport wrapper and the response envelope, so a caller
-//! sends one frame and receives one frame.
+//! The unary work plane is request-reply. [`SubmitWork`] nests the client's
+//! complete end-to-end [`Frame`] in a hop-local [`ClusterWorkRequest`] and
+//! unwraps the [`ClusterWorkResponse`] envelope of the reply. A caller sends
+//! one frame and receives the servlet's complete response frame.
 //!
 //! The returned frame is the servlet's end-to-end envelope. Verify its
-//! signature with [`Frame::verify`] before trusting the message body.
+//! signature with [`Frame::verify`] before you trust the message body.
 
 use crate::asn1::Frame;
-use crate::colony::common::messages::{ClusterWorkRequest, ClusterWorkResponse};
+use crate::colony::protocol::{ClusterWorkRequest, ClusterWorkResponse};
 use crate::error::TightBeamError;
 use crate::transport::client::GenericClient;
 use crate::transport::protocols::Protocol;
 use crate::transport::MessageEmitter;
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 use core::hash::Hash;
 
@@ -29,19 +27,17 @@ use crate::transport::MessageCollector;
 /// Submit unary work to a cluster gateway and receive the servlet's
 /// complete response frame.
 ///
-/// Implemented by the transport clients, so work submission is one
-/// method call on an established connection. A refusal surfaces as
+/// The transport clients implement it, so work submission is one method
+/// call on an established connection. A refusal surfaces as
 /// [`TightBeamError::WorkRefused`] with the gateway's transit status.
 pub trait SubmitWork {
-	/// Send `work` (the client's complete end-to-end frame) to the
-	/// servlet type addressed by `servlet_type` and return the
-	/// servlet's complete response frame.
+	/// Sends `work`, the client's complete end-to-end frame, to the servlet
+	/// type `servlet_type` and returns the servlet's complete response frame.
 	///
-	/// The gateway forwards `work` byte-for-byte, so its signature,
-	/// integrity, and previous-frame linkage stay verifiable at the
-	/// servlet. The returned frame is the servlet's envelope with the
-	/// same fidelity in the other direction. Verify it with
-	/// [`Frame::verify`] before decoding the message body.
+	/// The gateway forwards `work` and the servlet's reply byte-for-byte, so
+	/// the signature, integrity, and previous-frame linkage of each frame stay
+	/// verifiable at its receiver. Verify the reply with [`Frame::verify`]
+	/// before you decode the message body.
 	#[allow(async_fn_in_trait)]
 	async fn submit_work_to(&mut self, servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError>;
 }

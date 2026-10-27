@@ -1,27 +1,29 @@
-//! Oracle-driven action loop for the colony AFL harness.
+//! The oracle-driven action loop of the colony AFL harness.
 
 use core::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tightbeam::colony::cluster::{Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
+use tightbeam::colony::cluster::Cluster;
+use tightbeam::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::CertificateTrust;
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::x509::{CanonicalKey, CertificateSpec};
 use tightbeam::decode;
+use tightbeam::der::Encode;
 use tightbeam::policy::TransitStatus;
-use tightbeam::testing::fuzz::OracleAccess;
+use tightbeam::testing::fuzz::{FuzzTraceCollector, OracleAccess};
 use tightbeam::testing::routes::RoutedOpens;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::client::pool::{ConnectionPool, PoolConfig};
+use tightbeam::transport::client::{ConnectionPool, PoolConfig};
 use tightbeam::transport::error::{TransportError, TransportFailure};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::{RequestSink, StreamRoute};
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, PooledClient, Protocol};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
 use crate::control::{advertise_peer_at, advertise_peer_types, CONTROL_ORDER_BASE};
@@ -33,8 +35,8 @@ use crate::servlets::{PingRequest, PingResponse};
 use crate::shadow::{AccessAttempt, Prediction};
 use crate::topology::{ColonyTopology, OrgNode};
 
-/// The client I/O budget, sized above typical local emit latency so allowed
-/// work resolves as success or deny rather than racing a timeout.
+/// The client I/O budget. It sits above the local emit latency, so allowed
+/// work resolves as a success or a deny before the timeout ends it.
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// The classified unary or stream outcome for the security oracle.
@@ -48,8 +50,9 @@ pub(crate) enum AuthzClass {
 	InfraFail = 3,
 }
 
-/// Runs oracle-selected actions until the byte or action caps are hit.
-pub(crate) async fn run_actions(trace: &TraceCollector, topo: &mut ColonyTopology) -> Result<(), TightBeamError> {
+/// Runs oracle-selected actions until it hits the byte cap or the action cap.
+pub(crate) async fn run_actions(fuzz: &FuzzTraceCollector, topo: &mut ColonyTopology) -> Result<(), TightBeamError> {
+	let trace = fuzz.collector();
 	let mut actions = 0u64;
 	let mut order = 1u64;
 	let mut control_order = CONTROL_ORDER_BASE;
@@ -59,7 +62,7 @@ pub(crate) async fn run_actions(trace: &TraceCollector, topo: &mut ColonyTopolog
 			break;
 		}
 
-		let oracle = trace.oracle();
+		let oracle = fuzz.oracle();
 		if !oracle.fuzz_has_bytes(2).unwrap_or(false) {
 			break;
 		}
@@ -120,9 +123,9 @@ fn ijon_action(opcode: u8, selector: u8) {
 	}
 }
 
-/// IJON code for a shadow prediction. `Unmodeled` gets a neutral value
-/// so the coverage map does not misattribute those runs to either
-/// oracle direction.
+/// The IJON code of a shadow prediction. `Unmodeled` gets a neutral value,
+/// so the coverage map keeps those runs apart from both oracle
+/// directions.
 fn prediction_code(predicted: Prediction) -> u32 {
 	match predicted {
 		Prediction::Deny => 0,
@@ -158,18 +161,20 @@ fn pick_org_ref(topo: &ColonyTopology, idx: u8) -> &OrgNode {
 	}
 }
 
-/// Fixture-encoded SPKI DER borrowed from the identity bundle. Callers
-/// that need ownership (ACL mutation, CSR payloads) copy it themselves.
-fn org_spki(org: &OrgNode) -> &[u8] {
-	org.certs.spki.as_ref()
+/// The canonical key the fixtures read once, borrowed from the identity
+/// bundle, or `None` for an identity whose key the fixtures could not read.
+/// Such an identity matches no session, so a mutation of its grants or its
+/// gate changes no verdict.
+fn org_key(org: &OrgNode) -> Option<&CanonicalKey> {
+	org.certs.canonical.as_ref()
 }
 
 fn mutate_export(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<(), TightBeamError> {
 	let target = target_urn(selector);
 	if selector & 1 == 0 {
-		org.exports.insert(target);
+		org.exports.insert(target)?;
 	} else {
-		org.exports.remove(&target);
+		org.exports.remove(&target)?;
 	}
 
 	trace.event(events::EXPORT_MUTATED)?;
@@ -178,12 +183,14 @@ fn mutate_export(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<
 
 fn mutate_grant(trace: &TraceCollector, topo: &ColonyTopology, selector: u8) -> Result<(), TightBeamError> {
 	let target = target_urn(selector);
-	let grantee_spki = org_spki(pick_org_ref(topo, selector >> 2));
+	let grantee = org_key(pick_org_ref(topo, selector >> 2));
 	let org = pick_org_ref(topo, selector);
-	if selector & 1 == 0 {
-		org.acl.grant(grantee_spki, &target);
-	} else {
-		org.acl.revoke_grant(grantee_spki, &target);
+	if let Some(grantee) = grantee {
+		if selector & 1 == 0 {
+			org.acl.grant(grantee, &target);
+		} else {
+			org.acl.revoke_grant(grantee, &target);
+		}
 	}
 
 	trace.event(events::GRANT_MUTATED)?;
@@ -191,11 +198,12 @@ fn mutate_grant(trace: &TraceCollector, topo: &ColonyTopology, selector: u8) -> 
 }
 
 fn mutate_gate(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<(), TightBeamError> {
-	let spki = org_spki(org);
-	if selector & 1 == 0 {
-		org.acl.deny(spki);
-	} else {
-		org.acl.allow(spki);
+	if let Some(key) = org_key(org) {
+		if selector & 1 == 0 {
+			org.acl.deny(key);
+		} else {
+			org.acl.allow(key);
+		}
 	}
 
 	trace.event(events::GATE_MUTATED)?;
@@ -219,7 +227,7 @@ async fn connect_with_identity(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
-		.with_client_identity(ClientIdentity::from_spec(cert, key)?)
+		.with_client_identity(SigningIdentity::from_spec(cert, key)?)
 		.build()
 		.connect(addr.to_owned())
 		.await?)
@@ -252,7 +260,7 @@ async fn pooled_client(
 			.with_config(config)
 			.with_timeout(CLIENT_IO_TIMEOUT)
 			.with_trust_store(Arc::clone(&identity.trust))
-			.with_client_identity(ClientIdentity::from_spec(cert, key)?)
+			.with_client_identity(SigningIdentity::from_spec(cert, key)?)
 			.with_trace(trace.share())
 			.build(),
 	);
@@ -387,8 +395,8 @@ async fn emit_cluster_work(
 
 /// Predicts one hop against `org`'s export boundary through its shadow.
 ///
-/// SPKI DER is borrowed from the identity bundle, encoded once in the
-/// fixtures rather than re-encoded per prediction.
+/// It borrows the canonical key from the identity bundle, which the
+/// fixtures read once for every prediction.
 fn shadow_predict(
 	org: &OrgNode,
 	target: &Urn<'static>,
@@ -398,7 +406,7 @@ fn shadow_predict(
 	org.predict(&AccessAttempt {
 		target,
 		caller_cert: identity.map(|id| id.cert.as_ref()),
-		caller_spki: identity.map(|id| id.spki.as_ref()),
+		caller_key: identity.and_then(|id| id.canonical.as_ref()),
 		relayed,
 	})
 }
@@ -407,8 +415,8 @@ fn shadow_predict(
 ///
 /// The composed prediction is [`Prediction::Allow`] only when every hop
 /// allows. It is [`Prediction::Deny`] only when every hop denies. Any mix,
-/// or any unmodeled hop, yields [`Prediction::Unmodeled`] so the oracle
-/// never fires on a path the shadow cannot fully model.
+/// or any unmodeled hop, yields [`Prediction::Unmodeled`], so the oracle
+/// fires only on a path that the shadow models in full.
 fn compose_path(hops: impl IntoIterator<Item = Prediction>) -> Prediction {
 	let mut all_allow = true;
 	let mut all_deny = true;
@@ -474,13 +482,9 @@ async fn submit_csr(
 
 	let target = servlet_urn("csr");
 	let predicted = shadow_predict(org, &target, Some(&org.certs), false);
-	let spki = org_spki(org);
+	let spki = org.certs.cert.tbs_certificate.subject_public_key_info.to_der()?;
 
-	let req = CsrRequest {
-		spki: spki.to_vec(),
-		colony: colony_urn(org.name).to_string(),
-		cn: format!("csr-{}", selector),
-	};
+	let req = CsrRequest { spki, colony: colony_urn(org.name).to_string(), cn: format!("csr-{}", selector) };
 	let inner = compose! { V0: id: "colony-fuzz-csr-inner", order: 0u64, message: req }?;
 
 	emit_cluster_work(
@@ -562,8 +566,8 @@ async fn advertise_live_peer(
 /// The oracle byte selects one of two hostile shapes:
 ///
 /// - An advertisement signed by an identity outside the receiver's peer-trust set.
-/// - A replayed `control_order`. The shadow does not model the freshness and
-///   replay stage (see [`crate::shadow`]), so this case asserts `Deny` only
+/// - A replayed `control_order`. The freshness and replay stage sits outside
+///   the shadow (see [`crate::shadow`]), so this case asserts `Deny` only
 ///   when the priming advertisement landed.
 ///
 /// Each shape expects the wire to refuse into `PEER_AD_DENIED`, never
@@ -577,9 +581,9 @@ async fn negative_peer_ad(
 	let types = vec![advertised_type(selector)];
 
 	if selector & 1 == 0 {
-		// Untrusted signer shape. Alpha signs an advertisement to its
-		// own gateway, but alpha is not in alpha's peer-trust set, so
-		// the peer-origin check refuses. The shadow agrees with Deny.
+		// In the untrusted-signer shape, alpha signs an advertisement to
+		// its own gateway, but alpha is not in alpha's peer-trust set, so
+		// the peer-origin check refuses. The shadow predicts `Deny` too.
 		let order = *control_order;
 
 		*control_order += 1;
@@ -589,9 +593,9 @@ async fn negative_peer_ad(
 
 		record_authz_oracle(trace, predicted, class, events::PEER_AD_OK, events::PEER_AD_DENIED)
 	} else {
-		// Replayed control order shape. A first legitimate advertisement
-		// primes the replay guard, then the same signer resends at the
-		// same order. The replay guard refuses the duplicate signature.
+		// In the replayed-order shape, a first legitimate advertisement
+		// primes the replay guard, and then the same signer resends at
+		// the same order. The replay guard refuses the duplicate signature.
 		let order = *control_order;
 
 		*control_order += 1;
@@ -603,10 +607,9 @@ async fn negative_peer_ad(
 
 		let replay_class = advertise_peer_types(trace, &topo.beta, &topo.alpha, types, order).await?;
 
-		// A prime that did not land leaves the replay guard unprimed,
-		// so the resend is fresh on the wire and may legitimately
-		// succeed. Only a landed prime makes the duplicate order a
-		// modeled `Deny`.
+		// A prime that did not land leaves the replay guard unprimed, so
+		// the resend is fresh on the wire and its success is correct. Only
+		// a landed prime makes the duplicate order a modeled `Deny`.
 		let replay_predicted = if prime_class == AuthzClass::Success {
 			Prediction::Deny
 		} else {
@@ -634,11 +637,9 @@ async fn cross_org_work(
 	let target = servlet_urn("peer-ping");
 	let relayed = selector & 0x80 != 0;
 
-	// Model the full cross-org path per hop. Alpha is the dial org and
-	// does not serve peer-ping locally, so the request relays to the
-	// downstream orgs that do (beta and gamma) with the dial org's
-	// gateway certificate as caller and `relayed = true`. A mixed
-	// composition yields Unmodeled.
+	// One hop per org composes the prediction. Alpha dials, and only the
+	// downstream orgs, beta and gamma, serve peer-ping, so the request relays
+	// to them with alpha's gateway certificate as caller and `relayed = true`.
 	let dial_hop = shadow_predict(&topo.alpha, &target, Some(&topo.alpha.certs), relayed);
 	let beta_hop = shadow_predict(&topo.beta, &target, Some(&topo.alpha.certs), true);
 	let gamma_hop = shadow_predict(&topo.gamma, &target, Some(&topo.alpha.certs), true);
@@ -825,9 +826,9 @@ async fn hostile_foreign_work(
 	let identity = Arc::clone(&pick_org_ref(topo, id_idx).certs);
 	let target = target_urn(selector);
 
-	// The accept plane captures the possession-verified foreign identity
-	// (validators are configured), so the boundary classifies that
-	// certificate, not an anonymous session. Predict with it.
+	// The accept plane has validators, so it captures the possession-verified
+	// foreign identity, and the boundary classifies the session by that
+	// certificate. The prediction uses that identity too.
 	let predicted = shadow_predict(pick_org_ref(topo, dial_idx), &target, Some(&identity), false);
 	let request = ClusterWorkRequest::new(target, &inner_ping_frame()?)?;
 

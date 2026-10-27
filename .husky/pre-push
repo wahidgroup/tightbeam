@@ -2,7 +2,7 @@
 set -e
 
 # Installed via husky-rs (core.hooksPath = .husky).
-# Redirect stdin so make/npm cannot consume the ref list git feeds this hook.
+# The hook runs `make lint`, the same check CI runs.
 if ! make lint </dev/null; then
 	echo "ERROR: make lint failed; push aborted."
 	exit 1

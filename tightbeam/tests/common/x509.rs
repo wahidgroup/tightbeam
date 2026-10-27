@@ -1,7 +1,7 @@
 //! X.509 certificate test helpers.
 //!
-//! These fixtures mint gateway identities and multi-anchor trust stores for
-//! colony transport and federation tests, including split-plane export
+//! These fixtures create gateway identities and multi-anchor trust stores for
+//! the colony transport and federation tests, including split-plane export
 //! scenarios that need distinct organizations and mutual TLS.
 
 #![allow(dead_code)]
@@ -12,11 +12,12 @@ use std::sync::Arc;
 use tightbeam::{
 	cert,
 	crypto::{
+		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
 		sign::{
 			ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey},
-			Sha3Signer,
+			Sha3Signer, SigningIdentity,
 		},
 		x509::{
 			policy::CertificateValidation,
@@ -25,56 +26,74 @@ use tightbeam::{
 	},
 	error::Result,
 	prelude::{collect::TokioListener, *},
+	random::OsRng,
 	server,
 	spki::SubjectPublicKeyInfoOwned,
-	testing::{TestCertificate, TestKey},
-	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
-	utils::urn::Urn,
+	testing::TestCertificate,
+	transport::{EncryptedProtocol, TransportEncryptionConfig},
+	urn::Urn,
 	x509::Certificate,
 	Frame, TightBeamError,
 };
 
-/// Create a test certificate with signing key for a given subject and validity period
+/// Creates a self-issued end-entity test certificate for `subject`, valid for
+/// `validity_days`, with its signing key. Its `keyUsage` asserts
+/// `digitalSignature`, so a handshake admits it for signing.
+///
+/// Each call draws its own key, so a scenario that holds the identity trusts
+/// it alone, and a dial that a released port carries to the listener of
+/// another scenario fails its handshake.
 pub fn create_test_cert_with_key(
 	subject: impl AsRef<str>,
 	validity_days: u64,
 ) -> Result<(Certificate, Secp256k1SigningKey)> {
 	let subject = subject.as_ref();
-	let signing_key = TestKey::insecure_fixed_signing();
+	let signing_key = Secp256k1SigningKey::from(k256::ecdsa::SigningKey::random(&mut OsRng));
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let sha3_signer = Sha3Signer::from(&signing_key);
 	let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
 	let validity_duration = Duration::from_secs(validity_days * 24 * 60 * 60);
 
 	let cert = cert! {
-		profile: Root,
+		profile: Leaf,
 		subject: subject,
+		issuer: subject,
 		serial: 1u32,
 		duration: validity_duration,
-		signer: &sha3_signer,
-		subject_public_key: spki
+		subject_public_key: spki,
+		signer: &sha3_signer
 	}?;
 
 	Ok((cert, signing_key))
 }
 
-/// Create server encryption config with certificate, key, and validators
+/// The server encryption config of `cert` and `key`, which validates clients
+/// with `validators`.
 pub fn create_server_config(
 	cert: Certificate,
-	key_provider: impl Into<HandshakeKeyManager<DefaultCryptoProvider>>,
+	key: Secp256k1SigningKey,
 	validators: Vec<Arc<dyn CertificateValidation>>,
 ) -> TransportEncryptionConfig<DefaultCryptoProvider> {
-	let key_manager = key_provider.into();
-	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
+	let identity = signing_identity(cert, key);
+	TransportEncryptionConfig::new(identity).with_client_validators(validators)
 }
 
-/// Self-signed gateway materials shared by colony transport tests.
+/// The signing identity of `cert`, whose private key is `key`.
+pub fn signing_identity(cert: impl Into<Arc<Certificate>>, key: Secp256k1SigningKey) -> SigningIdentity {
+	let provider = Arc::new(Secp256k1KeyProvider::from(key));
+	SigningIdentity::new(cert, provider).expect("the key must match its certificate")
+}
+
+/// The self-signed gateway materials that the colony transport tests share.
 ///
-/// One certificate serves as identity and trust anchor for cluster, hive,
-/// and servlet endpoints alike.
+/// One certificate serves as the identity and the trust anchor of cluster,
+/// hive, and servlet endpoints alike.
 pub struct GatewayCerts {
+	/// The self-signed certificate of the gateway.
 	pub cert: Certificate,
+	/// The signing key of `cert`.
 	pub key: Secp256k1SigningKey,
+	/// The trust store that anchors `cert`.
 	pub trust: Arc<dyn CertificateTrust>,
 }
 
@@ -84,7 +103,7 @@ impl GatewayCerts {
 		let subject = subject.as_ref();
 		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy::default())
 				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
@@ -92,14 +111,14 @@ impl GatewayCerts {
 		Self { cert, key, trust }
 	}
 
-	/// Generate a colony-member gateway identity.
+	/// Generate a colony-member gateway identity on a fresh key.
 	///
 	/// The certificate carries `colony_urn` as a URI Subject Alternative Name
 	/// (RFC 5280 section 4.2.1.6) with an empty subject, so membership
 	/// provably binds to the SAN alone. Colony membership gates gossip and
-	/// peer federation.
+	/// peer federation. Each call draws its own key.
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
-		let raw = TestKey::insecure_fixed_signing();
+		let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
 		let cert = TestCertificate::with_uri_sans(&raw, &[&colony_urn.to_string()]);
 		let key = Secp256k1SigningKey::from(raw);
 		let trust = combined_trust(&[&cert]);
@@ -107,9 +126,9 @@ impl GatewayCerts {
 	}
 }
 
-/// Trust builder anchoring several independent identities at once.
+/// A trust builder that anchors every certificate of `certs`.
 fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
+	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())
@@ -119,45 +138,42 @@ fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
 	builder
 }
 
-/// Trust store anchoring several independent identities at once.
+/// A trust store that anchors every certificate of `certs`.
 ///
-/// Used by multi-peer federation and split-plane export tests.
+/// The multi-peer federation and split-plane export tests use it.
 pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
 	Arc::new(combined_trust_builder(certs).build())
 }
 
-/// Client-certificate validator anchoring several identities at once.
+/// A client-certificate validator that anchors every certificate of `certs`.
 ///
-/// Used on the inbound mutual-TLS accept plane
-/// (`ClusterTlsConfig::client_validators`). Export scenarios turn this on so
+/// It serves the inbound mutual-TLS accept plane
+/// (`ClusterTlsConfig::client_validators`). Export scenarios turn it on so
 /// the gateway can recognize first-party origin sessions.
 pub fn combined_validator(certs: &[&Certificate]) -> Arc<dyn CertificateValidation> {
 	Arc::new(combined_trust_builder(certs).build())
 }
 
-/// Extract Common Name (CN) from certificate subject
+/// Extracts the Common Name (CN) from the subject of `cert`.
 ///
-/// Returns the first CN found in the certificate subject RDN sequence.
+/// It returns the first CN in the subject RDN sequence that decodes as a
+/// UTF8String, a PrintableString, or an IA5String, tried in that order.
 pub fn extract_cn(cert: &Certificate) -> Option<String> {
 	use der::asn1::{Ia5StringRef, PrintableStringRef, Utf8StringRef};
 
-	// OID for Common Name (CN) is 2.5.4.3
 	const CN_OID: &str = "2.5.4.3";
 
-	// Iterate through RDN sequence to find CN
 	for rdn in cert.tbs_certificate.subject.0.iter() {
 		for attr in rdn.0.iter() {
 			if attr.oid.to_string() == CN_OID {
-				// The value is an Any type which can be various string types
-				// Try UTF8String first
+				// The value is an `Any`, which holds one of the directory
+				// string types.
 				if let Ok(utf8_str) = attr.value.decode_as::<Utf8StringRef>() {
 					return Some(utf8_str.to_string());
 				}
-				// Try PrintableString
 				if let Ok(printable) = attr.value.decode_as::<PrintableStringRef>() {
 					return Some(printable.to_string());
 				}
-				// Try IA5String
 				if let Ok(ia5) = attr.value.decode_as::<Ia5StringRef>() {
 					return Some(ia5.to_string());
 				}
@@ -167,18 +183,23 @@ pub fn extract_cn(cert: &Certificate) -> Option<String> {
 	None
 }
 
-/// Test fixture for a server with mutual authentication
+/// A test server that requires mutual authentication.
 ///
-/// Provides a managed server instance with message reception channel
-/// for integration testing.
+/// It answers each ping with a pong and hands every frame it receives to
+/// `rx`, for integration tests.
 pub struct MutualAuthServer {
+	/// The task that runs the server.
 	pub handle: tokio::task::JoinHandle<()>,
+	/// The address the server listens on.
 	pub addr: TightBeamSocketAddr,
+	/// The frames the server receives, in arrival order.
 	pub rx: tokio::sync::mpsc::Receiver<Frame>,
 }
 
 impl MutualAuthServer {
-	/// Create a new mutual auth server with specified certificate and validators
+	/// Starts a mutual-authentication server on a local port with
+	/// `server_cert` and `server_key`, which validates clients with
+	/// `client_validators`.
 	pub async fn new(
 		server_cert: Certificate,
 		server_key: Secp256k1SigningKey,
@@ -225,7 +246,8 @@ impl MutualAuthServer {
 		Ok(Self { handle, addr, rx })
 	}
 
-	/// Expect to receive a message within the given timeout
+	/// Waits up to `timeout` for the next frame the server receives, and
+	/// panics when none arrives in time.
 	pub async fn expect_message(&mut self, timeout: Duration) -> Frame {
 		tokio::time::timeout(timeout, self.rx.recv())
 			.await
@@ -233,8 +255,24 @@ impl MutualAuthServer {
 			.expect("Message should not be None")
 	}
 
-	/// Abort the server task
+	/// Aborts the server task.
 	pub fn abort(self) {
 		self.handle.abort();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Each call draws its own key, so the store of one identity holds no key
+	/// of another.
+	#[test]
+	fn a_gateway_identity_trusts_no_key_of_another_call() {
+		let scenario = GatewayCerts::generate("CN=Scenario Gateway");
+		let other = GatewayCerts::generate("CN=Scenario Gateway");
+
+		let other_key = &other.cert.tbs_certificate.subject_public_key_info;
+		assert!(scenario.trust.find_by_public_key(other_key).is_none());
 	}
 }

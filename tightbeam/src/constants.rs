@@ -1,19 +1,18 @@
-//! Shared constants for the handshake, cryptography, serving, testing, and
-//! configuration.
+//! Shared constants for the handshake, cryptography, accept loops, testing,
+//! and configuration.
 //!
-//! - **Handshake protocol.** Domain separation labels for cryptographic
-//!   operations. They are the canonical constants for every handshake
-//!   operation.
-//! - **Cryptographic.** HKDF, key, and salt sizes, elliptic curve key sizes,
-//!   and the AES-GCM sizes and rekey limits.
-//! - **Serving.** Accept-loop limits for the `server!` macro.
+//! - **Handshake protocol.** The canonical domain separation labels of every handshake operation.
+//! - **Cryptographic.** HKDF, key, and salt sizes, and the AES-GCM sizes and rekey limits.
+//! - **Accept loops.** The connection cap and retry delay of the servlet, hive, gateway, and `server!` loops.
 //! - **Testing and verification.** Generator constants and seeds for
 //!   deterministic exploration and fault injection.
 //! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
 
 /// KDF info string for the handshake secret (HKDF), which both protocols
-/// extract from the client's base secret and the ephemeral-ephemeral ECDH
-/// output under the protocol salt.
+/// extract under the protocol salt:
+///
+/// - The CMS flow extracts it from the ephemeral-ephemeral ECDH output followed by the client's base secret.
+/// - The HPKE flow extracts it from that output alone.
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 
 /// KDF info string for the key that seals the receipt acknowledgement (HKDF).
@@ -24,15 +23,59 @@ pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 ///
 /// # Sources
 ///
-/// - RFC 5116 § 3.2, a nonce used once per key: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
+/// - RFC 5116 § 3.1, a nonce used once per key: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.1>
 pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
 
-/// Domain label the receipt acknowledgement seal binds as associated data,
+/// Domain label that leads the `kekid` of the receipt acknowledgement seal,
 /// ahead of the transcript hash.
 ///
-/// The label names the AEAD context alone, so the associated data differs
-/// from every signed Finished content and from [`TIGHTBEAM_ACK_KDF_INFO`].
-pub const TIGHTBEAM_ACK_AAD_DOMAIN: &[u8] = b"tb/handshake/ack/aad/v1";
+/// The label names the acknowledgement's key-encryption key, so an opener of
+/// another purpose refuses the seal by its `kekid`.
+pub const TIGHTBEAM_ACK_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/ack/kekid/v1";
+
+/// KDF info label of the key that seals the closing of a handshake (HKDF):
+/// the client Finished, or the attributes of an anonymous client.
+///
+/// The key derives from the handshake secret, which mixes the
+/// ephemeral-ephemeral agreement, so a later theft of a server static key
+/// does not recover it. One closing travels per handshake, so the key is
+/// single-use.
+///
+/// # Sources
+///
+/// - RFC 9846 § 4.5 and Appendix F.1, the client identity under handshake
+///   keys: <https://datatracker.ietf.org/doc/html/rfc9846#appendix-F.1>
+pub const TIGHTBEAM_CLOSING_KDF_INFO: &[u8] = b"tb/session/kdf/closing/v1";
+
+/// Domain label that leads the `kekid` of the closing seal, ahead of the
+/// transcript hash.
+pub const TIGHTBEAM_CLOSING_KEY_ID_DOMAIN: &[u8] = b"tb/handshake/closing/kekid/v1";
+
+/// HKDF-Expand label of the `MacKey` of the client Finished, the key of the
+/// key-confirmation tag the closing carries.
+///
+/// The key expands from the PRK of the handshake secret to the output length
+/// of the negotiated digest, and it keys the one HMAC over the transcript hash
+/// that forms the tag. The server derives the same tag before it settles, so a
+/// client that holds another secret ends the handshake at the closing.
+///
+/// # Sources
+///
+/// - RFC 9846 § 4.5.3, a Finished key per role: <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
+pub const TIGHTBEAM_CLIENT_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/client/mac/v1";
+
+/// HKDF-Expand label of the `MacKey` of the server Finished, which the reply
+/// of either flow carries.
+///
+/// The key keys one HMAC over the transcript hash followed by the octets of
+/// the reply's signature, so the tag covers the transcript through the
+/// signature. The client verifies it before it sends its closing.
+///
+/// # Sources
+///
+/// - RFC 9846 § 4.5.3, the server Finished in the server's first flight:
+///   <https://datatracker.ietf.org/doc/html/rfc9846#section-4.5.3>
+pub const TIGHTBEAM_SERVER_FINISHED_KEY_INFO: &[u8] = b"tb/handshake/finished/server/mac/v1";
 
 /// KDF info string for the client-to-server session key (HKDF).
 ///
@@ -49,7 +92,19 @@ pub const TIGHTBEAM_C2S_KDF_INFO: &[u8] = b"tb/session/kdf/c2s/v1";
 /// KDF info string for the server-to-client session key (HKDF).
 pub const TIGHTBEAM_S2C_KDF_INFO: &[u8] = b"tb/session/kdf/s2c/v1";
 
-/// KDF info string for the epoch secret retained for in-band rekeying.
+/// Domain label that leads the `kekid` of every record, ahead of the
+/// big-endian epoch of the directional key the record seals under.
+///
+/// Each directional key is the key-encryption key of its records, and the
+/// epoch names the renewal that derived it.
+///
+/// # Sources
+///
+/// - RFC 5652 § 6.2.3, the `kekid` of a key both ends hold:
+///   <https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.3>
+pub const TIGHTBEAM_RECORD_KEY_ID_DOMAIN: &[u8] = b"tb/session/record/kekid/v1";
+
+/// KDF info string for the epoch secret retained for the in-band rekey.
 ///
 /// The label separates the epoch chain from the traffic keys.
 ///
@@ -62,51 +117,93 @@ pub const TIGHTBEAM_S2C_KDF_INFO: &[u8] = b"tb/session/kdf/s2c/v1";
 ///   <https://datatracker.ietf.org/doc/html/rfc9846#section-7.2>
 pub const TIGHTBEAM_EPOCH_KDF_INFO: &[u8] = b"tb/session/kdf/epoch/v1";
 
-/// KDF info string for CMS KARI (Key Agreement Recipient Info) KEK derivation.
-pub const TIGHTBEAM_KARI_KDF_INFO: &[u8] = b"tb/kari/kdf/v1";
+/// The purpose label that leads the `ukm` of the CMS opening's
+/// `KEMRecipientInfo`, ahead of the 32 random octets the seal draws for
+/// itself.
+///
+/// The `ukm` enters the KDF input of the key that wraps the content key, and
+/// the server admits this label alone, so a KEM seal of another purpose does
+/// not open as an opening.
+///
+/// # Sources
+///
+/// - RFC 9629 § 3 and § 5, the `ukm` and the KDF input:
+///   <https://datatracker.ietf.org/doc/html/rfc9629#section-5>
+pub const TIGHTBEAM_OPENING_UKM_LABEL: &[u8] = b"tb/handshake/opening/ukm/v1";
 
-/// Domain label a server CMS Finished signs ahead of the transcript hash.
+/// The purpose label that leads the `ukm` of the `KEMRecipientInfo` of a
+/// frame sealed to a recipient key, ahead of the 32 random octets the seal
+/// draws for itself.
+///
+/// A frame decryptor admits this label alone, so a KEM seal of another
+/// purpose, such as the CMS opening, does not open as a frame.
+///
+/// # Sources
+///
+/// - RFC 9629 § 3 and § 5, the `ukm` and the KDF input:
+///   <https://datatracker.ietf.org/doc/html/rfc9629#section-5>
+pub const TIGHTBEAM_FRAME_UKM_LABEL: &[u8] = b"tb/frame/ukm/v1";
+
+/// Domain label the CMS server Finished signs ahead of the transcript hash.
 pub const TIGHTBEAM_SERVER_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/server/v1";
 
-/// Domain label a client CMS Finished signs ahead of the transcript hash.
+/// Domain label the client Finished of either flow signs ahead of the
+/// transcript hash.
 pub const TIGHTBEAM_CLIENT_FINISHED_DOMAIN: &[u8] = b"tb/handshake/finished/client/v1";
 
-/// AAD (Additional Authenticated Data) domain tag prefix.
-pub const TIGHTBEAM_AAD_DOMAIN_TAG: &[u8] = b"tb/aead/v1";
+/// Whether neither byte string is a prefix of the other, in a `const` context,
+/// where slice comparison is unavailable. Two equal strings are each a prefix
+/// of the other.
+pub(crate) const fn prefix_free(a: &[u8], b: &[u8]) -> bool {
+	let (mut a, mut b) = (a, b);
+	while let ([a_first, a_rest @ ..], [b_first, b_rest @ ..]) = (a, b) {
+		if *a_first != *b_first {
+			return true;
+		}
+		(a, b) = (a_rest, b_rest);
+	}
+
+	false
+}
+
+/// Whether no member of `labels` is a prefix of another member.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) const fn pairwise_prefix_free(labels: &[&[u8]]) -> bool {
+	let mut rest = labels;
+	while let [first, later @ ..] = rest {
+		let mut others = later;
+		while let [second, after @ ..] = others {
+			if !prefix_free(first, second) {
+				return false;
+			}
+			others = after;
+		}
+		rest = later;
+	}
+
+	true
+}
+
+// Each Finished signs its role's label ahead of the transcript hash. When
+// neither label is a prefix of the other, a Finished of one role never reads
+// as one of the other.
+const _: () = assert!(prefix_free(TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN));
 
 /// Minimum salt entropy in bytes for secure key derivation (HKDF).
 ///
-/// CMS and ECIES both read it when they derive session keys through HKDF, and
+/// CMS and HPKE both read it when they derive session keys through HKDF, and
 /// the salt must carry at least this many bytes of randomness.
 pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
 
-/// UKM (User Keying Material) prefix for KARI operations.
-pub const TIGHTBEAM_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
-
-/// ECIES KDF info parameter for domain separation and protocol versioning.
-pub const TIGHTBEAM_ECIES_KDF_INFO: &[u8] = b"tb/ecies/v1";
-
-/// Maximum HKDF output size in bytes for one dual-key expansion.
+/// Maximum HKDF output size in bytes for one expansion, a dual-key expansion
+/// included.
 pub const MAX_HKDF_OUTPUT_SIZE: usize = 128;
 
 /// Minimum secure key size in bytes.
 pub const MIN_KEY_SIZE: usize = 16;
 
-/// Minimum HKDF salt size in bytes when a non-empty salt is supplied.
+/// Minimum size in bytes of a non-empty blinding salt of a message commitment.
 pub const MIN_SALT_SIZE: usize = 16;
-
-/// Compressed secp256k1 or P-256 public key size in SEC1 format.
-///
-/// The encoding is a `0x02` or `0x03` prefix byte plus 32 bytes.
-pub const EC_PUBKEY_COMPRESSED_SIZE: usize = 33;
-
-/// Uncompressed secp256k1 or P-256 public key size in SEC1 format.
-///
-/// The encoding is a `0x04` prefix byte plus 64 bytes.
-pub const EC_PUBKEY_UNCOMPRESSED_SIZE: usize = 65;
-
-/// ECDH shared secret size for 256-bit curves (secp256k1, P-256, X25519).
-pub const ECDH_SHARED_SECRET_SIZE: usize = 32;
 
 /// AES-GCM nonce size (96 bits).
 ///
@@ -121,49 +218,49 @@ pub const AES_GCM_NONCE_SIZE: usize = 12;
 pub const AES_GCM_TAG_SIZE: usize = 16;
 
 /// Bytes in the full-size TLS record that the AES-GCM record analysis
-/// counts in (2^14, RFC 8446 § 5.1).
+/// counts in (2^14, RFC 9846 § 5.1).
 const TLS_FULL_SIZE_RECORD_BYTES: u64 = 1 << 14;
 
 /// Full-size TLS records AES-GCM admits per key with its safety margin
 /// intact (2^24, RFC 9846 § 5.5).
 const AES_GCM_FULL_SIZE_RECORDS_PER_KEY: u64 = 1 << 24;
 
-/// Bytes one AES-GCM key admits with its safety margin intact: 2^24
-/// full-size TLS records, which is 2^38 bytes (RFC 9846 § 5.5).
-pub(crate) const AES_GCM_VOLUME_BYTES_PER_KEY: u64 = AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES;
+/// The renewal volume of one directional key: 2^24 full-size TLS records,
+/// which is 2^38 bytes (RFC 9846 § 5.5). Each record runs under a fresh
+/// content key (RFC 5084 § 3.2), so this volume is the renewal trigger of the
+/// key that wraps them.
+pub(crate) const RENEWAL_VOLUME_BYTES: u64 = AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES;
 
-/// AEAD records one directional key admits at an encrypted-envelope ceiling
-/// of `encrypted_envelope` bytes: [`AES_GCM_VOLUME_BYTES_PER_KEY`] divided
-/// by the ceiling. A ceiling of zero counts as one byte.
+/// Records one directional key wraps before its renewal at an
+/// encrypted-envelope ceiling of `encrypted_envelope` bytes:
+/// [`RENEWAL_VOLUME_BYTES`] divided by the ceiling. A ceiling of zero
+/// counts as one byte.
 ///
 /// # Sources
 ///
 /// - RFC 9846 § 5.5, AEAD limits: <https://datatracker.ietf.org/doc/html/rfc9846#section-5.5>
 pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
-	let envelope = if encrypted_envelope == 0 {
-		1
-	} else {
-		encrypted_envelope as u64
-	};
-
-	AES_GCM_VOLUME_BYTES_PER_KEY / envelope
+	match RENEWAL_VOLUME_BYTES.checked_div(encrypted_envelope as u64) {
+		Some(limit) => limit,
+		None => RENEWAL_VOLUME_BYTES,
+	}
 }
 
-/// AEAD record limit per directional key before a rekey is required.
+/// Record limit per directional key before a rekey is required.
 ///
 /// It is the record limit at [`DEFAULT_MAX_ENCRYPTED_ENVELOPE`]: 2^20
-/// records of up to 256 KiB, which keeps the per-key volume inside the
-/// AES-GCM bound. A session at a raised ceiling holds a lower limit. The
-/// limit keeps room for one renewal exchange up to a 2 GiB ceiling (128
-/// records) and loses it at 4 GiB (64 records).
+/// records of up to 256 KiB, inside the renewal volume. A raised ceiling
+/// lowers the limit. It keeps room for one renewal exchange up to a 2 GiB
+/// ceiling (128 records) and loses it at 4 GiB (64 records).
 ///
 /// # Enforcement
 ///
 /// - Senders fail closed with `RekeyRequired` at their configured limit.
 /// - Receipt-bearing mux sessions renew in band first.
-/// - Other sessions drain via GoAway.
-/// - Receivers refuse a counter at or past this constant, at any ceiling.
-/// - Receivers refuse a record that takes the bytes one key opened past the AES-GCM volume.
+/// - Other sessions drain through GoAway.
+/// - Receivers refuse a sequence number at or past this constant, at any ceiling.
+/// - Receivers refuse a record that takes the bytes one key opened past the renewal volume.
+/// - Both receive-side refusals are the crate's own renewal policy. RFC 9846 § 5.5 sets the sender's limit.
 /// - `with_rekey_limit` overrides the renewal and drain trigger. Both receive-side refusals stay fixed.
 ///
 /// # Sources
@@ -179,16 +276,16 @@ const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT > DEFAULT_REKEY_MIN_SPEND_RECOR
 /// The slack gives the three-leg exchange (request, ack, control) room to
 /// finish before the hard floor parks data.
 ///
-/// - If the exchange finishes in time, data resumes under the new epoch.
-/// - Otherwise data parks until install completes, or the renewal deadline triggers GoAway drain.
+/// - If the exchange finishes in time, data resumes under the next epoch.
+/// - Otherwise data parks until the install completes, or the renewal deadline triggers the GoAway drain.
 pub const DEFAULT_REKEY_RENEWAL_ALLOWANCE: u64 = 64;
 
 /// Minimum records a server must have received since the last epoch
 /// install before it accepts another `RekeyRequest`.
 ///
-/// The constant bounds rekey floods. Together with the one-exchange-in-flight
-/// rule, it caps how often a client can force the server through signing and
-/// settlement work. A violation is a protocol error.
+/// It bounds rekey floods. With the one-exchange-in-flight rule, it caps how
+/// often a client can force the server through signature and settlement
+/// work. A violation is a protocol error.
 ///
 /// # Sources
 ///
@@ -197,29 +294,34 @@ pub const DEFAULT_REKEY_RENEWAL_ALLOWANCE: u64 = 64;
 ///   <https://datatracker.ietf.org/doc/html/rfc9846>
 pub const DEFAULT_REKEY_MIN_SPEND_RECORDS: u64 = 4;
 
-/// Seconds a rekey initiator waits for the exchange to complete before
-/// draining the connection.
+/// Seconds a rekey initiator waits for the exchange to complete before it
+/// drains the connection.
 ///
 /// The deadline bounds the c2s data park, which spans the Ack-to-Done window
-/// plus the hard floor. When a peer stops answering, expiry releases the park
-/// and converges on the GoAway drain path.
+/// plus the hard floor. When a peer goes silent, expiry releases the park and
+/// takes the GoAway drain path.
 pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 
-/// Concurrent-connection cap for the `server!` async accept loop.
+/// Concurrent-connection cap of each accept loop, async or blocking.
 ///
-/// The loop stops accepting while this many connection tasks are alive, so a
-/// connection flood queues in the listener backlog instead of pinning
-/// unbounded tasks and file descriptors.
+/// The servlet, hive, and gateway planes take it, and the `server!` macro
+/// takes it unless a `max_connections` policy names another.
+///
+/// The loop pauses its accepts while this many connections are alive, so a
+/// connection flood waits in the listener backlog rather than pin unbounded
+/// tasks and file descriptors.
 ///
 /// # Sources
 ///
 /// - CWE-400, uncontrolled resource consumption: <https://cwe.mitre.org/data/definitions/400.html>
-pub const DEFAULT_MAX_SERVER_CONNECTIONS: usize = 1024;
+pub const DEFAULT_MAX_SERVER_CONNECTIONS: core::num::NonZeroUsize = match core::num::NonZeroUsize::new(1024) {
+	Some(cap) => cap,
+	None => panic!("the default connection cap takes one connection or more"),
+};
 
 /// Delay between accept retries after a failed accept.
 ///
-/// The delay spaces the retries far enough apart that a descriptor shortage
-/// has time to clear between attempts.
+/// It spaces the retries so a descriptor shortage can clear between them.
 pub const DEFAULT_ACCEPT_RETRY_DELAY: core::time::Duration = core::time::Duration::from_millis(50);
 
 /// Linear Congruential Generator (LCG) multiplier constant.
@@ -227,7 +329,7 @@ pub const DEFAULT_ACCEPT_RETRY_DELAY: core::time::Duration = core::time::Duratio
 /// # Properties
 ///
 /// - Period: 2^64, the full period for a 64-bit state.
-/// - Spectral test: passes all dimensions up to at least dimension 6.
+/// - Spectral test: the multiplier passes all dimensions up to at least dimension 6.
 /// - The value comes from Donald Knuth's MMIX LCG parameters.
 ///
 /// # Used by
@@ -245,8 +347,7 @@ pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 ///
 /// # Properties
 ///
-/// - The increment must be odd for a full period.
-/// - It is co-prime with 2^64 because it is odd.
+/// - The increment is odd, as a full period requires, so it is co-prime with 2^64.
 /// - It pairs with [`LCG_MULTIPLIER`] for the properties listed there.
 /// - The same seed produces identical sequences on every platform.
 /// - The generator uses integer arithmetic only.
@@ -263,6 +364,7 @@ pub const LCG_INCREMENT: u64 = 1442695040888963407;
 ///
 /// # Used by
 ///
+/// - The `StochasticForager` load balancer for its weighted instance draw.
 /// - The `PowerOfTwoChoices` load balancer for candidate-pair selection.
 ///
 /// # Sources
@@ -282,12 +384,11 @@ pub const SPLITMIX64_MIX_1: u64 = 0xBF58476D1CE4E5B9;
 /// See [`SPLITMIX64_GAMMA`] for the sources.
 pub const SPLITMIX64_MIX_2: u64 = 0x94D049BB133111EB;
 
-/// Default seed for fault injection reproducibility.
+/// Default seed of the random fault injection strategy, so a run repeats.
 ///
-/// The value `0xDEADBEEF` is a recognizable debug marker. Systems
-/// programming conventionally uses it for test, debug, or uninitialized
-/// state. Override it for production fault testing through
-/// `FaultModel::with_seed(custom_seed)`.
+/// The value `0xDEADBEEF` is the debug marker systems programming uses for
+/// test, debug, or uninitialized state. Override it in production fault tests
+/// through `FaultModel::with_seed(custom_seed)`.
 ///
 /// # Used by
 ///
@@ -297,9 +398,8 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 
 /// Default backpressure threshold in basis points (90% = 9000 bps).
 ///
-/// When aggregate utilization exceeds this threshold, the hive signals
-/// `TransitStatus::ResourceExhausted` to the cluster, so the cluster should
-/// route work elsewhere.
+/// The hive signals `TransitStatus::ResourceExhausted` to the cluster at this
+/// aggregate utilization, and the cluster should route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 
 /// Utilization assumed for a servlet that reports none (50% = 5000 bps).
@@ -318,7 +418,7 @@ pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 ///
 /// - `Frame.metadata.order` is within this many milliseconds of the hive's own
 ///   clock, in both directions to tolerate skew.
-/// - The signature is new inside the window.
+/// - The signature is unseen inside the window.
 ///
 /// # Sources
 ///
@@ -334,7 +434,7 @@ pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 ///
 /// - Cancels of already-completed streams are free.
 /// - Each cancel that aborts a live handler draws on this budget.
-/// - Exhausting the budget ends the connection with a GoAway.
+/// - A connection that exhausts the budget ends with a GoAway.
 /// - Only authenticated peers reach this path, so the budget is generous.
 ///
 /// Tighten it per connection through `MuxTransport::with_cancel_budget`.
@@ -348,8 +448,8 @@ pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
 /// Ceiling on negotiated per-direction concurrent-stream caps.
 ///
 /// Handshake transport offers and accepts carry peer-chosen
-/// `max_peer_initiated_streams` values, and deriving [`MuxSettings`] clamps
-/// both directions to this ceiling.
+/// `max_peer_initiated_streams` values, and the derivation of [`MuxSettings`]
+/// clamps both directions to this ceiling.
 ///
 /// - An advertisement inflates bookkeeping bounds only up to useful concurrency.
 /// - Both endpoints apply the same clamp to the same advertised values.
@@ -385,9 +485,8 @@ pub const MIN_MUX_CHUNK_SIZE: u32 = 1024;
 ///   <https://datatracker.ietf.org/doc/html/rfc9113#section-4.2>
 pub const MAX_MUX_CHUNK_SIZE: u32 = 64 * 1024;
 
-/// Default per-chunk payload size advertised when none is configured.
-///
-/// The value is 16 KiB, the HTTP/2 default frame size.
+/// Default per-chunk payload size advertised when none is configured: 16 KiB,
+/// the HTTP/2 default frame size.
 ///
 /// # Sources
 ///
@@ -417,45 +516,42 @@ pub const MAX_MUX_STREAM_CREDIT: u64 = 4096;
 
 /// Default initial per-stream chunk credit window.
 ///
-/// 64 chunks at the default chunk size bounds per-stream reassembly at
-/// 1 MiB before the receiver must grant more.
+/// At the default chunk size, 64 chunks bound per-stream reassembly at 1 MiB
+/// before the receiver must grant more.
 pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
 
 /// Ceiling on a negotiated per-direction session budget, in credits.
 ///
-/// Budgets meter data-chunk credits only.
+/// Budgets meter data-chunk credits only. The cap is half the per-key record
+/// limit, so in the worst case the data records of one epoch stay under
+/// [`DEFAULT_REKEY_RECORD_LIMIT`].
 ///
-/// - Control envelopes (credit grants, cancels, pings, GoAway) pass outside the
-///   budget but still consume AEAD records.
 /// - Every data chunk debits at least one credit and consumes exactly one record.
-/// - Capping budgets at half the per-key record limit therefore bounds
-///   worst-case epoch data-record consumption under
-///   [`DEFAULT_REKEY_RECORD_LIMIT`].
-/// - This holds at the default ceiling. At a raised one the record limit can fall below the budget.
-/// - The default batching grantor keeps control traffic at `O(data chunks /
-///   window)` records, inside the remaining half.
+/// - Control envelopes (credit grants, cancels, pings, GoAway) spend AEAD records outside the budget.
+/// - The default grantor grants credit in batches, so control traffic stays at
+///   `O(data chunks / window)` records, inside the other half.
+/// - The bound holds at the default ceiling. At a raised one the record limit can fall below the budget.
 /// - The record limit itself stays the fail-closed backstop either way.
 pub const MAX_MUX_SESSION_BUDGET: u64 = DEFAULT_REKEY_RECORD_LIMIT / 2;
 
 /// Default ceiling in bytes for an encoded cleartext envelope (128 KiB).
 ///
-/// [`TransportEncryptionConfig`] applies it when no explicit limit is
-/// configured. Cleartext envelopes exist only during the handshake and in
-/// unencrypted deployments, so the bound is half the encrypted ceiling.
+/// [`TransportLimits`] applies it when no explicit limit is configured.
+/// Cleartext envelopes exist only during the handshake and in unencrypted
+/// deployments, so the bound is half the encrypted ceiling.
 ///
-/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
+/// [`TransportLimits`]: crate::transport::TransportLimits
 pub const DEFAULT_MAX_CLEARTEXT_ENVELOPE: usize = 128 * 1024;
 
 /// Default ceiling in bytes for an encoded encrypted envelope (256 KiB).
 ///
 /// A server refuses a frame whose declared content length exceeds this
-/// ceiling. It refuses before reading the content, so the declared length
-/// bounds the allocation.
+/// ceiling before it reads the content, so the declared length bounds the
+/// allocation.
 ///
-/// - The refusal closes the connection.
-/// - The sender sees a reset instead of a typed error.
+/// - The refusal closes the connection, so the sender sees a reset and no typed error.
 /// - Clients therefore preflight outgoing encrypted envelopes against this ceiling.
-/// - When no explicit limit is set, the client fails locally with typed `SizeExceeded`.
+/// - With no explicit limit set, the client fails locally with a typed `SizeExceeded`.
 ///
 /// # Sources
 ///
@@ -464,12 +560,10 @@ pub const DEFAULT_MAX_ENCRYPTED_ENVELOPE: usize = 256 * 1024;
 
 /// Default deadline for a single read or write on an established session.
 ///
-/// The handshake carries its own allowance. Once a session is established,
-/// a peer that stops speaking mid-frame holds the connection, its task, and
-/// its accept-loop permit for as long as it stays silent.
-///
-/// Every transport carries this deadline, including one that sets no
-/// explicit timeout, so an established session always has an expiry.
+/// The handshake carries its own allowance. On an established session, a peer
+/// that stalls mid-frame holds the connection, its task, and its accept-loop
+/// permit while it stays silent. Every transport carries this deadline, even
+/// one with no explicit timeout, so an established session always expires.
 ///
 /// # Sources
 ///
@@ -480,17 +574,17 @@ pub const DEFAULT_OPERATION_TIMEOUT: core::time::Duration = core::time::Duration
 
 /// Default allowance for a handshake to complete.
 ///
-/// [`TransportEncryptionConfig`] and the TCP transports both read the
-/// allowance from this constant.
+/// The default [`TransportLimits`] carries this allowance, so a server
+/// configuration and every transport start from it.
 ///
-/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
+/// [`TransportLimits`]: crate::transport::TransportLimits
 pub const DEFAULT_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
 
 /// Default ceiling in bytes for one encoded handshake-phase message.
 ///
 /// A handshake message carries certificates, a key share, and a signature. It
 /// is bounded far below a data envelope so an unauthenticated peer cannot make
-/// this endpoint buffer a large allocation before proving its identity.
+/// this endpoint buffer a large allocation before it proves its identity.
 ///
 /// # Sources
 ///
@@ -498,12 +592,42 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const DEFAULT_HANDSHAKE_MAX_WIRE: usize = 16 * 1024;
 
+/// Ceiling on the certificates a signer presents in the `certificates` of one
+/// `SignedData`: its signing certificate and the issuers above it.
+///
+/// A reply, and the client Finished of a mutual client, carry the path of the
+/// signing certificate below the trust anchor of the peer (RFC 5652 § 5.1). A
+/// reader refuses a larger set before it walks a path or checks a signature,
+/// so an unauthenticated peer cannot make it build a long path.
+///
+/// # Sources
+///
+/// - RFC 5652 § 5.1, the `certificates` of a `SignedData`:
+///   <https://datatracker.ietf.org/doc/html/rfc5652#section-5.1>
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const MAX_PRESENTED_PATH: usize = 8;
+
+/// Ceiling on the elements of a universal SET, or of a constructed
+/// context-specific element, in the CMS values a peer sends, such as the
+/// `signerInfos` or the `certificates` of a `SignedData`.
+///
+/// The pinned `der` decoder sorts such a set in time quadratic in its length
+/// whatever order it arrives in. The value is above [`MAX_PRESENTED_PATH`]
+/// and above every such set the crate emits.
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 11.6, set-of components:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
+/// - CWE-407, inefficient algorithmic complexity: <https://cwe.mitre.org/data/definitions/407.html>
+pub(crate) const MAX_CMS_SET_LEN: usize = 32;
+
 /// Default ceiling for decompressed message bodies (16 MiB).
 ///
-/// Compressed frame bodies arrive under the transport's envelope ceiling, and
-/// zstd can expand a small input by several orders of magnitude. Capping the
-/// inflated size bounds the memory an attacker can force with a
-/// decompression bomb.
+/// A compressed frame body arrives under the transport's envelope ceiling,
+/// and zstd can inflate it past this one. The cap on the inflated size bounds
+/// the memory an attacker can force with a decompression bomb.
 ///
 /// Override it per inflator through `ZstdCompression::with_max_output`.
 ///
@@ -512,11 +636,11 @@ pub const DEFAULT_HANDSHAKE_MAX_WIRE: usize = 16 * 1024;
 /// - CWE-409, improper handling of highly compressed data: <https://cwe.mitre.org/data/definitions/409.html>
 pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 
-/// Hard ceiling on unary mux reassembly buffer bytes per stream.
+/// Hard ceiling on the bytes one mux stream reassembles: a unary reassembly
+/// buffer, or the body that `StreamBody::into_bytes` collects.
 ///
-/// Credit grants may raise the chunk window, and accepted payload bytes still
-/// stay within this bound. The value equals
-/// [`DEFAULT_MAX_DECOMPRESSED_LEN`].
+/// Credit grants may raise the chunk window, and accepted payload bytes stay
+/// within this bound, which equals [`DEFAULT_MAX_DECOMPRESSED_LEN`].
 ///
 /// # Sources
 ///
@@ -526,11 +650,10 @@ pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
 
 /// Reassembly bytes one connection may buffer across every open stream.
 ///
-/// [`MAX_MUX_REASSEMBLY_BYTES`] bounds a single stream. A peer that opens many
-/// streams multiplies it, so the connection carries this ceiling as well and
-/// every stream charges against it. A connection legitimately reassembling
-/// several streams at once stays inside four stream ceilings. Beyond that the
-/// peer spends this endpoint's memory without making progress.
+/// [`MAX_MUX_REASSEMBLY_BYTES`] bounds one stream, and a peer that opens many
+/// streams multiplies it, so every stream also charges against this ceiling.
+/// Concurrent streams in good faith stay inside four stream ceilings. Past
+/// that, the peer spends this endpoint's memory and makes no progress.
 ///
 /// # Sources
 ///
@@ -540,12 +663,10 @@ pub const MAX_MUX_CONNECTION_REASSEMBLY_BYTES: usize = 4 * MAX_MUX_REASSEMBLY_BY
 
 /// Ceiling on servlet types carried in one peer advertisement.
 ///
-/// A peer gateway advertisement enumerates the servlet types its colony
-/// exports. Bounding the count fail-closes an oversized advertisement
-/// before it installs unbounded peer routes.
-///
-/// Gossip meshes apply the same control-message flood bound to their
-/// advertisement path.
+/// A peer gateway advertisement lists the servlet types its colony exports.
+/// The bound refuses an oversized advertisement before it installs unbounded
+/// peer routes. Gossip meshes apply the same control-message flood bound to
+/// their advertisement path.
 ///
 /// # Sources
 ///
@@ -555,8 +676,8 @@ pub const MAX_ADVERTISED_TYPES: usize = 256;
 
 /// Ceiling on distinct peer gateways tracked in one servlet registry.
 ///
-/// Per-advertisement type caps alone leave trusted-peer registry growth
-/// unbounded across many signers.
+/// Per-advertisement type caps alone leave the registry free to grow without
+/// bound across many trusted signers.
 ///
 /// # Sources
 ///
@@ -577,9 +698,9 @@ pub const MAX_PEER_ROUTES: usize = 1024;
 /// Ceiling on distinct relay-trail buckets tracked in one servlet registry.
 ///
 /// Relay trails bucket per `(origin, relay)` pair, so a colony of `N`
-/// members can create up to `N * (N - 1)` buckets. The budget is separate
-/// from [`MAX_PEER_GATEWAYS`], because relay fan-in and direct-gateway
-/// admission each hold their own budget.
+/// members can create up to `N * (N - 1)` buckets. The budget is apart from
+/// [`MAX_PEER_GATEWAYS`], so relay fan-in and direct-gateway admission each
+/// hold their own.
 ///
 /// # Sources
 ///
@@ -589,9 +710,9 @@ pub const MAX_RELAY_BUCKETS: usize = 64;
 
 /// Ceiling on total live relay-trail routes tracked in one servlet registry.
 ///
-/// The ceiling is separate from [`MAX_PEER_ROUTES`] for the same reason that
-/// [`MAX_RELAY_BUCKETS`] is separate from [`MAX_PEER_GATEWAYS`]. A full relay
-/// plane must leave the direct-route budget untouched.
+/// The ceiling is apart from [`MAX_PEER_ROUTES`], as [`MAX_RELAY_BUCKETS`] is
+/// apart from [`MAX_PEER_GATEWAYS`], so a full relay plane leaves the
+/// direct-route budget untouched.
 ///
 /// # Sources
 ///
@@ -601,7 +722,7 @@ pub const MAX_RELAY_ROUTES: usize = 1024;
 
 /// Origin sentinel for the relay budget on work and routed stream opens.
 ///
-/// The budget is the number of gateway forwards a request may still spend.
+/// The budget is the number of gateway forwards a request has left to spend.
 /// Each peer hop decrements it, and `0` serves locally only.
 ///
 /// - An origin stamps `u8::MAX`, which means "forward as far as policy allows".
@@ -609,7 +730,7 @@ pub const MAX_RELAY_ROUTES: usize = 1024;
 ///   asserts its own reachability alone and a crafted large value clamps to the
 ///   same ceiling.
 /// - A relayed hop carries the explicit value, which every later gateway clamps again.
-/// - The sentinel is also the DER DEFAULT, so the common origin request omits the field from its encoding.
+/// - The sentinel is also the DER DEFAULT, so the common origin request omits the field.
 ///
 /// # Sources
 ///
@@ -619,17 +740,16 @@ pub const DEFAULT_HOP_BUDGET: u8 = u8::MAX;
 
 /// Default advertisement-rumor refresh interval in milliseconds.
 ///
-/// The advertise beat floods the local slate as an advertisement rumor only
-/// when the slate or the flood target set changed. One refresh on this
-/// interval lets late joiners and pruned witnesses relearn the origin.
-/// Bitcoin self-announces addresses the same way, on change and on a slow
-/// timer, well below one refresh per beat.
+/// The advertise beat floods the local slate as an advertisement rumor when
+/// the slate or the flood targets change, and once per interval, so late
+/// joiners and pruned witnesses relearn the origin. Bitcoin self-announces
+/// addresses the same way, on change and on a slow timer, well below one
+/// refresh per beat.
 ///
 /// # Contract
 ///
-/// The refresh MUST stay under the gossip freshness window
-/// ([`DEFAULT_GOSSIP_SEEN_TTL_MS`]) so a refreshed rumor always admits as
-/// fresh.
+/// The refresh MUST stay under [`DEFAULT_GOSSIP_SEEN_TTL_MS`], the gossip
+/// freshness window, so a refreshed rumor always admits as fresh.
 ///
 /// # Sources
 ///
@@ -639,12 +759,12 @@ pub const DEFAULT_AD_RUMOR_REFRESH_MS: u64 = 30_000;
 
 /// Default `max_hops` relay cap on a cluster gateway.
 ///
-/// The default allows one forward. A gateway relays a request to a peer at
-/// most once, and the peer serves locally only. Operators raise the cap to
-/// enable relay-trail fallback, which needs two forwards end to end.
+/// The default allows one forward: a gateway relays a request to a peer at
+/// most once, and the peer serves locally only. Raise the cap to enable
+/// relay-trail fallback, which needs two forwards end to end.
 ///
-/// The cap bounds the forwarding work one request can demand from this
-/// gateway, whatever budget the request carries.
+/// The cap bounds the forwards one request can demand from this gateway,
+/// whatever budget it carries.
 ///
 /// # Sources
 ///
@@ -655,8 +775,8 @@ pub const DEFAULT_MAX_HOPS: u8 = 1;
 /// Ceiling on the payload bytes carried in one gossip envelope.
 ///
 /// A gossip rumor floods the peer graph, so an oversized payload amplifies
-/// across every edge. Bounding the payload fail-closes the amplification
-/// dose before the rumor is recorded or forwarded again.
+/// across every edge. The bound refuses an oversized payload before a gateway
+/// records the rumor or forwards it again.
 ///
 /// # Sources
 ///
@@ -666,9 +786,8 @@ pub const MAX_GOSSIP_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Ceiling on the initial time-to-live an origin gossip may request.
 ///
-/// The time-to-live is the hop radius of a flood, so capping it bounds the
-/// basic reproduction number of a single rumor, whatever value a publisher
-/// requests.
+/// The time-to-live is the hop radius of a flood, so the cap bounds the basic
+/// reproduction number of one rumor, whatever a publisher requests.
 ///
 /// # Sources
 ///
@@ -679,10 +798,8 @@ pub const MAX_GOSSIP_TTL: u8 = 8;
 /// Ceiling on distinct gossip rumors retained in one in-memory journal.
 ///
 /// The journal retains recent rumors for deduplication and anti-entropy
-/// reconciliation.
-///
-/// - Bounding the count keeps memory finite under a flood.
-/// - The journal fails closed once the ceiling is reached.
+/// reconciliation. The bound keeps its memory finite under a flood, and the
+/// journal fails closed at the ceiling.
 ///
 /// # Sources
 ///
@@ -692,9 +809,8 @@ pub const MAX_GOSSIP_LOG: usize = 4096;
 
 /// Ceiling on gossip rumors retained per signer in one in-memory journal.
 ///
-/// Partitioning the journal per signer isolates retention per identity.
-/// One signer's distinct digests spend that signer's own retention, which
-/// leaves other signers' rumors recorded.
+/// The journal partitions retention per signer, so one signer's distinct
+/// digests spend its own retention and leave other signers' rumors recorded.
 ///
 /// # Sources
 ///
@@ -704,17 +820,18 @@ pub const MAX_GOSSIP_LOG_PER_SIGNER: usize = 256;
 
 /// Default gossip deduplication window in milliseconds.
 ///
-/// A rumor whose digest was recorded within this window counts as already
-/// seen, which is the recovered or immune state of the epidemic model. The
-/// window must exceed the time a flood takes to traverse the peer graph, so
-/// late duplicates are still suppressed.
+/// A rumor is fresh while its stated issue time lies within this window of
+/// the clock. The journal keeps its digest while it is fresh, so a replay
+/// counts as seen: the recovered or immune state of the epidemic model. The
+/// window must exceed the time a flood takes to cross the peer graph, so the
+/// journal suppresses even a late duplicate.
 pub const DEFAULT_GOSSIP_SEEN_TTL_MS: u64 = 120_000;
 
 /// Default gossip retention window in milliseconds.
 ///
-/// Anti-entropy reconciliation can repair only a rumor that a peer still
-/// retains. Retention must be at least as long as the deduplication window,
-/// so a node that returns within the window can still be repaired.
+/// Anti-entropy reconciliation can repair only a rumor that a peer retains.
+/// Retention must be at least as long as the deduplication window, so
+/// reconciliation can repair a node that returns within the window.
 pub const DEFAULT_GOSSIP_RETENTION_MS: u64 = 120_000;
 
 /// Default initial time-to-live an origin gossip requests.
@@ -735,15 +852,14 @@ pub const DEFAULT_GOSSIP_RATE_BURST: u32 = 128;
 
 /// Default interval that restores one token to a signer's gossip bucket.
 ///
-/// Together with [`DEFAULT_GOSSIP_RATE_BURST`], this sets the sustained
-/// per-signer publish rate a gateway admits. The default rate is four rumors
-/// per second.
+/// With [`DEFAULT_GOSSIP_RATE_BURST`], it sets the sustained per-signer
+/// publish rate a gateway admits: four rumors per second by default.
 pub const DEFAULT_GOSSIP_RATE_REFILL_MS: u64 = 250;
 
 /// Ceiling on distinct signers tracked by one in-memory admission store.
 ///
-/// Bounding tracked signers keeps memory finite when many identities
-/// publish. Admission fails closed once the ceiling is reached.
+/// The bound on tracked signers keeps memory finite when many identities
+/// publish. Admission fails closed once the store reaches the ceiling.
 ///
 /// # Sources
 ///
@@ -753,8 +869,8 @@ pub const MAX_GOSSIP_RATE_SIGNERS: usize = 4096;
 
 /// Ceiling on unverified candidates held in the peer discovery table.
 ///
-/// Peer-exchange hints are attacker-suppliable, so the new table is bounded
-/// before any hint is dialed.
+/// Peer-exchange hints are attacker-suppliable, so discovery bounds the `new`
+/// table before it dials any hint.
 ///
 /// # Sources
 ///
@@ -773,11 +889,11 @@ pub const MAX_PEER_TABLE_NEW: usize = 256;
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const MAX_PEER_TABLE_TRIED: usize = MAX_PEER_GATEWAYS;
 
-/// Ceiling on peer-table entries sharing one address prefix bucket.
+/// Ceiling on peer-table entries that share one address prefix bucket.
 ///
 /// Discovery buckets learned peers by /16 (IPv4) or /32 (IPv6) prefix. The
 /// per-bucket bound is the eclipse countermeasure, so one network position
-/// holds its own share of either table.
+/// holds at most this many entries of either table.
 ///
 /// # Sources
 ///
@@ -800,18 +916,50 @@ pub const MAX_PEX_SAMPLE: usize = 8;
 
 /// Ceiling on unverified candidates probed per advertise beat.
 ///
-/// Feeler dials verify candidates before promotion. Bounding them per beat
-/// keeps discovery traffic a small constant beside the anchor and tried
-/// dials.
+/// Feeler dials verify candidates before promotion, and this bound keeps
+/// discovery traffic a small constant beside the anchor and tried dials.
 pub const PEER_PROBE_PER_BEAT: usize = 4;
+
+/// Wait before a candidate that failed one feeler probe is probed again.
+///
+/// Each further failed probe doubles the wait, up to
+/// [`PEER_PROBE_BACKOFF_MAX_MS`]. A dead address therefore costs a connect
+/// timeout at a rate that drops with each failure, and its prefix yields the
+/// probe slot meanwhile.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const PEER_PROBE_BACKOFF_MS: u64 = 1_000;
+
+/// Ceiling on the wait between two feeler probes of one failed candidate.
+///
+/// Discovery therefore probes a recovered candidate again within this wait
+/// of its last failed probe.
+pub const PEER_PROBE_BACKOFF_MAX_MS: u64 = 60_000;
 
 /// Consecutive failed beat dials before a tried peer is evicted.
 ///
-/// Tried residents re-dial on every beat, so consecutive failures are the
+/// The beat re-dials every tried resident, so consecutive failures are the
 /// liveness clock.
 ///
 /// - The threshold tolerates a two-beat partition.
-/// - Eviction frees the prefix bucket slot for a live candidate.
-/// - Discovery refills the table.
+/// - Eviction frees the prefix bucket slot for a live candidate, and discovery refills the table.
 /// - Eviction is the fail-closed direction.
 pub const MAX_PEER_TRIED_FAILURES: usize = 3;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A prefix pair at the two ends of a set fails the check, so the check
+	/// reaches every pair of the set.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_prefix_pair_at_the_ends_of_a_set_is_found() {
+		let labels: [&[u8]; 3] = [b"tb/a", b"tb/b", b"tb/a/v1"];
+		let free = pairwise_prefix_free(&labels);
+		assert!(!free);
+	}
+}

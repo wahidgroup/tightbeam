@@ -1,4 +1,5 @@
-//! Mux chunking, credit, budgets, flow violations, authorizers.
+//! Mux scenarios for chunking, credit, budgets, flow violations, and
+//! authorizers.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -21,181 +22,85 @@ use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::{
 	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure,
 };
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
-	await_ok, bind_encrypted_listener, bind_encrypted_listener_with_timeout, connect_pinned_client,
-	establish_mutual_transports, join_task, mux_frame, mux_offer, serve_one_handshake_message, MutualSessionHooks,
+	await_ok, await_transport, await_within_deadline, bind_encrypted_listener, bind_encrypted_listener_with_timeout,
+	connect_pinned_client, establish_mutual_transports, join_task, mux_frame, mux_offer, serve_one_handshake_message,
+	MutualSessionHooks,
 };
 
 use super::common::*;
 
-pub(crate) const BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/budget-overrun-answered-with-goaway");
-pub(crate) const CHUNKED_TRANSFER_SURVIVES_DRAIN: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/chunked-transfer-survives-drain");
-pub(crate) const CLIENT_FAILS_CLOSED: Urn<'static> = tightbeam::urn!("test", "event:credit/client-fails-closed");
-pub(crate) const CLIENT_VIEWS_REDUCED_GRANT: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/client-views-reduced-grant");
 pub(crate) const CONTROL_STILL_FLOWS: Urn<'static> = tightbeam::urn!("test", "event:credit/control-still-flows");
-pub(crate) const CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/credit-overrun-answered-with-goaway");
 pub(crate) const DRAIN_COMPLETES_CLEAN: Urn<'static> = tightbeam::urn!("test", "event:credit/drain-completes-clean");
-pub(crate) const DRAIN_REASON_SURFACES: Urn<'static> = tightbeam::urn!("test", "event:credit/drain-reason-surfaces");
-pub(crate) const EXHAUSTING_EMIT_STILL_ECHOES: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/exhausting-emit-still-echoes");
-pub(crate) const FIRST_LARGE_FRAME_ECHOED: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/first-large-frame-echoed");
-pub(crate) const OPEN_CHUNK_SPENDS_INITIAL_CREDIT: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/open-chunk-spends-initial-credit");
-pub(crate) const OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/oversize-chunk-answered-with-goaway");
-pub(crate) const PEER_OBSERVES_BUDGET_EXHAUSTED: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/peer-observes-budget-exhausted");
-pub(crate) const REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/reassembly-flood-answered-with-goaway");
-pub(crate) const SECOND_LARGE_FRAME_ECHOED: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/second-large-frame-echoed");
-pub(crate) const SENDER_STALLS_AT_INITIAL_CREDIT: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/sender-stalls-at-initial-credit");
-pub(crate) const SERVER_BOUNDS_HUNG_AUTHORIZER: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/server-bounds-hung-authorizer");
-pub(crate) const SERVER_REFUSES_WITH_CODE: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/server-refuses-with-code");
-pub(crate) const SERVER_VIEWS_REDUCED_GRANT: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/server-views-reduced-grant");
-pub(crate) const STALLED_STREAM_STILL_ECHOES: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/stalled-stream-still-echoes");
-pub(crate) const TRANSFER_RESUMES_ON_GRANT: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/transfer-resumes-on-grant");
-pub(crate) const ZERO_BUDGET_EMIT_REFUSED: Urn<'static> =
-	tightbeam::urn!("test", "event:credit/zero-budget-emit-refused");
 
-tb_assert_spec! {
-	pub MuxChunkedRoundtripSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(FIRST_LARGE_FRAME_ECHOED, exactly!(1), equals!(true)),
-			(SECOND_LARGE_FRAME_ECHOED, exactly!(1), equals!(true))
-		]
-	}
+/// Two concurrent chunked frames each echo on their own stream.
+#[tokio::test]
+async fn mux_chunked_large_frames_roundtrip_and_interleave() -> Result<(), TightBeamError> {
+	let config = MuxEndpointConfig::default();
+	let pair = establish_echo_pair(chunked_offer(4), chunked_offer(4), config, TraceCollector::new()).await?;
+	let first = large_mux_frame("mux-chunked-first");
+	let second = large_mux_frame("mux-chunked-second");
+	let (first_echo, second_echo) = tokio::join!(
+		pair.client.handle.emit_on_stream(&first),
+		pair.client.handle.emit_on_stream(&second),
+	);
+
+	assert!(is_echo(first_echo?, &first), "the first chunked frame must echo");
+	assert!(is_echo(second_echo?, &second), "the second chunked frame must echo");
+	Ok(())
 }
 
-tb_scenario! {
-	name: mux_chunked_large_frames_roundtrip_and_interleave,
-	spec: MuxChunkedRoundtripSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let pair = establish_echo_pair(chunked_offer(4), chunked_offer(4), MuxEndpointConfig::default(), trace.share())
-				.await?;
-			let first = large_mux_frame("mux-chunked-first");
-			let second = large_mux_frame("mux-chunked-second");
-			let (first_echo, second_echo) = tokio::join!(
-				pair.client.handle.emit_on_stream(&first),
-				pair.client.handle.emit_on_stream(&second),
-			);
-
-			trace.event_with(
-				FIRST_LARGE_FRAME_ECHOED,
-				&[],
-				is_echo(first_echo?, &first),
-			)?;
-			trace.event_with(
-				SECOND_LARGE_FRAME_ECHOED,
-				&[],
-				is_echo(second_echo?, &second),
-			)?;
-
-			Ok(())
+/// Reads the next envelope as the first chunk of a chunked open on
+/// `stream_id`, and returns its payload.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- an expectation failure when the envelope is another record, or the read failure.
+async fn read_partial_open(reader: &mut SplitReader, stream_id: u32) -> Result<Vec<u8>, TightBeamError> {
+	let open = reader.read_envelope().await?;
+	match open {
+		TransportEnvelope::Mux(MuxEnvelope::Open(package)) if !package.last() && package.stream_id() == stream_id => {
+			Ok(package.payload().to_vec())
 		}
+		_ => Err(expectation_failure(
+			"the open chunk must spend the initial credit of its stream",
+		)),
 	}
 }
 
-tb_assert_spec! {
-	pub MuxCreditStallSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(OPEN_CHUNK_SPENDS_INITIAL_CREDIT, exactly!(1), equals!(true)),
-			(SENDER_STALLS_AT_INITIAL_CREDIT, exactly!(1), equals!(true)),
-			(TRANSFER_RESUMES_ON_GRANT, exactly!(1), equals!(true)),
-			(STALLED_STREAM_STILL_ECHOES, exactly!(1), equals!(true))
-		]
-	}
-}
+/// A sender parks at the initial credit of its stream, and the transfer
+/// resumes on the grant.
+#[tokio::test]
+async fn mux_stream_credit_stall_and_resume() -> Result<(), TightBeamError> {
+	let server_offer = chunked_offer(4).with_initial_stream_credit(1);
+	let mut link = establish_client_mux_server_raw_with(chunked_offer(4), server_offer, TraceCollector::new()).await?;
 
-tb_process_spec! {
-	pub MuxCreditStallProcess,
-	events {
-		observable {
-			OPEN_CHUNK_SPENDS_INITIAL_CREDIT,
-			SENDER_STALLS_AT_INITIAL_CREDIT,
-			TRANSFER_RESUMES_ON_GRANT,
-			STALLED_STREAM_STILL_ECHOES
-		}
-		hidden { }
-	}
-	states {
-		Idle => { OPEN_CHUNK_SPENDS_INITIAL_CREDIT => Opened },
-		Opened => { SENDER_STALLS_AT_INITIAL_CREDIT => Stalled },
-		Stalled => { TRANSFER_RESUMES_ON_GRANT => Resumed },
-		Resumed => { STALLED_STREAM_STILL_ECHOES => Done },
-		Done => { }
-	}
-	terminal { Done }
-}
+	let frame = large_mux_frame("mux-credit-stall");
+	let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
+	let payload = read_partial_open(&mut link.server_reader, client_stream_id(0)).await?;
 
-tb_scenario! {
-	name: mux_stream_credit_stall_and_resume,
-	config: ScenarioConfig::builder()
-		.with_spec(MuxCreditStallSpec::latest())
-		.with_csp(MuxCreditStallProcess)
-		.build(),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let server_offer = chunked_offer(4).with_initial_stream_credit(1);
-			let mut link =
-				establish_client_mux_server_raw_with(chunked_offer(4), server_offer, trace.share()).await?;
+	let stalled = timeout(Duration::from_millis(200), link.server_reader.read_envelope())
+		.await
+		.is_err();
+	assert!(stalled, "the sender must stall at the initial credit of its stream");
 
-			let frame = large_mux_frame("mux-credit-stall");
-			let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
+	let grant = MuxCreditPackage::new(client_stream_id(0), 64);
+	link.server_writer.write_envelope(grant.into()).await?;
 
-			let open = link.server_reader.read_envelope().await?;
-			let (payload, open_ok) = match open {
-				TransportEnvelope::Mux(MuxEnvelope::Open(package))
-					if !package.last() && package.stream_id() == client_stream_id(0) =>
-				{
-					(package.payload().to_vec(), true)
-				}
-				_ => (Vec::new(), false),
-			};
+	let payload = read_remaining_chunks(&mut link.server_reader, client_stream_id(0), payload).await?;
+	let received = Frame::from_der(&payload)?;
+	assert_eq!(received, frame, "the transfer must resume on the grant");
 
-			trace.event_with(OPEN_CHUNK_SPENDS_INITIAL_CREDIT, &[], open_ok)?;
+	let ack = mux_frame("mux-stall-ack");
+	write_muxed_echo(&mut link.server_writer, client_stream_id(0), &Arc::new(ack.to_owned())).await?;
 
-			let stalled = timeout(Duration::from_millis(200), link.server_reader.read_envelope())
-				.await
-				.is_err();
-			trace.event_with(SENDER_STALLS_AT_INITIAL_CREDIT, &[], stalled)?;
-
-			let grant = MuxCreditPackage::new(client_stream_id(0), 64);
-			link.server_writer.write_envelope(grant.into()).await?;
-
-			let payload = read_remaining_chunks(&mut link.server_reader, client_stream_id(0), payload).await?;
-			let received = Frame::from_der(&payload)?;
-
-			let ack = mux_frame("mux-stall-ack");
-			write_muxed_echo(&mut link.server_writer, client_stream_id(0), &Arc::new(ack.to_owned())).await?;
-
-			let resolved = await_ok(emit_task, "stalled emit task must not panic").await?;
-			trace.event_with(TRANSFER_RESUMES_ON_GRANT, &[], received == frame)?;
-			trace.event_with(STALLED_STREAM_STILL_ECHOES, &[], is_echo(resolved, &ack))?;
-
-			Ok(())
-		}
-	}
+	let resolved = await_ok(emit_task, "stalled emit task must not panic").await?;
+	assert!(is_echo(resolved, &ack), "the stalled stream must still echo");
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -204,7 +109,7 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
-			(ZERO_BUDGET_EMIT_REFUSED, exactly!(1), equals!(true)),
+			(events::MUX_BUDGET_REFUSED, exactly!(1)),
 			(CONTROL_STILL_FLOWS, exactly!(1), equals!(true)),
 			(DRAIN_COMPLETES_CLEAN, exactly!(1), equals!(true))
 		]
@@ -215,14 +120,14 @@ tb_process_spec! {
 	pub MuxZeroBudgetProcess,
 	events {
 		observable {
-			ZERO_BUDGET_EMIT_REFUSED,
+			events::MUX_BUDGET_REFUSED,
 			CONTROL_STILL_FLOWS,
 			DRAIN_COMPLETES_CLEAN
 		}
 		hidden { }
 	}
 	states {
-		Idle => { ZERO_BUDGET_EMIT_REFUSED => DataRefused },
+		Idle => { events::MUX_BUDGET_REFUSED => DataRefused },
 		DataRefused => { CONTROL_STILL_FLOWS => ControlOk },
 		ControlOk => { DRAIN_COMPLETES_CLEAN => Done },
 		Done => { }
@@ -230,7 +135,8 @@ tb_process_spec! {
 	terminal { Done }
 }
 
-// Zero budget: data emits fail fast; ping/shutdown still work.
+// Under a zero budget, a data emit fails at once, while a ping and the
+// shutdown succeed.
 tb_scenario! {
 	name: mux_zero_budget_refuses_data_drains_clean,
 	config: ScenarioConfig::builder()
@@ -248,7 +154,7 @@ tb_scenario! {
 			let pair = spawn_echo_pair(session.client, session.server, config, trace.share())?;
 
 			let refused = pair.client.handle.emit_on_stream(&mux_frame("mux-zero-budget")).await;
-			trace.event_with(ZERO_BUDGET_EMIT_REFUSED, &[], is_budget_exhausted(&refused))?;
+			assert!(is_budget_exhausted(&refused), "a data emit under a zero budget must fail as budget exhausted");
 
 			trace.event_with(
 				CONTROL_STILL_FLOWS,
@@ -271,14 +177,13 @@ tb_assert_spec! {
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
-			(events::MUX_GOAWAY_RECV, exactly!(1)),
-			(EXHAUSTING_EMIT_STILL_ECHOES, exactly!(1), equals!(true)),
-			(PEER_OBSERVES_BUDGET_EXHAUSTED, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::BudgetExhausted)))
 		]
 	}
 }
 
-// Caps 1/1, 1 KiB chunk: reserve = 5 credits; grant 6 exhausts on first emit.
+// With caps of 1/1 and a 1 KiB chunk, the reserve is 5 credits, so a grant of 6
+// runs out on the first emit.
 tb_scenario! {
 	name: mux_budget_exhaustion_drains,
 	spec: MuxBudgetExhaustionSpec,
@@ -294,20 +199,14 @@ tb_scenario! {
 
 			let frame = mux_frame("mux-budget-last");
 			let echoed = pair.client.handle.emit_on_stream(&frame).await?;
-			trace.event_with(
-				EXHAUSTING_EMIT_STILL_ECHOES,
-				&[],
-				is_echo(echoed, &frame),
-			)?;
+			assert!(is_echo(echoed, &frame), "the emit that reaches the reserve must still echo");
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// The late emit is a stimulus alone: its refusal emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("mux-budget-late")).await;
 
-			trace.event_with(
-				PEER_OBSERVES_BUDGET_EXHAUSTED,
-				&[],
-				await_goaway_reason(&pair.server.handle, GoAwayReason::BudgetExhausted).await,
-			)?;
+			let received = await_transport(|| trace.recorded(events::MUX_GOAWAY_RECV) > 0).await;
+			assert!(received, "the server must receive the GoAway of the exhausted budget");
 
 			Ok(())
 		}
@@ -357,7 +256,8 @@ async fn credit_overrun_rejected(trace: TraceCollector) -> Result<bool, TightBea
 	protocol_error_goaway_after(link, envelopes).await
 }
 
-// Five partial opens exceeds cap 4 ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)).
+// Five partial opens exceed the concurrent stream cap of 4 (RFC 9113 § 5.1.2,
+// <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>).
 async fn reassembly_flood_rejected(trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let client_offer = chunked_offer(4);
 	let server_offer = chunked_offer(4);
@@ -398,10 +298,7 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
-			(OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
-			(CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
-			(REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
-			(BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(4), equals!(u32::from(GoAwayReason::ProtocolError)))
 		]
 	}
 }
@@ -412,67 +309,44 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let oversize = oversize_chunk_rejected(trace.share()).await?;
-			trace.event_with(OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY, &[], oversize)?;
+			assert!(oversize, "an oversize chunk must draw a ProtocolError GoAway");
 
 			let credit = credit_overrun_rejected(trace.share()).await?;
-			trace.event_with(CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY, &[], credit)?;
+			assert!(credit, "a credit overrun must draw a ProtocolError GoAway");
 
 			let flood = reassembly_flood_rejected(trace.share()).await?;
-			trace.event_with(REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY, &[], flood)?;
+			assert!(flood, "a reassembly flood must draw a ProtocolError GoAway");
 
 			let budget = budget_overrun_rejected(trace.share()).await?;
-			trace.event_with(BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY, &[], budget)?;
+			assert!(budget, "a budget overrun must draw a ProtocolError GoAway");
 
 			Ok(())
 		}
 	}
 }
 
-tb_assert_spec! {
-	pub MuxAuthorizerSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(CLIENT_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true)),
-			(SERVER_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true))
-		]
-	}
-}
+/// An authorizer that halves the requested budgets binds the same reduced
+/// grant on both sides.
+#[tokio::test]
+async fn mux_authorizer_reduced_grant_both_sides() -> Result<(), TightBeamError> {
+	let request = MuxBudgets { client_to_server: 10, server_to_client: 10 };
+	let hooks = MutualSessionHooks { authorizer: Some(Arc::new(HalvingAuthorizer)), ..MutualSessionHooks::default() };
+	let session = establish_mutual_transports(mux_offer(4).with_budgets(request), mux_offer(4), hooks).await?;
 
-tb_scenario! {
-	name: mux_authorizer_reduced_grant_both_sides,
-	spec: MuxAuthorizerSpec,
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			let request = MuxBudgets { client_to_server: 10, server_to_client: 10 };
-			let hooks =
-				MutualSessionHooks { authorizer: Some(Arc::new(HalvingAuthorizer)), ..MutualSessionHooks::default() };
-			let session =
-				establish_mutual_transports(mux_offer(4).with_budgets(request), mux_offer(4), hooks).await?;
+	let client_settings = session
+		.client
+		.negotiated_mux()
+		.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
+	let server_settings = session
+		.server
+		.negotiated_mux()
+		.ok_or_else(|| expectation_failure("server must negotiate multiplexing"))?;
 
-			let client_settings = session
-				.client
-				.negotiated_mux()
-				.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
-			let server_settings = session
-				.server
-				.negotiated_mux()
-				.ok_or_else(|| expectation_failure("server must negotiate multiplexing"))?;
-
-			trace.event_with(
-				CLIENT_VIEWS_REDUCED_GRANT,
-				&[],
-				client_settings.send_budget == Some(5) && client_settings.recv_budget == Some(5),
-			)?;
-			trace.event_with(
-				SERVER_VIEWS_REDUCED_GRANT,
-				&[],
-				server_settings.send_budget == Some(5) && server_settings.recv_budget == Some(5),
-			)?;
-
-			Ok(())
-		}
-	}
+	let client_grant = (client_settings.send_budget, client_settings.recv_budget);
+	let server_grant = (server_settings.send_budget, server_settings.recv_budget);
+	assert_eq!(client_grant, (Some(5), Some(5)), "the client must take the halved grant");
+	assert_eq!(server_grant, (Some(5), Some(5)), "the server must bind the halved grant");
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -480,13 +354,13 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SERVER_REFUSES_WITH_CODE, exactly!(1), equals!(true)),
-			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
+			(events::SESSION_AUTHORIZATION_REFUSED, exactly!(1), equals!(REFUSAL_CODE))
 		]
 	}
 }
 
-// Refusal before accept enters transcript: fail closed both sides.
+// The authorizer refuses before the accept enters the transcript, so both sides
+// fail closed.
 tb_scenario! {
 	name: mux_authorizer_refusal_fails_closed,
 	spec: MuxAuthorizerRefusalSpec,
@@ -494,12 +368,14 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
 			let (listener, addr) = bind_encrypted_listener(&materials).await?;
+			let server_trace = trace.share();
 
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
 					.with_mux_offer(Some(mux_offer(4)))
-					.with_transport_authorizer(Arc::new(RefusingAuthorizer));
+					.with_transport_authorizer(Arc::new(RefusingAuthorizer))
+					.with_trace(server_trace);
 
 				serve_one_handshake_message(&mut transport).await?;
 				serve_one_handshake_message(&mut transport).await?;
@@ -512,19 +388,14 @@ tb_scenario! {
 
 			let client_result = client.perform_client_handshake().await;
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
-			trace.event_with(
-				SERVER_REFUSES_WITH_CODE,
-				&[],
-				matches!(
-					server_result,
-					Err(TightBeamError::TransportError(TransportError::HandshakeError(
-						HandshakeError::NegotiationError(NegotiationError::AuthorizationRefused {
-							code: REFUSAL_CODE,
-						})
-					)))
-				),
-			)?;
-			trace.event_with(CLIENT_FAILS_CLOSED, &[], client_result.is_err())?;
+			let refused_with_code = matches!(
+				server_result,
+				Err(TightBeamError::TransportError(TransportError::HandshakeError(
+					HandshakeError::NegotiationError(NegotiationError::AuthorizationRefused { code: REFUSAL_CODE })
+				)))
+			);
+			assert!(refused_with_code, "the server must refuse the session with the authorizer's code");
+			assert!(client_result.is_err(), "the client handshake must fail closed when the server refuses it");
 
 			Ok(())
 		}
@@ -536,13 +407,13 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SERVER_BOUNDS_HUNG_AUTHORIZER, exactly!(1), equals!(true)),
-			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_EXPIRED, exactly!(1))
 		]
 	}
 }
 
-// Hung authorizer: handshake deadline -> DeadlineExceeded.
+// The handshake deadline bounds a hung authorizer, and the server fails with
+// `DeadlineExceeded`.
 tb_scenario! {
 	name: mux_hung_authorizer_bounded_by_handshake_deadline,
 	spec: MuxAuthorizerDeadlineSpec,
@@ -551,12 +422,14 @@ tb_scenario! {
 			let materials = ServerMaterials::generate();
 			let (listener, addr) =
 				bind_encrypted_listener_with_timeout(&materials, Duration::from_millis(200)).await?;
+			let server_trace = trace.share();
 
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
 					.with_mux_offer(Some(mux_offer(4)))
-					.with_transport_authorizer(Arc::new(HangingAuthorizer));
+					.with_transport_authorizer(Arc::new(HangingAuthorizer))
+					.with_trace(server_trace);
 
 				serve_one_handshake_message(&mut transport).await?;
 				serve_one_handshake_message(&mut transport).await?;
@@ -569,25 +442,20 @@ tb_scenario! {
 			let client_task = tokio::spawn(async move { client.perform_client_handshake().await });
 
 			let server_join = join_task(server_task, "server handshake task must not panic");
-			let server_result = timeout(Duration::from_secs(5), server_join)
-				.await
-				.map_err(|_| expectation_failure("hung authorizer must not stall the server past the deadline"))??;
-			trace.event_with(
-				SERVER_BOUNDS_HUNG_AUTHORIZER,
-				&[],
-				matches!(
-					server_result,
-					Err(TightBeamError::TransportError(TransportError::OperationFailed(
-						TransportFailure::DeadlineExceeded
-					)))
-				),
-			)?;
+			let server_bounded = await_within_deadline(server_join, "hung authorizer must not stall the server past the deadline");
+			let server_result = server_bounded.await??;
+			let expired = matches!(
+				server_result,
+				Err(TightBeamError::TransportError(TransportError::OperationFailed(
+					TransportFailure::DeadlineExceeded
+				)))
+			);
+			assert!(expired, "the handshake deadline must end the server handshake");
 
 			let client_join = join_task(client_task, "client handshake task must not panic");
-			let client_result = timeout(Duration::from_secs(5), client_join)
-				.await
-				.map_err(|_| expectation_failure("client must fail closed once the server abandons the handshake"))??;
-			trace.event_with(CLIENT_FAILS_CLOSED, &[], client_result.is_err())?;
+			let client_bounded = await_within_deadline(client_join, "client must fail closed once the server abandons the handshake");
+			let client_result = client_bounded.await??;
+			assert!(client_result.is_err(), "the client handshake must fail closed when the server abandons it");
 
 			Ok(())
 		}
@@ -600,15 +468,15 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
-			(events::MUX_GOAWAY_RECV, exactly!(1)),
-			(events::MUX_EMIT_DRAINING, exactly!(1)),
-			(CHUNKED_TRANSFER_SURVIVES_DRAIN, exactly!(1), equals!(true)),
-			(DRAIN_REASON_SURFACES, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Shutdown))),
+			(events::MUX_EMIT_DRAINING, exactly!(1))
 		]
 	}
 }
 
-// limit=18: 15 response records + reserve 5 (caps 1/1, chunk 1024); headroom for GoAway.
+// The rekey limit of 18 records is below the 15 response records plus the
+// reserve of 5 (caps 1/1, chunk 1024), so the transfer crosses the drain floor,
+// and the reserve keeps headroom for the GoAway.
 tb_scenario! {
 	name: mux_rekey_drain_with_inflight_chunked_transfer,
 	spec: MuxRekeyChunkedDrainSpec,
@@ -619,19 +487,13 @@ tb_scenario! {
 
 			let frame = large_mux_frame("mux-rekey-chunked");
 			let echoed = pair.client.handle.emit_on_stream(&frame).await?;
-			trace.event_with(
-				CHUNKED_TRANSFER_SURVIVES_DRAIN,
-				&[],
-				is_echo(echoed, &frame),
-			)?;
+			assert!(is_echo(echoed, &frame), "the chunked transfer must echo across the drain");
 
-			trace.event_with(
-				DRAIN_REASON_SURFACES,
-				&[],
-				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
-			)?;
+			let received = await_transport(|| trace.recorded(events::MUX_GOAWAY_RECV) > 0).await;
+			assert!(received, "the client must receive the drain GoAway of the server");
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// The late emit is a stimulus alone: its refusal emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("mux-rekey-late")).await;
 
 			Ok(())

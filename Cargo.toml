@@ -31,18 +31,25 @@ cargo-hack = "0.6.45"
 cargo-semver-checks = "0.50.0"
 typos-cli = "1.49.0"
 cargo-afl = "0.18.2"
+cargo-llvm-cov = "0.9.1"
 
 [workspace.lints.rust]
 # Catch dead imports under cfg-gated paths that `--all-features` never compiles.
 unused_imports = "deny"
 
 [workspace.lints.clippy]
-# Zero-copy: Arc/Rc refcount bumps must be written as `Arc::clone(&x)` so they
-# disambiguated from deep copies.
+# Zero-copy: an Arc or Rc refcount bump must read `Arc::clone(&x)`, so a
+# reader can tell it from a deep copy.
 clone_on_ref_ptr = "deny"
+# Zero-panic: these lints deny an index or an integer operation that can
+# panic in production code. Test code is exempt: `lib.rs` allows both under
+# `cfg(test)`, `testing/mod.rs` allows both for the fixture surface, and a test
+# or fuzz target that indexes allows both at its root.
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
 
 [workspace.dependencies]
-tightbeam-derive = { version = "0.1.7", path = "tightbeam-derive" }
+tightbeam-derive = { version = "=0.1.7", path = "tightbeam-derive" }
 
 # RustCrypto dependencies
 spki = { version = "=0.7.3", default-features = false }
@@ -56,6 +63,9 @@ pkcs12 = { version = "=0.1.0", default-features = false }
 hkdf = { version = "=0.12.4", default-features = false }
 x509-cert = { version = "=0.2.5", default-features = false, features = [
 	"pem",
+	# The `hazmat` feature opens `Profile::Manual`, so `cert!` writes the key
+	# identifiers of RFC 7093 §2 method 1 in place of the builder's SHA-1 ones.
+	"hazmat",
 ] }
 hex-literal = { version = "=1.1.0", default-features = false }
 elliptic-curve = { version = "=0.13.8", default-features = false }
@@ -76,6 +86,10 @@ aes-gcm = { version = "=0.10.3", default-features = false, features = [
 	"alloc",
 ] }
 aes-kw = { version = "=0.2.1", default-features = false, features = ["alloc"] }
+# Named so the `zeroize` feature of each is reachable: `aes-gcm` 0.10 passes
+# its own `zeroize` feature to neither.
+ghash = { version = "=0.5.1", default-features = false }
+polyval = { version = "=0.6.2", default-features = false }
 sha3 = { version = "=0.10.9", default-features = false, features = ["oid"] }
 ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"signing",
@@ -96,7 +110,7 @@ rayon = { version = "=1.12.0", default-features = false }
 rand_core = { version = "=0.6.4", default-features = false, features = [
 	"getrandom",
 ] }
-tokio = { version = "=1.53.1", default-features = false, features = [
+tokio = { version = "=1.53.3", default-features = false, features = [
 	"rt",
 	"rt-multi-thread",
 	"net",
@@ -113,10 +127,13 @@ time = { version = "=0.3.47", default-features = false, features = [
 futures = { version = "=0.3.33", default-features = false, features = ["alloc"] }
 
 # Compression dependencies
-zstd-safe = { version = "=7.2.4", default-features = false }
+zstd-safe = { version = "=8.2.0", default-features = false }
 
 # Dev dependencies
 husky-rs = { version = "=0.3.3" }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+p521 = { version = "=0.13.3", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 paste = { version = "=1.0.15" }
 trybuild = { version = "=1.0.118", features = ["diff"] }
 
@@ -127,4 +144,4 @@ syn = { version = "=2.0.119", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
 afl = { version = "=0.17.1" }
-proptest = { version = "1.8.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }

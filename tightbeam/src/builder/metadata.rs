@@ -4,8 +4,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::asn1::{AuthEnvelopedData, WireDer};
 use crate::builder::error::BuildError;
-use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::matrix::MatrixDyn;
 use crate::{CompressedData, DigestInfo, MessagePriority, Metadata, Version};
 
@@ -16,7 +16,7 @@ pub struct MetadataBuilder {
 	pub(crate) order: Option<u64>,
 	pub(crate) integrity: Option<DigestInfo>,
 	pub(crate) compactness: Option<CompressedData>,
-	pub(crate) confidentiality: Option<EncryptedContentInfo>,
+	pub(crate) confidentiality: Option<WireDer<AuthEnvelopedData>>,
 	pub(crate) priority: Option<MessagePriority>,
 	pub(crate) lifetime: Option<u64>,
 	pub(crate) previous_frame: Option<DigestInfo>,
@@ -41,110 +41,110 @@ impl From<Version> for MetadataBuilder {
 }
 
 impl MetadataBuilder {
-	/// Set the message ID from bytes.
-	/// This is useful for idempotence.
+	/// Sets the message ID from bytes, so a caller can make a send idempotent.
 	pub fn with_id(mut self, id: impl AsRef<[u8]>) -> Self {
 		self.id = Some(id.as_ref().to_vec());
 		self
 	}
 
-	/// Set the order.
+	/// Sets the order.
 	///
 	/// The value is protocol-opaque: any monotonic scheme works, such as a
-	/// Unix timestamp or a dense per-channel counter. When omitted, the
-	/// frame build defaults it to the current Unix time in seconds.
+	/// Unix timestamp or a dense per-channel counter. When the caller sets no
+	/// order, the frame build defaults it to the current Unix time in seconds.
 	pub fn with_order(mut self, order: u64) -> Self {
 		self.order = Some(order);
 		self
 	}
 
-	/// Set the integrity information
+	/// Sets the integrity information.
 	pub fn with_integrity_info(mut self, hash: DigestInfo) -> Self {
 		self.integrity = Some(hash);
 		self
 	}
 
-	/// Set the compression information
+	/// Sets the compression information.
 	pub fn with_compactness_info(mut self, compression: CompressedData) -> Self {
 		self.compactness = Some(compression);
 		self
 	}
 
-	/// Set the encryption information
-	pub fn with_confidentiality_info(mut self, encryption: EncryptedContentInfo) -> Self {
+	/// Sets the envelope of the encrypted body, its ciphertext detached into
+	/// the message, beside the DER it encodes as.
+	pub fn with_confidentiality_info(mut self, encryption: WireDer<AuthEnvelopedData>) -> Self {
 		self.confidentiality = Some(encryption);
 		self
 	}
 
-	/// Set the message priority (V2+ only)
+	/// Sets the message priority, which a V2 or later frame permits.
 	pub fn with_priority(mut self, priority: MessagePriority) -> Self {
 		self.priority = Some(priority);
 		self
 	}
 
-	/// Set the time-to-live in seconds (V2+ only)
+	/// Sets the time-to-live in seconds, which a V2 or later frame permits.
 	pub fn with_lifetime(mut self, seconds: u64) -> Self {
 		self.lifetime = Some(seconds);
 		self
 	}
 
-	/// Set the previous hash reference (V2+ only)
+	/// Sets the previous hash reference, which a V2 or later frame permits.
 	pub fn previous_frame(mut self, previous: DigestInfo) -> Self {
 		self.previous_frame = Some(previous);
 		self
 	}
 
-	/// Set the routing matrix (V3+ only)
+	/// Sets the routing matrix, which a V3 or later frame permits.
 	pub fn with_matrix(mut self, matrix: MatrixDyn) -> Self {
 		self.matrix = Some(matrix);
 		self
 	}
 
-	/// Build the metadata based on the protocol version
+	/// Builds the metadata for the protocol version of the builder.
 	///
 	/// # Errors
-	/// Returns an error if required fields are missing, or if a set field is
-	/// not permitted by the specified version
+	/// - [`BuildError::InvalidMetadata`] -- the builder has no id or no order,
+	///   or a set field is gated above the builder's version.
 	pub fn build(self) -> Result<Metadata, BuildError> {
 		Metadata::try_from(self)
 	}
 
-	/// Check if ID is set
+	/// Returns whether the ID is set.
 	pub fn has_id(&self) -> bool {
 		self.id.is_some()
 	}
 
-	/// Check if priority is set
+	/// Returns whether the priority is set.
 	pub fn has_priority(&self) -> bool {
 		self.priority.is_some()
 	}
 
-	// Check if order is set
+	/// Returns whether the order is set.
 	pub fn has_order(&self) -> bool {
 		self.order.is_some()
 	}
 
-	/// Check if lifetime is set
+	/// Returns whether the lifetime is set.
 	pub fn has_lifetime(&self) -> bool {
 		self.lifetime.is_some()
 	}
 
-	/// Check if previous hash is set
+	/// Returns whether the previous hash is set.
 	pub fn has_previous(&self) -> bool {
 		self.previous_frame.is_some()
 	}
 
-	/// Check if matrix is set
+	/// Returns whether the matrix is set.
 	pub fn has_matrix(&self) -> bool {
 		self.matrix.is_some()
 	}
 
-	/// Check if compression is set
+	/// Returns whether the compression information is set.
 	pub fn has_compression(&self) -> bool {
 		self.compactness.is_some()
 	}
 
-	/// Check if integrity info is set
+	/// Returns whether the integrity information is set.
 	pub fn has_integrity(&self) -> bool {
 		self.integrity.is_some()
 	}
@@ -157,7 +157,7 @@ mod tests {
 	use crate::builder::error::MetadataError;
 	use crate::testing::TestDigest;
 
-	/// Fixture 2x2 zero matrix for builder chains.
+	/// A 2x2 zero matrix, the fixture of the builder chains.
 	fn fixture_matrix() -> MatrixDyn {
 		MatrixDyn::try_from(2u8).expect("2 is a valid matrix dimension")
 	}
@@ -170,7 +170,8 @@ mod tests {
 					.build()
 					.expect(concat!("Failed to build ", stringify!($version), " metadata"));
 
-				// X.509-style: single structure, validate based on version
+				// One structure serves every version, as in X.509, so the
+				// assertions branch on the version.
 				match $version {
 					Version::V0 => {
 						assert!(metadata.priority().is_none());
@@ -197,8 +198,8 @@ mod tests {
 		};
 	}
 
-	// V0 permits no integrity info; setting one is covered by the rejection
-	// tests below.
+	// V0 permits no integrity info. The rejection tests below cover a V0
+	// builder that sets one.
 	test_metadata_builder!(
 		test_metadata_builder_v0,
 		Version::V0,
@@ -248,116 +249,62 @@ mod tests {
 	mod errors {
 		use super::*;
 
-		struct ErrorTestCase {
-			name: &'static str,
-			builder: fn() -> MetadataBuilder,
-			expected_error: MetadataError,
-		}
+		/// The builder of one case, and the error that its build returns.
+		type ErrorCase = (MetadataBuilder, MetadataError);
 
-		#[test]
-		fn test_metadata_validation_errors() {
-			let test_cases = [
-				ErrorTestCase {
-					name: "V0 missing id",
-					builder: || MetadataBuilder::from(Version::V0).with_order(1696521600),
-					expected_error: MetadataError::MissingId,
-				},
-				ErrorTestCase {
-					name: "V0 missing order",
-					builder: || MetadataBuilder::from(Version::V0).with_id("test-id"),
-					expected_error: MetadataError::MissingOrder,
-				},
-				ErrorTestCase {
-					name: "V1 missing id",
-					builder: || MetadataBuilder::from(Version::V1).with_order(1696521600),
-					expected_error: MetadataError::MissingId,
-				},
-				ErrorTestCase {
-					name: "V1 missing order",
-					builder: || MetadataBuilder::from(Version::V1).with_id("test-id"),
-					expected_error: MetadataError::MissingOrder,
-				},
-				ErrorTestCase {
-					name: "V2 missing id",
-					builder: || MetadataBuilder::from(Version::V2).with_order(1696521600),
-					expected_error: MetadataError::MissingId,
-				},
-				ErrorTestCase {
-					name: "V2 missing order",
-					builder: || MetadataBuilder::from(Version::V2).with_id("test-id"),
-					expected_error: MetadataError::MissingOrder,
-				},
-				ErrorTestCase {
-					name: "V0 rejects integrity",
-					builder: || {
-						MetadataBuilder::from(Version::V0)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_integrity_info(TestDigest::info())
-					},
-					expected_error: MetadataError::UnsupportedField {
-						field: GatedField::MessageIntegrity,
-						version: Version::V0,
-					},
-				},
-				ErrorTestCase {
-					name: "V0 rejects priority",
-					builder: || {
-						MetadataBuilder::from(Version::V0)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_priority(MessagePriority::LowLatency)
-					},
-					expected_error: MetadataError::UnsupportedField {
-						field: GatedField::Priority,
-						version: Version::V0,
-					},
-				},
-				ErrorTestCase {
-					name: "V1 rejects lifetime",
-					builder: || {
-						MetadataBuilder::from(Version::V1)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_lifetime(3600)
-					},
-					expected_error: MetadataError::UnsupportedField {
-						field: GatedField::Lifetime,
-						version: Version::V1,
-					},
-				},
-				ErrorTestCase {
-					name: "V0 rejects previous_frame",
-					builder: || {
-						MetadataBuilder::from(Version::V0)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.previous_frame(TestDigest::info())
-					},
-					expected_error: MetadataError::UnsupportedField {
-						field: GatedField::PreviousFrame,
-						version: Version::V0,
-					},
-				},
-				ErrorTestCase {
-					name: "V2 rejects matrix",
-					builder: || {
-						MetadataBuilder::from(Version::V2)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_matrix(MatrixDyn::default())
-					},
-					expected_error: MetadataError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 },
-				},
-			];
-
-			for case in test_cases {
-				let result = (case.builder)().build();
-				assert!(
-					matches!(result, Err(BuildError::InvalidMetadata(ref err)) if *err == case.expected_error),
-					"{}",
-					case.name
-				);
+		crate::tb_cases! {
+			fn test_metadata_validation_errors((builder, expected): ErrorCase) {
+				let result = builder.build();
+				assert!(matches!(result, Err(BuildError::InvalidMetadata(ref err)) if *err == expected));
+			}
+			cases {
+				v0_missing_id => (MetadataBuilder::from(Version::V0).with_order(1696521600), MetadataError::MissingId),
+				v0_missing_order => (
+					MetadataBuilder::from(Version::V0).with_id("test-id"),
+					MetadataError::MissingOrder,
+				),
+				v1_missing_id => (MetadataBuilder::from(Version::V1).with_order(1696521600), MetadataError::MissingId),
+				v1_missing_order => (
+					MetadataBuilder::from(Version::V1).with_id("test-id"),
+					MetadataError::MissingOrder,
+				),
+				v2_missing_id => (MetadataBuilder::from(Version::V2).with_order(1696521600), MetadataError::MissingId),
+				v2_missing_order => (
+					MetadataBuilder::from(Version::V2).with_id("test-id"),
+					MetadataError::MissingOrder,
+				),
+				v0_rejects_integrity => (
+					MetadataBuilder::from(Version::V0)
+						.with_id("test-id")
+						.with_order(1696521600)
+						.with_integrity_info(TestDigest::info()),
+					MetadataError::UnsupportedField { field: GatedField::MessageIntegrity, version: Version::V0 },
+				),
+				v0_rejects_priority => (
+					MetadataBuilder::from(Version::V0)
+						.with_id("test-id")
+						.with_order(1696521600)
+						.with_priority(MessagePriority::LowLatency),
+					MetadataError::UnsupportedField { field: GatedField::Priority, version: Version::V0 },
+				),
+				v1_rejects_lifetime => (
+					MetadataBuilder::from(Version::V1).with_id("test-id").with_order(1696521600).with_lifetime(3600),
+					MetadataError::UnsupportedField { field: GatedField::Lifetime, version: Version::V1 },
+				),
+				v0_rejects_previous_frame => (
+					MetadataBuilder::from(Version::V0)
+						.with_id("test-id")
+						.with_order(1696521600)
+						.previous_frame(TestDigest::info()),
+					MetadataError::UnsupportedField { field: GatedField::PreviousFrame, version: Version::V0 },
+				),
+				v2_rejects_matrix => (
+					MetadataBuilder::from(Version::V2)
+						.with_id("test-id")
+						.with_order(1696521600)
+						.with_matrix(MatrixDyn::default()),
+					MetadataError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 },
+				),
 			}
 		}
 	}

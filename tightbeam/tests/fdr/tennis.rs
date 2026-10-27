@@ -1,15 +1,18 @@
-//! Tennis Game Scoring System tests
+//! The tennis scoring tests.
 //!
-//! Tests for the tennis scoring CSP process, including:
-//! - Valid trace refinement
-//! - Invalid trace refinement
-//! - Deuce to advantage scenarios
-//! - Failures refinement
+//! They refine traces against the tennis scoring CSP process:
+//! - A trace that A wins refines the process.
+//! - A trace that scores a point after the game ends fails refinement.
+//! - A trace through deuce and advantage refines the process.
+//! - A partial game passes failures refinement.
 
 #![cfg(feature = "testing-fdr")]
 
-use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConfig, SetupEnv};
-use tightbeam::utils::urn::Urn;
+use core::error::Error;
+
+use tightbeam::testing::macros::BuiltAssertSpec;
+use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, Expect, Layer, ScenarioConfig, SetupEnv};
+use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 pub(crate) const POINTA: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointa");
@@ -34,62 +37,56 @@ fn build_fdr_config(
 	}
 }
 
-// ===== Tennis Game Scoring System =====
+/// The configuration that grades `spec`, refines the run against
+/// [`TennisScorer`] under the bounds that every tennis scenario takes, and
+/// expects `expect`.
+fn tennis_config(spec: &'static BuiltAssertSpec, expect: Expect) -> Result<ScenarioConfig, Box<dyn Error>> {
+	let fdr = build_fdr_config(vec![TennisScorer::process()?], 4, 16, 8, 500);
+	let builder = ScenarioConfig::builder().with_spec(spec).with_fdr(fdr);
+	Ok(builder.with_expect(expect).build()?)
+}
+
+// The tennis scoring process.
 
 tb_process_spec! {
-	/// Tennis Game Scoring System CSP Process
+	/// The tennis scoring CSP process of one game.
 	///
-	/// Models tennis scoring with states:
-	/// - Score pairs: (0,0), (15,0), (30,0), (40,0), (40,15), (40,30)
-	/// - Special states: Deuce, AdvantageA, AdvantageB
-	/// - Terminal states: GameA (A wins), GameB (B wins)
-	///
-	/// Events: pointA, pointB
+	/// Its states are:
+	/// - A state per score pair, such as (0,0), (15,0), (40,15), and (30,40).
+	/// - The special states Deuce, AdvantageA, and AdvantageB.
+	/// - The terminal states GameA, which A wins, and GameB, which B wins.
 	pub TennisScorer,
 	events {
 		observable { POINTA, POINTB }
 		hidden { }
 	}
 	states {
-		// Initial state: (0,0)
+		// The game starts at (0,0).
 		S0_0 => { POINTA => S15_0, POINTB => S0_15 },
-		// Score (15,0)
 		S15_0 => { POINTA => S30_0, POINTB => S15_15 },
-		// Score (0,15)
 		S0_15 => { POINTA => S15_15, POINTB => S0_30 },
-		// Score (30,0)
 		S30_0 => { POINTA => S40_0, POINTB => S30_15 },
-		// Score (15,15)
 		S15_15 => { POINTA => S30_15, POINTB => S15_30 },
-		// Score (0,30)
 		S0_30 => { POINTA => S15_30, POINTB => S0_40 },
-		// Score (40,0) - A can win or B can score
+		// At (40,0), the next point of A wins the game, or B scores.
 		S40_0 => { POINTA => GameA, POINTB => S40_15 },
-		// Score (30,15)
 		S30_15 => { POINTA => S40_15, POINTB => S30_30 },
-		// Score (15,30)
 		S15_30 => { POINTA => S30_30, POINTB => S15_40 },
-		// Score (0,40) - B can win or A can score
+		// At (0,40), the next point of B wins the game, or A scores.
 		S0_40 => { POINTA => S15_40, POINTB => GameB },
-		// Score (40,15)
 		S40_15 => { POINTA => GameA, POINTB => S40_30 },
-		// Score (30,30)
 		S30_30 => { POINTA => S40_30, POINTB => S30_40 },
-		// Score (15,40)
 		S15_40 => { POINTA => S30_40, POINTB => GameB },
-		// Score (40,30) - A can win or go to Deuce
+		// At (40,30), the next point of A wins the game, or B brings Deuce.
 		S40_30 => { POINTA => GameA, POINTB => Deuce },
-		// Score (30,40) - B can win or go to Deuce
+		// At (30,40), the next point of B wins the game, or A brings Deuce.
 		S30_40 => { POINTA => Deuce, POINTB => GameB },
 
-		// Deuce state
+		// From Deuce, a player wins with two points in a row.
 		Deuce => { POINTA => AdvantageA, POINTB => AdvantageB },
-		// Advantage A
 		AdvantageA => { POINTA => GameA, POINTB => Deuce },
-		// Advantage B
 		AdvantageB => { POINTA => Deuce, POINTB => GameB },
 
-		// Terminal states
 		GameA => {},
 		GameB => {}
 	}
@@ -97,10 +94,10 @@ tb_process_spec! {
 	annotations { description: "Tennis game scoring system" }
 }
 
-// ===== Test 1: Tennis Game - Valid Trace Refinement =====
+// Test 1: a trace that A wins refines the process.
 
-// Define assertion spec for valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-// Score progression: (0,0) -> (15,0) -> (30,0) -> (30,15) -> (40,15) -> GameA
+// In the valid trace, A scores twice, B once, and A twice, so A wins. The
+// score runs (0,0), (15,0), (30,0), (30,15), (40,15), and then GameA.
 tb_assert_spec! {
 	pub ValidTennisSpec,
 	V(1,0,0): {
@@ -114,19 +111,10 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_tennis_valid_trace_refinement,
-	config: ScenarioConfig::builder()
-		.with_spec(ValidTennisSpec::latest())
-		.with_fdr(build_fdr_config(
-			vec![TennisScorer::process()],
-			4,
-			16,
-			8,
-			500,
-		))
-		.build(),
+	config: tennis_config(ValidTennisSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
+			// The points go A, A, B, A, A, and A wins the game.
 			trace.event(POINTA)?;
 			trace.event(POINTA)?;
 			trace.event(POINTB)?;
@@ -137,52 +125,45 @@ tb_scenario! {
 	}
 }
 
-// ===== Test 2: Tennis Game - Invalid Trace Refinement =====
+// Test 2: a trace that scores a point after the game ends fails refinement.
 
-// Define assertion spec for invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
-// This is impossible because after (0,40), B should win, not continue scoring
+// A wins the game with four points in a row, and then B scores. GameA is
+// terminal, so the process has no trace with a point after it. The trace
+// holds four points for A and one for B, as the valid trace of Test 1 does,
+// so the assertion spec passes it, and refinement alone refuses the order.
 tb_assert_spec! {
 	pub InvalidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(POINTA, exactly!(1)),
-			(POINTB, exactly!(4))
+			(POINTA, exactly!(4)),
+			(POINTB, exactly!(1))
 		]
 	},
 }
 
 tb_scenario! {
 	name: test_tennis_invalid_trace_refinement,
-	config: ScenarioConfig::builder()
-		.with_spec(InvalidTennisSpec::latest())
-		.with_fdr(build_fdr_config(
-			vec![TennisScorer::process()],
-			4,
-			16,
-			8,
-			500,
-		))
-		.build(),
+	config: tennis_config(InvalidTennisSpec::latest(), Expect::Violation(Layer::Refinement)),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
-			// This violates the tennis scoring rules - after (0,40), B should win
+			// The points go A, A, A, A, and A wins the game. The point of B
+			// comes after the end of the game.
 			trace.event(POINTA)?;
-			trace.event(POINTB)?;
-			trace.event(POINTB)?;
-			trace.event(POINTB)?;
+			trace.event(POINTA)?;
+			trace.event(POINTA)?;
+			trace.event(POINTA)?;
 			trace.event(POINTB)?;
 			Ok(())
 		}
 	}
 }
 
-// ===== Test 3: Tennis Game - Deuce to Advantage Trace =====
+// Test 3: a trace through deuce and advantage refines the process.
 
-// Define assertion spec for complex valid trace going through deuce
-// Valid trace: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
-// Score progression: (0,0) -> (15,0) -> (15,15) -> (30,15) -> (30,30) -> (40,30) -> Deuce -> AdvantageA -> GameA
+// The trace alternates A and B for six points, and then A scores twice. The
+// score runs (0,0), (15,0), (15,15), (30,15), (30,30), (40,30), Deuce,
+// AdvantageA, and then GameA.
 tb_assert_spec! {
 	pub DeuceTennisSpec,
 	V(1,0,0): {
@@ -196,19 +177,10 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_tennis_deuce_to_advantage,
-	config: ScenarioConfig::builder()
-		.with_spec(DeuceTennisSpec::latest())
-		.with_fdr(build_fdr_config(
-			vec![TennisScorer::process()],
-			4,
-			16,
-			8,
-			500,
-		))
-		.build(),
+	config: tennis_config(DeuceTennisSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
+			// The points go A, B, A, B, A, B, A, A, and A wins through Deuce.
 			trace.event(POINTA)?;
 			trace.event(POINTB)?;
 			trace.event(POINTA)?;
@@ -222,9 +194,9 @@ tb_scenario! {
 	}
 }
 
-// ===== Test 4: Failures Refinement =====
+// Test 4: a partial game passes failures refinement.
 
-// Create a trace that should pass failures refinement
+// The partial game takes three points and stays open at (30,15).
 tb_assert_spec! {
 	pub FailuresTennisSpec,
 	V(1,0,0): {
@@ -238,19 +210,10 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_failures_refinement,
-	config: ScenarioConfig::builder()
-		.with_spec(FailuresTennisSpec::latest())
-		.with_fdr(build_fdr_config(
-			vec![TennisScorer::process()],
-			4,
-			16,
-			8,
-			500,
-		))
-		.build(),
+	config: tennis_config(FailuresTennisSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Create a trace that should pass failures refinement
+			// The points go A, B, A, and the game stays open.
 			trace.event(POINTA)?;
 			trace.event(POINTB)?;
 			trace.event(POINTA)?;

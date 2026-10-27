@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit ci
+.PHONY: all help help-body help-ref version setup check build clean test lint doc test-all coverage miri loom bench fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit interop ci
 
 .NOTPARALLEL: ci
 
@@ -36,7 +36,7 @@ help:
 help-body:
 	@printf 'USAGE:\n'
 	@printf '    make <target> [fix=1] [debug=1] [features="<comma-separated>"] [no-default=1]\n'
-	@printf '                  [version=vX.Y.Z] [dry-run=1] [allow-staged=1] [yank=1]\n'
+	@printf '                  [version=vX.Y.Z] [dry-run=1] [allow-staged=1] [yank=1] [baseline=<ref>]\n'
 	@printf '                  [ARGS="<clippy-args>"]\n\n'
 	@printf 'DESCRIPTION:\n'
 	@printf '    Build, lint, test, and document the %s workspace following POSIX/GNU CLI conventions.\n\n' '$(PROJECT)'
@@ -51,19 +51,23 @@ help-body:
 	@printf '    clean           Clean build artifacts\n'
 	@printf '    test            Run all tests (honors cargo features and no-default)\n'
 	@printf '    test-all        Run tests with all feature combinations\n'
+	@printf '    coverage        Report the line coverage of the workspace tests (cargo-llvm-cov, HTML)\n'
+	@printf '    miri            Run the decode and zeroize unit tests under Miri (nightly toolchain)\n'
+	@printf '    loom            Run the loom models of the multiplexer atomics\n'
+	@printf '    bench           Run the benches of the record, the frame, and the replay guard\n'
 	@printf '    fuzz-build      Build AFL-instrumented fuzz targets (cargo-afl via setup)\n'
 	@printf '    fuzz-test       Build and fuzz every target (seconds=N, default 60)\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix; extra clippy args via ARGS)\n'
-	@printf '    spellcheck      Spellcheck the repository with typos\n'
 	@printf '    audit           Run dependency audit (cargo-deny: advisories, licences, bans)\n'
-	@printf '    ci              Full pipeline: lint + audit + build + test-all\n'
+	@printf '    interop         Write the CMS samples and check each with OpenSSL\n'
+	@printf '    ci              Full pipeline: lint + audit + build + test-all + interop\n'
 	@printf '    doc             Build documentation (all features; -D warnings)\n'
 	@printf '    release         Release workflow (see OPTIONS)\n'
 	@printf '    release-derive  Derive-only release: tag tightbeam-derive (see OPTIONS)\n'
 	@printf '    check-yanked    Check if current version has been yanked (derive=1 for derive)\n'
-	@printf '    check-semver    Check the public API against the published baseline\n\n'
+	@printf '    check-semver    Check the public API against the published baseline (baseline=<ref> for a git ref)\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    fix             If set (e.g., fix=1), apply fmt + clippy --fix; rustdoc still denies warnings\n'
 	@printf '    debug           If set (e.g., debug=1), export RUST_LOG=debug\n'
@@ -75,13 +79,15 @@ help-body:
 	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
 	@printf '    yank            If set (e.g., yank=1), yank a published release instead\n'
 	@printf '    derive          If set (e.g., derive=1), check-yanked and check-semver target tightbeam-derive\n'
+	@printf '    baseline        A git ref (e.g., baseline=master) that check-semver compares against\n'
 	@printf 'EXAMPLES:\n'
 	@printf '    make build features="std,tcp,tokio"\n'
 	@printf '    make test no-default=1 features="testing"\n'
 	@printf '    make lint fix=1\n'
 	@printf '    make release version=v0.9.1\n'
 	@printf '    make release version=v0.9.1 dry-run=1\n'
-	@printf '    make release-derive version=v0.1.8\n\n'
+	@printf '    make release-derive version=v0.1.8\n'
+	@printf '    make check-semver baseline=master\n\n'
 	@printf 'EXIT STATUS:\n'
 	@printf '    0    Success\n'
 	@printf '    >0   Error occurred\n\n'
@@ -124,6 +130,35 @@ test-all: setup
 	@echo "Running tests with all feature combinations..."
 	./scripts/test_features.sh
 
+# The report lands in target/coverage/html.
+coverage: setup
+	@echo "Measuring the line coverage of the workspace tests..."
+	cargo llvm-cov --workspace --all-features --html --output-dir target/coverage \
+		&& cargo llvm-cov report --summary-only; \
+		status=$$?; cargo llvm-cov clean --workspace; exit $$status
+
+# The unit tests that decode untrusted DER (frame, envelope, CMS, certificate)
+# and that wipe secrets.
+MIRI_TESTS := frame::tests:: wire::tests:: asn1:: transport::envelopes::tests:: transport::framing::tests:: \
+	crypto::cms::tests:: crypto::x509::key::tests:: crypto::x509::utils:: crypto::secret:: crypto::kdf::zeroizing:: \
+	--skip builder::
+
+# The fixtures read the host clock, so Miri reads the host clock.
+miri:
+	@echo "Running the decode and zeroize unit tests under Miri..."
+	rustup component add --toolchain nightly miri rust-src
+	MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --package tightbeam-rs --lib -- $(MIRI_TESTS)
+
+# The cfg flag changes every crate's build, so the models build in their own
+# target directory and leave the main build warm.
+loom:
+	@echo "Running the loom models..."
+	RUSTFLAGS="--cfg tightbeam_loom" cargo test --package tightbeam-rs --lib --release --target-dir target/loom -- loom_models::
+
+bench:
+	@echo "Running the benches..."
+	cargo bench --package tightbeam-rs --bench '*'
+
 fuzz-build: setup
 	@./scripts/fuzz-build.sh
 
@@ -147,7 +182,7 @@ clean-fuzz:
 	@echo "Fuzz output directory cleaned."
 
 lint: setup
-	@echo "Running linters (mode: $(LINT_MODE))..."
+	@echo "Checking rustfmt, clippy, rustdoc, and spelling (mode: $(LINT_MODE))..."
 ifeq ($(LINT_MODE),fix)
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features $(ARGS)
@@ -155,31 +190,29 @@ else
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
 endif
-	@$(MAKE) doc-lint
-	@$(MAKE) spellcheck
-
-# Rustdoc has no cargo --fix path for intra-doc / private-link warnings.
-# Both lint and doc deny them so CI and local builds fail closed the same way.
-doc-lint: setup
-	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-
-spellcheck: setup
-	@echo "Checking spelling..."
 	typos
 
-doc: doc-lint
+doc: setup
+	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 	@echo "Documentation build complete."
 
 audit: setup
 	@chmod +x scripts/audit.sh
 	@./scripts/audit.sh
 
+interop: setup
+	@echo "Writing the CMS samples and checking them with OpenSSL..."
+	TIGHTBEAM_CMS_SAMPLES=1 cargo test -p tightbeam-rs --all-features --lib the_emitted_structures_write_their_interop_samples
+	./scripts/cms-interop.sh
+
 ci:
 	$(MAKE) lint
 	$(MAKE) audit
 	$(MAKE) build
 	$(MAKE) test-all
+	$(MAKE) interop
 
 release: setup
 	@chmod +x scripts/release.sh
@@ -198,5 +231,6 @@ check-yanked:
 	@./scripts/check-yanked.sh $(if $(filter 1,$(derive)),--derive)
 
 check-semver: setup
-	@echo "Checking the public API against the published baseline..."
-	cargo semver-checks check-release --package $(if $(filter 1,$(derive)),tightbeam-derive,tightbeam-rs)
+	@echo "Checking the public API against the $(if $(baseline),baseline at $(baseline),published baseline)..."
+	cargo semver-checks check-release --package $(if $(filter 1,$(derive)),tightbeam-derive,tightbeam-rs) \
+		$(if $(baseline),--baseline-rev $(baseline))

@@ -1,7 +1,7 @@
-//! Multiplexed transport integration tests over ECIES/TCP.
+//! Multiplexed transport integration tests over HPKE/TCP.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio",

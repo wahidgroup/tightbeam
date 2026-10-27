@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run AFL fuzz testing over every built target for a short time (CI smoke).
-# Assumes fuzz targets are already built (see scripts/fuzz-build.sh).
+# Fuzz every built target with AFL for a short time, as the CI smoke test.
+# Build the fuzz targets first with scripts/fuzz-build.sh.
 #
-# Exits non-zero when any target produces a crash or a hang, so this script
-# is a gate rather than a report.
+# The script exits non-zero when any target produces a crash or a hang, or
+# runs no input, so it gates CI.
 #
 # Flags:
 #   --skip-missing-crashes  Set AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
@@ -29,9 +29,12 @@ done
 echo "Cleaning previous fuzz output..."
 rm -rf built/fuzz/out
 
-mapfile -t FUZZ_TARGETS < <(find target/debug -maxdepth 1 -type f -name 'fuzz_*' ! -name '*.d' | sort)
+# scripts/fuzz-build.sh builds into the directory that fuzz-run.sh names.
+BIN_DIR="$("$(dirname "$0")/fuzz-run.sh" --bin-dir)"
+
+mapfile -t FUZZ_TARGETS < <(find "$BIN_DIR" -maxdepth 1 -type f -name 'fuzz_*' ! -name '*.d' | sort)
 if [ "${#FUZZ_TARGETS[@]}" -eq 0 ]; then
-	echo "Error: Could not find any fuzz binary in target/debug/" >&2
+	echo "Error: Could not find any fuzz binary in $BIN_DIR/" >&2
 	echo "Run 'make fuzz-build' first" >&2
 	exit 1
 fi
@@ -49,7 +52,7 @@ fi
 echo "Fuzzing ${#FUZZ_TARGETS[@]} target(s) for ${SECONDS_PER_TARGET}s each"
 echo ""
 
-# A directory AFL never created counts as zero. Letting `find` fail here
+# A directory that AFL never created counts as zero. A failed `find` here
 # would trip `pipefail` and report a failure with no crash behind it.
 count_files() {
 	if [ -d "$1" ]; then
@@ -67,10 +70,15 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 	# fallback, because AFL refuses to start with an empty input directory.
 	CORPUS="tightbeam/fuzz/${NAME#fuzz_}/seeds"
 	IN_DIR="built/fuzz/in/$NAME"
+	rm -rf "$IN_DIR"
 	mkdir -p "$IN_DIR"
-	if [ -d "$CORPUS" ] && [ -n "$(find "$CORPUS" -type f -print -quit)" ]; then
-		find "$CORPUS" -type f -exec cp {} "$IN_DIR/" \;
-		echo "[$NAME] corpus: $CORPUS"
+	SEEDS=()
+	if [ -d "$CORPUS" ]; then
+		mapfile -t SEEDS < <("$(dirname "$0")/fuzz-run.sh" --seeds "$CORPUS")
+	fi
+	if [ "${#SEEDS[@]}" -gt 0 ]; then
+		cp "${SEEDS[@]}" "$IN_DIR/"
+		echo "[$NAME] corpus: $CORPUS (${#SEEDS[@]} seeds)"
 	else
 		echo "seed" > "$IN_DIR/seed.txt"
 		echo "[$NAME] corpus: none, using a generic seed"

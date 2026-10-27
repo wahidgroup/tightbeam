@@ -1,6 +1,7 @@
-//! Multiplex transport test fixtures.
+//! The fixtures of the multiplex transport tests.
 
-use core::future::{pending, poll_fn, Future, Pending};
+use core::error::Error;
+use core::future::{pending, poll_fn, ready, Future, Pending};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
@@ -11,6 +12,8 @@ use std::sync::Arc;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::{SessionContext, TransitStatus};
+use tightbeam::testing::macros::BuiltAssertSpec;
+use tightbeam::testing::{HookContext, ScenarioConfig, Violations};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{
 	CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxEndPackage, MuxEnvelope, MuxOpenPackage,
@@ -40,48 +43,48 @@ use tokio::time::timeout;
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
-	await_ok, await_transport, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
-	serve_one_handshake_message,
+	await_ok, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
+	serve_one_handshake_message, HandlerSignal,
 };
 
-/// Receive half of a split TCP test transport.
+/// The receive half of a split TCP test transport.
 pub type SplitReader = TransportReader<TokioReadHalf>;
-/// Send half of a split TCP test transport.
+/// The send half of a split TCP test transport.
 pub type SplitWriter = TransportWriter<TokioWriteHalf>;
-/// Spawned emit that resolves to the reply frame or the emit error.
+/// A spawned emit that resolves to the reply frame or the emit error.
 pub type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
-/// Spawned responder loop that resolves when serving ends.
+/// A spawned responder loop that resolves when its serve call returns.
 pub type ServeTask = JoinHandle<Result<(), TransportError>>;
-/// Boxed unary or streaming handler future that answers with a response.
+/// A boxed unary or streaming handler future that answers with a response.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
-/// Boxed duplex handler future that answers with the trailer status.
+/// A boxed duplex handler future that answers with the trailer status.
 pub type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
 
-/// Frame labeled `label` whose encoding spans many mux chunks.
+/// A frame labeled `label` whose encoding spans many mux chunks.
 pub fn large_mux_frame(label: impl AsRef<str>) -> Frame {
 	let label = label.as_ref();
-	// Sized so the encoded frame spans roughly fifteen 1024-byte chunks,
-	// enough to cross the rekey record limits the drain scenarios configure.
+	// The padding sizes the encoded frame to roughly fifteen 1024-byte chunks,
+	// enough to cross the rekey record limits that the drain scenarios set.
 	let padding = "x".repeat(15000);
 	mux_frame(format!("{label}-{padding}"))
 }
 
-/// Mux offer at `cap` streams with a 1024-byte chunk payload size.
+/// A mux offer of `cap` streams with a chunk payload size of 1024 bytes.
 pub fn chunked_offer(cap: u32) -> TransportOffer {
 	mux_offer(cap).with_chunk_payload_size(1024)
 }
 
-/// The ID of the client-initiated stream at `index`, counting from zero.
+/// The ID of the client-initiated stream at the zero-based `index`.
 pub fn client_stream_id(index: u32) -> u32 {
 	index * 2 + 1
 }
 
-/// Complete an ECIES handshake between a pinned client and an encrypted
+/// Completes an HPKE handshake between a pinned client and an encrypted
 /// server, with each side's optional mux offer.
 ///
 /// # Errors
 ///
-/// The bind, connect, or handshake failure of either side.
+/// - [`TightBeamError`] -- the bind, connect, or handshake failure of either side, or a panicked server task.
 pub async fn establish_transports(
 	client_offer: Option<TransportOffer>,
 	server_offer: Option<TransportOffer>,
@@ -95,7 +98,8 @@ pub async fn establish_transports(
 			transport = transport.with_mux_offer(Some(offer));
 		}
 
-		// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+		// An HPKE handshake takes two client messages: the hello and the
+		// closing.
 		serve_one_handshake_message(&mut transport).await?;
 		serve_one_handshake_message(&mut transport).await?;
 		Ok::<_, TightBeamError>(transport)
@@ -114,28 +118,29 @@ pub async fn establish_transports(
 
 /// A spawned mux endpoint.
 pub struct MuxEndpoint {
-	/// Handle that opens and emits on streams.
+	/// The handle that opens streams and emits on them.
 	pub handle: MuxHandle,
-	/// Reader driver task, held so it runs for the endpoint's lifetime.
+	/// The reader driver task, which runs until the connection ends.
 	pub _reader_task: JoinHandle<()>,
 }
 
-/// Per-endpoint limits for hardening scenarios.
+/// Per-endpoint limits for the scenarios that harden an endpoint.
 #[derive(Default)]
 pub struct MuxEndpointConfig {
-	/// Send-cipher rekey record limit override for the writer half.
+	/// An override of the rekey record limit of the writer half.
 	pub rekey_limit: Option<u64>,
-	/// Peer cancel budget override for the responder.
+	/// An override of the responder's budget for peer cancels.
 	pub cancel_budget: Option<u32>,
-	/// Receiver-side credit policy override.
+	/// An override of the credit policy on the receive side.
 	pub grantor: Option<Arc<dyn CreditGrantor>>,
 	/// Whether to attach the in-band rekey context.
 	pub rekey: bool,
-	/// Time budget override for one renewal exchange.
+	/// An override of the time budget for one renewal exchange.
 	pub renewal_deadline: Option<Duration>,
 }
 
-/// Shared tail of encrypted and cleartext endpoint constructors.
+/// Applies the optional cancel budget and spawns the drivers, the shared
+/// tail of the encrypted and cleartext endpoint constructors.
 pub fn spawn_mux_tasks<R, W>(mut mux: MuxTransport<R, W>, cancel_budget: Option<u32>) -> (MuxEndpoint, MuxResponder)
 where
 	R: EnvelopeSource + Send + 'static,
@@ -151,13 +156,13 @@ where
 	(endpoint, responder)
 }
 
-/// Split a handshaken transport into a spawned mux endpoint for `role`, with
+/// Splits a handshaken transport into a spawned mux endpoint for `role`, with
 /// every override in `config` applied.
 ///
 /// # Errors
 ///
-/// An expectation failure when the handshake negotiated no multiplexing, or
-/// the rekey harvest or split failure.
+/// - [`TightBeamError`] -- an expectation failure when the handshake negotiated
+///   no multiplexing, or the rekey harvest or split failure.
 pub fn spawn_mux_endpoint_with(
 	mut transport: TcpTransport<TokioStream>,
 	role: MuxRole,
@@ -180,12 +185,12 @@ pub fn spawn_mux_endpoint_with(
 		writer = writer.with_rekey_limit(limit);
 	}
 
-	let mut mux = MuxTransport::new(reader, writer, role, settings);
+	let mut mux = match rekey {
+		Some(context) => MuxTransport::with_rekey(reader, writer, context, settings),
+		None => MuxTransport::new(reader, writer, role, settings),
+	};
 	if let Some(grantor) = config.grantor {
 		mux = mux.with_credit_grantor(grantor);
-	}
-	if let Some(context) = rekey {
-		mux = mux.with_rekey(context);
 	}
 	if let Some(deadline) = config.renewal_deadline {
 		mux = mux.with_renewal_deadline(deadline);
@@ -195,11 +200,11 @@ pub fn spawn_mux_endpoint_with(
 	Ok(endpoint_pair)
 }
 
-/// Spawn a mux endpoint for `role` with the default configuration.
+/// Spawns a mux endpoint for `role` with the default configuration.
 ///
 /// # Errors
 ///
-/// The [`spawn_mux_endpoint_with`] set.
+/// - [`TightBeamError`] -- the errors of [`spawn_mux_endpoint_with`].
 pub fn spawn_mux_endpoint(
 	transport: TcpTransport<TokioStream>,
 	role: MuxRole,
@@ -207,12 +212,12 @@ pub fn spawn_mux_endpoint(
 	spawn_mux_endpoint_with(transport, role, MuxEndpointConfig::default())
 }
 
-/// Spawn a cleartext mux endpoint for `role` under explicit `settings`,
+/// Spawns a cleartext mux endpoint for `role` under explicit `settings`,
 /// because a cleartext transport negotiates none.
 ///
 /// # Errors
 ///
-/// The split failure of the transport.
+/// - [`TightBeamError`] -- the split failure of the transport.
 pub fn spawn_cleartext_mux_endpoint(
 	transport: TcpTransport<TokioStream>,
 	role: MuxRole,
@@ -226,15 +231,15 @@ pub fn spawn_cleartext_mux_endpoint(
 	Ok(endpoint_pair)
 }
 
-/// Connect a cleartext client to a cleartext listener and return both
+/// Connects a cleartext client to a cleartext listener and returns both
 /// transports.
 ///
 /// # Errors
 ///
-/// The bind, connect, or accept failure.
+/// - [`TightBeamError`] -- the bind, connect, or accept failure, or a panicked accept task.
 pub async fn establish_cleartext_transports(
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
-	let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
+	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 	let addr = listener.local_addr()?;
 
 	let accept_task = tokio::spawn(async move {
@@ -250,14 +255,14 @@ pub async fn establish_cleartext_transports(
 	Ok((client, server))
 }
 
-/// Accept one encrypted mux server as the server-side trace entrypoint.
+/// Accepts one encrypted mux server as the server-side trace entrypoint.
 ///
 /// The accepted connection carries the collector, and every downstream plane
 /// inherits it.
 ///
 /// # Errors
 ///
-/// The accept or handshake failure, or the [`spawn_mux_endpoint`] set.
+/// - [`TightBeamError`] -- the accept or handshake failure, or the errors of [`spawn_mux_endpoint`].
 pub async fn accept_mux_server(
 	listener: TokioListener,
 	offer: TransportOffer,
@@ -266,19 +271,19 @@ pub async fn accept_mux_server(
 	let (transport, _) = listener.accept().await?;
 	let mut transport = transport.with_mux_offer(Some(offer)).with_trace(trace);
 
-	// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+	// An HPKE handshake takes two client messages: the hello and the closing.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 
 	spawn_mux_endpoint(transport, MuxRole::Server)
 }
 
-/// Bind an encrypted listener and spawn a task that accepts one mux server
+/// Binds an encrypted listener and spawns a task that accepts one mux server
 /// and serves `handler` on it.
 ///
 /// # Errors
 ///
-/// The bind failure of the listener.
+/// - [`TightBeamError`] -- the bind failure of the listener.
 pub async fn start_mux_server<H, Fut>(
 	materials: &ServerMaterials,
 	cap: u32,
@@ -294,6 +299,8 @@ where
 		let Ok((_endpoint, responder)) = accept_mux_server(listener, mux_offer(cap), trace).await else {
 			return;
 		};
+		// The serve loop ends when the connection does, and a scenario reads
+		// its outcome from the trace.
 		let _ = responder.serve(handler).await;
 	});
 
@@ -302,30 +309,30 @@ where
 
 /// A connected mux client with its negotiated settings.
 pub struct MuxClient {
-	/// Spawned client endpoint.
+	/// The spawned client endpoint.
 	pub endpoint: MuxEndpoint,
-	/// Responder for peer-initiated streams on the client.
+	/// The responder for the streams that the peer opens on the client.
 	pub responder: MuxResponder,
-	/// Settings the handshake negotiated.
+	/// The settings that the handshake negotiated.
 	pub settings: MuxSettings,
 }
 
 impl MuxClient {
-	/// Handle of the client endpoint.
+	/// The handle of the client endpoint.
 	pub fn handle(&self) -> &MuxHandle {
 		&self.endpoint.handle
 	}
 }
 
-/// Connect one encrypted mux client as the client-side trace entrypoint.
+/// Connects one encrypted mux client as the client-side trace entrypoint.
 ///
 /// The connection carries the collector, and every downstream plane inherits
 /// it.
 ///
 /// # Errors
 ///
-/// An expectation failure when the client negotiated no multiplexing, or the
-/// connect, handshake, or spawn failure.
+/// - [`TightBeamError`] -- an expectation failure when the client negotiated no
+///   multiplexing, or the connect, handshake, or spawn failure.
 pub async fn connect_mux_client(
 	addr: SocketAddr,
 	materials: &ServerMaterials,
@@ -339,26 +346,27 @@ pub async fn connect_mux_client(
 	let settings = client
 		.negotiated_mux()
 		.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
+
 	let (endpoint, responder) = spawn_mux_endpoint(client, MuxRole::Client)?;
 	Ok(MuxClient { endpoint, responder, settings })
 }
 
-/// Muxed client against raw server halves, so the test owns wire ordering.
+/// A muxed client against raw server halves, so the test owns the wire order.
 pub struct ClientMuxServerRaw {
-	/// Muxed client endpoint.
+	/// The muxed client endpoint.
 	pub client: MuxEndpoint,
-	/// Raw receive half of the server.
+	/// The raw receive half of the server.
 	pub server_reader: SplitReader,
-	/// Raw send half of the server.
+	/// The raw send half of the server.
 	pub server_writer: SplitWriter,
 }
 
-/// Build a [`ClientMuxServerRaw`] from explicit client and server offers.
+/// Builds a [`ClientMuxServerRaw`] from explicit client and server offers.
 ///
 /// # Errors
 ///
-/// The [`establish_transports`] and [`spawn_mux_endpoint`] sets, or the split
-/// failure of the server.
+/// - [`TightBeamError`] -- the errors of [`establish_transports`] and
+///   [`spawn_mux_endpoint`], or the split failure of the server.
 pub async fn establish_client_mux_server_raw_with(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -371,11 +379,11 @@ pub async fn establish_client_mux_server_raw_with(
 	Ok(ClientMuxServerRaw { client: client_end, server_reader, server_writer })
 }
 
-/// Build a [`ClientMuxServerRaw`] with both sides offering `cap` streams.
+/// Builds a [`ClientMuxServerRaw`] where both sides offer `cap` streams.
 ///
 /// # Errors
 ///
-/// The [`establish_client_mux_server_raw_with`] set.
+/// - [`TightBeamError`] -- the errors of [`establish_client_mux_server_raw_with`].
 pub async fn establish_client_mux_server_raw(
 	cap: u32,
 	trace: TraceCollector,
@@ -383,12 +391,12 @@ pub async fn establish_client_mux_server_raw(
 	establish_client_mux_server_raw_with(mux_offer(cap), mux_offer(cap), trace).await
 }
 
-/// Emit `frame` from the muxed client, echo it from the raw server, and report
-/// whether the echo matched.
+/// Emits `frame` from the muxed client, echoes it from the raw server, and
+/// reports whether the echo matched.
 ///
 /// # Errors
 ///
-/// The read or write failure of the raw server, or a panicked emit task.
+/// - [`TightBeamError`] -- the read or write failure of the raw server, or a panicked emit task.
 pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) -> Result<bool, TightBeamError> {
 	let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
 	let (stream_id, message) = read_muxed_request(&mut link.server_reader).await?;
@@ -398,24 +406,24 @@ pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) ->
 	Ok(is_echo(echoed, frame))
 }
 
-/// Muxed server against raw client halves, so the test drives requests on the
-/// wire.
+/// A muxed server against raw client halves, so the test drives requests on
+/// the wire.
 pub struct ServerMuxClientRaw {
-	/// Muxed server endpoint.
+	/// The muxed server endpoint.
 	pub server: MuxEndpoint,
-	/// Responder that serves the client's streams.
+	/// The responder that serves the client's streams.
 	pub responder: MuxResponder,
-	/// Raw receive half of the client.
+	/// The raw receive half of the client.
 	pub client_reader: SplitReader,
-	/// Raw send half of the client.
+	/// The raw send half of the client.
 	pub client_writer: SplitWriter,
 }
 
-/// Spawn the muxed server and split the client into raw halves.
+/// Spawns the muxed server and splits the client into raw halves.
 ///
 /// # Errors
 ///
-/// The [`spawn_mux_endpoint_with`] set, or the split failure of the client.
+/// - [`TightBeamError`] -- the errors of [`spawn_mux_endpoint_with`], or the split failure of the client.
 pub fn split_server_mux_client_raw(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
@@ -427,11 +435,11 @@ pub fn split_server_mux_client_raw(
 	Ok(ServerMuxClientRaw { server: server_end, responder, client_reader, client_writer })
 }
 
-/// Build a [`ServerMuxClientRaw`] from explicit client and server offers.
+/// Builds a [`ServerMuxClientRaw`] from explicit client and server offers.
 ///
 /// # Errors
 ///
-/// The [`establish_transports`] and [`split_server_mux_client_raw`] sets.
+/// - [`TightBeamError`] -- the errors of [`establish_transports`] and [`split_server_mux_client_raw`].
 pub async fn establish_server_mux_client_raw_with(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -442,11 +450,11 @@ pub async fn establish_server_mux_client_raw_with(
 	split_server_mux_client_raw(client, server, server_config, trace)
 }
 
-/// Build a [`ServerMuxClientRaw`] with each side offering its own cap.
+/// Builds a [`ServerMuxClientRaw`] where each side offers its own cap.
 ///
 /// # Errors
 ///
-/// The [`establish_server_mux_client_raw_with`] set.
+/// - [`TightBeamError`] -- the errors of [`establish_server_mux_client_raw_with`].
 pub async fn establish_server_mux_client_raw(
 	client_cap: u32,
 	server_cap: u32,
@@ -456,22 +464,22 @@ pub async fn establish_server_mux_client_raw(
 	establish_server_mux_client_raw_with(mux_offer(client_cap), mux_offer(server_cap), server_config, trace).await
 }
 
-/// Two muxed endpoints with an echo responder serving the server side.
+/// Two muxed endpoints with an echo responder that serves the server side.
 pub struct MuxPair {
-	/// Muxed client endpoint.
+	/// The muxed client endpoint.
 	pub client: MuxEndpoint,
-	/// Muxed server endpoint.
+	/// The muxed server endpoint.
 	pub server: MuxEndpoint,
-	/// Echo responder task, held so it serves for the pair's lifetime.
+	/// The echo responder task, which serves until the connection ends.
 	pub _server_serve: ServeTask,
 }
 
-/// Spawn both endpoints with their own configurations and start the server's
-/// immediate echo.
+/// Spawns both endpoints with their own configurations and starts the
+/// immediate echo of the server.
 ///
 /// # Errors
 ///
-/// The [`spawn_mux_endpoint_with`] set of either side.
+/// - [`TightBeamError`] -- the errors of [`spawn_mux_endpoint_with`] on either side.
 pub fn spawn_echo_pair_with(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
@@ -491,11 +499,11 @@ pub fn spawn_echo_pair_with(
 	})
 }
 
-/// Spawn an echo pair whose client takes the default configuration.
+/// Spawns an echo pair whose client takes the default configuration.
 ///
 /// # Errors
 ///
-/// The [`spawn_echo_pair_with`] set.
+/// - [`TightBeamError`] -- the errors of [`spawn_echo_pair_with`].
 pub fn spawn_echo_pair(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
@@ -505,11 +513,11 @@ pub fn spawn_echo_pair(
 	spawn_echo_pair_with(client, server, MuxEndpointConfig::default(), server_config, trace)
 }
 
-/// Handshake both transports and spawn an echo pair over them.
+/// Runs the handshake of both transports and spawns an echo pair over them.
 ///
 /// # Errors
 ///
-/// The [`establish_transports`] and [`spawn_echo_pair`] sets.
+/// - [`TightBeamError`] -- the errors of [`establish_transports`] and [`spawn_echo_pair`].
 pub async fn establish_echo_pair(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -525,17 +533,17 @@ pub fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
 	ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(frame)))
 }
 
-/// Terminal outcome of a fully drained [`StreamBody`].
+/// The terminal outcome of a fully drained [`StreamBody`].
 pub struct DrainedBody {
-	/// Every chunk's bytes, in arrival order.
+	/// The bytes of every chunk, in arrival order.
 	pub bytes: Vec<u8>,
-	/// Chunks consumed before the terminal event.
+	/// The count of chunks that the drain consumes before the terminal event.
 	pub chunks: usize,
-	/// The failure that ended the body, `None` on a clean end.
+	/// The failure that ends the body, or `None` on a clean end.
 	pub failure: Option<TransportError>,
 }
 
-/// Drain a stream body to its terminal outcome, collecting chunks.
+/// Drains a stream body to its terminal outcome, and collects its chunks.
 pub async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 	let mut bytes = Vec::new();
 	let mut chunks = 0usize;
@@ -551,12 +559,12 @@ pub async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 	}
 }
 
-/// Whether a counting handler observed a chunked (multi-record) body.
+/// Whether a handler that counts chunks observed a chunked (multi-record) body.
 pub fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
 	counter.load(Ordering::SeqCst) > 1
 }
 
-/// Echo of a body reassembled from streamed chunks.
+/// The echo of a body reassembled from streamed chunks.
 pub fn echo_reassembled(buffer: impl AsRef<[u8]>) -> ResponsePackage {
 	let buffer = buffer.as_ref();
 	match Frame::from_der(buffer) {
@@ -565,7 +573,7 @@ pub fn echo_reassembled(buffer: impl AsRef<[u8]>) -> ResponsePackage {
 	}
 }
 
-/// Streaming echo handler that consumes the body chunk by chunk, counts
+/// A streaming echo handler that consumes the body chunk by chunk, counts
 /// arrivals, and then echoes the reassembled frame.
 pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody) -> HandlerFuture {
 	move |mut body| {
@@ -584,24 +592,24 @@ pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBo
 	}
 }
 
-/// Push a payload through a request sink as two chunks, and then close it.
+/// Pushes a payload through a request sink as two chunks, and then closes it.
 ///
-/// This is the smallest sequence that exercises the held-back `last` framing.
+/// It is the smallest sequence that sends more than one data chunk before the
+/// empty `last`-flagged record of the close.
 ///
 /// # Errors
 ///
-/// The push or close failure of the sink.
+/// - [`TransportError`] -- the push or close failure of the sink.
 pub async fn push_split(mut sink: RequestSink, payload: impl AsRef<[u8]>) -> Result<(), TransportError> {
 	let payload = payload.as_ref();
 	let middle = payload.len() / 2;
 	sink.push(&payload[..middle]).await?;
 	sink.push(&payload[middle..]).await?;
-
 	sink.close().await
 }
 
-/// Duplex echo handler that streams every request chunk straight back, counts
-/// arrivals, and ends the reply with the trailer status.
+/// A duplex echo handler that streams every request chunk straight back,
+/// counts arrivals, and ends the reply with the trailer status.
 pub fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody, ReplySink) -> StatusFuture {
 	move |mut body, mut reply| {
 		let counter = Arc::clone(&chunks_seen);
@@ -622,24 +630,24 @@ pub fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody,
 	}
 }
 
-/// Echo handler that signals `started` and waits for `release` before it
+/// An echo handler that raises `started` and waits for `release` before it
 /// answers.
-pub fn gated_echo_handler(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
+pub fn gated_echo_handler(started: Arc<HandlerSignal>, release: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame| {
 		let started = Arc::clone(&started);
 		let release = Arc::clone(&release);
 		Box::pin(async move {
-			started.notify_one();
+			started.raise();
 			release.notified().await;
 			echo_response(&frame)
 		})
 	}
 }
 
-/// Serve [`gated_echo_handler`] on `responder`, returning its started and
+/// Serves [`gated_echo_handler`] on `responder`, and returns its started and
 /// release signals and the serve task.
-pub fn spawn_gated_echo(responder: MuxResponder) -> (Arc<Notify>, Arc<Notify>, ServeTask) {
-	let started = Arc::new(Notify::new());
+pub fn spawn_gated_echo(responder: MuxResponder) -> (Arc<HandlerSignal>, Arc<Notify>, ServeTask) {
+	let started = Arc::new(HandlerSignal::default());
 	let release = Arc::new(Notify::new());
 	let handler = gated_echo_handler(Arc::clone(&started), Arc::clone(&release));
 
@@ -648,49 +656,50 @@ pub fn spawn_gated_echo(responder: MuxResponder) -> (Arc<Notify>, Arc<Notify>, S
 
 /// Server materials and the signals a gated echo handler waits on.
 pub struct GatedMuxContext {
-	/// Server certificate and key for the encrypted listener.
+	/// The server certificate and key for the encrypted listener.
 	pub materials: ServerMaterials,
-	/// Signalled when a handler starts.
-	pub started: Notify,
-	/// Signalled to let a parked handler answer.
+	/// The signal a handler raises when it starts.
+	pub started: HandlerSignal,
+	/// The notifier that lets a parked handler answer.
 	pub release: Notify,
 }
 
 impl GatedMuxContext {
-	/// Fresh materials and unsignalled notifiers.
+	/// A context of fresh materials, an unraised signal, and an unsignalled
+	/// notifier.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
-			started: Notify::new(),
+			started: HandlerSignal::default(),
 			release: Notify::new(),
 		}
 	}
 }
 
-/// Echo handler that signals `ctx.started` and waits for `ctx.release`
+/// An echo handler that raises `ctx.started` and waits for `ctx.release`
 /// before it answers.
 pub fn gated_echo(ctx: Arc<GatedMuxContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame| {
 		let ctx = Arc::clone(&ctx);
 		Box::pin(async move {
-			ctx.started.notify_one();
+			ctx.started.raise();
 			ctx.release.notified().await;
 			echo_response(&frame)
 		})
 	}
 }
 
-/// Echo handler that answers at once.
+/// An echo handler that answers at once.
 pub fn immediate_echo_handler() -> impl Fn(Arc<Frame>) -> core::future::Ready<ResponsePackage> {
 	|frame| core::future::ready(echo_response(&frame))
 }
 
-/// Serve [`immediate_echo_handler`] on `responder`.
+/// Serves [`immediate_echo_handler`] on `responder`.
 pub fn spawn_immediate_echo(responder: MuxResponder) -> ServeTask {
 	tokio::spawn(responder.serve(immediate_echo_handler()))
 }
 
-/// Echo handler that holds `held_frame` until a different frame arrives,
+/// An echo handler that holds `held_frame` until a different frame arrives,
 /// which releases the hold.
 pub fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame: Arc<Frame>| {
@@ -708,26 +717,28 @@ pub fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<F
 	}
 }
 
-/// Cancel-abort fixture. Its drop witness records the handler abort.
+/// The cancel-abort fixture, whose drop witness records the handler abort.
 pub struct AbortContext {
-	/// Server certificate and key for the encrypted listener.
+	/// The server certificate and key for the encrypted listener.
 	pub materials: ServerMaterials,
-	/// Signalled when the first handler starts.
-	pub started: Notify,
-	/// Left unsignalled, so the first handler parks until it is aborted.
+	/// The signal the first handler raises when it starts.
+	pub started: HandlerSignal,
+	/// A notifier that stays unsignalled, so the first handler parks until a
+	/// cancel aborts it.
 	pub never: Notify,
-	/// Set by the drop witness when the parked handler is aborted.
+	/// The flag the drop witness sets when a cancel aborts the parked handler.
 	pub aborted: AtomicBool,
-	/// Count of handler calls.
+	/// The count of handler calls.
 	pub calls: AtomicU32,
 }
 
 impl AbortContext {
-	/// Fresh materials, unsignalled notifiers, and zeroed counters.
+	/// A context of fresh materials, an unraised signal, an unsignalled
+	/// notifier, and zeroed counters.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
-			started: Notify::new(),
+			started: HandlerSignal::default(),
 			never: Notify::new(),
 			aborted: AtomicBool::new(false),
 			calls: AtomicU32::new(0),
@@ -735,7 +746,7 @@ impl AbortContext {
 	}
 }
 
-/// Echo handler whose first call parks forever under a drop witness, and
+/// An echo handler whose first call parks forever under a drop witness, and
 /// whose later calls echo at once.
 pub fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame: Arc<Frame>| {
@@ -743,7 +754,7 @@ pub fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> H
 		Box::pin(async move {
 			if ctx.calls.fetch_add(1, Ordering::SeqCst) == 0 {
 				let _witness = DropWitness(Arc::clone(&ctx));
-				ctx.started.notify_one();
+				ctx.started.raise();
 				ctx.never.notified().await;
 			}
 
@@ -752,18 +763,19 @@ pub fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> H
 	}
 }
 
-/// Spawn an emit of `frame` on its own stream.
+/// Spawns an emit of `frame` on its own stream.
 pub fn spawn_emit(handle: &MuxHandle, frame: Frame) -> EmitTask {
 	let handle = handle.to_owned();
 	tokio::spawn(async move { handle.emit_on_stream(&frame).await })
 }
 
-/// Abort an in-flight emit, whose drop guard removes the pending stream and
+/// Aborts an in-flight emit, whose drop guard removes the pending stream and
 /// queues a `MuxCancel`.
 ///
 /// # Panics
 ///
-/// When the aborted task reports anything other than cancellation.
+/// The call panics when the aborted task reports anything other than
+/// cancellation.
 pub async fn abort_emit(task: EmitTask) {
 	task.abort();
 
@@ -774,12 +786,12 @@ pub async fn abort_emit(task: EmitTask) {
 	);
 }
 
-/// Read one single-chunk muxed open and decode its frame.
+/// Reads one single-chunk muxed open and decodes its frame.
 ///
 /// # Errors
 ///
-/// An expectation failure when the next envelope is not a single-chunk open,
-/// or the read or decode failure.
+/// - [`TightBeamError`] -- an expectation failure when the next envelope is not
+///   a single-chunk open, or the read or decode failure.
 pub async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u32, Arc<Frame>), TightBeamError> {
 	let envelope = reader.read_envelope().await?;
 	match envelope {
@@ -791,22 +803,22 @@ pub async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u3
 	}
 }
 
-/// Read one single-chunk muxed open and return its stream ID.
+/// Reads one single-chunk muxed open and returns its stream ID.
 ///
 /// # Errors
 ///
-/// The [`read_muxed_request`] set.
+/// - [`TightBeamError`] -- the errors of [`read_muxed_request`].
 pub async fn read_muxed_request_id<R: EnvelopeSource>(reader: &mut R) -> Result<u32, TightBeamError> {
 	let (stream_id, _frame) = read_muxed_request(reader).await?;
 	Ok(stream_id)
 }
 
-/// Read one single-chunk muxed open and require it on `expected_id`.
+/// Reads one single-chunk muxed open and requires it on `expected_id`.
 ///
 /// # Errors
 ///
-/// An expectation failure that carries `msg` when the open is on another
-/// stream, or the [`read_muxed_request`] set.
+/// - [`TightBeamError`] -- an expectation failure that carries `msg` when the
+///   open is on another stream, or the errors of [`read_muxed_request`].
 pub async fn expect_muxed_request(
 	reader: &mut SplitReader,
 	expected_id: u32,
@@ -824,17 +836,17 @@ pub async fn expect_muxed_request(
 ///
 /// # Errors
 ///
-/// The encode failure of the frame or the open package.
+/// - [`TightBeamError`] -- the encode failure of the frame or the open package.
 pub fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportEnvelope, TightBeamError> {
 	let payload = frame.to_der()?;
 	Ok(MuxOpenPackage::new(stream_id, true, MuxStreamKind::Unary, payload)?.into())
 }
 
-/// Write a single-chunk unary open on `stream_id`.
+/// Writes a single-chunk unary open on `stream_id`.
 ///
 /// # Errors
 ///
-/// The [`muxed_request_envelope`] set, or the write failure.
+/// - [`TightBeamError`] -- the errors of [`muxed_request_envelope`], or the write failure.
 pub async fn write_muxed_request<W: EnvelopeSink>(
 	writer: &mut W,
 	stream_id: u32,
@@ -844,11 +856,11 @@ pub async fn write_muxed_request<W: EnvelopeSink>(
 	Ok(())
 }
 
-/// Write an `End` trailer on `stream_id` with `status` and `payload`.
+/// Writes an `End` trailer on `stream_id` with `status` and `payload`.
 ///
 /// # Errors
 ///
-/// The encode or write failure.
+/// - [`TightBeamError`] -- the encode or write failure.
 pub async fn write_muxed_end(
 	writer: &mut SplitWriter,
 	stream_id: u32,
@@ -861,11 +873,11 @@ pub async fn write_muxed_end(
 	Ok(())
 }
 
-/// Answer `stream_id` with an Ok trailer that echoes `frame`.
+/// Answers `stream_id` with an Ok trailer that echoes `frame`.
 ///
 /// # Errors
 ///
-/// The encode or write failure.
+/// - [`TightBeamError`] -- the encode or write failure.
 pub async fn write_muxed_echo(
 	writer: &mut SplitWriter,
 	stream_id: u32,
@@ -875,11 +887,11 @@ pub async fn write_muxed_echo(
 	write_muxed_end(writer, stream_id, TransitStatus::Ok, payload).await
 }
 
-/// Write a GoAway at `last_stream_id` with `reason`.
+/// Writes a GoAway at `last_stream_id` with `reason`.
 ///
 /// # Errors
 ///
-/// The write failure.
+/// - [`TightBeamError`] -- the write failure.
 pub async fn write_goaway(
 	writer: &mut SplitWriter,
 	last_stream_id: u32,
@@ -890,12 +902,12 @@ pub async fn write_goaway(
 	Ok(())
 }
 
-/// Write a muxed request and then its cancel, which is the Rapid Reset open
-/// and cancel pair.
+/// Writes a muxed request, then its cancel: the Rapid Reset open and cancel
+/// pair.
 ///
 /// # Errors
 ///
-/// The [`write_muxed_request`] set, or the write failure of the cancel.
+/// - [`TightBeamError`] -- the errors of [`write_muxed_request`], or the write failure of the cancel.
 pub async fn write_open_cancel<W: EnvelopeSink>(
 	writer: &mut W,
 	stream_id: u32,
@@ -915,22 +927,25 @@ pub fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) -> bool {
 	)
 }
 
-/// Poll `shutdown` once so GoAway is sent and the allocator halts, then
-/// return the pinned future for the caller to await the drain.
+/// Polls `shutdown` once so the handle sends a GoAway and the allocator halts,
+/// and then returns a future for the caller to await the drain.
+///
+/// A shutdown that the first poll completes hands its output to the returned
+/// future, which yields it at once.
 pub async fn kick_shutdown(
 	handle: &MuxHandle,
 ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
 	let mut shutdown_future = Box::pin(handle.shutdown());
-	poll_fn(|cx| {
-		let _ = shutdown_future.as_mut().poll(cx);
-		Poll::Ready(())
-	})
-	.await;
+	// One poll sends the GoAway and halts the allocator.
+	let first = poll_fn(|cx| Poll::Ready(shutdown_future.as_mut().poll(cx))).await;
 
-	shutdown_future
+	match first {
+		Poll::Ready(output) => Box::pin(ready(output)),
+		Poll::Pending => shutdown_future,
+	}
 }
 
-/// Whether `result` is exactly `expected`.
+/// Whether `result` equals `expected`.
 pub fn is_echo(result: Option<Frame>, expected: &Frame) -> bool {
 	result.as_ref() == Some(expected)
 }
@@ -948,7 +963,7 @@ pub fn is_busy(result: &Result<Option<Frame>, TransportError>) -> bool {
 	)
 }
 
-/// Whether the emit failed because the connection is draining.
+/// Whether the emit failed because the connection drains.
 pub fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::Draining))
 }
@@ -963,7 +978,7 @@ pub fn is_invalid_message<T>(result: &Result<T, TransportError>) -> bool {
 	matches!(result, Err(TransportError::InvalidMessage))
 }
 
-/// Whether serving ended on a policy rejection.
+/// Whether the serve loop ended on a policy rejection.
 pub fn is_policy_rejection(result: &Result<(), TransportError>) -> bool {
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::PolicyRejection)))
 }
@@ -973,13 +988,13 @@ pub fn is_budget_exhausted(result: &Result<Option<Frame>, TransportError>) -> bo
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted)))
 }
 
-/// Append the continuation chunks of `stream_id` to `payload` until its
+/// Appends the continuation chunks of `stream_id` to `payload` until its
 /// `last` chunk.
 ///
 /// # Errors
 ///
-/// An expectation failure when a record is not a data chunk on `stream_id`,
-/// or the read failure.
+/// - [`TightBeamError`] -- an expectation failure when a record is not a data
+///   chunk on `stream_id`, or the read failure.
 pub async fn read_remaining_chunks(
 	reader: &mut SplitReader,
 	stream_id: u32,
@@ -1003,13 +1018,13 @@ pub async fn read_remaining_chunks(
 	}
 }
 
-/// Skip stream traffic until a GoAway arrives, and report whether it carries
+/// Skips stream traffic until a GoAway arrives, and reports whether it carries
 /// `reason`.
 ///
 /// # Errors
 ///
-/// An expectation failure when no GoAway arrives within two seconds, or the
-/// read failure.
+/// - [`TightBeamError`] -- an expectation failure when no GoAway arrives within
+///   two seconds, or the read failure.
 pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -> Result<bool, TightBeamError> {
 	timeout(Duration::from_secs(2), async {
 		loop {
@@ -1023,13 +1038,7 @@ pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -
 	.map_err(|_| expectation_failure("GoAway must arrive before the read timeout"))?
 }
 
-/// Poll [`MuxHandle::goaway_reason`] until it reports `reason` or the wait
-/// times out.
-pub async fn await_goaway_reason(handle: &MuxHandle, reason: GoAwayReason) -> bool {
-	await_transport(|| handle.goaway_reason() == Some(reason)).await
-}
-
-/// Receiver policy that keeps every stream's limit at the initial credit
+/// A receiver policy that keeps every stream's limit at the initial credit
 /// window, which pins the sender there.
 pub struct NeverGrant;
 
@@ -1039,7 +1048,7 @@ impl CreditGrantor for NeverGrant {
 	}
 }
 
-/// Authorizer granting half of each requested budget direction.
+/// An authorizer that grants half of each requested budget direction.
 pub struct HalvingAuthorizer;
 
 impl TransportAuthorizer for HalvingAuthorizer {
@@ -1058,10 +1067,10 @@ impl TransportAuthorizer for HalvingAuthorizer {
 	}
 }
 
-/// Application refusal code carried by [`RefusingAuthorizer`].
+/// The application refusal code that [`RefusingAuthorizer`] carries.
 pub const REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR;
 
-/// Authorizer that refuses every offer with [`REFUSAL_CODE`].
+/// An authorizer that refuses every offer with [`REFUSAL_CODE`].
 pub struct RefusingAuthorizer;
 
 impl TransportAuthorizer for RefusingAuthorizer {
@@ -1073,7 +1082,7 @@ impl TransportAuthorizer for RefusingAuthorizer {
 	}
 }
 
-/// Authorizer whose backend never responds, simulating a hung
+/// An authorizer whose backend hangs forever, which simulates a hung
 /// authorization service on the unauthenticated handshake path.
 pub struct HangingAuthorizer;
 
@@ -1103,8 +1112,8 @@ pub fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream
 	}
 }
 
-/// Drop witness that records the abort of an in-flight handler, because its
-/// flag flips only on cancellation.
+/// A drop witness that records the abort of an in-flight handler. The call it
+/// guards parks forever, so only a cancel drops it.
 pub struct DropWitness(pub Arc<AbortContext>);
 
 impl Drop for DropWitness {
@@ -1116,16 +1125,16 @@ impl Drop for DropWitness {
 /// One rekey headroom case, where
 /// `drain_headroom = 2 * (local_cap + peer_cap) + 1`.
 pub struct RekeyCase {
-	/// Streams the server may initiate.
+	/// The count of streams that the server may initiate.
 	pub server_local_cap: u32,
-	/// Peer-initiated streams the server accepts.
+	/// The count of peer-initiated streams that the server accepts.
 	pub server_peer_cap: u32,
-	/// Send-cipher rekey record limit under test.
+	/// The rekey record limit of the send cipher under test.
 	pub rekey_limit: u64,
 }
 
 impl RekeyCase {
-	/// The drain headroom in records for this case.
+	/// The drain headroom of this case, in records.
 	pub fn headroom(&self) -> u64 {
 		u64::from(self.server_local_cap)
 			.saturating_add(u64::from(self.server_peer_cap))
@@ -1133,11 +1142,12 @@ impl RekeyCase {
 			.saturating_add(1)
 	}
 
-	/// Responses the server sends before the drain floor forces its GoAway.
+	/// The count of responses that the server sends before the drain floor
+	/// forces its GoAway.
 	///
 	/// # Panics
 	///
-	/// In a debug build, when `rekey_limit` does not exceed the headroom.
+	/// A debug build panics when `rekey_limit` does not exceed the headroom.
 	pub fn responses_before_goaway(&self) -> u32 {
 		let headroom = self.headroom();
 		debug_assert!(self.rekey_limit > headroom);
@@ -1148,13 +1158,12 @@ impl RekeyCase {
 /// One Rapid Reset pair past the budget draws GoAway(EnhanceYourCalm) and a
 /// PolicyRejection.
 ///
-/// The run checks the wire answer, which is the reason and the abuse
-/// watermark, inline and returns whether the responder surfaced a policy
-/// rejection.
+/// The run asserts the reason and the abuse watermark of the GoAway inline,
+/// and returns whether the responder reports a policy rejection.
 ///
 /// # Errors
 ///
-/// The [`run_cancel_abuse_against`] set.
+/// - [`TightBeamError`] -- the errors of [`run_cancel_abuse_against`].
 pub async fn run_cancel_abuse<R, W>(
 	client_reader: R,
 	client_writer: W,
@@ -1170,18 +1179,19 @@ where
 	run_cancel_abuse_against(client_reader, client_writer, serve_task, cancel_budget).await
 }
 
-/// Cancel abuse against an already-serving endpoint whose handlers park
-/// forever, so every cancel aborts a live handler. The responder and the
-/// `MuxAcceptor::serve` paths share it.
+/// Runs cancel abuse against a serving endpoint whose handlers park forever,
+/// so every cancel aborts a live handler. The responder path and the
+/// [`MuxAcceptor::serve`] path share it.
 ///
 /// # Errors
 ///
-/// An expectation failure when no GoAway arrives within two seconds, or the
-/// write, read, or join failure.
+/// - [`TightBeamError`] -- an expectation failure when no GoAway arrives within
+///   two seconds, or the write, read, or join failure.
 ///
 /// # Panics
 ///
-/// When the GoAway carries another reason or watermark.
+/// The call panics when the GoAway carries a reason or a watermark other than
+/// the expected one.
 pub async fn run_cancel_abuse_against<R, W>(
 	mut client_reader: R,
 	mut client_writer: W,
@@ -1211,45 +1221,62 @@ where
 	Ok(is_policy_rejection(&refused))
 }
 
-/// Unary `MuxService` closure whose handlers never answer, so every peer
+/// A unary `MuxService` closure whose handlers stay pending, so every peer
 /// cancel aborts a live handler.
 pub fn parked_unary_service() -> impl Fn(Frame, SessionContext) -> Pending<Result<Option<Frame>, TightBeamError>> {
 	|_frame, _session| pending()
 }
 
-/// Server materials and the signal a server-initiated stream test waits on.
-pub struct ServerInitContext {
-	/// Server certificate and key for the encrypted listener.
-	pub materials: ServerMaterials,
-	/// Signalled once the server-side emit has resolved.
-	pub done: Notify,
-}
-
-impl ServerInitContext {
-	/// Fresh materials and an unsignalled notifier.
-	pub fn generate() -> Self {
-		Self { materials: ServerMaterials::generate(), done: Notify::new() }
-	}
-}
-
-/// Ping fixture, whose `handler_calls` count proves pings bypass the
-/// responder.
+/// The ping fixture, whose flag carries the outcome of the server's ping to
+/// the client's task.
 pub struct PingContext {
-	/// Server certificate and key for the encrypted listener.
+	/// The server certificate and key for the encrypted listener.
 	pub materials: ServerMaterials,
-	/// Count of calls the unary handler received.
-	pub handler_calls: AtomicU32,
-	/// Signalled once the server's own ping has resolved.
-	pub server_ping_done: Notify,
+	/// The signal the server task raises once its own ping resolves.
+	pub server_ping_done: HandlerSignal,
+	/// Whether the client acked the server's ping, which the server task
+	/// stores before it raises `server_ping_done`.
+	pub server_ping_acked: AtomicBool,
 }
 
 impl PingContext {
-	/// Fresh materials, a zeroed counter, and an unsignalled notifier.
+	/// A context of fresh materials, an unraised signal, and a cleared ack
+	/// flag.
 	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
-			handler_calls: AtomicU32::new(0),
-			server_ping_done: Notify::new(),
+			server_ping_done: HandlerSignal::default(),
+			server_ping_acked: AtomicBool::new(false),
 		}
 	}
+}
+
+/// Runs one case of a case table on its own runtime, and grades the trace of
+/// the case against `spec`, as `tb_scenario!` grades a scenario.
+///
+/// `case` drives the endpoints with a share of the trace, and the grade takes
+/// the result of `case` beside the trace.
+///
+/// # Errors
+///
+/// - [`ScenarioConfigError`] -- `spec` builds no configuration.
+/// - [`std::io::Error`] -- the runtime of the case fails to build.
+/// - [`TightBeamError`] -- the grade refuses an exploration event.
+/// - [`Violations`] -- the grade finds a violation.
+///
+/// [`ScenarioConfigError`]: tightbeam::testing::ScenarioConfigError
+pub fn grade_case<F, Fut>(spec: &'static BuiltAssertSpec, case: F) -> Result<(), Box<dyn Error>>
+where
+	F: FnOnce(TraceCollector) -> Fut,
+	Fut: Future<Output = Result<(), TightBeamError>>,
+{
+	let config = ScenarioConfig::builder().with_spec(spec).build()?;
+	let trace = config.trace();
+	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+
+	let outcome = runtime.block_on(case(trace.share()));
+	let graded = HookContext::build(&config, &trace, outcome)?;
+	graded.outcome().map_err(Violations::clone)?;
+
+	Ok(())
 }

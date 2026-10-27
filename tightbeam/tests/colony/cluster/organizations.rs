@@ -1,22 +1,27 @@
-//! Multi-organization federation tests for the colony boundary at the
+//! The multi-organization federation tests of the flood boundary at the
 //! gateway edge.
 //!
-//! One transport trust store, two colonies: "main" runs the entry and origin
-//! gateways, "other" holds one trusted gateway identity, and a third identity
-//! is trusted for transport but belongs to no colony. Work federates inside
-//! "main" while every cross-organization control-plane frame is refused at the
-//! edge, weakening no in-organization route.
+//! One transport trust store admits two colonies and one outside identity:
 //!
-//! Beat-driven discovery lives in `federation`.
+//! - Colony "main" runs the entry and origin gateways.
+//! - Colony "other" holds one trusted gateway identity.
+//! - The store also trusts a third identity, which belongs to no colony.
+//!
+//! Both colonies are inside one flood: gossip and work cross the organization
+//! edge, and every in-organization route stays intact. Every gossip path
+//! refuses the outside identity, because it carries no colony URN.
+//!
+//! Transitive discovery over live beats lives in `federation`.
 
 use super::common::*;
-use super::federation::{federation_conf, flood_ad_rumor, type_route_count};
+use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor, type_route_count};
 use super::gossip::relay_application_rumor;
-use crate::common::security::expectation_failure;
 use tightbeam::utils::time::{Clock, ManualClock};
 
 #[cfg(feature = "testing-fdr")]
 use tightbeam::testing::fdr::FdrConfig;
+#[cfg(feature = "testing-fdr")]
+use tightbeam::testing::specs::csp::ProcessBuildError;
 #[cfg(feature = "testing-fdr")]
 use tightbeam::testing::{Expect, Layer};
 
@@ -28,103 +33,61 @@ struct MultiOrgCtx {
 	/// The origin member gateway of colony "main", built by
 	/// [`member_identity`].
 	origin: Arc<ClusterTestCerts>,
-	/// The gateway identity of colony "other". Transport admits it and the
-	/// colony gate must not. It carries full gateway certs, so a scenario can
-	/// also run it as a live gateway.
-	foreign: Arc<ClusterTestCerts>,
+	/// The gateway identity of colony "other". Transport admits it, and it is
+	/// inside the flood. It carries the full gateway certificates, so a
+	/// scenario can also run it as a live gateway.
+	neighbor: Arc<ClusterTestCerts>,
 	/// A "main" member whose advertisement claims a type from a foreign realm.
 	/// The outer relay gate admits it and the inner advertisement admission
 	/// must drop it.
 	rogue_key: Secp256k1SigningKey,
 	/// A trusted transport identity with no colony SAN.
 	stranger_key: Secp256k1SigningKey,
-	/// The peer-plane store for `entry`, excluding its own identity: peer
+	/// The peer-plane store of `entry`, without its own identity. Peer
 	/// membership wins on the hive plane, so a member's hive registrations
 	/// must not verify on its own peer store.
 	peers_of_entry: Arc<dyn CertificateTrust>,
-	/// The peer-plane store for `origin`, excluding its own identity.
+	/// The peer-plane store of `origin`, without its own identity.
 	peers_of_origin: Arc<dyn CertificateTrust>,
-	/// The peer-plane store for `foreign`, excluding its own identity.
-	peers_of_foreign: Arc<dyn CertificateTrust>,
+	/// The peer-plane store of `neighbor`, without its own identity.
+	peers_of_neighbor: Arc<dyn CertificateTrust>,
 }
 
 fn multi_org_ctx() -> MultiOrgCtx {
-	use tightbeam::random::OsRng;
-	use tightbeam::testing::fixtures::TestCertificate;
-
 	let (cert_entry, key_entry) = member_identity("Org Main Entry Gateway");
 	let (cert_origin, key_origin) = member_identity("Org Main Origin Gateway");
 
 	let other_urn = colony_ns().colony("other").expect("static colony name");
-	let (cert_foreign, foreign_key) = colony_identity("Org Other Gateway", &other_urn);
+	let (cert_neighbor, neighbor_key) = colony_identity("Org Other Gateway", &other_urn);
 	let (cert_rogue, rogue_key) = member_identity("Org Main Rogue");
 
-	let raw_stranger = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let stranger_cert = TestCertificate::self_signed(&raw_stranger);
+	let stranger = stranger_gateway_certs();
 
-	let trust = combined_trust(&[&cert_entry, &cert_origin, &cert_foreign, &cert_rogue, &stranger_cert]);
-	let peers_of_entry = combined_trust(&[&cert_origin, &cert_foreign, &cert_rogue, &stranger_cert]);
-	let peers_of_origin = combined_trust(&[&cert_entry, &cert_foreign, &cert_rogue, &stranger_cert]);
-	let peers_of_foreign = combined_trust(&[&cert_entry, &cert_origin, &cert_rogue, &stranger_cert]);
+	let trust = combined_trust(&[&cert_entry, &cert_origin, &cert_neighbor, &cert_rogue, &stranger.cert]);
+	let peers_of_entry = combined_trust(&[&cert_origin, &cert_neighbor, &cert_rogue, &stranger.cert]);
+	let peers_of_origin = combined_trust(&[&cert_entry, &cert_neighbor, &cert_rogue, &stranger.cert]);
+	let peers_of_neighbor = combined_trust(&[&cert_entry, &cert_origin, &cert_rogue, &stranger.cert]);
 
 	MultiOrgCtx {
 		entry: Arc::new(GatewayCerts { cert: cert_entry, key: key_entry, trust: Arc::clone(&trust) }),
 		origin: Arc::new(GatewayCerts { cert: cert_origin, key: key_origin, trust: Arc::clone(&trust) }),
-		foreign: Arc::new(GatewayCerts { cert: cert_foreign, key: foreign_key, trust }),
+		neighbor: Arc::new(GatewayCerts { cert: cert_neighbor, key: neighbor_key, trust }),
 		rogue_key,
-		stranger_key: Secp256k1SigningKey::from(raw_stranger),
+		stranger_key: stranger.key,
 		peers_of_entry,
 		peers_of_origin,
-		peers_of_foreign,
+		peers_of_neighbor,
 	}
 }
 
-/// A live advertise beat races direct advertisements against slate rumors, so
-/// a rumor can land after a fresher advertisement and drop as stale. Scenarios
-/// built on this config inject their control-plane frames instead, which is
-/// what keeps their traces exact enough to refine a process.
+/// A member configuration with the advertise beat off. A live beat races
+/// direct advertisements against slate rumors, so a rumor can land after a
+/// fresher advertisement and drop as stale. Scenarios on it inject their
+/// control-plane frames, so each trace stays exact enough to refine a process.
 fn quiet_member_conf(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTrust>) -> ClusterConfig {
 	let mut conf = federation_conf(certs, peer_trust, vec![], 1);
 	conf.peer.advertise_interval = None;
 	conf
-}
-
-/// One advertise beat of the gateway [`federation_conf`] builds.
-const FOREIGN_BEAT: Duration = Duration::from_millis(100);
-
-/// Beats the foreign gateway drives before the scenario gives up.
-///
-/// Twenty beats move its clock two seconds, well inside the entry gateway's
-/// freshness window, so every frame they sign stays admissible.
-const FOREIGN_BEATS: u32 = 20;
-
-/// Drives the foreign gateway one beat at a time until a beat has both
-/// advertised and been refused at the entry gateway's colony gate. The
-/// branching lives here, not in the scenario.
-///
-/// - The beat task may not be sleeping yet when the scenario starts, and a
-///   sleep begun after an advance waits a whole beat from there, so each
-///   round advances again.
-/// - The two events come from two tasks on the foreign gateway: the direct
-///   advertisement and the rumor flood it spawns.
-/// - The refusal changes no public state, so the trace is the one place both
-///   events land. Each round reads it once the round's socket work has had a
-///   moment to run.
-async fn drive_until_refused(clock: &ManualClock, trace: &TraceCollector) -> Result<(), TightBeamError> {
-	let landed = || {
-		let advertised = trace.recorded(events::CLUSTER_PEER_ADVERTISED);
-		let refused = trace.recorded(events::CLUSTER_GOSSIP_REFUSED);
-		advertised > 0 && refused > 0
-	};
-
-	for _ in 0..FOREIGN_BEATS {
-		clock.advance(FOREIGN_BEAT);
-		if poll_until(5, Duration::from_millis(20), landed).await {
-			return Ok(());
-		}
-	}
-
-	Err(expectation_failure("the entry gateway never refused the foreign beat"))
 }
 
 tb_assert_spec! {
@@ -133,18 +96,13 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(events::CLUSTER_PEER_AD_LEARNED, exactly!(1)),
-			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
-			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ROUTES_INSTALLED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(WORK_ECHOED, exactly!(1), equals!(42u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(2), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
-			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(events::CLUSTER_PEER_AD_DROPPED, exactly!(1)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64))
+			(events::CLUSTER_PEER_AD_DROPPED, exactly!(1))
 		]
 	}
 }
@@ -165,10 +123,7 @@ tb_process_spec! {
 		Isolated => { events::CLUSTER_PEER_AD_LEARNED => Federated },
 		Federated => { events::CLUSTER_WORK_FORWARDED => Routed },
 		Routed => { events::CLUSTER_GOSSIP_REFUSED => EdgeRefused },
-		EdgeRefused => {
-			events::CLUSTER_GOSSIP_REFUSED => EdgeRefused,
-			events::CLUSTER_PEER_AD_DROPPED => EdgeDropped
-		},
+		EdgeRefused => { events::CLUSTER_PEER_AD_DROPPED => EdgeDropped },
 		EdgeDropped => { }
 	}
 	terminal { EdgeDropped }
@@ -177,37 +132,49 @@ tb_process_spec! {
 /// FDR bounds for the multi-organization control plane. The process has no
 /// hidden events, so `max_internal_run` guards against model regressions.
 #[cfg(feature = "testing-fdr")]
-fn multi_org_fdr() -> FdrConfig {
-	FdrConfig {
+fn multi_org_fdr() -> Result<FdrConfig, ProcessBuildError> {
+	Ok(FdrConfig {
 		seeds: 2,
 		max_depth: 16,
 		max_internal_run: 4,
 		timeout_ms: 5000,
-		specs: vec![MultiOrgControlPlane::process()],
+		specs: vec![MultiOrgControlPlane::process()?],
 		fail_fast: true,
 		..Default::default()
-	}
+	})
 }
 
 #[cfg(feature = "testing-fdr")]
-fn multi_org_config() -> Result<ScenarioConfig, ScenarioConfigError> {
-	ScenarioConfig::builder()
+fn multi_org_config() -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let builder = ScenarioConfig::builder()
 		.with_spec(ClusterMultiOrgBoundarySpec::latest())
-		.with_csp(MultiOrgControlPlane)
-		.with_fdr(multi_org_fdr())
-		.build()
+		.with_csp(MultiOrgControlPlane);
+
+	Ok(builder.with_fdr(multi_org_fdr()?).build()?)
 }
 
 #[cfg(not(feature = "testing-fdr"))]
-fn multi_org_config() -> Result<ScenarioConfig, ScenarioConfigError> {
-	ScenarioConfig::builder()
+fn multi_org_config() -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let builder = ScenarioConfig::builder()
 		.with_spec(ClusterMultiOrgBoundarySpec::latest())
-		.with_csp(MultiOrgControlPlane)
-		.build()
+		.with_csp(MultiOrgControlPlane);
+
+	Ok(builder.build()?)
+}
+
+/// The configuration that grades `spec`, refines the run against the
+/// multi-organization control plane, and expects `expect`.
+#[cfg(feature = "testing-fdr")]
+fn multi_org_model_config(
+	spec: &'static tightbeam::testing::macros::BuiltAssertSpec,
+	expect: Expect,
+) -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
+	let builder = ScenarioConfig::builder().with_spec(spec).with_fdr(multi_org_fdr()?);
+	Ok(builder.with_expect(expect).build()?)
 }
 
 tb_scenario! {
-	name: cluster_org_boundary_holds_while_federation_routes,
+	name: cluster_flood_admits_neighbor_colony_and_refuses_the_stranger,
 	config: multi_org_config(),
 	environment Hive {
 		context: multi_org_ctx(),
@@ -232,38 +199,31 @@ tb_scenario! {
 				b"origin-ad",
 			)
 			.await?;
-			trace.event_with(PEER_AD_STATUS, &[], status)?;
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], type_route_count(&gateway_entry, "ping") as u64)?;
+			assert_eq!(status, TransitStatus::Ok, "the entry gateway admits the advertisement rumor of the origin");
+			assert_eq!(type_route_count(&gateway_entry, "ping"), 1, "the rumor of the origin installs one ping route");
 
 			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
-			trace.event(WORK_SENT)?;
 
 			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"multi-org-work").await?;
 			let ping_response = decode_ping_echo(&servlet_frame)?;
-			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
 
-			// Cross-organization relay: colony "other" is trusted on
-			// the transport plane, so only the colony gate can refuse.
-			relay_application_rumor(&trace, &ctx.entry, &gateway_entry, &ctx.foreign.key, &ctx.foreign.key, "other-org")
-				.await?;
+			// Cross-organization relay: colony "other" is inside the flood,
+			// so the gateway admits its rumor.
+			let neighbor = &ctx.neighbor.key;
+			let replied = relay_application_rumor(&ctx.entry, &gateway_entry, neighbor, neighbor, "other-org").await?;
+			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
-			// No-colony relay: a trusted identity outside every
-			// organization is refused the same way.
-			relay_application_rumor(
-				&trace,
-				&ctx.entry,
-				&gateway_entry,
-				&ctx.stranger_key,
-				&ctx.stranger_key,
-				"stranger",
-			)
-			.await?;
+			// No-colony relay: a trusted identity outside every organization
+			// is outside the flood, so only the membership proof can refuse.
+			let stranger = &ctx.stranger_key;
+			let replied = relay_application_rumor(&ctx.entry, &gateway_entry, stranger, stranger, "stranger").await?;
+			assert_eq!(replied, TransitStatus::PermissionDenied, "the gateway refuses a stranger's rumor");
 
-			// The relay envelope is admitted, so only the inner realm
+			// The gateway admits the relay envelope, so only the inner realm
 			// admission can drop this one.
-			let foreign_ns =
-				ColonyNamespace::new("tightbeam", "other-realm").map_err(|_| TightBeamError::MissingResponse)?;
-			let foreign_type = foreign_ns.servlet("ping").map_err(|_| TightBeamError::MissingResponse)?;
+			let foreign_ns = ColonyNamespace::new("tightbeam", "other-realm")?;
+			let foreign_type = foreign_ns.servlet("ping")?;
 			let status = flood_ad_rumor(
 				&ctx.entry,
 				&ctx.rogue_key,
@@ -274,10 +234,13 @@ tb_scenario! {
 				b"rogue-realm-ad",
 			)
 			.await?;
-			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], status)?;
+			assert_eq!(
+				status,
+				TransitStatus::Ok,
+				"the entry gateway admits the relay envelope of the rogue advertisement"
+			);
 
-			// No refusal weakened the in-organization route.
-			trace.event_with(PEER_ROUTES_AFTER, &[], type_route_count(&gateway_entry, "ping") as u64)?;
+			assert_eq!(type_route_count(&gateway_entry, "ping"), 1, "the in-organization route survives every refusal");
 
 			gateway_entry.stop();
 			gateway_origin.stop();
@@ -287,46 +250,184 @@ tb_scenario! {
 	}
 }
 
+/// Polls until gateways have learned `count` slate rumors, or five seconds
+/// pass. The spec judges the count, so the wait leaves the verdict to the spec.
+async fn wait_for_learned_slates(trace: &TraceCollector, count: usize) {
+	let learned = || trace.recorded(events::CLUSTER_PEER_AD_LEARNED) >= count;
+	poll_until(50, Duration::from_millis(100), learned).await;
+}
+
 tb_assert_spec! {
-	pub ClusterLiveForeignGatewaySpec,
+	pub ClusterLiveNeighborGatewaySpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
-			(events::CLUSTER_GOSSIP_REFUSED, at_least!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(2)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0)),
+			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, exactly!(0)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
-			(events::CLUSTER_PEER_AD_LEARNED, exactly!(0)),
-			(events::CLUSTER_PEER_AD_DROPPED, exactly!(0)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64))
+			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
+			(events::CLUSTER_PEER_AD_DROPPED, exactly!(0))
 		]
 	}
 }
 
-// A real gateway's beat drives this run, so the counts are bounds rather than
-// exacts. The direct advertisement plane admits the foreign member by design
-// and its empty slate installs nothing, which is why an advertisement is
-// observed while nothing is learned.
+// A real gateway's beat drives this run, so the counts are bounds. The entry
+// gateway admits the neighbor's direct advertisement and the slate rumor its
+// beat floods, because colony "other" is inside the flood.
 tb_scenario! {
-	name: cluster_live_foreign_gateway_beat_refused_at_org_edge,
-	spec: ClusterLiveForeignGatewaySpec,
+	name: cluster_live_neighbor_beat_floods_its_slate_across_the_org_edge,
+	spec: ClusterLiveNeighborGatewaySpec,
 	environment Cluster {
 		context: multi_org_ctx(),
 		start: |SetupEnv { trace, context: ctx }| async move {
 			start_cluster(&trace, quiet_member_conf(&ctx.entry, Arc::clone(&ctx.peers_of_entry))).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			// The foreign gateway beats on a clock only this test moves.
+			// The neighbor gateway beats on a clock only this test moves.
 			let clock = Arc::new(ManualClock::default());
-			let mut foreign_conf = federation_conf(&ctx.foreign, Arc::clone(&ctx.peers_of_foreign), vec![cluster.addr().to_string()], 1);
-			foreign_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
-			let gateway_foreign = start_cluster(&trace, foreign_conf).await?;
+			let mut neighbor_conf = federation_conf(&ctx.neighbor, Arc::clone(&ctx.peers_of_neighbor), vec![cluster.addr().to_string()], 1);
+			neighbor_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
 
-			drive_until_refused(&clock, &trace).await?;
+			let gateway_neighbor = start_cluster(&trace, neighbor_conf).await?;
 
-			trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_routes()?.len() as u64)?;
+			// The beat floods the slate rumor after it advertises, so the
+			// scenario also waits for the entry gateway to learn that rumor.
+			drive_until_advertised(&clock, &trace, 2).await;
+			wait_for_learned_slates(&trace, 1).await;
 
-			gateway_foreign.stop();
+			assert!(cluster.peer_routes()?.is_empty(), "an empty neighbor slate installs no route");
+
+			gateway_neighbor.stop();
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterNeighborColonySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
+			(events::CLUSTER_PEER_HINTS_LEARNED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1))
+		]
+	}
+}
+
+// A gateway of colony "other" serves work by direct peering, through the route
+// that its signed advertisement installs at the entry gateway.
+//
+// - The advertiser is inside the flood, so the peer table learns it.
+// - The gateway that answers is the advertiser, so the entry forwards the work.
+tb_scenario! {
+	name: cluster_neighbor_colony_serves_work_and_enters_discovery,
+	spec: ClusterNeighborColonySpec,
+	environment Hive {
+		context: multi_org_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_ping_hive(trace, Arc::clone(&ctx.neighbor), None).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let neighbor_conf = quiet_member_conf(&ctx.neighbor, Arc::clone(&ctx.peers_of_neighbor));
+			let gateway_neighbor = start_cluster(&trace, neighbor_conf).await?;
+			hive.register_with_cluster(gateway_neighbor.addr()).await?;
+
+			let entry_conf = quiet_member_conf(&ctx.entry, Arc::clone(&ctx.peers_of_entry));
+			let gateway_entry = start_cluster(&trace, entry_conf).await?;
+
+			let neighbor_key = &ctx.neighbor.key;
+			let neighbor_addr = gateway_neighbor.addr().to_string();
+			let claimed = neighbor_addr.as_bytes();
+			let types = vec![servlet_urn("ping")];
+			let ad_reply = advertise_peer_signed(&ctx.entry, neighbor_key, &gateway_entry, claimed, types).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_entry.peer_servlets()?.len(), 1, "the advertisement of the neighbor installs its route");
+
+			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
+
+			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"neighbor-work").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
+
+			gateway_entry.stop();
+			gateway_neighbor.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterNeighborAnchorSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(3)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0)),
+			(events::CLUSTER_GOSSIP_FANOUT_UNREACHED, exactly!(0)),
+			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1))
+		]
+	}
+}
+
+// A configured peer of colony "other" keeps its routes through two live beats
+// of the entry gateway, after its signed advertisement installs them.
+//
+// - The neighbor admits the advertisement of each beat and the slate rumor
+//   that the first beat floods, and each reconcile leaves the routes in place.
+// - The gateway that answers is the advertiser, so the entry forwards the work.
+tb_scenario! {
+	name: cluster_neighbor_anchor_keeps_its_routes_through_the_beat,
+	spec: ClusterNeighborAnchorSpec,
+	environment Hive {
+		context: multi_org_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_ping_hive(trace, Arc::clone(&ctx.neighbor), None).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let neighbor_conf = quiet_member_conf(&ctx.neighbor, Arc::clone(&ctx.peers_of_neighbor));
+			let gateway_neighbor = start_cluster(&trace, neighbor_conf).await?;
+			hive.register_with_cluster(gateway_neighbor.addr()).await?;
+
+			// The entry gateway beats on a clock only this test moves.
+			let clock = Arc::new(ManualClock::default());
+			let neighbor_addr = gateway_neighbor.addr().to_string();
+			let peers_of_entry = Arc::clone(&ctx.peers_of_entry);
+			let mut entry_conf = federation_conf(&ctx.entry, peers_of_entry, vec![neighbor_addr.clone()], 1);
+			entry_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+
+			let gateway_entry = start_cluster(&trace, entry_conf).await?;
+			let neighbor_key = &ctx.neighbor.key;
+			let claimed = neighbor_addr.as_bytes();
+			let types = vec![servlet_urn("ping")];
+			let ad_reply = advertise_peer_signed(&ctx.entry, neighbor_key, &gateway_entry, claimed, types).await?;
+			assert_eq!(ad_reply, TransitStatus::Ok, "the gateway admits the advertisement");
+			assert_eq!(gateway_entry.peer_servlets()?.len(), 1, "the advertisement of the neighbor installs its route");
+
+			// One advertisement is the neighbor's own, placed above. The other
+			// two are the entry gateway's, one from each of two beats.
+			drive_until_advertised(&clock, &trace, 3).await;
+
+			let routes = type_route_count(&gateway_entry, "ping");
+			assert_eq!(routes, 1, "the neighbor keeps its route through the beats");
+
+			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
+
+			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"neighbor-anchor-work").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
+			assert_eq!(ping_response.doubled, 42, "the ping servlet doubles the request");
+
+			gateway_entry.stop();
+			gateway_neighbor.stop();
+			hive.stop();
 			Ok(())
 		}
 	}
@@ -340,7 +441,7 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_PEER_AD_LEARNED, exactly!(1)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
 			(events::CLUSTER_PEER_AD_DROPPED, exactly!(1))
 		]
 	}
@@ -349,15 +450,11 @@ tb_assert_spec! {
 #[cfg(feature = "testing-fdr")]
 tb_scenario! {
 	name: cluster_multi_org_control_plane_refines_model,
-	config: ScenarioConfig::builder()
-		.with_spec(ClusterMultiOrgModelSpec::latest())
-		.with_fdr(multi_org_fdr())
-		.build(),
+	config: multi_org_model_config(ClusterMultiOrgModelSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(events::CLUSTER_PEER_AD_LEARNED)?;
 			trace.event(events::CLUSTER_WORK_FORWARDED)?;
-			trace.event(events::CLUSTER_GOSSIP_REFUSED)?;
 			trace.event(events::CLUSTER_GOSSIP_REFUSED)?;
 			trace.event(events::CLUSTER_PEER_AD_DROPPED)?;
 			Ok(())
@@ -379,16 +476,12 @@ tb_assert_spec! {
 	}
 }
 
-// Counting cannot catch this order: the counts are legal and the L1 spec
-// passes, so only the refinement rejects it.
+// This order keeps every count legal, so the L1 spec passes and only the
+// refinement rejects it.
 #[cfg(feature = "testing-fdr")]
 tb_scenario! {
 	name: cluster_multi_org_model_rejects_forward_before_learn,
-	config: ScenarioConfig::builder()
-		.with_spec(ClusterMultiOrgViolationSpec::latest())
-		.with_fdr(multi_org_fdr())
-		.with_expect(Expect::Violation(Layer::Refinement))
-		.build(),
+	config: multi_org_model_config(ClusterMultiOrgViolationSpec::latest(), Expect::Violation(Layer::Refinement)),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(events::CLUSTER_WORK_FORWARDED)?;

@@ -1,63 +1,113 @@
-//! FDR exploration engine subsystem
+//! The engine subsystem of FDR.
 //!
-//! This module contains the core FdrExplorer struct that orchestrates
-//! exploration and refinement checking by delegating to pluggable subsystems.
+//! This module holds [`FdrExplorer`], which runs exploration and refinement
+//! checks through subsystems that a caller can replace.
 
+use core::convert::Infallible;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-
-#[cfg(feature = "rayon")]
-use std::collections::HashSet;
 
 use super::cache::DefaultCache;
 use super::exploration::DefaultExplorationEngine;
 use super::refinement::DefaultRefinementChecker;
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, RefinementOutcome, SeedResult};
-use crate::testing::fdr::verdict::{Decision, Failure, FdrVerdict, Trace};
+use crate::testing::fdr::verdict::{Decision, FdrVerdict};
 use crate::testing::specs::csp::{Event, Process, State};
 
-/// FDR exploration engine (pluggable design)
+use crate::trace::TraceCollector;
+use crate::TightBeamError;
+
+#[cfg(feature = "instrument")]
+use super::recorder::ExplorationRecorder;
+
+/// The FDR explorer, generic over its two subsystems.
 ///
-/// Generic over subsystem implementations:
-/// - `E`: Exploration engine (implements `ExplorationCore`)
-/// - `R`: Refinement checker (implements `RefinementChecker`)
+/// The type parameters name the subsystems:
+/// - `E` is the exploration engine, an [`ExplorationCore`].
+/// - `R` is the refinement checker, a [`RefinementChecker`].
 ///
-/// The refinement checker manages its own memoization cache internally.
+/// The refinement checker owns its memoization cache.
 pub struct FdrExplorer<'a, E, R>
 where
 	E: ExplorationCore,
 	R: RefinementChecker,
 {
-	/// Process being verified
+	/// The process under verification.
 	process: &'a Process,
 
-	/// Configuration
+	/// The FDR configuration, which the subsystems share.
 	config: Arc<FdrConfig>,
 
-	/// Exploration engine
+	/// The exploration engine, which runs each seed.
 	explorer: E,
 
-	/// Refinement checker
+	/// The refinement checker, which tests the process against each spec.
 	refinement: R,
 
-	/// Verdict accumulator
+	/// The verdict that the run accumulates.
 	verdict: FdrVerdict,
 }
 
-/// Default FDR explorer using default subsystem implementations
+/// The FDR explorer with the default exploration engine and refinement checker.
 pub type DefaultFdrExplorer<'a> =
 	FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>>;
+
+/// A divergence that a seed found: the state where the seed diverged, and the
+/// hidden events of the run that diverges from it.
+pub(crate) type Divergence = (State, Vec<Event>);
+
+/// The type of the `None` recording that [`FdrExplorer::explore`] passes,
+/// whose error is [`Infallible`].
+type Unrecorded = fn(&Process, &HashSet<State>, &[Divergence]) -> Result<(), Infallible>;
+
+/// The divergences that the seeds of one explored process found, which an
+/// exploration keeps when it records them.
+struct FoundDivergences(Option<Vec<Divergence>>);
+
+impl FoundDivergences {
+	/// A collection that keeps each divergence when `recording` holds.
+	fn kept_when(recording: bool) -> Self {
+		Self(recording.then(Vec::new))
+	}
+
+	/// Keeps the divergence of `result` when the result has one and this
+	/// collection keeps divergences.
+	fn note(&mut self, result: &SeedResult) {
+		let found = result.divergence();
+		if let (Some(kept), Some((state, run))) = (self.0.as_mut(), found) {
+			kept.push((state, run.to_vec()));
+		}
+	}
+
+	/// The divergences kept so far, in the order of the seeds.
+	fn divergences(&self) -> &[Divergence] {
+		self.0.as_deref().unwrap_or_default()
+	}
+}
+
+/// The exploration that a caller of the explorer asks for.
+#[derive(Clone, Copy)]
+enum Run {
+	/// The mode that the configuration selects, as
+	/// [`FdrExplorer::explore_modes`] decides it.
+	Configured,
+	/// The state-space exploration of the subject, whatever specs the
+	/// configuration names.
+	StateSpace,
+}
 
 impl<'a, E, R> FdrExplorer<'a, E, R>
 where
 	E: ExplorationCore,
 	R: RefinementChecker,
 {
-	/// Create new FDR explorer with custom subsystems
+	/// An explorer of `process` under `config` with the given subsystems.
 	///
-	/// The cache is managed by the refinement checker, which receives it during construction.
+	/// The refinement checker owns the cache, which it receives at its
+	/// construction.
 	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R) -> Self {
 		Self {
 			process,
@@ -68,28 +118,177 @@ where
 		}
 	}
 
-	/// Create new FDR explorer with custom subsystems using `Arc<FdrConfig>`
+	/// An explorer of `process` under a shared `config` with the given
+	/// subsystems.
 	///
-	/// Use this when you've already created an `Arc<FdrConfig>` to share across subsystems.
+	/// Use it when the subsystems already share `config` through an [`Arc`].
 	pub fn new_with_arc(process: &'a Process, config: Arc<FdrConfig>, explorer: E, refinement: R) -> Self {
 		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
 
-	/// Run Layer 3 and report what it decided.
-	///
-	/// Schedulability is decided on this one exit path, so a spec that misses
-	/// its deadlines cannot reach a consumer as a verdict that held.
+	/// Runs Layer 3 and reports what it decided.
 	pub fn explore(&mut self) -> FdrVerdict {
-		let mut verdict = self.explore_modes();
-		verdict.schedulable = self.schedulability();
+		self.explore_unrecorded(Run::Configured)
+	}
+
+	/// Runs the exploration of `run`, records no event, and reports what it
+	/// decided.
+	fn explore_unrecorded(&mut self, run: Run) -> FdrVerdict {
+		let explored = self.explore_recording(None::<Unrecorded>, run);
+		let Ok(verdict) = explored;
 
 		verdict
 	}
 
+	/// Runs Layer 3, records into `trace` the exploration events that its
+	/// instrumentation settings ask for, and reports what Layer 3 decided.
+	///
+	/// Each event covers one state of one explored process, in the order of
+	/// the state names, and its label names the process and the state:
+	///
+	/// - `sample_enabled_sets` records [`ENABLED_SET_SAMPLE`] at each state that a seed visited.
+	/// - `sample_refusals` records [`REFUSAL_SNAPSHOT`] at each visited state that is stable or accepting.
+	/// - `divergence_heuristics` records [`DIVERGENCE_DETECT`] at each state where a seed diverged.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that `trace` refused.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events::ENABLED_SET_SAMPLE;
+	/// use tightbeam::instrumentation::TbInstrumentationConfig;
+	/// use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::trace::{TraceCollector, TraceConfig};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
+	/// let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
+	/// let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
+	/// explorer.explore_into(&trace)?;
+	///
+	/// let events = trace.drain_events();
+	/// let samples = events.iter().filter(|event| event.urn == ENABLED_SET_SAMPLE);
+	/// let labels: Vec<_> = samples.filter_map(|event| event.label.as_deref()).collect();
+	/// assert_eq!(labels, ["Send.S0: {send}", "Send.S1: {}"]);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`ENABLED_SET_SAMPLE`]: crate::instrumentation::events::ENABLED_SET_SAMPLE
+	/// [`REFUSAL_SNAPSHOT`]: crate::instrumentation::events::REFUSAL_SNAPSHOT
+	/// [`DIVERGENCE_DETECT`]: crate::instrumentation::events::DIVERGENCE_DETECT
+	#[cfg(feature = "instrument")]
+	pub fn explore_into(&mut self, trace: &TraceCollector) -> Result<FdrVerdict, TightBeamError> {
+		self.record_into(trace, Run::Configured)
+	}
+
+	/// Runs Layer 3 and reports what it decided. A build without `instrument`
+	/// ignores `trace` and runs [`FdrExplorer::explore`].
+	///
+	/// # Errors
+	///
+	/// - In a build with `instrument`, the error of the first exploration event that `trace` refused.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	/// use tightbeam::trace::TraceCollector;
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
+	/// let verdict = explorer.explore_into(&TraceCollector::default())?;
+	/// assert_eq!(verdict.states_visited, 2);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[cfg(not(feature = "instrument"))]
+	pub fn explore_into(&mut self, trace: &TraceCollector) -> Result<FdrVerdict, TightBeamError> {
+		self.record_into(trace, Run::Configured)
+	}
+
+	/// Runs the state-space exploration of the subject over every seed,
+	/// whatever specs the configuration names, records into `trace` the
+	/// exploration events that its instrumentation settings ask for, and
+	/// reports what the exploration decided.
+	///
+	/// A scenario explores its CSP model this way, while its specs grade the
+	/// recorded trace.
+	///
+	/// # Errors
+	///
+	/// - In a build with `instrument`, the error of the first exploration event that `trace` refused.
+	pub(crate) fn explore_state_space_into(&mut self, trace: &TraceCollector) -> Result<FdrVerdict, TightBeamError> {
+		self.record_into(trace, Run::StateSpace)
+	}
+
+	/// Runs the exploration of `run`, records into `trace` the exploration
+	/// events that its instrumentation settings ask for, and reports what the
+	/// exploration decided.
+	///
+	/// # Errors
+	///
+	/// - The error of the first exploration event that `trace` refused.
+	#[cfg(feature = "instrument")]
+	fn record_into(&mut self, trace: &TraceCollector, run: Run) -> Result<FdrVerdict, TightBeamError> {
+		let Some(recorder) = ExplorationRecorder::of(trace) else {
+			let verdict = self.explore_unrecorded(run);
+			return Ok(verdict);
+		};
+
+		let record = |process: &Process, visited: &HashSet<State>, divergences: &[Divergence]| {
+			recorder.record(process, visited, divergences)
+		};
+		self.explore_recording(Some(record), run)
+	}
+
+	/// Runs the exploration of `run` and reports what it decided. A build
+	/// without `instrument` records no event, so it ignores `trace`.
+	#[cfg(not(feature = "instrument"))]
+	#[expect(unused_variables)]
+	fn record_into(&mut self, trace: &TraceCollector, run: Run) -> Result<FdrVerdict, TightBeamError> {
+		let verdict = self.explore_unrecorded(run);
+		Ok(verdict)
+	}
+
+	/// Runs the exploration of `run`, hands `record` what the seeds of each
+	/// explored process found, and reports what the exploration decided.
+	///
+	/// This one exit path decides schedulability, so a spec that misses its
+	/// deadlines cannot reach a consumer as a verdict that held.
+	fn explore_recording<X, F>(&mut self, mut record: Option<F>, run: Run) -> Result<FdrVerdict, X>
+	where
+		F: FnMut(&Process, &HashSet<State>, &[Divergence]) -> Result<(), X>,
+	{
+		let mut verdict = match run {
+			Run::Configured => self.explore_modes(&mut record)?,
+			Run::StateSpace => self.explore_state_space(&mut record)?,
+		};
+
+		verdict.schedulable = self.schedulability();
+
+		Ok(verdict)
+	}
+
 	/// What schedulability analysis decided about the configured specs.
 	///
-	/// A spec declaring no schedulability block has no task set. An analysis
-	/// error refutes rather than leaving the question open: every
+	/// A spec with no schedulability block has no task set, so no analysis
+	/// runs and it decides [`Decision::NotAsserted`]. An analysis error decides
+	/// [`Decision::Refuted`] and not [`Decision::Unknown`], because every
 	/// `SchedulabilityError` names a defect in the declared task set, such as
 	/// a period with no WCET.
 	#[cfg(feature = "testing-schedulability")]
@@ -97,8 +296,9 @@ where
 		let mut decision = Decision::NotAsserted;
 		for spec in self.config.specs.iter() {
 			let analysed = match spec.schedulability_violated() {
-				Ok(false) => Decision::Holds,
-				Ok(true) | Err(_) => Decision::Refuted,
+				Ok(None) => Decision::NotAsserted,
+				Ok(Some(false)) => Decision::Holds,
+				Ok(Some(true)) | Err(_) => Decision::Refuted,
 			};
 
 			decision = decision.and(analysed);
@@ -107,7 +307,8 @@ where
 		decision
 	}
 
-	/// Where schedulability analysis does not compile in.
+	/// A build without `testing-schedulability` leaves schedulability
+	/// [`Decision::NotAsserted`].
 	#[cfg(not(feature = "testing-schedulability"))]
 	fn schedulability(&self) -> Decision {
 		Decision::NotAsserted
@@ -123,200 +324,127 @@ where
 		self.config.fault_model.is_none()
 	}
 
-	/// Where no fault model can be configured.
+	/// A build without `testing-fault` has no fault model, so every run asserts
+	/// freedom.
 	#[cfg(not(feature = "testing-fault"))]
 	fn asserts_freedom(&self) -> bool {
 		true
 	}
 
-	/// Run multi-seed exploration
-	fn explore_modes(&mut self) -> FdrVerdict {
-		// Mode 1: Specification robustness testing (fault model + specs)
-		// When fault_model is provided with specs, explore the spec WITH faults
+	/// Runs the exploration mode that the configuration selects, and hands
+	/// `record` the states that the seeds of each explored process visited and
+	/// the divergences they found.
+	fn explore_modes<X, F>(&mut self, record: &mut Option<F>) -> Result<FdrVerdict, X>
+	where
+		F: FnMut(&Process, &HashSet<State>, &[Divergence]) -> Result<(), X>,
+	{
+		// Mode 1: a fault model with specs explores each spec under faults.
 		#[cfg(feature = "testing-fault")]
 		if self.config.fault_model.is_some() && !self.config.specs.is_empty() {
-			// Explore the specification process with faults injected
-			// This tests if the SPEC correctly models error conditions
-			self.explore_specification_with_faults();
+			// The run tests whether each spec models the error conditions that
+			// the faults cause.
+			self.explore_specification_with_faults(record)?;
 			#[cfg(feature = "testing-fmea")]
 			self.generate_fmea_if_configured();
-			return self.verdict.clone();
+			return Ok(self.verdict.clone());
 		}
 
-		// Mode 2: Refinement checking (specs without fault model)
+		// Mode 2: specs with no fault model run the refinement checks.
 		if !self.config.specs.is_empty() {
 			self.check_refinement();
 			#[cfg(feature = "testing-fmea")]
 			self.generate_fmea_if_configured();
-			return self.verdict.clone();
+			return Ok(self.verdict.clone());
 		}
 
-		// Mode 3: Single-process multi-seed exploration
+		// Mode 3: a run with no spec explores the process over every seed.
+		self.explore_state_space(record)
+	}
+
+	/// Explores the subject over every seed through the engine, and hands
+	/// `record` the states that the seeds visited and the divergences they
+	/// found.
+	fn explore_state_space<X, F>(&mut self, record: &mut Option<F>) -> Result<FdrVerdict, X>
+	where
+		F: FnMut(&Process, &HashSet<State>, &[Divergence]) -> Result<(), X>,
+	{
 		if self.asserts_freedom() {
 			self.verdict.divergence_free = Decision::Holds;
 			self.verdict.deadlock_free = Decision::Holds;
 		}
 
-		#[cfg(feature = "rayon")]
-		{
-			use rayon::prelude::*;
-			let seeds: Vec<u64> = (0..self.config.seeds).map(|s| s as u64).collect();
-			let process = self.process;
-			let config = &self.config;
-
-			let results: Vec<(u64, SeedResult, HashSet<State>, usize)> = seeds
-				.par_iter()
-				.map(|&seed| {
-					let (result, visited, pruned) =
-						DefaultExplorationEngine::explore_seed_static(process, config, seed);
-					(seed, result, visited, pruned)
-				})
-				.collect();
-
-			for (seed, result, visited, pruned) in results {
-				self.update_verdict_from_result(seed, &result);
-				self.explorer.add_seed_result(seed, result);
-				self.explorer.update_visited_states(&visited);
-				self.explorer.add_timing_pruned(pruned);
-			}
-		}
-
-		#[cfg(not(feature = "rayon"))]
-		{
-			for seed in 0..self.config.seeds {
-				let result = self.explorer.explore_seed(seed as u64);
-				self.update_verdict_from_result(seed as u64, &result);
-				self.explorer.add_seed_result(seed as u64, result);
-			}
+		let mut found = FoundDivergences::kept_when(record.is_some());
+		let seeds = 0..u64::from(self.config.seeds);
+		for (seed, result) in self.explorer.explore_seeds(seeds) {
+			self.verdict.add_seed(*seed, result);
+			found.note(result);
 		}
 
 		self.verdict.traces_explored = self.explorer.traces().len();
-		self.verdict.states_visited = self.explorer.states_visited();
+		self.verdict.states_visited = self.explorer.visited_states().len();
 		self.verdict.timing_pruned = self.explorer.timing_pruned();
+
+		if let Some(record) = record.as_mut() {
+			record(self.process, self.explorer.visited_states(), found.divergences())?;
+		}
 
 		self.check_determinism();
 
 		#[cfg(feature = "testing-fmea")]
 		self.generate_fmea_if_configured();
 
-		self.verdict.clone()
+		Ok(self.verdict.clone())
 	}
 
-	/// Update verdict based on seed result
+	/// Explores every configured spec under fault injection, over every seed,
+	/// and hands `record` the states that each spec's seeds visited and the
+	/// divergences they found.
 	///
-	/// A seed that injected a fault feeds the error-recovery counters, which
-	/// FMEA detection ratings divide.
-	fn update_verdict_from_result(&mut self, seed: u64, result: &SeedResult) {
-		match result {
-			#[cfg(feature = "testing-fault")]
-			SeedResult::Divergence(_trace, hidden, faults) => {
-				self.verdict.divergence_free = self.verdict.divergence_free.refute();
-				self.verdict.divergence_witness = Some((seed, hidden.clone()));
-				self.verdict.failing_seed = Some(seed);
-				if !faults.is_empty() {
-					self.verdict.error_recovery_failed += 1;
-				}
-				self.verdict.faults_injected.extend(faults.clone());
-			}
-			#[cfg(not(feature = "testing-fault"))]
-			SeedResult::Divergence(_trace, hidden) => {
-				self.verdict.divergence_free = self.verdict.divergence_free.refute();
-				self.verdict.divergence_witness = Some((seed, hidden.clone()));
-				self.verdict.failing_seed = Some(seed);
-			}
-			#[cfg(feature = "testing-fault")]
-			SeedResult::Deadlock(trace, state, faults) => {
-				self.verdict.deadlock_free = self.verdict.deadlock_free.refute();
-				self.verdict.deadlock_witness = Some((seed, trace.clone(), *state));
-				self.verdict.failing_seed = Some(seed);
-				if !faults.is_empty() {
-					self.verdict.error_recovery_failed += 1;
-				}
-				self.verdict.faults_injected.extend(faults.clone());
-			}
-			#[cfg(not(feature = "testing-fault"))]
-			SeedResult::Deadlock(trace, state) => {
-				self.verdict.deadlock_free = self.verdict.deadlock_free.refute();
-				self.verdict.deadlock_witness = Some((seed, trace.clone(), *state));
-				self.verdict.failing_seed = Some(seed);
-			}
-			#[cfg(feature = "testing-fault")]
-			SeedResult::Success(_trace, _failures, faults) => {
-				self.verdict.seeds_completed += 1;
-				if !faults.is_empty() {
-					self.verdict.error_recovery_successful += 1;
-				}
-				self.verdict.faults_injected.extend(faults.clone());
-			}
-			#[cfg(not(feature = "testing-fault"))]
-			SeedResult::Success(..) => {
-				self.verdict.seeds_completed += 1;
-			}
-		}
-	}
-
-	/// Explore every configured spec with fault injection
-	///
-	/// Every spec, not just `specs[0]`: stressing only the first silently
-	/// skips the rest.
+	/// - The verdict describes the spec runs that this mode judges, and the subject's engine stays empty.
+	/// - Each spec runs on a [`DefaultExplorationEngine`] of its own, because
+	///   the engine `E` explores the subject alone.
+	/// - `states_visited` counts the distinct states of each spec.
+	/// - The loop covers every spec, because a fault run of `specs[0]` alone would leave the rest untested.
 	#[cfg(feature = "testing-fault")]
-	fn explore_specification_with_faults(&mut self) {
+	fn explore_specification_with_faults<X, F>(&mut self, record: &mut Option<F>) -> Result<(), X>
+	where
+		F: FnMut(&Process, &HashSet<State>, &[Divergence]) -> Result<(), X>,
+	{
 		if self.config.specs.is_empty() {
-			return;
+			return Ok(());
 		}
 
 		let config = Arc::clone(&self.config);
 		for spec_process in &config.specs {
-			#[cfg(feature = "rayon")]
-			{
-				use rayon::prelude::*;
-				let seeds: Vec<u64> = (0..config.seeds).map(|s| s as u64).collect();
-
-				let results: Vec<(u64, SeedResult, HashSet<State>, usize)> = seeds
-					.par_iter()
-					.map(|&seed| {
-						let (result, visited, pruned) =
-							DefaultExplorationEngine::explore_seed_static(spec_process, &config, seed);
-						(seed, result, visited, pruned)
-					})
-					.collect();
-
-				for (seed, result, visited, pruned) in results {
-					self.update_verdict_from_result(seed, &result);
-					self.explorer.add_seed_result(seed, result);
-					self.explorer.update_visited_states(&visited);
-					self.explorer.add_timing_pruned(pruned);
-				}
+			let mut engine = DefaultExplorationEngine::new(spec_process, Arc::clone(&config));
+			let mut found = FoundDivergences::kept_when(record.is_some());
+			let seeds = 0..u64::from(config.seeds);
+			for (seed, result) in engine.explore_seeds(seeds) {
+				self.add_spec_seed(*seed, result);
+				found.note(result);
 			}
 
-			#[cfg(not(feature = "rayon"))]
-			{
-				let results: Vec<_> = (0..config.seeds)
-					.map(|seed| {
-						let seed = seed as u64;
-						let (result, visited, pruned) =
-							DefaultExplorationEngine::explore_seed_static(spec_process, &config, seed);
-						(seed, result, visited, pruned)
-					})
-					.collect();
-
-				for (seed, result, visited, pruned) in results {
-					self.update_verdict_from_result(seed, &result);
-					self.explorer.add_seed_result(seed, result);
-					self.explorer.update_visited_states(&visited);
-					self.explorer.add_timing_pruned(pruned);
-				}
+			self.verdict.timing_pruned += engine.timing_pruned();
+			self.verdict.states_visited += engine.visited_states().len();
+			if let Some(record) = record.as_mut() {
+				record(spec_process, engine.visited_states(), found.divergences())?;
 			}
 		}
 
-		self.verdict.traces_explored = self.explorer.traces().len();
-		self.verdict.states_visited = self.explorer.states_visited();
-		self.verdict.timing_pruned = self.explorer.timing_pruned();
-
 		self.check_determinism();
+
+		Ok(())
 	}
 
-	/// Generate FMEA report if configured
+	/// Adds the result of `seed` of a spec run under faults to the verdict.
+	#[cfg(feature = "testing-fault")]
+	fn add_spec_seed(&mut self, seed: u64, result: &SeedResult) {
+		self.verdict.add_seed(seed, result);
+		self.verdict.traces_explored += usize::from(result.succeeded());
+	}
+
+	/// Builds the FMEA report when the FMEA configuration sets `auto_generate`
+	/// and the run injected a fault.
 	#[cfg(feature = "testing-fmea")]
 	fn generate_fmea_if_configured(&mut self) {
 		if let Some(ref fmea_config) = self.config.fmea_config {
@@ -329,11 +457,11 @@ where
 		}
 	}
 
-	/// Structural determinism check
+	/// Records whether the process is structurally deterministic.
 	///
-	/// No hidden actions and no multi-target `(state, event)` transition is
-	/// sufficient for CSP determinism (Roscoe 2010, §10.5). External choice is
-	/// deterministic and is not flagged.
+	/// A process with no hidden action and no multi-target `(state, event)`
+	/// transition is deterministic in CSP (Roscoe 2010, §10.5). External choice
+	/// is deterministic, so the check passes it.
 	fn check_determinism(&mut self) {
 		let mut states: Vec<State> = self.process.states.iter().copied().collect();
 		states.sort_unstable_by_key(|state| state.0);
@@ -352,20 +480,20 @@ where
 		self.verdict.determinism_witness = witness;
 	}
 
-	/// Check `process ⊑ spec` in the models the subject admits
+	/// Checks `spec ⊑ process` in the models that the subject admits.
 	///
-	/// Traces refinement is always asked. Failures and divergences are asked
-	/// only of a subject whose refusals are known, or the checker would grade
-	/// it on refusals it synthesized. Under `fail_fast`, each pass stops at
-	/// its first violation.
+	/// The check always asks traces refinement. It asks failures and
+	/// divergences only of a subject whose observation carries refusals, or the
+	/// checker would grade the subject on refusals it synthesized. Under
+	/// `fail_fast`, each pass stops at its first violation.
 	fn check_refinement(&mut self) {
 		if self.config.specs.is_empty() {
 			return;
 		}
 
-		// The spec list is read through a refcount rather than a copy: cloning
-		// `Vec<Process>` duplicates every state set and transition map that
-		// the checker only ever reads.
+		// The check reads the spec list through an `Arc` clone and not a copy,
+		// because a clone of `Vec<Process>` duplicates every state set and
+		// transition map that the checker only reads.
 		let config = Arc::clone(&self.config);
 		let specs = config.specs.as_slice();
 		self.verdict.unmodelled_events = self.unmodelled_events();
@@ -402,8 +530,8 @@ where
 	/// The events the subject can perform that no configured spec models,
 	/// sorted by name.
 	///
-	/// An event one spec models is modelled, so the specs intersect rather
-	/// than accumulate.
+	/// An event that one spec models counts as modelled, so the result is the
+	/// intersection of the unmodelled events of each spec.
 	fn unmodelled_events(&self) -> Vec<Event> {
 		let Some((first, rest)) = self.config.specs.split_first() else {
 			return Vec::new();
@@ -420,10 +548,10 @@ where
 
 	/// What one refinement model decided across every spec.
 	///
-	/// A check that ran out of budget decides [`Decision::Unknown`]: no
-	/// counterexample refutes nothing, and an unexhausted search proves
-	/// nothing. A truncated enumeration decides the same way, because
-	/// refinement quantifies over every trace of the subject.
+	/// A check that ran out of budget decides [`Decision::Unknown`], because it
+	/// holds neither a counterexample nor a finished search. A truncated
+	/// enumeration decides the same way, because refinement quantifies over
+	/// every trace of the subject.
 	fn check_refinement_for_specs<W, F, G>(
 		&mut self,
 		specs: impl AsRef<[Process]>,
@@ -459,25 +587,16 @@ where
 
 		decision
 	}
-
-	/// Get traces explored (for compatibility)
-	pub fn traces(&self) -> Vec<Trace> {
-		self.explorer.traces()
-	}
-
-	/// Get failures collected (for compatibility)
-	pub fn failures(&self) -> Vec<Failure> {
-		self.explorer.failures()
-	}
 }
 
 impl<'a> DefaultFdrExplorer<'a> {
-	/// Create new FDR explorer with default subsystems
+	/// An explorer of `process` under `config` with the default subsystems.
 	///
-	/// This is a convenience constructor that uses the default implementations
-	/// of all subsystems. For custom subsystems, use `FdrExplorer::new` directly.
+	/// The default subsystems are [`DefaultExplorationEngine`] and
+	/// [`DefaultRefinementChecker`] over a [`DefaultCache`].
+	/// [`FdrExplorer::new`] takes other subsystems.
 	///
-	/// Accepts either owned `FdrConfig` or `Arc<FdrConfig>`.
+	/// `config` is an owned [`FdrConfig`] or an `Arc<FdrConfig>`.
 	pub fn with_defaults(process: &'a Process, config: impl Into<Arc<FdrConfig>>) -> Self {
 		let config = config.into();
 		let explorer_config = Arc::clone(&config);
@@ -492,9 +611,22 @@ impl<'a> DefaultFdrExplorer<'a> {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(feature = "testing-timing")]
+	use core::time::Duration;
+
 	use super::Decision;
 	use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
 	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+	use crate::trace::TraceCollector;
+
+	#[cfg(feature = "testing-fault")]
+	use crate::testing::fdr::FaultModel;
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::timing::TimingGuard;
+
+	/// The error type of a test that builds processes and records an
+	/// exploration.
+	type TestResult = Result<(), Box<dyn core::error::Error>>;
 
 	/// A spec that models `start` and nothing else.
 	fn narrow_spec() -> Result<Process, ProcessBuildError> {
@@ -503,6 +635,70 @@ mod tests {
 			.add_observable(Event("start"))
 			.add_transition(State("S0"), Event("start"), State("S1"))
 			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A subject in which `arm` takes `S0` to `S1` when `clk` reads at most
+	/// 5 ms, and `S1` is not terminal and offers no event.
+	#[cfg(feature = "testing-timing")]
+	fn guarded_deadlock() -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		Process::builder("GuardedDeadlock")
+			.initial_state(State("S0"))
+			.clock("clk")
+			.add_observable(Event("arm"))
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.build()
+	}
+
+	/// A subject in which `start` takes `S0` to `S1` and resets `clk`, and
+	/// `arm` takes `S1` to the terminal `S2` when `clk` reads at most 5 ms.
+	#[cfg(feature = "testing-timing")]
+	fn reset_then_guard() -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		Process::builder("ResetThenGuard")
+			.initial_state(State("S0"))
+			.clock("clk")
+			.add_observable(Event("start"))
+			.add_observable(Event("arm"))
+			.add_timed_transition(State("S0"), Event("start"), State("S1"), None, ["clk".to_string()])
+			.add_timed_transition(State("S1"), Event("arm"), State("S2"), Some(guard), Vec::new())
+			.add_terminal(State("S2"))
+			.build()
+	}
+
+	/// A subject in which `arm` takes `S0` to the terminal `S1` when `clk`
+	/// reads at most 5 ms, and no transition resets `clk`.
+	#[cfg(feature = "testing-timing")]
+	fn guarded_from_the_start() -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		Process::builder("GuardedFromTheStart")
+			.initial_state(State("S0"))
+			.clock("clk")
+			.add_observable(Event("arm"))
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A subject whose hidden `t` and `u` take `S1` to `S2` and back, with
+	/// the exit `b` at `S2`, so a seed that takes `b` never runs past
+	/// `max_internal_run` hidden events.
+	fn spinning() -> Result<Process, ProcessBuildError> {
+		Process::builder("Spinning")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_transition(State("S2"), Event("u"), State("S1"))
+			.add_transition(State("S2"), Event("b"), State("S3"))
+			.add_terminal(State("S3"))
 			.build()
 	}
 
@@ -516,6 +712,152 @@ mod tests {
 			.add_transition(State("T1"), Event("audit"), State("T2"))
 			.add_terminal(State("T2"))
 			.build()
+	}
+
+	/// A subject whose hidden `p` takes `S0` onto the hidden cycle of `t` and
+	/// `u` between `S1` and `S2`, so `S0` lies off the cycle and reaches it.
+	fn lasso() -> Result<Process, ProcessBuildError> {
+		Process::builder("Lasso")
+			.initial_state(State("S0"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("p"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("S0"), Event("p"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_transition(State("S2"), Event("u"), State("S1"))
+			.add_transition(State("S2"), Event("b"), State("S3"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// A subject in which `a` takes `I` to `X`, whose two hidden runs meet at
+	/// `Q`, which loops on the hidden `first`.
+	///
+	/// The run through `P` takes `first` twice, and the run that `second`
+	/// names takes one hidden event, so the order of the event names decides
+	/// which run a search takes first.
+	fn meeting(first: &'static str, second: &'static str) -> Result<Process, ProcessBuildError> {
+		Process::builder("Meeting")
+			.initial_state(State("I"))
+			.add_observable(Event("a"))
+			.add_hidden(Event(first))
+			.add_hidden(Event(second))
+			.add_transition(State("I"), Event("a"), State("X"))
+			.add_transition(State("X"), Event(first), State("P"))
+			.add_transition(State("P"), Event(first), State("Q"))
+			.add_transition(State("X"), Event(second), State("Q"))
+			.add_transition(State("Q"), Event(first), State("Q"))
+			.build()
+	}
+
+	/// A subject whose hidden `t` and `u` take `S0` through `S1` to `S2`, a run
+	/// of two hidden events with no cycle, before `c` ends it at `S3`.
+	fn hidden_chain() -> Result<Process, ProcessBuildError> {
+		Process::builder("HiddenChain")
+			.initial_state(State("S0"))
+			.add_observable(Event("c"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("S0"), Event("t"), State("S1"))
+			.add_transition(State("S1"), Event("u"), State("S2"))
+			.add_transition(State("S2"), Event("c"), State("S3"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// A subject whose hidden `p` comes before the observable `a`, and whose
+	/// hidden run `t`, `u` comes after it.
+	fn chain_after_a_run() -> Result<Process, ProcessBuildError> {
+		Process::builder("ChainAfterARun")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("c"))
+			.add_hidden(Event("p"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("S0"), Event("p"), State("S1"))
+			.add_transition(State("S1"), Event("a"), State("S2"))
+			.add_transition(State("S2"), Event("t"), State("S3"))
+			.add_transition(State("S3"), Event("u"), State("S4"))
+			.add_transition(State("S4"), Event("c"), State("S5"))
+			.add_terminal(State("S5"))
+			.build()
+	}
+
+	/// A spec whose accepting `S0` spins on the hidden `t`, so it diverges at
+	/// once and its one trace is the empty trace.
+	fn spinning_at_once() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAtOnce")
+			.initial_state(State("S0"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("t"), State("S0"))
+			.add_terminal(State("S0"))
+			.build()
+	}
+
+	/// A subject whose accepting `Idle` offers `b`, which leads to a spin on
+	/// the hidden `t` at `D`.
+	fn spinning_after_b() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAfterB")
+			.initial_state(State("Idle"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_transition(State("Idle"), Event("b"), State("D"))
+			.add_transition(State("D"), Event("t"), State("D"))
+			.add_terminal(State("Idle"))
+			.build()
+	}
+
+	/// A subject whose accepting `Idle` offers `b`, which leads to `D`, a
+	/// state that can neither terminate nor act.
+	fn stuck_after_b() -> Result<Process, ProcessBuildError> {
+		Process::builder("StuckAfterB")
+			.initial_state(State("Idle"))
+			.add_observable(Event("b"))
+			.add_transition(State("Idle"), Event("b"), State("D"))
+			.add_terminal(State("Idle"))
+			.build()
+	}
+
+	/// A subject whose `start` resets `clk` on its way to the accepting `S1`,
+	/// where the hidden `t` spins under `guard`.
+	#[cfg(feature = "testing-timing")]
+	fn guarded_spin(guard: TimingGuard) -> Result<Process, ProcessBuildError> {
+		Process::builder("GuardedSpin")
+			.initial_state(State("S0"))
+			.clock("clk")
+			.add_observable(Event("start"))
+			.add_hidden(Event("t"))
+			.add_timed_transition(State("S0"), Event("start"), State("S1"), None, ["clk".to_string()])
+			.add_timed_transition(State("S1"), Event("t"), State("S1"), Some(guard), Vec::new())
+			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A subject whose hidden `t` resets `clk` on its way from `S0` to `S1`,
+	/// where the hidden `u` spins while `clk` reads at most 5 ms.
+	#[cfg(feature = "testing-timing")]
+	fn spinning_after_a_reset() -> Result<Process, ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+
+		Process::builder("SpinningAfterAReset")
+			.initial_state(State("S0"))
+			.clock("clk")
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_timed_transition(State("S0"), Event("t"), State("S1"), None, ["clk".to_string()])
+			.add_timed_transition(State("S1"), Event("u"), State("S1"), Some(guard), Vec::new())
+			.build()
+	}
+
+	/// What an exploration of `subject` under `config` decided about
+	/// divergence freedom.
+	fn divergence_of(subject: &Process, config: FdrConfig) -> Decision {
+		let mut explorer = DefaultFdrExplorer::with_defaults(subject, config);
+		let verdict = explorer.explore();
+		verdict.divergence_free
 	}
 
 	#[test]
@@ -532,6 +874,214 @@ mod tests {
 			"`audit` is projected away, so it is coverage and not a counterexample"
 		);
 
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_guarded_process_over_a_deadlock_is_not_deadlock_free() -> Result<(), ProcessBuildError> {
+		let subject = guarded_deadlock()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.deadlock_free, Decision::Refuted);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_reset_clock_lets_exploration_take_the_guard_behind_it() -> Result<(), ProcessBuildError> {
+		let subject = reset_then_guard()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.deadlock_free, Decision::Holds);
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn exploration_starts_each_clock_at_zero() -> Result<(), ProcessBuildError> {
+		let subject = guarded_from_the_start()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.deadlock_free, Decision::Holds);
+		Ok(())
+	}
+
+	#[test]
+	fn a_reachable_hidden_cycle_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
+		let subject = spinning()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		let run = verdict.divergence_witness.map(|(_seed, run)| run);
+		assert_eq!(verdict.divergence_free, Decision::Refuted);
+		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "the witness is the run of the cycle");
+		Ok(())
+	}
+
+	#[test]
+	fn a_renamed_process_keeps_its_divergence_verdict() -> Result<(), ProcessBuildError> {
+		let config = FdrConfig { seeds: 8, max_depth: 1, max_internal_run: 2, ..Default::default() };
+		let named_t = divergence_of(&meeting("t", "u")?, config.clone());
+		let named_z = divergence_of(&meeting("z", "u")?, config);
+
+		let refuted = [Decision::Refuted, Decision::Refuted];
+		assert_eq!([named_t, named_z], refuted, "`X` reaches the loop at `Q`");
+		Ok(())
+	}
+
+	#[test]
+	fn a_state_off_a_hidden_cycle_diverges_along_the_run_that_reaches_it() -> Result<(), ProcessBuildError> {
+		let subject = lasso()?;
+		let config = FdrConfig { max_internal_run: 1, ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+
+		let run = verdict.divergence_witness.map(|(_seed, run)| run);
+		let to_the_cycle_and_around = vec![Event("p"), Event("t"), Event("u")];
+		assert_eq!(run, Some(to_the_cycle_and_around), "`S0` reaches the cycle of `t` and `u`");
+		Ok(())
+	}
+
+	#[test]
+	fn a_hidden_cycle_at_the_depth_cut_off_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
+		let subject = spinning()?;
+		let config = FdrConfig { max_depth: 1, ..Default::default() };
+
+		let decided = divergence_of(&subject, config);
+
+		assert_eq!(decided, Decision::Refuted, "`a` reaches `S1` at the depth cut-off");
+		Ok(())
+	}
+
+	#[test]
+	fn a_hidden_run_past_max_internal_run_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
+		let subject = hidden_chain()?;
+
+		let at_the_bound = divergence_of(&subject, FdrConfig { max_internal_run: 2, ..Default::default() });
+		let past_the_bound = divergence_of(&subject, FdrConfig { max_internal_run: 1, ..Default::default() });
+
+		assert_eq!([at_the_bound, past_the_bound], [Decision::Holds, Decision::Refuted]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_hidden_run_past_max_internal_run_reports_that_run_alone() -> Result<(), ProcessBuildError> {
+		let subject = chain_after_a_run()?;
+		let config = FdrConfig { max_internal_run: 1, ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+		let run = verdict.divergence_witness.map(|(_seed, run)| run);
+		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "`a` ends the run of `p`");
+		Ok(())
+	}
+
+	#[test]
+	fn a_hidden_cycle_behind_an_accepting_state_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
+		let subject = spinning_after_b()?;
+		let decided = divergence_of(&subject, FdrConfig::default());
+		assert_eq!(decided, Decision::Refuted, "the accepting `Idle` offers `b` into the spin");
+		Ok(())
+	}
+
+	#[test]
+	fn a_deadlock_behind_an_accepting_state_refutes_deadlock_freedom() -> Result<(), ProcessBuildError> {
+		let subject = stuck_after_b()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let decided = explorer.explore().deadlock_free;
+		assert_eq!(decided, Decision::Refuted, "`b` leads from the accepting `Idle` to `D`");
+		Ok(())
+	}
+
+	#[test]
+	fn a_spec_that_diverges_at_once_refutes_an_event_that_it_lacks() -> Result<(), ProcessBuildError> {
+		let subject = spinning_after_b()?;
+		let config = FdrConfig { specs: vec![spinning_at_once()?], ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.outcome(), Decision::Refuted, "the spec has the empty trace alone");
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_hidden_cycle_that_a_guard_blocks_leaves_divergence_freedom_held() -> Result<(), ProcessBuildError> {
+		let guard = TimingGuard::ClockGreaterThan("clk".to_string(), Duration::from_millis(5));
+		let subject = guarded_spin(guard)?;
+
+		let decided = divergence_of(&subject, FdrConfig::default());
+		assert_eq!(decided, Decision::Holds, "`clk` reads 0 at `S1`, so `t` never fires");
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_hidden_cycle_that_a_guard_admits_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
+		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+		let subject = guarded_spin(guard)?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		let run = verdict.divergence_witness.map(|(_seed, run)| run);
+		assert_eq!(run, Some(vec![Event("t")]), "`clk` reads 0 at `S1`, so `t` fires forever");
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-timing")]
+	#[test]
+	fn a_clock_that_a_hidden_step_resets_opens_the_guard_of_a_cycle() -> Result<(), ProcessBuildError> {
+		let subject = spinning_after_a_reset()?;
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+
+		let verdict = explorer.explore();
+		let run = verdict.divergence_witness.map(|(_seed, run)| run);
+		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "`t` starts `clk`, which `u` reads");
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-schedulability")]
+	#[test]
+	fn a_spec_with_no_schedulability_block_leaves_schedulability_unasserted() -> Result<(), ProcessBuildError> {
+		let subject = wider_subject()?;
+		let config = FdrConfig { specs: vec![narrow_spec()?], ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.schedulable, Decision::NotAsserted, "no analysis ran");
+		Ok(())
+	}
+
+	#[test]
+	fn a_state_space_exploration_decides_freedom_whatever_specs_the_configuration_names() -> TestResult {
+		let subject = stuck_after_b()?;
+		let config = FdrConfig { specs: vec![narrow_spec()?], ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore_state_space_into(&TraceCollector::new())?;
+		let decided = verdict.deadlock_free;
+		assert_eq!(decided, Decision::Refuted, "`b` leads from the accepting `Idle` to `D`");
+		Ok(())
+	}
+
+	#[cfg(feature = "testing-fault")]
+	#[test]
+	fn a_fault_run_describes_the_spec_runs_it_judged() -> Result<(), ProcessBuildError> {
+		let subject = wider_subject()?;
+		let specs = vec![narrow_spec()?];
+		let fault_model = Some(FaultModel::default());
+		let config = FdrConfig { specs, fault_model, seeds: 4, ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+		let statistics = (verdict.states_visited, verdict.traces_explored, verdict.seeds_completed);
+		assert_eq!(statistics, (2, 4, 4), "the spec visits `S0` and `S1` on each of four seeds");
 		Ok(())
 	}
 }

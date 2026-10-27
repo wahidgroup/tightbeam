@@ -1,24 +1,29 @@
-//! # Key-exchange splice threat (mutual authentication)
+//! # Identity splice threat (mutual authentication)
 //!
 //! ## Weakness
-//! If the ECIES mutual-auth client signature covers only the transcript hash,
-//! it does not commit to the ECIES `encrypted_data` carrying the base secret.
-//! ECIES encryption is a public-key operation, and `client_random` is public
-//! (sent in `ClientHello`), so anyone can produce a decryptable payload with
-//! the victim's random.
+//! A client certificate is public. If a server admitted an offered certificate
+//! without a signature by its key over this session, an attacker could splice
+//! the certificate of a victim into a closing of its own. The server would then
+//! attribute a session key the attacker holds to the identity of the victim.
 //!
 //! ## Attack
-//! 1. A MITM captures a victim's `ClientKeyExchange` (certificate and signature).
-//! 2. The MITM encrypts a payload of `attacker_key` and `victim_client_random` to the server's public key.
-//! 3. The MITM splices its `encrypted_data` into the victim's message, keeping
-//!    the victim's certificate and signature intact.
-//! 4. A transcript-only signature still verifies: the server would attribute an
-//!    attacker-controlled session key to the victim's authenticated identity.
+//! 1. The attacker holds the certificate of a victim, but not its signing key.
+//! 2. The attacker runs a handshake of its own and offers the certificate of the victim as its identity.
+//! 3. The attacker's key provider claims the victim's key and signs the client Finished under its own key.
+//! 4. A second forger holds a signature the victim made over another message,
+//!    and answers the Finished with it.
+//!
+//! In both forms the attacker's own client derives the handshake secret, so
+//! the key-confirmation tag verifies. The closing seals the client Finished,
+//! which carries the certificate, under a key of the handshake secret, so an
+//! attacker cannot lift the Finished of a victim from a recorded closing into
+//! its own.
 //!
 //! ## Expected control
-//! The client signature MUST commit to the exact `encrypted_data` and client
-//! certificate (`Digest(transcript_hash || encrypted_data || cert_der)`), so a
-//! spliced payload MUST fail signature verification.
+//! The client Finished MUST verify under the key of the certificate its signer
+//! names, over signed attributes that bind the client role and the transcript
+//! hash of this handshake. The closing of each forger MUST fail signature
+//! verification, the one check that stands in its way.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -29,41 +34,74 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	asn1::OctetString,
 	crypto::{
-		aead::Aes256Gcm,
-		ecies::{encrypt, Secp256k1EciesMessage},
-		kdf::HkdfSha3_256,
-		profiles::DefaultCryptoProvider,
-		secret::ToInsecure,
+		hash::{Digest, Sha3_256},
+		key::{KeyBackend, KeyError, SigningKeyProvider},
+		sign::SigningIdentity,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	der::{Decode, Encode, Sequence},
-	exactly, job,
-	random::OsRng,
+	exactly,
+	instrumentation::events,
+	job,
+	spki::AlgorithmIdentifierOwned,
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{negotiation::SecurityOffer, ClientKeyExchange, Handshake, PeerAuthentication},
-	utils::urn::Urn,
+	utils::marker::MaybeSendFuture,
 	TightBeamError,
 };
 
-use crate::common::security::{
-	carried_closing, carried_key_exchange, default_security_profile, ecies_client_config, ecies_server_config,
-	expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
-};
+use crate::common::security::{ClientMaterials, ServerMaterials};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::LiveHandshake;
 
-pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
+/// A key provider that claims the public key of `claimed` and signs under
+/// the key of `signer`, as software the attacker runs may.
+#[derive(Debug)]
+struct SplicedKeyProvider {
+	claimed: Arc<dyn SigningKeyProvider>,
+	signer: Arc<dyn SigningKeyProvider>,
+}
 
-/// The attacker's view of the DER key-exchange plaintext. The two leading
-/// OCTET STRINGs are all a splice needs, because this unmetered session
-/// carries no trailing receipt acknowledgement.
-#[derive(Sequence)]
-struct SplicedPayload {
-	base_key: OctetString,
-	client_random: OctetString,
+impl KeyBackend for SplicedKeyProvider {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.signer.algorithm()
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		self.claimed.to_public_key_bytes()
+	}
+}
+
+impl SigningKeyProvider for SplicedKeyProvider {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		self.signer.sign_prehash(prehash)
+	}
+}
+
+/// A key provider that claims the public key of `victim` and answers every
+/// request with `lifted`, a signature the victim made over another message,
+/// as an attacker that lifted a signature of the victim does.
+#[derive(Debug)]
+struct LiftedSignatureProvider {
+	victim: Arc<dyn SigningKeyProvider>,
+	lifted: Vec<u8>,
+}
+
+impl KeyBackend for LiftedSignatureProvider {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.victim.algorithm()
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		self.victim.to_public_key_bytes()
+	}
+}
+
+impl SigningKeyProvider for LiftedSignatureProvider {
+	fn sign_prehash(&self, _prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		Box::pin(async move { Ok(self.lifted.to_owned()) })
+	}
 }
 
 tb_assert_spec! {
@@ -71,7 +109,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SPLICED_KEX_REJECTED, exactly!(1u32))
+			(events::SESSION_CERT_REJECTED, exactly!(2u32), equals!("signature"))
 		]
 	}
 }
@@ -79,15 +117,35 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SpliceAttackProcess,
 	events {
-		observable { SPLICED_KEX_REJECTED }
+		observable { events::SESSION_CERT_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { SPLICED_KEX_REJECTED => Done },
+		Idle => { events::SESSION_CERT_REJECTED => Spliced },
+		Spliced => { events::SESSION_CERT_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Splice attack: client signature must bind encrypted_data + certificate" }
+	annotations { description: "Splice attack: the client Finished must verify under the offered certificate" }
+}
+
+/// A live handshake with a mutual server of `materials`, which files its
+/// verdict in `trace`, and a client that offers the certificate of `victim`
+/// and signs through `provider`. The client is a real one, so it computes the
+/// key-confirmation tag for its own secrets.
+fn forged_by(
+	materials: &ServerMaterials,
+	victim: &ClientMaterials,
+	provider: Arc<dyn SigningKeyProvider>,
+	trace: &TraceCollector,
+) -> Result<LiveHandshake, TightBeamError> {
+	let spliced = SigningIdentity::new(Arc::clone(&victim.certificate), provider)?;
+
+	// The server holds a validator, so it requires client authentication.
+	let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	let handshake = LiveHandshake::new(HandshakeBackendKind::Hpke, materials.to_owned());
+	let handshake = handshake.with_client_validators([validator]).with_client_identity(spliced);
+	Ok(handshake.audit_server(trace))
 }
 
 tb_scenario! {
@@ -107,82 +165,29 @@ job! {
 	name: SpliceAttackScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let materials = ServerMaterials::generate();
-		let profile = default_security_profile();
 
-		// The victim is a client with an authenticated identity.
-		let client_materials = ClientMaterials::deterministic();
-		let client_identity = client_materials.identity();
-		let validator = pinning_validator(&materials.certificate);
+		// The first attacker offers the public certificate of the victim and
+		// proves it with its own key, behind a provider that claims the key of
+		// the victim.
+		let victim = ClientMaterials::deterministic();
+		let attacker = ClientMaterials::generate();
+		let claimed = Arc::clone(&victim.key_provider);
+		let signer = Arc::clone(&attacker.key_provider);
+		let splicer = Arc::new(SplicedKeyProvider { claimed, signer });
+		let spliced = forged_by(&materials, &victim, splicer, &trace)?.run().await?;
 
-		let mut config = ecies_client_config(validator);
-		config.flow.identity = Some(client_identity);
-		config.security_offer = Some(SecurityOffer::new(vec![profile]));
+		// The signature of the client Finished is the control, so the refusal
+		// must name it. The key confirmation and the validator both admit the
+		// closing of the attacker, so no other check refuses it first.
+		spliced.refused_by_server("server admitted a spliced client Finished")?;
 
-		let mut client = Handshake::client(config);
+		// The second forger holds a signature of the victim's own key over
+		// another message, so the right key signed the wrong transcript.
+		let other = Sha3_256::digest(b"the client Finished of another handshake");
+		let lifted = victim.key_provider.sign_prehash(&other).await?;
+		let forger = Arc::new(LiftedSignatureProvider { victim: Arc::clone(&victim.key_provider), lifted });
+		let lifted = forged_by(&materials, &victim, forger, &trace)?.run().await?;
 
-		// The server holds a validator, so it requires client authentication.
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
-		server_config.peer_authentication = PeerAuthentication::mutual([validator]);
-
-		let mut server = Handshake::server(server_config);
-
-		// The victim's certificate is public, so the attacker can seal its
-		// splice under the same associated data the victim used.
-		let victim_certificate = Some(client_materials.certificate.as_ref());
-		let spliced_aad = ClientKeyExchange::client_bound_aad(crate::security::common::HANDSHAKE_AAD, victim_certificate)?;
-
-		let reply = server.reply(client.start()?).await?;
-		let closing = client.respond(reply).await?;
-		let client_kex_der = carried_key_exchange(closing).to_der()?;
-
-		// Recover the victim's client_random from the legitimate payload so the
-		// spliced ciphertext still passes the server's replay check.
-		let victim_kex = ClientKeyExchange::from_der(&client_kex_der)?;
-		let victim_message = Secp256k1EciesMessage::from_bytes(victim_kex.encrypted_data.as_bytes())?;
-		let victim_plain = tightbeam::crypto::ecies::decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(
-			materials.secret_key(),
-			&victim_message,
-			Some(spliced_aad.as_slice()),
-		)?
-		.to_insecure();
-
-		// The attacker forges a payload with its own key under the server's
-		// public key and splices it into the victim's message, preserving
-		// the victim's client_random and the DER framing.
-		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
-		let forged_payload = SplicedPayload {
-			base_key: OctetString::new([0x41u8; 32])?, // attacker-chosen key
-			client_random: victim_payload.client_random,
-		};
-
-		let forged_plain = forged_payload.to_der()?;
-		let recipient_pub = materials.secret_key().public_key();
-		let forged_message = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
-			&recipient_pub,
-			&forged_plain,
-			Some(spliced_aad.as_slice()),
-			Some(&mut OsRng),
-		)?;
-
-		let spliced = ClientKeyExchange {
-			encrypted_data: OctetString::new(forged_message.to_bytes())?,
-			client_certificate: victim_kex.client_certificate.to_owned(),
-			client_signature: victim_kex.client_signature.to_owned(),
-		};
-
-		let spliced_der = spliced.to_der()?;
-		if spliced_der == client_kex_der {
-			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
-		}
-
-		match server.finish(carried_closing(&spliced)).await {
-			Err(_) => {
-				trace.event(SPLICED_KEX_REJECTED)?;
-			}
-			Ok(_) => return Err(expectation_failure("server accepted a spliced key exchange under victim identity")),
-		}
-
-		Ok(())
+		lifted.refused_by_server("server admitted a lifted client Finished")
 	}
 }

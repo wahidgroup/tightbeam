@@ -1,27 +1,23 @@
-//! Handshake primitives for building custom protocols.
+//! Handshake primitives that a custom handshake protocol builds on.
 //!
-//! This module provides composable building blocks for implementing
-//! custom handshake protocols like PQXDH. These primitives handle:
-//! - Multi-input key derivation functions
-//! - Transcript hashing utilities
-//! - Prekey bundle ASN.1 structures
+//! A custom protocol such as PQXDH composes these parts:
+//!
+//! - The multi-input key derivation of [`multi_input_kdf`] and [`kdf_chain`].
+//! - The transcript hash of [`transcript_hash`] and [`TranscriptHash`].
+//! - The prekey bundle ASN.1 structures, under the `unstable-pqxdh` feature.
 
-pub mod kdf;
-pub mod transcript;
+mod kdf;
+pub(crate) mod transcript;
 
-/// UNSTABLE: PQXDH prekey structures. No orchestrator consumes them yet.
-/// Gated behind `unstable-pqxdh` until an end-to-end protocol exists.
+// The prekey structures stay unstable until a handshake protocol consumes
+// them.
 #[cfg(feature = "unstable-pqxdh")]
-#[doc(hidden)]
-pub mod prekeys;
+mod prekeys;
 
 pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
-pub use transcript::transcript_hash;
+pub use transcript::{transcript_hash, TranscriptHash};
 
-#[cfg(any(
-	feature = "transport-ecies",
-	all(feature = "transport-multiplex", feature = "transport-cms")
-))]
+#[cfg(any(feature = "transport-hpke", mux_rekey))]
 pub(crate) use kdf::RandomsSalt;
 #[cfg(feature = "unstable-pqxdh")]
 pub use prekeys::{PrekeyBundle, PrekeyIdentifiers, PrekeyInitialMessage};

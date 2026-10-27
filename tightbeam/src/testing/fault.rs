@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 
 /// Trait for type-safe process state identifiers
 ///

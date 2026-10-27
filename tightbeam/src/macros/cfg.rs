@@ -1,4 +1,4 @@
-//! Feature-delegation helpers for the `client!`/`server!` macros.
+//! The feature-delegation macros of the `client!`, `server!`, and test macros.
 //!
 //! `#[cfg(feature = "...")]` written inside a `macro_rules!` body is evaluated
 //! in the crate that *invokes* the macro, not in the crate that *defines* it.
@@ -13,8 +13,8 @@
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_std {
-	// Associated-item form: emits the tokens as-is (e.g. a method with a
-	// `self` receiver, which the `item` fragment cannot parse).
+	// The associated-item form emits the tokens as they are, such as a method
+	// with a `self` receiver, which the `item` fragment cannot parse.
 	($($body:tt)*) => { $($body)* };
 }
 
@@ -63,36 +63,23 @@ macro_rules! __tb_if_tokio {
 	($($body:tt)*) => {};
 }
 
-#[cfg(feature = "testing-timing")]
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __tb_if_testing_timing {
-	({ $($body:tt)* }) => { { $($body)* } };
-	($($body:tt)*) => { $($body)* };
-}
-
-#[cfg(not(feature = "testing-timing"))]
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __tb_if_testing_timing {
-	({ $($body:tt)* }) => {{}};
-	($($body:tt)*) => {};
-}
-
+// Picks one of two statement sequences on the `testing-schedulability`
+// feature.
+//
+// A select takes both halves in one call, so a spec form whose feature is off
+// reaches the half that refuses it.
 #[cfg(feature = "testing-schedulability")]
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __tb_if_testing_schedulability {
-	({ $($body:tt)* }) => { { $($body)* } };
-	($($body:tt)*) => { $($body)* };
+macro_rules! __tb_select_testing_schedulability {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($enabled)* };
 }
 
 #[cfg(not(feature = "testing-schedulability"))]
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __tb_if_testing_schedulability {
-	({ $($body:tt)* }) => {{}};
-	($($body:tt)*) => {};
+macro_rules! __tb_select_testing_schedulability {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($disabled)* };
 }
 
 #[cfg(feature = "testing-fault")]
@@ -111,26 +98,28 @@ macro_rules! __tb_if_testing_fault {
 	($($body:tt)*) => {};
 }
 
+// Picks one of two statement sequences on the `instrument` feature.
+//
+// A select takes both halves in one call, so a spec form whose feature is off
+// reaches the half that refuses it.
 #[cfg(feature = "instrument")]
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __tb_if_instrument {
-	({ $($body:tt)* }) => { { $($body)* } };
-	($($body:tt)*) => { $($body)* };
+macro_rules! __tb_select_instrument {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($enabled)* };
 }
 
 #[cfg(not(feature = "instrument"))]
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __tb_if_instrument {
-	({ $($body:tt)* }) => {{}};
-	($($body:tt)*) => {};
+macro_rules! __tb_select_instrument {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($disabled)* };
 }
 
 // Picks one of two statement sequences on the `testing-timing` feature.
 //
-// A select takes both halves in one call. Delegating only the positive half
-// and leaving a `#[cfg(not(...))]` twin behind emits both in a consumer.
+// A select takes both halves in one call, because a consumer that receives
+// a delegated positive half and a `#[cfg(not(...))]` twin emits both.
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 #[doc(hidden)]
@@ -147,8 +136,8 @@ macro_rules! __tb_select_testing_timing {
 
 // Picks one of two item sequences on the `tokio` feature.
 //
-// A select takes both halves in one call. Delegating only the positive half
-// and leaving a `#[cfg(not(...))]` twin behind emits both in a consumer.
+// A select takes both halves in one call, because a consumer that receives
+// a delegated positive half and a `#[cfg(not(...))]` twin emits both.
 #[cfg(feature = "tokio")]
 #[macro_export]
 #[doc(hidden)]
@@ -165,10 +154,9 @@ macro_rules! __tb_select_tokio {
 
 // Picks one of two statement sequences on the `testing-fault` feature.
 //
-// Unlike the `__tb_if_*` helpers this emits the chosen tokens bare rather than
-// wrapped in a block, because both alternatives are `let` bindings the
-// surrounding code goes on to use, and one of them borrows a temporary whose
-// lifetime a block would end.
+// This select emits the chosen tokens bare, where the `__tb_if_*` macros wrap
+// them in a block. Both alternatives are `let` bindings that later code uses,
+// and one of them borrows a temporary whose lifetime a block would end.
 #[cfg(feature = "testing-fault")]
 #[macro_export]
 #[doc(hidden)]
@@ -183,16 +171,16 @@ macro_rules! __tb_select_testing_fault {
 	({ $($with_fault:tt)* } { $($without_fault:tt)* }) => { $($without_fault)* };
 }
 
-// Harness-feature delegation for `tb_scenario!`. The generated scenario body
-// runs in the consumer's crate, where tightbeam's feature names do not exist,
-// so a `#[cfg(feature = "testing-csp")]` written into the expansion would
-// silently drop the verification it guards.
+// This macro delegates a harness feature of `tb_scenario!`. The generated
+// scenario body runs in the consumer's crate, where tightbeam's feature names
+// do not exist, so a `#[cfg(feature = "testing-csp")]` written into the
+// expansion would silently drop the verification it guards.
 #[cfg(feature = "testing-csp")]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_testing_csp {
 	({ $($body:tt)* }) => { { $($body)* } };
-	// Item form: an `impl` block cannot be produced by the expression form.
+	// The item form emits an `impl` block, which the expression form cannot.
 	($($body:tt)*) => { $($body)* };
 }
 
@@ -316,10 +304,10 @@ macro_rules! __tb_if_compress {
 
 /// Picks one of two `fn main` definitions on the `fuzzing` cfg.
 ///
-/// The choice rides on an attribute rather than a `$crate` path, because a
-/// `$crate` path expands to a call and a call cannot put an item in the
-/// consumer's crate root. Emitting both halves makes the flag read in the
-/// crate AFL builds with `--cfg fuzzing`.
+/// - The choice follows an attribute instead of a `$crate` path, because a
+///   `$crate` path expands to a call, and a call cannot put an item in the
+///   consumer's crate root.
+/// - The macro emits both halves, so the crate that AFL builds with `--cfg fuzzing` reads the flag.
 ///
 /// Each half MUST be exactly one item: the attribute binds to the first item
 /// it precedes.

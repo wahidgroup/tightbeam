@@ -1,10 +1,13 @@
-//! Chess Engine Fuzz Test
-//! - ChessEngine servlet handling moves and game state
-//! - Matrix<8> storing chess board state (8x8 grid)
-//! - Layered CSP specs (high-level flow + detailed chess rules)
-//! - AFL fuzzing with invalid move testing
+//! The chess engine fuzz test plays AFL input as moves against a servlet:
+//! - The `ChessEngineServlet` handles the moves and the game state.
+//! - A `Matrix<8>` holds the chess board state as an 8x8 grid.
+//! - The CSP process spec `ChessGameFlow` states the high-level game flow.
+//! - AFL drives the moves, so the servlet also meets invalid moves.
 
 #![cfg(all(feature = "std", feature = "full"))]
+// A fuzz harness is test code, exempt from the zero-panic index and arithmetic
+// lints (workspace lints): a harness fault ends the run as a finding.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 mod board;
 mod constants;
@@ -36,33 +39,30 @@ use r#move::ChessMove;
 use state::ChessGameState;
 use utils::restart_game;
 
-// ============================================================================
-// ASSERTION SPEC
-// ============================================================================
+// The assertion spec bounds the event counts of a run.
 
 tb_assert_spec! {
-	/// Chess game assertion specification
+	/// The assertion spec of a chess run.
 	///
-	/// Tests chess game behavior:
-	/// - Ensures moves are sent and the system processes them
-	/// - Validates that validated moves trigger server responses
+	/// - The client sends at least one move, and the system processes each move it sends.
+	/// - Each move the server validates draws a server move in reply.
 	pub ChessAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			// Core requirement: at least one move must be sent
+			// The core requirement is that the client sends at least one move.
 			(events::CLIENT_MOVE_SENT, at_least!(1)),
 			(events::CLIENT_MOVES_PROCESSED_BALANCE, exactly!(1), equals!(0i64), tags: ["balance"]),
 			(events::CLIENT_SERVER_MOVE_BALANCE, exactly!(1), equals!(0i64), tags: ["balance"]),
 			(events::CLIENT_GAME_RESTART_BALANCE, exactly!(1), equals!(0i64), tags: ["lifecycle"]),
 
-			// Server-side servlet instrumentation guarantees
+			// The servlet instrumentation guarantees these server-side counts.
 			(events::SERVER_MOVE_RECEIVED, at_least!(1)),
 			(events::SERVER_RESPONSE_EMITTED, at_least!(1)),
 			(events::SERVER_DECODE_FAILURE, exactly!(0)),
 			(events::SERVER_STATE_LOCK_POISONED, exactly!(0)),
 
-			// Individual error bounds remain for diagnostics
+			// Each error event keeps a bound of its own, for diagnostics.
 			(events::CLIENT_NO_RESPONSE, at_most!(5)),
 			(events::CLIENT_DECODE_ERROR, at_most!(5)),
 		]
@@ -70,9 +70,7 @@ tb_assert_spec! {
 	annotations { description: "Comprehensive chess game assertion specification" }
 }
 
-// ============================================================================
-// CSP PROCESS SPECS (LAYERED)
-// ============================================================================
+// The CSP process spec states the high-level game flow.
 
 tb_process_spec! {
 	pub ChessGameFlow,
@@ -147,16 +145,13 @@ tb_process_spec! {
 	annotations { description: "High-level chess game protocol flow" }
 }
 
-// ============================================================================
-// FUZZ TEST
-// ============================================================================
+// The fuzz scenario plays the AFL input as moves.
 
 tb_scenario! {
 	fuzz: afl,
 	csp: ChessGameFlow,
 	config: ScenarioConfig::builder()
 		.with_spec(ChessAssertSpec::latest())
-		.with_csp(ChessGameFlow)
 		.build(),
 	environment Servlet {
 		context: ChessEngineServletConfig {
@@ -165,23 +160,27 @@ tb_scenario! {
 		start: |SetupEnv { trace, context }| async move {
 			let servlet_conf = ServletConfig::<TokioListener, ChessMoveRequest>::builder()
 				.with_config(context)
+				.allow_cleartext()
 				.build();
 
-			ChessEngineServlet::start(Arc::new(trace), servlet_conf).await
+			ChessEngineServlet::start(Arc::new(trace.collector().share()), servlet_conf).await
 		},
 		setup: |env| async move {
-			// Create a custom client with exponential backoff retry policy
-			// Exponential backoff: 100ms, 200ms, 400ms, 800ms delays (max 3 attempts)
+			// The client retries a failed emit up to 3 times, with exponential
+			// backoff delays of 100, 200, and 400 ms.
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
 			let client_builder = ClientBuilder::<TokioListener>::builder()
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))
+				.allow_cleartext()
 				.build();
 
 			let client = client_builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |ServletEnv { trace, mut client, .. }| async move {
+		client: |ServletEnv { trace: fuzz, mut client, .. }| async move {
+			let trace = fuzz.collector();
+
 			#[derive(Default)]
 			struct GameStats {
 				move_sent_count: u64,
@@ -194,21 +193,20 @@ tb_scenario! {
 				decode_error_count: u64,
 			}
 
-			// Initialize client-side game state
 			let mut client_game_state = ChessGameState::new();
 			let mut stats = GameStats::default();
 			let mut order = 1u64;
 
 			const MAX_TOTAL_MOVES: u64 = 50;
 			const MAX_GAME_REPLAYS: u64 = 3;
-			// Maximum time for entire fuzz execution
+			// The time budget of one whole fuzz execution, in seconds.
 			const MAX_EXECUTION_TIME_SECS: u64 = 1;
 
-			// Continuous: Play multiple games until input bytes are exhausted
-			// This maximizes state exploration across different game scenarios
+			// The loop plays games until the input runs out or a cap stops it,
+			// so one input explores the states of more than one game.
 			let start_time = Instant::now();
 			loop {
-				// Check execution time limit to prevent hangs
+				// The time limit stops a run that would hang.
 				if start_time.elapsed().as_secs() >= MAX_EXECUTION_TIME_SECS {
 					trace.event(events::CLIENT_EXECUTION_TIMEOUT)?;
 					break;
@@ -218,50 +216,49 @@ tb_scenario! {
 					break;
 				}
 
-				// Check if we have enough bytes before attempting to read
-				// For short inputs, break immediately - the loop will have run at least once
-				// if we had any bytes, satisfying the "at least 1 move" requirement
-				let oracle = trace.oracle();
+				// A move reads 4 input bytes, so the loop checks them first.
+				let oracle = fuzz.oracle();
 				if !oracle.fuzz_has_bytes(4).unwrap_or(false) {
-					// If we haven't sent any moves yet and have no bytes, we need to send
-					// at least one move to satisfy server assertions. Use zeros.
+					// The spec requires at least one move, so a run that has
+					// sent none sends a synthetic move of zeros.
 					if stats.move_sent_count == 0 {
-						// Continue to send a synthetic move with zeros
+						// The synthetic move goes out below.
 					} else {
-						// We've sent at least one move, safe to break
+						// At least one move has gone out, so the run ends.
 						break;
 					}
 				}
 
-				// We have bytes (or need to send synthetic move), try to read them
+				// The next 4 input bytes give the move.
 				let move_req = match (oracle.fuzz_u8(), oracle.fuzz_u8(), oracle.fuzz_u8(), oracle.fuzz_u8()) {
 					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => {
-						// Generate move from fuzz bytes
+						// The bytes name the from and to squares, and the high
+						// bits of the third byte name a promotion piece.
 						ChessMove::from((fr, fc, tr, tc)).to_request()
 					},
-					// Partial read or no bytes - use zeros for synthetic move
+					// A short read gives the synthetic move of zeros.
 					_ => ChessMove::from((0u8, 0u8, 0u8, 0u8)).to_request(),
 				};
 
 				trace.event(events::CLIENT_MOVE_SENT)?;
 				stats.move_sent_count += 1;
 
-				// Emit piece kind event only after move is sent (not before validation)
+				// The piece kind event follows the move-sent event, because
+				// the CSP flow admits a piece event only during validation.
 				if let Some(piece) = Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
 					trace.event(piece.as_kind_event())?;
 				}
 
-				// Send move request to server with current board state in matrix
+				// The request carries the client's board in its matrix.
 				let matrix = MatrixDyn::try_from(&client_game_state)?;
 				let frame = compose! {
-					V0: id: "chess-client",
+					V3: id: "chess-client",
 					order: order,
 					message: move_req,
 					matrix: matrix
 				}?;
 
-				// Get response frame with timeout protection
-				// Wrap emit in timeout to prevent hang
+				// A 1 s timeout on the emit stops a run that would hang.
 				let response_frame = match tokio::time::timeout(
 					Duration::from_millis(1000),
 					client.emit(frame, None)
@@ -273,20 +270,19 @@ tb_scenario! {
 						break;
 					}
 					Ok(Err(_e)) => {
-						// Transport error - log and break
+						// A transport error ends the run.
 						trace.event(events::CLIENT_EMIT_ERROR)?;
 						stats.no_response_count += 1;
 						break;
 					}
 					Err(_) => {
-						// Timeout occurred
+						// The emit timed out, so the run ends.
 						trace.event(events::CLIENT_TIMEOUT)?;
 						stats.no_response_count += 1;
 						break;
 					}
 				};
 
-				// Decode response
 				let response: ChessMoveResponse = match decode(response_frame.message()) {
 					Ok(r) => r,
 					Err(_) => {
@@ -296,42 +292,42 @@ tb_scenario! {
 					}
 				};
 
-				// Update client game state from response matrix if present
-				// Only update board, preserve client's own move tracking
+				// The response matrix updates the client's board, and the
+				// client keeps its own move tracking.
 				if let Some(asn1_matrix) = response_frame.metadata().matrix() {
 					if client_game_state.update_board_from_matrix(asn1_matrix).is_err() {
-						// Invalid matrix format - ignore and continue
+						// A malformed matrix leaves the board unchanged.
 					}
 				}
 
-				// Track response type for coverage feedback
+				// The response type picks the event, for coverage feedback.
 				match response.game_status {
 					GameStatusCode::InvalidMove => {
 						trace.event(events::CLIENT_MOVE_REJECTED)?;
 						stats.move_rejected_count += 1;
-						// Continue to next move even if invalid
+						// A rejected move leaves the loop running.
 					}
 					GameStatusCode::InProgress => {
 						trace.event(events::CLIENT_MOVE_VALIDATED)?;
 						trace.event(events::CLIENT_SERVER_MOVE)?;
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
-						order += 2; // Client move + server move
+						order += 2; // The client move and the server move.
 					}
 					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
-						// Move was validated (we got a response), emit events
+						// A game-ending response also validates the move.
 						trace.event(events::CLIENT_MOVE_VALIDATED)?;
 						trace.event(events::CLIENT_SERVER_MOVE)?;
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
 						stats.game_ended_count += 1;
-					stats.game_restarted_count += 1;
+						stats.game_restarted_count += 1;
 
-					restart_game(&mut client_game_state, &mut order, &trace)?;
-					if stats.game_restarted_count >= MAX_GAME_REPLAYS {
+						restart_game(&mut client_game_state, &mut order, trace)?;
+						if stats.game_restarted_count >= MAX_GAME_REPLAYS {
 							break;
 						}
-						// Continue loop to play another game
+						// The loop plays another game.
 					}
 				}
 			}

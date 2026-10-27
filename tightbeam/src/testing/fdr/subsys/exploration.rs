@@ -1,43 +1,57 @@
-//! Exploration subsystem
+//! The exploration subsystem of FDR.
 //!
-//! This module contains the exploration engine implementation and helper
-//! functions for the FDR exploration loop. These handle state space traversal,
-//! seed management, and basic property verification.
+//! It holds the exploration engine and the functions of the FDR exploration
+//! loop. They walk the state space of a process once per seed and check each
+//! state they visit for divergence and deadlock. The module also adds to
+//! [`Process`] the divergence of a state on a branch of the walk.
 
-#[cfg(feature = "testing-fault")]
-use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-#[cfg(feature = "testing-timing")]
-use core::time::Duration;
+#[cfg(feature = "rayon")]
+use core::ops::Range;
 
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
-use crate::testing::fdr::verdict::{Failure, RefusalSet, Trace};
-use crate::testing::specs::csp::{Action, Event, Process, State};
+use crate::testing::fdr::verdict::Trace;
+use crate::testing::specs::csp::{Action, DivergentStates, Event, Process, State};
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::{FaultInjection, FaultModel, InjectedFaultRecord};
 #[cfg(feature = "testing-timing")]
-use crate::testing::timing::{TimingConstraint, TimingConstraints};
+use crate::testing::timing::TimingConstraints;
 
-/// Default exploration engine implementation
+/// The default exploration engine, which walks one process once per seed and
+/// keeps the result of each seed.
 pub struct DefaultExplorationEngine<'a> {
-	/// Process being explored
+	/// The process under exploration.
 	process: &'a Process,
-	/// Configuration
+	/// The FDR configuration of the exploration.
 	config: Arc<FdrConfig>,
-	/// Results per seed
+	/// The result of each seed.
 	seed_results: Vec<(u64, SeedResult)>,
-	/// States visited (for statistics)
+	/// The states that exploration visited, for statistics.
 	visited_states: HashSet<State>,
-	/// Branches pruned for timing violations across all seeds
+	/// The count of branches pruned for timing violations across all seeds.
+	timing_pruned: usize,
+	/// The divergent states of the process, which the first walk computes and
+	/// each later walk reads.
+	divergent: OnceLock<DivergentStates>,
+}
+
+/// What the walk of one seed found.
+struct SeedWalk {
+	/// The result of the seed.
+	result: SeedResult,
+	/// The states that the walk visited.
+	visited: HashSet<State>,
+	/// The count of the branches that the walk pruned for timing violations.
 	timing_pruned: usize,
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
-	/// Create new exploration engine
+	/// Creates the engine of `process` under `config`, with an empty list of
+	/// seed results and an empty set of visited states.
 	pub fn new(process: &'a Process, config: Arc<FdrConfig>) -> Self {
 		Self {
 			process,
@@ -45,157 +59,145 @@ impl<'a> DefaultExplorationEngine<'a> {
 			seed_results: Vec::new(),
 			visited_states: HashSet::new(),
 			timing_pruned: 0,
+			divergent: OnceLock::new(),
 		}
 	}
 
-	/// Get seed results (for use by FdrExplorer)
-	pub fn seed_results(&self) -> &[(u64, SeedResult)] {
-		&self.seed_results
-	}
-
-	/// Get seed results mutably (for use by FdrExplorer)
+	/// A mutable view of the result of each seed that the engine recorded.
 	pub fn seed_results_mut(&mut self) -> &mut Vec<(u64, SeedResult)> {
 		&mut self.seed_results
 	}
 
-	/// Get visited states (for use by FdrExplorer)
-	pub fn visited_states(&self) -> &HashSet<State> {
-		&self.visited_states
-	}
-
-	/// Get visited states mutably (for use by FdrExplorer)
+	/// A mutable view of the states that exploration visited.
 	pub fn visited_states_mut(&mut self) -> &mut HashSet<State> {
 		&mut self.visited_states
 	}
 
-	/// Explore single seed (different scheduling)
-	fn explore_seed_internal(&mut self, seed: u64) -> SeedResult {
-		let mut pruned = 0usize;
-		let result = Self::explore_seed_core(
-			self.process,
-			&self.config,
-			seed,
-			|state| {
-				self.visited_states.insert(state);
-			},
-			&mut pruned,
-		);
-
-		self.timing_pruned += pruned;
-
-		result
+	/// The divergent states of the process, which the first call computes.
+	fn divergent(&self) -> &DivergentStates {
+		self.divergent.get_or_init(|| self.process.divergent_states())
 	}
 
-	/// Static version of explore_seed usable from both the rayon-parallel and
-	/// sequential exploration loops.
-	/// Returns (SeedResult, visited_states, timing_pruned_count)
-	pub fn explore_seed_static(
-		process: &Process,
-		config: &FdrConfig,
-		seed: u64,
-	) -> (SeedResult, HashSet<State>, usize) {
-		let mut visited_states = HashSet::new();
-		let mut pruned = 0usize;
-		let result = Self::explore_seed_core(
-			process,
-			config,
-			seed,
-			|state| {
-				visited_states.insert(state);
-			},
-			&mut pruned,
-		);
+	/// Adds the visited states and the timing prunes of `walk` to the engine,
+	/// and returns the result of its seed.
+	fn absorb(&mut self, walk: SeedWalk) -> SeedResult {
+		self.visited_states.extend(walk.visited);
+		self.timing_pruned += walk.timing_pruned;
 
-		(result, visited_states, pruned)
+		walk.result
 	}
 
-	/// Core exploration logic shared between internal and static versions
+	/// Walks the schedule of `seed` through the process.
+	fn walk(&self, seed: u64) -> SeedWalk {
+		let mut visited = HashSet::new();
+		let mut timing_pruned = 0usize;
+		let result = self.walk_into(seed, &mut visited, &mut timing_pruned);
+
+		SeedWalk { result, visited, timing_pruned }
+	}
+
+	/// The walk of `seed` under its own RNG schedule.
 	///
-	/// `timing_pruned` counts branches dropped for WCET/deadline
-	/// violations so model-level timing violations surface in the verdict
-	/// instead of silently vanishing from exploration.
-	fn explore_seed_core<F>(
-		process: &Process,
-		config: &FdrConfig,
-		seed: u64,
-		mut track_visited: F,
-		timing_pruned: &mut usize,
-	) -> SeedResult
-	where
-		F: FnMut(State),
-	{
+	/// `visited` receives each state the seed visits. `timing_pruned` counts
+	/// the branches dropped for deadline or path WCET violations, so the
+	/// verdict reports the model-level timing violations exploration pruned.
+	fn walk_into(&self, seed: u64, visited: &mut HashSet<State>, timing_pruned: &mut usize) -> SeedResult {
+		let process = self.process;
+		let config = &self.config;
 		let mut rng = SeededRng::new(seed);
 		let mut queue = VecDeque::new();
 
-		// Initial exploration state
+		// A run starts each clock that the process names at zero.
+		#[cfg(feature = "testing-timing")]
+		let initial = ExplorationState {
+			clock_values: process.initial_clocks(),
+			..ExplorationState::initial(process.initial)
+		};
+		#[cfg(not(feature = "testing-timing"))]
 		let initial = ExplorationState::initial(process.initial);
 		queue.push_back(initial);
 
-		// Track best result for this seed
+		// The seed reports the longest trace that it reaches.
 		let mut longest_trace = Vec::new();
 		let mut failures = Vec::new();
 		#[cfg(feature = "testing-fault")]
 		let mut injected_faults: Vec<InjectedFaultRecord> = Vec::new();
 
 		while let Some(state) = queue.pop_front() {
-			// Track visited states
-			track_visited(state.process_state);
+			visited.insert(state.process_state);
 
-			// Depth cutoff
+			// A state from which a run of hidden events reaches a cycle of
+			// hidden events diverges, so the seed ends with a divergence.
+			if let Some(run) = process.divergence_at(self.divergent(), &state) {
+				#[cfg(feature = "testing-fault")]
+				return SeedResult::Divergence(state.trace.clone(), state.process_state, run, injected_faults);
+				#[cfg(not(feature = "testing-fault"))]
+				return SeedResult::Divergence(state.trace.clone(), state.process_state, run);
+			}
+
+			// Exploration cuts a trace off at the maximum depth. An unstable
+			// state at the bound takes its hidden steps, so the walk reaches
+			// the failure behind them.
 			if state.trace.len() >= config.max_depth {
 				if state.trace.len() > longest_trace.len() {
 					longest_trace = state.trace.clone();
 				}
 
-				// Record failure at depth limit
-				let refusals = Self::compute_refusals_helper(process, state.process_state);
-				failures.push((state.trace.clone(), refusals));
-
-				continue;
-			}
-
-			// Divergence detection
-			if state.internal_run > config.max_internal_run {
-				#[cfg(feature = "testing-fault")]
-				return SeedResult::Divergence(state.trace.clone(), state.hidden_events.clone(), injected_faults);
-				#[cfg(not(feature = "testing-fault"))]
-				return SeedResult::Divergence(state.trace.clone(), state.hidden_events.clone());
-			}
-
-			// Terminal state: record trace and mark success
-			if process.is_terminal(state.process_state) {
-				if state.trace.len() > longest_trace.len() {
-					longest_trace = state.trace.clone();
+				// A stable or accepting cut-off state records its refusals as a
+				// failure, and the walk ends there.
+				if let Some(refusals) = self.compute_refusals(process, state.process_state) {
+					failures.push((state.trace.clone(), refusals));
+					continue;
 				}
-
-				// Terminal state can refuse everything
-				let refusals = process.observable.iter().cloned().collect();
-				failures.push((state.trace.clone(), refusals));
-
-				continue;
 			}
 
-			// Get enabled actions
-			let actions = process.enabled(state.process_state);
-			if actions.is_empty() {
-				// Deadlock: no enabled actions in non-terminal state
+			// A run of hidden events past the limit is a divergence.
+			if state.internal_run > config.max_internal_run {
+				let run = state.current_run().to_vec();
+				#[cfg(feature = "testing-fault")]
+				return SeedResult::Divergence(state.trace.clone(), state.process_state, run, injected_faults);
+				#[cfg(not(feature = "testing-fault"))]
+				return SeedResult::Divergence(state.trace.clone(), state.process_state, run);
+			}
+
+			// An accepting state can end the trace successfully, and the walk
+			// goes on through each action it enables.
+			let accepting = process.is_terminal(state.process_state);
+			if accepting && state.trace.len() > longest_trace.len() {
+				longest_trace = state.trace.clone();
+			}
+
+			// An action is enabled at these clocks when one of its edges has no
+			// guard or a guard that holds.
+			#[cfg(feature = "testing-timing")]
+			let mut actions = process.enabled_under(state.process_state, &state.clock_values);
+			#[cfg(not(feature = "testing-timing"))]
+			let mut actions = process.enabled(state.process_state);
+			if actions.is_empty() && !accepting {
+				// A state that can neither terminate nor act is a deadlock.
 				#[cfg(feature = "testing-fault")]
 				return SeedResult::Deadlock(state.trace.clone(), state.process_state, injected_faults);
 				#[cfg(not(feature = "testing-fault"))]
 				return SeedResult::Deadlock(state.trace.clone(), state.process_state);
 			}
 
-			// Record stable state refusals before taking action
-			if state.internal_run == 0 {
-				let refusals = Self::compute_refusals_helper(process, state.process_state);
+			// A stable or accepting state records its refusals before it takes
+			// an action.
+			if let Some(refusals) = self.compute_refusals(process, state.process_state) {
 				failures.push((state.trace.clone(), refusals));
 			}
 
-			// Select action, retrying past fault-suppressed transitions.
-			// An injected fault makes the chosen event fail: the transition
-			// is not taken and exploration falls back to the remaining
-			// enabled actions. A state left with no usable action is a
-			// fault-induced deadlock (recovery failure).
+			// A state at the bound takes its hidden steps alone, as
+			// `Action::keeps_within` decides, and a state left with no step
+			// ends the walk.
+			actions.retain(|action| action.keeps_within(&state.trace, config.max_depth));
+			if actions.is_empty() {
+				continue;
+			}
+
+			// An injected fault fails the chosen event, and the walk selects
+			// again from the enabled actions that remain. A state with no
+			// usable action is a fault-induced deadlock (recovery failure).
 			#[cfg(feature = "testing-fault")]
 			let action = {
 				let mut candidates: Vec<&Action> = actions.iter().collect();
@@ -227,11 +229,10 @@ impl<'a> DefaultExplorationEngine<'a> {
 			#[cfg(not(feature = "testing-fault"))]
 			let action = Self::select_action_helper(&mut rng, process, state.process_state, &actions);
 
-			// Execute transition
 			Self::execute_transition_helper(process, &state, action, &mut queue, timing_pruned);
 		}
 
-		// Return success with longest trace found and collected failures
+		// The seed succeeds with its longest trace and its collected failures.
 		#[cfg(feature = "testing-fault")]
 		{
 			SeedResult::Success(longest_trace, failures, injected_faults)
@@ -253,7 +254,25 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 	}
 
 	fn explore_seed(&mut self, seed: u64) -> SeedResult {
-		self.explore_seed_internal(seed)
+		let walk = self.walk(seed);
+		self.absorb(walk)
+	}
+
+	/// Walks the seeds in parallel on the `rayon` pool, then adds what each
+	/// walk found to the engine and records its result, in seed order.
+	#[cfg(feature = "rayon")]
+	fn explore_seeds(&mut self, seeds: Range<u64>) -> &[(u64, SeedResult)] {
+		use rayon::prelude::*;
+
+		let engine = &*self;
+		let walks: Vec<(u64, SeedWalk)> = seeds.into_par_iter().map(|seed| (seed, engine.walk(seed))).collect();
+		let start = self.seed_results.len();
+		for (seed, walk) in walks {
+			let result = self.absorb(walk);
+			self.seed_results.push((seed, result));
+		}
+
+		self.seed_results.get(start..).unwrap_or_default()
 	}
 
 	fn traces(&self) -> Vec<Trace> {
@@ -269,80 +288,26 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 			.collect()
 	}
 
-	fn failures(&self) -> Vec<Failure> {
-		let mut failures = Vec::new();
-		for (_, result) in &self.seed_results {
-			#[cfg(feature = "testing-fault")]
-			if let SeedResult::Success(_trace, seed_failures, _faults) = result {
-				failures.extend(seed_failures.clone());
-			}
-			#[cfg(not(feature = "testing-fault"))]
-			if let SeedResult::Success(_trace, seed_failures) = result {
-				failures.extend(seed_failures.clone());
-			}
-		}
-		failures
-	}
-
-	fn states_visited(&self) -> usize {
-		self.visited_states.len()
-	}
-
-	fn seeds_completed(&self) -> u32 {
-		self.seed_results.len() as u32
+	fn visited_states(&self) -> &HashSet<State> {
+		&self.visited_states
 	}
 
 	fn timing_pruned(&self) -> usize {
 		self.timing_pruned
 	}
 
-	fn add_timing_pruned(&mut self, count: usize) {
-		self.timing_pruned += count;
-	}
-
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
 		self.seed_results.push((seed, result));
 	}
 
-	fn update_visited_states(&mut self, visited: &HashSet<State>) {
-		self.visited_states.extend(visited.iter().cloned());
-	}
-
-	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event> {
-		Self::compute_refusals_helper(process, state)
+	fn seed_results(&self) -> &[(u64, SeedResult)] {
+		&self.seed_results
 	}
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
-	/// Compute refusal set at a given state
-	///
-	/// Refusal set = all observable events minus enabled observable events.
-	/// Hidden events (τ-transitions) are filtered out as they cannot be refused.
-	/// Reference: Roscoe (1998, 2010)
-	fn compute_refusals_helper(process: &Process, state: State) -> RefusalSet {
-		// Only consider observable events (filter out hidden τ-transitions)
-		let enabled_events: HashSet<_> = process
-			.enabled(state)
-			.iter()
-			.filter_map(|action| {
-				if !process.hidden.contains(&action.event) {
-					Some(action.event)
-				} else {
-					None
-				}
-			})
-			.collect();
-
-		// Refusal set = all observable events minus enabled observable events
-		process
-			.observable
-			.iter()
-			.filter(|&event| !enabled_events.contains(event))
-			.cloned()
-			.collect()
-	}
-
-	/// Select action at a choice point using RNG
+	/// Selects the action that exploration takes from `actions`, with the RNG
+	/// wherever more than one action is enabled.
 	#[cfg(not(feature = "testing-fault"))]
 	fn select_action_helper<'b>(
 		rng: &mut SeededRng,
@@ -352,21 +317,22 @@ impl<'a> DefaultExplorationEngine<'a> {
 	) -> &'b Action {
 		let actions = actions.as_ref();
 		if process.choice.contains(&process_state) {
-			// Nondeterministic choice point: use RNG to select
+			// A nondeterministic choice point selects with the RNG.
 			rng.choose(actions).unwrap_or(&actions[0])
 		} else if actions.len() == 1 {
-			// Deterministic: only one choice
+			// A state with one action takes it.
 			&actions[0]
 		} else {
-			// Multiple actions but not marked as choice state: use RNG anyway
+			// An unmarked state with more than one action uses the RNG too.
 			rng.choose(actions).unwrap_or(&actions[0])
 		}
 	}
 
-	/// Select action from a candidate list (fault mode)
+	/// Selects the action that exploration takes from `actions`, under
+	/// `testing-fault`.
 	///
-	/// Same policy as `select_action_helper`, over the remaining
-	/// candidates after fault suppression removed failing events.
+	/// It applies the policy of `select_action_helper` to the candidates left
+	/// after each injected fault removes the event it fails.
 	#[cfg(feature = "testing-fault")]
 	fn select_action_helper_from<'b>(
 		rng: &mut SeededRng,
@@ -381,7 +347,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
-	/// Check for fault injection at current (state, event) combination
+	/// The fault record when the fault model holds an injection for this
+	/// `(state, event)` pair and the RNG draw fires it.
 	#[cfg(feature = "testing-fault")]
 	fn check_fault_injection(
 		fault_model: &FaultModel,
@@ -390,21 +357,18 @@ impl<'a> DefaultExplorationEngine<'a> {
 		event: &Event,
 		rng: &mut SeededRng,
 	) -> Option<InjectedFaultRecord> {
-		// One allocation for the "proc.state" lookup key; borrowed into the
-		// Cow-keyed map so the fault-injection table itself is not cloned.
+		// The `Process.State` lookup key costs one allocation. The Cow-keyed
+		// map borrows it, so the lookup reads the fault-injection table in
+		// place.
 		let state_key_str = format!("{}.{}", process.name, state.0);
-		let lookup_key = (Cow::Borrowed(state_key_str.as_str()), Cow::Borrowed(event.0));
 
-		// Check if fault should be injected at this point
 		fault_model
-			.injection_points
-			.get(&lookup_key)
+			.state_injection(&state_key_str, event.0)
 			.and_then(|injection: &FaultInjection| {
-				// Use SeededRng's get_next() and convert to basis points range (0-10000)
-				let rng_value = (rng.get_next() % 10001) as u16;
-				if rng_value < injection.probability_bps.get() {
+				let rng_value = rng.get_next();
+				if injection.should_inject(rng_value) {
 					let error = (injection.error_factory)();
-					// Clone only when actually injecting fault (rare path)
+					// Only a path that injects a fault clones the key.
 					Some(InjectedFaultRecord {
 						csp_state: state_key_str.clone(),
 						event_label: event.0.to_string(),
@@ -417,115 +381,59 @@ impl<'a> DefaultExplorationEngine<'a> {
 			})
 	}
 
-	/// Execute transition and enqueue next states
+	/// Executes a transition and queues the next states.
 	///
-	/// Branches violating WCET/deadline constraints are dropped from
-	/// exploration; each drop increments `timing_pruned` so the verdict
-	/// records that timing-violating paths existed.
+	/// It drops each branch that violates a deadline or path WCET constraint
+	/// and counts the drop in `timing_pruned`, so the verdict records that a
+	/// path violated timing.
 	fn execute_transition_helper(
 		process: &Process,
 		state: &ExplorationState,
 		action: &Action,
 		queue: &mut VecDeque<ExplorationState>,
+		#[cfg_attr(
+			not(feature = "testing-timing"),
+			expect(unused_variables, reason = "only the timing checks prune a branch")
+		)]
 		timing_pruned: &mut usize,
 	) {
-		#[cfg(not(feature = "testing-timing"))]
-		let _ = &timing_pruned;
-
+		// Each edge that the clocks allow is a branch, which resets the clocks
+		// that the edge names.
 		#[cfg(feature = "testing-timing")]
-		{
-			// Check timing guards if timed transitions exist
-			if let Some(ref timed_transitions) = process.timed_transitions {
-				if let Some(transitions) = timed_transitions.get(&(state.process_state, action.event)) {
-					// Filter transitions by guard satisfaction
-					let valid_transitions: Vec<_> = transitions
-						.iter()
-						.filter(|tt| tt.guard_satisfied(&state.clock_values))
-						.collect();
+		let successors = process.successors(state.process_state, &action.event, &state.clock_values);
+		#[cfg(feature = "testing-timing")]
+		let branches = successors.map(|successor| {
+			let mut branch = state.branch();
+			branch.reset_clocks(successor.resets);
+			(branch, successor.to)
+		});
+		#[cfg(not(feature = "testing-timing"))]
+		let targets = process.step(state.process_state, &action.event);
+		#[cfg(not(feature = "testing-timing"))]
+		let branches = targets.into_iter().map(|to| (state.branch(), to));
 
-					if valid_transitions.is_empty() {
-						// Prune branch: no valid transitions (guards not satisfied)
-						return;
-					}
-
-					// Process each valid timed transition
-					for timed_trans in valid_transitions {
-						let mut next_exploration = state.branch();
-						let next_state = timed_trans.to;
-
-						// Reset clocks if specified
-						next_exploration.reset_clocks(&timed_trans.reset_clocks);
-
-						if process.hidden.contains(&action.event) {
-							// Hidden (τ) transition
-							next_exploration.record_hidden(action.event, next_state);
-						} else {
-							// Observable transition
-							next_exploration.record_observable(action.event, next_state);
-
-							// Update timing if timing constraints exist
-							if let Some(ref constraints) = process.timing_constraints {
-								// Look up WCET for this event
-								let wcet = Self::lookup_wcet(&action.event, constraints);
-								if constraints.wcet_violated(&action.event, wcet) {
-									// Prune this branch: WCET violation
-									*timing_pruned += 1;
-									continue;
-								}
-
-								next_exploration.update_timing(&action.event, wcet);
-								// Advance clocks by WCET
-								next_exploration.update_clocks(wcet);
-
-								// Check other timing violations (deadline, path WCET) before adding to queue
-								if Self::check_timing_violations(&next_exploration, constraints) {
-									// Prune this branch: timing violation
-									*timing_pruned += 1;
-									continue;
-								}
-							}
-						}
-
-						queue.push_back(next_exploration);
-					}
-
-					// Return early since we handled timed transitions
-					return;
-				}
-			}
-		}
-
-		// Regular transitions (no timed transitions or no match)
-		let next_states = process.step(state.process_state, &action.event);
-		for next_state in next_states {
-			let mut next_exploration = state.branch();
-			if process.hidden.contains(&action.event) {
-				// Hidden (τ) transition
+		for (mut next_exploration, next_state) in branches {
+			if action.is_hidden() {
+				// A hidden (τ) transition extends the run of hidden events.
 				next_exploration.record_hidden(action.event, next_state);
 			} else {
-				// Observable transition
+				// An observable transition extends the trace and ends the run
+				// of hidden events.
 				next_exploration.record_observable(action.event, next_state);
 
-				// Update timing if timing constraints exist
+				// The timing constraints charge the WCET of the event to the
+				// elapsed time and the clocks of the branch.
 				#[cfg(feature = "testing-timing")]
 				{
 					if let Some(ref constraints) = process.timing_constraints {
-						// Look up WCET for this event
-						// Check if this event's WCET violates its constraint
-						let wcet = Self::lookup_wcet(&action.event, constraints);
-						if constraints.wcet_violated(&action.event, wcet) {
-							// Prune this branch: WCET violation
-							*timing_pruned += 1;
-							continue;
-						}
-
+						let wcet = constraints.wcet_of(&action.event);
 						next_exploration.update_timing(&action.event, wcet);
-						// Advance clocks by WCET
 						next_exploration.update_clocks(wcet);
 
-						// Check other timing violations (deadline, path WCET) before adding to queue
+						// The deadline and path WCET checks run before the
+						// branch joins the queue.
 						if Self::check_timing_violations(&next_exploration, constraints) {
-							// Prune this branch: timing violation
+							// A timing violation prunes this branch.
 							*timing_pruned += 1;
 							continue;
 						}
@@ -537,22 +445,202 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
-	/// Look up WCET for an event from timing constraints
-	#[cfg(feature = "testing-timing")]
-	fn lookup_wcet(event: &Event, constraints: &TimingConstraints) -> Duration {
-		if let Some(constraint) = constraints.get(event) {
-			match constraint {
-				TimingConstraint::Wcet(wcet_config) => wcet_config.duration,
-				_ => Duration::ZERO, // Jitter/deadline don't contribute to WCET
-			}
-		} else {
-			Duration::ZERO // No constraint = zero time (conservative)
-		}
-	}
-
-	/// Check if exploration state violates timing constraints
+	/// Whether `state` violates the timing constraints.
 	#[cfg(feature = "testing-timing")]
 	fn check_timing_violations(state: &ExplorationState, constraints: &TimingConstraints) -> bool {
 		constraints.violated_by(&state.trace, state.elapsed_time, &state.event_times)
+	}
+}
+
+impl Process {
+	/// The hidden events of a run by which `branch` can diverge from its
+	/// state, or `None` when it cannot, where `divergent` holds the divergent
+	/// states of this process.
+	///
+	/// [`Process::divergent_states`] decides a process with no timed
+	/// transition. A guard can block a hidden edge, so the clocks of `branch`
+	/// decide a timed process, through `Process::divergence_under`.
+	fn divergence_at(&self, divergent: &DivergentStates, branch: &ExplorationState) -> Option<Vec<Event>> {
+		if !divergent.contains(branch.process_state) {
+			return None;
+		}
+
+		#[cfg(feature = "testing-timing")]
+		if self.has_timed_transitions() {
+			return self.divergence_under(branch.process_state, &branch.clock_values);
+		}
+
+		divergent.witness(branch.process_state)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashSet;
+	use std::sync::Arc;
+
+	use super::DefaultExplorationEngine;
+	use crate::testing::fdr::config::FdrConfig;
+	use crate::testing::fdr::explorer::{ExplorationCore, SeedResult};
+	use crate::testing::fdr::verdict::Failure;
+	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+
+	/// A process whose hidden `t` sits between `a` and `c`, so `S1` enables a
+	/// hidden event and `S2` is stable though a hidden event reached it.
+	fn hiding() -> Result<Process, ProcessBuildError> {
+		Process::builder("Hiding")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("c"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_transition(State("S2"), Event("c"), State("S3"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// The process of `hiding` with `c` at `S1` as well, so `S1` enables a
+	/// hidden and an observable event, and `t` leads to the accepting `S2`.
+	fn hiding_beside_c() -> Result<Process, ProcessBuildError> {
+		Process::builder("HidingBesideC")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("c"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S2"))
+			.add_transition(State("S1"), Event("c"), State("S3"))
+			.add_terminal(State("S2"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	/// A process whose `e`, in the observable and in the hidden alphabet,
+	/// takes `S0` to the accepting `S1`.
+	fn e_in_both_alphabets() -> Result<Process, ProcessBuildError> {
+		Process::builder("EInBothAlphabets")
+			.initial_state(State("S0"))
+			.add_observable(Event("e"))
+			.add_hidden(Event("e"))
+			.add_transition(State("S0"), Event("e"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A process whose `a` leads from `S0` to `S1`, which can neither terminate
+	/// nor act.
+	fn stuck_after_a() -> Result<Process, ProcessBuildError> {
+		Process::builder("StuckAfterA")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.build()
+	}
+
+	/// A process whose `a` leads from `S0` to `S1`, which spins on the hidden
+	/// `t`.
+	fn spinning_after_a() -> Result<Process, ProcessBuildError> {
+		Process::builder("SpinningAfterA")
+			.initial_state(State("S0"))
+			.add_observable(Event("a"))
+			.add_hidden(Event("t"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("t"), State("S1"))
+			.build()
+	}
+
+	/// The result of seed 0 of `process` under `config`.
+	fn result_of(process: &Process, config: FdrConfig) -> SeedResult {
+		let mut engine = DefaultExplorationEngine::new(process, Arc::new(config));
+		engine.explore_seed(0)
+	}
+
+	/// The failures that seed 0 of `process` under `config` records, a seed
+	/// that runs to its end.
+	fn failures_of(process: &Process, config: FdrConfig) -> Vec<Failure> {
+		match result_of(process, config) {
+			#[cfg(feature = "testing-fault")]
+			SeedResult::Success(_trace, failures, _faults) => failures,
+			#[cfg(not(feature = "testing-fault"))]
+			SeedResult::Success(_trace, failures) => failures,
+			ended => panic!("seed 0 ended in {ended:?}"),
+		}
+	}
+
+	#[test]
+	fn the_walk_records_a_failure_at_each_stable_state() -> Result<(), ProcessBuildError> {
+		let process = hiding()?;
+
+		let failures = failures_of(&process, FdrConfig::default());
+		let expected: Vec<Failure> = vec![
+			(vec![], HashSet::from([Event("c")])),
+			(vec![Event("a")], HashSet::from([Event("a")])),
+			(vec![Event("a"), Event("c")], HashSet::from([Event("a"), Event("c")])),
+		];
+		assert_eq!(failures, expected, "`S1` enables `t`, and `S2` is stable");
+		Ok(())
+	}
+
+	#[test]
+	fn the_walk_records_the_failure_behind_a_hidden_step_at_max_depth() -> Result<(), ProcessBuildError> {
+		let process = hiding()?;
+		let config = FdrConfig { max_depth: 1, ..Default::default() };
+
+		let failures = failures_of(&process, config);
+		let expected: Vec<Failure> = vec![
+			(vec![], HashSet::from([Event("c")])),
+			(vec![Event("a")], HashSet::from([Event("a")])),
+		];
+		assert_eq!(failures, expected, "`S1` takes the hidden `t` at the bound to the stable `S2`");
+		Ok(())
+	}
+
+	#[test]
+	fn the_walk_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
+		let process = hiding_beside_c()?;
+		let config = FdrConfig { max_depth: 1, ..Default::default() };
+
+		let failures = failures_of(&process, config);
+		let expected: Vec<Failure> = vec![
+			(vec![], HashSet::from([Event("c")])),
+			(vec![Event("a")], HashSet::from([Event("a"), Event("c")])),
+		];
+		assert_eq!(failures, expected, "`S1` lies at the bound, so it takes `t` and leaves `c`");
+		Ok(())
+	}
+
+	#[test]
+	fn the_walk_extends_the_trace_by_the_alphabet_of_its_action() -> Result<(), ProcessBuildError> {
+		let process = e_in_both_alphabets()?;
+
+		let failures = failures_of(&process, FdrConfig::default());
+		let expected: Vec<Failure> = vec![(vec![Event("e")], HashSet::from([Event("e")]))];
+		assert_eq!(failures, expected, "seed 0 takes the observable action of `e`");
+		Ok(())
+	}
+
+	#[test]
+	fn a_state_that_can_neither_terminate_nor_act_ends_the_seed_in_a_deadlock() -> Result<(), ProcessBuildError> {
+		let process = stuck_after_a()?;
+		let result = result_of(&process, FdrConfig::default());
+		assert!(matches!(result, SeedResult::Deadlock(..)), "the result was {result:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn a_state_on_a_hidden_cycle_ends_the_seed_in_a_divergence() -> Result<(), ProcessBuildError> {
+		let process = spinning_after_a()?;
+		let result = result_of(&process, FdrConfig::default());
+		assert!(matches!(result, SeedResult::Divergence(..)), "the result was {result:?}");
+		Ok(())
+	}
+
+	#[test]
+	fn a_seed_that_reaches_an_accepting_state_succeeds() -> Result<(), ProcessBuildError> {
+		let process = hiding()?;
+		let result = result_of(&process, FdrConfig::default());
+		assert!(matches!(result, SeedResult::Success(..)), "the result was {result:?}");
+		Ok(())
 	}
 }

@@ -1,19 +1,14 @@
-//! Payment Harness - Validation Components
+//! The validation components of the payment harness.
 //!
-//! Re-implements patterns from zero_queue.rs locally for test isolation:
-//! - DedupBook: Idempotence tracking using (frame.metadata.id, frame.metadata.order)
-//! - ChainState: DAG validation for previous_frame linkage
+//! [`PaymentHarness`] answers each frame once through the shared dedup book
+//! and chain state of `common::dedup`.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
-
-use sha3::Sha3_256;
-use tightbeam::asn1::DigestInfo;
 use tightbeam::trace::TraceCollector;
-use tightbeam::utils::urn::Urn;
-use tightbeam::{utils, Frame, TightBeamError};
+use tightbeam::urn::Urn;
+use tightbeam::{Frame, TightBeamError};
 
 use super::messages::TransactionStatus;
+use crate::common::dedup::{ChainState, DedupBook, HarnessEvents};
 
 pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:harness/chain-broken");
 pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:harness/chain-valid");
@@ -21,232 +16,75 @@ pub(crate) const DEDUP_CACHE_HIT: Urn<'static> = tightbeam::urn!("test", "event:
 pub(crate) const DEDUP_KEPT: Urn<'static> = tightbeam::urn!("test", "event:harness/dedup-kept");
 pub(crate) const DEDUP_SKIPPED: Urn<'static> = tightbeam::urn!("test", "event:harness/dedup-skipped");
 
-// ============================================================================
-// Constants
-// ============================================================================
+// The tag of every payment event.
 
 pub const PAYMENT_TAG: &str = "payment";
 
-// ============================================================================
-// Helpers
-// ============================================================================
+/// The events of the payment harness.
+pub struct PaymentEvents;
 
-/// Idempotency key type: (frame ID, frame order)
-type IdempotencyKey = (Vec<u8>, u64);
-
-/// Extract idempotency key from frame (DRY helper)
-#[inline]
-fn frame_key(frame: &Frame) -> IdempotencyKey {
-	(frame.metadata().id().to_owned(), frame.metadata().order())
+impl HarnessEvents for PaymentEvents {
+	const TAG: &'static str = PAYMENT_TAG;
+	const DEDUP_KEPT: Urn<'static> = DEDUP_KEPT;
+	const DEDUP_SKIPPED: Urn<'static> = DEDUP_SKIPPED;
+	const DEDUP_CACHE_HIT: Urn<'static> = DEDUP_CACHE_HIT;
+	const CHAIN_VALID: Urn<'static> = CHAIN_VALID;
+	const CHAIN_BROKEN: Urn<'static> = CHAIN_BROKEN;
 }
 
-// ============================================================================
-// DedupBook - Idempotence Tracking
-// ============================================================================
+// The payment harness combines both validations.
 
-type SeenSet = Arc<Mutex<BTreeSet<IdempotencyKey>>>;
-type CacheMap = Arc<Mutex<std::collections::HashMap<IdempotencyKey, TransactionStatus>>>;
-
-/// Deduplication book for idempotent payment processing
+/// The payment harness, which combines the dedup book and the chain state.
 ///
-/// Uses Frame's (metadata.id, metadata.order) as the idempotency key.
-/// Caches responses for duplicate detection.
-#[derive(Clone)]
-pub struct DedupBook {
-	trace: Arc<TraceCollector>,
-	seen: SeenSet,
-	cache: CacheMap,
-}
-
-impl DedupBook {
-	/// Create a new dedup book
-	pub fn new(trace: Arc<TraceCollector>) -> Self {
-		Self {
-			trace,
-			seen: Arc::new(Mutex::new(BTreeSet::new())),
-			cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-		}
-	}
-
-	/// Record a frame and check if it's a duplicate
-	///
-	/// Returns Ok(true) if this is a new frame (should process)
-	/// Returns Ok(false) if this is a duplicate (skip processing)
-	pub fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		let key = frame_key(frame);
-		let mut guard = self.seen.lock().map_err(|_| TightBeamError::LockPoisoned)?;
-
-		let inserted = guard.insert(key);
-		if inserted {
-			self.trace.event_with(DEDUP_KEPT, &[PAYMENT_TAG], true)?;
-		} else {
-			self.trace.event_with(DEDUP_SKIPPED, &[PAYMENT_TAG], true)?;
-		}
-
-		Ok(inserted)
-	}
-
-	/// Cache a response for a frame
-	pub fn cache_response(&self, frame: &Frame, response: TransactionStatus) -> Result<(), TightBeamError> {
-		let key = frame_key(frame);
-		let mut guard = self.cache.lock().map_err(|_| TightBeamError::LockPoisoned)?;
-		guard.insert(key, response);
-
-		Ok(())
-	}
-
-	/// Get cached response for a frame
-	pub fn get_cached(&self, frame: &Frame) -> Option<TransactionStatus> {
-		let key = frame_key(frame);
-		let guard = self.cache.lock().ok()?;
-		guard.get(&key).cloned()
-	}
-}
-
-// ============================================================================
-// ChainState - DAG Validation
-// ============================================================================
-
-/// Chain state for DAG validation
-///
-/// Validates that frames correctly link to their predecessors via previous_frame.
-#[derive(Clone)]
-pub struct ChainState {
-	trace: Arc<TraceCollector>,
-	state: Arc<Mutex<ChainInner>>,
-}
-
-struct ChainInner {
-	last_order: Option<u64>,
-	last_digest: Option<DigestInfo>,
-}
-
-impl ChainState {
-	/// Create a new chain state
-	pub fn new(trace: Arc<TraceCollector>) -> Self {
-		Self {
-			trace,
-			state: Arc::new(Mutex::new(ChainInner { last_order: None, last_digest: None })),
-		}
-	}
-
-	/// Record a frame and validate chain linkage
-	pub fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		let mut guard = self.state.lock().map_err(|_| TightBeamError::LockPoisoned)?;
-
-		let expected = guard.last_digest.to_owned();
-		let actual = frame.metadata().previous_frame();
-
-		// Validate previous frame linkage
-		let prev_ok = match (expected.as_ref(), actual) {
-			(None, None) => true, // First frame, no previous
-			(Some(expected_digest), Some(actual_digest)) => {
-				// Compare digests by algorithm and value
-				expected_digest.algorithm == actual_digest.algorithm
-					&& expected_digest.digest.as_bytes() == actual_digest.digest.as_bytes()
-			}
-			(None, Some(_)) => false, // Unexpected previous frame
-			(Some(_), None) => false, // Missing expected previous frame
-		};
-
-		// Validate order is increasing
-		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata().order() > prev);
-		let valid = prev_ok && order_ok;
-		if valid {
-			self.trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
-
-			guard.last_order = Some(frame.metadata().order());
-
-			let digest = utils::digest::<Sha3_256>(frame.message())?;
-			guard.last_digest = Some(digest);
-		} else {
-			self.trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
-		}
-
-		Ok(valid)
-	}
-
-	/// Get the last digest for linking the next frame
-	#[allow(dead_code)]
-	pub fn last_digest(&self) -> Option<DigestInfo> {
-		let guard = self.state.lock().ok()?;
-		guard.last_digest.to_owned()
-	}
-
-	/// Reset the chain state (for testing different chains)
-	#[allow(dead_code)]
-	pub fn reset(&self) -> Result<(), TightBeamError> {
-		let mut guard = self.state.lock().map_err(|_| TightBeamError::LockPoisoned)?;
-		guard.last_order = None;
-		guard.last_digest = None;
-		Ok(())
-	}
-}
-
-// ============================================================================
-// PaymentHarness - Combined Validation
-// ============================================================================
-
-/// Payment harness combining all validation components
-#[derive(Clone)]
+/// The servlets of one payment flow share one harness as their environment,
+/// so the dedup book and the chain state span every frame of the flow.
+#[derive(Clone, Default)]
 pub struct PaymentHarness {
-	pub trace: Arc<TraceCollector>,
-	pub dedup: DedupBook,
-	pub chain: ChainState,
+	/// The book of the frames the flow has seen, with the reply to each.
+	pub dedup: DedupBook<PaymentEvents, TransactionStatus>,
+	/// The chain of the frames of the flow, each linked to the one before.
+	pub chain: ChainState<PaymentEvents>,
 }
 
 impl PaymentHarness {
-	/// Create a new payment harness
-	pub fn new(trace: Arc<TraceCollector>) -> Self {
-		Self {
-			dedup: DedupBook::new(Arc::clone(&trace)),
-			chain: ChainState::new(Arc::clone(&trace)),
-			trace,
-		}
-	}
-
-	/// Handle an incoming frame with full validation
+	/// Answers an incoming frame once, through both validations, and returns
+	/// the response.
 	///
-	/// Returns Ok(true) if frame should be processed
-	/// Returns Ok(false) if frame is duplicate (use cached response)
-	pub fn handle(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		// Check for duplicates first
-		if !self.dedup.record(frame)? {
-			return Ok(false);
-		}
-
-		// Validate chain linkage
-		self.chain.record(frame)?;
-
-		Ok(true)
-	}
-
-	/// Check if frame is duplicate and return cached response if available
+	/// The book answers a duplicate from its cache. A new frame gets the
+	/// response of `respond` once the chain takes it, and the chain and the
+	/// book keep the frame only when `respond` passes.
 	///
-	/// Returns Ok(Some(cached)) if duplicate with cached response
-	/// Returns Ok(None) if not duplicate or no cached response
-	/// Emits dedup_cache_hit trace event on cache hit
-	pub fn check_dedup_cache(&self, frame: &Frame) -> Result<Option<TransactionStatus>, TightBeamError> {
-		if !self.handle(frame)? {
-			if let Some(cached) = self.dedup.get_cached(frame) {
-				self.trace.event_with(DEDUP_CACHE_HIT, &[PAYMENT_TAG], true)?;
-				return Ok(Some(cached));
-			}
-		}
-		Ok(None)
+	/// # Errors
+	///
+	/// - [`TightBeamError::InvalidMetadata`] -- the `previous_frame` or the
+	///   order of a new frame breaks the chain.
+	/// - [`TightBeamError`] -- `respond` refuses the frame, a lock is poisoned, or a trace record fails.
+	pub fn answer(
+		&self,
+		frame: &Frame,
+		trace: &TraceCollector,
+		respond: impl FnOnce() -> Result<TransactionStatus, TightBeamError>,
+	) -> Result<TransactionStatus, TightBeamError> {
+		// A duplicate returns before the chain check, so a replay leaves the
+		// chain intact. A frame that the chain or `respond` refuses leaves no
+		// answer, so its resend meets both again. The lock of the book comes
+		// before the lock of the chain.
+		self.dedup.answer(frame, trace, || self.chain.record(frame, trace, respond))
 	}
 }
 
-// ============================================================================
-// Unit Tests
-// ============================================================================
+// The unit tests of the harness.
 
 #[cfg(test)]
 mod tests {
+	use sha3::Sha3_256;
+
 	use super::*;
+	use crate::payments::messages::PaymentIdentification;
 	use tightbeam::asn1::Version;
 	use tightbeam::builder::TypeBuilder;
 	use tightbeam::testing::TestMessage;
+	use tightbeam::utils;
 
 	fn test_frame(id: impl AsRef<[u8]>, order: u64) -> Frame {
 		let id = id.as_ref();
@@ -259,42 +97,67 @@ mod tests {
 			.expect("a V2 frame with an id and an order builds")
 	}
 
-	#[test]
-	fn dedup_first_frame_accepted() -> Result<(), TightBeamError> {
-		let trace = Arc::new(TraceCollector::default());
-		let dedup = DedupBook::new(trace);
-		let frame = test_frame(b"txn1", 1);
+	/// A frame at `order` that carries `content` and links to `previous`.
+	fn linked_frame(id: impl AsRef<[u8]>, order: u64, content: &str, previous: &Frame) -> Frame {
+		let previous = utils::digest::<Sha3_256>(previous.message()).expect("SHA3-256 digests a message");
+		let frame = Version::V2
+			.compose()
+			.with_id(id.as_ref())
+			.with_order(order)
+			.with_previous_hash(previous)
+			.with_message(TestMessage::sample(Some(content)))
+			.build();
 
-		let result = dedup.record(&frame);
-		assert!(result.is_ok());
-		assert!(result?);
+		frame.expect("a V2 frame with a previous frame builds")
+	}
+
+	/// The approval of a test payment under `code`.
+	fn approval(code: &str) -> TransactionStatus {
+		let payment_id = PaymentIdentification::new(b"INST", b"E2E", b"TXN").expect("short identifiers fit");
+		TransactionStatus::approved(payment_id, code).expect("a short code fits")
+	}
+
+	/// A frame whose `previous_frame` misses the last frame of the chain fails.
+	#[test]
+	fn a_frame_that_breaks_the_chain_fails() -> Result<(), TightBeamError> {
+		let trace = TraceCollector::default();
+		let harness = PaymentHarness::default();
+		harness.answer(&test_frame(b"txn1", 1), &trace, || Ok(approval("AUTH1")))?;
+
+		let refusal = harness.answer(&test_frame(b"txn2", 2), &trace, || Ok(approval("AUTH2")));
+		assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
 		Ok(())
 	}
 
+	/// A resend of a frame that broke the chain fails again at the chain check.
 	#[test]
-	fn dedup_duplicate_rejected() -> Result<(), TightBeamError> {
-		let trace = Arc::new(TraceCollector::default());
-		let dedup = DedupBook::new(trace);
-		let frame = test_frame(b"txn1", 1);
+	fn a_resent_frame_that_breaks_the_chain_fails_again() -> Result<(), TightBeamError> {
+		let trace = TraceCollector::default();
+		let harness = PaymentHarness::default();
+		let broken = test_frame(b"txn2", 2);
+		harness.answer(&test_frame(b"txn1", 1), &trace, || Ok(approval("AUTH1")))?;
 
-		let _ = dedup.record(&frame);
-		let result = dedup.record(&frame);
-		assert!(result.is_ok());
-		assert!(!result?);
+		let first = harness.answer(&broken, &trace, || Ok(approval("AUTH2")));
+		let resend = harness.answer(&broken, &trace, || Ok(approval("AUTH2")));
+		assert!(first.is_err());
+		assert!(matches!(resend, Err(TightBeamError::InvalidMetadata)));
 		Ok(())
 	}
 
+	/// A frame whose response fails leaves the chain for its resend.
 	#[test]
-	fn dedup_different_order_accepted() -> Result<(), TightBeamError> {
-		let trace = Arc::new(TraceCollector::default());
-		let dedup = DedupBook::new(trace);
-		let frame1 = test_frame(b"txn1", 1);
-		let frame2 = test_frame(b"txn1", 2);
+	fn a_frame_whose_response_fails_leaves_the_chain_for_its_resend() -> Result<(), TightBeamError> {
+		let trace = TraceCollector::default();
+		let harness = PaymentHarness::default();
+		let first = test_frame(b"txn1", 1);
+		let second = linked_frame(b"txn2", 2, "the second transfer", &first);
 
-		let _ = dedup.record(&frame1);
-		let result = dedup.record(&frame2);
-		assert!(result.is_ok());
-		assert!(result?);
+		harness.answer(&first, &trace, || Ok(approval("AUTH1")))?;
+
+		let failed = harness.answer(&second, &trace, || Err(TightBeamError::InvalidBody));
+		let resend = harness.answer(&second, &trace, || Ok(approval("AUTH2")))?;
+		assert!(matches!(failed, Err(TightBeamError::InvalidBody)));
+		assert_eq!(resend, approval("AUTH2"));
 		Ok(())
 	}
 }

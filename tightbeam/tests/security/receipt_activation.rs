@@ -34,25 +34,21 @@
 
 use std::sync::Arc;
 
+use tightbeam::absent;
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
-use tightbeam::transport::handshake::negotiation::MuxBudgets;
+use tightbeam::transport::handshake::negotiation::{MuxBudgets, SETTLEMENT_UNSUPPORTED_CODE};
 use tightbeam::transport::handshake::HandshakeError;
-use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{
-	cms_mutual_budget_pair, CmsSessionHooks, GrantingAuthorizer, PayingApprover, ServerMaterials,
+	cms_mutual_budget_pair, ClientMaterials, CmsSessionHooks, GrantingAuthorizer, PayingApprover, ServerMaterials,
 };
-
-pub(crate) const COMPLETE_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-activation/complete-fails-without-settlement");
-pub(crate) const REPLAY_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-activation/replay-fails-without-settlement");
-pub(crate) const SETTLEMENT_REFUSED: Urn<'static> =
-	tightbeam::urn!("test", "event:receipt-activation/settlement-refused");
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::{LiveHandshake, ReceiptHooks};
 
 const CHALLENGE: &[u8] = b"activation-invoice";
 const RESPONSE: &[u8] = b"activation-preimage";
@@ -63,52 +59,67 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SETTLEMENT_REFUSED, exactly!(1), equals!(true)),
-			(REPLAY_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true)),
-			(COMPLETE_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true))
+			(events::SESSION_RECEIPT_REFUSED, exactly!(1), equals!(SETTLEMENT_UNSUPPORTED_CODE)),
+			(events::SESSION_HANDSHAKE_COMPLETE, absent!())
 		]
 	}
 }
 
 // A CMS handshake whose settlement the authorizer refuses MUST NOT activate
-// the budget-bearing session: the replayed client Finished and the
-// completion both fail closed.
+// the budget-bearing session: the server records the refused settlement, and
+// its session never reaches the encrypted phase.
 tb_scenario! {
 	name: complete_requires_settled_receipt,
 	spec: ReceiptActivationSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
-			let hooks = CmsSessionHooks {
-				authorizer: Some(Arc::new(GrantingAuthorizer::challenging(CHALLENGE)?)),
-				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
-				..CmsSessionHooks::default()
-			};
-
-			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
-			let (mut client, mut server) = (pair.client, pair.server);
+			let identity = ClientMaterials::generate().identity();
 
 			// The authorizer issues a challenge and keeps the default
 			// settlement, which refuses a challenged receipt.
-			let reply = server.reply(client.start()?).await?;
+			let hooks = ReceiptHooks {
+				authorizer: Some(Arc::new(GrantingAuthorizer::challenging(CHALLENGE)?)),
+				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
+				observer: None,
+			};
 
-			let client_finished = client.respond(reply).await?;
-			let closing = server.finish(client_finished.to_owned()).await;
-			let settlement_refused = matches!(closing, Err(HandshakeError::SettlementRejected { .. }));
-			trace.event_with(SETTLEMENT_REFUSED, &[], settlement_refused)?;
+			let kind = HandshakeBackendKind::Cms;
+			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
+			let outcome = handshake.audit_server(&trace).run().await?;
 
-			// The refused settlement left the handshake spent and dropped the
-			// issued receipt with it, so the server refuses the replayed
-			// Finished before it reads it.
-			let replay = server.finish(client_finished).await;
-			let replay_refused = matches!(replay, Err(HandshakeError::InvalidState));
-			trace.event_with(REPLAY_FAILS_WITHOUT_SETTLEMENT, &[], replay_refused)?;
-
-			let completion = server.complete();
-			let completion_refused = matches!(completion, Err(HandshakeError::InvalidState));
-			trace.event_with(COMPLETE_FAILS_WITHOUT_SETTLEMENT, &[], completion_refused)?;
-
-			Ok::<(), TightBeamError>(())
+			outcome.refused_by_server("server activated a session whose settlement its authorizer refused")
 		}
 	}
+}
+
+/// A refused settlement leaves the server handshake spent and drops the
+/// issued receipt with it, so the server refuses a replayed client Finished
+/// before it reads it.
+#[tokio::test]
+async fn a_spent_server_refuses_a_replayed_finished() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let hooks = CmsSessionHooks {
+		authorizer: Some(Arc::new(GrantingAuthorizer::challenging(CHALLENGE)?)),
+		approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
+		..CmsSessionHooks::default()
+	};
+
+	let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
+	let (mut client, mut server) = (pair.client, pair.server);
+	let reply = server.reply(client.start()?).await?;
+	let client_finished = client.respond(reply).await?;
+	let closing = server.finish(client_finished.to_owned()).await;
+	assert!(
+		matches!(closing, Err(HandshakeError::SettlementRejected { .. })),
+		"the authorizer settled a challenged receipt"
+	);
+
+	let replay = server.finish(client_finished).await;
+
+	assert!(
+		matches!(replay, Err(HandshakeError::InvalidState)),
+		"a spent server read a replayed client Finished"
+	);
+	Ok(())
 }

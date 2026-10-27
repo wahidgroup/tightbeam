@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tightbeam::colony::common::{InstanceMetrics, LoadBalancer};
+use tightbeam::colony::cluster::{InstanceMetrics, LoadBalancer};
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 use tightbeam::Frame;
 
@@ -36,7 +36,8 @@ impl GatePolicy for DynamicPolicyGate {
 	}
 }
 
-/// Round-robin without wall-clock seeding (stable AFL coverage).
+/// Round-robin balancer whose counter starts at zero, so AFL coverage stays
+/// stable from run to run.
 pub(crate) struct StableRoundRobin {
 	counter: AtomicU64,
 }
@@ -58,9 +59,11 @@ impl LoadBalancer for StableRoundRobin {
 	}
 }
 
-/// Pins the first pick to a preferred route key so decoy failover is deterministic.
+/// Balancer that pins the first pick to a preferred route key, so decoy
+/// failover is deterministic.
 pub(crate) struct DecoyFirstBalancer {
-	/// Route key the balancer prefers first so decoy failover stays deterministic.
+	/// Route key of the first pick. With `None`, or with a key that no
+	/// candidate holds, the balancer picks the first candidate.
 	pub preferred: Arc<Mutex<Option<Vec<u8>>>>,
 }
 

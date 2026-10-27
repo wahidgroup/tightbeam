@@ -1,4 +1,4 @@
-//! Gossip background tasks for the cluster advertise beat.
+//! The gossip background tasks of the cluster advertise beat.
 //!
 //! The beat re-announces the local slate, publishes origin-signed
 //! advertisement rumors, and runs anti-entropy reconcile rounds against
@@ -6,96 +6,106 @@
 //!
 //! # Planes
 //!
-//! - **Direct advertisement**: one signed frame goes to every verified target.
-//! - **Rumor flood**: the same signed frame, wrapped in a gossip rumor, reaches
-//!   members beyond direct reach.
-//! - **Pipeline**: an inbound rumor is admitted, rate-limited, journaled,
-//!   delivered locally, and reflooded.
-//! - **Reconcile**: anti-entropy rounds repair missing rumors and learn peer-exchange hints.
+//! - Direct advertisement: one signed frame goes to every beat target.
+//! - Rumor flood: the same signed frame, wrapped in a gossip rumor, reaches members beyond direct reach.
+//! - Pipeline: the gateway admits, rate-limits, journals, delivers locally, and refloods an inbound rumor.
+//! - Reconcile: anti-entropy rounds repair the rumors a peer lacks and learn peer-exchange hints.
 
-use core::hash::Hash;
-use core::str::{from_utf8, FromStr};
+use core::num::NonZeroUsize;
+use core::str::from_utf8;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
-use crate::colony::cluster::gossip::LocalClaimGuard;
+use crate::colony::cluster::export::ExportScope;
+use crate::colony::cluster::gossip::{LocalClaimGuard, RumorConsumer};
 use crate::colony::cluster::peer::AdmittedPeerAd;
-use crate::colony::cluster::peer::ColonyCertificate;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
-use crate::colony::cluster::runtime::hop::Hop;
+use crate::colony::cluster::runtime::advertise::{Advertiser, SignedAdvertisement};
+use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, ColonyDigest, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::hop::{FloodClient, HivePlane, PeerPlane};
 use crate::colony::cluster::runtime::refuse::Refusal;
+use crate::colony::cluster::runtime::verify::RequestAudit;
+use crate::colony::cluster::runtime::work::RouteChoice;
 use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
+use crate::colony::cluster::servlet_registry::SlateChange;
 use crate::colony::cluster::{
-	gossip_fresh, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind,
+	Admission, AdmittedGossip, FreshnessWindow, GossipDigest, PeerCaps, PeerHint, RouteKind, VerifiedRumor, WantList,
 };
-use crate::colony::cluster::{AdmittedDial, ClusterConfig, ClusterError, PeerAddress, ServletRegistry};
-use crate::colony::common::IssuedAt;
-use crate::colony::common::{reply_frame, TaskGroup};
-use crate::colony::common::{
-	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipRumorKind, GossipWant, PeerAdvertisement,
-	PeerAdvertisementResponse, PeerGossip,
+use crate::colony::cluster::{AdmittedDial, ClusterConfig, ClusterError, PeerAddress, ServletRegistry, SharedId};
+use crate::colony::protocol::IssuedAt;
+use crate::colony::protocol::ReplyForm;
+use crate::colony::protocol::{
+	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, PeerGossip,
 };
-use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
-	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_FANOUT_UNREACHED,
-	CLUSTER_GOSSIP_REFLOOD_FAILED, CLUSTER_GOSSIP_RELAY_WEAKENED, CLUSTER_GOSSIP_WITNESS_REFUSED,
-	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
+	CLUSTER_GOSSIP_ADMITTED, CLUSTER_GOSSIP_DELIVERED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE,
+	CLUSTER_GOSSIP_FANOUT_UNREACHED, CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER, CLUSTER_GOSSIP_REFLOOD_FAILED,
+	CLUSTER_GOSSIP_RELAY_WEAKENED, CLUSTER_GOSSIP_REPAIR_PUSHED, CLUSTER_GOSSIP_WITNESS_REFUSED,
+	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED, CLUSTER_PEER_EXPELLED,
 };
 use crate::instrumentation::events::{
-	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_RELAY_TRAIL_REFUSED,
+	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_PEER_HINTS_LEARNED,
+	CLUSTER_PEER_ROUTES_INSTALLED, CLUSTER_PEER_ROUTES_WITHDRAWN, CLUSTER_PEER_ROUTE_ABANDONED,
+	CLUSTER_RECONCILE_FAILED, CLUSTER_RELAY_TRAIL_INSTALLED, CLUSTER_RELAY_TRAIL_REFUSED,
 };
 use crate::policy::TransitStatus;
+use crate::runtime::{rt, TaskGroup};
 use crate::trace::TraceCollector;
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::MuxConnector;
-use crate::transport::policy::PolicyConfig;
-use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
+use crate::transport::Protocol;
+use crate::urn::Urn;
 use crate::utils::time::UnixMillis;
-use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 use crate::{MessagePriority, Version};
 
-/// Origin of a gossip pipeline invocation.
+/// The origin of one gossip pipeline run.
 #[derive(Clone, Copy)]
 pub(crate) enum GossipOrigin {
 	/// A peer-relayed rumor. Invalid input may score the relay.
 	Relay,
-	/// A local publish. An admission failure refuses without trail scoring.
+	/// A local publish. An admission failure refuses the publish and leaves
+	/// every trail's score as it stands.
 	Origin,
 }
 
 impl GossipOrigin {
 	/// The frame whose signer owns this rumor's rate and journal budget.
 	///
-	/// A relay hop signs the outer frame, so the origin's own signature
-	/// on the inner rumor is what a relayed invocation spends against.
+	/// A relay hop signs the outer frame, so a relayed rumor spends against
+	/// the origin's signature on the inner rumor.
 	fn attributed<'a>(self, frame: &'a Frame, rumor: &'a Frame) -> &'a Frame {
 		match self {
 			Self::Origin => frame,
 			Self::Relay => rumor,
 		}
 	}
+
+	/// The relay hop of a rumor whose outer frame `sender` signed: `sender`
+	/// for a relayed rumor, and `None` for a local publish, whose sender is
+	/// the hive that publishes it.
+	fn relay(self, sender: &VerifiedSignerId) -> Option<&VerifiedSignerId> {
+		match self {
+			Self::Relay => Some(sender),
+			Self::Origin => None,
+		}
+	}
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// The pool peers are dialed on.
+	/// The plane this gateway dials peers on.
 	///
 	/// A configured peer plane keeps peer traffic off the hive pool. With
 	/// no peer plane the hive pool serves both.
-	pub(crate) fn peer_dial_pool(&self) -> Arc<ClusterPool<P>> {
-		self.peer_pool
-			.as_ref()
-			.map(Arc::clone)
-			.unwrap_or_else(|| Arc::clone(&self.pool))
+	pub(crate) fn peer_dial_plane(&self) -> PeerPlane<P> {
+		match self.peer_plane.as_ref() {
+			Some(peer_plane) => peer_plane.clone(),
+			None => self.hive_plane.peers(self.config.clone()),
+		}
 	}
 }
 
@@ -108,12 +118,12 @@ struct MintedAdRumor {
 }
 
 impl ServletRegistry {
-	/// The dial socket of a relaying peer, from its live direct routes.
+	/// The dial socket of a relay peer, from its live direct routes.
 	///
-	/// Only direct routes qualify, because a relay entry's dial address
-	/// belongs to a further relay while a direct route holds `relay_id`'s
-	/// own. [`None`] means the relay reached this gateway through another
-	/// hop, so the direct trail from the rumor stands on its own.
+	/// Only direct routes qualify, because a relay entry dials a further relay
+	/// while a direct route dials `relay_id` itself. [`None`] means the relay
+	/// reached this gateway through another hop, or the registry lock is
+	/// poisoned, and the rumor's direct trail stands alone.
 	fn relay_dial_addr(&self, relay_id: impl AsRef<[u8]>) -> Option<PeerAddress> {
 		let relay_id = relay_id.as_ref();
 		let entries = self.peer_entries().ok()?;
@@ -121,103 +131,82 @@ impl ServletRegistry {
 			.iter()
 			.filter(|entry| entry.route_kind() == RouteKind::Peer)
 			.find(|entry| entry.owner_id().as_ref() == relay_id)
-			.and_then(|entry| entry.dial_target().socket())
+			.and_then(|entry| entry.dial_target().as_socket().copied())
+	}
+}
+
+impl<P: ColonyDialProtocol> ColonyConfig<P> {
+	/// Creates, signs, and digests one advertisement rumor for a beat.
+	///
+	/// The rumor wraps `advertisement`, the [`ColonyConfig::mint_ad_frame`]
+	/// frame the beat dials out directly, so both copies carry one order. It
+	/// extracts the digest and signer id for the witness and the reflood.
+	///
+	/// It returns [`None`] on a local fault (key, codec, or journal input),
+	/// which the caller records. A later beat re-publishes fresh.
+	async fn mint_slate_rumor(&self, advertisement: &SignedAdvertisement) -> Option<MintedAdRumor> {
+		let ad_bytes = encode(advertisement.frame()).ok()?;
+
+		let minted_at = self.clock.unix();
+		let body = GossipRumor::peer_advertisement(ad_bytes);
+		let builder = FrameBuilder::from(Version::V2)
+			.with_id(b"peer-ad-rumor")
+			.with_order(minted_at.get())
+			.with_message(body)
+			.with_priority(MessagePriority::NetworkControl);
+
+		let mut rumor = self.witnessed(builder).build().ok()?;
+		rumor.sign_with_provider(self.tls.identity()).await.ok()?;
+
+		let verified = self.tls.verify_own(rumor).ok()?;
+		let digest = verified.gossip_digest::<ColonyDigest<P>>().ok()?;
+		let rumor = verified.into_frame();
+		let signer_id = rumor.signer_id()?;
+		Some(MintedAdRumor { rumor, digest, signer_id, minted_at })
+	}
+}
+
+impl<P: Protocol> ColonyConfig<P> {
+	/// Admits one verified rumor under the colony digest, `hop_ttl` hops from
+	/// its origin, against this gateway's seen window at `now`.
+	///
+	/// # Errors
+	///
+	/// - [`TransitStatus::PermissionDenied`] -- every refusal of [`AdmittedGossip::admit`].
+	pub(crate) fn admit_rumor(
+		&self,
+		rumor: &VerifiedRumor,
+		hop_ttl: u64,
+		now: UnixMillis,
+	) -> Result<AdmittedGossip, TransitStatus> {
+		AdmittedGossip::admit::<ColonyDigest<P>>(rumor, hop_ttl, self.gossip.seen_window(), now)
+	}
+
+	/// The entries of a peer's `want` list that read as rumor digests under
+	/// the colony digest, by the rule of [`WantList::read`].
+	pub(crate) fn read_want(&self, want: impl AsRef<[Vec<u8>]>) -> WantList {
+		WantList::read::<ColonyDigest<P>>(want)
 	}
 }
 
 impl ClusterConfig {
-	/// Creates and signs one peer advertisement frame for the local slate.
-	///
-	/// One frame serves both delivery paths, so direct dials and gossip
-	/// rumors carry the same signer-binds-to-address unit.
-	///
-	/// # Delivery paths
-	///
-	/// - A direct dial through [`GossipBeat::send_advertisement`].
-	/// - An advertisement rumor through [`ClusterConfig::mint_slate_rumor`].
-	async fn mint_ad_frame<D: ClusterDigest>(
-		&self,
-		gateway_addr: impl AsRef<[u8]>,
-		types: impl IntoIterator<Item = Urn<'static>>,
-	) -> Result<Frame, ClusterError> {
-		let gateway_addr = gateway_addr.as_ref();
-		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		// The message type owns its bytes, so the encode boundary takes an
-		// owned copy of the address.
-		let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
-			gateway_addr: gateway_addr.to_vec(),
-			advertised_types: types,
-		});
-
-		let mut signed_frame = FrameBuilder::from(Version::V2)
-			.with_id(b"peer-advertise")
-			.with_order(self.clock.unix().get())
-			.with_message(request)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_witness_hasher::<D>()
-			.build()?;
-
-		signed_frame
-			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
-			.await?;
-		Ok(signed_frame)
-	}
-
-	/// Creates, signs, and digests one advertisement rumor for the local slate.
-	///
-	/// Wraps a [`ClusterConfig::mint_ad_frame`] payload in a signed rumor
-	/// and extracts the digest and signer id for witness and reflood.
-	///
-	/// It returns [`None`] on a local fault (key, codec, or journal input).
-	/// The caller records it, and a later beat re-publishes fresh.
-	async fn mint_slate_rumor<D: ClusterDigest>(
-		&self,
-		gateway_addr: impl AsRef<[u8]>,
-		types: impl IntoIterator<Item = Urn<'static>>,
-	) -> Option<MintedAdRumor> {
-		let gateway_addr = gateway_addr.as_ref();
-		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		let ad_frame = self.mint_ad_frame::<D>(gateway_addr, types).await.ok()?;
-		let ad_bytes = encode(&ad_frame).ok()?;
-
-		let minted_at = self.clock.unix();
-		let body = GossipRumor::peer_advertisement(ad_bytes);
-		let mut rumor = FrameBuilder::from(Version::V2)
-			.with_id(b"peer-ad-rumor")
-			.with_order(minted_at.get())
-			.with_message(body)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_witness_hasher::<D>()
-			.build()
-			.ok()?;
-
-		rumor
-			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
-			.await
-			.ok()?;
-		let digest = rumor.gossip_digest::<D>().ok()?;
-		let signer_id = rumor.signer_id()?;
-
-		Some(MintedAdRumor { rumor, digest, signer_id, minted_at })
-	}
-
 	/// Whether `order` sits inside this colony's control freshness window.
 	///
-	/// The rumor path carries no signed-control replay guard, because the
-	/// gossip journal already dedups identical rumors by digest. This bound
-	/// keeps the two paths admitting the same orders.
+	/// The rumor path relies on the gossip journal's digest deduplication
+	/// where a signed control frame passes a replay guard. This bound makes the
+	/// two paths admit the same orders.
 	///
 	/// # Fail-closed
 	///
 	/// - Admission requires an order inside the window, so the ad-order
 	///   tombstone covers every replay that reaches reconcile (CWE-294).
-	/// - A far-future order is refused, so every ledger row stays prunable
-	///   (CWE-770).
+	/// - Admission refuses a far-future order, so every ledger row stays prunable (CWE-770).
 	fn ad_order_fresh(&self, order: UnixMillis, now: UnixMillis) -> bool {
-		now.abs_diff(order) <= self.control_freshness_window
+		let window = FreshnessWindow::new(self.control_freshness_window);
+		window.admits(order, now)
 	}
 
-	/// Peer-exchange hints this gateway may learn.
+	/// The peer-exchange hints that this gateway may learn.
 	///
 	/// An entry becomes a hint through [`PeerConfig::admit_hint`], so a
 	/// later feeler probe dials only addresses the operator's dial policy
@@ -229,461 +218,378 @@ impl ClusterConfig {
 
 		pex.into_iter().filter_map(move |entry| self.peer.admit_hint(entry).ok())
 	}
+
+	/// Offers `hints` from `source` to the peer table, and records the count
+	/// it admits as [`CLUSTER_PEER_HINTS_LEARNED`] on `trace`.
+	///
+	/// The table holds no trace, so this method is the one place a learn
+	/// becomes an event. A learn that admits no hint records nothing.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Registry`] -- the table lock is poisoned.
+	/// - [`LoopFault::Runtime`] -- the trace refused the event.
+	pub(crate) fn learn_hints(
+		&self,
+		trace: &TraceCollector,
+		source: HintSource<'_>,
+		hints: impl IntoIterator<Item = PeerHint>,
+		now: UnixMillis,
+	) -> Result<(), LoopFault> {
+		let admitted = self.peer.table.learn(hints, now)?;
+		if let Some(admitted) = NonZeroUsize::new(admitted) {
+			let label = source.label();
+			source.with_payload(|payload| {
+				trace.emit_event_with_value_and_evidence(CLUSTER_PEER_HINTS_LEARNED, label, admitted, Some(payload))
+			})?;
+		}
+
+		Ok(())
+	}
+}
+
+/// Where a batch of discovery hints came from, which names the label and the
+/// payload of its [`CLUSTER_PEER_HINTS_LEARNED`].
+#[derive(Clone, Copy)]
+pub(crate) enum HintSource<'a> {
+	/// The signer of a direct peer advertisement, by its fingerprint.
+	Advertiser(&'a [u8]),
+	/// The origin of an advertisement rumor, by its fingerprint.
+	Origin(&'a [u8]),
+	/// The peer-exchange sample of a reconcile reply, by the dial address of
+	/// the peer that answered.
+	Pex(PeerAddress),
+}
+
+impl HintSource<'_> {
+	/// The label of the event: the kind of the source.
+	fn label(self) -> &'static str {
+		match self {
+			Self::Advertiser(_) => "advertiser",
+			Self::Origin(_) => "origin",
+			Self::Pex(_) => "pex",
+		}
+	}
+
+	/// Runs `record` on the payload of the event: the fingerprint or the
+	/// address that names the source. An address renders here alone, so a
+	/// learn that admits no hint renders nothing.
+	fn with_payload<R>(self, record: impl FnOnce(&[u8]) -> R) -> R {
+		match self {
+			Self::Advertiser(source) | Self::Origin(source) => record(source),
+			Self::Pex(address) => record(address.route_bytes().as_ref()),
+		}
+	}
+}
+
+impl SlateChange {
+	/// Records the direct routes this swap installed and withdrew for
+	/// `advertiser`, as [`CLUSTER_PEER_ROUTES_INSTALLED`] and
+	/// [`CLUSTER_PEER_ROUTES_WITHDRAWN`] on `trace`.
+	///
+	/// Each event fires only for a count above 0, so a refresh of the held
+	/// slate records nothing.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused an event.
+	pub(crate) fn record_direct(
+		&self,
+		trace: &TraceCollector,
+		advertiser: impl AsRef<[u8]>,
+	) -> Result<(), TightBeamError> {
+		let advertiser = Some(advertiser.as_ref());
+		if let Some(installed) = self.installed() {
+			trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ROUTES_INSTALLED, "direct", installed, advertiser)?;
+		}
+		if let Some(withdrawn) = self.withdrawn() {
+			trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ROUTES_WITHDRAWN, "slate", withdrawn, advertiser)?;
+		}
+
+		Ok(())
+	}
 }
 
 impl GossipWant {
 	/// Whether this reconcile reply exceeds its protocol bounds.
 	///
-	/// A conforming gateway holds its reply to [`MAX_GOSSIP_LOG`] wants
-	/// and [`MAX_PEX_SAMPLE`] peer-exchange entries, so an oversized reply
-	/// is abuse and the requester drops the whole round (CWE-770).
+	/// A gateway that follows the protocol holds its reply to
+	/// [`MAX_GOSSIP_LOG`] wants and [`MAX_PEX_SAMPLE`] peer-exchange entries,
+	/// so an oversized reply is abuse and the requester drops the whole round
+	/// (CWE-770).
 	fn is_oversized(&self) -> bool {
 		self.want.len() > MAX_GOSSIP_LOG || self.pex.len() > MAX_PEX_SAMPLE
 	}
 }
 
-/// The peer pool outbound gossip floods and reconciles on.
+/// How one reconcile round ended, as the peer's score reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Round {
+	/// The peer answered in bounds or from outside the flood, or a local fault
+	/// skipped the round, so the peer's score stands.
+	Settled,
+	/// The dial failed, or the peer answered out of bounds, so the caller
+	/// scores the peer.
+	Failed,
+}
+
+/// The step at which a reconcile round ended early.
 ///
-/// The advertise beat and the inbound reflood both reach peers through
-/// this one owner, so a rumor leaves on the same plane either way.
-struct GossipBeat<P: Protocol> {
-	config: Arc<ClusterConfig>,
-	peer_pool: Arc<ClusterPool<P>>,
+/// Each step names the label of the round's [`CLUSTER_RECONCILE_FAILED`] and
+/// decides whether the round charges the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundEnd {
+	/// The journal failed to list its held digests.
+	Journal,
+	/// The dial or the handshake failed.
+	Unreachable,
+	/// The request frame failed to build.
+	Build,
+	/// The signature of the request failed.
+	Sign,
+	/// The exchange failed, or the reply failed to decode or exceeded its
+	/// bounds.
+	Reply,
+	/// A local step after the reply failed, such as the promotion or a repair.
+	Bookkeeping,
+}
+
+impl RoundEnd {
+	/// The label of the round's event.
+	fn label(self) -> &'static str {
+		match self {
+			Self::Journal => "journal",
+			Self::Unreachable => "unreachable",
+			Self::Build => "build",
+			Self::Sign => "sign",
+			Self::Reply => "reply",
+			Self::Bookkeeping => "bookkeeping",
+		}
+	}
+
+	/// How the round reads to the peer's score.
+	///
+	/// A step the peer failed charges the peer. A step that failed on this
+	/// gateway leaves the peer's score as it stands.
+	fn round(self) -> Round {
+		match self {
+			Self::Unreachable | Self::Reply => Round::Failed,
+			Self::Journal | Self::Build | Self::Sign | Self::Bookkeeping => Round::Settled,
+		}
+	}
+}
+
+/// How one hop of a reflood ended.
+enum FloodHop {
+	/// The target answered, and this gateway's offer to it stands.
+	Settled,
+	/// A gateway outside the flood answered at the target, and this gateway
+	/// owes it no rumor.
+	OutsideFlood(AdmittedDial),
+	/// The target answered that the rumor's origin is outside its trust.
+	OriginRefused(AdmittedDial),
+	/// The dial or the emit failed.
+	Unreached,
+}
+
+/// The ledger of every gossip target, behind one lock.
+///
+/// The beat's repair and each inbound reflood both record what a target
+/// answered, so the gateway holds one map and shares it. [`Self::with`] takes
+/// the lock and releases it before it returns, so no guard crosses an await.
+///
+/// # Poison recovery
+///
+/// Each write is one insert or one removal on a set or a map, so a panic
+/// cannot leave a ledger half-written. Every method recovers a poisoned
+/// guard, so the flood runs on after a panic.
+#[derive(Default)]
+pub(crate) struct PeerLedgers {
+	by_target: Mutex<HashMap<AdmittedDial, PeerLedger>>,
+}
+
+impl PeerLedgers {
+	/// Runs `read` on the ledger of `target`, which starts empty.
+	fn with<T>(&self, target: AdmittedDial, read: impl FnOnce(&mut PeerLedger) -> T) -> T {
+		let mut by_target = self.by_target.lock().unwrap_or_else(PoisonError::into_inner);
+		read(by_target.entry(target).or_default())
+	}
+
+	/// Keeps the ledgers of the targets `live` names, and forgets every
+	/// refusal older than `window`.
+	///
+	/// The table's caps bound the live set, so they bound this map (CWE-770).
+	fn prune(&self, live: impl Fn(&AdmittedDial) -> bool, now: UnixMillis, window: Duration) {
+		let mut by_target = self.by_target.lock().unwrap_or_else(PoisonError::into_inner);
+		by_target.retain(|target, _| live(target));
+
+		for ledger in by_target.values_mut() {
+			ledger.expire(now, window);
+		}
+	}
+}
+
+/// What this gateway knows about one target's reception of its gossip.
+#[derive(Default)]
+struct PeerLedger {
+	/// The digests the target acknowledged with an explicit `Ok`.
+	acked: HashSet<GossipDigest>,
+	/// The origins the target answered as outside its trust, each with the
+	/// time of that answer.
+	refused_origins: HashMap<Vec<u8>, UnixMillis>,
+}
+
+impl PeerLedger {
+	/// Records that the target acknowledged `digest`.
+	fn ack(&mut self, digest: GossipDigest) {
+		self.acked.insert(digest);
+	}
+
+	/// Decides whether the target drops rumors it acknowledged, and forgets
+	/// the acknowledgement of every digest in `wanted`.
+	///
+	/// A digest this gateway saw acknowledged, wanted again while retained,
+	/// is a drop.
+	fn drop_signal(&mut self, wanted: impl AsRef<[GossipDigest]>) -> bool {
+		let wanted = wanted.as_ref();
+		let dropped = wanted.iter().any(|digest| self.acked.contains(digest));
+		for digest in wanted {
+			self.acked.remove(digest);
+		}
+
+		dropped
+	}
+
+	/// Records that the target answered `origin` as outside its trust.
+	fn refuse_origin(&mut self, origin: impl Into<Vec<u8>>, now: UnixMillis) {
+		self.refused_origins.insert(origin.into(), now);
+	}
+
+	/// Decides whether this gateway offers a rumor of `origin` to the target.
+	///
+	/// A refusal stands for `window`. This gateway then offers the origin once
+	/// more, so a target that enrolled it since catches up.
+	fn offers(&self, origin: impl AsRef<[u8]>, now: UnixMillis, window: Duration) -> bool {
+		match self.refused_origins.get(origin.as_ref()) {
+			Some(refused_at) => now.saturating_since(*refused_at) >= window,
+			None => true,
+		}
+	}
+
+	/// Forgets every refusal older than `window`.
+	fn expire(&mut self, now: UnixMillis, window: Duration) {
+		let stands = |refused_at: UnixMillis| now.saturating_since(refused_at) < window;
+		self.refused_origins.retain(|_, refused_at| stands(*refused_at));
+	}
+}
+
+/// The direct-advertisement arm of the advertise beat.
+///
+/// Every gateway with a dial list runs it, in a flood or in none.
+struct AdvertiseBeat<P: Protocol> {
+	config: ColonyConfig<P>,
+	advertiser: Advertiser<P>,
+	servlet_registry: Arc<ServletRegistry>,
+}
+
+/// The gossip arm of the advertise beat and of the inbound pipeline:
+/// reconcile rounds, feeler probes, the slate rumor, refloods, and repairs.
+///
+/// The beat and the inbound reflood both reach peers through it, so a rumor
+/// leaves on the same plane either way. [`Self::new`] returns one only for a
+/// gateway in a flood, so every method here runs on a flood member.
+struct FloodBeat<P: Protocol> {
+	config: ColonyConfig<P>,
+	peer_plane: PeerPlane<P>,
 	servlet_registry: Arc<ServletRegistry>,
 	trace: Arc<TraceCollector>,
+	ledgers: Arc<PeerLedgers>,
+}
+
+impl<P: Protocol> FloodBeat<P> {
+	/// The gossip arm of a gateway that is in a flood, or `None` for a
+	/// gateway that is in none.
+	fn new(
+		config: ColonyConfig<P>,
+		peer_plane: PeerPlane<P>,
+		servlet_registry: Arc<ServletRegistry>,
+		trace: Arc<TraceCollector>,
+		ledgers: Arc<PeerLedgers>,
+	) -> Option<Self> {
+		config.flood()?;
+
+		Some(Self { config, peer_plane, servlet_registry, trace, ledgers })
+	}
+
+	/// Records that `target` answered `origin` as outside its trust, so this
+	/// gateway offers it no further rumor of that origin for one window.
+	fn settle_refused_origin(
+		&self,
+		target: AdmittedDial,
+		origin: impl AsRef<[u8]>,
+		now: UnixMillis,
+	) -> Result<(), TightBeamError> {
+		let origin = origin.as_ref();
+		self.ledgers.with(target, |ledger| ledger.refuse_origin(origin, now));
+
+		let evidence = || Some(target.address().route_bytes());
+		self.trace
+			.emit_marker_with_evidence(CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER, evidence)?;
+
+		Ok(())
+	}
+
+	/// Whether this gateway offers a rumor of `origin` to `target`. A rumor
+	/// with no signer names no origin that a target could have refused, so
+	/// this gateway offers it.
+	fn offers(&self, target: AdmittedDial, origin: Option<&[u8]>, now: UnixMillis) -> bool {
+		let Some(origin) = origin else {
+			return true;
+		};
+
+		let window = self.config.gossip.seen_ttl;
+		self.ledgers.with(target, |ledger| ledger.offers(origin, now, window))
+	}
+
+	/// Keeps the ledgers of this beat's targets and probes, and expires the
+	/// refusals that have stood for a whole seen window.
+	fn prune_ledgers(&self, targets: impl AsRef<[AdmittedDial]>, probes: impl AsRef<[AdmittedDial]>) {
+		let targets = targets.as_ref();
+		let probes = probes.as_ref();
+		let live = |peer: &AdmittedDial| targets.contains(peer) || probes.contains(peer);
+
+		self.ledgers.prune(live, self.config.clock.unix(), self.config.gossip.seen_ttl);
+	}
 }
 
 // The impl is manual because a derive would demand `P: Clone`, and the
 // fields are reference-counted regardless of `P`.
-impl<P: Protocol> Clone for GossipBeat<P> {
+impl<P: Protocol> Clone for FloodBeat<P> {
 	fn clone(&self) -> Self {
 		Self {
-			config: Arc::clone(&self.config),
-			peer_pool: Arc::clone(&self.peer_pool),
+			config: self.config.clone(),
+			peer_plane: self.peer_plane.clone(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
 			trace: Arc::clone(&self.trace),
+			ledgers: Arc::clone(&self.ledgers),
 		}
 	}
 }
 
-impl<P> GossipBeat<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
-	/// Refloods a still-live rumor to configured peers with a decremented TTL.
-	///
-	/// Targets are anchors plus verified tried peers, so rumor bytes reach
-	/// verified identities only. Each target receives an owned clone of the
-	/// signed frame because emit consumes the frame.
-	async fn reflood<D: ClusterDigest>(&self, rumor: Frame, ttl: u64) -> Result<(), LoopFault> {
-		let targets = self.config.peer.table.target_set()?;
-		if targets.is_empty() {
-			return Ok(());
-		}
-
-		// Embedding the decoded rumor re-encodes it, which is byte-identical
-		// to the received bytes because DER is canonical (ITU-T X.690 §10).
-		//
-		// The origin signature and witness digest therefore survive the hop.
-		// Splicing pre-encoded bytes would need an opaque passthrough field
-		// in the codec, a redesign that buys no correctness.
-		let request = ClusterRequest::Gossip(Box::new(rumor));
-		let mut signed_frame = match FrameBuilder::from(Version::V2)
-			.with_id(b"gossip-reflood")
-			.with_message(request)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_lifetime(ttl)
-			.with_witness_hasher::<D>()
-			.build()
-		{
-			Ok(signed_frame) => signed_frame,
-			Err(_unbuilt) => {
-				self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
-
-				return Ok(());
-			}
-		};
-
-		let signing = signed_frame
-			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await;
-		if signing.is_err() {
-			self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
-
-			return Ok(());
-		}
-
-		let mut fanout = tokio::task::JoinSet::new();
-		let mut unreached: u64 = 0;
-		for peer in targets.iter() {
-			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
-				unreached += 1;
-				continue;
-			};
-
-			let dial_pool = Arc::clone(&self.peer_pool);
-			// Each emit consumes an owned frame, so a fan-out to N targets
-			// needs N owned frames. The clone is that fan-out cost.
-			let frame = signed_frame.clone();
-			fanout.spawn(async move {
-				let Ok(mut client) = dial_pool.connect(peer_addr).await else {
-					return false;
-				};
-
-				client.emit(frame, None).await.is_ok()
-			});
-		}
-
-		// One peer being down must not stop the flood to the peers that are
-		// up, so a hop that fails is counted rather than returned. A task
-		// that could not be joined did not reach its peer either, which is
-		// why both fold into the same count.
-		while let Some(joined) = fanout.join_next().await {
-			if !joined.unwrap_or(false) {
-				unreached += 1;
-			}
-		}
-
-		if unreached > 0 {
-			self.trace.event_with(CLUSTER_GOSSIP_FANOUT_UNREACHED, &[], unreached)?;
-		}
-
-		Ok(())
-	}
-
-	/// Sends one pre-signed peer advertisement to a dialed peer gateway.
-	///
-	/// The caller creates and signs one frame per beat and fans it out, so
-	/// one signature serves every dial.
-	async fn send_advertisement(
-		&self,
-		peer_addr: P::Address,
-		signed_frame: Frame,
-	) -> Result<TransitStatus, ClusterError> {
-		let mut client = self.peer_pool.connect(peer_addr).await?;
-		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
-
-		let decoded: PeerAdvertisementResponse = decode(response.message())?;
-		Ok(decoded.status)
-	}
-
-	/// Publishes the local slate as an origin-signed advertisement rumor.
-	///
-	/// The rumor wraps the identical signed frame that direct advertisement
-	/// dials out, so members beyond direct reach admit through the same
-	/// signer-binds-to-address path once the flood relays it.
-	///
-	/// # Journal
-	///
-	/// The published digest is witnessed for dedup only. Advertisements are
-	/// ephemeral hints that re-publish keeps fresh, and the origin already
-	/// holds the slate it published.
-	///
-	/// # Failures
-	///
-	/// A creation fault returns `false`, traces
-	/// [`CLUSTER_PEER_AD_PUBLISH_FAILED`], and leaves the caller's publish
-	/// baseline intact so the next beat retries.
-	async fn publish_slate_rumor<D: ClusterDigest>(
-		&self,
-		gateway_addr: Arc<[u8]>,
-		types: impl IntoIterator<Item = Urn<'static>>,
-	) -> Result<bool, LoopFault> {
-		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		let Some(minted) = self.config.mint_slate_rumor::<D>(gateway_addr.as_ref(), types).await else {
-			self.trace.event(CLUSTER_PEER_AD_PUBLISH_FAILED)?;
-			return Ok(false);
-		};
-
-		// Witness the published digest so the origin's own echo dedups.
-		// Retention serves repair and retry, which advertisements forgo.
-		// A journal that refuses the witness leaves this gateway able to
-		// re-admit its own echo. The rumor is already created, so the beat
-		// records the refusal and floods anyway rather than dropping a rumor
-		// that is live.
-		if self
-			.config
-			.gossip
-			.journal
-			.witness(&minted.signer_id, minted.digest, minted.minted_at)
-			.is_err()
-		{
-			self.trace.event(CLUSTER_GOSSIP_WITNESS_REFUSED)?;
-		}
-
-		// The stamped lifetime is the budget remaining after this first
-		// hop arrives, matching what the pipeline stamps when it refloods
-		// a published rumor.
-		let hop_ttl = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
-		self.reflood::<D>(minted.rumor, hop_ttl.saturating_sub(1)).await?;
-
-		Ok(true)
-	}
-
-	/// One anti-entropy reconcile round with a peer, including grey-hole
-	/// scoring.
-	///
-	/// An `Err` from this function is peer-attributable, so the beat loops
-	/// score it toward eviction or probe discard. A local fault skips its own
-	/// step, which keeps scoring attributable to the peer alone.
-	///
-	/// # Round order
-	///
-	/// 1. Collect the held digests from the journal.
-	/// 2. Complete the handshake and verify the colony scope.
-	/// 3. Emit a signed reconcile request and decode the reply.
-	/// 4. Reject an oversized want-list or PEX sample.
-	/// 5. Promote the peer, learn PEX hints, and score grey-hole drops.
-	/// 6. Repair missing rumors from the journal.
-	///
-	/// # Fault attribution
-	///
-	/// - A local fault before the emit or inside the post-reply scope skips scoring.
-	/// - An oversized reply or a dial failure returns `Err` for peer scoring.
-	/// - A peer outside the colony leaves the peer table at once.
-	async fn reconcile_round<D: ClusterDigest>(
-		&self,
-		peer_addr: P::Address,
-		acked: &mut HashSet<GossipDigest>,
-		peer: AdmittedDial,
-	) -> Result<(), ClusterError> {
-		let now = self.config.clock.unix();
-		// A journal fault belongs to this gateway, so the round is skipped and
-		// scoring stays attributable to the peer.
-		let Ok(held_digests) = self.config.gossip.journal.held_digests(now) else {
-			return Ok(());
-		};
-		// The reconciliation message type carries digests as owned OCTET
-		// STRING bytes, so each fixed-size digest copies once here.
-		let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
-
-		let mut client = self.peer_pool.connect(peer_addr).await?;
-
-		// A feeler probe reconciles on a cold connection whose handshake
-		// defers to first emit. Completing it here is the only way to learn
-		// peer identity before the reconcile discloses anything (CWE-668).
-		client.complete_handshake().await?;
-
-		// The colony scope gate requires the peer's handshake certificate to
-		// match the local colony.
-		let peer_colony = client
-			.peer_certificate()
-			.and_then(|cert| self.config.namespace.cert_colony_urn(cert));
-		if peer_colony.as_ref() != self.config.colony_urn() {
-			// A definitive foreign identity leaves both learned tables at
-			// once. Waiting out the failure threshold would keep advertising
-			// to a peer that re-keyed outside the colony.
-			self.config.peer.table.expel(peer)?;
-			return Ok(());
-		}
-
-		let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
-
-		// Frame construction and signing are local. A fault here happened
-		// before the peer was asked anything, so the round is skipped rather
-		// than scored.
-		let Ok(mut signed_frame) = FrameBuilder::from(Version::V2)
-			.with_id(b"gossip-reconcile")
-			.with_order(now.get())
-			.with_message(request)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_witness_hasher::<D>()
-			.build()
-		else {
-			return Ok(());
-		};
-
-		let signing = signed_frame
-			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await;
-		if signing.is_err() {
-			return Ok(());
-		}
-		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
-		let reply: GossipWant = decode(response.message())?;
-
-		// An oversized want-list or PEX sample is abuse, so the round fails
-		// (CWE-770). The beat then scores the peer like any failed round, so an
-		// abuser is discarded from `new` or counted toward eviction from
-		// `tried`.
-		if reply.is_oversized() {
-			return Err(ClusterError::OversizedReconcileReply);
-		}
-
-		// The decoded, in-bounds reply already proves liveness, so a fault in
-		// the bookkeeping below leaves the peer scored on its answer.
-		let local_round = self.settle_round::<D>(&mut client, reply, acked, peer, now).await;
-
-		// The round already succeeded, so a local fault in the bookkeeping
-		// skips the rest of the round without charging the peer. The next
-		// beat retries the skipped bookkeeping and repair.
-		let _ = local_round;
-
-		Ok(())
-	}
-
-	/// Applies one answered round's bookkeeping: promotion, PEX hints,
-	/// grey-hole scoring, and journal repair.
-	///
-	/// Every step here is local, so a fault skips the rest of the round
-	/// and leaves the peer scored on the answer it already gave.
-	async fn settle_round<D: ClusterDigest>(
-		&self,
-		client: &mut crate::transport::PooledClient<P>,
-		reply: GossipWant,
-		acked: &mut HashSet<GossipDigest>,
-		peer: AdmittedDial,
-		now: UnixMillis,
-	) -> Result<(), ClusterError> {
-		let round: Result<(), ClusterError> = async {
-			// Promotion waits for the reply because a pooled connection keeps
-			// its handshake certificate after the peer dies. Promoting on the
-			// gate alone would reset the failure count every beat, holding a
-			// dead peer in the table.
-			let peer_id = client.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
-			if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
-				self.trace
-					.event(CLUSTER_PEER_DISCOVERED)?
-					.with_payload(peer.address().route_bytes().as_ref())
-					.emit();
-			}
-
-			let GossipWant { want, pex } = reply;
-
-			// PEX entries are unverified hints: the allowlist gates them, the
-			// capped new table holds them, and a later feeler probe under the
-			// colony gate is the only path to dial target (CWE-345).
-			let hints = self.config.admissible_pex_hints(pex);
-			self.config.peer.table.learn(hints)?;
-
-			let wanted: Vec<[u8; 32]> = wanted_digests(&want);
-
-			// Grey-hole containment: a digest this gateway acked, wanted again
-			// while retained, is a drop. One weaken per round scores it.
-			let dropped = wanted.iter().any(|digest| acked.contains(digest));
-			if dropped {
-				self.servlet_registry.weaken_peer_by_dial(peer.address())?;
-				self.trace.event(CLUSTER_GOSSIP_DROP_SIGNAL)?;
-			}
-
-			for digest in &wanted {
-				acked.remove(digest);
-			}
-
-			self.push_repairs::<D>(client, &wanted, acked).await
-		}
-		.await;
-
-		round
-	}
-
-	/// Advertises to and reconciles with every verified target.
-	///
-	/// `ad_frame` is the single signed advertisement this beat created, so
-	/// one signature serves every dial. A failed round counts toward
-	/// eviction, so a dead tried peer frees its bucket slot at the
-	/// threshold.
-	async fn dial_targets<D: ClusterDigest>(
-		&self,
-		targets: impl AsRef<[AdmittedDial]>,
-		ad_frame: Option<&Frame>,
-		push_ledger: &mut HashMap<AdmittedDial, HashSet<GossipDigest>>,
-		trace: &TraceCollector,
-	) -> Result<(), LoopFault> {
-		let targets = targets.as_ref();
-		let reconciling = self.config.colony_urn().is_some();
-		for peer in targets {
-			// A protocol that cannot address this peer is this gateway's
-			// choice, so the peer is skipped rather than scored.
-			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
-				continue;
-			};
-
-			if let Some(frame) = ad_frame {
-				// The dial consumes both arguments. The address serves the
-				// reconcile below again, and the frame serves every
-				// remaining target. A dial that fails is the peer's answer,
-				// and the reconcile round below scores it, so the status is
-				// not read here.
-				let _advertised = self.send_advertisement(peer_addr.clone(), frame.clone()).await;
-			}
-
-			if !reconciling {
-				continue;
-			}
-
-			// The entry API takes an owned key even on a hit, and the short
-			// address clone costs less than a second lookup.
-			let acked = push_ledger.entry(*peer).or_default();
-			let round = self.reconcile_round::<D>(peer_addr, acked, *peer).await;
-			if round.is_err() && self.config.peer.table.record_failure(*peer)? {
-				trace
-					.event(CLUSTER_PEER_EVICTED)?
-					.with_payload(peer.address().route_bytes().as_ref())
-					.emit();
-			}
-		}
-
-		Ok(())
-	}
-
-	/// Reconciles with unverified candidates and discards the ones that fail.
-	///
-	/// Feeler probes run reconcile only: the colony gate inside the round
-	/// promotes a verified candidate, and a failed dial discards it, so a
-	/// prefix bucket keeps holding live addresses.
-	async fn probe_candidates<D: ClusterDigest>(
-		&self,
-		probes: impl AsRef<[AdmittedDial]>,
-		push_ledger: &mut HashMap<AdmittedDial, HashSet<GossipDigest>>,
-	) -> Result<(), LoopFault> {
-		let probes = probes.as_ref();
-		if self.config.colony_urn().is_none() {
-			return Ok(());
-		}
-
-		for peer in probes {
-			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
-				self.config.peer.table.discard(*peer)?;
-				continue;
-			};
-
-			let acked = push_ledger.entry(*peer).or_default();
-			if self.reconcile_round::<D>(peer_addr, acked, *peer).await.is_err() {
-				self.config.peer.table.discard(*peer)?;
-			}
-		}
-
-		Ok(())
-	}
-
+impl<P: ColonyDialProtocol> AdvertiseBeat<P> {
 	/// The advertised types that this gateway exports, capped at
 	/// [`MAX_ADVERTISED_TYPES`].
 	///
-	/// This is the single place advertised types are gathered, so one
-	/// export filter covers the direct ads and the rumor flood.
-	/// Membership is asked per key each beat, so a live `ExportAllowlist`
-	/// stays aligned with enforcement.
+	/// It is the one place that gathers advertised types, so one export filter
+	/// covers the direct ads and the rumor flood. The filter asks the export
+	/// scope per key each beat, so a live `ExportAllowlist` stays aligned with
+	/// enforcement.
 	fn exported_slate(&self) -> Result<Vec<Urn<'static>>, ClusterError> {
-		let exports = self.config.peer.exported_types.as_deref();
+		let scope = ExportScope::from(&self.config.peer);
 		let local = self.servlet_registry.local_servlets()?;
 		let slate = local
 			.iter()
-			.filter(|bytes| exports.is_none_or(|list| list.allows_canonical(bytes)))
+			.filter(|bytes| scope.exports_canonical(bytes))
 			.filter_map(|bytes| from_utf8(bytes).ok())
 			.filter_map(|canonical| canonical.parse().ok())
 			.take(MAX_ADVERTISED_TYPES)
@@ -692,50 +598,551 @@ where
 		Ok(slate)
 	}
 
-	/// Resends the journaled rumors that this peer still wants.
+	/// Advertises to every beat target, and hands each one to the flood arm
+	/// when this gateway has one.
 	///
-	/// Each push carries an outer lifetime of 0, so a repair never
-	/// refloods. Only a rumor still inside the seen window is admissible,
-	/// and only an explicit `Ok` reply arms the grey-hole ledger.
-	async fn push_repairs<D: ClusterDigest>(
+	/// `advertisement` is the single signed advertisement this beat created,
+	/// so one signature serves every dial.
+	async fn dial_targets(
 		&self,
-		client: &mut crate::transport::PooledClient<P>,
-		wanted: impl AsRef<[GossipDigest]>,
-		acked: &mut HashSet<GossipDigest>,
-	) -> Result<(), ClusterError> {
-		let wanted = wanted.as_ref();
-		let now = self.config.clock.unix();
-		let seen_ttl = self.config.gossip.seen_ttl;
-		let missing = self.config.gossip.journal.fetch(wanted, now)?;
-		let admissible = missing
-			.into_iter()
-			.filter(|rumor| gossip_fresh(rumor.issued_at(), seen_ttl, now));
-
-		for rumor in admissible {
-			let Ok(pushed_digest) = rumor.gossip_digest::<D>() else {
+		flood: Option<&FloodBeat<P>>,
+		targets: impl AsRef<[AdmittedDial]>,
+		advertisement: Option<&SignedAdvertisement>,
+		trace: &TraceCollector,
+	) -> Result<(), LoopFault> {
+		let targets = targets.as_ref();
+		for peer in targets {
+			// A protocol that cannot address this peer is this gateway's
+			// choice, so the beat skips the peer and leaves it unscored.
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
 				continue;
 			};
 
+			if let Some(advertisement) = advertisement {
+				// The address clones, because the reconcile below reuses it.
+				// The reconcile round scores a failed dial, so the status goes
+				// unread.
+				let _advertised = self.advertiser.advertise(peer_addr.clone(), advertisement).await;
+			}
+
+			let Some(flood) = flood else {
+				continue;
+			};
+
+			flood.reconcile_target(peer_addr, *peer, trace).await?;
+		}
+
+		Ok(())
+	}
+}
+
+impl<P: ColonyDialProtocol> FloodBeat<P> {
+	/// Refloods a live rumor to the dial targets with a decremented TTL.
+	///
+	/// The targets are the anchors plus the verified tried peers. Each dial
+	/// proves the answer is a flood member in [`PeerPlane::connect_member`]
+	/// before the rumor leaves, so a configured peer outside the flood
+	/// receives none (CWE-668).
+	///
+	/// # Re-encoding
+	///
+	/// The reflood re-encodes the decoded rumor when it embeds it. DER is
+	/// canonical (ITU-T X.690 §10), so the bytes equal the received bytes, and
+	/// the origin signature and the witness digest survive the hop. A splice
+	/// of the pre-encoded bytes would need an opaque passthrough field in the
+	/// codec, a redesign that buys no correctness.
+	async fn reflood(&self, rumor: Frame, ttl: u64) -> Result<(), LoopFault> {
+		let targets = self.config.peer.table.target_set()?;
+		if targets.is_empty() {
+			return Ok(());
+		}
+
+		// A target that answered this origin as outside its trust gets none
+		// of its rumors until that answer expires.
+		let origin = rumor.signer_id();
+		let now = self.config.clock.unix();
+
+		let request = ClusterRequest::Gossip(Box::new(rumor));
+		let builder = FrameBuilder::from(Version::V2)
+			.with_id(b"gossip-reflood")
+			.with_message(request)
+			.with_priority(MessagePriority::NetworkControl)
+			.with_lifetime(ttl);
+		let mut signed_frame = match self.config.witnessed(builder).build() {
+			Ok(signed_frame) => signed_frame,
+			Err(_unbuilt) => {
+				self.trace.emit_marker(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
+
+				return Ok(());
+			}
+		};
+
+		let signing = signed_frame.sign_with_provider(self.config.tls.identity()).await;
+		if signing.is_err() {
+			self.trace.emit_marker(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
+			return Ok(());
+		}
+
+		let mut fanout = tokio::task::JoinSet::new();
+		let mut unreached: u64 = 0;
+		for peer in targets.iter() {
+			if !self.offers(*peer, origin.as_deref(), now) {
+				continue;
+			}
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
+				unreached = unreached.saturating_add(1);
+				continue;
+			};
+
+			let target = *peer;
+			let dial_plane = self.peer_plane.clone();
+			// Each emit consumes an owned frame, so a fan-out to N targets
+			// needs N owned frames. The clone is that fan-out cost.
+			let frame = signed_frame.clone();
+			fanout.spawn(async move {
+				let Ok(answered) = dial_plane.connect_member(peer_addr).await else {
+					return FloodHop::Unreached;
+				};
+				// A gateway outside the flood is owed no rumor, so the hop ends
+				// without an emit.
+				let Some(mut client) = answered else {
+					return FloodHop::OutsideFlood(target);
+				};
+				let Ok(reply) = client.emit(frame, None).await else {
+					return FloodHop::Unreached;
+				};
+
+				// Only a reply that names the origin as outside the target's
+				// trust changes what this gateway offers it next.
+				let response = reply.and_then(|reply| decode::<GossipResponse>(reply.message()).ok());
+				match response {
+					Some(response) if response.refuses_origin() => FloodHop::OriginRefused(target),
+					_ => FloodHop::Settled,
+				}
+			});
+		}
+
+		// A down peer must not stop the flood to the live ones, so the reflood
+		// counts a failed hop and moves on. A task that fails to join reaches
+		// no peer either, so it folds into the same count.
+		while let Some(joined) = fanout.join_next().await {
+			match joined {
+				Ok(FloodHop::Settled) => {}
+				// The answer is definitive on either path, so the reflood drops
+				// the address the way the beat's reconcile round does.
+				Ok(FloodHop::OutsideFlood(target)) => self.expel(target)?,
+				Ok(FloodHop::OriginRefused(target)) => {
+					if let Some(origin) = origin.as_deref() {
+						self.settle_refused_origin(target, origin, now)?;
+					}
+				}
+				Ok(FloodHop::Unreached) | Err(_) => unreached = unreached.saturating_add(1),
+			}
+		}
+
+		if unreached > 0 {
+			self.trace
+				.emit_event_with_value_and_evidence(CLUSTER_GOSSIP_FANOUT_UNREACHED, "", unreached, None)?;
+		}
+
+		Ok(())
+	}
+
+	/// Publishes the local slate as an origin-signed advertisement rumor.
+	///
+	/// The rumor wraps the same signed frame that direct advertisement dials
+	/// out, so members beyond direct reach admit it through the same
+	/// signer-binds-to-address path once the flood relays it.
+	///
+	/// # Journal
+	///
+	/// - The beat witnesses the published digest for deduplication alone, so
+	///   the origin's own echo arrives as a duplicate.
+	/// - Advertisements forgo retention, which serves repair and retry. They
+	///   are ephemeral hints that re-publish keeps fresh, and the origin holds
+	///   the slate it published.
+	/// - A journal that refuses the witness lets this gateway admit its own
+	///   echo again. The rumor is already created, so the beat traces
+	///   [`CLUSTER_GOSSIP_WITNESS_REFUSED`] and floods it anyway.
+	///
+	/// # Failures
+	///
+	/// A beat that built no advertisement, or a creation fault, returns
+	/// `false`, traces [`CLUSTER_PEER_AD_PUBLISH_FAILED`], and leaves the
+	/// caller's publish baseline intact so the next beat retries.
+	async fn publish_slate_rumor(&self, advertisement: Option<&SignedAdvertisement>) -> Result<bool, LoopFault> {
+		let minted = match advertisement {
+			Some(advertisement) => self.config.mint_slate_rumor(advertisement).await,
+			None => None,
+		};
+		let Some(minted) = minted else {
+			self.trace.emit_marker(CLUSTER_PEER_AD_PUBLISH_FAILED)?;
+			return Ok(false);
+		};
+
+		// The rumor states its creation instant, which is also the clock
+		// reading the witness prunes at.
+		let journal = &self.config.gossip.journal;
+		let witnessed = journal.witness(&minted.signer_id, minted.digest, minted.minted_at, minted.minted_at);
+		if witnessed.is_err() {
+			self.trace.emit_marker(CLUSTER_GOSSIP_WITNESS_REFUSED)?;
+		}
+
+		// The stamped lifetime is the budget left after this first hop
+		// arrives, the same value the pipeline stamps when it refloods a
+		// published rumor.
+		let hop_ttl = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
+		self.reflood(minted.rumor, hop_ttl.saturating_sub(1)).await?;
+
+		Ok(true)
+	}
+
+	/// Runs one anti-entropy reconcile round with a peer, and scores the
+	/// grey-hole drops the round finds.
+	///
+	/// A [`Round::Failed`] is peer-attributable, so the beat loops score it
+	/// toward eviction or probe discard. A local fault skips its own step, or
+	/// ends the beat as a [`LoopFault`] when it does not clear, so every score
+	/// stays attributable to the peer alone.
+	///
+	/// # Round order
+	///
+	/// 1. Collect the held digests from the journal.
+	/// 2. Complete the handshake and prove flood membership.
+	/// 3. Emit a signed reconcile request and decode the reply.
+	/// 4. Reject an oversized want-list or PEX sample.
+	/// 5. Promote the peer, learn PEX hints, and score grey-hole drops.
+	/// 6. Repair the rumors the peer lacks from the journal.
+	///
+	/// # Fault attribution
+	///
+	/// - A local fault before the emit or inside the post-reply scope leaves the peer unscored.
+	/// - An oversized reply or a dial failure returns [`Round::Failed`], so the caller scores the peer.
+	/// - Each early end records [`CLUSTER_RECONCILE_FAILED`] with the label its [`RoundEnd`] names.
+	/// - A learned peer outside the flood leaves the peer table at once and keeps its routes.
+	/// - A poisoned peer table at that expulsion ends the beat as
+	///   [`LoopFault::Registry`], and the peer's score stands.
+	/// - A trace fault anywhere in the round, its bookkeeping included, ends
+	///   the beat as [`LoopFault::Runtime`].
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault`] -- the errors of [`Self::expel`], and a trace that refused an event of the round.
+	async fn reconcile_round(&self, peer_addr: P::Address, peer: AdmittedDial) -> Result<Round, LoopFault> {
+		let now = self.config.clock.unix();
+		// A journal fault belongs to this gateway, so this gateway skips the
+		// round, and every score stays attributable to the peer.
+		let Ok(held_digests) = self.config.gossip.journal.held_digests(now) else {
+			return self.end_round(peer, RoundEnd::Journal);
+		};
+		// The reconciliation message type carries digests as owned OCTET
+		// STRING bytes, so each digest copies once here.
+		let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.as_bytes().to_vec()).collect();
+
+		// The round proves membership on the completed handshake, before the
+		// reconcile discloses anything (CWE-668).
+		let Ok(answered) = self.peer_plane.connect_member(peer_addr).await else {
+			return self.end_round(peer, RoundEnd::Unreachable);
+		};
+		let Some(mut client) = answered else {
+			// An answer from outside the flood is definitive, so a learned
+			// address leaves both learned tables at once.
+			self.expel(peer)?;
+
+			return Ok(Round::Settled);
+		};
+
+		let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
+
+		// The frame build and the signature are local. A fault here comes
+		// before the round asks the peer anything, so this gateway skips the
+		// round and leaves the peer unscored.
+		let builder = FrameBuilder::from(Version::V2)
+			.with_id(b"gossip-reconcile")
+			.with_order(now.get())
+			.with_message(request)
+			.with_priority(MessagePriority::NetworkControl);
+		let Ok(mut signed_frame) = self.config.witnessed(builder).build() else {
+			return self.end_round(peer, RoundEnd::Build);
+		};
+
+		let signing = signed_frame.sign_with_provider(self.config.tls.identity()).await;
+		if signing.is_err() {
+			return self.end_round(peer, RoundEnd::Sign);
+		}
+
+		// Each fault of the exchange is the peer's, so it fails the round.
+		let asked: Result<GossipWant, ClusterError> = async {
+			let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
+			let reply: GossipWant = decode(response.message())?;
+
+			// An oversized reply fails the round (CWE-770). The beat scores it
+			// like any failed round, so an abuser keeps its `new` entry with
+			// one more failure, or counts toward eviction from `tried`.
+			if reply.is_oversized() {
+				return Err(ClusterError::OversizedReconcileReply);
+			}
+
+			Ok(reply)
+		}
+		.await;
+		let Ok(reply) = asked else {
+			return self.end_round(peer, RoundEnd::Reply);
+		};
+
+		// A decoded, in-bounds reply proves liveness, so a bookkeeping fault
+		// leaves the peer's score as it stands. The round's event records the
+		// skip, and the next beat retries the skipped bookkeeping and repair.
+		match self.settle_round(&mut client, reply, peer, now).await {
+			Ok(()) => Ok(Round::Settled),
+			Err(LoopFault::Registry(_)) => self.end_round(peer, RoundEnd::Bookkeeping),
+			Err(fault @ LoopFault::Runtime(_)) => Err(fault),
+		}
+	}
+
+	/// Records that the round with `peer` ended early at `end`, as
+	/// [`CLUSTER_RECONCILE_FAILED`] with the peer's dial address, and returns
+	/// how the round reads to the peer's score.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Runtime`] -- the trace refused the event.
+	fn end_round(&self, peer: AdmittedDial, end: RoundEnd) -> Result<Round, LoopFault> {
+		let round = end.round();
+		let charged = round == Round::Failed;
+		let evidence = || Some(peer.address().route_bytes());
+		self.trace.emit_event_with_value_and_rendered_evidence(
+			CLUSTER_RECONCILE_FAILED,
+			end.label(),
+			charged,
+			evidence,
+		)?;
+
+		Ok(round)
+	}
+
+	/// Takes `peer`, which answered from outside the flood, out of the peer
+	/// table, and records it as [`CLUSTER_PEER_EXPELLED`] with the address as
+	/// its payload.
+	///
+	/// - The routes of `peer` stay, because that gateway may serve work by
+	///   direct peering, and each forward binds to its route's gateway.
+	/// - A configured anchor keeps its slot, so each beat advertises to it.
+	///
+	/// A poisoned table is this gateway's fault, so it ends the caller's loop,
+	/// and every peer's score stands.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Registry`] -- the table lock is poisoned.
+	/// - [`LoopFault::Runtime`] -- the trace refused the event.
+	fn expel(&self, peer: AdmittedDial) -> Result<(), LoopFault> {
+		self.config.peer.table.expel(peer)?;
+
+		let evidence = || Some(peer.address().route_bytes());
+		self.trace.emit_marker_with_evidence(CLUSTER_PEER_EXPELLED, evidence)?;
+
+		Ok(())
+	}
+
+	/// Applies one answered round's bookkeeping: promotion, PEX hints,
+	/// grey-hole scores, and journal repair.
+	///
+	/// A local fault in any step, a repair emit included, skips the rest of the
+	/// round and leaves the peer scored on the answer it already gave. A trace
+	/// fault ends the beat.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Registry`] -- a local step failed: a poisoned table,
+	///   registry, or journal, or a repair that failed to build, sign, or
+	///   reach the peer.
+	/// - [`LoopFault::Runtime`] -- the trace refused an event.
+	async fn settle_round(
+		&self,
+		client: &mut FloodClient<P>,
+		reply: GossipWant,
+		peer: AdmittedDial,
+		now: UnixMillis,
+	) -> Result<(), LoopFault> {
+		// A pooled connection keeps a dead peer's handshake certificate, so
+		// promotion waits for the reply. Promotion on the membership proof
+		// alone would reset the failure count each beat and hold the peer.
+		let answer = client.peer_certificate();
+		let peer_id = answer.and_then(|answer| self.config.peer_identity(answer));
+		if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
+			let evidence = || Some(peer.address().route_bytes());
+			self.trace.emit_marker_with_evidence(CLUSTER_PEER_DISCOVERED, evidence)?;
+		}
+
+		let GossipWant { want, pex } = reply;
+
+		// PEX entries are unverified hints: the allowlist gates them, the
+		// capped `new` table holds them, and a later feeler probe that
+		// proves membership is the only path to a dial target (CWE-345).
+		let hints = self.config.admissible_pex_hints(pex);
+		self.config
+			.learn_hints(&self.trace, HintSource::Pex(peer.address()), hints, now)?;
+
+		let wanted = self.config.read_want(&want);
+
+		// Grey-hole containment: one weaken per round scores a target whose
+		// ledger shows drops of rumors it acknowledged.
+		let dropping = self.ledgers.with(peer, |ledger| ledger.drop_signal(wanted.digests()));
+		if dropping {
+			let weakened = self.servlet_registry.weaken_peer_by_dial(peer.address())?;
+			self.trace.emit_marker(CLUSTER_GOSSIP_DROP_SIGNAL)?;
+
+			if let Some(abandoned) = weakened.abandoned() {
+				let cause = "drop-signal";
+				let address = peer.address().route_bytes();
+				let payload = Some(address.as_ref());
+				let trace = &self.trace;
+				trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ROUTE_ABANDONED, cause, abandoned, payload)?;
+			}
+		}
+
+		self.push_repairs(client, wanted.digests(), peer).await
+	}
+
+	/// Reconciles with one beat target, and counts a failed round toward its
+	/// eviction.
+	///
+	/// A dead tried peer frees its bucket slot at the threshold, and the
+	/// routes that dial it leave the registry.
+	///
+	/// # Lock order
+	///
+	/// `record_failure` releases the table guard before `withdraw_peer_by_dial`
+	/// takes the route lock, so the two locks never nest.
+	async fn reconcile_target(
+		&self,
+		peer_addr: P::Address,
+		peer: AdmittedDial,
+		trace: &TraceCollector,
+	) -> Result<(), LoopFault> {
+		let round = self.reconcile_round(peer_addr, peer).await?;
+		if round == Round::Settled {
+			return Ok(());
+		}
+
+		let evicted = self.config.peer.table.record_failure(peer)?;
+		if !evicted {
+			return Ok(());
+		}
+
+		// The routes that dial the evicted address leave before the beat
+		// emits the eviction event, so an observer of the event finds none
+		// of them.
+		let withdrawn = self.servlet_registry.withdraw_peer_by_dial(peer.address())?;
+
+		let address = peer.address().route_bytes();
+		let payload = Some(address.as_ref());
+		if let Some(withdrawn) = withdrawn {
+			trace.emit_event_with_value_and_evidence(CLUSTER_PEER_ROUTES_WITHDRAWN, "evicted", withdrawn, payload)?;
+		}
+		trace.emit_marker_with_evidence(CLUSTER_PEER_EVICTED, || payload)?;
+
+		Ok(())
+	}
+
+	/// Reconciles with unverified candidates and records the ones that fail.
+	///
+	/// Feeler probes run reconcile only, and a round that proves membership
+	/// and gets an in-bounds reply promotes the candidate. A failed round
+	/// stays on its candidate, which then waits out its backoff behind every
+	/// fresher one in its prefix bucket.
+	async fn probe_candidates(&self, probes: impl AsRef<[AdmittedDial]>) -> Result<(), LoopFault> {
+		let probes = probes.as_ref();
+		for peer in probes {
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
+				self.config.peer.table.discard(*peer)?;
+				continue;
+			};
+
+			let round = self.reconcile_round(peer_addr, *peer).await?;
+			if round == Round::Failed {
+				let now = self.config.clock.unix();
+				self.config.peer.table.record_probe_failure(*peer, now)?;
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Resends the journaled rumors that this peer wants.
+	///
+	/// - Each push carries an outer lifetime of 0, so a repair never refloods.
+	/// - Only a rumor inside the seen window is admissible.
+	/// - Only an explicit `Ok` reply arms the grey-hole ledger.
+	/// - The peer names every digest it lacks, and it lacks for good the
+	///   rumors of an origin its trust does not hold. Its first refusal of
+	///   such an origin settles that origin for the window, so this gateway
+	///   offers the push once.
+	/// - Each push whose reply decodes records [`CLUSTER_GOSSIP_REPAIR_PUSHED`] with the reply's status.
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Registry`] -- the journal failed, or a push failed to
+	///   build, to sign, or to reach the peer.
+	/// - [`LoopFault::Runtime`] -- the trace refused an event.
+	async fn push_repairs(
+		&self,
+		client: &mut FloodClient<P>,
+		wanted: impl AsRef<[GossipDigest]>,
+		peer: AdmittedDial,
+	) -> Result<(), LoopFault> {
+		let wanted = wanted.as_ref();
+		let now = self.config.clock.unix();
+		let seen = self.config.gossip.seen_window();
+		let missing = self.config.gossip.journal.fetch(wanted, now)?;
+		let admissible = missing.into_iter().filter(|(_, rumor)| seen.admits(rumor.issued_at(), now));
+
+		// The address renders at the first reply that decodes, so a round that
+		// pushes nothing renders nothing.
+		let mut address: Option<SharedId> = None;
+
+		for (pushed_digest, rumor) in admissible {
+			let origin = rumor.signer_id();
+			if !self.offers(peer, origin.as_deref(), now) {
+				continue;
+			}
+
+			// A push that fails to build, to sign, or to reach the peer is a
+			// local fault of the round, so it leaves as a cluster error, which
+			// skips the round. A trace fault ends the beat.
 			let push = ClusterRequest::Gossip(Box::new(rumor));
-			let mut signed = FrameBuilder::from(Version::V2)
+			let builder = FrameBuilder::from(Version::V2)
 				.with_id(b"gossip-repair")
 				.with_message(push)
 				.with_priority(MessagePriority::NetworkControl)
-				.with_lifetime(0)
-				.with_witness_hasher::<D>()
-				.build()?;
+				.with_lifetime(0);
+			let mut signed = self.config.witnessed(builder).build().map_err(ClusterError::from)?;
 
-			signed
-				.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-				.await?;
-			let Some(push_reply) = client.emit(signed, None).await? else {
+			let signing = signed.sign_with_provider(self.config.tls.identity()).await;
+			signing.map_err(ClusterError::from)?;
+
+			let Some(push_reply) = client.emit(signed, None).await.map_err(ClusterError::from)? else {
 				continue;
 			};
 			let Ok(gossip_reply) = decode::<GossipResponse>(push_reply.message()) else {
 				continue;
 			};
-			if matches!(gossip_reply.status, TransitStatus::Ok) {
-				acked.insert(pushed_digest);
+
+			let status = gossip_reply.status;
+			let label = status.as_str();
+			let rendered = address.get_or_insert_with(|| peer.address().route_bytes());
+			let payload = Some(rendered.as_ref());
+			self.trace
+				.emit_event_with_value_and_evidence(CLUSTER_GOSSIP_REPAIR_PUSHED, label, status, payload)?;
+
+			let acknowledged = gossip_reply.status == TransitStatus::Ok;
+			let refused_origin = origin.filter(|_| gossip_reply.refuses_origin());
+			if acknowledged {
+				self.ledgers.with(peer, |ledger| ledger.ack(pushed_digest));
+			}
+			if let Some(origin) = refused_origin {
+				self.settle_refused_origin(peer, origin, now)?;
 			}
 		}
 
@@ -749,60 +1156,72 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 	pub(crate) servlet_registry: Arc<ServletRegistry>,
 	/// The colony identity, the gossip journal, the rate admission, and the
 	/// peer caps that a rumor is checked against.
-	pub(crate) config: Arc<ClusterConfig>,
-	/// The connection pool that local ingress delivery dials on.
-	pub(crate) pool: Arc<ClusterPool<P>>,
-	/// The peer dial pool, resolved once from the gateway's planes.
-	pub(crate) peer_pool: Arc<ClusterPool<P>>,
+	pub(crate) config: ColonyConfig<P>,
+	/// The plane that local ingress delivery dials its servlet on.
+	pub(crate) hive_plane: HivePlane<P>,
+	/// The peer dial plane, resolved once from the gateway's planes.
+	pub(crate) peer_plane: PeerPlane<P>,
 	/// The trace collector for gossip admission and refusal events.
 	pub(crate) trace: Arc<TraceCollector>,
-	/// The owner of the reflood that this pipeline starts.
+	/// The gateway's task group, which owns the reflood this pipeline starts,
+	/// so a stop of the gateway also stops a reflood in flight.
 	pub(crate) tasks: TaskGroup,
+	/// What each gossip target acknowledged and refused, shared with the beat.
+	pub(crate) ledgers: Arc<PeerLedgers>,
 }
 
 impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
 	/// Projects the gateway's runtime state onto what a rumor needs.
 	fn from(ctx: GatewayRuntimeCtx<P>) -> Self {
-		let peer_pool = ctx.peer_dial_pool();
+		let peer_plane = ctx.peer_dial_plane();
 
 		Self {
 			servlet_registry: ctx.servlet_registry,
 			config: ctx.config,
-			peer_pool,
-			pool: ctx.pool,
+			peer_plane,
+			hive_plane: ctx.hive_plane,
 			trace: ctx.trace,
 			tasks: ctx.tasks,
+			ledgers: ctx.ledgers,
 		}
 	}
 }
 
-impl<P> GossipPipelineCtx<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
-	/// Delivers one admitted rumor payload to the configured local ingress
-	/// servlet.
+/// The consumers of one rumor on a gateway's gossip pipeline: the local
+/// ingress, and the routing state an advertisement applies to.
+struct RumorIntake<'a, P: Protocol> {
+	/// The pipeline that delivers and applies the rumor.
+	pipeline: &'a GossipPipelineCtx<P>,
+	/// The verified relay that carried the rumor, when a peer relayed it.
+	relay_id: Option<VerifiedSignerId>,
+	/// The verified signer of the rumor, which an advertisement binds to the
+	/// signer of the advertisement it carries.
+	rumor_signer: Option<VerifiedSignerId>,
+}
+
+impl<P: ColonyDialProtocol> RumorConsumer for RumorIntake<'_, P> {
+	async fn deliver(self, rumor: Frame, digest: GossipDigest) -> Result<(), LoopFault> {
+		self.pipeline.deliver_local(rumor, digest).await
+	}
+
+	fn apply_advertisement(self, payload: &[u8]) -> Result<(), LoopFault> {
+		self.pipeline.apply_peer_ad_rumor(self.relay_id, self.rumor_signer, payload)
+	}
+}
+
+impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
+	/// Delivers one admitted rumor to the configured local ingress servlet.
 	///
-	/// The claim is taken before the round trip and owned by a guard, so
-	/// the admission path and the reconcile beat never deliver one rumor
-	/// twice (CWE-362), and a delivery this task never finishes returns
-	/// the rumor to the retry set rather than stranding it.
-	async fn deliver_local(&self, payload: impl Into<Vec<u8>>, digest_value: GossipDigest) -> Result<(), LoopFault> {
-		let payload: Vec<u8> = payload.into();
+	/// - The servlet receives the origin-signed rumor frame unchanged, as it receives a work frame.
+	/// - The dial admits only the identity the servlet's registration names (CWE-346).
+	/// - The frame's message decodes as a [`GossipRumor`], and its signature
+	///   names the publishing gateway, so a servlet that serves many parties
+	///   can tell them apart and verify each one.
+	/// - The task takes the claim before the round trip, and a guard owns it,
+	///   so the admission path and the reconcile beat never deliver one rumor
+	///   twice (CWE-362).
+	/// - A delivery this task never finishes returns the rumor to the retry set.
+	async fn deliver_local(&self, rumor: Frame, digest_value: GossipDigest) -> Result<(), LoopFault> {
 		let journal = &self.config.gossip.journal;
 		let Some(type_key) = self.config.gossip.ingress.as_ref() else {
 			// With no ingress servlet configured, the rumor has no local
@@ -811,51 +1230,48 @@ where
 			return Ok(());
 		};
 
-		// Taking the claim before the round trip keeps the reconcile beat
-		// off this rumor. Every exit below drops the guard, which returns
-		// the rumor to the retry set.
+		// A claim taken before the round trip keeps the reconcile beat
+		// off this rumor. Each early exit below drops the guard, which
+		// returns the rumor to the retry set.
 		let Some(claim) = LocalClaimGuard::take(journal.as_ref(), &digest_value, self.config.clock.unix())? else {
 			return Ok(());
 		};
 
 		let entries = self.servlet_registry.local_entries_for_type(type_key)?;
-		// An out-of-range balancer answer skips delivery instead of
-		// panicking the gossip task (see `ClusterConfig::pick_instance`).
+		// An out-of-range balancer answer skips the delivery, and the gossip
+		// task runs on (see `ClusterConfig::pick_instance`).
 		let Some(entry) = self.config.pick_instance(&entries) else {
 			return Ok(());
 		};
 
-		let dial = entry.dial_target().clone();
-		let Ok(_response) = Hop::new(&self.pool, dial).deliver_envelope(payload).await else {
+		let choice = RouteChoice::of(entry);
+		let Ok(hop) = choice.hop(&self.hive_plane, None) else {
+			return Ok(());
+		};
+		let Ok(_response) = hop.deliver_frame(rumor).await else {
 			return Ok(());
 		};
 
 		claim.ack()?;
-		self.trace.event(CLUSTER_GOSSIP_ACCEPTED)?;
+		self.trace.emit_marker(CLUSTER_GOSSIP_DELIVERED)?;
 
 		Ok(())
 	}
 
-	/// Delivers the journal entries whose local consumption is still pending.
+	/// Delivers the journal entries whose local consumption is pending.
 	///
-	/// A rumor is still pending when ingress registered after admission,
-	/// or when a delivery hit a transient fault. Application rumors are the
-	/// retained kind, so delivery accepts that kind alone.
-	async fn retry_pending_local<D: ClusterDigest>(&self) -> Result<(), LoopFault> {
+	/// A rumor stays pending when ingress registers after its admission,
+	/// or when a delivery hits a transient fault. The kind of each rumor
+	/// decides its retry.
+	async fn retry_pending_local(&self) -> Result<(), LoopFault> {
 		let pending = self.config.gossip.journal.pending_local(self.config.clock.unix())?;
-
-		for rumor in pending {
+		for (digest, rumor) in pending {
 			let Ok(body) = decode::<GossipRumor>(rumor.message()) else {
 				continue;
 			};
-			let Ok(digest) = rumor.gossip_digest::<D>() else {
-				continue;
-			};
-			let GossipRumorKind::Application = body.kind else {
-				continue;
-			};
 
-			self.deliver_local(body.payload, digest).await?;
+			let intake = RumorIntake { pipeline: self, relay_id: None, rumor_signer: None };
+			body.kind.retry(intake, rumor, digest).await?;
 		}
 
 		Ok(())
@@ -872,140 +1288,149 @@ where
 	/// 3. Rate-limit before the journal and the reflood.
 	/// 4. Witness advertisement rumors, and retain application rumors for repair.
 	/// 5. Deliver application rumors locally, or apply advertisement rumors to routing.
-	/// 6. Reflood on a separate task when hop TTL and targets remain.
-	pub(crate) async fn run<D: ClusterDigest>(
+	/// 6. Record the admission as [`CLUSTER_GOSSIP_ADMITTED`], once the flood targets read.
+	/// 7. Reflood on a separate task when hop TTL and targets remain.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refuses an event, a delivery meets a
+	///   runtime fault, or the reply frame fails to build. A refused rumor
+	///   answers with a reply frame that carries its status.
+	pub(crate) async fn run(
 		self,
 		origin: GossipOrigin,
 		frame: Frame,
-		rumor: Frame,
+		rumor: VerifiedRumor,
 		hop_ttl: u64,
-		relay_id: Option<VerifiedSignerId>,
+		sender: VerifiedSignerId,
 		rumor_signer: Option<VerifiedSignerId>,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let admitted =
-			match AdmittedGossip::admit::<D>(&rumor, hop_ttl, self.config.gossip.seen_ttl, self.config.clock.unix()) {
-				Ok(admitted) => admitted,
-				Err(status) => {
-					let scored = self.weaken_invalid_relay(origin, relay_id.as_ref());
-					return Refusal::to(&frame, &self.trace).gossip_scored(scored, status);
-				}
-			};
+		// The caller verifies the sender's signature on the outer frame before
+		// the run, so each refusal of the run names the sender.
+		let audit = RequestAudit::proven(&self.trace);
+		let refusal = Refusal::to(&frame, &audit).by(&sender);
+		let relay_id = origin.relay(&sender);
+
+		let now = self.config.clock.unix();
+		let admitted = self.config.admit_rumor(&rumor, hop_ttl, now);
+		let rumor = rumor.into_frame();
+		let admitted = match admitted {
+			Ok(admitted) => admitted,
+			Err(status) => {
+				let scored = self.weaken_invalid_relay(origin, relay_id);
+				return refusal.gossip_scored(scored, status);
+			}
+		};
 
 		// Rate and journal keys use the verified origin signer, so a relay
 		// spends the origin's budget (CWE-770).
 		let attributed = origin.attributed(&frame, &rumor);
 		if attributed.nonrepudiation().is_none() {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unauthenticated);
+			return refusal.gossip(TransitStatus::Unauthenticated);
 		}
 		let Some(signer_id) = attributed.signer_id() else {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
+			return refusal.gossip(TransitStatus::PermissionDenied);
 		};
 
 		// Drop known duplicates before rate admission so the bucket spends on
-		// new rumors only.
+		// unseen rumors only.
 		let now = self.config.clock.unix();
-		match self.config.gossip.journal.seen(&admitted.digest(), now) {
+		match self.config.gossip.journal.seen(admitted.digest(), now) {
 			Ok(true) => {
-				self.trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
-				return reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
+				self.trace.emit_marker(CLUSTER_GOSSIP_DUPLICATE)?;
+				return ReplyForm::Plain.reply(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
 			}
 			Ok(false) => {}
-			Err(_) => {
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+			Err(error) => {
+				return refusal.gossip_error(&error);
 			}
 		}
 
-		// The rate limit runs before journal and reflood (CWE-770). A
+		// The rate limit runs before the journal and the reflood (CWE-770). A
 		// backend fault refuses closed.
 		match self.config.gossip.admission.allow(&signer_id, now) {
 			Ok(true) => {}
 			Ok(false) => {
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::ResourceExhausted);
+				return refusal.gossip(TransitStatus::ResourceExhausted);
 			}
-			Err(_) => {
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+			Err(error) => {
+				return refusal.gossip_error(&error);
 			}
 		}
 
-		// Application rumors retain for anti-entropy repair and delivery
-		// retry. Advertisement rumors witness for dedup only, which keeps
-		// retention and repair bandwidth for the rumors that use them.
-		let journaled = match admitted.kind() {
-			GossipRumorKind::Application => {
-				self.config.gossip.journal.record(&signer_id, admitted.digest(), &rumor, now)
-			}
-			GossipRumorKind::PeerAdvertisement => {
-				self.config.gossip.journal.witness(&signer_id, admitted.digest(), now)
-			}
-		};
+		// The kind decides whether the journal retains the rumor or witnesses
+		// its digest alone.
+		let digest = *admitted.digest();
+		let journal = self.config.gossip.journal.as_ref();
+		let journaled = admitted.kind().journal(journal, &signer_id, digest, &rumor, now);
 		match journaled {
 			Ok(Admission::Duplicate) => {
-				self.trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
-				return reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
+				self.trace.emit_marker(CLUSTER_GOSSIP_DUPLICATE)?;
+				return ReplyForm::Plain.reply(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
 			}
 			Ok(Admission::New) => {}
-			Err(_) => {
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+			Err(error) => {
+				return refusal.gossip_error(&error);
 			}
 		}
 
-		// Local consumption is separate from journal admission. A retained
-		// application rumor acks after delivery, and an advertisement rumor is
-		// gateway routing control that applies to the registry instead.
-		let applied = match admitted.kind() {
-			GossipRumorKind::Application => {
-				let digest_value = admitted.digest();
-				self.deliver_local(admitted.into_payload(), digest_value).await
-			}
-			GossipRumorKind::PeerAdvertisement => {
-				// Only a relayed rumor names a relay hop to fall back on, and
-				// the origin already holds the slate it published.
-				self.apply_peer_ad_rumor(relay_id, rumor_signer, admitted.payload())
-			}
-		};
+		// Local consumption is separate from journal admission, and the kind
+		// decides it. Only a relayed rumor names a relay hop to fall back on,
+		// and the origin already holds the slate it published.
+		let intake = RumorIntake { pipeline: &self, relay_id: relay_id.cloned(), rumor_signer };
+		let applied = admitted.kind().consume(intake, &rumor, digest, admitted.payload()).await;
 		if let Err(fault) = applied {
-			return Refusal::to(&frame, &self.trace).gossip_fault(fault);
+			return refusal.gossip_fault(fault);
 		}
 
 		let has_targets = match self.config.peer.table.has_targets() {
 			Ok(has_targets) => has_targets,
 			Err(error) => {
-				return Refusal::to(&frame, &self.trace).gossip_fault(LoopFault::Registry(error));
+				return refusal.gossip_error(&error);
 			}
 		};
 
-		let flood = GossipBeat {
-			config: Arc::clone(&self.config),
-			peer_pool: Arc::clone(&self.peer_pool),
-			servlet_registry: Arc::clone(&self.servlet_registry),
-			trace: Arc::clone(&self.trace),
-		};
+		// The rumor passed every check, so the verdict is the admission. The
+		// payload names the signer that the rumor's budget spends against.
+		let kind = admitted.kind().label();
+		let signer = Some(signer_id.as_slice());
+		self.trace
+			.emit_event_with_value_and_evidence(CLUSTER_GOSSIP_ADMITTED, kind, hop_ttl, signer)?;
+
+		let flood = FloodBeat::new(
+			self.config.clone(),
+			self.peer_plane.clone(),
+			Arc::clone(&self.servlet_registry),
+			Arc::clone(&self.trace),
+			Arc::clone(&self.ledgers),
+		);
 		let GossipPipelineCtx { tasks, .. } = self;
 
 		// The reflood runs on its own task so the Ok reply below returns at
-		// this gateway's pace. The gateway's group owns it, so stopping the
-		// gateway stops a reflood still dialling. The rumor moves into the task
-		// unchanged, and the reply only needs the outer frame id.
-		if hop_ttl > 0 && has_targets {
-			let next_ttl = hop_ttl - 1;
-			tasks.spawn(async move {
-				// Detached, so nothing above can act on the outcome. A
-				// delivery fault is already on the trace, and a poisoned
-				// table is recorded here, which is where a reader looks.
-				if let Err(fault) = flood.reflood::<D>(rumor, next_ttl).await {
-					fault.record(&flood.trace);
-				}
-			});
+		// this gateway's pace. The rumor moves into the task unchanged, and the
+		// reply only needs the outer frame id.
+		match (flood, hop_ttl.checked_sub(1)) {
+			(Some(flood), Some(next_ttl)) if has_targets => {
+				tasks.spawn(async move {
+					// The detached task has no caller. Its reflood traces
+					// unreached hops, and the task records a poisoned table
+					// here, where a reader looks.
+					if let Err(fault) = flood.reflood(rumor, next_ttl).await {
+						fault.record(&flood.trace);
+					}
+				});
+			}
+			_ => {}
 		}
 
-		reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok })
+		ReplyForm::Plain.reply(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok })
 	}
 
 	/// Verifies, admits, and reconciles one advertisement rumor.
 	///
 	/// It returns the learned origin fingerprint, or [`None`] for any refusal.
-	/// The caller owns learned and dropped audit events. Relay-trail refusal
-	/// traces here because the ad itself still learns.
+	/// The caller owns the learned and dropped audit events. A relay-trail
+	/// refusal traces here, because the function learns the ad all the same.
 	///
 	/// # Evaluation order
 	///
@@ -1013,9 +1438,10 @@ where
 	/// 2. Bind the rumor signer and the inner signer to the same origin.
 	/// 3. Reject a stale or far-future control order.
 	/// 4. Admit through [`AdmittedPeerAd::admit`].
-	/// 5. Learn the discovery hint and reconcile the direct slate.
-	/// 6. Install a best-effort relay trail when the hop budget and the relay's
-	///    dial address allow.
+	/// 5. Learn the discovery hint and reconcile the direct slate, and record what each changed.
+	/// 6. Install a best-effort relay trail when the hop budget and the relay's dial address allow.
+	/// 7. Record a new relay trail as [`CLUSTER_RELAY_TRAIL_INSTALLED`], and a
+	///    refused one as [`CLUSTER_RELAY_TRAIL_REFUSED`].
 	fn try_apply_peer_ad_rumor(
 		&self,
 		relay_id: Option<VerifiedSignerId>,
@@ -1027,8 +1453,8 @@ where
 		};
 
 		let payload = payload.as_ref();
-		// `decode` borrows through `AsRef`, so the extra reference is the
-		// signature's requirement, not an indirection slip.
+		// `decode` borrows through `AsRef`, so its signature requires the extra
+		// reference.
 		let Ok(inner) = decode::<Frame>(&payload) else {
 			return Ok(None);
 		};
@@ -1043,10 +1469,9 @@ where
 			return Ok(None);
 		}
 
-		// The direct path bounds the control order through its replay guard.
-		// The rumor path applies the same bound here, so every admitted order
-		// falls inside the withdrawal tombstone's window (CWE-294) and inside
-		// the ledger's prunable range (CWE-770).
+		// The rumor path applies the direct path's order bound here, so every
+		// admitted order falls inside the withdrawal tombstone's window
+		// (CWE-294) and the ledger's prunable range (CWE-770).
 		if !self.config.ad_order_fresh(inner.issued_at(), self.config.clock.unix()) {
 			return Ok(None);
 		}
@@ -1060,46 +1485,51 @@ where
 
 		let origin = Arc::clone(&admitted.peer_hive_id);
 
-		// The relay hop that delivered this rumor is itself a verified peer.
-		// A trail installs under its own bucket beside the direct trail when
-		// this gateway may spend the two forwards a relay needs and the
-		// relay's dial address is known, which is exactly when pheromone can
-		// fail over to it (CWE-772).
+		// The relay hop that delivered this rumor is itself a verified peer, so
+		// its trail can install under its own bucket beside the direct one
+		// (CWE-772).
 		let relay_trail = relay_id.filter(|_| self.config.peer.max_hops >= 2).and_then(|relay_id| {
 			let relay_socket = self.servlet_registry.relay_dial_addr(relay_id.as_shared())?;
 			let relay_dial = self.config.peer.admit_dial(relay_socket).ok()?;
 			admitted.relay_trail(relay_id.as_shared(), relay_dial, &self.config.pheromone)
 		});
 
-		// The learned origin is also a discovery hint, exactly like a
-		// direct advertiser. It waits in the capped new table until this
-		// gateway's own probe passes the colony gate.
+		// The learned origin is also a discovery hint, as a direct
+		// advertiser is. It waits in the capped `new` table until this
+		// gateway's own probe proves it a flood member.
 		let hint = admitted.discovery_hint();
-		self.config.peer.table.learn([hint])?;
+		let learned_at = self.config.clock.unix();
+		self.config
+			.learn_hints(&self.trace, HintSource::Origin(origin.as_ref()), [hint], learned_at)?;
 
-		// A poisoned registry is this gateway's fault and ends the caller,
-		// where a refused slate is the advertisement's and drops it.
-		match self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
-			Ok(()) => {}
-			Err(ClusterError::LockPoisoned) => return Err(LoopFault::Registry(ClusterError::LockPoisoned)),
-			Err(_) => return Ok(None),
-		}
+		// A refused slate that is the advertiser's fault drops the rumor, and
+		// a fault of this gateway's, such as a poisoned registry, ends the
+		// caller.
+		let change = match self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
+			Ok(change) => change,
+			Err(error) if error.blames_the_advertiser() => return Ok(None),
+			Err(error) => return Err(LoopFault::Registry(error)),
+		};
+		change.record_direct(&self.trace, origin.as_ref())?;
 
-		// Fallback install is best-effort. The direct trail already
-		// landed, and a refused relay bucket (caps or a stale order) only
-		// forfeits the fallback path. The refusal still traces, so a
-		// missing fallback is diagnosable (ISO 27001 A.8.15).
-		if let Some(trail) = relay_trail {
-			match self.servlet_registry.reconcile_relay_trail(trail, PeerCaps::default()) {
-				Ok(()) => {}
-				Err(ClusterError::LockPoisoned) => return Err(LoopFault::Registry(ClusterError::LockPoisoned)),
-				Err(_) => {
-					self.trace
-						.event(CLUSTER_RELAY_TRAIL_REFUSED)?
-						.with_payload(origin.as_ref())
-						.emit();
-				}
+		// The direct trail already landed, so a refused relay bucket (caps or a
+		// stale order) forfeits the fallback path alone. The refusal traces
+		// all the same, so a lost fallback is diagnosable (ISO 27001 A.8.15).
+		let Some(trail) = relay_trail else {
+			return Ok(Some(origin));
+		};
+
+		let payload = Some(origin.as_ref());
+		match self.servlet_registry.reconcile_relay_trail(trail, PeerCaps::default()) {
+			Ok(change) if change.opens_bucket() => {
+				self.trace
+					.emit_marker_with_evidence(CLUSTER_RELAY_TRAIL_INSTALLED, || payload)?;
 			}
+			Ok(_refreshed) => {}
+			Err(error) if error.blames_the_advertiser() => {
+				self.trace.emit_marker_with_evidence(CLUSTER_RELAY_TRAIL_REFUSED, || payload)?;
+			}
+			Err(error) => return Err(LoopFault::Registry(error)),
 		}
 
 		Ok(Some(origin))
@@ -1108,28 +1538,30 @@ where
 	/// Applies one admitted peer-advertisement rumor to routing state.
 	///
 	/// The wrapped frame MUST verify on the peer trust plane, and the rumor
-	/// signer MUST match the inner advertisement signer. An advertisement
-	/// therefore travels only under the identity that authored it.
+	/// signer MUST match the inner advertisement signer. So an advertisement
+	/// travels only under its author's identity.
 	///
 	/// # Admission
 	///
-	/// A rumor follows the identical direct-ad path
-	/// ([`AdmittedPeerAd::admit`]): order freshness, the colony gate, the dial
-	/// allowlist, the message checks, and the discovery hint.
+	/// A rumor follows the same direct-ad path ([`AdmittedPeerAd::admit`]):
+	/// order freshness, flood membership, the dial allowlist, the message
+	/// checks, and the discovery hint.
 	///
 	/// # Reconciliation
 	///
 	/// - Slate reconciliation installs a direct trail that dials the origin.
-	/// - When `max_hops` affords relay forwarding and the relaying peer is
-	///   known, a relay trail installs beside the direct trail as fallback.
-	/// - Registry policy refuses a slate that collides with a local route,
-	///   including this gateway's own echoed slate.
+	/// - When `max_hops` affords a relay's two forwards and the relay's dial
+	///   address is known, a relay trail installs beside the direct trail as
+	///   fallback. Only then can pheromone fail over to it (CWE-772).
+	/// - Registry policy refuses a slate that collides with a local route, such
+	///   as this gateway's own echoed slate.
 	///
 	/// # Audit
 	///
 	/// A learned slate traces [`CLUSTER_PEER_AD_LEARNED`] with the origin
 	/// fingerprint. Every refusal traces [`CLUSTER_PEER_AD_DROPPED`] (ISO 27001
-	/// A.8.15), carrying the rumor signer when it is verifiable.
+	/// A.8.15), with the rumor signer as its payload when the signer is
+	/// verifiable.
 	fn apply_peer_ad_rumor(
 		&self,
 		relay_id: Option<VerifiedSignerId>,
@@ -1139,27 +1571,36 @@ where
 		let payload = payload.as_ref();
 		match self.try_apply_peer_ad_rumor(relay_id, rumor_signer.clone(), payload)? {
 			Some(origin) => {
-				self.trace.event(CLUSTER_PEER_AD_LEARNED)?.with_payload(origin.as_ref()).emit();
+				let origin = Some(origin.as_ref());
+				self.trace.emit_marker_with_evidence(CLUSTER_PEER_AD_LEARNED, || origin)?;
 			}
 			None => {
 				// The rumor signer is the closest identity a refusal can
 				// name for the audit trail. An unverifiable signer drops
 				// without attribution (ISO 27001 A.8.15).
-				let event = self.trace.event(CLUSTER_PEER_AD_DROPPED)?;
-				match rumor_signer {
-					Some(signer) => event.with_payload(signer.as_shared().as_ref()).emit(),
-					None => event.emit(),
-				}
+				let signer = rumor_signer.as_ref().map(|signer| signer.as_shared().as_ref());
+				self.trace.emit_marker_with_evidence(CLUSTER_PEER_AD_DROPPED, || signer)?;
 			}
 		}
 
 		Ok(())
 	}
+}
 
-	/// Scores a misbehaving relay peer.
+// A relay score reads the registry and the trace alone, so this impl bounds
+// `P` by `Protocol` and leaves the dial bounds to the pipeline's own impl.
+impl<P: Protocol> GossipPipelineCtx<P> {
+	/// Scores a relay peer that sent invalid input.
 	///
 	/// An origin publish has no relay to score, so it returns without
-	/// effect.
+	/// effect. A score that weakened a route records
+	/// [`CLUSTER_GOSSIP_RELAY_WEAKENED`], and a score that drove routes to
+	/// their abandonment limit records [`CLUSTER_PEER_ROUTE_ABANDONED`].
+	///
+	/// # Errors
+	///
+	/// - [`LoopFault::Registry`] -- the route lock is poisoned.
+	/// - [`LoopFault::Runtime`] -- the trace refused the event.
 	pub(crate) fn weaken_invalid_relay(
 		&self,
 		origin: GossipOrigin,
@@ -1172,42 +1613,43 @@ where
 			return Ok(());
 		};
 
+		// The audit payload names the scored peer's fingerprint.
 		let weakened = self.servlet_registry.weaken_peer(peer_id.as_shared())?;
-		if weakened > 0 {
-			// The audit payload names the scored peer's fingerprint.
+		let payload = Some(peer_id.as_shared().as_ref());
+		if weakened.count() > 0 {
 			self.trace
-				.event(CLUSTER_GOSSIP_RELAY_WEAKENED)?
-				.with_payload(peer_id.as_shared().as_ref())
-				.emit();
+				.emit_marker_with_evidence(CLUSTER_GOSSIP_RELAY_WEAKENED, || payload)?;
+		}
+		if let Some(abandoned) = weakened.abandoned() {
+			let cause = "relay-score";
+			self.trace
+				.emit_event_with_value_and_evidence(CLUSTER_PEER_ROUTE_ABANDONED, cause, abandoned, payload)?;
 		}
 
 		Ok(())
 	}
 }
 
-/// Change-driven publish state for the advertisement rumor.
+/// The change-driven publish state of the advertisement rumor.
 ///
-/// The beat publishes when the slate or flood target set changed, and on
+/// The beat publishes when the slate or the flood target set changed, and on
 /// a configured refresh interval for late joiners (see
 /// [`DEFAULT_AD_RUMOR_REFRESH_MS`]).
 ///
 /// # Poison recovery
 ///
-/// The guarded value is written by plain field assignments alone, so a
-/// panic cannot leave it half-written and every method recovers a poisoned
-/// guard instead of refusing the beat.
+/// Plain field assignments alone write the guarded value, so a panic cannot
+/// leave it half-written. Every method recovers a poisoned guard, so the beat
+/// runs on after a panic.
 ///
 /// # Claim lifecycle
 ///
-/// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while
-///    the task runs.
-/// 2. The claiming task creates and refloods the rumor.
-/// 3. [`Self::commit`] records the baseline after a rumor went out.
-/// 4. [`Self::abort`] releases a failed claim with the old baseline
-///    intact, so the next beat retries.
+/// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while the task runs.
+/// 2. The task that holds the claim creates and refloods the rumor.
+/// 3. [`Self::commit`] records the baseline after a rumor goes out.
+/// 4. [`Self::abort`] releases a failed claim with the committed baseline intact, so the next beat retries.
 ///
-/// [`DEFAULT_AD_RUMOR_REFRESH_MS`]:
-/// crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
+/// [`DEFAULT_AD_RUMOR_REFRESH_MS`]: crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
 struct AdPublishState {
 	inner: Mutex<AdPublishInner>,
 	refresh: Duration,
@@ -1229,8 +1671,8 @@ impl AdPublishState {
 	///
 	/// `true` marks a publish in flight and leaves the baseline untouched
 	/// until [`Self::commit`] or [`Self::abort`] settles the claim. `false`
-	/// means that the slate and the targets still match the baseline inside
-	/// the refresh window, or that a publish already holds the claim.
+	/// means that the slate and the targets match the baseline inside the
+	/// refresh window, or that a publish already holds the claim.
 	fn take_due(
 		&self,
 		now: UnixMillis,
@@ -1255,7 +1697,8 @@ impl AdPublishState {
 		due
 	}
 
-	/// Records a completed publish as the new suppression baseline.
+	/// Records a completed publish as the suppression baseline, and releases
+	/// the claim.
 	fn commit(
 		&self,
 		now: UnixMillis,
@@ -1273,44 +1716,33 @@ impl AdPublishState {
 	/// Releases a failed claim and keeps the baseline.
 	fn abort(&self) {
 		let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-
 		inner.in_flight = false;
 	}
 }
 
-impl<P> GatewayRuntimeCtx<P>
-where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-{
+impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// Spawns the beat that re-announces local types to peers.
 	///
 	/// Each beat retries pending local delivery, publishes due advertisement
-	/// rumors, dials verified targets with one shared signed frame, and runs
-	/// reconcile rounds for colony members and feeler probes.
-	pub(crate) fn spawn_advertise<D: ClusterDigest>(self, gateway_addr: Arc<[u8]>) -> rt::JoinHandle {
+	/// rumors, dials beat targets with one shared signed frame, and runs
+	/// reconcile rounds for flood members and feeler probes.
+	pub(crate) fn spawn_advertise(self, gateway_addr: Arc<[u8]>) -> rt::JoinHandle {
 		// Repair delivery is a gossip pipeline invocation, so it reuses the
-		// inbound context rather than re-pairing the same four handles.
+		// inbound context, which pairs the same seven handles once.
 		let delivery = GossipPipelineCtx::from(self.clone());
-		let beat = GossipBeat {
-			config: Arc::clone(&self.config),
-			peer_pool: self.peer_dial_pool(),
+		let peer_plane = self.peer_dial_plane();
+		let beat = AdvertiseBeat {
+			config: self.config.clone(),
+			advertiser: peer_plane.advertiser(),
 			servlet_registry: Arc::clone(&self.servlet_registry),
-			trace: Arc::clone(&self.trace),
 		};
+		let flood = FloodBeat::new(
+			self.config.clone(),
+			peer_plane,
+			Arc::clone(&self.servlet_registry),
+			Arc::clone(&self.trace),
+			Arc::clone(&self.ledgers),
+		);
 
 		let GatewayRuntimeCtx { config, trace, tasks, .. } = self;
 
@@ -1327,22 +1759,23 @@ where
 					config.peer.table.exclude_self(local)?;
 				}
 
-				// The per-peer ledger of `Ok` replies feeds grey-hole
-				// detection. Each beat keeps only the live target and probe
-				// addresses, so the table's own caps bound the map (CWE-770).
-				let mut push_ledger: HashMap<AdmittedDial, HashSet<GossipDigest>> = HashMap::new();
 				let ad_publish = Arc::new(AdPublishState::new(config.rumor_refresh()));
 				loop {
 					config.clock.sleep(interval).await;
-					delivery.retry_pending_local::<D>().await?;
+					delivery.retry_pending_local().await?;
 
-					// Beat targets are anchors plus verified tried peers.
-					// Probes are unverified candidates awaiting their feeler
-					// dial.
+					// The beat targets are the anchors plus the verified tried
+					// peers. The probes are unverified candidates that wait for
+					// their feeler dial.
 					let targets = config.peer.table.target_set()?;
 					let probes = config.peer.table.probe_sample(config.clock.unix())?;
 
-					push_ledger.retain(|peer, _| targets.contains(peer) || probes.contains(peer));
+					// The per-peer ledgers feed grey-hole detection and hold
+					// each target's refusals. Each beat keeps the live target
+					// and probe addresses alone.
+					if let Some(flood) = flood.as_ref() {
+						flood.prune_ledgers(&targets, &probes);
+					}
 
 					if targets.is_empty() && probes.is_empty() {
 						continue;
@@ -1350,29 +1783,42 @@ where
 
 					let slate = beat.exported_slate()?;
 
-					// The slate also floods as an origin-signed rumor, so
-					// members beyond direct reach learn it. The publish runs on
-					// its own task so the direct advertisements below dial at
-					// this gateway's pace.
+					// The rumor publish runs on its own task, so the direct
+					// advertisements below dial at this gateway's pace.
 					let now = config.clock.unix();
-					if config.colony_urn().is_some() && ad_publish.take_due(now, &slate, &targets) {
-						let publish_state = Arc::clone(&ad_publish);
-						let publish_beat = beat.clone();
-						let publish_addr = Arc::clone(&gateway_addr);
+					let publishing = match flood.as_ref() {
+						Some(flood) if ad_publish.take_due(now, &slate, &targets) => Some(flood.clone()),
+						_ => None,
+					};
 
-						// The captured vectors become the commit baseline,
-						// and the publish consumes its own slate copy inside
-						// the task.
-						let publish_slate = slate.clone();
+					// A beat that publishes keeps the slate as its commit
+					// baseline, so that beat alone copies the slate for
+					// `mint_ad_frame`.
+					let (ad_slate, publishing) = match publishing {
+						Some(publish_beat) => (slate.clone(), Some((publish_beat, slate))),
+						None => (slate, None),
+					};
+
+					// An advertisement that fails to build skips this beat's
+					// advertisements, and the next beat builds another.
+					let mut advertisement = None;
+					if !targets.is_empty() || publishing.is_some() {
+						let minted = config.mint_ad_frame(gateway_addr.as_ref(), ad_slate).await;
+						advertisement = minted.ok().map(Arc::new);
+					}
+
+					if let Some((publish_beat, publish_slate)) = publishing {
+						let publish_state = Arc::clone(&ad_publish);
+						let publish_advertisement = advertisement.clone();
+
+						// The captured vectors become the commit baseline.
 						let publish_targets = targets.clone();
 						tasks.spawn(async move {
-							let published =
-								publish_beat.publish_slate_rumor::<D>(publish_addr, publish_slate.clone()).await;
+							let publish_advertisement = publish_advertisement.as_deref();
+							let published = publish_beat.publish_slate_rumor(publish_advertisement).await;
 
-							// A publish that faulted releases its claim, so
-							// the next beat retries it. A poisoned table is
-							// recorded, because this task has no other
-							// observer.
+							// This task records a poisoned table here, because
+							// it has no other observer.
 							match published {
 								Ok(true) => {
 									publish_state.commit(
@@ -1390,19 +1836,11 @@ where
 						});
 					}
 
-					// One frame and one signature serve every direct target,
-					// and each dial takes a clone of the signed frame. The
-					// build moves the slate in, because this is its last use in
-					// the beat. A frame that fails to build skips this beat's
-					// direct advertisements, and the next beat builds another.
-					let mut ad_frame = None;
-					if !targets.is_empty() {
-						ad_frame = config.mint_ad_frame::<D>(gateway_addr.as_ref(), slate).await.ok();
+					let advertisement = advertisement.as_deref();
+					beat.dial_targets(flood.as_ref(), &targets, advertisement, &trace).await?;
+					if let Some(flood) = flood.as_ref() {
+						flood.probe_candidates(&probes).await?;
 					}
-
-					beat.dial_targets::<D>(&targets, ad_frame.as_ref(), &mut push_ledger, &trace)
-						.await?;
-					beat.probe_candidates::<D>(&probes, &mut push_ledger).await?;
 				}
 			}
 			.await;
@@ -1419,12 +1857,120 @@ where
 
 #[cfg(test)]
 mod tests {
+	use core::num::{NonZeroU32, NonZeroUsize};
+
 	use super::*;
-	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PeerConfig};
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
+	use crate::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
+	use crate::colony::urn::ColonyNamespace;
+	use crate::constants::MAX_PEER_TRIED_FAILURES;
+	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::Certificate;
+	use crate::instrumentation::events::CLUSTER_RECONCILE_ANSWERED;
+	use crate::oids::HASH_SHA3_256;
+	use crate::testing::{unhex, SetupEnv, TestCertificate, TestKey, TestRumor};
+	use crate::transport::TokioListener;
+	use crate::utils::time::ManualClock;
+	use crate::{absent, exactly, tb_assert_spec, tb_cases, tb_scenario};
+
+	/// The window a refusal stands for in these tests.
+	const WINDOW: Duration = Duration::from_secs(120);
+
+	#[test]
+	fn ledger_holds_a_refused_origin_for_one_window() {
+		let mut ledger = PeerLedger::default();
+		ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
+
+		let offers = [
+			ledger.offers(b"origin-a", UnixMillis::new(1_000), WINDOW),
+			ledger.offers(b"origin-a", UnixMillis::new(120_999), WINDOW),
+			ledger.offers(b"origin-a", UnixMillis::new(121_000), WINDOW),
+			ledger.offers(b"origin-b", UnixMillis::new(1_000), WINDOW),
+		];
+
+		assert_eq!(offers, [false, false, true, true]);
+	}
+
+	#[test]
+	fn ledger_expires_a_refusal_once_its_window_has_passed() {
+		let mut ledger = PeerLedger::default();
+		ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
+		ledger.refuse_origin(b"origin-b", UnixMillis::new(60_000));
+		ledger.expire(UnixMillis::new(121_000), WINDOW);
+
+		let held: Vec<&[u8]> = ledger.refused_origins.keys().map(Vec::as_slice).collect();
+		assert_eq!(held, vec![b"origin-b".as_slice()]);
+	}
+
+	/// A SHA3-256 rumor digest of 32 octets of `fill`.
+	fn digest_of(fill: u8) -> GossipDigest {
+		GossipDigest::read::<Sha3_256>([fill; 32]).expect("32 octets read as a SHA3-256 digest")
+	}
+
+	#[test]
+	fn ledger_reads_an_acknowledged_digest_wanted_again_as_a_drop() {
+		let mut ledger = PeerLedger::default();
+		ledger.ack(digest_of(1));
+		let signals = [
+			ledger.drop_signal([digest_of(2)]),
+			ledger.drop_signal([digest_of(1)]),
+			ledger.drop_signal([digest_of(1)]),
+		];
+
+		assert_eq!(signals, [false, true, false]);
+	}
+
+	#[test]
+	fn ledgers_keep_the_live_targets_alone() {
+		let ledgers = PeerLedgers::default();
+		let live = dial("10.0.0.1:9000");
+		let gone = dial("10.0.0.2:9000");
+		ledgers.with(live, |ledger| ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000)));
+		ledgers.with(gone, |ledger| ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000)));
+		ledgers.prune(|target| *target == live, UnixMillis::new(2_000), WINDOW);
+
+		let offers = [
+			ledgers.with(live, |ledger| ledger.offers(b"origin-a", UnixMillis::new(2_000), WINDOW)),
+			ledgers.with(gone, |ledger| ledger.offers(b"origin-a", UnixMillis::new(2_000), WINDOW)),
+		];
+		assert_eq!(offers, [false, true]);
+	}
+
+	/// The SHA3-256 digest of the to-be-signed encoding and then the signature
+	/// of the fixed test rumor, `TestRumor::application(1_000, [1, 2, 3])`,
+	/// computed with Python's `hashlib.sha3_256`.
+	const HOUSE_RUMOR_DIGEST: &str = "6d94eba786b7f0f7dc8edf6f96289336b4d2fe4ffeddec6052ee8ccafbf70e20";
+
+	/// A house gateway admits a rumor under the SHA3-256 digest of its
+	/// to-be-signed encoding and then its origin signature, the digest its
+	/// protocol's provider names.
+	#[test]
+	fn a_house_gateway_digests_a_rumor_under_sha3_256() -> Result<(), TransitStatus> {
+		let config = ColonyConfig::<TokioListener>::new(test_config());
+		let rumor = TestRumor::verified(TestRumor::application(1_000, [1, 2, 3]));
+
+		let admitted = config.admit_rumor(&rumor, 0, UnixMillis::new(1_000))?;
+		assert_eq!(admitted.digest().as_bytes(), unhex(HOUSE_RUMOR_DIGEST));
+		Ok(())
+	}
+
+	/// A house gateway witnesses each frame it builds under SHA3-256, the
+	/// digest its protocol's provider names.
+	#[test]
+	fn a_house_gateway_witnesses_its_frames_under_sha3_256() -> Result<(), TightBeamError> {
+		let config = ColonyConfig::<TokioListener>::new(test_config());
+		let message = GossipRumor::application(vec![1, 2, 3]);
+		let builder = FrameBuilder::from(Version::V2).with_id(b"witnessed").with_order(1_000);
+
+		let frame = config.witnessed(builder.with_message(message)).build()?;
+		let witness = frame.integrity().map(|info| info.algorithm.oid);
+		assert_eq!(witness, Some(HASH_SHA3_256));
+		Ok(())
+	}
 
 	/// A config that holds the fields these tests read.
 	fn test_config() -> ClusterConfig {
@@ -1457,15 +2003,16 @@ mod tests {
 		GossipWant { want, pex }
 	}
 
-	#[test]
-	fn reconcile_reply_bounds_want_and_pex() {
-		let cases = [
-			(MAX_GOSSIP_LOG, MAX_PEX_SAMPLE, false),
-			(MAX_GOSSIP_LOG + 1, MAX_PEX_SAMPLE, true),
-			(MAX_GOSSIP_LOG, MAX_PEX_SAMPLE + 1, true),
-		];
-		for (want_len, pex_len, oversized) in cases {
+	// A reply at both caps is in bounds, and one entry past either cap makes
+	// it oversized.
+	tb_cases! {
+		fn reconcile_reply_bounds_want_and_pex((want_len, pex_len, oversized): (usize, usize, bool)) {
 			assert_eq!(reply(want_len, pex_len).is_oversized(), oversized);
+		}
+		cases {
+			at_both_caps => (MAX_GOSSIP_LOG, MAX_PEX_SAMPLE, false),
+			want_past_its_cap => (MAX_GOSSIP_LOG + 1, MAX_PEX_SAMPLE, true),
+			pex_past_its_cap => (MAX_GOSSIP_LOG, MAX_PEX_SAMPLE + 1, true),
 		}
 	}
 
@@ -1585,5 +2132,634 @@ mod tests {
 		state.commit(UnixMillis::new(500), Vec::new(), Vec::new());
 		assert!(!state.take_due(UnixMillis::new(1_499), [], []));
 		assert!(state.take_due(UnixMillis::new(1_500), [], []));
+	}
+
+	/// The key of a gateway in no colony.
+	fn stranger_key() -> Secp256k1SigningKey {
+		Secp256k1SigningKey::from_bytes(&[3u8; 32].into()).expect("the fixture scalar is a valid key")
+	}
+
+	/// A live gateway in no colony, and its certificate. The certificate
+	/// carries no colony URN, so a member that dials it finds it outside the
+	/// flood.
+	async fn stranger_gateway() -> (ClusterGateway<TokioListener>, Certificate) {
+		let key = stranger_key();
+		let certificate = TestCertificate::self_signed(&key);
+		let spec = CertificateSpec::Built(Box::new(certificate.clone()));
+		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
+		let config = ClusterConfig::new(tls.expect("the stranger certificate must decode"));
+
+		let trace = Arc::new(TraceCollector::default());
+		let gateway = ClusterGateway::start(trace, config).await.expect("the stranger gateway starts");
+		(gateway, certificate)
+	}
+
+	/// The gossip arm of a colony member whose peer trust enrolls `stranger`,
+	/// which records on `trace`.
+	fn member_beat(stranger: &Certificate, trace: Arc<TraceCollector>) -> FloodBeat<TokioListener> {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let colony = ColonyNamespace::default().colony("main").expect("a literal colony name");
+		let certificate = TestCertificate::with_uri_sans(&key, &[&colony.to_string()]);
+		let spec = CertificateSpec::Built(Box::new(certificate));
+		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
+		let enrolled = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(stranger.clone());
+		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the stranger enrolls").build());
+		let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
+
+		let config = ColonyConfig::new(ClusterConfig::new(tls));
+		let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
+		let peer_pool = pools.peer.expect("a peer trust builds a peer pool");
+		let peer_plane = PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
+		let registry = Arc::new(ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock)));
+
+		FloodBeat::new(config, peer_plane, registry, trace, Arc::default()).expect("a colony member is in a flood")
+	}
+
+	// A poisoned peer table is this gateway's own fault. A round that meets it
+	// at an expulsion ends the beat as a local fault, so the score of the peer
+	// that answered from outside the flood stands.
+	#[tokio::test]
+	async fn a_poisoned_table_at_an_expulsion_is_a_local_fault() -> Result<(), TightBeamError> {
+		let (stranger, certificate) = stranger_gateway().await;
+		let beat = member_beat(&certificate, Arc::default());
+		beat.config.peer.table.poison();
+
+		let address = *stranger.addr();
+		let peer = dial(&address.to_string());
+
+		let round = beat.reconcile_round(address, peer).await;
+		assert!(matches!(round, Err(LoopFault::Registry(ClusterError::LockPoisoned))));
+		Ok(())
+	}
+
+	/// The name of the authority that issues both certificates of
+	/// [`SignerRotation`].
+	const AUTHORITY: &str = "Signer Authority";
+
+	/// One gateway key under two certificates that one authority issued, and
+	/// the gossip arm of a colony member that enrolls the authority and the
+	/// first certificate alone.
+	///
+	/// - `enrolled` serves under the enrolled certificate, and `rotated` under the second.
+	/// - The member's discovery table holds one tried entry per signer.
+	struct SignerRotation {
+		beat: FloodBeat<TokioListener>,
+		enrolled: ClusterGateway<TokioListener>,
+		rotated: ClusterGateway<TokioListener>,
+	}
+
+	impl SignerRotation {
+		/// Starts the member's beat and both gateways, which record on
+		/// `scenario`.
+		async fn start(scenario: &TraceCollector) -> Self {
+			let colony = ColonyNamespace::default().colony("main");
+			let colony = colony.expect("a literal colony name").to_string();
+			let authority_key = Secp256k1SigningKey::from_bytes(&[6u8; 32].into()).expect("a valid fixture scalar");
+			let gateway_key = Secp256k1SigningKey::from_bytes(&[7u8; 32].into()).expect("a valid fixture scalar");
+			let member_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+			let authority = TestCertificate::authority(&authority_key, AUTHORITY);
+			let authority = authority.expect("the authority issues its certificate");
+			let issue = |cn: &str| {
+				let uris = [colony.as_str()];
+				let issued = TestCertificate::issued_with_uri_sans(&authority_key, AUTHORITY, &gateway_key, cn, &uris);
+				issued.expect("the authority issues a gateway certificate")
+			};
+
+			let enrolled = issue("Signer Gateway");
+			let rotated = issue("Signer Gateway Rotated");
+			let member = TestCertificate::with_uri_sans(&member_key, &[&colony]);
+
+			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = builder.with_certificate(authority).expect("the store admits it");
+			let builder = builder.with_certificate(enrolled.clone()).expect("the store admits it");
+			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(builder.build());
+
+			let spec = CertificateSpec::Built(Box::new(member.clone()));
+			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(member_key)));
+			let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
+			let config = ClusterConfig::builder(tls).with_tried_per_signer(NonZeroUsize::MIN).build();
+			let config = ColonyConfig::new(config);
+
+			let trace = Arc::new(scenario.share());
+			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
+			let peer_pool = pools.peer.expect("a peer trust builds a peer pool");
+			let peer_plane = PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
+			let registry = Arc::new(ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock)));
+			let beat = FloodBeat::new(config, peer_plane, registry, trace, Arc::default());
+
+			Self {
+				beat: beat.expect("a colony member is in a flood"),
+				enrolled: Self::serve(enrolled, &gateway_key, &member, scenario).await,
+				rotated: Self::serve(rotated, &gateway_key, &member, scenario).await,
+			}
+		}
+
+		/// A gateway that serves under `certificate`, answers the reconcile
+		/// round of `member`, which its peer trust enrolls, and records on
+		/// `trace`.
+		async fn serve(
+			certificate: Certificate,
+			key: &Secp256k1SigningKey,
+			member: &Certificate,
+			trace: &TraceCollector,
+		) -> ClusterGateway<TokioListener> {
+			let spec = CertificateSpec::Built(Box::new(certificate));
+			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key.clone())));
+			let enrolled = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(member.clone());
+			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the member enrolls").build());
+			let tls = tls.expect("the gateway certificate must decode").with_peer_trust(peer_trust);
+
+			let gateway = ClusterGateway::start(Arc::new(trace.share()), ClusterConfig::new(tls)).await;
+			gateway.expect("the gateway starts")
+		}
+	}
+
+	// The discovery table names a gateway by the certificate the member
+	// enrolls for its key, so a second certificate of that key at another
+	// address takes no second slot under the signer cap (CWE-770).
+	#[tokio::test]
+	async fn a_rotated_certificate_counts_as_the_signer_its_key_enrolls() -> Result<(), TightBeamError> {
+		let rotation = SignerRotation::start(&TraceCollector::default()).await;
+		let beat = &rotation.beat;
+		let enrolled = *rotation.enrolled.addr();
+		let rotated = *rotation.rotated.addr();
+
+		let first = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
+		let second = beat.reconcile_round(rotated, dial(&rotated.to_string())).await;
+		let learned = beat.config.peer.table.learned()?;
+		assert_eq!([first.ok(), second.ok()], [Some(Round::Settled); 2]);
+		assert_eq!(learned, (0, 1));
+		Ok(())
+	}
+
+	/// The advertisement frame that a `MintedAdRumor` slate rumor carries.
+	fn carried_ad_frame(minted: Option<MintedAdRumor>) -> Frame {
+		let minted = minted.expect("the test identity mints a rumor");
+		let rumor: GossipRumor = decode(minted.rumor.message()).expect("a minted rumor decodes");
+		decode(&rumor.payload).expect("a slate rumor carries a frame")
+	}
+
+	/// The slate rumor that the test identity creates.
+	fn minted_rumor(minted: Option<MintedAdRumor>) -> MintedAdRumor {
+		minted.expect("the test identity mints a rumor")
+	}
+
+	// A beat witnesses its slate rumor under the digest its echo admits under,
+	// so the journal refuses the echo that a peer floods back as a duplicate.
+	#[tokio::test]
+	async fn a_slate_rumor_carries_the_digest_its_echo_admits_under() -> Result<(), TightBeamError> {
+		let config = ColonyConfig::<TokioListener>::new(test_config());
+		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
+		let minted = minted_rumor(config.mint_slate_rumor(&advertisement).await);
+
+		let echo = config.tls.verify_own(minted.rumor)?;
+		let admitted = config.admit_rumor(&echo, 0, minted.minted_at);
+		assert_eq!(admitted.map(|admitted| *admitted.digest()), Ok(minted.digest));
+		Ok(())
+	}
+
+	// A beat's slate rumor wraps the frame the beat dials out directly, so both
+	// copies carry one order. A receiver that admits either copy first then
+	// admits the other, because its order ledger refuses only an older order.
+	#[tokio::test]
+	async fn a_slate_rumor_wraps_the_frame_its_beat_dials_out() -> Result<(), TightBeamError> {
+		let clock = Arc::new(ManualClock::default());
+		let mut config = test_config();
+		config.clock = Arc::<ManualClock>::clone(&clock);
+
+		let config = ColonyConfig::<TokioListener>::new(config);
+		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
+
+		clock.advance(Duration::from_millis(1));
+
+		let minted = config.mint_slate_rumor(&advertisement).await;
+		assert_eq!(&carried_ad_frame(minted), advertisement.frame());
+		Ok(())
+	}
+
+	// A step the peer failed charges the peer, and a step that failed on this
+	// gateway leaves the peer's score as it stands. Each step names the label
+	// its event carries.
+	tb_cases! {
+		fn a_round_end_names_its_label_and_its_charge((end, label, round): (RoundEnd, &str, Round)) {
+			assert_eq!((end.label(), end.round()), (label, round));
+		}
+		cases {
+			journal => (RoundEnd::Journal, "journal", Round::Settled),
+			unreachable => (RoundEnd::Unreachable, "unreachable", Round::Failed),
+			build => (RoundEnd::Build, "build", Round::Settled),
+			sign => (RoundEnd::Sign, "sign", Round::Settled),
+			reply => (RoundEnd::Reply, "reply", Round::Failed),
+			bookkeeping => (RoundEnd::Bookkeeping, "bookkeeping", Round::Settled),
+		}
+	}
+
+	/// A loopback socket that no listener holds, so a dial to it fails.
+	fn closed_address() -> core::net::SocketAddr {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port binds");
+		listener.local_addr().expect("a bound listener has an address")
+	}
+
+	tb_assert_spec! {
+		pub UnreachableRoundSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_RECONCILE_FAILED, exactly!(1), equals!(true))
+			]
+		}
+	}
+
+	// A round whose dial fails charges the peer, and its event says so.
+	tb_scenario! {
+		name: an_unreachable_peer_fails_its_round_on_the_record,
+		spec: UnreachableRoundSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let stranger = TestCertificate::self_signed(&stranger_key());
+				let beat = member_beat(&stranger, Arc::new(trace.share()));
+				let closed = closed_address();
+
+				let round = beat.reconcile_round(closed.into(), dial(&closed.to_string())).await;
+				assert_eq!(round.ok(), Some(Round::Failed));
+				Ok(())
+			}
+		}
+	}
+
+	/// Records, in `beat`'s journal, one application rumor that `beat`'s own
+	/// identity signs at its clock reading, and returns its digest.
+	async fn journal_a_rumor(beat: &FloodBeat<TokioListener>) -> Result<GossipDigest, TightBeamError> {
+		let config = &beat.config;
+		let now = config.clock.unix();
+		let builder = FrameBuilder::from(Version::V2)
+			.with_id(b"repaired")
+			.with_order(now.get())
+			.with_message(GossipRumor::application(vec![1, 2, 3]));
+
+		let mut rumor = config.witnessed(builder).build()?;
+		rumor.sign_with_provider(config.tls.identity()).await?;
+
+		let verified = config.tls.verify_own(rumor)?;
+		let admitted = config.admit_rumor(&verified, 0, now).expect("the member admits its own rumor");
+		let rumor = verified.into_frame();
+		let signer = rumor.signer_id().expect("a signed rumor names its signer");
+
+		let digest = *admitted.digest();
+		config.gossip.journal.record(&signer, digest, &rumor, rumor.issued_at(), now)?;
+		Ok(digest)
+	}
+
+	tb_assert_spec! {
+		pub AnsweredRoundSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_RECONCILE_ANSWERED, exactly!(1), equals!(1u64)),
+				(CLUSTER_GOSSIP_REPAIR_PUSHED, exactly!(1), equals!(TransitStatus::Ok)),
+				(CLUSTER_GOSSIP_ADMITTED, exactly!(1), equals!(0u64)),
+				(CLUSTER_PEER_DISCOVERED, exactly!(1)),
+				(CLUSTER_RECONCILE_FAILED, absent!())
+			]
+		}
+	}
+
+	// A member answers a round that holds one rumor it lacks. The member
+	// records the answer and its want, the requester promotes the member and
+	// pushes the rumor, and the member admits the push with no hop left.
+	tb_scenario! {
+		name: an_answered_round_records_the_answer_the_push_and_the_admission,
+		spec: AnsweredRoundSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let rotation = SignerRotation::start(&trace).await;
+				let beat = &rotation.beat;
+				journal_a_rumor(beat).await?;
+				let enrolled = *rotation.enrolled.addr();
+
+				let round = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
+				assert_eq!(round.ok(), Some(Round::Settled));
+				Ok(())
+			}
+		}
+	}
+
+	/// A discovery hint for each socket of `sockets`.
+	fn hints(sockets: &[&str]) -> Vec<PeerHint> {
+		let config = test_config();
+		let entries = sockets.iter().map(pex_entry);
+		config.admissible_pex_hints(entries).collect()
+	}
+
+	/// The error a test reports for `fault`: the trace's own error, or the
+	/// local fault that it carries.
+	fn loop_error(fault: LoopFault) -> TightBeamError {
+		match fault {
+			LoopFault::Runtime(error) => error,
+			LoopFault::Registry(error) => error.into(),
+		}
+	}
+
+	tb_assert_spec! {
+		pub LearnedHintsSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_PEER_HINTS_LEARNED, exactly!(1), equals!(2u64))
+			]
+		}
+	}
+
+	// A learn records the count of hints the table admits.
+	tb_scenario! {
+		name: a_learn_records_the_hints_the_table_admits,
+		spec: LearnedHintsSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| {
+				let config = test_config();
+				let source = HintSource::Pex(PeerAddress::fixture("10.0.0.9:9000"));
+				let now = UnixMillis::new(1_000);
+				let offered = hints(&["10.0.0.1:9000", "10.1.0.1:9000"]);
+
+				config.learn_hints(&trace, source, offered, now).map_err(loop_error)?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		pub EmptyLearnSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_PEER_HINTS_LEARNED, exactly!(1), equals!(1u64))
+			]
+		}
+	}
+
+	// A learn that admits no hint records nothing. The learn after it admits
+	// one hint, so its record proves the trace reaches the table, and the one
+	// record proves that the empty learn leaves none.
+	tb_scenario! {
+		name: a_learn_that_admits_no_hint_records_nothing,
+		spec: EmptyLearnSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| {
+				let config = test_config();
+				let source = HintSource::Pex(PeerAddress::fixture("10.0.0.9:9000"));
+				let now = UnixMillis::new(1_000);
+
+				config.learn_hints(&trace, source, hints(&[]), now).map_err(loop_error)?;
+				config.learn_hints(&trace, source, hints(&["10.0.0.1:9000"]), now).map_err(loop_error)?;
+				Ok(())
+			}
+		}
+	}
+
+	/// The advertisement of `peer` at `dial`, at `order`, whose slate names
+	/// `types`, each route abandoned after `limit` failures.
+	fn advertisement(
+		peer: &[u8],
+		dial: AdmittedDial,
+		types: &[&[u8]],
+		order: u64,
+		limit: NonZeroU32,
+	) -> AdmittedPeerAd {
+		let route = |servlet_type: &&[u8]| {
+			let route = PeerRoute { peer_id: Arc::from(peer), servlet_type: Arc::from(*servlet_type), dial };
+			ServletEntry::peer(route, DEFAULT_INITIAL_PHEROMONE, limit)
+		};
+
+		let slate = types.iter().map(route).collect();
+		AdmittedPeerAd { peer_hive_id: Arc::from(peer), dial, slate, order: UnixMillis::new(order) }
+	}
+
+	/// The advertisement of `gw` at the fixture socket, at `order`, whose
+	/// slate names `types`.
+	fn fixture_advertisement(types: &[&[u8]], order: u64) -> AdmittedPeerAd {
+		advertisement(b"gw", dial("127.0.0.1:9000"), types, order, DEFAULT_ABANDONMENT_LIMIT)
+	}
+
+	/// A registry on the fixture config, which holds no route yet.
+	fn empty_registry() -> ServletRegistry {
+		let config = test_config();
+		ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock))
+	}
+
+	tb_assert_spec! {
+		pub FirstSlateSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_PEER_ROUTES_INSTALLED, exactly!(1), equals!(2u64)),
+				(CLUSTER_PEER_ROUTES_WITHDRAWN, absent!())
+			]
+		}
+	}
+
+	// A first slate records the routes it installs.
+	tb_scenario! {
+		name: a_first_slate_records_its_installs,
+		spec: FirstSlateSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| {
+				let registry = empty_registry();
+				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
+				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
+				first.record_direct(&trace, b"gw")?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		pub ShrunkSlateSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_PEER_ROUTES_INSTALLED, exactly!(1), equals!(2u64)),
+				(CLUSTER_PEER_ROUTES_WITHDRAWN, exactly!(1), equals!(1u64))
+			]
+		}
+	}
+
+	// A slate that leaves out a held route records its withdrawal.
+	tb_scenario! {
+		name: a_shrunk_slate_records_its_withdrawal,
+		spec: ShrunkSlateSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| {
+				let registry = empty_registry();
+				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
+				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
+				first.record_direct(&trace, b"gw")?;
+
+				let shrunk = fixture_advertisement(&[b"ping"], 2);
+				let shrunk = registry.reconcile_peer_slate(shrunk, PeerCaps::default())?;
+				shrunk.record_direct(&trace, b"gw")?;
+				Ok(())
+			}
+		}
+	}
+
+	// A refresh of the held slate records nothing. The first slate's install
+	// proves the trace reaches the registry, and its one record proves that
+	// the refresh leaves none.
+	tb_scenario! {
+		name: a_refreshed_slate_records_nothing,
+		spec: FirstSlateSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| {
+				let registry = empty_registry();
+				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
+				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
+				first.record_direct(&trace, b"gw")?;
+
+				let refreshed = fixture_advertisement(&[b"ping", b"echo"], 2);
+				let refreshed = registry.reconcile_peer_slate(refreshed, PeerCaps::default())?;
+				refreshed.record_direct(&trace, b"gw")?;
+				Ok(())
+			}
+		}
+	}
+
+	/// Runs `rounds` reconcile rounds against `peer` at the closed `address`,
+	/// each of which fails, and returns the first fault of a round.
+	async fn fail_rounds(
+		beat: &FloodBeat<TokioListener>,
+		address: core::net::SocketAddr,
+		peer: AdmittedDial,
+		rounds: usize,
+	) -> Result<(), LoopFault> {
+		for _ in 0..rounds {
+			beat.reconcile_target(address.into(), peer, &beat.trace).await?;
+		}
+
+		Ok(())
+	}
+
+	tb_assert_spec! {
+		pub EvictedPeerSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_RECONCILE_FAILED, exactly!(3), equals!(true)),
+				(CLUSTER_PEER_ROUTES_WITHDRAWN, exactly!(1), equals!(1u64)),
+				(CLUSTER_PEER_EVICTED, exactly!(1))
+			]
+		}
+	}
+
+	// The failed round that reaches the eviction threshold withdraws the route
+	// that dials the peer, and records the count withdrawn ahead of the
+	// eviction.
+	tb_scenario! {
+		name: an_evicted_peer_withdraws_the_routes_that_dial_it,
+		spec: EvictedPeerSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let stranger = TestCertificate::self_signed(&stranger_key());
+				let beat = member_beat(&stranger, Arc::new(trace.share()));
+				let closed = closed_address();
+				let peer = dial(&closed.to_string());
+				beat.config.peer.table.promote(peer, None, UnixMillis::now())?;
+
+				let slate = advertisement(b"gw", peer, &[b"ping"], 1, DEFAULT_ABANDONMENT_LIMIT);
+				beat.servlet_registry.reconcile_peer_slate(slate, PeerCaps::default())?;
+
+				fail_rounds(&beat, closed, peer, MAX_PEER_TRIED_FAILURES).await.map_err(loop_error)?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		pub DroppingTargetSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_GOSSIP_DROP_SIGNAL, exactly!(1)),
+				(CLUSTER_PEER_ROUTE_ABANDONED, exactly!(1), equals!(1u64))
+			]
+		}
+	}
+
+	// A target that wants again a rumor it acknowledged drops rumors, so the
+	// round weakens the route that dials it, here to its abandonment limit.
+	tb_scenario! {
+		name: a_dropping_target_abandons_the_route_that_dials_it,
+		spec: DroppingTargetSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let rotation = SignerRotation::start(&trace).await;
+				let beat = &rotation.beat;
+				let digest = journal_a_rumor(beat).await?;
+				let enrolled = *rotation.enrolled.addr();
+				let peer = dial(&enrolled.to_string());
+
+				beat.ledgers.with(peer, |ledger| ledger.ack(digest));
+				let slate = advertisement(b"gw", peer, &[b"ping"], 1, NonZeroU32::MIN);
+				beat.servlet_registry.reconcile_peer_slate(slate, PeerCaps::default())?;
+
+				let round = beat.reconcile_round(enrolled, peer).await;
+				assert_eq!(round.ok(), Some(Round::Settled));
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		pub SkippedBookkeepingSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLUSTER_RECONCILE_ANSWERED, exactly!(1)),
+				(CLUSTER_RECONCILE_FAILED, exactly!(1), equals!(false))
+			]
+		}
+	}
+
+	// A poisoned table fails the promotion after the member answers, so the
+	// round records the skipped bookkeeping and leaves the member's score as
+	// it stands.
+	tb_scenario! {
+		name: a_local_fault_after_the_reply_skips_the_round_on_the_record,
+		spec: SkippedBookkeepingSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let rotation = SignerRotation::start(&trace).await;
+				let beat = &rotation.beat;
+				beat.config.peer.table.poison();
+
+				let enrolled = *rotation.enrolled.addr();
+				let round = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
+				assert_eq!(round.ok(), Some(Round::Settled));
+				Ok(())
+			}
+		}
+	}
+
+	/// The error each fault of these tests injects.
+	#[cfg(feature = "testing-fault")]
+	fn closed() -> TightBeamError {
+		TightBeamError::ChannelClosed
+	}
+
+	// A trace that refuses an event of the round's bookkeeping ends the beat,
+	// so a fault the fault model injects at the promotion reaches the beat's
+	// exit.
+	#[cfg(feature = "testing-fault")]
+	#[tokio::test]
+	async fn a_trace_fault_in_the_bookkeeping_ends_the_beat() -> Result<(), TightBeamError> {
+		use crate::testing::fdr::FaultModel;
+
+		let model = FaultModel::default().with_event_fault(CLUSTER_PEER_DISCOVERED, closed, crate::bps!(10000));
+		let trace = TraceCollector::new().with_fault_model(model);
+		let rotation = SignerRotation::start(&trace).await;
+		let enrolled = *rotation.enrolled.addr();
+
+		let round = rotation.beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
+		assert!(matches!(round, Err(LoopFault::Runtime(TightBeamError::ChannelClosed))));
+		Ok(())
 	}
 }

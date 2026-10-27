@@ -1,5 +1,6 @@
-//! Runtime assertion recording types for `TraceCollector`.
+//! The types that a `TraceCollector` records for runtime assertions.
 
+use core::num::NonZeroUsize;
 #[cfg(any(test, feature = "testing"))]
 use std::borrow::Cow;
 
@@ -16,17 +17,18 @@ pub enum AssertionLabel {
 
 #[cfg(any(test, feature = "testing"))]
 impl AssertionLabel {
-	/// Check if this label matches another by exact URN identity.
+	/// Whether this label and `other` name one URN.
 	///
-	/// Both recorded events and spec assertions carry full URN renderings
-	/// (`urn:<nid>:<nss>`), so no shorthand or suffix matching applies:
-	/// identical strings are the only match.
+	/// Recorded events and spec assertions both carry full URN renderings
+	/// (`urn:<nid>:<nss>`), so two labels match only when their strings are
+	/// identical, and a shorthand or a suffix never matches.
 	pub fn matches(&self, other: &AssertionLabel) -> bool {
 		self == other
 	}
 }
 
-/// Type-safe wrapper for assertion values supporting PartialEq comparison
+/// The value of an assertion, typed so that a spec compares it through
+/// `PartialEq`.
 #[derive(Debug, Clone)]
 pub enum AssertionValue {
 	String(String),
@@ -49,7 +51,7 @@ pub enum AssertionValue {
 }
 
 impl AssertionValue {
-	/// One-line rendering of the held value, for instrument-log payloads.
+	/// Renders the held value on one line, for an instrument-log payload.
 	#[cfg(feature = "instrument")]
 	pub(crate) fn render(&self) -> String {
 		match self {
@@ -77,15 +79,16 @@ impl AssertionValue {
 impl PartialEq for AssertionValue {
 	fn eq(&self, other: &Self) -> bool {
 		match (self, other) {
-			// IsSome matches any Some(_) value
+			// `IsSome` matches any `Some(_)` value.
 			(Self::IsSome, Self::Some(_)) => true,
 			(Self::Some(_), Self::IsSome) => true,
-			// IsSome matches IsSome (both represent "some value exists")
+			// Two `IsSome` values match, because each asserts a value.
 			(Self::IsSome, Self::IsSome) => true,
-			// IsSome does not match None
+			// `IsSome` and `IsNone` differ.
 			(Self::IsSome, Self::IsNone) => false,
 			(Self::IsNone, Self::IsSome) => false,
-			// Standard comparisons for other variants
+			// Two values of one variant compare what they hold, and an actual
+			// ratio matches a limit when it is at or below the limit.
 			(Self::String(a), Self::String(b)) => a == b,
 			(Self::Bool(a), Self::Bool(b)) => a == b,
 			(Self::U8(a), Self::U8(b)) => a == b,
@@ -123,7 +126,6 @@ fn ratio_less_equal(an: u64, ad: u64, bn: u64, bd: u64) -> bool {
 	an.saturating_mul(bd) <= bn.saturating_mul(ad)
 }
 
-// From implementations for ergonomic conversion
 impl From<String> for AssertionValue {
 	fn from(s: String) -> Self {
 		Self::String(s)
@@ -160,6 +162,21 @@ impl From<u64> for AssertionValue {
 	}
 }
 
+/// A count reads as a `u64`, the type of the value that each counted event
+/// carries. A count past `u64::MAX` saturates there.
+impl From<usize> for AssertionValue {
+	fn from(count: usize) -> Self {
+		Self::U64(u64::try_from(count).unwrap_or(u64::MAX))
+	}
+}
+
+/// A count above 0 reads as a `u64`, as a [`usize`] count does.
+impl From<NonZeroUsize> for AssertionValue {
+	fn from(count: NonZeroUsize) -> Self {
+		Self::from(count.get())
+	}
+}
+
 impl From<i32> for AssertionValue {
 	fn from(n: i32) -> Self {
 		Self::I32(n)
@@ -191,7 +208,8 @@ impl From<TransitStatus> for AssertionValue {
 	}
 }
 
-// Option support - convert Some(x) to Some(Box<AssertionValue>) and None to None
+// An `Option` converts `Some(x)` to a boxed `Some` value and `None` to
+// `IsNone`.
 impl<T> From<Option<T>> for AssertionValue
 where
 	T: Into<AssertionValue>,
@@ -204,8 +222,8 @@ where
 	}
 }
 
-/// Marker type for asserting that an Option is Some(_) without checking the inner value
-/// Use with `equals!(IsSome)` in assertion specs.
+/// A marker that asserts an `Option` is `Some(_)`, whatever its inner value.
+/// A spec uses it as `equals!(IsSome)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IsSome;
 
@@ -215,8 +233,8 @@ impl From<IsSome> for AssertionValue {
 	}
 }
 
-/// Marker type for asserting that an Option is None
-/// Use with `equals!(IsNone)` in assertion specs.
+/// A marker that asserts an `Option` is `None`. A spec uses it as
+/// `equals!(IsNone)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IsNone;
 
@@ -226,18 +244,18 @@ impl From<IsNone> for AssertionValue {
 	}
 }
 
-/// Option occupancy recorded as an assertion value, without exposing
-/// the payload itself.
+/// Whether an `Option` holds a value, recorded as an assertion value that
+/// keeps the payload out of the trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
-	/// The observed Option was `Some`.
+	/// The observed `Option` is `Some`.
 	Present,
-	/// The observed Option was `None`.
+	/// The observed `Option` is `None`.
 	Absent,
 }
 
 impl Presence {
-	/// Classify an Option's occupancy.
+	/// Classifies whether `opt` holds a value.
 	pub fn of_option<T>(opt: &Option<T>) -> Self {
 		if opt.is_some() {
 			Self::Present
@@ -256,8 +274,8 @@ impl From<Presence> for AssertionValue {
 	}
 }
 
-/// Ceiling for a ratio assertion: numerator per denominator.
-/// Use with `equals!(RatioLimit(n, d))` in assertion specs.
+/// The ceiling of a ratio assertion, as a numerator per denominator. A spec
+/// uses it as `equals!(RatioLimit(n, d))`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RatioLimit(pub u64, pub u64);
 
@@ -273,31 +291,31 @@ impl From<RatioLimit> for AssertionValue {
 	}
 }
 
-/// One recorded trace event: an ordered, labeled observation a spec's
-/// assertions are verified against.
+/// One recorded trace event: an ordered, labeled observation that the
+/// assertions of a spec check.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug)]
 pub struct Assertion {
-	/// Position of the event in the recorded trace.
+	/// The position of the event in the recorded trace.
 	pub seq: usize,
-	/// Spec assertion this event answers to.
+	/// The spec assertion that this event answers.
 	pub label: AssertionLabel,
-	/// Free-form tags refining the label.
+	/// The free-form tags that refine the label.
 	pub tags: Vec<&'static str>,
-	/// Digest of the associated payload, when one was recorded.
+	/// The digest of the associated payload, when the event records one.
 	pub payload_hash: Option<[u8; 32]>,
-	/// Observed value, when the assertion compares one.
+	/// The observed value, when the assertion compares one.
 	pub value: Option<AssertionValue>,
 }
 
 #[cfg(any(test, feature = "testing"))]
 impl Assertion {
-	/// Event carrying no observed value.
+	/// Creates an event whose `value` is `None`.
 	pub fn new(seq: usize, label: AssertionLabel, tags: Vec<&'static str>, payload_hash: Option<[u8; 32]>) -> Self {
 		Self { seq, label, tags, payload_hash, value: None }
 	}
 
-	/// Event carrying an observed value.
+	/// Creates an event that carries the observed `value`.
 	pub fn with_value(
 		seq: usize,
 		label: AssertionLabel,

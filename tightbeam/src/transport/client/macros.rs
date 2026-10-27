@@ -66,7 +66,7 @@ macro_rules! client {
 		$crate::client!(
 			@options $crate::transport::ConnectionBuilder::with_client_identity(
 				$builder,
-				$crate::transport::state::ClientIdentity::from_spec($cert, $key)?,
+				$crate::crypto::sign::SigningIdentity::from_spec($cert, $key)?,
 			)
 			$(, $($rest)*)?
 		)

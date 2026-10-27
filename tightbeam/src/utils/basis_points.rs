@@ -1,7 +1,7 @@
 //! Basis points representation for probabilities, percentages, and rates.
 //!
-//! Basis points (bps) are a common unit in finance and statistics for expressing
-//! fractional values where 1 basis point = 0.01% or 1/10000.
+//! Basis points (bps) are a common unit in finance and statistics for a
+//! fractional value, where 1 basis point is 0.01%, or 1/10000.
 //!
 //! # Examples
 //!
@@ -19,7 +19,7 @@
 //! assert_eq!(prob.as_percentage(), 75.0);
 //! ```
 
-use crate::der::{Decode, Encode, Reader, Writer};
+use crate::der::{Decode, Encode, Reader, Tag, Writer};
 
 /// Shorthand for [`BasisPoints::new::<N>()`](BasisPoints::new).
 ///
@@ -49,7 +49,7 @@ macro_rules! bps {
 	};
 }
 
-/// Error for values outside the 0-10000 basis-point range
+/// The error for a value outside the 0-10000 basis-point range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BasisPointsOutOfRange;
 
@@ -61,15 +61,15 @@ impl core::fmt::Display for BasisPointsOutOfRange {
 
 impl core::error::Error for BasisPointsOutOfRange {}
 
-/// Probability in basis points (0-10000, where 10000 = 100%)
+/// A probability in basis points, from 0 to 10000, where 10000 is 100%.
 ///
-/// Provides deterministic integer-only math for no_std compatibility.
+/// A `u16` value gives deterministic integer-only math for no_std builds.
 ///
 /// # Validation
 ///
-/// - Values must be in range [0, 10000]
-/// - [`BasisPoints::new`] and [`bps!`](crate::bps) reject an out-of-range value at compile time
-/// - `TryFrom<u16>` returns an error for a value known only at run time
+/// - A value must be in the range [0, 10000].
+/// - [`BasisPoints::new`] and [`bps!`](crate::bps) reject an out-of-range value at compile time.
+/// - `TryFrom<u16>` returns an error for a value known only at run time.
 ///
 /// # Use Cases
 ///
@@ -77,11 +77,11 @@ impl core::error::Error for BasisPointsOutOfRange {}
 /// - Rate limiting thresholds
 /// - Statistical sampling rates
 /// - Quality-of-service parameters
-/// - Any fractional value requiring deterministic math
+/// - Any fractional value that needs deterministic math
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BasisPoints(u16);
 
-/// Round-half-up for non-negative values already range-checked by the caller.
+/// Round half up a non-negative value that the caller already range-checked.
 ///
 /// `f64::round` lives on `std` (core has no float intrinsics), so add-then-
 /// truncate keeps this module no_std-compatible.
@@ -90,29 +90,29 @@ fn round_non_negative(value: f64) -> u16 {
 }
 
 impl BasisPoints {
-	/// Maximum value (100%)
+	/// The maximum value, 100%.
 	pub const MAX: Self = Self(10000);
 
-	/// Minimum value (0%)
+	/// The minimum value, 0%.
 	pub const MIN: Self = Self(0);
 
 	/// A BasisPoints value (0-10000) known at compile time.
 	///
-	/// `N` is a const parameter, so a value known only at run time cannot be
-	/// passed here: use `TryFrom<u16>` for that. The range check runs in a
-	/// `const` block, so an out-of-range `N` fails to compile and there is no
-	/// run-time panic path. [`bps!`](crate::bps) is shorthand for this.
+	/// `N` is a const parameter, so a value known only at run time goes through
+	/// `TryFrom<u16>` instead. The range check runs in a `const` block, so an
+	/// out-of-range `N` is a compile error rather than a run-time panic.
+	/// [`bps!`](crate::bps) is shorthand for this.
 	pub const fn new<const N: u16>() -> Self {
 		const { assert!(N <= Self::MAX.0, "BasisPoints must be 0-10000") };
 		Self(N)
 	}
 
-	/// Get the raw value (0-10000)
+	/// The raw value, from 0 to 10000.
 	pub const fn get(self) -> u16 {
 		self.0
 	}
 
-	/// Convert to percentage (0.0-100.0)
+	/// Convert to a percentage, from 0.0 to 100.0.
 	///
 	/// # Example
 	///
@@ -126,7 +126,7 @@ impl BasisPoints {
 		self.0 as f64 / 100.0
 	}
 
-	/// Convert to fraction (0.0-1.0)
+	/// Convert to a fraction, from 0.0 to 1.0.
 	///
 	/// # Example
 	///
@@ -140,12 +140,11 @@ impl BasisPoints {
 		self.0 as f64 / 10000.0
 	}
 
-	/// Create from percentage (0.0-100.0)
+	/// Create a value from a percentage in the range 0.0 to 100.0.
 	///
 	/// # Errors
 	///
-	/// Returns [`BasisPointsOutOfRange`] if percentage is NaN or outside
-	/// the [0.0, 100.0] range.
+	/// - [`BasisPointsOutOfRange`] -- `percentage` is NaN or outside the [0.0, 100.0] range.
 	///
 	/// # Example
 	///
@@ -166,12 +165,11 @@ impl BasisPoints {
 		Ok(Self(round_non_negative(percentage * 100.0)))
 	}
 
-	/// Create from fraction (0.0-1.0)
+	/// Create a value from a fraction in the range 0.0 to 1.0.
 	///
 	/// # Errors
 	///
-	/// Returns [`BasisPointsOutOfRange`] if fraction is NaN or outside
-	/// the [0.0, 1.0] range.
+	/// - [`BasisPointsOutOfRange`] -- `fraction` is NaN or outside the [0.0, 1.0] range.
 	///
 	/// # Example
 	///
@@ -192,10 +190,10 @@ impl BasisPoints {
 		Ok(Self(round_non_negative(fraction * 10000.0)))
 	}
 
-	/// Create a new BasisPoints value, saturating at MAX (10000)
+	/// Create a value that saturates at `MAX` (10000).
 	///
-	/// Unlike `new()`, this does not panic for out-of-range values.
-	/// Values > 10000 are clamped to 10000.
+	/// `new` refuses an out-of-range value at compile time. This function takes
+	/// a value at run time and clamps a value past 10000 to 10000.
 	///
 	/// # Example
 	///
@@ -212,10 +210,28 @@ impl BasisPoints {
 			Self(value)
 		}
 	}
+
+	/// Convert an unsigned value of any width, and saturate at [`Self::MAX`].
+	///
+	/// The clamp reads the whole value, so a value past `u16::MAX` reads as
+	/// [`Self::MAX`] and never wraps into the range.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use tightbeam::utils::BasisPoints;
+	///
+	/// assert_eq!(BasisPoints::saturating_from(7_500u32).get(), 7_500);
+	/// assert_eq!(BasisPoints::saturating_from(65_537u64), BasisPoints::MAX);
+	/// ```
+	pub fn saturating_from(value: impl Into<u64>) -> Self {
+		let value: u64 = value.into();
+		u16::try_from(value).map_or(Self::MAX, Self::new_saturating)
+	}
 }
 
 impl Default for BasisPoints {
-	/// Default is 0 basis points (0%)
+	/// The default is 0 basis points, or 0%.
 	fn default() -> Self {
 		Self::MIN
 	}
@@ -239,7 +255,7 @@ impl From<BasisPoints> for u16 {
 	}
 }
 
-// DER encoding: BasisPoints encodes as an INTEGER (u16)
+// A `BasisPoints` value encodes as a DER INTEGER, its `u16` value.
 impl Encode for BasisPoints {
 	fn encoded_len(&self) -> crate::der::Result<der::Length> {
 		self.0.encoded_len()
@@ -250,10 +266,12 @@ impl Encode for BasisPoints {
 	}
 }
 
+/// An INTEGER past `BasisPoints::MAX` is refused, as `TryFrom<u16>` refuses
+/// it, so one decoded value has one encoding.
 impl<'a> Decode<'a> for BasisPoints {
 	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
 		let value = u16::decode(reader)?;
-		Ok(Self::new_saturating(value))
+		Self::try_from(value).map_err(|_| Tag::Integer.value_error())
 	}
 }
 
@@ -277,6 +295,25 @@ mod tests {
 	#[test]
 	fn try_from_refuses_above_max() {
 		assert_eq!(BasisPoints::try_from(10001u16), Err(BasisPointsOutOfRange));
+	}
+
+	/// 65,537 narrows to 1 in a `u16`, so a clamp after the narrowing would
+	/// answer 1 basis point.
+	#[test]
+	fn a_value_past_the_u16_range_saturates() {
+		assert_eq!(BasisPoints::saturating_from(65_537u64), BasisPoints::MAX);
+	}
+
+	/// The decode refuses what the conversion refuses, so INTEGER 65535 is
+	/// refused rather than read as 10000.
+	#[test]
+	fn decode_refuses_above_max() -> crate::der::Result<()> {
+		let encoded = u16::MAX.to_der()?;
+
+		let refused = BasisPoints::from_der(&encoded);
+		let out_of_range = crate::der::ErrorKind::Value { tag: Tag::Integer };
+		assert_eq!(refused.map_err(|error| error.kind()), Err(out_of_range));
+		Ok(())
 	}
 
 	#[test]
@@ -386,21 +423,5 @@ mod tests {
 		let decoded = BasisPoints::from_der(encoded.as_ref().map(|s| *s).unwrap_or(&[]));
 		assert!(decoded.is_ok());
 		assert_eq!(decoded.ok(), Some(original));
-	}
-
-	#[test]
-	fn der_decode_saturates() {
-		use crate::der::Encode;
-
-		// Encode a u16 value > 10000 directly
-		let over_max: u16 = 15000;
-		let mut buf = [0u8; 16];
-		let encoded = over_max.encode_to_slice(&mut buf);
-		assert!(encoded.is_ok());
-
-		// Decode as BasisPoints - should saturate to 10000
-		let decoded = BasisPoints::from_der(encoded.as_ref().map(|s| *s).unwrap_or(&[]));
-		assert!(decoded.is_ok());
-		assert_eq!(decoded.ok(), Some(BasisPoints::MAX));
 	}
 }

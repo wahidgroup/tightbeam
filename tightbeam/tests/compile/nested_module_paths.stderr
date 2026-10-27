@@ -1,0 +1,59 @@
+error[E0603]: module `envelope` is private
+ --> tests/compile/nested_module_paths.rs:5:37
+  |
+5 | use tightbeam::transport::builders::envelope::EnvelopeBuilder;
+  |                                     ^^^^^^^^ private module
+  |
+note: the module `envelope` is defined here
+ --> src/transport/builders/mod.rs
+  |
+  | mod envelope;
+  | ^^^^^^^^^^^^
+
+error[E0603]: module `builder` is private
+ --> tests/compile/nested_module_paths.rs:6:35
+  |
+6 | use tightbeam::transport::client::builder::ClientBuilder;
+  |                                   ^^^^^^^ private module
+  |
+note: the module `builder` is defined here
+ --> src/transport/client/mod.rs
+  |
+  | mod builder;
+  | ^^^^^^^^^^^
+
+error[E0603]: module `pool` is private
+ --> tests/compile/nested_module_paths.rs:7:35
+  |
+7 | use tightbeam::transport::client::pool::ConnectionPool;
+  |                                   ^^^^ private module
+  |
+note: the module `pool` is defined here
+ --> src/transport/client/mod.rs
+  |
+  | mod pool;
+  | ^^^^^^^^
+
+error[E0603]: module `kdf` is private
+ --> tests/compile/nested_module_paths.rs:8:50
+  |
+8 | use tightbeam::transport::handshake::primitives::kdf::KdfSalt;
+  |                                                  ^^^ private module
+  |
+note: the module `kdf` is defined here
+ --> src/transport/handshake/primitives/mod.rs
+  |
+  | mod kdf;
+  | ^^^^^^^
+
+error[E0603]: module `transcript` is private
+ --> tests/compile/nested_module_paths.rs:9:50
+  |
+9 | use tightbeam::transport::handshake::primitives::transcript::transcript_hash;
+  |                                                  ^^^^^^^^^^ private module
+  |
+note: the module `transcript` is defined here
+ --> src/transport/handshake/primitives/mod.rs
+  |
+  | pub(crate) mod transcript;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^

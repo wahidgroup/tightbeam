@@ -3,15 +3,15 @@ use crate::error::Result;
 use crate::Frame;
 
 impl Frame {
-	/// Decompress the message body in place for a cleartext-but-compressed
-	/// frame, clearing `compactness` on success.
+	/// Decompress the message body in place for a frame that is cleartext but
+	/// compressed, and clear `compactness` on success.
 	///
-	/// A frame without `compactness` is returned unchanged. On decompression
-	/// failure the frame is restored unchanged.
+	/// A frame with no `compactness` stays as it is. A failed decompression
+	/// restores the frame to its state before the call.
 	///
 	/// # Errors
 	///
-	/// Returns the underlying codec error when the inflator rejects the body.
+	/// - The error of [`Inflator::decompress`], when the codec rejects the body.
 	pub fn inflate_in_place(&mut self, inflator: &dyn Inflator) -> Result<()> {
 		let Some(compactness) = self.metadata.compactness.take() else {
 			return Ok(());
@@ -32,11 +32,8 @@ impl Frame {
 	}
 }
 
-#[cfg(all(test, feature = "compress"))]
+#[cfg(all(test, feature = "zstd"))]
 mod tests {
-	#[cfg(not(feature = "std"))]
-	use alloc::vec;
-
 	use crate::compress::{Compressor, ZstdCompression};
 	use crate::error::Result;
 	use crate::testing::TestMessage;
@@ -65,7 +62,6 @@ mod tests {
 		let body = b"inflate me".repeat(64);
 		let mut frame = compressed_frame(&body)?;
 		frame.inflate_in_place(&ZstdCompression::default())?;
-
 		assert!(frame.metadata.compactness.is_none());
 		assert_eq!(frame.message, body);
 		Ok(())
@@ -86,11 +82,10 @@ mod tests {
 	#[test]
 	fn uncompressed_frame_untouched() -> Result<()> {
 		let message = TestMessage::sample(None);
+
 		let mut frame = compose! { V0: id: "inf-002", order: 1u64, message: message }?;
 		let original = frame.clone();
-
 		frame.inflate_in_place(&ZstdCompression::default())?;
-
 		assert_eq!(frame, original);
 		Ok(())
 	}

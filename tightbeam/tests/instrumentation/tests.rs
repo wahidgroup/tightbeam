@@ -1,43 +1,48 @@
-//! Integration tests for automatic instrumentation in testing framework
+//! The integration tests of automatic instrumentation in the testing framework.
 //!
-//! Demonstrates Phase 2: tb_scenario! automatic instrumentation capture
+//! The scenario shows that `tb_scenario!` captures the production events of a
+//! server that records into the scenario trace: the gate verdict and the
+//! handler span of the request that the server serves.
 
 #![cfg(all(feature = "instrument", feature = "tokio", feature = "tcp", feature = "testing"))]
 
+use tightbeam::instrumentation::{events, TbInstrumentationConfig};
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestMessage};
+use tightbeam::trace::TraceConfig;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{EndpointConfig, MessageEmitter, Protocol};
-use tightbeam::utils::urn::Urn;
 use tightbeam::{compose, exactly, server, tb_assert_spec, tb_process_spec, tb_scenario};
-
-pub(crate) const MESSAGE_COLLECT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-collect");
-pub(crate) const MESSAGE_EMIT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-emit");
 
 tb_assert_spec! {
 	pub AutoInstrSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(MESSAGE_EMIT, exactly!(1)),
-			(MESSAGE_COLLECT, exactly!(1))
+			(events::POLICY_EVAL, exactly!(1)),
+			(events::GATE_ACCEPT, exactly!(1)),
+			(events::HANDLER_ENTER, exactly!(1)),
+			(events::HANDLER_EXIT, exactly!(1))
 		]
 	}
 }
 
-// CSP process spec for automatic message flow verification
+// The CSP process spec of the request flow on the server: the gate evaluates
+// the request and admits it, and then the handler runs.
 tb_process_spec! {
 	pub MessageFlowProc,
 	events {
-		observable { MESSAGE_EMIT, MESSAGE_COLLECT }
+		observable { events::POLICY_EVAL, events::GATE_ACCEPT, events::HANDLER_ENTER, events::HANDLER_EXIT }
 		hidden { }
 	}
 	states {
-		S0 => { MESSAGE_EMIT => S1 },
-		S1 => { MESSAGE_COLLECT => S2 }
+		S0 => { events::POLICY_EVAL => S1 },
+		S1 => { events::GATE_ACCEPT => S2 },
+		S2 => { events::HANDLER_ENTER => S3 },
+		S3 => { events::HANDLER_EXIT => S4 }
 	}
-	terminal { S2 }
-	annotations { description: "Automatic message emit -> collect flow" }
+	terminal { S4 }
+	annotations { description: "The server gates the request and then runs its handler" }
 }
 
 mod sink {
@@ -46,7 +51,7 @@ mod sink {
 	use tightbeam::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
 	use tightbeam::trace::{TraceCollector, TraceConfig};
 
-	/// Mission-critical sink: retains every event, never drops.
+	/// A loss-free sink, which holds every event in an unbounded list.
 	#[derive(Default)]
 	struct LossFreeSink {
 		events: Mutex<Vec<TbEvent>>,
@@ -72,13 +77,13 @@ mod sink {
 		}
 	}
 
-	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::utils::urn::Urn<'static>) -> usize {
+	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::urn::Urn<'static>) -> usize {
 		let drained = drained.as_ref();
 		drained.iter().filter(|e| e.urn == urn).count()
 	}
 
 	#[test]
-	fn consumer_sink_keeps_every_event_past_default_bound() {
+	fn consumer_sink_keeps_every_event_past_default_bound() -> Result<(), tightbeam::TightBeamError> {
 		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
 		let collector = TraceCollector::from(
 			TraceConfig::builder()
@@ -87,9 +92,9 @@ mod sink {
 				.build(),
 		);
 
-		collector.emit_event(events::MUX_GOAWAY_SENT);
-		collector.emit_event(events::MUX_EMIT_DRAINING);
-		collector.emit_event(events::MUX_GOAWAY_RECV);
+		collector.emit_event(events::MUX_GOAWAY_SENT)?;
+		collector.emit_event(events::MUX_EMIT_DRAINING)?;
+		collector.emit_event(events::MUX_GOAWAY_RECV)?;
 
 		assert!(!collector.overflowed(), "loss-free sink must never report overflow");
 
@@ -101,18 +106,20 @@ mod sink {
 			"sink must retain emit-draining"
 		);
 		assert_eq!(count_urn(&drained, events::MUX_GOAWAY_RECV), 1, "sink must retain goaway-recv");
+		Ok(())
 	}
 
 	#[test]
-	fn default_bounded_sink_truncates_and_reports_overflow() {
+	fn default_bounded_sink_truncates_and_reports_overflow() -> Result<(), tightbeam::TightBeamError> {
 		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
 		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
 
-		collector.emit_event(events::MUX_GOAWAY_SENT);
-		collector.emit_event(events::MUX_EMIT_DRAINING);
+		collector.emit_event(events::MUX_GOAWAY_SENT)?;
+		collector.emit_event(events::MUX_EMIT_DRAINING)?;
 
 		assert!(collector.overflowed(), "bounded sink past cap must latch overflow");
 		assert_eq!(collector.drain_events().len(), 1, "bounded sink must retain only up to cap");
+		Ok(())
 	}
 }
 
@@ -121,22 +128,26 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(AutoInstrSpec::latest())
 		.with_csp(MessageFlowProc)
+		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {
+			enable_internal_detail: true,
+			..Default::default()
+		}).into())
 		.build(),
 	environment ServiceClient {
 		worker_threads: 1,
 		server: |SetupEnv { trace, .. }| async move {
 			let bind_addr = TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
-			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+			let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
-				assertions: trace.share(),
-				handle: |frame, _trace| async move {
+				policies: { with_trace: [ trace.share() ] },
+				handle: |frame: tightbeam::Frame| async move {
 					Ok(Some(frame))
 				}
 			};
 			Ok((handle, addr))
 		},
-		client: |ClientEnv { trace, addr, .. }| async move {
+		client: |ClientEnv { addr, .. }| async move {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
 			let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
@@ -145,9 +156,7 @@ tb_scenario! {
 				V0: id: "test", order: 1u64, message: test_message
 			}?;
 
-			trace.emit_event(MESSAGE_EMIT);
 			let response = client.emit(test_frame, None).await?;
-			trace.emit_event(MESSAGE_COLLECT);
 
 			assert!(response.is_some(), "the echo handler must return the frame it received");
 			Ok(())

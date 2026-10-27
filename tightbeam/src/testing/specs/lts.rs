@@ -31,9 +31,10 @@ impl fmt::Display for State {
 /// timing verification to identify events with timing constraints (WCET,
 /// deadlines, jitter) and in violation reports.
 ///
-/// Event identity is the full URN rendering (`urn:<nid>:<nss>`): spec
-/// surfaces convert from [`Urn`](crate::utils::urn::Urn) so alphabets never
-/// collide across NIDs.
+/// Event identity is the full URN rendering (`urn:<nid>:<nss>`): spec surfaces
+/// convert from [`Urn`] so alphabets never collide across NIDs.
+///
+/// [`Urn`]: crate::urn::Urn
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event(pub &'static str);
 
@@ -88,6 +89,18 @@ impl Action {
 
 	pub fn is_hidden(&self) -> bool {
 		matches!(self.alphabet, Alphabet::Hidden)
+	}
+
+	/// Whether a search whose trace holds the events of `trace` takes this
+	/// action under a bound of `max_depth` observable events.
+	///
+	/// An observable action extends the trace, so a search takes it while the
+	/// trace holds fewer than `max_depth` events. A hidden action keeps the
+	/// trace's length, so a search takes it at the bound as well.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn keeps_within(&self, trace: impl AsRef<[Event]>, max_depth: usize) -> bool {
+		let below_the_bound = trace.as_ref().len() < max_depth;
+		below_the_bound || self.is_hidden()
 	}
 }
 

@@ -3,7 +3,7 @@
 //! One URN per emit site, domain-scoped under `event:colony/` so trace
 //! assertions stay local to this harness.
 
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 const FUZZ_NID: &str = "fuzz";
 

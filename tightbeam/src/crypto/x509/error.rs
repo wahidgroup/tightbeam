@@ -27,7 +27,7 @@ pub enum CertificateValidationError {
 	#[error("Certificate has empty signature")]
 	EmptySignature,
 
-	/// The timestamp provided for validation is invalid.
+	/// The validation timestamp is invalid, or the build has no clock.
 	#[error("Invalid timestamp")]
 	InvalidTimestamp,
 
@@ -60,18 +60,43 @@ pub enum CertificateValidationError {
 	#[error("Certificate is denied")]
 	CertificateDenied,
 
-	/// The certificate encoding is invalid.
-	#[error("Invalid certificate encoding")]
-	InvalidCertificateEncoding,
+	/// A configured fingerprint differs in width from the output of its
+	/// digest, so it names no certificate.
+	#[error("Fingerprint length mismatch: {0}")]
+	FingerprintLength(crate::error::ReceivedExpectedError<usize, usize>),
 
 	/// The trust store does not hold the certificate.
 	#[error("Certificate not trusted")]
 	CertificateNotTrusted,
 
-	/// The certificate chain is invalid, because a certificate's issuer does
-	/// not name the subject of the certificate above it.
-	#[error("Certificate chain broken: issuer {issuer} does not match subject {subject}")]
-	InvalidChain { issuer: String, subject: String },
+	/// The certificate chain is invalid, because the issuer name of a
+	/// certificate differs from the subject name of the certificate above it.
+	#[error("Certificate chain broken at issuer {issuer} and subject {subject}")]
+	InvalidChain {
+		/// The issuer name of the lower certificate.
+		issuer: String,
+		/// The subject name of the certificate the chain reached above it.
+		subject: String,
+	},
+
+	/// Two certificates of a presented path carry the issuer name of one
+	/// certificate as their subject, so the path names no single issuer above
+	/// that certificate. A self-issued certificate names itself as its issuer,
+	/// so a chain that sets another certificate of the same name above it
+	/// holds two.
+	#[error("Certificate path holds two issuers named {issuer}")]
+	AmbiguousIssuer {
+		/// The issuer name that two certificates carry.
+		issuer: String,
+	},
+
+	/// A presented path returns to a certificate it holds, so it reaches no
+	/// trust anchor.
+	#[error("Certificate path returns to the issuer {issuer}")]
+	PathCycle {
+		/// The issuer name at which the path returns.
+		issuer: String,
+	},
 
 	/// The certificate chain is empty.
 	#[error("Empty certificate chain")]
@@ -79,22 +104,66 @@ pub enum CertificateValidationError {
 
 	/// Two certificates with different fingerprints have the same SKID.
 	///
-	/// The error carries the colliding key identifier, so the store entry can
-	/// be found.
+	/// The error carries the key identifier of the collision, so the operator
+	/// can find the store entry.
 	#[error("SKID collision: two certificates share key identifier {skid}")]
-	SkidCollision { skid: String },
+	SkidCollision {
+		/// The key identifier both certificates carry, in hex.
+		skid: String,
+	},
+
+	/// Two certificates with different fingerprints hold the same public key,
+	/// by the key rule of the
+	/// [`CertificateTrust`](super::store::CertificateTrust#contract) contract.
+	///
+	/// The error carries the SubjectPublicKeyInfo DER of the refused
+	/// certificate in hex, and the serial number and issuer of the held one,
+	/// so the operator can find both certificates.
+	#[error("Public key collision: SubjectPublicKeyInfo {public_key} holds the key of the certificate of {holder}")]
+	PublicKeyCollision {
+		/// The SubjectPublicKeyInfo DER of the second certificate, in hex.
+		public_key: String,
+		/// The serial number in hex and the issuer of the certificate that
+		/// holds the key, the pair that names one certificate (RFC 5280
+		/// §4.1.2.2).
+		holder: String,
+	},
 
 	/// The issuer certificate is not a CA (RFC 5280 §6.1.4(k)).
 	#[error("Issuer certificate is not a CA")]
 	IssuerNotCa,
 
-	/// The issuer keyUsage extension does not assert keyCertSign
+	/// The `keyUsage` extension of the issuer does not assert `keyCertSign`
 	/// (RFC 5280 §6.1.4(n)).
 	#[error("Issuer keyUsage does not permit certificate signing")]
 	MissingKeyCertSign,
 
-	/// The certification path exceeds the pathLenConstraint of an issuer
-	/// (RFC 5280 §6.1.4(m)).
+	/// The `keyUsage` extension is absent, or it does not assert the usage the
+	/// certificate's role needs (RFC 5280 §4.2.1.3).
+	#[error("Certificate keyUsage does not assert {0:?}")]
+	MissingKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
+
+	/// The `keyUsage` extension asserts a bit that narrows the use the
+	/// certificate is read for, as `decipherOnly` narrows `keyAgreement` to
+	/// decipherment (RFC 5280 §4.2.1.3).
+	#[error("Certificate keyUsage restricts the use with {0:?}")]
+	ExcludedKeyUsage(crate::crypto::x509::ext::pkix::KeyUsages),
+
+	/// The `extendedKeyUsage` extension names neither the purpose of the role
+	/// the certificate is read for nor `anyExtendedKeyUsage`
+	/// (RFC 5280 §4.2.1.12).
+	#[error("Certificate extendedKeyUsage excludes the role")]
+	ExcludedKeyPurpose,
+
+	/// The certificate carries more than one instance of an extension
+	/// (RFC 5280 §4.2).
+	#[error("Duplicate extension: {0}")]
+	DuplicateExtension(der::asn1::ObjectIdentifier),
+
+	/// The certification path is longer than a constraint allows: the
+	/// `pathLenConstraint` of an issuer (RFC 5280 §6.1.4(m)), or the
+	/// [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH)
+	/// certificates a reader takes from one `SignedData`.
 	#[error("Certification path length constraint exceeded")]
 	PathLenExceeded,
 
@@ -102,6 +171,12 @@ pub enum CertificateValidationError {
 	/// not process (RFC 5280 §4.2).
 	#[error("Unprocessed critical extension: {0}")]
 	UnprocessedCriticalExtension(der::asn1::ObjectIdentifier),
+
+	/// A certificate of the path carries a `nameConstraints` extension, which
+	/// RFC 5280 §6.1.4(g) applies whatever its criticality, and which the
+	/// store's path validation does not apply.
+	#[error("Certificate states name constraints that path validation does not apply")]
+	NameConstraintsUnapplied,
 
 	/// The end-entity certificate asserts `basicConstraints.cA`.
 	#[error("End-entity certificate asserts the CA basic constraint")]
@@ -124,6 +199,69 @@ pub enum CertificateValidationError {
 	#[cfg(feature = "signature")]
 	#[error("Signature verification failed: {0}")]
 	SignatureVerificationFailed(signature::Error),
+}
+
+// The audit records of a refused handshake and of a refused failover alone
+// name a refusal, so the names take the gate of those records.
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+impl CertificateValidationError {
+	crate::macros::names::refusal_names! {
+		[
+			/// The stable kebab-case name of this refusal, for audit labels.
+			///
+			/// The name leaves out the fields a refusal carries, so one
+			/// refusal reads as one label whatever certificate it names. The
+			/// refusal of a pooled failover alone labels its record with the
+			/// bare name.
+			#[cfg(pooled_mux)]
+			fn as_str = "";
+			/// The label of a handshake that refuses the certificate of its
+			/// peer for this cause: `certificate/` and the stable kebab-case
+			/// name of the refusal.
+			fn refusal_label = "certificate/";
+		]
+		{
+			Self::Expired => "expired",
+			Self::NotYetValid => "not-yet-valid",
+			Self::EmptyPublicKey => "empty-public-key",
+			Self::EmptySignature => "empty-signature",
+			Self::InvalidTimestamp => "invalid-timestamp",
+			Self::UnsupportedAlgorithm(_) => "unsupported-algorithm",
+			Self::EncodingError(_) => "encoding-error",
+			Self::AlgorithmMismatch => "algorithm-mismatch",
+			Self::SpkiError(_) => "spki-error",
+			Self::PublicKeyNotPinned => "public-key-not-pinned",
+			Self::CertificateNotPinned => "certificate-not-pinned",
+			Self::CertificateDenied => "certificate-denied",
+			Self::FingerprintLength(_) => "fingerprint-length",
+			Self::CertificateNotTrusted => "certificate-not-trusted",
+			Self::InvalidChain { .. } => "invalid-chain",
+			Self::AmbiguousIssuer { .. } => "ambiguous-issuer",
+			Self::PathCycle { .. } => "path-cycle",
+			Self::EmptyChain => "empty-chain",
+			Self::SkidCollision { .. } => "skid-collision",
+			Self::PublicKeyCollision { .. } => "public-key-collision",
+			Self::IssuerNotCa => "issuer-not-ca",
+			Self::MissingKeyCertSign => "missing-key-cert-sign",
+			Self::MissingKeyUsage(_) => "missing-key-usage",
+			Self::ExcludedKeyUsage(_) => "excluded-key-usage",
+			Self::ExcludedKeyPurpose => "excluded-key-purpose",
+			Self::DuplicateExtension(_) => "duplicate-extension",
+			Self::PathLenExceeded => "path-len-exceeded",
+			Self::UnprocessedCriticalExtension(_) => "unprocessed-critical-extension",
+			Self::NameConstraintsUnapplied => "name-constraints-unapplied",
+			Self::EndEntityIsCa => "end-entity-is-ca",
+			Self::CertificateRevoked => "certificate-revoked",
+			Self::RevocationStatusUnknown => "revocation-status-unknown",
+			#[cfg(feature = "signature")]
+			Self::PublicKeyError(_) => "public-key-error",
+			#[cfg(feature = "signature")]
+			Self::SignatureVerificationFailed(_) => "signature-verification-failed",
+		}
+	}
 }
 
 crate::impl_from!(der::Error => CertificateValidationError::EncodingError);

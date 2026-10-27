@@ -1,15 +1,19 @@
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::entry::Owner;
-use super::{Bucket, ClusterError, HiveSlate, KindCaps, PeerCaps, RouteKind, ServletEntry, ServletRegistry};
+use super::{
+	Bucket, ClusterError, HiveSlate, KindCaps, PeerCaps, RouteKind, ServletEntry, ServletRegistry, SlateChange,
+};
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
+use crate::colony::cluster::PeerAddress;
 
 impl ServletRegistry {
 	/// Adds one servlet entry outside any slate, for tests that seed a
 	/// registry directly.
 	///
-	/// Re-registering an address retires its index rows first. Peer route
-	/// replacement preserves its pheromone and trial state.
+	/// A second registration of an address retires its index rows first, and
+	/// a replaced peer route keeps its pheromone and trial state.
 	#[cfg(test)]
 	pub(in crate::colony::cluster) fn add(&self, entry: ServletEntry) -> Result<(), ClusterError> {
 		let now = self.clock.monotonic();
@@ -42,7 +46,12 @@ impl ServletRegistry {
 		let (hive_id, entries) = slate.into_parts();
 		let bucket = Bucket { id: hive_id.as_ref(), owner: Owner::hive(hive_id.as_ref()) };
 		let now = self.clock.monotonic();
-		self.routes.write()?.reconcile(bucket, entries, now)
+
+		// A registration reads only whether its slate applied, so the route
+		// count goes unread.
+		self.routes.write()?.reconcile(bucket, entries, now)?;
+
+		Ok(())
 	}
 
 	/// Reconciles an admitted peer slate after the stale, cap, and ownership
@@ -52,8 +61,9 @@ impl ServletRegistry {
 	///   applied for the origin, so a replayed ad inside the freshness window
 	///   leaves the fresher slate in place (CWE-294).
 	/// - An empty slate clears the origin's relay trails with its direct
-	///   routes, because a fallback lasts as long as the claim it was learned
-	///   from.
+	///   routes, because a fallback lasts as long as the claim it came from.
+	/// - The change it returns counts the routes the slate installed and the
+	///   routes it withdrew, those relay trails included.
 	///
 	/// # Errors
 	///
@@ -65,7 +75,7 @@ impl ServletRegistry {
 		&self,
 		ad: AdmittedPeerAd,
 		caps: PeerCaps,
-	) -> Result<(), ClusterError> {
+	) -> Result<SlateChange, ClusterError> {
 		let AdmittedPeerAd { peer_hive_id, slate, order, .. } = ad;
 		let bucket = Bucket { id: peer_hive_id.as_ref(), owner: Owner::peer(peer_hive_id.as_ref()) };
 		let kind_caps = KindCaps {
@@ -88,18 +98,19 @@ impl ServletRegistry {
 	///
 	/// - Relay buckets spend the separate budget in
 	///   [`PeerCaps::max_relay_buckets`] and [`PeerCaps::max_relay_routes`],
-	///   which bounds what a member relaying many origins can claim and
+	///   which bounds what a member that relays many origins can claim and
 	///   leaves direct-gateway admission its own headroom (CWE-770).
 	/// - The relay dial address comes from this registry's recorded value for
 	///   the relay, which the direct reconcile's ownership check has already
 	///   gated.
-	/// - Each bucket refuses stale advertisements on its own order ledger, as
-	///   direct slates do (CWE-294).
+	/// - Each bucket refuses stale advertisements on its own order ledger, as direct slates do (CWE-294).
+	///
+	/// The change it returns says whether the trail is new to its bucket.
 	pub(in crate::colony::cluster) fn reconcile_relay_trail(
 		&self,
 		trail: RelayTrail,
 		caps: PeerCaps,
-	) -> Result<(), ClusterError> {
+	) -> Result<SlateChange, ClusterError> {
 		let RelayTrail { bucket, origin, slate, order } = trail;
 		let bucket = Bucket { id: bucket.as_ref(), owner: Owner::peer(origin.as_ref()) };
 		let kind_caps = KindCaps {
@@ -113,7 +124,7 @@ impl ServletRegistry {
 			.admit_peer_ad(bucket, slate, kind_caps, order, self.tombstone(), self.clock.monotonic())
 	}
 
-	/// Removes every route a retiring hive owns.
+	/// Removes every route that a hive owns when the hive retires.
 	///
 	/// A route another owner landed under the same bucket bytes belongs to
 	/// that owner, so it stays in place (CWE-639).
@@ -124,6 +135,29 @@ impl ServletRegistry {
 		let hive_id = hive_id.as_ref();
 		let bucket = Bucket { id: hive_id, owner: Owner::hive(hive_id) };
 		Ok(self.routes.write()?.remove_owned(bucket))
+	}
+
+	/// Withdraws every peer route that dials `gateway`, relay trails through
+	/// it included, under one guard, and returns how many it withdrew, or
+	/// [`None`] when it withdrew none.
+	///
+	/// An eviction is evidence about a socket: its rounds failed up to the
+	/// eviction threshold. The socket therefore selects the routes, whichever
+	/// peer advertised them.
+	///
+	/// - A hive route stays, because the evidence concerns the peer plane.
+	/// - A fallback trail to the same origin through another relay stays, because it dials that relay.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
+	pub(in crate::colony::cluster) fn withdraw_peer_by_dial(
+		&self,
+		gateway: impl Into<PeerAddress>,
+	) -> Result<Option<NonZeroUsize>, ClusterError> {
+		let gateway: PeerAddress = gateway.into();
+		let withdrawn = self.routes.write()?.remove_peer_routes_dialing(gateway);
+		Ok(NonZeroUsize::new(withdrawn))
 	}
 
 	/// Applies a batch of servlet address additions and removals for one hive.

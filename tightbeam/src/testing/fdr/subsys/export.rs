@@ -1,11 +1,11 @@
-//! CSPM Export for FDR4 Integration
+//! The CSPM export for FDR4.
 //!
-//! Provides functionality to export CSP processes to CSPM (CSP Machine-readable) format
-//! for analysis with FDR4 model checker.
+//! It writes CSP processes in CSPM (machine-readable CSP), for analysis with
+//! the FDR4 model checker.
 
 use std::io::Write;
 
-use crate::testing::specs::composition::ProcessExpr;
+use crate::testing::specs::composition::{CompositionOperator, ProcessExpr};
 use crate::testing::specs::csp::Process;
 
 /// CSPM (CSP Machine-readable) export
@@ -123,25 +123,103 @@ impl<'a> CspmExporter<'a> {
 		writeln!(writer, "-- Composition: {}", expr.name())?;
 		writeln!(writer)?;
 
-		Self::write_process_expr(expr, writer)?;
+		expr.write_cspm(writer)?;
 
 		Ok(())
 	}
+}
 
-	/// Write a process expression recursively
-	fn write_process_expr<W: Write>(expr: &ProcessExpr, writer: &mut W) -> std::io::Result<()> {
-		match expr {
-			ProcessExpr::Atomic { name: _, process } => {
-				// Export the atomic process
+impl ProcessExpr {
+	/// Writes this expression to `writer` in CSPM, each operand first.
+	fn write_cspm<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+		match self {
+			Self::Atomic { name: _, process } => {
 				let exporter = CspmExporter::new(process);
 				exporter.export(writer)?;
 			}
 
-			ProcessExpr::Synchronized { left, right } => {
+			Self::Parallel { operator, left, right } => {
+				operator.write_cspm(left, right, writer)?;
+			}
+
+			Self::Sequential { first, second } => {
+				writeln!(writer, "-- Sequential composition: P ; Q")?;
+
+				first.write_cspm(writer)?;
+				second.write_cspm(writer)?;
+
+				writeln!(writer, "System = {} ; {}", first.name(), second.name())?;
+			}
+
+			Self::Hiding { process, hidden_events } => {
+				writeln!(writer, "-- Hiding: P \\ A")?;
+
+				process.write_cspm(writer)?;
+
+				write!(writer, "HiddenEvents = {{")?;
+
+				for (i, event) in hidden_events.iter().enumerate() {
+					if i > 0 {
+						write!(writer, ", ")?;
+					}
+
+					write!(writer, "{}", event.0)?;
+				}
+
+				writeln!(writer, "}}")?;
+				writeln!(writer, "System = {} \\ HiddenEvents", process.name())?;
+			}
+
+			Self::Renaming { process, mapping } => {
+				writeln!(writer, "-- Renaming: P [[ old <- new ]]")?;
+
+				process.write_cspm(writer)?;
+
+				writeln!(writer, "System = {} [[", process.name())?;
+
+				for (i, (old, new)) in mapping.iter().enumerate() {
+					if i > 0 {
+						writeln!(writer, ",")?;
+					}
+
+					write!(writer, "  {} <- {}", old.0, new.0)?;
+				}
+
+				writeln!(writer, "\n]]")?;
+			}
+
+			Self::ExternalChoice { left, right } => {
+				writeln!(writer, "-- External choice: P [] Q")?;
+
+				left.write_cspm(writer)?;
+				right.write_cspm(writer)?;
+
+				writeln!(writer, "System = {} [] {}", left.name(), right.name())?;
+			}
+
+			Self::InternalChoice { left, right } => {
+				writeln!(writer, "-- Internal choice: P |~| Q")?;
+
+				left.write_cspm(writer)?;
+				right.write_cspm(writer)?;
+
+				writeln!(writer, "System = {} |~| {}", left.name(), right.name())?;
+			}
+		}
+
+		Ok(())
+	}
+}
+
+impl CompositionOperator {
+	/// Writes `left`, `right`, and their composition under this operator.
+	fn write_cspm<W: Write>(&self, left: &ProcessExpr, right: &ProcessExpr, writer: &mut W) -> std::io::Result<()> {
+		match self {
+			Self::Synchronized => {
 				writeln!(writer, "-- Synchronized parallel: P || Q")?;
 
-				Self::write_process_expr(left, writer)?;
-				Self::write_process_expr(right, writer)?;
+				left.write_cspm(writer)?;
+				right.write_cspm(writer)?;
 
 				writeln!(
 					writer,
@@ -153,23 +231,23 @@ impl<'a> CspmExporter<'a> {
 				)?;
 			}
 
-			ProcessExpr::Interleaved { left, right } => {
+			Self::Interleaved => {
 				writeln!(writer, "-- Interleaved parallel: P ||| Q")?;
 
-				Self::write_process_expr(left, writer)?;
-				Self::write_process_expr(right, writer)?;
+				left.write_cspm(writer)?;
+				right.write_cspm(writer)?;
 
 				writeln!(writer, "System = {} ||| {}", left.name(), right.name())?;
 			}
 
-			ProcessExpr::InterfaceParallel { left, sync_alphabet, right } => {
+			Self::Interface { events } => {
 				writeln!(writer, "-- Interface parallel: P [| A |] Q")?;
 
-				Self::write_process_expr(left, writer)?;
-				Self::write_process_expr(right, writer)?;
+				left.write_cspm(writer)?;
+				right.write_cspm(writer)?;
 
 				write!(writer, "System = {} [| {{", left.name())?;
-				for (i, event) in sync_alphabet.iter().enumerate() {
+				for (i, event) in events.iter().enumerate() {
 					if i > 0 {
 						write!(writer, ", ")?;
 					}
@@ -180,13 +258,13 @@ impl<'a> CspmExporter<'a> {
 				writeln!(writer, "}} |] {}", right.name())?;
 			}
 
-			ProcessExpr::AlphabetizedParallel { left, left_alphabet, right_alphabet, right } => {
+			Self::Alphabetized { left: left_alphabet, right: right_alphabet } => {
 				writeln!(writer, "-- Alphabetized parallel: P [| αP | αQ |] Q")?;
 
-				Self::write_process_expr(left, writer)?;
-				Self::write_process_expr(right, writer)?;
+				left.write_cspm(writer)?;
+				right.write_cspm(writer)?;
 
-				// Sync alphabet is intersection
+				// The processes synchronize on the intersection.
 				write!(writer, "AlphaP = {{")?;
 
 				for (i, event) in left_alphabet.iter().enumerate() {
@@ -209,72 +287,42 @@ impl<'a> CspmExporter<'a> {
 				writeln!(writer, "}}")?;
 				writeln!(writer, "System = {} [| inter(AlphaP, AlphaQ) |] {}", left.name(), right.name())?;
 			}
-
-			ProcessExpr::Sequential { first, second } => {
-				writeln!(writer, "-- Sequential composition: P ; Q")?;
-
-				Self::write_process_expr(first, writer)?;
-				Self::write_process_expr(second, writer)?;
-
-				writeln!(writer, "System = {} ; {}", first.name(), second.name())?;
-			}
-
-			ProcessExpr::Hiding { process, hidden_events } => {
-				writeln!(writer, "-- Hiding: P \\ A")?;
-
-				Self::write_process_expr(process, writer)?;
-
-				write!(writer, "HiddenEvents = {{")?;
-
-				for (i, event) in hidden_events.iter().enumerate() {
-					if i > 0 {
-						write!(writer, ", ")?;
-					}
-
-					write!(writer, "{}", event.0)?;
-				}
-
-				writeln!(writer, "}}")?;
-				writeln!(writer, "System = {} \\ HiddenEvents", process.name())?;
-			}
-
-			ProcessExpr::Renaming { process, mapping } => {
-				writeln!(writer, "-- Renaming: P [[ old <- new ]]")?;
-
-				Self::write_process_expr(process, writer)?;
-
-				writeln!(writer, "System = {} [[", process.name())?;
-
-				for (i, (old, new)) in mapping.iter().enumerate() {
-					if i > 0 {
-						writeln!(writer, ",")?;
-					}
-
-					write!(writer, "  {} <- {}", old.0, new.0)?;
-				}
-
-				writeln!(writer, "\n]]")?;
-			}
-
-			ProcessExpr::ExternalChoice { left, right } => {
-				writeln!(writer, "-- External choice: P [] Q")?;
-
-				Self::write_process_expr(left, writer)?;
-				Self::write_process_expr(right, writer)?;
-
-				writeln!(writer, "System = {} [] {}", left.name(), right.name())?;
-			}
-
-			ProcessExpr::InternalChoice { left, right } => {
-				writeln!(writer, "-- Internal choice: P |~| Q")?;
-
-				Self::write_process_expr(left, writer)?;
-				Self::write_process_expr(right, writer)?;
-
-				writeln!(writer, "System = {} |~| {}", left.name(), right.name())?;
-			}
 		}
 
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashSet;
+
+	use super::*;
+	use crate::testing::specs::csp::{Event, State};
+
+	/// The atomic expression `name` of a process that takes `ping` once.
+	fn ping(name: &'static str) -> Box<ProcessExpr> {
+		let process = Process::builder("Ping")
+			.initial_state(State("idle"))
+			.add_observable(Event("ping"))
+			.add_transition(State("idle"), Event("ping"), State("done"))
+			.add_terminal(State("done"))
+			.build()
+			.expect("a process with one transition to its terminal state builds");
+
+		Box::new(ProcessExpr::atomic(name, process))
+	}
+
+	#[test]
+	fn an_interface_parallel_writes_its_interface_alphabet() -> Result<(), Box<dyn core::error::Error>> {
+		let operator = CompositionOperator::Interface { events: HashSet::from([Event("ping")]) };
+		let expression = ProcessExpr::Parallel { operator, left: ping("P"), right: ping("Q") };
+
+		let mut cspm = Vec::new();
+		CspmExporter::export_composition(&expression, &mut cspm)?;
+
+		let cspm = String::from_utf8(cspm)?;
+		assert_eq!(cspm.lines().last(), Some("System = P [| {ping} |] Q"));
 		Ok(())
 	}
 }

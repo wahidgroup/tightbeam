@@ -1,11 +1,14 @@
-//! Transport assembly: wires the shared state, both drivers, the
+//! The transport assembly, which connects the shared state, both drivers, the
 //! client handle, and the responder over split envelope halves.
 
 use std::sync::Arc;
 
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use core::time::Duration;
+
 use futures::channel::mpsc;
 
-use super::flow::{cap_as_usize, CreditGrantor};
+use super::flow::cap_as_usize;
 use super::handle::MuxHandle;
 use super::link::MuxLink;
 use super::reader::MuxReaderDriver;
@@ -14,18 +17,12 @@ use super::shared::MuxShared;
 use super::writer::MuxWriterDriver;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-use crate::transport::multiplex::MuxRole;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::multiplex::MuxRekeyContext;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::rekey::RekeyDriver;
-
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use core::time::Duration;
+use crate::transport::multiplex::{CreditGrantor, MuxRole};
 
 #[cfg(feature = "tokio")]
 use crate::runtime::rt;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::multiplex::MuxRekeyContext;
 
 /// Multiplexed transport assembled from split envelope halves and
 /// [`MuxSettings`].
@@ -47,14 +44,17 @@ where
 {
 	/// Assemble a multiplexed transport over split halves.
 	///
-	/// `role` fixes odd/even stream IDs and MUST match the endpoint's
-	/// connection role (initiator = client). On encrypted halves,
-	/// `settings` MUST come from
-	/// [`negotiated_mux`](crate::transport::TcpTransport::negotiated_mux).
-	/// A peer that never negotiated multiplexing rejects every muxed
-	/// envelope as invalid. On cleartext halves there is no
-	/// negotiation: both endpoints MUST agree on the same settings out
-	/// of band ([`MuxSettings::symmetric`]).
+	/// - `role` fixes odd or even stream IDs and MUST match the endpoint's
+	///   connection role, where the initiator is the client. A transport with
+	///   in-band rekey takes the role of its context ([`Self::with_rekey`]).
+	/// - On encrypted halves, `settings` MUST come from [`negotiated_mux`]. A
+	///   peer that never negotiated multiplexing rejects every muxed envelope
+	///   as invalid.
+	/// - On cleartext halves there is no negotiation, so both endpoints MUST
+	///   agree on the same settings out of band ([`MuxSettings::symmetric`]).
+	/// - The renewal deadline runs on the clock of `writer` ([`EnvelopeSink::clock`]), its endpoint's clock.
+	///
+	/// [`negotiated_mux`]: crate::transport::TcpTransport::negotiated_mux
 	pub fn new(reader: R, writer: W, role: MuxRole, settings: MuxSettings) -> Self {
 		let outbound_capacity =
 			cap_as_usize(settings.local_initiated_cap.saturating_add(settings.peer_initiated_cap)).max(1);
@@ -62,8 +62,9 @@ where
 		let (outbound_sender, outbound_receiver) = mpsc::channel(outbound_capacity);
 		let (inbound_sender, inbound_receiver) = mpsc::channel(inbound_capacity);
 
-		// Seam instrumentation inherits the connection collector the
-		// halves carried across the split; no separate injection.
+		// Instrumentation inherits the connection collector that the halves
+		// carried across the split, so the mux plane records into the collector
+		// of its connection.
 		#[cfg(not(feature = "instrument"))]
 		let shared = MuxShared::new(role, &settings);
 		#[cfg(feature = "instrument")]
@@ -84,61 +85,112 @@ where
 		Self { handle, reader, writer, responder }
 	}
 
-	/// Attach in-band rekey (receipt-bearing sessions only).
-	/// Seeds the handle receipt accessor from the handshake artifact;
-	/// each completed renewal overwrites it.
+	/// Assemble a multiplexed transport with in-band rekey over split halves,
+	/// for receipt-bearing sessions only. The transport takes the role of the
+	/// half `context` holds, so its stream IDs and its rekey exchange share one
+	/// role.
 	///
-	/// The client half of the exchange is shared between the reader
-	/// (drives the legs), the writer (record-watermark trigger),
-	/// and the budget trigger. The server half lives in the reader
-	/// alone.
+	/// The receipt in `context` seeds [`MuxHandle::session_receipt`], and each
+	/// completed renewal overwrites it. `settings` follow [`Self::new`].
+	///
+	/// # Exchange halves
+	///
+	/// - The reader, the writer, and the budget trigger share the client half.
+	///   The reader drives the legs, and the writer holds the record-watermark
+	///   trigger.
+	/// - The server half lives in the reader alone.
 	///
 	/// # Renewal deadline
 	///
-	/// The renewal deadline (`with_renewal_deadline`, tokio-only)
-	/// bounds how long a peer that never answers a renewal can park
-	/// this endpoint's data at the hard floor. Builds without tokio
-	/// have no timer here: the embedding application MUST bound
-	/// parked emits itself by wrapping emit futures in its own
-	/// timeout (a cancelled emit frees its stream slot).
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	#[must_use]
-	pub fn with_rekey(mut self, context: MuxRekeyContext) -> Self {
+	/// The renewal deadline (`with_renewal_deadline`, tokio-only) bounds how
+	/// long a peer that never answers a renewal can park this endpoint's data
+	/// at the hard floor. A build without tokio has no timer here, so the host
+	/// application MUST bound parked emits itself, with its own timeout around
+	/// each emit future. A cancelled emit frees its stream slot.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	/// use tightbeam::transport::multiplex::{MuxConnector, MuxRole, MuxTransport};
+	/// use tightbeam::transport::TransportResult;
+	///
+	/// // A dialed connection that negotiated `settings`, assembled in the role
+	/// // of the rekey context its handshake left, or as a client without one.
+	/// fn assemble<T: MuxConnector>(
+	///     mut connection: T,
+	///     settings: MuxSettings,
+	/// ) -> TransportResult<MuxTransport<T::EnvelopeReader, T::EnvelopeWriter>> {
+	///     let rekey = connection.take_rekey()?;
+	///     let (reader, writer) = connection.into_envelope_halves()?;
+	///     let mux = match rekey {
+	///         Some(context) => MuxTransport::with_rekey(reader, writer, context, settings),
+	///         None => MuxTransport::new(reader, writer, MuxRole::Client, settings),
+	///     };
+	///     Ok(mux)
+	/// }
+	/// ```
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub fn with_rekey(reader: R, writer: W, context: MuxRekeyContext, settings: MuxSettings) -> Self {
 		let MuxRekeyContext { driver, receipt } = context;
-		if let RekeyDriver::Client(exchange) = &driver {
-			self.writer.set_exchange(Arc::clone(exchange));
-		}
-		self.reader.attach_rekey(driver, receipt);
+		let mut transport = Self::new(reader, writer, driver.role(), settings);
+		let opener = driver.renewal_opener().map(Arc::clone);
+		transport.writer.set_exchange(opener);
+		transport.reader.attach_rekey(driver, receipt);
 
-		self
+		transport
 	}
 
-	/// Override the time budget for one in-band renewal exchange
-	/// (default [`DEFAULT_REKEY_DEADLINE_SECS`](crate::constants::DEFAULT_REKEY_DEADLINE_SECS)).
-	/// Expiry drains the connection on the GoAway path.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	/// Assemble a transport over split halves in `role`, or with in-band
+	/// rekey ([`Self::with_rekey`]) when `rekey` holds a context, which brings
+	/// the role it was detached for.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn assemble(
+		reader: R,
+		writer: W,
+		role: MuxRole,
+		settings: MuxSettings,
+		rekey: Option<MuxRekeyContext>,
+	) -> Self {
+		match rekey {
+			Some(context) => Self::with_rekey(reader, writer, context, settings),
+			None => Self::new(reader, writer, role, settings),
+		}
+	}
+
+	/// Override the time budget for one in-band renewal exchange. The default
+	/// is [`DEFAULT_REKEY_DEADLINE_SECS`] seconds, and expiry drains the
+	/// connection on the GoAway path.
+	///
+	/// [`DEFAULT_REKEY_DEADLINE_SECS`]: crate::constants::DEFAULT_REKEY_DEADLINE_SECS
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 	#[must_use]
 	pub fn with_renewal_deadline(mut self, deadline: Duration) -> Self {
 		self.writer.set_renewal_deadline(deadline);
 		self
 	}
 
-	/// Override the peer cancel budget (CVE-2023-44487 hardening).
+	/// Override the peer cancel budget, which hardens the connection against
+	/// CVE-2023-44487 Rapid Reset.
 	pub fn with_cancel_budget(mut self, budget: u32) -> Self {
 		self.responder.set_cancel_budget(budget);
 		self
 	}
 
-	/// Override the receiver-side stream credit policy (default:
-	/// [`crate::transport::multiplex::BufferedGrantor`] with a [`crate::constants::DEFAULT_MUX_STREAM_CREDIT`]-chunk window).
+	/// Override the receiver-side stream credit policy. The default is a
+	/// [`BufferedGrantor`] with a window of [`DEFAULT_MUX_STREAM_CREDIT`]
+	/// chunks.
+	///
+	/// [`BufferedGrantor`]: crate::transport::multiplex::BufferedGrantor
+	/// [`DEFAULT_MUX_STREAM_CREDIT`]: crate::constants::DEFAULT_MUX_STREAM_CREDIT
 	#[must_use]
 	pub fn with_credit_grantor(mut self, grantor: Arc<dyn CreditGrantor>) -> Self {
 		self.reader.set_grantor(grantor);
 		self
 	}
 
-	/// Clone the client handle without decomposing the transport
-	/// (`Arc` + channel refcount bumps).
+	/// Clone the client handle and leave the transport whole. The clone raises
+	/// the reference counts of an `Arc` and a channel.
 	pub fn handle(&self) -> MuxHandle {
 		self.handle.clone()
 	}
@@ -158,48 +210,51 @@ where
 	/// Spawn both drivers on the runtime and hand back the live plane.
 	///
 	/// Driver failures resolve pending streams through the shared state
-	/// (`fail_all_pending`), so the tasks are fire-and-forget: the
-	/// reader task doubles as the connection's liveness witness
-	/// ([`SpawnedMux::reader_task`]), the writer task ends on its own
-	/// when the connection dies.
+	/// (`fail_all_pending`), so the tasks are fire-and-forget. The reader task
+	/// doubles as the connection's liveness witness
+	/// ([`SpawnedMux::reader_task`]), and the writer task ends on its own when
+	/// the connection dies.
 	pub fn spawn(self) -> SpawnedMux {
 		let (handle, reader_driver, writer_driver, responder) = self.into_parts();
 		let reader_task = rt::spawn(async move {
+			// A reader failure has already resolved every pending stream
+			// through the shared state, so the task has nowhere else to
+			// report it.
 			let _ = reader_driver.drive().await;
 		});
 
 		rt::spawn(async move {
+			// A writer failure ends the connection, and the reader task is
+			// the liveness witness, so the writer task has nothing left to
+			// report.
 			let _ = writer_driver.drive().await;
 		});
 
 		SpawnedMux { handle, responder, reader_task }
 	}
 
-	/// Apply the optional cancel budget and rekey context, then spawn both
-	/// drivers through [`MuxTransport::spawn`].
+	/// Apply the optional cancel budget, then spawn both drivers through
+	/// [`MuxTransport::spawn`].
 	#[cfg(pooled_mux)]
-	pub(crate) fn spawn_with(mut self, cancel_budget: Option<u32>, rekey: Option<MuxRekeyContext>) -> SpawnedMux {
+	pub(crate) fn spawn_with(mut self, cancel_budget: Option<u32>) -> SpawnedMux {
 		if let Some(budget) = cancel_budget {
 			self = self.with_cancel_budget(budget);
-		}
-		if let Some(context) = rekey {
-			self = self.with_rekey(context);
 		}
 
 		self.spawn()
 	}
 }
 
-/// A running mux plane: both drivers spawned, ready to emit and serve.
+/// A live mux plane, with both drivers spawned and ready to emit and serve.
 ///
-/// Produced by [`MuxTransport::spawn`].
+/// [`MuxTransport::spawn`] produces it.
 #[cfg(feature = "tokio")]
 pub struct SpawnedMux {
-	/// Client-side handle for emitting on streams.
+	/// Client-side handle that emits on streams.
 	pub handle: MuxHandle,
 	/// Server-side dispatcher for peer-initiated streams.
 	pub responder: MuxResponder,
-	/// The reader driver's task: finishes when the connection dies, so
+	/// The reader driver's task, which finishes when the connection dies, so
 	/// holders use it as the connection's liveness witness.
 	pub reader_task: rt::JoinHandle,
 }

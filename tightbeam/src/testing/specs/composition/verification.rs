@@ -1,29 +1,33 @@
-//! CSP Verification Algorithms
+//! Verification checks for composed CSP processes.
 //!
-//! Implements verification algorithms for composed processes:
-//! - Deadlock detection
-//! - Livelock detection
-//! - Determinism checking
-//! - Refinement verification
+//! Each check walks the process and returns an error of its own:
+//! - [`DeadlockChecker`] finds a reachable state that enables no action and is not terminal.
+//! - [`LivelockChecker`] finds a reachable state that can diverge.
+//! - [`DeterminismChecker`] finds a state where one event leads to more than one state.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use crate::testing::specs::composition::CompositionError;
 use crate::testing::specs::csp::{Event, Process, State};
 
-/// Deadlock checker for CSP processes
+/// The deadlock check for a CSP process.
 pub struct DeadlockChecker;
 
 impl DeadlockChecker {
-	/// Check if process is deadlock-free
+	/// Checks that each state the process reaches enables an action or is
+	/// terminal.
 	///
-	/// A deadlock is a state with:
-	/// 1. No enabled transitions
-	/// 2. Not in terminal set
+	/// A deadlock is a state that meets both conditions:
+	/// 1. It enables no action.
+	/// 2. It is not a terminal state.
 	///
-	/// Returns the first deadlock state found, or Ok(()) if deadlock-free.
+	/// # Errors
+	///
+	/// - [`DeadlockError`] -- a reachable state is a deadlock, and the error
+	///   names the first one the search finds.
 	pub fn check(process: &Process) -> Result<(), DeadlockError> {
-		// BFS to explore all reachable states
+		// The search is breadth-first, so the first deadlock it finds is one
+		// that the fewest steps reach.
 		let mut visited = HashSet::new();
 		let mut queue = VecDeque::new();
 
@@ -31,13 +35,11 @@ impl DeadlockChecker {
 		visited.insert(process.initial);
 
 		while let Some(state) = queue.pop_front() {
-			// Check if this is a deadlock: no transitions and not terminal
 			let enabled = process.enabled(state);
 			if enabled.is_empty() && !process.terminal.contains(&state) {
 				return Err(DeadlockError { state });
 			}
 
-			// Explore successors
 			for action in enabled {
 				let successors = process.step(state, &action.event);
 				for successor in successors {
@@ -52,9 +54,10 @@ impl DeadlockChecker {
 	}
 }
 
-/// Deadlock error
+/// The error of [`DeadlockChecker::check`], which names a deadlocked state.
 #[derive(Debug, Clone)]
 pub struct DeadlockError {
+	/// The reachable state that enables no action and is not terminal.
 	pub state: State,
 }
 
@@ -66,154 +69,49 @@ impl std::fmt::Display for DeadlockError {
 
 impl std::error::Error for DeadlockError {}
 
-/// Livelock checker for CSP processes
+/// The livelock check for a CSP process.
 pub struct LivelockChecker;
 
 impl LivelockChecker {
-	/// Check if process is livelock-free
+	/// Checks that each state the process reaches is free of divergence.
 	///
-	/// A livelock is a cycle reachable only via hidden (τ) events.
-	/// Uses Tarjan's SCC algorithm to detect strongly connected components
-	/// in the hidden event graph.
+	/// A livelock is a reachable state from which a run of hidden events
+	/// reaches a cycle of hidden events. A cycle with an observable exit is a
+	/// livelock too, because the run can stay on the cycle.
+	///
+	/// [`Process::divergent_states`] decides each state, and the check reads
+	/// that answer at each state that the process reaches.
+	///
+	/// # Errors
+	///
+	/// - [`LivelockError`] -- a reachable state can diverge, and the error holds the cycle of its witness.
 	pub fn check(process: &Process) -> Result<(), LivelockError> {
-		// Build graph of hidden transitions only
-		let hidden_graph: HashMap<State, HashSet<State>> = process
-			.states
-			.iter()
-			.map(|state| {
-				let hidden_successors = process
-					.enabled(*state)
-					.into_iter()
-					.filter(|action| process.hidden.contains(&action.event))
-					.flat_map(|action| process.step(*state, &action.event))
-					.collect();
-				(*state, hidden_successors)
-			})
-			.collect();
+		let divergent = process.divergent_states();
+		let mut visited = HashSet::from([process.initial]);
+		let mut queue = VecDeque::from([process.initial]);
 
-		// Find SCCs using Tarjan's algorithm
-		let sccs = Self::tarjan_scc(&hidden_graph, process.initial);
-		// Check if any SCC has size > 1 and is reachable only via hidden events
-		sccs.into_iter()
-			.find(|scc| scc.len() > 1 && Self::is_hidden_cycle(scc, &hidden_graph, process))
-			.map_or(Ok(()), |scc| Err(LivelockError { cycle: scc }))
-	}
-
-	/// Tarjan's SCC algorithm
-	fn tarjan_scc(graph: &HashMap<State, HashSet<State>>, initial: State) -> Vec<Vec<State>> {
-		let mut index = 0;
-		let mut stack = Vec::new();
-		let mut indices: HashMap<State, usize> = HashMap::new();
-		let mut low_links: HashMap<State, usize> = HashMap::new();
-		let mut on_stack: HashSet<State> = HashSet::new();
-		let mut sccs = Vec::new();
-
-		#[allow(clippy::too_many_arguments)]
-		fn strong_connect(
-			v: State,
-			graph: &HashMap<State, HashSet<State>>,
-			index: &mut usize,
-			stack: &mut Vec<State>,
-			indices: &mut HashMap<State, usize>,
-			low_links: &mut HashMap<State, usize>,
-			on_stack: &mut HashSet<State>,
-			sccs: &mut Vec<Vec<State>>,
-		) {
-			indices.insert(v, *index);
-			low_links.insert(v, *index);
-			*index += 1;
-			stack.push(v);
-			on_stack.insert(v);
-
-			if let Some(successors) = graph.get(&v) {
-				for &w in successors {
-					if !indices.contains_key(&w) {
-						strong_connect(w, graph, index, stack, indices, low_links, on_stack, sccs);
-						let w_low_link = *low_links.get(&w).unwrap_or(&usize::MAX);
-						let v_low_link = *low_links.get(&v).unwrap_or(&usize::MAX);
-						low_links.insert(v, v_low_link.min(w_low_link));
-					} else if on_stack.contains(&w) {
-						let w_index = *indices.get(&w).unwrap_or(&usize::MAX);
-						let v_low_link = *low_links.get(&v).unwrap_or(&usize::MAX);
-						low_links.insert(v, v_low_link.min(w_index));
-					}
-				}
+		while let Some(state) = queue.pop_front() {
+			if let Some(cycle) = divergent.cycle(state) {
+				return Err(LivelockError { cycle });
 			}
 
-			if low_links.get(&v) == indices.get(&v) {
-				let mut scc = Vec::new();
-				loop {
-					let w = stack.pop().expect("Stack underflow in Tarjan");
-					on_stack.remove(&w);
-					scc.push(w);
-					if w == v {
-						break;
-					}
-				}
-				sccs.push(scc);
+			for action in process.enabled(state) {
+				let successors = process.step(state, &action.event);
+				let unvisited = successors.into_iter().filter(|successor| visited.insert(*successor));
+				queue.extend(unvisited);
 			}
 		}
 
-		// Run for all states reachable from initial
-		let mut to_visit: HashSet<State> = HashSet::new();
-		let mut visited = HashSet::new();
-		to_visit.insert(initial);
-
-		while let Some(&state) = to_visit.iter().next() {
-			to_visit.remove(&state);
-			if visited.insert(state) {
-				if let Some(successors) = graph.get(&state) {
-					for &successor in successors {
-						if !visited.contains(&successor) {
-							to_visit.insert(successor);
-						}
-					}
-				}
-
-				if !indices.contains_key(&state) {
-					strong_connect(
-						state,
-						graph,
-						&mut index,
-						&mut stack,
-						&mut indices,
-						&mut low_links,
-						&mut on_stack,
-						&mut sccs,
-					);
-				}
-			}
-		}
-
-		sccs
-	}
-
-	/// Check if SCC forms a hidden cycle (livelock)
-	fn is_hidden_cycle(
-		scc: impl AsRef<[State]>,
-		_hidden_graph: &HashMap<State, HashSet<State>>,
-		process: &Process,
-	) -> bool {
-		let scc = scc.as_ref();
-		// If cycle has any observable events that lead out of SCC, it's not a livelock
-		!scc.iter().any(|&state| {
-			process
-				.enabled(state)
-				.into_iter()
-				.filter(|action| process.observable.contains(&action.event))
-				.any(|action| {
-					process
-						.step(state, &action.event)
-						.into_iter()
-						.any(|target| !scc.contains(&target))
-				})
-		})
+		Ok(())
 	}
 }
 
-/// Livelock error
+/// The error of [`LivelockChecker::check`], which holds the cycle of a
+/// witness.
 #[derive(Debug, Clone)]
 pub struct LivelockError {
+	/// The states of the cycle of hidden events, in the order the run passes
+	/// them.
 	pub cycle: Vec<State>,
 }
 
@@ -225,27 +123,36 @@ impl std::fmt::Display for LivelockError {
 
 impl std::error::Error for LivelockError {}
 
-/// Determinism checker for CSP processes
+/// The determinism check for a CSP process.
 pub struct DeterminismChecker;
 
 impl DeterminismChecker {
-	/// Check if process is deterministic
+	/// Checks that each event of each state leads to one state at most.
 	///
-	/// A process is non-deterministic if any state has the same event
-	/// leading to multiple different target states.
+	/// A process is nondeterministic when one of its states has an event that
+	/// leads to more than one state.
+	///
+	/// - The check reads every state of the process, reachable or not.
+	/// - It reads the states in name order and the events of each state in
+	///   the order of [`Process::enabled`], so each run names the same witness.
+	///
+	/// # Errors
+	///
+	/// - [`NonDeterminismError`] -- a state has an event that leads to more
+	///   than one state, and the error names the first such pair.
 	pub fn check(process: &Process) -> Result<(), NonDeterminismError> {
-		for state in &process.states {
-			// Group transitions by event and check for multiple targets
-			let event_targets: HashMap<Event, HashSet<State>> =
-				process.enabled(*state).into_iter().fold(HashMap::new(), |mut acc, action| {
-					let targets = process.step(*state, &action.event);
-					acc.entry(action.event).or_insert_with(HashSet::new).extend(targets);
-					acc
-				});
+		let mut states: Vec<State> = process.states.iter().copied().collect();
+		states.sort_unstable();
 
-			// Find first non-deterministic event
-			if let Some((event, targets)) = event_targets.into_iter().find(|(_, targets)| targets.len() > 1) {
-				return Err(NonDeterminismError { state: *state, event, targets: targets.into_iter().collect() });
+		for state in states {
+			for action in process.enabled(state) {
+				let mut targets = process.step(state, &action.event);
+				targets.sort_unstable();
+				targets.dedup();
+
+				if targets.len() > 1 {
+					return Err(NonDeterminismError { state, event: action.event, targets });
+				}
 			}
 		}
 
@@ -253,11 +160,15 @@ impl DeterminismChecker {
 	}
 }
 
-/// Non-determinism error
+/// The error of [`DeterminismChecker::check`], which names a state, an event,
+/// and the states the event leads to.
 #[derive(Debug, Clone)]
 pub struct NonDeterminismError {
+	/// The state where the event leads to more than one state.
 	pub state: State,
+	/// The event that leads to more than one state.
 	pub event: Event,
+	/// Every state that the event leads to from `state`, sorted by name.
 	pub targets: Vec<State>,
 }
 
@@ -276,7 +187,7 @@ impl std::fmt::Display for NonDeterminismError {
 
 impl std::error::Error for NonDeterminismError {}
 
-/// Convert verification errors to CompositionError
+/// A deadlock becomes [`CompositionError::DeadlockDetected`] at the same state.
 impl From<DeadlockError> for CompositionError {
 	fn from(e: DeadlockError) -> Self {
 		CompositionError::DeadlockDetected { state: e.state }
@@ -298,7 +209,7 @@ impl From<NonDeterminismError> for CompositionError {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Event, Process, State};
+	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 
 	fn deadlock_process() -> Process {
 		Process::builder("Deadlock")
@@ -356,10 +267,69 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
+	/// A process where `x` and `y` each lead from every state of `a` to `l`
+	/// to the four states `t0` to `t3`.
+	fn nondeterministic_everywhere() -> Process {
+		let sources = ["f", "c", "a", "e", "b", "d", "l", "h", "k", "g", "j", "i"];
+		let targets = ["t2", "t0", "t3", "t1"];
+		let mut builder = Process::builder("Everywhere")
+			.initial_state(State("a"))
+			.add_observable(Event("y"))
+			.add_observable(Event("x"));
+
+		for from in sources {
+			for event in ["y", "x"] {
+				for to in targets {
+					builder = builder.add_transition(State(from), Event(event), State(to));
+				}
+			}
+		}
+
+		builder.build().expect("a process with an initial state builds")
+	}
+
+	#[test]
+	fn the_witness_names_the_first_state_and_event_by_name_with_sorted_targets() {
+		let process = nondeterministic_everywhere();
+		let checked = DeterminismChecker::check(&process);
+
+		let witness = checked.err().map(|error| (error.state, error.event, error.targets));
+		let targets = vec![State("t0"), State("t1"), State("t2"), State("t3")];
+		assert_eq!(witness, Some((State("a"), Event("x"), targets)));
+	}
+
 	#[test]
 	fn test_livelock_detection_no_livelock() {
 		let p = deterministic_process();
 		let result = LivelockChecker::check(&p);
 		assert!(result.is_ok());
+	}
+
+	/// A process whose hidden `t` and `u` take `s1` to `s2` and back, with the
+	/// observable exit `b` at `s2`.
+	fn spinning() -> Result<Process, ProcessBuildError> {
+		Process::builder("Spinning")
+			.initial_state(State("s0"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("t"))
+			.add_hidden(Event("u"))
+			.add_transition(State("s0"), Event("a"), State("s1"))
+			.add_transition(State("s1"), Event("t"), State("s2"))
+			.add_transition(State("s2"), Event("u"), State("s1"))
+			.add_transition(State("s2"), Event("b"), State("s3"))
+			.add_terminal(State("s3"))
+			.build()
+	}
+
+	#[test]
+	fn a_hidden_cycle_with_an_observable_exit_is_a_livelock() -> Result<(), ProcessBuildError> {
+		let process = spinning()?;
+		let checked = LivelockChecker::check(&process);
+
+		let cycle = checked.err().map(|error| error.cycle);
+		let spin = vec![State("s1"), State("s2")];
+		assert_eq!(cycle, Some(spin), "the run of `t` and `u` can go on forever");
+		Ok(())
 	}
 }

@@ -23,7 +23,7 @@ tightbeam = { package = "tightbeam-rs", path = "../../tightbeam", default-featur
 	"kdf",
 	"ecdh",
 	"x509",
-	"transport-ecies",
+	"transport-hpke",
 	"tcp",
 	"tokio",
 	"transport-policy",

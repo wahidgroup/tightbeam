@@ -1,0 +1,11 @@
+error: `wcet!` takes an analyzer with a percentile: add `percentile: ...`
+ --> tests/compile/wcet_analyzer_without_percentile.rs:6:27
+  |
+6 |       let config: WcetConfig = tightbeam::wcet!(
+  |  ______________________________^
+7 | |         std::time::Duration::from_millis(10),
+8 | |         analyzer: tightbeam::testing::timing::DefaultStatisticalAnalyzer
+9 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `tightbeam::wcet` (in Nightly builds, run with -Z macro-backtrace for more info)

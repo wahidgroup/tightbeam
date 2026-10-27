@@ -1,288 +1,84 @@
-//! Utility modules and functions
+//! The utility modules, and the DER encode, decode, and digest functions.
 
+use crate::asn1::admission::DerAdmission;
 use crate::error::TightBeamError;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "builder")]
-use crate::builder::FrameBuilder;
-#[cfg(feature = "compress")]
-use crate::{
-	compress::{Compressor, Inflator},
-	error::CompressionError,
-	CompressedData,
-};
-#[cfg(feature = "builder")]
-use crate::{Message, Version};
-
-// Submodules
 pub mod basis_points;
-pub mod jitter;
 pub mod marker;
-pub mod math;
-pub mod statistics;
 pub mod task;
 pub mod time;
-pub mod urn;
 
 pub use basis_points::{BasisPoints, BasisPointsOutOfRange};
 
-// Re-exports
 #[cfg(feature = "hex")]
 pub use ::hex_literal::hex;
 
-/// Macro to implement From trait for both reference and owned types
+/// Encode a value to DER format.
 ///
-/// This generates:
-/// - `impl From<&TightBeam> for TargetType` that clones or copies the field
-/// - `impl From<TightBeam> for TargetType` that delegates to the reference impl
-#[macro_export]
-macro_rules! impl_from {
-	// Pattern for field extraction from structs
-	($source:ty, $param:ident => $target:ty: $($field:tt)*) => {
-		impl From<&$source> for $target {
-			fn from($param: &$source) -> Self {
-				$($field)*
-			}
-		}
-
-		impl From<$source> for $target {
-			fn from($param: $source) -> Self {
-				(&$param).into()
-			}
-		}
-	};
-
-	// Pattern for error conversions (unconditional)
-	($from_type:ty => $target:ident::$variant:ident) => {
-		impl From<$from_type> for $target {
-			fn from(err: $from_type) -> Self {
-				$target::$variant(err)
-			}
-		}
-	};
-
-	// Pattern for conditional error conversions (with cfg)
-	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident) => {
-		#[cfg($feature)]
-		impl From<$from_type> for $target {
-			fn from(err: $from_type) -> Self {
-				$target::$variant(err)
-			}
-		}
-	};
-
-	// Pattern for conditional error conversions via enum wrapper (with cfg)
-	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident via $wrapper:path) => {
-		#[cfg($feature)]
-		impl From<$from_type> for $target {
-			fn from(err: $from_type) -> Self {
-				$target::$variant($wrapper(err))
-			}
-		}
-	};
-
-	// Pattern for unconditional error conversions via enum wrapper
-	($from_type:ty => $target:ident::$variant:ident via $wrapper:path) => {
-		impl From<$from_type> for $target {
-			fn from(err: $from_type) -> Self {
-				$target::$variant($wrapper(err))
-			}
-		}
-	};
-
-	// Pattern for extracting inner value from enum variant with fallback
-	($from_type:ty => $target:ident::$variant:ident extract $enum_variant:pat => $inner:ident else $fallback:expr) => {
-		impl From<$from_type> for $target {
-			fn from(err: $from_type) -> Self {
-				match err {
-					$enum_variant => $target::$variant($inner),
-					_ => $target::$variant($fallback),
-				}
-			}
-		}
-	};
-
-	// Pattern for extracting inner value from enum variant with fallback
-	// (conditional)
-	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident extract $enum_variant:pat => $inner:ident else $fallback:expr) => {
-		#[cfg($feature)]
-		impl From<$from_type> for $target {
-			fn from(err: $from_type) -> Self {
-				match err {
-					$enum_variant => $target::$variant($inner),
-					_ => $target::$variant($fallback),
-				}
-			}
-		}
-	};
-
-	// Pattern for unit variants (discard the error value)
-	($from_type:ty => $target:ident::$variant:ident discard) => {
-		impl From<$from_type> for $target {
-			fn from(_: $from_type) -> Self {
-				$target::$variant
-			}
-		}
-	};
-
-	// Pattern for unit variants with cfg (discard the error value)
-	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident discard) => {
-		#[cfg($feature)]
-		impl From<$from_type> for $target {
-			fn from(_: $from_type) -> Self {
-				$target::$variant
-			}
-		}
-	};
-
-	// Pattern for generic types to unit variants (e.g., PoisonError<T>)
-	(<$($gen:ident),+> $from_type:ty => $target:ident::$variant:ident discard) => {
-		impl<$($gen),+> From<$from_type> for $target {
-			fn from(_: $from_type) -> Self {
-				$target::$variant
-			}
-		}
-	};
-
-	// Pattern for generic types to unit variants with cfg
-	(#[cfg($feature:meta)] <$($gen:ident),+> $from_type:ty => $target:ident::$variant:ident discard) => {
-		#[cfg($feature)]
-		impl<$($gen),+> From<$from_type> for $target {
-			fn from(_: $from_type) -> Self {
-				$target::$variant
-			}
-		}
-	};
-
-	// Pattern for transformative conversions (wrap error via expression)
-	($from_type:ty => $target:ident::$variant:ident via |$err:ident| $transform:expr) => {
-		impl From<$from_type> for $target {
-			fn from($err: $from_type) -> Self {
-				$target::$variant($transform)
-			}
-		}
-	};
-
-	// Pattern for transformative conversions with cfg
-	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident via |$err:ident| $transform:expr) => {
-		#[cfg($feature)]
-		impl From<$from_type> for $target {
-			fn from($err: $from_type) -> Self {
-				$target::$variant($transform)
-			}
-		}
-	};
-}
-
-/// Macro to implement TryFrom trait for extracting optional fields
+/// Every universal SET of the output holds its elements in DER order
+/// (X.690 § 11.6). `der` 0.7 alone sorts a SET OF a CHOICE, such as the
+/// `SignerInfos` of a countersigned `SignedData`, in another order, which the
+/// decoders of this crate refuse.
 ///
-/// This generates:
-/// - `impl TryFrom<TightBeam> for TargetType` that consumes the source
-/// - Uses `take()` for zero-copy extraction when consuming the source
-#[macro_export]
-macro_rules! impl_try_from {
-	// For fields directly on TightBeam
-	($source:ty, $param:ident => $target:ty: $field:ident) => {
-		impl TryFrom<$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from(mut $param: $source) -> Result<Self, Self::Error> {
-				$param.$field.take().ok_or($crate::error::TightBeamError::InvalidMetadata)
-			}
-		}
-	};
-
-	($source:ty, $param:ident => $target:ty: $field:ident, $error:expr) => {
-		impl TryFrom<$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from(mut $param: $source) -> core::result::Result<Self, Self::Error> {
-				$param.$field.take().ok_or($error)
-			}
-		}
-	};
-
-	// For fields in metadata
-	($source:ty, $param:ident => $target:ty: metadata.$field:ident) => {
-		impl TryFrom<$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from(mut $param: $source) -> Result<Self, Self::Error> {
-				$param
-					.metadata
-					.$field
-					.take()
-					.ok_or($crate::error::TightBeamError::InvalidMetadata)
-			}
-		}
-	};
-
-	($source:ty, $param:ident => $target:ty: metadata.$field:ident, $error:expr) => {
-		impl TryFrom<$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from(mut $param: $source) -> core::result::Result<Self, Self::Error> {
-				$param.metadata.$field.take().ok_or($error)
-			}
-		}
-	};
-}
-
-/// Encode a value to DER format
+/// # Errors
+///
+/// - [`TightBeamError::SerializationError`] -- `value` fails to encode.
+///
+/// # Examples
+///
+/// ```
+/// let encoded = tightbeam::encode(&7u64)?;
+/// assert_eq!(encoded, [0x02, 0x01, 0x07]);
+/// # Ok::<(), tightbeam::TightBeamError>(())
+/// ```
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 11.6, set-of components:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
 #[inline]
 pub fn encode<T: der::Encode>(value: &T) -> Result<Vec<u8>, TightBeamError> {
-	Ok(der::Encode::to_der(value)?)
+	let mut der = der::Encode::to_der(value)?;
+	DerAdmission::arrange(&mut der)?;
+	Ok(der)
 }
 
 /// Decode a DER value, such as a typed message from a frame body.
 ///
 /// `content` is any borrowed byte source, such as `&[u8]`, `&Vec<u8>`, or
 /// `&[u8; N]`. The borrow outlives the call so a decoded type may borrow from
-/// those bytes.
+/// those bytes. Every universal SET in `content` MUST hold its elements in
+/// DER order (X.690 § 11.6), which the decode checks before it sorts one.
+///
+/// # Errors
+///
+/// - [`TightBeamError::SerializationError`] -- `content` is no DER encoding of
+///   `T`, or a SET in it holds its elements out of DER order.
+///
+/// # Examples
+///
+/// ```
+/// let encoded = tightbeam::encode(&7u64)?;
+/// let decoded: u64 = tightbeam::decode(&encoded)?;
+/// assert_eq!(decoded, 7);
+/// # Ok::<(), tightbeam::TightBeamError>(())
+/// ```
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 11.6, set-of components:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
 #[inline]
 pub fn decode<'a, T: der::Decode<'a>>(content: &'a (impl AsRef<[u8]> + ?Sized)) -> Result<T, TightBeamError> {
-	Ok(der::Decode::from_der(content.as_ref())?)
+	let content = content.as_ref();
+	DerAdmission::SetOrder.admit(content)?;
+	Ok(der::Decode::from_der(content)?)
 }
 
-/// Create a new FrameBuilder for the given message type and version
-///
-/// This is a convenience function for creating frames without using the
-/// `compose!` macro. Useful in contexts where macros cannot be used
-/// (e.g., within other macro definitions).
-#[cfg(feature = "builder")]
-impl Version {
-	/// Start a [`FrameBuilder`] for message type `T` at this version.
-	///
-	/// This is the method form of the `compose!` macro, for contexts
-	/// where a macro cannot be used (inside another macro definition).
-	pub fn compose<T: Message>(self) -> FrameBuilder<T> {
-		FrameBuilder::from(self)
-	}
-}
-
-/// Compress data using the specified algorithm.
-#[cfg(feature = "compress")]
-#[inline]
-pub fn compress(
-	data: impl AsRef<[u8]>,
-	compressor: &impl Compressor,
-	content_info: Option<crate::cms::signed_data::EncapsulatedContentInfo>,
-) -> Result<(Vec<u8>, CompressedData), CompressionError> {
-	let data = data.as_ref();
-	compressor.compress(data, content_info)
-}
-
-/// Decompress data using the specified algorithm.
-#[cfg(feature = "compress")]
-#[inline]
-pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Vec<u8>, TightBeamError> {
-	let data = data.as_ref();
-	inflator.decompress(data)
-}
-
-/// Compute a digest of the provided data using the specified algorithm.
+/// Compute the `DigestInfo` of `data` under the digest algorithm `D`.
 #[cfg(feature = "digest")]
 #[inline]
 pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
@@ -296,8 +92,7 @@ pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
 /// Finalize `hasher` into the [`DigestInfo`] that names its algorithm.
 ///
 /// Callers whose preimage arrives in pieces stream it into `hasher` and end
-/// here, so no caller has to concatenate a preimage into one buffer to get a
-/// `DigestInfo` back.
+/// here, so the pieces reach a `DigestInfo` with no copy into one buffer.
 ///
 /// [`DigestInfo`]: crate::asn1::DigestInfo
 #[cfg(feature = "digest")]
@@ -314,72 +109,54 @@ pub(crate) fn digest_info<D: digest::Digest + crate::der::oid::AssociatedOid>(
 mod tests {
 	use super::*;
 
+	use crate::asn1::admission::fixtures::descending_attribute;
+	use crate::cms::cert::x509::attr::Attribute;
 	use crate::der::asn1::OctetStringRef;
 	use crate::der::oid::ObjectIdentifier;
+	use crate::der::ErrorKind;
+	use crate::error::TightBeamError::SerializationError;
 
-	#[test]
-	fn data_driven_der_round_trip() -> Result<(), TightBeamError> {
-		// OID cases
-		let oid_cases = [
-			ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
-			ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1"),
-			ObjectIdentifier::new_unwrap("2.5.4.3"),
-		];
-
-		// Octet string cases (varied sizes/patterns)
-		let octet_cases: &[&[u8]] = &[
-			b"",
-			b"a",
-			b"hello",
-			b"The quick brown fox jumps over the lazy dog",
-			&(0u16..64).map(|v| (v % 251) as u8).collect::<Vec<u8>>(),
-		];
-
-		for oid in oid_cases {
+	crate::tb_cases! {
+		fn data_driven_der_round_trip_of_an_oid(oid: ObjectIdentifier) -> Result<(), TightBeamError> {
 			let enc = encode(&oid)?;
 			assert!(!enc.is_empty());
 			assert_eq!(enc[0], 0x06);
 
 			let dec: ObjectIdentifier = decode(&enc)?;
 			assert_eq!(dec, oid);
+			Ok(())
 		}
+		cases {
+			rsa_encryption => ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
+			server_auth => ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1"),
+			common_name => ObjectIdentifier::new_unwrap("2.5.4.3"),
+		}
+	}
 
-		for data in octet_cases {
-			let oct = OctetStringRef::new(data)?;
+	// The octet string cases vary in size and pattern.
+	crate::tb_cases! {
+		fn data_driven_der_round_trip_of_an_octet_string(data: Vec<u8>) -> Result<(), TightBeamError> {
+			let oct = OctetStringRef::new(&data)?;
 			let enc = encode(&oct)?;
 			assert_eq!(enc[0], 0x04);
 
 			let dec: OctetStringRef<'_> = decode(&enc)?;
-			assert_eq!(dec.as_bytes(), *data);
+			assert_eq!(dec.as_bytes(), data);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			empty => b"".to_vec(),
+			one_octet => b"a".to_vec(),
+			word => b"hello".to_vec(),
+			sentence => b"The quick brown fox jumps over the lazy dog".to_vec(),
+			counting => (0u16..64).map(|v| (v % 251) as u8).collect(),
+		}
 	}
 
 	#[test]
-	#[cfg(feature = "compress")]
-	fn test_compress_decompress() -> Result<(), TightBeamError> {
-		use crate::compress::ZstdCompression;
-
-		// Data-driven cases
-		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
-		let big_repeat = vec![b'a'; 16 * 1024];
-		let cases: Vec<&[u8]> = vec![
-			b"",
-			b"a",
-			b"hello world",
-			b"The quick brown fox jumps over the lazy dog",
-			&patterned,
-			&big_repeat,
-		];
-
-		let compressor = ZstdCompression::default();
-		for &data in &cases {
-			let (compressed, _info) = compress(data, &compressor, None)?;
-			let decompressed = decompress(&compressed, &compressor)?;
-			assert_eq!(decompressed, data);
-		}
-
-		Ok(())
+	fn a_descending_set_is_refused() {
+		let refused = decode::<Attribute>(&descending_attribute());
+		let set_ordering = matches!(refused, Err(SerializationError(error)) if error.kind() == ErrorKind::SetOrdering);
+		assert!(set_ordering);
 	}
 }

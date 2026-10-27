@@ -1,15 +1,18 @@
 //! Multi-org colony AFL fuzz (export, work, CSR, routing, streams, trust).
 //!
-//! One Cluster AFL target that boots a three-organization federation,
-//! mutates live export/ACL/GatePolicy state, installs peer routes through
-//! one-shot advertisements, and drives work/CSR/stream/hostile/failover
-//! actions from oracle bytes. The scenario owns [`ColonyTopology`] as the
-//! ClusterEnv program under test.
+//! The one Cluster AFL target boots a three-organization federation. It
+//! mutates live export, ACL, and `GatePolicy` state, installs peer routes
+//! through one-shot advertisements, and drives work, CSR, stream, hostile,
+//! and failover actions from oracle bytes. The scenario owns
+//! [`ColonyTopology`] as the `ClusterEnv` program under test.
 
 #![cfg(all(feature = "std", feature = "full"))]
 // The AFL arm expands `cfg(fuzzing)`, which cargo does not know as a
 // check-cfg name (same allowance as the other fuzz targets).
 #![allow(unexpected_cfgs)]
+// A fuzz harness is test code, exempt from the zero-panic index and arithmetic
+// lints (workspace lints): a harness fault ends the run as a finding.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 mod acl;
 mod actions;
@@ -30,7 +33,7 @@ use crate::actions::run_actions;
 use crate::topology::ColonyTopology;
 
 tb_assert_spec! {
-	/// Colony cooperation assertion specification.
+	/// Assertion specification of the colony cooperation flow.
 	pub ColonyAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -100,18 +103,15 @@ tb_scenario! {
 	csp: ColonyCoopFlow,
 	config: ScenarioConfig::builder()
 		.with_spec(ColonyAssertSpec::latest())
-		.with_csp(ColonyCoopFlow)
 		.build(),
 	environment Cluster {
 		context: (),
 		start: |SetupEnv { trace, .. }| async move {
-			ColonyTopology::boot(&trace).await
+			ColonyTopology::boot(trace.collector()).await
 		},
 		client: |ClusterEnv { trace, cluster: mut topo, .. }| async move {
 			let result = run_actions(&trace, &mut topo).await;
-
 			topo.stop();
-
 			result
 		}
 	}

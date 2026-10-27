@@ -1,14 +1,14 @@
-//! Specification module for testing framework
+//! The specs of the testing framework.
 //!
-//! This module organizes the three-layer testing stack:
-//! - Layer 1 (L1): AssertSpec - deterministic assertion verification
-//! - Layer 2 (L2): ProcessSpec (CSP) - labeled transition systems with external/internal events
-//! - Layer 3 (L3): FDR/Refinement - bounded refinement checking
+//! It organizes the three-layer testing stack:
+//! - Layer 1 (L1), the AssertSpec, verifies deterministic assertions.
+//! - Layer 2 (L2), the ProcessSpec (CSP), checks a labeled transition system of external and internal events.
+//! - Layer 3 (L3), FDR refinement, runs a bounded refinement check.
 //!
-//! Each layer builds on the previous, with feature flags controlling availability:
-//! - `testing` - Base layer (L1)
-//! - `testing-csp` - L2 (requires `testing`)
-//! - `testing-fdr` - L3 (requires `testing-csp`)
+//! Each layer builds on the previous one, and a feature flag enables it:
+//! - `testing` enables the base layer, L1.
+//! - `testing-csp` enables L2, and it requires `testing`.
+//! - `testing-fdr` enables L3, and it requires `testing-csp`.
 
 pub mod assert;
 pub mod error;
@@ -16,15 +16,16 @@ pub mod lts;
 
 /// The verification layer that graded a scenario.
 ///
-/// The three layers run in order, and each one grades what the layer before
-/// it accepted, so a scenario reaches Layer 3 only when Layer 1 and Layer 2
-/// both had their say. A negative test names the layer it expects to be
-/// rejected by through [`Expect::Violation`](crate::testing::Expect).
+/// The layers grade each run in this order. Each layer that the configuration
+/// names grades the run whatever the layers before it decided. A negative test
+/// names the layer it expects a rejection from through
+/// [`Expect::Violation`](crate::testing::Expect).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Layer {
 	/// Layer 1, the assertion spec that grades the recorded trace.
 	Assertion,
-	/// Layer 2, the CSP process that grades the trace as a labelled transition system.
+	/// Layer 2, the CSP process that grades the trace as a labeled transition
+	/// system.
 	Csp,
 	/// Layer 3, the bounded refinement check over the FDR exploration.
 	Refinement,
@@ -40,14 +41,15 @@ pub mod composition;
 #[cfg(feature = "testing-csp")]
 pub mod csp;
 
-// Re-exports
-pub use assert::TBSpec;
+pub use assert::{AssertionOrderContract, ResponseContract, TBSpec};
 pub use error::{
 	AssertionViolationDetail, EventCountMismatchDetail, EventOrderViolationDetail, GateDecisionMismatch, SpecViolation,
 	Violations,
 };
 pub use lts::*;
 
+#[cfg(feature = "instrument")]
+pub use assert::EventCountContract;
 #[cfg(feature = "testing-csp")]
 pub use composition::*;
 #[cfg(feature = "testing-csp")]

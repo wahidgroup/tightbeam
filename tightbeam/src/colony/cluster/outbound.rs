@@ -1,152 +1,61 @@
-//! Outbound connection-pool construction for cluster gateways.
+//! The outbound connection pools of a cluster gateway.
 //!
 //! Hive and peer hops use separate pools, so each trust plane stays
-//! attached to the dials it authorizes. The client identity is materialized
-//! once and shared by `Arc` across both pools.
+//! attached to the dials it authorizes. The gateway builds its client
+//! identity once, and both pools share it by `Arc`.
 
 use std::sync::Arc;
 
 use crate::colony::cluster::ClusterTlsConfig;
-use crate::crypto::policy::VerificationPolicy;
-use crate::crypto::profiles::DefaultCryptoProvider;
-use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::Certificate;
-use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool, PoolConfig};
-use crate::transport::handshake::HandshakeKeyManager;
+use crate::trace::TraceCollector;
+use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
-use crate::TightBeamError;
 
 type ClusterPool<P> = ConnectionPool<P>;
-type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;
 
 /// The hive pool plus the optional peer-plane pool.
 ///
 /// The fields are named because both pools share one type, so a tuple would
-/// let a hive and peer transposition compile and cross the two trust planes.
+/// let a swap of the two pools compile and cross the two trust planes.
 pub struct ClusterPools<P: Protocol> {
-	/// Outbound dials to this gateway's own hives, on the `hive_trust` plane.
+	/// The pool of outbound dials to this gateway's own hives, on the
+	/// `hive_trust` plane.
 	pub hive: Arc<ClusterPool<P>>,
-	/// Outbound dials to federated peer gateways, on the `peer_trust` plane.
-	/// The value is `None` when federation is disabled.
+	/// The pool of outbound dials to federated peer gateways, on the
+	/// `peer_trust` plane. The value is `None` when `peer_trust` is unset.
 	pub peer: Option<Arc<ClusterPool<P>>>,
 }
 
-/// Outbound trust store composed with the operator validator chain.
-///
-/// The handshake client validates the server identity through the pool
-/// trust store on two paths:
-///
-/// - [`CertificateValidation::evaluate`] for a bare certificate.
-/// - [`CertificateTrust::verify_chain`] for a provisioned chain.
-///
-/// This composite appends `ClusterTlsConfig::validators` to both paths, so
-/// each outbound dial enforces the operator's extra checks (pinning,
-/// expiry, policy).
-///
-/// # Evaluation order
-///
-/// 1. The underlying trust store evaluates the certificate or chain.
-/// 2. Each configured operator validator evaluates the dialed leaf in
-///    registration order.
-///
-/// [`CertificateTrust::is_trusted`] still delegates to the store alone.
-struct ValidatedTrust {
-	store: Arc<dyn CertificateTrust>,
-	validators: Vec<Arc<dyn CertificateValidation>>,
-}
-
-impl ValidatedTrust {
-	/// Run the operator validator chain over the dialed server leaf.
-	fn validate_leaf(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		for validator in self.validators.iter() {
-			validator.evaluate(cert)?;
-		}
-
-		Ok(())
-	}
-}
-
-impl core::fmt::Debug for ValidatedTrust {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		f.debug_struct("ValidatedTrust")
-			.field("store", &self.store)
-			.field("validators", &format!("[{} validators]", self.validators.len()))
-			.finish()
-	}
-}
-
-impl CertificateValidation for ValidatedTrust {
-	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		self.store.evaluate(cert)?;
-		self.validate_leaf(cert)
-	}
-}
-
-impl CertificateTrust for ValidatedTrust {
-	fn is_trusted(&self, cert: &Certificate) -> bool {
-		self.store.is_trusted(cert)
-	}
-
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-		self.store.verify_chain(chain)?;
-
-		// The chain is anchor-first, so the dialed server identity is the
-		// last entry. Operator validators target that leaf rather than an
-		// intermediate, so a pin on the server certificate cannot false-fail
-		// on a CA.
-		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
-		self.validate_leaf(leaf)
-	}
-
-	fn find_by_signer_identifier(&self, sid: &crate::cms::signed_data::SignerIdentifier) -> Option<&Certificate> {
-		self.store.find_by_signer_identifier(sid)
-	}
-
-	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-		self.store.to_policy_ref()
-	}
-}
-
-/// Wrap `store` with the validator chain when one is configured.
-///
-/// An empty chain returns the store unchanged, so the common
-/// no-validator path adds no indirection.
-fn validated_trust(
-	store: Arc<dyn CertificateTrust>,
-	validators: &[Arc<dyn CertificateValidation>],
-) -> Arc<dyn CertificateTrust> {
-	if validators.is_empty() {
-		return store;
-	}
-
-	Arc::new(ValidatedTrust { store, validators: validators.iter().map(Arc::clone).collect() })
-}
-
-impl PoolConfig {
-	/// One outbound pool on this configuration, presenting `certificate`
-	/// and `key`, validating servers against `trust`, and measuring time on
-	/// `clock`.
-	fn build_one<P>(
+impl ClusterTlsConfig {
+	/// Builds one outbound pool from the settings `pool`. The pool dials as
+	/// [`Self::outbound`] configures it, validates servers against `trust`
+	/// before the server policy of this config, measures time on `clock`, and
+	/// records its dials and the sessions they open into `trace`.
+	// The `instrument` build alone attaches a trace to a pool, so that build
+	// alone reads `trace`.
+	#[cfg_attr(not(feature = "instrument"), allow(unused_variables))]
+	fn pool<P>(
 		&self,
+		pool: &PoolConfig,
 		clock: &Arc<dyn Clock>,
-		certificate: Arc<Certificate>,
-		key: Arc<ClusterKey>,
 		trust: Option<Arc<dyn CertificateTrust>>,
+		trace: &TraceCollector,
 	) -> Arc<ClusterPool<P>>
 	where
-		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+		P: Protocol + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		// `with_config` takes the config by value, so the copy costs a
-		// refcount bump on the mux offer.
-		let mut builder = ClusterPool::<P>::builder()
-			.with_config(self.clone())
-			.with_clock(Arc::clone(clock))
-			.with_shared_client_identity(certificate, key);
+		// `with_config` takes the config by value, so the copy costs one `Arc`
+		// clone of the mux offer.
+		let builder = ClusterPool::<P>::builder()
+			.with_config(pool.clone())
+			.with_clock(Arc::clone(clock));
+		#[cfg(feature = "instrument")]
+		let builder = builder.with_trace(trace.share());
+		let mut builder = self.outbound(builder);
 
 		if let Some(store) = trust {
 			builder = builder.with_trust_store(store);
@@ -155,91 +64,33 @@ impl PoolConfig {
 		Arc::new(builder.build())
 	}
 
-	/// Builds the hive pool and, when peer trust is configured, the peer
-	/// pool from one client identity. Both pools measure time on the
-	/// gateway's `clock`.
+	/// Builds the hive pool from `pool` and, when `peer_trust` is set, the
+	/// peer pool, both under one client identity. Both pools measure time on
+	/// the gateway's `clock` and record into the gateway's `trace`.
 	///
-	/// The method takes the whole TLS config because `hive_trust` and
-	/// `peer_trust` share a type, so passing them positionally would let a
-	/// swap compile and cross the trust planes.
-	pub(crate) fn build_cluster_pools<P>(
-		&self,
-		tls: &ClusterTlsConfig,
-		clock: &Arc<dyn Clock>,
-	) -> Result<ClusterPools<P>, TightBeamError>
+	/// Each pool reads its trust plane here, on the config that holds both,
+	/// because `hive_trust` and `peer_trust` share a type, so a caller that
+	/// passed them by position could swap them and cross the trust planes.
+	///
+	/// # Warning
+	///
+	/// The trace records each dial of both pools and the session it opens, a
+	/// session that the peer fails included. The default `BoundedMemorySink`
+	/// drops each event past `max_events`, the gateway's own refusals
+	/// included, so a long-lived gateway needs an `EventSink` that forwards
+	/// each event, or a reader that drains the trace.
+	pub(crate) fn pools<P>(&self, pool: &PoolConfig, clock: &Arc<dyn Clock>, trace: &TraceCollector) -> ClusterPools<P>
 	where
-		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+		P: Protocol + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		let (certificate, key) = tls.identity().parts();
-		let hive_pool = self.build_one::<P>(
-			clock,
-			Arc::clone(&certificate),
-			Arc::clone(&key),
-			tls.hive_trust
-				.as_ref()
-				.map(|trust| validated_trust(Arc::clone(trust), &tls.validators)),
-		);
-		let peer_pool = tls.peer_trust.as_ref().map(|trust| {
-			self.build_one::<P>(
-				clock,
-				Arc::clone(&certificate),
-				Arc::clone(&key),
-				Some(validated_trust(Arc::clone(trust), &tls.validators)),
-			)
-		});
+		let hive_trust = self.hive_trust.as_ref().map(Arc::clone);
+		let hive_pool = self.pool::<P>(pool, clock, hive_trust, trace);
+		let peer_trust = self.peer_trust.as_ref().map(Arc::clone);
+		let build_peer = |trust| self.pool::<P>(pool, clock, Some(trust), trace);
+		let peer_pool = peer_trust.map(build_peer);
 
-		Ok(ClusterPools { hive: hive_pool, peer: peer_pool })
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::testing::{TestCertificate, TestKey};
-
-	struct RejectAll;
-
-	impl CertificateValidation for RejectAll {
-		fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-			Err(CertificateValidationError::CertificateDenied)
-		}
-	}
-
-	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy)
-			.with_certificate(cert.clone())
-			.expect("test certificates satisfy the trust builder")
-			.build();
-		Arc::new(store)
-	}
-
-	#[test]
-	fn empty_validator_chain_returns_store_unchanged() {
-		let store = trust_of(&TestCertificate::self_signed(&TestKey::insecure_fixed_signing()));
-		let composed = validated_trust(Arc::clone(&store), &[]);
-		assert!(Arc::ptr_eq(&store, &composed));
-	}
-
-	#[test]
-	fn operator_validator_rejects_store_trusted_certificate() {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
-		assert!(composed.is_trusted(&cert));
-		assert!(composed.evaluate(&cert).is_err());
-	}
-
-	#[test]
-	fn operator_validator_rejects_store_verified_chain() {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let store = trust_of(&cert);
-		let chain = [cert];
-		assert!(store.verify_chain(&chain).is_ok());
-
-		let composed = validated_trust(store, &[Arc::new(RejectAll)]);
-		assert!(composed.verify_chain(&chain).is_err());
+		ClusterPools { hive: hive_pool, peer: peer_pool }
 	}
 }

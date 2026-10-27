@@ -1,41 +1,44 @@
 //! # Post-handshake envelope tamper threat
 //!
 //! ## Weakness
-//! If the receive-direction AEAD nonce is not bound to an exact-next
-//! invocation counter, an active attacker on the connection can delete or
-//! replay whole encrypted envelopes without detection.
+//! If the receive direction does not bind each record to an exact-next
+//! authenticated sequence number, an active attacker on the connection can
+//! delete or replay whole encrypted envelopes without detection.
+//!
+//! A refused forgery that leaves no audit record hides the attack from the
+//! operator.
 //!
 //! ## Attack
-//! 1. A pinned client and encrypted server complete a real ECIES handshake
-//!    through a frame-aware TCP relay.
+//! 1. A pinned client and an encrypted server complete an HPKE handshake through a frame-aware TCP relay.
 //! 2. The relay tampers with the client-to-server direction after the
-//!    handshake: either drops or duplicates the first encrypted envelope.
-//! 3. The server decrypts subsequent envelopes under the exact-next counter discipline.
+//!    handshake: it drops, duplicates, or forges the first encrypted envelope.
+//! 3. The server opens subsequent envelopes under the exact-next sequence discipline.
 //!
 //! ## Expected control
-//! Exact-next counter nonces (RFC 9846 § 5.3) MUST fail closed:
-//! deleting an envelope desynchronizes the counter and surfaces
-//! `TamperDetected` on the very next message. Replaying an envelope is
-//! rejected after the original consumes its counter.
+//! An exact-next record sequence in the authenticated attributes (RFC 9846
+//! § 5.3) MUST fail closed:
+//!
+//! - A deleted envelope desynchronizes the sequence and surfaces `TamperDetected` on the next message.
+//! - The server rejects a replayed envelope once the original consumes its sequence number.
+//! - A forged record fails its tag, and the server records the refusal as `OpenFailed`.
 //!
 //! ## References
 //! - CWE-345: Insufficient Verification of Data Authenticity
 //!   <https://cwe.mitre.org/data/definitions/345.html>
-//! - RFC 9846 (TLS 1.3) §5.3: per-record nonce construction / sequencing
+//! - CWE-778: Insufficient Logging <https://cwe.mitre.org/data/definitions/778.html>
+//! - RFC 9846 (TLS 1.3) §5.3: the per-record sequence number
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio"
 ))]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
-
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::job;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
@@ -43,37 +46,25 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::config::ScenarioConfig;
 use tightbeam::testing::{SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::protocols::{AsyncReadStream, AsyncWriteStream, SplittableStream};
-use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader};
-use tightbeam::transport::TransportLimits;
-use tightbeam::transport::{
-	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
-};
-use tightbeam::utils::urn::Urn;
+use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioWriteHalf, TransportReader};
+use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportWriter};
 use tightbeam::TightBeamError;
 
-use crate::common::security::{expectation_failure, ServerMaterials};
-use crate::transport::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
+use crate::security::common::{Direction, HandshakeBackendKind, ServerMaterials};
+use crate::security::live::{AttackStep, FrameEdit, FrameSlot, LiveHandshake};
 
-pub(crate) const DELETED_ENVELOPE_DETECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:envelope-tamper/deleted-envelope-detected");
-pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:envelope-tamper/replayed-envelope-detected");
+/// HPKE sends exactly two client handshake frames, the hello and the closing,
+/// as cleartext envelopes, so the first encrypted envelope is frame 3.
+const FIRST_ENCRYPTED_FRAME: FrameSlot = FrameSlot { direction: Direction::ClientToServer, ordinal: 3 };
 
-/// ECIES sends exactly two cleartext client frames (ClientHello,
-/// ClientKeyExchange), so the first encrypted envelope is frame 3.
-const FIRST_ENCRYPTED_FRAME: usize = 3;
-
-// ---------------------------------------------------------------------------
-// Delete: dropping an encrypted envelope desynchronizes the AEAD counter
-// ---------------------------------------------------------------------------
+// Delete: a dropped encrypted envelope desynchronizes the record sequence.
 
 tb_assert_spec! {
 	pub EnvelopeDeleteSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(DELETED_ENVELOPE_DETECTED, exactly!(1u32))
+			(events::TRANSPORT_ENVELOPE_REFUSED, exactly!(1), equals!("TamperDetected"))
 		]
 	}
 }
@@ -81,15 +72,15 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub EnvelopeDeleteProcess,
 	events {
-		observable { DELETED_ENVELOPE_DETECTED }
+		observable { events::TRANSPORT_ENVELOPE_REFUSED }
 		hidden { }
 	}
 	states {
-		Idle => { DELETED_ENVELOPE_DETECTED => Done },
+		Idle => { events::TRANSPORT_ENVELOPE_REFUSED => Done },
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Exact-next AEAD counter rejects a deleted encrypted envelope" }
+	annotations { description: "Exact-next record sequence rejects a deleted encrypted envelope" }
 }
 
 tb_scenario! {
@@ -108,35 +99,26 @@ tb_scenario! {
 job! {
 	name: EnvelopeDeleteScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		let detected = with_tampered_link(TamperRule::Drop(FIRST_ENCRYPTED_FRAME), 2, |mut reader| async move {
-			// First envelope deleted: second arrives with counter 1 while 0 expected.
-			let tampered = reader.read_envelope().await;
-			Ok(is_tamper_detected(&tampered))
-		})
-		.await?;
+		let (mut reader, mut writer) = tampered_link(&trace, FrameEdit::Drop).await?;
+		write_plain_requests(&mut writer, 2).await?;
 
-		if !detected {
-			return Err(expectation_failure(
-				"server accepted traffic after a deleted encrypted envelope",
-			));
-		}
-
-		trace.event(DELETED_ENVELOPE_DETECTED)?;
+		// The relay deletes the first envelope, so sequence 1 arrives where the
+		// server expects 0.
+		let tampered = reader.read_envelope().await;
+		assert!(tampered.is_err(), "server accepted traffic after a deleted encrypted envelope");
 
 		Ok(())
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Replay: duplicating an encrypted envelope is rejected after the original
-// ---------------------------------------------------------------------------
+// Replay: the server rejects a duplicate encrypted envelope after the original.
 
 tb_assert_spec! {
 	pub EnvelopeReplaySpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REPLAYED_ENVELOPE_DETECTED, exactly!(1u32))
+			(events::TRANSPORT_ENVELOPE_REFUSED, exactly!(1), equals!("TamperDetected"))
 		]
 	}
 }
@@ -144,15 +126,15 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub EnvelopeReplayProcess,
 	events {
-		observable { REPLAYED_ENVELOPE_DETECTED }
+		observable { events::TRANSPORT_ENVELOPE_REFUSED }
 		hidden { }
 	}
 	states {
-		Idle => { REPLAYED_ENVELOPE_DETECTED => Done },
+		Idle => { events::TRANSPORT_ENVELOPE_REFUSED => Done },
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Exact-next AEAD counter rejects a replayed encrypted envelope" }
+	annotations { description: "Exact-next record sequence rejects a replayed encrypted envelope" }
 }
 
 tb_scenario! {
@@ -171,99 +153,58 @@ tb_scenario! {
 job! {
 	name: EnvelopeReplayScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		let detected = with_tampered_link(TamperRule::Duplicate(FIRST_ENCRYPTED_FRAME), 1, |mut reader| async move {
-			let original = reader.read_envelope().await?;
-			let original_ok = matches!(original, TransportEnvelope::Request(_));
+		let (mut reader, mut writer) = tampered_link(&trace, FrameEdit::Duplicate).await?;
+		write_plain_requests(&mut writer, 1).await?;
 
-			// Replay re-presents counter 0 while 1 is expected.
-			let replayed = reader.read_envelope().await;
-			Ok(original_ok && is_tamper_detected(&replayed))
-		})
-		.await?;
+		let original = reader.read_envelope().await?;
+		assert!(matches!(original, TransportEnvelope::Request(_)), "server refused the original encrypted envelope");
 
-		if !detected {
-			return Err(expectation_failure(
-				"server accepted a replayed encrypted envelope",
-			));
-		}
-
-		trace.event(REPLAYED_ENVELOPE_DETECTED)?;
+		// The replay presents sequence 0 again where the server expects 1.
+		let replayed = reader.read_envelope().await;
+		assert!(replayed.is_err(), "server accepted a replayed encrypted envelope");
 
 		Ok(())
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Frame-aware TCP relay (shared setup)
-// ---------------------------------------------------------------------------
+// Forgery: a record whose tag fails leaves an audit record of its refusal.
 
-/// How the relay tampers with one client-to-server frame (1-based index).
-#[derive(Clone, Copy)]
-enum TamperRule {
-	Drop(usize),
-	Duplicate(usize),
-}
-
-/// Bind a frame-aware relay in front of `upstream` and return its address.
-///
-/// Server-to-client frames pass unchanged. Client-to-server frames go
-/// through the tamper rule. Operating on whole DER frames (not bytes)
-/// keeps the tampering an active-attacker envelope operation rather than
-/// a corruption the AEAD tag would already catch.
-async fn spawn_tamper_relay(upstream: SocketAddr, rule: TamperRule) -> Result<SocketAddr, TightBeamError> {
-	let listener = TcpListener::bind("127.0.0.1:0").await?;
-	let relay_addr = listener.local_addr()?;
-
-	tokio::spawn(async move {
-		let Ok((inbound, _)) = listener.accept().await else {
-			return;
-		};
-		let Ok(outbound) = TcpStream::connect(upstream).await else {
-			return;
-		};
-
-		let (client_read, client_write) = TokioStream::from(inbound).into_split();
-		let (server_read, server_write) = TokioStream::from(outbound).into_split();
-		tokio::join!(
-			forward_tampered_frames(client_read, server_write, rule),
-			forward_unchanged_frames(server_read, client_write),
-		);
-	});
-
-	Ok(relay_addr)
-}
-
-fn tamper_repeats(rule: TamperRule, index: usize) -> usize {
-	match rule {
-		TamperRule::Drop(target) if index == target => 0,
-		TamperRule::Duplicate(target) if index == target => 2,
-		_ => 1,
+tb_assert_spec! {
+	pub EnvelopeForgerySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::TRANSPORT_ENVELOPE_REFUSED, exactly!(1), equals!("OpenFailed"))
+		]
 	}
 }
 
-async fn forward_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf, rule: TamperRule) {
-	let mut index = 0usize;
-	while let Ok(frame) = reader.read_frame(TransportLimits::default().max_envelope()).await {
-		index += 1;
-		for _ in 0..tamper_repeats(rule, index) {
-			if writer.write_frame(&frame).await.is_err() {
-				return;
-			}
+tb_scenario! {
+	name: envelope_forgery_detected,
+	spec: EnvelopeForgerySpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			EnvelopeForgeryScenario::run((trace.into(),)).await
 		}
 	}
 }
 
-async fn forward_unchanged_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf) {
-	while let Ok(frame) = reader.read_frame(TransportLimits::default().max_envelope()).await {
-		if writer.write_frame(&frame).await.is_err() {
-			return;
-		}
+job! {
+	name: EnvelopeForgeryScenario,
+	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
+		let (mut reader, mut writer) = tampered_link(&trace, FrameEdit::FlipLastOctet).await?;
+		write_plain_requests(&mut writer, 1).await?;
+
+		// The forged record reads as a message the server cannot use.
+		let forged = reader.read_envelope().await;
+		let refused = matches!(forged, Err(TransportError::InvalidMessage));
+		assert!(refused, "server accepted a forged encrypted envelope");
+
+		Ok(())
 	}
 }
 
-fn is_tamper_detected(result: &Result<TransportEnvelope, TransportError>) -> bool {
-	matches!(result, Err(TransportError::OperationFailed(TransportFailure::TamperDetected)))
-}
+// The tampered link that every case shares.
 
 async fn write_plain_requests(
 	writer: &mut TransportWriter<TokioWriteHalf>,
@@ -277,30 +218,19 @@ async fn write_plain_requests(
 	Ok(())
 }
 
-/// Handshake through a tampering relay, run `on_server` against the server
-/// half, and send `request_count` plain encrypted requests from the client.
-async fn with_tampered_link<F, Fut>(
-	rule: TamperRule,
-	request_count: usize,
-	on_server: F,
-) -> Result<bool, TightBeamError>
-where
-	F: FnOnce(TransportReader<TokioReadHalf>) -> Fut + Send + 'static,
-	Fut: core::future::Future<Output = Result<bool, TightBeamError>> + Send + 'static,
-{
-	let materials = ServerMaterials::generate();
-	let (listener, server_addr) = bind_encrypted_listener(&materials).await?;
-	let relay_addr = spawn_tamper_relay(server_addr, rule).await?;
+/// Handshake through a relay that applies `edit` to the first encrypted
+/// envelope of the client, and return the reader of the server, which files
+/// its refusals in `trace`, beside the writer of the client.
+async fn tampered_link(
+	trace: &TraceCollector,
+	edit: FrameEdit,
+) -> Result<(TransportReader<TokioReadHalf>, TransportWriter<TokioWriteHalf>), TightBeamError> {
+	let step = AttackStep::new(FIRST_ENCRYPTED_FRAME, edit);
+	let link = LiveHandshake::new(HandshakeBackendKind::Hpke, ServerMaterials::generate());
+	let outcome = link.audit_server(trace).with_step(step).run().await?;
 
-	let server_task = tokio::spawn(async move {
-		let (reader, _writer) = accept_handshaken_split(listener).await?;
-		on_server(reader).await
-	});
-
-	let (_reader, mut writer) = connect_handshaken_split(relay_addr, &materials.certificate).await?;
-
-	write_plain_requests(&mut writer, request_count).await?;
-
-	let detected = await_ok(server_task, "server task must not panic").await?;
-	Ok(detected)
+	let (client, server) = outcome.established()?;
+	let (reader, _) = server.into_split()?;
+	let (_, writer) = client.into_split()?;
+	Ok((reader, writer))
 }

@@ -1,7 +1,8 @@
-//! Derive macro for TightBeam message types
+//! Derive macros for TightBeam message, flag, and error types.
 //!
-//! This crate provides the `#[derive(Beamable)]` macro that automatically
-//! implements the `Message` trait for structs.
+//! - `#[derive(Beamable)]` implements the `Message` trait for a struct.
+//! - `#[derive(Flaggable)]` implements the `u8` conversion and comparison of a flag enum.
+//! - `#[derive(Errorizable)]` implements `Display`, `Error`, and `From` for an error enum.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -152,23 +153,24 @@ fn get_error_message(attrs: impl AsRef<[Attribute]>) -> Option<String> {
 	None
 }
 
-/// Derive macro for implementing `Message`
+/// Derive macro that implements `Message` for a struct.
 ///
-/// This macro can be applied to any struct that implements the necessary
-/// serialization traits (typically `der::Sequence`).
+/// The struct must implement the DER traits that `Message` requires, which
+/// `der::Sequence` typically provides.
 ///
 /// # Attributes
 ///
 /// All configuration lives in a `#[beam(...)]` attribute:
 ///
 /// - `confidential`, `nonrepudiable`, `compressed`, `prioritized`,
-///   `message_integrity`, `frame_integrity` - set the corresponding
-///   `MUST_*` constant to `true`
-/// - `min_version = "V1"` - minimum protocol version for the type
-/// - `profile(MyProfile)` - pin the type to a `SecurityProfile`. The builder
+///   `message_integrity`, and `frame_integrity` set the matching `MUST_*`
+///   constant to `true`.
+/// - `min_version = "V1"` sets the minimum protocol version of the type.
+/// - `profile(MyProfile)` pins the type to a `SecurityProfile`. The builder
 ///   refuses a digest, AEAD, or signature algorithm that the profile does not
-///   name. A mismatched algorithm type also fails to compile at the builder call.
-/// - `profile = N` - numeric shorthand for a set of requirement flags:
+///   name. A mismatched algorithm type also fails to compile at the builder
+///   call.
+/// - `profile = N` is a numeric shorthand for a set of requirement flags:
 ///
 ///   | N | Profile  | Effect                                          |
 ///   |---|----------|-------------------------------------------------|
@@ -177,8 +179,8 @@ fn get_error_message(attrs: impl AsRef<[Attribute]>) -> Option<String> {
 ///
 ///   A numeric profile constrains no algorithm, so a `profile = 1` message
 ///   accepts any digest, AEAD, or signature algorithm. Use `profile(Type)` to
-///   constrain algorithms. Any other number is rejected at compile time.
-///   `profile = N` and `profile(Type)` are mutually exclusive.
+///   constrain algorithms. The derive rejects any other number at compile
+///   time, and it rejects `profile = N` together with `profile(Type)`.
 #[proc_macro_derive(Beamable, attributes(beam))]
 pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -189,7 +191,7 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 /// feature the build disables.
 ///
 /// The check runs through tightbeam's `shim` macro, so tightbeam's own feature
-/// state decides it. This crate carries no copy of tightbeam's features.
+/// state decides it, and the feature list lives in tightbeam alone.
 fn feature_check(
 	name: &syn::Ident,
 	shim: impl AsRef<str>,
@@ -222,7 +224,7 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 	let profile_value = get_profile_value(&input.attrs)?;
 	let profile_type = get_profile_type(&input.attrs)?;
 
-	// Validate that we don't have both numeric and type-based profiles
+	// `profile = N` and `profile(Type)` are mutually exclusive.
 	if profile_value.is_some() && profile_type.is_some() {
 		return Err(syn::Error::new_spanned(
 			input,
@@ -230,9 +232,9 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 		));
 	}
 
-	// Profile-based security requirements (see the profile table in the
-	// derive rustdoc). FIPS and Standard currently impose identical
-	// requirements; they are kept distinct as wire-visible policy levels.
+	// The profile table in the `Beamable` rustdoc lists these requirements.
+	// FIPS and Standard impose the same requirements, and they stay distinct
+	// because each is a wire-visible policy level.
 	let (profile_confidential, profile_nonrep, profile_min_version) = match profile_value {
 		Some((1 | 2, _)) => (true, true, Some(syn::Ident::new("V1", name.span()))),
 		Some((n, span)) => {
@@ -244,7 +246,7 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 		None => (false, false, None),
 	};
 
-	// Apply profile requirements (override individual flags)
+	// A numeric profile's requirements override the matching attributes.
 	let final_confidential = profile_confidential || confidential;
 	let final_nonrep = profile_nonrep || nonrep;
 	let final_min_version = profile_min_version.or(min_version);
@@ -280,7 +282,8 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 			::tightbeam::__tb_if_crypto! { type Profile = #profile_ty; }
 		}
 	} else {
-		// Always define HAS_PROFILE, even when false (needed for checker trait impls)
+		// HAS_PROFILE is defined even when false, because the checker trait
+		// impls need it.
 		quote! {
 			const HAS_PROFILE: bool = false;
 			::tightbeam::__tb_if_crypto! { type Profile = ::tightbeam::crypto::profiles::TightbeamProfile; }
@@ -361,13 +364,14 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 	})
 }
 
-/// Derive macro for implementing flag enum traits
+/// Derive macro for a TightBeam flag enum.
 ///
-/// This macro automatically adds the necessary attributes and trait
-/// implementations for flag enums used with the TightBeam flag system.
+/// For an enum `E`, it implements `From<E> for u8` and `PartialEq<u8>`, and
+/// it adds a `TYPE_NAME` constant that holds the name of the enum.
 ///
-/// The target must be a fieldless enum: the generated conversions cast
-/// variants with `as u8`, which only exists for C-like enums.
+/// The target must be a fieldless `#[repr(u8)]` enum: the generated
+/// conversions cast variants with `as u8`, which only exists for C-like
+/// enums, and `repr(u8)` keeps every discriminant inside a `u8`.
 #[proc_macro_derive(Flaggable)]
 pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -436,18 +440,18 @@ fn is_received_expected_error(ty: &syn::Type) -> bool {
 	false
 }
 
-/// Derive macro for implementing error traits with automatic Display and From
-/// implementations
+/// Derive macro for the error traits of an enum.
 ///
-/// This macro automatically implements `Display`, `Error`, and `From`
-/// conversions for error enums, similar to the `snafu` crate.
+/// The macro implements `Display`, `Error`, and `From` for an error enum,
+/// similar to the `snafu` crate.
 ///
 /// # Attributes
 ///
-/// - `#[error("format string")]` -- Specifies the display format for the variant
-/// - `#[from]` -- Implements `From` for the wrapped type and reports that value
-///   through `Error::source`, so the payload must implement `core::error::Error`
-/// - `#[source]` -- Reports the wrapped value through `Error::source`
+/// - `#[error("format string")]` -- sets the display format of the variant.
+/// - `#[from]` -- implements `From` for the wrapped type and reports that
+///   value through `Error::source`, so the payload must implement
+///   `core::error::Error`.
+/// - `#[source]` -- reports the wrapped value through `Error::source`.
 #[proc_macro_derive(Errorizable, attributes(error, from, source))]
 pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -469,15 +473,15 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 		let variant_name = &variant.ident;
 		let variant_cfgs: Vec<_> = variant.attrs.iter().filter(|attr| attr.path().is_ident("cfg")).collect();
 
-		// Get the error message from #[error("...")] attribute
 		let error_msg = get_error_message(&variant.attrs);
 		let has_from = has_attr(&variant.attrs, "from");
 		let has_source = has_attr(&variant.attrs, "source");
 
-		// A variant that carries data must render it. A message with no
-		// placeholder drops the payload, and the caller sees a bare
-		// description where the values it needed used to be.
-		if !matches!(&variant.fields, syn::Fields::Unit) {
+		// A variant that carries data must render it, unless #[source] keeps
+		// it as the cause. A message with no placeholder drops the payload,
+		// so the caller sees a bare description in place of the values it
+		// needs.
+		if !matches!(&variant.fields, syn::Fields::Unit) && !has_source {
 			if let Some(msg) = error_msg.as_deref() {
 				let literal_braces_removed = msg.replace("{{", "").replace("}}", "");
 				if !literal_braces_removed.contains('{') {
@@ -497,7 +501,7 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 			));
 		}
 
-		// Build the display match arm based on variant fields
+		// The shape of the variant's fields decides its display arm.
 		match &variant.fields {
 			syn::Fields::Unnamed(fields) => {
 				let field_count = fields.unnamed.len();
@@ -520,11 +524,19 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						.is_some_and(|msg| msg.contains("{expected") || msg.contains("{received"));
 
 				if let Some(msg) = error_msg {
+					let renders_payload = msg.replace("{{", "").replace("}}", "").contains('{');
 					if formats_by_accessor {
 						display_arms.push(quote! {
 							#(#variant_cfgs)*
 							#name::#variant_name(ref f0) => {
 								write!(f, #msg, expected = f0.expected, received = f0.received)
+							}
+						});
+					} else if !renders_payload {
+						display_arms.push(quote! {
+							#(#variant_cfgs)*
+							#name::#variant_name(..) => {
+								write!(f, #msg)
 							}
 						});
 					} else {
@@ -543,7 +555,6 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 					));
 				}
 
-				// Generate From impl if #[from] is present and there's exactly one field
 				if has_from && field_count == 1 {
 					if let Some(field) = fields.unnamed.first() {
 						let field_type = &field.ty;
@@ -604,9 +615,9 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 		}
 	}
 
-	// `source()` requires each wrapped type to implement `Error`; some
-	// dependencies (e.g. `rand_core`) only do so with `std`, so the method
-	// is emitted through tightbeam's `std`-gated delegation macro.
+	// `source()` requires each wrapped type to implement `Error`. Some
+	// dependencies, such as `rand_core`, implement it only with `std`, so the
+	// method is emitted through tightbeam's `std`-gated delegation macro.
 	let source_impl = if source_arms.is_empty() {
 		quote! {}
 	} else {

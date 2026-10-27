@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 description = "A secure, high-performance messaging protocol library"
 
-# The test tree and the fuzz corpus serve development
-exclude = ["tests/**", "fuzz/**"]
+# The test tree, the benches, and the fuzz corpus serve development
+exclude = ["tests/**", "benches/**", "fuzz/**"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -48,13 +48,15 @@ kem = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 aes-kw = { workspace = true, optional = true }
+ghash = { workspace = true, optional = true }
+polyval = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 ecdsa = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
 
 # Non-RustCrypto dependencies
 rand_core = { workspace = true, optional = true }
-getrandom = { version = "0.2", optional = true }
+getrandom = { version = "=0.2.17", optional = true }
 tokio = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
@@ -70,9 +72,11 @@ afl = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The dev feature set leaves `rayon` off, so `cargo test` runs the suite with
+# the sequential FDR walk and `--all-features` runs it with the parallel one.
+# `make test-all` runs both.
 tightbeam-rs = { path = ".", features = [
 	"full",
-	"rayon",
 	"zstd",
 	"testing",
 	"testing-csp",
@@ -83,8 +87,16 @@ tightbeam-rs = { path = ".", features = [
 	"testing-timing",
 ] }
 husky-rs = { workspace = true }
+p256 = { workspace = true }
+p384 = { workspace = true }
+p521 = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
+
+# `make loom` builds the library tests under `--cfg tightbeam_loom`, where the
+# atomics of the multiplexer's hand-built protocols come from `loom`.
+[target.'cfg(tightbeam_loom)'.dev-dependencies]
+loom = "=0.7.2"
 
 [features]
 default = ["std", "builder"]
@@ -100,7 +112,7 @@ full = [
 	"transport",
 	"transport-policy",
 	"transport-cms",
-	"transport-ecies",
+	"transport-hpke",
 	"transport-multiplex",
 	"tcp",
 	"aead",
@@ -111,7 +123,7 @@ full = [
 	"sha3",
 	"secp256k1",
 	"kdf",
-	"ecies",
+	"hpke",
 	"ecdh",
 	"tokio",
 	"futures",
@@ -130,7 +142,6 @@ builder = ["x509-cert/builder", "crypto"]
 policy = []
 router = []
 transport = [
-	"cms/builder",
 	"builder",
 	"transport-policy",
 	"aead",
@@ -153,7 +164,7 @@ colony = [
 	"policy",
 	"router",
 	"transport",
-	"transport-ecies",
+	"transport-hpke",
 	"transport-multiplex",
 	"transport-policy",
 	"x509",
@@ -204,17 +215,26 @@ signature = [
 	"x509-cert/signature",
 ]
 digest = ["crypto", "dep:digest", "sha3"]
-x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "digest"]
+x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "ecdsa/alloc", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
-ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
+hpke = ["crypto", "kdf", "aead", "ecdh", "k256/ecdh", "secp256k1", "sha3"]
 ecdh = ["elliptic-curve/ecdh", "secp256k1"]
 kem = ["crypto", "dep:kem"]
 
 ## Security features
 random = ["dep:rand_core"]
-zeroize = ["dep:zeroize", "der/zeroize", "cms/zeroize", "aes-gcm?/zeroize"]
+zeroize = [
+	"dep:zeroize",
+	"der/zeroize",
+	"cms/zeroize",
+	"aes-gcm?/zeroize",
+	"aes?/zeroize",
+	"ghash?/zeroize",
+	"polyval?/zeroize",
+	"sha3?/zeroize",
+]
 
-aes-gcm = ["crypto", "dep:aes-gcm", "cms/aes"]
+aes-gcm = ["crypto", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval", "cms/aes"]
 sha3 = ["crypto", "dep:sha3", "dep:digest"]
 secp256k1 = ["crypto", "dep:k256"]
 
@@ -223,6 +243,7 @@ transport-cms = [
 	"transport",
 	"transport-policy",
 	"builder",
+	"hpke",
 	"aead",
 	"aes-gcm",
 	"signature",
@@ -234,11 +255,11 @@ transport-cms = [
 	"x509",
 	"ecdh",
 ]
-transport-ecies = [
+transport-hpke = [
 	"transport",
 	"transport-policy",
 	"builder",
-	"ecies",
+	"hpke",
 	"aead",
 	"aes-gcm",
 	"signature",
@@ -325,5 +346,14 @@ path = "fuzz/colony/mod.rs"
 # IJON annotations steer the colony state search
 required-features = ["full", "testing-fuzz", "testing-fuzz-ijon"]
 
+# Benches, one binary each, that `make bench` runs.
+[[bench]]
+name = "seal_open"
+harness = false
+
+[[bench]]
+name = "replay_guard"
+harness = false
+
 [build-dependencies]
-cfg_aliases = "0.2.2"
+cfg_aliases = "=0.2.2"

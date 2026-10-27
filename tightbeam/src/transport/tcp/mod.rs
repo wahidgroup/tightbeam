@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 #[cfg(feature = "std")]
-#[allow(unused_imports)] // Used in macro expansion
+#[allow(unused_imports)] // The expansion of `impl_tcp_common!` names it.
 use std::sync::Arc;
 
 #[cfg(feature = "std")]
@@ -28,22 +28,65 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "std")]
 use crate::transport::TightBeamAddress;
 #[cfg(feature = "tcp")]
-use crate::transport::{tcp::sync::TcpTransport, Protocol, ProtocolStream};
+use crate::transport::{tcp::sync::TcpTransport, Protocol, ProtocolStream, TransportError};
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub mod r#async;
 #[cfg(feature = "tcp")]
 pub mod sync;
 
-// Canonical definition lives in transport::io so it exists without the TCP features.
-
-/// Abstract TCP listener trait for different networking backends.
+/// The blocking TCP listener trait that a networking backend implements to
+/// accept a stream and its peer address.
+///
+/// The house [`TcpListener`](sync::TcpListener) builds each transport from the
+/// stream the backend accepts.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Error as IoError;
+/// use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
+///
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::testing::{TestIdentity, TestKey};
+/// use tightbeam::transport::tcp::sync::TcpListener;
+/// use tightbeam::transport::tcp::TcpListenerTrait;
+/// use tightbeam::transport::TransportEncryptionConfig;
+///
+/// /// A backend that accepts on a socket it bound itself.
+/// struct Backend(NetTcpListener);
+///
+/// impl TcpListenerTrait for Backend {
+///     type Stream = NetTcpStream;
+///     type Error = IoError;
+///
+///     fn accept(&self) -> Result<(NetTcpStream, SocketAddr), IoError> {
+///         self.0.accept()
+///     }
+/// }
+///
+/// let backend = Backend(NetTcpListener::bind("127.0.0.1:0")?);
+/// let identity = TestIdentity::of(&TestKey::insecure_fixed_signing());
+/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
+/// let _listener = TcpListener::from_listener_with(backend, config)?;
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
 #[cfg(feature = "tcp")]
-pub trait TcpListenerTrait: Protocol + Send {
+pub trait TcpListenerTrait: Send {
+	/// The stream of one accepted connection.
+	type Stream: ProtocolStream;
+	/// The error the listener reports, convertible into a [`TransportError`].
+	type Error: Into<TransportError>;
+
+	/// Accepts one connection and returns its stream and peer address.
+	///
+	/// # Errors
+	///
+	/// - `Self::Error` -- the listener accepts no connection.
 	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error>;
 }
 
-/// Socket address abstraction for no_std environments.
+/// The socket address of a `no_std` build.
 #[cfg(not(feature = "std"))]
 #[derive(Debug, Clone)]
 pub enum SocketAddr {
@@ -66,7 +109,7 @@ impl Protocol for TcpListener {
 			.map_err(|_| IoError::new(ErrorKind::InvalidInput, "Invalid default address"))
 	}
 
-	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		Ok((listener, TightBeamSocketAddr(bound_addr)))
@@ -84,14 +127,7 @@ impl Protocol for TcpListener {
 	}
 }
 
-// The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs.
-
-#[cfg(all(feature = "std", feature = "tcp"))]
-impl TcpListenerTrait for TcpListener {
-	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error> {
-		TcpListener::accept(self)
-	}
-}
+// The `EncryptedProtocol` impl of sync TCP sits on the wrapper in `sync.rs`.
 
 #[cfg(all(feature = "std", feature = "tcp"))]
 impl ProtocolStream for TcpStream {
@@ -101,8 +137,28 @@ impl ProtocolStream for TcpStream {
 		Write::write_all(self, buf)
 	}
 
+	/// A send that a signal interrupts runs again, as `write_all` does.
+	fn write_some(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+		loop {
+			match Write::write(self, buf) {
+				Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+				sent => return sent,
+			}
+		}
+	}
+
 	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
 		Read::read_exact(self, buf)
+	}
+
+	/// A receive that a signal interrupts runs again, as `read_exact` does.
+	fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+		loop {
+			match Read::read(self, buf) {
+				Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+				received => return received,
+			}
+		}
 	}
 
 	fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Self::Error> {
@@ -112,7 +168,7 @@ impl ProtocolStream for TcpStream {
 	}
 }
 
-/// Newtype wrapper for `SocketAddr` that implements `Into<Vec<u8>>`.
+/// A newtype over `SocketAddr` that implements `Into<Vec<u8>>`.
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TightBeamSocketAddr(pub SocketAddr);
@@ -166,50 +222,51 @@ impl ops::Deref for TightBeamSocketAddr {
 #[cfg(feature = "std")]
 impl TightBeamAddress for TightBeamSocketAddr {}
 
-/// Macro to generate the common transport implementation for both sync
-/// and async.
+/// Generates the transport implementation that the sync and the async TCP
+/// transports share.
 ///
-/// Defines the transport struct itself plus its one constructor and the
-/// shared trait impls. The struct definition is the single source for the
-/// field list.
+/// It defines the transport struct, the single source of the field list, with
+/// its one constructor and the shared trait impls.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! impl_tcp_common {
 	($transport:ident, $stream_trait:path) => {
-		/// TCP transport over a stream `S`, generated by `impl_tcp_common!`.
+		/// A TCP transport over a stream `S`, generated by `impl_tcp_common!`.
 		pub struct $transport<
 			S: $stream_trait,
 			P: $crate::crypto::profiles::CryptoProvider = $crate::crypto::profiles::DefaultCryptoProvider,
 		> {
 			pub(crate) stream: S,
-			#[cfg(feature = "transport-policy")]
 			pub(crate) restart_policy: Box<dyn $crate::transport::policy::RestartPolicy>,
-			#[cfg(feature = "transport-policy")]
 			pub(crate) emitter_gate: $crate::policy::GateChain,
-			#[cfg(feature = "transport-policy")]
 			pub(crate) collector_gate: $crate::policy::GateChain,
 			pub(crate) state: $crate::transport::state::SessionState<P>,
 			pub(crate) limits: $crate::transport::TransportLimits,
 			pub(crate) clock: Arc<dyn $crate::utils::time::Clock>,
 			pub(crate) server_handshake: Option<$crate::transport::handshake::BoxedServerHandshake>,
-			/// Connection instrumentation collector.
+			/// The instrumentation collector of this connection.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
+			/// The peer address that a listener accepted this connection from,
+			/// which the acceptance record names.
+			#[cfg(feature = "instrument")]
+			pub(crate) accepted_from: Option<core::net::SocketAddr>,
 		}
 
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
-			/// Build a transport over `stream` from `config`.
+			/// Builds a transport over `stream` from `config`. It is the one
+			/// constructor.
 			///
-			/// The one constructor. The configuration's provisioning already
-			/// answered the dialer rule, so the session starts where that
-			/// provisioning says: `Provisioned` when it names a peer authority,
-			/// `Cleartext` only when cleartext was named.
+			/// The provisioning already answered the dialer rule, so the
+			/// session starts where it says: `Provisioned` when it names a peer
+			/// authority, and `Cleartext` only when it names cleartext.
 			pub fn new(stream: S, config: $crate::transport::EndpointConfig<P>) -> Self {
 				let $crate::transport::EndpointConfig {
 					encryption,
+					negotiation,
 					limits,
 					clock,
 					#[cfg(feature = "instrument")]
@@ -218,41 +275,42 @@ macro_rules! impl_tcp_common {
 
 				Self {
 					stream,
-					#[cfg(feature = "transport-policy")]
 					restart_policy: Box::new($crate::transport::policy::NoRestart),
-					#[cfg(feature = "transport-policy")]
 					emitter_gate: $crate::policy::GateChain::default(),
-					#[cfg(feature = "transport-policy")]
 					collector_gate: $crate::policy::GateChain::default(),
-					state: $crate::transport::state::SessionState::new(encryption),
+					state: $crate::transport::state::SessionState::negotiating(encryption, negotiation),
 					limits,
 					clock,
 					server_handshake: None,
 					#[cfg(feature = "instrument")]
 					trace,
+					#[cfg(feature = "instrument")]
+					accepted_from: None,
 				}
 			}
 
-			/// Peer certificate after completed mutual authentication.
-			/// `None` if unused or incomplete.
+			/// Returns the validated peer certificate of the established
+			/// session, or `None` when no session is established or the peer
+			/// presented none.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
 				self.state.peer_certificate()
 			}
 
-			/// Negotiated multiplexing settings. `None` means single-flight.
+			/// Returns the negotiated multiplexing settings, or `None` for a
+			/// single-flight session.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
 				self.state.established()?.mux()
 			}
 
-			/// Dual-signed session receipt from a budget-bearing handshake.
+			/// Returns the dual-signed session receipt of a budget-bearing
+			/// handshake, if the session holds one.
 			pub fn session_receipt(&self) -> Option<&$crate::transport::handshake::receipt::StoredReceipt> {
 				self.state.receipt()
 			}
 
-			/// Override the budget-grant policy consulted between the
-			/// client's transport offer and the server's accept. Without
-			/// an authorizer the server grants its local configuration
-			/// ceiling.
+			/// Overrides the budget-grant policy that the server consults
+			/// between the client's transport offer and its accept. The default
+			/// grants the ceiling of the local configuration.
 			#[must_use]
 			pub fn with_transport_authorizer(
 				mut self,
@@ -262,7 +320,8 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Session outcome observer for budget-bearing handshakes this endpoint serves.
+			/// Sets the observer of session outcomes for the budget-bearing
+			/// handshakes that this endpoint serves.
 			#[must_use]
 			pub fn with_session_observer(
 				mut self,
@@ -272,8 +331,8 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Approver consulted before countersigning a challenge-bearing
-			/// receipt.
+			/// Sets the approver that this endpoint consults before it
+			/// countersigns a challenge-bearing receipt.
 			#[must_use]
 			pub fn with_receipt_approver(
 				mut self,
@@ -283,14 +342,18 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// Handshake protocol this endpoint runs once provisioned.
+			/// Sets the handshake protocol that this endpoint runs once
+			/// provisioned.
 			#[must_use]
-			pub fn with_handshake_protocol(mut self, kind: $crate::transport::handshake::HandshakeProtocolKind) -> Self {
+			pub fn with_handshake_protocol(
+				mut self,
+				kind: $crate::transport::handshake::HandshakeProtocolKind,
+			) -> Self {
 				self.state.select_handshake(kind);
 				self
 			}
 
-			/// Attach the connection's instrumentation collector.
+			/// Attaches the connection's instrumentation collector.
 			#[cfg(feature = "instrument")]
 			#[must_use]
 			pub fn with_trace(mut self, trace: $crate::trace::TraceCollector) -> Self {
@@ -298,24 +361,27 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			/// True while this endpoint expects an encryption handshake that has
-			/// not completed yet. Such reads face an unauthenticated peer, so the
-			/// read layer applies the tight `handshake_wire` ceiling and the
-			/// handshake deadline instead of the general envelope limits.
-			pub(crate) fn is_handshake_pending(&self) -> bool {
-				self.state.phase().is_handshake_pending()
-			}
-
-			/// Share of the connection's instrumentation collector, if
-			/// attached.
+			/// Returns a share of the connection's instrumentation collector,
+			/// if one is attached.
 			#[cfg(feature = "instrument")]
 			pub fn trace(&self) -> Option<$crate::trace::TraceCollector> {
 				self.trace.as_ref().map($crate::trace::TraceCollector::share)
 			}
+
+			/// Returns this connection with `peer` as the address that a
+			/// listener accepted it from.
+			// The async expansion has its one caller in the tokio listener.
+			#[cfg(feature = "instrument")]
+			#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+			#[must_use]
+			pub(crate) fn accepted_from_peer(mut self, peer: core::net::SocketAddr) -> Self {
+				self.accepted_from = Some(peer);
+				self
+			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::RestartConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::RestartConfig
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -325,8 +391,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::EmitterGateConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::EmitterGateConfig
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -336,8 +402,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::CollectorGateConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
+			$crate::transport::policy::CollectorGateConfig for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -347,8 +413,8 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::TimeoutConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::TimeoutConfig
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -358,27 +424,10 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		// Without x509 there is no encryption-aware override, so the
-		// default single-flight collector applies. The gate items only
-		// exist under transport-policy.
-		#[cfg(not(all(feature = "x509", feature = "transport-policy")))]
-		impl<S: $stream_trait> $crate::transport::MessageCollector for $transport<S>
-		where
-			TransportError: From<S::Error>,
-		{
-			#[cfg(feature = "transport-policy")]
-			type CollectorGate = dyn GatePolicy;
-
-			#[cfg(feature = "transport-policy")]
-			fn collector_gate(&self) -> &Self::CollectorGate {
-				&self.collector_gate
-			}
-		}
-
-		// Audit source for gate verdicts. One definition feeds every
+		// This impl is the one audit source of gate verdicts for every
 		// collector plane this transport serves.
-		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::GateAudit for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::GateAudit
+			for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -388,28 +437,11 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(not(feature = "transport-policy"))]
-		impl<S: $stream_trait> $crate::transport::MessageEmitter for $transport<S>
-		where
-			TransportError: From<S::Error>
-		{}
-
-		// Each transport implements the seal by name, with no blanket impl,
-		// so no type outside this crate can reach the traits it guards.
+		// Each transport implements the seal by name, one impl per type, so
+		// only the types of this crate reach the traits it guards.
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::state::sealed::Sealed
 			for $transport<S, P>
 		{
-		}
-
-		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
-			$crate::transport::state::ServerHandshakeSlot for $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
-			fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-				&mut self.server_handshake
-			}
 		}
 
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider + Send + Sync + 'static>
@@ -434,6 +466,18 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "instrument")]
 			fn to_trace_ref(&self) -> Option<&TraceCollector> {
 				self.trace.as_ref()
+			}
+
+			// `Self::with_trace` resolves to the inherent builder ahead of this
+			// method, so the call forwards to the one setter of the trail.
+			#[cfg(feature = "instrument")]
+			fn with_trace(self, trace: TraceCollector) -> Self {
+				Self::with_trace(self, trace)
+			}
+
+			#[cfg(feature = "instrument")]
+			fn accepted_from(&self) -> Option<core::net::SocketAddr> {
+				self.accepted_from
 			}
 		}
 	};

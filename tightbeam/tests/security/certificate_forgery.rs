@@ -1,18 +1,23 @@
 //! # Certificate forgery threat
 //!
 //! ## Weakness
-//! If the handshake does not enforce a configured certificate validator, a
-//! forged or untrusted certificate can pass validation and be accepted.
+//! If the handshake skips a configured certificate validator, a forged or
+//! untrusted certificate can pass validation, and the endpoint accepts it.
 //!
 //! ## Attack
-//! A certificate bearing the wrong (forged) public key is presented during the
-//! handshake alongside a genuine certificate, exercising the configured
-//! validators (here, key pinning).
+//! During the handshake, a peer presents a certificate that carries the wrong
+//! (forged) public key, beside a genuine certificate, so the scenarios run the
+//! configured validators (here, key pinning).
 //!
 //! ## Expected control
-//! Certificate validation MUST be enforced during the handshake: a forged
-//! certificate MUST be rejected and a valid certificate MUST pass. Validator
-//! configuration is the application's responsibility.
+//! The handshake MUST enforce certificate validation: it MUST reject a forged
+//! certificate, and a valid certificate MUST pass. Validator configuration is
+//! the application's responsibility.
+//!
+//! The handshake carries the refusal of the validator:
+//!
+//! - `PublicKeyNotPinned` from the pin of a wrong key.
+//! - `CertificateDenied` from the validator that refuses every certificate.
 //!
 //! ## References
 //! - CWE-295: Improper Certificate Validation <https://cwe.mitre.org/data/definitions/295.html>
@@ -25,24 +30,20 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConfig, SetupEnv},
-	trace::TraceCollector,
-	transport::handshake::Handshake,
-	utils::urn::Urn,
+	crypto::x509::{
+		error::CertificateValidationError::{self, CertificateDenied, PublicKeyNotPinned},
+		policy::CertificateValidation,
+		Certificate,
+	},
+	exactly,
+	instrumentation::events,
+	tb_assert_spec, tb_scenario,
+	testing::SetupEnv,
 	TightBeamError,
 };
 
-use crate::common::security::{ecies_client_config, ecies_server_config};
-use crate::security::common::{default_security_profile, expectation_failure, ServerMaterials};
-
-pub(crate) const CERT_REJECT_ALL_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:certificate-forgery/cert-reject-all-rejected");
-pub(crate) const CERT_VALID_ACCEPTED: Urn<'static> =
-	tightbeam::urn!("test", "event:certificate-forgery/cert-valid-accepted");
-pub(crate) const CERT_WRONG_KEY_REJECTED: Urn<'static> =
-	tightbeam::urn!("test", "event:certificate-forgery/cert-wrong-key-rejected");
+use crate::security::common::{HandshakeBackendKind, ServerMaterials};
+use crate::security::live::LiveHandshake;
 
 /// A validator that rejects every certificate, for the rejection-path test.
 #[derive(Debug, Clone, Copy)]
@@ -50,7 +51,7 @@ pub struct RejectAllValidator;
 
 impl CertificateValidation for RejectAllValidator {
 	fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-		Err(CertificateValidationError::CertificateDenied)
+		Err(CertificateDenied)
 	}
 }
 
@@ -71,8 +72,8 @@ impl SingleKeyPinning {
 		Self { allowed_key: key }
 	}
 
-	/// Create a pinning validator that accepts a DIFFERENT key, for the
-	/// rejection test.
+	/// Create a pinning validator that accepts another key, for the rejection
+	/// test.
 	pub fn wrong_key() -> Self {
 		// These bytes match no real certificate.
 		Self { allowed_key: vec![0xDE; 65] }
@@ -85,127 +86,89 @@ impl CertificateValidation for SingleKeyPinning {
 		if pub_key_bytes == self.allowed_key.as_slice() {
 			Ok(())
 		} else {
-			Err(CertificateValidationError::PublicKeyNotPinned)
+			Err(PublicKeyNotPinned)
+		}
+	}
+}
+
+/// A live HPKE handshake whose client admits its server under the validator
+/// that `policy` builds over the server certificate.
+fn pinned_under<V>(policy: impl FnOnce(&Certificate) -> V) -> LiveHandshake
+where
+	V: CertificateValidation + 'static,
+{
+	let materials = ServerMaterials::generate();
+	let validator: Arc<dyn CertificateValidation> = Arc::new(policy(&materials.certificate));
+	LiveHandshake::new(HandshakeBackendKind::Hpke, materials).with_server_policy([validator])
+}
+
+tb_assert_spec! {
+	pub ValidCertificateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2))
+		]
+	}
+}
+
+// A valid certificate under the matching pin completes the handshake on both
+// endpoints.
+tb_scenario! {
+	name: certificate_forgery_valid_certificate_accepted,
+	spec: ValidCertificateSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let handshake = pinned_under(SingleKeyPinning::new).audit_client(&trace).audit_server(&trace);
+			let outcome = handshake.run().await?;
+			let (_client, _server) = outcome.established()?;
+
+			Ok::<(), TightBeamError>(())
 		}
 	}
 }
 
 tb_assert_spec! {
-	pub CertificateForgerySpec,
+	pub WrongKeySpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(CERT_VALID_ACCEPTED, exactly!(1u32)),
-			(CERT_WRONG_KEY_REJECTED, exactly!(1u32)),
-			(CERT_REJECT_ALL_REJECTED, exactly!(1u32))
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("certificate/public-key-not-pinned"))
 		]
 	}
 }
 
-tb_process_spec! {
-	pub CertificateForgeryProcess,
-	events {
-		observable {
-			CERT_VALID_ACCEPTED,
-			CERT_WRONG_KEY_REJECTED,
-			CERT_REJECT_ALL_REJECTED
-		}
-		hidden { }
-	}
-	states {
-		Idle => { CERT_VALID_ACCEPTED => ValidDone },
-		ValidDone => { CERT_WRONG_KEY_REJECTED => WrongKeyDone },
-		WrongKeyDone => { CERT_REJECT_ALL_REJECTED => Complete },
-		Complete => { }
-	}
-	terminal { Complete }
-	annotations { description: "Certificate Forgery: X.509 validation enforcement" }
-}
-
+// A pin on a wrong public key fails the handshake when the client reads the
+// reply.
 tb_scenario! {
-	name: certificate_forgery,
-	config: ScenarioConfig::builder()
-		.with_spec(CertificateForgerySpec::latest())
-		.with_csp(CertificateForgeryProcess)
-		.build(),
+	name: certificate_forgery_wrong_key_rejected,
+	spec: WrongKeySpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			CertificateForgeryScenario::run((trace.into(),)).await
+			let outcome = pinned_under(|_| SingleKeyPinning::wrong_key()).audit_client(&trace).run().await?;
+			outcome.refused_by_client("certificate with wrong pinned key should be rejected")
 		}
 	}
 }
 
-job! {
-	name: CertificateForgeryScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		use tightbeam::crypto::profiles::DefaultCryptoProvider;
+tb_assert_spec! {
+	pub RejectAllSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("certificate/certificate-denied"))
+		]
+	}
+}
 
-		let materials = ServerMaterials::generate();
-		let profile = default_security_profile();
-
-		// Test 1: A valid certificate with correct pinning succeeds.
-		{
-			let valid_pinning = SingleKeyPinning::new(&materials.certificate);
-
-			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
-			let mut server = Handshake::server(server_config);
-
-			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(valid_pinning));
-			let mut client = Handshake::client(config);
-
-			let reply = server.reply(client.start()?).await?;
-			let closing = client.respond(reply).await?;
-			server.finish(closing).await?;
-
-			// Reaching this point without an error means that the valid
-			// certificate was accepted.
-			trace.event(CERT_VALID_ACCEPTED)?;
+// The RejectAll validator fails the handshake when the client reads the reply.
+tb_scenario! {
+	name: certificate_forgery_reject_all_rejected,
+	spec: RejectAllSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let outcome = pinned_under(|_| RejectAllValidator).audit_client(&trace).run().await?;
+			outcome.refused_by_client("RejectAll validator should reject all certificates")
 		}
-
-		// Test 2: Pinning a wrong public key fails the handshake.
-		{
-			let wrong_pinning = SingleKeyPinning::wrong_key();
-
-			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
-			let mut server = Handshake::server(server_config);
-
-			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(wrong_pinning));
-			let mut client = Handshake::client(config);
-
-			// Run the handshake, which fails when the client reads the reply.
-			let reply = server.reply(client.start()?).await?;
-			match client.respond(reply).await {
-				Err(_) => {
-					trace.event(CERT_WRONG_KEY_REJECTED)?;
-				}
-				Ok(_) => {
-					return Err(expectation_failure("certificate with wrong pinned key should be rejected"));
-				}
-			}
-		}
-
-		// Test 3: The RejectAll validator fails the handshake.
-		{
-			let reject_all = RejectAllValidator;
-
-			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
-			let mut server = Handshake::server(server_config);
-
-			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(reject_all));
-			let mut client = Handshake::client(config);
-
-			// Run the handshake, which fails when the client reads the reply.
-			let reply = server.reply(client.start()?).await?;
-			match client.respond(reply).await {
-				Err(_) => {
-					trace.event(CERT_REJECT_ALL_REJECTED)?;
-				}
-				Ok(_) => {
-					return Err(expectation_failure("RejectAll validator should reject all certificates"));
-				}
-			}
-		}
-
-		Ok(())
 	}
 }

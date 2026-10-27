@@ -1,14 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Answer questions about the fuzz output layout, which is one directory per
-# target under built/fuzz/out:
+# Print one path or name of the fuzz layout. The binaries sit in the directory
+# Cargo builds into, and the output holds one directory per target under
+# built/fuzz/out. The forms are:
 #
 #   fuzz-run.sh                  the run to analyze, as an absolute path
 #   fuzz-run.sh --target PATH    the target name owning a crash or hang file
+#   fuzz-run.sh --bin-dir        the directory the fuzz binaries build into
+#   fuzz-run.sh --seeds DIR      each seed file of the corpus DIR, one per line
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/built/fuzz/out"
+
+if [ "${1:-}" = "--bin-dir" ]; then
+	# Cargo names the directory for this workspace, so the path honours
+	# CARGO_TARGET_DIR and build.target-dir.
+	TARGET_DIR="$(cargo metadata --manifest-path "$ROOT/Cargo.toml" --no-deps --format-version 1 | jq -r .target_directory)"
+	printf '%s\n' "$TARGET_DIR/debug"
+	exit 0
+fi
+
+if [ "${1:-}" = "--seeds" ]; then
+	if [ "$#" -ne 2 ]; then
+		echo "usage: $(basename "$0") --seeds <corpus-dir>" >&2
+		exit 2
+	fi
+
+	# A seed file ends in .txt, .bin, or .dat, so the README of a corpus
+	# stays out of the AFL input directory.
+	find "$2" -type f \( -name '*.txt' -o -name '*.bin' -o -name '*.dat' \) | sort
+	exit 0
+fi
 
 if [ "${1:-}" = "--target" ]; then
 	if [ "$#" -ne 2 ]; then
@@ -16,7 +39,7 @@ if [ "${1:-}" = "--target" ]; then
 		exit 2
 	fi
 
-	# Resolve the argument so a relative path answers the same as an absolute one.
+	# Resolve the path so a relative one answers as an absolute one does.
 	FILE="$(cd "$(dirname "$2")" 2>/dev/null && pwd || true)/$(basename "$2")"
 	case "$FILE" in
 		"$OUT"/*)

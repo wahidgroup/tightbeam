@@ -11,6 +11,7 @@ use futures::task::ArcWake;
 
 use super::body::{DrainNote, ForwardedStream, StreamBody};
 use super::link::MuxLink;
+use super::reassembly::ReassemblyBudget;
 use super::shared::{MuxShared, OpenSlot};
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
@@ -54,9 +55,18 @@ pub fn client_shared() -> Arc<MuxShared> {
 /// Body/forwarder pair with its drain-note receiver, on the drain channel a
 /// production link opens.
 pub fn body_fixture(stream_id: u32, window: u64) -> (StreamBody, ForwardedStream, mpsc::Receiver<DrainNote>) {
+	budgeted_body_fixture(stream_id, window, Arc::new(ReassemblyBudget::default()))
+}
+
+/// The pair of [`body_fixture`], whose collect charges `budget`.
+pub fn budgeted_body_fixture(
+	stream_id: u32,
+	window: u64,
+	budget: Arc<ReassemblyBudget>,
+) -> (StreamBody, ForwardedStream, mpsc::Receiver<DrainNote>) {
 	let (outbound, _wire) = mpsc::channel(0);
 	let (link, notes) = MuxLink::new(client_shared(), outbound);
-	let (body, forwarder) = StreamBody::pair(OpenSlot::assigned(stream_id), window, link.drain_feedback());
+	let (body, forwarder) = StreamBody::pair(OpenSlot::assigned(stream_id), window, link.drain_feedback(), budget);
 
 	(body, forwarder, notes)
 }

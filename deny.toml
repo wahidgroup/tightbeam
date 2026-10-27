@@ -9,8 +9,8 @@ version = 2
 # SECURITY.md, Accepted advisories, dates and justifies each suppressed
 # advisory. An entry with no reason is not accepted here.
 ignore = [
-	{ id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack. Justified in SECURITY.md, Accepted advisories." },
 	{ id = "RUSTSEC-2024-0436", reason = "paste unmaintained. Justified in SECURITY.md, Accepted advisories." },
+	{ id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing. The fix needs der 0.8. Justified in SECURITY.md, Accepted advisories." },
 ]
 
 [licenses]

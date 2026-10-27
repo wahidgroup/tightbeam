@@ -1,17 +1,63 @@
-//! One `tb_scenario!` body, compiled under two tightbeam feature selections.
+//! This crate compiles one `tb_scenario!` body under two tightbeam feature
+//! selections.
 //!
-//! `narrow` enables `testing` alone; `wide` adds `testing-csp`, `testing-fdr`
-//! and `instrument`. Restoring a `#[cfg(feature = ...)]` to
-//! [`SpecViolation::CspProcessViolation`] or `EventOrderViolationDetail` stops
-//! `narrow` from building.
+//! `narrow` enables `testing` alone, and `wide` adds `testing-csp`,
+//! `testing-fdr`, `testing-timing`, and `instrument`. A
+//! `#[cfg(feature = ...)]` on [`SpecViolation::CspProcessViolation`] or
+//! [`EventOrderViolationDetail`] breaks the `narrow` build, and so does a
+//! `#[cfg]` on `ScenarioVerdict::exploration`, which the observer reads.
 
 use tightbeam::testing::specs::{EventOrderViolationDetail, SpecViolation};
 use tightbeam::testing::TestHooks;
 
+/// Under `narrow`, a `tb_assert_spec!` block whose feature is off fails to
+/// compile, so a spec keeps every check it states.
+///
+/// The `schedulability:` block needs `testing-timing`:
+///
+/// ```compile_fail
+/// const RAN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
+///
+/// tightbeam::tb_assert_spec! {
+///     pub ScheduleBlockSpec,
+///     V(1,0,0): {
+///         mode: Accept,
+///         assertions: [
+///             (RAN, tightbeam::exactly!(1))
+///         ],
+///         schedulability: {
+///             task_set: tightbeam::testing::schedulability::TaskSet {
+///                 tasks: vec![],
+///                 scheduler: tightbeam::testing::schedulability::SchedulerType::RateMonotonic,
+///             },
+///             scheduler: RateMonotonic,
+///             must_be_schedulable: true,
+///         }
+///     }
+/// }
+/// ```
+///
+/// The `events:` list needs `instrument`:
+///
+/// ```compile_fail
+/// const RAN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
+///
+/// tightbeam::tb_assert_spec! {
+///     pub OrderedSpec,
+///     V(1,0,0): {
+///         mode: Accept,
+///         assertions: [],
+///         events: [ RAN ]
+///     }
+/// }
+/// ```
+#[cfg(not(feature = "wide"))]
+pub struct RefusedSpecForms;
+
 /// Names the verification layer that produced a violation.
 ///
 /// Each arm binds its variant's payload, so both payload types must resolve
-/// under whichever selection compiled this.
+/// under whichever selection compiles this crate.
 pub fn layer_of(violation: &SpecViolation) -> String {
 	match violation {
 		SpecViolation::CspProcessViolation(violations) => {
@@ -25,10 +71,12 @@ pub fn layer_of(violation: &SpecViolation) -> String {
 	}
 }
 
-/// Installs an observer that reads every violation the run produced.
+/// Returns hooks whose `on_fail` observer reads every violation of the run
+/// and the trace of the Layer 3 exploration.
 pub fn observing_hooks() -> TestHooks {
-	TestHooks::on_fail(|_context, violations| {
+	TestHooks::on_fail(|context, violations| {
 		let _layers: Vec<String> = violations.iter().map(layer_of).collect();
+		let _explored = context.verdict().exploration().map(|exploration| exploration.assertions.len());
 	})
 }
 
@@ -37,14 +85,14 @@ mod tests {
 	use tightbeam::testing::env::SetupEnv;
 	use tightbeam::testing::specs::SpecViolation;
 	use tightbeam::testing::ScenarioConfig;
-	use tightbeam::utils::urn::Urn;
+	use tightbeam::urn::Urn;
 
 	use super::{layer_of, observing_hooks};
 
 	const SCENARIO_RAN: Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
 
-	// `narrow` compiles without a CSP or refinement layer, so the assertion
-	// layer is the one verifier both selections share.
+	// `narrow` compiles the assertion layer alone, so that layer is the one
+	// verifier both selections share.
 	tightbeam::tb_assert_spec! {
 		pub ScenarioRanSpec,
 		V(1,0,0): {
@@ -55,10 +103,10 @@ mod tests {
 		}
 	}
 
-	// Neither selection enables `testing-timing`, so this spec is the proof
-	// that the schedulability block expands to nothing rather than to a name
-	// the consumer cannot resolve. The `task_set:` expression is dropped with
-	// the block, which is why it may name a feature-gated type.
+	// `wide` turns `testing-timing` on, so the schedulability block expands
+	// to its assertion. Under `narrow` the block fails to compile, as the
+	// `compile_fail` examples of `RefusedSpecForms` show.
+	#[cfg(feature = "wide")]
 	tightbeam::tb_assert_spec! {
 		pub ScheduleBlockSpec,
 		V(1,0,0): {

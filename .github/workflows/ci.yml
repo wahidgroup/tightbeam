@@ -25,6 +25,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-latest-l
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -44,9 +45,63 @@ jobs:
       - name: CI
         run: make ci
 
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest-l
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # The setup installs cargo-llvm-cov at its pin, and the toolchain file
+      # names `llvm-tools-preview`.
+      - name: Setup
+        run: make setup
+
+      - name: Coverage
+        run: make coverage
+
+      - name: Upload the report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: target/coverage/html/
+          retention-days: 14
+
+  loom:
+    name: Loom
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup
+        run: make setup
+
+      - name: Loom
+        run: make loom
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:

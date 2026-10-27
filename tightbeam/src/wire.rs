@@ -1,10 +1,10 @@
 //! DER Sequence codecs that encode owned byte fields as OCTET STRING.
 //!
-//! `der_derive` 0.7 encodes an owned `Vec<u8>` field as `SEQUENCE OF INTEGER`.
-//! That form costs three to four wire bytes per payload byte.
-//! It contradicts the OCTET STRING schema this crate documents.
-//! The derive accepts `#[asn1(type = "OCTET STRING")]` only for borrowed `&[u8]`.
-//! This module keeps public fields as `Vec<u8>` while encoding the octet form.
+//! `der_derive` 0.7 encodes an owned `Vec<u8>` field as `SEQUENCE OF INTEGER`,
+//! which costs three to four wire bytes per payload byte and contradicts the
+//! OCTET STRING schema this crate documents. The derive accepts
+//! `#[asn1(type = "OCTET STRING")]` only for a borrowed `&[u8]`, so this
+//! module keeps public fields as `Vec<u8>` and encodes the octet form.
 //!
 //! # Sources
 //!
@@ -34,16 +34,44 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::der::asn1::{OctetString, OctetStringRef};
-use crate::der::{Decode, Reader, Result};
+use crate::der::asn1::{ContextSpecific, OctetString, OctetStringRef};
+use crate::der::{Decode, Reader, Result, Tag, TagNumber};
 
 #[cfg(feature = "colony")]
 use crate::der::{ErrorKind, FixedTag};
 
-/// Decode one field through its own [`Decode`] impl, so macro expansions
-/// do not depend on the `Reader` trait being in scope at the call site.
+/// Decode one field through its own [`Decode`] impl, so a macro expansion
+/// compiles whatever traits its call site imports.
 pub(crate) fn decode_plain<'a, R: Reader<'a>, T: Decode<'a>>(reader: &mut R) -> Result<T> {
 	reader.decode()
+}
+
+/// Decode an optional EXPLICIT `[number]` field, the `ctx` kind.
+///
+/// `der` 0.7 skips a context field numbered below `number` while it looks for
+/// `number`, so a repeated field, or one out of schema order, would decode as
+/// if it were absent. DER encodes each field of a SEQUENCE once, in the order
+/// of the definition, so this decoder refuses a context field numbered below
+/// `number` ahead of it.
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 8.9.2, the order of sequence components:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=18>
+pub(crate) fn decode_ctx_explicit<'a, R: Reader<'a>, T: Decode<'a>>(
+	reader: &mut R,
+	number: TagNumber,
+) -> Result<Option<T>> {
+	if let Some(octet) = reader.peek_byte() {
+		let next = Tag::try_from(octet)?;
+		if next.is_context_specific() && next.number() < number {
+			let expected = Tag::ContextSpecific { constructed: true, number };
+			return Err(next.unexpected_error(Some(expected)));
+		}
+	}
+
+	let field = ContextSpecific::<T>::decode_explicit(reader, number)?;
+	Ok(field.map(|field| field.value))
 }
 
 /// Decode a trailing `DEFAULT` field: an absent field takes the schema
@@ -52,8 +80,8 @@ pub(crate) fn decode_plain<'a, R: Reader<'a>, T: Decode<'a>>(reader: &mut R) -> 
 /// A present field equal to the default is refused as non-canonical.
 /// Accepting both forms would give one value two distinct signed encodings.
 ///
-/// Gated on `colony` with its only consumers, the colony message codecs,
-/// so minimal builds carry no dead helper.
+/// It sits behind the `colony` gate of its only consumers, the colony
+/// message codecs, so a minimal build omits it.
 ///
 /// # Sources
 ///
@@ -77,11 +105,11 @@ where
 	Ok(value)
 }
 
-/// Encode a `DEFAULT` field: a value equal to its schema default
-/// encodes nothing.
+/// Encode a `DEFAULT` field, which DER omits when its value equals the
+/// schema default.
 ///
-/// Gated on `colony` with its only consumers, the colony message codecs,
-/// so minimal builds carry no dead helper.
+/// It sits behind the `colony` gate of its only consumers, the colony
+/// message codecs, so a minimal build omits it.
 ///
 /// # Sources
 ///
@@ -104,8 +132,8 @@ pub(crate) fn decode_octets<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec<u8>
 
 /// Decode an optional `OCTET STRING` into owned bytes.
 ///
-/// Gated on `colony` with its only consumers, the colony message codecs,
-/// so minimal builds carry no dead helper.
+/// It sits behind the `colony` gate of its only consumers, the colony
+/// message codecs, so a minimal build omits it.
 #[cfg(feature = "colony")]
 pub(crate) fn decode_octets_opt<'a, R: Reader<'a>>(reader: &mut R) -> Result<Option<Vec<u8>>> {
 	Ok(Option::<OctetString>::decode(reader)?.map(OctetString::into_bytes))
@@ -113,8 +141,8 @@ pub(crate) fn decode_octets_opt<'a, R: Reader<'a>>(reader: &mut R) -> Result<Opt
 
 /// Decode a `SEQUENCE OF OCTET STRING` into owned byte vectors.
 ///
-/// Gated on `colony` with its only consumers, the colony message codecs,
-/// so minimal builds carry no dead helper.
+/// It sits behind the `colony` gate of its only consumers, the colony
+/// message codecs, so a minimal build omits it.
 #[cfg(feature = "colony")]
 pub(crate) fn decode_octets_seq<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec<Vec<u8>>> {
 	Ok(Vec::<OctetString>::decode(reader)?
@@ -131,8 +159,8 @@ pub(crate) fn octets_ref(bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<OctetStr
 
 /// Borrow optional bytes as an encodable `OCTET STRING OPTIONAL`.
 ///
-/// Gated on `colony` with its only consumers, the colony message codecs,
-/// so minimal builds carry no dead helper.
+/// It sits behind the `colony` gate of its only consumers, the colony
+/// message codecs, so a minimal build omits it.
 #[cfg(feature = "colony")]
 pub(crate) fn octets_opt_ref(bytes: &Option<Vec<u8>>) -> Result<Option<OctetStringRef<'_>>> {
 	bytes.as_deref().map(OctetStringRef::new).transpose()
@@ -140,8 +168,8 @@ pub(crate) fn octets_opt_ref(bytes: &Option<Vec<u8>>) -> Result<Option<OctetStri
 
 /// Borrow byte vectors as an encodable `SEQUENCE OF OCTET STRING`.
 ///
-/// Gated on `colony` with its only consumers, the colony message codecs,
-/// so minimal builds carry no dead helper.
+/// It sits behind the `colony` gate of its only consumers, the colony
+/// message codecs, so a minimal build omits it.
 #[cfg(feature = "colony")]
 pub(crate) fn octets_seq_refs(list: &(impl AsRef<[Vec<u8>]> + ?Sized)) -> Result<Vec<OctetStringRef<'_>>> {
 	let list = list.as_ref();
@@ -154,8 +182,7 @@ pub(crate) fn octets_seq_refs(list: &(impl AsRef<[Vec<u8>]> + ?Sized)) -> Result
 /// The generated impls match `#[derive(der::Sequence)]` field for field.
 /// Only the byte-field codec differs. Field kinds:
 ///
-/// - `plain`: delegate to the field type's `Decode`/`Encode` impls
-///   (including plain `Option<T>` fields).
+/// - `plain`: delegate to the field type's `Decode`/`Encode` impls (including plain `Option<T>` fields).
 /// - `octets`: `Vec<u8>` as `OCTET STRING`.
 /// - `octets_opt`: `Option<Vec<u8>>` as `OCTET STRING OPTIONAL`.
 /// - `octets_seq`: `Vec<Vec<u8>>` as `SEQUENCE OF OCTET STRING`.
@@ -163,9 +190,10 @@ pub(crate) fn octets_seq_refs(list: &(impl AsRef<[Vec<u8>]> + ?Sized)) -> Result
 /// - `default($value)`: trailing `T DEFAULT $value` for `Copy` scalars.
 ///   The field is omitted when equal to `$value`.
 ///
-/// A trailing `where $check` names a `fn(&Self) -> der::Result<()>` that the
-/// decoder runs on the assembled value. It rejects a cross-field constraint in
-/// the same pass that reads the fields, so no decoded value skips it.
+/// A trailing `where $check` names a `fn(&Self) -> der::Result<()>`:
+///
+/// - The decoder runs it on the assembled value, in the same pass that reads the fields.
+/// - It rejects a cross-field constraint, so no decoded value skips it.
 ///
 /// # Sources
 ///
@@ -193,7 +221,7 @@ macro_rules! wire_sequence {
 		$crate::wire::decode_octets_seq($reader)?
 	};
 	(@decode $reader:ident, ctx($tag:expr)) => {
-		::der::asn1::ContextSpecific::decode_explicit($reader, $tag)?.map(|field| field.value)
+		$crate::wire::decode_ctx_explicit($reader, $tag)?
 	};
 	(@decode $reader:ident, default($value:expr)) => {
 		$crate::wire::decode_or_default($reader, $value)?
@@ -379,9 +407,9 @@ mod tests {
 	#[cfg(feature = "colony")]
 	#[test]
 	fn present_default_value_is_refused_as_noncanonical() {
-		// SEQUENCE { INTEGER 7 }: an encoder violating ITU-T X.690 § 11.5 by
-		// writing the schema default instead of omitting the field.
-		// See the module-level `# Sources` for the recommendation link.
+		// SEQUENCE { INTEGER 7 }: an encoder that breaks ITU-T X.690 § 11.5
+		// writes the schema default in place of an omitted field. The module
+		// `# Sources` links the recommendation.
 		let encoded = [0x30, 0x03, 0x02, 0x01, 0x07];
 		assert!(BudgetProbe::from_der(&encoded).is_err());
 	}

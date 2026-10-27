@@ -1,115 +1,178 @@
 //! X.509 certificate fingerprints, SubjectKeyIdentifiers, and certificate
 //! checks.
 
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeSet;
+#[cfg(feature = "std")]
+use std::collections::BTreeSet;
+
 use core::fmt::{self, Debug, Formatter};
 use core::hash::{Hash, Hasher};
-use core::marker::PhantomData;
 use core::time::Duration;
 
+use crate::asn1::admission::DerAdmission;
+use crate::cms::cert::IssuerAndSerialNumber;
+use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
-use crate::crypto::hash::{Digest, Sha3_256, U32};
+use crate::crypto::common::Output;
+use crate::crypto::hash::{Digest, OutputSizeUser};
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::crypto::x509::ext::pkix::{
+	BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, NameConstraints, SubjectAltName, SubjectKeyIdentifier,
+};
 use crate::crypto::x509::Certificate;
-use crate::der::asn1::{GeneralizedTime, OctetString};
+use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString, OctetStringRef};
+use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 use crate::der::oid::AssociatedOid;
-use crate::der::{DecodeOwned, Encode};
-use crate::spki::EncodePublicKey;
+use crate::der::{Decode, Encode, Reader, Writer};
+use crate::error::ReceivedExpectedError;
 use crate::x509::certificate::{CertificateInner, Profile};
+use crate::x509::serial_number::SerialNumber;
 
-/// A 32-byte certificate fingerprint bound to the digest that produced it.
+#[cfg(feature = "secp256k1")]
+use crate::spki::SubjectPublicKeyInfoOwned;
+#[cfg(any(host_clock, feature = "time"))]
+use crate::utils::time::UnixMillis;
+
+/// A certificate fingerprint bound to the digest that produced it, as wide
+/// as the output of that digest.
 ///
 /// [`Fingerprint::from_certificate`] digests the certificate DER under `D`.
-pub struct Fingerprint<D> {
-	bytes: [u8; 32],
-	_digest: PhantomData<fn() -> D>,
+/// [`Fingerprint::try_from`] reads a fingerprint an operator configured, and
+/// refuses one of another width, so a list under SHA-384 or SHA-512 names
+/// its entries at the width of its digest.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hash::Sha3_256;
+/// use tightbeam::crypto::x509::error::CertificateValidationError;
+/// use tightbeam::crypto::x509::utils::Fingerprint;
+/// use tightbeam::testing::{TestCertificate, TestKey};
+///
+/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+/// let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+///
+/// let configured = Fingerprint::<Sha3_256>::try_from(fingerprint.as_slice())?;
+/// assert_eq!(configured, fingerprint);
+///
+/// let short = Fingerprint::<Sha3_256>::try_from(&[0u8; 31][..]);
+/// assert!(matches!(short, Err(CertificateValidationError::FingerprintLength(_))));
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+pub struct Fingerprint<D: OutputSizeUser> {
+	bytes: Output<D>,
 }
 
-impl<D> Copy for Fingerprint<D> {}
+/// A fingerprint copies wherever its digest output copies, which holds for
+/// the output of every digest.
+impl<D: OutputSizeUser> Copy for Fingerprint<D> where Output<D>: Copy {}
 
-impl<D> Clone for Fingerprint<D> {
+impl<D: OutputSizeUser> Clone for Fingerprint<D> {
 	fn clone(&self) -> Self {
-		*self
+		Self { bytes: self.bytes.clone() }
 	}
 }
 
-impl<D> Debug for Fingerprint<D> {
+impl<D: OutputSizeUser> Debug for Fingerprint<D> {
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Fingerprint").field("bytes", &self.bytes).finish()
 	}
 }
 
-impl<D> PartialEq for Fingerprint<D> {
+impl<D: OutputSizeUser> PartialEq for Fingerprint<D> {
 	fn eq(&self, other: &Self) -> bool {
 		self.bytes == other.bytes
 	}
 }
 
-impl<D> Eq for Fingerprint<D> {}
+impl<D: OutputSizeUser> Eq for Fingerprint<D> {}
 
-impl<D> Hash for Fingerprint<D> {
+impl<D: OutputSizeUser> Hash for Fingerprint<D> {
 	fn hash<H: Hasher>(&self, state: &mut H) {
-		self.bytes.hash(state);
+		self.bytes.as_slice().hash(state);
 	}
 }
 
-impl<D> Fingerprint<D> {
+impl<D: OutputSizeUser> Fingerprint<D> {
 	/// Return the fingerprint bytes.
 	pub fn as_slice(&self) -> &[u8] {
 		&self.bytes
 	}
 }
 
-impl<D> Fingerprint<D>
-where
-	D: Digest<OutputSize = U32>,
-{
+impl<D: Digest> Fingerprint<D> {
 	/// Digest the certificate DER and bind the result to `D`.
+	///
+	/// The encoder streams the certificate DER into the digest as it writes.
 	///
 	/// # Errors
 	///
 	/// - [`CertificateValidationError::EncodingError`] -- the certificate fails to DER-encode.
 	pub fn from_certificate(cert: &Certificate) -> Result<Self, CertificateValidationError> {
-		let der_bytes = cert.to_der()?;
-		let hash = D::digest(&der_bytes);
+		let mut digest = DigestWriter(D::new());
+		cert.encode(&mut digest)?;
 
-		let mut bytes = [0u8; 32];
-		bytes.copy_from_slice(hash.as_ref());
-
-		Ok(Self { bytes, _digest: PhantomData })
+		let bytes = digest.0.finalize();
+		Ok(Self { bytes })
 	}
 }
 
-/// The digest a tightbeam SubjectKeyIdentifier is taken from.
-///
-/// RFC 5280 leaves the derivation to the issuer, so the protocol fixes one:
-/// every SKID this crate computes, indexes, or resolves is
-/// `SHA3-256(SPKI)[..20]`. A signer and a trust store that chose their own
-/// digests would never resolve each other.
-pub type SkidDigest = Sha3_256;
+impl<D: OutputSizeUser> TryFrom<&[u8]> for Fingerprint<D> {
+	type Error = CertificateValidationError;
 
-/// The 20-byte SubjectKeyIdentifier truncation of a digest (RFC 5280).
+	/// Read `bytes` as a fingerprint under `D`.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::FingerprintLength`] -- `bytes` differs
+	///   in width from the output of `D`, so it names no certificate.
+	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+		let width = ReceivedExpectedError { received: bytes.len(), expected: D::output_size() };
+		let read = Output::<D>::from_exact_iter(bytes.iter().copied());
+
+		let bytes = read.ok_or(CertificateValidationError::FingerprintLength(width))?;
+		Ok(Self { bytes })
+	}
+}
+
+/// A DER writer that feeds each encoded octet to the digest it holds.
+struct DigestWriter<D>(D);
+
+impl<D: Digest> Writer for DigestWriter<D> {
+	fn write(&mut self, slice: &[u8]) -> crate::der::Result<()> {
+		self.0.update(slice);
+		Ok(())
+	}
+}
+
+/// A 20-octet key identifier by RFC 7093 §2 method 1: the leftmost 160 bits
+/// of the SHA-256 hash of the `subjectPublicKey` BIT STRING value.
 ///
-/// [`Skid::of_public_key`] takes the window from a public key's digest.
-/// [`Skid::parse`] reads an exact 20-byte window already on the wire.
+/// Every certificate the crate creates carries its key's identifier as its
+/// `subjectKeyIdentifier`, and an issued one carries its issuer's as its
+/// `authorityKeyIdentifier`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Skid([u8; 20]);
 
 impl Skid {
-	/// The SubjectKeyIdentifier of a DER-encoded public key.
+	/// Returns the RFC 7093 §2 method 1 identifier of `spki`'s public key.
 	///
-	/// The digest is the protocol constant [`SkidDigest`]. A signer stamps this
-	/// value into the `SignerInfo` it puts on the wire, and a trust store
-	/// indexes by it.
-	pub fn of_public_key(public_key_der: impl AsRef<[u8]>) -> Self {
-		let digest: [u8; 32] = <SkidDigest as Digest>::digest(public_key_der.as_ref()).into();
+	/// The hash input is the BIT STRING value alone, without the tag, the
+	/// length, and the unused-bits octet.
+	#[cfg(feature = "secp256k1")]
+	pub fn of_public_key(spki: &SubjectPublicKeyInfoOwned) -> Self {
+		use k256::sha2::Sha256;
+
+		let digest: [u8; 32] = Sha256::digest(spki.subject_public_key.raw_bytes()).into();
 		let mut bytes = [0u8; 20];
 		bytes.copy_from_slice(&digest[..20]);
 
 		Self(bytes)
 	}
 
-	/// Read a SKID that is already exactly 20 bytes.
+	/// Read `bytes` as a SKID, or return `None` unless they are exactly 20
+	/// octets.
 	pub fn parse(bytes: impl AsRef<[u8]>) -> Option<Self> {
 		let bytes: &[u8; 20] = bytes.as_ref().try_into().ok()?;
 		Some(Self(*bytes))
@@ -118,6 +181,37 @@ impl Skid {
 	/// Return the SKID bytes.
 	pub fn as_bytes(&self) -> &[u8; 20] {
 		&self.0
+	}
+}
+
+/// A SKID as the `subjectKeyIdentifier` extension value (RFC 5280 §4.2.1.2).
+///
+/// # Errors
+///
+/// - [`der::Error`] -- the 20 SKID bytes do not fit an `OCTET STRING`, which
+///   the `der` length rules make unreachable here.
+impl TryFrom<Skid> for SubjectKeyIdentifier {
+	type Error = crate::der::Error;
+
+	fn try_from(skid: Skid) -> Result<Self, Self::Error> {
+		let octets = OctetString::new(skid.as_bytes().as_slice())?;
+		Ok(SubjectKeyIdentifier::from(octets))
+	}
+}
+
+/// The `subjectKeyIdentifier` extension (RFC 5280 §4.2.1.2), read in place.
+///
+/// [`CertificateExt::is_named_by`] and the trust store each read the value
+/// through it, so a reader of the identifier borrows the certificate.
+pub(crate) struct SubjectKeyIdentifierRef<'a>(pub(crate) OctetStringRef<'a>);
+
+impl AssociatedOid for SubjectKeyIdentifierRef<'_> {
+	const OID: ObjectIdentifier = SubjectKeyIdentifier::OID;
+}
+
+impl<'a> Decode<'a> for SubjectKeyIdentifierRef<'a> {
+	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		OctetStringRef::decode(reader).map(Self)
 	}
 }
 
@@ -132,23 +226,25 @@ macro_rules! pem {
 	}};
 }
 
-/// Certificate checks this crate runs before trusting a peer.
+/// The certificate checks this crate runs before it trusts a peer.
 ///
-/// `Certificate` is defined in `x509-cert`, so the checks are trait methods.
-/// Every check still reaches the certificate through the certificate itself.
+/// The `x509-cert` crate defines `Certificate`, so the checks are trait
+/// methods that a caller calls on the certificate itself.
 pub trait CertificateExt {
 	/// Validate certificate expiry (`not_before <= now <= not_after`).
 	///
-	/// The method implements the validity-period check of RFC 5280 §6.1.3(a)(2)
-	/// over the `Validity` field (§4.1.2.5). It covers temporal validity only.
-	/// Signature and trust chains belong to the `CertificateValidation` trait.
+	/// It runs the validity-period check of RFC 5280 §6.1.3(a)(2) over the
+	/// `Validity` field (§4.1.2.5) and covers temporal validity alone.
+	/// Signature and trust chains belong to the
+	/// [`CertificateValidation`](super::policy::CertificateValidation) trait.
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
-	/// - [`CertificateValidationError::Expired`] after `not_after`
-	/// - [`CertificateValidationError::InvalidTimestamp`] when the build
-	///   carries no clock, so a higher layer owns temporal validation
+	/// - [`CertificateValidationError::NotYetValid`] -- the current time is before `not_before`.
+	/// - [`CertificateValidationError::Expired`] -- the current time is after `not_after`.
+	/// - [`CertificateValidationError::InvalidTimestamp`] -- the build carries
+	///   no clock, so a higher layer owns temporal validation, or the clock
+	///   reading does not convert to a certificate time.
 	///
 	/// # Sources
 	///
@@ -158,21 +254,17 @@ pub trait CertificateExt {
 
 	/// Validate expiry against a caller-supplied Unix timestamp.
 	///
-	/// The same comparison [`CertificateExt::validate_expiry`] runs, with
-	/// `now_unix` in place of the local clock. A path that already knows
-	/// the time, such as receipt verification, uses this so the two cannot
-	/// diverge.
+	/// It runs the comparison of [`CertificateExt::validate_expiry`] with
+	/// `now_unix` in place of the local clock. A path that already knows the
+	/// time, such as receipt verification, uses it so the two cannot diverge.
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
-	/// - [`CertificateValidationError::Expired`] after `not_after`
-	/// - [`CertificateValidationError::InvalidTimestamp`] when `now_unix` does
-	///   not convert to a certificate time
+	/// - [`CertificateValidationError::NotYetValid`] -- `now_unix` is before `not_before`.
+	/// - [`CertificateValidationError::Expired`] -- `now_unix` is after `not_after`.
+	/// - [`CertificateValidationError::InvalidTimestamp`] -- `now_unix` does
+	///   not convert to a certificate time.
 	fn validate_expiry_at(&self, now_unix: u64) -> Result<(), CertificateValidationError>;
-
-	/// Raw public key bytes from the certificate's SPKI.
-	fn verifying_key_bytes(&self) -> &[u8];
 
 	/// Enforce algorithm-identifier consistency within the certificate.
 	///
@@ -182,7 +274,7 @@ pub trait CertificateExt {
 	///
 	/// # Errors
 	///
-	/// - [`CertificateValidationError::AlgorithmMismatch`] on disagreement
+	/// - [`CertificateValidationError::AlgorithmMismatch`] -- the two identifiers disagree.
 	///
 	/// # Sources
 	///
@@ -192,22 +284,130 @@ pub trait CertificateExt {
 
 	/// Decode a typed X.509 extension by its associated OID, if present.
 	///
-	/// The method locates the extension (RFC 5280 §4.2) whose `extnID` matches
-	/// the requested type's [`AssociatedOid`] and decodes its `extnValue`. It
-	/// returns `Ok(None)` when the certificate carries no such extension.
+	/// It decodes the `extnValue` of the extension (RFC 5280 §4.2) whose
+	/// `extnID` is the [`AssociatedOid`] of `T`, or returns `Ok(None)` when the
+	/// certificate carries none. A type that borrows, such as one over
+	/// `OctetStringRef`, reads the value in place.
 	///
 	/// # Errors
 	///
+	/// - [`CertificateValidationError::DuplicateExtension`] -- the certificate carries the extension twice.
 	/// - [`CertificateValidationError::EncodingError`] -- the extension's
-	///   `extnValue` fails to decode.
+	///   `extnValue` fails to decode, or a SET in it holds its elements out of
+	///   DER order.
 	///
 	/// # Sources
 	///
-	/// - RFC 5280 §4.2, certificate extensions:
-	///   <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>
-	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
+	/// - RFC 5280 §4.2, certificate extensions: <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>
+	fn extension<'a, T>(&'a self) -> Result<Option<T>, CertificateValidationError>
 	where
-		T: AssociatedOid + DecodeOwned;
+		T: AssociatedOid + Decode<'a>;
+
+	/// The CMS `SignerIdentifier` that names this certificate
+	/// (RFC 5652 §5.3).
+	///
+	/// It is the `subjectKeyIdentifier` extension value when the certificate
+	/// carries one, and the issuer and serial number when it carries none.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value
+	///   or the serial number fails to decode.
+	fn signer_identifier(&self) -> Result<SignerIdentifier, CertificateValidationError>;
+
+	/// The CMS `RecipientIdentifier` that names this certificate
+	/// (RFC 9629 §3), under the rule of [`Self::signer_identifier`].
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value
+	///   or the serial number fails to decode.
+	fn recipient_identifier(&self) -> Result<RecipientIdentifier, CertificateValidationError>;
+
+	/// Whether `sid` names this certificate: a `subjectKeyIdentifier` form by
+	/// the value of this certificate's extension, an issuer-and-serial form
+	/// by its issuer and serial number (RFC 5652 §5.3). It compares the
+	/// extension value in place.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value fails to decode.
+	fn is_named_by(&self, sid: &SignerIdentifier) -> Result<bool, CertificateValidationError>;
+
+	/// Refuse this certificate unless its `keyUsage` extension is present and
+	/// asserts `usage` (RFC 5280 §4.2.1.3). For `keyAgreement`, the
+	/// extension must also leave out `decipherOnly`, which restricts the key
+	/// to decipherment.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::MissingKeyUsage`] -- the extension is absent, or it lacks `usage`.
+	/// - [`CertificateValidationError::ExcludedKeyUsage`] -- `usage` is
+	///   `keyAgreement`, and `decipherOnly` is asserted.
+	/// - [`CertificateValidationError::DuplicateExtension`] -- the extension repeats.
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value fails to decode.
+	fn require_key_usage(&self, usage: KeyUsages) -> Result<(), CertificateValidationError>;
+
+	/// Refuse this certificate when it carries more than one instance of an
+	/// extension, which RFC 5280 §4.2 forbids.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::DuplicateExtension`] -- an extension repeats.
+	fn ensure_unique_extensions(&self) -> Result<(), CertificateValidationError>;
+
+	/// Refuse this certificate when it bears a critical extension the crate
+	/// does not process (RFC 5280 §4.2, §6.1.3(f)).
+	///
+	/// The processed extensions are `basicConstraints` (§4.2.1.9), `keyUsage`
+	/// (§4.2.1.3), `extendedKeyUsage` (§4.2.1.12), and `subjectAltName`
+	/// (§4.2.1.6). Colony membership reads the URI of a `subjectAltName`,
+	/// which §4.1.2.6 marks critical when the subject is empty.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::UnprocessedCriticalExtension`] -- a
+	///   critical extension is outside the processed set.
+	fn ensure_critical_extensions_processed(&self) -> Result<(), CertificateValidationError>;
+
+	/// Refuse this certificate when it carries a `nameConstraints` extension
+	/// (RFC 5280 §4.2.1.10), critical or not.
+	///
+	/// RFC 5280 §6.1.4(g) applies the extension whatever its criticality,
+	/// and name constraints stay out of the scope of the store's path
+	/// validation, so a certificate that states one fails closed.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::NameConstraintsUnapplied`] -- the
+	///   certificate carries a `nameConstraints` extension.
+	fn ensure_no_name_constraints(&self) -> Result<(), CertificateValidationError>;
+
+	/// Refuse this certificate for a use whose `keyUsage` bit is `usage`. Every
+	/// admission of a certificate for a use runs these checks, in order:
+	///
+	/// 1. No extension repeats, and every critical extension is processed (RFC 5280 §4.2).
+	/// 2. The `keyUsage` extension is present and admits `usage` (RFC 5280 §4.2.1.3).
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::DuplicateExtension`] -- an extension repeats.
+	/// - [`CertificateValidationError::UnprocessedCriticalExtension`] -- a
+	///   critical extension is outside the processed set.
+	/// - The errors of [`CertificateExt::require_key_usage`].
+	fn require_use(&self, usage: KeyUsages) -> Result<(), CertificateValidationError>;
+
+	/// Refuse this certificate for a role whose key purpose is `purpose`
+	/// (RFC 5280 §4.2.1.12). A certificate with no `extendedKeyUsage`, or one
+	/// that names `anyExtendedKeyUsage`, serves every role.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::ExcludedKeyPurpose`] --
+	///   `extendedKeyUsage` names neither `purpose` nor `anyExtendedKeyUsage`.
+	/// - [`CertificateValidationError::DuplicateExtension`] -- the extension repeats.
+	/// - [`CertificateValidationError::EncodingError`] -- the extension value fails to decode.
+	fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError>;
 }
 
 impl<P: Profile> CertificateExt for CertificateInner<P> {
@@ -228,44 +428,27 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		Ok(())
 	}
 
-	#[cfg(feature = "time")]
+	/// Runs the check at the reading of [`UnixMillis::now`], so certificate
+	/// validity reads the same clock as every other time decision in the
+	/// crate, on each target that has one.
+	#[cfg(any(host_clock, feature = "time"))]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
-		use crate::time::OffsetDateTime;
-
-		let now = OffsetDateTime::now_utc().unix_timestamp();
-		if now < 0 {
-			return Err(CertificateValidationError::InvalidTimestamp);
-		}
-
-		self.validate_expiry_at(now as u64)
+		let now = UnixMillis::now();
+		let now_unix = Duration::from_millis(now.get()).as_secs();
+		self.validate_expiry_at(now_unix)
 	}
 
-	#[cfg(all(feature = "std", not(feature = "time")))]
-	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map_err(|_| CertificateValidationError::InvalidTimestamp)?;
-
-		self.validate_expiry_at(now.as_secs())
-	}
-
-	#[cfg(all(not(feature = "std"), not(feature = "time")))]
+	/// A build with no clock has no current time, so every certificate fails
+	/// closed with [`CertificateValidationError::InvalidTimestamp`].
+	#[cfg(all(not(feature = "time"), not(host_clock)))]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
 		Err(CertificateValidationError::InvalidTimestamp)
 	}
 
-	/// Raw `subjectPublicKey` bits, borrowed from the certificate.
-	///
-	/// The bits stay unparsed here. A profile turns them into a key of its
-	/// own curve in `HandshakeVerifyingKey::verifying_key`.
-	fn verifying_key_bytes(&self) -> &[u8] {
-		self.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes()
-	}
-
 	/// Enforce algorithm-identifier consistency within a certificate.
 	///
-	/// [`CertificateExt::ensure_signature_algorithm_consistency`] owns the RFC
-	/// 5280 §4.1.1.2 contract.
+	/// [`CertificateExt::ensure_signature_algorithm_consistency`] owns the
+	/// RFC 5280 §4.1.1.2 contract.
 	fn ensure_signature_algorithm_consistency(&self) -> Result<(), CertificateValidationError> {
 		if self.signature_algorithm != self.tbs_certificate.signature {
 			return Err(CertificateValidationError::AlgorithmMismatch);
@@ -277,73 +460,252 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 	/// Decode a typed X.509 extension by its associated OID, if present.
 	///
 	/// [`CertificateExt::extension`] owns the RFC 5280 §4.2 contract.
-	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
+	fn extension<'a, T>(&'a self) -> Result<Option<T>, CertificateValidationError>
 	where
-		T: AssociatedOid + DecodeOwned,
+		T: AssociatedOid + Decode<'a>,
 	{
 		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
 			return Ok(None);
 		};
 
-		for extension in extensions {
-			if extension.extn_id == T::OID {
-				return Ok(Some(T::from_der(extension.extn_value.as_bytes())?));
-			}
+		let mut matching = extensions.iter().filter(|extension| extension.extn_id == T::OID);
+		let Some(extension) = matching.next() else {
+			return Ok(None);
+		};
+		if matching.next().is_some() {
+			return Err(CertificateValidationError::DuplicateExtension(T::OID));
 		}
 
-		Ok(None)
+		let value = extension.extn_value.as_bytes();
+		DerAdmission::SetOrder.admit(value)?;
+		Ok(Some(T::from_der(value)?))
+	}
+
+	/// Name this certificate as a CMS signer.
+	///
+	/// [`CertificateExt::signer_identifier`] owns the RFC 5652 §5.3 contract.
+	fn signer_identifier(&self) -> Result<SignerIdentifier, CertificateValidationError> {
+		if let Some(key_identifier) = self.extension::<SubjectKeyIdentifier>()? {
+			return Ok(SignerIdentifier::SubjectKeyIdentifier(key_identifier));
+		}
+
+		let issuer = self.tbs_certificate.issuer.clone();
+		let serial_number = SerialNumber::new(self.tbs_certificate.serial_number.as_bytes())?;
+		let named = IssuerAndSerialNumber { issuer, serial_number };
+		Ok(SignerIdentifier::IssuerAndSerialNumber(named))
+	}
+
+	/// Name this certificate as a CMS recipient.
+	///
+	/// [`CertificateExt::recipient_identifier`] owns the RFC 9629 §3 contract.
+	fn recipient_identifier(&self) -> Result<RecipientIdentifier, CertificateValidationError> {
+		let sid = self.signer_identifier()?;
+		Ok(recipient_identifier_of(&sid))
+	}
+
+	/// Match `sid` against this certificate.
+	///
+	/// [`CertificateExt::is_named_by`] owns the RFC 5652 §5.3 contract.
+	fn is_named_by(&self, sid: &SignerIdentifier) -> Result<bool, CertificateValidationError> {
+		match sid {
+			SignerIdentifier::IssuerAndSerialNumber(named) => {
+				let tbs = &self.tbs_certificate;
+				Ok(tbs.issuer == named.issuer && tbs.serial_number.as_bytes() == named.serial_number.as_bytes())
+			}
+			SignerIdentifier::SubjectKeyIdentifier(named) => {
+				let own = self.extension::<SubjectKeyIdentifierRef<'_>>()?;
+				Ok(own.is_some_and(|own| own.0.as_bytes() == named.0.as_bytes()))
+			}
+		}
+	}
+
+	/// Check `usage` against the `keyUsage` this certificate asserts.
+	///
+	/// [`CertificateExt::require_key_usage`] owns the RFC 5280 §4.2.1.3
+	/// contract.
+	fn require_key_usage(&self, usage: KeyUsages) -> Result<(), CertificateValidationError> {
+		let Some(KeyUsage(asserted)) = self.extension::<KeyUsage>()? else {
+			return Err(CertificateValidationError::MissingKeyUsage(usage));
+		};
+		if !asserted.contains(usage) {
+			return Err(CertificateValidationError::MissingKeyUsage(usage));
+		}
+		if usage == KeyUsages::KeyAgreement && asserted.contains(KeyUsages::DecipherOnly) {
+			return Err(CertificateValidationError::ExcludedKeyUsage(KeyUsages::DecipherOnly));
+		}
+
+		Ok(())
+	}
+
+	/// Find the first extension that an earlier one repeats, in O(n log n)
+	/// over the extension count, which the certificate's sender chooses.
+	///
+	/// [`CertificateExt::ensure_unique_extensions`] owns the RFC 5280 §4.2
+	/// contract.
+	fn ensure_unique_extensions(&self) -> Result<(), CertificateValidationError> {
+		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
+			return Ok(());
+		};
+
+		let mut seen = BTreeSet::new();
+		let repeated = extensions.iter().find(|extension| !seen.insert(extension.extn_id));
+		match repeated {
+			Some(extension) => Err(CertificateValidationError::DuplicateExtension(extension.extn_id)),
+			None => Ok(()),
+		}
+	}
+
+	/// Find the first critical extension outside the processed set.
+	///
+	/// [`CertificateExt::ensure_critical_extensions_processed`] owns the
+	/// RFC 5280 §4.2 contract.
+	fn ensure_critical_extensions_processed(&self) -> Result<(), CertificateValidationError> {
+		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
+			return Ok(());
+		};
+
+		let processed = [BasicConstraints::OID, KeyUsage::OID, ExtendedKeyUsage::OID, SubjectAltName::OID];
+		let unprocessed = extensions
+			.iter()
+			.find(|extension| extension.critical && !processed.contains(&extension.extn_id));
+		match unprocessed {
+			Some(extension) => Err(CertificateValidationError::UnprocessedCriticalExtension(extension.extn_id)),
+			None => Ok(()),
+		}
+	}
+
+	/// Find a `nameConstraints` extension of either criticality.
+	///
+	/// [`CertificateExt::ensure_no_name_constraints`] owns the
+	/// RFC 5280 §6.1.4(g) contract.
+	fn ensure_no_name_constraints(&self) -> Result<(), CertificateValidationError> {
+		let Some(extensions) = self.tbs_certificate.extensions.as_ref() else {
+			return Ok(());
+		};
+
+		let constrained = extensions.iter().any(|extension| extension.extn_id == NameConstraints::OID);
+		if constrained {
+			return Err(CertificateValidationError::NameConstraintsUnapplied);
+		}
+
+		Ok(())
+	}
+
+	/// Run the checks of one use, in the order the contract lists them.
+	///
+	/// [`CertificateExt::require_use`] owns the RFC 5280 §4.2 and §4.2.1.3
+	/// contract.
+	fn require_use(&self, usage: KeyUsages) -> Result<(), CertificateValidationError> {
+		self.ensure_unique_extensions()?;
+		self.ensure_critical_extensions_processed()?;
+		self.require_key_usage(usage)
+	}
+
+	/// Check `purpose` against the key purposes this certificate names.
+	///
+	/// [`CertificateExt::require_purpose`] owns the RFC 5280 §4.2.1.12
+	/// contract.
+	fn require_purpose(&self, purpose: ObjectIdentifier) -> Result<(), CertificateValidationError> {
+		let Some(ExtendedKeyUsage(named)) = self.extension::<ExtendedKeyUsage>()? else {
+			return Ok(());
+		};
+
+		let admitted = named.iter().any(|named| *named == purpose || *named == ANY_EXTENDED_KEY_USAGE);
+		if !admitted {
+			return Err(CertificateValidationError::ExcludedKeyPurpose);
+		}
+
+		Ok(())
 	}
 }
 
-/// Compute a SubjectKeyIdentifier-based SignerIdentifier from a verifying key.
+/// The CMS `RecipientIdentifier` that names the certificate `sid` names.
 ///
-/// The identifier is [`Skid::of_public_key`] of the key's DER encoding, the
-/// one definition every signer and trust store in this crate uses, wrapped
-/// as `SignerIdentifier::SubjectKeyIdentifier` for CMS SignedData.
-///
-/// # Examples
-///
-/// ```
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use tightbeam::cms::signed_data::SignerIdentifier;
-/// use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
-/// use tightbeam::crypto::x509::utils::compute_signer_identifier;
-///
-/// let signing_key = Secp256k1SigningKey::from_slice(&[7u8; 32])?;
-/// let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
-/// let signer_id = compute_signer_identifier(&verifying_key)?;
-///
-/// assert!(matches!(signer_id, SignerIdentifier::SubjectKeyIdentifier(_)));
-/// # Ok(())
-/// # }
-/// ```
-pub fn compute_signer_identifier<V>(verifying_key: &V) -> Result<SignerIdentifier, CertificateValidationError>
-where
-	V: EncodePublicKey,
-{
-	let public_key_der = verifying_key.to_public_key_der()?;
-	compute_signer_identifier_from_der(public_key_der.as_bytes())
-}
-
-/// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded
-/// public key bytes.
-///
-/// This byte-based variant accepts the output of
-/// `KeyProvider::to_public_key_bytes()`.
-pub fn compute_signer_identifier_from_der(
-	public_key_der: impl AsRef<[u8]>,
-) -> Result<SignerIdentifier, CertificateValidationError> {
-	let skid = Skid::of_public_key(public_key_der);
-	let skid_octets = OctetString::new(skid.as_bytes().as_slice())?;
-	let skid = SubjectKeyIdentifier::from(skid_octets);
-	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
+/// A `rid` and a `sid` share their two arms (RFC 9629 §3, RFC 5652 §5.3), so
+/// one rule names a certificate as a signer and as a recipient.
+pub(crate) fn recipient_identifier_of(sid: &SignerIdentifier) -> RecipientIdentifier {
+	match sid {
+		SignerIdentifier::SubjectKeyIdentifier(skid) => RecipientIdentifier::SubjectKeyIdentifier(skid.clone()),
+		SignerIdentifier::IssuerAndSerialNumber(issuer) => RecipientIdentifier::IssuerAndSerialNumber(issuer.clone()),
+	}
 }
 
 #[cfg(test)]
 mod tests {
+	use super::{CertificateExt, Fingerprint, Skid};
+	use crate::asn1::admission::fixtures::{tlv, DESCENDING_LEN};
+	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::crypto::x509::error::CertificateValidationError;
+	use crate::crypto::x509::error::CertificateValidationError::EncodingError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::testing::TestCertificate;
+	use crate::crypto::x509::Certificate;
+	use crate::der::asn1::OctetString;
+	use crate::der::oid::AssociatedOid;
+	use crate::der::{Encode, ErrorKind, Tag, TagNumber};
+	use crate::testing::{TestCertificate, TestKey};
+	use crate::x509::ext::pkix::{IssuerAltName, SubjectKeyIdentifier};
+	use crate::x509::ext::Extension;
+
+	/// The self-signed test certificate with an `issuerAltName` extension
+	/// around `value`. The lookup of an extension reads the extensions alone,
+	/// so the stale signature leaves the lookup as it is.
+	fn with_issuer_alt_name(value: Vec<u8>) -> Certificate {
+		let mut certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let extn_value = OctetString::new(value).expect("a test value fits an OCTET STRING");
+		let extension = Extension { extn_id: IssuerAltName::OID, critical: false, extn_value };
+		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
+		extensions.push(extension);
+		certificate
+	}
+
+	/// The `GeneralNames` of one `directoryName` whose one RDN holds
+	/// [`DESCENDING_LEN`] common names in descending order, which `der`
+	/// decodes and sorts.
+	fn descending_general_names() -> Vec<u8> {
+		let common_name = tlv(Tag::ObjectIdentifier, &[0x55, 0x04, 0x03]);
+		let entries = (0..DESCENDING_LEN).rev().map(|value| {
+			let value = tlv(Tag::OctetString, &value.to_be_bytes());
+			tlv(Tag::Sequence, &[common_name.as_slice(), &value].concat())
+		});
+		let rdn = tlv(Tag::Set, &entries.collect::<Vec<_>>().concat());
+		let directory_name = Tag::ContextSpecific { constructed: true, number: TagNumber::N4 };
+		tlv(Tag::Sequence, &tlv(directory_name, &tlv(Tag::Sequence, &rdn)))
+	}
+
+	/// The one decoder of extension values runs the DER admission on the
+	/// value before the name in it decodes and sorts its RDN, so it refuses a
+	/// SET out of DER order.
+	#[test]
+	fn an_extension_of_a_descending_set_is_refused() {
+		let certificate = with_issuer_alt_name(descending_general_names());
+
+		let refused = certificate.extension::<IssuerAltName>();
+		let set_ordering = matches!(refused, Err(EncodingError(error)) if error.kind() == ErrorKind::SetOrdering);
+		assert!(set_ordering);
+	}
+
+	/// A fingerprint that the encoder streams into the digest equals the
+	/// digest of the whole DER, which the encoder writes outside the code
+	/// under test.
+	#[test]
+	fn a_fingerprint_is_the_digest_of_the_certificate_der() -> Result<(), CertificateValidationError> {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let expected = Sha3_256::digest(certificate.to_der()?);
+
+		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
+		assert_eq!(fingerprint.as_slice(), expected.as_slice());
+		Ok(())
+	}
+
+	/// The extension value a SKID converts to carries the SKID bytes whole,
+	/// so a certificate the crate creates holds the 20 bytes its key names.
+	#[test]
+	fn a_skid_converts_to_the_extension_value_that_carries_it() -> Result<(), crate::der::Error> {
+		let skid = Skid::parse([0x5au8; 20]).ok_or(crate::der::Tag::OctetString.value_error())?;
+		let identifier = SubjectKeyIdentifier::try_from(skid)?;
+		assert_eq!(identifier.0.as_bytes(), skid.as_bytes());
+		Ok(())
+	}
 
 	#[test]
 	fn test_pem_macro() {
@@ -407,10 +769,9 @@ mod tests {
 		let result = validator.evaluate(&expired_cert);
 		assert!(result.is_err(), "Expired certificate should be rejected");
 
-		// The rejection is specifically an expiry error.
 		match result {
 			Err(CertificateValidationError::Expired) => {
-				// Expected error
+				// This arm is the expected error.
 			}
 			other => panic!("Expected Expired error, got: {other:?}"),
 		}
@@ -418,9 +779,192 @@ mod tests {
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
 	mod certificate_extension {
-		use crate::crypto::x509::ext::pkix::BasicConstraints;
+		use crate::crypto::x509::error::CertificateValidationError;
+		use crate::crypto::x509::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
 		use crate::crypto::x509::utils::CertificateExt;
+		use crate::der::oid::db::rfc5280::{ANY_EXTENDED_KEY_USAGE, ID_KP_CLIENT_AUTH, ID_KP_TIME_STAMPING};
+		use crate::der::oid::AssociatedOid;
 		use crate::testing::fixtures::TestCertificate;
+		use crate::testing::TestKey;
+		use crate::x509::Certificate;
+
+		/// A self-signed certificate of the fixed test key, whose `keyUsage`
+		/// carries `digitalSignature` and `keyAgreement`.
+		fn both_uses() -> Certificate {
+			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		}
+
+		/// [`both_uses`] with an `extendedKeyUsage` of `purposes` alone.
+		fn with_purposes(purposes: Vec<crate::der::asn1::ObjectIdentifier>) -> Certificate {
+			TestCertificate::with_key_purposes(both_uses(), purposes)
+		}
+
+		#[test]
+		fn rejects_unknown_critical_extension() {
+			// nameConstraints (2.5.29.30) sits outside the processed set.
+			let mut cert = both_uses();
+			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.30", true)]);
+			assert!(matches!(
+				cert.ensure_critical_extensions_processed(),
+				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
+			));
+		}
+
+		#[test]
+		fn accepts_unknown_noncritical_extension() {
+			let mut cert = both_uses();
+			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.30", false)]);
+			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		}
+
+		#[test]
+		fn accepts_processed_critical_extensions() {
+			let mut cert = both_uses();
+			cert.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, None));
+			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		}
+
+		/// The crate processes `extendedKeyUsage`, so it admits a critical one
+		/// (RFC 5280 §4.2.1.12).
+		#[test]
+		fn accepts_a_critical_extended_key_usage() {
+			let extension = TestCertificate::extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]), true);
+			let cert = TestCertificate::with_extension(both_uses(), extension);
+			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		}
+
+		/// The uniqueness check refuses a certificate with two `keyUsage`
+		/// extensions (RFC 5280 §4.2).
+		#[test]
+		fn rejects_a_repeated_extension() {
+			let mut cert = both_uses();
+			let key_usage = TestCertificate::opaque_extension("2.5.29.15", true);
+			let repeated = vec![key_usage.clone(), key_usage];
+
+			cert.tbs_certificate.extensions = Some(repeated);
+
+			let refused = cert.ensure_unique_extensions();
+			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+		}
+
+		#[test]
+		fn accepts_one_instance_of_each_extension() {
+			let cert = both_uses();
+			assert!(cert.ensure_unique_extensions().is_ok());
+		}
+
+		#[test]
+		fn accepts_critical_subject_alt_name() {
+			// Colony membership reads subjectAltName (2.5.29.17), which
+			// RFC 5280 §4.1.2.6 marks critical when the subject DN is empty.
+			let mut cert = both_uses();
+			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.17", true)]);
+			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		}
+
+		/// The read of one extension refuses a certificate that carries it
+		/// twice, so no reader takes the first of two values (RFC 5280 §4.2).
+		#[test]
+		fn reading_an_extension_carried_twice_is_refused() {
+			let key_usage = KeyUsage(KeyUsages::DigitalSignature.into());
+			let cert = TestCertificate::with_extension(both_uses(), TestCertificate::extension(&key_usage, true));
+
+			let refused = cert.extension::<KeyUsage>();
+			assert!(
+				matches!(refused, Err(CertificateValidationError::DuplicateExtension(oid)) if oid == KeyUsage::OID)
+			);
+		}
+
+		/// Each use admits a certificate whose `keyUsage` carries both bits.
+		#[test]
+		fn a_certificate_with_both_bits_is_admitted_for_signing() {
+			assert!(both_uses().require_use(KeyUsages::DigitalSignature).is_ok());
+		}
+
+		#[test]
+		fn a_certificate_with_both_bits_is_admitted_for_key_agreement() {
+			assert!(both_uses().require_use(KeyUsages::KeyAgreement).is_ok());
+		}
+
+		/// The signing use refuses a certificate whose `keyUsage` carries
+		/// `keyAgreement` alone.
+		#[test]
+		fn a_key_agreement_certificate_is_refused_for_signing() {
+			let cert = TestCertificate::with_key_usage(both_uses(), KeyUsage(KeyUsages::KeyAgreement.into()));
+			let refused = cert.require_use(KeyUsages::DigitalSignature);
+			assert!(matches!(
+				refused,
+				Err(CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature))
+			));
+		}
+
+		/// The key-agreement use refuses a certificate whose `keyUsage`
+		/// carries `digitalSignature` alone.
+		#[test]
+		fn a_signing_certificate_is_refused_for_key_agreement() {
+			let cert = TestCertificate::with_key_usage(both_uses(), KeyUsage(KeyUsages::DigitalSignature.into()));
+			let refused = cert.require_use(KeyUsages::KeyAgreement);
+			assert!(matches!(
+				refused,
+				Err(CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement))
+			));
+		}
+
+		/// An `extendedKeyUsage` that omits a purpose refuses its role
+		/// (RFC 5280 §4.2.1.12).
+		#[test]
+		fn a_purpose_the_extended_key_usage_omits_is_refused() {
+			let cert = with_purposes(vec![ID_KP_TIME_STAMPING]);
+			let refused = cert.require_purpose(ID_KP_CLIENT_AUTH);
+			assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
+		}
+
+		/// An `extendedKeyUsage` that names a purpose among others admits its
+		/// role.
+		#[test]
+		fn a_purpose_the_extended_key_usage_names_is_admitted() {
+			let cert = with_purposes(vec![ID_KP_TIME_STAMPING, ID_KP_CLIENT_AUTH]);
+			assert!(cert.require_purpose(ID_KP_CLIENT_AUTH).is_ok());
+		}
+
+		/// `anyExtendedKeyUsage` admits every role (RFC 5280 §4.2.1.12).
+		#[test]
+		fn any_extended_key_usage_admits_the_role() {
+			let cert = with_purposes(vec![ANY_EXTENDED_KEY_USAGE]);
+			assert!(cert.require_purpose(ID_KP_CLIENT_AUTH).is_ok());
+		}
+
+		/// A certificate with no `extendedKeyUsage` serves every role.
+		#[test]
+		fn a_certificate_without_extended_key_usage_admits_the_role() {
+			assert!(both_uses().require_purpose(ID_KP_CLIENT_AUTH).is_ok());
+		}
+
+		/// The use refuses a repeated extension before it reads `keyUsage`,
+		/// so it refuses a certificate with no `keyUsage` for the repeat.
+		#[test]
+		fn a_use_refuses_a_repeated_extension() {
+			let extension = TestCertificate::opaque_extension("2.5.29.30", false);
+			let cert = TestCertificate::without_extension(both_uses(), KeyUsage::OID);
+			let cert = TestCertificate::with_extension(cert, extension.clone());
+			let cert = TestCertificate::with_extension(cert, extension);
+
+			let refused = cert.require_use(KeyUsages::DigitalSignature);
+			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+		}
+
+		/// The use refuses a critical extension the crate does not process.
+		#[test]
+		fn a_use_refuses_an_unknown_critical_extension() {
+			let extension = TestCertificate::opaque_extension("2.5.29.30", true);
+			let cert = TestCertificate::with_extension(both_uses(), extension);
+
+			let refused = cert.require_use(KeyUsages::KeyAgreement);
+			assert!(matches!(
+				refused,
+				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
+			));
+		}
 
 		#[test]
 		fn reads_basic_constraints() -> Result<(), Box<dyn core::error::Error>> {

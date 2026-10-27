@@ -1,9 +1,9 @@
-//! Connection Keep-Alive and Reuse Tests
+//! The tests of connection keep-alive and reuse.
 //!
-//! Tests that a single client connection can send multiple messages
-//! without reconnecting (connection keep-alive):
-//! - Basic TCP connection reuse (no TLS)
-//! - TLS connection reuse with session persistence
+//! Each test checks that one client connection sends three messages without a
+//! reconnect (connection keep-alive), in two cases:
+//! - the reuse of a cleartext TCP connection, and
+//! - the reuse of a TLS connection, whose one session carries all three.
 
 #![cfg(all(
 	feature = "std",
@@ -12,131 +12,76 @@
 	feature = "builder",
 	feature = "testing",
 	feature = "colony",
-	feature = "hex"
+	feature = "hex",
+	feature = "instrument"
 ))]
 
 use std::sync::Arc;
 
-use tightbeam::transport::state::ClientIdentity;
-use tightbeam::utils::urn::Urn;
-
-pub(crate) const CLIENT_CONNECT: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/client-connect");
-pub(crate) const RECEIVE_RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/receive-response");
-pub(crate) const SEND_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/send-message");
+use tightbeam::crypto::sign::SigningIdentity;
 
 use tightbeam::{
 	colony::servlet::ServletConfig,
 	compose,
 	der::Sequence,
-	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::SetupEnv,
+	exactly,
+	instrumentation::events,
+	servlet, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{macros::BuiltAssertSpec, ScenarioConfig, ScenarioConfigError, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	Beamable,
 };
 
 #[cfg(feature = "x509")]
+use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
+#[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
-		key::SigningKeySpec,
 		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
 		x509::{
-			policy::{CertificateValidation, PublicKeyPinning},
+			policy::CertificateValidation,
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			Certificate, CertificateSpec,
+			Certificate,
 		},
 	},
 	error::TightBeamError,
-	hex,
 };
 
-// ============================================================================
-// Test Message Types
-// ============================================================================
+// The tests exchange this message type.
 
 #[derive(Clone, Debug, PartialEq, Beamable, Sequence)]
 struct TestMessage {
 	content: String,
 }
 
-// ============================================================================
-// TLS Test Certificates (x509 feature only)
-// ============================================================================
-
-#[cfg(feature = "x509")]
-const SERVER_CERT: CertificateSpec = CertificateSpec::Pem(
-	r#"-----BEGIN CERTIFICATE-----
-MIIBajCCAQ+gAwIBAgIBATALBglghkgBZQMEAwowHTEbMBkGA1UEAwwSU3RhdGlj
-IFRlc3QgU2VydmVyMB4XDTI1MTEyMTIyMDkxMVoXDTM1MTExOTIyMDkxMVowHTEb
-MBkGA1UEAwwSU3RhdGljIFRlc3QgU2VydmVyMFYwEAYHKoZIzj0CAQYFK4EEAAoD
-QgAEG4TFVnsSZECZXT7VqroFZdceGDRgSBn/nBf16dXdB49wvq+PWItUFQf+1qZC
-xatC39+BIKf2Od5RItR6aajo0aNCMEAwHQYDVR0OBBYEFEOubLl6za81S4KG3bKb
-SSyV6VhwMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAsGCWCGSAFl
-AwQDCgNIADBFAiEA2aChCQdJ1LI46IWMds2yNoOG8Pq4nYqbEgETdIR+vnQCID7U
-88OyM9q8+mrRAHYOyG7zYxKaxeWQTpwQVoVgCjs+
------END CERTIFICATE-----"#,
-);
-
-#[cfg(feature = "x509")]
-const CLIENT_CERT: CertificateSpec = CertificateSpec::Pem(
-	r#"-----BEGIN CERTIFICATE-----
-MIIBajCCAQ+gAwIBAgIBATALBglghkgBZQMEAwowHTEbMBkGA1UEAwwSU3RhdGlj
-IFRlc3QgQ2xpZW50MB4XDTI1MTEyMTIyMDkxMVoXDTM1MTExOTIyMDkxMVowHTEb
-MBkGA1UEAwwSU3RhdGljIFRlc3QgQ2xpZW50MFYwEAYHKoZIzj0CAQYFK4EEAAoD
-QgAETUts0TYQMsqb0q652QCqTUXZ6tgKyUIzdMRRpyVNB2YqPq2i0P4gi20lfOsP
-BkKEZi6Ff1e2a1TBmL0xDe020KNCMEAwHQYDVR0OBBYEFKPczeMV5zGTz6VPSCJD
-QZFgb0XEMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAsGCWCGSAFl
-AwQDCgNIADBFAiEA0HI5WVq8ch27rQx7SO+hGwsQGLGHHvc34pfa7MQ3R4kCICJP
-7O7AR01io0/m4Hez90niWi1m+zeJS00hvuznD/Hp
------END CERTIFICATE-----"#,
-);
-
-#[cfg(feature = "x509")]
-const SERVER_KEY: SigningKeySpec =
-	SigningKeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
-
-#[cfg(feature = "x509")]
-const CLIENT_KEY: SigningKeySpec =
-	SigningKeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
-
-#[cfg(feature = "x509")]
-const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
-
-#[cfg(feature = "x509")]
-const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KEY]);
-
-// ============================================================================
-// Test Helpers
-// ============================================================================
+// The TLS scenario trusts the server certificate through this store.
 
 #[cfg(feature = "x509")]
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy::default())
 			.with_certificate(server_cert)?
 			.build(),
 	))
 }
 
-// ============================================================================
-// Spec Definitions
-// ============================================================================
+// These specs state the event contract of both scenarios.
 
+// The servlet accepts one connection, and its gate then admits the three
+// messages on that same connection.
 tb_process_spec! {
 	pub ConnectionReuseProcess,
 	events {
-		observable { CLIENT_CONNECT, SEND_MESSAGE, RECEIVE_RESPONSE }
+		observable { events::CONNECTION_ACCEPTED, events::GATE_ACCEPT }
 		hidden { }
 	}
 	states {
-		Init => { CLIENT_CONNECT => Connected },
-		Connected => { SEND_MESSAGE => Sent1 },
-		Sent1 => { RECEIVE_RESPONSE => Received1 },
-		Received1 => { SEND_MESSAGE => Sent2 },
-		Sent2 => { RECEIVE_RESPONSE => Received2 },
-		Received2 => { SEND_MESSAGE => Sent3 },
-		Sent3 => { RECEIVE_RESPONSE => Complete }
+		Init => { events::CONNECTION_ACCEPTED => Connected },
+		Connected => { events::GATE_ACCEPT => Served1 },
+		Served1 => { events::GATE_ACCEPT => Served2 },
+		Served2 => { events::GATE_ACCEPT => Complete }
 	}
 	terminal { Complete }
 }
@@ -146,23 +91,50 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(CLIENT_CONNECT, exactly!(1)),
-			(SEND_MESSAGE, exactly!(3)),
-			(RECEIVE_RESPONSE, exactly!(3))
+			(events::CONNECTION_ACCEPTED, exactly!(1)),
+			(events::GATE_ACCEPT, exactly!(3))
 		]
 	}
 }
 
-// ============================================================================
-// Scenario: Basic TCP Connection Reuse (No TLS)
-// ============================================================================
+tb_assert_spec! {
+	pub TlsConnectionReuseSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CONNECTION_ACCEPTED, exactly!(1)),
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::GATE_ACCEPT, exactly!(3))
+		]
+	}
+}
+
+/// The message whose id is `prefix` and `index`, and whose content is `test`
+/// and `index`.
+fn numbered(prefix: &str, index: usize) -> Result<tightbeam::Frame, tightbeam::TightBeamError> {
+	compose! {
+		V0: id: format!("{prefix}{index}").as_bytes(),
+			message: TestMessage { content: format!("test{index}") }
+	}
+}
+
+/// Grades `spec`, and orders the accept and gate events by
+/// `ConnectionReuseProcess` in a build with `testing-csp`.
+fn connection_reuse_config(spec: &'static BuiltAssertSpec) -> Result<ScenarioConfig, ScenarioConfigError> {
+	let builder = ScenarioConfig::builder().with_spec(spec);
+	#[cfg(feature = "testing-csp")]
+	let builder = builder.with_csp(ConnectionReuseProcess);
+	builder.build()
+}
+
+// Scenario: one cleartext TCP connection carries three messages.
 
 tb_scenario! {
 	name: tcp_connection_reuse,
-	spec: ConnectionReuseSpec,
+	config: connection_reuse_config(ConnectionReuseSpec::latest()),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			// Start echo servlet
+			// The echo servlet answers each frame with itself.
 			servlet! {
 				EchoServlet<TestMessage, EnvConfig = ()>,
 				protocol: TokioListener,
@@ -171,35 +143,24 @@ tb_scenario! {
 				}
 			}
 
-			let servlet_task = EchoServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
+			let servlet_task = EchoServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
 			let addr = servlet_task.addr().to_owned();
-
-			trace.event(CLIENT_CONNECT)?;
-
-			// Send 3 messages using the same client (connection keep-alive)
+			// One client sends all three messages over its one connection.
 			let client_builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let mut client = client_builder.connect(addr).await?;
-			for i in 1..=3 {
-				trace.event(SEND_MESSAGE)?;
 
-				let msg = compose! {
-					V0: id: format!("msg{}", i).as_bytes(),
-						message: TestMessage { content: format!("test{}", i) }
-				}?;
-
-				if client.emit(msg, None).await?.is_some() {
-					trace.event(RECEIVE_RESPONSE)?;
-				}
-			}
-
+			let first = client.emit(numbered("msg", 1)?, None).await?;
+			let second = client.emit(numbered("msg", 2)?, None).await?;
+			let third = client.emit(numbered("msg", 3)?, None).await?;
+			assert!(first.is_some(), "message 1 must draw its echo on the kept connection");
+			assert!(second.is_some(), "message 2 must draw its echo on the kept connection");
+			assert!(third.is_some(), "message 3 must draw its echo on the kept connection");
 			Ok(())
 		}
 	}
 }
 
-// ============================================================================
-// Scenario: TLS Connection Reuse with Session Persistence
-// ============================================================================
+// Scenario: one TLS connection carries three messages in one session.
 
 #[cfg(all(
 	feature = "x509",
@@ -211,10 +172,10 @@ tb_scenario! {
 ))]
 tb_scenario! {
 	name: tls_connection_reuse,
-	spec: ConnectionReuseSpec,
+	config: connection_reuse_config(TlsConnectionReuseSpec::latest()),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			// Start TLS echo servlet
+			// The TLS echo servlet answers each frame with itself.
 			servlet! {
 				TlsEchoServlet<TestMessage, EnvConfig = ()>,
 				protocol: TokioListener,
@@ -224,7 +185,7 @@ tb_scenario! {
 			}
 
 			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
-			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+			let validators = vec![Arc::new(client_pinning()) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, TestMessage>::builder()
 				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
@@ -233,31 +194,22 @@ tb_scenario! {
 			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 			let addr = servlet_task.addr().to_owned();
 
-			trace.event(CLIENT_CONNECT)?;
-
-			// Configure client with TLS credentials
+			// The client presents its own certificate and trusts the server's.
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
+				.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
-			// Send 3 messages using the same TLS client
-			// (no re-handshake, session reuse)
+			// One TLS client sends all three messages after one handshake.
 			let mut client = builder.connect(addr).await?;
-			for i in 1..=3 {
-				trace.event(SEND_MESSAGE)?;
 
-				let msg = compose! {
-					V0: id: format!("tls-msg{}", i).as_bytes(),
-						message: TestMessage { content: format!("test{}", i) }
-				}?;
-
-				if client.emit(msg, None).await?.is_some() {
-					trace.event(RECEIVE_RESPONSE)?;
-				}
-			}
-
+			let first = client.emit(numbered("tls-msg", 1)?, None).await?;
+			let second = client.emit(numbered("tls-msg", 2)?, None).await?;
+			let third = client.emit(numbered("tls-msg", 3)?, None).await?;
+			assert!(first.is_some(), "message 1 must draw its echo on the kept session");
+			assert!(second.is_some(), "message 2 must draw its echo on the kept session");
+			assert!(third.is_some(), "message 3 must draw its echo on the kept session");
 			Ok(())
 		}
 	}

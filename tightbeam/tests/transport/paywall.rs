@@ -1,19 +1,20 @@
 //! Paywall lottery integration tests.
 //!
-//! The full metered-service story on the real TCP + pool stack: a client
-//! connects, the house presents an invoice (the settlement challenge bound
-//! into the budget-bearing session receipt), the client countersigns to pay,
-//! and only then does the lottery serve draws. Credits are draws: every
-//! ticket debits one session-budget credit, so the negotiated budget is the
-//! number of draws a paid invoice buys.
+//! The tests run the full metered-service story on the real TCP and pool
+//! stack. The lottery serves draws only after these steps:
+//! 1. A client connects.
+//! 2. The house presents an invoice, the settlement challenge bound into the budget-bearing session receipt.
+//! 3. The client countersigns the invoice to pay.
 //!
-//! The draw itself is rigged per scenario: the house decides whether the
-//! reply repeats the client's pick (a win) or never does (the house keeps
-//! the pot), which turns settlement, budget, renewal, and refusal mechanics
-//! into observable lottery outcomes.
+//! Credits are draws: every ticket debits one session-budget credit, so the
+//! negotiated budget is the number of draws a paid invoice buys.
+//!
+//! The house rigs the draw per scenario: the reply repeats the client's pick
+//! (a win) or differs from it (the house keeps the pot), so settlement,
+//! budget, renewal, and refusal become observable lottery outcomes.
 
 #![cfg(all(
-	feature = "transport-ecies",
+	feature = "transport-hpke",
 	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",
@@ -27,9 +28,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::sign::SigningIdentity;
+use tightbeam::crypto::x509::{CanonicalKey, CertificateSpec};
 use tightbeam::decode;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
@@ -44,9 +45,9 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, MuxSettings, TransportAuthorizer, TransportOffer,
+	SETTLEMENT_UNSUPPORTED_CODE,
 };
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 use tightbeam::utils::marker::MaybeSendFuture;
@@ -57,35 +58,14 @@ use tokio::task::JoinHandle;
 use crate::common::security::{
 	expectation_failure, pinning_trust_store, random_signing_key, test_certificate, PayingApprover, ServerMaterials,
 };
-use crate::transport::support::{await_receipt_rotation, bind_mutual_listener};
+use crate::transport::support::{await_transport, bind_mutual_listener};
 
 use tightbeam::instrumentation::events;
-use tightbeam::utils::urn::Urn;
-
-pub(crate) const CREDITS_BOUND_THE_DRAWS: Urn<'static> =
-	tightbeam::urn!("test", "event:paywall/credits-bound-the-draws");
-pub(crate) const CUTOFF_CLOSES_THE_WINDOW: Urn<'static> =
-	tightbeam::urn!("test", "event:paywall/cutoff-closes-the-window");
-pub(crate) const HOUSE_NEVER_PAYS: Urn<'static> = tightbeam::urn!("test", "event:paywall/house-never-pays");
-pub(crate) const HOUSE_SEES_ROTATED_RECEIPT: Urn<'static> =
-	tightbeam::urn!("test", "event:paywall/house-sees-rotated-receipt");
-pub(crate) const GAMBLER_LOSES_EVERY_TICKET: Urn<'static> =
-	tightbeam::urn!("test", "event:paywall/gambler-loses-every-ticket");
-pub(crate) const LEDGER_BALANCE_EXACT: Urn<'static> = tightbeam::urn!("test", "event:paywall/ledger-balance-exact");
-pub(crate) const LEDGER_RUNS_DRY: Urn<'static> = tightbeam::urn!("test", "event:paywall/ledger-runs-dry");
-pub(crate) const INVOICE_SETTLES_BEFORE_SERVICE: Urn<'static> =
-	tightbeam::urn!("test", "event:paywall/invoice-settles-before-service");
-pub(crate) const TALLY_NO_CUTOFF: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-no-cutoff");
-pub(crate) const TALLY_NO_LOSSES: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-no-losses");
-pub(crate) const TALLY_WINS_MATCH: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-wins-match");
-pub(crate) const TOPUP_ROTATES_RECEIPT: Urn<'static> = tightbeam::urn!("test", "event:paywall/topup-rotates-receipt");
-pub(crate) const UNPAID_CLIENT_LOCKED_OUT: Urn<'static> =
-	tightbeam::urn!("test", "event:paywall/unpaid-client-locked-out");
 
 /// The invoice the house binds into every budget-bearing receipt.
 const LOTTERY_INVOICE: &[u8] = b"lottery-invoice-one-credit-per-draw";
 
-/// The payment preimage a paying client countersigns the invoice with.
+/// The payment preimage a client countersigns the invoice with to pay.
 const LOTTERY_PAYMENT: &[u8] = b"lottery-payment-preimage";
 
 /// The application code for an unpaid or short-paid invoice.
@@ -114,8 +94,8 @@ fn lottery_settings() -> MuxSettings {
 
 /// The draws served against the initial invoice before the budget watermark
 /// opens a renewal, which is a top-up invoice, for the rest. The value comes
-/// from the same public watermark math the mux enforces rather than from a
-/// copied reserve formula.
+/// from `MuxSettings::usable_send_budget`, the public watermark math that the
+/// mux enforces.
 fn prepaid_draws() -> u64 {
 	lottery_settings().usable_send_budget().unwrap_or_default()
 }
@@ -131,7 +111,7 @@ const OPENING_DRAWS: u64 = 3;
 enum DrawRig {
 	/// The reply repeats the pick: the client always wins.
 	AlwaysWin,
-	/// The reply never repeats the pick: the house keeps the pot.
+	/// The reply differs from the pick: the house keeps the pot.
 	HouseAlwaysWins,
 }
 
@@ -160,8 +140,8 @@ fn ledger_offer() -> Option<TransportOffer> {
 	Some(offer)
 }
 
-/// Invoices every session and every renewal. An unpaid or short-paid
-/// invoice fails closed with [`INVOICE_REFUSAL_CODE`].
+/// The house, which invoices every session and every renewal. An unpaid or
+/// short-paid invoice fails closed with [`INVOICE_REFUSAL_CODE`].
 struct LotteryHouse {
 	invoice: OctetString,
 	expected_payment: OctetString,
@@ -210,8 +190,8 @@ impl TransportAuthorizer for LotteryHouse {
 	}
 }
 
-/// Pays the first invoice, then refuses every renewal invoice with
-/// [`WALLET_EMPTY_CODE`]: the gambler is out of money.
+/// A wallet that pays the first invoice, then refuses every renewal invoice
+/// with [`WALLET_EMPTY_CODE`]: the gambler is out of money.
 struct EmptyWallet {
 	payment: OctetString,
 	invoices: AtomicUsize,
@@ -279,17 +259,17 @@ async fn start_lottery_server(
 	Ok((handle, addr))
 }
 
-/// The house's account book: remaining draw credits keyed by the
-/// authenticated client public key. The book outlives every connection, so
-/// a reconnecting gambler resumes the balance a lost connection left behind.
+/// The house's account book: the unspent draw credits of each authenticated
+/// client public key. The book outlives every connection, so a gambler that
+/// reconnects resumes the balance that a lost connection left behind.
 #[derive(Default)]
 struct CreditLedger {
 	accounts: Mutex<HashMap<Vec<u8>, u64>>,
 }
 
 impl CreditLedger {
-	/// The house's announcement for one ticket: a rigged outcome while
-	/// the account holds credit (debiting one), [`ACCOUNT_EMPTY`] after.
+	/// The house's announcement for one ticket: a rigged outcome that debits
+	/// one credit while the account holds credit, and [`ACCOUNT_EMPTY`] after.
 	/// The first ticket from a public key deposits the opening balance.
 	fn announce(&self, account: impl AsRef<[u8]>, rig: DrawRig, pick: impl AsRef<str>) -> String {
 		let account = account.as_ref();
@@ -313,10 +293,9 @@ impl CreditLedger {
 	}
 }
 
-/// Lottery service whose credits live in a [`CreditLedger`] keyed by the
-/// client's public key rather than in per-session budgets: the session-aware
-/// handler meters every ticket against the durable account of the
-/// authenticated peer.
+/// The lottery service whose credits live in a [`CreditLedger`] keyed by the
+/// client's public key. The session-aware handler meters every ticket against
+/// the durable account of the authenticated peer.
 async fn start_ledger_lottery_server(
 	ctx: &PaywallContext,
 	rig: DrawRig,
@@ -335,7 +314,8 @@ async fn start_ledger_lottery_server(
 			let ledger = Arc::clone(&ledger);
 			async move {
 				let account = session
-					.peer_public_key()
+					.peer_key()
+					.map(CanonicalKey::as_der)
 					.ok_or_else(|| expectation_failure("mutual handshake left no client public key"))?;
 				let pick: TestMessage = decode(ticket.message())?;
 				let announced = ledger.announce(account, rig, &pick.content);
@@ -347,8 +327,8 @@ async fn start_ledger_lottery_server(
 	Ok((handle, addr))
 }
 
-/// Builds the pool for a gambler. `wallet` decides how, or whether, invoices
-/// get paid.
+/// Builds the pool for a gambler. `wallet` decides how the gambler pays each
+/// invoice, or whether it pays at all.
 fn lottery_pool(
 	ctx: &PaywallContext,
 	trace: &TraceCollector,
@@ -358,7 +338,7 @@ fn lottery_pool(
 }
 
 /// Builds a pool over the generous ledger offer, with the same paywall and
-/// account metering.
+/// the same meter on each account.
 fn ledger_pool(
 	ctx: &PaywallContext,
 	trace: &TraceCollector,
@@ -381,7 +361,7 @@ fn pool_with_offer(
 	let mut builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
-		.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
+		.with_client_identity(SigningIdentity::from_spec(identity, client_provider)?)
 		.with_trace(trace.share());
 
 	if let Some(wallet) = wallet {
@@ -392,8 +372,8 @@ fn pool_with_offer(
 	Ok(pool)
 }
 
-/// Plays one draw: it emits the pick as a ticket, decodes the announced
-/// number, and reports whether the gambler won.
+/// Plays one draw: it emits the pick as a ticket and returns the number
+/// that the house announces.
 async fn draw(lease: &mut PooledClient<TokioListener>, pick: impl AsRef<str>) -> Result<String, TightBeamError> {
 	let pick = pick.as_ref();
 	let ticket = TestFrame::v0(Some(pick), None);
@@ -412,13 +392,12 @@ struct DrawTally {
 	cutoff: Option<TightBeamError>,
 }
 
-/// Records each clause of an all-win tally as its own event, so a
-/// failing spec names the exact clause instead of one compound boolean.
-fn record_winning_tally(trace: &TraceCollector, tally: &DrawTally, expected_wins: u64) -> Result<(), TightBeamError> {
-	trace.event_with(TALLY_WINS_MATCH, &[], tally.wins == expected_wins)?;
-	trace.event_with(TALLY_NO_LOSSES, &[], tally.losses == 0)?;
-	trace.event_with(TALLY_NO_CUTOFF, &[], tally.cutoff.is_none())?;
-	Ok(())
+/// Asserts each clause of an all-win tally on its own, so a failure names the
+/// exact clause instead of one compound boolean.
+fn assert_winning_tally(tally: &DrawTally, expected_wins: u64) {
+	assert_eq!(tally.wins, expected_wins, "every draw must win");
+	assert_eq!(tally.losses, 0, "the always-win rig must lose no draw");
+	assert!(tally.cutoff.is_none(), "no draw may be cut off: {:?}", tally.cutoff);
 }
 
 /// Draws until the house cuts the gambler off or `attempts` runs out.
@@ -465,17 +444,13 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
-			(events::SESSION_RECEIPT_SETTLED, at_least!(1)),
-			(events::MUX_REKEY_REQUESTED, exactly!(0)),
-			(INVOICE_SETTLES_BEFORE_SERVICE, exactly!(1), equals!(true)),
-			(TALLY_WINS_MATCH, exactly!(1), equals!(true)),
-			(TALLY_NO_LOSSES, exactly!(1), equals!(true)),
-			(TALLY_NO_CUTOFF, exactly!(1), equals!(true))
+			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
+			(events::MUX_REKEY_REQUESTED, exactly!(0))
 		]
 	}
 }
 
-// A paid invoice unlocks the lottery. On the always-win rig, every announced
+// A paid invoice opens the lottery. On the always-win rig, every announced
 // number repeats the gambler's pick, well inside the prepaid credits.
 tb_scenario! {
 	name: paywall_paid_invoice_unlocks_winning_draws,
@@ -488,10 +463,8 @@ tb_scenario! {
 			let pool = lottery_pool(&ctx, &trace, Some(wallet))?;
 			let mut lease = pool.connect(addr).await?;
 
-			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], lease.session_receipt().is_some())?;
-
 			let tally = draw_until_cutoff(&mut lease, prepaid_draws() - 1).await;
-			record_winning_tally(&trace, &tally, prepaid_draws() - 1)?;
+			assert_winning_tally(&tally, prepaid_draws() - 1);
 			Ok(())
 		}
 	}
@@ -504,7 +477,7 @@ tb_assert_spec! {
 		assertions: [
 			(events::POOL_DIAL, exactly!(0)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(0)),
-			(UNPAID_CLIENT_LOCKED_OUT, exactly!(1), equals!(true))
+			(events::SESSION_RECEIPT_REFUSED, exactly!(1), equals!(SETTLEMENT_UNSUPPORTED_CODE))
 		]
 	}
 }
@@ -520,7 +493,7 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = lottery_pool(&ctx, &trace, None)?;
 			let locked_out = pool.connect(addr).await.is_err();
-			trace.event_with(UNPAID_CLIENT_LOCKED_OUT, &[], locked_out)?;
+			assert!(locked_out, "a client without an approver must be locked out");
 			Ok(())
 		}
 	}
@@ -537,21 +510,16 @@ tb_assert_spec! {
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, exactly!(0)),
 			(events::MUX_REKEY_REFUSED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
-			(events::MUX_GOAWAY_SENT, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(WALLET_EMPTY_CODE)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
-			(events::POOL_EVICTED, exactly!(1)),
-			(INVOICE_SETTLES_BEFORE_SERVICE, exactly!(1), equals!(true)),
-			(HOUSE_NEVER_PAYS, exactly!(1), equals!(true)),
-			(GAMBLER_LOSES_EVERY_TICKET, exactly!(1), equals!(true)),
-			(CREDITS_BOUND_THE_DRAWS, exactly!(1), equals!(true)),
-			(CUTOFF_CLOSES_THE_WINDOW, exactly!(1), equals!(true))
+			(events::POOL_EVICTED, exactly!(1))
 		]
 	}
 }
 
-// The house rig never announces the pick and the gambler's wallet cannot
-// pay the top-up invoice: the prepaid credits are the exact draw count,
-// then the refused renewal drains the window shut.
+// On the house rig every draw loses, and the gambler's wallet refuses the
+// top-up invoice: the prepaid credits buy the exact draw count, and the
+// refused renewal then drains the window shut.
 tb_scenario! {
 	name: paywall_house_rig_exhausts_draw_credits,
 	spec: PaywallExhaustedCreditsSpec,
@@ -563,17 +531,20 @@ tb_scenario! {
 			let pool = lottery_pool(&ctx, &trace, Some(wallet))?;
 			let mut lease = pool.connect(addr).await?;
 
-			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], lease.session_receipt().is_some())?;
+			let tally = draw_until_cutoff(&mut lease, prepaid_draws()).await;
+			assert_eq!(tally.wins, 0, "the house rig must never pay");
+			assert_eq!(tally.losses, prepaid_draws(), "every prepaid draw must be served and lost");
 
-			let tally = draw_until_cutoff(&mut lease, DRAW_CREDITS).await;
-			trace.event_with(HOUSE_NEVER_PAYS, &[], tally.wins == 0)?;
-			trace.event_with(GAMBLER_LOSES_EVERY_TICKET, &[], tally.losses == prepaid_draws())?;
-			trace.event_with(CREDITS_BOUND_THE_DRAWS, &[], tally.cutoff.is_some())?;
+			// The last prepaid draw opens the refused top-up renewal. The wait
+			// ends on the GoAway that follows, so the next ticket always meets
+			// a drained window.
+			let drained = await_transport(|| trace.recorded(events::MUX_GOAWAY_SENT) > 0).await;
+			assert!(drained, "the refused renewal must drain the window with a GoAway");
 
-			// Stimulus for `events::MUX_EMIT_DRAINING`: the window is
-			// drained shut, so one more ticket is refused at admission.
+			// Stimulus for `events::MUX_EMIT_DRAINING`: the drained window
+			// refuses one more ticket at admission.
 			let late_draw = draw(&mut lease, LUCKY_NUMBER).await;
-			trace.event_with(CUTOFF_CLOSES_THE_WINDOW, &[], late_draw.is_err())?;
+			assert!(late_draw.is_err(), "a ticket after the drain must be refused");
 			Ok(())
 		}
 	}
@@ -590,17 +561,12 @@ tb_assert_spec! {
 			(events::MUX_REKEY_RECEIPT_COUNTERSIGNED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(1)),
 			(events::MUX_REKEY_REFUSED, exactly!(0)),
-			(events::MUX_EMIT_DRAINING, exactly!(0)),
-			(INVOICE_SETTLES_BEFORE_SERVICE, exactly!(1), equals!(true)),
-			(TALLY_WINS_MATCH, exactly!(1), equals!(true)),
-			(TALLY_NO_LOSSES, exactly!(1), equals!(true)),
-			(TALLY_NO_CUTOFF, exactly!(1), equals!(true)),
-			(TOPUP_ROTATES_RECEIPT, exactly!(1), equals!(true))
+			(events::MUX_EMIT_DRAINING, exactly!(0))
 		]
 	}
 }
 
-// A wallet that keeps paying turns the budget watermark into a top-up:
+// A wallet that pays every invoice turns the budget watermark into a top-up:
 // the renewal invoice settles in-band and draws continue past the prepaid
 // credits under a rotated receipt.
 tb_scenario! {
@@ -614,14 +580,13 @@ tb_scenario! {
 			let pool = lottery_pool(&ctx, &trace, Some(wallet))?;
 			let mut lease = pool.connect(addr).await?;
 
-			let initial = lease.session_receipt();
-			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], initial.is_some())?;
-
 			let tally = draw_until_cutoff(&mut lease, prepaid_draws() + 3).await;
-			record_winning_tally(&trace, &tally, prepaid_draws() + 3)?;
+			assert_winning_tally(&tally, prepaid_draws() + 3);
 
-			let rotated = await_receipt_rotation(|| lease.session_receipt(), initial.as_deref()).await;
-			trace.event_with(TOPUP_ROTATES_RECEIPT, &[], rotated.is_some())?;
+			// The renewal rotates the receipt before it records its event, so
+			// the wait ends on the event.
+			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) > 0).await;
+			assert!(renewed, "the paid top-up must renew the session");
 			Ok(())
 		}
 	}
@@ -634,21 +599,14 @@ tb_assert_spec! {
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
-			(events::MUX_REKEY_REQUESTED, exactly!(0)),
-			(INVOICE_SETTLES_BEFORE_SERVICE, exactly!(2), equals!(true)),
-			(TALLY_WINS_MATCH, exactly!(1), equals!(true)),
-			(TALLY_NO_LOSSES, exactly!(1), equals!(true)),
-			(TALLY_NO_CUTOFF, exactly!(1), equals!(true)),
-			(LEDGER_BALANCE_EXACT, exactly!(1), equals!(true)),
-			(LEDGER_RUNS_DRY, exactly!(1), equals!(true))
+			(events::MUX_REKEY_REQUESTED, exactly!(0))
 		]
 	}
 }
 
-// A lost connection does not forfeit credits: the house books credits
-// against the authenticated public key, so a reconnecting gambler pays a
-// fresh invoice but resumes the balance the dead connection left behind,
-// down to the exact draw the account runs empty on.
+// Credits survive a lost connection: a gambler that reconnects pays a fresh
+// invoice and resumes the balance that `CreditLedger` books against its
+// public key, down to the exact draw the account runs empty on.
 tb_scenario! {
 	name: paywall_ledger_survives_reconnect,
 	spec: PaywallLedgerReconnectSpec,
@@ -662,26 +620,24 @@ tb_scenario! {
 
 			let first_pool = ledger_pool(&ctx, &trace, Some(Arc::clone(&wallet)))?;
 			let mut lease = first_pool.connect(addr).await?;
-			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], lease.session_receipt().is_some())?;
 
 			let opening = draw_until_cutoff(&mut lease, OPENING_DRAWS).await;
-			record_winning_tally(&trace, &opening, OPENING_DRAWS)?;
+			assert_winning_tally(&opening, OPENING_DRAWS);
 
-			// The connection is lost: the lease and the pool drop and tear
-			// the transport down with credits still on the account.
+			// The test drops the lease and the pool, which tears the transport
+			// down and loses the connection while the account holds credits.
 			drop(lease);
 			drop(first_pool);
 
 			let second_pool = ledger_pool(&ctx, &trace, Some(wallet))?;
 			let mut lease = second_pool.connect(addr).await?;
-			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], lease.session_receipt().is_some())?;
 
 			// The same public key reaches the same account, so exactly the
 			// unspent balance remains, and the draw after it finds the
 			// account empty.
 			let (resumed_wins, went_broke) = draw_until_broke(&mut lease, DRAW_CREDITS).await?;
-			trace.event_with(LEDGER_BALANCE_EXACT, &[], resumed_wins == DRAW_CREDITS - OPENING_DRAWS)?;
-			trace.event_with(LEDGER_RUNS_DRY, &[], went_broke)?;
+			assert_eq!(resumed_wins, DRAW_CREDITS - OPENING_DRAWS, "the reconnect must resume the unspent balance");
+			assert!(went_broke, "the account must run dry after the resumed balance");
 			Ok(())
 		}
 	}
@@ -689,7 +645,7 @@ tb_scenario! {
 
 /// Context for the rotated-receipt scenario: the house records the
 /// distinct receipt transcript hashes its handler observes, one per
-/// epoch the session lived under.
+/// epoch of the session.
 struct HouseBooks {
 	paywall: PaywallContext,
 	receipts_seen: Mutex<HashSet<Vec<u8>>>,
@@ -724,19 +680,14 @@ tb_assert_spec! {
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
-			(events::MUX_REKEY_RENEWED, exactly!(1)),
-			(TALLY_WINS_MATCH, exactly!(1), equals!(true)),
-			(TALLY_NO_LOSSES, exactly!(1), equals!(true)),
-			(TALLY_NO_CUTOFF, exactly!(1), equals!(true)),
-			(HOUSE_SEES_ROTATED_RECEIPT, exactly!(1), equals!(true))
+			(events::MUX_REKEY_RENEWED, exactly!(1))
 		]
 	}
 }
 
-// The handler's session context carries the live receipt, not a
-// handshake snapshot: draws past the prepaid credits arrive after the
-// in-band renewal, so the house sees the epoch-1 receipt on them and
-// books two distinct transcript hashes across one connection.
+// Draws past the prepaid credits arrive after the in-band renewal, so the
+// handler's session context carries the epoch-1 receipt on them, and the
+// house books two distinct transcript hashes across one connection.
 tb_scenario! {
 	name: paywall_house_observes_rotated_receipt,
 	spec: PaywallLiveReceiptSpec,
@@ -777,9 +728,8 @@ tb_scenario! {
 			// Draws past the prepaid credits force a renewal. The extra
 			// tickets park until it settles and then carry epoch 1.
 			let tally = draw_until_cutoff(&mut lease, prepaid_draws() + 3).await;
-			record_winning_tally(&trace, &tally, prepaid_draws() + 3)?;
-
-			trace.event_with(HOUSE_SEES_ROTATED_RECEIPT, &[], ctx.distinct_receipts() >= 2)?;
+			assert_winning_tally(&tally, prepaid_draws() + 3);
+			assert!(ctx.distinct_receipts() >= 2, "the handler must see the rotated receipt");
 			Ok(())
 		}
 	}

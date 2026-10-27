@@ -1,89 +1,80 @@
-//! # Unsigned-attribute injection threat (CMS)
+//! # Unprotected-attribute injection threat (CMS)
 //!
 //! ## Weakness
-//! The client Finished carries the sealed receipt acknowledgement among its
-//! *unsigned* attributes, where RFC 5652 s11.4 places a countersignature. No
-//! signature covers them, so an intermediary can add attributes without
-//! invalidating the message.
+//! The client Finished travels sealed as an `AuthEnvelopedData`, whose
+//! unauthenticated attributes (RFC 5083 § 2.1) no key covers. An intermediary
+//! can add attributes there, and the message stays valid.
 //!
-//! If the server picks "the first" matching attribute, an injected duplicate
-//! lets an attacker steer which value is consumed.
+//! If the server read a handshake attribute from beside the seal, an injected
+//! value would steer what the server consumes, such as a forged receipt
+//! acknowledgement.
 //!
 //! ## Attack
-//! A MITM captures the client Finished `SignedData` and inserts a second
-//! `RECEIPT_ACK` unsigned attribute carrying a forged value. Every
-//! signature on the message still verifies.
+//! A MITM captures the sealed client Finished and inserts a `RECEIPT_ACK`
+//! unauthenticated attribute that carries a forged value beside the seal.
 //!
 //! ## Expected control
-//! Every TightBeam handshake attribute is single-use: the server MUST
-//! parse the SignedData once, and a duplicate unsigned attribute MUST
-//! fail closed before any value is consumed. The refusal is the attribute
-//! rule and not a signature failure, because the injection passes every
-//! signature. The budget-bearing session MUST stay inactive.
+//! The server reads every handshake attribute of the client Finished from
+//! inside the seal, where the handshake secret authenticates it. Beside the
+//! seal, it reads only an abort alert. The server therefore never consumes the
+//! forged value, the closing settles on the client's own countersignature, and
+//! the session activates.
+//!
+//! Inside the seal, every handshake attribute is single-use, so a client that
+//! sends a duplicate fails closed. The CMS flow tests cover that case.
 //!
 //! ## References
-//! - CWE-347: Improper Verification of Cryptographic Signature
-//!   <https://cwe.mitre.org/data/definitions/347.html>
+//! - CWE-345: Insufficient Verification of Data Authenticity
+//!   <https://cwe.mitre.org/data/definitions/345.html>
 //! - CWE-694: Use of Multiple Resources with Duplicate Identifier
 //!   <https://cwe.mitre.org/data/definitions/694.html>
-//! - RFC 5652 s11.4: countersignature travels in unsigned attributes
-//!   <https://datatracker.ietf.org/doc/html/rfc5652#section-11.4>
+//! - RFC 5083 § 2.1: the unauthenticated attributes of `AuthEnvelopedData`
+//!   <https://datatracker.ietf.org/doc/html/rfc5083#section-2.1>
 
 #![cfg(all(feature = "transport-cms", feature = "transport-multiplex", feature = "testing"))]
 
 use std::sync::Arc;
 
+use tightbeam::absent;
 use tightbeam::asn1::{Any, OctetString};
-use tightbeam::cms::signed_data::SignedData;
+use tightbeam::crypto::cms::AuthEnvelopedData;
 use tightbeam::der::asn1::SetOfVec;
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::oids::RECEIPT_ACK;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
-use tightbeam::transport::handshake::{HandshakeError, HandshakeMessage};
-use tightbeam::utils::urn::Urn;
-use tightbeam::x509::attr::Attribute;
+use tightbeam::transport::handshake::HandshakeMessage;
+use tightbeam::x509::attr::{Attribute, Attributes};
 use tightbeam::TightBeamError;
 
-pub(crate) const DUPLICATE_ATTRIBUTE_FAILS_CLOSED: Urn<'static> =
-	tightbeam::urn!("test", "event:attribute-injection/duplicate-attribute-fails-closed");
-pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
-	tightbeam::urn!("test", "event:attribute-injection/session-never-activates");
-
-use crate::common::security::{
-	cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, GrantingAuthorizer, ServerMaterials,
-};
+use crate::common::security::{ClientMaterials, GrantingAuthorizer, ServerMaterials};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME};
 
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// The client Finished with a second `RECEIPT_ACK` unsigned attribute
-/// carrying a forged value. No signature covers unsigned attributes, so the
-/// result stays signature-valid.
-fn inject_duplicate_receipt_ack(client_finished: &SignedData) -> Result<SignedData, TightBeamError> {
-	let mut signed_data = client_finished.to_owned();
-	let mut signer_info = signed_data
-		.signer_infos
-		.0
-		.iter()
-		.next()
-		.cloned()
-		.ok_or_else(|| expectation_failure("client Finished must carry a SignerInfo"))?;
-
+/// The sealed client Finished with a `RECEIPT_ACK` unauthenticated
+/// attribute that carries a forged value beside the seal.
+fn inject_receipt_ack(sealed_finished: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
 	let forged_value = Any::encode_from(&OctetString::new(*b"forged-acknowledgement")?)?;
 	let mut values = SetOfVec::new();
 	values.insert(forged_value)?;
 
-	let mut attrs = signer_info
-		.unsigned_attrs
-		.take()
-		.ok_or_else(|| expectation_failure("client Finished must carry unsigned attributes"))?;
+	let mut attrs = Attributes::new();
 	attrs.insert(Attribute { oid: RECEIPT_ACK, values })?;
 
-	signer_info.unsigned_attrs = Some(attrs);
-	signed_data.signer_infos = vec![signer_info].try_into()?;
-	Ok(signed_data)
+	Ok(AuthEnvelopedData { unauth_attrs: Some(attrs), ..sealed_finished.to_owned() })
+}
+
+/// `closing`, the client Finished, with the forged acknowledgement injected
+/// beside its seal.
+fn injected(closing: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
+	let sealed_finished = closing.auth_enveloped()?;
+	let injected = inject_receipt_ack(sealed_finished.value())?;
+	Ok(HandshakeMessage::try_from(injected)?)
 }
 
 tb_assert_spec! {
@@ -91,50 +82,33 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(DUPLICATE_ATTRIBUTE_FAILS_CLOSED, exactly!(1), equals!(true)),
-			(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::SESSION_CERT_REJECTED, absent!()),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(1))
 		]
 	}
 }
 
-// No signature covers an unsigned attribute, so the injected duplicate passes
-// every signature. The server's single-use attribute rule is the control: the
-// receipt acknowledgement must fail closed and the session must stay inactive.
+// The injected acknowledgement travels beside the seal unchanged, and the
+// closing settles on the client's own acknowledgement.
 tb_scenario! {
-	name: cms_duplicate_receipt_attribute_fails_closed,
+	name: cms_injected_receipt_attribute_is_never_consumed,
 	spec: AttributeInjectionSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
-			let hooks = CmsSessionHooks {
+			let identity = ClientMaterials::generate().identity();
+			let hooks = ReceiptHooks {
 				authorizer: Some(Arc::new(GrantingAuthorizer::challenge_free())),
-				..CmsSessionHooks::default()
+				..ReceiptHooks::default()
 			};
 
-			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
-			let (mut client, mut server) = (pair.client, pair.server);
-
-			let reply = server.reply(client.start()?).await?;
-
-			// The MITM injects the duplicate on the wire.
-			let client_finished = client.respond(reply).await?.signed()?;
-			let tampered = inject_duplicate_receipt_ack(client_finished.value())?;
-
-			// The Finished signature covers no unsigned attribute, so the
-			// tampered Finished passes it, and the single-use attribute rule
-			// is the control that refuses the step.
-			let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
-			let duplicate_rejected = matches!(closing, Err(HandshakeError::DuplicateAttribute));
-
-			trace.event_with(
-				DUPLICATE_ATTRIBUTE_FAILS_CLOSED,
-				&[],
-				duplicate_rejected,
-			)?;
-
-			let activation = server.complete();
-			let activation_refused = matches!(activation, Err(HandshakeError::InvalidState));
-			trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
+			// The MITM injects the forged acknowledgement on the wire.
+			let injection = AttackStep::new(CLOSING_FRAME, FrameEdit::Rewrite(Box::new(injected)));
+			let kind = HandshakeBackendKind::Cms;
+			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
+			let outcome = handshake.audit_server(&trace).with_step(injection).run().await?;
+			let (_client, _server) = outcome.established()?;
 
 			Ok::<(), TightBeamError>(())
 		}

@@ -1,0 +1,7 @@
+error[E0560]: struct `WcetConfig` has no field named `analyzer`
+  --> tests/compile/wcet_config_analyzer_without_percentile.rs:13:3
+   |
+13 |         analyzer: Some(Arc::new(DefaultStatisticalAnalyzer)),
+   |         ^^^^^^^^ `WcetConfig` does not have this field
+   |
+   = note: all struct fields are already assigned

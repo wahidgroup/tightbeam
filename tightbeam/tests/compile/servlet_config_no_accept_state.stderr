@@ -1,0 +1,35 @@
+error[E0277]: the trait bound `NoAcceptState: AcceptState<DefaultCryptoProvider>` is not satisfied
+  --> tests/compile/servlet_config_no_accept_state.rs:13:64
+   |
+13 |     let _config = ServletConfig::<TokioListener, Ping>::builder().build();
+   |                                                                   ^^^^^ the trait `AcceptState<DefaultCryptoProvider>` is not implemented for `NoAcceptState`
+   |
+help: the following other types implement trait `AcceptState<C>`
+  --> src/colony/servlet/config.rs
+   |
+   | impl<C: CryptoProvider> AcceptState<C> for Cleartext {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `tightbeam::colony::servlet::Cleartext`
+   | impl<C: CryptoProvider> AcceptState<C> for WithCertificate<C> {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `WithCertificate<C>`
+note: required by a bound in `ServletConfigBuilder::<P, M, C, Env, A>::build`
+  --> src/colony/servlet/config.rs
+   |
+   |     pub fn build(self) -> ServletConfig<P, M, C, Env>
+   |            ----- required by a bound in this associated function
+   |     where
+   |         A: AcceptState<C>,
+   |            ^^^^^^^^^^^^^^ required by this bound in `ServletConfigBuilder::<P, M, C, Env, A>::build`
+
+error[E0599]: no function or associated item named `default` found for struct `ServletConfig<P, M, C, Env>` in the current scope
+  --> tests/compile/servlet_config_no_accept_state.rs:16:68
+   |
+16 |     let _unnamed: ServletConfig<TokioListener, Ping> = ServletConfig::default();
+   |                                                                       ^^^^^^^ function or associated item not found in `ServletConfig<_, _, _, _>`
+   |
+note: if you're trying to build a new `ServletConfig<_, _, _, _>`, consider using `ServletConfig::<P, M, C, Env>::cleartext` which returns `ServletConfig<_, _, _, _>`
+  --> src/colony/servlet/config.rs
+   |
+   | /     pub fn cleartext() -> Self
+   | |     where
+   | |         Env: Default,
+   | |_____________________^

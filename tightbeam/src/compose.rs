@@ -19,7 +19,7 @@
 /// | `message` | [`with_message`](crate::builder::FrameBuilder::with_message) |
 /// | `message_integrity<D>` | `with_message_hasher::<D>` |
 /// | `frame_integrity: type D` | `with_witness_hasher::<D>` |
-/// | `confidentiality` | `with_aead` |
+/// | `confidentiality` | `with_encryptor` |
 /// | `encryptor<C, _>` | `with_encryptor::<C, _>` |
 /// | `nonrepudiation<S, _>` | `with_signer::<S, _>` |
 /// | `compactness` | `with_compression` |
@@ -99,7 +99,7 @@ macro_rules! __compose_call {
 	($builder:ident; message_integrity < $($g:ty),+ > : $value:expr) => { $builder = $builder.with_message_hasher::<$($g),+>($value); };
 	($builder:ident; message_integrity : $value:expr) => { $builder = $builder.with_message_hasher($value); };
 	($builder:ident; frame_integrity : type $ty:ty) => { $builder = $builder.with_witness_hasher::<$ty>(); };
-	($builder:ident; confidentiality : $value:expr) => { $builder = $builder.with_aead($value); };
+	($builder:ident; confidentiality : $value:expr) => { $builder = $builder.with_encryptor($value); };
 	($builder:ident; encryptor < $($g:ty),+ > : $value:expr) => { $builder = $builder.with_encryptor::<$($g),+>($value); };
 	($builder:ident; encryptor : $value:expr) => { $builder = $builder.with_encryptor($value); };
 	($builder:ident; nonrepudiation < $($g:ty),+ > : $value:expr) => { $builder = $builder.with_signer::<$($g),+>($value); };

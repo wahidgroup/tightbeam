@@ -1,16 +1,21 @@
 //! Independent shadow oracle for the colony harness export boundary.
 //!
 //! The shadow predicts allow or deny from harness-owned state: the dynamic
-//! export list, ACL, policy gate, and fixed trust sets. It does not call
-//! production `ExportPolicy::verdict`. The only shared production classifier
-//! is [`TrustPlanes`], reused for the first-party origin stage. Drift
-//! versus the live wire is the detection signal, not a defect. Wire
-//! allowed and shadow denied fires `SHADOW_VIOLATION`. Wire denied and
-//! shadow allowed fires `SHADOW_TOO_CLOSED`.
+//! export list, the ACL, the policy gate, and the fixed trust sets. It
+//! predicts every stage in place of the production `ExportPolicy::verdict`,
+//! and it shares two production parts:
+//!
+//! - [`TrustPlanes`], which the first-party origin stage reuses.
+//! - [`CanonicalKey`], which keys the ACL, so the key rule rests on its own tests.
+//!
+//! A drift from the live wire is the detection signal, not a defect:
+//!
+//! - When the wire allows and the shadow denies, the oracle fires `SHADOW_VIOLATION`.
+//! - When the wire denies and the shadow allows, the oracle fires `SHADOW_TOO_CLOSED`.
 //!
 //! # Composition
 //!
-//! [`GatewayShadow::predict`] walks one fixed order that mirrors the
+//! [`GatewayShadow::predict`] walks one fixed order that follows the
 //! production export stack (allowlist, grants, first-party origin, with
 //! deny gates and the pre-decode policy gate ahead of it):
 //!
@@ -18,24 +23,29 @@
 //! 2. ACL deny gate
 //! 3. Export allowlist
 //! 4. ACL grant on origin requests only
-//! 5. First-party origin via [`TrustPlanes`]
+//! 5. First-party origin through [`TrustPlanes`]
 //!
 //! # Peer advertisement
 //!
 //! [`GatewayShadow::predict_peer_ad`] models the pre-decode gate and the
-//! fixed peer-trust set only. It does not model frame-signature checks,
-//! freshness or replay guards, admit binding, or slate caps. The harness
-//! keeps those stages non-refusing on the positive path by construction
-//! (monotonic `control_order`, single-type slates). [`Prediction::Unmodeled`]
-//! skips both oracle directions so an unmodeled stage cannot look like a
-//! shadow miss.
+//! fixed peer-trust set only. The harness builds its inputs so that the other
+//! stages pass on the positive path (monotonic `control_order`, single-type
+//! slates):
+//!
+//! - Frame-signature checks.
+//! - Freshness and replay guards.
+//! - Admit binding.
+//! - Slate caps.
+//!
+//! [`Prediction::Unmodeled`] skips both oracle directions so an unmodeled
+//! stage cannot look like a shadow miss.
 
 use std::sync::Arc;
 
-use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, TrustPlaneStores, TrustPlanes};
+use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, Party, TrustPlaneStores, TrustPlanes};
 use tightbeam::crypto::x509::store::CertificateTrust;
-use tightbeam::crypto::x509::Certificate;
-use tightbeam::utils::urn::Urn;
+use tightbeam::crypto::x509::{CanonicalKey, Certificate};
+use tightbeam::urn::Urn;
 
 use crate::acl::DynamicAclState;
 use crate::policy::DynamicPolicyGate;
@@ -44,10 +54,11 @@ use crate::policy::DynamicPolicyGate;
 pub(crate) struct AccessAttempt<'a> {
 	/// Servlet type under the export boundary.
 	pub target: &'a Urn<'static>,
-	/// Caller certificate when the dial presents one; `None` for anonymous.
+	/// Caller certificate when the dial presents one, or `None` when anonymous.
 	pub caller_cert: Option<&'a Certificate>,
-	/// Precomputed SPKI DER for ACL lookups; `None` when anonymous.
-	pub caller_spki: Option<&'a [u8]>,
+	/// The canonical key the fixtures read for ACL lookups, or `None` when
+	/// anonymous.
+	pub caller_key: Option<&'a CanonicalKey>,
 	/// `true` when the request carries a spent hop budget (peer-relayed).
 	pub relayed: bool,
 }
@@ -56,16 +67,17 @@ pub(crate) struct AccessAttempt<'a> {
 ///
 /// [`Prediction::Allow`] and [`Prediction::Deny`] feed `SHADOW_VIOLATION`
 /// and `SHADOW_TOO_CLOSED`. [`Prediction::Unmodeled`] skips both directions
-/// when the outcome depends on state this shadow does not model (for
+/// when the outcome depends on state outside this shadow's model (for
 /// example mixed multi-hop verdicts or slate caps). Plain outcome events
 /// still emit in that case.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Prediction {
-	/// Shadow expects the wire to allow.
+	/// The shadow expects the wire to allow.
 	Allow,
-	/// Shadow expects the wire to deny.
+	/// The shadow expects the wire to deny.
 	Deny,
-	/// Outcome depends on unmodeled stages; skip both oracle directions.
+	/// The outcome depends on unmodeled stages, so the oracle skips both
+	/// directions.
 	Unmodeled,
 }
 
@@ -86,19 +98,19 @@ pub(crate) struct GatewayShadow {
 impl GatewayShadow {
 	/// Predict allow or deny for one access attempt against harness state.
 	///
-	/// Per-attempt work is borrows only. Fixture code encodes SPKI DER once
-	/// per identity; this path never re-encodes it.
+	/// The fixtures read the canonical key once per identity, so the work of
+	/// each attempt only borrows it.
 	pub fn predict(&self, attempt: &AccessAttempt<'_>) -> Prediction {
 		if self.policy_gate.is_rejecting() {
 			return Prediction::Deny;
 		}
-		if self.acl.is_denied(attempt.caller_spki) {
+		if self.acl.is_denied(attempt.caller_key) {
 			return Prediction::Deny;
 		}
 		if self.exports.contains(attempt.target) {
 			return Prediction::Allow;
 		}
-		if !attempt.relayed && self.acl.is_granted(attempt.caller_spki, attempt.target) {
+		if !attempt.relayed && self.acl.is_granted(attempt.caller_key, attempt.target) {
 			return Prediction::Allow;
 		}
 
@@ -106,7 +118,8 @@ impl GatewayShadow {
 			hive: Some(self.hive_trust.as_ref()),
 			peer: Some(self.peer_trust.as_ref()),
 		});
-		if !attempt.relayed && planes.is_first_party(attempt.caller_cert) {
+		let first_party = matches!(planes.classify(attempt.caller_cert), Party::FirstParty);
+		if !attempt.relayed && first_party {
 			return Prediction::Allow;
 		}
 
@@ -115,8 +128,8 @@ impl GatewayShadow {
 
 	/// Predict whether a signed peer advertisement from `signer` admits.
 	///
-	/// Covers the pre-decode gate and peer-trust membership only. Other
-	/// wire stages stay non-refusing by harness construction (see the
+	/// It covers the pre-decode gate and peer-trust membership only. The
+	/// harness builds its inputs so that the other wire stages pass (see the
 	/// module header).
 	pub fn predict_peer_ad(&self, signer: &Certificate) -> Prediction {
 		if self.policy_gate.is_rejecting() {

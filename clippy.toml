@@ -1,0 +1,3 @@
+# `der::Length` checks its own arithmetic: each of its operators returns a
+# `der::Result`, so an overflow is an error value.
+arithmetic-side-effects-allowed = ["der::Length"]

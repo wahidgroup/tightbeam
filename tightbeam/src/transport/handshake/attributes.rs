@@ -7,33 +7,39 @@ use alloc::vec::Vec;
 use core::cmp::{Ord, Ordering, PartialOrd};
 
 use super::HandshakeError;
-use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec};
 use crate::der::{Sequence, Tagged};
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::HandshakeAlert;
 #[cfg(feature = "transport-cms")]
 use crate::cms::enveloped_data::OriginatorPublicKey;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::cms::signed_data::SignedData;
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::cms::AttributesExt;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::Signed;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::attr::Attributes;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::OctetString;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::UintRef;
-#[cfg(feature = "x509")]
-use crate::oids::CLIENT_CERTIFICATE;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::oids::HANDSHAKE_ABORT_ALERT;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::oids::{HANDSHAKE_KEY_CONFIRMATION, RECEIPT_ACK, SESSION_RECEIPT};
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
 	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_TRANSPORT_ACCEPT,
-	HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
+	HANDSHAKE_TRANSPORT_OFFER,
 };
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
-#[cfg(feature = "x509")]
-use crate::x509::Certificate;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::schedule::KeyConfirmation;
 
 /// A CMS attribute that carries one value, as the handshake profile requires.
 ///
@@ -41,7 +47,7 @@ use crate::x509::Certificate;
 /// `attrValues` to exactly one element, and [`Self::value`] enforces it.
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
-	/// OID naming the attribute (RFC 5652 § 5.3 `attrType`).
+	/// OID that names the attribute (RFC 5652 § 5.3 `attrType`).
 	pub attr_type: ObjectIdentifier,
 	/// Values of the attribute. The profile requires exactly one element.
 	pub attr_values: Vec<Any>,
@@ -89,10 +95,10 @@ impl HandshakeAttribute {
 	///
 	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
 	pub fn value(&self) -> Result<&Any, HandshakeError> {
-		if self.attr_values.len() != 1 {
-			return Err(HandshakeError::InvalidAttributeArity);
+		match self.attr_values.as_slice() {
+			[value] => Ok(value),
+			_ => Err(HandshakeError::InvalidAttributeArity),
 		}
-		Ok(&self.attr_values[0])
 	}
 }
 
@@ -106,7 +112,7 @@ impl From<&Attribute> for HandshakeAttribute {
 }
 
 /// Converts a [`HandshakeAttribute`] into the X.509 attribute an
-/// `EnvelopedData` carries.
+/// `AuthEnvelopedData` carries.
 impl TryFrom<HandshakeAttribute> for Attribute {
 	type Error = HandshakeError;
 
@@ -120,17 +126,9 @@ impl TryFrom<HandshakeAttribute> for Attribute {
 ///
 /// Each implementation is the one home for its type's attribute OID, so
 /// the encode and decode sides agree on which OID names which type.
-#[cfg(feature = "x509")]
 pub trait AttributePayload {
 	/// OID this payload is carried under.
 	const OID: ObjectIdentifier;
-}
-
-/// The client certificate a key exchange carries under mutual
-/// authentication, on the CMS and the ECIES path alike.
-#[cfg(feature = "x509")]
-impl AttributePayload for Certificate {
-	const OID: ObjectIdentifier = CLIENT_CERTIFICATE;
 }
 
 #[cfg(feature = "transport-cms")]
@@ -153,25 +151,33 @@ impl AttributePayload for TransportAccept {
 	const OID: ObjectIdentifier = HANDSHAKE_TRANSPORT_ACCEPT;
 }
 
-#[cfg(feature = "transport-cms")]
-impl AttributePayload for SignedData {
+/// The session receipt a reply carries, as a server-signed artifact that a
+/// third party can verify.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl AttributePayload for Signed<SignedData> {
 	const OID: ObjectIdentifier = SESSION_RECEIPT;
 }
 
-/// The sealed receipt acknowledgement a client Finished carries.
-#[cfg(feature = "transport-cms")]
+/// The sealed receipt acknowledgement a closing carries.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl AttributePayload for OctetString {
 	const OID: ObjectIdentifier = RECEIPT_ACK;
 }
 
 /// The server's per-handshake ephemeral public key on its Finished, carried
-/// as the same type the client's KARI originator uses.
+/// as the same type the client's agreement key uses in the opening.
 #[cfg(feature = "transport-cms")]
 impl AttributePayload for OriginatorPublicKey {
 	const OID: ObjectIdentifier = HANDSHAKE_SERVER_EPHEMERAL;
 }
 
-#[cfg(feature = "x509")]
+/// The key-confirmation tag a closing carries, and the server Finished the
+/// HPKE reply carries.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl AttributePayload for KeyConfirmation {
+	const OID: ObjectIdentifier = HANDSHAKE_KEY_CONFIRMATION;
+}
+
 impl HandshakeAttribute {
 	/// Encodes `payload` under its own OID for transmission.
 	///
@@ -185,7 +191,7 @@ impl HandshakeAttribute {
 		Self::new_single(T::OID, Any::encode_from(payload)?)
 	}
 
-	/// Decodes this attribute, requiring the OID `T` is carried under.
+	/// Decodes this attribute as `T`, when it carries the OID of `T`.
 	///
 	/// An attribute of another type yields
 	/// [`HandshakeError::MissingAttribute`], so a peer cannot substitute one
@@ -211,8 +217,8 @@ impl HandshakeAttribute {
 	///
 	/// A receiver binds what the peer sent. Re-encoding the decoded value
 	/// instead would erase any difference the decoder normalised away: `der`
-	/// sorts a `SET OF` before validating it, so a reordered set would hash
-	/// the same as the well-ordered one and pass unseen (CWE-345).
+	/// sorts a `SET OF` before it validates the set, so a reordered set would
+	/// hash the same as the well-ordered one and pass unseen (CWE-345).
 	///
 	/// # Errors
 	///
@@ -227,9 +233,9 @@ impl HandshakeAttribute {
 	/// Returns the canonical DER bytes of `payload` for transcript binding.
 	///
 	/// The sender calls this and the receiver calls [`Self::received_bytes`].
-	/// These are the bytes about to go on the wire, so both sides hash the
-	/// same encoding and a tampered attribute diverges the two transcript
-	/// hashes (CWE-345).
+	/// These are the bytes the sender is about to transmit, so both sides hash
+	/// the same encoding and a tampered attribute makes the two transcript
+	/// hashes differ (CWE-345).
 	///
 	/// # Errors
 	///
@@ -245,25 +251,21 @@ impl HandshakeAttribute {
 }
 
 /// Decode a one- or two-byte unsigned INTEGER from an `Any`.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
-	let b = uint_ref.as_bytes();
-	if b.is_empty() || b.len() > 2 {
-		return Err(HandshakeError::IntegerOutOfRange);
+	match uint_ref.as_bytes() {
+		[low] => Ok(u16::from(*low)),
+		[high, low] => Ok(u16::from_be_bytes([*high, *low])),
+		_ => Err(HandshakeError::IntegerOutOfRange),
 	}
-	if b.len() == 1 {
-		return Ok(b[0] as u16);
-	}
-
-	Ok(((b[0] as u16) << 8) | b[1] as u16)
 }
 
 /// Decode an alert code from a single INTEGER-bearing `Any`.
 ///
 /// Alert codes occupy the u8 domain. A wider value is refused, so a two-byte
 /// code can never alias a valid alert through truncation.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	let code = u16_from_any(any)?;
 	if code > u8::MAX as u16 {
@@ -281,11 +283,12 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 }
 
 /// Handshake attribute lookups on a CMS `SignedData` or an attribute set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeAttributes {
-	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
+	/// Finds at most one unsigned attribute with `oid`, and rejects duplicates.
 	///
 	/// On a `SignedData` the search spans the SignerInfos of a parsed
-	/// Finished message or of an ECIES tunnel.
+	/// Finished message or of an HPKE reply.
 	///
 	/// # Duplicates
 	///
@@ -316,7 +319,7 @@ pub trait HandshakeAttributes {
 	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the alert code is not an INTEGER.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- the alert code is above `u8::MAX`.
 	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn refuse_alert(&self) -> Result<(), HandshakeError> {
 		let Some(alert) = self.find_unsigned_attr(HANDSHAKE_ABORT_ALERT)? else {
 			return Ok(());
@@ -326,23 +329,15 @@ pub trait HandshakeAttributes {
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAttributes for Attributes {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
-		let mut found = None;
-		let matches = self.iter().filter(|attr| attr.oid == oid);
-		for attr in matches {
-			if found.is_some() {
-				return Err(HandshakeError::DuplicateAttribute);
-			}
-
-			found = Some(HandshakeAttribute::from(attr));
-		}
-
-		Ok(found)
+		let found = self.single(oid, HandshakeError::DuplicateAttribute)?;
+		Ok(found.map(HandshakeAttribute::from))
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAttributes for SignedData {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
 		let mut found = None;
@@ -367,8 +362,18 @@ impl HandshakeAttributes for SignedData {
 	}
 }
 
+/// An attribute set that may be absent, as the unprotected attributes of a CMS
+/// container are.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl HandshakeAttributes for Option<Attributes> {
+	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
+		let found = self.as_ref().map(|attrs| attrs.find_unsigned_attr(oid));
+		Ok(found.transpose()?.flatten())
+	}
+}
+
 /// Handshake alert decoding on a [`HandshakeAttribute`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeAlertAttribute {
 	/// Returns the alert code this attribute carries.
 	///
@@ -383,7 +388,7 @@ pub trait HandshakeAlertAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError>;
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAlertAttribute for HandshakeAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError> {
 		alert_from_any(self.value()?)
@@ -421,8 +426,8 @@ mod tests {
 		Ok(Attribute { oid, values: SetOfVec::try_from(vec![value])? })
 	}
 
-	/// The one `SignerInfo` of a fresh test `SignedData`, carrying the same
-	/// security offer as an unsigned attribute on every call.
+	/// The one `SignerInfo` of a fresh test `SignedData`, which carries the
+	/// same security offer as an unsigned attribute on every call.
 	fn signer_with_offer() -> SignerInfo {
 		let signed_data = create_test_signed_data([0x07u8; 32]);
 		let value = mk_octet([0x11u8; 32]).expect("a 32-byte OCTET STRING encodes");
@@ -470,6 +475,19 @@ mod tests {
 		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
 		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
 		let attrs = Attributes::try_from(vec![first, second])?;
+
+		let refused = attrs.refuse_alert();
+		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));
+		Ok(())
+	}
+
+	/// The unprotected attributes of a CMS container are an optional set, and
+	/// a present set that repeats the abort alert fails closed as the set does.
+	#[test]
+	fn a_duplicate_abort_alert_in_an_optional_set_fails_closed() -> Result<(), HandshakeError> {
+		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
+		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
+		let attrs = Some(Attributes::try_from(vec![first, second])?);
 
 		let refused = attrs.refuse_alert();
 		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));
@@ -556,10 +574,20 @@ mod tests {
 		let wide = mk_alert_attr([0x01, 0x02, 0x03])?;
 		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 
-		// 0x0101 = 257. Truncating to u8 would alias alert code 1
+		// 0x0101 is 257, which a truncation to u8 would alias to alert code 1
 		// (AuthRequired).
 		let above = mk_alert_attr([0x01, 0x01])?;
 		assert!(matches!(above.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
+		Ok(())
+	}
+
+	/// A two-octet alert code reads big-endian: `0x0100` is 256, past the
+	/// alert domain, and never alert 1.
+	#[test]
+	fn a_two_octet_alert_code_reads_big_endian() -> Result<(), der::Error> {
+		let wide = mk_alert_attr([0x01, 0x00])?;
+
+		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 		Ok(())
 	}
 

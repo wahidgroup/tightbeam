@@ -1,21 +1,26 @@
-//! Comprehensive fault injection demonstration
+//! The fault injection tests of tightbeam.
 //!
-//! This test suite demonstrates tightbeam's fault injection capabilities,
-//! aligned with academic research and industry standards for fault tolerance testing.
+//! The suite injects faults into a request-response-retry process. Its
+//! scenarios follow the research papers and the safety standards below.
 //!
-//! Academic Foundation:
-//! - Avižienis et al. (2004) - "Basic Concepts and Taxonomy of Dependable and Secure Computing"
-//! - Arlat et al. (1990) - "Fault Injection for Dependability Validation"
-//! - Hsueh et al. (1997) - "Fault Injection Techniques and Tools"
+//! The research papers are:
+//! - Avižienis et al. (2004), "Basic Concepts and Taxonomy of Dependable and Secure Computing".
+//! - Arlat et al. (1990), "Fault Injection for Dependability Validation".
+//! - Hsueh et al. (1997), "Fault Injection Techniques and Tools".
 //!
-//! Industry Standards:
-//! - ISO 26262 (Automotive Safety)
-//! - DO-178C (Avionics Software)
-//! - IEC 61508 (Functional Safety)
+//! The safety standards are:
+//! - ISO 26262, for automotive safety.
+//! - DO-178C, for avionics software.
+//! - IEC 61508, for functional safety.
+
+use core::error::Error;
+use std::collections::HashSet;
 
 use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
-use tightbeam::utils::urn::Urn;
+use tightbeam::testing::macros::BuiltAssertSpec;
+use tightbeam::testing::specs::csp::Process;
+use tightbeam::testing::{FaultModel, HookContext, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
+use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
@@ -29,14 +34,12 @@ pub(crate) const RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:fault-b
 pub(crate) const RETRY: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/retry");
 pub(crate) const SUCCESS: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/success");
 
-// ============================================================================
-// ACADEMIC DEMONSTRATION: State-based fault injection with formal verification
-// ============================================================================
+// The fault-tolerant process, whose states and events the faults target.
 
 tb_process_spec! {
-	/// Request-Response-Retry process with error recovery
-	/// Models academic research on fault-tolerant distributed systems
-	/// Reference: Cristian (1991) - "Understanding fault-tolerant distributed systems"
+	/// A request-response-retry process with error recovery, which models a
+	/// fault-tolerant distributed system after Cristian (1991), "Understanding
+	/// fault-tolerant distributed systems".
 	pub FaultTolerantProcess,
 	events {
 		observable { REQUEST, RESPONSE, RETRY, FALLBACK, SUCCESS, FAILURE }
@@ -64,18 +67,14 @@ tb_process_spec! {
 	}
 }
 
-// Generate type-safe enums for fault injection
-//
-// Note: Automatic generation would require complex deduplication logic for
-// states that appear as both source and destination. Manual generation gives
-// explicit control.
+// The macro generates the typed state enum that each fault names. The call
+// lists the states by hand, because a list read from the transitions holds a
+// state once for each transition that starts or ends at it.
 tb_gen_process_types!(FaultTolerantProcess, Idle, Sending, Retrying, Success, Fallback);
 
-// ============================================================================
-// INDUSTRY DEMONSTRATION: Real-world error types
-// ============================================================================
+// The error types that the faults inject.
 
-/// Network timeout - transient failure (retryable)
+/// A network timeout, a transient failure that a retry can clear.
 #[derive(Debug, Clone)]
 struct NetworkTimeoutError {
 	duration_ms: u64,
@@ -94,7 +93,7 @@ impl From<NetworkTimeoutError> for TightBeamError {
 	}
 }
 
-/// Message corruption - permanent failure (non-retryable)
+/// A corrupted message, a permanent failure that persists across retries.
 #[derive(Debug, Clone)]
 struct MessageCorruptionError {
 	corrupted_bytes: usize,
@@ -112,7 +111,7 @@ impl From<MessageCorruptionError> for TightBeamError {
 	}
 }
 
-/// Resource exhaustion - system-level failure
+/// An exhausted system resource, a failure of the system as a whole.
 #[derive(Debug, Clone)]
 struct ResourceExhaustionError {
 	resource: &'static str,
@@ -130,9 +129,7 @@ impl From<ResourceExhaustionError> for TightBeamError {
 	}
 }
 
-// ============================================================================
-// TEST 1: Deterministic fault injection (Academic: Repeatability)
-// ============================================================================
+// TEST 1: Deterministic fault injection, a research test of repeatability.
 
 tb_assert_spec! {
 	pub DeterministicSpec,
@@ -144,12 +141,46 @@ tb_assert_spec! {
 	}
 }
 
-fn build_deterministic_config() -> FdrConfig {
+/// The state of [`FaultTolerantProcess`] that `state` names, as an injection
+/// record names it.
+fn state_key(state: &str) -> String {
+	format!("FaultTolerantProcess.{state}")
+}
+
+/// The injection points that took a fault in the exploration of `context`,
+/// each as its state and its event, or `None` for a run with no FDR verdict.
+fn injected_points(context: &HookContext) -> Option<HashSet<(String, String)>> {
+	let faults = &context.verdict().fdr()?.faults_injected;
+	let points = faults.iter().map(|fault| (fault.csp_state.clone(), fault.event_label.clone()));
+	Some(points.collect())
+}
+
+/// The count of the faults that the exploration of `context` injected, and
+/// the count of the seeds that it completed.
+fn faults_and_seeds(context: &HookContext) -> Option<(usize, usize)> {
+	let verdict = context.verdict().fdr()?;
+	let seeds = usize::try_from(verdict.seeds_completed).ok()?;
+	Some((verdict.faults_injected.len(), seeds))
+}
+
+/// The configuration that grades `spec`, explores the FDR configuration that
+/// `fdr` builds over [`FaultTolerantProcess`], and runs `hooks`.
+fn fault_config(
+	spec: &'static BuiltAssertSpec,
+	fdr: fn(Process) -> FdrConfig,
+	hooks: TestHooks,
+) -> Result<ScenarioConfig, Box<dyn Error>> {
+	let fdr = fdr(FaultTolerantProcess::process()?);
+	let builder = ScenarioConfig::builder().with_spec(spec).with_fdr(fdr);
+	Ok(builder.with_hooks(hooks).build()?)
+}
+
+fn build_deterministic_config(process: Process) -> FdrConfig {
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic).with_fault(
 		States::Sending,
 		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
-		tightbeam::bps!(10000), // 100% - always inject (deterministic)
+		tightbeam::bps!(10000), // 100%, so each visit injects the fault.
 	);
 
 	FdrConfig {
@@ -157,7 +188,7 @@ fn build_deterministic_config() -> FdrConfig {
 		max_depth: 15,
 		max_internal_run: 5,
 		timeout_ms: 2000,
-		specs: vec![FaultTolerantProcess::process()],
+		specs: vec![process],
 		fail_fast: false,
 		scheduler_count: None,
 		process_count: None,
@@ -170,30 +201,17 @@ fn build_deterministic_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_deterministic_fault_injection,
-	config: ScenarioConfig::builder()
-		.with_spec(DeterministicSpec::latest())
-		.with_fdr(build_deterministic_config())
-		.with_hooks(TestHooks::on_pass(|context| {
-			if let Some(verdict) = context.verdict().fdr() {
-				// Academic requirement: Deterministic = same faults every run
-				assert!(!verdict.faults_injected.is_empty(), "Deterministic injection must be reproducible");
-				// Note: Each seed explores multiple paths, so we get multiple faults per seed
-				// The important thing is that it's deterministic (same number every run)
-				assert!(verdict.faults_injected.len() >= verdict.seeds_completed as usize,
-					"Should have at least one fault per seed");
+	config: fault_config(DeterministicSpec::latest(), build_deterministic_config, TestHooks::on_pass(|context| {
+			// Each injection hits the one configured state and event.
+			let configured = HashSet::from([(state_key("Sending"), RESPONSE.to_string())]);
+			assert_eq!(injected_points(context), Some(configured));
 
-				// Verify all injections at the same point
-				for fault in &verdict.faults_injected {
-					assert_eq!(fault.csp_state, "FaultTolerantProcess.Sending");
-					assert_eq!(fault.event_label, RESPONSE.to_string());
-					assert_eq!(fault.probability_bps, 10000);
-				}
-
-				println!("✓ Deterministic fault injection verified: {} faults across {} seeds",
-					verdict.faults_injected.len(), verdict.seeds_completed);
-			}
-		}))
-	.build(),
+			// A fault at 100% fires on each visit, so each seed injects at
+			// least one. A seed explores more than one path, so it can inject
+			// more, and the count is the same on every run.
+			let counts = faults_and_seeds(context);
+			assert!(matches!(counts, Some((faults, seeds)) if seeds > 0 && faults >= seeds), "{counts:?}");
+		})),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(REQUEST)?;
@@ -204,9 +222,7 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// TEST 2: Probabilistic fault injection (Industry: Realistic scenarios)
-// ============================================================================
+// TEST 2: Probabilistic fault injection, an industry test of a real fault rate.
 
 tb_assert_spec! {
 	pub ProbabilisticSpec,
@@ -218,23 +234,23 @@ tb_assert_spec! {
 	}
 }
 
-fn build_probabilistic_config() -> FdrConfig {
-	// Industry standard: Model real-world failure rates
-	// E.g., AWS S3 durability: 99.999999999% (11 nines)
-	// Network timeout rate: ~1-5% in distributed systems
+fn build_probabilistic_config(process: Process) -> FdrConfig {
+	// The fault models a network timeout at a real-world rate. A distributed
+	// system times out on about 1% to 5% of requests, and AWS S3, for scale,
+	// states a durability of 99.999999999% (11 nines).
 	let fault_model = FaultModel::from(InjectionStrategy::Random).with_fault(
 		States::Sending,
 		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 5000, attempt: 1 },
-		tightbeam::bps!(500), // 5% probability (realistic network timeout rate)
+		tightbeam::bps!(500), // 5%, the top of the network timeout range.
 	);
 
 	FdrConfig {
-		seeds: 100, // More seeds for statistical significance
+		seeds: 100, // Enough seeds for a statistically significant count.
 		max_depth: 15,
 		max_internal_run: 5,
 		timeout_ms: 5000,
-		specs: vec![FaultTolerantProcess::process()],
+		specs: vec![process],
 		fail_fast: false,
 		scheduler_count: None,
 		process_count: None,
@@ -247,29 +263,15 @@ fn build_probabilistic_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_probabilistic_fault_injection,
-	config: ScenarioConfig::builder()
-		.with_spec(ProbabilisticSpec::latest())
-		.with_fdr(build_probabilistic_config())
-		.with_hooks(TestHooks::on_pass(|context| {
-				if let Some(verdict) = context.verdict().fdr() {
-					let fault_count = verdict.faults_injected.len();
-
-					// Industry standard: Statistical validation
-					// Expected: 5% of 100 seeds = ~5 faults
-					// Acceptable range: 1-15 (binomial distribution, 95% CI)
-					assert!(
-						(1..=15).contains(&fault_count),
-						"Probabilistic injection outside expected range: {} faults",
-						fault_count
-					);
-
-					println!("✓ Probabilistic fault injection: {}/100 seeds ({:.1}%)",
-						fault_count,
-						(fault_count as f64 / 100.0) * 100.0
-					);
-				}
-			}))
-		.build(),
+	config: fault_config(ProbabilisticSpec::latest(), build_probabilistic_config, TestHooks::on_pass(|context| {
+				// At 5% over 100 seeds, the run expects about 5 faults, and
+				// the central 95% interval of Bin(100, 0.05) is 1 to 10. A
+				// seed can inject more than one fault, so the interval is a
+				// guide and not an exact bound. The seeded generator gives
+				// the same count on every run.
+				let counts = faults_and_seeds(context);
+				assert!(matches!(counts, Some((1..=10, _))), "{counts:?}");
+			})),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(REQUEST)?;
@@ -280,9 +282,7 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// TEST 3: Multi-fault injection (Academic: Fault combinations)
-// ============================================================================
+// TEST 3: Multi-fault injection, a research test of fault combinations.
 
 tb_assert_spec! {
 	pub MultiFaultSpec,
@@ -294,27 +294,27 @@ tb_assert_spec! {
 	}
 }
 
-fn build_multi_fault_config() -> FdrConfig {
-	// Academic: Test multiple fault types to verify error handling diversity
-	// Reference: Hsueh et al. (1997) - Multiple fault injection campaigns
+fn build_multi_fault_config(process: Process) -> FdrConfig {
+	// Three fault types at three injection points reach three error paths,
+	// after the multiple fault injection campaigns of Hsueh et al. (1997).
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 		.with_fault(
 			States::Sending,
 			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
-			tightbeam::bps!(5000), // 50% - transient failure
+			tightbeam::bps!(5000), // 50%, a transient failure.
 		)
 		.with_fault(
 			States::Sending,
 			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 42 },
-			tightbeam::bps!(3000), // 30% - permanent failure
+			tightbeam::bps!(3000), // 30%, a permanent failure.
 		)
 		.with_fault(
 			States::Retrying,
 			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "memory" },
-			tightbeam::bps!(2000), // 20% - system failure
+			tightbeam::bps!(2000), // 20%, a system failure.
 		);
 
 	FdrConfig {
@@ -322,7 +322,7 @@ fn build_multi_fault_config() -> FdrConfig {
 		max_depth: 20,
 		max_internal_run: 10,
 		timeout_ms: 3000,
-		specs: vec![FaultTolerantProcess::process()],
+		specs: vec![process],
 		fail_fast: false,
 		scheduler_count: None,
 		process_count: None,
@@ -335,25 +335,16 @@ fn build_multi_fault_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_multi_fault_injection,
-	config: ScenarioConfig::builder()
-		.with_spec(MultiFaultSpec::latest())
-		.with_fdr(build_multi_fault_config())
-		.with_hooks(TestHooks::on_pass(|context| {
-				if let Some(verdict) = context.verdict().fdr() {
-					// Academic: Verify fault diversity (multiple injection points triggered)
-					let unique_states: std::collections::HashSet<_> = verdict
-						.faults_injected
-						.iter()
-						.map(|f| &f.csp_state)
-						.collect();
-
-					println!("✓ Multi-fault injection: {} faults across {} states",
-						verdict.faults_injected.len(),
-						unique_states.len()
-					);
-				}
-			}))
-		.build(),
+	config: fault_config(MultiFaultSpec::latest(), build_multi_fault_config, TestHooks::on_pass(|context| {
+				// Each of the three injection points takes a fault, the one at
+				// the hidden retry event among them.
+				let configured = HashSet::from([
+					(state_key("Sending"), RESPONSE.to_string()),
+					(state_key("Sending"), RETRY.to_string()),
+					(state_key("Retrying"), INTERNAL_RETRY.to_string()),
+				]);
+				assert_eq!(injected_points(context), Some(configured));
+			})),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(REQUEST)?;
@@ -364,9 +355,7 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// TEST 4: Fault coverage analysis (Industry: Test completeness)
-// ============================================================================
+// TEST 4: Fault coverage analysis, an industry test of test completeness.
 
 tightbeam::tb_assert_spec! {
 	pub CoverageSpec,
@@ -378,8 +367,8 @@ tightbeam::tb_assert_spec! {
 	}
 }
 
-fn build_coverage_config() -> FdrConfig {
-	// Industry: Ensure all error paths are tested (100% branch coverage)
+fn build_coverage_config(process: Process) -> FdrConfig {
+	// One fault on each of five transitions aims at full branch coverage.
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 		.with_fault(
 			States::Idle,
@@ -417,7 +406,7 @@ fn build_coverage_config() -> FdrConfig {
 		max_depth: 25,
 		max_internal_run: 10,
 		timeout_ms: 5000,
-		specs: vec![FaultTolerantProcess::process()],
+		specs: vec![process],
 		fail_fast: false,
 		scheduler_count: None,
 		process_count: None,
@@ -430,36 +419,13 @@ fn build_coverage_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_fault_coverage_analysis,
-	config: ScenarioConfig::builder()
-		.with_spec(CoverageSpec::latest())
-		.with_fdr(build_coverage_config())
-		.with_hooks(TestHooks::on_pass(|context| {
-				if let Some(verdict) = context.verdict().fdr() {
-					// Industry standard: Calculate fault coverage metrics
-					let total_injection_points = 5; // Configured in fault_model
-					let unique_injection_points: std::collections::HashSet<_> = verdict
-						.faults_injected
-						.iter()
-						.map(|f| (&f.csp_state, &f.event_label))
-						.collect();
-
-					let coverage_percent = (unique_injection_points.len() as f64 / total_injection_points as f64) * 100.0;
-
-					println!("✓ Fault coverage: {}/{} injection points ({:.1}%)",
-						unique_injection_points.len(),
-						total_injection_points,
-						coverage_percent
-					);
-
-					// Industry requirement: Minimum 80% fault coverage for critical systems
-					assert!(
-						coverage_percent >= 60.0,
-						"Insufficient fault coverage: {:.1}% (minimum 60% required)",
-						coverage_percent
-					);
-				}
-			}))
-		.build(),
+	config: fault_config(CoverageSpec::latest(), build_coverage_config, TestHooks::on_pass(|context| {
+				// The coverage is the share of the five configured injection
+				// points that took a fault, and a critical system calls for
+				// 80% of them, four of five.
+				let covered = injected_points(context).map(|points| points.len());
+				assert!(matches!(covered, Some(4..=5)), "{covered:?} of 5 injection points took a fault");
+			})),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(REQUEST)?;

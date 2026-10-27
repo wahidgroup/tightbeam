@@ -1,9 +1,9 @@
 //! ASN.1 export for timing verification results
 
+use super::statistics::StatisticalMeasures;
 use crate::der::Sequence;
 use crate::instrumentation::EvidenceArtifact;
 use crate::testing::timing::verification::TimingVerificationResult;
-use crate::utils::statistics::StatisticalMeasures;
 use crate::Beamable;
 
 /// Timing verification artifact in ASN.1 format
@@ -40,7 +40,7 @@ mod tests {
 	use crate::instrumentation::EvidenceArtifact;
 	use crate::testing::specs::csp::Event;
 	use crate::testing::timing::violations::{DeadlineMiss, JitterViolation, TimingSlackViolation, TimingViolation};
-	use crate::utils::statistics::{ConfidenceIntervals, Percentile, PercentileValue};
+	use crate::testing::timing::{ConfidenceIntervals, Percentile, PercentileValue};
 	use crate::utils::{decode, encode};
 	use crate::TightBeamError;
 

@@ -4,6 +4,7 @@ mod cms_socket;
 mod cms_toolkit;
 mod connection_pool;
 mod connection_reuse;
+mod key_purposes;
 mod loopback;
 mod multiplex;
 mod mutual_auth;

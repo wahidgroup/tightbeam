@@ -1,18 +1,20 @@
-//! Testing macro layer providing unified `tb_scenario!` macro and helpers.
+//! The testing macro layer: the `tb_scenario!` entry point and the macros and
+//! functions that its expansion calls.
 //!
-//! - Layer 1 (Assertions): `verification_spec`
-//! - Layer 2 (CSP): `process_spec`
-//! - Layer 3 (FDR): integrated via `tb_scenario!`
+//! - Layer 1 (assertions) has its macro in `verification_spec`.
+//! - Layer 2 (CSP) has its macro in `process_spec`.
+//! - Layer 3 (FDR) runs inside `tb_scenario!`.
 
-// ProcessSpec macro (Layer 2 - CSP)
+// The `tb_process_spec!` macro of Layer 2 (CSP).
 pub mod process_spec;
-// CompositionSpec macro (Layer 2 - CSP Composition)
+// The `tb_compose_spec!` macro of Layer 2 (CSP composition).
 pub mod compose_spec;
-// Gen States macro for fault injection (opt-in)
+// The opt-in `tb_gen_process_types!` macro, which generates the state and
+// event types of a process for fault injection.
 pub mod gen_states;
-// Timing-constraint helper macros (Layer 3 - timing)
+// The timing-constraint macros of `tb_process_spec!` and `tb_assert_spec!`.
 pub mod timing_spec;
-// VerificationSpec macro (Layer 1 - assertions)
+// The `tb_assert_spec!` macro of Layer 1 (assertions).
 pub mod verification_spec;
 
 pub use timing_spec::DeadlineParams;
@@ -20,7 +22,6 @@ pub use verification_spec::{
 	versions_strictly_ascending, AssertSpecBuilder, BuiltAssertSpec, Cardinality, SpecBuildError,
 };
 
-// Re-exports
 pub use crate::testing::assertions::{AssertionValue, IsNone, IsSome, Presence, RatioLimit};
 pub use crate::trace::TraceCollector;
 pub use crate::{absent, at_least, at_most, between, equals, exactly, falsy, present, truthy};
@@ -28,7 +29,7 @@ pub use crate::{absent, at_least, at_most, between, equals, exactly, falsy, pres
 #[cfg(feature = "testing-timing")]
 pub use verification_spec::SchedulabilityAssertion;
 
-/// Helper macro to wrap values for equality assertions in specs
+/// Wraps a value as the expected value of an equality assertion in a spec.
 #[macro_export]
 macro_rules! equals {
 	($value:expr) => {
@@ -36,8 +37,8 @@ macro_rules! equals {
 	};
 }
 
-/// Helper macro for boolean true assertions in specs
-/// Checks that the value is truthy (non-zero, true, non-empty)
+/// Builds the boolean assertion value of a spec that holds when the value is
+/// truthy (unequal to 0).
 #[macro_export]
 macro_rules! truthy {
 	($value:expr) => {
@@ -45,8 +46,8 @@ macro_rules! truthy {
 	};
 }
 
-/// Helper macro for boolean false assertions in specs
-/// Checks that the value is falsy (zero, false, empty)
+/// Builds the boolean assertion value of a spec that holds when the value is
+/// falsy (equal to 0).
 #[macro_export]
 macro_rules! falsy {
 	($value:expr) => {
@@ -54,7 +55,7 @@ macro_rules! falsy {
 	};
 }
 
-/// Helper macro for ratio limits (numerator / denominator)
+/// Builds a ratio limit from a numerator and a denominator, each cast to `u64`.
 #[macro_export]
 macro_rules! ratio {
 	($numer:expr, $denom:expr) => {
@@ -62,10 +63,75 @@ macro_rules! ratio {
 	};
 }
 
-// Helper Functions for tb_scenario!
+/// The output of the server task of a ServiceClient scenario.
+///
+/// The runner aborts the task at teardown and then joins it, so a server that
+/// failed during the run fails the test.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::macros::ServerOutcome;
+///
+/// assert_eq!(().failure(), None);
+/// assert_eq!(Err::<(), &str>("bound twice").failure(), Some("\"bound twice\"".to_string()));
+/// ```
+#[cfg(feature = "tokio")]
+pub trait ServerOutcome: Sized {
+	/// The failure that the task ended with, or `None` when it ended cleanly.
+	fn failure(self) -> Option<String>;
 
-/// Call an async scenario closure with its environment struct. The
-/// concrete env type drives closure parameter inference.
+	/// Settles the server task that the runner joined after its abort.
+	///
+	/// A task that ran until the abort, or that ended cleanly, settles.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::macros::ServerOutcome;
+	///
+	/// // A server that ended cleanly settles.
+	/// <()>::settle(Ok(()));
+	/// ```
+	///
+	/// # Panics
+	///
+	/// Testing suite functions MUST panic on error.
+	///
+	/// - The task panicked, and the panic resumes with its own payload.
+	/// - The task ended with a failure, and the panic names it.
+	fn settle(joined: Result<Self, crate::runtime::rt::JoinError>) {
+		match joined {
+			Ok(outcome) => {
+				if let Some(failure) = outcome.failure() {
+					panic!("the server of the scenario failed: {failure}");
+				}
+			}
+			Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+			// Teardown's abort ended a live server, which is its expected end.
+			Err(_cancelled) => {}
+		}
+	}
+}
+
+#[cfg(feature = "tokio")]
+impl ServerOutcome for () {
+	fn failure(self) -> Option<String> {
+		None
+	}
+}
+
+#[cfg(feature = "tokio")]
+impl<E: core::fmt::Debug> ServerOutcome for Result<(), E> {
+	fn failure(self) -> Option<String> {
+		self.err().map(|error| format!("{error:?}"))
+	}
+}
+
+// The `tb_scenario!` expansion calls the functions below.
+
+/// Calls an async scenario closure with its environment struct, so the
+/// compiler infers the closure's parameter from the concrete environment type.
 #[doc(hidden)]
 pub async fn __tb_env_call<E, F, Fut, T>(closure: F, env: E) -> Result<T, crate::TightBeamError>
 where
@@ -75,18 +141,17 @@ where
 	closure(env).await
 }
 
-/// Call a synchronous scenario closure with its environment struct.
 /// Hands one fuzz input to a raw target.
 ///
-/// Named so the closure's argument type is checked at the definition rather
-/// than inside the `afl::fuzz!` expansion, where a mismatch reports against
-/// the macro.
+/// A named function makes the compiler report a mismatch of the closure's
+/// argument type at the definition, not against the `afl::fuzz!` expansion.
 #[doc(hidden)]
 pub fn __tb_call_raw_fuzz<F: FnOnce(&[u8])>(target: F, data: impl AsRef<[u8]>) {
 	let data = data.as_ref();
 	target(data);
 }
 
+/// Calls a synchronous scenario closure with its environment struct.
 #[doc(hidden)]
 pub fn __tb_env_call_sync<E, F, T>(closure: F, env: E) -> T
 where
@@ -95,8 +160,8 @@ where
 	closure(env)
 }
 
-/// Helper function for pipeline exec closures (Pipeline environment)
-/// Accepts closures that return Result<T, TightBeamError> and maps to Result<(), TightBeamError>
+/// Runs the exec closure of the Pipeline environment, and maps its
+/// `Result<T, TightBeamError>` to `Result<(), TightBeamError>`.
 #[doc(hidden)]
 pub fn __tb_call_pipeline_exec<F, T>(
 	closure: F,
@@ -108,12 +173,10 @@ where
 	closure(pipeline).map(|_| ())
 }
 
-/// Binds the configuration a scenario runs, or fails the test with the reason
-/// it was refused.
+/// Binds the configuration a scenario runs, or fails the test with the refusal.
 ///
-/// `tb_scenario!` binds a configuration at several sites. This is the one
-/// place that decides what a refusal does, so the message is not copied at
-/// each of them.
+/// Each environment arm of `tb_scenario!` binds its configuration here, so
+/// every arm shares one refusal message.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_accept_config {
@@ -125,45 +188,91 @@ macro_rules! __tb_accept_config {
 	};
 }
 
-/// Unified scenario entry point for AssertSpec (and optional CSP/FDR)
-/// verification under a selectable execution environment.
+/// Binds the configuration of a guided fuzz run, whose CSP process comes from
+/// the `csp:` key alone, or fails the run with the refusal.
 ///
-/// Closures take one parameter. Non-Pipeline environments use a struct
-/// from [`crate::testing::env`]: `trace` is a [`TraceCollector`] share
-/// and `context` is `Arc<C>` (unit when `context:` is omitted). Name
-/// the parameter `env`, or destructure fields in the pattern.
+/// The oracle and the CSP layer read one process, because
+/// `ScenarioConfig::guided_by` refuses a configuration that names one.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_accept_guided_config {
+	($csp_type:ty, $config:expr) => {
+		$crate::__tb_accept_config!(
+			($config).and_then(|config| config.guided_by(<$csp_type as ::core::default::Default>::default()))
+		)
+	};
+}
+
+/// Binds the process of a guided fuzz run, or fails the run with the reason
+/// that the process does not build.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_accept_process {
+	($process:expr) => {
+		match $process {
+			Ok(process) => process,
+			Err(refused) => ::core::panic!("the CSP process of the guided run does not build: {}", refused),
+		}
+	};
+}
+
+/// The scenario entry point, which verifies an AssertSpec (and optionally CSP
+/// and FDR) under a selectable execution environment.
 ///
-/// Supported environments:
-/// - Bare: `exec: |env|` sync or `async move` ([`SetupEnv`])
-/// - Pipeline: `exec: |pipeline|` receives [`PipelineBuilder`]
-/// - Worker: `setup: |env|` sync returns builder ([`SetupEnv`]).
-///   `stimulus: |env|` async owns started worker ([`WorkerEnv`])
-/// - Servlet: `start: |env|` async returns servlet ([`SetupEnv`]).
-///   Optional `setup: |env|` async returns connected client
-///   ([`ClientEnv`]). Default connects a plain [`TokioListener`] client.
-///   `client: |env|` async ([`ServletEnv`])
-/// - ServiceClient: `server: |env|` async returns
-///   `(JoinHandle, TightBeamSocketAddr)` ([`SetupEnv`]).
-///   `client: |env|` async connects via `env.addr` ([`ClientEnv`]).
-///   Optional `worker_threads: N`
-/// - Cluster: `start: |env|` async returns cluster ([`SetupEnv`]).
-///   Optional `hives: |env|` returns hive futures `tb_scenario!` awaits
-///   and registers ([`SetupEnv`]). `client: |env|` async owns cluster
-///   ([`ClusterEnv`])
-/// - Hive: `start: |env|` async returns hive ([`SetupEnv`]).
-///   `client: |env|` async owns hive ([`HiveEnv`])
+/// Each closure takes one parameter, a struct from [`crate::testing::env`] in
+/// every environment but Pipeline. Its `trace` shares a [`TraceCollector`] (a
+/// [`FuzzTraceCollector`] under `fuzz: afl`), and its `context` is `Arc<C>`
+/// (`Arc<()>` without `context:`). Name it `env`, or destructure it.
 ///
-/// Top-level keys:
-/// - `name:` test function name (omit with `fuzz: afl`)
-/// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConfig
-/// - `fuzz: afl` optional AFL target (Bare/Servlet/Hive/Cluster). Every
-///   environment wraps `afl::fuzz!` and passes
-///   [`TraceCollector::with_fuzz_oracle`] into the same runner the named
-///   test uses, so each AFL iteration verifies its specs and its CSP
-///   process. Requires `csp:` and feature `testing-fuzz`
+/// # Environments
 ///
-/// Environment-block keys:
-/// - `context:` fixture evaluated once per test, shared as `Arc<C>`
+/// - Bare: `exec: |env|` runs sync or as `async move` ([`SetupEnv`]).
+/// - Pipeline: `exec: |pipeline|` receives a [`PipelineBuilder`].
+/// - Worker: the sync `setup: |env|` returns the builder ([`SetupEnv`]), and
+///   the async `stimulus: |env|` owns the started worker ([`WorkerEnv`]).
+/// - Servlet: the async `start: |env|` returns the servlet ([`SetupEnv`]).
+///   The optional async `setup: |env|` returns a connected client
+///   ([`ClientEnv`]), and without it a plain [`TokioListener`] client
+///   connects. The async `client: |env|` receives a [`ServletEnv`].
+/// - ServiceClient: the async `server: |env|` returns
+///   `(JoinHandle<T>, TightBeamSocketAddr)` ([`SetupEnv`]), where `T` is a
+///   [`ServerOutcome`]. The async `client: |env|` connects through
+///   `env.addr` ([`ClientEnv`]). The optional `worker_threads: N` runs the
+///   test on N runtime worker threads.
+/// - Cluster: the async `start: |env|` returns the cluster ([`SetupEnv`]).
+///   The optional `hives: |env|` returns hive futures that `tb_scenario!`
+///   awaits and registers ([`SetupEnv`]). The async `client: |env|` owns the
+///   cluster ([`ClusterEnv`]).
+/// - Hive: the async `start: |env|` returns the hive ([`SetupEnv`]), and the
+///   async `client: |env|` owns it ([`HiveEnv`]).
+///
+/// # Top-level keys
+///
+/// - `name:` names the test function, and a scenario with `fuzz: afl` omits it.
+/// - `spec:` takes an AssertSpec type and grades with its latest version, or
+///   `config:` takes the result of [`ScenarioConfigBuilder::build`].
+/// - The optional `fuzz: afl` makes the scenario an AFL target (Bare, Servlet,
+///   Hive, or Cluster). The target wraps `afl::fuzz!` and passes a
+///   [`FuzzTraceCollector`] into the runner of the named test, so each
+///   iteration verifies the specs and the CSP process. The key needs the
+///   `testing-fuzz` feature and `csp:`, the one process that steers the oracle
+///   and grades the CSP layer. A `config:` that also names a process fails the
+///   run at start, and an environment with no `csp:` fails to compile.
+///
+/// # Environment-block keys
+///
+/// - `context:` is a fixture that the test evaluates once and shares as `Arc<C>`.
+///
+/// # Panics
+///
+/// Testing suite functions MUST panic on error. A scenario panics, and so
+/// fails its test, when:
+///
+/// - [`ScenarioConfigBuilder::build`] or [`ScenarioConfig::guided_by`] refuses its configuration.
+/// - The process of a guided fuzz run does not build.
+/// - A setup closure fails, such as a worker, a servlet, a server, a cluster, or a hive that does not start.
+/// - The server task of a ServiceClient run fails or panics ([`ServerOutcome::settle`]).
+/// - The grade refuses an exploration event, or a layer decides against what the scenario expects.
 ///
 /// [`SetupEnv`]: crate::testing::env::SetupEnv
 /// [`ClientEnv`]: crate::testing::env::ClientEnv
@@ -172,11 +281,14 @@ macro_rules! __tb_accept_config {
 /// [`ClusterEnv`]: crate::testing::env::ClusterEnv
 /// [`HiveEnv`]: crate::testing::env::HiveEnv
 /// [`TraceCollector`]: crate::trace::TraceCollector
+/// [`FuzzTraceCollector`]: crate::testing::fuzz::FuzzTraceCollector
 /// [`PipelineBuilder`]: crate::utils::task::PipelineBuilder
+/// [`ScenarioConfigBuilder::build`]: crate::testing::ScenarioConfigBuilder::build
+/// [`ScenarioConfig::guided_by`]: crate::testing::ScenarioConfig::guided_by
 /// [`TokioListener`]: crate::transport::tcp::async::TokioListener
 #[macro_export]
 macro_rules! tb_scenario {
-	// spec: -> config:
+	// The `spec:` form expands to the `config:` form.
 	(
 		name: $test_name:ident,
 		spec: $spec:ty,
@@ -197,21 +309,18 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario! {
 			fuzz: afl,
 			csp: $csp_type,
-			// The oracle uses the type to pick events. Layer 2 verification
-			// reads `config.csp()`, so a config without it grades nothing.
+			// The guided arms take the process from `csp:` alone, and both the
+			// oracle and the CSP layer read it.
 			config: $crate::testing::ScenarioConfig::builder()
 				.with_spec(<$spec>::latest())
-				.with_csp(<$csp_type as ::core::default::Default>::default())
 				.build(),
 			$($rest)*
 		}
 	};
 
-	// ===== FUZZ VARIANT: raw bytes into a decoder =====
-	//
-	// No oracle and no scenario. A decoder's contract is that arbitrary bytes
-	// produce a typed error, so the property under test is that the body
-	// returns at all, and there is no trace to grade.
+	// The fuzz variant that feeds raw bytes into a decoder, with no oracle and
+	// no scenario. A decoder turns arbitrary bytes into a typed error, so the
+	// one property under test is that the body returns.
 	(
 		fuzz: afl,
 		raw: $body:expr
@@ -227,31 +336,50 @@ macro_rules! tb_scenario {
 			}
 			{
 				fn main() {
-					// Smoke build: the target still has to compile and run
-					// once, so a decoder that cannot handle an empty input is
-					// caught without AFL.
+					// Smoke build: without AFL, this main runs the target once,
+					// which catches a decoder that fails on an empty input.
 					$crate::testing::macros::__tb_call_raw_fuzz($body, &[]);
 				}
 			}
 		}
 	};
 
-	// ===== HELPER: Grade a finished scenario =====
+	// The guided fuzz variant with no `csp:`, which fails to compile.
+	(
+		fuzz: afl,
+		$(spec: $spec:ty,)?
+		$(config: $config:expr,)?
+		environment $($rest:tt)*
+	) => {
+		::core::compile_error!(
+			"tb_scenario! with fuzz: afl needs a csp: parameter, the CSP process that guides the run"
+		);
+	};
+
+	// The internal arm that grades a finished scenario.
 	(@grade $config:expr, $trace:expr, $exec_result:expr) => {
-		// An AFL iteration whose input ran out drove a prefix of a run, not a
-		// violation. Grading it would report every short mutation as a finding.
+		// An AFL iteration whose input runs out drives only a prefix of a run.
+		// A grade of that prefix would report every short mutation as a
+		// violation.
 		if $exec_result.as_ref().err().is_some_and(|error| error.is_fuzz_input_exhausted()) {
 			return;
 		}
 
-		let hook_ctx = $crate::testing::HookContext::build(&$config, &$trace, $exec_result);
+		let collector = ::core::convert::AsRef::<$crate::trace::TraceCollector>::as_ref(&$trace);
+		let built = $crate::testing::HookContext::build(&$config, collector, $exec_result);
+		// A refused exploration event leaves the scenario ungraded, so the
+		// test fails on the error rather than on a verdict.
+		let hook_ctx = match built {
+			::core::result::Result::Ok(hook_ctx) => hook_ctx,
+			::core::result::Result::Err(error) => ::core::panic!("Scenario verification failed: {}", error),
+		};
 		$crate::tb_scenario!(@verify_and_call_hooks $config, hook_ctx);
 	};
 
-	// ===== HELPER: Read the verdict and call hooks =====
+	// The internal arm that reads the verdict and calls the hooks.
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr) => {
-		// The verdict is read once, here. Every layer reached it through
-		// `ScenarioVerdict::from_layers`, and the body's own result reached it
+		// This arm reads the verdict once. Every layer reaches it through
+		// `ScenarioVerdict::explored`, and the body's own result reaches it
 		// through Layer 1.
 		match $hook_ctx.outcome() {
 			Err(violations) => {
@@ -273,13 +401,11 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== INTERNAL: Sync AFL mains =====
-	//
-	// Shared by the Bare `fuzz: afl` arm. Both mains forward into the same
-	// `@run_*` body, so spec and CSP verification is not something the
-	// fuzzing path can omit: only the oracle's input bytes differ. Without
-	// `--cfg fuzzing` the smoke main runs one empty-input iteration, which
-	// keeps `config` and `exec` used under an IDE and `cargo check`.
+	// The internal sync AFL mains of the Bare `fuzz: afl` arm. Both forward
+	// into the same `@run_*` body and differ only in the oracle's input bytes,
+	// so the fuzzing path always verifies the specs and the CSP process.
+	// Without `--cfg fuzzing`, the smoke main runs one empty-input iteration,
+	// so `config` and `exec` stay used under an IDE and `cargo check`.
 	(@afl_sync
 		csp: $csp_type:ty,
 		config: $config:expr,
@@ -289,12 +415,16 @@ macro_rules! tb_scenario {
 		$crate::__tb_select_fuzzing! {
 			{
 				fn main() {
+					// The run builds its configuration and its process
+					// once, so each iteration grades against the claims
+					// the build checked. Each iteration clones both, so a
+					// panic in one leaves them whole for the next.
+					let config = ::std::panic::AssertUnwindSafe($crate::__tb_accept_guided_config!($csp_type, $config));
+					let process = ::std::panic::AssertUnwindSafe($crate::__tb_accept_process!(<$csp_type>::process()));
 					afl::fuzz!(|data: &[u8]| {
-						let process = <$csp_type>::process();
-						let config = $crate::__tb_accept_config!($config);
-						let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+						let trace = $crate::testing::fuzz::FuzzTraceCollector::new(data.to_vec(), process.0.clone());
 						$crate::tb_scenario!(@$run
-							config: config,
+							config: config.0.clone(),
 							trace: trace,
 							$($run_body)*
 						)
@@ -303,9 +433,9 @@ macro_rules! tb_scenario {
 			}
 			{
 				fn main() {
-					let process = <$csp_type>::process();
-					let config = $crate::__tb_accept_config!($config);
-					let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
+					let config = $crate::__tb_accept_guided_config!($csp_type, $config);
+					let process = $crate::__tb_accept_process!(<$csp_type>::process());
+					let trace = $crate::testing::fuzz::FuzzTraceCollector::new(::std::vec::Vec::new(), process);
 					$crate::tb_scenario!(@$run
 						config: config,
 						trace: trace,
@@ -316,7 +446,8 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== FUZZ VARIANT: AFL fuzz target for Bare environment (generates fn main()) =====
+	// The fuzz variant that generates the `fn main()` AFL target of the Bare
+	// environment.
 	(
 		fuzz: afl,
 		csp: $csp_type:ty,
@@ -334,7 +465,8 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== FUZZ VARIANT: AFL fuzz target for Servlet environment (generates fn main()) =====
+	// The fuzz variant that generates the `fn main()` AFL target of the
+	// Servlet environment.
 	(
 		fuzz: afl,
 		csp: $csp_type:ty,
@@ -352,13 +484,11 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== INTERNAL: Tokio AFL mains =====
-	//
-	// Shared by the Servlet, Hive, and Cluster `fuzz: afl` arms. Builds
-	// `TraceCollector::with_fuzz_oracle` each AFL iteration (or empty
-	// bytes for smoke) and forwards into the matching `@run_*` body.
-	// The Tokio runtime is created inside the fuzz closure so worker
-	// threads are not live before AFL's forkserver handoff.
+	// The internal Tokio AFL mains of the Servlet, Hive, and Cluster
+	// `fuzz: afl` arms. Each iteration builds a `FuzzTraceCollector` (over
+	// empty bytes in the smoke main) and forwards into the matching `@run_*`
+	// body. The AFL main builds its Tokio runtime inside the fuzz closure, so
+	// no worker thread is live before the AFL forkserver handoff.
 	(@afl_async
 		csp: $csp_type:ty,
 		config: $config:expr,
@@ -371,18 +501,27 @@ macro_rules! tb_scenario {
 				$crate::__tb_select_fuzzing! {
 					{
 						fn main() {
+							// As in the sync mains, the run builds its
+							// configuration and its process once, and each
+							// iteration clones both.
+							let config =
+								::std::panic::AssertUnwindSafe($crate::__tb_accept_guided_config!($csp_type, $config));
+							let process =
+								::std::panic::AssertUnwindSafe($crate::__tb_accept_process!(<$csp_type>::process()));
 							afl::fuzz!(|data: &[u8]| {
-								let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
-								else {
-									return;
+								// An iteration with no runtime tests
+								// nothing, so it panics, and AFL records
+								// the panic as a crash.
+								let built = tokio::runtime::Builder::new_current_thread().enable_all().build();
+								let runtime = match built {
+									Ok(runtime) => runtime,
+									Err(error) => panic!("the AFL harness could not build its Tokio runtime: {error}"),
 								};
 								runtime.block_on(async {
-									let process = <$csp_type>::process();
-									let config = $crate::__tb_accept_config!($config);
 									let trace =
-										$crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+										$crate::testing::fuzz::FuzzTraceCollector::new(data.to_vec(), process.0.clone());
 									$crate::tb_scenario!(@$run
-										config: config,
+										config: config.0.clone(),
 										trace: trace,
 										$($run_body)*
 									)
@@ -393,10 +532,10 @@ macro_rules! tb_scenario {
 					{
 						#[tokio::main]
 						async fn main() {
-							let process = <$csp_type>::process();
-							let config = $crate::__tb_accept_config!($config);
+							let config = $crate::__tb_accept_guided_config!($csp_type, $config);
+							let process = $crate::__tb_accept_process!(<$csp_type>::process());
 							let trace =
-								$crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
+								$crate::testing::fuzz::FuzzTraceCollector::new(::std::vec::Vec::new(), process);
 							$crate::tb_scenario!(@$run
 								config: config,
 								trace: trace,
@@ -412,7 +551,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== FUZZ VARIANT: AFL fuzz target for Hive environment =====
+	// The fuzz variant that generates the AFL target of the Hive environment.
 	(
 		fuzz: afl,
 		csp: $csp_type:ty,
@@ -436,7 +575,8 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== FUZZ VARIANT: AFL fuzz target for Cluster environment =====
+	// The fuzz variant that generates the AFL target of the Cluster
+	// environment.
 	(
 		fuzz: afl,
 		csp: $csp_type:ty,
@@ -462,7 +602,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Bare environment, async exec =====
+	// The Bare environment with an async exec.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -484,7 +624,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Bare environment, sync exec =====
+	// The Bare environment with a sync exec.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -507,9 +647,9 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Pipeline environment (sync) =====
-	// exec receives a PipelineBuilder with trace context pre-configured
-	// and returns Result<T, TightBeamError> directly from .run()
+	// The Pipeline environment, which is sync. Its `exec` receives a
+	// `PipelineBuilder` with its trace context set, and it returns
+	// `Result<T, TightBeamError>` straight from `.run()`.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -525,7 +665,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Worker environment (async) =====
+	// The Worker environment, which is async.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -549,7 +689,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Servlet environment (async) =====
+	// The Servlet environment, which is async.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -570,7 +710,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== ServiceClient environment with worker_threads =====
+	// The ServiceClient environment with `worker_threads`.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -595,7 +735,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== ServiceClient environment =====
+	// The ServiceClient environment.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -619,7 +759,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Cluster environment (async) =====
+	// The Cluster environment, which is async.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -648,7 +788,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Hive environment (async) =====
+	// The Hive environment, which is async.
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -675,7 +815,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== INTERNAL: Bare environment (ASYNC) =====
+	// The internal runner of the async Bare environment.
 	(@run_bare_async
 		config: $config:expr,
 		context: [ $($context:expr)? ],
@@ -693,10 +833,9 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@grade config, trace, exec_result);
 	}};
 
-	// ===== INTERNAL: Bare environment (SYNC) =====
-	// `trace` is caller-supplied: a named test passes `config.trace()` and an
-	// AFL arm passes `TraceCollector::with_fuzz_oracle(...)`, so both reach the
-	// one verification below.
+	// The internal runner of the sync Bare environment. The caller supplies
+	// `trace`, `config.trace()` from a named test or a `FuzzTraceCollector`
+	// from an AFL arm, so both reach the one verification below.
 	(@run_bare_sync
 		config: $config:expr,
 		trace: $trace:expr,
@@ -716,7 +855,7 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@grade config, trace, exec_result);
 	}};
 
-	// ===== INTERNAL: Pipeline environment =====
+	// The internal runner of the Pipeline environment.
 	(@run_pipeline
 		config: $config:expr,
 		exec: $exec_closure:expr
@@ -726,16 +865,14 @@ macro_rules! tb_scenario {
 		let config = $crate::__tb_accept_config!($config);
 		let trace = config.trace();
 
-		// Create PipelineBuilder with trace context
 		let pipeline = PipelineBuilder::new(std::sync::Arc::clone(&trace));
 
-		// Execute the pipeline closure (returns Result<T, E>, mapped to Result<(), E>)
 		let exec_result = $crate::testing::macros::__tb_call_pipeline_exec($exec_closure, pipeline);
 
 		$crate::tb_scenario!(@grade config, trace, exec_result);
 	}};
 
-	// ===== INTERNAL: Worker environment =====
+	// The internal runner of the Worker environment.
 	(@run_worker
 		config: $config:expr,
 		context: [ $($context:expr)? ],
@@ -770,20 +907,21 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@grade config, trace, exec_result);
 	}};
 
-	// ===== INTERNAL: Servlet client setup (default connect) =====
+	// The internal setup of the default Servlet client, for a block with no
+	// `setup:` key.
 	(@servlet_client $trace:expr, $context:expr, $addr:expr) => {{
 		use $crate::transport::tcp::r#async::TokioListener;
 		use $crate::transport::{ClientBuilder, ConnectionBuilder};
 
 		// The default servlet scenario provisions no trust store, so the
-		// scenario runs in the clear and says so.
+		// scenario runs in the clear, and `allow_cleartext` says so.
 		let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 		builder
 			.connect($addr)
 			.await
 			.expect("Failed to setup servlet client (default)")
 	}};
-	// ===== INTERNAL: Servlet client setup (custom closure) =====
+	// The internal setup of a Servlet client through the `setup:` closure.
 	(@servlet_client $trace:expr, $context:expr, $addr:expr, $setup_closure:expr) => {{
 		$crate::testing::macros::__tb_env_call(
 			$setup_closure,
@@ -797,8 +935,8 @@ macro_rules! tb_scenario {
 		.expect("Failed to setup servlet client (custom)")
 	}};
 
-	// ===== INTERNAL: Servlet environment =====
-	// `trace` is caller-supplied (see `@run_bare_sync`).
+	// The internal runner of the Servlet environment, whose caller supplies
+	// `trace` as for `@run_bare_sync`.
 	(@run_servlet
 		config: $config:expr,
 		trace: $trace:expr,
@@ -845,7 +983,7 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@grade config, trace, client_result);
 	}};
 
-	// ===== INTERNAL: ServiceClient environment =====
+	// The internal runner of the ServiceClient environment.
 	(@run_service_client
 		config: $config:expr,
 		context: [ $($context:expr)? ],
@@ -866,7 +1004,8 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Server setup failed");
 
-		let stop_server = $crate::testing::Teardown::new(move || server_handle.abort());
+		let server_abort = server_handle.abort_handle();
+		let stop_server = $crate::testing::Teardown::new(move || server_abort.abort());
 
 		let client_result = $crate::testing::macros::__tb_env_call(
 			$client_closure,
@@ -879,18 +1018,14 @@ macro_rules! tb_scenario {
 		.await;
 
 		stop_server.run();
+		$crate::testing::macros::ServerOutcome::settle(server_handle.await);
 
 		$crate::tb_scenario!(@grade config, trace, client_result);
 	}};
 
-	// ===== INTERNAL: Cluster environment =====
-	// `start` returns the cluster. Optional `hives` returns futures that
-	// `tb_scenario!` awaits and registers. `client` owns the cluster for
-	// registry assertions and the consuming `stop`.
-	//
-	// `trace` is supplied by the caller: named tests pass `config.trace()`,
-	// AFL arms pass `TraceCollector::with_fuzz_oracle(...)` so the oracle
-	// wires through the same path as Bare.
+	// The internal runner of the Cluster environment, whose `client` owns the
+	// cluster for registry assertions and the consuming `stop`. Its caller
+	// supplies `trace` as for `@run_bare_sync`, so the oracle runs as in Bare.
 	(@run_cluster
 		config: $config:expr,
 		trace: $trace:expr,
@@ -918,16 +1053,19 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Failed to start cluster");
 
-		// Type-erased as consuming closures, so the list has one type
-		// whether or not the scenario starts hives.
+		// Each hive stop is type-erased as a consuming closure, so the list
+		// has one type whether or not the scenario starts hives.
 		#[allow(unused_mut)]
 		let mut hive_stops: Vec<$crate::testing::Teardown> = Vec::new();
 		$(
 			let cluster_addr = cluster_instance.addr().clone();
-			let hive_futures = ($hives_closure)($crate::testing::env::SetupEnv {
-				trace: trace.share(),
-				context: ::std::sync::Arc::clone(&context),
-			});
+			let hive_futures = $crate::testing::macros::__tb_env_call_sync(
+				$hives_closure,
+				$crate::testing::env::SetupEnv {
+					trace: trace.share(),
+					context: ::std::sync::Arc::clone(&context),
+				},
+			);
 			for hive_future in hive_futures {
 				let hive = hive_future.await.expect("Failed to start hive");
 				hive.register_with_cluster(&cluster_addr).await.expect("Failed to register hive");
@@ -935,7 +1073,7 @@ macro_rules! tb_scenario {
 			}
 		)?
 
-		// Cluster client owns the instance. Teardown runs in the closure
+		// The cluster client owns the instance. Teardown runs in the closure
 		// because `stop(self)` consumes it.
 		let client_result = $crate::testing::macros::__tb_env_call(
 			$client_closure,
@@ -954,9 +1092,8 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@grade config, trace, client_result);
 	}};
 
-	// ===== INTERNAL: Hive environment =====
-	// Like Cluster without registration: `start` returns the hive and
-	// `client` owns it. `trace` is caller-supplied (see `@run_cluster`).
+	// The internal runner of the Hive environment: Cluster without the
+	// registration. The caller supplies `trace`, as for `@run_cluster`.
 	(@run_hive
 		config: $config:expr,
 		trace: $trace:expr,
@@ -978,7 +1115,7 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Failed to start hive");
 
-		// Hive client owns the instance. Teardown runs in the closure
+		// The hive client owns the instance. Teardown runs in the closure
 		// because `stop(self)` consumes it.
 		let client_result = $crate::testing::macros::__tb_env_call(
 			$client_closure,
@@ -1002,6 +1139,7 @@ crate::__tb_if_test! {
 			use std::sync::atomic::{AtomicBool, Ordering};
 			use std::sync::Arc;
 
+			use crate::testing::specs::composition::CompositionError;
 			use crate::testing::specs::csp::{CspValidationResult, CspViolation, Event, Process, ProcessSpec, State};
 			use crate::testing::{HookContext, ScenarioConfig, TestHooks};
 			use crate::trace::ConsumedTrace;
@@ -1009,27 +1147,24 @@ crate::__tb_if_test! {
 			struct AlwaysInvalidSpec;
 
 			impl ProcessSpec for AlwaysInvalidSpec {
-				fn validate_trace(&self, _trace: &ConsumedTrace) -> CspValidationResult {
+				fn validate_trace(&self, _process: &Process, _trace: &ConsumedTrace) -> CspValidationResult {
 					CspValidationResult {
 						valid: false,
 						violations: vec![CspViolation::Deadlock { event: Event("noop"), state: State("start") }],
 					}
 				}
 
-				fn to_process_cow(&self) -> Cow<'_, Process> {
-					let process = Process::builder("always_invalid")
-						.initial_state(State("start"))
-						.build()
-						.expect("single-state process builds");
-					Cow::Owned(process)
+				fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
+					let process = Process::builder("always_invalid").initial_state(State("start")).build()?;
+					Ok(Cow::Owned(process))
 				}
 			}
 
 			// Layer 2 CSP failures must travel the same failure path as Layer 1
-			// assertion failures: on_fail runs before the panic, so logging and
-			// cleanup hooks observe the regression.
+			// assertion failures: `on_fail` runs before the panic, so logging
+			// and cleanup hooks observe the regression.
 			#[test]
-			fn csp_failure_invokes_on_fail_before_panicking() {
+			fn csp_failure_invokes_on_fail_before_panicking() -> Result<(), crate::TightBeamError> {
 				let failed = Arc::new(AtomicBool::new(false));
 				let observed = Arc::clone(&failed);
 				let hooks = TestHooks::on_fail(move |_context, _violations| {
@@ -1040,14 +1175,310 @@ crate::__tb_if_test! {
 					ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build()
 				);
 				let trace = config.trace();
-				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()));
+				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()))?;
 				let outcome = catch_unwind(AssertUnwindSafe(|| {
 					crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx);
 				}));
 
 				assert!(outcome.is_err());
 				assert!(failed.load(Ordering::SeqCst));
+				Ok(())
+			}
+
+			struct AlwaysValidSpec;
+
+			impl ProcessSpec for AlwaysValidSpec {
+				fn validate_trace(&self, _process: &Process, _trace: &ConsumedTrace) -> CspValidationResult {
+					CspValidationResult { valid: true, violations: Vec::new() }
+				}
+
+				fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
+					let process = Process::builder("always_valid").initial_state(State("start")).build()?;
+					Ok(Cow::Owned(process))
+				}
+			}
+
+			// A scenario that every layer accepts returns, and `on_pass` runs.
+			#[test]
+			fn a_passing_scenario_invokes_on_pass_and_returns() -> Result<(), crate::TightBeamError> {
+				let passed = Arc::new(AtomicBool::new(false));
+				let observed = Arc::clone(&passed);
+				let hooks = TestHooks::on_pass(move |_context| {
+						observed.store(true, Ordering::SeqCst);
+					});
+
+				let config = crate::__tb_accept_config!(
+					ScenarioConfig::builder().with_csp(AlwaysValidSpec).with_hooks(hooks).build()
+				);
+
+				let trace = config.trace();
+				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()))?;
+				let outcome = catch_unwind(AssertUnwindSafe(|| {
+					crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx);
+				}));
+
+				assert!(outcome.is_ok());
+				assert!(passed.load(Ordering::SeqCst));
+				Ok(())
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod outcome_tests {
+	use core::error::Error;
+
+	use crate::testing::TestFrame;
+	use crate::trace::{ConsumedTrace, Exchange, Presence, TraceCollector};
+	use crate::Frame;
+
+	/// The request and the response of one exchange, as distinct frames.
+	fn frames() -> (Frame, Frame) {
+		(TestFrame::v0(None, Some("request")), TestFrame::v0(None, Some("response")))
+	}
+
+	/// The trace of a run whose client recorded `exchanges` in order.
+	fn traced(exchanges: Vec<Exchange>) -> ConsumedTrace {
+		let collector = TraceCollector::new();
+		exchanges.into_iter().for_each(|exchange| collector.record_exchange(exchange));
+
+		let mut trace = ConsumedTrace::new();
+		trace.populate_from_collector(&collector);
+		trace
+	}
+
+	#[test]
+	fn an_accepted_exchange_records_its_request_and_its_response() -> Result<(), Box<dyn Error>> {
+		let (request, response) = frames();
+		let exchange = Exchange::Accepted { request: request.clone(), response: Some(Box::new(response.clone())) };
+
+		let trace = traced(vec![exchange]);
+		assert_eq!((trace.accepted_frame(), trace.response()), (Some(&request), Some(&response)));
+		Ok(())
+	}
+
+	#[test]
+	fn a_rejected_exchange_records_its_request() -> Result<(), Box<dyn Error>> {
+		let (request, _) = frames();
+		let trace = traced(vec![Exchange::Rejected { request: request.clone() }]);
+		assert_eq!((trace.rejected_frame(), trace.accepted_frame()), (Some(&request), None));
+		Ok(())
+	}
+
+	#[test]
+	fn the_response_of_a_run_is_the_first_that_arrived() -> Result<(), Box<dyn Error>> {
+		let (request, response) = frames();
+		let first = Exchange::Accepted { request: request.clone(), response: Some(Box::new(response.clone())) };
+		let second = Exchange::Accepted { request: request.clone(), response: Some(Box::new(request)) };
+
+		let trace = traced(vec![first, second]);
+		assert_eq!(trace.response(), Some(&response));
+		Ok(())
+	}
+
+	/// A trace that already holds a response keeps it over the response of the
+	/// collector it drains.
+	#[test]
+	fn a_trace_keeps_its_own_response_over_a_drained_one() -> Result<(), Box<dyn Error>> {
+		let (request, response) = frames();
+		let collector = TraceCollector::new();
+		collector.record_exchange(Exchange::Accepted { request: request.clone(), response: Some(Box::new(request)) });
+
+		let mut trace = ConsumedTrace::new();
+		trace.record_accepted(response.clone(), Some(response.clone()));
+		trace.populate_from_collector(&collector);
+		assert_eq!(trace.response(), Some(&response));
+		Ok(())
+	}
+
+	#[test]
+	fn a_run_that_reports_no_exchange_reports_no_response() -> Result<(), Box<dyn Error>> {
+		let trace = traced(Vec::new());
+		assert_eq!(trace.response_presence(), None);
+		Ok(())
+	}
+
+	#[test]
+	fn a_refused_request_reports_an_absent_response() -> Result<(), Box<dyn Error>> {
+		let (request, _) = frames();
+		let trace = traced(vec![Exchange::Rejected { request }]);
+		assert_eq!(trace.response_presence(), Some(Presence::Absent));
+		Ok(())
+	}
+}
+
+#[cfg(all(test, feature = "tcp", feature = "tokio"))]
+mod scenario_outcome_tests {
+	use core::error::Error;
+	use core::future::Future;
+	use std::sync::Arc;
+
+	use tokio::sync::Notify;
+
+	use super::ServerOutcome;
+	use crate::runtime::rt::JoinHandle;
+	use crate::testing::{ClientEnv, Expect, Layer, ScenarioConfig, SetupEnv, TestFrame};
+	use crate::trace::{Exchange, TraceCollector};
+	use crate::transport::tcp::r#async::TokioListener;
+	use crate::transport::tcp::TightBeamSocketAddr;
+	use crate::transport::{EndpointConfig, MessageEmitter, Protocol};
+	use crate::urn::Urn;
+	use crate::{exactly, tb_assert_spec, Frame, TightBeamError};
+
+	const STEP: Urn<'static> = crate::urn!("test", "event:outcome/step");
+
+	tb_assert_spec! {
+		pub AnsweredSpec,
+		V(1,0,0): {
+			mode: Accept,
+			response: Present,
+			assertions: [
+				(STEP, exactly!(1))
+			]
+		}
+	}
+
+	tb_assert_spec! {
+		pub UnansweredSpec,
+		V(1,0,0): {
+			mode: Accept,
+			response: Absent,
+			assertions: [
+				(STEP, exactly!(1))
+			]
+		}
+	}
+
+	tb_assert_spec! {
+		pub SteppedSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(STEP, exactly!(1))
+			]
+		}
+	}
+
+	/// A loopback address on a port that the system picks.
+	fn loopback() -> TightBeamSocketAddr {
+		TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+	}
+
+	/// Starts a server that answers each request with the request itself.
+	async fn echo_server() -> Result<(JoinHandle, TightBeamSocketAddr), TightBeamError> {
+		let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback()).await?;
+		let handle = crate::server! {
+			protocol TokioListener: listener,
+			handle: |frame: Frame| async move { Ok(Some(frame)) }
+		};
+
+		Ok((handle, addr))
+	}
+
+	/// Sends one request to the server at `addr`, records `STEP`, and records
+	/// into `trace` how the server answered.
+	async fn echo_exchange(trace: TraceCollector, addr: TightBeamSocketAddr) -> Result<(), TightBeamError> {
+		let stream = <TokioListener as Protocol>::connect(addr).await?;
+		let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
+
+		let request = TestFrame::v0(None, Some("request"));
+		let response = client.emit(request.clone(), None).await?;
+
+		trace.event(STEP)?;
+		trace.record_exchange(Exchange::Accepted { request, response: response.map(Box::new) });
+		Ok(())
+	}
+
+	/// Starts a server task that signals `ended` and then fails.
+	async fn failed_server(
+		ended: Arc<Notify>,
+	) -> Result<(tokio::task::JoinHandle<Result<(), TightBeamError>>, TightBeamSocketAddr), TightBeamError> {
+		let (_listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback()).await?;
+		let handle = tokio::spawn(async move {
+			ended.notify_one();
+			Err(TightBeamError::MissingConfiguration)
+		});
+
+		Ok((handle, addr))
+	}
+
+	/// Starts a server task that signals `ended` and then panics.
+	async fn panicked_server(ended: Arc<Notify>) -> Result<(JoinHandle, TightBeamSocketAddr), TightBeamError> {
+		let (_listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback()).await?;
+		let handle = tokio::spawn(async move {
+			ended.notify_one();
+			panic!("the scenario server broke");
+		});
+
+		Ok((handle, addr))
+	}
+
+	/// Waits until the server task signals `ended`, and then records `STEP`.
+	async fn stepped_after(trace: TraceCollector, ended: Arc<Notify>) -> Result<(), TightBeamError> {
+		ended.notified().await;
+		trace.event(STEP)?;
+		Ok(())
+	}
+
+	tb_scenario! {
+		name: a_response_that_arrives_breaks_a_spec_that_forbids_one,
+		config: ScenarioConfig::builder()
+			.with_spec(UnansweredSpec::latest())
+			.with_expect(Expect::Violation(Layer::Assertion))
+			.build(),
+		environment ServiceClient {
+			server: |_env: SetupEnv| echo_server(),
+			client: |ClientEnv { trace, addr, .. }| echo_exchange(trace, addr)
+		}
+	}
+
+	tb_scenario! {
+		name: a_response_that_arrives_meets_a_spec_that_requires_one,
+		config: ScenarioConfig::builder().with_spec(AnsweredSpec::latest()).build(),
+		environment ServiceClient {
+			server: |_env: SetupEnv| echo_server(),
+			client: |ClientEnv { trace, addr, .. }| echo_exchange(trace, addr)
+		}
+	}
+
+	/// The text that a ServiceClient scenario panics with over the server
+	/// that `server` starts.
+	async fn panic_of<S, F, T>(server: S) -> Result<String, Box<dyn Error>>
+	where
+		S: FnOnce(Arc<Notify>) -> F + Send + 'static,
+		F: Future<Output = Result<(tokio::task::JoinHandle<T>, TightBeamSocketAddr), TightBeamError>> + Send,
+		T: ServerOutcome + Send + 'static,
+	{
+		let run = tokio::spawn(async move {
+			crate::tb_scenario!(@run_service_client
+				config: ScenarioConfig::builder().with_spec(SteppedSpec::latest()).build(),
+				context: [ Notify::new() ],
+				server: move |SetupEnv { context, .. }| server(context),
+				client: |ClientEnv { trace, context, .. }| stepped_after(trace, context)
+			)
+		});
+
+		let joined = run.await.err().ok_or("the scenario ended with no panic")?;
+		let payload = joined
+			.try_into_panic()
+			.map_err(|_cancelled| "the scenario task was cancelled")?;
+		let borrowed = payload.downcast_ref::<&str>().map(|text| text.to_string());
+		let text = borrowed.or_else(|| payload.downcast_ref::<String>().cloned());
+		Ok(text.ok_or("the panic payload holds no text")?)
+	}
+
+	#[tokio::test]
+	async fn a_server_that_failed_fails_the_scenario_with_its_failure() -> Result<(), Box<dyn Error>> {
+		let payload = panic_of(failed_server).await?;
+		assert_eq!(payload, "the server of the scenario failed: MissingConfiguration");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_server_that_panicked_fails_the_scenario_with_its_own_panic() -> Result<(), Box<dyn Error>> {
+		let payload = panic_of(panicked_server).await?;
+		assert_eq!(payload, "the scenario server broke");
+		Ok(())
 	}
 }

@@ -1,10 +1,12 @@
-//! Socket-level CMS handshake integration test.
+//! The socket-level integration test of the CMS handshake.
 //!
-//! Every other wire test negotiates ECIES. This scenario runs the CMS
+//! Every other wire test negotiates HPKE. This scenario runs the CMS
 //! handshake over a real TCP socket through public interfaces only:
 //!
 //! - the `server!` policy list selects the protocol per accepted connection, and
-//! - [`ClientBuilder`] carries the server chain the client's first flight encrypts its base secret to.
+//! - [`ClientBuilder`] pins the server's key-agreement certificate: the
+//!   client's first flight seals its base secret to it, and the store admits
+//!   the signing certificate the reply carries.
 
 #![cfg(all(
 	feature = "tcp",
@@ -16,6 +18,7 @@
 use std::sync::Arc;
 
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
@@ -26,21 +29,17 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::HandshakeProtocolKind;
-use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
-use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;
 
-use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
-use crate::transport::support::bind_mutual_listener;
+use crate::common::security::{random_signing_key, test_certificate, ServerMaterials};
+use crate::transport::support::bind_cms_mutual_listener;
 
-pub(crate) const CMS_WIRE_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cms-socket/cms-wire-echoed");
-
-/// Mutual-auth CMS fixture: server materials plus the client identity the
-/// server pins.
+/// The mutual-auth CMS fixture, which holds the server materials and the
+/// client identity that the server pins.
 struct CmsWireContext {
 	materials: ServerMaterials,
 	client_certificate: Arc<Certificate>,
@@ -56,13 +55,13 @@ impl CmsWireContext {
 	}
 }
 
-/// Echo server that answers CMS handshakes instead of the ECIES default;
-/// gate verdicts audit into `trace`.
+/// An echo server that answers CMS handshakes in place of the HPKE default,
+/// and records its handshake outcomes and gate verdicts into `trace`.
 async fn start_cms_echo_server(
 	ctx: &Arc<CmsWireContext>,
 	trace: &TraceCollector,
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
-	let (listener, addr) = bind_mutual_listener(&ctx.materials, &ctx.client_certificate).await?;
+	let (listener, addr) = bind_cms_mutual_listener(&ctx.materials, &ctx.client_certificate).await?;
 	let addr = TightBeamSocketAddr(addr);
 	let trace = trace.share();
 	let handle = server! {
@@ -82,15 +81,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(events::GATE_ACCEPT, exactly!(1)),
-			(CMS_WIRE_ECHOED, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::GATE_ACCEPT, exactly!(1))
 		]
 	}
 }
 
-// The client seals its base secret to the pre-known server chain in its
-// first flight, the pinning server validates the client certificate, and
-// an application frame round-trips over the derived traffic keys.
+// The client seals its base secret in its first flight, the pinning server
+// validates the client certificate, and an application frame round-trips over
+// the derived traffic keys.
 tb_scenario! {
 	name: cms_handshake_round_trips_over_tcp,
 	spec: CmsSocketSpec,
@@ -99,23 +98,21 @@ tb_scenario! {
 		server: |SetupEnv { context: ctx, trace }| async move {
 			start_cms_echo_server(&ctx, &trace).await
 		},
-		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let trust_store = pinning_trust_store(&ctx.materials.certificate)?;
+		client: |ClientEnv { context: ctx, addr, .. }| async move {
 			let client_certificate = ctx.client_certificate.as_ref().to_owned();
 			let identity = CertificateSpec::Built(Box::new(client_certificate));
-			let server_chain = vec![Certificate::clone(&ctx.materials.certificate)];
-
+			let server_trust = ctx.materials.cms.trust();
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_trust_store(trust_store)
-				.with_client_identity(ClientIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
-				.with_server_certificate_chain(server_chain)
+				.with_client_identity(SigningIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
+				.with_cms_server(server_trust)
 				.with_handshake_protocol(HandshakeProtocolKind::Cms)
 				.build();
 
 			let mut client = builder.connect(addr).await?;
 			let frame = TestFrame::v0(Some("cms-wire"), None);
 			let reply = client.emit(frame.to_owned(), None).await?;
-			trace.event_with(CMS_WIRE_ECHOED, &[], reply == Some(frame))?;
+
+			assert_eq!(reply, Some(frame), "the CMS session must echo the frame");
 			Ok(())
 		}
 	}

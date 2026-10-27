@@ -4,57 +4,57 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
+use tightbeam::crypto::x509::CanonicalKey;
 use tightbeam::policy::{SessionContext, TransitStatus};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
-/// Shared mutable grant/gate tables for one gateway.
+/// Shared mutable grant and deny tables for one gateway.
 #[derive(Default)]
 pub(crate) struct DynamicAclState {
-	/// SPKI DER bytes granted per target URN string.
-	grants: RwLock<HashMap<Vec<u8>, HashSet<String>>>,
-	/// SPKI DER bytes denied for any target when present.
-	denied: RwLock<HashSet<Vec<u8>>>,
+	/// The canonical keys granted per target URN string.
+	grants: RwLock<HashMap<CanonicalKey, HashSet<String>>>,
+	/// The canonical keys denied for any target when present.
+	denied: RwLock<HashSet<CanonicalKey>>,
 }
 
 impl DynamicAclState {
-	/// `spki` accepts any type that converts via `AsRef<[u8]>`.
-	pub fn grant(&self, spki: impl AsRef<[u8]>, target: &Urn<'_>) {
+	/// Grant `target` to `key`, the canonical key of the grantee.
+	pub fn grant(&self, key: &CanonicalKey, target: &Urn<'_>) {
 		if let Ok(mut guard) = self.grants.write() {
-			guard.entry(spki.as_ref().to_vec()).or_default().insert(target.to_string());
+			guard.entry(key.clone()).or_default().insert(target.to_string());
 		}
 	}
 
-	pub fn revoke_grant(&self, spki: impl AsRef<[u8]>, target: &Urn<'_>) {
-		let spki = spki.as_ref();
+	pub fn revoke_grant(&self, key: &CanonicalKey, target: &Urn<'_>) {
 		if let Ok(mut guard) = self.grants.write() {
-			let empty = if let Some(targets) = guard.get_mut(spki) {
+			let empty = if let Some(targets) = guard.get_mut(key) {
 				targets.remove(&target.to_string());
 				targets.is_empty()
 			} else {
 				false
 			};
 			if empty {
-				guard.remove(spki);
+				guard.remove(key);
 			}
 		}
 	}
 
-	pub fn deny(&self, spki: impl AsRef<[u8]>) {
+	pub fn deny(&self, key: &CanonicalKey) {
 		if let Ok(mut guard) = self.denied.write() {
-			guard.insert(spki.as_ref().to_vec());
+			guard.insert(key.clone());
 		}
 	}
 
-	pub fn allow(&self, spki: impl AsRef<[u8]>) {
+	pub fn allow(&self, key: &CanonicalKey) {
 		if let Ok(mut guard) = self.denied.write() {
-			guard.remove(spki.as_ref());
+			guard.remove(key);
 		}
 	}
 
-	/// Lookup borrows the SPKI bytes through [`HashMap`]'s `Borrow<[u8]>`
-	/// support, so the hot path does not allocate a temporary SPKI key.
-	pub fn is_granted(&self, spki: Option<&[u8]>, target: &Urn<'_>) -> bool {
-		let Some(spki) = spki else {
+	/// Whether `key` holds a grant to `target`, by a lookup that borrows the
+	/// canonical key the session holds.
+	pub fn is_granted(&self, key: Option<&CanonicalKey>, target: &Urn<'_>) -> bool {
+		let Some(key) = key else {
 			return false;
 		};
 		let Ok(guard) = self.grants.read() else {
@@ -62,18 +62,18 @@ impl DynamicAclState {
 		};
 
 		let target = target.to_string();
-		guard.get(spki).is_some_and(|targets| targets.contains(&target))
+		guard.get(key).is_some_and(|targets| targets.contains(&target))
 	}
 
-	pub fn is_denied(&self, spki: Option<&[u8]>) -> bool {
-		let Some(spki) = spki else {
+	pub fn is_denied(&self, key: Option<&CanonicalKey>) -> bool {
+		let Some(key) = key else {
 			return false;
 		};
 		let Ok(guard) = self.denied.read() else {
 			return true;
 		};
 
-		guard.contains(spki)
+		guard.contains(key)
 	}
 }
 
@@ -89,7 +89,7 @@ impl ExportGrant for DynamicGrant {
 			return false;
 		}
 
-		self.state.is_granted(session.peer_public_key(), target)
+		self.state.is_granted(session.peer_key(), target)
 	}
 }
 
@@ -107,7 +107,7 @@ impl ExportGate for DynamicDenyGate {
 		_planes: &TrustPlanes<'_>,
 		_relayed: bool,
 	) -> TransitStatus {
-		if self.state.is_denied(session.peer_public_key()) {
+		if self.state.is_denied(session.peer_key()) {
 			return TransitStatus::PermissionDenied;
 		}
 

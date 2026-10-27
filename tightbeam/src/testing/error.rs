@@ -1,9 +1,17 @@
 use crate::Errorizable;
 
+#[cfg(feature = "testing-timing")]
+use crate::error::TightBeamError;
+#[cfg(feature = "testing-timing")]
+use crate::testing::specs::Event;
+#[cfg(feature = "testing-timing")]
+use crate::testing::timing::Percentile;
+
 pub type Result<T> = core::result::Result<T, TestingError>;
 
-/// FDR configuration error details
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The field of an FDR configuration that breaks a rule, and the rule it
+/// breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FdrConfigError {
 	pub field: &'static str,
 	pub reason: &'static str,
@@ -15,7 +23,8 @@ impl core::fmt::Display for FdrConfigError {
 	}
 }
 
-/// Schedulability violation details
+/// The details of a schedulability violation: the task, a message, and the
+/// utilization or the deadline miss that the check measured.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulabilityViolationDetail {
 	pub task_id: &'static str,
@@ -39,7 +48,7 @@ impl core::fmt::Display for SchedulabilityViolationDetail {
 	}
 }
 
-/// Testing error types
+/// An error of the testing surface.
 #[derive(Debug, Errorizable)]
 pub enum TestingError {
 	#[error("Fuzz input exhausted")]
@@ -56,8 +65,142 @@ pub enum TestingError {
 	InvalidTimingConstraint,
 	#[error("Slack exceeds deadline duration")]
 	InvalidSlack,
-	#[error("Invalid FDR configuration: {0}")]
-	InvalidFdrConfig(FdrConfigError),
+	/// The event holds a WCET or jitter constraint that disagrees with the
+	/// one added.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::TestingError;
+	/// use tightbeam::testing::specs::csp::Event;
+	///
+	/// let refused = TestingError::ConflictingTimingConstraint(Event("send"));
+	/// assert_eq!(refused.to_string(), "Event send holds a timing constraint that disagrees with the one added");
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	#[error("Event {0} holds a timing constraint that disagrees with the one added")]
+	ConflictingTimingConstraint(Event),
+	/// The trace holds fewer events than its run emitted, so it decides no
+	/// timing bound.
+	#[cfg(feature = "testing-timing")]
+	#[error("The trace holds a truncated record, which decides no timing bound")]
+	TimingRecordIncomplete,
+	/// A timing record of a constrained event carries no measure: a run of
+	/// an event under a WCET or jitter bound with no duration, or a deadline
+	/// marker with no timestamp. A trace holds durations only when its
+	/// instrumentation config sets `record_durations`.
+	#[cfg(feature = "testing-timing")]
+	#[error("The timing record {seq} of event {event} carries no measure")]
+	TimingSampleUnmeasured {
+		/// The event of the record.
+		event: Event,
+		/// The sequence number of the record.
+		seq: u32,
+	},
+	/// A deadline start marker has no end marker after it, so the window it
+	/// opens has no latency.
+	#[cfg(feature = "testing-timing")]
+	#[error("The deadline window that record {seq} of event {start} opens has no {end} after it")]
+	DeadlineUnterminated {
+		/// The start event of the deadline.
+		start: Event,
+		/// The end event of the deadline.
+		end: Event,
+		/// The sequence number of the start marker.
+		seq: u32,
+	},
+	/// The analyzer of a percentile WCET bound failed on the samples of its
+	/// event. The cause sits in a box, because a `TightBeamError` can hold a
+	/// `TestingError`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::TestingError;
+	/// use tightbeam::testing::specs::csp::Event;
+	/// use tightbeam::TightBeamError;
+	///
+	/// let cause = Box::new(TightBeamError::MissingConfiguration);
+	/// let refused = TestingError::WcetAnalysisFailed { event: Event("send"), cause };
+	/// assert!(refused.to_string().starts_with("The analyzer of the WCET bound on event send failed"));
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	#[error("The analyzer of the WCET bound on event {event} failed: {cause}")]
+	WcetAnalysisFailed {
+		/// The event of the bound.
+		event: Event,
+		/// The error of the analyzer.
+		cause: Box<TightBeamError>,
+	},
+	/// The analyzer of a percentile WCET bound gave no value for that
+	/// percentile.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::TestingError;
+	/// use tightbeam::testing::specs::csp::Event;
+	/// use tightbeam::testing::timing::Percentile;
+	///
+	/// let refused = TestingError::WcetPercentileMissing { event: Event("send"), percentile: Percentile::P99 };
+	/// assert_eq!(refused.to_string(), "The analyzer of the WCET bound on event send gave no P99 value");
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	#[error("The analyzer of the WCET bound on event {event} gave no {percentile:?} value")]
+	WcetPercentileMissing {
+		/// The event of the bound.
+		event: Event,
+		/// The percentile of the bound.
+		percentile: Percentile,
+	},
+	/// The calculator of a jitter bound failed on the samples of its event.
+	/// The cause sits in a box, because a `TightBeamError` can hold a
+	/// `TestingError`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::TestingError;
+	/// use tightbeam::testing::specs::csp::Event;
+	/// use tightbeam::TightBeamError;
+	///
+	/// let cause = Box::new(TightBeamError::MissingConfiguration);
+	/// let refused = TestingError::JitterCalculationFailed { event: Event("send"), cause };
+	/// assert!(refused.to_string().starts_with("The jitter calculator of the bound on event send failed"));
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	#[error("The jitter calculator of the bound on event {event} failed: {cause}")]
+	JitterCalculationFailed {
+		/// The event of the bound.
+		event: Event,
+		/// The error of the calculator.
+		cause: Box<TightBeamError>,
+	},
+	/// A test harness observed an outcome that its scenario rules out, for
+	/// the stated reason.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::TestingError;
+	///
+	/// let refused = TestingError::UnexpectedOutcome("the peer accepted a forged frame");
+	/// assert_eq!(refused.to_string(), "Unexpected outcome: the peer accepted a forged frame");
+	/// ```
+	#[error("Unexpected outcome: {0}")]
+	UnexpectedOutcome(&'static str),
+	/// A test harness names a step at `index` that the flow under test lacks.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::TestingError;
+	///
+	/// let refused = TestingError::UnknownFlowStep(7);
+	/// assert_eq!(refused.to_string(), "The flow under test has no step 7");
+	/// ```
+	#[error("The flow under test has no step {0}")]
+	UnknownFlowStep(usize),
 	#[error("Invalid fault model configuration")]
 	InvalidFaultModel,
 	#[error("Schedulability violation: {0}")]

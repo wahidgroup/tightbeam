@@ -9,10 +9,12 @@
 	feature = "sha3",
 	feature = "aead",
 	feature = "testing",
-	feature = "testing-csp"
+	feature = "testing-csp",
+	feature = "transport-hpke",
+	feature = "instrument"
 ))]
 
-//! Security-focused transport integration tests.
+//! The transport integration tests that target security.
 //!
 //! Each module exercises the threat controls documented in the README's
 //! transport security table.
@@ -28,6 +30,7 @@ pub mod dos_attack;
 pub mod downgrade_attack;
 pub mod envelope_tamper;
 pub mod forward_secrecy;
+pub mod live;
 pub mod mitm_attack;
 pub mod nonce_reuse;
 pub mod receipt_activation;

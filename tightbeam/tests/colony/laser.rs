@@ -1,8 +1,9 @@
-//! The colony stack over a non-TCP transport: cluster, hive, and servlet
-//! all bound to the in-memory "laser" protocol, work routed end to end.
+//! The colony stack over a non-TCP transport. The cluster, the hive, and the
+//! servlet all bind to the in-memory "laser" protocol, and work routes end to
+//! end.
 //!
-//! A laser tightbeam arrives at the cluster gateway and is relayed to a
-//! servlet through the hive, every link encrypted and multiplexed.
+//! A laser tightbeam arrives at the cluster gateway, which relays it to a
+//! servlet through the hive, with every link encrypted and multiplexed.
 
 #![cfg(all(
 	feature = "std",
@@ -16,7 +17,6 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use sha3::Sha3_256;
 use tightbeam::der::Sequence;
 use tightbeam::{
 	at_least,
@@ -24,9 +24,9 @@ use tightbeam::{
 	cluster,
 	colony::{
 		cluster::{Cluster, ClusterConfig, ClusterTlsConfig},
-		common::ColonyNamespace,
 		hive::{Hive, HiveConfig, HiveTlsConfig},
 		servlet::ServletConfig,
+		urn::ColonyNamespace,
 		SubmitWork,
 	},
 	compose,
@@ -38,28 +38,19 @@ use tightbeam::{
 	testing::{ClientEnv, ClusterEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
-		handshake::{negotiation::TransportOffer, HandshakeKeyManager},
-		multiplex::StreamBody,
-		serve::{CallContext, MuxService},
+		handshake::negotiation::TransportOffer,
+		multiplex::{CallContext, MuxService, StreamBody},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
+	urn::Urn,
 	utils::time::{Clock, ManualClock},
-	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
 
+use crate::common::hive::scenario_hive_config;
 use crate::common::laser::{LaserAddr, LaserListener};
 use crate::common::security::expectation_failure;
-use crate::common::x509::GatewayCerts;
-
-pub(crate) const LASER_WORK_SENT: Urn<'static> = tightbeam::urn!("test", "event:laser/work-sent");
-pub(crate) const LASER_WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:laser/work-status");
-pub(crate) const LASER_WORK_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:laser/work-echoed");
-pub(crate) const LASER_SERVER_STREAM_REPORTS_LENGTH: Urn<'static> =
-	tightbeam::urn!("test", "event:laser/server-stream-reports-length");
-pub(crate) const LASER_ROUTE_BEFORE_RESTART: Urn<'static> = tightbeam::urn!("test", "event:laser/route-before-restart");
-pub(crate) const LASER_ROUTE_AFTER_RESTART: Urn<'static> = tightbeam::urn!("test", "event:laser/route-after-restart");
-pub(crate) const LASER_UNROUTED_BEFORE_BEAT: Urn<'static> = tightbeam::urn!("test", "event:laser/unrouted-before-beat");
+use crate::common::x509::{signing_identity, GatewayCerts};
 
 /// The restart scenario's re-announce interval. It is long enough that only
 /// an advance of the hive clock can end it inside the test.
@@ -74,13 +65,17 @@ const REGISTRATION_ROUNDS: u32 = 10_000;
 /// above the slots that `LaserAddr::ANY` assigns sequentially.
 const RESTART_GATEWAY_ADDR: &str = "laser://9901";
 
+/// The request whose `value` the laser servlet doubles.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct BeamRequest {
+	/// The number the servlet doubles.
 	pub value: u32,
 }
 
+/// The laser servlet's reply.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct BeamResponse {
+	/// Twice the request's `value`.
 	pub doubled: u32,
 }
 
@@ -112,7 +107,10 @@ fn laser_certs() -> GatewayCerts {
 	GatewayCerts::generate("CN=Laser Gateway")
 }
 
-/// The restart scenario's certificates and the clock its hive beats on.
+/// The restart scenario's certificates and the clock its hive beats on. The
+/// hive and both gateways share the clock, and only the test moves it, so
+/// the replacement routes only after the test lets one interval pass, and the
+/// frames the beat signs stay fresh at the gateway.
 struct LaserRestartCtx {
 	certs: Arc<GatewayCerts>,
 	clock: Arc<ManualClock>,
@@ -155,7 +153,7 @@ fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
 	let mut conf = HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.trust)),
-		..Default::default()
+		..scenario_hive_config()
 	};
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
@@ -181,19 +179,17 @@ async fn start_laser_hive(
 	let servlet = LaserServlet::start(Arc::clone(&trace), config).await?;
 
 	let mut hive = LaserHive::new(Some(conf))?;
-	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, ServletConfig::default()))?;
+	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, ServletConfig::cleartext()))?;
 	hive.establish(trace).await?;
 	Ok(hive)
 }
 
-/// Submits one beam work request through a gateway via
-/// [`SubmitWork::submit_work_to`] and returns the servlet's response
-/// frame.
+/// Submits one beam work request through a gateway with
+/// [`SubmitWork::submit_work_to`] and returns the servlet's response frame.
 ///
-/// The typed request travels as the client's complete signed frame, so
-/// the servlet receives the same envelope over the laser transport as
-/// over any other protocol. A refusal surfaces as
-/// [`TightBeamError::WorkRefused`].
+/// The typed request travels as the client's complete signed frame, so the
+/// servlet receives the same envelope over the laser transport as over any
+/// other protocol. A refusal surfaces as [`TightBeamError::WorkRefused`].
 async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame, TightBeamError> {
 	let mut inner = Version::V1
 		.compose()
@@ -202,8 +198,8 @@ async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame,
 		.with_message(BeamRequest { value: 21 })
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(certs.key.to_owned());
-	inner.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+	inner.sign_with_provider(&identity).await?;
 
 	let mut client = ClientBuilder::<LaserListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
@@ -230,8 +226,9 @@ fn refusal_status(outcome: Result<Frame, TightBeamError>) -> Result<TransitStatu
 /// [`REGISTRATION_ROUNDS`] pass.
 ///
 /// The scenario runtime runs on one thread, so each yield lets the hive's
-/// beat and the gateway's handler make progress without a wait on the
-/// operating system's clock. Branching lives here, not in the scenarios.
+/// beat and the gateway's handler make progress, and the wait counts
+/// scheduler rounds in place of the operating system's clock. The branching
+/// lives here, so the scenarios stay assertion-focused.
 async fn wait_for_hives(cluster: &LaserCluster, hives: usize) -> Result<(), TightBeamError> {
 	for _ in 0..REGISTRATION_ROUNDS {
 		if cluster.hive_count()? >= hives {
@@ -269,12 +266,12 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(LASER_SERVER_STREAM_REPORTS_LENGTH, exactly!(1), equals!(true))
+			(events::GATE_ACCEPT, exactly!(1))
 		]
 	}
 }
 
-// A lone `server!` (no colony) bound to the laser protocol serves a
+// A lone `server!`, outside any colony, bound to the laser protocol serves a
 // streaming interaction end to end. Encryption, mux negotiation, and
 // stream dispatch all go through the protocol traits.
 tb_scenario! {
@@ -282,20 +279,23 @@ tb_scenario! {
 	spec: LaserLoneServerSpec,
 	environment ServiceClient {
 		context: laser_certs(),
-		server: |SetupEnv { context: certs, .. }| async move {
-			let key_manager = HandshakeKeyManager::new(Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())));
-			let config = TransportEncryptionConfig::new(certs.cert.to_owned(), key_manager);
+		server: |SetupEnv { trace, context: certs }| async move {
+			let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
+			let config = TransportEncryptionConfig::new(identity);
 			let (listener, addr) = <LaserListener as EncryptedProtocol>::bind_with(LaserAddr::ANY, config).await?;
 
 			let handle = server! {
 				protocol LaserListener: listener,
-				policies: { with_mux_offer: [ Some(TransportOffer::mux(8)) ] },
+				policies: {
+					with_trace: [ trace.share() ],
+					with_mux_offer: [ Some(TransportOffer::mux(8)) ]
+				},
 				service: BeamLengthService
 			};
 
 			Ok((handle, addr))
 		},
-		client: |ClientEnv { trace, context: certs, addr }| async move {
+		client: |ClientEnv { context: certs, addr, .. }| async move {
 			let pool = Arc::new(
 				ConnectionPool::<LaserListener>::builder()
 					.with_config(PoolConfig {
@@ -314,9 +314,7 @@ tb_scenario! {
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
 			let decoded: BeamResponse = decode(reply.message())?;
-			let value = decoded.doubled == 8;
-
-			trace.event_with(LASER_SERVER_STREAM_REPORTS_LENGTH, &[], value)?;
+			assert_eq!(decoded.doubled, 8, "the lone server reports the 8-byte body");
 
 			Ok(())
 		}
@@ -328,19 +326,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(LASER_WORK_SENT, exactly!(1)),
-			(LASER_WORK_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
-			(LASER_WORK_ECHOED, exactly!(1), equals!(42u32)),
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1))
 		]
 	}
 }
 
-// A laser tightbeam reaches the cluster gateway and routes to a hive
-// servlet. The path runs from the client through the cluster and hive
-// control to the servlet. Every link uses the in-memory laser protocol,
-// encrypted and multiplexed.
+// A laser tightbeam runs from the client through the cluster gateway and the
+// hive control plane to a hive servlet, and every link runs the in-memory
+// laser protocol, encrypted and multiplexed.
 tb_scenario! {
 	name: cluster_routes_work_over_laser_protocol,
 	spec: LaserRoutingSpec,
@@ -355,16 +349,13 @@ tb_scenario! {
 			let conf = laser_hive_conf(&certs);
 			vec![start_laser_hive(trace, certs, conf)]
 		},
-		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			trace.event(LASER_WORK_SENT)?;
-
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			// A served frame proves the gateway reported `Ok`, because the
 			// client surface resolves any other status into `WorkRefused`.
 			let servlet_frame = emit_beam_work(&certs, cluster.addr()).await?;
-			trace.event_with(LASER_WORK_STATUS, &[], TransitStatus::Ok)?;
 
 			let beam_response: BeamResponse = decode(servlet_frame.message())?;
-			trace.event_with(LASER_WORK_ECHOED, &[], beam_response.doubled)?;
+			assert_eq!(beam_response.doubled, 42, "the laser servlet doubles 21");
 
 			cluster.stop();
 			Ok(())
@@ -377,10 +368,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(LASER_ROUTE_BEFORE_RESTART, exactly!(1), equals!(TransitStatus::Ok)),
-			(LASER_UNROUTED_BEFORE_BEAT, exactly!(1), equals!(TransitStatus::Unavailable)),
 			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1)),
-			(LASER_ROUTE_AFTER_RESTART, exactly!(1), equals!(TransitStatus::Ok)),
 			(events::HIVE_REREGISTERED, at_least!(1)),
 			(events::CLUSTER_HIVE_REGISTERED, at_least!(2), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, at_least!(2))
@@ -388,13 +376,9 @@ tb_assert_spec! {
 	}
 }
 
-// The gateway registry is soft state. A replacement gateway starts empty
-// on the same stable address, the hive's anti-entropy beat re-registers
-// within one interval, and work routes again with no operator, no
-// consensus, and no persistence. The hive and both gateways share a clock
-// only this test moves, so the replacement routes only after the test lets
-// one interval pass, and the frames the beat signs stay fresh at the
-// gateway.
+// The gateway registry is soft state. A replacement gateway starts empty on
+// the same address, the hive's anti-entropy beat re-registers within one
+// interval, and work routes again with no operator, consensus, or persistence.
 tb_scenario! {
 	name: cluster_recovers_hive_after_gateway_restart,
 	spec: LaserGatewayRestartSpec,
@@ -418,8 +402,6 @@ tb_scenario! {
 			// after the restart, because refusals surface as errors instead.
 			emit_beam_work(&ctx.certs, cluster.addr()).await?;
 
-			trace.event_with(LASER_ROUTE_BEFORE_RESTART, &[], TransitStatus::Ok)?;
-
 			cluster.stop();
 
 			let replacement = {
@@ -430,15 +412,14 @@ tb_scenario! {
 			};
 
 			// An empty registry refuses the type as unavailable. Any other
-			// failure fails the scenario instead of passing for that refusal.
+			// failure fails the scenario rather than pass for that refusal.
 			let unrouted = emit_beam_work(&ctx.certs, replacement.addr()).await;
 			let refused = refusal_status(unrouted)?;
-			trace.event_with(LASER_UNROUTED_BEFORE_BEAT, &[], refused)?;
+			assert_eq!(refused, TransitStatus::Unavailable, "an empty registry refuses the type as unavailable");
 
 			ctx.clock.advance(REREGISTER_INTERVAL);
 			wait_for_hives(&replacement, 1).await?;
 			emit_beam_work(&ctx.certs, replacement.addr()).await?;
-			trace.event_with(LASER_ROUTE_AFTER_RESTART, &[], TransitStatus::Ok)?;
 
 			replacement.stop();
 			Ok(())

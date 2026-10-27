@@ -12,7 +12,7 @@ use crate::{Frame, TightBeamError};
 
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 
-use crate::colony::servlet::servlet_runtime::rt;
+use crate::runtime::rt;
 
 /// A servlet configuration, and the application env it carries.
 ///
@@ -266,16 +266,4 @@ where
 	C: CryptoProvider,
 {
 	type Env = Env;
-}
-
-impl<P, M, C, Env> Default for RuntimeServletConf<P, M, C, Env>
-where
-	P: Protocol,
-	M: Message,
-	C: CryptoProvider + Send + Sync + 'static,
-	Env: Default,
-{
-	fn default() -> Self {
-		Self { config: ServletConfig::default(), service: ServletHandlers::default() }
-	}
 }

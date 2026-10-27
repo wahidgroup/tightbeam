@@ -1,5 +1,5 @@
-//! Client handle: stream emission, streaming opens, pings, and the
-//! drop guards that reclaim abandoned in-flight work.
+//! The client handle emits streams, opens streaming requests, pings the peer,
+//! and owns the drop guards that reclaim abandoned in-flight work.
 
 use core::future::Future;
 use std::sync::Arc;
@@ -18,25 +18,26 @@ use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, 
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
+use crate::urn::Urn;
 use crate::utils::marker::MaybeSend;
-use crate::utils::urn::Urn;
 use crate::Frame;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "transport-policy")]
 use crate::transport::GateAudit;
 
-/// Cancels the stream if the owning emit future is dropped before its
-/// response arrives: frees the cap slot and notifies the peer (best-effort,
-/// [RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4)).
+/// Cancels the stream if the owning emit future is dropped before its response
+/// arrives. The cancel frees the cap slot and notifies the peer, best-effort
+/// ([RFC 9113 § 6.4][rfc9113-6.4]).
 ///
-/// The stream's ID is read through its [`OpenSlot`] at drop time: a
-/// guard dropped before the Open ever went out stands down on its
-/// own (nothing on the wire, the reservation releases the cap slot).
+/// The guard reads the stream's ID through its [`OpenSlot`] at drop time. A
+/// guard dropped before the Open went out stands down on its own, because
+/// nothing is on the wire and the reservation releases the cap slot.
+///
+/// [rfc9113-6.4]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.4
 pub struct CancelOnDrop {
 	link: MuxLink,
 	slot: Arc<OpenSlot>,
@@ -44,7 +45,7 @@ pub struct CancelOnDrop {
 }
 
 impl CancelOnDrop {
-	/// Armed guard over a stream identified by `slot`.
+	/// Returns an armed guard over the stream that `slot` identifies.
 	fn new(link: &MuxLink, slot: Arc<OpenSlot>) -> Self {
 		Self { link: link.clone(), slot, armed: true }
 	}
@@ -67,8 +68,9 @@ impl Drop for CancelOnDrop {
 }
 
 /// Forgets the pending ping if the owning ping future is dropped
-/// before its ack arrives. A later ack resolves nothing (discarded
-/// like a stale response), so no peer notification is needed.
+/// before its ack arrives. A later ack finds no pending entry and
+/// resolves nothing, as a stale response does, so the peer needs no
+/// notification.
 struct ForgetPingOnDrop {
 	shared: Arc<MuxShared>,
 	opaque: u64,
@@ -93,20 +95,26 @@ impl Drop for ForgetPingOnDrop {
 
 /// Cloneable client handle for a multiplexed connection.
 ///
-/// Shares pending-stream state and the outbound queue across clones (`Arc` +
-/// channel refcount bumps only). Does not drive I/O: spawn
-/// [`crate::transport::multiplex::MuxReaderDriver`] and
-/// [`crate::transport::multiplex::MuxWriterDriver`] on the caller's executor.
+/// Clones share the pending-stream state and the outbound queue, at the cost of
+/// `Arc` and channel refcount bumps only. The drivers own the I/O, so the
+/// caller spawns [`MuxReaderDriver`] and [`MuxWriterDriver`] on its executor.
 /// See [`MuxHandle::emit_on_stream`] and [`MuxHandle::ping`].
+///
+/// # Ended connection
+///
+/// - Once either driver has ended, every call that would wait on the peer returns `ConnectionClosed`.
+/// - That outranks `Draining`, so a connection that took a GoAway and then ended reports the end.
+///
+/// [`MuxReaderDriver`]: crate::transport::multiplex::MuxReaderDriver
+/// [`MuxWriterDriver`]: crate::transport::multiplex::MuxWriterDriver
 #[derive(Clone)]
 pub struct MuxHandle {
 	link: MuxLink,
 }
 
-// Audit source for gate verdicts on the mux plane: the responder
-// gates requests through `gate_inbound`, which records the
-// verdict into this connection's collector.
-#[cfg(feature = "transport-policy")]
+// The handle is the audit source for gate verdicts on the mux plane. The
+// responder gates requests through `gate_inbound`, which records the verdict
+// into this connection's collector.
 impl GateAudit for MuxHandle {
 	#[cfg(feature = "instrument")]
 	fn audit_trace(&self) -> Option<&TraceCollector> {
@@ -123,22 +131,23 @@ impl MuxHandle {
 
 	/// Send a request on a freshly allocated stream and await its response.
 	///
-	/// Frames beyond the peer's advertised chunk size are segmented into
-	/// `Open(first) Data(...)* Data(last)`, each chunk gated by the peer's
-	/// stream credit.
+	/// The call segments a frame beyond the peer's advertised chunk size into
+	/// `Open(first) Data(...)* Data(last)`, and the peer's stream credit gates
+	/// each chunk.
 	///
 	/// # Cancellation
 	///
-	/// Dropping the returned future before it resolves cancels the
-	/// stream: the pending entry is removed, the cap slot freed, and a
-	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] sent.
+	/// Dropping the returned future before it resolves cancels the stream. The
+	/// cancel removes the pending entry, frees the cap slot, and sends a
+	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`].
 	///
 	/// # Errors
-	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
-	/// - `OperationFailed(BudgetExhausted)`: the outbound budget cannot cover frame
-	/// - `OperationFailed(ResourceExhausted)`: the peer refused the stream
-	/// - `Draining`: GoAway sent or received. No new streams
-	/// - `ConnectionClosed`: connection failed before the response
+	///
+	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
+	/// - `OperationFailed(BudgetExhausted)` -- the outbound budget cannot cover the frame.
+	/// - `OperationFailed(ResourceExhausted)` -- the peer refused the stream.
+	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection failed, before this call or before the response.
 	pub async fn emit_on_stream(&self, frame: &Frame) -> TransportResult<Option<Frame>> {
 		// Encode before reserving so an encoding failure never burns
 		// a cap slot or queues work for a stream the peer never saw.
@@ -146,9 +155,9 @@ impl MuxHandle {
 		let credits = self.link.shared().credits_for(payload.len());
 
 		let (sender, receiver) = oneshot::channel();
-		// The reservation holds the cap slot until the Open goes out
-		// and releases it if this future is dropped waiting out a
-		// renewal: no ID exists yet, so nothing needs cancelling
+		// The reservation holds the cap slot until the Open goes out, and
+		// releases it if this future is dropped while it waits out a renewal.
+		// No ID exists yet, so nothing needs cancelling.
 		let mut reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
 
@@ -159,8 +168,8 @@ impl MuxHandle {
 
 		match self.send_request_chunks(&mut reservation, &payload, total).await {
 			Ok(()) => {}
-			// Ledger removed mid-send: the stream resolved underneath
-			// the sender and the outcome channel carries the truth
+			// A send that finds its ledger gone means the stream resolved
+			// underneath the sender, so the outcome channel carries the result.
 			Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => {}
 			Err(err) => return Err(err),
 		}
@@ -183,15 +192,19 @@ impl MuxHandle {
 	/// Open a streaming request: push chunks through the returned
 	/// [`RequestSink`], then await the returned response future.
 	///
-	/// - Every push debits the session budget and parks on the peer's stream credit exactly like
-	///   [`emit_on_stream`](Self::emit_on_stream) chunks. Streamed requests are metered and paid,
-	///   not a side channel.
-	/// - Dropping the sink before [`RequestSink::close`], or the response future before it
-	///   resolves, cancels the stream.
+	/// - Every push debits the session budget and parks on the peer's stream
+	///   credit exactly like [`emit_on_stream`](Self::emit_on_stream) chunks,
+	///   so a streamed request is metered and paid like a unary one.
+	/// - Dropping the sink before [`RequestSink::close`], or the response
+	///   future before it resolves, cancels the stream.
+	/// - A connection that fails or drains before the first push resolves the
+	///   response future with `ConnectionClosed` or `Draining`.
 	///
 	/// # Errors
-	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
-	/// - `Draining`: GoAway sent or received. No new streams
+	///
+	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
+	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_stream(
 		&self,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -201,14 +214,16 @@ impl MuxHandle {
 	/// Open a streaming request to a servlet type, so a gateway
 	/// responder can dispatch or splice the stream by that target.
 	///
-	/// The target names a servlet type, exactly as `HiveContext::call`
-	/// does: the caller says what work it wants, never a specific
-	/// instance. A `Urn<'static>` const passes with no allocation.
-	/// Otherwise identical to [`open_stream`](Self::open_stream).
+	/// The target names a servlet type, exactly as `HiveContext::call` does, so
+	/// the caller says what work it wants and not which instance does it. A
+	/// `Urn<'static>` const passes with no allocation. The call is otherwise
+	/// identical to [`open_stream`](Self::open_stream).
 	///
 	/// # Errors
-	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
-	/// - `Draining`: GoAway sent or received. No new streams
+	///
+	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
+	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_stream_to(
 		&self,
 		target: impl Into<Urn<'static>>,
@@ -218,11 +233,10 @@ impl MuxHandle {
 
 	/// Open a streaming request carrying a fully-formed [`StreamRoute`].
 	///
-	/// Shared open core behind [`open_stream`](Self::open_stream) and
-	/// [`open_stream_to`](Self::open_stream_to). It is the
-	/// crate-internal entry a gateway uses to re-emit a client stream
-	/// to a peer with [`StreamRoute::relayed_to`]. The route parts
-	/// stay on the sink until its first chunk emits the Open.
+	/// - [`open_stream`](Self::open_stream) and [`open_stream_to`](Self::open_stream_to) share this core.
+	/// - A gateway re-emits a client stream to a peer through it, with [`StreamRoute::relayed_to`].
+	///
+	/// The route parts stay on the sink until its first chunk emits the Open.
 	pub(crate) fn open_stream_with_route(
 		&self,
 		route: StreamRoute,
@@ -231,15 +245,7 @@ impl MuxHandle {
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
-
-		let sink = RequestSink::new(
-			reservation,
-			MuxStreamKind::Streaming,
-			self.link.clone(),
-			None,
-			target,
-			hops_remaining,
-		);
+		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, self.link.clone(), target, hops_remaining);
 
 		let link = self.link.clone();
 		let response = async move {
@@ -264,23 +270,27 @@ impl MuxHandle {
 	///
 	/// # Pacing
 	///
-	/// - Pushes reach the wire eagerly (see [`RequestSink::push`]), so a push-one-await-one
-	///   conversation with the handler is sound.
-	/// - The reply's pace stays the handler's choice: only its trailer is guaranteed, so an
-	///   exchange that must not park awaits reply chunks it knows the handler sends.
-	/// - Consuming reply chunks replenishes the peer's stream credit, so a slow reader parks the
-	///   responder (end-to-end backpressure).
+	/// - Pushes reach the wire eagerly (see [`RequestSink::push`]), so a
+	///   push-one-await-one conversation with the handler is sound.
+	/// - The reply's pace stays the handler's choice. Only its trailer is
+	///   guaranteed, so an exchange that must not park awaits reply chunks
+	///   that it knows the handler sends.
+	/// - Consuming reply chunks replenishes the peer's stream credit, so a
+	///   slow reader parks the responder (end-to-end backpressure).
 	///
 	/// # Ending
 	///
 	/// The reply ends with the responder's trailer: `Ok(None)` on an Ok status,
 	/// otherwise the status mapped to its transport error. Dropping the sink
 	/// before [`RequestSink::close`], or the reply body before its terminal
-	/// event, cancels the stream.
+	/// event, cancels the stream. A connection that fails or drains before the
+	/// first push ends the body with `ConnectionClosed` or `Draining`.
 	///
 	/// # Errors
-	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
-	/// - `Draining`: GoAway sent or received. No new streams
+	///
+	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
+	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 		self.open_duplex_with_route(StreamRoute::local())
 	}
@@ -288,64 +298,48 @@ impl MuxHandle {
 	/// Open a duplex stream to a servlet type, so a gateway responder
 	/// can dispatch or splice both directions by that target.
 	///
-	/// The target names a servlet type, exactly as `HiveContext::call`
-	/// does: the caller says what work it wants, never a specific
-	/// instance. A `Urn<'static>` const passes with no allocation.
-	/// Otherwise identical to [`open_duplex`](Self::open_duplex).
+	/// The target names a servlet type, exactly as `HiveContext::call` does,
+	/// so the caller says what work it wants and not which instance does it.
+	/// A `Urn<'static>` const passes with no allocation. The call is otherwise
+	/// identical to [`open_duplex`](Self::open_duplex).
 	///
 	/// # Errors
-	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
-	/// - `Draining`: GoAway sent or received. No new streams
+	///
+	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
+	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
+	/// - `ConnectionClosed` -- the connection has failed, so nothing would answer the stream.
 	pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 		self.open_duplex_with_route(StreamRoute::to(target.into()))
 	}
 
 	/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 	///
-	/// Shared open core behind [`open_duplex`](Self::open_duplex) and
-	/// [`open_duplex_to`](Self::open_duplex_to). It is the
-	/// crate-internal entry a gateway uses to re-emit a client duplex
-	/// stream to a peer with [`StreamRoute::relayed_to`]. The route
-	/// parts stay on the sink until its first chunk emits the Open.
+	/// - [`open_duplex`](Self::open_duplex) and [`open_duplex_to`](Self::open_duplex_to) share this core.
+	/// - A gateway re-emits a client duplex stream to a peer through it, with [`StreamRoute::relayed_to`].
+	///
+	/// The route parts stay on the sink until its first chunk emits the Open.
 	pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 		let (target, hops_remaining) = route.into_parts();
-		let (sender, receiver) = oneshot::channel();
-		let reservation = self.link.shared().reserve_stream_slot(sender)?;
+		// The reply forwarder waits with the reservation in the pending table,
+		// where a failed or draining connection reaches it. It registers under
+		// the assigned ID at first push, before the Open can reach the peer.
+		let drained = self.link.drain_feedback();
+		let (reservation, mut body) = self.link.shared().reserve_duplex_slot(drained)?;
 		let slot = reservation.slot();
 
-		// The reply travels through the body, not the outcome slot:
-		// the pending entry only holds the stream's cap slot
-		drop(receiver);
-
-		// The forwarder follows the reservation into the sink and
-		// registers under the assigned ID at first push, before the
-		// Open can reach the peer.
-		let (mut body, forwarder) = StreamBody::pair(
-			Arc::clone(&slot),
-			self.link.shared().initial_recv_credit,
-			self.link.drain_feedback(),
-		);
-
-		// An abandoned reply must reclaim its cap slot: without the
-		// guard, a closed-sink duplex stream has no cancel path and
-		// the slot stays pinned until the peer's trailer
+		// An abandoned reply must reclaim its cap slot. Without the guard, a
+		// closed-sink duplex stream has no cancel path, and the slot stays
+		// pinned until the peer's trailer.
 		body.arm_guard(CancelOnDrop::new(&self.link, slot));
 
-		let sink = RequestSink::new(
-			reservation,
-			MuxStreamKind::Duplex,
-			self.link.clone(),
-			Some(forwarder),
-			target,
-			hops_remaining,
-		);
+		let sink = RequestSink::new(reservation, MuxStreamKind::Duplex, self.link.clone(), target, hops_remaining);
 		Ok((sink, body))
 	}
 
-	/// Segment a request payload into the initiator grammar, one
-	/// credit-gated chunk per record. The first chunk travels through
-	/// the atomic open (assigning the stream ID and seeding the
-	/// ledger with `total` records), the rest as `Data`.
+	/// Segment a request payload into the initiator grammar, one credit-gated
+	/// chunk per record. The first chunk travels through the atomic open, which
+	/// assigns the stream ID and seeds the ledger with `total` records, and the
+	/// rest travel as `Data`.
 	async fn send_request_chunks(
 		&self,
 		reservation: &mut StreamReservation,
@@ -358,20 +352,19 @@ impl MuxHandle {
 		let mut sent: u64 = 0;
 		let first = chunks.next().unwrap_or(&[]);
 
-		sent += 1;
+		sent = sent.saturating_add(1);
 		let mut request = OpenRequest {
 			kind: MuxStreamKind::Unary,
 			last: sent == total,
 			payload: first,
 			records: total,
-			duplex: None,
 			target: None,
 			hops_remaining: DEFAULT_HOP_BUDGET,
 		};
 
 		let stream_id = self.link.send_open_envelope(reservation, &mut request).await?;
 		for chunk in chunks {
-			sent += 1;
+			sent = sent.saturating_add(1);
 
 			let data = MuxDataPackage::new(stream_id, sent == total, chunk)?;
 			let data_envelope = TransportEnvelope::from(data);
@@ -381,16 +374,18 @@ impl MuxHandle {
 		Ok(())
 	}
 
-	/// Whether a new locally-initiated stream would be admitted now: cap
-	/// headroom, live ID space, and no GoAway either way.
+	/// Returns whether a new locally-initiated stream would be admitted now,
+	/// which needs cap headroom, live ID space, a connection that has not
+	/// failed, and no GoAway in either direction.
 	///
-	/// Advisory: a concurrent emit can take the last slot after this
-	/// returns, so callers still handle `StreamsExhausted`.
+	/// The answer is advisory. A concurrent emit can take the last slot after
+	/// this returns, so callers still handle `StreamsExhausted`.
 	pub fn has_stream_headroom(&self) -> bool {
 		self.link.shared().has_stream_headroom()
 	}
 
-	/// Whether any locally-initiated stream is still awaiting its response.
+	/// Returns whether any locally-initiated stream is still awaiting its
+	/// response.
 	///
 	/// Callers with a clock use this to pin a connection as active while
 	/// streams are in flight (see pool `last_used` stamping).
@@ -398,48 +393,53 @@ impl MuxHandle {
 		self.link.shared().has_pending_streams()
 	}
 
-	/// Reason carried by the peer's GoAway, or `None` while the
+	/// Returns the reason carried by the peer's GoAway, or `None` while the
 	/// connection is live or was shut down locally.
 	///
-	/// Reconnect policies branch on this: `Shutdown` invites an
-	/// immediate reconnect, `EnhanceYourCalm` calls for backoff, and
-	/// `ProtocolError` points at a bug rather than a transient fault.
+	/// Reconnect policies branch on this: `Shutdown` invites an immediate
+	/// reconnect, `EnhanceYourCalm` calls for backoff, and `ProtocolError`
+	/// points at a bug rather than a transient fault.
 	pub fn goaway_reason(&self) -> Option<GoAwayReason> {
 		self.link.shared().goaway_reason()
 	}
 
-	/// Current epoch's dual-signed session receipt, rotated in
-	/// place by each completed in-band renewal. `None` on sessions
-	/// without receipt-bearing rekey materials.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	/// Returns the current epoch's dual-signed session receipt, which each
+	/// completed in-band renewal rotates in place. The answer is `None` on a
+	/// session without receipt-bearing rekey materials.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
 		self.link.shared().session_receipt()
 	}
 
-	/// Resolve once a locally-initiated stream would be admitted:
-	/// cap headroom, live ID space, and no GoAway either way.
+	/// Resolve once a locally-initiated stream would be admitted, on the
+	/// conditions [`MuxHandle::has_stream_headroom`] names.
 	///
-	/// Replaces polling [`MuxHandle::has_stream_headroom`] in a loop.
-	/// Advisory like the getter: a concurrent emit can take the slot
-	/// between wake and use, so callers still handle `StreamsExhausted`.
+	/// A caller awaits this in place of a polling loop over that getter. The
+	/// answer is advisory like the getter, because a concurrent emit can take
+	/// the slot between wake and use, so callers still handle
+	/// `StreamsExhausted`.
 	///
 	/// # Errors
-	/// - `Draining`: GoAway sent or received, or stream IDs exhausted.
+	///
+	/// - `Draining` -- a GoAway was sent or received, or the stream IDs are exhausted.
+	/// - `ConnectionClosed` -- the connection has failed.
 	pub fn wait_for_stream_slot(&self) -> impl Future<Output = TransportResult<()>> + MaybeSend {
 		self.link.shared().stream_slot()
 	}
 
-	/// Connection-level liveness probe
-	/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)):
-	/// resolves when the peer's ack arrives.
+	/// Probe connection-level liveness ([RFC 9113 § 6.7][rfc9113-6.7]). The
+	/// future resolves when the peer's ack arrives.
 	///
-	/// No stream is allocated and the peer's application handler never runs,
-	/// so this doubles as an idle keepalive for links whose carrier cannot
-	/// ping itself.
+	/// The probe stays off the stream table and the peer's application handler,
+	/// so it doubles as an idle keepalive for links whose carrier cannot ping
+	/// itself.
 	///
 	/// # Errors
-	/// - `Draining`: GoAway sent or received. The connection is ending
-	/// - `ConnectionClosed`: connection failed before the ack
+	///
+	/// - `Draining` -- a GoAway was sent or received, so the connection is ending.
+	/// - `ConnectionClosed` -- the connection failed, before this call or before the ack.
+	///
+	/// [rfc9113-6.7]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.7
 	pub async fn ping(&self) -> TransportResult<()> {
 		let (sender, receiver) = oneshot::channel();
 		let opaque = self.link.shared().allocate_ping(sender)?;
@@ -462,25 +462,29 @@ impl MuxHandle {
 		Ok(())
 	}
 
-	/// Gracefully shut the connection down
-	/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8)):
-	/// sends GoAway, halts the allocator, awaits pending-table drain, then
-	/// closes the writer driver.
+	/// Gracefully shut the connection down ([RFC 9113 § 6.8][rfc9113-6.8]). The
+	/// call sends GoAway, halts the allocator, awaits the pending-table drain,
+	/// then closes the writer driver.
 	///
-	/// A drain deadline composes by wrapping this future in the
-	/// caller's timer.
+	/// A drain deadline composes by wrapping this future in the caller's timer.
+	///
+	/// [rfc9113-6.8]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.8
 	pub async fn shutdown(&self) -> TransportResult<()> {
 		self.shutdown_with(GoAwayReason::Shutdown).await
 	}
 
-	/// As [`shutdown`](Self::shutdown), advertising `reason` in the
-	/// GoAway. Application-defined codes live at or above
-	/// [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
+	/// Shut down as [`shutdown`](Self::shutdown) does, and advertise `reason`
+	/// in the GoAway. Application-defined codes live at or above
+	/// [`MUX_APPLICATION_CODE_FLOOR`].
+	///
+	/// [`MUX_APPLICATION_CODE_FLOOR`]: crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR
 	pub async fn shutdown_with(&self, reason: GoAwayReason) -> TransportResult<()> {
 		self.link.announce_goaway(reason).await?;
 		self.link.shared().drain_pending().await;
 
 		let mut outbound = self.link.sender();
+		// A writer that already ended with the connection has closed the
+		// queue, which is the outcome Close asks for.
 		let _ = outbound.send(Outbound::Close).await;
 		Ok(())
 	}
@@ -568,8 +572,8 @@ mod tests {
 		Ok(())
 	}
 
-	// An explicit spent budget on the Open is served locally and
-	// never re-forwarded by a peer gateway.
+	// An explicit spent budget reaches the Open, so a peer gateway serves
+	// the stream locally and never re-forwards it.
 	#[test]
 	fn test_open_stream_with_relayed_route_stamps_budget() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
@@ -601,6 +605,105 @@ mod tests {
 		Ok(())
 	}
 
+	// A failed connection refuses the first push, and the body has ended with
+	// it.
+	#[test]
+	fn test_duplex_body_ends_when_the_open_meets_a_failed_connection() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (mut sink, mut body) = handle.open_duplex()?;
+		handle.link.shared().fail_all_pending();
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		Ok(())
+	}
+
+	// The body reports what it drained under its stream ID, and it learns that
+	// ID from the slot it shares with the reservation.
+	#[test]
+	fn test_duplex_body_reports_drains_under_the_opened_id() -> TransportResult<()> {
+		let (outbound, _sent) = mpsc::channel(8);
+		let (link, mut notes) = MuxLink::new(client_shared(), outbound);
+		let handle = MuxHandle { link };
+		let (mut sink, mut body) = handle.open_duplex()?;
+		assert!(matches!(poll_now(sink.push([1u8])), Poll::Ready(Ok(()))));
+
+		let mut forwarder = handle.link.shared().take_duplex(1).expect("the open registered the forwarder");
+		assert!(forwarder.accept_and_forward([7u8]));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(Some(_)))));
+
+		let note = notes.try_recv();
+		assert!(matches!(note, Ok(note) if note.stream_id == 1 && note.consumed == 1));
+		Ok(())
+	}
+
+	// A stream that is reserved and not yet opened has to end with its
+	// connection, even while its sink is alive and has pushed nothing.
+	#[test]
+	fn test_unopened_stream_response_ends_on_connection_failure() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, response) = handle.open_stream()?;
+		handle.link.shared().fail_all_pending();
+
+		let ended = poll_now(response);
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		Ok(())
+	}
+
+	#[test]
+	fn test_unopened_duplex_body_ends_on_connection_failure() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, mut body) = handle.open_duplex()?;
+		handle.link.shared().fail_all_pending();
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		Ok(())
+	}
+
+	// A sink dropped before its first push cancels a stream that never opened,
+	// and its body reads that as a cancel on a connection that still runs.
+	#[test]
+	fn test_unopened_duplex_body_ends_cancelled_when_its_sink_drops() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (sink, mut body) = handle.open_duplex()?;
+		drop(sink);
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(
+			ended,
+			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
+		));
+		Ok(())
+	}
+
+	// A GoAway in either direction ends admission, so a stream that has not
+	// opened never will.
+	#[test]
+	fn test_unopened_stream_response_ends_on_local_shutdown() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, response) = handle.open_stream()?;
+		handle.link.shared().begin_shutdown();
+
+		let ended = poll_now(response);
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
+		Ok(())
+	}
+
+	#[test]
+	fn test_unopened_duplex_body_ends_on_peer_goaway() -> TransportResult<()> {
+		let (handle, _sent) = duplex_handle();
+		let (_sink, mut body) = handle.open_duplex()?;
+		handle.link.shared().fail_pending_above(0, GoAwayReason::Shutdown)?;
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
+		Ok(())
+	}
+
 	// A resolved reply disarms the guard: dropping the body after
 	// its terminal event sends no cancel.
 	#[test]
@@ -615,6 +718,8 @@ mod tests {
 			.take_duplex(1)
 			.expect("open_duplex registered the forwarder");
 
+		// The reply ledger entry is dropped so the terminal event alone, and
+		// no pending reply, decides what the drop guard sees.
 		let _ = handle.link.shared().remove_pending(1);
 		assert!(forwarder.forward(BodyEvent::End));
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));

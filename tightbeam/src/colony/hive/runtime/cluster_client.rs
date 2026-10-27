@@ -1,28 +1,28 @@
 //! The hive's client for the cluster control plane.
 //!
 //! [`ClusterLink`] carries registration, the anti-entropy re-announce, and
-//! the scaling fan-out. All three share one signed control frame shape and
-//! the same transport identity rules.
+//! the scaling fan-out. All three share one control frame shape, signed when
+//! hive TLS is configured, the same transport identity rules, and the hive's
+//! trace.
 
 use core::time::Duration;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::builder::TypeBuilder;
-use crate::colony::common::{ClusterRequest, ServletChange, TaskGroup};
-use crate::colony::hive::{
-	HashMapRegistry, HiveConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse,
-	ServletRegistry,
+use crate::colony::hive::{HiveConfig, ServletRegistry};
+use crate::colony::protocol::{
+	ClusterRequest, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse, ServletChange,
 };
-use crate::crypto::hash::Sha3_256;
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
-use crate::runtime::rt;
-use crate::trace::TraceCollector;
-use crate::transport::state::{DialableEncryption, EncryptionConfig};
+use crate::runtime::{rt, TaskGroup};
+use crate::trace::{TraceCollector, TraceHandle};
+use crate::transport::accept::ConnectionTerms;
+use crate::transport::multiplex::MuxCapable;
+use crate::transport::state::{DialableEncryption, EncryptedProtocolState};
 use crate::transport::{EndpointConfig, MessageEmitter, Protocol, TransportResult};
-use crate::utils::urn::Urn;
+use crate::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
 
 /// This hive's link to the gateways it registered with.
@@ -30,23 +30,36 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// # Shared state
 ///
 /// Registration, the anti-entropy re-announce, and the scaling fan-out read
-/// the same slate, gateway list, control address, and configuration. One
-/// owner holds those four, so a caller names the operation and the link
-/// supplies the state.
+/// one slate, gateway list, control address, and configuration. The link
+/// holds all four, so a caller names the operation and the link supplies the
+/// state.
 ///
 /// # Poison recovery
 ///
-/// The gateway list changes by one push at a time, so a thread that
-/// panicked while holding its lock left a whole list behind it. The link
-/// therefore recovers a poisoned lock and keeps announcing.
-pub struct ClusterLink<P: Protocol> {
-	servlets: Arc<HashMapRegistry>,
+/// The gateway list changes by one push at a time, so a thread that panicked
+/// under the lock left a whole list. The link recovers a poisoned lock, and
+/// the announcements go on.
+///
+/// # Warning
+///
+/// Each transport the link dials records into the hive's trace, so the trace
+/// holds the session of each dial, a session that the gateway fails
+/// included. The default `BoundedMemorySink` drops each event past
+/// `max_events`, the hive's own included, so a long-lived hive needs an
+/// `EventSink` that forwards each event, or a reader that drains the trace.
+pub struct ClusterLink<P: Protocol, R: ServletRegistry> {
+	servlets: Arc<R>,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_addr: P::Address,
 	config: Arc<HiveConfig>,
+	/// The hive's trace, which the re-announce beat records into.
+	trace: Arc<TraceCollector>,
+	/// The terms the link sets on each transport it dials: the hive's trace,
+	/// and no mux offer, because each control exchange is one request.
+	terms: ConnectionTerms,
 }
 
-impl<P: Protocol> Clone for ClusterLink<P>
+impl<P: Protocol, R: ServletRegistry> Clone for ClusterLink<P, R>
 where
 	P::Address: Clone,
 {
@@ -56,51 +69,58 @@ where
 			cluster_addrs: Arc::clone(&self.cluster_addrs),
 			hive_addr: self.hive_addr.clone(),
 			config: Arc::clone(&self.config),
+			trace: Arc::clone(&self.trace),
+			terms: self.terms.clone(),
 		}
 	}
 }
 
-impl<P> ClusterLink<P>
+impl<P, R> ClusterLink<P, R>
 where
-	P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + Send + 'static,
+	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + 'static,
+	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Binds the hive's slate and control address to its gateway list.
+	/// Binds the hive's slate, control address, configuration, and trace to
+	/// its gateway list.
 	pub fn new(
-		servlets: Arc<HashMapRegistry>,
+		servlets: Arc<R>,
 		cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 		hive_addr: P::Address,
 		config: Arc<HiveConfig>,
+		trace: Arc<TraceCollector>,
 	) -> Self {
-		Self { servlets, cluster_addrs, hive_addr, config }
+		let handle = TraceHandle::new(Arc::clone(&trace));
+		let terms = ConnectionTerms::new(handle, None);
+
+		Self { servlets, cluster_addrs, hive_addr, config, trace, terms }
 	}
 
-	/// The gateway list for reading, recovered from a poisoned lock because
-	/// every write under the guard leaves a whole list.
+	/// Takes the read lock of the gateway list, and recovers a poisoned lock.
 	fn addrs(&self) -> RwLockReadGuard<'_, Vec<P::Address>> {
 		self.cluster_addrs.read().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// The gateway list for writing, recovered the same way.
+	/// Takes the write lock of the gateway list, and recovers a poisoned lock.
 	fn addrs_mut(&self) -> RwLockWriteGuard<'_, Vec<P::Address>> {
 		self.cluster_addrs.write().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// The gateways this hive has registered with.
+	/// Returns a copy of the list of gateways that accepted this hive.
 	pub fn gateways(&self) -> Vec<P::Address> {
 		self.addrs().clone()
 	}
 
-	/// Whether any gateway has accepted this hive.
+	/// Returns whether any gateway accepted this hive.
 	pub fn has_gateways(&self) -> bool {
 		!self.addrs().is_empty()
 	}
 
-	/// Records `gateway` as one this hive is registered with.
+	/// Records `gateway` as a gateway that accepted this hive.
 	///
 	/// Registration is idempotent, so the list holds one row per gateway and
 	/// each beat of [`ClusterLink::spawn_reregister`] dials each gateway once.
@@ -116,7 +136,14 @@ where
 		}
 	}
 
-	/// Sends one signed registration of the current slate to `gateway`.
+	/// Sends one registration of the current slate to `gateway`, signed when
+	/// hive TLS is configured.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingResponse`] -- the gateway answers with no frame.
+	/// - [`TightBeamError`] -- the dial, the frame's build or signature, the
+	///   exchange, or the decode of the answer fails.
 	pub async fn register(&self, gateway: P::Address) -> Result<RegisterHiveResponse, TightBeamError> {
 		let servlet_addresses = self.servlets.slate();
 		let request = ClusterRequest::RegisterHive(RegisterHiveRequest {
@@ -143,10 +170,11 @@ where
 
 	/// Runs the anti-entropy beat that re-announces the slate on an interval.
 	///
-	/// The beat ends once the hive drains: a hive that is going away stops
-	/// advertising itself, and the drain announces its emptied slate once.
-	pub fn spawn_reregister(&self, trace: Arc<TraceCollector>) -> rt::JoinHandle {
+	/// The beat ends once the hive drains, so the hive stops its
+	/// advertisements, and the drain announces its emptied slate once.
+	pub fn spawn_reregister(&self) -> rt::JoinHandle {
 		let link = self.clone();
+		let trace = Arc::clone(&self.trace);
 		rt::spawn(async move {
 			let Some(interval) = link.config.control.reregister_interval else {
 				return;
@@ -160,7 +188,14 @@ where
 					for gateway in link.gateways() {
 						let outcome = link.register(gateway).await;
 						let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
-						trace.event_with(HIVE_REREGISTERED, &[], status)?;
+						let label = status.as_str();
+						let evidence = || -> Option<Vec<u8>> { Some(gateway.into()) };
+						trace.emit_event_with_value_and_rendered_evidence(
+							HIVE_REREGISTERED,
+							label,
+							status,
+							evidence,
+						)?;
 					}
 				}
 			}
@@ -174,12 +209,12 @@ where
 
 	/// Fans out one scaling add/remove update to every registered gateway.
 	///
-	/// A hive whose URN could not be created withholds the update, because
+	/// A hive whose URN failed to derive withholds the update, because
 	/// the change needs an identity to attribute it to.
 	///
-	/// The fan-out runs under `tasks`, so stopping the hive stops an update
-	/// still retrying against an unreachable gateway. Exhausted retries fall
-	/// back to a full-slate announcement.
+	/// The fan-out runs under `tasks`, so a hive stop also stops an update that
+	/// retries against an unreachable gateway. When the retries run out, the
+	/// link announces the full slate.
 	pub(crate) fn notify_scaling(
 		&self,
 		tasks: &TaskGroup,
@@ -209,39 +244,44 @@ where
 		});
 	}
 
-	/// Everything a cluster dial is built from.
+	/// The endpoint configuration of a cluster dial.
 	///
-	/// A hive dials the cluster, so it answers the dialer's question here
-	/// rather than at the first frame it tries to write. A hive identity with
-	/// no trust store would present that identity to whoever answered the
-	/// cluster address (CWE-295). A TLS-registered hive therefore never falls
-	/// back to cleartext for a scaling update (CWE-319).
-	fn endpoint(&self) -> TransportResult<EndpointConfig<DefaultCryptoProvider>> {
-		let mut encryption = EncryptionConfig::unconfigured();
-		if let Some(store) = &self.config.trust_store {
-			encryption.trust_store = Some(Arc::clone(store));
-		}
-		if let Some(hive_tls) = &self.config.hive_tls {
-			hive_tls.identity().install(&mut encryption);
-		}
-
-		let encryption = DialableEncryption::new(encryption)?;
+	/// A hive dials the cluster, so [`DialableEncryption::new`] checks the
+	/// dialer rule here, before the dial writes a frame. A hive identity with
+	/// no trust store would present itself to whoever answers the cluster
+	/// address (CWE-295). A TLS-registered hive never falls back to cleartext
+	/// for a scaling update (CWE-319).
+	fn endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
+		let encryption = DialableEncryption::new(self.config.gateway_dial())?;
 		Ok(EndpointConfig::new(encryption, Arc::clone(&self.config.clock)))
 	}
 
-	/// One transport to `gateway` under this hive's identity.
+	/// Opens one transport to `gateway` under this hive's identity.
 	async fn dial(&self, gateway: P::Address) -> Result<P::Transport, TightBeamError> {
 		let endpoint = self.endpoint()?;
-		let stream = P::connect(gateway).await?;
-		Ok(P::create_transport(stream, endpoint))
+		let transport = self.connect(gateway, endpoint).await?;
+		Ok(transport)
 	}
 
-	/// A hive-to-cluster control frame, signed when hive TLS is configured.
+	/// Connects to `gateway` under `endpoint`, and sets the link's terms on
+	/// the transport before its handshake. Every dial of the link connects
+	/// here.
+	async fn connect(
+		&self,
+		gateway: P::Address,
+		endpoint: EndpointConfig<P::CryptoProvider>,
+	) -> Result<P::Transport, P::Error> {
+		let stream = P::connect(gateway).await?;
+		let transport = P::create_transport(stream, endpoint);
+		Ok(self.terms.apply(transport))
+	}
+
+	/// Builds a hive-to-cluster control frame, signed when hive TLS is
+	/// configured.
 	async fn control_frame(&self, id: impl AsRef<[u8]>, message: impl Message) -> Result<Frame, TightBeamError> {
 		let id = id.as_ref();
 		// `metadata.order` is the control freshness binding (CWE-294).
 		let order = self.config.clock.unix();
-
 		match self.config.hive_tls.as_ref() {
 			Some(hive_tls) => {
 				// Signatures are a V1 field (§5.6), so a signed frame is V1.
@@ -251,9 +291,7 @@ where
 					.with_order(order.get())
 					.with_message(message)
 					.build()?;
-				signed
-					.sign_with_provider::<Sha3_256, _>(hive_tls.identity().signing_provider())
-					.await?;
+				signed.sign_with_provider(hive_tls.identity()).await?;
 				Ok(signed)
 			}
 			None => {
@@ -268,11 +306,12 @@ where
 		}
 	}
 
-	/// Sends `frame` to every gateway, returning whether any refused it.
+	/// Sends `frame` to every gateway and returns whether any gateway failed
+	/// to accept it.
 	async fn fanout_scaling_update(&self, gateways: impl AsRef<[P::Address]>, frame: &Frame) -> bool {
-		let gateways = gateways.as_ref();
 		let mut any_failed = false;
 
+		let gateways = gateways.as_ref();
 		for gateway in gateways.iter().copied() {
 			let accepted = self.emit_scaling_update_with_retry(gateway, frame).await;
 			if !accepted {
@@ -283,25 +322,24 @@ where
 		any_failed
 	}
 
-	/// Sends `frame` to `gateway` under the notify retry policy, returning
+	/// Sends `frame` to `gateway` under the notify retry policy and returns
 	/// whether the gateway accepted it.
 	async fn emit_scaling_update_with_retry(&self, gateway: P::Address, frame: &Frame) -> bool {
-		// The provisioning does not change between attempts, and a refused
-		// dial is a configuration this loop cannot retry its way out of.
+		// The provisioning holds across attempts, so a refused endpoint is a
+		// configuration fault that no retry of this loop repairs.
 		let Ok(endpoint) = self.endpoint() else {
 			return false;
 		};
 
 		let max_attempts = self.config.control.notify_retry.max_attempts();
 		for attempt in 0..=max_attempts {
-			let Ok(stream) = P::connect(gateway).await else {
+			let Ok(mut transport) = self.connect(gateway, endpoint.clone()).await else {
 				self.retry_delay(attempt).await;
 				continue;
 			};
 
 			// A transport-level answer is not acceptance, so the body MUST
 			// carry `TransitStatus::Ok`.
-			let mut transport = P::create_transport(stream, endpoint.clone());
 			match transport.emit(frame.clone(), None).await {
 				Ok(Some(response)) => {
 					let decoded = decode::<ServletAddressUpdateResponse>(response.message());
@@ -321,7 +359,8 @@ where
 	}
 
 	/// Waits out the notify retry policy's delay before `attempt`'s retry,
-	/// on the hive clock. The last attempt has no retry to wait for.
+	/// on the hive clock. After the last attempt it returns at once, because
+	/// no retry follows.
 	async fn retry_delay(&self, attempt: usize) {
 		let policy = &self.config.control.notify_retry;
 		if attempt < policy.max_attempts() {

@@ -31,7 +31,7 @@ use tightbeam::flags::{Flags, FlagsError};
 use tightbeam::matrix::{Matrix, MatrixError};
 use tightbeam::oids::{AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256};
 use tightbeam::testing::{TestMessage, TestSigner};
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 
 /// Every wire version, so a field a later version added is exercised under
 /// the version that does not carry it as well as the ones that do.
@@ -156,7 +156,7 @@ proptest! {
 
 	/// What a URN displays, the parser reads back as the same URN.
 	#[test]
-	fn a_urn_survives_display_and_parse(nid in "[a-zA-Z][a-zA-Z0-9-]{1,31}", nss in ".{1,64}") {
+	fn a_urn_survives_display_and_parse(nid in "[a-zA-Z][a-zA-Z0-9-]{0,30}[a-zA-Z0-9]", nss in ".{1,64}") {
 		let urn = Urn::from_parts(nid, nss)?;
 		prop_assert_eq!(urn.to_string().parse::<Urn<'static>>()?, urn);
 	}

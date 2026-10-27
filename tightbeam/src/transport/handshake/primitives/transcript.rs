@@ -1,69 +1,230 @@
-//! Transcript hashing for handshake protocols.
+//! The transcript hash of a handshake protocol.
 //!
-//! The module computes cryptographic hashes over handshake message
-//! sequences, which protects transcript integrity.
+//! The module hashes the message sequence of a handshake, which protects the
+//! integrity of its transcript.
 
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+use core::fmt;
+use core::hash::{Hash, Hasher};
+
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "transport-ecies")]
-use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
-#[cfg(feature = "transport-cms")]
-use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
+use digest::Output;
 
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::CryptoProvider;
+use crate::der::asn1::ObjectIdentifier;
+use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
 
-/// Width of a transcript hash in bytes.
-pub const TRANSCRIPT_HASH_LEN: usize = 32;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::asn1::DigestInfo;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::der::asn1::{Any, OctetString, SetOfVec};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::der::{Encode, Writer};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::spki::AlgorithmIdentifierOwned;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::x509::attr::Attribute;
 
-/// Convert a digest output into the fixed transcript-hash array.
+/// The width of the narrowest digest output the handshake runs, in bytes, as
+/// a 256-bit digest such as SHA3-256 gives.
+const MIN_DIGEST_OUTPUT_LEN: usize = 32;
+
+/// The width of the widest digest output the handshake runs, in bytes, as a
+/// 512-bit digest such as SHA3-512 gives.
+const MAX_DIGEST_OUTPUT_LEN: usize = 64;
+
+/// A byte string as wide as the output of a digest the handshake runs, from 32
+/// to 64 bytes.
 ///
-/// Digests wider than [`TRANSCRIPT_HASH_LEN`] are *deliberately* truncated to
-/// their leading 32 bytes, following the NIST SHA-512/256 construction: the
-/// wire format carries exactly 32 bytes and the leading bytes of a wider
-/// digest retain full 256-bit collision resistance (CWE-1240).
-fn digest_output_to_array(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
-	let bytes = bytes.as_ref();
-	if bytes.len() < TRANSCRIPT_HASH_LEN {
-		return Err(HandshakeError::TranscriptDigestLength { expected: TRANSCRIPT_HASH_LEN, received: bytes.len() });
+/// [`Self::parse`] is the one width rule. A transcript hash, a
+/// key-confirmation tag, and the content digest of a gossip rumor each hold
+/// one.
+#[derive(Clone, Copy)]
+pub(crate) struct DigestOutput {
+	bytes: [u8; MAX_DIGEST_OUTPUT_LEN],
+	len: usize,
+}
+
+impl DigestOutput {
+	/// The digest output `output`, whole.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::TranscriptDigestLength`] -- `output` is not 32 to 64 bytes wide.
+	pub(crate) fn parse(output: impl AsRef<[u8]>) -> Result<Self, HandshakeError> {
+		let output = output.as_ref();
+		let received = output.len();
+		if !(MIN_DIGEST_OUTPUT_LEN..=MAX_DIGEST_OUTPUT_LEN).contains(&received) {
+			let (min, max) = (MIN_DIGEST_OUTPUT_LEN, MAX_DIGEST_OUTPUT_LEN);
+			return Err(HandshakeError::TranscriptDigestLength { min, max, received });
+		}
+
+		let mut bytes = [0u8; MAX_DIGEST_OUTPUT_LEN];
+		for (slot, octet) in bytes.iter_mut().zip(output) {
+			*slot = *octet;
+		}
+		Ok(Self { bytes, len: received })
 	}
 
-	let mut out = [0u8; TRANSCRIPT_HASH_LEN];
-	out.copy_from_slice(&bytes[..TRANSCRIPT_HASH_LEN]);
-	Ok(out)
+	/// The output of digest `D` over the DER of `value`, which encodes
+	/// straight into the digest.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- `value` fails to encode.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the output of `D` is not 32 to 64 bytes wide.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn of_der<D: Digest>(value: &impl Encode) -> Result<Self, HandshakeError> {
+		let mut writer = DigestWriter(D::new());
+		value.encode(&mut writer)?;
+		Self::parse(writer.0.finalize())
+	}
+
+	/// The output bytes.
+	#[expect(
+		clippy::indexing_slicing,
+		reason = "`parse` holds `len` to 32..=64, within the 64 octets of `bytes`"
+	)]
+	pub(crate) fn as_bytes(&self) -> &[u8] {
+		&self.bytes[..self.len]
+	}
+}
+
+/// A DER writer that feeds digest `D`, so a value hashes as its encoding
+/// with no buffer between the two.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+struct DigestWriter<D>(D);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl<D: Digest> Writer for DigestWriter<D> {
+	fn write(&mut self, slice: &[u8]) -> crate::der::Result<()> {
+		self.0.update(slice);
+		Ok(())
+	}
+}
+
+/// Two outputs are equal when their bytes are, whatever the buffer holds past
+/// them.
+impl PartialEq for DigestOutput {
+	fn eq(&self, other: &Self) -> bool {
+		self.as_bytes() == other.as_bytes()
+	}
+}
+
+impl Eq for DigestOutput {}
+
+/// An output hashes as its bytes, so two outputs that compare equal hash
+/// alike.
+impl Hash for DigestOutput {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.as_bytes().hash(state);
+	}
+}
+
+/// Debug output prints the output bytes alone.
+impl fmt::Debug for DigestOutput {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_tuple("DigestOutput").field(&self.as_bytes()).finish()
+	}
+}
+
+/// The hash of a handshake transcript: the whole output of the digest that
+/// computed it, beside the identifier of that digest.
+///
+/// A transcript sealed under SHA3-256 holds 32 bytes, and one sealed under
+/// SHA3-512 holds 64. Its constructor refuses the output of a digest narrower
+/// than 32 bytes or wider than 64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptHash {
+	algorithm: ObjectIdentifier,
+	output: DigestOutput,
+}
+
+impl TranscriptHash {
+	/// The transcript hash that is the output `output` of digest `D`, whole.
+	///
+	/// `D` types the output, so its bytes and the identifier the hash names
+	/// come from one digest.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::TranscriptDigestLength`] -- `output` is not 32 to 64 bytes wide.
+	pub(crate) fn from_output<D: Digest + AssociatedOid>(output: Output<D>) -> Result<Self, HandshakeError> {
+		let output = DigestOutput::parse(output)?;
+		Ok(Self { algorithm: D::OID, output })
+	}
+
+	/// The hash bytes, as wide as the digest output.
+	#[must_use]
+	pub fn as_bytes(&self) -> &[u8] {
+		self.output.as_bytes()
+	}
+
+	/// The hash as the `DigestInfo` a session receipt carries: the identifier
+	/// of its digest with absent parameters, and the whole output.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- the output fails to encode as an OCTET STRING.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn digest_info(&self) -> Result<DigestInfo, HandshakeError> {
+		let algorithm = AlgorithmIdentifierOwned { oid: self.algorithm, parameters: None };
+		let digest = OctetString::new(self.as_bytes())?;
+		Ok(DigestInfo { algorithm, digest })
+	}
+
+	/// The hash as the attribute of [`HANDSHAKE_TRANSCRIPT_HASH`], whose one
+	/// value is the hash as an OCTET STRING. A seal of the handshake secret
+	/// authenticates it, and the HPKE reply signs it.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- the attribute fails to encode.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn attribute(&self) -> Result<Attribute, HandshakeError> {
+		let hash = OctetString::new(self.as_bytes())?;
+		let values = SetOfVec::try_from(vec![Any::encode_from(&hash)?])?;
+		Ok(Attribute { oid: HANDSHAKE_TRANSCRIPT_HASH, values })
+	}
+}
+
+impl AsRef<[u8]> for TranscriptHash {
+	fn as_ref(&self) -> &[u8] {
+		self.as_bytes()
+	}
 }
 
 /// Compute a transcript hash over a sequence of messages.
 ///
 /// The function hashes `messages` in chronological order with the digest
-/// algorithm of the provider and returns the 32-byte transcript hash.
+/// algorithm of the provider and returns the whole digest output.
 ///
 /// # Errors
 ///
-/// - [`HandshakeError::TranscriptDigestLength`] -- the provider digest produces fewer than 32 bytes.
-pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+/// - [`HandshakeError::TranscriptDigestLength`] -- the provider digest is not 32 to 64 bytes wide.
+pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<TranscriptHash, HandshakeError> {
 	let mut hasher = P::Digest::default();
 	for message in messages {
 		hasher.update(message);
 	}
 
-	digest_output_to_array(hasher.finalize())
+	TranscriptHash::from_output::<P::Digest>(hasher.finalize())
 }
 
-/// The bytes a handshake binds, until their hash is sealed.
+/// The bytes a handshake binds, until [`Transcript::seal`] fixes their hash.
 ///
-/// Only an open transcript accepts bytes, so nothing reaches the transcript
-/// after its hash is fixed. The state stays private, so a hash exists only
+/// Only an open transcript accepts bytes, so the hash covers every byte the
+/// transcript ever held. The state stays private, so a hash exists only
 /// where [`Transcript::seal`] computed it.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct Transcript(State);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 enum State {
 	/// The messages exchanged so far, in the order both endpoints hash them.
 	Open(Vec<u8>),
@@ -71,75 +232,21 @@ enum State {
 	Sealed,
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl Transcript {
-	/// Compute the 32-byte transcript digest under digest algorithm `D`.
+	/// Compute the transcript digest of `bytes` under digest algorithm `D`.
 	///
-	/// A wider digest, such as SHA3-512, truncates to its leading 32 bytes.
-	pub(crate) fn digest<D: Digest>(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+	/// The hash is the whole digest output, so SHA3-512 gives 64 bytes.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the output of `D` is not 32 to 64 bytes wide.
+	pub(crate) fn digest<D: Digest + AssociatedOid>(bytes: impl AsRef<[u8]>) -> Result<TranscriptHash, HandshakeError> {
 		let bytes = bytes.as_ref();
-		digest_output_to_array(D::digest(bytes))
-	}
-
-	/// Open the ECIES handshake transcript over its ordered legs.
-	///
-	/// Both roles derive this identically. A divergence here is a protocol
-	/// break, so the concatenation order lives in one place. The hash binds
-	/// every leg (CWE-347), and the fixed-width ephemeral leg keeps the
-	/// variable-length legs beside it in their positions.
-	#[cfg(feature = "transport-ecies")]
-	pub(crate) fn ecies_handshake(legs: EciesHandshakeLegs<'_>) -> Self {
-		let EciesHandshakeLegs {
-			client_hello,
-			server_random,
-			server_ephemeral,
-			spki,
-			security_accept_der,
-			transport_accept_der,
-		} = legs;
-		let fixed = server_random.len() + server_ephemeral.len();
-		let len = client_hello.len() + fixed + spki.len() + security_accept_der.len() + transport_accept_der.len();
-
-		let mut buffer = Vec::with_capacity(len);
-		buffer.extend_from_slice(client_hello);
-		buffer.extend_from_slice(server_random);
-		buffer.extend_from_slice(server_ephemeral);
-		buffer.extend_from_slice(spki);
-		buffer.extend_from_slice(security_accept_der);
-		buffer.extend_from_slice(transport_accept_der);
-		Self(State::Open(buffer))
-	}
-
-	/// Open the ECIES client mutual-auth transcript.
-	///
-	/// The digest binds the transcript hash, the ECIES-encrypted key exchange
-	/// payload, and the client certificate into a single value that the client
-	/// signs. A valid client signature therefore cannot be spliced onto a
-	/// different key exchange or a different identity (CWE-347).
-	///
-	/// # Parameters
-	///
-	/// - `transcript_hash`: the 32-byte handshake transcript hash.
-	/// - `encrypted_data`: the ECIES-encrypted key exchange bytes.
-	/// - `client_cert_der`: the DER encoding of the client certificate.
-	#[cfg(feature = "transport-ecies")]
-	pub(crate) fn ecies_client_auth(
-		transcript_hash: &[u8; 32],
-		encrypted_data: impl AsRef<[u8]>,
-		client_cert_der: impl AsRef<[u8]>,
-	) -> Self {
-		let encrypted_data = encrypted_data.as_ref();
-		let client_cert_der = client_cert_der.as_ref();
-
-		let mut buffer = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
-		buffer.extend_from_slice(transcript_hash);
-		buffer.extend_from_slice(encrypted_data);
-		buffer.extend_from_slice(client_cert_der);
-		Self(State::Open(buffer))
+		TranscriptHash::from_output::<D>(D::digest(bytes))
 	}
 
 	/// Create an open transcript that holds no bytes.
-	#[cfg(feature = "transport-cms")]
 	pub(crate) const fn new() -> Self {
 		Self(State::Open(Vec::new()))
 	}
@@ -149,7 +256,6 @@ impl Transcript {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
-	#[cfg(feature = "transport-cms")]
 	pub(crate) fn append(&mut self, bytes: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
 		match &mut self.0 {
 			State::Open(buffer) => {
@@ -162,16 +268,16 @@ impl Transcript {
 
 	/// Append the server Finished legs in the order both endpoints bind them.
 	///
-	/// The server appends the bytes it is about to send and the client the
-	/// bytes it received, so the order lives here once and a drift on either
-	/// side fails the Finished signature.
+	/// The server appends the bytes it is about to send, and the client appends
+	/// the bytes it received, so the order lives here once and a drift on
+	/// either side fails the Finished signature.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
 	#[cfg(feature = "transport-cms")]
-	pub(crate) fn append_server_finished(&mut self, legs: ServerFinishedLegs) -> Result<(), HandshakeError> {
-		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral } = legs;
+	pub(crate) fn append_server_finished(&mut self, legs: ServerFinishedLegs<'_>) -> Result<(), HandshakeError> {
+		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral, certificates } = legs;
 		if let Some(accept) = security_accept {
 			self.append(accept)?;
 		}
@@ -179,7 +285,9 @@ impl Transcript {
 			self.append(accept)?;
 		}
 
-		self.append(server_ephemeral)
+		self.append(server_ephemeral)?;
+
+		self.append(certificates)
 	}
 
 	/// Fix the hash over the bytes appended so far under digest `D`, and
@@ -188,8 +296,8 @@ impl Transcript {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- the transcript is already sealed.
-	/// - [`HandshakeError::TranscriptDigestLength`] -- `D` produces fewer than 32 bytes.
-	pub(crate) fn seal<D: Digest>(&mut self) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+	/// - [`HandshakeError::TranscriptDigestLength`] -- the output of `D` is not 32 to 64 bytes wide.
+	pub(crate) fn seal<D: Digest + AssociatedOid>(&mut self) -> Result<TranscriptHash, HandshakeError> {
 		let State::Open(buffer) = &self.0 else {
 			return Err(HandshakeError::InvalidState);
 		};
@@ -200,79 +308,29 @@ impl Transcript {
 	}
 }
 
-/// The ECIES handshake legs the transcript binds, in the order both roles
-/// hash them. [`Transcript::ecies_handshake`] fixes that order.
-#[cfg(feature = "transport-ecies")]
-pub(crate) struct EciesHandshakeLegs<'a> {
-	/// The DER of the ClientHello as it was sent and received.
-	pub(crate) client_hello: &'a [u8],
-	/// The 32-byte server random.
-	pub(crate) server_random: &'a [u8; 32],
-	/// The compressed SEC1 server ephemeral public key.
-	pub(crate) server_ephemeral: &'a [u8; EC_PUBKEY_COMPRESSED_SIZE],
-	/// The raw `subjectPublicKey` bits of the server certificate.
-	pub(crate) spki: &'a [u8],
-	/// The DER of the security accept, empty when the server sent none.
-	pub(crate) security_accept_der: &'a [u8],
-	/// The DER of the transport accept, empty when the server sent none.
-	pub(crate) transport_accept_der: &'a [u8],
-}
-
-/// The server Finished attributes the CMS transcript binds, as encoded bytes.
+/// The server Finished legs the CMS transcript binds: its attributes as
+/// encoded bytes, then the DER of the `certificates` field it carries.
 ///
 /// The accepts are present when negotiation produced them, and the server
-/// ephemeral public key is mandatory, so every sealed transcript binds one.
-/// [`Transcript::append_server_finished`] fixes the order.
+/// ephemeral public key and the field are mandatory, so every sealed
+/// transcript binds both. [`Transcript::append_server_finished`] fixes the
+/// order.
 #[cfg(feature = "transport-cms")]
-pub(crate) struct ServerFinishedLegs {
-	/// The `SecurityAccept` attribute value, when a profile was negotiated.
+pub(crate) struct ServerFinishedLegs<'a> {
+	/// The `SecurityAccept` attribute value, when the endpoints negotiated a
+	/// profile.
 	pub(crate) security_accept: Option<Vec<u8>>,
-	/// The `TransportAccept` attribute value, when transport terms were
-	/// negotiated.
+	/// The `TransportAccept` attribute value, when the endpoints negotiated
+	/// transport terms.
 	pub(crate) transport_accept: Option<Vec<u8>>,
-	/// The `OriginatorPublicKey` attribute value carrying the server
+	/// The `OriginatorPublicKey` attribute value that carries the server
 	/// ephemeral.
 	pub(crate) server_ephemeral: Vec<u8>,
-}
-
-/// The endpoint that signed a CMS Finished.
-///
-/// Both Finished messages sign the same transcript hash, so the signed content
-/// names its role ahead of the hash. A Finished one endpoint signed then cannot
-/// verify as the other endpoint's, and a peer cannot reflect a Finished back.
-#[cfg(feature = "transport-cms")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FinishedRole {
-	/// The server Finished, signed with the server certificate's key.
-	Server,
-	/// The client Finished, signed with the client's key.
-	Client,
-}
-
-#[cfg(feature = "transport-cms")]
-impl FinishedRole {
-	/// Return the domain label this role signs ahead of the transcript hash.
-	const fn domain(self) -> &'static [u8] {
-		match self {
-			Self::Server => TIGHTBEAM_SERVER_FINISHED_DOMAIN,
-			Self::Client => TIGHTBEAM_CLIENT_FINISHED_DOMAIN,
-		}
-	}
-
-	/// Build the content a Finished of this role signs, which is the role's
-	/// domain label followed by the transcript hash.
-	pub(crate) fn content(self, transcript_hash: &[u8; TRANSCRIPT_HASH_LEN]) -> Vec<u8> {
-		[self.domain(), transcript_hash.as_slice()].concat()
-	}
-
-	/// Read the transcript hash that a Finished of this role signed.
-	///
-	/// Content that names another role, or carries a hash of another length,
-	/// yields `None`.
-	pub(crate) fn transcript_hash(self, content: &[u8]) -> Option<[u8; TRANSCRIPT_HASH_LEN]> {
-		let hash = content.strip_prefix(self.domain())?;
-		hash.try_into().ok()
-	}
+	/// The DER of the `certificates` field the Finished carries, which holds
+	/// the signing certificate its `sid` names and the issuers above it: the
+	/// server's as its identity encoded it once, the client's as the bytes
+	/// arrived (RFC 9846 §4.5.2).
+	pub(crate) certificates: &'a [u8],
 }
 
 #[cfg(test)]
@@ -280,10 +338,16 @@ mod tests {
 	use super::*;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	use crate::crypto::hash::Sha3_256;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::crypto::hash::{Sha3_256, Sha3_512};
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::oids::HASH_SHA3_512;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::testing::Aes256Sha3_512Provider;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::transport::handshake::tests::fixture_transcript;
 
-	#[cfg(feature = "transport-cms")]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn a_sealed_transcript_refuses_more_bytes() -> Result<(), HandshakeError> {
 		let mut transcript = Transcript::new();
@@ -295,7 +359,27 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "transport-cms")]
+	/// The transcript-hash attribute is `HANDSHAKE_TRANSCRIPT_HASH` with the
+	/// hash as its one OCTET STRING value.
+	///
+	/// The expected DER comes from a hand encoding in Python of the
+	/// RFC 5652 § 5.3 `Attribute` module and the OID `1.3.6.1.4.1.64586.1.8`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn the_transcript_hash_attribute_encodes_as_its_known_answer() -> Result<(), Box<dyn core::error::Error>> {
+		use crate::der::Encode;
+
+		let attribute = fixture_transcript::<Sha3_256>([0x07u8; 32]).attribute()?;
+		let sequence = [0x30, 0x30];
+		let oid = [0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xf8, 0x4a, 0x01, 0x08];
+		let values = [0x31, 0x22, 0x04, 0x20];
+
+		let expected = [sequence.as_slice(), &oid, &values, &[0x07u8; 32]].concat();
+		assert_eq!(attribute.to_der()?, expected);
+		Ok(())
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
 	fn a_sealed_transcript_refuses_a_second_seal() -> Result<(), HandshakeError> {
 		let mut transcript = Transcript::new();
@@ -308,17 +392,25 @@ mod tests {
 	}
 
 	/// The CMS transcript hash of a key exchange followed by server Finished
-	/// legs that carry `server_ephemeral`.
+	/// legs that carry `server_ephemeral` and `certificates`.
 	#[cfg(feature = "transport-cms")]
-	fn cms_hash_with_ephemeral(server_ephemeral: &[u8]) -> Result<[u8; 32], HandshakeError> {
+	fn cms_hash_of(server_ephemeral: &[u8], certificates: &[u8]) -> Result<TranscriptHash, HandshakeError> {
 		let mut transcript = Transcript::new();
 		transcript.append(b"key exchange")?;
 		transcript.append_server_finished(ServerFinishedLegs {
 			security_accept: Some(b"accept".to_vec()),
 			transport_accept: None,
 			server_ephemeral: server_ephemeral.to_vec(),
+			certificates,
 		})?;
 		transcript.seal::<Sha3_256>()
+	}
+
+	/// The CMS transcript hash of a key exchange followed by server Finished
+	/// legs that carry `server_ephemeral` and a fixed `certificates` field.
+	#[cfg(feature = "transport-cms")]
+	fn cms_hash_with_ephemeral(server_ephemeral: &[u8]) -> Result<TranscriptHash, HandshakeError> {
+		cms_hash_of(server_ephemeral, b"certificates")
 	}
 
 	/// Two CMS transcripts that differ only in the server ephemeral hash
@@ -332,30 +424,16 @@ mod tests {
 		Ok(())
 	}
 
-	/// The ECIES transcript hash of fixed legs around `server_ephemeral`.
-	#[cfg(feature = "transport-ecies")]
-	fn ecies_hash_with_ephemeral(server_ephemeral: &[u8; 33]) -> Result<[u8; 32], HandshakeError> {
-		let legs = EciesHandshakeLegs {
-			client_hello: b"client hello",
-			server_random: &[0x01u8; 32],
-			server_ephemeral,
-			spki: b"spki",
-			security_accept_der: b"accept",
-			transport_accept_der: b"",
-		};
-
-		let mut transcript = Transcript::ecies_handshake(legs);
-		transcript.seal::<Sha3_256>()
-	}
-
-	/// Two ECIES transcripts that differ only in the server ephemeral hash
-	/// differently, so the server signature binds the ephemeral.
-	#[cfg(feature = "transport-ecies")]
+	/// The CMS transcript binds the server's `certificates` field after the
+	/// server ephemeral, so the expected hash is SHA3-256 of the legs in that
+	/// order, which the `sha3` crate computes outside the transcript.
+	#[cfg(feature = "transport-cms")]
 	#[test]
-	fn the_ecies_transcript_binds_the_server_ephemeral() -> Result<(), HandshakeError> {
-		let first = ecies_hash_with_ephemeral(&[0x02u8; 33])?;
-		let second = ecies_hash_with_ephemeral(&[0x03u8; 33])?;
-		assert_ne!(first, second);
+	fn the_cms_transcript_binds_the_certificates_after_the_ephemeral() -> Result<(), HandshakeError> {
+		let bound = cms_hash_of(&[0x02u8; 33], b"certificates")?;
+		let legs = [b"key exchange".as_slice(), b"accept", &[0x02u8; 33], b"certificates"].concat();
+		let expected = Sha3_256::digest(&legs);
+		assert_eq!(bound.as_bytes(), expected.as_slice());
 		Ok(())
 	}
 
@@ -363,7 +441,7 @@ mod tests {
 	fn test_transcript_hash_single_message() -> Result<(), HandshakeError> {
 		let msg = b"Hello, World!";
 		let hash = transcript_hash::<DefaultCryptoProvider>(&[msg])?;
-		assert_eq!(hash.len(), 32);
+		assert_eq!(hash.as_bytes().len(), 32);
 		Ok(())
 	}
 
@@ -374,7 +452,7 @@ mod tests {
 		let msg3 = b"Message 3";
 
 		let hash = transcript_hash::<DefaultCryptoProvider>(&[msg1, msg2, msg3])?;
-		assert_eq!(hash.len(), 32);
+		assert_eq!(hash.as_bytes().len(), 32);
 		Ok(())
 	}
 
@@ -400,63 +478,91 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	#[test]
-	fn test_transcript_digest_widths() -> Result<(), HandshakeError> {
-		use crate::crypto::hash::{Sha3_256, Sha3_512};
-
-		let digest = Transcript::digest::<Sha3_256>(b"transcript")?;
-		assert_eq!(digest.len(), 32);
-
-		// Wider digests truncate to their leading 32 bytes (SHA-512/256 style).
-		let wide = Transcript::digest::<Sha3_512>(b"transcript")?;
-		assert_eq!(wide.as_slice(), &Sha3_512::digest(b"transcript")[..32]);
-
-		Ok(())
-	}
-
-	/// The ECIES transcript hashes its legs in wire order: the hello, the
-	/// server random, the server ephemeral, the server key, the security
-	/// accept, and the transport accept.
+	/// A SHA3-512 transcript hash is the whole 64-byte digest.
 	///
-	/// Both peers sign and verify this digest, so the expected value is a
-	/// literal that no code of the crate computes.
-	#[cfg(feature = "transport-ecies")]
+	/// The expected bytes come from an independent SHA3-512 (Python's
+	/// `hashlib`), so a truncation to any width fails here.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn the_ecies_transcript_hashes_its_legs_in_wire_order() -> Result<(), HandshakeError> {
-		let legs = EciesHandshakeLegs {
-			client_hello: b"client hello",
-			server_random: &[0x11; 32],
-			server_ephemeral: &[0x22; EC_PUBKEY_COMPRESSED_SIZE],
-			spki: b"server spki",
-			security_accept_der: b"security accept",
-			transport_accept_der: b"transport accept",
-		};
+	fn a_sha3_512_transcript_hash_is_the_whole_digest() -> Result<(), HandshakeError> {
+		use crate::crypto::hash::Sha3_512;
 
-		let hash = Transcript::ecies_handshake(legs).seal::<Sha3_256>()?;
+		let wide = Transcript::digest::<Sha3_512>(b"transcript")?;
 		let expected = [
-			0x96, 0x7f, 0xd9, 0x7c, 0xdb, 0x45, 0xd5, 0x1e, 0xca, 0x2a, 0x41, 0x0f, 0xb3, 0xb0, 0x91, 0xdf, 0x1d, 0xde,
-			0x66, 0xa1, 0x69, 0x15, 0xde, 0x9a, 0xf3, 0xb4, 0xfb, 0x40, 0x55, 0x65, 0xf3, 0x89,
+			0x7a, 0x03, 0x50, 0x48, 0xdf, 0x98, 0xb5, 0x57, 0xe4, 0xa6, 0x77, 0x2a, 0x7b, 0x5f, 0x78, 0x17, 0x94, 0xcc,
+			0x4f, 0xde, 0xc8, 0x16, 0x39, 0x4f, 0x56, 0x6d, 0x20, 0x4a, 0x68, 0x9f, 0xe1, 0xf1, 0x36, 0x70, 0xca, 0x10,
+			0x6d, 0x8a, 0x7a, 0x82, 0xc4, 0xf8, 0xd7, 0xea, 0xba, 0x53, 0x04, 0x3e, 0x23, 0x25, 0xd8, 0x2e, 0x92, 0x4f,
+			0xc1, 0x37, 0xc2, 0x07, 0x7c, 0x0a, 0x9a, 0x0c, 0x8f, 0x5b,
 		];
-		assert_eq!(hash, expected);
+		assert_eq!(wide.as_bytes(), expected);
 		Ok(())
 	}
 
+	/// [`DigestOutput::parse`] refuses the output of a digest narrower than 256
+	/// bits.
 	#[test]
-	fn test_digest_output_narrow_rejected_wide_truncated() -> Result<(), HandshakeError> {
-		let narrow = [0u8; 28];
+	fn a_digest_output_narrower_than_32_bytes_is_refused() {
+		let narrow = DigestOutput::parse([0u8; 28]);
 		assert!(matches!(
-			digest_output_to_array(narrow),
-			Err(HandshakeError::TranscriptDigestLength { expected: 32, received: 28 })
+			narrow,
+			Err(HandshakeError::TranscriptDigestLength { min: 32, max: 64, received: 28 })
 		));
+	}
 
-		let mut wide = [0u8; 64];
-		for (i, byte) in wide.iter_mut().enumerate() {
-			*byte = i as u8;
-		}
+	/// [`DigestOutput::parse`] refuses the output of a digest wider than 512
+	/// bits.
+	#[test]
+	fn a_digest_output_wider_than_64_bytes_is_refused() {
+		let wide = DigestOutput::parse([0u8; 65]);
+		assert!(matches!(
+			wide,
+			Err(HandshakeError::TranscriptDigestLength { min: 32, max: 64, received: 65 })
+		));
+	}
 
-		let truncated = digest_output_to_array(wide)?;
-		assert_eq!(truncated, wide[..32]);
+	/// An output hashes as its bytes, as it compares, so two equal outputs
+	/// whose buffers differ past their width hash alike.
+	#[cfg(feature = "std")]
+	#[test]
+	fn equal_outputs_hash_alike() -> Result<(), HandshakeError> {
+		use std::hash::{BuildHasher, RandomState};
+
+		let parsed = DigestOutput::parse([0x07u8; 32])?;
+		let padded = DigestOutput { bytes: [0x07u8; MAX_DIGEST_OUTPUT_LEN], len: 32 };
+
+		let state = RandomState::new();
+		assert_eq!(parsed, padded);
+		assert_eq!(state.hash_one(parsed), state.hash_one(padded));
+		Ok(())
+	}
+
+	/// The `DigestInfo` of a 64-byte transcript hash carries all 64 bytes.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_sha3_512_digest_info_carries_all_64_bytes() -> Result<(), HandshakeError> {
+		let info = fixture_transcript::<Sha3_512>([0x07u8; 64]).digest_info()?;
+		assert_eq!(info.digest.as_bytes(), [0x07u8; 64]);
+		Ok(())
+	}
+
+	/// The `DigestInfo` of a transcript hash names the digest that computed
+	/// it.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_digest_info_names_the_digest_of_its_hash() -> Result<(), HandshakeError> {
+		let info = Transcript::digest::<Sha3_512>(b"transcript")?.digest_info()?;
+		assert_eq!(info.algorithm.oid, HASH_SHA3_512);
+		Ok(())
+	}
+
+	/// The transcript hash of a provider names the digest of that provider.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_provider_transcript_hash_names_the_provider_digest() -> Result<(), HandshakeError> {
+		let hash = transcript_hash::<Aes256Sha3_512Provider>(&[b"transcript"])?;
+
+		let info = hash.digest_info()?;
+		assert_eq!(info.algorithm.oid, HASH_SHA3_512);
 		Ok(())
 	}
 }

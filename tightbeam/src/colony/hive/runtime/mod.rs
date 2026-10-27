@@ -16,5 +16,6 @@ pub(crate) use cluster_client::ClusterLink;
 pub use context::HiveContextImpl;
 pub(crate) use control::HiveControlCtx;
 pub(crate) use instances::{HiveInstances, InsertRefusal};
+pub(crate) use lifecycle::DrainMode;
 pub use lifecycle::HiveRuntime;
 pub(crate) use scaling::ScalingLoop;

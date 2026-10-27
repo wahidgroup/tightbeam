@@ -1,6 +1,8 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use crate::asn1::admission::DerAdmission;
+use crate::der::Decode;
 use crate::frame::BodyTransform;
 use crate::Errorizable;
 use crate::{Frame, Message};
@@ -30,12 +32,10 @@ crate::impl_from!(crate::der::Error => RouterError::DecodeFailed);
 
 /// A frame whose body a router may decode.
 ///
-/// Minting is [`CleartextFrame::admit`] alone. An encrypted or compressed
-/// body is opaque bytes, so a decode against the dispatched type either
-/// fails confusingly or succeeds against a structurally similar type and
-/// misdelivers in silence. Carrying the proof in the type means a caller
-/// who invokes [`RouterPolicy::dispatch_cleartext`] directly still cannot
-/// reach a decode with an opaque body (CWE-345).
+/// [`CleartextFrame::admit`] is the one constructor. An encrypted or
+/// compressed body is opaque bytes, so a decode against the dispatched type
+/// either fails confusingly or succeeds against a structurally similar type
+/// and misdelivers in silence.
 pub struct CleartextFrame(Arc<Frame>);
 
 impl CleartextFrame {
@@ -67,45 +67,89 @@ impl CleartextFrame {
 	pub fn into_shared(self) -> Arc<Frame> {
 		self.0
 	}
-}
 
-pub trait RouterPolicy: Send + Sync {
-	/// Route `frame` to the handler registered for message type `T`,
-	/// delivering the body decoded as `T`.
+	/// Decode the body of the admitted frame as `T`.
 	///
-	/// Dispatch decodes the cleartext body exactly once and hands the
-	/// typed value to the handler, so a mismatched turbofish fails
-	/// loudly at the dispatch site instead of silently delivering
-	/// foreign bytes. Opaque payloads are rejected before any decode
-	/// attempt (see [`CleartextFrame`]).
+	/// The body arrived from a peer, so every universal SET in it MUST hold its
+	/// elements in DER order (X.690 § 11.6), which the decode checks before it
+	/// sorts one (CWE-407).
 	///
 	/// # Errors
 	///
-	/// - The [`CleartextFrame::admit`] set, for a body still opaque.
-	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
-	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
+	/// - [`RouterError::DecodeFailed`] -- the body is no DER encoding of `T`,
+	///   or a SET in it holds its elements out of DER order.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::der::Sequence;
+	/// use tightbeam::router::CleartextFrame;
+	/// use tightbeam::{compose, Beamable};
+	///
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// struct Ping {
+	///     sequence: u64,
+	/// }
+	///
+	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+	/// let frame = compose! { V0: id: "ping", order: 1u64, message: Ping { sequence: 7 } }?;
+	/// let admitted = CleartextFrame::admit(Arc::new(frame))?;
+	///
+	/// let ping: Ping = admitted.decode()?;
+	/// assert_eq!(ping, Ping { sequence: 7 });
+	/// # Ok(())
+	/// # }
+	/// ```
+	///
+	/// # Sources
+	///
+	/// - ITU-T X.690 (02/2021) § 11.6, set-of components: <https://www.itu.int/rec/T-REC-X.690-202102-I/en>
+	pub fn decode<'a, T: Decode<'a>>(&'a self) -> Result<T> {
+		let body = self.0.message();
+		DerAdmission::SetOrder.admit(body)?;
+
+		Ok(T::from_der(body)?)
+	}
+}
+
+pub trait RouterPolicy: Send + Sync {
+	/// Route `frame` to the handler registered for message type `T`, and
+	/// deliver the body decoded as `T`.
+	///
+	/// Dispatch decodes the cleartext body exactly once and hands the typed
+	/// value to the handler, so a mismatched turbofish fails loudly at the
+	/// dispatch site, and foreign bytes never reach the handler.
+	/// [`CleartextFrame::admit`] rejects an opaque payload before any decode.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`CleartextFrame::admit`], for a body still opaque.
+	/// - [`RouterError::DecodeFailed`] -- the body did not decode as `T`.
+	/// - [`RouterError::UnknownRoute`] -- no handler is registered for `T`.
 	fn dispatch<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()> {
 		self.dispatch_cleartext::<T>(CleartextFrame::admit(frame)?)
 	}
 
 	/// Deliver a frame the [`CleartextFrame`] boundary already admitted.
 	///
-	/// Implementations decode and route. The parameter type is the proof,
-	/// so this method cannot be reached with an opaque body.
+	/// Implementations decode the body through [`CleartextFrame::decode`] and
+	/// route it. The parameter type is the proof, so this method cannot be
+	/// reached with an opaque body, even by a direct call (CWE-345).
 	///
 	/// # Errors
 	///
-	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
-	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
+	/// - [`RouterError::DecodeFailed`] -- the body did not decode as `T`.
+	/// - [`RouterError::UnknownRoute`] -- no handler is registered for `T`.
 	fn dispatch_cleartext<T: Message + Send + 'static>(&self, frame: CleartextFrame) -> Result<()>;
 }
 
 /// Declare a router struct and its [`RouterPolicy`] impl.
 ///
-/// Each route pairs a message type with a handler receiving
-/// `|router, frame, msg|`: the router's fields, the original
-/// [`Frame`] (metadata access), and the body already decoded as the
-/// registered type.
+/// Each route pairs a message type with a handler that receives
+/// `|router, frame, msg|`: the router's fields, the original [`Frame`] for
+/// metadata reads, and the body already decoded as the registered type.
 #[macro_export]
 macro_rules! routes {
 	(
@@ -123,8 +167,7 @@ macro_rules! routes {
 			) -> $crate::router::Result<()> {
 				$(
 					if core::any::TypeId::of::<T>() == core::any::TypeId::of::<$MsgTy>() {
-						let decoded: $MsgTy =
-							$crate::der::Decode::from_der(frame.frame().message())?;
+						let decoded: $MsgTy = frame.decode()?;
 						let ($router, $frame, $msg) = (self, frame.into_shared(), decoded);
 						{ $handler }
 						return Ok(());
@@ -141,7 +184,8 @@ mod tests {
 	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
-	use crate::der::Sequence;
+	use crate::der::asn1::SetOfVec;
+	use crate::der::{Decode, Encode, ErrorKind, Sequence};
 	use crate::router::{RouterError, RouterPolicy};
 	use crate::Beamable;
 	use crate::Frame;
@@ -162,6 +206,12 @@ mod tests {
 		pub note: String,
 	}
 
+	/// A tally whose counts travel as a DER `SET OF`.
+	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	pub struct Tally {
+		pub counts: SetOfVec<u8>,
+	}
+
 	type Delivery<T> = (Arc<Frame>, T);
 
 	routes! {
@@ -175,6 +225,38 @@ mod tests {
 			HealthCheck |router, frame, msg| {
 				let _ = router.health_tx.send((frame, msg));
 			}
+	}
+
+	routes! {
+		TallyRouter {
+			tally_tx: mpsc::Sender<Tally>,
+		}:
+			Tally |router, _frame, msg| {
+				let _ = router.tally_tx.send(msg);
+			}
+	}
+
+	/// The set of counts 1 and 2 in DER order, as it travels inside a `Tally`
+	/// body.
+	const ASCENDING_COUNTS: [u8; 8] = [0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+
+	/// The same set with its counts in descending order.
+	const DESCENDING_COUNTS: [u8; 8] = [0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01];
+
+	/// A frame whose `Tally` body holds its counts in descending order, as a
+	/// peer that skips DER order sends it.
+	fn descending_tally() -> Result<Frame, Box<dyn std::error::Error>> {
+		let counts = SetOfVec::try_from(vec![1u8, 2])?;
+		let frame = compose! { V0: id: "tally", order: 1u64, message: Tally { counts } }?;
+		let mut der = frame.to_der()?;
+		let at = der
+			.windows(ASCENDING_COUNTS.len())
+			.position(|window| window == ASCENDING_COUNTS);
+
+		let at = at.ok_or("the encoded frame carries the counts in DER order")?;
+		der[at..at + DESCENDING_COUNTS.len()].copy_from_slice(&DESCENDING_COUNTS);
+
+		Ok(Frame::from_der(&der)?)
 	}
 
 	fn build_router() -> (
@@ -245,19 +327,31 @@ mod tests {
 		Ok(())
 	}
 
+	/// A routed body arrives from a peer, so a SET in it out of DER order is
+	/// refused before the decode sorts it (X.690 § 11.6, CWE-407).
+	#[test]
+	fn dispatch_refuses_a_body_whose_set_is_out_of_der_order() -> Result<(), Box<dyn std::error::Error>> {
+		let (tally_tx, _tally_rx) = mpsc::channel();
+		let router = TallyRouter { tally_tx };
+
+		let refused = router.dispatch::<Tally>(Arc::new(descending_tally()?));
+		assert!(matches!(refused, Err(RouterError::DecodeFailed(error)) if error.kind() == ErrorKind::SetOrdering));
+		Ok(())
+	}
+
 	#[test]
 	fn dispatch_rejects_unregistered_type() -> Result<(), Box<dyn std::error::Error>> {
 		let (router, _payment_rx, _health_rx) = build_router();
-
 		let result = router.dispatch::<Unrouted>(Arc::new(compose_payment(0)?));
 		assert!(matches!(result, Err(RouterError::UnknownRoute)));
 		Ok(())
 	}
 
-	/// A policy that decodes whatever it is handed, with no guard of its own.
+	/// A policy that counts every frame it is handed, with no guard of its own.
 	///
-	/// Stands in for a consumer implementing [`RouterPolicy`] by hand: the
-	/// guard must come from the seam, not from this implementation.
+	/// It stands in for a consumer that implements [`RouterPolicy`] by hand, so
+	/// the guard must come from the provided `dispatch`, not from this
+	/// implementation.
 	struct NaiveRouter {
 		seen: std::sync::Mutex<usize>,
 	}

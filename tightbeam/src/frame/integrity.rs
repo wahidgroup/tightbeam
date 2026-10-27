@@ -7,6 +7,19 @@ use crate::frame::FrameIntegrityScaffold;
 use crate::Frame;
 
 impl Frame {
+	/// Compute the hash of the frame with the digest algorithm `D`.
+	///
+	/// # Errors
+	///
+	/// - The frame does not encode, or its digest does not fit a `DigestInfo`.
+	pub fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
+	where
+		D: Digest + AssociatedOid,
+	{
+		let encoded = crate::encode(self)?;
+		crate::utils::digest::<D>(&encoded)
+	}
+
 	/// Check a disclosed [`Opening`] against this frame's message commitment,
 	/// reporting which condition held.
 	pub fn message_commitment_verdict<D>(&self, opening: &Opening) -> Result<IntegrityVerdict>

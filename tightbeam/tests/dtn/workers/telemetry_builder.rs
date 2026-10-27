@@ -1,4 +1,4 @@
-//! Telemetry builder worker for creating telemetry messages
+//! The worker that builds the rover's telemetry messages.
 
 use tightbeam::{worker, TightBeamError};
 
@@ -14,10 +14,10 @@ worker! {
 	handle: |request, _trace, config| async move {
 		Ok(RoverTelemetry::new(
 			request.instrument,
-			request.data.to_owned(),
+			request.data.as_bytes(),
 			request.mission_time_ms,
 			config.default_battery,
 			config.default_temp,
-		))
+		)?)
 	}
 }

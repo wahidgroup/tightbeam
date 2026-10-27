@@ -15,6 +15,8 @@ use crate::Beamable;
 
 /// Prekey bundle for PQXDH-style protocols.
 ///
+/// UNSTABLE: a PQXDH prekey structure behind `unstable-pqxdh`.
+///
 /// Contains the public key material that a party publishes for asynchronous
 /// key agreement. Other parties retrieve this bundle and use it to establish
 /// a shared secret without real-time interaction.
@@ -52,6 +54,8 @@ pub struct PrekeyBundle {
 
 /// Identifiers for prekeys in a bundle.
 ///
+/// UNSTABLE: a PQXDH prekey structure behind `unstable-pqxdh`.
+///
 /// Used to reference specific prekeys when constructing initial messages,
 /// and for tracking/rotating prekeys on the server.
 #[derive(Sequence, Clone, Debug, PartialEq, Eq, Beamable)]
@@ -70,6 +74,8 @@ pub struct PrekeyIdentifiers {
 }
 
 /// Initial message in a PQXDH-style handshake.
+///
+/// UNSTABLE: a PQXDH prekey structure behind `unstable-pqxdh`.
 ///
 /// Sent by the initiating party to establish a shared secret with a party
 /// whose prekey bundle was retrieved. Contains the initiator's identity,

@@ -1,37 +1,38 @@
-//! Hive auto-scaling loop: per-type scale decisions and cluster fan-out.
+//! The hive auto-scaling loop decides a scale per servlet type and fans each
+//! change out to the cluster.
 
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
 
-use crate::colony::common::{
-	aggregate_utilization, ScalingDecision, ScalingMetrics, ServletChange, ServletInfo, ServletScaleConfig, TaskGroup,
-};
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
-use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
-use crate::colony::servlet::servlet_runtime::rt;
+use crate::colony::hive::{
+	HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry, ServletScaleConfig, SpawnerFn,
+};
+use crate::colony::protocol::ServletChange;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
-use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::runtime::{rt, TaskGroup};
 use crate::trace::TraceCollector;
+use crate::transport::multiplex::MuxCapable;
+use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{MessageEmitter, Protocol};
+use crate::urn::Urn;
 use crate::utils::time::{Clock, MonotonicInstant};
-use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 /// The shared handles that the hive auto-scaling loop runs on.
-pub struct ScalingLoop<P: Protocol> {
+pub struct ScalingLoop<P: Protocol, R: ServletRegistry> {
 	/// The registered servlet instances, keyed by instance URN bytes.
-	pub servlets: Arc<HashMapRegistry>,
+	pub servlets: Arc<R>,
 	/// The per-type spawners that a scale-up calls.
 	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	/// The hive-level trace collector, shared with each spawned servlet.
 	pub trace: Arc<TraceCollector>,
 	/// The aggregate utilization, published for manage-path backpressure.
 	pub utilization: Arc<AtomicU16>,
-	/// The per-instance utilization samples, keyed by instance URN bytes.
-	pub utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
 	/// The gateways that receive scaling address updates.
 	pub cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	/// The intra-hive route maps, updated when instances appear or leave.
@@ -48,25 +49,24 @@ pub struct ScalingLoop<P: Protocol> {
 	pub tasks: TaskGroup,
 }
 
-impl<P> ScalingLoop<P>
+impl<P, R> ScalingLoop<P, R>
 where
-	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + Send + Sync + 'static,
+	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + Sync + 'static,
+	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Spawns the loop that evaluates each servlet type once per cooldown and
-	/// scales its instances.
+	/// Spawns the loop that evaluates each servlet type once per cooldown,
+	/// scales its instances, and publishes the hive's aggregate utilization.
 	pub fn spawn(self) -> rt::JoinHandle {
 		let ScalingLoop {
 			servlets,
 			spawners,
 			trace,
 			utilization,
-			utilization_map,
 			cluster_addrs,
 			hive_context,
 			hive_addr,
@@ -76,15 +76,22 @@ where
 
 		let config = Arc::new(config);
 		let link = hive_addr.map(|addr| {
-			ClusterLink::<P>::new(Arc::clone(&servlets), Arc::clone(&cluster_addrs), addr, Arc::clone(&config))
+			ClusterLink::<P, R>::new(
+				Arc::clone(&servlets),
+				Arc::clone(&cluster_addrs),
+				addr,
+				Arc::clone(&config),
+				Arc::clone(&trace),
+			)
 		});
+
 		let evaluation_period = config.scaling.cooldown;
-		let task = ScalingTask {
+		let mut task = ScalingTask {
 			hive_urn: hive_addr.and_then(|addr| config.hive_urn(addr)).map(Arc::new),
 			servlets,
 			trace,
 			utilization,
-			utilization_map,
+			samples: LastSamples::default(),
 			hive_context,
 			link,
 			config,
@@ -120,16 +127,16 @@ where
 				}
 
 				task.utilization.store(hive_load.utilization().get(), Ordering::Relaxed);
+				task.samples.close_tick();
 			}
 		})
 	}
 }
 
-/// Instance count and summed utilization over one servlet type.
+/// The instance count and the summed utilization of one servlet type.
 ///
-/// The two numbers are only meaningful together: a mean over the wrong
-/// count reads as a different load. Carrying them in one value keeps the
-/// division with the pair it divides.
+/// A mean over the wrong count reads as a different load, so one value
+/// carries both numbers and the division stays with the pair it divides.
 #[derive(Default)]
 struct TypeLoad {
 	instances: usize,
@@ -139,20 +146,68 @@ struct TypeLoad {
 impl TypeLoad {
 	/// Adds one type's load into this running hive total.
 	fn absorb(&mut self, load: &Self) {
-		self.instances += load.instances;
-		self.utilization_sum += load.utilization_sum;
+		self.instances = self.instances.saturating_add(load.instances);
+		self.utilization_sum = self.utilization_sum.saturating_add(load.utilization_sum);
 	}
 
 	/// The mean utilization across the counted instances.
+	///
+	/// A load of no instances reads as [`BasisPoints::MAX`], so backpressure
+	/// and heartbeats report saturation while per-type scaling sees the zero
+	/// count and can spawn. A mean past the range of [`BasisPoints`] saturates.
 	fn utilization(&self) -> BasisPoints {
-		aggregate_utilization(self.utilization_sum, self.instances)
+		let instances = u64::try_from(self.instances).unwrap_or(u64::MAX);
+		match NonZeroU64::new(instances) {
+			None => BasisPoints::MAX,
+			Some(count) => BasisPoints::saturating_from(self.utilization_sum / count),
+		}
 	}
 }
 
-/// Per-type stamps for one scale direction, read against the hive clock.
+/// The last utilization each instance reported, which counts for a tick in
+/// which the instance reports none.
 ///
-/// A stamp is written where a scale reached the registry, so an attempt
-/// that failed to spawn or found nothing to remove leaves the next
+/// A tick keeps the sample of each instance it counts, so the sample of an
+/// instance that left the registry drops at the end of the next tick.
+#[derive(Default)]
+struct LastSamples {
+	/// The samples the current tick reads, kept by the tick before it.
+	held: HashMap<Vec<u8>, BasisPoints>,
+	/// The samples the current tick keeps for the next one.
+	kept: HashMap<Vec<u8>, BasisPoints>,
+}
+
+impl LastSamples {
+	/// Returns the utilization that counts for the instance under `key` in
+	/// this tick: its report, else its last sample, else
+	/// [`UNKNOWN_SERVLET_UTILIZATION_BPS`].
+	///
+	/// A report or a last sample stays as the instance's sample for the next
+	/// tick. The key moves from the held samples to the kept ones, so a sample
+	/// that stays copies no key.
+	fn resolve(&mut self, key: &[u8], reported: Option<BasisPoints>) -> u64 {
+		let held = self.held.remove_entry(key);
+		let last = held.as_ref().map(|(_, sample)| *sample);
+		let Some(sample) = reported.or(last) else {
+			return u64::from(UNKNOWN_SERVLET_UTILIZATION_BPS);
+		};
+
+		let key = held.map_or_else(|| key.to_vec(), |(key, _)| key);
+		self.kept.insert(key, sample);
+
+		u64::from(sample.get())
+	}
+
+	/// Ends a tick, so the samples it kept are the ones the next tick reads.
+	fn close_tick(&mut self) {
+		self.held = core::mem::take(&mut self.kept);
+	}
+}
+
+/// The per-type stamps of one scale direction, read against the hive clock.
+///
+/// The loop writes a stamp only after a scale reaches the registry, so an
+/// attempt that failed to spawn or found nothing to remove leaves the next
 /// evaluation free to retry.
 struct Cooldowns {
 	stamps: HashMap<Vec<u8>, MonotonicInstant>,
@@ -183,39 +238,39 @@ impl Cooldowns {
 	}
 }
 
-/// One running scaling loop's resolved handles.
+/// The resolved handles of one live scaling loop.
 ///
-/// [`ScalingLoop`] names what the hive supplies. This names what the loop
-/// body works with once the hive URN is created and the cluster link is
-/// bound, so every scale decision reads one owner instead of a parameter
-/// bundle rebuilt per attempt.
-struct ScalingTask<P: Protocol> {
-	servlets: Arc<HashMapRegistry>,
+/// [`ScalingLoop`] names what the hive supplies. This type holds what the
+/// loop body works with once [`ScalingLoop::spawn`] derives the hive URN and
+/// binds the cluster link, so every scale decision reads one owner.
+struct ScalingTask<P: Protocol, R: ServletRegistry> {
+	servlets: Arc<R>,
 	trace: Arc<TraceCollector>,
 	utilization: Arc<AtomicU16>,
-	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
+	samples: LastSamples,
 	hive_context: Arc<HiveContextImpl<P>>,
-	link: Option<ClusterLink<P>>,
+	link: Option<ClusterLink<P, R>>,
 	hive_urn: Option<Arc<Urn<'static>>>,
 	config: Arc<HiveConfig>,
 	tasks: TaskGroup,
 }
 
-impl<P> ScalingTask<P>
+impl<P, R> ScalingTask<P, R>
 where
-	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + Send + Sync + 'static,
+	P::Transport: MessageEmitter + MuxCapable + EncryptedProtocolState + Send + Sync + 'static,
+	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Whether local scaling must hold off.
 	///
 	/// A hive that derived its own URN attributes a scale change to itself.
-	/// Without that identity a watching gateway would keep a slate this
-	/// hive has moved past, so scaling waits until the gateway list empties.
+	/// Without that identity, a gateway that watches this hive would keep a
+	/// slate the hive has moved past, so scaling waits until the gateway list
+	/// empties.
 	fn scale_blocked(&self) -> bool {
 		self.hive_urn.is_none() && self.link.as_ref().is_some_and(|link| link.has_gateways())
 	}
@@ -224,21 +279,17 @@ where
 	///
 	/// An instance that reports no utilization falls back to its last
 	/// sample, then to [`UNKNOWN_SERVLET_UTILIZATION_BPS`].
-	fn type_load(&self, type_prefix: impl AsRef<[u8]>) -> TypeLoad {
+	fn type_load(&mut self, type_prefix: impl AsRef<[u8]>) -> TypeLoad {
 		let type_prefix = type_prefix.as_ref();
 		let mut load = TypeLoad::default();
-		// Each sample is one `u16` insert, so a poisoned lock still holds a
-		// whole map and the samples are read rather than dropped.
-		let samples = self.utilization_map.lock().unwrap_or_else(PoisonError::into_inner);
+		let samples = &mut self.samples;
 
 		self.servlets.for_each_by_type(type_prefix, |key, reg| {
-			load.instances += 1;
+			load.instances = load.instances.saturating_add(1);
 
-			let reported = reg.servlet.utilization().map(|bp| bp.get() as u64);
-			let cached = samples.get(key).map(|&sample| sample as u64);
-			let unknown = UNKNOWN_SERVLET_UTILIZATION_BPS as u64;
-
-			load.utilization_sum += reported.or(cached).unwrap_or(unknown);
+			let reported = reg.servlet.utilization();
+			let utilization = samples.resolve(key, reported);
+			load.utilization_sum = load.utilization_sum.saturating_add(utilization);
 		});
 
 		load
@@ -270,12 +321,16 @@ where
 		// The registry takes the instance before the announcement, because
 		// the notify failure path reconciles from the registry.
 		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
-		let Ok((instance, addr_bytes)) = instances.insert(registration) else {
+		let Ok(placed) = instances.insert(registration) else {
 			return;
 		};
 
-		let added = ServletInfo { servlet_id: instance, address: addr_bytes.as_ref().to_vec() };
-		self.announce(ServletChange::Added(added));
+		// The slate leaves out an instance that names no signer, so the hive
+		// announces only an instance that has a route.
+		if let Some(added) = placed.into_servlet_info() {
+			self.announce(ServletChange::Added(added));
+		}
+
 		cooldowns.stamp(type_key);
 	}
 
@@ -320,8 +375,16 @@ where
 
 #[cfg(test)]
 mod tests {
+	use std::sync::{Mutex, PoisonError};
+
 	use super::*;
+	use crate::bps;
+	use crate::cms::signed_data::SignerIdentifier;
+	use crate::colony::hive::{HashMapRegistry, ServletBox};
+	use crate::colony::urn::ColonyNamespace;
 	use crate::tb_cases;
+	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
+	use crate::transport::TokioListener;
 	use crate::utils::time::ManualClock;
 
 	/// The cooldown every stamp in this module holds for.
@@ -332,11 +395,11 @@ mod tests {
 		Arc::new(ManualClock::default())
 	}
 
-	/// Cooldowns on `clock`, with the `echo` type stamped now.
+	/// Cooldowns on `clock`, with the `echo` type stamped at its current
+	/// instant.
 	fn stamped_cooldowns(clock: &Arc<ManualClock>) -> Cooldowns {
 		let mut cooldowns = Cooldowns::new(Arc::clone(clock) as Arc<dyn Clock>);
 		cooldowns.stamp(b"echo".as_slice());
-
 		cooldowns
 	}
 
@@ -351,9 +414,136 @@ mod tests {
 
 			assert_eq!(cooldowns.active(b"echo", COOLDOWN), active);
 		}
+
 		cases {
 			one_millisecond_short => (COOLDOWN.saturating_sub(Duration::from_millis(1)), true),
 			at_the_cooldown => (COOLDOWN, false),
 		}
+	}
+
+	// A load reads as the mean of its instances' basis points. Each case is
+	// an `(instances, utilization_sum, expected_bps)` row.
+	tb_cases! {
+		fn aggregate_utilization_means_across_all_instances((instances, utilization_sum, expected): (usize, u64, u16)) {
+			let load = TypeLoad { instances, utilization_sum };
+			assert_eq!(load.utilization().get(), expected);
+		}
+
+		cases {
+			with_no_instances_saturates => (0, 0, 10_000),
+			with_every_instance_idle => (4, 0, 0),
+			with_one_uniform_mean => (4, 20_000, 5_000),
+			with_one_loaded_type_and_one_idle => (2, 10_000, 5_000),
+			with_every_instance_fully_loaded => (4, 40_000, 10_000),
+		}
+	}
+
+	// A mean of 65,536 basis points is past the `u16` range, and it reads as
+	// saturation.
+	#[test]
+	fn a_mean_past_the_u16_range_reads_as_saturation() {
+		let load = TypeLoad { instances: 2, utilization_sum: 131_072 };
+
+		assert_eq!(load.utilization(), BasisPoints::MAX);
+	}
+
+	/// The utilization a servlet reports in the tick a test runs: `Some`
+	/// basis points, or `None` for a tick in which it reports nothing.
+	type Report = Arc<Mutex<Option<BasisPoints>>>;
+
+	/// A servlet whose utilization report the test sets for each tick.
+	struct ReportingProbe {
+		report: Report,
+	}
+
+	impl ServletBox for ReportingProbe {
+		fn addr_bytes(&self) -> Arc<[u8]> {
+			Arc::from(b"127.0.0.1:7010".as_slice())
+		}
+
+		fn stop_boxed(self: Box<Self>) {}
+
+		fn signer(&self) -> Option<&SignerIdentifier> {
+			None
+		}
+
+		fn utilization(&self) -> Option<BasisPoints> {
+			*self.report.lock().unwrap_or_else(PoisonError::into_inner)
+		}
+	}
+
+	/// The servlet type of the probe.
+	fn echo_type() -> Urn<'static> {
+		let namespace = ColonyNamespace::default();
+		namespace.servlet("echo").expect("test names satisfy the mint grammar")
+	}
+
+	/// A scaling task over a registry that holds one [`ReportingProbe`] of
+	/// [`echo_type`], which reports what `report` holds.
+	fn reporting_task(report: &Report) -> ScalingTask<TokioListener, HashMapRegistry> {
+		let servlet_type = echo_type();
+		let key = servlet_type.instance_urn(b"127.0.0.1:7010");
+		let key = key.expect("the probe locator names an instance");
+		let probe = ReportingProbe { report: Arc::clone(report) };
+		let spawner: SpawnerFn = Arc::new(|_| Box::pin(async { Err(TightBeamError::NotEstablished) }));
+		let registration = ServletRegistration { servlet: Box::new(probe), spawner, servlet_type };
+		let servlets = HashMapRegistry::default();
+		let inserted = servlets.insert(key.canonical_bytes(), registration);
+		assert!(inserted.is_ok(), "the map registry takes every registration");
+
+		let pool = Arc::new(ConnectionPool::<TokioListener>::builder().build());
+		ScalingTask {
+			servlets: Arc::new(servlets),
+			trace: Arc::new(TraceCollector::default()),
+			utilization: Arc::new(AtomicU16::new(0)),
+			samples: LastSamples::default(),
+			hive_context: Arc::new(HiveContextImpl::new(pool)),
+			link: None,
+			hive_urn: None,
+			config: Arc::new(HiveConfig::default()),
+			tasks: TaskGroup::default(),
+		}
+	}
+
+	/// The load of the probe's type in a tick in which the probe reports
+	/// nothing, after a tick in which it reported `last`.
+	fn load_after_a_silent_tick(last: BasisPoints) -> TypeLoad {
+		let report: Report = Arc::new(Mutex::new(Some(last)));
+		let mut task = reporting_task(&report);
+		let type_prefix = echo_type().type_prefix_bytes();
+		task.type_load(&type_prefix);
+		task.samples.close_tick();
+
+		*report.lock().unwrap_or_else(PoisonError::into_inner) = None;
+		task.type_load(&type_prefix)
+	}
+
+	/// An instance that reports nothing in a tick counts at the sample it
+	/// reported last.
+	#[test]
+	fn a_silent_instance_counts_at_its_last_sample() {
+		let load = load_after_a_silent_tick(bps!(9000));
+		assert_eq!(load.utilization_sum, 9_000);
+	}
+
+	/// The key of the one instance the sample tests read.
+	const INSTANCE: &[u8] = b"urn:tightbeam:servlet:echo/127.0.0.1:7010";
+
+	/// An instance with no report and no sample counts at the unknown figure.
+	#[test]
+	fn an_instance_with_no_sample_counts_as_unknown() {
+		let mut samples = LastSamples::default();
+		assert_eq!(samples.resolve(INSTANCE, None), u64::from(UNKNOWN_SERVLET_UTILIZATION_BPS));
+	}
+
+	/// A tick that skips an instance drops its sample, so the samples hold the
+	/// registered instances alone.
+	#[test]
+	fn a_sample_drops_after_a_tick_that_skips_its_instance() {
+		let mut samples = LastSamples::default();
+		samples.resolve(INSTANCE, Some(bps!(9000)));
+		samples.close_tick();
+		samples.close_tick();
+		assert_eq!(samples.resolve(INSTANCE, None), u64::from(UNKNOWN_SERVLET_UTILIZATION_BPS));
 	}
 }

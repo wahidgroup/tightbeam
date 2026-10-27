@@ -1,8 +1,7 @@
-//! Logging subsystem with RFC 5424 severity levels
+//! The logging subsystem, with RFC 5424 severity levels.
 //!
-//! Provides trait-based logging backends with runtime injection for flexible
-//! output targets (stdout, file, SIEM, etc.) while maintaining no_std
-//! compatibility for core traits.
+//! A [`LogBackend`], injected at runtime, writes the records to an output
+//! target, such as stdout, a file, or a SIEM.
 
 use core::fmt;
 
@@ -12,10 +11,9 @@ use alloc::{borrow::Cow, collections::BTreeMap as HashMap, vec::Vec};
 #[cfg(feature = "std")]
 use std::{borrow::Cow, collections::HashMap};
 
-/// RFC 5424 Severity Levels
+/// The RFC 5424 severity levels, as syslog numbers them.
 ///
-/// Maps to syslog severity levels where lower numeric values indicate
-/// higher severity.
+/// A lower value is a higher severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum LogLevel {
@@ -82,35 +80,31 @@ pub enum LogError {
 }
 
 #[cfg(feature = "std")]
-/// Trait for logging backends
-///
-/// Implementations can output logs to various targets (stdout, files, SIEM systems, etc.)
+/// A logging backend, which writes log records to its output target.
 pub trait LogBackend: Send + Sync {
-	/// Emit a log record
+	/// Emit a log record.
 	///
 	/// # Errors
 	///
-	/// Returns `LogError` if the backend cannot emit the log record
+	/// - [`LogError`] -- the backend cannot emit the record.
 	fn emit(&self, record: &LogRecord) -> Result<(), LogError>;
 
-	/// Check if this backend accepts logs at the given level
-	///
-	/// This allows backends to filter based on their own criteria
+	/// Whether this backend accepts records at `level`, by its own criteria.
 	fn accepts(&self, level: LogLevel) -> bool;
 
-	/// Flush any buffered logs (optional, for async backends)
+	/// Flush the buffered records of an async backend. The default flushes
+	/// nothing.
 	///
 	/// # Errors
 	///
-	/// Returns `LogError` if flushing fails
+	/// - [`LogError`] -- the flush fails.
 	fn flush(&self) -> Result<(), LogError> {
 		Ok(())
 	}
 }
 
-/// Filter for controlling which log records are emitted
-///
-/// Supports a global minimum level plus per-component overrides
+/// The filter that decides which log records emit: a global minimum level,
+/// with overrides per component.
 #[derive(Debug, Clone)]
 pub struct LogFilter {
 	/// Minimum log level (global default)
@@ -131,10 +125,8 @@ impl LogFilter {
 		Self { min_level, component_overrides: HashMap::new() }
 	}
 
-	/// Add a component-specific log level override
-	///
-	/// This allows fine-grained control, e.g., enabling Debug logs for
-	/// "security" while keeping Info for everything else.
+	/// Override the log level of `component`, such as Debug for "security"
+	/// while every other component stays at Info.
 	pub fn with_component(mut self, component: impl Into<Cow<'static, str>>, level: LogLevel) -> Self {
 		self.component_overrides.insert(component.into(), level);
 		self
@@ -152,9 +144,8 @@ impl LogFilter {
 	}
 }
 
-/// Configuration for logging subsystem
-///
-/// Encapsulates backend, filter, and optional default log level
+/// The logger configuration: a backend, a filter, and an optional default
+/// level.
 pub struct LoggerConfig {
 	/// Log backend for output
 	pub backend: Box<dyn LogBackend>,
@@ -222,10 +213,8 @@ impl LogBackend for StdoutBackend {
 	}
 }
 
-/// Multiplex backend that fans out to multiple backends
-///
-/// Emits log records to all configured backends, allowing simultaneous
-/// logging to multiple destinations (e.g., stdout + file + SIEM)
+/// A backend that fans each record out to every inner backend that accepts its
+/// level, so one record can reach stdout, a file, and a SIEM at once.
 pub struct MultiplexBackend {
 	backends: Vec<Box<dyn LogBackend>>,
 }
@@ -264,8 +253,8 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
-	use crate::trace::TraceCollector;
-	use crate::utils::urn::Urn;
+	use crate::trace::{TraceCollector, TraceStateShared};
+	use crate::urn::Urn;
 
 	const TEST1: Urn<'static> = crate::urn!("test", "event:log/test1");
 	const TEST2: Urn<'static> = crate::urn!("test", "event:log/test2");
@@ -317,8 +306,8 @@ mod tests {
 		assert!(filter.should_log(LogLevel::Info, Some("security")));
 	}
 
-	// Capture backend: records real emitted output into a shared Vec so
-	// tests can assert on it (spy, not a stubbed dependency)
+	// A spy backend, not a stub. It records the emitted output in a shared
+	// `Vec` for the tests to assert on.
 	#[derive(Debug, Clone)]
 	struct CaptureBackend {
 		captured: Arc<std::sync::Mutex<Vec<(LogLevel, String)>>>,
@@ -346,14 +335,14 @@ mod tests {
 
 	#[cfg(feature = "std")]
 	#[test]
-	fn test_logger_config_default_level() -> Result<(), crate::TightBeamError> {
+	fn test_logger_config_default_level() -> Result<(), Box<dyn core::error::Error>> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let backend = {
 			let captured = Arc::clone(&captured);
 			CaptureBackend::with_captured(captured)
 		};
 		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
-		let trace = TraceCollector::default().with_logger(config);
+		let trace = TraceCollector::default().with_logger(config)?;
 
 		trace.event(TEST1)?.emit();
 		trace.event(TEST2)?.with_log_level(LogLevel::Error).emit();
@@ -370,14 +359,15 @@ mod tests {
 
 	#[cfg(feature = "std")]
 	#[test]
-	fn test_logger_config_no_default_level() -> Result<(), crate::TightBeamError> {
+	fn test_logger_config_no_default_level() -> Result<(), Box<dyn core::error::Error>> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let backend = {
 			let captured = Arc::clone(&captured);
 			CaptureBackend::with_captured(captured)
 		};
+
 		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config);
+		let trace = TraceCollector::default().with_logger(config)?;
 
 		trace.event(NO_LOG)?.emit();
 		trace.event(SHOULD_LOG)?.with_log_level(LogLevel::Warning).emit();
@@ -392,7 +382,7 @@ mod tests {
 
 	#[cfg(feature = "std")]
 	#[test]
-	fn test_log_filter_with_logger() -> Result<(), crate::TightBeamError> {
+	fn test_log_filter_with_logger() -> Result<(), Box<dyn core::error::Error>> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let backend = {
 			let captured = Arc::clone(&captured);
@@ -400,8 +390,7 @@ mod tests {
 		};
 
 		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Warning));
-		let trace = TraceCollector::default().with_logger(config);
-
+		let trace = TraceCollector::default().with_logger(config)?;
 		trace.event(EMERGENCY)?.with_log_level(LogLevel::Emergency).emit();
 		trace.event(ERROR)?.with_log_level(LogLevel::Error).emit();
 		trace.event(WARNING)?.with_log_level(LogLevel::Warning).emit();
@@ -420,7 +409,7 @@ mod tests {
 
 	#[cfg(feature = "std")]
 	#[test]
-	fn test_multiplex_backend() -> Result<(), crate::TightBeamError> {
+	fn test_multiplex_backend() -> Result<(), Box<dyn core::error::Error>> {
 		let captured1 = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let captured2 = Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -435,7 +424,7 @@ mod tests {
 
 		let multiplex = MultiplexBackend::new(vec![Box::new(backend1), Box::new(backend2)]);
 		let config = LoggerConfig::new(multiplex, LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config);
+		let trace = TraceCollector::default().with_logger(config)?;
 
 		trace.event(TEST)?.with_log_level(LogLevel::Info).emit();
 
@@ -446,6 +435,19 @@ mod tests {
 		assert_eq!(records1[0].1, TEST.to_string());
 		assert_eq!(records2[0].1, TEST.to_string());
 
+		Ok(())
+	}
+
+	/// A collector whose state another handle shares refuses a logger config,
+	/// which only the sole owner of the state can set.
+	#[cfg(feature = "std")]
+	#[test]
+	fn a_shared_collector_refuses_a_logger_config() -> Result<(), Box<dyn core::error::Error>> {
+		let trace = TraceCollector::default();
+		let _shared = trace.share();
+
+		let config = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Debug));
+		assert_eq!(trace.with_logger(config).err(), Some(TraceStateShared));
 		Ok(())
 	}
 

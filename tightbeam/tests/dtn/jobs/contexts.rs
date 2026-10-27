@@ -1,20 +1,19 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::{aead::Aes256Gcm, sign::ecdsa::Secp256k1SigningKey},
+	crypto::sign::ecdsa::Secp256k1SigningKey,
 	transport::{tcp::r#async::TokioListener, ConnectionPool},
 };
 
-use crate::dtn::{chain_processor::ChainProcessor, frame_builder::FrameBuilderHelper};
+use crate::dtn::{certs::SharedCipher, frame_builder::FrameBuilderHelper};
 
-/// Context for gap recovery operations.
+/// The shared state of the gap recovery jobs.
 ///
-/// Contains all dependencies needed for building and sending gap recovery frames.
+/// It holds what the jobs need to build and send a gap recovery frame.
 #[derive(Clone)]
 pub struct GapRecoveryContext {
-	pub chain_processor: Arc<ChainProcessor>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
 	pub signing_key: Arc<Secp256k1SigningKey>,
-	pub cipher: Arc<Aes256Gcm>,
+	pub cipher: Arc<SharedCipher>,
 	pub pool: Arc<ConnectionPool<TokioListener>>,
 }

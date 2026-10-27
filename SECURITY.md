@@ -34,8 +34,8 @@ Reporters are credited in the advisory and release notes unless they prefer anon
 
 `deny.toml` ignores these RustSec advisories.
 
-- `RUSTSEC-2023-0071`, accepted 2026-06-02: the `rsa` Marvin Attack timing side-channel has no fixed release. `cms` 0.2.3 pulls in `rsa` through its `builder` feature for the RSA KeyTrans recipient path. tightbeam uses only KARI/ECDH key agreement, so that code path never runs.
 - `RUSTSEC-2024-0436`, accepted 2026-06-02: `paste` is archived because it is complete. The advisory claims no vulnerability, and no replacement is required.
+- `RUSTSEC-2026-0387`, accepted 2026-10-23: `crypto-bigint` 0.5.5 has timing variability in operations meant to run in constant time. The fixed release needs the RustCrypto line built on `der` 0.8, and the stable releases this crate depends on, `cms` among them, still use `der` 0.7. Of the four affected operation classes, only subtraction runs on secret values here, in ECDSA signing, ECDH, and key generation.
 
 ## Out of Scope
 

@@ -1,19 +1,58 @@
 pub use rand_core::{CryptoRngCore, OsRng, RngCore};
 
+#[cfg(all(feature = "std", feature = "transport"))]
+use std::hash::{DefaultHasher, Hash, Hasher};
+#[cfg(all(feature = "std", feature = "transport"))]
+use std::sync::OnceLock;
+
 use crate::error::Result;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(all(host_clock, feature = "transport"))]
+use crate::utils::time::{Clock, SystemClock};
+#[cfg(any(feature = "transport-cms", feature = "hpke"))]
 use rand_core::CryptoRng;
+
+/// The static whose address [`placement_entropy`] hashes.
+#[cfg(all(feature = "std", feature = "transport"))]
+static PLACEMENT_ANCHOR: u8 = 0;
+
+/// The value of [`placement_entropy`], which its first call takes.
+#[cfg(all(feature = "std", feature = "transport"))]
+static PLACEMENT: OnceLock<u64> = OnceLock::new();
+
+/// The entropy of the placement of this process, one value per process.
+///
+/// The first call hashes two readings, and the process keeps the hash:
+///
+/// - The address of a static of this crate, which address-space layout
+///   randomization places apart in each process.
+/// - The monotonic clock in nanoseconds, where the host has one, so no address alone gives the value.
+///
+/// A draw that the random source refused seeds from it, so peers that lose the
+/// source together seed apart. The value seeds a spread and is no secret.
+#[cfg(all(feature = "std", feature = "transport"))]
+pub(crate) fn placement_entropy() -> u64 {
+	let take = || {
+		let mut hasher = DefaultHasher::new();
+		core::ptr::addr_of!(PLACEMENT_ANCHOR).addr().hash(&mut hasher);
+		#[cfg(host_clock)]
+		SystemClock.monotonic().hash(&mut hasher);
+
+		hasher.finish()
+	};
+
+	*PLACEMENT.get_or_init(take)
+}
 
 /// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
 /// bounds required by generic constructors such as `SecretKey::random`.
 ///
 /// A `dyn` RNG is unsized, so `impl CryptoRngCore` bounds take this sized
-/// wrapper. It forwards every method to the underlying trait object,
-/// letting callers inject their own CSPRNG.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+/// wrapper. It forwards every method to the underlying trait object, so
+/// callers can inject their own CSPRNG.
+#[cfg(any(feature = "transport-cms", feature = "hpke"))]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "hpke"))]
 impl RngCore for RngWrapper<'_> {
 	fn next_u32(&mut self) -> u32 {
 		self.0.next_u32()
@@ -32,10 +71,10 @@ impl RngCore for RngWrapper<'_> {
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[cfg(any(feature = "transport-cms", feature = "hpke"))]
 impl CryptoRng for RngWrapper<'_> {}
 
-/// Generate a cryptographically random nonce.
+/// Generates a cryptographically random nonce.
 ///
 /// `None` draws from the OS CSPRNG through `getrandom`, and `Some` draws from
 /// the supplied RNG.
@@ -66,21 +105,21 @@ pub fn generate_nonce<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Re
 	Ok(nonce)
 }
 
-/// Generate a random number that is `N` bytes wide.
+/// Generates a random number that is `N` bytes wide.
 ///
 /// `None` draws from the OS CSPRNG, as [`generate_nonce`] does.
 pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Result<usize> {
 	const USIZE_BYTES: usize = core::mem::size_of::<usize>();
-	if N > USIZE_BYTES {
-		return Err(crate::TightBeamError::InvalidOverflowValue);
-	}
-
 	let mut bytes = [0u8; USIZE_BYTES];
-	generate_random_bytes(&mut bytes[..N], rng)?;
+	let Some(drawn) = bytes.get_mut(..N) else {
+		return Err(crate::TightBeamError::InvalidOverflowValue);
+	};
+
+	generate_random_bytes(drawn, rng)?;
 	Ok(usize::from_le_bytes(bytes))
 }
 
-/// Fill the provided byte slice with random bytes.
+/// Fills the provided byte slice with random bytes.
 ///
 /// `None` draws from the OS CSPRNG, and a supplied RNG must be
 /// cryptographically secure, so no caller can weaken the source.
@@ -100,36 +139,15 @@ pub fn generate_random_bytes(bytes: &mut [u8], rng: Option<&mut dyn CryptoRngCor
 mod tests {
 	use super::*;
 
-	#[test]
-	fn test_random() -> Result<()> {
-		// Each case pairs a byte size with a generator that draws once from the
-		// supplied RNG and once from the default source.
-		#[allow(clippy::type_complexity)]
-		let cases: &[(usize, fn(&mut rand_core::OsRng) -> Result<(Vec<u8>, Vec<u8>)>)] = &[
-			(8, |rng| {
-				let n1 = generate_random_number::<8>(Some(rng))?;
-				let n2 = generate_random_number::<8>(None)?;
-				Ok((n1.to_be_bytes().to_vec(), n2.to_be_bytes().to_vec()))
-			}),
-			(16, |rng| {
-				let n1 = generate_nonce::<16>(Some(rng))?;
-				let n2 = generate_nonce::<16>(None)?;
-				Ok((n1.to_vec(), n2.to_vec()))
-			}),
-			(24, |rng| {
-				let mut n1 = [0u8; 24];
-				generate_random_bytes(&mut n1, Some(rng))?;
+	/// A generator that draws once from the supplied RNG and once from the
+	/// default source.
+	type DrawPair = fn(&mut rand_core::OsRng) -> Result<(Vec<u8>, Vec<u8>)>;
 
-				let mut n2 = [0u8; 24];
-				generate_random_bytes(&mut n2, None)?;
-
-				Ok((n1.to_vec(), n2.to_vec()))
-			}),
-		];
-
-		for &(size, gen) in cases {
+	// Each case pairs a byte size with the generator of one draw function.
+	crate::tb_cases! {
+		fn test_random((size, draw): (usize, DrawPair)) -> Result<()> {
 			let mut rng = rand_core::OsRng;
-			let (nonce1, nonce2) = gen(&mut rng)?;
+			let (nonce1, nonce2) = draw(&mut rng)?;
 
 			assert_eq!(nonce1.len(), size);
 			assert_eq!(nonce2.len(), size);
@@ -139,8 +157,95 @@ mod tests {
 
 			assert_ne!(nonce1, vec![0u8; size]);
 			assert_ne!(nonce2, vec![0u8; size]);
+
+			Ok(())
 		}
 
+		cases {
+			number => (8, |rng| {
+				let n1 = generate_random_number::<8>(Some(rng))?;
+				let n2 = generate_random_number::<8>(None)?;
+				Ok((n1.to_be_bytes().to_vec(), n2.to_be_bytes().to_vec()))
+			}),
+			nonce => (16, |rng| {
+				let n1 = generate_nonce::<16>(Some(rng))?;
+				let n2 = generate_nonce::<16>(None)?;
+				Ok((n1.to_vec(), n2.to_vec()))
+			}),
+			bytes => (24, |rng| {
+				let mut n1 = [0u8; 24];
+				generate_random_bytes(&mut n1, Some(rng))?;
+
+				let mut n2 = [0u8; 24];
+				generate_random_bytes(&mut n2, None)?;
+
+				Ok((n1.to_vec(), n2.to_vec()))
+			}),
+		}
+	}
+
+	// The balancers of a gateway seed by XOR with the placement, which keeps
+	// their seeds distinct only while it holds one value in a process.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	#[test]
+	fn the_placement_entropy_holds_one_value_per_process() {
+		assert_eq!(placement_entropy(), placement_entropy());
+	}
+
+	/// The hash of the address of the anchor alone, which an observer who
+	/// enumerates the address space can compute.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	fn address_hash() -> u64 {
+		let placed = core::ptr::addr_of!(PLACEMENT_ANCHOR).addr();
+		let mut hasher = DefaultHasher::new();
+		placed.hash(&mut hasher);
+
+		hasher.finish()
+	}
+
+	// A retry delay reveals the placement, so the placement holds more than
+	// the hash of an address that the layout of the process names.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	#[test]
+	fn the_placement_entropy_is_more_than_the_hash_of_an_address() {
+		assert_ne!(placement_entropy(), address_hash());
+	}
+
+	/// The name that [`two_processes_take_two_placements`] runs in a child
+	/// process.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	const PLACEMENT_PRINTER: &str = "random::tests::print_the_placement_of_this_process";
+
+	/// The child half of [`two_processes_take_two_placements`], which prints
+	/// the placement of the process it runs in.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	#[test]
+	#[ignore = "the child half of two_processes_take_two_placements, which runs it in a process of its own"]
+	fn print_the_placement_of_this_process() {
+		println!("placement={}", placement_entropy());
+	}
+
+	/// The placement that the child half prints in a process of its own.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	fn placement_of_a_child_process() -> core::result::Result<u64, Box<dyn std::error::Error>> {
+		let exe = std::env::current_exe()?;
+		let args = ["--ignored", "--exact", PLACEMENT_PRINTER, "--nocapture", "--test-threads=1"];
+		let output = std::process::Command::new(exe).args(args).output()?;
+		let stdout = String::from_utf8(output.stdout)?;
+		let printed = stdout
+			.lines()
+			.find_map(|line| line.split_once("placement=").map(|(_, placement)| placement));
+
+		Ok(printed.ok_or("the child prints its placement")?.trim().parse()?)
+	}
+
+	// Peers that lose the random source together seed apart only while each
+	// process takes a placement of its own.
+	#[cfg(all(feature = "std", feature = "transport"))]
+	#[test]
+	fn two_processes_take_two_placements() -> core::result::Result<(), Box<dyn std::error::Error>> {
+		let child = placement_of_a_child_process()?;
+		assert_ne!(child, placement_entropy());
 		Ok(())
 	}
 }

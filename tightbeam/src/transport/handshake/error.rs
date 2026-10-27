@@ -1,49 +1,51 @@
 #[cfg(not(feature = "std"))]
-extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::string::ToString;
+use alloc::boxed::Box;
 
 use crate::Errorizable;
 
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 use crate::instrumentation::events;
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
-use crate::utils::urn::Urn;
+use crate::trace::TraceCollector;
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::transport::handshake::negotiation::NegotiationError;
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+use crate::TightBeamError;
 
-/// Result type for handshake operations.
-pub type Result<T> = core::result::Result<T, HandshakeError>;
-
-/// Errors that a handshake operation returns.
+/// The errors that a handshake operation returns.
 ///
-/// The handshake reports an invariant violation through one of these variants
-/// instead of a panic.
+/// An invariant violation returns one of these variants, not a panic.
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum HandshakeError {
-	/// The client key exchange message is invalid.
-	#[error("Invalid client key exchange message")]
-	InvalidClientKeyExchange,
-
-	/// The server key exchange message is invalid.
-	#[error("Invalid server key exchange message")]
-	InvalidServerKeyExchange,
-
 	/// A public key in the handshake is invalid.
 	#[error("Invalid public key in handshake: {0}")]
 	#[from]
 	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
 
-	/// The server sent its static key as its ephemeral. The agreement would
-	/// then collapse into the static one, which the server's key recovers, so
-	/// the client refuses it.
+	/// The server sent its static key, or its negation, as its ephemeral. The
+	/// agreement would collapse into the static one, which the server's key
+	/// recovers, so the client refuses it.
 	#[error("Server ephemeral equals the server static key")]
 	ServerEphemeralIsStatic,
+
+	/// The client sent its static key, or its negation, as an ephemeral of the
+	/// handshake or of a rekey. The agreement would collapse into the static
+	/// one, which the client's key recovers, so the server refuses it.
+	#[error("Client ephemeral equals the client static key")]
+	ClientEphemeralIsStatic,
 
 	/// The peer certificate failed validation.
 	#[error("Invalid certificate: {0}")]
@@ -59,7 +61,7 @@ pub enum HandshakeError {
 	#[from]
 	SignatureError(crate::crypto::sign::Error),
 
-	/// The underlying DER encoding or decoding failed.
+	/// The DER encoding or decoding failed.
 	#[error("DER error: {0}")]
 	#[from]
 	DerError(crate::der::Error),
@@ -74,10 +76,6 @@ pub enum HandshakeError {
 	#[from]
 	KeyError(crate::crypto::key::KeyError),
 
-	/// The CMS builder failed.
-	#[error("CMS builder error: {0}")]
-	CmsBuilderError(crate::cms::builder::Error),
-
 	/// The handshake state is invalid for this operation.
 	#[error("Invalid handshake state")]
 	InvalidState,
@@ -86,12 +84,8 @@ pub enum HandshakeError {
 	#[error("Unexpected handshake container for this step")]
 	UnexpectedContainer,
 
-	/// The server key is missing.
-	#[error("Missing server key")]
-	MissingServerKey,
-
 	/// No trust store or certificate validator is configured, so the handshake
-	/// refuses expiry-only peer certificate validation.
+	/// refuses to validate a peer certificate by its expiry alone.
 	#[error("Trust store required: refusing expiry-only peer certificate validation")]
 	MissingTrustStore,
 
@@ -103,18 +97,26 @@ pub enum HandshakeError {
 	#[error("Missing client certificate")]
 	MissingClientCertificate,
 
-	/// The certificate the client Finished embeds differs from the certificate
-	/// the key exchange bound into the transcript. Only the key-exchange
-	/// certificate proved knowledge of the base secret, so only it may sign
-	/// the Finished.
-	#[error("Client Finished certificate does not match the key-exchange certificate")]
-	ClientCertificateMismatch,
+	/// The signing and the key-agreement certificate of a CMS server name
+	/// two subjects.
+	#[error("The two server certificates name two subjects")]
+	SubjectMismatch,
 
-	/// The digest output width differs from the required transcript hash
-	/// width. `expected` is the required width and `received` is the digest
-	/// output width, both in bytes.
-	#[error("Transcript digest length invalid: expected {expected} bytes, got {received}")]
-	TranscriptDigestLength { expected: usize, received: usize },
+	/// The signing certificate a CMS server's Finished carries and the
+	/// key-agreement certificate its client pins chain to two trust anchors.
+	#[error("The two server certificates chain to two trust anchors")]
+	AnchorMismatch,
+
+	/// The signing and the key-agreement certificate of a CMS server hold one
+	/// key, which would serve two purposes (NIST SP 800-57 Part 1 Rev. 5 §5.2).
+	#[error("The two server certificates hold one key")]
+	KeyReuse,
+
+	/// A digest output of `received` bytes lies outside the `min` to `max`
+	/// bytes the handshake admits for a transcript hash and a key-confirmation
+	/// tag.
+	#[error("Transcript digest length invalid: {received} bytes, outside {min} to {max}")]
+	TranscriptDigestLength { min: usize, max: usize, received: usize },
 
 	/// The server requires mutual authentication, and the client has no
 	/// identity configured.
@@ -134,31 +136,47 @@ pub enum HandshakeError {
 	#[error("Receipt countersignature required for budget-bearing session but missing")]
 	CountersignatureMissing,
 
-	/// The client's receipt approver refused the session receipt. `code` is
-	/// the refusal code the approver returned.
+	/// The client's receipt approver refused the session receipt with the
+	/// refusal code `code`.
 	#[error("Session receipt refused by approver: code {code}")]
 	ApprovalRefused { code: u32 },
 
-	/// The server's authorizer rejected the settlement answer. `code` is the
-	/// rejection code the authorizer returned.
+	/// The server's authorizer rejected the settlement answer with the
+	/// rejection code `code`.
 	#[error("Settlement rejected: code {code}")]
 	SettlementRejected { code: u32 },
 
-	/// The approver's settlement answer exceeds the length prefix of its
-	/// encoding.
-	#[error("Settlement answer too large for the wire encoding")]
-	AnswerTooLarge,
+	/// The envelope refused to seal or open the receipt acknowledgement under
+	/// the key the handshake secret derives. An open fails when another
+	/// handshake secret or transcript sealed it, or when it changed in flight.
+	/// The payload is the envelope's refusal.
+	#[cfg(feature = "hpke")]
+	#[error("Receipt acknowledgement envelope refused: {0}")]
+	ReceiptAckCipher(crate::crypto::cms::EnvelopeError),
 
-	/// The AEAD refused to seal or open the receipt acknowledgement under the
-	/// key the handshake secret derives. On the opening side the
-	/// acknowledgement was sealed under another handshake secret or altered
-	/// in flight.
-	#[error("Receipt acknowledgement AEAD failure: {0}")]
-	ReceiptAckCipher(crate::crypto::aead::Error),
+	/// The envelope refused to seal or open the closing under the key the
+	/// handshake secret derives. An open fails when another handshake secret
+	/// or transcript sealed it, or when it changed in flight. The payload is
+	/// the envelope's refusal.
+	#[cfg(feature = "hpke")]
+	#[error("Sealed closing refused: {0}")]
+	SealedClosing(crate::crypto::cms::EnvelopeError),
 
-	/// The KDF salt of a traffic-key derivation is below the minimum entropy
-	/// requirement. `actual` is the salt length and `minimum` is the required
-	/// length, both in bytes.
+	/// The closing exceeds the padded frame it seals in, or an opened frame
+	/// carries a length past its end, a non-zero padding byte, or another
+	/// padded length.
+	#[error("Sealed frame malformed")]
+	SealedFrame,
+
+	/// A key-confirmation tag differs from the tag its receiver derived: the
+	/// client's tag in the closing, or the server Finished of the HPKE reply.
+	/// The peer holds another handshake secret, or it confirmed another
+	/// transcript.
+	#[error("Key confirmation failed")]
+	KeyConfirmationFailed,
+
+	/// The KDF salt of a traffic-key derivation is `actual` bytes, below the
+	/// `minimum` bytes the entropy requirement sets.
 	#[error("KDF salt too short: {actual} bytes (minimum {minimum} required)")]
 	InsufficientSaltEntropy { actual: usize, minimum: usize },
 
@@ -166,31 +184,18 @@ pub enum HandshakeError {
 	#[error("Handshake aborted by peer: {0:?}")]
 	AbortReceived(crate::transport::handshake::HandshakeAlert),
 
-	/// The handshake timed out.
-	#[error("Handshake timeout")]
-	Timeout,
-
 	/// The server selected no profile, or one that the client did not offer.
 	#[error("Server selected no profile, or one outside the client's offer")]
 	InvalidProfileSelection,
 
-	/// Profile negotiation failed.
+	/// The profile negotiation failed.
 	#[error("Profile negotiation failed: {0}")]
 	#[from]
 	NegotiationError(crate::transport::handshake::negotiation::NegotiationError),
 
-	/// Negotiation found no mutually supported profiles.
-	#[error("No mutually supported cryptographic profiles found")]
-	NoMutualProfiles,
-
 	/// The server has no supported profile configured, so it can select none.
 	#[error("No supported profiles configured on server")]
 	NoSupportedProfiles,
-
-	/// Profile negotiation is required, and the server has no profiles
-	/// configured.
-	#[error("Profile negotiation required but no profiles configured on server")]
-	NegotiationRequired,
 
 	/// An attribute holds more or fewer than one value.
 	#[error("Attribute must contain exactly one value")]
@@ -201,16 +206,6 @@ pub enum HandshakeError {
 	/// A required attribute is missing.
 	#[error("Required attribute missing")]
 	MissingAttribute,
-	/// The supported-curves list exceeds its cap. `count` is the number of
-	/// curves offered and `max` is the cap.
-	#[error("Too many supported curves: {count} exceeds cap of {max}")]
-	TooManySupportedCurves { count: usize, max: usize },
-	/// The nonce value is not a valid OCTET STRING.
-	#[error("Nonce value not valid OCTET STRING")]
-	InvalidNonceEncoding,
-	/// The nonce has the wrong length.
-	#[error("Nonce length mismatch: {0}")]
-	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 	/// An OCTET STRING has the wrong length.
 	#[error("OCTET STRING length mismatch: {0}")]
 	OctetStringLengthError(crate::error::ReceivedExpectedError<usize, usize>),
@@ -224,112 +219,190 @@ pub enum HandshakeError {
 	#[error("Unknown alert code: {0:?}")]
 	UnknownAlertCode(u8),
 
-	/// The certificate is not yet valid.
-	#[error("Certificate not yet valid")]
-	CertificateNotYetValid,
-	/// The certificate has expired.
-	#[error("Certificate expired")]
-	CertificateExpired,
-	/// A certificate timestamp is invalid.
-	#[error("Invalid timestamp")]
-	InvalidTimestamp,
-
-	/// An ECIES operation failed.
-	#[cfg(feature = "ecies")]
-	#[error("ECIES operation failed: {0}")]
+	/// An HPKE operation failed.
+	#[cfg(feature = "hpke")]
+	#[error("HPKE operation failed: {0}")]
 	#[from]
-	EciesError(crate::crypto::ecies::EciesError),
-	/// The ECIES message carries no encrypted content.
-	#[error("Missing encrypted content in ECIES message")]
-	MissingEncryptedContent,
-	/// The decrypted ECIES payload has an invalid size.
-	#[error("Invalid decrypted payload size")]
-	InvalidDecryptedPayloadSize,
-	/// The client random differs from the expected value, which indicates a
-	/// possible replay attack.
-	#[error("client_random mismatch - possible replay attack")]
-	ClientRandomMismatchReplay,
+	HpkeError(crate::crypto::hpke::HpkeError),
+	/// The authenticated envelope of a CMS opening fails to open, or an
+	/// envelope fails to seal.
+	#[cfg(feature = "hpke")]
+	#[error("Authenticated envelope refused: {0}")]
+	#[from]
+	Envelope(crate::crypto::cms::EnvelopeError),
 
-	/// An ECDH operation failed during key agreement.
-	#[error("ECDH operation failed")]
-	EcdhFailed,
 	/// A KDF operation failed.
 	#[error("KDF operation failed: {0}")]
 	#[from]
 	KdfError(crate::crypto::kdf::KdfError),
-	/// A key has an invalid size. `expected` and `received` are the required
-	/// and the actual key length in bytes.
+	/// A key has an invalid size: `received` bytes, not the `expected` bytes.
 	#[error("Invalid key size: expected {expected}, got {received}")]
 	InvalidKeySize { expected: usize, received: usize },
-	/// A ciphertext is shorter than the minimum length. `minimum` and
-	/// `received` are the required and the actual length in bytes.
-	#[error("Ciphertext too short: {received} bytes (minimum {minimum} required)")]
-	CiphertextTooShort { minimum: usize, received: usize },
-	/// ASN.1 encoding failed during CMS key agreement (KARI).
-	#[error("ASN.1 encoding error: {0}")]
-	Asn1Error(der::Error),
-	/// The recipient index is invalid.
-	#[error("Invalid recipient index")]
-	InvalidRecipientIndex,
-	/// The KeyAgreeRecipientInfo carries no user keying material (UKM).
-	#[error("Missing UKM in KeyAgreeRecipientInfo")]
-	MissingUkm,
-	/// The originator public key failed to parse.
-	#[error("Failed to parse originator public key")]
-	InvalidOriginatorPublicKey,
-	/// The originator identifier type is unsupported.
-	#[error("Unsupported originator identifier type")]
-	UnsupportedOriginatorIdentifier,
-	/// The KARI builder was already consumed.
-	#[error("KARI builder already consumed")]
-	KariBuilderConsumed,
-	/// The security profile configures no key wrap algorithm.
-	#[error("Key wrap algorithm not configured in security profile")]
-	MissingKeyWrapAlgorithm,
-	/// The negotiated key wrap algorithm is not AES-128, AES-192, or AES-256
-	/// key wrap.
-	#[error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")]
-	UnsupportedKeyWrapAlgorithm,
-	/// An AES key wrap operation failed.
-	#[cfg(all(feature = "builder", feature = "aead"))]
-	#[error("AES key wrap operation failed: {0}")]
-	#[from]
-	AesKeyWrap(crate::crypto::aead::aes_kw::Error),
 
-	/// Random generation failed.
+	/// The generation of random bytes failed.
 	#[error("Random generation failed")]
 	RandomGenerationFailed,
 
-	/// Cryptographic key or nonce material has the wrong length.
+	/// The material of a cryptographic key or a nonce has the wrong length.
 	#[error("Invalid key material length: {0}")]
 	#[from]
 	InvalidKeyMaterialLength(crypto_common::InvalidLength),
+
+	/// A crate error that names no handshake fault, kept whole.
+	/// [`Error::source`](core::error::Error::source) returns it as the cause.
+	#[error("Crate error during the handshake")]
+	#[source]
+	Other(Box<crate::error::TightBeamError>),
 }
 
 #[cfg(all(
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 impl HandshakeError {
-	/// Returns the audit event a failed handshake records for this error, when
-	/// the error names one.
+	/// Returns the record a failed handshake files in its audit trail for this
+	/// error, when the error names one.
 	///
-	/// - A receipt approval or settlement refusal records
-	///   [`SESSION_RECEIPT_REFUSED`](events::SESSION_RECEIPT_REFUSED).
-	/// - A refused peer certificate or proof of possession, including a
-	///   certificate the peer did not present, records
-	///   [`SESSION_CERT_REJECTED`](events::SESSION_CERT_REJECTED).
-	pub(crate) fn audit_event(&self) -> Option<Urn<'static>> {
+	/// - A receipt that the approver refuses, the authorizer rejects, or that
+	///   is missing, mismatched, or not countersigned files a receipt refusal
+	///   for its reason, with the code of a refusal that carries one.
+	/// - A refused proof or identity of the peer files an identity refusal for
+	///   its reason: a peer certificate that fails validation or is absent, a
+	///   signature or key confirmation that fails, a closing or frame that
+	///   fails to open, two server certificates that conflict, and an ephemeral
+	///   that equals its static key.
+	/// - A refusal of the transport authorizer files the code it returned.
+	/// - A crate error that names no handshake fault files the generic failure.
+	/// - A local fault, a malformed message, and a negotiation outcome other
+	///   than an authorizer refusal name no record.
+	pub(crate) fn audit(&self) -> Option<HandshakeAudit> {
+		let audit = match self {
+			Self::ApprovalRefused { code } => {
+				HandshakeAudit::ReceiptRefused { reason: "approval-refused", code: Some(*code) }
+			}
+			Self::SettlementRejected { code } => {
+				HandshakeAudit::ReceiptRefused { reason: "settlement-rejected", code: Some(*code) }
+			}
+			Self::ReceiptMissing => HandshakeAudit::ReceiptRefused { reason: "receipt-missing", code: None },
+			Self::ReceiptMismatch => HandshakeAudit::ReceiptRefused { reason: "receipt-mismatch", code: None },
+			Self::CountersignatureMissing => {
+				HandshakeAudit::ReceiptRefused { reason: "countersignature-missing", code: None }
+			}
+			Self::CertificateValidationError(cause) => HandshakeAudit::IdentityRefused(cause.refusal_label()),
+			Self::SignatureVerificationFailed | Self::SignatureError(_) => HandshakeAudit::IdentityRefused("signature"),
+			Self::MissingClientCertificate => HandshakeAudit::IdentityRefused("missing-client-certificate"),
+			Self::MissingServerCertificate => HandshakeAudit::IdentityRefused("missing-server-certificate"),
+			Self::MutualAuthRequired => HandshakeAudit::IdentityRefused("mutual-auth-required"),
+			Self::SealedFrame => HandshakeAudit::IdentityRefused("sealed-frame"),
+			#[cfg(feature = "hpke")]
+			Self::SealedClosing(cause) => HandshakeAudit::IdentityRefused(cause.sealed_closing_label()),
+			Self::KeyConfirmationFailed => HandshakeAudit::IdentityRefused("key-confirmation"),
+			Self::SubjectMismatch => HandshakeAudit::IdentityRefused("subject-mismatch"),
+			Self::AnchorMismatch => HandshakeAudit::IdentityRefused("anchor-mismatch"),
+			Self::KeyReuse => HandshakeAudit::IdentityRefused("key-reuse"),
+			Self::ServerEphemeralIsStatic => HandshakeAudit::IdentityRefused("server-ephemeral-is-static"),
+			Self::ClientEphemeralIsStatic => HandshakeAudit::IdentityRefused("client-ephemeral-is-static"),
+			Self::NegotiationError(NegotiationError::AuthorizationRefused { code }) => {
+				HandshakeAudit::AuthorizationRefused(*code)
+			}
+			Self::Other(_) => HandshakeAudit::Failed,
+			Self::NegotiationError(_)
+			| Self::InvalidPublicKey(_)
+			| Self::DerError(_)
+			| Self::SpkiError(_)
+			| Self::KeyError(_)
+			| Self::InvalidState
+			| Self::UnexpectedContainer
+			| Self::MissingTrustStore
+			| Self::TranscriptDigestLength { .. }
+			| Self::InsufficientSaltEntropy { .. }
+			| Self::AbortReceived(_)
+			| Self::InvalidProfileSelection
+			| Self::NoSupportedProfiles
+			| Self::InvalidAttributeArity
+			| Self::DuplicateAttribute
+			| Self::MissingAttribute
+			| Self::OctetStringLengthError(_)
+			| Self::InvalidIntegerEncoding
+			| Self::IntegerOutOfRange
+			| Self::UnknownAlertCode(_)
+			| Self::KdfError(_)
+			| Self::InvalidKeySize { .. }
+			| Self::RandomGenerationFailed
+			| Self::InvalidKeyMaterialLength(_) => return None,
+			#[cfg(feature = "hpke")]
+			Self::ReceiptAckCipher(_) | Self::HpkeError(_) | Self::Envelope(_) => return None,
+		};
+
+		Some(audit)
+	}
+}
+
+/// The record that a failed handshake files in the audit trail of its
+/// endpoint, at the record of the handshake outcome.
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HandshakeAudit {
+	/// The receipt failed for `reason`, with the code of a refusal that
+	/// carries one, which files [`SESSION_RECEIPT_REFUSED`].
+	///
+	/// [`SESSION_RECEIPT_REFUSED`]: events::SESSION_RECEIPT_REFUSED
+	ReceiptRefused {
+		/// Why the receipt failed, such as `approval-refused`.
+		reason: &'static str,
+		/// The code that the approver or the authorizer returned.
+		code: Option<u32>,
+	},
+	/// The handshake refused the identity of its peer for the reason it holds,
+	/// such as `signature`, which files [`SESSION_CERT_REJECTED`].
+	///
+	/// [`SESSION_CERT_REJECTED`]: events::SESSION_CERT_REJECTED
+	IdentityRefused(&'static str),
+	/// The transport authorizer refused the session with the code it holds,
+	/// which files [`SESSION_AUTHORIZATION_REFUSED`].
+	///
+	/// [`SESSION_AUTHORIZATION_REFUSED`]: events::SESSION_AUTHORIZATION_REFUSED
+	AuthorizationRefused(u32),
+	/// A deadline ended the handshake. It files [`SESSION_HANDSHAKE_EXPIRED`].
+	///
+	/// [`SESSION_HANDSHAKE_EXPIRED`]: events::SESSION_HANDSHAKE_EXPIRED
+	Expired,
+	/// A crate error that names no handshake fault ended the handshake, which
+	/// files [`ERROR`](events::ERROR).
+	Failed,
+}
+
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+impl HandshakeAudit {
+	/// Files this record in `trace`.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at the event of this record.
+	pub(crate) fn file(&self, trace: &TraceCollector) -> Result<(), TightBeamError> {
 		match self {
-			Self::ApprovalRefused { .. } | Self::SettlementRejected { .. } => Some(events::SESSION_RECEIPT_REFUSED),
-			Self::CertificateValidationError(_)
-			| Self::SignatureVerificationFailed
-			| Self::MissingClientCertificate
-			| Self::ClientCertificateMismatch
-			| Self::CertificateNotYetValid
-			| Self::CertificateExpired
-			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),
-			_ => None,
+			Self::ReceiptRefused { reason, code: Some(code) } => {
+				trace.emit_event_with_value(events::SESSION_RECEIPT_REFUSED, *reason, *code)
+			}
+			Self::ReceiptRefused { reason, code: None } => {
+				trace.emit_event_with_value(events::SESSION_RECEIPT_REFUSED, *reason, ())
+			}
+			Self::IdentityRefused(reason) => {
+				trace.emit_event_with_value(events::SESSION_CERT_REJECTED, *reason, *reason)
+			}
+			Self::AuthorizationRefused(code) => {
+				// The trace renders the digits for a record its sink keeps.
+				let label = || code.to_string();
+				trace.emit_event_with_value_and_rendered_label(events::SESSION_AUTHORIZATION_REFUSED, label, *code)
+			}
+			Self::Expired => trace.emit_event(events::SESSION_HANDSHAKE_EXPIRED),
+			Self::Failed => trace.emit_event(events::ERROR),
 		}
 	}
 }
@@ -337,44 +410,50 @@ impl HandshakeError {
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into
 /// [`HandshakeError`].
 ///
-/// A variant without a handshake counterpart collapses to
-/// [`HandshakeError::InvalidState`].
+/// A variant with a handshake counterpart becomes that counterpart. Any other
+/// becomes [`HandshakeError::Other`], which keeps it as the source, so the
+/// conversion reports a handshake fault only when the error names one.
 impl From<crate::error::TightBeamError> for HandshakeError {
 	fn from(err: crate::error::TightBeamError) -> Self {
 		use crate::error::TightBeamError;
 		match err {
 			TightBeamError::HandshakeError(h) => h,
 			TightBeamError::SerializationError(e) => HandshakeError::DerError(e),
-			#[cfg(feature = "x509")]
 			TightBeamError::SpkiError(e) => HandshakeError::SpkiError(e),
-			#[cfg(feature = "x509")]
 			TightBeamError::CertificateValidationError(e) => HandshakeError::CertificateValidationError(e),
-			#[cfg(feature = "crypto")]
 			TightBeamError::KeyError(e) => HandshakeError::KeyError(e),
-			#[cfg(feature = "signature")]
 			TightBeamError::SignatureError(e) => HandshakeError::SignatureError(e),
-			#[cfg(feature = "ecies")]
-			TightBeamError::EciesError(e) => HandshakeError::EciesError(e),
-			#[cfg(feature = "random")]
+			TightBeamError::SignatureEncodingError => HandshakeError::SignatureVerificationFailed,
+			TightBeamError::Signer(e) => HandshakeError::from(e),
+			TightBeamError::EllipticCurveError(e) => HandshakeError::InvalidPublicKey(e),
+			TightBeamError::KeyDerivationError(e) => HandshakeError::KdfError(e),
+			TightBeamError::InvalidKeyLength(e) => HandshakeError::InvalidKeyMaterialLength(e),
+			#[cfg(feature = "hpke")]
+			TightBeamError::HpkeError(e) => HandshakeError::HpkeError(e),
+			#[cfg(feature = "hpke")]
+			TightBeamError::EnvelopeError(e) => HandshakeError::Envelope(e),
 			TightBeamError::OsRngError(_) => HandshakeError::RandomGenerationFailed,
-			_ => HandshakeError::InvalidState,
+			other => HandshakeError::Other(Box::new(other)),
 		}
 	}
 }
 
-/// Narrows [`HandshakeError`] into the foreign [`crate::cms::builder::Error`].
+/// Narrows a CMS signer error into [`HandshakeError`].
 ///
-/// A variant without a counterpart collapses into
-/// [`Builder`](crate::cms::builder::Error::Builder) through its `Display`.
-#[cfg(all(feature = "builder", feature = "aead"))]
-impl From<HandshakeError> for crate::cms::builder::Error {
-	fn from(err: HandshakeError) -> Self {
+/// An encoding, key, or certificate failure keeps its variant. Every other
+/// refusal of a signature, its signer, its version, or its signed attributes
+/// is [`HandshakeError::SignatureVerificationFailed`], the one verdict both
+/// flows report for a signature they refuse.
+impl From<crate::crypto::sign::SignerError> for HandshakeError {
+	fn from(err: crate::crypto::sign::SignerError) -> Self {
+		use crate::crypto::sign::SignerError;
+
 		match err {
-			HandshakeError::CmsBuilderError(e) => e,
-			HandshakeError::DerError(e) => crate::cms::builder::Error::Asn1(e),
-			HandshakeError::Asn1Error(e) => crate::cms::builder::Error::Asn1(e),
-			HandshakeError::SpkiError(e) => crate::cms::builder::Error::PublicKey(e),
-			other => crate::cms::builder::Error::Builder(other.to_string()),
+			SignerError::Encoding(e) => HandshakeError::DerError(e),
+			SignerError::PublicKey(e) => HandshakeError::SpkiError(e),
+			SignerError::Key(e) => HandshakeError::KeyError(e),
+			SignerError::Certificate(e) => HandshakeError::CertificateValidationError(e),
+			_ => HandshakeError::SignatureVerificationFailed,
 		}
 	}
 }
@@ -382,25 +461,195 @@ impl From<HandshakeError> for crate::cms::builder::Error {
 #[cfg(all(
 	test,
 	feature = "instrument",
-	any(feature = "transport-cms", feature = "transport-ecies")
+	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 mod tests {
 	use super::*;
+	use crate::crypto::cms::EnvelopeError;
+	use crate::crypto::kdf::KdfError;
+	use crate::crypto::sign::{elliptic_curve, SignerError};
+	use crate::crypto::x509::error::CertificateValidationError;
+	use crate::error::ReceivedExpectedError;
+	use crate::TightBeamError;
 
 	#[test]
 	fn a_missing_client_certificate_is_a_certificate_rejection() {
-		let event = HandshakeError::MissingClientCertificate.audit_event();
-		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
+		let audit = HandshakeError::MissingClientCertificate.audit();
+		let expected = HandshakeAudit::IdentityRefused("missing-client-certificate");
+		assert_eq!(audit, Some(expected));
+	}
+
+	/// A closing that fails to open names no certificate the server could
+	/// check, so it records the refusal of an unproven identity.
+	#[test]
+	fn a_sealed_identity_that_fails_to_open_is_a_certificate_rejection() {
+		let audit = HandshakeError::SealedClosing(EnvelopeError::Authentication).audit();
+		let expected = HandshakeAudit::IdentityRefused("sealed-closing/authentication");
+		assert_eq!(audit, Some(expected));
 	}
 
 	#[test]
 	fn a_refused_approval_is_a_receipt_refusal() {
-		let event = HandshakeError::ApprovalRefused { code: 7 }.audit_event();
-		assert_eq!(event, Some(events::SESSION_RECEIPT_REFUSED));
+		let audit = HandshakeError::ApprovalRefused { code: 7 }.audit();
+		let expected = HandshakeAudit::ReceiptRefused { reason: "approval-refused", code: Some(7) };
+		assert_eq!(audit, Some(expected));
+	}
+
+	// Each refusal files the reason it names, and the code of a refusal that
+	// carries one, so a spec tells one refusal from another.
+	crate::tb_cases! {
+		fn a_refusal_files_its_reason((error, expected): (HandshakeError, HandshakeAudit)) {
+			assert_eq!(error.audit(), Some(expected));
+		}
+		cases {
+			settlement_rejected => (
+				HandshakeError::SettlementRejected { code: 9 },
+				HandshakeAudit::ReceiptRefused { reason: "settlement-rejected", code: Some(9) },
+			),
+			receipt_missing => (
+				HandshakeError::ReceiptMissing,
+				HandshakeAudit::ReceiptRefused { reason: "receipt-missing", code: None },
+			),
+			receipt_mismatch => (
+				HandshakeError::ReceiptMismatch,
+				HandshakeAudit::ReceiptRefused { reason: "receipt-mismatch", code: None },
+			),
+			countersignature_missing => (
+				HandshakeError::CountersignatureMissing,
+				HandshakeAudit::ReceiptRefused { reason: "countersignature-missing", code: None },
+			),
+			certificate_cause => (
+				HandshakeError::CertificateValidationError(CertificateValidationError::CertificateDenied),
+				HandshakeAudit::IdentityRefused("certificate/certificate-denied"),
+			),
+			signature => (
+				HandshakeError::SignatureVerificationFailed,
+				HandshakeAudit::IdentityRefused("signature"),
+			),
+			mutual_auth_required => (
+				HandshakeError::MutualAuthRequired,
+				HandshakeAudit::IdentityRefused("mutual-auth-required"),
+			),
+			sealed_frame => (HandshakeError::SealedFrame, HandshakeAudit::IdentityRefused("sealed-frame")),
+			authorization_refused => (
+				HandshakeError::NegotiationError(NegotiationError::AuthorizationRefused { code: 11 }),
+				HandshakeAudit::AuthorizationRefused(11),
+			),
+			key_confirmation_failed => (
+				HandshakeError::KeyConfirmationFailed,
+				HandshakeAudit::IdentityRefused("key-confirmation"),
+			),
+			subject_mismatch => (HandshakeError::SubjectMismatch, HandshakeAudit::IdentityRefused("subject-mismatch")),
+			anchor_mismatch => (HandshakeError::AnchorMismatch, HandshakeAudit::IdentityRefused("anchor-mismatch")),
+			key_reuse => (HandshakeError::KeyReuse, HandshakeAudit::IdentityRefused("key-reuse")),
+			missing_server_certificate => (
+				HandshakeError::MissingServerCertificate,
+				HandshakeAudit::IdentityRefused("missing-server-certificate"),
+			),
+			server_ephemeral_is_static => (
+				HandshakeError::ServerEphemeralIsStatic,
+				HandshakeAudit::IdentityRefused("server-ephemeral-is-static"),
+			),
+			client_ephemeral_is_static => (
+				HandshakeError::ClientEphemeralIsStatic,
+				HandshakeAudit::IdentityRefused("client-ephemeral-is-static"),
+			),
+			signature_error => (
+				HandshakeError::SignatureError(crate::crypto::sign::Error::new()),
+				HandshakeAudit::IdentityRefused("signature"),
+			),
+		}
+	}
+
+	// The label of a refused authorization holds the decimal digits of its
+	// code, from one digit to the ten of `u32::MAX`.
+	crate::tb_cases! {
+		fn a_refusal_code_labels_its_record_in_decimal((code, label): (u32, &str)) -> Result<(), TightBeamError> {
+			let trace = TraceCollector::new();
+			HandshakeAudit::AuthorizationRefused(code).file(&trace)?;
+
+			let recorded = trace.drain_events();
+			let refusals = recorded.into_iter().filter(|event| event.urn == events::SESSION_AUTHORIZATION_REFUSED);
+			let labels: Vec<Option<String>> = refusals.map(|event| event.label.map(String::from)).collect();
+			assert_eq!(labels, [Some(label.to_owned())]);
+			Ok(())
+		}
+		cases {
+			zero => (0, "0"),
+			two_digits => (11, "11"),
+			the_largest_code => (u32::MAX, "4294967295"),
+		}
 	}
 
 	#[test]
 	fn a_state_error_records_no_audit_event() {
-		assert_eq!(HandshakeError::InvalidState.audit_event(), None);
+		assert_eq!(HandshakeError::InvalidState.audit(), None);
+	}
+
+	/// A crate error with no handshake counterpart keeps its cause, so the
+	/// conversion reports no state fault.
+	#[test]
+	fn an_unmapped_crate_error_reads_back_through_its_source() -> Result<(), Box<dyn core::error::Error>> {
+		let error = HandshakeError::from(TightBeamError::MissingEncryptionInfo);
+		let source = core::error::Error::source(&error).ok_or("the conversion keeps the cause")?;
+
+		let downcast = source.downcast_ref::<Box<TightBeamError>>();
+		let cause = downcast.ok_or("the cause is the crate error")?;
+		assert!(matches!(**cause, TightBeamError::MissingEncryptionInfo));
+		Ok(())
+	}
+
+	/// The widths that a shared-secret length error of the KDF holds, or
+	/// `None` for every other error.
+	fn held_width(error: HandshakeError) -> Option<ReceivedExpectedError<usize, usize>> {
+		match error {
+			HandshakeError::KdfError(KdfError::InvalidSharedSecretLength(held)) => Some(held),
+			_ => None,
+		}
+	}
+
+	/// A key derivation failure has a handshake counterpart, so it keeps its
+	/// kind.
+	#[test]
+	fn a_key_derivation_failure_converts_to_its_counterpart() {
+		let width = ReceivedExpectedError { received: 16, expected: 32 };
+		let failure = KdfError::InvalidSharedSecretLength(width.clone());
+		let error = HandshakeError::from(TightBeamError::KeyDerivationError(failure));
+		assert_eq!(held_width(error), Some(width));
+	}
+
+	/// A signature that fails to encode is a signature the handshake refuses.
+	#[test]
+	fn a_signature_encoding_failure_is_a_failed_verification() {
+		let error = HandshakeError::from(TightBeamError::SignatureEncodingError);
+		assert!(matches!(error, HandshakeError::SignatureVerificationFailed));
+	}
+
+	/// A signer error that the crate error carries whole converts as the
+	/// signer conversion converts it.
+	#[test]
+	fn a_carried_signer_error_converts_as_a_signer_refusal() {
+		let error = HandshakeError::from(TightBeamError::Signer(SignerError::SignerIdentifier));
+		assert!(matches!(error, HandshakeError::SignatureVerificationFailed));
+	}
+
+	/// A curve failure is an invalid public key.
+	#[test]
+	fn a_curve_failure_is_an_invalid_public_key() {
+		let error = HandshakeError::from(TightBeamError::EllipticCurveError(elliptic_curve::Error));
+		assert!(matches!(error, HandshakeError::InvalidPublicKey(_)));
+	}
+
+	/// Key material of the wrong length keeps its kind.
+	#[test]
+	fn an_invalid_key_length_converts_to_its_counterpart() {
+		let error = HandshakeError::from(TightBeamError::InvalidKeyLength(crypto_common::InvalidLength));
+		assert!(matches!(error, HandshakeError::InvalidKeyMaterialLength(_)));
+	}
+
+	#[test]
+	fn an_unmapped_crate_error_records_the_generic_failure() {
+		let audit = HandshakeError::from(TightBeamError::MissingEncryptionInfo).audit();
+		assert_eq!(audit, Some(HandshakeAudit::Failed));
 	}
 }

@@ -1,61 +1,76 @@
-//! # Base-secret confidentiality threat
+//! # Closing confidentiality threat
 //!
 //! ## Weakness
-//! If the base secret is transmitted in the clear, or the encryption is not
-//! applied, an observer can recover it.
+//! If the client's closing travels in the clear, or under a key that a
+//! server's static key recovers, an observer who records the handshake and
+//! later obtains that key reads the client identity, the key-confirmation tag,
+//! and the receipt acknowledgement.
 //!
 //! ## Attack
-//! Captured ECIES ciphertext is examined: decrypted with the correct key,
-//! attempted with a wrong key, and compared across two handshakes.
+//! An observer captures an HPKE handshake and later obtains the server's
+//! static key. It extracts the closing, and tries to open it under every
+//! closing key that key and the legs in the clear yield. It also compares the
+//! closings of two handshakes.
+//!
+//! CMS carries its base secret inside an `AuthEnvelopedData` with a
+//! `KEMRecipientInfo`. The unit test
+//! `the_base_secret_crosses_the_wire_only_sealed` in
+//! `transport::handshake::orchestrator` covers that carriage.
 //!
 //! ## Expected control
-//! The base secret MUST NOT be transmitted in the clear. The payload MUST be
-//! sealed via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with
-//! the correct private key, yield the expected DER plaintext (a SEQUENCE of the
-//! 32-byte base secret and 32-byte client random OCTET STRINGs), and produce
-//! fresh ciphertext per handshake.
+//! The HPKE flow seals nothing to a server key. The closing MUST be an
+//! `AuthEnvelopedData` whose one recipient is a `KEKRecipientInfo` under a key
+//! of the ephemeral-ephemeral agreement, so no closing key the static key
+//! yields unwraps its content key. Each handshake MUST seal its closing afresh.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data <https://cwe.mitre.org/data/definitions/311.html>
 //! - CAPEC-157: Sniffing Attacks <https://capec.mitre.org/data/definitions/157.html>
-//! - RFC 9180 (HPKE): ECDH + KDF + AEAD construction
+//! - RFC 9846 Appendix F.1, the client identity under handshake keys:
+//!   <https://datatracker.ietf.org/doc/html/rfc9846#appendix-F.1>
 
 use std::sync::Arc;
 
 use tightbeam::{
+	cms::enveloped_data::RecipientInfo,
+	crypto::cms::{AuthEnvelopedData, EnvelopeError},
+	der::Decode,
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	utils::urn::Urn,
+	urn::Urn,
 	TightBeamError,
 };
 
 use crate::security::common::{
-	expectation_failure, extract_ecies_ciphertext, generate_wrong_secret_key, try_decrypt_ecies, DecryptionResult,
-	Direction, HandshakeBackendKind, SecurityThreatHarness,
+	closing_key, expectation_failure, CapturedHandshake, HandshakeBackendKind, SecurityThreatHarness,
+	StaticKeyObserver, STATIC_KEY_CANDIDATES,
 };
 
 pub(crate) const CONF_CAPTURE_HANDSHAKE: Urn<'static> =
 	tightbeam::urn!("test", "event:confidentiality/conf-capture-handshake");
-pub(crate) const CONF_CIPHERTEXTS_DIFFER: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-ciphertexts-differ");
-pub(crate) const CONF_DECRYPT_CORRECT_KEY: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-decrypt-correct-key");
-pub(crate) const CONF_DECRYPT_WRONG_KEY_FAILS: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-decrypt-wrong-key-fails");
-pub(crate) const CONF_EXTRACT_CIPHERTEXT: Urn<'static> =
-	tightbeam::urn!("test", "event:confidentiality/conf-extract-ciphertext");
+
+/// The DER of the message at `step` of a captured handshake.
+fn message_of(captured: &CapturedHandshake, step: usize) -> Result<&[u8], TightBeamError> {
+	let message = captured.message_at(step);
+	let message = message.ok_or_else(|| expectation_failure("a leg is missing"))?;
+	Ok(&message.payload)
+}
+
+/// Whether `closing` is an `AuthEnvelopedData` whose one recipient is a
+/// `KEKRecipientInfo`.
+fn sealed_under_kek(closing: &[u8]) -> Result<bool, TightBeamError> {
+	let envelope = AuthEnvelopedData::from_der(closing)?;
+	let recipients = envelope.recipient_infos.0.as_slice();
+	Ok(matches!(recipients, [RecipientInfo::Kekri(_)]))
+}
 
 tb_assert_spec! {
 	pub ConfidentialitySpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(CONF_CAPTURE_HANDSHAKE, exactly!(1u32)),
-			(CONF_EXTRACT_CIPHERTEXT, exactly!(1u32)),
-			(CONF_DECRYPT_CORRECT_KEY, exactly!(1u32)),
-			(CONF_DECRYPT_WRONG_KEY_FAILS, exactly!(1u32)),
-			(CONF_CIPHERTEXTS_DIFFER, exactly!(1u32))
+			(CONF_CAPTURE_HANDSHAKE, exactly!(2u32))
 		]
 	}
 }
@@ -65,29 +80,19 @@ tb_process_spec! {
 	events {
 		observable {
 			CONF_CAPTURE_HANDSHAKE,
-			CONF_EXTRACT_CIPHERTEXT,
-			CONF_DECRYPT_CORRECT_KEY,
-			CONF_DECRYPT_WRONG_KEY_FAILS,
-			CONF_CIPHERTEXTS_DIFFER,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_ECIES
+			SecurityThreatHarness::HARNESS_SPAWN_HPKE
 		}
 		hidden { }
 	}
 	states {
 		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
-		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady },
-		SessionReady => {
-			CONF_CAPTURE_HANDSHAKE => Captured,
-			CONF_CIPHERTEXTS_DIFFER => Idle
-		},
-		Captured => { CONF_EXTRACT_CIPHERTEXT => Extracted },
-		Extracted => { CONF_DECRYPT_CORRECT_KEY => CorrectKeyVerified },
-		CorrectKeyVerified => { CONF_DECRYPT_WRONG_KEY_FAILS => WrongKeyVerified },
-		WrongKeyVerified => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
+		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_HPKE => SessionReady },
+		SessionReady => { CONF_CAPTURE_HANDSHAKE => Captured },
+		Captured => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
 	}
-	terminal { Idle }
-	annotations { description: "Confidentiality: ECIES encryption verification via manual decryption" }
+	terminal { Captured }
+	annotations { description: "Confidentiality: the HPKE closing opens under no key the server's static key yields" }
 }
 
 tb_scenario! {
@@ -107,83 +112,58 @@ job! {
 	name: ConfidentialityScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-
-		// This test decrypts the ECIES ClientKeyExchange blob directly. CMS
-		// carries the base secret inside an EnvelopedData/KARI structure, and
-		// the unit test `the_base_secret_crosses_the_wire_only_sealed` in
-		// `transport::handshake::orchestrator` covers that wire.
-		let kind = HandshakeBackendKind::Ecies;
+		// The observer reads the HPKE closing, so the scenario runs over HPKE
+		// alone.
+		let kind = HandshakeBackendKind::Hpke;
 
 		// Step 1: Capture a complete handshake.
-		let mut session = harness.spawn(kind);
+		let mut session = harness.spawn(kind)?;
 		let captured = session.capture_full().await?;
 
 		trace.event(CONF_CAPTURE_HANDSHAKE)?;
 
-		// Step 2: Extract the ECIES ciphertext from the ClientKeyExchange, at
-		// flow step 2.
-		let client_kex = captured
-			.messages
-			.iter()
-			.find(|m| m.step == 2 && m.direction == Direction::ClientToServer)
-			.ok_or_else(|| expectation_failure("no ClientKeyExchange message captured"))?;
+		// Step 2: The client seals the closing under a key both endpoints
+		// derive, and to no server key.
+		let closing = message_of(&captured, 2)?;
+		assert!(sealed_under_kek(closing)?, "the closing names a recipient other than one KEKRecipientInfo");
 
-		let ciphertext = extract_ecies_ciphertext(&client_kex.payload)?;
-		// The blob holds a 33-byte public key, a 12-byte nonce, a 16-byte tag,
-		// and the 70-byte plaintext, which is 131 bytes in all. A blob under
-		// 100 bytes is no ECIES ciphertext.
-		if ciphertext.len() < 100 {
-			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
-		}
+		// Step 3: Each closing key from the server's static key, the hello, and
+		// the reply passes the key identifier and fails the key-wrap integrity
+		// check, so the observer reaches the recipient and lacks its key.
+		let static_key = harness.materials().secret_key();
+		let (hello, reply) = (message_of(&captured, 0)?, message_of(&captured, 1)?);
+		let observer = StaticKeyObserver::new(hello, reply, closing, static_key)?;
+		let attempts = observer.closing_attempts().await?;
+		let unwrap_refused = attempts.iter().all(|attempt| matches!(attempt, Err(EnvelopeError::KeyUnwrap)));
+		let refused = attempts.len() == STATIC_KEY_CANDIDATES && unwrap_refused;
 
-		trace.event(CONF_EXTRACT_CIPHERTEXT)?;
+		assert!(refused, "a closing key that the server's static key yields opened the closing");
 
-		// Step 3: Decrypt with the correct key, to prove the encryption works.
-		let correct_key = harness.materials().secret_key();
-		match try_decrypt_ecies(&ciphertext, correct_key, None) {
-			DecryptionResult::Success { plaintext_len } => {
-				// The plaintext must be the 70-byte DER SEQUENCE of the 32-byte
-				// base secret and the 32-byte client random as OCTET STRINGs.
-				// This unmetered session carries no receipt acknowledgement.
-				if plaintext_len != 70 {
-					return Err(expectation_failure("decrypted plaintext is not the 70-byte DER payload"));
-				}
-
-				trace.event(CONF_DECRYPT_CORRECT_KEY)?;
-			}
-			DecryptionResult::Failed => {
-				return Err(expectation_failure("decryption with correct key failed"));
-			}
-		}
-
-		// Step 4: Decrypt with a wrong key, to prove the encryption is real.
-		let wrong_key = generate_wrong_secret_key();
-		match try_decrypt_ecies(&ciphertext, &wrong_key, None) {
-			DecryptionResult::Failed => {
-				trace.event(CONF_DECRYPT_WRONG_KEY_FAILS)?;
-			}
-			DecryptionResult::Success { .. } => {
-				return Err(expectation_failure("decryption with wrong key should fail"));
-			}
-		}
-
-		// Step 5: Two handshakes MUST produce different ciphertexts, because
-		// each one draws a fresh ephemeral key and a fresh nonce.
-		let mut session2 = harness.spawn(kind);
+		// Step 4: Two handshakes seal two closings, each under a fresh content
+		// key and nonce.
+		let mut session2 = harness.spawn(kind)?;
 		let captured2 = session2.capture_full().await?;
-		let client_kex2 = captured2
-			.messages
-			.iter()
-			.find(|m| m.step == 2 && m.direction == Direction::ClientToServer)
-			.ok_or_else(|| expectation_failure("no ClientKeyExchange in second handshake"))?;
 
-		let ciphertext2 = extract_ecies_ciphertext(&client_kex2.payload)?;
-		if ciphertext == ciphertext2 {
-			return Err(expectation_failure("ciphertexts are identical across handshakes"));
-		}
+		trace.event(CONF_CAPTURE_HANDSHAKE)?;
 
-		trace.event(CONF_CIPHERTEXTS_DIFFER)?;
+		let closing2 = message_of(&captured2, 2)?;
+		assert_ne!(closing, closing2, "two handshakes sealed byte-equal closings");
 
 		Ok(())
 	}
+}
+
+/// The observer's closing key over `ee` = `0x11` × 32 and the salt `0x99` ×
+/// 32 matches an independent HKDF-SHA3-256 (Python's `hmac` and `hashlib`).
+/// Its intermediate handshake secret is the crate's known answer of the
+/// ephemeral handshake secret, so the observer runs the flow's own schedule.
+#[test]
+fn the_observer_closing_key_matches_its_known_answer() -> Result<(), TightBeamError> {
+	let closing = closing_key(&[0x11u8; 32], &[0x99u8; 32])?;
+	let expected = [
+		0x5d, 0xb3, 0x7d, 0x19, 0x92, 0xd1, 0x26, 0xa1, 0x41, 0x3e, 0x0a, 0xeb, 0xc5, 0x88, 0xd3, 0x19, 0xcc, 0xc8,
+		0x26, 0x2c, 0xa8, 0x1b, 0x21, 0xb4, 0x12, 0x69, 0xfd, 0xd2, 0x6e, 0xc9, 0xf5, 0x3d,
+	];
+	assert_eq!(closing, expected);
+	Ok(())
 }

@@ -1,35 +1,34 @@
-//! FDR memoization cache subsystem
+//! The memoization cache subsystem of FDR.
 //!
-//! This module contains the MemoizationCache trait implementation.
+//! [`DefaultCache`] is the house implementation of [`MemoizationCache`].
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::testing::fdr::explorer::MemoizationCache;
+use crate::testing::fdr::explorer::{CacheKey, MemoizationCache};
 use crate::testing::fdr::verdict::{Failure, Trace};
 
-/// Default memoization cache implementation
+/// The default [`MemoizationCache`], with one map for each kind of set.
 ///
-/// Keyed on [`crate::testing::specs::csp::Process::structure_digest`] values so structurally
-/// different processes never share entries, even when algebra operators
-/// give them identical names. Each entry stores the completeness
-/// flag of the computation that produced it.
+/// Each map keys on [`CacheKey`], so a set of one depth bound never answers a
+/// search at another, and two processes share an entry only when their
+/// structures are equal. Each entry stores the completeness flag of the
+/// computation that produced it.
 pub struct DefaultCache {
-	/// Memoization cache: structure digest -> (traces, complete)
-	traces_cache: RefCell<HashMap<u64, (Vec<Trace>, bool)>>,
-	/// Memoization cache: structure digest -> (failures, complete)
-	failures_cache: RefCell<HashMap<u64, (Vec<Failure>, bool)>>,
-	/// Memoization cache: structure digest -> (divergences, complete)
-	divergences_cache: RefCell<HashMap<u64, (Vec<Trace>, bool)>>,
+	/// The traces under each key, and whether the set is complete.
+	traces_cache: HashMap<CacheKey, (Vec<Trace>, bool)>,
+	/// The failures under each key, and whether the set is complete.
+	failures_cache: HashMap<CacheKey, (Vec<Failure>, bool)>,
+	/// The divergences under each key, and whether the set is complete.
+	divergences_cache: HashMap<CacheKey, (Vec<Trace>, bool)>,
 }
 
 impl DefaultCache {
-	/// Create new cache
+	/// Creates an empty cache.
 	pub fn new() -> Self {
 		Self {
-			traces_cache: RefCell::new(HashMap::new()),
-			failures_cache: RefCell::new(HashMap::new()),
-			divergences_cache: RefCell::new(HashMap::new()),
+			traces_cache: HashMap::new(),
+			failures_cache: HashMap::new(),
+			divergences_cache: HashMap::new(),
 		}
 	}
 }
@@ -41,30 +40,30 @@ impl Default for DefaultCache {
 }
 
 impl MemoizationCache for DefaultCache {
-	fn get_cached_traces(&self, structure: u64) -> Option<(Vec<Trace>, bool)> {
-		self.traces_cache.borrow().get(&structure).cloned()
+	fn get_cached_traces(&self, key: &CacheKey) -> Option<(Vec<Trace>, bool)> {
+		self.traces_cache.get(key).cloned()
 	}
 
-	fn cache_traces(&mut self, structure: u64, traces: impl IntoIterator<Item = Trace>, complete: bool) {
+	fn cache_traces(&mut self, key: CacheKey, traces: impl IntoIterator<Item = Trace>, complete: bool) {
 		let traces: Vec<Trace> = traces.into_iter().collect();
-		self.traces_cache.borrow_mut().insert(structure, (traces, complete));
+		self.traces_cache.insert(key, (traces, complete));
 	}
 
-	fn get_cached_failures(&self, structure: u64) -> Option<(Vec<Failure>, bool)> {
-		self.failures_cache.borrow().get(&structure).cloned()
+	fn get_cached_failures(&self, key: &CacheKey) -> Option<(Vec<Failure>, bool)> {
+		self.failures_cache.get(key).cloned()
 	}
 
-	fn cache_failures(&mut self, structure: u64, failures: impl IntoIterator<Item = Failure>, complete: bool) {
+	fn cache_failures(&mut self, key: CacheKey, failures: impl IntoIterator<Item = Failure>, complete: bool) {
 		let failures: Vec<Failure> = failures.into_iter().collect();
-		self.failures_cache.borrow_mut().insert(structure, (failures, complete));
+		self.failures_cache.insert(key, (failures, complete));
 	}
 
-	fn get_cached_divergences(&self, structure: u64) -> Option<(Vec<Trace>, bool)> {
-		self.divergences_cache.borrow().get(&structure).cloned()
+	fn get_cached_divergences(&self, key: &CacheKey) -> Option<(Vec<Trace>, bool)> {
+		self.divergences_cache.get(key).cloned()
 	}
 
-	fn cache_divergences(&mut self, structure: u64, divergences: impl IntoIterator<Item = Trace>, complete: bool) {
+	fn cache_divergences(&mut self, key: CacheKey, divergences: impl IntoIterator<Item = Trace>, complete: bool) {
 		let divergences: Vec<Trace> = divergences.into_iter().collect();
-		self.divergences_cache.borrow_mut().insert(structure, (divergences, complete));
+		self.divergences_cache.insert(key, (divergences, complete));
 	}
 }

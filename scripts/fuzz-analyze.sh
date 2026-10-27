@@ -9,9 +9,9 @@ FUZZ_RUN_SH="$ROOT/scripts/fuzz-run.sh"
 
 FILE="${1:-}"
 
-# The run is searched for only when the caller named no file. A caller holding
-# a crash path has already answered the question, and after `make fuzz-test`
-# every target has a run, so searching first would refuse every invocation.
+# The script looks for the run only when the caller names no file. A caller
+# with a crash path has answered the question, and after `make fuzz-test`
+# every target has a run, so a search first would refuse every invocation.
 if [ -z "$FILE" ]; then
 	FUZZ_RUN=$("$FUZZ_RUN_SH")
 
@@ -31,10 +31,10 @@ if [ ! -f "$FILE" ]; then
 	exit 1
 fi
 
-# The path names its own target, so the input is replayed through the binary
-# that found it rather than through whichever binary a glob happened to match.
+# The path names its own target, so the script replays the input through the
+# binary that found it. A glob over the binaries could match another target.
 TARGET="$("$FUZZ_RUN_SH" --target "$FILE")"
-BINARY="$ROOT/target/debug/$TARGET"
+BINARY="$("$FUZZ_RUN_SH" --bin-dir)/$TARGET"
 
 if [ ! -x "$BINARY" ]; then
 	echo "Error: $TARGET is not built at $BINARY. Run 'make fuzz-build' first." >&2
