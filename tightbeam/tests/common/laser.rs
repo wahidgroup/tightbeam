@@ -240,7 +240,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for LaserList
 
 impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for LaserListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		transport.is_alive()
+		transport.is_leasable()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {

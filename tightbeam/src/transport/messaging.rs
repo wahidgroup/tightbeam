@@ -315,7 +315,9 @@ impl From<Frame> for Letter {
 /// - `Ok` carries the frame to resend and the delay to observe first.
 /// - `Err` carries the terminal error.
 ///
-/// An error that carries no frame passes through unchanged.
+/// An error that carries no frame passes through unchanged, and so does a
+/// failure that spends its session, ahead of the policy, because a resend on
+/// that session can never succeed. The frame then goes back unsent.
 fn evaluate_retry<P>(
 	policy: &P,
 	error: TransportError,
@@ -325,6 +327,7 @@ where
 	P: RestartPolicy + ?Sized,
 {
 	match error {
+		TransportError::MessageNotSent(_, failure) if failure.spends_the_session() => Err(error),
 		TransportError::MessageNotSent(boxed_frame, ref failure) => {
 			// The policy takes the box, so the frame stays in its single
 			// allocation.
@@ -530,6 +533,12 @@ pub trait MessageCollector: MessageIO + GateAudit {
 		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: HandshakeProvider,
 	{
+		// A session that can answer no request collects none, so a request on
+		// its way never reaches a handler.
+		if self.session_state().phase().is_spent() {
+			return Err(TransportError::OperationFailed(TransportFailure::RekeyRequired));
+		}
+
 		loop {
 			match self.collect_step().await? {
 				CollectStep::Handshake(request) => self.perform_server_handshake(request).await?,
@@ -610,12 +619,28 @@ mod tests {
 		}
 	}
 
-	/// An emitter whose every send fails, so every attempt reaches the
-	/// restart policy.
+	/// An emitter whose every send fails with `failure`, so every attempt
+	/// reaches the restart policy.
 	struct FailingEmitter {
 		clock: RecordingClock,
 		gate: GateChain,
 		restart: RestartLinearBackoff,
+		failure: TransportFailure,
+	}
+
+	impl FailingEmitter {
+		/// An emitter that fails each send with `failure`, under three
+		/// restarts a second apart and a second more each time.
+		fn failing_with(failure: TransportFailure) -> Self {
+			let restart = RestartLinearBackoff::new(3, core::time::Duration::from_secs(1), 1, None);
+			Self { clock: RecordingClock::default(), gate: GateChain::default(), restart, failure }
+		}
+
+		/// The waits the emitter slept through, in order.
+		fn sleeps(&self) -> Vec<core::time::Duration> {
+			let sleeps = self.clock.sleeps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+			sleeps.clone()
+		}
 	}
 
 	impl MessageIO for FailingEmitter {
@@ -648,7 +673,7 @@ mod tests {
 			&mut self,
 			message: Frame,
 		) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
-			Err(TransportError::from_failure(message, TransportFailure::DeadlineExceeded))
+			Err(TransportError::from_failure(message, self.failure))
 		}
 	}
 
@@ -656,21 +681,24 @@ mod tests {
 	/// target retries hot, and the waits follow the policy's schedule.
 	#[tokio::test]
 	async fn a_restart_backoff_waits_on_the_transport_clock() {
-		let restart = RestartLinearBackoff::new(3, core::time::Duration::from_secs(1), 1, None);
-		let mut emitter = FailingEmitter { clock: RecordingClock::default(), gate: GateChain::default(), restart };
+		let mut emitter = FailingEmitter::failing_with(TransportFailure::DeadlineExceeded);
 
 		let outcome = emitter.emit(TestFrame::v0(None, None), None).await;
 		assert!(outcome.is_err());
 
-		let sleeps = emitter
-			.clock
-			.sleeps
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner)
-			.clone();
-
 		let schedule = [1, 2, 3].map(core::time::Duration::from_secs);
-		assert_eq!(sleeps, schedule);
+		assert_eq!(emitter.sleeps(), schedule);
+	}
+
+	/// A send refused at the record limit is not resent on its session, which
+	/// can never send again, so the frame goes back unsent at once.
+	#[tokio::test]
+	async fn a_send_at_the_record_limit_is_not_resent() {
+		let mut emitter = FailingEmitter::failing_with(TransportFailure::RekeyRequired);
+
+		let outcome = emitter.emit(TestFrame::v0(None, None), None).await;
+		let unsent = matches!(outcome, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
+		assert_eq!((unsent, emitter.sleeps()), (true, Vec::new()));
 	}
 
 	impl GateAudit for AuditProbe {

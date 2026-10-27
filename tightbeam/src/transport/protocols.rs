@@ -504,12 +504,17 @@ where
 /// once per connection, not once per message.
 pub trait PersistentConnection: Protocol {
 	/// Whether a pool may lease the transport again: the connection is open,
-	/// and its session is sound.
+	/// and its session can carry another exchange.
 	///
-	/// Returns `false` on EOF, a socket error, or an explicit close, and on a
-	/// session whose last exchange broke or never settled, as a caller that
-	/// dropped its emit leaves it. A protocol should use a lightweight check,
-	/// such as a peek, that neither blocks nor allocates.
+	/// Returns `false` on EOF, a socket error, or an explicit close. It also
+	/// returns `false` on a session whose last exchange broke or never
+	/// settled, as a caller that dropped its emit leaves it, and on one whose
+	/// send cipher has no record left. A protocol over [`TcpTransport`]
+	/// answers with [`TcpTransport::is_leasable`]. A protocol should use a
+	/// lightweight check, such as a peek, that neither blocks nor allocates.
+	///
+	/// [`TcpTransport`]: crate::transport::TcpTransport
+	/// [`TcpTransport::is_leasable`]: crate::transport::TcpTransport::is_leasable
 	fn is_connected(transport: &Self::Transport) -> bool;
 
 	/// Attempt a best-effort graceful close.

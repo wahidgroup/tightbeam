@@ -1413,7 +1413,7 @@ mod tests {
 	}
 
 	/// An established session whose send cipher holds a record limit of zero.
-	#[cfg(feature = "instrument")]
+	#[cfg(any(feature = "instrument", feature = "tcp", feature = "async-transport"))]
 	fn spent_phase() -> SessionPhase {
 		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
 
@@ -1436,6 +1436,25 @@ mod tests {
 		let at_limit = matches!(refusal, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
 		assert!(at_limit);
 		assert_eq!(records_of(&trace, events::TRANSPORT_REKEY_REQUIRED), [expected]);
+	}
+
+	/// An exchange whose request meets the record limit of the send cipher
+	/// sends nothing, so it leaves the session established. The spent cipher
+	/// keeps the connection out of a pool, which dials a fresh one.
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
+	#[tokio::test]
+	async fn an_exchange_at_the_record_limit_keeps_its_session_out_of_the_pool() {
+		use crate::transport::state::SettledExchange;
+
+		let mut probe = StreamProbe::at(spent_phase());
+		let frame = TestFrame::prioritized();
+		let exchange = async move |endpoint: &mut StreamProbe| endpoint.perform_emit_cycle(frame).await;
+		let refusal = probe.settled_exchange(exchange).await;
+
+		let at_limit = matches!(refusal, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
+		let established = matches!(probe.session_state().phase(), SessionPhase::Encrypted(_));
+		let leasable = probe.session_state().is_leasable();
+		assert_eq!((at_limit, established, leasable), (true, true, false));
 	}
 
 	/// A request around `frame`.

@@ -426,3 +426,33 @@ tb_scenario! {
 		}
 	}
 }
+
+/// An outside protocol over the TCP transport keeps the lease contract of
+/// the house pool: a connection whose emit was dropped before its answer is
+/// not leased again, though its stream is still open.
+#[tokio::test]
+async fn a_laser_lease_whose_emit_was_dropped_is_not_leased_again() -> Result<(), Box<dyn std::error::Error>> {
+	use tightbeam::testing::TestFrame;
+	use tightbeam::transport::{MessageCollector, PersistentConnection, Protocol};
+
+	// The server reads the request and never answers, so the emit stays in
+	// flight while the stream stays open.
+	let (listener, addr) = <LaserListener as Protocol>::bind_cleartext(LaserAddr::ANY).await?;
+	tokio::spawn(async move {
+		let Ok((mut transport, _)) = listener.accept().await else {
+			return;
+		};
+
+		let _request = transport.collect_message().await;
+		core::future::pending::<()>().await;
+	});
+
+	let pool = Arc::new(ConnectionPool::<LaserListener>::builder().allow_cleartext().build());
+	let mut lease = pool.connect(addr).await?;
+	let emit = lease.emit(TestFrame::v0(Some("request"), None), None);
+	let abandoned = tokio::time::timeout(Duration::from_millis(100), emit).await;
+
+	let leasable = <LaserListener as PersistentConnection>::is_connected(lease.conn()?.transport());
+	assert_eq!((abandoned.is_err(), leasable), (true, false));
+	Ok(())
+}

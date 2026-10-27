@@ -115,13 +115,23 @@ impl SessionPhase {
 		Self::Cleartext
 	}
 
-	/// Whether this phase may write application traffic.
+	/// Whether this phase may write application traffic: cleartext, or an
+	/// established session whose send cipher has a record left.
 	///
 	/// The pool leases a connection only in a writable phase, so a peer that
-	/// stalls its handshake keeps that connection out of the pool. A phase
-	/// added later stays unwritable until this method names it.
-	pub const fn is_writable(&self) -> bool {
-		matches!(self, Self::Cleartext | Self::Encrypted(_))
+	/// stalls its handshake, and a session that spent its send cipher, keep
+	/// that connection out of the pool. A phase added later stays unwritable
+	/// until this method names it.
+	pub fn is_writable(&self) -> bool {
+		matches!(self, Self::Cleartext | Self::Encrypted(_)) && !self.is_spent()
+	}
+
+	/// Whether this phase holds a session whose send cipher has no record
+	/// left. A multiplexed session renews its keys before the limit, and
+	/// nothing renews a spent cipher, so the session carries no further
+	/// exchange.
+	pub(crate) fn is_spent(&self) -> bool {
+		matches!(self, Self::Encrypted(session) if session.keys().send().is_spent())
 	}
 
 	/// Whether this phase admits `event`.
@@ -487,9 +497,12 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Whether a pool may lease this connection again: its phase is writable,
 	/// and no exchange is in flight.
 	///
-	/// The pool of the tokio transport is its one reader.
+	/// [`TcpTransport::is_leasable`] is its one reader, for the house pool
+	/// and for an outside protocol over the TCP transport alike.
+	///
+	/// [`TcpTransport::is_leasable`]: crate::transport::TcpTransport::is_leasable
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
-	#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+	#[cfg_attr(not(feature = "async-transport"), allow(dead_code))]
 	pub(crate) fn is_leasable(&self) -> bool {
 		self.phase.is_writable() && !self.exchange_in_flight
 	}
@@ -1505,6 +1518,39 @@ mod tests {
 
 		state.settle_exchange(Ok(()))?;
 		assert_eq!((in_flight, state.is_leasable()), (false, true));
+		Ok(())
+	}
+
+	// A pool leases an established session while its send cipher has a record
+	// left. A ceiling past the renewal volume spends the cipher before its
+	// first record.
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
+	crate::tb_cases! {
+		fn an_established_session_is_leasable_while_its_cipher_has_a_record((ceiling, expected): (usize, bool)) {
+			let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
+			let session = EstablishedSession::forged(keys.with_envelope_ceiling(ceiling), None, None);
+			let state = SessionState::at(provisioned_encryption(), SessionPhase::Encrypted(Box::new(session)));
+			assert_eq!(state.is_leasable(), expected);
+		}
+		cases {
+			a_cipher_with_records_left => (DEFAULT_MAX_ENCRYPTED_ENVELOPE, true),
+			a_spent_cipher => (usize::MAX, false),
+		}
+	}
+
+	/// The seal of the last record a send cipher holds takes its session out
+	/// of the pool. A ceiling of the whole renewal volume leaves one record.
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
+	#[test]
+	fn the_last_seal_of_a_send_cipher_takes_its_session_out_of_the_pool() -> TransportResult<()> {
+		let ceiling = crate::constants::RENEWAL_VOLUME_BYTES as usize;
+		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
+		let session = EstablishedSession::forged(keys.with_envelope_ceiling(ceiling), None, None);
+		let state = SessionState::at(provisioned_encryption(), SessionPhase::Encrypted(Box::new(session)));
+		let before = state.is_leasable();
+
+		state.encryptor()?.encrypt_next(b"the last record".to_vec())?;
+		assert_eq!((before, state.is_leasable()), (true, false));
 		Ok(())
 	}
 

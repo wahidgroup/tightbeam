@@ -747,6 +747,15 @@ impl TransportFailure {
 			self.into()
 		}
 	}
+
+	/// Whether this failure leaves its session unable to send again, so a
+	/// resend on that session can never succeed: the send cipher is at its
+	/// record limit ([RFC 9846 § 5.5][rfc9846-5.5]).
+	///
+	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
+	pub(crate) const fn spends_the_session(&self) -> bool {
+		matches!(self, Self::RekeyRequired)
+	}
 }
 
 // The audit records of the transport alone name a failure, so the names take
@@ -966,6 +975,14 @@ mod tests {
 				false
 			),
 			a_spent_budget_keeps_the_stream => (TransportError::OperationFailed(TransportFailure::BudgetExhausted), false),
+			a_send_past_the_record_limit_keeps_the_stream => (
+				TransportFailure::RekeyRequired.with_frame(crate::testing::TestFrame::prioritized()),
+				false
+			),
+			an_answer_past_the_record_limit_ends_the_stream => (
+				TransportError::OperationFailed(TransportFailure::RekeyRequired),
+				true
+			),
 		}
 	}
 

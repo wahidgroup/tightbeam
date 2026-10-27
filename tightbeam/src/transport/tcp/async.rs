@@ -317,11 +317,18 @@ where
 	TransportError: From<S::Error>,
 {
 	/// Reports whether the underlying stream appears connected.
-	///
-	/// An external protocol implements [`PersistentConnection`] for pooled
-	/// connections through this hook, because the stream stays private.
 	pub fn is_alive(&self) -> bool {
 		AsyncProtocolStream::is_alive(&self.stream)
+	}
+
+	/// Whether a pool may lease this transport again: its stream is alive, its
+	/// session may write, and no exchange is in flight.
+	///
+	/// A protocol over this transport implements
+	/// [`PersistentConnection::is_connected`] through this hook, because the
+	/// stream and the session stay private.
+	pub fn is_leasable(&self) -> bool {
+		self.is_alive() && self.state.is_leasable()
 	}
 }
 
@@ -1092,7 +1099,7 @@ where
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		transport.is_alive() && transport.session_state().is_leasable()
+		transport.is_leasable()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
@@ -2099,6 +2106,7 @@ mod tests {
 			tokio::time::sleep(Duration::from_secs(2)).await;
 			Ok(7)
 		};
+
 		let budget = Duration::from_secs(1);
 		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
 		let outcome = bounded.await;
@@ -2128,6 +2136,7 @@ mod tests {
 		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, Some(peer))));
 		let mut transport = transport.with_trace(trace.share());
 		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
+
 		let (mut reader, _writer) = transport.into_split()?;
 		raw_peer.write_all(WAITING_FRAME).await?;
 
@@ -2138,6 +2147,34 @@ mod tests {
 		let refusal = recorded.iter().find(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED);
 		let evidence = refusal.and_then(|event| event.payload_hash);
 		assert_eq!(evidence, Some(expected));
+		Ok(())
+	}
+
+	/// A server whose send cipher is spent can answer no request, so it
+	/// collects none, and the request that waits on the wire never reaches a
+	/// handler.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_spent_server_collects_no_request() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::aead::SessionKeys;
+		use crate::transport::envelopes::{RequestPackage, TransportEnvelope, WireEnvelope};
+		use crate::transport::handshake::EstablishedSession;
+		use crate::transport::state::{SessionPhase, SessionState};
+
+		let clock = Arc::new(ManualClock::default());
+		let (mut transport, mut peer) = handshaking_server(&clock).await;
+		let client = SessionKeys::for_client(TestKey::insecure_directional_keys());
+		let server = SessionKeys::for_server(TestKey::insecure_directional_keys()).with_envelope_ceiling(usize::MAX);
+		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(server, None, None)));
+		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
+
+		let request = TransportEnvelope::Request(RequestPackage::new(TestFrame::prioritized()));
+		let record = client.send().encrypt_next(request.to_der()?)?;
+		peer.write_all(&WireEnvelope::Encrypted(record).to_der()?).await?;
+
+		let collected = transport.collect_message().await;
+		let refused = matches!(collected, Err(TransportError::OperationFailed(TransportFailure::RekeyRequired)));
+		assert!(refused, "a spent server collects no request, but it collected {collected:?}");
 		Ok(())
 	}
 

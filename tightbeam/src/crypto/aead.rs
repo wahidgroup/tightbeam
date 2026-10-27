@@ -606,6 +606,12 @@ impl SendCipher {
 		self.rekey_limit.saturating_sub(used)
 	}
 
+	/// Whether this cipher has no record left to seal, so every seal fails
+	/// with [`TightBeamError::RekeyRequired`].
+	pub fn is_spent(&self) -> bool {
+		self.remaining_records() == 0
+	}
+
 	/// Seal `payload`, the encoded envelope of one record, as the next record.
 	///
 	/// The payload moves in, and the envelope encrypts it in place, so its
