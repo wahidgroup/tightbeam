@@ -20,6 +20,7 @@ use crate::der::{
 };
 use crate::policy::TransitStatus;
 use crate::transport::error::{ArrivalCause, TransportError, TransportFailure};
+use crate::transport::TransportResult;
 use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -1030,7 +1031,7 @@ impl<'a> ArrivingEnvelope<'a> {
 	///   [`TransportFailure::EncryptionFailed`] -- a record arrived on a reader
 	///   that holds no keys.
 	/// - The cause of a record that `recv` refused to open, which [`ArrivalCause::of_open`] names.
-	pub(crate) fn admit_under(self, recv: Option<&RecvCipher>) -> Result<&'a [u8], ArrivalCause> {
+	pub(crate) fn admit_under(self, recv: Option<&mut RecvCipher>) -> Result<&'a [u8], ArrivalCause> {
 		match (recv, self) {
 			(Some(key), Self::Encrypted(record)) => key.open(record).map_err(ArrivalCause::of_open),
 			(Some(_), Self::Cleartext(_)) => Err(TransportError::MissingEncryption.into()),
@@ -1065,6 +1066,16 @@ impl WireEnvelope {
 	/// - [`der::Error`] -- `wire` is no wire envelope, or carries bytes past it.
 	pub fn arrive(wire: &mut [u8]) -> DerResult<Arrived<'_>> {
 		Self::admit(wire)?.arrive()
+	}
+
+	/// Returns the frame of a cleartext request, which a refused exchange
+	/// hands back for its retry. Any other envelope returns `None`, a sealed
+	/// request among them, because its frame travels inside the record.
+	pub(crate) fn cleartext_request(&self) -> Option<Arc<Frame>> {
+		match self {
+			Self::Cleartext(envelope) => envelope.request_frame().map(Arc::clone),
+			Self::Encrypted(_) => None,
+		}
 	}
 
 	/// Reads the outer header of `wire`, the DER of one wire envelope, and
@@ -1188,6 +1199,50 @@ impl TransportEnvelope {
 	pub fn new_request(msg: Frame) -> Self {
 		Self::Request(RequestPackage { message: Arc::new(msg) })
 	}
+
+	/// Lends the application frame of a single-flight request, or `None` for
+	/// an envelope of any other kind.
+	pub(crate) fn request_frame(&self) -> Option<&Arc<Frame>> {
+		match self {
+			Self::Request(package) => Some(&package.message),
+			Self::Response(_) => None,
+			Self::SignedData(_) | Self::AuthEnvelopedData(_) | Self::Data(_) => None,
+			#[cfg(feature = "transport-multiplex")]
+			Self::Mux(_) => None,
+		}
+	}
+
+	/// Returns the application request frame inside a single-flight envelope.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the envelope is any kind other than a request.
+	pub(crate) fn into_request_frame(self) -> TransportResult<Arc<Frame>> {
+		match self {
+			Self::Request(msg) => Ok(msg.message),
+			Self::Response(_) => Err(TransportError::InvalidMessage),
+			Self::SignedData(_) | Self::AuthEnvelopedData(_) | Self::Data(_) => Err(TransportError::InvalidMessage),
+			#[cfg(feature = "transport-multiplex")]
+			Self::Mux(_) => Err(TransportError::InvalidMessage),
+		}
+	}
+
+	/// Returns the response package of an envelope that answers a
+	/// single-flight request.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the envelope is any kind other
+	///   than a response, a request among them.
+	pub(crate) fn into_response(self) -> TransportResult<ResponsePackage> {
+		match self {
+			Self::Response(package) => Ok(package),
+			Self::Request(_) => Err(TransportError::InvalidMessage),
+			Self::SignedData(_) | Self::AuthEnvelopedData(_) | Self::Data(_) => Err(TransportError::InvalidMessage),
+			#[cfg(feature = "transport-multiplex")]
+			Self::Mux(_) => Err(TransportError::InvalidMessage),
+		}
+	}
 }
 
 #[cfg(test)]
@@ -1268,6 +1323,18 @@ mod tests {
 			unauthenticated => PackageTestCase::new("Unauthenticated", TransitStatus::Unauthenticated, false),
 			not_found => PackageTestCase::new("NotFound", TransitStatus::NotFound, false),
 		}
+	}
+
+	/// A request lends the frame it carries, and a response that carries a
+	/// frame lends none, so only a request hands a frame back for its retry.
+	#[test]
+	fn the_request_frame_is_the_frame_of_a_request_alone() {
+		let frame = TestFrame::v0(Some("lent"), None);
+		let request = TransportEnvelope::new_request(frame.clone());
+		let response = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, Some(frame.clone())));
+
+		let lent = (request.request_frame().map(Arc::as_ref), response.request_frame());
+		assert_eq!(lent, (Some(&frame), None));
 	}
 
 	#[test]

@@ -65,6 +65,30 @@ pub enum TestingError {
 	FuzzInputUnavailable,
 	#[error("Fuzz input lock poisoned")]
 	FuzzInputLockPoisoned,
+	/// A panic that held a lock of the testing surface poisoned the lock.
+	///
+	/// [`From<PoisonError>`](std::sync::PoisonError) produces it for every
+	/// lock, and [`Self::FuzzInputLockPoisoned`] names the fuzz cursor alone.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Mutex;
+	///
+	/// use tightbeam::testing::error::TestingError;
+	///
+	/// let lock = Mutex::new(0u8);
+	/// let poisoned = std::panic::catch_unwind(|| {
+	///     let _held = lock.lock();
+	///     panic!("poison the lock");
+	/// });
+	/// assert!(poisoned.is_err());
+	///
+	/// let refused = lock.lock().map(|_| ()).map_err(TestingError::from);
+	/// assert!(matches!(refused, Err(TestingError::LockPoisoned)));
+	/// ```
+	#[error("A lock of the testing surface is poisoned")]
+	LockPoisoned,
 	#[error("Invalid timing constraint configuration")]
 	InvalidTimingConstraint,
 	#[error("Slack exceeds deadline duration")]
@@ -216,6 +240,35 @@ pub enum TestingError {
 #[cfg(feature = "std")]
 impl<T> From<std::sync::PoisonError<T>> for TestingError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
-		TestingError::FuzzInputLockPoisoned
+		TestingError::LockPoisoned
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::panic::{catch_unwind, AssertUnwindSafe};
+	use std::sync::Mutex;
+
+	use super::TestingError;
+
+	/// A lock that a panic poisoned while it held the guard.
+	fn poisoned() -> Mutex<u8> {
+		let lock = Mutex::new(0);
+		let panicked = catch_unwind(AssertUnwindSafe(|| {
+			let _held = lock.lock();
+			panic!("poison the lock");
+		}));
+
+		assert!(panicked.is_err());
+		lock
+	}
+
+	#[test]
+	fn a_poisoned_lock_outside_the_fuzz_cursor_reads_as_lock_poisoned() {
+		let lock = poisoned();
+
+		let refused = lock.lock().map(|_| ()).map_err(TestingError::from);
+
+		assert!(matches!(refused, Err(TestingError::LockPoisoned)));
 	}
 }

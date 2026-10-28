@@ -11,6 +11,12 @@
 /// - The method takes the leftmost 160 bits of the SHA-256 of the `subjectPublicKey` BIT STRING.
 /// - An issued certificate also carries the issuer's `authorityKeyIdentifier` by the same method.
 ///
+/// # Signature type
+///
+/// The optional `signature:` key names the type the signer signs under, such
+/// as `p256::ecdsa::DerSignature` for a P-256 signer. Without the key, the
+/// certificate carries an ECDSA signature over secp256k1 in DER form.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -78,6 +84,7 @@ macro_rules! cert {
 		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr,
+		signature: $sig:ty,
 		extensions: [$($ext:expr),* $(,)?]
 	) => {{
 		use $crate::crypto::x509::builder::Builder;
@@ -98,7 +105,7 @@ macro_rules! cert {
 		builder.add_extension(&key_identifier)?;
 		$( builder.add_extension(&$ext)?; )*
 
-		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
+		builder.build::<$sig>()
 	}};
 
 	// A root CA certificate that sets pathLenConstraint (RFC 5280 §4.2.1.9).
@@ -110,6 +117,7 @@ macro_rules! cert {
 		signer: $signer:expr,
 		subject_public_key: $spki:expr,
 		path_len: $path_len:expr
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: None,
@@ -118,6 +126,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: true, path_len_constraint: Some($path_len) },
 				$crate::cert!(@ca_usage),
@@ -133,6 +142,7 @@ macro_rules! cert {
 		duration: $duration:expr,
 		signer: $signer:expr,
 		subject_public_key: $spki:expr
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: None,
@@ -141,6 +151,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: true, path_len_constraint: None },
 				$crate::cert!(@ca_usage),
@@ -176,6 +187,7 @@ macro_rules! cert {
 		signer: $signer:expr
 		$(, key_usage: $key_usage:expr)?
 		$(, extensions: [$($ext:expr),* $(,)?])?
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: Some($crate::cert!(@name $issuer)),
@@ -184,6 +196,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::cert!(@authority $signer),
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: false, path_len_constraint: None },
@@ -203,6 +216,7 @@ macro_rules! cert {
 		subject_public_key: $spki:expr,
 		signer: $signer:expr
 		$(, path_len: $path_len:expr)?
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: Some($crate::cert!(@name $issuer)),
@@ -211,6 +225,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::cert!(@authority $signer),
 				$crate::crypto::x509::ext::pkix::BasicConstraints {
@@ -221,6 +236,15 @@ macro_rules! cert {
 			]
 		)
 	}};
+
+	// Resolve the signature type: the `signature:` key, or ECDSA over
+	// secp256k1 in DER when the key is absent.
+	(@signature) => {
+		$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>
+	};
+	(@signature $sig:ty) => {
+		$sig
+	};
 
 	// Resolve an optional pathLenConstraint: absent yields an unbounded path.
 	(@path_len) => {
@@ -244,9 +268,10 @@ macro_rules! cert {
 /// Builds a PKCS #10 certificate signing request (RFC 2986) for `subject`,
 /// signed by `signer`.
 ///
-/// The request carries a secp256k1 ECDSA signature in DER form. Each entry of
-/// `extensions:` goes into the extensionRequest attribute of the request
-/// (RFC 2985 §5.4.2).
+/// The optional `signature:` key names the signature type, as it does for
+/// [`cert!`](crate::cert). The default is an ECDSA signature over secp256k1 in
+/// DER form. Each entry of `extensions:` goes into the extensionRequest
+/// attribute of the request (RFC 2985 §5.4.2).
 ///
 /// # Examples
 ///
@@ -269,6 +294,7 @@ macro_rules! csr {
 		subject: $subject:expr,
 		signer: $signer:expr
 		$(, extensions: [$($ext:expr),* $(,)?])?
+		$(, signature: $sig:ty)?
 	) => {{
 		use core::str::FromStr;
 
@@ -284,7 +310,7 @@ macro_rules! csr {
 			)*
 		)?
 
-		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
+		builder.build::<$crate::cert!(@signature $($sig)?)>()
 	}};
 }
 

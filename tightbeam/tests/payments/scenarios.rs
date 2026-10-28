@@ -56,6 +56,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer,
+		handshake::PeerAuthentication,
 		tcp::{r#async::TokioListener, TightBeamSocketAddr},
 		ClientBuilder, ConnectionBuilder, GenericClient, TransportError,
 	},
@@ -143,7 +144,8 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 
 fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 	let (certificate, key) = certs.hive_identity();
-	let hive_tls = HiveTlsConfig::new(certificate, key, vec![]).expect("the hive TLS material must decode");
+	let hive_tls = HiveTlsConfig::new(certificate, key, PeerAuthentication::Anonymous);
+	let hive_tls = hive_tls.expect("the hive TLS material must decode");
 	HiveConfig {
 		hive_tls: Some(Arc::new(hive_tls)),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),

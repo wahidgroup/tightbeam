@@ -50,7 +50,7 @@ impl CompositionOperator {
 	///
 	/// let interface = CompositionOperator::Interface { events: HashSet::from([Event("ping")]) };
 	/// let composed = interface.compose(&ping, &ping)?;
-	/// assert_eq!(composed.name, "(Ping [|A|] Ping)");
+	/// assert_eq!(composed.name(), "(Ping [|A|] Ping)");
 	///
 	/// let misspelled = CompositionOperator::Interface { events: HashSet::from([Event("pnig")]) };
 	/// let refused = misspelled.compose(&ping, &ping);

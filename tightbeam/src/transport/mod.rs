@@ -290,7 +290,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	///
 	/// # Empty set
 	///
-	/// An empty set demands nothing, by the rule of
+	/// An empty set names no demand, by the rule of
 	/// [`PeerAuthentication::mutual`], so it leaves the endpoint as it is. An
 	/// endpoint that demands mutual authentication keeps that demand.
 	#[must_use]
@@ -298,11 +298,35 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		mut self,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Self {
-		let demanded = PeerAuthentication::mutual(validators);
-		if demanded.requires_certificate() {
+		if let Some(demanded) = PeerAuthentication::mutual(validators) {
 			self.peer_authentication = demanded;
 		}
 
+		self
+	}
+
+	/// Names `authentication` as the rule by which this server authenticates
+	/// its client, in place of the rule named before.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::crypto::x509::policy::ExpiryValidator;
+	/// use tightbeam::testing::TestIdentity;
+	/// use tightbeam::transport::handshake::PeerAuthentication;
+	/// use tightbeam::transport::TransportEncryptionConfig;
+	///
+	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(TestIdentity::insecure_fixed());
+	/// let mutual = config.with_peer_authentication(authentication);
+	/// # drop(mutual);
+	/// ```
+	#[must_use]
+	pub fn with_peer_authentication(mut self, authentication: impl Into<PeerAuthentication>) -> Self {
+		self.peer_authentication = authentication.into();
 		self
 	}
 
@@ -552,8 +576,7 @@ mod tests {
 
 		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame)
-			.with_wire_mode(WireMode::Encrypted)
-			.with_encryptor(&encryptor)
+			.sealed_by(&encryptor)
 			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() })
 			.finish();
 		assert!(matches!(
@@ -574,8 +597,7 @@ mod tests {
 
 		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame.clone())
-			.with_wire_mode(WireMode::Encrypted)
-			.with_encryptor(&encryptor)
+			.sealed_by(&encryptor)
 			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() })
 			.finish();
 		assert!(matches!(

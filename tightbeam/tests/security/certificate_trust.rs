@@ -29,16 +29,17 @@ use crate::common::security::{deterministic_signing_key, random_signing_key, tes
 /// Direct trust refuses a self-signed, unexpired certificate that is no
 /// configured anchor.
 #[test]
-fn certificate_trust() {
+fn certificate_trust() -> Result<(), CertificateValidationError> {
 	let trusted_cert = test_certificate(&deterministic_signing_key());
 
 	// An attacker holds an unrelated, self-signed, unexpired certificate.
 	let attacker_cert = test_certificate(&random_signing_key());
-	let validator = DirectTrustValidator::default().with_trust_chain(vec![trusted_cert]);
+	let validator = DirectTrustValidator::default().with_trust_chain(vec![trusted_cert])?;
 	let verdict = validator.evaluate(&attacker_cert);
 
 	assert!(
 		matches!(verdict, Err(CertificateValidationError::CertificateNotTrusted)),
 		"direct trust admitted a certificate outside its anchors"
 	);
+	Ok(())
 }

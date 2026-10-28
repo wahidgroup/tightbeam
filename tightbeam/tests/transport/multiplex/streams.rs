@@ -93,7 +93,7 @@ tb_scenario! {
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let client = connect_mux_client(addr, &ctx.materials, 4, trace.share()).await?;
-			assert_eq!(client.settings.local_initiated_cap, 1, "the client must take the server's cap of 1");
+			assert_eq!(client.settings.local_initiated_cap(), 1, "the client must take the server's cap of 1");
 
 			let frame_held = mux_frame("mux-held");
 			let held_task = spawn_emit(client.handle(), frame_held.to_owned());

@@ -50,12 +50,10 @@ impl SplicePlan {
 	async fn dial<P: ColonyDialProtocol>(
 		&self,
 		hive: &HivePlane<P>,
-		peers: Option<&PeerPlane<P>>,
+		peers: &PeerPlane<P>,
 	) -> Result<PooledClient<P>, TransitStatus> {
-		let unavailable = |_| TransitStatus::Unavailable;
-		let hop = self.choice.hop(hive, peers).map_err(unavailable)?;
-
-		hop.connect().await.map_err(unavailable)
+		let hop = self.choice.hop(hive, peers);
+		hop.connect().await.map_err(|_| TransitStatus::Unavailable)
 	}
 }
 
@@ -68,7 +66,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// failed dial, so a bounded retry picks the next-best trail.
 	///
 	/// - [`TransitStatus::PermissionDenied`] -- the target is not bare, or it names a foreign realm.
-	/// - [`TransitStatus::Unavailable`] -- no live trail exists, or a peer route has no peer plane.
+	/// - [`TransitStatus::Unavailable`] -- no live trail exists.
 	///
 	/// # Errors
 	///
@@ -92,9 +90,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			return Ok(Err(TransitStatus::Unavailable));
 		};
 
-		let route = choice.plane.stream_route(target, budget, self.peer_plane.as_ref());
-		let planned = route.map(|route| SplicePlan { choice, route });
-		Ok(planned)
+		let route = choice.plane.stream_route(target, budget);
+		Ok(Ok(SplicePlan { choice, route }))
 	}
 
 	/// Plan and dial the splice route, with one retry on a failed dial. The
@@ -108,7 +105,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		trace: &TraceCollector,
 	) -> Result<(SplicePlan, PooledClient<P>), TightBeamError> {
 		let plan = self.plan_splice(target, budget, None, trace)?.map_err(TransitStatus::refusal)?;
-		let dial_status = match plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
+		let dial_status = match plan.dial(&self.hive_plane, &self.peer_plane).await {
 			Ok(client) => {
 				return Ok((plan, client));
 			}
@@ -123,7 +120,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			return Err(dial_status.refusal());
 		};
 
-		match retry_plan.dial(&self.hive_plane, self.peer_plane.as_ref()).await {
+		match retry_plan.dial(&self.hive_plane, &self.peer_plane).await {
 			Ok(client) => Ok((retry_plan, client)),
 			Err(status) => {
 				registry.work_trail_weaken(&retry_plan.choice.route_key, status, &self.config, trace)?;
@@ -165,9 +162,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// # Errors
 	///
 	/// - [`TransitStatus::PermissionDenied`] -- the target is not bare, or it names a foreign realm.
-	/// - [`TransitStatus::Unavailable`] -- no live trail exists, a peer route
-	///   has no peer plane, the dial failed, or another gateway answered.
-	/// - A stream failure returns the route's own terminal status.
+	/// - [`TransitStatus::Unavailable`] -- no live trail exists, the dial
+	///   failed, or another gateway answered.
+	/// - [`TightBeamError`] -- the stream failed, under the route's own terminal status.
 	pub(crate) async fn splice_streaming(
 		self,
 		body: StreamBody,
@@ -211,9 +208,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// # Errors
 	///
 	/// - [`TransitStatus::PermissionDenied`] -- the target is not bare, or it names a foreign realm.
-	/// - [`TransitStatus::Unavailable`] -- no live trail exists, a peer route
-	///   has no peer plane, the dial failed, or another gateway answered.
-	/// - A stream failure returns the route's own terminal status.
+	/// - [`TransitStatus::Unavailable`] -- no live trail exists, the dial
+	///   failed, or another gateway answered.
+	/// - [`TightBeamError`] -- the stream failed, under the route's own terminal status.
 	pub(crate) async fn splice_duplex(
 		self,
 		body: StreamBody,
@@ -254,7 +251,15 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::colony::cluster::{
+		AdmittedDial, CertificateSpec, ClusterConfig, ClusterTlsConfig, PeerRoute, ServletEntry,
+		DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	};
 	use crate::colony::urn::ColonyNamespace;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::testing::{TestCertificate, TestKey};
+	use crate::transport::TokioListener;
 
 	fn stream_type() -> Urn<'static> {
 		ColonyNamespace::default()
@@ -281,5 +286,44 @@ mod tests {
 	fn relayed_route_keeps_the_target() {
 		let route = HopBudget::for_test(2).relayed_route(&stream_type());
 		assert_eq!(route.target(), Some(&stream_type()));
+	}
+
+	/// The route of [`stream_type`] through the peer gateway `first`.
+	fn peer_route() -> ServletEntry {
+		let servlet_type = stream_type().canonical_bytes();
+		let route = PeerRoute {
+			peer_id: Arc::from(b"first".as_slice()),
+			servlet_type: Arc::from(servlet_type.as_slice()),
+			dial: AdmittedDial::fixture("192.0.2.1:9001"),
+		};
+
+		ServletEntry::peer(route, DEFAULT_INITIAL_PHEROMONE, DEFAULT_ABANDONMENT_LIMIT)
+	}
+
+	/// The request context of a gateway that configures no peer trust, so it
+	/// holds no peer pool.
+	fn gateway_with_no_peer_pool(trace: &Arc<TraceCollector>) -> GatewayRuntimeCtx<TokioListener> {
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
+		let config = ClusterConfig::new(tls.expect("the fixture certificate decodes"));
+
+		GatewayRuntimeCtx::for_test(config, trace, &Arc::new(TraceCollector::new()))
+	}
+
+	// A gateway with no peer pool dials its peers on its hive pool, so a peer
+	// route plans a relayed splice and refuses nothing before the dial.
+	#[test]
+	fn a_peer_route_on_a_gateway_with_no_peer_pool_hops_on_the_hive_pool() -> Result<(), Box<dyn core::error::Error>> {
+		let trace = Arc::new(TraceCollector::new());
+		let gateway = gateway_with_no_peer_pool(&trace);
+		gateway.servlet_registry.add(peer_route())?;
+
+		let planned = gateway.plan_splice(&stream_type(), HopBudget::for_test(2), None, &trace)?;
+
+		let route = planned.map(|plan| plan.route);
+		let read = route.as_ref().map(|route| (route.hops_remaining(), route.target()));
+		assert_eq!(read, Ok((1, Some(&stream_type()))));
+		Ok(())
 	}
 }

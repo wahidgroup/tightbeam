@@ -26,36 +26,43 @@ use crate::{Frame, TightBeamError};
 
 /// The states of one signer's circuit in a [`ClusterCircuitBreaker`].
 ///
-/// The breaker follows the standard circuit breaker pattern.
+/// A tripped circuit refuses every request of its signer until its cooldown
+/// passes, and then admits requests again. A request whose signature verifies
+/// closes it and clears its count, and a failure that comes first opens it
+/// for another cooldown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CircuitState {
 	/// The circuit admits requests in normal operation.
 	Closed = 0,
-	/// The circuit has tripped and rejects every request.
+	/// The circuit has tripped and rejects every request until its cooldown
+	/// passes.
 	Open = 1,
-	/// The circuit let one probe through to test recovery, and refuses every
-	/// other request until the probe's outcome closes or reopens it. A probe
-	/// with no outcome expires one cooldown after it went out.
-	HalfOpen = 2,
 }
 
 /// A circuit breaker for cluster authentication failures.
 ///
 /// Consecutive failures of one signer trip its circuit, which halts cluster
-/// traffic with it. After a cooldown, the next request is a half-open probe
-/// ([`CircuitState::HalfOpen`]). The cooldown runs on the monotonic clock, so
-/// a step of the system time neither shortens nor stretches it.
+/// traffic with it.
+///
+/// # Cooldown
+///
+/// After a cooldown, the circuit admits requests again. A request whose
+/// signature verifies closes it and clears its count, and a failure that comes
+/// first opens it for another cooldown. The cooldown runs on the monotonic
+/// clock, so a step of the system time neither shortens nor stretches it.
 ///
 /// # Failures that count
 ///
 /// Only failures of a *known* signer count ([`ClusterSecurityGate`]), so
 /// unauthenticated frames cannot cut a hive off from its cluster (CWE-645).
+/// Each signer's failures gate that signer alone, so the colony control plane
+/// stays open to every other member.
 ///
 /// # Thread Safety
 ///
-/// One mutex holds every circuit, so one caller alone moves a circuit to
-/// half-open per cooldown expiry.
+/// One mutex holds every circuit, so the verdict and the close of
+/// [`Self::admit_verified`] are one step (CWE-367).
 pub struct ClusterCircuitBreaker {
 	/// The per-signer circuits, one row for each signer with a failure history.
 	/// A poisoned lock answers every signer as open, so the breaker fails
@@ -63,7 +70,7 @@ pub struct ClusterCircuitBreaker {
 	signers: Mutex<HashMap<CanonicalKey, SignerCircuit>>,
 	/// The count of consecutive failures that trips a signer's circuit.
 	failure_threshold: u8,
-	/// The time an open circuit waits before it lets one probe through.
+	/// The time an open circuit refuses requests before it admits them again.
 	cooldown: Duration,
 	/// The clock the breaker measures the cooldown on.
 	clock: Arc<dyn Clock>,
@@ -72,13 +79,10 @@ pub struct ClusterCircuitBreaker {
 /// Where one signer's circuit stands.
 ///
 /// An open circuit carries the instant it opened, the start of its cooldown.
-/// A half-open circuit carries the instant its probe went out, so a probe
-/// with no outcome expires on the same cooldown.
 #[derive(Clone, Copy)]
 enum Position {
 	Closed,
 	Open(MonotonicInstant),
-	HalfOpen(MonotonicInstant),
 }
 
 impl Position {
@@ -86,7 +90,6 @@ impl Position {
 		match self {
 			Self::Closed => CircuitState::Closed,
 			Self::Open(_) => CircuitState::Open,
-			Self::HalfOpen(_) => CircuitState::HalfOpen,
 		}
 	}
 }
@@ -110,8 +113,8 @@ impl SignerCircuit {
 
 impl ClusterCircuitBreaker {
 	/// Creates a breaker that opens after `failure_threshold` consecutive
-	/// failures from one signer and lets one probe through once `cooldown` has
-	/// passed on `clock`.
+	/// failures from one signer and admits that signer again once `cooldown`
+	/// has passed on `clock`.
 	pub fn new(failure_threshold: u8, cooldown: Duration, clock: Arc<dyn Clock>) -> Self {
 		Self { signers: Mutex::new(HashMap::new()), failure_threshold, cooldown, clock }
 	}
@@ -121,88 +124,83 @@ impl ClusterCircuitBreaker {
 		self.clock.monotonic().saturating_duration_since(since) >= self.cooldown
 	}
 
-	/// Admits or refuses one request from `signer`.
-	///
-	/// - A closed circuit admits the request.
-	/// - An open circuit whose cooldown has passed moves to half-open and admits the request as its probe.
-	/// - A half-open circuit refuses the request until the probe's outcome
-	///   lands, and admits it as a new probe once the probe has been out for a
-	///   cooldown.
-	///
-	/// Each signer's failures gate that signer alone, so the colony control
-	/// plane stays open to every other member (CWE-645). A poisoned lock
-	/// refuses every request.
-	pub fn admit_request(&self, signer: ProvenPeer<'_>) -> bool {
-		let Ok(mut signers) = self.signers.lock() else {
-			return false;
-		};
-
-		let Some(circuit) = signers.get_mut(signer.as_key()) else {
-			return true;
-		};
-
+	/// The verdict on one request through `circuit`: a closed circuit admits
+	/// it, and an open one admits it once its cooldown has passed.
+	fn admits(&self, circuit: &SignerCircuit) -> bool {
 		match circuit.position {
 			Position::Closed => true,
-			Position::Open(since) | Position::HalfOpen(since) => {
-				if !self.cooled(since) {
-					return false;
-				}
-
-				// The lock serializes concurrent callers at the same cooldown
-				// expiry, so exactly one of them sends the probe.
-				circuit.position = Position::HalfOpen(self.clock.monotonic());
-
-				true
-			}
+			Position::Open(since) => self.cooled(since),
 		}
 	}
 
 	/// Returns whether the breaker would admit the next request from `signer`.
 	///
-	/// The check is read-only. An expired cooldown reports `true` and leaves
-	/// the one probe for [`ClusterCircuitBreaker::admit_request`] to spend. A
-	/// verdict that spent the probe would leave the circuit half-open with no
-	/// outcome, and half-open refuses every request until the probe expires.
+	/// The check is read-only, and it reads the verdict that
+	/// [`Self::admit_verified`] takes, so a request that passes it passes the
+	/// admission unless a failure lands between the two. A poisoned lock
+	/// refuses every request.
 	#[must_use]
 	pub fn would_allow(&self, signer: ProvenPeer<'_>) -> bool {
 		let Ok(signers) = self.signers.lock() else {
 			return false;
 		};
-		let Some(circuit) = signers.get(signer.as_key()) else {
-			return true;
-		};
 
-		match circuit.position {
-			Position::Closed => true,
-			Position::Open(since) | Position::HalfOpen(since) => self.cooled(since),
-		}
+		signers.get(signer.as_key()).is_none_or(|circuit| self.admits(circuit))
 	}
 
-	/// Records a successful request from `signer`, which closes its circuit
-	/// and clears its failure history.
-	pub fn record_success(&self, signer: ProvenPeer<'_>) {
+	/// Admits one request whose signature the caller verified, from `signer`,
+	/// and closes its circuit, in one critical section.
+	///
+	/// - A closed circuit, or an open one whose cooldown has passed, admits the
+	///   request and clears its history.
+	/// - An open circuit within its cooldown refuses the request.
+	/// - A poisoned lock refuses every request.
+	///
+	/// The verdict and the close take one lock, so a failure that another
+	/// request records for the signer lands before or after both (CWE-367).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::hive::ClusterCircuitBreaker;
+	/// use tightbeam::policy::SessionContext;
+	/// use tightbeam::utils::time::SystemClock;
+	///
+	/// /// Whether `breaker` admits the verified request of the peer that
+	/// /// `session` proved, which closes the circuit of that peer.
+	/// fn admits(breaker: &ClusterCircuitBreaker, session: &SessionContext) -> bool {
+	///     session.proven_peer().is_some_and(|peer| breaker.admit_verified(peer))
+	/// }
+	///
+	/// // A session that proved no peer has no circuit to admit through.
+	/// let breaker = ClusterCircuitBreaker::new(3, Duration::from_secs(30), Arc::new(SystemClock));
+	/// assert!(!admits(&breaker, &SessionContext::default()));
+	/// ```
+	pub fn admit_verified(&self, signer: ProvenPeer<'_>) -> bool {
 		let Ok(mut signers) = self.signers.lock() else {
-			return;
+			return false;
 		};
 
-		signers.remove(signer.as_key());
+		let admitted = signers.get(signer.as_key()).is_none_or(|circuit| self.admits(circuit));
+		if admitted {
+			signers.remove(signer.as_key());
+		}
+
+		admitted
 	}
 
 	/// Records an authentication failure attributed to `signer`.
 	///
-	/// A failure while the circuit is half-open reopens it at once and restarts
-	/// the cooldown.
+	/// A failure on an open circuit restarts its cooldown.
 	pub fn record_auth_failure(&self, signer: ProvenPeer<'_>) {
 		let Ok(mut signers) = self.signers.lock() else {
 			return;
 		};
 
 		let circuit = signers.entry(signer.as_key().clone()).or_insert(SignerCircuit::CLOSED);
-		if matches!(circuit.position, Position::HalfOpen(_)) {
-			circuit.position = Position::Open(self.clock.monotonic());
-			return;
-		}
-
 		circuit.failures = circuit.failures.saturating_add(1);
 		if circuit.failures >= self.failure_threshold {
 			circuit.position = Position::Open(self.clock.monotonic());
@@ -228,7 +226,11 @@ impl ClusterCircuitBreaker {
 
 	/// Closes `signer`'s circuit and clears its failure history.
 	pub fn reset(&self, signer: ProvenPeer<'_>) {
-		self.record_success(signer);
+		let Ok(mut signers) = self.signers.lock() else {
+			return;
+		};
+
+		signers.remove(signer.as_key());
 	}
 
 	/// Drops the rows of signers that carry no failure history.
@@ -489,8 +491,8 @@ impl ReplayGuard {
 /// | 7 | `Frame.metadata.order` is fresh | `PermissionDenied` |
 /// | 8 | The signature is new inside the window | `PermissionDenied` |
 ///
-/// On success the gate takes the breaker's cooldown probe and records the
-/// success, which resets the breaker.
+/// On success the breaker admits the command and closes the circuit of its
+/// peer in one step.
 ///
 /// - Only step 5 counts, against the [`ProvenPeer`], so one member's failures gate it alone (CWE-645).
 /// - Steps 6 to 8 stay uncounted, because a relayed or replayed capture carries a valid signature.
@@ -527,7 +529,7 @@ pub struct GateLimits {
 	/// The count of consecutive bad signatures from one peer that opens its
 	/// circuit.
 	pub failure_threshold: u8,
-	/// The time an open circuit waits before it lets one probe through.
+	/// The time an open circuit refuses commands before it admits them again.
 	pub cooldown: Duration,
 	/// How far a command's stated issue time may sit from the gate clock.
 	pub freshness_window: Duration,
@@ -566,7 +568,7 @@ impl AdmittedCommand {
 	///
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
-	/// - The injected error, when the runtime fault model injects a fault at the acceptance event.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the acceptance event.
 	pub(crate) fn reply(
 		&self,
 		response: ClusterCommandResponse,
@@ -593,7 +595,7 @@ impl AdmittedCommand {
 	///
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
-	/// - The injected error, when the runtime fault model injects a fault at the refusal event.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the refusal event.
 	pub(crate) fn refuse(
 		&self,
 		refusal: CommandRefusal,
@@ -754,7 +756,7 @@ impl AdmitRefusal {
 	///
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
-	/// - The injected error, when the runtime fault model injects a fault at the refusal event.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the refusal event.
 	pub(crate) fn reply(&self, audit: &CommandAudit<'_>) -> Result<Option<Frame>, TightBeamError> {
 		let status = self.status();
 		let reply = self.shape.refuse(self.frame.metadata().id(), status)?;
@@ -796,7 +798,7 @@ impl<'a> CommandAudit<'a> {
 	///
 	/// # Errors
 	///
-	/// - The injected error, when the runtime fault model injects a fault at the event.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the event.
 	fn refused(&self, label: &'static str, status: TransitStatus) -> Result<(), TightBeamError> {
 		let peer = self.peer();
 		self.trace
@@ -810,7 +812,7 @@ impl<'a> CommandAudit<'a> {
 	///
 	/// # Errors
 	///
-	/// - The injected error, when the runtime fault model injects a fault at the event.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the event.
 	fn accepted(&self, record: &AcceptedRecord<'_>) -> Result<(), TightBeamError> {
 		let peer = self.peer();
 		self.trace
@@ -880,8 +882,7 @@ impl ClusterSecurityGate {
 	/// - The admission records an auth failure.
 	/// - It refuses a body that names no single command.
 	/// - It inserts the signature, which refuses a full partition.
-	/// - It takes the breaker's cooldown probe.
-	/// - It records a success.
+	/// - It closes the circuit of the peer.
 	fn inspect<'a>(
 		&self,
 		frame: &Frame,
@@ -949,9 +950,9 @@ impl ClusterSecurityGate {
 	/// Authenticates `frame`, decodes its cluster command once, and spends
 	/// the admission.
 	///
-	/// It takes the breaker's cooldown probe, records an auth failure or a
-	/// success, and spends the signature's replay slot. The control plane
-	/// calls it exactly once per frame.
+	/// It records an auth failure, or closes the circuit of the peer, and
+	/// spends the signature's replay slot. The control plane calls it exactly
+	/// once per frame.
 	pub(crate) fn admit(&self, frame: Frame, session: &SessionContext) -> Result<AdmittedCommand, Box<AdmitRefusal>> {
 		// The body decodes once. A CHOICE names exactly one alternative, so a
 		// body that names none or more than one decodes to `None`, which the
@@ -986,17 +987,14 @@ impl ClusterSecurityGate {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
 
-		// The gate takes the cooldown probe last, immediately before the
-		// outcome it waits for, so no refusal path leaves the circuit
-		// half-open with nothing recorded.
-		if !self.circuit_breaker.admit_request(breaker_key) {
+		// The signature verified, so the breaker admits the command and closes
+		// the circuit in one step (CWE-367).
+		if !self.circuit_breaker.admit_verified(breaker_key) {
 			// The gate refuses this frame, so it releases the signature: a
 			// kept record would refuse a legitimate retry as a replay.
 			self.replay_guard.forget(&signature);
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
-
-		self.circuit_breaker.record_success(breaker_key);
 
 		let replay_guard = Arc::clone(&self.replay_guard);
 		Ok(AdmittedCommand { body, frame, signature, replay_guard })
@@ -1014,8 +1012,7 @@ impl GatePolicy for ClusterSecurityGate {
 	///
 	/// A verdict must not consume what it judges. Otherwise a transport that
 	/// gates on this and then hands the frame to the control plane would see
-	/// its own admission refused as a replay, and would spend the breaker's
-	/// cooldown probe on a question.
+	/// its own admission refused as a replay.
 	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let Some(frame) = frame else {
 			return TransitStatus::Unauthenticated;
@@ -1284,7 +1281,7 @@ mod tests {
 	}
 
 	/// Returns gate limits whose one failure opens a circuit that has already
-	/// cooled, so the next admission is the probe.
+	/// cooled, so the next admission closes it.
 	fn instant_cooldown() -> GateLimits {
 		GateLimits {
 			failure_threshold: 1,
@@ -1429,18 +1426,18 @@ mod tests {
 		breaker.record_auth_failure(signer());
 
 		assert_eq!(breaker.state(signer()), CircuitState::Open);
-		assert!(!breaker.admit_request(signer()));
+		assert!(!breaker.admit_verified(signer()));
 	}
 
-	// The cooldown runs on the breaker's clock, so an open circuit lets its
-	// probe through once that clock reaches the cooldown and not before.
+	// The cooldown runs on the breaker's clock, so an open circuit admits a
+	// request again once that clock reaches the cooldown and not before.
 	tb_cases! {
 		fn breaker_cooldown_runs_on_its_clock((advance, admitted): (Duration, bool)) {
 			let clock = manual_clock();
 			let breaker = breaker_on(&clock, 1);
 			breaker.record_auth_failure(signer());
 			clock.advance(advance);
-			assert_eq!(breaker.admit_request(signer()), admitted);
+			assert_eq!(breaker.admit_verified(signer()), admitted);
 		}
 		cases {
 			one_millisecond_short => (COOLDOWN.saturating_sub(Duration::from_millis(1)), false),
@@ -1448,76 +1445,18 @@ mod tests {
 		}
 	}
 
-	/// The admitted probe leaves the circuit half-open until the breaker
-	/// records its outcome.
+	/// A failure on a circuit whose cooldown has passed opens it again, so its
+	/// cooldown starts over.
 	#[test]
-	fn breaker_probe_leaves_the_circuit_half_open() {
+	fn a_failure_after_the_cooldown_restarts_it() {
 		let clock = manual_clock();
 		let breaker = breaker_on(&clock, 1);
 		breaker.record_auth_failure(signer());
 		clock.advance(COOLDOWN);
-		assert!(breaker.admit_request(signer()));
-		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
-	}
 
-	/// Builds a breaker on `clock` whose circuit for [`signer`] is half-open,
-	/// with its probe sent at the clock's current reading.
-	fn probing_breaker(clock: &Arc<ManualClock>) -> ClusterCircuitBreaker {
-		let breaker = breaker_on(clock, 1);
 		breaker.record_auth_failure(signer());
-		clock.advance(COOLDOWN);
-		assert!(breaker.admit_request(signer()), "the cooled circuit sends its probe");
-		breaker
-	}
 
-	// A half-open circuit refuses each request while its probe is out, and
-	// a probe with no recorded outcome expires one cooldown after it went
-	// out, so the next request is the new probe.
-	tb_cases! {
-		fn breaker_half_open_admits_one_probe_per_cooldown((advance, admitted): (Duration, bool)) {
-			let clock = manual_clock();
-			let breaker = probing_breaker(&clock);
-			clock.advance(advance);
-			assert_eq!(breaker.admit_request(signer()), admitted);
-		}
-		cases {
-			with_the_probe_just_sent => (Duration::ZERO, false),
-			one_millisecond_short => (COOLDOWN.saturating_sub(Duration::from_millis(1)), false),
-			at_the_cooldown => (COOLDOWN, true),
-		}
-	}
-
-	/// A verdict reads a half-open circuit with its probe out as a refusal,
-	/// as the admission does.
-	#[test]
-	fn breaker_verdict_refuses_while_the_probe_is_out() {
-		let clock = manual_clock();
-		let breaker = probing_breaker(&clock);
 		assert!(!breaker.would_allow(signer()));
-	}
-
-	#[test]
-	fn breaker_probe_success_closes() {
-		let breaker = ClusterCircuitBreaker::new(1, Duration::ZERO, erased(&manual_clock()));
-		breaker.record_auth_failure(signer());
-		assert!(breaker.admit_request(signer()));
-		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
-
-		breaker.record_success(signer());
-
-		assert_eq!(breaker.state(signer()), CircuitState::Closed);
-	}
-
-	#[test]
-	fn breaker_probe_failure_reopens() {
-		let breaker = ClusterCircuitBreaker::new(1, Duration::ZERO, erased(&manual_clock()));
-		breaker.record_auth_failure(signer());
-		assert!(breaker.admit_request(signer()));
-		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
-
-		breaker.record_auth_failure(signer());
-
-		assert_eq!(breaker.state(signer()), CircuitState::Open);
 	}
 
 	#[test]
@@ -1529,7 +1468,48 @@ mod tests {
 		breaker.reset(signer());
 
 		assert_eq!(breaker.state(signer()), CircuitState::Closed);
-		assert!(breaker.admit_request(signer()));
+		assert!(breaker.admit_verified(signer()));
+	}
+
+	/// A step that puts the circuit of [`signer`] in the state a case names.
+	type Prepare = fn(&ClusterCircuitBreaker, &ManualClock);
+
+	/// Whether the gate admits the request, and the circuit state after it.
+	type Verdict = (bool, CircuitState);
+
+	/// Leaves the circuit of [`signer`] closed.
+	fn leave_closed(_breaker: &ClusterCircuitBreaker, _clock: &ManualClock) {}
+
+	/// Opens the circuit of [`signer`].
+	fn open_circuit(breaker: &ClusterCircuitBreaker, _clock: &ManualClock) {
+		breaker.record_auth_failure(signer());
+	}
+
+	/// Opens the circuit of [`signer`] and lets its cooldown pass.
+	fn cool_circuit(breaker: &ClusterCircuitBreaker, clock: &ManualClock) {
+		breaker.record_auth_failure(signer());
+		clock.advance(COOLDOWN);
+	}
+
+	// A verified request passes a closed or a cooled circuit and closes it in
+	// the same step, and an open circuit refuses it.
+	tb_cases! {
+		fn admit_verified_admits_a_closed_and_a_cooled_circuit_and_refuses_an_open_one(
+			(prepare, verdict): (Prepare, Verdict)
+		) -> Result<(), Box<dyn std::error::Error>> {
+			let clock = manual_clock();
+			let breaker = breaker_on(&clock, 1);
+			prepare(&breaker, &clock);
+
+			let admitted = breaker.admit_verified(signer());
+			assert_eq!((admitted, breaker.state(signer())), verdict);
+			Ok(())
+		}
+		cases {
+			a_closed_circuit => (leave_closed, (true, CircuitState::Closed)),
+			a_cooled_circuit => (cool_circuit, (true, CircuitState::Closed)),
+			an_open_circuit => (open_circuit, (false, CircuitState::Open)),
+		}
 	}
 
 	#[test]
@@ -2082,12 +2062,10 @@ mod tests {
 		Ok(())
 	}
 
-	/// A verdict leaves a tripped breaker's one cooldown probe for the
-	/// admission to take. A question that spent it would park the circuit
-	/// half-open with no outcome, refusing every request until the probe
-	/// expires.
+	/// A verdict leaves a tripped breaker as it found it, so the admission
+	/// alone closes the circuit.
 	#[tokio::test]
-	async fn a_gate_verdict_does_not_take_the_breakers_cooldown_probe() -> Result<(), TightBeamError> {
+	async fn a_gate_verdict_leaves_the_breaker_to_the_admission() -> Result<(), TightBeamError> {
 		let VerifiedGate { gate, sender, signed, .. } = verified_gate_with(instant_cooldown()).await?;
 		let peer_key = peer_key(&sender);
 		let breaker_key = || ProvenPeer::for_test(&peer_key);
@@ -2095,8 +2073,8 @@ mod tests {
 		gate.circuit_breaker.record_auth_failure(breaker_key());
 
 		assert!(gate.circuit_breaker.is_open(breaker_key()));
-		// The cooldown has expired, so the verdict admits. It must not be
-		// the one that spends the probe.
+		// The cooldown has passed, so the verdict admits and leaves the
+		// circuit open.
 		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::Ok);
 		assert!(gate.circuit_breaker.is_open(breaker_key()));
 		assert!(gate.admit(signed, &sender).is_ok());
@@ -2106,12 +2084,8 @@ mod tests {
 	}
 
 	/// A refused admission leaves the breaker as it found it.
-	///
-	/// The cooldown probe admits exactly one request. A path that spends it
-	/// and then refuses would park the circuit half-open with no outcome,
-	/// refusing everything until the probe expires.
 	#[tokio::test]
-	async fn a_refused_admission_does_not_strand_the_breaker_half_open() -> Result<(), TightBeamError> {
+	async fn a_refused_admission_leaves_the_breaker_open() -> Result<(), TightBeamError> {
 		let VerifiedGate { gate, sender, signed, clock } = verified_gate_with(instant_cooldown()).await?;
 		let peer_key = peer_key(&sender);
 		let breaker_key = || ProvenPeer::for_test(&peer_key);
@@ -2131,7 +2105,7 @@ mod tests {
 	}
 
 	/// The breaker a gate builds cools on the gate's clock, so a circuit
-	/// the gate opened admits its probe once that one clock reaches the
+	/// the gate opened admits a command again once that one clock reaches the
 	/// cooldown.
 	#[tokio::test]
 	async fn a_gates_breaker_cools_on_the_gates_clock() -> Result<(), TightBeamError> {
@@ -2196,8 +2170,8 @@ mod tests {
 	fn a_tripped_signer_does_not_gate_another() {
 		let breaker = tripped_breaker();
 		assert!(breaker.is_open(signer()));
-		assert!(!breaker.admit_request(signer()));
-		assert!(breaker.admit_request(other()));
+		assert!(!breaker.admit_verified(signer()));
+		assert!(breaker.admit_verified(other()));
 	}
 
 	/// The guard refuses a signature recorded under one signer when it

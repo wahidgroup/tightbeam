@@ -1,6 +1,7 @@
 //! The hive control plane: its accept loop, its cluster command handlers, and
 //! the in-flight count that a drain waits on.
 
+use core::future::Future;
 use core::pin::pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
@@ -11,7 +12,7 @@ use futures::future::{select, Either};
 use tokio::sync::Notify;
 
 use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand, CommandAudit, CommandRefusal};
-use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances};
+use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances, HiveRuntime};
 use crate::colony::hive::{
 	BackpressureGate, ClusterSecurityGate, HiveScalingConfig, ServletRegistration, ServletRegistry, SpawnerFn,
 };
@@ -27,9 +28,9 @@ use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{AsyncListenerTrait, Protocol};
+use crate::transport::{AsyncListenerTrait, Protocol, TransportError, TransportFailure};
 use crate::urn::Urn;
-use crate::utils::time::Clock;
+use crate::utils::time::{Clock, MonotonicInstant};
 use crate::{Frame, TightBeamError};
 
 /// The count of cluster commands that the hive holds in flight.
@@ -53,8 +54,51 @@ struct InFlightState {
 pub enum Settled {
 	/// Every command in flight finished.
 	Idle,
-	/// The timeout passed on the hive clock with commands in flight.
+	/// The drain deadline passed with commands in flight.
 	TimedOut,
+}
+
+/// The bound on the two waits of a drain: the drain timeout from the start of
+/// the drain, on the hive clock.
+///
+/// The wait on commands and the wait on the servlet drains both race it, so
+/// both waits end within the timeout of the drain's start. The slate
+/// announcement follows them.
+pub struct DrainDeadline<'a> {
+	clock: &'a dyn Clock,
+	started: MonotonicInstant,
+	timeout: Duration,
+}
+
+impl<'a> DrainDeadline<'a> {
+	/// Starts the deadline of a drain that may last `timeout` on `clock`.
+	pub fn start(clock: &'a dyn Clock, timeout: Duration) -> Self {
+		let started = clock.monotonic();
+		Self { clock, started, timeout }
+	}
+
+	/// The span of the timeout that is left on the clock.
+	fn remaining(&self) -> Duration {
+		let spent = self.clock.monotonic().saturating_duration_since(self.started);
+		self.timeout.saturating_sub(spent)
+	}
+
+	/// Runs `work` until it ends or the deadline passes. Past the deadline,
+	/// `work` drops unfinished.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the deadline passed first.
+	pub async fn within<F: Future>(&self, work: F) -> Result<F::Output, TransportError> {
+		let work = pin!(work);
+		let expired = self.clock.sleep(self.remaining());
+
+		match select(work, expired).await {
+			Either::Left((output, _)) => Ok(output),
+			Either::Right(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
+		}
+	}
 }
 
 impl InFlight {
@@ -84,17 +128,16 @@ impl InFlight {
 		}
 	}
 
-	/// Waits for the hive to fall idle, or for `timeout` to pass on `clock`.
+	/// Waits for the hive to fall idle, or for `deadline` to pass.
 	///
 	/// It races the two waits, so a hive on a clock that only a test advances
 	/// settles the moment its last command finishes.
-	pub async fn settle(&self, clock: &dyn Clock, timeout: Duration) -> Settled {
-		let idle = pin!(self.idle());
-		let expired = pin!(clock.sleep(timeout));
-
-		match select(idle, expired).await {
-			Either::Left(_) => Settled::Idle,
-			Either::Right(_) => Settled::TimedOut,
+	pub async fn settle(&self, deadline: &DrainDeadline<'_>) -> Settled {
+		match deadline.within(self.idle()).await {
+			Ok(()) => Settled::Idle,
+			// The expiry is the whole outcome of this wait, so the error adds
+			// nothing to it.
+			Err(_expired) => Settled::TimedOut,
 		}
 	}
 }
@@ -113,34 +156,62 @@ impl Drop for InFlightGuard {
 }
 
 /// The shared state that the hive control plane handles each command against.
+///
+/// [`Self::new`] alone builds one, from the runtime that owns the handles, so
+/// the drain state and the servlets of a context come from the same runtime.
 pub struct HiveControlCtx<P: Protocol, R: ServletRegistry> {
 	/// The registry of live servlet instances, keyed by instance URN bytes.
-	pub servlets: Arc<R>,
+	servlets: Arc<R>,
 	/// The spawner closures, keyed by servlet type URN, that scale-up and a
 	/// manage spawn call.
-	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
+	spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	/// The trace handle shared with spawned servlets, which files the record
 	/// of each command.
-	pub trace: Arc<TraceCollector>,
+	trace: Arc<TraceCollector>,
 	/// The trace of the plane, and of each record that no proven peer backs.
-	pub connections: Arc<TraceCollector>,
+	connections: Arc<TraceCollector>,
 	/// The one decider for whether this hive takes work, and the one home
 	/// for the utilization it reads.
-	pub backpressure: BackpressureGate,
+	backpressure: BackpressureGate,
 	/// The drain state. A draining hive refuses all commands but the heartbeat.
-	pub drain: DrainMode,
+	drain: DrainMode,
 	/// The instance set's admission lock, which the scaling loop shares.
-	pub admission: Arc<Mutex<()>>,
+	admission: Arc<Mutex<()>>,
 	/// The instance bounds of each servlet type, which a spawn and a stop keep.
-	pub scaling: HiveScalingConfig,
+	scaling: HiveScalingConfig,
 	/// The count of commands in flight, which a drain waits on to reach zero.
-	pub in_flight: InFlight,
+	in_flight: InFlight,
 	/// The intra-hive routing context, which [`HiveInstances`] updates as it
 	/// inserts or removes instances.
-	pub hive_context: Arc<HiveContextImpl<P>>,
+	hive_context: Arc<HiveContextImpl<P>>,
 	/// The one admission gate for cluster commands. It is [`None`] when the
 	/// hive has no trust store, and then the hive refuses every command.
-	pub security: Option<ClusterSecurityGate>,
+	security: Option<ClusterSecurityGate>,
+}
+
+impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
+	/// The context of the control plane of `runtime`, whose connections record
+	/// on `connections`.
+	pub(crate) fn new(runtime: &HiveRuntime<P, R>, connections: &Arc<TraceCollector>) -> Self {
+		let shares = runtime.shares();
+		let config = shares.config;
+		let threshold = config.control.backpressure_threshold;
+		let backpressure = BackpressureGate::new(Arc::clone(shares.utilization), threshold);
+
+		Self {
+			servlets: Arc::clone(shares.servlets),
+			spawners: Arc::clone(shares.spawners),
+			trace: Arc::clone(shares.trace),
+			connections: Arc::clone(connections),
+			backpressure,
+			drain: shares.drain.clone(),
+			admission: Arc::clone(shares.admission),
+			scaling: config.scaling.clone(),
+			in_flight: shares.in_flight.clone(),
+			hive_context: Arc::clone(shares.hive_context),
+			security: config.security_gate(),
+		}
+	}
 }
 
 impl<P, R> HiveControlCtx<P, R>
@@ -205,8 +276,8 @@ where
 	///
 	/// - [`TightBeamError::SerializationError`] -- the reply body does not encode.
 	/// - [`TightBeamError::BuildError`] -- the reply metadata fails validation.
-	/// - The injected error, when the runtime fault model injects a fault at
-	///   the refusal or the acceptance event.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the
+	///   refusal or the acceptance event.
 	///
 	/// [`HIVE_COMMAND_ACCEPTED`]: crate::instrumentation::events::HIVE_COMMAND_ACCEPTED
 	/// [`HIVE_COMMAND_REFUSED`]: crate::instrumentation::events::HIVE_COMMAND_REFUSED
@@ -293,10 +364,26 @@ impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
 		P: Protocol,
 	{
 		let load = self.backpressure.report();
-		let active_count = self.servlets.count() as u32;
+		let active_count = self.healthy_servlets();
 		let response = ClusterCommandResponse::heartbeat(load.status, load.utilization, active_count);
 
 		admitted.reply(response, audit)
+	}
+
+	/// The count of the servlets that report themselves healthy, read in one
+	/// walk of the registry under the lock contract of
+	/// [`ServletBox::is_healthy`].
+	///
+	/// [`ServletBox::is_healthy`]: crate::colony::hive::ServletBox::is_healthy
+	fn healthy_servlets(&self) -> u32 {
+		let mut healthy = 0u32;
+		self.servlets.for_each(|_, registration| {
+			if registration.servlet.is_healthy() {
+				healthy = healthy.saturating_add(1);
+			}
+		});
+
+		healthy
 	}
 
 	async fn manage_spawn(
@@ -404,8 +491,9 @@ mod tests {
 	async fn an_idle_hive_settles_at_once() -> Result<(), TightBeamError> {
 		let in_flight = InFlight::default();
 		let clock = erased(&manual_clock());
+		let deadline = DrainDeadline::start(clock.as_ref(), DRAIN_TIMEOUT);
 
-		let settled = bounded(in_flight.settle(clock.as_ref(), DRAIN_TIMEOUT)).await?;
+		let settled = bounded(in_flight.settle(&deadline)).await?;
 		assert_eq!(settled, Settled::Idle);
 		Ok(())
 	}
@@ -417,8 +505,9 @@ mod tests {
 	async fn a_settle_ends_when_the_last_command_finishes() -> Result<(), TightBeamError> {
 		let in_flight = InFlight::default();
 		let clock = erased(&manual_clock());
+		let deadline = DrainDeadline::start(clock.as_ref(), DRAIN_TIMEOUT);
 		let guard = in_flight.enter();
-		let mut settle = pin!(in_flight.settle(clock.as_ref(), DRAIN_TIMEOUT));
+		let mut settle = pin!(in_flight.settle(&deadline));
 		assert!(poll_once(&mut settle).await.is_pending());
 
 		drop(guard);
@@ -435,8 +524,9 @@ mod tests {
 		let in_flight = InFlight::default();
 		let clock = manual_clock();
 		let hive_clock = erased(&clock);
+		let deadline = DrainDeadline::start(hive_clock.as_ref(), DRAIN_TIMEOUT);
 		let _guard = in_flight.enter();
-		let mut settle = pin!(in_flight.settle(hive_clock.as_ref(), DRAIN_TIMEOUT));
+		let mut settle = pin!(in_flight.settle(&deadline));
 		assert!(poll_once(&mut settle).await.is_pending());
 
 		clock.advance(DRAIN_TIMEOUT);

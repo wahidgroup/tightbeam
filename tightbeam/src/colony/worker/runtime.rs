@@ -6,7 +6,7 @@
 
 use core::future::Future;
 use core::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::colony::worker::{WorkerKillFuture, WorkerPolicies, WorkerRelayError, WorkerRelayFuture, WorkerRequest};
 use crate::error::TightBeamError;
@@ -24,7 +24,7 @@ where
 	O: Send + 'static,
 {
 	/// [`WorkerRuntime::start`] has yet to open the queue and spawn the run
-	/// loop.
+	/// loop, or [`WorkerRuntime::kill`] has closed it.
 	Unstarted,
 	/// The queue is open and the run loop is spawned.
 	Started {
@@ -37,14 +37,78 @@ where
 	},
 }
 
+impl<I, O> Phase<I, O>
+where
+	I: Message + Send + Sync + 'static,
+	O: Send + 'static,
+{
+	/// A sender of the request queue, for one relay, or [`None`] before the
+	/// queue opens.
+	fn sender(&self) -> Option<rt::Sender<WorkerRequest<I, O>>> {
+		match self {
+			Self::Started { sender, .. } => Some(sender.clone()),
+			Self::Unstarted => None,
+		}
+	}
+
+	/// The bound of the request queue, `0` while no queue is open.
+	fn queue(&self) -> usize {
+		match self {
+			Self::Started { queue, .. } => *queue,
+			Self::Unstarted => 0,
+		}
+	}
+
+	/// Closes the queue of a started worker and returns its run loop, which
+	/// ends once each queued message has its answer.
+	fn close(self) -> Option<ClosedLoop> {
+		match self {
+			Self::Started { sender, join, .. } => {
+				drop(sender);
+				Some(ClosedLoop(join))
+			}
+			Self::Unstarted => None,
+		}
+	}
+}
+
+/// The run loop of a worker whose queue is closed.
+///
+/// [`WorkerRuntime::kill`] waits on it. A loop that drops before it ends is
+/// aborted, so a kill that its caller stops waiting on, such as a drain past
+/// its timeout, leaves no handler running.
+struct ClosedLoop(rt::JoinHandle);
+
+impl ClosedLoop {
+	/// Waits for the loop to end.
+	async fn ended(&mut self) -> Result<(), rt::JoinError> {
+		(&mut self.0).await
+	}
+}
+
+impl Drop for ClosedLoop {
+	fn drop(&mut self) {
+		rt::abort(&self.0);
+	}
+}
+
 /// The bounded queue and the run-loop handle of one worker instance.
+///
+/// # Poison recovery
+///
+/// Every write under the phase lock replaces the whole phase, so a thread
+/// that panicked under the guard left a whole phase. The runtime recovers a
+/// poisoned lock, and the worker stays in service.
 pub struct WorkerRuntime<I, O, C = ()>
 where
 	I: Message + Send + Sync + 'static,
 	O: Send + 'static,
 	C: Send + Sync + 'static,
 {
-	phase: Phase<I, O>,
+	/// The phase, which [`Self::relay`] locks for one clone of the sender and
+	/// [`Self::kill`] locks to take the phase out, so no guard crosses an
+	/// await.
+	phase: Mutex<Phase<I, O>>,
 	config: Arc<C>,
 	/// The collector every relayed request records into. Both phases read it,
 	/// so it sits beside the phase and not inside it.
@@ -60,10 +124,15 @@ where
 	/// Build a worker in its unstarted phase around `config`.
 	pub fn new(config: C) -> Self {
 		Self {
-			phase: Phase::Unstarted,
+			phase: Mutex::new(Phase::Unstarted),
 			config: Arc::new(config),
 			trace: Arc::new(TraceCollector::new()),
 		}
+	}
+
+	/// Takes the phase lock, and recovers a poisoned lock.
+	fn phase(&self) -> MutexGuard<'_, Phase<I, O>> {
+		self.phase.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
 	/// Open the queue and spawn the loop that runs the policies and the
@@ -81,7 +150,8 @@ where
 		F: Fn(Arc<I>, Arc<TraceCollector>, Arc<C>) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = O> + Send + 'static,
 	{
-		if matches!(self.phase, Phase::Started { .. }) {
+		let phase = self.phase.get_mut().unwrap_or_else(PoisonError::into_inner);
+		if matches!(phase, Phase::Started { .. }) {
 			return self;
 		}
 
@@ -90,19 +160,18 @@ where
 		let policies = Arc::new(policies);
 		let join = rt::spawn(run_loop(rx, config, policies, handler));
 
-		self.phase = Phase::Started { sender: tx, join, queue: queue_capacity };
+		*phase = Phase::Started { sender: tx, join, queue: queue_capacity };
 		self.trace = trace;
 		self
 	}
 
 	/// Enqueue a message and await the handler response.
 	///
-	/// Every `worker!`-generated `Worker::relay` calls this.
+	/// Every `worker!`-generated `Worker::relay` calls this. It locks the
+	/// phase for one clone of the sender alone, so a relay that waits on a
+	/// full queue holds no lock.
 	pub fn relay(&self, message: Arc<I>) -> WorkerRelayFuture<O> {
-		let sender = match &self.phase {
-			Phase::Started { sender, .. } => Some(sender.clone()),
-			Phase::Unstarted => None,
-		};
+		let sender = self.phase().sender();
 		let trace = Arc::clone(&self.trace);
 
 		Box::pin(async move {
@@ -124,32 +193,51 @@ where
 
 	/// Close the queue and join the run loop.
 	///
-	/// Every `worker!`-generated `Worker::kill` calls this. The dropped sender
-	/// ends the run loop's `recv` stream, so the join sees a clean exit and no
-	/// abort mid-message.
-	pub fn kill(mut self) -> WorkerKillFuture {
-		// `Drop` runs on `self` at the end of this method, so the phase is
-		// replaced in place rather than moved out.
-		let phase = mem::replace(&mut self.phase, Phase::Unstarted);
+	/// Every `worker!`-generated `Worker::kill` calls this.
+	///
+	/// - The call takes the phase out under the lock and closes the queue, so
+	///   a later relay meets a closed queue.
+	/// - The run loop ends once each queued message has its answer, so the join sees a clean exit.
+	/// - A kill future that drops before the loop ends aborts the loop.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::worker::{WorkerPolicies, WorkerRuntime};
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::trace::TraceCollector;
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+	/// # runtime.block_on(async {
+	/// let handler = |message: Arc<TestMessage>, _trace, _config| async move { message.content.len() };
+	/// let trace = Arc::new(TraceCollector::new());
+	/// let worker = WorkerRuntime::new(()).start(trace, 8, WorkerPolicies::default(), handler);
+	///
+	/// worker.kill().await?;
+	/// assert_eq!(worker.queue_capacity(), 0);
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn kill(&self) -> WorkerKillFuture {
+		let phase = mem::replace(&mut *self.phase(), Phase::Unstarted);
+		let closed = phase.close();
 
 		Box::pin(async move {
-			let Phase::Started { sender, join, .. } = phase else {
+			let Some(mut run_loop) = closed else {
 				return Ok(());
 			};
 
-			drop(sender);
-			rt::join(join).await.map_err(|_| TightBeamError::JoinError)?;
-
-			Ok(())
+			run_loop.ended().await.map_err(|_| TightBeamError::JoinError)
 		})
 	}
 
-	/// The bound of the request queue, which is `0` before [`Self::start`].
+	/// The bound of the request queue, which is `0` before [`Self::start`]
+	/// and after [`Self::kill`].
 	pub fn queue_capacity(&self) -> usize {
-		match &self.phase {
-			Phase::Started { queue, .. } => *queue,
-			Phase::Unstarted => 0,
-		}
+		self.phase().queue()
 	}
 }
 
@@ -160,12 +248,11 @@ where
 	C: Send + Sync + 'static,
 {
 	fn drop(&mut self) {
-		let Phase::Started { sender, join, .. } = mem::replace(&mut self.phase, Phase::Unstarted) else {
-			return;
-		};
+		let phase = self.phase.get_mut().unwrap_or_else(PoisonError::into_inner);
+		let closed = mem::replace(phase, Phase::Unstarted).close();
 
-		drop(sender);
-		rt::abort(&join);
+		// The closed loop drops unjoined, which aborts it.
+		drop(closed);
 	}
 }
 
@@ -200,9 +287,16 @@ async fn run_loop<I, O, C, F, Fut>(
 #[cfg(test)]
 mod tests {
 	use core::error::Error;
+	use core::time::Duration;
+
+	use tokio::sync::Notify;
 
 	use super::*;
 	use crate::testing::TestMessage;
+
+	/// A bound on a wait that the test expects to end. A wait that reaches it
+	/// is a hang, which the test reports as a failure.
+	const HANG_GUARD: Duration = Duration::from_secs(10);
 
 	/// A worker with no receptor gate that answers the length of the
 	/// message it was handed, on a queue of `queue_capacity`.
@@ -212,6 +306,25 @@ mod tests {
 		let handler = |message: Arc<TestMessage>, _trace, _config| async move { message.content.len() };
 
 		WorkerRuntime::new(()).start(trace, queue_capacity, policies, handler)
+	}
+
+	/// A started worker whose handler gives notice on `entered` and never
+	/// answers. Its run loop holds `alive` until the loop ends.
+	fn held(entered: &Arc<Notify>, alive: rt::Sender<()>) -> WorkerRuntime<TestMessage, usize> {
+		let policies = WorkerPolicies { receptor_gates: Vec::new() };
+		let trace = Arc::new(TraceCollector::new());
+		let entered = Arc::clone(entered);
+		let handler = move |_message: Arc<TestMessage>, _trace, _config| {
+			let entered = Arc::clone(&entered);
+			let alive = alive.clone();
+			async move {
+				let _alive = alive;
+				entered.notify_one();
+				core::future::pending::<usize>().await
+			}
+		};
+
+		WorkerRuntime::new(()).start(trace, 8, policies, handler)
 	}
 
 	fn ping() -> Arc<TestMessage> {
@@ -266,6 +379,36 @@ mod tests {
 		let restarted = runtime.start(trace, 16, policies, |_message, _trace, _config| async move { 0 });
 		assert_eq!(restarted.queue_capacity(), 8);
 		restarted.kill().await?;
+		Ok(())
+	}
+
+	/// A worker killed in place closes its queue, so a later relay meets a
+	/// closed queue.
+	#[tokio::test]
+	async fn a_killed_worker_refuses_a_later_relay() -> Result<(), Box<dyn Error>> {
+		let runtime = started(8);
+
+		runtime.kill().await?;
+
+		let relayed = runtime.relay(ping()).await;
+		assert!(matches!(relayed, Err(WorkerRelayError::QueueClosed)));
+		Ok(())
+	}
+
+	/// A kill that drops before its run loop ends aborts the loop, so a caller
+	/// that stops waiting on the kill leaves no handler running.
+	#[tokio::test]
+	async fn a_kill_dropped_before_its_loop_ends_aborts_the_loop() -> Result<(), Box<dyn Error>> {
+		let entered = Arc::new(Notify::new());
+		let (alive, mut released) = rt::channel::<()>(1);
+		let runtime = held(&entered, alive);
+		let _relaying = tokio::spawn(runtime.relay(ping()));
+		entered.notified().await;
+
+		drop(runtime.kill());
+
+		let ended = tokio::time::timeout(HANG_GUARD, rt::recv(&mut released)).await?;
+		assert_eq!(ended, None);
 		Ok(())
 	}
 }

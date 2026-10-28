@@ -80,19 +80,22 @@ pub fn layer_of(violation: &SpecViolation) -> String {
 pub fn observing_hooks() -> TestHooks {
 	TestHooks::on_fail(|context, violations| {
 		let _layers: Vec<String> = violations.iter().map(layer_of).collect();
-		let _explored = context.verdict().exploration().map(|exploration| exploration.assertions.len());
+		let exploration = context.verdict().exploration();
+		let _explored = exploration.map(|exploration| exploration.assertions().len());
 	})
 }
 
 #[cfg(test)]
 mod tests {
 	use core::str::FromStr;
+	use core::time::Duration;
 
 	use tightbeam::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use tightbeam::crypto::sign::Sha3Signer;
 	use tightbeam::crypto::x509::name::Name;
 	use tightbeam::der::Encode;
+	use tightbeam::spki::SubjectPublicKeyInfoOwned;
 	use tightbeam::testing::env::SetupEnv;
 	use tightbeam::testing::specs::SpecViolation;
 	use tightbeam::testing::ScenarioConfig;
@@ -101,6 +104,10 @@ mod tests {
 	use super::{layer_of, observing_hooks};
 
 	const SCENARIO_RAN: Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
+
+	/// An ECDSA signature over secp256k1 in DER form, the type that the
+	/// `signature:` key of `csr!` and `cert!` names here.
+	type Secp256k1Der = tightbeam::crypto::sign::ecdsa::der::Signature<tightbeam::crypto::sign::ecdsa::Secp256k1>;
 
 	// `narrow` compiles the assertion layer alone, so that layer is the one
 	// verifier both selections share.
@@ -167,6 +174,42 @@ mod tests {
 		let signature = request.signature.raw_bytes();
 		Secp256k1Policy::default().verify_signature(&request.algorithm.oid, &public_key, &message, signature)?;
 		assert_eq!(request.info.subject, Name::from_str("CN=consumer")?);
+		Ok(())
+	}
+
+	#[test]
+	fn a_csr_expansion_takes_a_signature_key_from_an_outside_crate() -> Result<(), Box<dyn core::error::Error>> {
+		let signing_key = Secp256k1SigningKey::from_bytes(&[7; 32].into())?;
+		let signer = Sha3Signer::from(&signing_key);
+		let request = tightbeam::csr!(subject: "CN=consumer", signer: &signer, signature: Secp256k1Der)?;
+		let public_key = request.info.public_key.to_der()?;
+
+		let message = request.info.to_der()?;
+		let signature = request.signature.raw_bytes();
+		Secp256k1Policy::default().verify_signature(&request.algorithm.oid, &public_key, &message, signature)?;
+		Ok(())
+	}
+
+	#[test]
+	fn a_cert_expansion_takes_a_signature_key_from_an_outside_crate() -> Result<(), Box<dyn core::error::Error>> {
+		let signing_key = Secp256k1SigningKey::from_bytes(&[7; 32].into())?;
+		let signer = Sha3Signer::from(&signing_key);
+		let spki = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key())?;
+		let public_key = spki.to_der()?;
+		let certificate = tightbeam::cert!(
+			profile: Root,
+			subject: "CN=consumer root",
+			serial: 1u32,
+			duration: Duration::from_secs(3600),
+			signer: &signer,
+			subject_public_key: spki,
+			signature: Secp256k1Der
+		)?;
+
+		let message = certificate.tbs_certificate.to_der()?;
+		let signature = certificate.signature.raw_bytes();
+		let algorithm = &certificate.signature_algorithm.oid;
+		Secp256k1Policy::default().verify_signature(algorithm, &public_key, &message, signature)?;
 		Ok(())
 	}
 }

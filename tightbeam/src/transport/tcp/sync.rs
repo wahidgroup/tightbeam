@@ -15,31 +15,28 @@ use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStr
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::builder::TypeBuilder;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-use crate::der::Encode;
 use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportError;
 use crate::transport::error::TransportFailure;
-use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
-use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
+use crate::transport::framing::{FrameAssembler, Step};
+use crate::transport::handshake::HandshakeProvider;
 use crate::transport::policy::RestartPolicy;
-use crate::transport::state::{EncryptedProtocolState, IoDeadline, SettledExchange};
+use crate::transport::state::{IoDeadline, SettledExchange};
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::{
 	EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO, Protocol,
-	ResponsePackage, TransportEncryptionConfig, TransportResult,
+	ProtocolStream, TransportEncryptionConfig, TransportResult,
 };
-use crate::transport::{EnvelopeBuilder, ProtocolStream};
 use crate::utils::time::Clock;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::state::ServerHandshakeSlot;
+use crate::transport::state::{HandshakeSlot, ServerHandshakeSlot};
 
 // The macro generates the `TcpTransport` struct and its common implementations.
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
@@ -162,39 +159,15 @@ where
 		let deadline = IoDeadline(policy.deadline());
 
 		let result = (|| -> TransportResult<Vec<u8>> {
-			// EOF before the tag means the peer closed between frames. EOF
-			// anywhere after it is a truncated frame.
-			let mut tag_byte = [0u8; 1];
-			let tag_read = self.fill_within(&mut tag_byte, deadline);
-			tag_read.map_err(TransportError::at_frame_boundary)?;
+			let mut assembler = FrameAssembler::new(policy.cap());
+			loop {
+				let filled = self.fill_within(assembler.wanted(), deadline);
+				filled.map_err(|error| assembler.classify(error))?;
 
-			let mut length_first = [0u8; 1];
-			let length_read = self.fill_within(&mut length_first, deadline);
-			length_read.map_err(TransportError::inside_frame)?;
-
-			let length_octets = match LengthForm::from(length_first[0]) {
-				LengthForm::Short(_) => Vec::new(),
-				LengthForm::Long(octet_count) => {
-					let mut length_octets = vec![0u8; octet_count];
-					let octets_read = self.fill_within(&mut length_octets, deadline);
-					octets_read.map_err(TransportError::inside_frame)?;
-
-					length_octets
+				if let Step::Done(frame) = assembler.advance()? {
+					return Ok(frame);
 				}
-			};
-
-			// The admitted header is the only source of a length to allocate
-			// with.
-			let prefix = HeaderPrefix { tag: tag_byte[0], length_first: length_first[0] };
-			let header = FrameHeader::parse(prefix, length_octets)?.admit(policy.cap())?;
-			let content_length = header.content_len();
-
-			let mut content = vec![0u8; content_length];
-			let content_read = self.fill_within(&mut content, deadline);
-			content_read.map_err(TransportError::inside_frame)?;
-
-			let buffer = header.reconstruct(&content);
-			Ok(buffer)
+			}
 		})();
 
 		#[cfg(feature = "std")]
@@ -226,8 +199,8 @@ impl<S: ProtocolStream, P: CryptoProvider> ServerHandshakeSlot for TcpTransport<
 where
 	TransportError: From<S::Error>,
 {
-	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-		&mut self.server_handshake
+	fn handshake_slot(&mut self) -> &mut HandshakeSlot {
+		self.state.handshake_slot()
 	}
 
 	/// Runs `operation` unbounded, because a blocking read holds its thread.
@@ -258,13 +231,7 @@ where
 	}
 
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let builder = EnvelopeBuilder::response(response_pkg).with_limits(self.limits);
-		let builder = self.apply_wire_mode(builder)?;
-
-		let wire_envelope = builder.build()?;
-		let wire_bytes = wire_envelope.to_der()?;
-		self.write_envelope_bytes(&wire_bytes).await
+		self.send_response_with_encryption(status, message).await
 	}
 }
 
@@ -379,7 +346,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpL
 		NetTcpStream::connect(addr.0)
 	}
 
-	/// Connects within `budget` through `TcpStream::connect_timeout`, because a
+	/// Connects within `budget` through `TcpStream::connect_timeout`. A
 	/// blocking connect holds its thread, so no race of the dial pre-empts it.
 	async fn connect_within(addr: Self::Address, budget: Duration) -> Result<Self::Stream, Self::Error> {
 		NetTcpStream::connect_timeout(&addr.0, budget)
@@ -501,7 +468,7 @@ mod tests {
 	/// `clock`.
 	fn validating_server_on(limits: TransportLimits, clock: Arc<dyn Clock>) -> EndpointConfig<DefaultCryptoProvider> {
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let peer_authentication = PeerAuthentication::mutual([validator]);
+		let peer_authentication = PeerAuthentication::Anonymous.and(validator);
 
 		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
 		let encryption = DialableEncryption::new(encryption).expect("mutual authentication answers for the peer");

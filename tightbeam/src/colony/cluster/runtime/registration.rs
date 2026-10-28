@@ -1,11 +1,13 @@
 //! Hive registration and servlet address-update request handlers.
 
 use core::str::FromStr;
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
+use crate::cms::signed_data::SignerIdentifier;
+use crate::colony::cluster::runtime::bounds::{ColonyConfig, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::verify::{RequestAudit, VerifiedControlFrame, VerifiedSignerId};
-use crate::colony::cluster::DialTarget;
+use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget, HiveSlate};
 use crate::colony::protocol::{
 	RegisterHiveRequest, RegisterHiveResponse, ReplyForm, ServletAddressUpdate, ServletAddressUpdateResponse,
 };
@@ -16,6 +18,7 @@ use crate::instrumentation::events::{
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::Protocol;
+use crate::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 
@@ -26,6 +29,91 @@ struct AdmittedControl<'a> {
 	verified: VerifiedControlFrame<'a>,
 	/// The audit trace, which each record of the request goes on.
 	trace: &'a TraceCollector,
+}
+
+/// A hive registration that the gateway admits: what the membership step
+/// installs, beside the hive identity the reply names.
+struct AdmittedRegistration {
+	/// The identity URN that the hive's address yields.
+	hive_identity: Urn<'static>,
+	/// The signer the verified frame names, which the hive's entry binds, so
+	/// the next registration of the hive must come from it (CWE-639).
+	signer: Arc<SignerIdentifier>,
+	/// The slate of the hive's servlets, each under the locator rule.
+	slate: HiveSlate,
+	/// The request, which the membership step installs.
+	request: RegisterHiveRequest,
+}
+
+impl AdmittedRegistration {
+	/// Admits `request`, which `verified` carried, under the namespace and the
+	/// slate rule of `config`.
+	///
+	/// The checks run in this order:
+	///
+	/// 1. The hive address MUST yield an exact hive identity URN.
+	/// 2. The protocol MUST parse the hive address to dial. The heartbeat dials
+	///    that address, so a hive whose address no dial reaches would register,
+	///    get no heartbeat, and leave by silent eviction.
+	/// 3. Each servlet MUST name the address beside it as its locator, so no
+	///    servlet advertises one address under the identity of another.
+	///
+	/// # Errors
+	///
+	/// - [`TransitStatus::PermissionDenied`] -- a check above refuses the registration.
+	fn admit<P>(
+		verified: &VerifiedControlFrame<'_>,
+		request: RegisterHiveRequest,
+		config: &ColonyConfig<P>,
+	) -> Result<Self, TransitStatus>
+	where
+		P: Protocol,
+		P::Address: FromStr,
+	{
+		let Some(hive_identity) = config.namespace.hive_from_bytes(&request.hive_addr) else {
+			return Err(TransitStatus::PermissionDenied);
+		};
+
+		let hive_addr: Arc<[u8]> = Arc::from(request.hive_addr.as_slice());
+		let dialable = DialTarget::of_registered(&hive_addr).protocol_address::<P::Address>();
+		if dialable.is_err() {
+			return Err(TransitStatus::PermissionDenied);
+		}
+
+		let slate = config.servlet_slate(&request.servlet_addresses, &hive_addr);
+		let slate = slate.map_err(|_| TransitStatus::PermissionDenied)?;
+		let signer = Arc::new(verified.signer_identifier().clone());
+		Ok(Self { hive_identity, signer, slate, request })
+	}
+}
+
+/// A servlet address update that the gateway admits: the signer the
+/// membership step checks, and the parsed delta.
+struct AdmittedUpdate<'a> {
+	/// The signer the verified frame names, which the hive's entry MUST bind.
+	signer: &'a SignerIdentifier,
+	/// The added routes, which the hive owns.
+	added: HiveSlate,
+	/// The locators of the instances the update removes.
+	removed: Vec<&'a [u8]>,
+}
+
+impl<'a> AdmittedUpdate<'a> {
+	/// Admits `update`, which `verified` carried, under the namespace and the
+	/// slate rule of `config`.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError`] -- the errors of [`ClusterConfig::parse_address_update`].
+	fn admit(
+		verified: &VerifiedControlFrame<'a>,
+		update: &'a ServletAddressUpdate,
+		config: &ClusterConfig,
+	) -> Result<Self, ClusterError> {
+		let (added, removed) = config.parse_address_update(update)?;
+		let signer = verified.signer_identifier();
+		Ok(Self { signer, added, removed })
+	}
 }
 
 /// A hive control frame that the origin and freshness gate refused, one
@@ -98,30 +186,14 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		let fingerprint = verified.fingerprint();
 		let signer = Some(&fingerprint);
 
-		// The gateway admits only a hive address that yields an exact hive
-		// identity URN.
-		let Some(hive_identity) = self.config.namespace.hive_from_bytes(&request.hive_addr) else {
-			return self.refuse_register(&frame, TransitStatus::PermissionDenied, trace, signer);
-		};
-
-		// The heartbeat dials the control address, so a hive whose address the
-		// protocol cannot parse would register, get no heartbeat, and leave by
-		// silent eviction. This check refuses it before the membership install.
-		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
-		if DialTarget::of_registered(&hive_addr).protocol_address::<P::Address>().is_err() {
-			return self.refuse_register(&frame, TransitStatus::PermissionDenied, trace, signer);
-		}
-
-		// The slate constructor owns the locator rule, so the gateway refuses a
-		// servlet that advertises one address under another's identity.
-		let Ok(slate) = self.config.servlet_slate(&request.servlet_addresses, &hive_addr) else {
-			return self.refuse_register(&frame, TransitStatus::PermissionDenied, trace, signer);
+		let admitted = match AdmittedRegistration::admit(&verified, request, &self.config) {
+			Ok(admitted) => admitted,
+			Err(status) => return self.refuse_register(&frame, status, trace, signer),
 		};
 
 		// The entry and its slate install atomically and replace the rows of a
-		// prior registration. The entry binds the verified signer, so the next
-		// registration of this hive must come from it (CWE-639).
-		let bound = Arc::new(verified.signer_identifier().clone());
+		// prior registration.
+		let AdmittedRegistration { hive_identity, signer: bound, slate, request } = admitted;
 		match self.membership().admit(request, bound, slate) {
 			Ok(hive_count) => {
 				let evidence = Some(fingerprint.as_shared().as_ref());
@@ -149,7 +221,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		let AdmittedControl { verified, trace } = match self.admit_hive_control(&frame, audit) {
 			Ok(admitted) => admitted,
 			Err(refused) => {
-				return self.refuse_update(&frame, refused.status(), refused.trace(), refused.signer());
+				let status = refused.status();
+				return self.refuse_update(&frame, status, || status.as_str(), refused.trace(), refused.signer());
 			}
 		};
 
@@ -158,13 +231,19 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		let fingerprint = verified.fingerprint();
 		let signer = Some(&fingerprint);
 
-		let Some((added, removed)) = self.config.parse_address_update(&update) else {
-			return self.refuse_update(&frame, TransitStatus::PermissionDenied, trace, signer);
+		// An update that does not parse names its cause in the record, so the
+		// trail tells a foreign identity from a refused route.
+		let admitted = match AdmittedUpdate::admit(&verified, &update, &self.config) {
+			Ok(admitted) => admitted,
+			Err(error) => {
+				let status = error.transit_status();
+				return self.refuse_update(&frame, status, || error.refusal_label(), trace, signer);
+			}
 		};
 
 		// The signer bind and the route write are one membership step, so
 		// a retirement lands before or after both (CWE-362).
-		let claimed = verified.signer_identifier();
+		let AdmittedUpdate { signer: claimed, added, removed } = admitted;
 		match self.membership().update_addresses(claimed, added, &removed) {
 			Ok(()) => {
 				let evidence = || Some(fingerprint.as_shared().as_ref());
@@ -241,16 +320,24 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	}
 
 	/// Answers an address update with `status`, and records the refusal on
-	/// `trace`, with the fingerprint of the verified `signer` as its payload.
-	fn refuse_update(
+	/// `trace` under the label that `label` renders, with the fingerprint of
+	/// the verified `signer` as its payload.
+	///
+	/// The trace runs `label` only when its sink keeps the event, so a record
+	/// that the sink drops renders no label.
+	fn refuse_update<L>(
 		&self,
 		frame: &Frame,
 		status: TransitStatus,
+		label: impl FnOnce() -> L,
 		trace: &TraceCollector,
 		signer: Option<&VerifiedSignerId>,
-	) -> Result<Option<Frame>, TightBeamError> {
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		L: Into<Cow<'static, str>>,
+	{
 		let evidence = signer.map(|signer| signer.as_shared().as_ref());
-		trace.emit_event_with_value_and_evidence(CLUSTER_UPDATE_REFUSED, status.as_str(), (), evidence)?;
+		trace.emit_rendered_event(CLUSTER_UPDATE_REFUSED, label, (), || evidence)?;
 
 		let response = ServletAddressUpdateResponse { status };
 		ReplyForm::Plain.reply(frame.metadata().id(), response)
@@ -267,6 +354,6 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		signer: Option<&VerifiedSignerId>,
 	) -> Result<Option<Frame>, TightBeamError> {
 		self.replay_guard.release(signature);
-		self.refuse_update(frame, status, trace, signer)
+		self.refuse_update(frame, status, || status.as_str(), trace, signer)
 	}
 }

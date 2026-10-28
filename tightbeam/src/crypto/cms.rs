@@ -79,6 +79,8 @@ pub use crate::asn1::{AuthEnvelopedData, CmsOriForKemOtherInfo, GcmParameters, K
 pub use attributes::AttributesExt;
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+pub(in crate::crypto) use envelope::ArrivedEnvelope;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub use envelope::ContentEncryption;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub(in crate::crypto) use envelope::Detached;

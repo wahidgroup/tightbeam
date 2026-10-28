@@ -1,0 +1,23 @@
+error[E0061]: this method takes 2 arguments but 3 arguments were supplied
+  --> tests/compile/decrypt_content_split_pair.rs:18:12
+   |
+18 |     decryptor.decrypt_content(envelope, arrived, content)
+   |               ^^^^^^^^^^^^^^^           ------- unexpected argument #2 of type `&'a [u8]`
+   |
+note: expected `&WireDer<AuthEnvelopedData>`, found `&AuthEnvelopedData`
+  --> tests/compile/decrypt_content_split_pair.rs:18:28
+   |
+18 |     decryptor.decrypt_content(envelope, arrived, content)
+   |                               ^^^^^^^^
+   = note: expected reference `&WireDer<tightbeam::asn1::AuthEnvelopedData>`
+              found reference `&'a tightbeam::asn1::AuthEnvelopedData`
+note: method defined here
+  --> src/crypto/aead.rs
+   |
+   |     fn decrypt_content<'a>(
+   |        ^^^^^^^^^^^^^^^
+help: remove the extra argument
+   |
+18 -     decryptor.decrypt_content(envelope, arrived, content)
+18 +     decryptor.decrypt_content(/* &WireDer<tightbeam::asn1::AuthEnvelopedData> */, content)
+   |

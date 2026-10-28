@@ -57,9 +57,9 @@ use crate::asn1::WireDer;
 use crate::cms::signed_data::SignedData;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::{
-	pairwise_prefix_free, prefix_free, MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN,
-	TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
-	TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO,
+	pairwise_prefix_free, prefix_free, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_C2S_KDF_INFO,
+	TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, TIGHTBEAM_CLOSING_KDF_INFO,
+	TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO,
 	TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -73,7 +73,7 @@ use crate::crypto::common::typenum::Unsigned;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::hash::Digest;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::kdf::{EcdhSecret, KdfError, KdfFunction, ZeroizingHkdf, ZeroizingHmac};
+use crate::crypto::kdf::{EcdhSecret, KdfError, KdfFunction, KdfSalt, ZeroizingHkdf, ZeroizingHmac};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -89,7 +89,7 @@ use crate::crypto::sign::elliptic_curve::sec1::{EncodedPoint, FromEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, Error as EllipticCurveError, PublicKey, SecretKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::CmsSigner;
+use crate::crypto::sign::SignedDataSigners;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::subtle::ConstantTimeEq;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -118,11 +118,11 @@ use crate::transport::handshake::primitives::multi_input_kdf;
 use crate::transport::handshake::primitives::transcript::DigestOutput;
 #[cfg(mux_rekey)]
 use crate::transport::handshake::primitives::transcript::Transcript;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::primitives::KdfInfo;
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::primitives::RandomsSalt;
 use crate::transport::handshake::primitives::TranscriptHash;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -280,8 +280,7 @@ impl HandshakeSecret {
 		P: CryptoProvider,
 	{
 		let label = KdfInfo::new(TIGHTBEAM_SESSION_KDF_INFO);
-		let salt = Some(salt.as_bytes());
-		let secret = P::Kdf::derive_dynamic_key(ikm, label.as_bytes(), salt, HANDSHAKE_SECRET_SIZE)?;
+		let secret = P::Kdf::derive_dynamic_key(ikm, label.as_bytes(), Some(salt), HANDSHAKE_SECRET_SIZE)?;
 		Ok(Self(secret))
 	}
 
@@ -307,7 +306,7 @@ impl HandshakeSecret {
 		P: CryptoProvider,
 	{
 		let kek_size = <<P::KeyWrap as KeyWrapAlgorithm>::KekSize as Unsigned>::USIZE;
-		let derived = P::Kdf::derive_dynamic_key(&self.0, purpose.label(), Some(salt.as_bytes()), kek_size)?;
+		let derived = P::Kdf::derive_dynamic_key(&self.0, purpose.label(), Some(salt), kek_size)?;
 		let kek = OwnedKek::try_from(derived.as_slice())?;
 		Ok(Sealer { kek, transcript_hash: *transcript_hash, purpose })
 	}
@@ -362,7 +361,7 @@ impl HandshakeSecret {
 	where
 		P: CryptoProvider,
 	{
-		let signer_info = CmsSigner::sole_signer(reply)?;
+		let signer_info = reply.sole_signer()?;
 
 		let signature = signer_info.signature.as_bytes();
 		self.finished::<P>(FinishedRole::Server, salt, &[transcript_hash.as_bytes(), signature])
@@ -1046,8 +1045,7 @@ impl EpochMaterials {
 		P: CryptoProvider,
 	{
 		let input_key = secret.as_bytes();
-		let kdf_salt = Some(salt.as_bytes());
-		let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, kdf_salt, EPOCH_SECRET_SIZE)?;
+		let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, Some(salt), EPOCH_SECRET_SIZE)?;
 
 		let materials = Self { secret: EpochSecret(secret), epoch: HANDSHAKE_EPOCH, transcript_hash };
 		Ok(materials)
@@ -1139,8 +1137,8 @@ impl EpochMaterials {
 	/// The chain hash after a completed exchange:
 	/// `H(hash || request_der || response_der || ack_der)`.
 	///
-	/// So every epoch receipt commits to the whole session history back to the
-	/// handshake transcript.
+	/// Every epoch receipt then commits to the whole session history back to
+	/// the handshake transcript.
 	///
 	/// # Errors
 	///
@@ -1417,13 +1415,12 @@ impl DirectionalCiphers<RuntimeAead> {
 	/// secret, for `epoch`.
 	///
 	/// Handshake finalization and epoch rotation share this derivation. Each
-	/// key is a key-encryption key at the provider's wrap size, and the salt
-	/// floor applies at every derivation. The [`TrafficSecret`] bound admits
+	/// key is a key-encryption key at the provider's wrap size, under a salt
+	/// that [`KdfSalt`] holds at the floor. The [`TrafficSecret`] bound admits
 	/// the handshake secret and its epoch chain.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
 	/// - [`HandshakeError::KdfError`] -- the KDF refused the key size.
 	/// - [`HandshakeError::KeyError`] -- the derived key is not the key size of the wrap of `P`.
 	pub(crate) fn derive<P, S>(secret: &S, salt: KdfSalt<'_>, epoch: u32) -> Result<Self, HandshakeError>
@@ -1432,11 +1429,6 @@ impl DirectionalCiphers<RuntimeAead> {
 		S: TrafficSecret,
 	{
 		let key_size = <<P::KeyWrap as KeyWrapAlgorithm>::KekSize as Unsigned>::USIZE;
-		let salt_len = salt.as_bytes().len();
-		if salt_len < MIN_SALT_ENTROPY_BYTES {
-			return Err(HandshakeError::InsufficientSaltEntropy { actual: salt_len, minimum: MIN_SALT_ENTROPY_BYTES });
-		}
-
 		let input_key = secret.as_bytes();
 		let c2s_label = KdfInfo::new(TIGHTBEAM_C2S_KDF_INFO);
 		let s2c_label = KdfInfo::new(TIGHTBEAM_S2C_KDF_INFO);
@@ -1463,7 +1455,7 @@ fn derive_labeled_key<P>(
 where
 	P: CryptoProvider<AeadCipher: ContentEncryption> + 'static,
 {
-	let key_bytes = P::Kdf::derive_dynamic_key(input_key, info.as_bytes(), Some(salt.as_bytes()), key_size)?;
+	let key_bytes = P::Kdf::derive_dynamic_key(input_key, info.as_bytes(), Some(salt), key_size)?;
 	let key = RuntimeAead::new::<P>(key_bytes)?;
 	Ok(key)
 }
@@ -1544,12 +1536,16 @@ impl<P: HandshakeProvider> Terms<P> {
 	}
 
 	/// The salt every derivation of this handshake runs under.
-	pub(crate) fn kdf_salt(&self) -> KdfSalt<'_> {
+	///
+	/// # Errors
+	///
+	/// - [`KdfError::SaltTooShort`] -- the salt is shorter than the floor of [`KdfSalt`].
+	pub(crate) fn kdf_salt(&self) -> Result<KdfSalt<'_>, KdfError> {
 		match &self.salt.0 {
 			#[cfg(feature = "transport-hpke")]
 			SaltSource::Randoms(randoms) => randoms.as_kdf_salt(),
 			#[cfg(feature = "transport-cms")]
-			SaltSource::TranscriptHash => KdfSalt::new(self.transcript_hash.as_bytes()),
+			SaltSource::TranscriptHash => KdfSalt::try_from(self.transcript_hash.as_bytes()),
 		}
 	}
 
@@ -1558,9 +1554,9 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::confirmation`].
+	/// - [`HandshakeError`] -- the errors of [`Self::kdf_salt`] and [`HandshakeSecret::confirmation`].
 	pub(crate) fn confirmation(&self, secret: &HandshakeSecret) -> Result<KeyConfirmation, HandshakeError> {
-		secret.confirmation::<P>(self.kdf_salt(), self.transcript_hash())
+		secret.confirmation::<P>(self.kdf_salt()?, self.transcript_hash())
 	}
 
 	/// `secret`, once `received` confirms it over the transcript of these
@@ -1568,13 +1564,13 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::confirmed`].
+	/// - [`HandshakeError`] -- the errors of [`Self::kdf_salt`] and [`HandshakeSecret::confirmed`].
 	pub(crate) fn confirm(
 		&self,
 		secret: HandshakeSecret,
 		received: &KeyConfirmation,
 	) -> Result<ConfirmedSecret, HandshakeError> {
-		secret.confirmed::<P>(self.kdf_salt(), self.transcript_hash(), received)
+		secret.confirmed::<P>(self.kdf_salt()?, self.transcript_hash(), received)
 	}
 
 	/// The server Finished of `secret` over the transcript of these terms and
@@ -1582,14 +1578,14 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::server_confirmation`].
+	/// - [`HandshakeError`] -- the errors of [`Self::kdf_salt`] and [`HandshakeSecret::server_confirmation`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn server_confirmation(
 		&self,
 		secret: &HandshakeSecret,
 		reply: &SignedData,
 	) -> Result<KeyConfirmation, HandshakeError> {
-		secret.server_confirmation::<P>(self.kdf_salt(), self.transcript_hash(), reply)
+		secret.server_confirmation::<P>(self.kdf_salt()?, self.transcript_hash(), reply)
 	}
 
 	/// `secret`, once `received` is its server Finished over the transcript of
@@ -1597,7 +1593,7 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::confirm_server`].
+	/// - [`HandshakeError`] -- the errors of [`Self::kdf_salt`] and [`HandshakeSecret::confirm_server`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn confirm_server(
 		&self,
@@ -1605,7 +1601,7 @@ impl<P: HandshakeProvider> Terms<P> {
 		reply: &SignedData,
 		received: &KeyConfirmation,
 	) -> Result<HandshakeSecret, HandshakeError> {
-		secret.confirm_server::<P>(self.kdf_salt(), self.transcript_hash(), reply, received)
+		secret.confirm_server::<P>(self.kdf_salt()?, self.transcript_hash(), reply, received)
 	}
 
 	/// The single-use seal of `purpose` under `secret`, bound to the salt and
@@ -1613,9 +1609,9 @@ impl<P: HandshakeProvider> Terms<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError`] -- the errors of [`HandshakeSecret::sealer`].
+	/// - [`HandshakeError`] -- the errors of [`Self::kdf_salt`] and [`HandshakeSecret::sealer`].
 	pub(crate) fn sealer(&self, secret: &HandshakeSecret, purpose: SecretSeal) -> Result<Sealer<P>, HandshakeError> {
-		secret.sealer::<P>(purpose, self.kdf_salt(), self.transcript_hash())
+		secret.sealer::<P>(purpose, self.kdf_salt()?, self.transcript_hash())
 	}
 }
 
@@ -1689,7 +1685,8 @@ impl<P: HandshakeProvider> Agreed<P> {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
+	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt of the terms is
+	///   shorter than the floor of [`KdfSalt`].
 	/// - [`HandshakeError::KdfError`] -- the KDF refused a key length.
 	/// - [`HandshakeError::KeyError`] -- the derived key is not the key size of the wrap of `P`.
 	pub(crate) fn complete(
@@ -1697,7 +1694,7 @@ impl<P: HandshakeProvider> Agreed<P> {
 		keys: fn(DirectionalCiphers<RuntimeAead>) -> SessionKeys,
 	) -> Result<EstablishedSession, HandshakeError> {
 		let Self { terms, secret, receipt, peer } = self;
-		let salt = terms.kdf_salt();
+		let salt = terms.kdf_salt()?;
 		#[cfg(mux_rekey)]
 		let epoch = EpochMaterials::derive::<P>(&secret, salt, terms.transcript_hash)?;
 		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt, HANDSHAKE_EPOCH)?;
@@ -1727,7 +1724,7 @@ mod tests {
 	use crate::random::OsRng;
 	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestCertificate, TestKey};
 	use crate::transport::handshake::tests::{
-		create_test_certificate, create_test_signed_data, fixture_agreement, fixture_transcript, negated,
+		create_test_certificate, create_test_signed_data, fixture_agreement, fixture_transcript, negated, FIXTURE_SALT,
 	};
 
 	#[cfg(mux_rekey)]
@@ -1766,7 +1763,8 @@ mod tests {
 	fn handshake_secret(shared: u8, base: u8, salt: &[u8]) -> HandshakeSecret {
 		let shared = fixture_agreement(shared);
 		let base = base_secret(base);
-		let secret = HandshakeSecret::hybrid::<DefaultCryptoProvider>(&shared, &base, KdfSalt::new(salt));
+		let salt = KdfSalt::try_from(salt).expect("a fixture salt meets the floor");
+		let secret = HandshakeSecret::hybrid::<DefaultCryptoProvider>(&shared, &base, salt);
 		secret.expect("fixture inputs derive a handshake secret")
 	}
 
@@ -1776,7 +1774,7 @@ mod tests {
 		secret: &HandshakeSecret,
 		salt: &[u8],
 	) -> Result<DirectionalCiphers<RuntimeAead>, HandshakeError> {
-		DirectionalCiphers::derive::<DefaultCryptoProvider, _>(secret, KdfSalt::new(salt), 0)
+		DirectionalCiphers::derive::<DefaultCryptoProvider, _>(secret, KdfSalt::try_from(salt)?, 0)
 	}
 
 	#[test]
@@ -1928,7 +1926,7 @@ mod tests {
 		let shared = fixture_agreement(0x11);
 		let salt = [0x99u8; 64];
 
-		let next = epoch.chained::<DefaultCryptoProvider>(&shared, KdfSalt::new(&salt))?;
+		let next = epoch.chained::<DefaultCryptoProvider>(&shared, KdfSalt::try_from(salt.as_slice())?)?;
 		let expected = [
 			0xad, 0x8e, 0x99, 0x9c, 0x3c, 0x48, 0x89, 0xe6, 0x28, 0x89, 0xc7, 0x98, 0xf7, 0x91, 0x97, 0x07, 0xdc, 0x45,
 			0x57, 0x59, 0x77, 0xa1, 0x65, 0x31, 0x42, 0x6a, 0xbb, 0x9c, 0x21, 0x01, 0xb4, 0x34,
@@ -2026,7 +2024,7 @@ mod tests {
 	fn the_ephemeral_handshake_secret_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let shared = fixture_agreement(0x11);
 
-		let secret = HandshakeSecret::ephemeral::<DefaultCryptoProvider>(&shared, KdfSalt::new(&[0x99u8; 32]))?;
+		let secret = HandshakeSecret::ephemeral::<DefaultCryptoProvider>(&shared, KdfSalt::try_from(FIXTURE_SALT)?)?;
 		let expected = [
 			0xaa, 0x37, 0x22, 0x1e, 0x40, 0xaa, 0x14, 0xc2, 0x09, 0x0a, 0x1a, 0xeb, 0xec, 0xf8, 0x5e, 0x68, 0x29, 0x75,
 			0xe5, 0x39, 0xa3, 0xff, 0xbc, 0x80, 0xa2, 0x82, 0x12, 0x79, 0x02, 0x70, 0x5f, 0xf8,
@@ -2061,10 +2059,10 @@ mod tests {
 	/// `hmac` and `hashlib`), so no code of the crate computes them.
 	#[test]
 	fn the_key_confirmation_matches_its_known_answer() -> Result<(), HandshakeError> {
-		let salt = [0x99u8; 32];
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
 
-		let tag = fixed_secret().confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &transcript_hash)?;
+		let tag = fixed_secret().confirmation::<DefaultCryptoProvider>(salt, &transcript_hash)?;
 		let expected = [
 			0xb6, 0x98, 0xa4, 0xe3, 0x74, 0xec, 0xce, 0xdf, 0x1e, 0xc1, 0x12, 0x58, 0xef, 0xa0, 0x92, 0x25, 0x50, 0x3c,
 			0x6f, 0x81, 0x01, 0xe4, 0xb5, 0xfa, 0x64, 0x08, 0x96, 0x13, 0xe5, 0xfa, 0x48, 0x02,
@@ -2081,10 +2079,10 @@ mod tests {
 	/// `hmac` and `hashlib`), so a tag or a key cut to 32 bytes fails here.
 	#[test]
 	fn a_sha3_512_key_confirmation_matches_its_known_answer() -> Result<(), HandshakeError> {
-		let salt = [0x99u8; 32];
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = fixture_transcript::<Sha3_512>([0x07u8; 64]);
 
-		let tag = fixed_secret().confirmation::<Aes256Sha3_512Provider>(KdfSalt::new(&salt), &transcript_hash)?;
+		let tag = fixed_secret().confirmation::<Aes256Sha3_512Provider>(salt, &transcript_hash)?;
 		let expected = [
 			0x36, 0x07, 0xb0, 0xcc, 0x6b, 0x27, 0x1d, 0xf9, 0x5d, 0x26, 0x99, 0xa8, 0xf2, 0x89, 0x74, 0x56, 0x04, 0xef,
 			0x55, 0xd9, 0xc6, 0x14, 0x30, 0x99, 0x57, 0x70, 0x5d, 0xa1, 0xbf, 0xd6, 0x97, 0x1a, 0x09, 0x29, 0x7a, 0x9e,
@@ -2147,7 +2145,7 @@ mod tests {
 		let secret = handshake_secret(0x11, 0x42, transcript_hash.as_bytes());
 		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
 
-		let salt = KdfSalt::new(transcript_hash.as_bytes());
+		let salt = KdfSalt::try_from(transcript_hash.as_bytes())?;
 		let server = secret.server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &reply)?;
 		let expected = [
 			0x73, 0x5f, 0x78, 0x2b, 0xbc, 0x96, 0x70, 0xa1, 0x9c, 0x5e, 0x57, 0xb3, 0xed, 0x51, 0xe3, 0xb2, 0x1b, 0x12,
@@ -2166,7 +2164,7 @@ mod tests {
 	/// here.
 	#[test]
 	fn the_server_finished_matches_its_known_answer() -> Result<(), HandshakeError> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
 		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
 
@@ -2186,7 +2184,7 @@ mod tests {
 	/// `hmac` and `hashlib`), so a tag or a key cut to 32 bytes fails here.
 	#[test]
 	fn a_sha3_512_server_finished_matches_its_known_answer() -> Result<(), HandshakeError> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = fixture_transcript::<Sha3_512>([0x07u8; 64]);
 		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
 
@@ -2206,7 +2204,7 @@ mod tests {
 	/// client's tag does, yet the two differ.
 	#[test]
 	fn the_server_finished_and_the_client_tag_differ_by_key() -> Result<(), HandshakeError> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
 		let reply = reply_signed_as([]);
 
@@ -2220,7 +2218,7 @@ mod tests {
 	/// itself back.
 	#[test]
 	fn a_server_finished_confirms_its_own_secret() -> Result<(), HandshakeError> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
 		let reply = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
 		let server = fixed_secret().server_confirmation::<DefaultCryptoProvider>(salt, &transcript_hash, &reply)?;
@@ -2235,7 +2233,7 @@ mod tests {
 	/// MAC covers the transcript through the signature.
 	#[test]
 	fn a_server_finished_over_another_signature_is_refused() -> Result<(), HandshakeError> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
 		let signed = reply_signed_as(REPLY_SIGNATURE.collect::<Vec<_>>());
 		let other = reply_signed_as(REPLY_SIGNATURE.rev().collect::<Vec<_>>());
@@ -2250,7 +2248,7 @@ mod tests {
 	/// The client's tag is no server Finished, so a reflected tag fails.
 	#[test]
 	fn a_client_tag_is_refused_as_the_server_finished() -> Result<(), HandshakeError> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
 		let reply = reply_signed_as([]);
 		let client = fixed_secret().confirmation::<DefaultCryptoProvider>(salt, &transcript_hash)?;
@@ -2272,7 +2270,7 @@ mod tests {
 	/// has one signature to cover.
 	#[test]
 	fn a_server_finished_over_two_signers_is_refused() -> Result<(), Box<dyn core::error::Error>> {
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let mut reply = create_test_signed_data(b"reply");
 		reply.signer_infos.0.insert(fresh_signer())?;
 
@@ -2285,9 +2283,9 @@ mod tests {
 	/// another digest confirms nothing.
 	#[test]
 	fn a_key_confirmation_of_another_width_is_refused() -> Result<(), HandshakeError> {
-		let salt = [0x99u8; 32];
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 		let transcript_hash = ack_transcript();
-		let tag = fixed_secret().confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &transcript_hash)?;
+		let tag = fixed_secret().confirmation::<DefaultCryptoProvider>(salt, &transcript_hash)?;
 		let wide = KeyConfirmation(DigestOutput::parse([tag.0.as_bytes(), tag.0.as_bytes()].concat())?);
 
 		let refused = tag.verify(&wide);
@@ -2323,10 +2321,11 @@ mod tests {
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let other = handshake_secret(0x12, 0x42, &salt);
 		let transcript_hash = ack_transcript();
+		let kdf_salt = KdfSalt::try_from(salt.as_slice())?;
 
-		let tag = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &transcript_hash)?;
-		let same = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &transcript_hash)?;
-		let foreign = other.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&salt), &transcript_hash)?;
+		let tag = secret.confirmation::<DefaultCryptoProvider>(kdf_salt, &transcript_hash)?;
+		let same = secret.confirmation::<DefaultCryptoProvider>(kdf_salt, &transcript_hash)?;
+		let foreign = other.confirmation::<DefaultCryptoProvider>(kdf_salt, &transcript_hash)?;
 		assert!(tag.verify(&same).is_ok());
 		assert!(matches!(tag.verify(&foreign), Err(HandshakeError::KeyConfirmationFailed)));
 		Ok(())
@@ -2340,7 +2339,8 @@ mod tests {
 		transcript_hash: &TranscriptHash,
 	) -> Sealer<DefaultCryptoProvider> {
 		let salt = [0x99u8; 32];
-		let sealer = secret.sealer::<DefaultCryptoProvider>(purpose, KdfSalt::new(&salt), transcript_hash);
+		let salt = KdfSalt::try_from(salt.as_slice()).expect("the fixture salt meets the floor");
+		let sealer = secret.sealer::<DefaultCryptoProvider>(purpose, salt, transcript_hash);
 		sealer.expect("the fixture secret derives a sealer")
 	}
 
@@ -2749,26 +2749,32 @@ mod tests {
 
 	/// A CMS handshake salts every derivation with its transcript hash.
 	#[test]
-	fn a_transcript_salt_is_the_transcript_hash() {
+	fn a_transcript_salt_is_the_transcript_hash() -> Result<(), KdfError> {
 		let terms = terms_with(&ack_transcript(), Salt::transcript_hash());
-		assert_eq!(terms.kdf_salt().as_bytes(), [0x07u8; 32]);
+		let salt = terms.kdf_salt()?;
+		assert_eq!(salt.as_bytes(), [0x07u8; 32]);
+		Ok(())
 	}
 
 	/// A CMS handshake under a 512-bit digest salts every derivation with all
 	/// 64 bytes of its transcript hash.
 	#[test]
-	fn a_transcript_salt_carries_all_64_bytes_of_the_hash() {
+	fn a_transcript_salt_carries_all_64_bytes_of_the_hash() -> Result<(), KdfError> {
 		let transcript = fixture_transcript::<Sha3_512>([0x07u8; 64]);
 		let terms = terms_with(&transcript, Salt::transcript_hash());
-		assert_eq!(terms.kdf_salt().as_bytes(), [0x07u8; 64]);
+		let salt = terms.kdf_salt()?;
+		assert_eq!(salt.as_bytes(), [0x07u8; 64]);
+		Ok(())
 	}
 
 	/// An HPKE handshake salts every derivation with the client random
 	/// followed by the server random.
 	#[test]
-	fn a_randoms_salt_is_the_client_random_then_the_server_random() {
+	fn a_randoms_salt_is_the_client_random_then_the_server_random() -> Result<(), KdfError> {
 		let terms = terms_with(&ack_transcript(), Salt::randoms(&[0x01u8; 32], &[0x02u8; 32]));
-		assert_eq!(terms.kdf_salt().as_bytes(), [[0x01u8; 32], [0x02u8; 32]].concat());
+		let salt = terms.kdf_salt()?;
+		assert_eq!(salt.as_bytes(), [[0x01u8; 32], [0x02u8; 32]].concat());
+		Ok(())
 	}
 
 	#[cfg(mux_rekey)]
@@ -2777,8 +2783,9 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let transcript = ack_transcript();
+		let kdf_salt = KdfSalt::try_from(salt.as_slice())?;
 
-		let materials = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&salt), transcript)?;
+		let materials = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, kdf_salt, transcript)?;
 		assert_eq!(materials.epoch(), 0);
 		assert_eq!(materials.transcript_hash(), transcript);
 		assert_eq!(materials.secret.as_bytes().len(), EPOCH_SECRET_SIZE);
@@ -2792,9 +2799,10 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let transcript = ack_transcript();
+		let kdf_salt = KdfSalt::try_from(salt.as_slice())?;
 
-		let first = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&salt), transcript)?;
-		let second = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&salt), transcript)?;
+		let first = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, kdf_salt, transcript)?;
+		let second = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, kdf_salt, transcript)?;
 		assert_eq!(first.secret.as_bytes(), second.secret.as_bytes());
 
 		Ok(())
@@ -2809,8 +2817,8 @@ mod tests {
 		let other_secret = handshake_secret(0x11, 0x43, &salt);
 		let transcript = ack_transcript();
 
-		let shared_salt = KdfSalt::new(&salt);
-		let changed_salt = KdfSalt::new(&other_salt);
+		let shared_salt = KdfSalt::try_from(salt.as_slice())?;
+		let changed_salt = KdfSalt::try_from(other_salt.as_slice())?;
 		let base = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, shared_salt, transcript)?;
 		let keyed = EpochMaterials::derive::<DefaultCryptoProvider>(&other_secret, shared_salt, transcript)?;
 		let salted = EpochMaterials::derive::<DefaultCryptoProvider>(&secret, changed_salt, transcript)?;
@@ -2831,7 +2839,7 @@ mod tests {
 		let next = EpochSecret(ZeroizingBytes::new(vec![0x43u8; 32]));
 		let next_hash = fixture_transcript::<Sha3_256>([0x08u8; 32]);
 
-		let _ciphers = materials.install::<DefaultCryptoProvider>(next, KdfSalt::new(&[0x99u8; 32]), next_hash)?;
+		let _ciphers = materials.install::<DefaultCryptoProvider>(next, KdfSalt::try_from(FIXTURE_SALT)?, next_hash)?;
 		assert_eq!((materials.epoch(), materials.transcript_hash()), (1, next_hash));
 		Ok(())
 	}
@@ -3007,12 +3015,12 @@ mod tests {
 			let local = small_scalar::<C>(2);
 			let peer = small_scalar::<C>(3).public_key();
 			let agreement = local.shared_secret(&peer);
-			let salt = KdfSalt::new(&[0x99u8; 32]);
+			let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 
 			let hpke = HandshakeSecret::ephemeral::<HouseOn<C>>(&agreement, salt)?;
 			let cms = HandshakeSecret::hybrid::<HouseOn<C>>(&agreement, &base_secret(0x42), salt)?;
 			let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
-			let rekey = epoch.chained::<HouseOn<C>>(&agreement, KdfSalt::new(&[0x99u8; 64]))?;
+			let rekey = epoch.chained::<HouseOn<C>>(&agreement, KdfSalt::try_from([0x99u8; 64].as_slice())?)?;
 			Ok(Self {
 				agreement: agreement.with(|x_coordinate| x_coordinate.to_vec()),
 				hpke: hpke.as_bytes().to_vec(),

@@ -186,7 +186,7 @@ impl TimingConstraints {
 	fn records_of(trace: &ConsumedTrace) -> Vec<&TbEvent> {
 		#[cfg(feature = "instrument")]
 		{
-			trace.instrument_events.iter().collect()
+			trace.instrument_events().iter().collect()
 		}
 		#[cfg(not(feature = "instrument"))]
 		{
@@ -361,7 +361,7 @@ impl TimingConstraints {
 							#[cfg(feature = "instrument")]
 							{
 								trace
-									.instrument_events
+									.instrument_events()
 									.iter()
 									.filter(|ev| {
 										ev.label.as_ref().map(|l| run.iter().any(|e| e.0 == &**l)) == Some(true)
@@ -481,12 +481,13 @@ mod tests {
 	// The functions that build the timing events, traces, and verdicts.
 
 	/// Creates a timing event. A deadline marker carries `value_ns` as a
-	/// timestamp, and every other timing URN carries it as a duration.
-	fn timing_event(event_urn: Urn<'static>, label: impl AsRef<str>, value_ns: u64, seq: u32) -> TbEvent {
+	/// timestamp, and every other timing URN carries it as a duration. The
+	/// collector of [`trace_with_events`] numbers it by its place.
+	fn timing_event(event_urn: Urn<'static>, label: impl AsRef<str>, value_ns: u64) -> TbEvent {
 		let label = label.as_ref();
 		let is_deadline = event_urn == events::TIMING_DEADLINE;
 		TbEvent {
-			seq,
+			seq: 0,
 			urn: event_urn,
 			label: Some(label.to_string().into()),
 			payload_hash: None,
@@ -505,17 +506,22 @@ mod tests {
 		}
 	}
 
-	/// Creates a trace whose instrumentation events are `events`, or an empty
-	/// trace in a build without `instrument`.
+	/// The trace that a collector records of `events`, one record of each in
+	/// order, so each record takes its place as its sequence number. A record
+	/// keeps the duration or the timestamp that its event carries.
 	fn trace_with_events(events: impl IntoIterator<Item = TbEvent>) -> ConsumedTrace {
-		let events: Vec<TbEvent> = events.into_iter().collect();
-		let mut trace = ConsumedTrace::new();
-		#[cfg(feature = "instrument")]
-		{
-			trace.instrument_events = events;
-		}
+		recorded(true, |collector| {
+			for event in events {
+				let label = event.label.unwrap_or_default();
+				match (event.duration_ns, event.timestamp_ns) {
+					(Some(span_ns), _) => collector.emit_with_timing(event.urn, label, Duration::from_nanos(span_ns)),
+					(None, Some(at_ns)) => collector.emit_with_timestamp(event.urn, label, Duration::from_nanos(at_ns)),
+					(None, None) => collector.emit(event.urn, label),
+				}
+			}
 
-		trace
+			Ok(())
+		})
 	}
 
 	/// Creates an empty trace.
@@ -523,12 +529,11 @@ mod tests {
 		ConsumedTrace::new()
 	}
 
-	/// Builds the timing events of a case, each numbered by its index.
+	/// Builds the timing events of a case, in order.
 	fn build_events(events: &[(Urn<'static>, &'static str, u64)]) -> Vec<TbEvent> {
 		events
 			.iter()
-			.enumerate()
-			.map(|(seq, (event_urn, label, value_ns))| timing_event(event_urn.clone(), label, *value_ns, seq as u32))
+			.map(|(event_urn, label, value_ns)| timing_event(event_urn.clone(), label, *value_ns))
 			.collect()
 	}
 
@@ -839,16 +844,22 @@ mod tests {
 		constraints
 	}
 
+	/// A measured record of `other`, an event that no constraint names, which
+	/// takes sequence number 0 ahead of the record that a test refuses.
+	fn a_record_of_another_event() -> TbEvent {
+		timing_event(events::TIMING_WCET, "other", 10_000_000)
+	}
+
 	#[test]
 	fn an_unmeasured_wcet_sample_is_an_error() -> Result<(), TestingError> {
 		let constraints = wcet_on_process();
-		let sample = unmeasured(timing_event(events::TIMING_WCET, "process", 500_000_000, 7));
-		let trace = trace_with_events(vec![sample]);
+		let sample = unmeasured(timing_event(events::TIMING_WCET, "process", 500_000_000));
+		let trace = trace_with_events(vec![a_record_of_another_event(), sample]);
 
 		let verified = constraints.verify(&trace);
 		let refused = matches!(
 			verified,
-			Err(TestingError::TimingSampleUnmeasured { event: Event("process"), seq: 7 })
+			Err(TestingError::TimingSampleUnmeasured { event: Event("process"), seq: 1 })
 		);
 		assert!(refused, "{verified:?}");
 		Ok(())
@@ -859,8 +870,8 @@ mod tests {
 		let mut constraints = TimingConstraints::default();
 		constraints.add(Event("process"), TimingConstraint::Jitter(Duration::from_millis(5), None))?;
 		let trace = trace_with_events(vec![
-			unmeasured(timing_event(events::TIMING_JITTER, "process", 10_000_000, 0)),
-			unmeasured(timing_event(events::TIMING_JITTER, "process", 90_000_000, 1)),
+			unmeasured(timing_event(events::TIMING_JITTER, "process", 10_000_000)),
+			unmeasured(timing_event(events::TIMING_JITTER, "process", 90_000_000)),
 		]);
 
 		let verified = constraints.verify(&trace);
@@ -879,14 +890,15 @@ mod tests {
 		constraints.add_deadline(create_deadline(100, "start", "end")?);
 
 		let trace = trace_with_events(vec![
-			unmeasured(timing_event(events::TIMING_DEADLINE, "start", 0, 3)),
-			timing_event(events::TIMING_DEADLINE, "end", 50_000_000, 4),
+			a_record_of_another_event(),
+			unmeasured(timing_event(events::TIMING_DEADLINE, "start", 0)),
+			timing_event(events::TIMING_DEADLINE, "end", 50_000_000),
 		]);
 
 		let verified = constraints.verify(&trace);
 		let refused = matches!(
 			verified,
-			Err(TestingError::TimingSampleUnmeasured { event: Event("start"), seq: 3 })
+			Err(TestingError::TimingSampleUnmeasured { event: Event("start"), seq: 1 })
 		);
 		assert!(refused, "{verified:?}");
 		Ok(())
@@ -896,8 +908,8 @@ mod tests {
 	fn an_incomplete_record_is_an_error() -> Result<(), TestingError> {
 		let constraints = wcet_on_process();
 		let mut trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "process", 50_000_000, 0),
-			timing_event(events::TIMING_WCET, "process", 60_000_000, 1),
+			timing_event(events::TIMING_WCET, "process", 50_000_000),
+			timing_event(events::TIMING_WCET, "process", 60_000_000),
 		]);
 		trace.mark_truncated();
 
@@ -911,12 +923,13 @@ mod tests {
 		let mut constraints = TimingConstraints::default();
 		constraints.add_deadline(create_deadline(100, "start", "end")?);
 
-		let trace = trace_with_events(vec![timing_event(events::TIMING_DEADLINE, "start", 1_000_000, 5)]);
+		let start = timing_event(events::TIMING_DEADLINE, "start", 1_000_000);
+		let trace = trace_with_events(vec![a_record_of_another_event(), start]);
 		let verified = constraints.verify(&trace);
 
 		let unterminated = matches!(
 			verified,
-			Err(TestingError::DeadlineUnterminated { start: Event("start"), end: Event("end"), seq: 5 })
+			Err(TestingError::DeadlineUnterminated { start: Event("start"), end: Event("end"), seq: 1 })
 		);
 		assert!(unterminated, "{verified:?}");
 		Ok(())
@@ -1058,11 +1071,11 @@ mod tests {
 		setup_combined_constraints(&mut constraints)?;
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "process", 50_000_000, 0),
-			timing_event(events::TIMING_JITTER, "request", 10_000_000, 1),
-			timing_event(events::TIMING_JITTER, "request", 12_000_000, 2),
-			timing_event(events::TIMING_DEADLINE, "start", 0, 3),
-			timing_event(events::TIMING_DEADLINE, "end", 100_000_000, 4),
+			timing_event(events::TIMING_WCET, "process", 50_000_000),
+			timing_event(events::TIMING_JITTER, "request", 10_000_000),
+			timing_event(events::TIMING_JITTER, "request", 12_000_000),
+			timing_event(events::TIMING_DEADLINE, "start", 0),
+			timing_event(events::TIMING_DEADLINE, "end", 100_000_000),
 		]);
 
 		let result = constraints.verify(&trace)?;
@@ -1079,11 +1092,11 @@ mod tests {
 		setup_combined_constraints(&mut constraints)?;
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "process", 150_000_000, 0), // WCET violation
-			timing_event(events::TIMING_JITTER, "request", 10_000_000, 1),
-			timing_event(events::TIMING_JITTER, "request", 70_000_000, 2), // Jitter violation
-			timing_event(events::TIMING_DEADLINE, "start", 0, 3),
-			timing_event(events::TIMING_DEADLINE, "end", 250_000_000, 4), // Deadline violation
+			timing_event(events::TIMING_WCET, "process", 150_000_000), // WCET violation
+			timing_event(events::TIMING_JITTER, "request", 10_000_000),
+			timing_event(events::TIMING_JITTER, "request", 70_000_000), // Jitter violation
+			timing_event(events::TIMING_DEADLINE, "start", 0),
+			timing_event(events::TIMING_DEADLINE, "end", 250_000_000), // Deadline violation
 		]);
 
 		let result = constraints.verify(&trace)?;
@@ -1099,7 +1112,7 @@ mod tests {
 	#[test]
 	fn test_empty_constraints() -> Result<(), TestingError> {
 		let constraints = TimingConstraints::default();
-		let event = timing_event(events::TIMING_WCET, "process", 50_000_000, 0);
+		let event = timing_event(events::TIMING_WCET, "process", 50_000_000);
 		let trace = trace_with_events(vec![event]);
 
 		let result = constraints.verify(&trace)?;
@@ -1127,9 +1140,9 @@ mod tests {
 
 		// The durations [10ms, 20ms, 15ms] feed the variance-based jitter.
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_JITTER, "process", 10_000_000, 0),
-			timing_event(events::TIMING_JITTER, "process", 20_000_000, 1),
-			timing_event(events::TIMING_JITTER, "process", 15_000_000, 2),
+			timing_event(events::TIMING_JITTER, "process", 10_000_000),
+			timing_event(events::TIMING_JITTER, "process", 20_000_000),
+			timing_event(events::TIMING_JITTER, "process", 15_000_000),
 		]);
 
 		// The result depends on the variance calculation, so the test checks
@@ -1193,7 +1206,7 @@ mod tests {
 	#[test]
 	fn a_failed_wcet_analysis_is_an_error() -> Result<(), TestingError> {
 		let constraints = p99_wcet_under(FailingAnalyzer);
-		let trace = trace_with_events(vec![timing_event(events::TIMING_WCET, "process", 50_000_000, 0)]);
+		let trace = trace_with_events(vec![timing_event(events::TIMING_WCET, "process", 50_000_000)]);
 
 		let verified = constraints.verify(&trace);
 		let failed = matches!(verified, Err(TestingError::WcetAnalysisFailed { event: Event("process"), .. }));
@@ -1204,7 +1217,7 @@ mod tests {
 	#[test]
 	fn a_wcet_analysis_with_no_value_for_the_percentile_is_an_error() -> Result<(), TestingError> {
 		let constraints = p99_wcet_under(MedianAnalyzer);
-		let trace = trace_with_events(vec![timing_event(events::TIMING_WCET, "process", 50_000_000, 0)]);
+		let trace = trace_with_events(vec![timing_event(events::TIMING_WCET, "process", 50_000_000)]);
 
 		let verified = constraints.verify(&trace);
 		let missing = matches!(
@@ -1223,8 +1236,8 @@ mod tests {
 		constraints.add(Event("process"), TimingConstraint::Jitter(max_jitter, Some(calculator)))?;
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_JITTER, "process", 10_000_000, 0),
-			timing_event(events::TIMING_JITTER, "process", 12_000_000, 1),
+			timing_event(events::TIMING_JITTER, "process", 10_000_000),
+			timing_event(events::TIMING_JITTER, "process", 12_000_000),
 		]);
 
 		let verified = constraints.verify(&trace);
@@ -1257,7 +1270,7 @@ mod tests {
 	#[test]
 	fn an_exceeded_percentile_fails_the_result_with_its_measure() -> Result<(), TestingError> {
 		let constraints = p99_wcet_under(DoublingAnalyzer);
-		let trace = trace_with_events(vec![timing_event(events::TIMING_WCET, "process", 80_000_000, 0)]);
+		let trace = trace_with_events(vec![timing_event(events::TIMING_WCET, "process", 80_000_000)]);
 
 		let result = constraints.verify(&trace)?;
 		let violation =
@@ -1313,9 +1326,9 @@ mod tests {
 			constraints.add_path_wcet(create_test_path_wcet(self.max_duration_ms));
 
 			let trace = trace_with_events(vec![
-				timing_event(events::TIMING_WCET, "start", self.start_duration_ns, 0),
-				timing_event(events::TIMING_WCET, "process", self.process_duration_ns, 1),
-				timing_event(events::TIMING_WCET, "end", self.end_duration_ns, 2),
+				timing_event(events::TIMING_WCET, "start", self.start_duration_ns),
+				timing_event(events::TIMING_WCET, "process", self.process_duration_ns),
+				timing_event(events::TIMING_WCET, "end", self.end_duration_ns),
 			]);
 
 			let result = constraints.verify_with_process(&trace, Some(&process))?;
@@ -1367,9 +1380,9 @@ mod tests {
 		constraints.add_path_wcet(create_test_path_wcet(50));
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "start", 10_000_000, 0),
-			unmeasured(timing_event(events::TIMING_WCET, "process", 60_000_000, 1)),
-			timing_event(events::TIMING_WCET, "end", 5_000_000, 2),
+			timing_event(events::TIMING_WCET, "start", 10_000_000),
+			unmeasured(timing_event(events::TIMING_WCET, "process", 60_000_000)),
+			timing_event(events::TIMING_WCET, "end", 5_000_000),
 		]);
 
 		let verified = constraints.verify_with_process(&trace, Some(&process));
@@ -1390,9 +1403,9 @@ mod tests {
 		constraints.add_path_wcet(PathWcet::new([Event("start"), Event("process")], Duration::from_millis(50)));
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "start", 10_000_000, 0),
-			timing_event(events::TIMING_WCET, "process", 20_000_000, 1),
-			timing_event(events::TIMING_WCET, "end", 30_000_000, 2),
+			timing_event(events::TIMING_WCET, "start", 10_000_000),
+			timing_event(events::TIMING_WCET, "process", 20_000_000),
+			timing_event(events::TIMING_WCET, "end", 30_000_000),
 		]);
 
 		let result = constraints.verify_with_process(&trace, Some(&process))?;
@@ -1434,9 +1447,9 @@ mod tests {
 		constraints.add_path_wcet(create_test_path_wcet(50));
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "start", 10_000_000, 0),
-			unmeasured(timing_event(events::ASSERT_PAYLOAD, "process", 60_000_000, 1)),
-			timing_event(events::TIMING_WCET, "end", 5_000_000, 2),
+			timing_event(events::TIMING_WCET, "start", 10_000_000),
+			unmeasured(timing_event(events::ASSERT_PAYLOAD, "process", 60_000_000)),
+			timing_event(events::TIMING_WCET, "end", 5_000_000),
 		]);
 
 		let verified = constraints.verify_with_process(&trace, Some(&process));
@@ -1457,12 +1470,12 @@ mod tests {
 		constraints.add_path_wcet(create_test_path_wcet(50));
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "start", 10_000_000, 0),
-			timing_event(events::TIMING_WCET, "process", 10_000_000, 1),
-			timing_event(events::TIMING_WCET, "end", 10_000_000, 2),
-			timing_event(events::TIMING_WCET, "start", 30_000_000, 3),
-			timing_event(events::TIMING_WCET, "process", 30_000_000, 4),
-			timing_event(events::TIMING_WCET, "end", 30_000_000, 5),
+			timing_event(events::TIMING_WCET, "start", 10_000_000),
+			timing_event(events::TIMING_WCET, "process", 10_000_000),
+			timing_event(events::TIMING_WCET, "end", 10_000_000),
+			timing_event(events::TIMING_WCET, "start", 30_000_000),
+			timing_event(events::TIMING_WCET, "process", 30_000_000),
+			timing_event(events::TIMING_WCET, "end", 30_000_000),
 		]);
 
 		let result = constraints.verify_with_process(&trace, Some(&process))?;
@@ -1478,9 +1491,9 @@ mod tests {
 		constraints.add_path_wcet(create_test_path_wcet(50));
 
 		let trace = trace_with_events(vec![
-			timing_event(events::TIMING_WCET, "start", 10_000_000, 0),
-			timing_event(events::TIMING_WCET, "process", 30_000_000, 1),
-			timing_event(events::TIMING_WCET, "end", 15_000_000, 2),
+			timing_event(events::TIMING_WCET, "start", 10_000_000),
+			timing_event(events::TIMING_WCET, "process", 30_000_000),
+			timing_event(events::TIMING_WCET, "end", 15_000_000),
 		]);
 
 		let result = constraints.verify(&trace)?;

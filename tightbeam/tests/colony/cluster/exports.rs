@@ -19,7 +19,7 @@
 //! # Harness
 //!
 //! First-party recognition needs the inbound mutual-TLS accept plane, so
-//! the enforcement scenarios turn on `client_validators` and dial with an
+//! the enforcement scenarios turn on `client_authentication` and dial with an
 //! explicit client identity. The scenarios inject route claims as direct
 //! signed advertisements with the beats off, so every event count is exact.
 
@@ -81,7 +81,7 @@ fn split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterTl
 /// decides the verdict.
 fn mtls_split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterTlsConfig {
 	let mut tls = split_plane_tls(own, peer);
-	tls.client_validators = vec![combined_validator(&[&own.cert, &peer.cert])];
+	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&own.cert, &peer.cert]));
 	tls
 }
 
@@ -133,10 +133,9 @@ fn exporter_conf_with_gate(
 
 /// An exporter on a fast beat toward `peer_addr`, which carries one grant.
 ///
-/// The ad-filter scenario, which tests discoverability itself, uses it. The
-/// grant proves that the slate stays filtered even when a grant opens an
-/// unexported type to a caller, because grants are per-session and stay out
-/// of ads.
+/// The ad-filter scenario uses it. The grant proves that the slate stays
+/// filtered when a grant opens an unexported type to a caller, because
+/// grants are per-session and stay out of ads.
 fn advertising_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -159,8 +158,8 @@ fn advertising_exporter_conf(
 /// [`mtls_exporter_conf`] with one positive grant and a third admitted
 /// client identity.
 ///
-/// The extra identity must pass the transport accept so the export
-/// boundary, not TLS, is what refuses it.
+/// The extra identity must pass the transport accept, so the refusal comes
+/// from the export boundary alone.
 fn grant_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -170,7 +169,8 @@ fn grant_exporter_conf(
 ) -> ClusterConfig {
 	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	let mut tls = split_plane_tls(own, peer);
-	tls.client_validators = vec![combined_validator(&[&own.cert, &peer.cert, &extra.cert])];
+	tls.client_authentication =
+		PeerAuthentication::Anonymous.and(combined_validator(&[&own.cert, &peer.cert, &extra.cert]));
 
 	ClusterConfig::builder(tls)
 		.with_exported_types(exported)
@@ -355,18 +355,16 @@ tb_assert_spec! {
 
 // # Enforcement (unary)
 //
-// The boundary refuses what the filter hides. B holds injected trails for both
-// of A's types, as if it had learned them before the export list narrowed (a
-// guessed name and a stale trail are the same attack). The fail-closed
-// allowlist gives four verdicts:
+// The boundary refuses what the filter hides. B holds injected trails for
+// both of A's types, as a guessed name or a trail from before the export list
+// narrowed would give it. The fail-closed allowlist gives four verdicts:
 //
 // 1. B relays "ledger": the request spent relay budget, so the allowlist
 //    refuses it (`PermissionDenied`, `CLUSTER_EXPORT_REFUSED`).
 // 2. B relays "ping": the target is exported, so A serves it and the echo returns.
-// 3. B dials A directly and sends "ledger" at the origin budget: the request
-//    is not relayed, but B's certificate is an external peer, so the identity
-//    rule refuses it. This is the fail-closed case a default-allow gate would
-//    have admitted.
+// 3. B dials A directly and sends "ledger" at the origin budget. B's
+//    certificate is an external peer, so the identity rule refuses it, where
+//    a default-allow gate would admit it.
 // 4. A's own client dials A directly with A's first-party identity and
 //    reaches "ledger": a recognized origin caller crosses the boundary.
 tb_scenario! {
@@ -604,7 +602,7 @@ tb_scenario! {
 
 /// A custom export gate that denies one authenticated peer key on one target.
 ///
-/// This is the granular identity-rule DX the trait exists for.
+/// It is the granular identity rule that the trait exists for.
 struct DenyPeerKeyGate {
 	denied: PeerListGate,
 	target: Urn<'static>,

@@ -2569,7 +2569,7 @@ let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 ```rust,ignore
 // Create shared pool with configuration (once per application)
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
-	.with_config(PoolConfig { max_connections: 3, ..Default::default() })
+	.with_config(PoolConfig { max_connections: NonZeroUsize::try_from(3)?, ..Default::default() })
 	.with_trust_store(trust_store)
 	.with_client_identity(SigningIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 	.with_timeout(Duration::from_millis(5000))
@@ -2584,7 +2584,7 @@ client.emit(frame, None).await?;
 
 **Configuration:**
 
-- `PoolConfig::max_connections`: Max connections per destination (default: 64)
+- `PoolConfig::max_connections`: A `NonZeroUsize` cap on live connections across all destinations (default: `DEFAULT_MAX_POOL_CONNECTIONS`, 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
 - `PoolConfig::mux_offer`: Optional multiplexing advertisement. See [§8.6.5](#865-serving-and-pooling) (default: None)
 - `ConnectionPoolBuilder::new(config, clock)`: The clock measures idle time, deadlines, and backoff. `with_clock` replaces it.
@@ -3063,7 +3063,7 @@ Hives include built-in resilience mechanisms:
 
 **Backpressure**: When utilization exceeds the threshold (default: 90%), the hive signals to the cluster that it is overloaded. The cluster can then route new work to less-loaded hives.
 
-**Circuit Breaker**: After consecutive authentication failures from one signer (default: 3), the hive refuses that signer's commands. After a cooldown, it lets one probe through.
+**Circuit Breaker**: After consecutive authentication failures from one signer (default: 3), the hive refuses that signer's commands. After a cooldown, the circuit admits commands again. A command whose signature verifies closes it and clears its count, and a failure that comes first opens it for another cooldown.
 
 **Drain**: `Hive::drain` refuses new commands, waits for in-flight work (up to `drain_timeout`), and stops its servlets. It then tells gateways to drop its routes.
 
@@ -3102,11 +3102,11 @@ A hive resolves each servlet type to a single instance address, so it carries no
 For secure communication, configure TLS on the hive:
 
 ```rust,ignore
-let tls_config = Arc::new(HiveTlsConfig {
-	certificate: CertificateSpec::Built(Box::new(cert)),
-	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
-	validators: vec![],  // Optional: validate client certificates
-});
+let tls_config = Arc::new(HiveTlsConfig::new(
+	CertificateSpec::Built(Box::new(cert)),
+	Arc::new(Secp256k1KeyProvider::from(signing_key)),
+	PeerAuthentication::Anonymous,  // Or `PeerAuthentication::Anonymous.and(validator)`: validate client certificates
+)?);
 
 let hive_conf = HiveConfig {
 	hive_tls: Some(tls_config),
@@ -3114,7 +3114,7 @@ let hive_conf = HiveConfig {
 };
 ```
 
-When `hive_tls` is set, the hive control server binds with TLS, and the hive signs its outbound control frames (registration, scaling updates) with the hive key. Cluster gateways reject control frames they cannot verify against `hive_trust`, so a hive in a cluster requires a signing identity. When `trust_store` is set too, the control server demands a client certificate that the store validates, because the hive authenticates each cluster command against the peer its handshake proves. The `validators` add checks to that store.
+When `hive_tls` is set, the hive control server binds with TLS, and the hive signs its outbound control frames (registration, scaling updates) with the hive key. Cluster gateways reject control frames they cannot verify against `hive_trust`, so a hive in a cluster requires a signing identity. When `trust_store` is set too, the control server demands a client certificate that the store validates, because the hive authenticates each cluster command against the peer its handshake proves. A `client_authentication` that names validators adds their checks to that store.
 
 ##### HiveConfig Reference
 
@@ -3258,7 +3258,7 @@ Clusters require TLS configuration for secure communication with hives and, when
 ```rust,ignore
 let tls = ClusterTlsConfig::new(CertificateSpec::Built(Box::new(cert)), Arc::new(Secp256k1KeyProvider::from(key)))?
 	.with_validators(vec![])         // Optional: server policy of each dial (both planes)
-	.with_client_validators(vec![])  // Non-empty: gateway requires client certs (mTLS)
+	.with_client_authentication(PeerAuthentication::Anonymous)  // Or `PeerAuthentication::Anonymous.and(validator)`: gateway requires client certs (mTLS)
 	.with_hive_trust(hive_trust)     // Hive-plane: registration, address updates, PublishGossip
 	.with_peer_trust(peer_trust);    // Peer-plane: AdvertisePeer, relayed Gossip, ReconcileGossip
 ```
@@ -3429,7 +3429,7 @@ let conf = ClusterConfig::builder(tls)
 
 **Mutual TLS**
 
-First-party checks need mutual TLS. Without `client_validators`, every session is anonymous, so peers reach exported types only.
+First-party checks need mutual TLS. When `client_authentication` is `PeerAuthentication::Anonymous`, every session is anonymous, so peers reach exported types only.
 
 **Configuration**
 
@@ -3818,7 +3818,7 @@ Wire shape:
 ```text
 EvidenceArtifact ::= SEQUENCE {
 	specHash      OCTET STRING,           -- SHA3-256(spec definition)
-	traceHash     OCTET STRING,           -- SHA3-256 over canonical event bytes
+	traceHash     OCTET STRING,           -- SHA3-256 over the DER of events
 	evidenceHash  OCTET STRING,           -- SHA3-256(specHash || traceHash)
 	events        SEQUENCE OF TbEvent,
 	overflow      BOOLEAN                 -- true if the collector dropped events
@@ -3842,10 +3842,12 @@ Binary serialization requirements:
 - Field ordering MUST follow the schema strictly.
 - Optional fields use explicit context tags so adjacent optionals of the same universal type stay unambiguous.
 - `payloadHash` MUST be 32 bytes when present (SHA3-256).
+- A decoder MUST refuse an artifact whose `specHash` is not 32 bytes, or whose `traceHash` or `evidenceHash` differs from the hash it recomputes from the decoded fields.
 
 Artifact integrity:
 
-- `trace_hash` MUST be SHA3-256 over a canonical byte encoding of the event list (sequence numbers, URN strings, labels, payload hashes, flags, durations, timestamps, and extras), and not a free-form dump of surrounding artifact fields.
+- `trace_hash` MUST be SHA3-256 over the DER of the `events` field, a SEQUENCE OF TbEvent, so an absent OPTIONAL field and an empty one hash apart.
+- `overflow` MUST be true for a trace that misses events of its run, which `EvidenceArtifact::of` reads from the consumed trace.
 - `evidence_hash` MUST be SHA3-256(`specHash` || `traceHash`) where `||` is raw byte concatenation.
 
 Privacy:
@@ -3863,15 +3865,19 @@ The logging subsystem implements [RFC 5424][rfc5424]-compliant logging with trai
 
 #### RFC 5424 Severity Levels
 
+`LogLevel` names `SyslogSeverity`, the one declaration of the RFC 5424 severity set. `SyslogSeverity::try_from(u8)` reads a severity from its number and refuses a number past 7.
+
 ```rust
-pub enum LogLevel {
+pub type LogLevel = SyslogSeverity;
+
+pub enum SyslogSeverity {
 	Emergency = 0,
 	Alert = 1,
 	Critical = 2,
 	Error = 3,
 	Warning = 4,
 	Notice = 5,
-	Info = 6,
+	Informational = 6,
 	Debug = 7,
 }
 ```
@@ -3899,16 +3905,14 @@ let filter = LogFilter::new(LogLevel::Warning)
 
 ```rust,ignore
 use tightbeam::instrumentation::events;
-use tightbeam::trace::{TraceConfig, logging::*};
+use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig};
 
 let backend = StdoutBackend;
 let filter = LogFilter::new(LogLevel::Warning);
 let config = LoggerConfig::new(backend, filter)
-	.with_default_level(LogLevel::Info);
+	.with_default_level(LogLevel::Informational);
 
-let trace: TraceCollector = TraceConfig::builder()
-	.with_logger(config)
-	.build();
+let trace = TraceCollector::from(TraceConfig::default().with_logger(config));
 
 trace.event(events::ERROR)?.with_log_level(LogLevel::Error).emit();
 ```
@@ -4077,23 +4081,23 @@ let frame = SendRequest::run(request)
 
 **Automatic trace with `PipelineBuilder`:**
 
-`PipelineBuilder` (feature `testing`) attaches a `TraceCollector`. Each traced `and_then` emits job lifecycle URNs:
+`PipelineBuilder` (feature `testing`) attaches a `TraceCollector`. Each `then_job` step emits job lifecycle URNs, and a closure step through `and_then` chains its result alone:
 
 ```text
 urn:tightbeam:event:job/<job-name>-<start|success|error>
 ```
 
-Job names are derived from the closure type (`Type::run` path), converted to snake_case, then hyphenated in the NSS (for example `CreateHandshakeRequest` becomes `create-handshake-request`).
+A job name is `Job::NAME`, the struct name that `job!` declares, converted to snake_case, then hyphenated in the NSS (for example `CreateHandshakeRequest` becomes `create-handshake-request`).
 
 ```rust,ignore
 PipelineBuilder::new(trace)
 	.start((client_id, nonce))
-	// Auto-emits: urn:tightbeam:event:job/create-handshake-request-start
-	//             urn:tightbeam:event:job/create-handshake-request-success
-	.and_then(|(id, n)| CreateHandshakeRequest::run((id, n)))
-	.map(|req| req.validate()) // no job URN (plain map)
-	.and_then(|req| ValidateRequest::run(req))
-	.and_then(|req| SendRequest::run(req))
+	// Emits: urn:tightbeam:event:job/create-handshake-request-start
+	//        urn:tightbeam:event:job/create-handshake-request-success
+	.then_job::<CreateHandshakeRequest, _>()
+	.map(|req| (req.validate(),)) // no job URN (plain map)
+	.then_job::<ValidateRequest, _>()
+	.and_then(|req| SendRequest::run(req)) // no job URN (closure step)
 	.run()?;
 ```
 
@@ -4156,9 +4160,9 @@ tb_scenario! {
 		exec: |pipeline| {
 			pipeline
 				.start(("test-001".to_string(), "nonce".to_string()))
-				.and_then(|input| CreateHandshakeRequest::run(input))
-				.map(|req| req.with_metadata())
-				.and_then(|req| ValidateRequest::run(req))
+				.then_job::<CreateHandshakeRequest, _>()
+				.map(|req| (req.with_metadata(),))
+				.then_job::<ValidateRequest, _>()
 				.run()
 		}
 	}
@@ -4171,8 +4175,8 @@ tb_scenario! {
 use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
 
 let session_id = PipelineBuilder::new(trace)
-	.start(client_id)
-	.and_then(|id| CreateHandshakeRequest::run((id, nonce)))
+	.start((client_id, nonce))
+	.then_job::<CreateHandshakeRequest, _>()
 	.map(|req| req.add_timestamp(now()))
 	.and_then(|req| {
 		let encrypted = EncryptPayload::run(payload);
@@ -5225,10 +5229,9 @@ tb_scenario! {
 		.with_spec(AssertSpecType::latest())          // Layer 1
 		.with_csp(ProcessSpecType)                    // OPTIONAL: L2 (testing-csp)
 		.with_fdr(FdrConfig { ... })                  // OPTIONAL: L3 (testing-fdr)
-		.with_trace(TraceConfig::builder()            // OPTIONAL: §10
-			.with_instrumentation(TbInstrumentationConfig { ... })
-			.with_logger(LoggerConfig::new(...))
-			.build())
+		.with_trace(TraceCollector::from(            // OPTIONAL: §10
+			TraceConfig::with_instrumentation(TbInstrumentationConfig { ... })
+				.with_logger(LoggerConfig::new(...))))
 		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail
 		.build(),
 	fuzz: afl,                       // OPTIONAL: AFL mode (testing-csp / testing-fuzz)

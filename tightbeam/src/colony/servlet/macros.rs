@@ -149,6 +149,10 @@ macro_rules! __servlet_define {
 			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
 				$crate::colony::hive::ServletBox::utilization(&self.runtime)
 			}
+
+			fn drain_boxed(self: Box<Self>) -> $crate::colony::hive::ServletDrainFuture {
+				Box::pin(self.runtime.drain())
+			}
 		}
 	};
 }

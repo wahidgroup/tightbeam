@@ -2,6 +2,7 @@
 
 use core::hash::Hash;
 use core::marker::PhantomData;
+use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
@@ -12,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "std")]
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+use crate::constants::DEFAULT_MAX_POOL_CONNECTIONS;
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
@@ -83,19 +85,26 @@ pub struct PoolConfig {
 	/// or multiplexed. `None` keeps idle connections until another reason
 	/// evicts them.
 	pub idle_timeout: Option<Duration>,
-	/// The cap on live connections across all destinations, 64 by default.
-	pub max_connections: usize,
+	/// The cap on live connections across all destinations,
+	/// [`DEFAULT_MAX_POOL_CONNECTIONS`] by default.
+	pub max_connections: NonZeroUsize,
 	/// The multiplexing offer that pooled dials advertise.
 	///
-	/// When set, [`ConnectionPool::connect`] reuses one multiplexed connection
-	/// per destination until stream caps fill. Every dial shares it through
-	/// its `Arc`, and the handshake clones it once into the orchestrator.
+	/// When set, [`ConnectionPool::connect`] reuses a pooled multiplexed
+	/// connection to a destination until its stream caps fill. Two concurrent
+	/// first dials to one destination can each open one, within
+	/// `max_connections`. Every dial shares the offer through its `Arc`, and
+	/// the handshake clones it once into the orchestrator.
 	pub mux_offer: Option<Arc<TransportOffer>>,
 }
 
 impl Default for PoolConfig {
 	fn default() -> Self {
-		Self { idle_timeout: None, max_connections: 64, mux_offer: None }
+		Self {
+			idle_timeout: None,
+			max_connections: DEFAULT_MAX_POOL_CONNECTIONS,
+			mux_offer: None,
+		}
 	}
 }
 
@@ -157,8 +166,7 @@ impl<C: CryptoProvider> PoolProvisioning<C> {
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
 	///   authenticates no peer and did not name cleartext, or it sets a server
-	///   policy and holds no trust in a server, whether or not it names
-	///   cleartext.
+	///   policy with no trust in a server, with or without cleartext.
 	/// - [`TransportError::HandshakeError`] -- the client identity names a key
 	///   purpose other than the client's, or its extended key usage fails to
 	///   decode.
@@ -461,9 +469,9 @@ pooled_mux! {
 		/// The finished drivers leave first. While the shelf is full, its
 		/// oldest drivers leave, and their drop aborts both of their tasks,
 		/// which closes a connection that its peer never closed (CWE-400).
-		fn shelve(&mut self, drivers: MuxDrivers, cap: usize) {
+		fn shelve(&mut self, drivers: MuxDrivers, cap: NonZeroUsize) {
 			self.drivers.retain(|held| !held.is_finished());
-			while self.drivers.len() >= cap {
+			while self.drivers.len() >= cap.get() {
 				let Some(oldest) = self.drivers.pop_front() else {
 					break;
 				};
@@ -539,8 +547,7 @@ impl<P: Protocol> ConnectionPool<P> {
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
 	///   authenticates no peer and did not name cleartext, or it sets a server
-	///   policy and holds no trust in a server, whether or not it names
-	///   cleartext.
+	///   policy with no trust in a server, with or without cleartext.
 	/// - [`TransportError::HandshakeError`] -- the client identity names a key
 	///   purpose other than the client's, or its extended key usage fails to
 	///   decode.
@@ -691,7 +698,7 @@ where
 		let reserved = self
 			.total_connections
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-				if current >= self.config.max_connections {
+				if current >= self.config.max_connections.get() {
 					None
 				} else {
 					current.checked_add(1)
@@ -1144,9 +1151,9 @@ where
 	/// pinned.
 	///
 	/// A mux lease answers from the certificate pinned at its eager dial
-	/// handshake. An exclusive lease reads its transport, so the answer
-	/// is `None` until the handshake completes. A caller that gates
-	/// policy on peer identity MUST fail closed on `None`.
+	/// handshake. An exclusive lease reads its transport, so the answer is
+	/// `None` until the handshake completes. A caller that gates policy on peer
+	/// identity MUST fail closed on `None`.
 	pub fn peer_certificate(&self) -> Option<&Certificate>
 	where
 		P::Transport: crate::transport::state::EncryptedProtocolState,
@@ -1563,7 +1570,12 @@ mod tests {
 	fn test_pool_config_default() {
 		let config = PoolConfig::default();
 		assert!(config.idle_timeout.is_none());
-		assert_eq!(config.max_connections, 64);
+	}
+
+	#[test]
+	fn the_default_pool_cap_is_the_named_constant() {
+		let config = PoolConfig::default();
+		assert_eq!(config.max_connections, DEFAULT_MAX_POOL_CONNECTIONS);
 	}
 
 	#[test]
@@ -1574,8 +1586,8 @@ mod tests {
 
 	#[test]
 	fn test_pool_config_with_max_connections() {
-		let config = PoolConfig { max_connections: 16, ..PoolConfig::default() };
-		assert_eq!(config.max_connections, 16);
+		let config = PoolConfig { max_connections: NonZeroUsize::MIN, ..PoolConfig::default() };
+		assert_eq!(config.max_connections, NonZeroUsize::MIN);
 	}
 
 	/// A fault the trace injects where a connection leaves the pool reaches the
@@ -1622,7 +1634,11 @@ mod tests {
 			offer: Option<TransportOffer>,
 			trace: &TraceCollector,
 		) -> Arc<ConnectionPool<TokioListener>> {
-			let config = PoolConfig { max_connections: 1, mux_offer: offer.map(Arc::new), ..PoolConfig::default() };
+			let config = PoolConfig {
+				max_connections: NonZeroUsize::MIN,
+				mux_offer: offer.map(Arc::new),
+				..PoolConfig::default()
+			};
 			Arc::new(builder.with_config(config).with_trace(trace.share()).build())
 		}
 
@@ -1833,7 +1849,7 @@ mod tests {
 
 			let store: Arc<dyn CertificateTrust> = Arc::new(server.store());
 			let offer = Some(Arc::new(TransportOffer::mux(4)));
-			let config = PoolConfig { idle_timeout: Some(IDLE), max_connections: 1, mux_offer: offer };
+			let config = PoolConfig { idle_timeout: Some(IDLE), max_connections: NonZeroUsize::MIN, mux_offer: offer };
 			let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
 			let pool = builder
 				.with_clock(Arc::clone(clock) as Arc<dyn Clock>)

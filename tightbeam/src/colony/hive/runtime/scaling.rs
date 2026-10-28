@@ -7,12 +7,15 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::colony::hive::runtime::{ClusterLink, DrainMode, HiveContextImpl, HiveInstances};
+use crate::colony::hive::runtime::{
+	ClusterLink, DrainMode, HiveContextImpl, HiveInstances, HiveRuntime, RemoveRefusal,
+};
 use crate::colony::hive::{
 	HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry, ServletScaleConfig, SpawnerFn,
 };
 use crate::colony::protocol::ServletChange;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
+use crate::instrumentation::events::{HIVE_SCALED, HIVE_SCALE_REFUSED};
 use crate::runtime::{rt, TaskGroup};
 use crate::trace::TraceCollector;
 use crate::transport::multiplex::MuxCapable;
@@ -24,34 +27,59 @@ use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 /// The shared handles that the hive auto-scaling loop runs on.
+///
+/// [`Self::new`] alone builds one, from the runtime that owns the handles, so
+/// the drain state and the servlets of a loop come from the same runtime.
 pub struct ScalingLoop<P: Protocol, R: ServletRegistry> {
 	/// The registered servlet instances, keyed by instance URN bytes.
-	pub servlets: Arc<R>,
+	servlets: Arc<R>,
 	/// The per-type spawners that a scale-up calls.
-	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
+	spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	/// The hive-level trace collector, shared with each spawned servlet.
-	pub trace: Arc<TraceCollector>,
+	trace: Arc<TraceCollector>,
 	/// The aggregate utilization, published for manage-path backpressure.
-	pub utilization: Arc<AtomicU16>,
+	utilization: Arc<AtomicU16>,
 	/// The gateways that receive scaling address updates.
-	pub cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
+	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	/// The intra-hive route maps, updated when instances appear or leave.
-	pub hive_context: Arc<HiveContextImpl<P>>,
+	hive_context: Arc<HiveContextImpl<P>>,
 	/// The admission lock of the hive's instance set, which the control
 	/// plane shares.
-	pub admission: Arc<Mutex<()>>,
+	admission: Arc<Mutex<()>>,
 	/// The drain state, which a scale-up reads as it inserts its instance.
-	pub drain: DrainMode,
+	drain: DrainMode,
 	/// The hive control-plane address that the hive URN derives from.
 	///
 	/// It is [`None`] for a hive with no control plane, which scales its own
 	/// servlets but announces to no cluster.
-	pub hive_addr: Option<P::Address>,
+	hive_addr: Option<P::Address>,
 	/// The hive configuration, which carries the scaling thresholds, the
 	/// cooldowns, and the notify retry policy.
-	pub config: HiveConfig,
+	config: HiveConfig,
 	/// The owner of the gateway notifications that this loop starts.
-	pub tasks: TaskGroup,
+	tasks: TaskGroup,
+}
+
+impl<P: Protocol, R: ServletRegistry> ScalingLoop<P, R> {
+	/// The scaling loop of `runtime`, whose control plane, when it serves one,
+	/// listens at `hive_addr`.
+	pub(crate) fn new(runtime: &HiveRuntime<P, R>, hive_addr: Option<P::Address>) -> Self {
+		let shares = runtime.shares();
+
+		Self {
+			servlets: Arc::clone(shares.servlets),
+			spawners: Arc::clone(shares.spawners),
+			trace: Arc::clone(shares.trace),
+			utilization: Arc::clone(shares.utilization),
+			cluster_addrs: Arc::clone(shares.cluster_addrs),
+			hive_context: Arc::clone(shares.hive_context),
+			admission: Arc::clone(shares.admission),
+			drain: shares.drain.clone(),
+			hive_addr,
+			config: shares.config.clone(),
+			tasks: shares.tasks.clone(),
+		}
+	}
 }
 
 impl<P, R> ScalingLoop<P, R>
@@ -66,6 +94,9 @@ where
 {
 	/// Spawns the loop that evaluates each servlet type once per cooldown,
 	/// scales its instances, and publishes the hive's aggregate utilization.
+	///
+	/// A trace that refuses the record of a scale ends the loop, which is the
+	/// effect a `testing-fault` injection observes.
 	pub fn spawn(self) -> rt::JoinHandle {
 		let ScalingLoop {
 			servlets,
@@ -112,32 +143,41 @@ where
 			let mut scaled_up = Cooldowns::new(Arc::clone(&clock));
 			let mut scaled_down = Cooldowns::new(Arc::clone(&clock));
 
-			loop {
-				clock.sleep(evaluation_period).await;
+			let looped: Result<(), TightBeamError> = async {
+				loop {
+					clock.sleep(evaluation_period).await;
 
-				let mut hive_load = TypeLoad::default();
-				for (servlet_type, spawner) in spawners.iter() {
-					let scale = task.config.scaling.scale_config(servlet_type);
-					let load = task.type_load(servlet_type.type_prefix_bytes());
-					let metrics = ScalingMetrics {
-						servlet_type: servlet_type.clone(),
-						utilization: load.utilization(),
-						current_instances: load.instances,
-						config: scale,
-					};
+					let mut hive_load = TypeLoad::default();
+					for (servlet_type, spawner) in spawners.iter() {
+						let scale = task.config.scaling.scale_config(servlet_type);
+						let load = task.type_load(servlet_type.type_prefix_bytes());
+						let metrics = ScalingMetrics {
+							servlet_type: servlet_type.clone(),
+							utilization: load.utilization(),
+							current_instances: load.instances,
+							config: scale,
+						};
 
-					hive_load.absorb(&load);
+						hive_load.absorb(&load);
 
-					match metrics.decide() {
-						ScalingDecision::ScaleUp => task.scale_up(servlet_type, spawner, scale, &mut scaled_up).await,
-						ScalingDecision::ScaleDown => task.scale_down(servlet_type, scale, &mut scaled_down),
-						ScalingDecision::Hold => {}
+						match metrics.decide() {
+							ScalingDecision::ScaleUp => {
+								task.scale_up(servlet_type, spawner, scale, &mut scaled_up).await?;
+							}
+							ScalingDecision::ScaleDown => task.scale_down(servlet_type, scale, &mut scaled_down)?,
+							ScalingDecision::Hold => {}
+						}
 					}
-				}
 
-				task.utilization.store(hive_load.utilization().get(), Ordering::Relaxed);
-				task.samples.close_tick();
+					task.utilization.store(hive_load.utilization().get(), Ordering::Relaxed);
+					task.samples.close_tick();
+				}
 			}
+			.await;
+
+			// A trace fault ends the loop, which is the effect a
+			// `testing-fault` injection observes.
+			drop(looped);
 		})
 	}
 }
@@ -313,21 +353,29 @@ where
 		load
 	}
 
-	/// Adds one instance of `servlet_type` and announces it.
+	/// Adds one instance of `servlet_type`, records it, and announces it.
+	///
+	/// A scale the instance set refuses, or whose spawner fails, records its
+	/// refusal and leaves the type as it is, and the next evaluation decides
+	/// again.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the record of the scale or of its refusal.
 	async fn scale_up(
 		&self,
 		servlet_type: &Urn<'static>,
 		spawner: &SpawnerFn,
 		scale: ServletScaleConfig,
 		cooldowns: &mut Cooldowns,
-	) {
+	) -> Result<(), TightBeamError> {
 		let type_key = servlet_type.canonical_bytes();
 		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_up_cooldown()) {
-			return;
+			return Ok(());
 		}
 
 		let Ok(new_servlet) = (spawner)(Arc::clone(&self.trace)).await else {
-			return;
+			return self.record_refused(servlet_type, "SpawnFailed");
 		};
 
 		let registration = ServletRegistration {
@@ -338,10 +386,13 @@ where
 
 		// The registry takes the instance before the announcement, because the
 		// notify failure path reconciles from the registry. A refused insert
-		// stops its servlet, and the next evaluation decides again.
-		let Ok(placed) = self.instances().insert(registration) else {
-			return;
+		// stops its servlet.
+		let placed = match self.instances().insert(registration) {
+			Ok(placed) => placed,
+			Err(refusal) => return self.record_refused(servlet_type, refusal.as_str()),
 		};
+
+		self.record_scaled("Added", servlet_type, || placed.instance.canonical_bytes())?;
 
 		// The slate leaves out an instance that names no signer, so the hive
 		// announces only an instance that has a route.
@@ -350,33 +401,83 @@ where
 		}
 
 		cooldowns.stamp(type_key);
+		Ok(())
 	}
 
-	/// Removes one instance of `servlet_type` and announces its departure.
-	fn scale_down(&self, servlet_type: &Urn<'static>, scale: ServletScaleConfig, cooldowns: &mut Cooldowns) {
+	/// Removes one instance of `servlet_type`, records it, and announces its
+	/// departure.
+	///
+	/// A removal the instance set refuses records its refusal and leaves the
+	/// instance in place, and the next evaluation decides again.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the record of the scale or of its refusal.
+	fn scale_down(
+		&self,
+		servlet_type: &Urn<'static>,
+		scale: ServletScaleConfig,
+		cooldowns: &mut Cooldowns,
+	) -> Result<(), TightBeamError> {
 		let type_key = servlet_type.canonical_bytes();
 		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_down_cooldown()) {
-			return;
+			return Ok(());
 		}
 
 		let type_prefix = servlet_type.type_prefix_bytes();
 		// The registry states no key order, so scale-down picks any instance.
 		let Some(key) = self.servlets.keys().into_iter().rfind(|k| k.starts_with(&type_prefix)) else {
-			return;
+			return self.record_refused(servlet_type, RemoveRefusal::Absent.as_str());
 		};
 
-		// A refused removal leaves the instance in place, and the next
-		// evaluation decides again.
-		let Ok(removed) = self.instances().remove(&key) else {
-			return;
+		let removed = match self.instances().remove(&key) {
+			Ok(removed) => removed,
+			Err(refusal) => return self.record_refused(servlet_type, refusal.as_str()),
 		};
 
-		let Ok(instance) = removed.servlet_type.instance_urn(removed.address.as_ref()) else {
-			return;
-		};
+		self.record_scaled("Removed", servlet_type, || &key)?;
 
-		self.announce(ServletChange::Removed(instance));
+		// An instance whose URN fails to derive names no slate change, so the
+		// re-announce beat, which carries the slate whole, tells the gateways.
+		if let Ok(instance) = removed.servlet_type.instance_urn(removed.address.as_ref()) {
+			self.announce(ServletChange::Removed(instance));
+		}
+
 		cooldowns.stamp(type_key);
+		Ok(())
+	}
+
+	/// Records [`HIVE_SCALED`] under `label` for an instance of
+	/// `servlet_type`, whose canonical URN bytes `instance` renders.
+	///
+	/// The trace runs `instance` only when its sink keeps the event and its
+	/// config keeps payloads.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
+	fn record_scaled<E: AsRef<[u8]>>(
+		&self,
+		label: &'static str,
+		servlet_type: &Urn<'static>,
+		instance: impl FnOnce() -> E,
+	) -> Result<(), TightBeamError> {
+		let value = servlet_type.to_string();
+		let evidence = || Some(instance());
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_rendered_evidence(HIVE_SCALED, label, value, evidence)
+	}
+
+	/// Records [`HIVE_SCALE_REFUSED`] under `label` for a scale of
+	/// `servlet_type` that landed no change.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
+	fn record_refused(&self, servlet_type: &Urn<'static>, label: &'static str) -> Result<(), TightBeamError> {
+		let value = servlet_type.to_string();
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_evidence(HIVE_SCALE_REFUSED, label, value, None)
 	}
 
 	/// Announces one slate change to every registered gateway.

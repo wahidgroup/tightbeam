@@ -24,6 +24,7 @@
 	feature = "instrument"
 ))]
 
+use core::num::NonZeroUsize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -84,11 +85,8 @@ const DRAW_CREDITS: u64 = 10;
 /// The client-view settings the lottery negotiation lands on: both sides offer
 /// `mux(1)` with 1 KiB chunks, and the house grants the requested draw budget.
 fn lottery_settings() -> MuxSettings {
-	let mut settings = MuxSettings::symmetric(1);
-	settings.send_chunk_size = 1024;
-	settings.recv_chunk_size = 1024;
-	settings.send_budget = Some(DRAW_CREDITS);
-	settings
+	let settings = MuxSettings::symmetric(1).with_chunk_size(1024);
+	settings.with_send_budget(Some(DRAW_CREDITS))
 }
 
 /// The draws served against the initial invoice before the budget watermark
@@ -356,7 +354,11 @@ fn pool_with_offer(
 	let client_certificate = ctx.client_certificate.as_ref().to_owned();
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: mux_offer.map(Arc::new) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: NonZeroUsize::MIN,
+		mux_offer: mux_offer.map(Arc::new),
+	};
 	let mut builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
@@ -416,9 +418,8 @@ async fn draw_until_cutoff(lease: &mut PooledClient<TokioListener>, attempts: u6
 	tally
 }
 
-/// Draws until the house announces an empty account or `attempts` runs
-/// out, and returns the wins tallied and whether the broke announcement
-/// arrived.
+/// Draws until the house announces an empty account or `attempts` runs out,
+/// and returns the wins tallied and whether the broke announcement arrived.
 async fn draw_until_broke(
 	lease: &mut PooledClient<TokioListener>,
 	attempts: u64,
@@ -642,8 +643,8 @@ tb_scenario! {
 	}
 }
 
-/// Context for the rotated-receipt scenario: the house records the
-/// distinct receipt transcript hashes its handler observes, one per
+/// The context of the rotated-receipt scenario: the house records the
+/// distinct receipt transcript hashes that its handler observes, one per
 /// epoch of the session.
 struct HouseBooks {
 	paywall: PaywallContext,

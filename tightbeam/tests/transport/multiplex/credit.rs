@@ -342,8 +342,8 @@ async fn mux_authorizer_reduced_grant_both_sides() -> Result<(), TightBeamError>
 		.negotiated_mux()
 		.ok_or_else(|| expectation_failure("server must negotiate multiplexing"))?;
 
-	let client_grant = (client_settings.send_budget, client_settings.recv_budget);
-	let server_grant = (server_settings.send_budget, server_settings.recv_budget);
+	let client_grant = (client_settings.send_budget(), client_settings.recv_budget());
+	let server_grant = (server_settings.send_budget(), server_settings.recv_budget());
 	assert_eq!(client_grant, (Some(5), Some(5)), "the client must take the halved grant");
 	assert_eq!(server_grant, (Some(5), Some(5)), "the server must bind the halved grant");
 	Ok(())

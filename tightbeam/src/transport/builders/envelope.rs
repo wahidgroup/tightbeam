@@ -34,23 +34,40 @@ impl EnvelopePayload {
 	}
 }
 
-/// Builder that constructs `WireEnvelope` instances with shared size
-/// validation and encryption logic.
+/// How an envelope leaves the builder: in the clear, or as one record under a
+/// send cipher.
+///
+/// The encrypted form holds its cipher, so an encrypted envelope always names
+/// the cipher that seals it.
+#[derive(Clone, Copy)]
+pub(crate) enum Sealing<'a> {
+	/// The envelope travels in the clear.
+	Cleartext,
+	/// The envelope travels as one record that the cipher seals.
+	Encrypted(&'a SendCipher),
+}
+
+impl Sealing<'_> {
+	/// The wire mode of this sealing, whose ceiling the wire form must fit.
+	const fn mode(&self) -> WireMode {
+		match self {
+			Self::Cleartext => WireMode::Cleartext,
+			Self::Encrypted(_) => WireMode::Encrypted,
+		}
+	}
+}
+
+/// The builder of a [`WireEnvelope`], with shared size validation and
+/// encryption.
 pub struct EnvelopeBuilder<'a> {
 	pub(crate) payload: EnvelopePayload,
-	pub(crate) encryptor: Option<&'a SendCipher>,
 	pub(crate) limits: TransportLimits,
-	pub(crate) wire_mode: WireMode,
+	sealing: Sealing<'a>,
 }
 
 impl<'a> EnvelopeBuilder<'a> {
 	fn new(payload: EnvelopePayload) -> Self {
-		Self {
-			payload,
-			encryptor: None,
-			limits: TransportLimits::default(),
-			wire_mode: WireMode::Cleartext,
-		}
+		Self { payload, limits: TransportLimits::default(), sealing: Sealing::Cleartext }
 	}
 
 	/// Create a builder configured for a request frame.
@@ -68,8 +85,48 @@ impl<'a> EnvelopeBuilder<'a> {
 		Self::new(EnvelopePayload::Transport { envelope })
 	}
 
-	pub fn with_encryptor(mut self, encryptor: &'a SendCipher) -> Self {
-		self.encryptor = Some(encryptor);
+	/// Sends the envelope in the clear, which a builder does unless
+	/// [`Self::sealed_by`] names a cipher.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::TestFrame;
+	/// use tightbeam::transport::{EnvelopeBuilder, WireEnvelope};
+	///
+	/// let wire = EnvelopeBuilder::request(TestFrame::v0(None, None)).cleartext().finish()?;
+	/// assert!(matches!(wire, WireEnvelope::Cleartext(_)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn cleartext(self) -> Self {
+		self.with_sealing(Sealing::Cleartext)
+	}
+
+	/// Seals the envelope under `cipher` as one record, which takes the next
+	/// sequence number of the cipher.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::testing::TestFrame;
+	/// use tightbeam::transport::{EnvelopeBuilder, WireEnvelope};
+	///
+	/// let key = RuntimeAead::new::<DefaultCryptoProvider>(vec![0u8; 32])?;
+	/// let cipher = SendCipher::new(key, 0, RecordDirection::ClientToServer);
+	///
+	/// let wire = EnvelopeBuilder::request(TestFrame::v0(None, None)).sealed_by(&cipher).finish()?;
+	/// assert!(matches!(wire, WireEnvelope::Encrypted(_)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn sealed_by(self, cipher: &'a SendCipher) -> Self {
+		self.with_sealing(Sealing::Encrypted(cipher))
+	}
+
+	/// Sends the envelope as `sealing` names.
+	pub(crate) fn with_sealing(mut self, sealing: Sealing<'a>) -> Self {
+		self.sealing = sealing;
 		self
 	}
 
@@ -79,24 +136,25 @@ impl<'a> EnvelopeBuilder<'a> {
 		self
 	}
 
-	pub fn with_wire_mode(mut self, mode: WireMode) -> Self {
-		self.wire_mode = mode;
-		self
-	}
-
-	/// Finalize the builder into its wire form. An encrypted wire mode seals
+	/// Finalize the builder into its wire form. A sealing under a cipher seals
 	/// the envelope, and the call refuses a wire form past the envelope
-	/// ceiling of its limits.
+	/// ceiling of its mode.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MessageNotSent`] -- a request did not encode, seal,
+	///   or fit its ceiling, and its frame travels with the error.
+	/// - The error that the same failure of a response or a transport envelope converts into.
 	pub fn finish(self) -> TransportResult<WireEnvelope> {
-		let EnvelopeBuilder { payload, encryptor, limits, wire_mode } = self;
+		let EnvelopeBuilder { payload, limits, sealing } = self;
 
 		let envelope = payload.materialize();
 		let with_frame = Self::frame_error_context(&envelope);
 
-		let wire = match wire_mode {
-			WireMode::Cleartext => WireEnvelope::Cleartext(envelope),
-			WireMode::Encrypted => {
-				let encrypted = Self::encrypt(envelope, encryptor, &with_frame)?;
+		let wire = match sealing {
+			Sealing::Cleartext => WireEnvelope::Cleartext(envelope),
+			Sealing::Encrypted(cipher) => {
+				let encrypted = Self::encrypt(envelope, cipher, &with_frame)?;
 				WireEnvelope::Encrypted(encrypted)
 			}
 		};
@@ -104,7 +162,7 @@ impl<'a> EnvelopeBuilder<'a> {
 		// The ceiling names the wire form, so the tag and wrapper are inside
 		// the measurement. `encoded_len` computes it without building a
 		// buffer.
-		let ceiling = limits.envelope_ceiling(wire_mode);
+		let ceiling = limits.envelope_ceiling(sealing.mode());
 		let wire_len = u32::from(wire.encoded_len().map_err(|_| with_frame(TransportFailure::EncodingFailed))?);
 		if wire_len as usize > ceiling {
 			return Err(with_frame(TransportFailure::SizeExceeded));
@@ -116,10 +174,7 @@ impl<'a> EnvelopeBuilder<'a> {
 	/// Error constructor that returns the caller's frame with the failure, so a
 	/// refused request need not be reconstructed to retry.
 	fn frame_error_context(envelope: &TransportEnvelope) -> impl Fn(TransportFailure) -> TransportError {
-		let request_frame = match envelope {
-			TransportEnvelope::Request(pkg) => Some(Arc::clone(&pkg.message)),
-			_ => None,
-		};
+		let request_frame = envelope.request_frame().map(Arc::clone);
 
 		move |failure: TransportFailure| -> TransportError {
 			request_frame
@@ -139,15 +194,14 @@ impl<'a> EnvelopeBuilder<'a> {
 	/// The encoded envelope moves into the record, which encrypts it in place.
 	fn encrypt(
 		envelope: TransportEnvelope,
-		encryptor: Option<&'a SendCipher>,
+		cipher: &SendCipher,
 		with_frame: &impl Fn(TransportFailure) -> TransportError,
 	) -> TransportResult<AuthEnvelopedData> {
 		let encoded = envelope.to_der().map_err(|_| with_frame(TransportFailure::EncodingFailed))?;
 
 		// The send cipher owns the record sequence and draws each record's
 		// content key.
-		let encryptor = encryptor.ok_or_else(|| with_frame(TransportFailure::EncryptorUnavailable))?;
-		encryptor.encrypt_next(encoded).map_err(|error| {
+		cipher.encrypt_next(encoded).map_err(|error| {
 			// Rekey exhaustion stays distinguishable: the caller must
 			// reestablish the session, not retry the write.
 			let failure = match error {

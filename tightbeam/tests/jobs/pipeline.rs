@@ -1,7 +1,7 @@
 //! The integration tests of job pipeline orchestration under `tb_scenario!`.
 //!
 //! The tests show:
-//! - the URN trace events that `PipelineBuilder` emits on its own,
+//! - the URN trace events that each `then_job` step of a traced pipeline emits,
 //! - a CSP process spec that checks the state machine, and
 //! - L1 assertion specs that count the events.
 
@@ -78,7 +78,7 @@ job! {
 	}
 }
 
-// Direct result pipeline test
+// The test of a pipeline over plain results
 
 /// A pipeline over plain results runs its three jobs in order, so the last
 /// job transforms the frame that the first job created.
@@ -96,7 +96,7 @@ fn test_pipeline_direct_results() -> Result<(), TightBeamError> {
 	Ok(())
 }
 
-// L1: the assertion spec of the URN events that `PipelineBuilder` emits
+// L1: the assertion spec of the URN events that the job steps emit
 
 #[cfg(feature = "testing-csp")]
 tb_assert_spec! {
@@ -104,7 +104,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			// `PipelineBuilder` emits the job URNs on its own
+			// Each `then_job` step emits the URNs of its job
 			// (`urn:tightbeam:event:job/...`).
 			(CREATE_TEST_FRAME_START, exactly!(1)),
 			(CREATE_TEST_FRAME_SUCCESS, exactly!(1)),
@@ -154,17 +154,17 @@ tb_scenario! {
 		exec: |pipeline| {
 			pipeline
 				.start(("test-001".to_string(), "content".to_string()))
-				.and_then(CreateTestFrame::run)
+				.then_job::<CreateTestFrame, _>()
 				.map(|f| (f,))
-				.and_then(ValidateFrame::run)
+				.then_job::<ValidateFrame, _>()
 				.map(|f| (f,))
-				.and_then(TransformContent::run)
+				.then_job::<TransformContent, _>()
 				.run()
 		}
 	}
 }
 
-// Fallback pipeline test
+// The test of a pipeline with a fallback
 
 /// A failed result runs its fallback, which builds the frame in its place.
 #[test]

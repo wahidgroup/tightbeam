@@ -17,7 +17,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::envelopes::{WireEnvelope, WireMode};
+use crate::transport::envelopes::WireEnvelope;
 use crate::transport::error::{ArrivalCause, ArrivalRefusal, TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::handshake::{EstablishedSession, SessionPeer};
@@ -52,11 +52,13 @@ use crate::transport::handshake::negotiation::TransportOffer;
 ))]
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{BoxedServerHandshake, HandshakeMessage, ServerIdentity, ValidatorChain};
+use crate::transport::handshake::{
+	BoxedServerHandshake, HandshakeMessage, HandshakeProvider, ServerIdentity, ValidatorChain,
+};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 #[cfg(mux_rekey)]
-use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeProvider};
+use crate::transport::handshake::{EpochMaterials, HandshakeError};
 #[cfg(mux_rekey)]
 use crate::transport::rekey::{RekeyDriver, Renewal};
 
@@ -167,6 +169,21 @@ impl SessionPhase {
 	/// Whether the session awaits the end of a provisioned handshake.
 	pub const fn is_handshake_pending(&self) -> bool {
 		matches!(self, Self::Provisioned | Self::Handshaking { .. })
+	}
+
+	/// Whether a client owes the first round of its handshake: the session is
+	/// provisioned for encryption, and no round began.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::state::SessionPhase;
+	///
+	/// assert!(SessionPhase::Provisioned.awaits_handshake());
+	/// assert!(!SessionPhase::Cleartext.awaits_handshake());
+	/// ```
+	pub const fn awaits_handshake(&self) -> bool {
+		matches!(self, Self::Provisioned)
 	}
 
 	/// The instant the in-flight handshake began, if one is in flight.
@@ -329,9 +346,9 @@ pub(crate) enum SessionEvent {
 }
 
 /// A session's phase, the provisioning it starts from, its negotiation input,
-/// and the mark of an exchange in flight.
+/// the mark of an exchange in flight, and the server orchestrator in flight.
 ///
-/// All four are private, and one constructor sets them together, so the phase
+/// All five are private, and one constructor sets them together, so the phase
 /// an endpoint starts in and returns to on a reset follows from its
 /// provisioning. Every later move consults the transition table, so a session
 /// sits only in a phase the table names.
@@ -343,6 +360,10 @@ pub struct SessionState<P: CryptoProvider> {
 	/// exchange before it settles leaves the mark set.
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	exchange_in_flight: bool,
+	/// The server orchestrator that drives the handshake in flight, which
+	/// each round advances only after the phase admits the round.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	handshake: HandshakeSlot,
 }
 
 impl<P: CryptoProvider> SessionState<P> {
@@ -366,6 +387,8 @@ impl<P: CryptoProvider> SessionState<P> {
 			phase,
 			#[cfg(any(feature = "tcp", feature = "async-transport"))]
 			exchange_in_flight: false,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			handshake: HandshakeSlot::empty(),
 		}
 	}
 
@@ -411,6 +434,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// - It is the one writer of the phase, and it is private, so the named moves below are the only events.
 	/// - A refused event leaves the session in its phase and yields `None`.
 	/// - The replaced phase travels out whole, so a caller that detaches a session takes its keys from here.
+	/// - A reset or a failure empties the handshake slot in the same move, so
+	///   the next round builds a fresh orchestrator.
 	fn apply(&mut self, event: SessionEvent) -> Option<SessionPhase> {
 		if !self.phase.admits(&event) {
 			return None;
@@ -422,9 +447,21 @@ impl<P: CryptoProvider> SessionState<P> {
 				SessionPhase::Handshaking { initiated_at }
 			}
 			SessionEvent::Install(session) => SessionPhase::Encrypted(session),
-			SessionEvent::Reset => SessionPhase::start_for(self.encryption.encryption()),
+			SessionEvent::Reset => {
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+				{
+					self.handshake = HandshakeSlot::empty();
+				}
+				SessionPhase::start_for(self.encryption.encryption())
+			}
 			#[cfg(any(feature = "tcp", feature = "async-transport"))]
-			SessionEvent::Fail => SessionPhase::Failed,
+			SessionEvent::Fail => {
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+				{
+					self.handshake = HandshakeSlot::empty();
+				}
+				SessionPhase::Failed
+			}
 		};
 		let replaced = core::mem::replace(&mut self.phase, next);
 
@@ -554,10 +591,19 @@ impl<P: CryptoProvider> SessionState<P> {
 			return Err(self.refuse(oversize));
 		}
 
-		let recv = self.established().map(|session| session.keys().recv());
+		let recv = self.recv_cipher();
 		let admitted = arriving.admit_under(recv);
 
 		admitted.map_err(|cause| self.trip(cause))
+	}
+
+	/// The receive cipher of the established session, lent exclusively, so
+	/// one open runs on the key at a time.
+	fn recv_cipher(&mut self) -> Option<&mut RecvCipher> {
+		match &mut self.phase {
+			SessionPhase::Encrypted(session) => Some(session.keys_mut().recv_mut()),
+			_ => None,
+		}
 	}
 
 	/// The refusal of an arrival for `cause`, with the peer of this session,
@@ -757,7 +803,53 @@ impl<P: CryptoProvider> SessionState<P> {
 			phase,
 			#[cfg(any(feature = "tcp", feature = "async-transport"))]
 			exchange_in_flight: false,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			handshake: HandshakeSlot::empty(),
 		}
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl<P: CryptoProvider> SessionState<P> {
+	/// The slot of the server orchestrator in flight, which a TCP transport
+	/// lends through [`ServerHandshakeSlot::handshake_slot`].
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
+	pub(crate) fn handshake_slot(&mut self) -> &mut HandshakeSlot {
+		&mut self.handshake
+	}
+
+	/// Builds the server orchestrator of this endpoint into an empty slot,
+	/// once per handshake.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError`] -- the errors of the orchestrator build, which leave the slot empty.
+	pub(crate) fn occupy_handshake(&mut self) -> TransportResult<()>
+	where
+		P: HandshakeProvider,
+	{
+		let Self { encryption, negotiation, handshake, .. } = self;
+		handshake.occupy(|| Endpoint::new(encryption, negotiation).server_handshake())
+	}
+
+	/// Serves `request`, one handshake round at `now`: the phase admits the
+	/// round first, and the orchestrator in the slot advances only then.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- the phase refuses the round, or
+	///   the slot holds no orchestrator. Either leaves the slot as it was.
+	/// - The errors of [`HandshakeSlot::advance`].
+	pub(crate) async fn advance_handshake(
+		&mut self,
+		request: HandshakeMessage,
+		now: MonotonicInstant,
+	) -> TransportResult<Round> {
+		if !self.begin_handshake(now) {
+			return Err(TransportError::InvalidState);
+		}
+
+		self.handshake.advance(request).await
 	}
 }
 
@@ -1060,8 +1152,8 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
 	///   authenticates no peer and names no cleartext, or it sets a server
-	///   policy and holds no trust in a server, whether or not it names
-	///   cleartext, because the policy runs on the server a trust admits.
+	///   policy with no trust in a server, with or without cleartext, because
+	///   the policy runs on the server a trust admits.
 	pub fn check_dial_permitted(&self) -> TransportResult<()> {
 		if !self.is_provisioned() && !self.allow_cleartext {
 			return Err(TransportError::PeerAuthenticationUnconfigured);
@@ -1127,15 +1219,117 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	}
 }
 
+/// The one server orchestrator in flight on an endpoint that accepts
+/// handshakes, or none.
+///
+/// The slot is empty before the first client message arrives, again once the
+/// handshake completes and the endpoint installs its terms, and again when the
+/// session resets or fails. A round advances the orchestrator only after the
+/// session phase admits the round.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub struct HandshakeSlot {
+	orchestrator: Option<BoxedServerHandshake>,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+impl HandshakeSlot {
+	/// A slot that holds no orchestrator.
+	const fn empty() -> Self {
+		Self { orchestrator: None }
+	}
+
+	/// Places `orchestrator` in the slot, in place of any orchestrator in
+	/// flight, so the next round the endpoint serves runs it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::BoxedServerHandshake;
+	/// use tightbeam::transport::state::ServerHandshakeSlot;
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	///
+	/// /// Serve the next handshake on `transport` with `orchestrator`.
+	/// fn serve_with(transport: &mut TcpTransport<TokioStream>, orchestrator: BoxedServerHandshake) {
+	///     transport.handshake_slot().install(orchestrator);
+	/// }
+	/// ```
+	pub fn install(&mut self, orchestrator: BoxedServerHandshake) {
+		self.orchestrator = Some(orchestrator);
+	}
+
+	/// Places the orchestrator that `build` returns in an empty slot, and
+	/// keeps the orchestrator of a handshake in flight.
+	///
+	/// # Errors
+	///
+	/// - The error of `build`, which leaves the slot empty.
+	pub(crate) fn occupy(
+		&mut self,
+		build: impl FnOnce() -> TransportResult<BoxedServerHandshake>,
+	) -> TransportResult<()> {
+		if self.orchestrator.is_some() {
+			return Ok(());
+		}
+
+		let orchestrator = build()?;
+		self.orchestrator = Some(orchestrator);
+		Ok(())
+	}
+
+	/// Runs the orchestrator in the slot on `request`, one client message.
+	///
+	/// A reply means another round follows, and the orchestrator stays. No
+	/// reply means the handshake is complete, so the orchestrator leaves the
+	/// slot with the session it agreed.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- the slot holds no orchestrator.
+	/// - [`TransportError::HandshakeError`] -- the orchestrator refuses the
+	///   request, or fails to complete the session.
+	pub(crate) async fn advance(&mut self, request: HandshakeMessage) -> TransportResult<Round> {
+		let orchestrator = self.orchestrator.as_mut().ok_or(TransportError::InvalidState)?;
+		let reply = orchestrator.handle_request(request).await?;
+		if let Some(reply) = reply {
+			return Ok(Round::Reply(reply));
+		}
+
+		let finished = self.orchestrator.take().ok_or(TransportError::InvalidState)?;
+		let session = finished.complete().await?;
+		Ok(Round::Complete(session))
+	}
+}
+
+/// The outcome of one server handshake round.
+// A round lives for one step of the driver, so its session stays inline
+// until the install boxes it once.
+#[allow(clippy::large_enum_variant)]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) enum Round {
+	/// The orchestrator answers the round, and another round follows.
+	Reply(HandshakeMessage),
+	/// The orchestrator completed the handshake with the session it agreed.
+	Complete(EstablishedSession),
+}
+
 /// An endpoint that accepts handshakes, and so keeps the orchestrator that
 /// drives the one in flight.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait ServerHandshakeSlot: sealed::Sealed {
-	/// The orchestrator that holds this endpoint's in-flight server handshake.
+	/// The slot of this endpoint's in-flight server orchestrator.
 	///
-	/// It is `None` before the first client message arrives, and again once
-	/// the handshake completes and the endpoint installs its terms.
-	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::state::{HandshakeSlot, ServerHandshakeSlot};
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	///
+	/// /// The slot that serves the next handshake round of `transport`.
+	/// fn slot_of(transport: &mut TcpTransport<TokioStream>) -> &mut HandshakeSlot {
+	///     transport.handshake_slot()
+	/// }
+	/// ```
+	fn handshake_slot(&mut self) -> &mut HandshakeSlot;
 
 	/// Runs `operation` within `budget`, the time left to the handshake.
 	///
@@ -1227,10 +1421,8 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	/// - [`TransportError::ConnectionFailed`] -- the session is [`SessionPhase::Failed`].
 	fn apply_wire_mode<'a>(&'a self, builder: EnvelopeBuilder<'a>) -> TransportResult<EnvelopeBuilder<'a>> {
 		match self.session_state().phase() {
-			SessionPhase::Encrypted(session) => Ok(builder
-				.with_wire_mode(WireMode::Encrypted)
-				.with_encryptor(session.keys().send())),
-			SessionPhase::Cleartext => Ok(builder.with_wire_mode(WireMode::Cleartext)),
+			SessionPhase::Encrypted(session) => Ok(builder.sealed_by(session.keys().send())),
+			SessionPhase::Cleartext => Ok(builder.cleartext()),
 			SessionPhase::Provisioned | SessionPhase::Handshaking { .. } => {
 				Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
 			}
@@ -1413,7 +1605,7 @@ mod tests {
 
 	fn provisioned_encryption() -> EncryptionConfig<DefaultCryptoProvider> {
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let peer_authentication = PeerAuthentication::mutual([validator]);
+		let peer_authentication = PeerAuthentication::Anonymous.and(validator);
 		EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() }
 	}
 

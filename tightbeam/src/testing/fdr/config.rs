@@ -433,6 +433,45 @@ impl Default for FdrConfig {
 	}
 }
 
+impl FdrConfig {
+	/// Whether a run of this configuration refines the subject against
+	/// specs, which a configuration that names a spec does.
+	pub(crate) fn refines_against_specs(&self) -> bool {
+		!self.specs.is_empty()
+	}
+
+	/// The exploration that a run of this configuration performs.
+	///
+	/// - A configuration with no spec explores the state space, with a fault model or without one.
+	/// - Specs with a fault model run each spec under the faults.
+	/// - Specs with no fault model run the refinement checks.
+	pub(crate) fn mode(&self) -> ExplorationMode {
+		if !self.refines_against_specs() {
+			return ExplorationMode::StateSpace;
+		}
+
+		#[cfg(feature = "testing-fault")]
+		if self.fault_model.is_some() {
+			return ExplorationMode::UnderFaults;
+		}
+
+		ExplorationMode::Refinement
+	}
+}
+
+/// The exploration that a run of an [`FdrConfig`] performs, which its specs
+/// and its fault model select ([`FdrConfig::mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExplorationMode {
+	/// Each spec runs under the faults of the fault model.
+	#[cfg(feature = "testing-fault")]
+	UnderFaults,
+	/// The subject refines against each spec.
+	Refinement,
+	/// The subject runs over every seed, with no spec.
+	StateSpace,
+}
+
 /// The record of a fault that FDR exploration injected.
 #[cfg(feature = "testing-fault")]
 #[derive(Debug, Clone, PartialEq)]
@@ -630,14 +669,9 @@ mod tests {
 		assert!(config.fail_fast);
 	}
 
-	#[test]
-	fn dual_mode_support() {
-		// Mode 1: Single-process exploration
-		let config_exploration = FdrConfig::default();
-		assert!(config_exploration.specs.is_empty());
-
-		// Mode 2: Refinement checking
-		let spec = Process {
+	/// A spec of one state, which is its initial state and a terminal one.
+	fn one_state_spec() -> Process {
+		Process {
 			name: "Spec",
 			observation: Observation::Model,
 			requires_progress: true,
@@ -655,10 +689,56 @@ mod tests {
 			timed_transitions: None,
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: None,
-		};
+		}
+	}
+
+	#[test]
+	fn dual_mode_support() {
+		// Mode 1: Single-process exploration
+		let config_exploration = FdrConfig::default();
+		assert!(config_exploration.specs.is_empty());
+
+		// Mode 2: Refinement checking
+		let spec = one_state_spec();
 
 		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
 		assert!(!config_refinement.specs.is_empty());
+	}
+
+	/// A configuration that names no spec explores the state space.
+	#[test]
+	fn a_config_with_no_spec_explores_the_state_space() {
+		assert_eq!(FdrConfig::default().mode(), ExplorationMode::StateSpace);
+	}
+
+	/// A configuration that names a spec and no fault model runs the refinement
+	/// checks.
+	#[test]
+	fn a_config_with_a_spec_runs_the_refinement_checks() {
+		let config = FdrConfig { specs: vec![one_state_spec()], ..FdrConfig::default() };
+
+		assert_eq!(config.mode(), ExplorationMode::Refinement);
+	}
+
+	/// A configuration that names a spec and a fault model runs each spec under
+	/// the faults.
+	#[cfg(feature = "testing-fault")]
+	#[test]
+	fn a_config_with_a_spec_and_a_fault_model_runs_each_spec_under_faults() {
+		let fault_model = Some(FaultModel::default());
+		let config = FdrConfig { specs: vec![one_state_spec()], fault_model, ..FdrConfig::default() };
+
+		assert_eq!(config.mode(), ExplorationMode::UnderFaults);
+	}
+
+	/// A fault model with no spec explores the state space, because only a
+	/// spec runs under the faults.
+	#[cfg(feature = "testing-fault")]
+	#[test]
+	fn a_config_with_a_fault_model_and_no_spec_explores_the_state_space() {
+		let config = FdrConfig { fault_model: Some(FaultModel::default()), ..FdrConfig::default() };
+
+		assert_eq!(config.mode(), ExplorationMode::StateSpace);
 	}
 
 	#[cfg(feature = "testing-fault")]

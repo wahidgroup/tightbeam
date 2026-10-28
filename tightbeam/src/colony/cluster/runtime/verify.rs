@@ -347,7 +347,7 @@ impl ClusterConfig {
 		Ok(())
 	}
 
-	/// Run collector gate policies before the gateway decodes the request
+	/// Run the configured gate policies before the gateway decodes the request
 	/// envelope.
 	///
 	/// Each configured policy must return [`TransitStatus::Ok`], so the first
@@ -440,8 +440,9 @@ impl<P: Protocol> ColonyConfig<P> {
 	///
 	/// # Call sites
 	///
-	/// - The unary work arm in [`super::dispatch`]
-	/// - The streaming and duplex open handlers in [`super`]
+	/// [`ColonyConfig::admit_target`] alone calls it, for the unary work arm
+	/// in [`super::dispatch`] and the streaming and duplex open handlers in
+	/// [`super`].
 	///
 	/// # Sources
 	///

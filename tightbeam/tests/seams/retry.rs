@@ -29,6 +29,7 @@ use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::TestMessage;
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::policy::CoreRetryPolicy;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
@@ -148,7 +149,8 @@ async fn registered_hive(
 	retry: AskedRetry,
 ) -> RetryHive {
 	let (spec, provider) = identity_of(certs);
-	let hive_tls = HiveTlsConfig::new(spec, provider, vec![]).expect("the hive certificate decodes");
+	let hive_tls = HiveTlsConfig::new(spec, provider, PeerAuthentication::Anonymous);
+	let hive_tls = hive_tls.expect("the hive certificate decodes");
 	let mut conf = scenario_hive_config();
 	conf.hive_tls = Some(Arc::new(hive_tls));
 	conf.trust_store = Some(Arc::clone(&certs.trust));

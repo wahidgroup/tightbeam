@@ -14,6 +14,7 @@
 	feature = "signature"
 ))]
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer,
+		handshake::PeerAuthentication,
 		multiplex::{CallContext, MuxService, StreamBody},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
@@ -107,10 +109,10 @@ fn laser_certs() -> GatewayCerts {
 	GatewayCerts::generate("CN=Laser Gateway")
 }
 
-/// The restart scenario's certificates and the clock its hive beats on. The
-/// hive and both gateways share the clock, and only the test moves it, so
-/// the replacement routes only after the test lets one interval pass, and the
-/// frames the beat signs stay fresh at the gateway.
+/// The restart scenario's certificates and the clock its hive beats on.
+///
+/// - The hive and both gateways share the clock, so the frames the beat signs stay fresh at the gateway.
+/// - Only the test moves the clock, so the replacement routes only after the test lets one interval pass.
 struct LaserRestartCtx {
 	certs: Arc<GatewayCerts>,
 	clock: Arc<ManualClock>,
@@ -145,7 +147,7 @@ fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
 		HiveTlsConfig::new(
 			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
 			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-			vec![],
+			PeerAuthentication::Anonymous,
 		)
 		.expect("the hive TLS material must decode"),
 	);
@@ -300,7 +302,7 @@ tb_scenario! {
 				ConnectionPool::<LaserListener>::builder()
 					.with_config(PoolConfig {
 						idle_timeout: None,
-						max_connections: 1,
+						max_connections: NonZeroUsize::MIN,
 						mux_offer: Some(Arc::new(TransportOffer::mux(8)))
 					})
 					.with_trust_store(Arc::clone(&certs.trust))

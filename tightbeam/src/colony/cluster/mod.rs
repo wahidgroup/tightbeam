@@ -75,6 +75,7 @@ pub(crate) use runtime::ColonyDigest;
 
 use core::future::Future;
 use core::num::NonZeroUsize;
+use core::str::FromStr;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -91,7 +92,7 @@ use crate::trace::TraceCollector;
 use crate::transport::client::{ConnectionBuilder, ConnectionPoolBuilder, PoolConfig};
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::{Protocol, TightBeamAddress, TransportEncryptionConfig};
-use crate::urn::Urn;
+use crate::urn::{Urn, UrnValidationError};
 use crate::utils::time::Clock;
 use crate::TightBeamError;
 
@@ -191,8 +192,10 @@ pub struct ClusterTlsConfig {
 	/// certificate, such as a denylist, in the store's
 	/// [`RevocationChecker`](crate::crypto::x509::store::RevocationChecker).
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
-	/// The client-certificate validators for inbound mutual TLS.
-	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
+	/// How the accept planes authenticate their clients:
+	/// [`PeerAuthentication::Anonymous`], the default, or mutual TLS over the
+	/// validators the operator names.
+	pub client_authentication: PeerAuthentication,
 	/// The trust store of the hive plane. It has three roles:
 	///
 	/// - Outbound dials to hives and servlets validate the server certificate against it.
@@ -278,7 +281,7 @@ impl ClusterTlsConfig {
 			identity,
 			key_purposes,
 			validators: Vec::new(),
-			client_validators: Vec::new(),
+			client_authentication: PeerAuthentication::Anonymous,
 			hive_trust: None,
 			peer_trust: None,
 		})
@@ -291,20 +294,46 @@ impl ClusterTlsConfig {
 		self
 	}
 
-	/// Replace the client-certificate validators applied to inbound mutual TLS.
+	/// Set how the accept planes authenticate their clients
+	/// ([`Self::client_authentication`]).
+	///
+	/// An operator who demands mutual TLS names it whole, so an empty validator
+	/// list never turns into anonymous clients by accident (CWE-1188).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::cluster::ClusterTlsConfig;
+	/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// use tightbeam::crypto::x509::policy::ExpiryValidator;
+	/// use tightbeam::crypto::x509::CertificateSpec;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	/// use tightbeam::transport::handshake::PeerAuthentication;
+	///
+	/// let key = TestKey::insecure_fixed_signing();
+	/// let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+	/// let tls = ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+	///
+	/// let mutual = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// let tls = tls.with_client_authentication(mutual);
+	/// assert!(tls.peer_authentication().requires_certificate());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[must_use]
-	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
-		self.client_validators = validators;
+	pub fn with_client_authentication(mut self, authentication: impl Into<PeerAuthentication>) -> Self {
+		self.client_authentication = authentication.into();
 		self
 	}
 
-	/// How the accept planes authenticate their clients.
+	/// How the accept planes authenticate their clients: the
+	/// [`Self::client_authentication`] this config holds.
 	///
-	/// An empty validator list is server authentication alone, by the rule of
-	/// [`PeerAuthentication::mutual`], so the gateway captures no client
+	/// Under [`PeerAuthentication::Anonymous`], the gateway captures no client
 	/// identity.
 	pub fn peer_authentication(&self) -> PeerAuthentication {
-		PeerAuthentication::mutual(self.client_validators.iter().map(Arc::clone))
+		self.client_authentication.clone()
 	}
 
 	/// Replace the hive-plane trust store.
@@ -345,9 +374,9 @@ impl ClusterTlsConfig {
 	/// client pins the same gateway identity that hives trust.
 	pub(crate) fn accept_encryption<C: CryptoProvider>(&self) -> TransportEncryptionConfig<C> {
 		let encryption = TransportEncryptionConfig::new(self.identity.clone());
-		let validators = self.client_validators.iter().map(Arc::clone);
+		let authentication = self.peer_authentication();
 
-		let encryption = encryption.with_client_validators(validators);
+		let encryption = encryption.with_peer_authentication(authentication);
 		encryption.with_key_purposes(self.key_purposes)
 	}
 
@@ -366,7 +395,7 @@ impl Clone for ClusterTlsConfig {
 			identity: self.identity.clone(),
 			key_purposes: self.key_purposes,
 			validators: self.validators.iter().map(Arc::clone).collect(),
-			client_validators: self.client_validators.iter().map(Arc::clone).collect(),
+			client_authentication: self.client_authentication.clone(),
 			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
 			peer_trust: self.peer_trust.as_ref().map(Arc::clone),
 		}
@@ -379,7 +408,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 			.field("identity", &self.identity)
 			.field("key_purposes", &self.key_purposes)
 			.field("validators", &format!("[{} validators]", self.validators.len()))
-			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
+			.field("client_authentication", &self.client_authentication)
 			.field("hive_trust", &self.hive_trust.as_ref().map(|_| "Some(<TrustStore>)"))
 			.field("peer_trust", &self.peer_trust.as_ref().map(|_| "Some(<TrustStore>)"))
 			.finish()
@@ -622,29 +651,82 @@ impl ClusterConfig {
 		self.peer.rumor_refresh.min(self.gossip.seen_ttl)
 	}
 
+	/// The time a relay trail lives with no refresh: three refresh intervals
+	/// ([`Self::rumor_refresh`]), floored at the default refresh interval.
+	///
+	/// One missed refresh is churn, and three mean the refresh path died. The
+	/// floor keeps a healthy fallback under an aggressive refresh.
+	pub(crate) fn relay_trail_ttl(&self) -> Duration {
+		let ttl = self.rumor_refresh().saturating_mul(3);
+		ttl.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS))
+	}
+
+	/// The gateway bind address, parsed as `A`, or [`None`] to bind the
+	/// protocol default.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidAddress`] -- [`Self::bind_addr`] does not parse as `A`.
+	pub(crate) fn bind_address<A: FromStr>(&self) -> Result<Option<A>, ClusterError> {
+		Self::parse_bind_address(self.bind_addr.as_deref())
+	}
+
+	/// The bind address of the edge accept plane, parsed as `A`, or [`None`]
+	/// for a gateway with no edge plane.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidAddress`] -- [`Self::edge_bind_addr`] does not parse as `A`.
+	pub(crate) fn edge_bind_address<A: FromStr>(&self) -> Result<Option<A>, ClusterError> {
+		Self::parse_bind_address(self.edge_bind_addr.as_deref())
+	}
+
+	/// Parses `raw`, a configured bind address, as `A`, or answers [`None`]
+	/// for an address the operator left unset.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidAddress`] -- `raw` does not parse as `A`, and the error carries its octets.
+	fn parse_bind_address<A: FromStr>(raw: Option<&str>) -> Result<Option<A>, ClusterError> {
+		let Some(raw) = raw else {
+			return Ok(None);
+		};
+
+		let parsed = raw.parse().map_err(|_| ClusterError::InvalidAddress(raw.as_bytes().to_vec()));
+		Ok(Some(parsed?))
+	}
+
 	/// Parse the hive identity, the added entries, and the removed instance
 	/// locators, whole, so the registry applies all of the delta or none of it.
-	/// It returns [`None`] in each case below:
 	///
-	/// - The hive URN names no hive of this colony's namespace.
-	/// - An added or removed URN names no servlet instance of this namespace.
-	/// - An added locator names an address other than the one beside it.
-	pub(crate) fn parse_address_update<'a>(&self, update: &'a ServletAddressUpdate) -> Option<ParsedAddressUpdate<'a>> {
-		let ColonyResource::Hive { addr } = self.namespace.validate(&update.hive_id).ok()? else {
-			return None;
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidUrn`] -- the hive URN names no hive of this
+	///   colony's namespace, or a removed URN names no servlet instance of it.
+	/// - [`ClusterError::InvalidAddress`] -- an added locator names an address other than the one beside it.
+	pub(crate) fn parse_address_update<'a>(
+		&self,
+		update: &'a ServletAddressUpdate,
+	) -> Result<ParsedAddressUpdate<'a>, ClusterError> {
+		let hive = self.namespace.validate(&update.hive_id).map_err(ClusterError::InvalidUrn)?;
+		let ColonyResource::Hive { addr } = hive else {
+			let named = UrnValidationError::InvalidFormat { field: "resource-type", pattern: None };
+			return Err(ClusterError::InvalidUrn(named));
 		};
 
 		let mut removed = Vec::with_capacity(update.removed.len());
 		for urn in &update.removed {
-			match self.namespace.validate(urn) {
-				Ok(ColonyResource::Servlet { instance: Some(locator), .. }) => removed.push(locator.as_bytes()),
-				_ => return None,
-			}
+			let resource = self.namespace.validate(urn).map_err(ClusterError::InvalidUrn)?;
+			let ColonyResource::Servlet { instance: Some(locator), .. } = resource else {
+				return Err(ClusterError::InvalidUrn(UrnValidationError::RequiredFieldMissing("instance")));
+			};
+
+			removed.push(locator.as_bytes());
 		}
 
 		let hive_id: Arc<[u8]> = Arc::from(addr.as_bytes());
-		let added = self.servlet_slate(&update.added, &hive_id).ok()?;
-		Some((added, removed))
+		let added = self.servlet_slate(&update.added, &hive_id)?;
+		Ok((added, removed))
 	}
 
 	/// Draws one balancer pick over `entries` and guards the untrusted index.
@@ -729,10 +811,10 @@ pub trait Cluster: Sized + Send + Sync {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::TransportError`] -- `bind_addr` or `edge_bind_addr`
-	///   does not parse, or an accept plane fails to bind.
-	/// - [`TightBeamError::ClusterError`] -- the gateway beats from a wildcard
-	///   bind with no advertise address.
+	/// - [`TightBeamError::TransportError`] -- an accept plane fails to bind.
+	/// - [`TightBeamError::ClusterError`] -- `bind_addr` or `edge_bind_addr`
+	///   does not parse ([`ClusterError::InvalidAddress`]), or the gateway
+	///   beats from a wildcard bind with no advertise address.
 	/// - [`TightBeamError`] -- the trace collector refuses an export-posture warning.
 	fn start(
 		trace: Arc<TraceCollector>,
@@ -1002,19 +1084,20 @@ mod tests {
 		Ok(())
 	}
 
-	// An empty client-validator list is server authentication only, and a
-	// named validator demands a client certificate.
+	// The config keeps the client authentication its operator named, so an
+	// anonymous plane and a mutual plane each come back as named (CWE-1188).
 	tb_cases! {
-		fn the_client_validator_list_decides_client_authentication(
-			(validators, requires_certificate): (Vec<Arc<dyn CertificateValidation>>, bool)
-		) {
-			let tls = test_tls_config().with_client_validators(validators);
-			let authentication = tls.peer_authentication();
-			assert_eq!(authentication.requires_certificate(), requires_certificate);
+		fn a_cluster_config_keeps_the_authentication_it_was_given(
+			(authentication, requires_certificate): (PeerAuthentication, bool)
+		) -> Result<(), ClusterError> {
+			let tls = test_tls_config().with_client_authentication(authentication);
+			let kept = tls.peer_authentication();
+			assert_eq!(kept.requires_certificate(), requires_certificate);
+			Ok(())
 		}
 		cases {
-			no_validators => (Vec::new(), false),
-			one_validator => (vec![Arc::new(ExpiryValidator) as Arc<dyn CertificateValidation>], true),
+			anonymous => (PeerAuthentication::Anonymous, false),
+			mutual => (PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator)), true),
 		}
 	}
 
@@ -1079,6 +1162,22 @@ mod tests {
 		// The clamp is a ceiling, so an operator who asks to refresh more often
 		// than the window gets the interval they asked for.
 		assert_eq!(config.rumor_refresh(), Duration::from_millis(300));
+	}
+
+	// A relay trail outlives three missed refreshes, and an aggressive
+	// refresh keeps the default interval as its floor.
+	tb_cases! {
+		fn a_relay_trail_ttl_is_three_refreshes_floored_at_the_default(
+			(refresh, ttl): (Duration, Duration)
+		) -> Result<(), ClusterError> {
+			let config = config_refreshing(refresh, Duration::from_secs(120));
+			assert_eq!(config.relay_trail_ttl(), ttl);
+			Ok(())
+		}
+		cases {
+			three_refreshes => (Duration::from_secs(20), Duration::from_secs(60)),
+			floored_at_the_default => (Duration::from_secs(5), Duration::from_secs(30)),
+		}
 	}
 
 	#[test]

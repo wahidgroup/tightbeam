@@ -432,7 +432,7 @@ tb_scenario! {
 				.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
 
 			assert_eq!(stored.receipt().budgets, REQUEST, "the receipt must state the requested budgets");
-			assert_eq!(stored.receipt().credit_unit, settings.credit_unit, "the receipt must state the negotiated credit unit");
+			assert_eq!(stored.receipt().credit_unit, settings.credit_unit().get(), "the receipt must state the negotiated credit unit");
 
 			let challenge = stored.receipt().ancillary.as_ref().map(OctetString::as_bytes);
 			let answer = stored.ancillary_response().map(OctetString::as_bytes);
@@ -773,7 +773,9 @@ tb_assert_spec! {
 	}
 }
 
-// Silence is never consent to a settlement demand.
+// A client with no receipt approver refuses a settlement challenge with
+// `SETTLEMENT_UNSUPPORTED_CODE`, and the server never activates, so silence is
+// never consent to a settlement demand.
 tb_scenario! {
 	name: receipt_challenge_without_approver_fails_closed,
 	spec: ReceiptNoApproverSpec,

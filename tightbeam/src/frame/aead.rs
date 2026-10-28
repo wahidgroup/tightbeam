@@ -5,6 +5,7 @@ use crate::core::{Inflator, Message};
 use crate::crypto::aead::{DecryptContent, Decryptor};
 use crate::crypto::secret::SecretSlice;
 use crate::error::Result;
+use crate::frame::Opened;
 use crate::zeroize::Zeroizing;
 use crate::{Frame, TightBeamError};
 
@@ -27,11 +28,10 @@ impl Frame {
 	///
 	/// # Plaintext
 	///
-	/// The plaintext comes back as a [`SecretSlice`] that zeroizes on drop.
-	/// The bytes of a compressed frame come back compressed, and the caller
-	/// decompresses them separately. A caller who must own the bytes takes
-	/// them through [`ToInsecure::to_insecure`], a buffer that also wipes on
-	/// drop.
+	/// The plaintext is a [`SecretSlice`] that zeroizes on drop. The bytes of a
+	/// compressed frame stay compressed, so the caller decompresses them. A
+	/// caller who must own the bytes takes them through
+	/// [`ToInsecure::to_insecure`], a buffer that also wipes on drop.
 	///
 	/// [`ToInsecure::to_insecure`]: crate::crypto::secret::ToInsecure::to_insecure
 	///
@@ -47,11 +47,10 @@ impl Frame {
 			.take()
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
-		let (arrived, envelope) = sealed.into_parts();
 		// The encrypted content lives in the message field, so it moves out
 		// with no copy and decrypts in place.
 		let mut content = Zeroizing::new(mem::take(&mut self.message));
-		decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+		decryptor.decrypt_content(&sealed, &mut content).await?;
 		Ok(SecretSlice::from(mem::take(&mut *content)))
 	}
 
@@ -59,7 +58,9 @@ impl Frame {
 	/// typed message `T`.
 	///
 	/// It combines [`Frame::decrypt_in_place`] and [`crate::decode`]. A
-	/// compressed body requires an `inflator`.
+	/// compressed body requires an `inflator`. The [`Opened`] drops with the
+	/// frame, so a caller that names the signer after the open calls
+	/// [`Frame::decrypt_in_place`].
 	///
 	/// # Errors
 	///
@@ -76,7 +77,9 @@ impl Frame {
 	where
 		T: Message,
 	{
-		self.decrypt_in_place(decryptor, inflator).await?;
+		// The typed message is the one product, so the digest and the
+		// signature the open takes out drop with the frame.
+		let _opened = self.decrypt_in_place(decryptor, inflator).await?;
 		crate::decode::<T>(&self.message)
 	}
 
@@ -85,11 +88,11 @@ impl Frame {
 	///
 	/// # Verify first
 	///
-	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted body,
-	/// and the decrypt leaves them untouched. Verify them *before* the call
-	/// ([`Frame::verify_frame_integrity`], [`Frame::verify`]), because they
-	/// fail on the cleartext. The message commitment in `metadata.integrity`
-	/// is the check that survives decryption ([`Frame::verify_commitment_of`]).
+	/// Frame-level `integrity` and `nonrepudiation` fail on the cleartext, so
+	/// verify them *before* the call ([`Frame::verify_frame_integrity`],
+	/// [`Frame::verify`]). The decrypt moves both into the [`Opened`] it
+	/// returns. The message commitment in `metadata.integrity` is the check
+	/// that survives decryption ([`Frame::verify_commitment_of`]).
 	///
 	/// # Errors
 	///
@@ -100,7 +103,7 @@ impl Frame {
 		&mut self,
 		decryptor: &(impl Decryptor + ?Sized),
 		inflator: Option<&(dyn Inflator + Sync)>,
-	) -> Result<()> {
+	) -> Result<Opened> {
 		let Some(sealed) = self.metadata.confidentiality.as_ref() else {
 			return Err(TightBeamError::MissingEncryptionInfo);
 		};
@@ -119,20 +122,19 @@ impl Frame {
 			// ciphertext in the frame.
 			Some(inflator) => {
 				let mut compressed = Zeroizing::new(self.message.clone());
-				decryptor.decrypt_content(sealed.value(), sealed.der(), &mut compressed).await?;
+				decryptor.decrypt_content(sealed, &mut compressed).await?;
 				self.message = inflator.decompress(&compressed)?;
 			}
 			// The body opens in the buffer it arrived in, and a refused open
 			// leaves that buffer unchanged (`Decryptor::open`).
 			None => {
-				let opened = decryptor.decrypt_content(sealed.value(), sealed.der(), &mut self.message);
-				opened.await?;
+				decryptor.decrypt_content(sealed, &mut self.message).await?;
 			}
 		}
 
 		self.metadata.confidentiality = None;
 		self.metadata.compactness = None;
-		Ok(())
+		Ok(self.take_opened())
 	}
 
 	/// Encrypt the message body under the AEAD of `P`, and the content key
@@ -148,6 +150,7 @@ impl Frame {
 	/// # Errors
 	///
 	/// - [`TightBeamError::UnsupportedVersion`] -- the frame version predates confidentiality.
+	/// - [`TightBeamError::CoveredBeforeSeal`] -- the frame carries an FI digest or a signature.
 	/// - [`TightBeamError::EnvelopeError`] -- the provider or the envelope refuses to seal.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub async fn encrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<()>
@@ -155,6 +158,7 @@ impl Frame {
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
 		self.ensure_allows(GatedField::Confidentiality)?;
+		self.ensure_uncovered()?;
 
 		// Each step of the seal that can fail runs before the body encrypts in
 		// place, so a refused seal leaves the frame unchanged. The DER length
@@ -174,16 +178,39 @@ impl Frame {
 	/// it:
 	///
 	/// 1. holds the envelope of the `confidentiality` field to the provider's key and the AEAD of `P`,
-	/// 2. decrypts the message bytes in place with the content key the provider decrypts, and
-	/// 3. clears the `confidentiality` field.
+	/// 2. decrypts the message bytes in place with the content key the provider decrypts,
+	/// 3. clears the `confidentiality` field, and
+	/// 4. takes the FI digest and the signature out of the frame, into the [`Opened`] it returns.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingEncryptionInfo`] -- the frame is not encrypted.
 	/// - [`TightBeamError::EnvelopeError`] -- the envelope names another key or
 	///   another algorithm than the provider's and `P`'s, or fails to open.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::compose;
+	/// use tightbeam::crypto::key::Aes256GcmKeyProvider;
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::testing::TestMessage;
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+	/// # runtime.block_on(async {
+	/// let holder = Aes256GcmKeyProvider::new(vec![0x42; 32], b"example-kek".to_vec())?;
+	/// let message = TestMessage::sample(None);
+	/// let mut frame = compose! { V1: id: "held", order: 1u64, message: message.clone() }?;
+	/// frame.encrypt_with_provider::<DefaultCryptoProvider>(&holder).await?;
+	///
+	/// let _opened = frame.decrypt_with_provider::<DefaultCryptoProvider>(&holder).await?;
+	/// assert_eq!(tightbeam::decode::<TestMessage>(frame.message())?, message);
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-	pub async fn decrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<()>
+	pub async fn decrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<Opened>
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
@@ -202,7 +229,7 @@ impl Frame {
 		opened.await?;
 		self.metadata.confidentiality = None;
 
-		Ok(())
+		Ok(self.take_opened())
 	}
 }
 
@@ -239,14 +266,17 @@ mod tests {
 		use crate::asn1::{AuthEnvelopedData, WireDer};
 		use crate::cms::compressed_data::CompressedData;
 		use crate::cms::content_info::CmsVersion;
+		use crate::cms::enveloped_data::OriginatorInfo;
 		use crate::cms::signed_data::EncapsulatedContentInfo;
 		use crate::crypto::cms::EnvelopeError;
 		use crate::crypto::key::{Aes256GcmKeyProvider, KeyError};
 		use crate::crypto::secret::ToInsecure;
-		use crate::der::{AnyRef, Decode, ErrorKind, Tag};
+		use crate::der::asn1::{Null, ObjectIdentifier, SetOfVec};
+		use crate::der::{Any, AnyRef, Decode, ErrorKind, Tag, TagNumber};
 		use crate::error::ReceivedExpectedError;
 		use crate::oids::{COMPRESSION_ZSTD, DATA};
 		use crate::spki::AlgorithmIdentifier;
+		use crate::x509::attr::Attribute;
 
 		fn encrypted_frame() -> Result<Frame> {
 			let message = TestMessage::sample(Some("in-place"));
@@ -267,11 +297,38 @@ mod tests {
 			CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info }
 		}
 
+		/// Returns `frame` with `edit` applied to the envelope of its
+		/// `confidentiality` field, which the frame then carries in its DER.
+		fn with_envelope(mut frame: Frame, edit: impl FnOnce(&mut AuthEnvelopedData)) -> Frame {
+			let sealed = frame.metadata.confidentiality.take().expect("the frame is encrypted");
+			let mut envelope = sealed.into_value();
+			edit(&mut envelope);
+			frame.metadata.confidentiality = Some(WireDer::new(envelope).expect("the envelope encodes"));
+			frame
+		}
+
+		/// Returns an `unauthAttrs` of one attribute of one `NULL` value.
+		fn unauthenticated_attributes() -> SetOfVec<Attribute> {
+			let oid = ObjectIdentifier::new_unwrap("1.2.3.4");
+			let value = Any::encode_from(&Null).expect("a NULL encodes");
+			let values = SetOfVec::try_from(vec![value]).expect("a set of one value forms");
+			SetOfVec::try_from(vec![Attribute { oid, values }]).expect("a set of one attribute forms")
+		}
+
+		/// Returns the kind of the DER error that refused an open, or `None`
+		/// for another outcome.
+		fn encoding_refusal<T>(outcome: Result<T>) -> Option<ErrorKind> {
+			match outcome {
+				Err(TightBeamError::EnvelopeError(EnvelopeError::Encoding(error))) => Some(error.kind()),
+				_ => None,
+			}
+		}
+
 		#[tokio::test]
 		async fn yields_cleartext_frame_with_decodable_body() -> Result<()> {
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let mut frame = encrypted_frame()?;
-			frame.decrypt_in_place(&cipher, None).await?;
+			let _opened = frame.decrypt_in_place(&cipher, None).await?;
 
 			assert!(frame.metadata.confidentiality.is_none());
 
@@ -330,6 +387,36 @@ mod tests {
 			Ok(())
 		}
 
+		/// The tag of a frame covers no `originatorInfo`, so the open refuses
+		/// a frame whose envelope carries one, as a record refuses it
+		/// (RFC 5083 § 2.1).
+		#[tokio::test]
+		async fn a_frame_envelope_that_carries_an_originator_is_refused() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let originator = OriginatorInfo { certs: None, crls: None };
+			let mut frame = with_envelope(encrypted_frame()?, |envelope| envelope.originator_info = Some(originator));
+
+			let refused = frame.decrypt_in_place(&cipher, None).await;
+			let originator_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
+			assert_eq!(encoding_refusal(refused), Some(ErrorKind::Value { tag: originator_tag }));
+			Ok(())
+		}
+
+		/// The tag of a frame covers no `unauthAttrs`, so the open refuses a
+		/// frame whose envelope carries them, as a record refuses them
+		/// (RFC 5083 § 2.1).
+		#[tokio::test]
+		async fn a_frame_envelope_that_carries_unauthenticated_attributes_is_refused() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let attributes = unauthenticated_attributes();
+			let mut frame = with_envelope(encrypted_frame()?, |envelope| envelope.unauth_attrs = Some(attributes));
+
+			let refused = frame.decrypt_in_place(&cipher, None).await;
+			let unauth_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N2 };
+			assert_eq!(encoding_refusal(refused), Some(ErrorKind::Value { tag: unauth_tag }));
+			Ok(())
+		}
+
 		/// A frame with no compression opens in the buffer its body arrived
 		/// in.
 		#[tokio::test]
@@ -338,7 +425,7 @@ mod tests {
 			let mut frame = encrypted_frame()?;
 			let arrived = frame.message().as_ptr();
 
-			frame.decrypt_in_place(&cipher, None).await?;
+			let _opened = frame.decrypt_in_place(&cipher, None).await?;
 			assert_eq!(frame.message().as_ptr(), arrived);
 			Ok(())
 		}
@@ -468,7 +555,7 @@ mod tests {
 			assert!(frame.metadata.confidentiality.is_some());
 			assert_ne!(frame.message, original_message_bytes);
 
-			frame.decrypt_with_provider::<DefaultCryptoProvider>(&provider).await?;
+			let _opened = frame.decrypt_with_provider::<DefaultCryptoProvider>(&provider).await?;
 			assert!(frame.metadata.confidentiality.is_none());
 			assert_eq!(frame.message, original_message_bytes);
 			Ok(())
@@ -661,6 +748,127 @@ mod tests {
 				Err(TightBeamError::EnvelopeError(EnvelopeError::ContentEncryptionAlgorithm))
 			));
 			assert_eq!(frame, original);
+			Ok(())
+		}
+	}
+
+	#[cfg(all(
+		feature = "aes-gcm",
+		feature = "secp256k1",
+		feature = "signature",
+		feature = "tokio"
+	))]
+	mod opened {
+		use super::*;
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::testing::TestIdentity;
+
+		/// Returns an encrypted frame that carries an FI digest and a
+		/// signature, both over the frame as it was sealed.
+		fn signed_encrypted_frame() -> Result<Frame> {
+			let message = TestMessage::sample(Some("opened"));
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+			compose! {
+				V1: id: "opened-001",
+					order: 1u64,
+					message: message,
+					confidentiality: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signer,
+					frame_integrity: type Sha3_256
+			}
+		}
+
+		/// The digest and the signature cover the frame as it arrived, so the
+		/// open takes both out of the frame.
+		#[tokio::test]
+		async fn an_opened_frame_carries_no_integrity_or_signature() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let mut frame = signed_encrypted_frame()?;
+
+			let _opened = frame.decrypt_in_place(&cipher, None).await?;
+			assert_eq!((frame.integrity(), frame.nonrepudiation()), (None, None));
+			Ok(())
+		}
+
+		/// The open returns the signature it took out, for a caller that names
+		/// the signer after the open.
+		#[tokio::test]
+		async fn decrypt_in_place_returns_the_signature_it_took_out() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let mut frame = signed_encrypted_frame()?;
+			let signature = frame.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignatureInfo)?;
+
+			let opened = frame.decrypt_in_place(&cipher, None).await?;
+			assert_eq!(opened.nonrepudiation(), Some(&signature));
+			Ok(())
+		}
+
+		/// The signature covers the frame as it is before the seal, so the seal
+		/// refuses a signed frame and leaves it unchanged.
+		#[tokio::test]
+		async fn a_frame_that_carries_a_signature_is_refused_at_the_seal() -> Result<()> {
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+			let mut frame = compose! {
+				V1: id: "seal-signed",
+					order: 1u64,
+					message: message,
+					nonrepudiation<Secp256k1Signature, _>: signer
+			}?;
+			let original = frame.clone();
+
+			let result = frame.encrypt_with_provider::<DefaultCryptoProvider>(&cipher).await;
+			assert!(matches!(result, Err(TightBeamError::CoveredBeforeSeal)));
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		/// The FI digest covers the metadata as it is before the seal, so the
+		/// seal refuses a digested frame and leaves it unchanged.
+		#[tokio::test]
+		async fn a_frame_that_carries_a_digest_is_refused_at_the_seal() -> Result<()> {
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let mut frame = compose! {
+				V1: id: "seal-digested",
+					order: 1u64,
+					message: message,
+					frame_integrity: type Sha3_256
+			}?;
+			let original = frame.clone();
+
+			let result = frame.encrypt_with_provider::<DefaultCryptoProvider>(&cipher).await;
+			assert!(matches!(result, Err(TightBeamError::CoveredBeforeSeal)));
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		/// The open returns the FI digest it took out.
+		#[tokio::test]
+		async fn decrypt_in_place_returns_the_digest_it_took_out() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let mut frame = signed_encrypted_frame()?;
+			let digest = frame.integrity().cloned().ok_or(TightBeamError::MissingDigestInfo)?;
+
+			let opened = frame.decrypt_in_place(&cipher, None).await?;
+			assert_eq!(opened.integrity(), Some(&digest));
+			Ok(())
+		}
+
+		/// The open through a key provider moves the signature out of the
+		/// frame and into the product it returns.
+		#[tokio::test]
+		async fn a_provider_open_moves_the_signature_out_of_the_frame() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let mut frame = signed_encrypted_frame()?;
+			let signature = frame.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignatureInfo)?;
+
+			let opened = frame.decrypt_with_provider::<DefaultCryptoProvider>(&cipher).await?;
+			assert_eq!((frame.nonrepudiation(), opened.nonrepudiation()), (None, Some(&signature)));
 			Ok(())
 		}
 	}

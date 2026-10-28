@@ -387,6 +387,7 @@ fn hpke_endpoints(
 	policy: Arc<dyn CertificateValidation>,
 ) -> (HouseClient<Hpke>, HouseServer<Hpke>) {
 	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let trust = trust.expect("an outside certificate encodes");
 	let client = hpke_client(LearnedTrust::new(trust));
 	let client = Handshake::client(client.with_server_policy([policy]));
 	(client, hpke_server(server))
@@ -472,8 +473,7 @@ async fn an_outside_policy_refuses_an_hpke_server_it_does_not_pin() -> Result<()
 }
 
 /// An HPKE client anchored on the outside store admits the server whose
-/// certificate the store pins, through the path validation the store
-/// defines.
+/// certificate the store pins, through the path validation the store defines.
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
 async fn an_outside_store_anchors_an_hpke_client_on_the_server_it_pins() -> Result<(), HandshakeError> {
@@ -550,7 +550,7 @@ async fn an_outside_store_admits_the_client_it_pins_beside_its_presented_issuers
 	let chain = TestCertificate::insecure_fixed_chain()?;
 	let identity = TestIdentity::presenting(chain.leaf.to_owned(), &chain.leaf_key).with_chain([chain.intermediate])?;
 	let server = TestIdentity::of(&TestKey::insecure_fixed_signing());
-	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()])?;
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(trust));
 	settings.identity = Some(identity);
 
@@ -558,7 +558,7 @@ async fn an_outside_store_admits_the_client_it_pins_beside_its_presented_issuers
 	let mut server = hpke_server_config(server);
 	let validator: Arc<dyn CertificateValidation> = Arc::new(PinningTrust::of(vec![chain.leaf.to_owned()]));
 
-	server.peer_authentication = PeerAuthentication::mutual([validator]);
+	server.peer_authentication = PeerAuthentication::Anonymous.and(validator);
 
 	let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
 	let reply = server.reply(client.start()?).await?;

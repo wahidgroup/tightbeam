@@ -1,7 +1,7 @@
 //! Multi-input key derivation functions for hybrid key agreement.
 //!
-//! The module holds KDF primitives for protocols that combine two or more
-//! shared secrets, for example ECDH with a KEM in PQXDH.
+//! The primitives serve protocols that combine two or more shared secrets,
+//! such as ECDH with a KEM in PQXDH.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -12,38 +12,14 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::mem::size_of;
 
-use crate::crypto::kdf::KdfFunction;
+use crate::crypto::kdf::{KdfFunction, KdfSalt};
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::error::HandshakeError;
 use crate::zeroize::Zeroizing;
 use crate::ZeroizingBytes;
 
-/// The per-session randomness mixed into the KDF extract step.
-///
-/// HKDF takes a salt and a label, and both arrive as bytes. A caller that
-/// holds them as two slices can exchange them and still compile, so each
-/// role travels as its own type and an exchange of the two fails to
-/// compile.
-///
-/// # Sources
-///
-/// - RFC 5869 § 2.2, the extract step and its salt:
-///   <https://datatracker.ietf.org/doc/html/rfc5869#section-2.2>
-#[derive(Clone, Copy, Debug)]
-pub struct KdfSalt<'a>(&'a [u8]);
-
-impl<'a> KdfSalt<'a> {
-	/// Wraps `salt` as the salt for one derivation.
-	pub fn new(salt: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
-		Self(salt.as_ref())
-	}
-
-	/// The salt bytes, for the provider call that consumes them.
-	#[must_use]
-	pub fn as_bytes(&self) -> &'a [u8] {
-		self.0
-	}
-}
+#[cfg(any(feature = "transport-hpke", mux_rekey))]
+use crate::crypto::kdf::KdfError;
 
 /// The salt of a key derivation over the handshake randoms,
 /// `client_random || server_random`.
@@ -66,9 +42,12 @@ impl RandomsSalt {
 	}
 
 	/// This salt as the [`KdfSalt`] of one derivation.
-	#[must_use]
-	pub(crate) fn as_kdf_salt(&self) -> KdfSalt<'_> {
-		KdfSalt::new(self.0.as_slice())
+	///
+	/// # Errors
+	///
+	/// - [`KdfError::SaltTooShort`] -- the two randoms are shorter than the salt floor.
+	pub(crate) fn as_kdf_salt(&self) -> Result<KdfSalt<'_>, KdfError> {
+		KdfSalt::try_from(self.0.as_slice())
 	}
 }
 
@@ -124,9 +103,8 @@ impl fmt::Debug for KdfStage<'_> {
 /// Multi-input HKDF: the provider KDF over the length-prefixed concatenation
 /// of the secrets.
 ///
-/// This function prefixes each input with its length as a big-endian `u32`,
-/// so the concatenation is unambiguous (for example "ab"+"cd" against
-/// "abc"+"d").
+/// Each input carries its length as a big-endian `u32` prefix, so the
+/// concatenation is unambiguous ("ab"+"cd" against "abc"+"d").
 ///
 /// # Errors
 ///
@@ -141,21 +119,15 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 ) -> Result<ZeroizingBytes, HandshakeError> {
 	let combined = length_prefixed_inputs(inputs)?;
 
-	Ok(P::Kdf::derive_dynamic_key(
-		&combined,
-		info.as_bytes(),
-		Some(salt.as_bytes()),
-		key_size,
-	)?)
+	Ok(P::Kdf::derive_dynamic_key(&combined, info.as_bytes(), Some(salt), key_size)?)
 }
 
 /// Concatenates the inputs, each behind its length prefix, into one wiping
 /// buffer.
 ///
 /// [`multi_input_kdf`] states the framing. The buffer holds secret material,
-/// so this function reserves it at its final length before the first byte
-/// lands. The buffer then allocates once, and no reallocation frees an
-/// unwiped copy on the way (CWE-226).
+/// so it is reserved at its final length before the first byte lands. It
+/// allocates once, and no reallocation frees an unwiped copy (CWE-226).
 ///
 /// # Errors
 ///
@@ -190,6 +162,8 @@ fn length_prefixed_inputs(inputs: &[&[u8]]) -> Result<Zeroizing<Vec<u8>>, Handsh
 /// # Errors
 ///
 /// - [`HandshakeError::KdfError`] -- the KDF refused a stage.
+/// - [`HandshakeError::InsufficientSaltEntropy`] -- a stage derived fewer
+///   bytes than the salt floor that the next stage reads.
 pub fn kdf_chain<P: CryptoProvider>(
 	stages: &[KdfStage<'_>],
 	initial_salt: KdfSalt<'_>,
@@ -202,7 +176,8 @@ pub fn kdf_chain<P: CryptoProvider>(
 	// `Zeroizing` buffer that wipes it before the allocator reuses it.
 	let mut current = Zeroizing::new(initial_salt.as_bytes().to_vec());
 	for stage in stages {
-		current = P::Kdf::derive_dynamic_key(stage.input, stage.info.as_bytes(), Some(&current), 32)?;
+		let salt = KdfSalt::try_from(current.as_slice())?;
+		current = P::Kdf::derive_dynamic_key(stage.input, stage.info.as_bytes(), Some(salt), 32)?;
 	}
 
 	Ok(current)
@@ -218,7 +193,7 @@ mod tests {
 		let input1 = [0x42u8; 32];
 		let input2 = [0x99u8; 32];
 		let salt_bytes = [0xAAu8; 32];
-		let salt = KdfSalt::new(&salt_bytes);
+		let salt = KdfSalt::try_from(salt_bytes.as_slice())?;
 		let info = KdfInfo::new(b"test-info");
 
 		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], salt, info, 32);
@@ -231,15 +206,16 @@ mod tests {
 	}
 
 	#[test]
-	fn test_multi_input_kdf_different_lengths() {
+	fn test_multi_input_kdf_different_lengths() -> Result<(), Box<dyn core::error::Error>> {
 		let input1 = [0x42u8; 16];
 		let input2 = [0x99u8; 48];
 		let salt_bytes = [0xAAu8; 32];
-		let salt = KdfSalt::new(&salt_bytes);
+		let salt = KdfSalt::try_from(salt_bytes.as_slice())?;
 		let info = KdfInfo::new(b"test-info");
 
 		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], salt, info, 32);
 		assert!(result.is_ok());
+		Ok(())
 	}
 
 	#[test]
@@ -250,7 +226,7 @@ mod tests {
 		let first = KdfStage { input: &input1, info: KdfInfo::new(b"stage1") };
 		let second = KdfStage { input: &input2, info: KdfInfo::new(b"stage2") };
 
-		let result = kdf_chain::<DefaultCryptoProvider>(&[first, second], KdfSalt::new(&initial_salt));
+		let result = kdf_chain::<DefaultCryptoProvider>(&[first, second], KdfSalt::try_from(initial_salt.as_slice())?);
 		assert!(result.is_ok());
 
 		let key = result?;
@@ -260,13 +236,14 @@ mod tests {
 	}
 
 	#[test]
-	fn test_kdf_chain_single_stage() {
+	fn test_kdf_chain_single_stage() -> Result<(), Box<dyn core::error::Error>> {
 		let input = [0x42u8; 32];
 		let salt = [0xAAu8; 32];
 
 		let only = KdfStage { input: &input, info: KdfInfo::new(b"single") };
-		let result = kdf_chain::<DefaultCryptoProvider>(&[only], KdfSalt::new(&salt));
+		let result = kdf_chain::<DefaultCryptoProvider>(&[only], KdfSalt::try_from(salt.as_slice())?);
 		assert!(result.is_ok());
+		Ok(())
 	}
 
 	/// [`length_prefixed_inputs`] allocates the combined buffer once at its

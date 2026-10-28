@@ -1,4 +1,5 @@
-//! Worker macros: name, config, policies, and handler wiring over [`crate::colony::worker::WorkerRuntime`].
+//! Worker macros: name, config, policies, and handler wiring over
+//! [`crate::colony::worker::WorkerRuntime`].
 
 #[macro_export]
 macro_rules! worker {
@@ -169,21 +170,12 @@ macro_rules! worker {
 				self.runtime.relay(message)
 			}
 
-			fn kill(self) -> $crate::colony::worker::WorkerKillFuture {
+			fn kill(&self) -> $crate::colony::worker::WorkerKillFuture {
 				self.runtime.kill()
 			}
 
 			fn queue_capacity(&self) -> usize {
 				self.runtime.queue_capacity()
-			}
-		}
-
-		impl $crate::colony::worker::WorkerMetadata for $worker_name {
-			fn name() -> &'static str {
-				// module_path! resolves at the macro call site, so workers
-				// with the same ident in different modules cannot collide
-				// in a servlet's registration map.
-				concat!(module_path!(), "::", stringify!($worker_name))
 			}
 		}
 	};

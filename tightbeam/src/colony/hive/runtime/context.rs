@@ -6,9 +6,7 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWrite
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::{ColonyDialProtocol, DialTarget};
-use crate::colony::hive::{
-	CallFuture, DuplexOpenFuture, HiveContext, ServletRegistry, StreamOpenFuture, StreamResponseFuture,
-};
+use crate::colony::hive::{CallFuture, DuplexOpenFuture, HiveContext, StreamOpenFuture, StreamResponseFuture};
 use crate::router::RouterError;
 use crate::trace::TraceCollector;
 use crate::transport::client::ConnectionPool;
@@ -31,7 +29,7 @@ impl Sibling {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`BoundDial::connect`], as [`TightBeamError::ClusterError`].
+	/// - [`TightBeamError::ClusterError`] -- an error of [`BoundDial::connect`].
 	async fn connect<P: ColonyDialProtocol>(self, plane: &SiblingPlane<P>) -> Result<PooledClient<P>, TightBeamError> {
 		let target = DialTarget::of_registered(&self.address);
 		let dial = BoundDial::new(target, ExpectedSigner::Hive(self.signer));
@@ -299,26 +297,6 @@ impl<P: Protocol> HiveContextImpl<P> {
 		self.routes().resolve(&type_key).is_some()
 	}
 
-	/// Adds a route to every instance already in `servlets` that names a
-	/// signer.
-	///
-	/// Registration fills the registry before the hive starts, so the routes
-	/// catch up in one pass at start.
-	pub(crate) fn seed_routes(&self, servlets: &impl ServletRegistry) {
-		servlets.for_each(|key, reg| {
-			// A sibling's dial admits a servlet's answer by its signer alone,
-			// so a servlet that names none gets no route (CWE-346).
-			let Some(signer) = reg.servlet.signer() else {
-				return;
-			};
-
-			let addr_bytes = reg.servlet.addr_bytes();
-			let type_key = reg.servlet_type.canonical_bytes();
-			// `for_each` lends the key, and `add_route` needs an owned copy.
-			self.add_route(key.clone(), addr_bytes, signer.clone(), &type_key);
-		});
-	}
-
 	/// Returns the sibling this hive routes `servlet_type` to.
 	///
 	/// # Errors
@@ -375,15 +353,10 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::hive::{HashMapRegistry, ServletBox, ServletRegistration, SpawnerFn};
 	use crate::colony::protocol::ServletInfo;
-	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::utils::CertificateExt;
-	use crate::tb_cases;
 	use crate::testing::TestCertificate;
-	use crate::transport::client::ConnectionBuilder;
-	use crate::transport::TokioListener;
 	use std::sync::mpsc;
 	use std::thread;
 	use std::time::Duration;
@@ -495,69 +468,6 @@ mod tests {
 
 		for _ in 0..2 {
 			assert!(finished.recv_timeout(Duration::from_secs(10)).is_ok());
-		}
-	}
-
-	/// A servlet at a fixed locator that names `signer` as the identity it
-	/// answers under.
-	struct SignerProbe {
-		signer: Option<SignerIdentifier>,
-	}
-
-	impl ServletBox for SignerProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7005".as_slice())
-		}
-
-		fn stop_boxed(self: Box<Self>) {}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			self.signer.as_ref()
-		}
-	}
-
-	/// Returns the type the seeded registry holds.
-	fn echo_type() -> Urn<'static> {
-		let namespace = ColonyNamespace::default();
-		namespace.servlet("echo").expect("test names satisfy the mint grammar")
-	}
-
-	/// Returns the spawner of a [`SignerProbe`] that names no signer.
-	fn probe_spawner() -> SpawnerFn {
-		Arc::new(|_| Box::pin(async { Ok(Box::new(SignerProbe { signer: None }) as Box<dyn ServletBox>) }))
-	}
-
-	/// Builds a registry that holds one [`SignerProbe`] of [`echo_type`] that
-	/// names `signer`.
-	fn registry_holding(signer: Option<SignerIdentifier>) -> HashMapRegistry {
-		let servlet_type = echo_type();
-		let key = servlet_type.instance_urn(b"127.0.0.1:7005");
-		let key = key.expect("the probe locator names an instance");
-		let spawner = probe_spawner();
-		let registration = ServletRegistration { servlet: Box::new(SignerProbe { signer }), spawner, servlet_type };
-
-		let registry = HashMapRegistry::default();
-		let inserted = registry.insert(key.canonical_bytes(), registration);
-		assert!(inserted.is_ok(), "the map registry takes every registration");
-
-		registry
-	}
-
-	// A sibling's dial admits a servlet's answer by its signer alone, so the
-	// routes a hive seeds at start route a servlet that names its signer and
-	// leave out one that names none.
-	tb_cases! {
-		fn seed_routes_route_a_servlet_by_its_signer((signer, routed): (Option<SignerIdentifier>, bool)) {
-			let servlets = registry_holding(signer);
-			let routes = HiveContextImpl::new(Arc::new(ConnectionPool::<TokioListener>::builder().build()));
-
-			routes.seed_routes(&servlets);
-
-			assert_eq!(routes.resolves(&echo_type()), routed);
-		}
-		cases {
-			a_signed_servlet_is_routed => (Some(ServletInfo::fixture_signer()), true),
-			an_unsigned_servlet_is_left_out => (None, false),
 		}
 	}
 }

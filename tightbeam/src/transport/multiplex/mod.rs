@@ -161,8 +161,8 @@ pub struct StreamRoute {
 }
 
 /// The default route is unrouted and carries the origin relay budget, so DER
-/// omits both fields. An open stamped with it encodes the same as an unrouted
-/// local open, so the routed and unrouted open paths share one wire shape.
+/// omits both fields and the routed and unrouted open paths share one wire
+/// shape.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 impl Default for StreamRoute {
 	fn default() -> Self {
@@ -218,9 +218,9 @@ impl StreamRoute {
 		self.target.as_ref()
 	}
 
-	/// Returns the relay budget left on this open: the gateway forwards the
-	/// stream has left. A gateway serves a stream at `0` locally, so its relay
-	/// ends there.
+	/// Returns the relay budget left on this open, as a count of gateway
+	/// forwards. A gateway serves a stream at `0` locally, so its relay ends
+	/// there.
 	pub fn hops_remaining(&self) -> u8 {
 		self.hops_remaining
 	}
@@ -533,10 +533,12 @@ pub trait MuxAcceptor: MuxCapable {
 	}
 
 	/// Returns the authenticated peer context of the completed handshake, which
-	/// the transport snapshots before it splits. The default is empty.
-	fn session_context(&self) -> SessionContext {
-		SessionContext::default()
-	}
+	/// the transport snapshots before it splits, so the gate of each served
+	/// stream evaluates the peer it names.
+	///
+	/// A transport that authenticates no peer returns
+	/// `SessionContext::default()`, and its documentation says so.
+	fn session_context(&self) -> SessionContext;
 
 	/// Consumes the transport into its collector gate and its envelope halves.
 	///
@@ -558,8 +560,8 @@ pub trait MuxAcceptor: MuxCapable {
 	/// - A handler that fails with an error of its own closes its stream with
 	///   the failure's mapped status, which the trail records as
 	///   `HANDLER_FAILED`.
-	/// - A [`MuxService`] default refuses its kind, which answers
-	///   `Unimplemented` and the trail records as `MUX_STREAM_REFUSED`.
+	/// - A [`MuxService`] default refuses its kind with `Unimplemented`, which
+	///   the trail records as `MUX_STREAM_REFUSED`.
 	/// - A fault the trace injects at the verdict of the gate, or at the entry
 	///   of a handler, closes its stream as `Internal`.
 	///
@@ -636,7 +638,7 @@ pub trait MuxAcceptor: MuxCapable {
 /// request bodies and duplex replies over individual mux streams.
 ///
 /// It is a separate trait because the sink and body types live in the router
-/// plane, and so a unary caller needs the base trait alone.
+/// plane, so a unary caller needs the base trait alone.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait StreamingProtocol: MultiplexedProtocol {
 	/// Opens a streamed request. The caller pushes chunks through the sink and

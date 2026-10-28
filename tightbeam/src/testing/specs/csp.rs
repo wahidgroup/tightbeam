@@ -198,16 +198,15 @@ impl Observation {
 /// - The nondeterministic choice points.
 /// - The timing constraints for real-time verification, when the process has them.
 ///
-/// It is `#[non_exhaustive]`, because [`ProcessBuilder`] alone establishes the
-/// invariants between the fields.
+/// [`ProcessBuilder`] alone establishes the invariants between the fields,
+/// so a built process lends each part through a reader.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct Process {
 	/// The human-readable name of the process.
-	pub name: &'static str,
+	pub(crate) name: &'static str,
 
 	/// What this process is evidence of, as the code that builds it sets it.
-	pub observation: Observation,
+	pub(crate) observation: Observation,
 
 	/// Whether a run that records no event in this alphabet is a violation.
 	///
@@ -215,49 +214,49 @@ pub struct Process {
 	/// check would hold whatever the run did. A process requires progress,
 	/// unless [`ProcessBuilder::permits_no_progress`] lifts the rule for a
 	/// process that models a run with no event.
-	pub requires_progress: bool,
+	pub(crate) requires_progress: bool,
 
 	/// The state the process starts in.
-	pub initial: State,
+	pub(crate) initial: State,
 
 	/// Every state of the process.
-	pub states: HashSet<State>,
+	pub(crate) states: HashSet<State>,
 
 	/// The terminal (accepting) states. One with no enabled action is a STOP.
-	pub terminal: HashSet<State>,
+	pub(crate) terminal: HashSet<State>,
 
 	/// The nondeterministic choice points, where one event may lead to more
 	/// than one state.
-	pub choice: HashSet<State>,
+	pub(crate) choice: HashSet<State>,
 
 	/// The observable alphabet (Σ) of external events.
-	pub observable: HashSet<Event>,
+	pub(crate) observable: HashSet<Event>,
 
 	/// The hidden alphabet (τ) of internal events.
-	pub hidden: HashSet<Event>,
+	pub(crate) hidden: HashSet<Event>,
 
 	/// The transition relation of the untimed transitions.
-	pub transitions: TransitionRelation,
+	pub(crate) transitions: TransitionRelation,
 
 	/// The description of the process, when its spec gives one.
-	pub description: Option<&'static str>,
+	pub(crate) description: Option<&'static str>,
 
 	/// The timing constraints that real-time verification checks.
 	#[cfg(feature = "testing-timing")]
-	pub timing_constraints: Option<TimingConstraints>,
+	pub(crate) timing_constraints: Option<TimingConstraints>,
 
 	/// The timed transitions, keyed by the source state and the event.
 	///
 	/// Each one is an edge of the process. Its guard decides when FDR
 	/// exploration takes it.
 	#[cfg(feature = "testing-timing")]
-	pub timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
+	pub(crate) timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
 
 	/// The scheduler and the period of each event for schedulability analysis.
 	/// [`Self::generate_task_set`] combines them with the timing constraints
 	/// into a [`TaskSet`].
 	#[cfg(feature = "testing-schedulability")]
-	pub schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
+	pub(crate) schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
 }
 
 /// The parts of a process that a search of its traces, failures, and
@@ -303,6 +302,222 @@ impl Process {
 	/// Creates a [`ProcessBuilder`] for a process named `name`.
 	pub fn builder(name: &'static str) -> ProcessBuilder {
 		ProcessBuilder::new(name)
+	}
+
+	/// The human-readable name of the process.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.name(), "Send");
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn name(&self) -> &'static str {
+		self.name
+	}
+
+	/// What this process is evidence of, as the code that builds it sets it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Observation, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.observation(), Observation::Model);
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn observation(&self) -> Observation {
+		self.observation
+	}
+
+	/// Whether a run that records no event in this alphabet is a violation.
+	///
+	/// [`ProcessBuilder::permits_no_progress`] lifts the rule for a process
+	/// that models a run with no event.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert!(process.requires_progress());
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn requires_progress(&self) -> bool {
+		self.requires_progress
+	}
+
+	/// The state the process starts in.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.initial(), State("S0"));
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn initial(&self) -> State {
+		self.initial
+	}
+
+	/// Every state of the process.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.states().len(), 2);
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn states(&self) -> &HashSet<State> {
+		&self.states
+	}
+
+	/// The terminal (accepting) states. One with no enabled action is a STOP.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert!(process.terminal().contains(&State("S1")));
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn terminal(&self) -> &HashSet<State> {
+		&self.terminal
+	}
+
+	/// The declared nondeterministic choice points, where one event may lead to
+	/// more than one state.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert!(process.choice().is_empty());
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn choice(&self) -> &HashSet<State> {
+		&self.choice
+	}
+
+	/// The transition relation of the untimed transitions.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.transitions().targets(State("S0"), &Event("send")), Some(&[State("S1")][..]));
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn transitions(&self) -> &TransitionRelation {
+		&self.transitions
+	}
+
+	/// The description of the process, when its spec gives one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert_eq!(process.description(), None);
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	pub fn description(&self) -> Option<&'static str> {
+		self.description
+	}
+
+	/// The timing constraints that real-time verification checks, when the
+	/// process declares them.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let process = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	///
+	/// assert!(process.timing_constraints().is_none());
+	/// # Ok::<(), tightbeam::testing::specs::csp::ProcessBuildError>(())
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	pub fn timing_constraints(&self) -> Option<&TimingConstraints> {
+		self.timing_constraints.as_ref()
 	}
 
 	/// Returns the observable alphabet (Σ).
@@ -1202,7 +1417,7 @@ impl Process {
 		// URN identity, as Hoare's restriction `tr ↾ A` does. A label outside
 		// the alphabet falls outside this specification, so the check drops it.
 		let events: Vec<Event> = trace
-			.assertions
+			.assertions()
 			.iter()
 			.filter_map(|assertion| {
 				let AssertionLabel::Custom(recorded) = &assertion.label;
@@ -1670,8 +1885,8 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
-	use crate::testing::assertions::Assertion;
 	use crate::testing::{ScenarioConfig, SetupEnv};
+	use crate::trace::TraceCollector;
 	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -1815,30 +2030,35 @@ mod tests {
 		Ok(())
 	}
 
-	fn trace_of(labels: &[&'static str]) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		for (seq, label) in labels.iter().enumerate() {
-			trace.assertions.push(Assertion::new(
-				seq,
-				AssertionLabel::Custom(Cow::Borrowed(label)),
-				Vec::new(),
-				None,
-			));
+	const GO: Urn<'static> = crate::urn!("test", "event:csp/go");
+	const X: Urn<'static> = crate::urn!("test", "event:csp/x");
+	const Y: Urn<'static> = crate::urn!("test", "event:csp/y");
+	const A: Urn<'static> = crate::urn!("test", "event:csp/a");
+	const B: Urn<'static> = crate::urn!("test", "event:csp/b");
+	const TAU: Urn<'static> = crate::urn!("test", "event:csp/tau");
+	const TAU_1: Urn<'static> = crate::urn!("test", "event:csp/tau-1");
+	const TAU_2: Urn<'static> = crate::urn!("test", "event:csp/tau-2");
+
+	/// The trace of a run that records each of `labels` once, in order.
+	fn trace_of(labels: &[Urn<'static>]) -> ConsumedTrace {
+		let collector = TraceCollector::new();
+		for label in labels {
+			collector.event(label).expect("the run injects no fault").emit();
 		}
 
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
 	fn branching_process(declared_choice: bool) -> Result<Process, ProcessBuildError> {
 		let builder = Process::builder("Branching")
 			.initial_state(State("S0"))
-			.add_observable(Event("go"))
-			.add_observable(Event("x"))
-			.add_observable(Event("y"))
-			.add_transition(State("S0"), Event("go"), State("S1"))
-			.add_transition(State("S0"), Event("go"), State("S2"))
-			.add_transition(State("S1"), Event("x"), State("T"))
-			.add_transition(State("S2"), Event("y"), State("T"))
+			.add_observable(GO)
+			.add_observable(X)
+			.add_observable(Y)
+			.add_transition(State("S0"), GO, State("S1"))
+			.add_transition(State("S0"), GO, State("S2"))
+			.add_transition(State("S1"), X, State("T"))
+			.add_transition(State("S2"), Y, State("T"))
 			.add_terminal(State("T"));
 
 		if declared_choice {
@@ -1851,8 +2071,8 @@ mod tests {
 	#[test]
 	fn declared_choice_validates_both_branches() -> Result<(), ProcessBuildError> {
 		let proc = branching_process(true)?;
-		let via_first = proc.validate_trace(&trace_of(&["go", "x"]));
-		let via_second = proc.validate_trace(&trace_of(&["go", "y"]));
+		let via_first = proc.validate_trace(&trace_of(&[GO, X]));
+		let via_second = proc.validate_trace(&trace_of(&[GO, Y]));
 		assert!(via_first.valid);
 		assert!(via_second.valid);
 		Ok(())
@@ -1862,14 +2082,14 @@ mod tests {
 	fn tau_transitions_traversed_silently() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("TauBridge")
 			.initial_state(State("S0"))
-			.add_hidden(Event("tau"))
-			.add_observable(Event("a"))
-			.add_transition(State("S0"), Event("tau"), State("S1"))
-			.add_transition(State("S1"), Event("a"), State("T"))
+			.add_hidden(TAU)
+			.add_observable(A)
+			.add_transition(State("S0"), TAU, State("S1"))
+			.add_transition(State("S1"), A, State("T"))
 			.add_terminal(State("T"))
 			.build()?;
 
-		let result = proc.validate_trace(&trace_of(&["a"]));
+		let result = proc.validate_trace(&trace_of(&[A]));
 		assert!(result.valid);
 		Ok(())
 	}
@@ -1878,18 +2098,18 @@ mod tests {
 	fn tau_chain_traversed_across_multiple_hidden_steps() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("TauChain")
 			.initial_state(State("S0"))
-			.add_hidden(Event("tau_1"))
-			.add_hidden(Event("tau_2"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("tau_1"), State("S2"))
-			.add_transition(State("S2"), Event("tau_2"), State("S3"))
-			.add_transition(State("S3"), Event("b"), State("T"))
+			.add_hidden(TAU_1)
+			.add_hidden(TAU_2)
+			.add_observable(A)
+			.add_observable(B)
+			.add_transition(State("S0"), A, State("S1"))
+			.add_transition(State("S1"), TAU_1, State("S2"))
+			.add_transition(State("S2"), TAU_2, State("S3"))
+			.add_transition(State("S3"), B, State("T"))
 			.add_terminal(State("T"))
 			.build()?;
 
-		let result = proc.validate_trace(&trace_of(&["a", "b"]));
+		let result = proc.validate_trace(&trace_of(&[A, B]));
 		assert!(result.valid);
 		Ok(())
 	}
@@ -1897,7 +2117,7 @@ mod tests {
 	#[test]
 	fn undeclared_nondeterminism_is_flagged() -> Result<(), ProcessBuildError> {
 		let proc = branching_process(false)?;
-		let result = proc.validate_trace(&trace_of(&["go", "x"]));
+		let result = proc.validate_trace(&trace_of(&[GO, X]));
 		assert!(!result.valid);
 		assert!(result
 			.violations
@@ -1911,12 +2131,12 @@ mod tests {
 	fn hidden_only_event_in_trace_is_not_enabled() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("HiddenOnly")
 			.initial_state(State("S0"))
-			.add_hidden(Event("tau"))
-			.add_transition(State("S0"), Event("tau"), State("S1"))
+			.add_hidden(TAU)
+			.add_transition(State("S0"), TAU, State("S1"))
 			.add_terminal(State("S1"))
 			.build()?;
 
-		let result = proc.validate_trace(&trace_of(&["tau"]));
+		let result = proc.validate_trace(&trace_of(&[TAU]));
 		assert!(!result.valid);
 		assert!(result
 			.violations

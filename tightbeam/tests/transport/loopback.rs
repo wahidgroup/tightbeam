@@ -40,20 +40,22 @@ fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 	SecurityOffer::new(vec![profile])
 }
 
-/// Probes both directions and returns whether the plaintexts match the
-/// probes.
+/// Probes both directions and returns whether the plaintexts match the probes.
 ///
 /// Each direction has its own key and record sequence, and each record has
 /// its own content key.
-fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKeys) -> Result<bool, TightBeamError> {
+fn bidirectional_roundtrip_ok(
+	client_keys: &mut SessionKeys,
+	server_keys: &mut SessionKeys,
+) -> Result<bool, TightBeamError> {
 	let c2s_probe = b"client->server probe";
 	let mut c2s_record = client_keys.send().encrypt_next(c2s_probe)?.to_der()?;
-	let c2s_plaintext = server_keys.recv().open(&mut c2s_record)?;
+	let c2s_plaintext = server_keys.recv_mut().open(&mut c2s_record)?;
 	let c2s_ok = c2s_plaintext == c2s_probe;
 
 	let s2c_probe = b"server->client probe";
 	let mut s2c_record = server_keys.send().encrypt_next(s2c_probe)?.to_der()?;
-	let s2c_plaintext = client_keys.recv().open(&mut s2c_record)?;
+	let s2c_plaintext = client_keys.recv_mut().open(&mut s2c_record)?;
 	let s2c_ok = s2c_plaintext == s2c_probe;
 
 	Ok(c2s_ok && s2c_ok)
@@ -86,7 +88,9 @@ where
 
 	let client_session = ClientHandshakeProtocol::complete(client).await?;
 	let server_session = ServerHandshakeProtocol::complete(server).await?;
-	let keys_interoperate = bidirectional_roundtrip_ok(client_session.keys(), server_session.keys())?;
+	let mut client_keys = client_session.into_keys();
+	let mut server_keys = server_session.into_keys();
+	let keys_interoperate = bidirectional_roundtrip_ok(&mut client_keys, &mut server_keys)?;
 
 	Ok(Completion {
 		pending_before_completion,
@@ -250,7 +254,7 @@ async fn cms_unique_traffic_keys() -> Result<(), TightBeamError> {
 	let record_a = client_a.keys().send().encrypt_next(probe)?;
 
 	let mut arrived_a = record_a.to_der()?;
-	let isolated = server_b.keys().recv().open(&mut arrived_a).is_err();
+	let isolated = server_b.into_keys().recv_mut().open(&mut arrived_a).is_err();
 	assert!(isolated, "a CMS record of one session must not open under another (CWE-321)");
 
 	Ok(())

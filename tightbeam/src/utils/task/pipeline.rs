@@ -1,8 +1,7 @@
 //! A pipeline engine that orchestrates jobs.
 //!
-//! The `Pipeline` trait covers `Result<T, E>` and the closures that return
-//! one, so a `Result` is itself a pipeline. Jobs compose with standard Rust
-//! code through the familiar `Result` methods.
+//! A `Result<T, E>` and a closure that returns one are each a [`Pipeline`],
+//! so jobs compose with standard Rust code.
 
 #[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
@@ -13,12 +12,14 @@ use crate::error::TightBeamError;
 use crate::trace::TraceCollector;
 #[cfg(any(test, feature = "testing"))]
 use crate::urn::Urn;
+#[cfg(any(test, feature = "testing"))]
+use crate::utils::task::Job;
 
 /// A chain of jobs, with `Result` as the base pipeline.
 ///
-/// The trait is implemented for `Result<T, E>`, so a standard `Result`
-/// composes with jobs. The familiar `Result` methods (`and_then`, `map`,
-/// `or_else`) work as they do on `Result`, and `TracedResult` adds tracing.
+/// `Result<T, E>` implements the trait, so the familiar `Result` methods
+/// (`and_then`, `map`, `or_else`) chain jobs as they do on `Result`, and
+/// `TracedResult` adds tracing.
 pub trait Pipeline: Sized {
 	type Output;
 	type Error;
@@ -108,24 +109,14 @@ where
 	}
 }
 
-/// The job struct name in `type_name`, in snake_case, for trace events.
+/// The snake_case form of `name`, a job name such as `CreateTestFrame`, for
+/// trace events.
 ///
-/// For a `Job::run` path such as `crate::module::CreateTestFrame::run`, the
-/// name is the struct name, the second-to-last segment. Any other path falls
-/// back to its last segment.
-///
-/// For example:
-/// - `suite::jobs::CreateTestFrame::run` becomes `create_test_frame`.
-/// - `my_crate::ValidateConfig::run` becomes `validate_config`.
-/// - `CreateHandshakeRequest` becomes `create_handshake_request`, by the fallback.
+/// Each uppercase letter after the first starts a new word, so
+/// `CreateHandshakeRequest` becomes `create_handshake_request`.
 #[cfg(any(test, feature = "testing"))]
-fn to_snake_case(type_name: impl AsRef<str>) -> String {
-	let type_name = type_name.as_ref();
-	let segments: Vec<&str> = type_name.split("::").collect();
-	let name = match segments.as_slice() {
-		[.., struct_name, "run"] => *struct_name,
-		_ => segments.last().copied().unwrap_or(type_name),
-	};
+fn to_snake_case(name: impl AsRef<str>) -> String {
+	let name = name.as_ref();
 
 	// At worst every char is uppercase: "ABC" becomes "a_b_c", 2n - 1 chars.
 	let capacity = name.len().saturating_mul(2);
@@ -160,8 +151,9 @@ fn make_event_urn(
 
 /// A `Result` with the trace context that job events go to.
 ///
-/// `and_then` emits a start event before each job and a success or error
-/// event after it, under the snake_case form of the job's type name.
+/// [`Self::then_job`] emits a start event before a job and a success or error
+/// event after it, under the snake_case form of [`Job::NAME`]. A closure step
+/// through [`Pipeline::and_then`] chains its result alone.
 #[cfg(any(test, feature = "testing"))]
 pub struct TracedResult<T, E> {
 	result: Result<T, E>,
@@ -182,69 +174,98 @@ impl<T, E> TracedResult<T, E> {
 }
 
 #[cfg(any(test, feature = "testing"))]
-impl<T, E> Pipeline for TracedResult<T, E>
+impl<T, E> TracedResult<T, E>
 where
 	E: From<TightBeamError>,
 {
+	/// Runs the job `J` on the output of this step, and records its start and
+	/// its outcome under the snake_case form of [`Job::NAME`]: the event
+	/// `urn:tightbeam:event:job/<name>-start`, then `-success` or `-error`.
+	///
+	/// A failed step passes its error on, and the job runs on a success alone.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::urn::Urn;
+	/// use tightbeam::utils::task::{Pipeline, PipelineBuilder};
+	/// use tightbeam::{job, TightBeamError};
+	///
+	/// job! {
+	///     name: AddOne,
+	///     fn run((value,): (u32,)) -> Result<u32, TightBeamError> {
+	///         Ok(value.saturating_add(1))
+	///     }
+	/// }
+	///
+	/// const ADD_ONE_START: Urn<'static> = tightbeam::urn!("tightbeam", "event:job/add-one-start");
+	///
+	/// let trace = Arc::new(TraceCollector::new());
+	/// let value = PipelineBuilder::new(Arc::clone(&trace)).start((1u32,)).then_job::<AddOne, _>().run()?;
+	///
+	/// assert_eq!((value, trace.recorded(ADD_ONE_START)), (2, 1));
+	/// # Ok::<(), TightBeamError>(())
+	/// ```
+	pub fn then_job<J, U>(self) -> TracedResult<U, E>
+	where
+		J: Job<Input = T, Output = Result<U, E>>,
+	{
+		let job_name = to_snake_case(J::NAME);
+		let trace = self.trace;
+		let result = self.result.and_then(|input| {
+			Self::record_job_event(&trace, &job_name, "start")?;
+			let outcome = J::run(input);
+			let suffix = if outcome.is_ok() {
+				"success"
+			} else {
+				"error"
+			};
+			Self::record_job_event(&trace, &job_name, suffix)?;
+			outcome
+		});
+
+		TracedResult { result, trace }
+	}
+
+	/// Records the `suffix` event of the job named `job_name`, the URN that
+	/// [`make_event_urn`] names.
+	///
+	/// # Errors
+	///
+	/// - The error of the URN, or the fault that the trace injects at the event.
+	fn record_job_event(trace: &TraceCollector, job_name: &str, suffix: &str) -> Result<(), E> {
+		let urn = make_event_urn(job_name, suffix)?;
+		trace.event(urn)?.emit();
+		Ok(())
+	}
+}
+
+// Each step returns the traced result itself, so a chain keeps its trace
+// through a plain step and takes `then_job` after it.
+#[cfg(any(test, feature = "testing"))]
+#[allow(refining_impl_trait)]
+impl<T, E> Pipeline for TracedResult<T, E> {
 	type Output = T;
 	type Error = E;
 
-	fn and_then<F, U>(self, f: F) -> impl Pipeline<Output = U, Error = E>
+	fn and_then<F, U>(self, f: F) -> TracedResult<U, E>
 	where
 		F: FnOnce(T) -> Result<U, E>,
 	{
-		// The job name comes from the closure type: for example,
-		// "crate::CreateTestFrame::run" gives "create_test_frame".
-		let job_name = to_snake_case(core::any::type_name::<F>());
-		TracedResult {
-			result: self.result.and_then(|val| {
-				// The start event is urn:tightbeam:event:job/<job-name>-start.
-				let event_urn = match make_event_urn(&job_name, "start") {
-					Ok(urn) => urn,
-					Err(e) => return Err(E::from(e)),
-				};
-				if let Err(e) = self.trace.event(event_urn) {
-					return Err(E::from(e));
-				}
-
-				// The job then runs, and its outcome emits the end event,
-				// urn:tightbeam:event:job/<job-name>-success or -error.
-				let res = f(val);
-				match &res {
-					Ok(_) => {
-						let event_urn = match make_event_urn(&job_name, "success") {
-							Ok(urn) => urn,
-							Err(e) => return Err(E::from(e)),
-						};
-						if let Err(e) = self.trace.event(event_urn) {
-							return Err(E::from(e));
-						}
-					}
-					Err(_) => {
-						let event_urn = match make_event_urn(&job_name, "error") {
-							Ok(urn) => urn,
-							Err(e) => return Err(E::from(e)),
-						};
-						if let Err(e) = self.trace.event(event_urn) {
-							return Err(E::from(e));
-						}
-					}
-				}
-
-				res
-			}),
-			trace: self.trace,
-		}
+		TracedResult { result: self.result.and_then(f), trace: self.trace }
 	}
 
-	fn map<F, U>(self, f: F) -> impl Pipeline<Output = U, Error = E>
+	fn map<F, U>(self, f: F) -> TracedResult<U, E>
 	where
 		F: FnOnce(T) -> U,
 	{
 		TracedResult { result: self.result.map(f), trace: self.trace }
 	}
 
-	fn or_else<F>(self, f: F) -> impl Pipeline<Output = T, Error = E>
+	fn or_else<F>(self, f: F) -> TracedResult<T, E>
 	where
 		F: FnOnce(E) -> Result<T, E>,
 	{
@@ -258,8 +279,8 @@ where
 
 /// A builder for traced pipelines.
 ///
-/// It starts a pipeline with a trace context, so every job the pipeline
-/// chains with `and_then` emits trace events.
+/// It starts a pipeline with a trace context, so every job that the pipeline
+/// runs through [`TracedResult::then_job`] emits trace events.
 #[cfg(any(test, feature = "testing"))]
 pub struct PipelineBuilder {
 	trace: Arc<TraceCollector>,
@@ -353,16 +374,10 @@ mod tests {
 
 	#[test]
 	fn test_to_snake_case() {
-		// A bare type name takes the fallback, its last segment.
 		assert_eq!(to_snake_case("CreateHandshakeRequest"), "create_handshake_request");
 		assert_eq!(to_snake_case("ValidateConfig"), "validate_config");
 		assert_eq!(to_snake_case("HTTPRequest"), "h_t_t_p_request");
 		assert_eq!(to_snake_case("simple"), "simple");
-
-		// A `Job::run` path gives the struct name, the second-to-last segment.
-		assert_eq!(to_snake_case("suite::jobs::CreateTestFrame::run"), "create_test_frame");
-		assert_eq!(to_snake_case("my_crate::ValidateFrame::run"), "validate_frame");
-		assert_eq!(to_snake_case("TransformContent::run"), "transform_content");
 	}
 
 	#[test]
@@ -433,5 +448,45 @@ mod tests {
 		let result: Result<i32, &str> = Err("error");
 		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
 		assert_eq!(with_fallback, Ok(100));
+	}
+
+	/// A job that doubles its input.
+	struct DoubleCount;
+
+	impl Job for DoubleCount {
+		type Input = (u32,);
+		type Output = Result<u32, TightBeamError>;
+
+		const NAME: &'static str = "DoubleCount";
+
+		fn run((count,): Self::Input) -> Self::Output {
+			Ok(count * 2)
+		}
+	}
+
+	const DOUBLE_COUNT_START: Urn<'static> = crate::urn!("tightbeam", "event:job/double-count-start");
+	const DOUBLE_COUNT_SUCCESS: Urn<'static> = crate::urn!("tightbeam", "event:job/double-count-success");
+
+	#[test]
+	fn a_job_step_labels_its_events_with_the_job_name() -> Result<(), TightBeamError> {
+		let trace = Arc::new(TraceCollector::new());
+		let started = PipelineBuilder::new(Arc::clone(&trace)).start((2u32,));
+
+		started.then_job::<DoubleCount, _>().run()?;
+
+		let recorded = [DOUBLE_COUNT_START, DOUBLE_COUNT_SUCCESS].map(|label| trace.recorded(label));
+		assert_eq!(recorded, [1, 1]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_closure_step_emits_no_job_event() -> Result<(), TightBeamError> {
+		let trace = Arc::new(TraceCollector::new());
+		let started = PipelineBuilder::new(Arc::clone(&trace)).start(1u32);
+
+		started.and_then(|count| Ok::<u32, TightBeamError>(count + 1)).run()?;
+
+		assert_eq!(trace.drain_assertions().len(), 0);
+		Ok(())
 	}
 }

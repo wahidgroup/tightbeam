@@ -686,8 +686,7 @@ fn dtn_config(trace: TraceCollector) -> Result<ScenarioConfig, Box<dyn core::err
 
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	config: dtn_config(TraceConfig::builder()
-			.with_instrumentation(TbInstrumentationConfig {
+	config: dtn_config(TraceConfig::with_instrumentation(TbInstrumentationConfig {
 				enable_payloads: false,
 				enable_internal_detail: true,
 				sample_enabled_sets: true,
@@ -700,7 +699,6 @@ tb_scenario! {
 				StdoutBackend,
 				LogFilter::new(LogLevel::Error)
 			).with_default_level(LogLevel::Debug))
-			.build()
 			.into()
 		),
 	environment Servlet {

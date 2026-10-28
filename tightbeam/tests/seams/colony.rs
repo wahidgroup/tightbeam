@@ -48,6 +48,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::random::OsRng;
 use tightbeam::testing::{HiveEnv, SetupEnv, TestCertificate, TestMessage};
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
 use tightbeam::urn::Urn;
@@ -190,7 +191,7 @@ impl OutsideColony {
 	/// The configuration of the hive, which trusts both gateways and its own
 	/// servlet.
 	fn hive_conf(&self) -> HiveConfig {
-		let tls = HiveTlsConfig::from_identity(self.hive.identity(), Vec::new(), KeyPurposes::HOUSE);
+		let tls = HiveTlsConfig::from_identity(self.hive.identity(), PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
 		let tls = tls.expect("an outside certificate with no extended key usage signs for the hive");
 
 		let hive_tls = Some(Arc::new(tls));

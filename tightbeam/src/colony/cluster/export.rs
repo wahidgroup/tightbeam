@@ -32,22 +32,22 @@
 //! # Grants
 //!
 //! [`ExportGrant`] opens one unexported target to selected caller identities.
-//! Configure grants through [`ClusterConfigBuilder::with_export_grant`]. Allow
-//! sources compose as union: exported, granted, or first-party origin. Deny
-//! gates still override a grant.
+//! Configure grants through [`ClusterConfigBuilder::with_export_grant`]. A
+//! target passes when it is exported, granted, or a first-party origin, and a
+//! deny gate still overrides a grant.
 //!
 //! # Custom gates
 //!
 //! [`ExportGate`] adds per-identity rules keyed on [`SessionContext`].
-//! Configure gates through [`ClusterConfigBuilder::with_export_gate`]. Gates
-//! compose as intersection with the allow sources, so a gate may only narrow
-//! access.
+//! Configure gates through [`ClusterConfigBuilder::with_export_gate`]. Every
+//! gate must pass, so a gate only narrows what the allow sources admit.
 //!
 //! # Mutual TLS
 //!
 //! First-party recognition requires mutual TLS. The accept plane stores
-//! a session certificate only when [`ClusterTlsConfig::client_validators`]
-//! is configured. Without that configuration:
+//! a session certificate only when
+//! [`ClusterTlsConfig::client_authentication`] demands mutual TLS. Under
+//! anonymous clients:
 //!
 //! - Every session is anonymous, so an export list also blocks unexported targets on the origin plane.
 //! - With an export list set, the gateway emits a posture warning at startup.
@@ -56,7 +56,7 @@
 //!
 //! - CWE-285, improper authorization: <https://cwe.mitre.org/data/definitions/285.html>
 //!
-//! [`ClusterTlsConfig::client_validators`]: super::ClusterTlsConfig::client_validators
+//! [`ClusterTlsConfig::client_authentication`]: super::ClusterTlsConfig::client_authentication
 //! [`ClusterConfigBuilder::with_export_grant`]: super::ClusterConfigBuilder::with_export_grant
 //! [`ClusterConfigBuilder::with_export_gate`]: super::ClusterConfigBuilder::with_export_gate
 
@@ -103,8 +103,8 @@ pub trait ExportAllowlist: Send + Sync {
 	/// Whether a canonical registry type key is exported.
 	///
 	/// The default parses `key` and asks [`ExportAllowlist::contains`], so the
-	/// two views agree, and answers `false` for a key that fails to parse. The
-	/// built-in lists override it with a cached-set lookup that borrows `key`.
+	/// two views agree. A key that fails to parse answers `false`. The built-in
+	/// lists override it with a lookup in a cached set that borrows `key`.
 	fn allows_canonical(&self, key: &[u8]) -> bool {
 		let Ok(canonical) = from_utf8(key) else {
 			return false;
@@ -309,16 +309,16 @@ impl ExportAllowlist for DynamicExportList {
 pub trait ExportGate: Send + Sync {
 	/// Decides whether `session` may reach `target` on this gateway.
 	///
-	/// - `target`: servlet type under enforcement
-	/// - `session`: caller identity facts (see
-	///   [`SessionContext::peer_certificate`]), whose peer key a rule reads
-	///   when it asks a [`PeerListGate`](crate::colony::hive::PeerListGate)
-	///   through [`GatePolicy::evaluate`](crate::policy::GatePolicy::evaluate)
-	/// - `planes`: the two federation trust planes, for gates that reuse
-	///   the first-party classifier through
-	///   [`TrustPlanes::classify_session`] beside their own rules
-	/// - `relayed`: `true` when the request already spent relay budget and
-	///   therefore entered through a peer gateway
+	/// - `target`: the servlet type under enforcement.
+	/// - `session`: the caller identity facts
+	///   ([`SessionContext::peer_certificate`]). A rule reads its peer key when
+	///   it asks a [`PeerListGate`](crate::colony::hive::PeerListGate) through
+	///   [`GatePolicy::evaluate`](crate::policy::GatePolicy::evaluate).
+	/// - `planes`: the two federation trust planes, for a gate that reuses the
+	///   first-party classifier ([`TrustPlanes::classify_session`]) beside its
+	///   own rules.
+	/// - `relayed`: `true` when the request already spent relay budget, so it
+	///   entered through a peer gateway.
 	fn evaluate(
 		&self,
 		target: &Urn<'_>,
@@ -350,9 +350,9 @@ pub trait ExportGate: Send + Sync {
 pub trait ExportGrant: Send + Sync {
 	/// Whether `session` is positively granted `target` on this gateway.
 	///
-	/// - `target`: servlet type under the grant
-	/// - `session`: adjacent authenticated caller identity
-	/// - `relayed`: `true` when the request already spent relay budget
+	/// - `target`: the servlet type under the grant.
+	/// - `session`: the identity of the adjacent authenticated caller.
+	/// - `relayed`: `true` when the request already spent relay budget.
 	fn grants(&self, target: &Urn<'_>, session: &SessionContext, relayed: bool) -> bool;
 }
 
@@ -470,9 +470,9 @@ impl ExportPolicy<'_> {
 	/// rules of the module's Allowlist section. A first-party session is one
 	/// that [`TrustPlanes::classify_session`] places by its key.
 	///
-	/// The verdict asks the export scope, which reads the live allowlist on
-	/// each request, so the enforcement plane and the advertise filter stay
-	/// aligned. [`Self::verdict`] applies grants after this step refuses.
+	/// The export scope reads the live allowlist on each request, so the
+	/// enforcement plane and the advertise filter agree. [`Self::verdict`]
+	/// applies grants after this step refuses.
 	fn allowlist(&self, target: &Urn<'_>, session: &SessionContext, relayed: bool) -> TransitStatus {
 		if self.scope.exports(target) {
 			return TransitStatus::Ok;

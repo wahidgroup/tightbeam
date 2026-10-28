@@ -11,7 +11,6 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -92,8 +91,7 @@ fn house_key() -> SubjectPublicKeyInfoOwned {
 	certificate.tbs_certificate.subject_public_key_info
 }
 
-/// An Ed25519 key of 300 octets, whose canonical form exceeds the stack
-/// buffer.
+/// An Ed25519 key of 300 octets, whose canonical form exceeds the stack buffer.
 fn long_key() -> SubjectPublicKeyInfoOwned {
 	let mut spki = house_key();
 	spki.algorithm.oid = ID_ED_25519;
@@ -335,7 +333,7 @@ fn compressed_frame() -> Result<Frame, TightBeamError> {
 /// `enable_internal_detail` off.
 fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
 	let inflator: Arc<dyn Inflator + Send + Sync> = Arc::new(CopyInflator);
-	let ctx = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), HashMap::new(), None);
+	let ctx = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), [], None);
 	let ctx = ctx.with_message_inflator(Some(inflator));
 	let mut alone = compressed_frame()?;
 	let mut delivered = compressed_frame()?;
@@ -347,7 +345,7 @@ fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
 	let delivery = pin!(delivered.prepare_typed(&ctx)).poll(&mut cx);
 	let after = ALLOCATIONS.with(Cell::get);
 
-	inflated?;
+	let _opened = inflated?;
 
 	let Poll::Ready(prepared) = delivery else {
 		panic!("the inflate of a typed delivery completes on its first poll");
@@ -460,10 +458,10 @@ fn allocations_of_one_seed(process: &Process, bound: usize) -> usize {
 	let mut explorer = DefaultFdrExplorer::with_defaults(process, config);
 	// A first exploration fills the lazy state of the thread, which the count
 	// leaves out.
-	explorer.explore();
+	explorer.explore().expect("the run asks for no FMEA report");
 
 	let before = ALLOCATIONS.with(Cell::get);
-	explorer.explore();
+	explorer.explore().expect("the run asks for no FMEA report");
 
 	let after = ALLOCATIONS.with(Cell::get);
 	after - before
@@ -481,8 +479,7 @@ fn a_process_with_no_hidden_event_allocates_the_same_at_any_hidden_run_bound() -
 	Ok(())
 }
 
-/// The divergent states of a process with no hidden event cost no
-/// allocation.
+/// The divergent states of a process with no hidden event cost no allocation.
 #[test]
 fn a_process_with_no_hidden_event_computes_its_divergent_states_with_no_allocation() -> Result<(), ProcessBuildError> {
 	let process = ring()?;
@@ -530,25 +527,18 @@ fn a_state_with_no_hidden_step_answers_with_no_allocation() -> Result<(), Proces
 /// The allocation count of the conversion of a trace into a process, when the
 /// trace holds one gate acceptance and `extra` records the chain leaves out.
 fn chain_with_records_left_out(extra: u32) -> usize {
-	use tightbeam::instrumentation::TbEvent;
 	use tightbeam::testing::fdr::TraceProcessMode;
 
 	const PLAIN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:allocations/plain");
 
-	let record = |seq, urn| TbEvent {
-		seq,
-		urn,
-		label: Some("Ok".into()),
-		payload_hash: None,
-		duration_ns: None,
-		timestamp_ns: None,
-		flags: 0,
-		extras: None,
-	};
+	let collector = TraceCollector::new();
+	collector.emit(events::GATE_ACCEPT, "Ok");
+	for _ in 0..extra {
+		collector.emit(PLAIN, "Ok");
+	}
 
-	let left_out = (1..=extra).map(|seq| record(seq, PLAIN));
 	let mut trace = ConsumedTrace::new();
-	trace.instrument_events = core::iter::once(record(0, events::GATE_ACCEPT)).chain(left_out).collect();
+	trace.populate_from_collector(&collector);
 
 	// The first conversion interns the names of the chain, which the intern
 	// pool keeps, so the count reads the second.

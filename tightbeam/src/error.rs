@@ -398,6 +398,12 @@ pub enum TightBeamError {
 	#[error("Missing encryption info")]
 	MissingEncryptionInfo,
 
+	/// The frame carries an FI digest or a signature, which cover the frame
+	/// as it is before a seal rewrites its metadata and its body.
+	#[cfg(feature = "aead")]
+	#[error("Frame is digested or signed before the seal")]
+	CoveredBeforeSeal,
+
 	/// The commitment salt is shorter than the hiding floor.
 	#[cfg(feature = "digest")]
 	#[error("Invalid commitment salt length: {0}")]

@@ -85,12 +85,8 @@ mod sink {
 	#[test]
 	fn consumer_sink_keeps_every_event_past_default_bound() -> Result<(), tightbeam::TightBeamError> {
 		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
-		let collector = TraceCollector::from(
-			TraceConfig::builder()
-				.with_instrumentation(config)
-				.with_sink(LossFreeSink::default())
-				.build(),
-		);
+		let collector =
+			TraceCollector::from(TraceConfig::with_instrumentation(config).with_sink(LossFreeSink::default()));
 
 		collector.emit_event(events::MUX_GOAWAY_SENT)?;
 		collector.emit_event(events::MUX_EMIT_DRAINING)?;

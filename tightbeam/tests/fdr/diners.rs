@@ -45,8 +45,8 @@ fn build_fdr_config(
 
 /// The states of `process` that no path from its initial state reaches.
 fn unreachable_states(process: &Process) -> HashSet<State> {
-	let mut reached = HashSet::from([process.initial]);
-	let mut frontier = vec![process.initial];
+	let mut reached = HashSet::from([process.initial()]);
+	let mut frontier = vec![process.initial()];
 	while let Some(state) = frontier.pop() {
 		for action in process.enabled(state) {
 			for target in process.step(state, &action.event) {
@@ -57,7 +57,7 @@ fn unreachable_states(process: &Process) -> HashSet<State> {
 		}
 	}
 
-	process.states.difference(&reached).copied().collect()
+	process.states().difference(&reached).copied().collect()
 }
 
 /// The configuration that grades `spec`, refines the run against `process`

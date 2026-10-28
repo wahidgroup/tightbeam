@@ -30,15 +30,17 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use crate::asn1::admission::DerAdmission;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::cms::AuthEnvelopedData;
+use crate::crypto::kdf::KdfSalt;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::sign::{
-	CmsSigner, PresentedIssuers, PresentedPath, Signed, SignedContent, SignerInfoDraft, SigningIdentity,
+	CmsSigner, PresentedIssuers, PresentedPath, Signed, SignedContent, SignedDataExt, SignerInfoDraft, SigningIdentity,
 };
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::{Decode, Encode};
+use crate::frame::ArrivedCertificates;
 use crate::oids::{DATA, RECEIPT_ACK, SIGNED_DATA};
 use crate::random::CryptoRngCore;
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
@@ -47,7 +49,7 @@ use crate::transport::handshake::negotiation::{
 	RunnableProfile, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::peer::ServerTrust;
-use crate::transport::handshake::primitives::{KdfSalt, TranscriptHash};
+use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::schedule::{
 	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, PeerPoint, Salt, Sealer, SecretSeal, Terms,
 };
@@ -375,7 +377,7 @@ impl<C: HandshakeCurve> ServerPending<C> {
 	) -> Result<Self, HandshakeError> {
 		let agreement = opened.agreement();
 
-		let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt())?;
+		let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt()?)?;
 		let client_ephemeral = *opened.client_ephemeral().as_public_key();
 		Ok(Self { secret, client_ephemeral })
 	}
@@ -416,9 +418,9 @@ impl<P: HandshakeProvider, F: ServerLegs<P>> ServerFlow<P> for F {}
 ///
 /// Both flows return the same intake shapes and refuse with the same
 /// [`HandshakeError`] set, so the orchestrator runs one step order over
-/// either. The asynchronous open of the opening runs a static-key step
-/// through the backend of the server's key-agreement identity, so the private
-/// key can stay behind an external boundary.
+/// either. The open of the opening is asynchronous, so a static-key step can
+/// run through the backend of the server's key-agreement identity and the
+/// private key can stay behind an external boundary.
 pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// What a server of this protocol is provisioned with.
 	type Settings: MaybeSend + MaybeSync + 'static;
@@ -531,7 +533,7 @@ impl FinishedRole {
 		// The Finished covers a transcript hash, which is fresh for each
 		// handshake, so its verified signature is the key of no ledger and
 		// drops here.
-		let content = CmsSigner::content(finished, DATA)?;
+		let content = finished.content(DATA)?;
 		CmsSigner::verify_sole_signer::<P>(finished, certificate, SignedContent::data(content)).map(drop)?;
 
 		let expected = self.content::<P::Digest>(transcript_hash, certificate.certificate())?;
@@ -867,9 +869,9 @@ impl ClosingContent {
 			// The path moves out of the Finished, so the session keeps the
 			// certificate past the decoded Finished without a copy.
 			SIGNED_DATA => |der| {
-				CmsSigner::bound_presented(der)?;
+				ArrivedCertificates::bound_presented(der)?;
 				let finished = Signed::<SignedData>::from_der(der)?;
-				let (finished, path) = CmsSigner::take_signer_path(finished)?;
+				let (finished, path) = finished.take_signer_path()?;
 				Ok(Self::Finished(finished, path.map(Box::new)))
 			},
 			DATA => |der| {

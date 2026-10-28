@@ -162,7 +162,7 @@ impl ExplorationCore for OverReportingEngine<'_> {
 	}
 
 	fn visited_states(&self) -> &HashSet<State> {
-		&self.inner.process.states
+		self.inner.process.states()
 	}
 
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
@@ -221,7 +221,7 @@ impl ExplorationCore for CountingEngine<'_> {
 }
 
 #[test]
-fn an_outside_engine_walks_every_seed() -> Result<(), ProcessBuildError> {
+fn an_outside_engine_walks_every_seed() -> Result<(), Box<dyn std::error::Error>> {
 	let process = ready()?;
 	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
 	let walked = Rc::new(Cell::new(0));
@@ -232,7 +232,7 @@ fn an_outside_engine_walks_every_seed() -> Result<(), ProcessBuildError> {
 
 	let mut explorer = explorer_over(&process, config, engine);
 
-	explorer.explore();
+	explorer.explore()?;
 
 	assert_eq!(walked.get(), 4, "the explorer hands each of the four seeds to the engine");
 	Ok(())
@@ -240,7 +240,7 @@ fn an_outside_engine_walks_every_seed() -> Result<(), ProcessBuildError> {
 
 #[cfg(feature = "testing-fault")]
 #[test]
-fn mode_one_explores_each_spec_through_the_outside_engine() -> Result<(), ProcessBuildError> {
+fn mode_one_explores_each_spec_through_the_outside_engine() -> Result<(), Box<dyn std::error::Error>> {
 	let process = ready()?;
 	let specs = vec![ready()?, ready()?];
 	let fault_model = Some(FaultModel::default());
@@ -252,20 +252,20 @@ fn mode_one_explores_each_spec_through_the_outside_engine() -> Result<(), Proces
 	};
 	let mut explorer = explorer_over(&process, config, engine);
 
-	explorer.explore();
+	explorer.explore()?;
 
 	assert_eq!(walked.get(), 6, "each of the two specs runs its three seeds through the engine");
 	Ok(())
 }
 
 #[test]
-fn the_verdict_reads_each_result_that_an_outside_engine_records() -> Result<(), ProcessBuildError> {
+fn the_verdict_reads_each_result_that_an_outside_engine_records() -> Result<(), Box<dyn std::error::Error>> {
 	let process = ready()?;
 	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
 	let engine = OutsideEngine::new(&process, Arc::clone(&config));
 	let mut explorer = explorer_over(&process, config, engine);
 
-	let verdict = explorer.explore();
+	let verdict = explorer.explore()?;
 
 	assert_eq!(
 		verdict.seeds_completed, 4,

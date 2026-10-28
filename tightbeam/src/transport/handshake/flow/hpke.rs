@@ -34,7 +34,7 @@ use crate::asn1::OctetString;
 use crate::cms::content_info::ContentInfo;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::sign::elliptic_curve::SecretKey;
-use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignerInfoDraft, SigningIdentity};
+use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignedDataExt, SignerInfoDraft, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetStringRef;
 use crate::der::{Any, Decode, Encode, Tag};
@@ -152,14 +152,14 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		let reply = reply.signed()?;
 		reply.value().refuse_alert()?;
 
-		let content = CmsSigner::content(reply.value(), HANDSHAKE_REPLY_CONTENT)?;
+		let content = reply.value().content(HANDSHAKE_REPLY_CONTENT)?;
 		let handshake = ServerHandshake::from_der(content)?;
 		transcript.append(content)?;
 
 		// 2. Build the path the reply's signer presents, parsed from the bytes
 		//    it arrived as, for the trust to admit, and bind the `certificates`
 		//    field as it arrived after the content, then seal.
-		let presented = CmsSigner::signer_path(&reply)?;
+		let presented = reply.signer_path()?;
 		let (server, certificates) = presented.ok_or(HandshakeError::MissingServerCertificate)?;
 		transcript.append(certificates)?;
 		let transcript_hash = transcript.seal::<P::Digest>()?;
@@ -194,7 +194,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		// The transcript hash is a signed attribute, so a signer that saw
 		// another transcript fails. The hash is fresh for each handshake, so
 		// the verified signature keys no ledger and drops here.
-		let content = CmsSigner::content(reply, HANDSHAKE_REPLY_CONTENT)?;
+		let content = reply.content(HANDSHAKE_REPLY_CONTENT)?;
 		let signed = SignedContent::new(HANDSHAKE_REPLY_CONTENT, content).with_attribute(transcript_hash.attribute()?);
 		CmsSigner::verify_sole_signer::<P>(reply, server, signed).map(drop)?;
 		Ok(ReplyVerified(()))
@@ -377,6 +377,7 @@ mod tests {
 	use crate::crypto::cms::AuthEnvelopedData;
 	use crate::crypto::common::typenum::Unsigned;
 	use crate::crypto::hash::{Digest, Sha3_256};
+	use crate::crypto::kdf::KdfSalt;
 	use crate::crypto::key::SigningKeyProvider;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
@@ -396,7 +397,6 @@ mod tests {
 	use crate::transport::envelopes::TransportEnvelope;
 	use crate::transport::handshake::flow::{ClosingDraft, ClosingParts};
 	use crate::transport::handshake::negotiation::{RunnableProfile, SecurityOffer, TransportOffer};
-	use crate::transport::handshake::primitives::KdfSalt;
 	use crate::transport::handshake::schedule::{FinishedRole, KeyConfirmation, SecretSeal};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{
@@ -722,7 +722,7 @@ mod tests {
 		let (_, reply) = replied(&identity).await;
 
 		let signed_data = reply_signed_data(&reply);
-		let named = CmsSigner::signer_certificate(&signed_data)?;
+		let named = signed_data.signer_certificate()?;
 		assert_eq!(named, Some(&identity.certificate));
 		Ok(())
 	}
@@ -741,7 +741,7 @@ mod tests {
 		let opening = client.start()?;
 		let reply = server.reply(opening.to_owned()).await?;
 		let signed_data = reply_signed_data(&reply);
-		let content = CmsSigner::content(&signed_data, HANDSHAKE_REPLY_CONTENT)?;
+		let content = signed_data.content(HANDSHAKE_REPLY_CONTENT)?;
 		let certificates = certificates_field([identity.certificate.to_owned()]);
 		let expected = Sha3_256::new().chain_update(opening.der()).chain_update(content);
 		let expected = expected.chain_update(certificates).finalize();
@@ -867,7 +867,7 @@ mod tests {
 		let identity = create_test_certificate();
 		let twin = same_key_twin(&identity);
 		let anchors = [identity.certificate.to_owned(), twin.to_owned()];
-		let trusted = DirectTrustValidator::default().with_trust_chain(anchors);
+		let trusted = DirectTrustValidator::default().with_trust_chain(anchors)?;
 		let settings = HpkeClientSettings::new(LearnedTrust::new(trusted));
 		let mut client = Handshake::client(TestClientConfig::<Hpke>::new(settings, KeyPurposes::HOUSE)?);
 		let mut server = Handshake::server(hpke_server(&identity));
@@ -1494,7 +1494,7 @@ mod tests {
 		client.respond(reply.to_owned()).await.expect("the client admits the reply");
 
 		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT).expect("the fixture salt meets the floor");
 		let secret = fixture_handshake_secret(0x42);
 		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Closing, salt, &transcript_hash);
 		let sealer = sealer.expect("the closing key derives");

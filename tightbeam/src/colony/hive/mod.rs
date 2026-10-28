@@ -22,6 +22,7 @@ pub use runtime::{HiveContextImpl, HiveRuntime};
 pub use scaling::{ScaleConfigRefusal, ScaleCooldowns, ScalingDecision, ScalingMetrics, ServletScaleConfig};
 
 use core::future::Future;
+use core::num::NonZeroUsize;
 use core::pin::Pin;
 use core::time::Duration;
 use std::collections::HashMap;
@@ -39,6 +40,7 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::KeyPurposes;
 use crate::trace::TraceCollector;
 use crate::transport::client::{ConnectionBuilder, ConnectionPoolBuilder, PoolConfig};
+use crate::transport::handshake::PeerAuthentication;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::EncryptionConfig;
@@ -59,6 +61,19 @@ pub type SpawnerFn = Arc<
 		+ Sync,
 >;
 
+/// The future of [`ServletBox::drain_boxed`], which resolves once the servlet
+/// has drained.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::colony::hive::ServletDrainFuture;
+///
+/// let drained: ServletDrainFuture = Box::pin(core::future::ready(Ok(())));
+/// # drop(drained);
+/// ```
+pub type ServletDrainFuture = Pin<Box<dyn Future<Output = Result<(), TightBeamError>> + Send>>;
+
 /// A type-erased servlet that a hive stores and controls. A servlet implements
 /// it to register, so one hive collection holds servlets of many types.
 pub trait ServletBox: Send + Sync {
@@ -67,7 +82,69 @@ pub trait ServletBox: Send + Sync {
 	fn addr_bytes(&self) -> Arc<[u8]>;
 
 	/// Stops the servlet and consumes the boxed instance.
+	///
+	/// A [`ServletRuntime`], so also a `servlet!` servlet, ends its workers
+	/// by abort here.
+	///
+	/// [`ServletRuntime`]: crate::colony::servlet::ServletRuntime
 	fn stop_boxed(self: Box<Self>);
+
+	/// Drains the servlet and consumes the boxed instance, so the servlet
+	/// ends the work it holds before it stops.
+	///
+	/// - [`Hive::drain`] calls it on each servlet once the admission lock drops.
+	/// - [`Hive::drain`] drops a drain that outlasts the drain timeout, and a
+	///   [`ServletRuntime`] then ends by abort.
+	/// - The default stops the servlet through [`Self::stop_boxed`].
+	/// - A [`ServletRuntime`] and each `servlet!` servlet kill their workers ([`ServletRuntime::drain`]).
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the servlet failed to drain, such as a worker whose run loop panicked.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::sync::atomic::{AtomicBool, Ordering};
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::cms::signed_data::SignerIdentifier;
+	/// use tightbeam::colony::hive::ServletBox;
+	///
+	/// /// A servlet that sets `stopped` as it stops.
+	/// struct Probe {
+	///     stopped: Arc<AtomicBool>,
+	/// }
+	///
+	/// impl ServletBox for Probe {
+	///     fn addr_bytes(&self) -> Arc<[u8]> {
+	///         Arc::from(b"127.0.0.1:7000".as_slice())
+	///     }
+	///
+	///     fn stop_boxed(self: Box<Self>) {
+	///         self.stopped.store(true, Ordering::SeqCst);
+	///     }
+	///
+	///     fn signer(&self) -> Option<&SignerIdentifier> {
+	///         None
+	///     }
+	/// }
+	///
+	/// let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// let stopped = Arc::new(AtomicBool::new(false));
+	/// let servlet: Box<dyn ServletBox> = Box::new(Probe { stopped: Arc::clone(&stopped) });
+	///
+	/// runtime.block_on(servlet.drain_boxed())?;
+	/// assert!(stopped.load(Ordering::SeqCst));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`ServletRuntime`]: crate::colony::servlet::ServletRuntime
+	/// [`ServletRuntime::drain`]: crate::colony::servlet::ServletRuntime::drain
+	fn drain_boxed(self: Box<Self>) -> ServletDrainFuture {
+		self.stop_boxed();
+		Box::pin(core::future::ready(Ok(())))
+	}
 
 	/// Returns the [`SignerIdentifier`] that names the certificate the servlet
 	/// presents in its handshake (RFC 5652 §5.3), or [`None`] for a servlet
@@ -122,16 +199,29 @@ pub trait ServletBox: Send + Sync {
 	/// `servlet!` servlet, answers from the gauge of
 	/// [`ServletConfigBuilder::with_utilization`].
 	///
+	/// # Lock contract
+	///
+	/// The scaling task reads it inside [`ServletRegistry::for_each_by_type`],
+	/// which MAY hold the registry lock, and every command of the control
+	/// plane waits on that lock. An implementation MUST return a stored
+	/// reading and do no I/O, as the atomic load of
+	/// [`UtilizationReporter::utilization`] does.
+	///
 	/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
 	/// [`ServletRuntime`]: crate::colony::servlet::ServletRuntime
 	/// [`UNKNOWN_SERVLET_UTILIZATION_BPS`]: crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS
+	/// [`UtilizationReporter::utilization`]: crate::colony::servlet::UtilizationReporter::utilization
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
 
 	/// Returns whether the servlet is healthy and responsive, `true` by
-	/// default. An implementation may check its internal state or its
-	/// connectivity.
+	/// default.
+	///
+	/// The heartbeat of the control plane counts the servlets that report
+	/// healthy. It reads this inside [`ServletRegistry::for_each`], which MAY
+	/// hold the registry lock, so an implementation MUST return a stored
+	/// verdict and do no I/O, as [`Self::utilization`] states.
 	fn is_healthy(&self) -> bool {
 		true
 	}
@@ -265,8 +355,8 @@ impl RefusedRegistration {
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 pub struct ReplacedServlet {
-	/// The registration that the registry gave up, present until `retire` or
-	/// the drop takes it.
+	/// The registration that the registry gave up, present until the drop
+	/// takes it.
 	registration: Option<ServletRegistration>,
 }
 
@@ -279,13 +369,10 @@ impl ReplacedServlet {
 		Self { registration: Some(registration) }
 	}
 
-	/// Runs `leave` on the registration, then hands its servlet to the caller.
-	/// A caller that removes the servlet's route in `leave` then stops the
-	/// servlet once nothing routes to it.
-	pub(crate) fn retire(mut self, leave: impl FnOnce(&ServletRegistration)) -> Option<Box<dyn ServletBox>> {
-		let registration = self.registration.take()?;
-		leave(&registration);
-		Some(registration.servlet)
+	/// The registration that the registry gave up, present until this value
+	/// drops.
+	pub(crate) fn registration(&self) -> Option<&ServletRegistration> {
+		self.registration.as_ref()
 	}
 }
 
@@ -324,11 +411,19 @@ pub trait ServletRegistry: Send + Sync {
 	fn remove(&self, key: impl AsRef<[u8]>) -> Option<ServletRegistration>;
 
 	/// Calls `f` with every registration and its key.
+	///
+	/// The implementation MAY hold its lock across `f`, as [`HashMapRegistry`]
+	/// does, so `f` reads the registration and does no I/O. Each read of a
+	/// servlet in `f`, such as [`ServletBox::utilization`], keeps that
+	/// contract.
 	fn for_each<F>(&self, f: F)
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration);
 
 	/// Calls `f` with every registration whose key starts with `prefix`.
+	///
+	/// The implementation MAY hold its lock across `f`, as [`Self::for_each`]
+	/// states.
 	fn for_each_by_type<F>(&self, prefix: impl AsRef<[u8]>, f: F)
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration);
@@ -404,8 +499,8 @@ pub trait ServletRegistry: Send + Sync {
 	/// Returns every servlet address, as a pair of type URN and address bytes.
 	fn addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)>;
 
-	/// Removes and returns every registration, so that a stop or a drain can
-	/// stop each servlet.
+	/// Removes and returns every registration, so a stop or a drain can stop
+	/// each servlet.
 	fn drain_all(&self) -> Vec<(Vec<u8>, ServletRegistration)>;
 
 	/// Returns every registration key, which a scale-down reads to pick an
@@ -562,6 +657,7 @@ pub trait Hive: Sized + Send + Sync {
 	/// - A servlet whose type and address name an instance the hive holds
 	///   replaces that instance, and the replaced servlet stops through
 	///   [`ServletBox::stop_boxed`].
+	/// - A servlet that names its signer gets its sibling route at the registration ([`Hive::context`]).
 	///
 	/// # Errors
 	///
@@ -569,6 +665,9 @@ pub trait Hive: Sized + Send + Sync {
 	/// - [`TightBeamError::UrnValidationError`] -- `servlet_type` falls outside
 	///   the hive's namespace or names an instance, or the servlet's address is
 	///   not UTF-8.
+	/// - [`TightBeamError::WorkRefused`] -- the type holds the most instances
+	///   its bounds admit (`ResourceExhausted`), or the hive drains
+	///   (`Unavailable`). The servlet stops.
 	/// - [`TightBeamError`] -- the [`ServletRegistry`] refuses the insert, and the servlet stops.
 	fn register<S, F, Fut>(&mut self, servlet_type: Urn<'static>, servlet: S, spawner: F) -> Result<(), TightBeamError>
 	where
@@ -578,10 +677,10 @@ pub trait Hive: Sized + Send + Sync {
 
 	/// Establishes the hive.
 	///
-	/// The hive seeds intra-hive routing on its [`HiveContext`] and begins the
-	/// auto-scaling task. A hive with a `hive_tls` identity also starts the
-	/// control server for cluster commands and the re-registration beat.
-	/// Register every servlet first.
+	/// The hive moves the sibling calls of its [`HiveContext`] onto a pool that
+	/// records on `trace`, and begins the auto-scaling task. A hive with a
+	/// `hive_tls` identity also starts the control server for cluster
+	/// commands and the re-registration beat. Register every servlet first.
 	///
 	/// - `trace` records hive-level events and the record of each cluster command.
 	/// - The control plane records each connection on [`Hive::connection_trace`].
@@ -650,6 +749,10 @@ pub trait Hive: Sized + Send + Sync {
 	/// Waits for the hive's control server to finish. A hive with no control
 	/// plane returns at once.
 	///
+	/// The control server serves until its listener fails or its task
+	/// panics, so `join` returns on one of those. A hive that should end
+	/// calls [`Hive::stop`] in place of `join`.
+	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::JoinError`] -- the control server task panicked, or an abort ended it.
@@ -676,16 +779,31 @@ pub trait Hive: Sized + Send + Sync {
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
 	) -> impl Future<Output = Result<RegisterHiveResponse, TightBeamError>> + Send;
 
-	/// Drains the in-flight commands of the hive, then stops its servlets.
+	/// Drains the in-flight commands of the hive, then drains its servlets,
+	/// all within [`HiveControlConfig::drain_timeout`] on the hive clock.
 	///
-	/// The hive refuses every later command but the heartbeat, and stops its
-	/// background beats. It waits until no command is in flight, or until the
-	/// drain timeout on the hive clock. Then the servlets stop, and the hive
-	/// announces its empty slate so gateways retire its routes.
+	/// 1. The hive refuses every later command but the heartbeat, and stops its background beats.
+	/// 2. It waits until no command is in flight, or until the drain timeout passes.
+	/// 3. Each servlet drains through [`ServletBox::drain_boxed`] within what
+	///    remains of the timeout, so the workers of a `servlet!` servlet answer
+	///    each message their queues hold.
+	/// 4. A servlet that still drains when the timeout passes drops unfinished,
+	///    so a `servlet!` servlet ends its workers by abort.
+	/// 5. The hive announces its empty slate so gateways retire its routes, and
+	///    records the answer of each gateway as [`HIVE_REREGISTERED`].
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the implementation fails to drain. [`HiveRuntime`] always returns `Ok`.
+	/// - [`TightBeamError`] -- a servlet failed to drain. Every other servlet still drains.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the drain timeout passed
+	///   while a servlet drained. The hive still announces its empty slate.
+	/// - [`TightBeamError`] -- the trace refused the record of a gateway's
+	///   answer, the fault the `testing-fault` feature injects.
+	///
+	/// [`HIVE_REREGISTERED`]: crate::instrumentation::events::HIVE_REREGISTERED
+	/// [`TransportError::OperationFailed`]: crate::transport::TransportError::OperationFailed
+	/// [`TransportFailure::DeadlineExceeded`]: crate::transport::TransportFailure::DeadlineExceeded
 	fn drain(&self) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
 	/// Returns whether the hive began to drain.
@@ -702,8 +820,10 @@ pub struct HiveTlsConfig {
 	/// The key purpose of each role the identity serves: signer, server, and
 	/// client.
 	key_purposes: KeyPurposes,
-	/// The client certificate validators, such as public-key pinning.
-	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+	/// How the control plane authenticates its clients, such as public-key
+	/// pinning. A hive that holds a [`HiveConfig::trust_store`] adds that
+	/// store to it, so the plane then demands a client certificate.
+	pub client_authentication: PeerAuthentication,
 }
 
 impl HiveTlsConfig {
@@ -724,15 +844,15 @@ impl HiveTlsConfig {
 	pub fn new(
 		certificate: crate::crypto::x509::CertificateSpec,
 		key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
-		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+		authentication: impl Into<PeerAuthentication>,
 	) -> Result<Self, TightBeamError> {
 		let identity = SigningIdentity::from_spec(certificate, key)?;
-		Ok(Self::from_identity(identity, validators, KeyPurposes::HOUSE)?)
+		Ok(Self::from_identity(identity, authentication, KeyPurposes::HOUSE)?)
 	}
 
 	/// Presents `identity` under the key purposes that `key_purposes` names
-	/// ([`KeyPurposes::HOUSE`] for the house purposes), and holds the client
-	/// certificate `validators`.
+	/// ([`KeyPurposes::HOUSE`] for the house purposes), and authenticates the
+	/// clients of the control plane as `authentication` names.
 	///
 	/// - The identity signs this hive's registrations, so its certificate MUST
 	///   name `key_purposes.signer` or `anyExtendedKeyUsage`, or carry no
@@ -755,6 +875,7 @@ impl HiveTlsConfig {
 	/// use tightbeam::crypto::x509::KeyPurposes;
 	/// use tightbeam::der::asn1::ObjectIdentifier;
 	/// use tightbeam::testing::{TestCertificate, TestKey};
+	/// use tightbeam::transport::handshake::PeerAuthentication;
 	///
 	/// let key = TestKey::insecure_fixed_signing();
 	/// let own = ObjectIdentifier::new("1.3.6.1.4.1.99999.3.12")?;
@@ -764,18 +885,19 @@ impl HiveTlsConfig {
 	/// let identity = SigningIdentity::new(certificate, provider)?;
 	///
 	/// let purposes = KeyPurposes { signer: own, ..KeyPurposes::HOUSE };
-	/// let tls = HiveTlsConfig::from_identity(identity, Vec::new(), purposes)?;
-	/// assert!(tls.validators.is_empty());
+	/// let tls = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, purposes)?;
+	/// assert!(!tls.client_authentication.requires_certificate());
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	pub fn from_identity(
 		identity: SigningIdentity,
-		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+		authentication: impl Into<PeerAuthentication>,
 		key_purposes: KeyPurposes,
 	) -> Result<Self, CertificateValidationError> {
 		identity.certificate().require_purpose(key_purposes.signer)?;
 
-		Ok(Self { identity, key_purposes, validators })
+		let client_authentication = authentication.into();
+		Ok(Self { identity, key_purposes, client_authentication })
 	}
 
 	/// Returns the certificate and handshake key this hive presents on its
@@ -785,16 +907,23 @@ impl HiveTlsConfig {
 	}
 
 	/// Builds the encryption config of the control plane: this identity, the
-	/// client [`Self::validators`] and `command_trust`, and the key purposes
-	/// [`Self::from_identity`] installed.
+	/// [`Self::client_authentication`] with `command_trust` added, and the key
+	/// purposes [`Self::from_identity`] installed.
+	///
+	/// A command trust makes the plane demand a client certificate, whatever
+	/// the client authentication names ([`PeerAuthentication::and`]).
 	pub(crate) fn accept_encryption<C: CryptoProvider>(
 		&self,
 		command_trust: Option<Arc<dyn CertificateValidation>>,
 	) -> TransportEncryptionConfig<C> {
-		let encryption = TransportEncryptionConfig::new(self.identity.clone());
-		let validators = self.validators.iter().map(Arc::clone).chain(command_trust);
+		let authentication = self.client_authentication.clone();
+		let authentication = match command_trust {
+			Some(trust) => authentication.and(trust),
+			None => authentication,
+		};
 
-		let encryption = encryption.with_client_validators(validators);
+		let encryption = TransportEncryptionConfig::new(self.identity.clone());
+		let encryption = encryption.with_peer_authentication(authentication);
 		encryption.with_key_purposes(self.key_purposes)
 	}
 
@@ -812,7 +941,7 @@ impl core::fmt::Debug for HiveTlsConfig {
 		f.debug_struct("HiveTlsConfig")
 			.field("identity", &self.identity)
 			.field("key_purposes", &self.key_purposes)
-			.field("validators", &format!("[{} validators]", self.validators.len()))
+			.field("client_authentication", &self.client_authentication)
 			.finish()
 	}
 }
@@ -984,8 +1113,10 @@ impl Default for HiveScalingConfig {
 pub struct HiveControlConfig {
 	/// The utilization threshold that trips manage-path backpressure.
 	pub backpressure_threshold: BasisPoints,
-	/// The longest wait of a drain for in-flight commands, after which the
-	/// registered servlets stop.
+	/// The longest the two waits of a drain last on the hive clock: the wait
+	/// for in-flight commands, then the wait for the servlets to drain. A
+	/// servlet that still drains past it stops by abort. The slate
+	/// announcement follows the two waits.
 	pub drain_timeout: Duration,
 	/// The anti-entropy interval at which the hive re-announces its full
 	/// servlet slate, freshly signed, to every gateway it registered with.
@@ -994,7 +1125,8 @@ pub struct HiveControlConfig {
 	/// The count of consecutive authentication failures that opens the
 	/// cluster circuit breaker.
 	pub circuit_breaker_threshold: u8,
-	/// The time the circuit breaker stays open before a half-open probe.
+	/// The time an open circuit refuses a signer's commands before it admits
+	/// them again.
 	pub circuit_breaker_cooldown: Duration,
 	/// The freshness window for signed cluster commands. The hive rejects a
 	/// command whose `Frame.metadata.order` is outside this window, or whose
@@ -1080,13 +1212,29 @@ impl HiveConfig {
 	///
 	/// With a [`Self::trust_store`], each cluster command authenticates against
 	/// the peer its handshake proves, so the plane demands a client certificate
-	/// that the store validates, beside the [`HiveTlsConfig::validators`].
+	/// that the store validates, beside the checks of
+	/// [`HiveTlsConfig::client_authentication`].
 	pub(crate) fn control_encryption<C: CryptoProvider>(&self) -> Option<TransportEncryptionConfig<C>> {
 		let hive_tls = self.hive_tls.as_ref()?;
 		let trust_store = self.trust_store.as_ref().map(Arc::clone);
 		let command_trust = trust_store.map(|store| store as Arc<dyn CertificateValidation>);
 
 		Some(hive_tls.accept_encryption(command_trust))
+	}
+
+	/// Builds the one admission gate of the control plane, which trusts
+	/// [`Self::trust_store`] and reads [`Self::clock`]. It is [`None`] for a
+	/// hive with no trust store, which refuses every cluster command.
+	pub(crate) fn security_gate(&self) -> Option<ClusterSecurityGate> {
+		let store = self.trust_store.as_ref()?;
+		let control = &self.control;
+		let limits = GateLimits {
+			failure_threshold: control.circuit_breaker_threshold,
+			cooldown: control.circuit_breaker_cooldown,
+			freshness_window: control.command_freshness_window,
+		};
+
+		Some(ClusterSecurityGate::new(Arc::clone(store), limits, Arc::clone(&self.clock)))
 	}
 
 	/// Configures `builder` for the hive's calls to its own servlets: each dial
@@ -1138,6 +1286,15 @@ impl core::fmt::Debug for HiveConfig {
 	}
 }
 
+/// The connection cap of the intra-hive servlet pool that `HiveConfig::default`
+/// sets.
+///
+/// The compiler evaluates the match, so a cap of zero fails to compile.
+const DEFAULT_HIVE_POOL_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(8) {
+	Some(cap) => cap,
+	None => panic!("the default hive pool cap takes one connection or more"),
+};
+
 impl Default for HiveConfig {
 	fn default() -> Self {
 		Self {
@@ -1145,7 +1302,7 @@ impl Default for HiveConfig {
 			scaling: HiveScalingConfig::default(),
 			control: HiveControlConfig::default(),
 			pool: PoolConfig {
-				max_connections: 8,
+				max_connections: DEFAULT_HIVE_POOL_CONNECTIONS,
 				idle_timeout: Some(Duration::from_secs(30)),
 				..PoolConfig::default()
 			},
@@ -1200,7 +1357,7 @@ mod tests {
 		fn from_identity_admits_an_identity_for_the_signer(
 			purpose: Option<ObjectIdentifier>
 		) -> Result<(), TightBeamError> {
-			HiveTlsConfig::from_identity(identity_naming(purpose), Vec::new(), KeyPurposes::HOUSE)?;
+			HiveTlsConfig::from_identity(identity_naming(purpose), PeerAuthentication::Anonymous, KeyPurposes::HOUSE)?;
 
 			Ok(())
 		}
@@ -1215,7 +1372,7 @@ mod tests {
 	tb_cases! {
 		fn from_identity_refuses_an_identity_outside_the_signer(purpose: ObjectIdentifier) {
 			let identity = identity_naming(Some(purpose));
-			let installed = HiveTlsConfig::from_identity(identity, Vec::new(), KeyPurposes::HOUSE);
+			let installed = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
 
 			let excluded = matches!(installed, Err(ExcludedKeyPurpose));
 			assert!(excluded);
@@ -1231,7 +1388,7 @@ mod tests {
 	#[test]
 	fn from_identity_installs_an_own_signer_purpose_under_the_purposes_that_name_it() -> Result<(), TightBeamError> {
 		let key_purposes = KeyPurposes { signer: OWN_SIGNER, ..KeyPurposes::HOUSE };
-		HiveTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), Vec::new(), key_purposes)?;
+		HiveTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), PeerAuthentication::Anonymous, key_purposes)?;
 		Ok(())
 	}
 
@@ -1240,7 +1397,7 @@ mod tests {
 	#[test]
 	fn from_identity_refuses_an_own_signer_purpose_under_the_house_purposes() {
 		let identity = identity_naming(Some(OWN_SIGNER));
-		let installed = HiveTlsConfig::from_identity(identity, Vec::new(), KeyPurposes::HOUSE);
+		let installed = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
 
 		let excluded = matches!(installed, Err(ExcludedKeyPurpose));
 		assert!(excluded);
@@ -1306,10 +1463,12 @@ mod tests {
 
 	// A hive with a trust store authenticates each command against the peer
 	// its handshake proves, so its control plane demands a client
-	// certificate when its TLS config names no validator.
+	// certificate when its TLS config names anonymous clients.
 	#[test]
-	fn a_hive_that_authenticates_commands_demands_a_client_certificate() -> Result<(), TightBeamError> {
-		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), KeyPurposes::HOUSE)?;
+	fn a_hive_with_no_client_validators_and_a_command_trust_demands_a_client_certificate() -> Result<(), TightBeamError>
+	{
+		let identity = identity_naming(None);
+		let tls = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, KeyPurposes::HOUSE)?;
 		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		let store: Arc<dyn CertificateTrust> = Arc::new(builder.build());
 		let config = HiveConfig { trust_store: Some(store), hive_tls: Some(Arc::new(tls)), ..Default::default() };
@@ -1323,7 +1482,7 @@ mod tests {
 	// config names, so the transport and the hive read one purpose set.
 	#[test]
 	fn the_control_plane_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
-		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), SWAPPED_SERVER)?;
+		let tls = HiveTlsConfig::from_identity(identity_naming(None), PeerAuthentication::Anonymous, SWAPPED_SERVER)?;
 		let accept = tls.accept_encryption::<DefaultCryptoProvider>(None);
 		assert_eq!(accept.key_purposes, SWAPPED_SERVER);
 		Ok(())
@@ -1333,7 +1492,7 @@ mod tests {
 	// config names.
 	#[test]
 	fn a_gateway_dial_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
-		let tls = HiveTlsConfig::from_identity(identity_naming(None), Vec::new(), SWAPPED_SERVER)?;
+		let tls = HiveTlsConfig::from_identity(identity_naming(None), PeerAuthentication::Anonymous, SWAPPED_SERVER)?;
 		let mut encryption = EncryptionConfig::<DefaultCryptoProvider>::unconfigured();
 
 		tls.outbound(&mut encryption);
@@ -1351,7 +1510,8 @@ mod tests {
 		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
 		let spec = CertificateSpec::Built(Box::new(certificate));
 
-		let refused = HiveTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)), Vec::new());
+		let provider = Arc::new(Secp256k1KeyProvider::from(key));
+		let refused = HiveTlsConfig::new(spec, provider, PeerAuthentication::Anonymous);
 		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
 		assert!(excluded);
 		Ok(())

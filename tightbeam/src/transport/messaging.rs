@@ -27,6 +27,9 @@ use crate::transport::state::CollectStep;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod x509 {
+	pub use crate::der::Encode;
+	pub use crate::transport::builders::EnvelopeBuilder;
+	pub use crate::transport::envelopes::ResponsePackage;
 	pub use crate::transport::handshake::HandshakeProvider;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::{EncryptedProtocolState, ServerHandshakeSlot};
@@ -103,10 +106,9 @@ pub(crate) trait GateInbound: GateAudit {
 				events::GATE_REJECT
 			};
 
-			// As evidence, the status names why and the canonical form of the
-			// peer's key names who, so one peer leaves one audit identity in
-			// either SEC 1 form of its key. The status is also the value that a
-			// spec asserts.
+			// The status names why and the canonical peer key names who, so one
+			// peer leaves one audit identity in either SEC 1 form of its key.
+			// The status is also the value that a spec asserts.
 			let peer = session.peer_key().map(CanonicalKey::as_der);
 			trace.emit_event_with_value_and_evidence(event, status.as_str(), status, peer)?;
 		}
@@ -315,9 +317,9 @@ impl From<Frame> for Letter {
 /// - `Ok` carries the frame to resend and the delay to observe first.
 /// - `Err` carries the terminal error.
 ///
-/// An error that carries no frame passes through unchanged, and so does a
-/// failure that spends its session, ahead of the policy, because a resend on
-/// that session can never succeed. The frame then goes back unsent.
+/// An error that carries no frame passes through unchanged. A failure that
+/// spends its session also passes through ahead of the policy, with its frame
+/// unsent, because a resend on that session can never succeed.
 fn evaluate_retry<P>(
 	policy: &P,
 	error: TransportError,
@@ -516,6 +518,9 @@ pub trait MessageCollector: MessageIO + GateAudit {
 
 	/// Sends a response for one collected message, in the wire mode the session
 	/// phase decides.
+	///
+	/// A transport of this crate answers through
+	/// [`Self::send_response_with_encryption`].
 	fn send_response(
 		&mut self,
 		status: TransitStatus,
@@ -548,6 +553,46 @@ pub trait MessageCollector: MessageIO + GateAudit {
 				}
 			}
 		}
+	}
+
+	/// The X.509 form of [`Self::send_response`] over an encrypted session,
+	/// which builds the response in the wire mode the session phase decides
+	/// and writes it.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`EncryptedProtocolState::apply_wire_mode`], before the handshake installs keys.
+	/// - The errors of [`EnvelopeBuilder::finish`], and of the write.
+	///
+	/// # Examples
+	///
+	/// ```no_run
+	/// use tightbeam::policy::TransitStatus;
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	/// use tightbeam::transport::{MessageCollector, TransportResult};
+	///
+	/// /// Answer the message `transport` collected last with an empty reply.
+	/// async fn answer(transport: &mut TcpTransport<TokioStream>) -> TransportResult<()> {
+	///     transport.send_response_with_encryption(TransitStatus::Ok, None).await
+	/// }
+	/// ```
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[allow(async_fn_in_trait)]
+	async fn send_response_with_encryption(
+		&mut self,
+		status: TransitStatus,
+		message: Option<Frame>,
+	) -> TransportResult<()>
+	where
+		Self: Sized + EncryptedProtocolState,
+	{
+		let package = ResponsePackage { status, message: message.map(Arc::new) };
+		let builder = EnvelopeBuilder::response(package).with_limits(*self.limits());
+		let builder = self.apply_wire_mode(builder)?;
+
+		let wire_envelope = builder.finish()?;
+		let wire_bytes = wire_envelope.to_der()?;
+		self.write_envelope_bytes(&wire_bytes).await
 	}
 }
 

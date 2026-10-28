@@ -10,12 +10,15 @@ use crate::constants::{
 };
 use crate::transport::envelopes::WireMode;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::error::TransportError;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::TransportResult;
+
 /// Every ceiling a transport enforces, in one value.
 ///
-/// Each field is a plain `usize` or `Duration`, so every transport holds a
-/// value for every limit, and an unset limit is unrepresentable.
-///
-/// [`Default`] is the one place that chooses these values.
+/// Each field is a plain `usize` or `Duration`, so an unset limit is
+/// unrepresentable. [`Default`] is the one place that chooses the values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportLimits {
 	/// The ceiling in bytes of a cleartext envelope on the wire.
@@ -30,21 +33,17 @@ pub struct TransportLimits {
 	/// arms it under `tokio`. An async build without `tokio` has no timer, so
 	/// the application owns the deadline there.
 	pub operation_timeout: Duration,
-	/// The deadline of the whole handshake exchange.
-	///
-	/// It binds as [`Self::operation_timeout`] does: the blocking transport
-	/// arms it on its stream, and the async transport arms it under `tokio`.
-	/// An async build without `tokio` leaves it to the application.
+	/// The deadline of the whole handshake exchange. It binds as
+	/// [`Self::operation_timeout`] does.
 	pub handshake_timeout: Duration,
 }
 
 impl TransportLimits {
-	/// Returns the largest envelope this endpoint reads before the parse
-	/// decides which ceiling applies.
+	/// The largest envelope this endpoint reads before the parse picks a
+	/// ceiling.
 	///
-	/// A reader learns whether the bytes are a cleartext or an encrypted
-	/// envelope only once it has them, so it admits the larger ceiling, and the
-	/// per-mode check runs once the reader knows the wire form.
+	/// A reader knows the wire mode only once it has the bytes, so it admits
+	/// the larger ceiling and runs the per-mode check after the parse.
 	#[must_use]
 	pub fn max_envelope(&self) -> usize {
 		if self.encrypted_envelope > self.cleartext_envelope {
@@ -61,6 +60,21 @@ impl TransportLimits {
 			WireMode::Cleartext => self.cleartext_envelope,
 			WireMode::Encrypted => self.encrypted_envelope,
 		}
+	}
+
+	/// Admits a handshake message of `der_len` octets to the wire. Every
+	/// handshake message an endpoint sends takes its ceiling from here.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- `der_len` passes [`Self::handshake_wire`].
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn admit_handshake_wire(&self, der_len: usize) -> TransportResult<()> {
+		if der_len > self.handshake_wire {
+			return Err(TransportError::InvalidMessage);
+		}
+
+		Ok(())
 	}
 }
 

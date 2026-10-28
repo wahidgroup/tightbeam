@@ -1,6 +1,6 @@
 use crate::core::{IntegrityVerdict, Message};
 use crate::crypto::commitment::Opening;
-use crate::crypto::hash::Digest;
+use crate::crypto::hash::{ConstantTimeDigest, Digest};
 use crate::der::oid::AssociatedOid;
 use crate::error::Result;
 use crate::frame::FrameIntegrityScaffold;
@@ -21,7 +21,7 @@ impl Frame {
 	}
 
 	/// Check a disclosed [`Opening`] against this frame's message commitment,
-	/// reporting which condition held.
+	/// and report which condition held.
 	pub fn message_commitment_verdict<D>(&self, opening: &Opening) -> Result<IntegrityVerdict>
 	where
 		D: Digest + AssociatedOid,
@@ -42,10 +42,10 @@ impl Frame {
 
 	/// Verify a disclosed [`Opening`] against this frame's message commitment.
 	///
-	/// Convenience over [`Frame::message_commitment_verdict`]. Returns
+	/// It reduces [`Frame::message_commitment_verdict`] to a `bool`, with
 	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
-	/// Callers that must distinguish a stripped commitment from a tampered one
-	/// use the verdict method.
+	/// A caller that must tell a stripped commitment from a tampered one uses
+	/// the verdict.
 	pub fn verify_message_commitment<D>(&self, opening: &Opening) -> Result<bool>
 	where
 		D: Digest + AssociatedOid,
@@ -53,30 +53,31 @@ impl Frame {
 		Ok(self.message_commitment_verdict::<D>(opening)?.is_verified())
 	}
 
-	/// Verify this frame's message commitment against a message the
-	/// caller holds, re-proving the opening in place.
+	/// Verify this frame's message commitment against a message the caller
+	/// holds, with the opening proved again in place.
 	///
-	/// Convenience over [`Opening`] plus [`Frame::verify_message_commitment`]
-	/// for receivers that already decoded the typed message.
+	/// It joins the proof of an [`Opening`] and
+	/// [`Frame::verify_message_commitment`] for a receiver that already decoded
+	/// the typed message.
 	///
 	/// # Contract
 	///
-	/// - After [`Frame::decrypt_in_place`] unwraps the body, the
-	///   commitment in `metadata.integrity` is the surviving
-	///   cryptographic bind between the frame and that cleartext.
+	/// - After [`Frame::decrypt_in_place`] unwraps the body, the commitment in
+	///   `metadata.integrity` is the surviving cryptographic bind between the
+	///   frame and that cleartext.
 	/// - `salt` must match the value the sender committed with.
 	///
 	/// # Returns
 	///
-	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch
-	/// alike. Callers that must distinguish those conditions use
+	/// `Ok(false)` covers absence, algorithm mismatch, and digest mismatch
+	/// alike. A caller that must tell them apart uses
 	/// [`Frame::message_commitment_verdict`].
 	///
 	/// # Errors
 	///
-	/// - [`InvalidSaltLength`](crate::TightBeamError::InvalidSaltLength) --
-	///   when a non-empty `salt` is too short to have hidden the body.
-	/// - Encoding errors from `message`.
+	/// - [`InvalidSaltLength`](crate::TightBeamError::InvalidSaltLength) -- a
+	///   non-empty `salt` is too short to have hidden the body.
+	/// - The encoding errors of `message`.
 	pub fn verify_commitment_of<D, M>(&self, message: &M, salt: impl AsRef<[u8]>) -> Result<bool>
 	where
 		D: Digest + AssociatedOid,
@@ -86,18 +87,18 @@ impl Frame {
 		self.verify_message_commitment::<D>(&opening)
 	}
 
-	/// Check this frame's frame-integrity (FI) digest, reporting which
+	/// Check this frame's frame-integrity (FI) digest, and report which
 	/// condition held.
 	///
-	/// Recomputes `H(SEQUENCE { version, metadata })` with `D` and compares
-	/// it against the stored digest.
+	/// It computes `H(SEQUENCE { version, metadata })` again under `D` and
+	/// compares it with the stored digest.
 	///
 	/// # Ordering
 	///
-	/// The FI digest covers the wire envelope, including any
-	/// `confidentiality` info. Verify it *before*
-	/// [`Frame::decrypt_in_place`], because decryption rewrites the
-	/// envelope and the digest no longer recomputes afterwards.
+	/// The FI digest covers the wire envelope, any `confidentiality` info
+	/// included. Verify it *before* [`Frame::decrypt_in_place`], because
+	/// decryption rewrites the envelope, and the digest of the rewritten
+	/// envelope differs.
 	///
 	/// # See also
 	///
@@ -116,7 +117,7 @@ impl Frame {
 
 		let scaffold = FrameIntegrityScaffold { version: &self.version, metadata: &self.metadata };
 		let recomputed = crate::utils::digest::<D>(&crate::encode(&scaffold)?)?;
-		if recomputed.digest.as_bytes() == info.digest.as_bytes() {
+		if recomputed.digest_matches(info) {
 			Ok(IntegrityVerdict::Verified)
 		} else {
 			Ok(IntegrityVerdict::Mismatch)
@@ -125,10 +126,10 @@ impl Frame {
 
 	/// Verify this frame's frame-integrity (FI) digest.
 	///
-	/// Convenience over [`Frame::frame_integrity_verdict`]. Returns
-	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch
-	/// alike. Callers that must distinguish a stripped FI field from a
-	/// tampered envelope use the verdict method.
+	/// It reduces [`Frame::frame_integrity_verdict`] to a `bool`, with
+	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
+	/// A caller that must tell a stripped FI field from a tampered envelope
+	/// uses the verdict.
 	pub fn verify_frame_integrity<D>(&self) -> Result<bool>
 	where
 		D: Digest + AssociatedOid,

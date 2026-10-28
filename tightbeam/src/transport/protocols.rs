@@ -24,7 +24,7 @@ use crate::utils::marker::MaybeSend;
 use crate::transport::error::TransportFailure;
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
+use crate::transport::framing::{FrameAssembler, Step};
 
 /// Marker trait for a protocol address, in any form the application picks.
 pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
@@ -215,7 +215,7 @@ pub trait Protocol {
 	fn create_transport(stream: Self::Stream, config: EndpointConfig<Self::CryptoProvider>) -> Self::Transport;
 }
 
-/// The dial sits beside [`Protocol`], the seam it connects through, so the
+/// The dial sits beside [`Protocol`], the trait it connects through, so the
 /// owner of the clock and the limits bounds every connect of the crate.
 impl<P: CryptoProvider> EndpointConfig<P> {
 	/// Connects to `addr` over `Pr` within the operation timeout of this
@@ -452,50 +452,24 @@ impl<T: AsyncByteStream> AsyncProtocolStream for T {
 
 /// Read one DER-framed envelope from any async byte reader.
 ///
-/// It is the one async framing path: it classifies the length, enforces
-/// canonical encoding, and checks the cap before it allocates. The blanket
-/// frame-trait impls apply it, so no byte-level transport can diverge on wire
-/// framing.
+/// It drives the one framing sequence, [`FrameAssembler`], which classifies
+/// the length, enforces canonical encoding, and checks the cap before it
+/// wants the content. The blanket frame-trait impls apply it, so no
+/// byte-level transport can diverge on wire framing.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 async fn read_der_frame<R>(stream: &mut R, cap: usize) -> TransportResult<Vec<u8>>
 where
 	R: AsyncByteRead + ?Sized,
 {
-	// EOF before the tag is the peer closing between frames. EOF anywhere after
-	// it is a truncated frame.
-	let mut tag = [0u8; 1];
-	stream.read_exact(&mut tag).await.map_err(|e| (e.into()).at_frame_boundary())?;
+	let mut assembler = FrameAssembler::new(cap);
+	loop {
+		let read = stream.read_exact(assembler.wanted()).await;
+		read.map_err(|error| assembler.classify(error.into()))?;
 
-	let mut length_first = [0u8; 1];
-	stream
-		.read_exact(&mut length_first)
-		.await
-		.map_err(|e| (e.into()).inside_frame())?;
-
-	let length_octets = match LengthForm::from(length_first[0]) {
-		LengthForm::Short(_) => Vec::new(),
-		LengthForm::Long(octet_count) => {
-			let mut length_octets = vec![0u8; octet_count];
-
-			stream
-				.read_exact(&mut length_octets)
-				.await
-				.map_err(|e| (e.into()).inside_frame())?;
-
-			length_octets
+		if let Step::Done(frame) = assembler.advance()? {
+			return Ok(frame);
 		}
-	};
-
-	// Refuse before allocating or reading the content (CWE-400). `content_len`
-	// exists only on an admitted header, so the buffer below cannot be sized
-	// by a length this cap has not seen.
-	let prefix = HeaderPrefix { tag: tag[0], length_first: length_first[0] };
-	let header = FrameHeader::parse(prefix, length_octets)?.admit(cap)?;
-
-	let mut content = vec![0u8; header.content_len()];
-	stream.read_exact(&mut content).await.map_err(|e| (e.into()).inside_frame())?;
-
-	Ok(header.reconstruct(&content))
+	}
 }
 
 /// Protocol that supports persistent connections, or keep-alive.
@@ -506,12 +480,15 @@ pub trait PersistentConnection: Protocol {
 	/// Whether a pool may lease the transport again: the connection is open,
 	/// and its session can carry another exchange.
 	///
-	/// Returns `false` on EOF, a socket error, or an explicit close. It also
-	/// returns `false` on a session whose last exchange broke or never
-	/// settled, as a caller that dropped its emit leaves it, and on one whose
-	/// send cipher has no record left. A protocol over [`TcpTransport`]
-	/// answers with [`TcpTransport::is_leasable`]. A protocol should use a
-	/// lightweight check, such as a peek, that neither blocks nor allocates.
+	/// Returns `false` when any of these holds:
+	///
+	/// - The connection met EOF, a socket error, or an explicit close.
+	/// - The last exchange of the session broke or never settled, as a dropped emit future leaves it.
+	/// - The send cipher of the session has no record left.
+	///
+	/// A protocol over [`TcpTransport`] answers with
+	/// [`TcpTransport::is_leasable`]. A protocol should use a lightweight
+	/// check, such as a peek, that neither blocks nor allocates.
 	///
 	/// [`TcpTransport`]: crate::transport::TcpTransport
 	/// [`TcpTransport::is_leasable`]: crate::transport::TcpTransport::is_leasable

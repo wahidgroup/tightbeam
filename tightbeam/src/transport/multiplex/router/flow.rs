@@ -1,6 +1,6 @@
 //! Flow-control arithmetic and the receiver-side credit policy.
 
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::constants::DEFAULT_MUX_STREAM_CREDIT;
 use crate::transport::multiplex::{CreditGrantor, StreamId};
@@ -18,10 +18,9 @@ pub fn len_as_u64(len: usize) -> u64 {
 
 /// The count of bytes that one mux chunk carries.
 ///
-/// A payload length and a chunk size are both byte counts, so a call site
-/// that holds them loose can swap them, compile, and silently invert the
-/// credit arithmetic. The chunk size therefore travels as its own type, which
-/// applies the floor of one once for every call site.
+/// A payload length and a chunk size are both byte counts, so two loose values
+/// can swap, compile, and invert the credit arithmetic. The chunk size is its
+/// own type, and it applies the floor of one for every call site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChunkSize(NonZeroUsize);
 
@@ -54,9 +53,9 @@ impl ChunkSize {
 	/// `ceil(len / credit_unit)` summed per chunk, so the sender's whole-frame
 	/// debit equals the sum of the receiver's per-chunk debits.
 	#[must_use]
-	pub fn credits(self, payload_len: usize, credit_unit: u32) -> u64 {
+	pub fn credits(self, payload_len: usize, credit_unit: NonZeroU32) -> u64 {
 		let chunk_size = self.width();
-		let unit = u64::from(credit_unit.max(1));
+		let unit = u64::from(credit_unit.get());
 		let len = len_as_u64(payload_len);
 
 		let full_chunks = len / chunk_size;
@@ -83,11 +82,10 @@ pub fn renewal_floor(drain_floor: u64) -> u64 {
 ///
 /// # Low-water mark
 ///
-/// A grant fires only once the remaining credit falls to the half-window
-/// low-water mark, and it tops the limit back up to a full window ahead of
-/// arrival. One `MuxCredit` record therefore covers about half a window of
-/// data chunks, so the control plane consumes AEAD records at
-/// `O(chunks / window)`.
+/// A grant fires when the remaining credit falls to half the window, and it
+/// tops the limit up to a full window ahead of arrival. One `MuxCredit` record
+/// covers about half a window of data chunks, so the control plane spends AEAD
+/// records at `O(chunks / window)`.
 pub struct BufferedGrantor {
 	window: u64,
 }
@@ -144,19 +142,24 @@ mod tests {
 		}
 	}
 
+	/// A credit unit of `bytes`, which is at least one byte.
+	fn credit_unit(bytes: u32) -> NonZeroU32 {
+		NonZeroU32::new(bytes).expect("a credit unit holds at least one byte")
+	}
+
 	// Each case is (payload length, chunk size, credit unit, credits). The
 	// sender's whole-frame debit equals the receiver's per-chunk sum, and not
 	// the naive whole-frame ceil (3 for the last case).
 	crate::tb_cases! {
-		fn test_payload_credits_match_per_chunk_sum((len, chunk, unit, expect): (usize, usize, u32, u64)) {
+		fn test_payload_credits_match_per_chunk_sum((len, chunk, unit, expect): (usize, usize, NonZeroU32, u64)) {
 			assert_eq!(ChunkSize::new(chunk).credits(len, unit), expect);
 		}
 		cases {
-			empty => (0, 1024, 1000, 0),
-			under_one_unit => (100, 1024, 1000, 1),
-			one_chunk_of_one_unit => (1024, 1024, 1024, 1),
-			two_chunks_of_two_units => (2048, 1024, 512, 4),
-			three_chunks_past_their_units => (2500, 1024, 1000, 5),
+			empty => (0, 1024, credit_unit(1000), 0),
+			under_one_unit => (100, 1024, credit_unit(1000), 1),
+			one_chunk_of_one_unit => (1024, 1024, credit_unit(1024), 1),
+			two_chunks_of_two_units => (2048, 1024, credit_unit(512), 4),
+			three_chunks_past_their_units => (2500, 1024, credit_unit(1000), 5),
 		}
 	}
 

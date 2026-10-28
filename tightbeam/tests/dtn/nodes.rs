@@ -5,6 +5,7 @@
 //! - [`PathSide`] names the side of a node that a frame arrives from.
 //! - [`DtnPath`] holds what every node of one path shares, and starts each servlet with its workers.
 
+use core::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -55,6 +56,12 @@ type NodeConfigBuilder<Env> = ServletConfigBuilder<
 	Env,
 	WithCertificate<DefaultCryptoProvider>,
 >;
+
+/// The connection cap of the pool that [`DtnRole::dial_pool`] builds.
+const DIAL_POOL_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(3) {
+	Some(cap) => cap,
+	None => panic!("a pool cap takes one connection or more"),
+};
 
 /// One node of the DTN path, which encodes as an ENUMERATED.
 #[derive(Enumerated, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -147,7 +154,7 @@ impl DtnRole {
 	/// A pool that dials `peer` as this node over mutual TLS, with at most
 	/// 3 connections to each destination.
 	pub fn dial_pool(self, peer: Self) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
-		let config = PoolConfig { max_connections: 3, ..PoolConfig::default() };
+		let config = PoolConfig { max_connections: DIAL_POOL_CONNECTIONS, ..PoolConfig::default() };
 		let pool = ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
 			.with_trust_store(peer.trust_store()?)

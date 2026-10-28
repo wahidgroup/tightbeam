@@ -24,8 +24,8 @@ use crate::instrumentation::events;
 
 /// A connection's shared state and the outbound queue that serves it.
 ///
-/// Every send path needs both handles, and they belong to one connection.
-/// One owner of both keeps each queue on the state of its own connection.
+/// Every send path needs both handles, so one owner of both keeps each queue
+/// on the state of its own connection.
 pub(crate) struct MuxLink {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
@@ -431,11 +431,8 @@ mod tests {
 	/// Settings whose budget holds `credits`, above a drain reserve of five
 	/// records at one credit each.
 	fn budget_settings(credits: u64) -> MuxSettings {
-		let mut settings = MuxSettings::symmetric(1);
-		settings.send_chunk_size = 1024;
-		settings.credit_unit = 1024;
-		settings.send_budget = Some(credits);
-		settings
+		let settings = MuxSettings::symmetric(1).with_chunk_size(1024);
+		settings.with_send_budget(Some(credits))
 	}
 
 	/// Whether `command` carries a GoAway.

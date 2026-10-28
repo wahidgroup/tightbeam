@@ -1,11 +1,11 @@
-use core::any::Any;
+use core::any::{Any, TypeId};
 use core::future::Future;
 use core::pin::Pin;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::colony::hive::HiveContext;
-use crate::colony::worker::{Worker, WorkerMetadata};
+use crate::colony::worker::{Worker, WorkerKillFuture};
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
 use crate::frame::BodyTransform;
@@ -20,8 +20,46 @@ use crate::trace::InternalEvent;
 pub type WorkerBoxStartFuture = Pin<Box<dyn Future<Output = Result<Box<dyn WorkerBox>, TightBeamError>> + Send>>;
 
 /// The type-erased lifecycle of a worker in a worker map that a servlet owns.
+///
+/// Every [`Worker`] implements it, so a servlet starts and kills a worker of
+/// any type through it.
 pub trait WorkerBox: Send + Sync + Any {
 	fn start_boxed(self: Box<Self>, trace: Arc<TraceCollector>) -> WorkerBoxStartFuture;
+
+	/// Ends the worker through [`Worker::kill`], so its run loop answers each
+	/// message its queue holds before it exits.
+	///
+	/// It takes the worker by reference, because the servlet shares its
+	/// workers with every handler. [`ServletRuntime::drain`] calls it on each
+	/// worker of the servlet.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::WorkerBox;
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::worker;
+	///
+	/// worker! {
+	///     name: Echo<TestMessage, usize>,
+	///     handle: |message, _trace| async move { message.content.len() }
+	/// }
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+	/// # runtime.block_on(async {
+	/// let worker: Box<dyn WorkerBox> = Box::new(Echo::new(()));
+	/// let started = worker.start_boxed(Arc::new(TraceCollector::new())).await?;
+	/// started.kill_shared().await?;
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`ServletRuntime::drain`]: crate::colony::servlet::ServletRuntime::drain
+	fn kill_shared(&self) -> WorkerKillFuture;
 }
 
 impl<W: Worker + 'static> WorkerBox for W {
@@ -31,11 +69,21 @@ impl<W: Worker + 'static> WorkerBox for W {
 			Ok(Box::new(started) as Box<dyn WorkerBox>)
 		})
 	}
+
+	fn kill_shared(&self) -> WorkerKillFuture {
+		self.kill()
+	}
 }
 
 impl dyn WorkerBox {
 	pub fn downcast_ref<W: 'static>(&self) -> Option<&W> {
 		(self as &dyn Any).downcast_ref()
+	}
+
+	/// The key of this worker in the worker map of a servlet: the [`TypeId`]
+	/// of the worker's own type, which the erased box reads through its value.
+	pub(crate) fn type_key(&self) -> TypeId {
+		(self as &dyn Any).type_id()
 	}
 }
 
@@ -49,7 +97,9 @@ impl dyn WorkerBox {
 pub struct ServletContext<Env = ()> {
 	trace: TraceHandle,
 	env_config: Arc<Env>,
-	workers: HashMap<String, Box<dyn WorkerBox>>,
+	/// The servlet's workers, one of each type and keyed by that type, which
+	/// the servlet runtime shares to kill them at its drain.
+	workers: Arc<HashMap<TypeId, Box<dyn WorkerBox>>>,
 	hive_context: Option<Arc<dyn HiveContext>>,
 	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
@@ -57,21 +107,27 @@ pub struct ServletContext<Env = ()> {
 
 impl<Env> ServletContext<Env> {
 	/// Build a context whose message-body decryptor and inflator are unset.
+	///
+	/// The context keys each worker of `workers` by the type of the worker the
+	/// box holds, so [`Self::worker`] finds it by that type. A second worker of
+	/// one type replaces the first.
 	pub fn new(
 		trace: Arc<TraceCollector>,
 		env_config: Arc<Env>,
-		workers: HashMap<String, Box<dyn WorkerBox>>,
+		workers: impl IntoIterator<Item = Box<dyn WorkerBox>>,
 		hive_context: Option<Arc<dyn HiveContext>>,
 	) -> Self {
-		Self::sharing_trace(TraceHandle::new(trace), env_config, workers, hive_context)
+		let workers = workers.into_iter().map(|worker| (worker.type_key(), worker)).collect();
+		Self::sharing_trace(TraceHandle::new(trace), env_config, Arc::new(workers), hive_context)
 	}
 
 	/// A context that reads its trace from `trace`, the handle that the servlet
-	/// runtime replaces, with its message-body decryptor and inflator unset.
+	/// runtime replaces, and its workers from `workers`, the map the runtime
+	/// shares, with its message-body decryptor and inflator unset.
 	pub(crate) fn sharing_trace(
 		trace: TraceHandle,
 		env_config: Arc<Env>,
-		workers: HashMap<String, Box<dyn WorkerBox>>,
+		workers: Arc<HashMap<TypeId, Box<dyn WorkerBox>>>,
 		hive_context: Option<Arc<dyn HiveContext>>,
 	) -> Self {
 		Self {
@@ -118,14 +174,13 @@ impl<Env> ServletContext<Env> {
 	/// # Examples
 	///
 	/// ```
-	/// use std::collections::HashMap;
 	/// use std::sync::Arc;
 	///
 	/// use tightbeam::colony::servlet::ServletContext;
 	/// use tightbeam::trace::TraceCollector;
 	///
 	/// let trace = Arc::new(TraceCollector::default());
-	/// let ctx: ServletContext = ServletContext::new(Arc::clone(&trace), Arc::new(()), HashMap::new(), None);
+	/// let ctx: ServletContext = ServletContext::new(Arc::clone(&trace), Arc::new(()), [], None);
 	///
 	/// assert!(Arc::ptr_eq(&ctx.trace(), &trace));
 	/// ```
@@ -145,24 +200,52 @@ impl<Env> ServletContext<Env> {
 		self.hive_context.as_ref()
 	}
 
-	/// The worker registered under `name`, downcast to `W`.
-	pub fn worker<W: 'static>(&self, name: impl AsRef<str>) -> Option<&W> {
-		let name = name.as_ref();
-		self.workers.get(name)?.downcast_ref()
+	/// The worker of type `W` that the servlet holds, if it holds one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::{ServletContext, WorkerBox};
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::worker;
+	///
+	/// worker! {
+	///     name: Echo<TestMessage, usize>,
+	///     handle: |message, _trace| async move { message.content.len() }
+	/// }
+	///
+	/// let workers: [Box<dyn WorkerBox>; 1] = [Box::new(Echo::new(()))];
+	/// let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), workers, None);
+	///
+	/// assert!(ctx.worker::<Echo>().is_some());
+	/// ```
+	pub fn worker<W: 'static>(&self) -> Option<&W> {
+		let key = TypeId::of::<W>();
+		self.workers.get(&key)?.downcast_ref()
 	}
 
-	/// Relay `input` to the worker named by [`WorkerMetadata`].
+	/// Relay `input` to the worker of type `W` that the servlet holds.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingConfiguration`] -- the servlet holds no worker of type `W`.
+	/// - [`TightBeamError::WorkerRelay`] -- the worker refused or failed the relay.
 	pub async fn relay<W>(&self, input: Arc<W::Input>) -> Result<W::Output, TightBeamError>
 	where
-		W: Worker + WorkerMetadata + 'static,
+		W: Worker + 'static,
 	{
-		let name = W::name();
-		let worker = self.worker::<W>(name).ok_or(TightBeamError::MissingConfiguration)?;
+		let worker = self.worker::<W>().ok_or(TightBeamError::MissingConfiguration)?;
 		worker.relay(input).await.map_err(|error| error.into())
 	}
 }
 impl Frame {
 	/// Decrypt or inflate this frame's body in place for typed dispatch.
+	///
+	/// The open takes the FI digest and the signature out of the frame, and
+	/// typed dispatch drops them.
 	///
 	/// The trace of `ctx` records a decrypt as the internal event
 	/// `CRYPTO_STEP`, and the inflate of a cleartext body as `COMPRESS_STEP`.
@@ -171,20 +254,24 @@ impl Frame {
 	///
 	/// - [`RouterError::ConfidentialFrame`] -- the body is encrypted and the context has no decryptor.
 	/// - [`RouterError::CompressedFrame`] -- the body is compressed and the context has no inflator.
-	/// - The errors of the configured decryptor or inflator.
-	/// - The injected error, when the runtime fault model injects a fault at the record of the step.
+	/// - [`TightBeamError`] -- the configured decryptor or inflator fails.
+	/// - [`TightBeamError`] -- the runtime fault model injects a fault at the record of the step.
 	pub async fn prepare_typed<Env>(&mut self, ctx: &ServletContext<Env>) -> Result<(), TightBeamError> {
 		match self.body_transform() {
 			Some(BodyTransform::Decrypt) => {
 				let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
 				let inflator = ctx.message_inflator().map(|inflator| inflator as &(dyn Inflator + Sync));
-				self.decrypt_in_place(decryptor, inflator).await?;
+				// The digest and the signature verify only before the open,
+				// where the collector gates run. The typed handler reads the
+				// cleartext, so the two drop here.
+				let _opened = self.decrypt_in_place(decryptor, inflator).await?;
 				#[cfg(feature = "instrument")]
 				ctx.trace().emit_internal_event(InternalEvent::CryptoStep)?;
 			}
 			Some(BodyTransform::Inflate) => {
 				let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
-				self.inflate_in_place(inflator)?;
+				// The digest and the signature drop as in the decrypt arm.
+				let _opened = self.inflate_in_place(inflator)?;
 				#[cfg(feature = "instrument")]
 				ctx.trace().emit_internal_event(InternalEvent::CompressStep)?;
 			}
@@ -220,7 +307,6 @@ impl Frame {
 /// servlet.
 #[cfg(all(test, feature = "instrument"))]
 mod tests {
-	use std::collections::HashMap;
 	use std::sync::Arc;
 
 	use super::ServletContext;
@@ -240,7 +326,7 @@ mod tests {
 	/// `detail`, with no message transform.
 	fn context_with_detail(detail: bool) -> ServletContext {
 		let trace = TestTrace::with_detail(detail);
-		ServletContext::new(Arc::new(trace), Arc::new(()), HashMap::new(), None)
+		ServletContext::new(Arc::new(trace), Arc::new(()), [], None)
 	}
 
 	/// The crypto steps that the typed delivery of one encrypted frame records

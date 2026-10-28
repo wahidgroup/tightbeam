@@ -194,7 +194,8 @@ impl PresentedCertificates {
 				return Err(CertificateValidationError::InvalidChain { issuer: issuer.to_string(), subject }.into());
 			}
 			if *issuer == lower.tbs_certificate.subject {
-				return Err(CertificateValidationError::AmbiguousIssuer { issuer: issuer.to_string() }.into());
+				let subject = lower.tbs_certificate.subject.to_string();
+				return Err(CertificateValidationError::SelfIssuedBelowIssuer { subject }.into());
 			}
 		}
 

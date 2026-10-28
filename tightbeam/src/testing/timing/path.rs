@@ -102,8 +102,7 @@ impl PathWcet {
 	}
 
 	/// The duration `duration_ns` of a run of the events `run`, when the run
-	/// takes this path exactly and exceeds its maximum, or `None` when it
-	/// holds the bound.
+	/// takes this path exactly and exceeds its maximum, or `None` otherwise.
 	pub(crate) fn excess(&self, run: &[Event], duration_ns: u64) -> Option<u64> {
 		let on_path = run == self.path.as_slice();
 		let over_budget = duration_ns > self.max_duration_ns();
@@ -129,7 +128,7 @@ impl ConsumedTrace {
 		let mut state = process.initial;
 
 		#[cfg(feature = "instrument")]
-		let records = self.instrument_events.iter();
+		let records = self.instrument_events().iter();
 		#[cfg(not(feature = "instrument"))]
 		let records = core::iter::empty::<&crate::instrumentation::TbEvent>();
 
@@ -167,11 +166,10 @@ impl ConsumedTrace {
 
 #[cfg(test)]
 mod tests {
-	use std::borrow::Cow;
-
 	use super::*;
-	use crate::instrumentation::{events, TbEvent};
+	use crate::instrumentation::{events, TbInstrumentationConfig};
 	use crate::testing::specs::csp::{Process, ProcessBuildError, State};
+	use crate::trace::{TraceCollector, TraceConfig};
 	use crate::urn::Urn;
 
 	#[test]
@@ -231,62 +229,32 @@ mod tests {
 			.build()
 	}
 
-	/// A trace of one `TIMING_WCET` run for each label and duration of
-	/// `events`, numbered from 1.
-	fn create_trace_with_timing_events(events: &[(&str, u64)]) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		#[cfg(feature = "instrument")]
-		{
-			use crate::instrumentation::events;
-
-			trace.instrument_events = events
-				.iter()
-				.enumerate()
-				.map(|(idx, (label, duration_ns))| TbEvent {
-					seq: idx as u32 + 1,
-					urn: events::TIMING_WCET,
-					label: Some(label.to_string().into()),
-					payload_hash: None,
-					duration_ns: Some(*duration_ns),
-					timestamp_ns: None,
-					flags: 0,
-					extras: None,
-				})
-				.collect();
-		}
-
-		trace
+	/// The trace that a collector records of one `TIMING_WCET` run for each
+	/// label and duration of `runs`, in order.
+	fn create_trace_with_timing_events(runs: &[(&'static str, u64)]) -> ConsumedTrace {
+		let records: Vec<_> = runs
+			.iter()
+			.map(|(label, duration_ns)| (events::TIMING_WCET, *label, *duration_ns))
+			.collect();
+		trace_of(&records)
 	}
 
-	/// A trace of `records`, each a kind, a label, and a value. A deadline
-	/// marker carries its value as a timestamp, and every other record
-	/// carries it as a duration.
+	/// The trace that a collector records of `records`, each a kind, a label,
+	/// and a value, in order. A deadline marker carries its value as a
+	/// timestamp, and every other record carries it as a duration.
 	fn trace_of(records: &[(Urn<'static>, &'static str, u64)]) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		#[cfg(feature = "instrument")]
-		{
-			use crate::instrumentation::events;
-
-			trace.instrument_events = records
-				.iter()
-				.enumerate()
-				.map(|(seq, (urn, label, value))| {
-					let is_marker = *urn == events::TIMING_DEADLINE;
-					TbEvent {
-						seq: seq as u32,
-						urn: urn.clone(),
-						label: Some(Cow::Borrowed(*label)),
-						payload_hash: None,
-						duration_ns: (!is_marker).then_some(*value),
-						timestamp_ns: is_marker.then_some(*value),
-						flags: 0,
-						extras: None,
-					}
-				})
-				.collect();
+		let config = TbInstrumentationConfig { record_durations: true, ..TbInstrumentationConfig::default() };
+		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+		for (urn, label, value) in records {
+			let value = Duration::from_nanos(*value);
+			if *urn == events::TIMING_DEADLINE {
+				collector.emit_with_timestamp(urn.clone(), *label, value);
+			} else {
+				collector.emit_with_timing(urn.clone(), *label, value);
+			}
 		}
 
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
 	/// The path of the `start`, `process`, and `end` runs of 10, 20, and 5 ms.

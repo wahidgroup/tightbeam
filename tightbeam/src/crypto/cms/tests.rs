@@ -8,8 +8,8 @@ use crate::cms::enveloped_data::{
 };
 use crate::crypto::cms::kek;
 use crate::crypto::cms::{
-	AuthEnvelopedData, BareKemKey, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemKeyHolder, KemRecipient,
-	KemRecipientInfo, KeyAgreementIdentity, Opener, Recipient,
+	ArrivedEnvelope, AuthEnvelopedData, BareKemKey, CmsOriForKemOtherInfo, EnvelopeError, GcmParameters, KemKeyHolder,
+	KemRecipient, KemRecipientInfo, KeyAgreementIdentity, Opener, Recipient,
 };
 use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::hpke::DhKemSecp256k1;
@@ -411,7 +411,8 @@ fn two_seals_draw_two_nonces() {
 #[test]
 fn the_associated_data_is_the_attributes_under_the_set_of_tag() -> Result<(), EnvelopeError> {
 	let sealed = kek_sealed();
-	let arrived = sealed.to_der()?;
+	let encoded = sealed.to_der()?;
+	let arrived = ArrivedEnvelope::read(&encoded)?;
 	let associated_data = sealed.associated_data(&arrived, DATA)?;
 	let expected = unhex("311a301806092a864886f70d010903310b06092a864886f70d010701");
 	assert_eq!(associated_data, expected);

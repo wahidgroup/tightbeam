@@ -525,7 +525,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> PhaseView<P> for ServerPhase<F, P> 
 /// let certificate = TestCertificate::self_signed(&server_key);
 ///
 /// // The client admits the one server certificate it pins.
-/// let pinned = DirectTrustValidator::default().with_trust_chain([certificate.clone()]);
+/// let pinned = DirectTrustValidator::default().with_trust_chain([certificate.clone()])?;
 /// let settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
 /// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
 /// let mut client = Handshake::client(config);
@@ -802,12 +802,12 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		}
 
 		// 9. Derive the handshake secret, and verify the server Finished under
-		//    it before the receipt is read and before any part of the closing
-		//    exists. The Finished proves that the holder of the secret stood
-		//    behind the reply's signature (RFC 9846 §4.5.3), so a certificate
-		//    the store admits for the server's name, which this server never
-		//    sent, reaches neither the receipt check nor the approver.
-		let secret = pending.agree(&server_ephemeral, terms.kdf_salt())?;
+		//    it before the receipt is read or any part of the closing exists.
+		//    The Finished proves that the holder of the secret stood behind the
+		//    reply's signature (RFC 9846 §4.5.3), so a certificate the store
+		//    admits for the server's name that this server never sent reaches
+		//    neither the receipt check nor the approver.
+		let secret = pending.agree(&server_ephemeral, terms.kdf_salt()?)?;
 		let confirmed = ServerConfirmed::confirm(&reply, verified, secret, &terms)?;
 
 		// 10. Verify the session receipt against the accept, which fails closed on a mismatch.
@@ -844,7 +844,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// Seals the countersignature, and builds the closing up to its client
 	/// Finished, under the secret of a server whose Finished verified.
 	///
-	/// The function is synchronous, so it runs inside one poll, and it takes
+	/// It is synchronous, so it runs inside one poll. It takes
 	/// [`ServerConfirmed`], so a closing exists only after the server Finished
 	/// verified.
 	///

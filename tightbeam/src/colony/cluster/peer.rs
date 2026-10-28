@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use super::runtime::VerifiedControlFrame;
 use super::{
-	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry,
-	SharedId,
+	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, RouteKind,
+	ServletEntry, SharedId,
 };
 use crate::colony::protocol::IssuedAt;
 use crate::colony::protocol::{ClusterWorkRequest, PeerAdvertisement};
@@ -96,19 +96,42 @@ impl HopBudget {
 		self.relayed
 	}
 
-	/// Whether the budget affords a forward to a peer gateway.
+	/// Whether the budget affords the forwards that a route of `kind` spends.
+	///
+	/// - A local route spends no forward.
+	/// - A peer route spends one forward.
+	/// - A relay trail spends one forward at the relay before it reaches the owner, so it needs two.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::{HopBudget, RouteKind, WireHopBudget};
+	///
+	/// let budget = HopBudget::from_wire(WireHopBudget::new(1), 4);
+	/// assert!(budget.affords(RouteKind::Peer));
+	/// assert!(!budget.affords(RouteKind::PeerRelay));
+	/// ```
 	#[must_use]
-	pub fn allows_forward(&self) -> bool {
-		self.remaining > 0
+	pub fn affords(&self, kind: RouteKind) -> bool {
+		match kind {
+			RouteKind::Local => true,
+			RouteKind::Peer => self.remaining > 0,
+			RouteKind::PeerRelay => self.remaining >= 2,
+		}
 	}
 
-	/// Whether the budget affords the two forwards a relay trail needs.
-	///
-	/// A relay trail spends one hop at the relay before it reaches the owner,
-	/// so only a budget of two or more can select it.
+	/// Whether the budget affords a forward to a peer gateway, as
+	/// [`Self::affords`] decides for [`RouteKind::Peer`].
+	#[must_use]
+	pub fn allows_forward(&self) -> bool {
+		self.affords(RouteKind::Peer)
+	}
+
+	/// Whether the budget affords the two forwards a relay trail needs, as
+	/// [`Self::affords`] decides for [`RouteKind::PeerRelay`].
 	#[must_use]
 	pub fn allows_relay_trail(&self) -> bool {
-		self.remaining >= 2
+		self.affords(RouteKind::PeerRelay)
 	}
 
 	/// The count this budget puts back on the wire.
@@ -152,10 +175,9 @@ impl HopBudget {
 pub struct AdmittedPeerAd {
 	/// The fingerprint of the signer certificate, which keys the slate.
 	pub(super) peer_hive_id: SharedId,
-	/// The claimed gateway socket every slate entry dials, parsed and admitted
-	/// once. The slate entries carry it, so a score lookup and a stored route
-	/// agree on one socket. The discovery hint carries it as the proof that the
-	/// dial policy admitted it.
+	/// The claimed gateway socket, parsed and admitted once. Every slate entry
+	/// dials it, so a score lookup and a stored route agree on one socket. The
+	/// discovery hint carries it as the proof that the dial policy admitted it.
 	pub(super) dial: AdmittedDial,
 	/// The peer-routed entries, keyed by `peer_hive_id NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
@@ -496,6 +518,23 @@ mod tests {
 		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let id = certificate.fingerprint_id::<ColonyDigest<TokioListener>>();
 		assert_eq!(id.as_deref(), Some(unhex(HOUSE_GATEWAY_ID).as_slice()));
+	}
+
+	// A budget of one forward reaches a local servlet and a peer gateway, and a
+	// relay trail needs the second forward that the relay spends.
+	crate::tb_cases! {
+		fn a_budget_of_one_affords_a_peer_route_and_not_a_relay_trail(
+			(kind, afforded): (RouteKind, bool)
+		) -> Result<(), Box<dyn core::error::Error>> {
+			let budget = HopBudget::for_test(1);
+			assert_eq!(budget.affords(kind), afforded);
+			Ok(())
+		}
+		cases {
+			a_local_route => (RouteKind::Local, true),
+			a_peer_route => (RouteKind::Peer, true),
+			a_relay_trail => (RouteKind::PeerRelay, false),
+		}
 	}
 
 	/// A colony URN under another naming authority.

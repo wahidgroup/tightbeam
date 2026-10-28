@@ -73,6 +73,7 @@ pub use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 pub use tightbeam::testing::{ClusterEnv, HiveEnv, ScenarioConfig, SetupEnv, TestIdentity, TestKey};
 pub use tightbeam::trace::TraceCollector;
 pub use tightbeam::transport::handshake::negotiation::TransportOffer;
+pub use tightbeam::transport::handshake::PeerAuthentication;
 pub use tightbeam::transport::tcp::r#async::TokioListener;
 pub use tightbeam::transport::{ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig};
 pub use tightbeam::urn::Urn;
@@ -86,6 +87,9 @@ pub(crate) use super::events::*;
 pub use crate::common::hive::scenario_hive_config;
 pub use crate::common::poll::poll_until;
 pub use crate::common::x509::{combined_trust, combined_validator, signing_identity, GatewayCerts};
+
+#[cfg(feature = "instrument")]
+pub use crate::common::hive::recorded_labels;
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -299,10 +303,9 @@ pub fn member_identity(cn: impl AsRef<str>) -> (Certificate, Secp256k1SigningKey
 /// The hive-plane identity of the scenario whose gateway identity is
 /// `gateway`, disjoint from that gateway identity.
 ///
-/// The hive plane refuses a signer that `peer_trust` also holds, because
-/// peer membership wins. A fixture that puts the gateway certificate in
-/// `peer_trust` for relay verification registers hives and signs origin
-/// publishes with this identity.
+/// A fixture that puts the gateway certificate in `peer_trust` for relay
+/// verification registers hives and signs origin publishes with this
+/// identity, because peer membership wins on the hive plane.
 ///
 /// - The key derives from the gateway key, so every closure of a scenario derives the one identity.
 /// - The bundled trust store covers the gateway identity, so the hive can dial its gateway.
@@ -352,7 +355,7 @@ pub fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConfig {
 		HiveTlsConfig::new(
 			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
 			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-			vec![],
+			PeerAuthentication::Anonymous,
 		)
 		.expect("the hive TLS material must decode"),
 	);
@@ -532,10 +535,9 @@ pub fn probe_signing_key() -> Secp256k1SigningKey {
 /// Returns whether `frame` carries a signature that verifies against the
 /// public half of `key` over the frame's to-be-signed bytes.
 ///
-/// Every fixture certificate of a key carries that key's identifier, so the
-/// self-signed one is the signer any frame of `key` names. A verified
-/// signature proves byte fidelity end to end. It adapts [`Frame::verify`] to
-/// a boolean for trace events.
+/// It adapts [`Frame::verify`] to a boolean for trace events, with the
+/// self-signed certificate of `key` as the signer that any frame of `key`
+/// names. A verified signature proves byte fidelity end to end.
 pub fn frame_signature_verifies(frame: &Frame, key: &Secp256k1SigningKey) -> bool {
 	let certificate = TestCertificate::self_signed(key);
 	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
@@ -711,11 +713,9 @@ pub fn servlet_info_mismatched(
 	}
 }
 
-/// Polls until the gateway has learned peer types and `trace` holds a direct
-/// advertisement, or the attempts run out.
-///
-/// A slate rumor can install the routes first, so it also waits for
-/// [`wait_for_direct_advertisement`].
+/// Polls until the gateway has learned peer types, or the attempts run out,
+/// and then waits for [`wait_for_direct_advertisement`], because a slate
+/// rumor can install the routes first.
 pub async fn wait_for_peer_types(
 	trace: &TraceCollector,
 	cluster: &ClusterGateway,
@@ -737,7 +737,7 @@ pub async fn wait_for_peer_types(
 /// A beat sends its slate as a direct advertisement and inside a slate rumor.
 /// Either copy installs the routes, and only the direct copy records
 /// [`events::CLUSTER_PEER_ADVERTISED`]. The spec judges the count, so the wait
-/// leaves the verdict to the spec.
+/// returns no verdict.
 pub async fn wait_for_direct_advertisement(trace: &TraceCollector, attempts: u32, interval: Duration) {
 	let advertised = || trace.recorded(events::CLUSTER_PEER_ADVERTISED) > 0;
 	poll_until(attempts, interval, advertised).await;
@@ -967,13 +967,13 @@ pub fn check_work_refusal(
 	Ok(())
 }
 
-/// Submits unary work under `type_name` with a signed ping client frame
+/// Submits a signed ping client frame as unary work under `type_name`
 /// through [`SubmitWork::submit_work_to`], and returns the servlet's
 /// response frame.
 ///
-/// The type URN is caller-chosen, but the body is always [`PingRequest`].
-/// Export scenarios use this for private types whose servlet is the ping
-/// servlet. A refusal surfaces as [`TightBeamError::WorkRefused`].
+/// The body is always [`PingRequest`], so export scenarios use this for
+/// private types whose servlet is the ping servlet. A refusal surfaces as
+/// [`TightBeamError::WorkRefused`].
 pub async fn emit_typed_work(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,

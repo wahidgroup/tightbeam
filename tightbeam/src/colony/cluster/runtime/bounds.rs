@@ -13,10 +13,10 @@ use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::gossip_tasks::PeerLedgers;
 use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
 use crate::colony::cluster::runtime::verify::RequestAudit;
-use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
+use crate::colony::cluster::{ClusterConfig, HiveRegistry, HopBudget, ServletRegistry, WireHopBudget};
 use crate::crypto::profiles::DigestProvider;
 use crate::macros::server::AcceptedConnection;
-use crate::policy::SessionContext;
+use crate::policy::{SessionContext, TransitStatus};
 use crate::runtime::TaskGroup;
 use crate::trace::TraceCollector;
 use crate::transport::client::ConnectionPool;
@@ -26,7 +26,8 @@ use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol};
-use crate::Message;
+use crate::urn::Urn;
+use crate::{Message, TightBeamError};
 
 pub(crate) type ClusterPool<P> = ConnectionPool<P>;
 
@@ -131,8 +132,9 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	/// The plane this gateway dials its hives and their servlets on, which
 	/// holds the hive pool and hands out bound dials alone.
 	pub(crate) hive_plane: HivePlane<P>,
-	/// The plane this gateway dials peer gateways on, when one is configured.
-	pub(crate) peer_plane: Option<PeerPlane<P>>,
+	/// The plane this gateway dials peer gateways on: the peer pool, or the
+	/// hive pool for a gateway that configures no peer trust.
+	pub(crate) peer_plane: PeerPlane<P>,
 	/// The instrumentation collector for the gateway's control-plane events.
 	pub(crate) trace: Arc<TraceCollector>,
 	/// The trace of the accept planes, and of each record no credential backs.
@@ -219,6 +221,36 @@ impl<P> Deref for ColonyConfig<P> {
 	}
 }
 
+impl<P: Protocol> ColonyConfig<P> {
+	/// Admits a work request or a routed stream open to `target`: it clamps
+	/// the `wire` budget to the operator's cap and runs the export gates, which
+	/// read whether a peer relayed the request.
+	///
+	/// The unary work arm and the stream gate both admit through it, so the
+	/// two read one clamp of one octet and one export verdict. A refusal that
+	/// the caller answers comes back as the inner `Err`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- `trace` refused the record of the export verdict.
+	pub(crate) fn admit_target(
+		&self,
+		target: &Urn<'_>,
+		wire: WireHopBudget,
+		session: &SessionContext,
+		trace: &TraceCollector,
+	) -> Result<Result<HopBudget, TransitStatus>, TightBeamError> {
+		let budget = HopBudget::from_wire(wire, self.peer.max_hops);
+		let relayed = budget.is_relayed();
+		let status = self.evaluate_export_gates(target, session, relayed, trace)?;
+		if status != TransitStatus::Ok {
+			return Ok(Err(status));
+		}
+
+		Ok(Ok(budget))
+	}
+}
+
 impl<P: ColonyDialProtocol> ColonyConfig<P> {
 	/// `builder`, set to digest its frame witness under the colony digest.
 	pub(crate) fn witnessed<T>(&self, builder: FrameBuilder<T>) -> FrameBuilder<T>
@@ -280,13 +312,15 @@ pub(crate) mod fixtures {
 			let clock = Arc::clone(&config.clock);
 			let registry = HiveRegistry::new(config.heartbeat.timeout, Arc::clone(&clock));
 			let servlet_registry = ServletRegistry::new(config.pheromone.clone(), Arc::clone(&clock));
+			let hive_plane = HivePlane::new(pools.hive, Arc::clone(trace));
+			let peer_plane = hive_plane.peers(pools.peer, config.clone());
 
 			Self {
 				registry: Arc::new(registry),
 				servlet_registry: Arc::new(servlet_registry),
 				admission: Arc::default(),
-				hive_plane: HivePlane::new(pools.hive, Arc::clone(trace)),
-				peer_plane: None,
+				hive_plane,
+				peer_plane,
 				trace: Arc::clone(trace),
 				connections: Arc::clone(connections),
 				replay_guard: GatewayReplayGuard::new(config.control_freshness_window, clock),

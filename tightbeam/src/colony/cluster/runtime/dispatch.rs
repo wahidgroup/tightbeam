@@ -9,15 +9,16 @@
 //!
 //! 1. Run [`evaluate_gates`] on the request frame and the session.
 //! 2. Decode [`ClusterRequest`] from the frame body.
-//! 3. On [`ClusterRequest::Work`], run [`evaluate_export_gates`] with
-//!    [`HopBudget::is_relayed`] before [`GatewayRuntimeCtx::handle_work`].
+//! 3. On [`ClusterRequest::Work`], admit the target through [`admit_target`],
+//!    which clamps the hop budget and runs the export gates, before
+//!    [`GatewayRuntimeCtx::handle_work`].
 //! 4. Route every other variant to its handler, such as registration or gossip.
 //!
 //! [`evaluate_gates`]: crate::colony::cluster::ClusterConfig::evaluate_gates
-//! [`evaluate_export_gates`]: crate::colony::cluster::ColonyConfig::evaluate_export_gates
+//! [`admit_target`]: crate::colony::cluster::ColonyConfig::admit_target
 
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
-use crate::colony::cluster::{HopBudget, WireHopBudget};
+use crate::colony::cluster::WireHopBudget;
 use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
 use crate::decode;
 use crate::policy::{SessionContext, TransitStatus};
@@ -128,16 +129,13 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		request: ClusterWorkRequest,
 		audit: &RequestAudit,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let budget = HopBudget::from_wire(WireHopBudget::new(request.hops_remaining), self.config.peer.max_hops);
-		let target = &request.servlet_type;
-		let relayed = budget.is_relayed();
-		let config = &self.config;
-
+		let wire = WireHopBudget::new(request.hops_remaining);
 		let trace = audit.unproven();
-		let export_status = config.evaluate_export_gates(target, &session, relayed, trace)?;
-		if export_status != TransitStatus::Ok {
-			return ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(export_status));
-		}
+		let admitted = self.config.admit_target(&request.servlet_type, wire, &session, trace)?;
+		let budget = match admitted {
+			Ok(budget) => budget,
+			Err(status) => return ReplyForm::Plain.reply(frame.metadata().id(), ClusterWorkResponse::err(status)),
+		};
 
 		self.handle_work(frame, request, budget, trace).await
 	}

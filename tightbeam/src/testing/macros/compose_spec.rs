@@ -61,7 +61,7 @@
 ///     composition: Interface { events: ["pnig"] }
 /// }
 ///
-/// assert_eq!(PingsBesidePongs::process()?.name, "(Pings ||| Pongs)");
+/// assert_eq!(PingsBesidePongs::process()?.name(), "(Pings ||| Pongs)");
 /// assert!(matches!(Misspelled::process(), Err(CompositionError::AlphabetMismatch { .. })));
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```

@@ -313,7 +313,7 @@ impl ScenarioConfig {
 	/// Grades the scenario against its FDR configuration, or returns `None`
 	/// when it names none.
 	///
-	/// The verdict comes with the events exploration recorded into its own
+	/// The verdict carries the events that exploration recorded into its own
 	/// trace, apart from the events of the run. That trace takes the
 	/// instrumentation settings and the clock of the scenario's trace.
 	///
@@ -362,17 +362,9 @@ impl ScenarioConfig {
 
 		let model_cfg = Arc::clone(fdr_cfg);
 		let mut explorer = DefaultFdrExplorer::with_defaults(&layer.process, model_cfg);
-		let verdict = explorer.explore_state_space_into(exploration)?;
-		if fdr_cfg.specs.is_empty() {
-			return Ok(verdict);
-		}
-
 		let trace_process = trace.to_process();
-		let trace_cfg = Arc::clone(fdr_cfg);
-		let mut trace_explorer = DefaultFdrExplorer::with_defaults(&trace_process, trace_cfg);
-		let trace_verdict = trace_explorer.explore_into(exploration)?;
 
-		Ok(verdict.with_refinement_from(trace_verdict))
+		explorer.explore_model_then_trace(&trace_process, exploration)
 	}
 
 	/// The timing constraints that the first FDR spec declares, if any.
@@ -527,8 +519,8 @@ impl ScenarioConfigBuilder {
 	/// Whether `layer` can produce a rejection in this configuration.
 	///
 	/// A layer rejects only through a verifier, and the assertion layer rejects
-	/// only through a spec that grades something. It is the one predicate that
-	/// the effective-verifier check and the expectation check both ask.
+	/// only through a spec that grades something. The effective-verifier check
+	/// and the expectation check both ask this one predicate.
 	fn can_reject_at(&self, layer: Layer) -> bool {
 		match layer {
 			Layer::Assertion => self.specs.iter().any(|spec| spec.can_reject()),
@@ -550,8 +542,7 @@ impl ScenarioConfigBuilder {
 	/// - [`ScenarioConfigError::NoEffectiveVerifier`] -- no configured layer
 	///   can reject the run, so the scenario would pass whatever happened.
 	/// - [`ScenarioConfigError::ExpectViolationWithoutVerifier`] -- the
-	///   expectation names a layer that cannot reject this configuration, so
-	///   the rejection it waits for can never arrive.
+	///   expectation names a layer that cannot reject this configuration.
 	/// - [`ScenarioConfigError::CspRefused`] -- the process of the CSP spec
 	///   does not build, or a property that the spec claims fails.
 	pub fn build(self) -> Result<ScenarioConfig, ScenarioConfigError> {
@@ -985,7 +976,7 @@ mod tests {
 
 		/// The labels of the `urn` events in `trace`, or none for `None`.
 		fn labels(trace: Option<&ConsumedTrace>, urn: Urn<'static>) -> Vec<String> {
-			let events = trace.into_iter().flat_map(|trace| trace.instrument_events.iter());
+			let events = trace.into_iter().flat_map(|trace| trace.instrument_events().iter());
 			let named = events.filter(|event| event.urn == urn);
 			named.filter_map(|event| event.label.clone().map(String::from)).collect()
 		}
@@ -1058,8 +1049,7 @@ mod tests {
 		fn the_trace_of_the_run_receives_no_exploration_event() -> Result<(), Box<dyn core::error::Error>> {
 			let received = Arc::new(Received::default());
 			let sink = ReceivingSink(Arc::clone(&received));
-			let instrumented = TraceConfig::builder().with_instrumentation(every_flag());
-			let settings = instrumented.with_sink(sink).build();
+			let settings = TraceConfig::with_instrumentation(every_flag()).with_sink(sink);
 			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
 			let config = builder.with_trace(TraceCollector::from(settings)).build()?;
 
@@ -1084,6 +1074,35 @@ mod tests {
 			let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
 			let complete = verdict.exploration().map(ConsumedTrace::is_complete);
 			assert_eq!(complete, Some(false), "the sink holds two events");
+			Ok(())
+		}
+
+		/// The trace of a run that sends and is done.
+		fn sent_and_done() -> ConsumedTrace {
+			let collector = TraceCollector::new();
+			collector.event(SEND).expect("the run injects no fault").emit();
+			collector.event(DONE).expect("the run injects no fault").emit();
+
+			let mut run = ConsumedTrace::new();
+			run.populate_from_collector(&collector);
+			run
+		}
+
+		/// A configuration that names no FDR spec explores the CSP model alone.
+		#[test]
+		fn a_configuration_with_no_spec_explores_the_model_alone() -> Result<(), Box<dyn core::error::Error>> {
+			let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..TbInstrumentationConfig::default() };
+			let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
+			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
+			let config = builder.with_trace(trace).build()?;
+
+			let verdict = config.verify(&sent_and_done(), Ok(()))?;
+
+			let offers = [
+				"Spinning.S0: {urn:test:event:exploration/send}",
+				"Spinning.S1: {urn:test:event:exploration/done}",
+			];
+			assert_eq!(labels(verdict.exploration(), ENABLED_SET_SAMPLE), offers);
 			Ok(())
 		}
 	}

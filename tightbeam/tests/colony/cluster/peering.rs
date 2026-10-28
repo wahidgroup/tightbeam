@@ -1039,9 +1039,7 @@ tb_scenario! {
 }
 
 /// The exporter identity, which serves the advertiser and the hive, sits on
-/// one trust plane, and the receiver sits on another. Only `peer_trust` can
-/// validate the receiver's TLS identity, so the advertise beat must dial on
-/// the peer plane, never the hive one.
+/// one trust plane, and the receiver sits on another.
 struct SplitPlaneCerts {
 	exporter: ClusterTestCerts,
 	receiver: (Certificate, Secp256k1SigningKey),
@@ -1258,4 +1256,23 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+// A peer that refuses a direct advertisement leaves a record on the gateway
+// that sent it, so the sender's trail shows each refusal (CWE-778). The
+// receiver holds no peer trust, so it refuses every advertisement.
+#[tokio::test]
+async fn a_peer_that_refuses_a_direct_advertisement_leaves_a_record_on_the_sender() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let receiver = start_cluster(&TraceCollector::new(), routing_cluster_conf(&certs, None)).await?;
+	let trace = TraceCollector::new();
+	let sender = start_cluster(&trace, advertising_cluster_conf(&certs, receiver.addr().to_string())).await?;
+
+	let refused = || trace.recorded(events::CLUSTER_PEER_AD_REFUSED_BY_PEER) > 0;
+	let recorded = poll_until(50, Duration::from_millis(100), refused).await;
+	sender.stop();
+	receiver.stop();
+
+	assert!(recorded);
+	Ok(())
 }

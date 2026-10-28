@@ -18,7 +18,7 @@ use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
 use crate::transport::builders::EnvelopeBuilder;
-use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
+use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::TransportResult;
@@ -43,14 +43,13 @@ use crate::transport::handshake::SessionPeer;
 use crate::TightBeamError;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::state::{CollectStep, ServerHandshakeSlot};
+use crate::transport::state::{CollectStep, Round, ServerHandshakeSlot};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake {
 	pub use crate::transport::handshake::{
-		BoxedClientHandshake, ClientHandshakeProtocol, HandshakeMessage, HandshakeProvider, ServerHandshakeProtocol,
+		BoxedClientHandshake, ClientHandshakeProtocol, HandshakeMessage, HandshakeProvider,
 	};
-	pub use crate::transport::state::SessionPhase;
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -474,7 +473,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// A multi-round server handshake reports `Ok` per round, so only the
 		// encrypted phase marks the session as established.
-		if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
+		if !self.session_state().phase().requires_encryption() {
 			return outcome;
 		}
 
@@ -498,7 +497,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: Sized + EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let should_handshake = matches!(self.session_state().phase(), SessionPhase::Provisioned);
+		let should_handshake = self.session_state().phase().awaits_handshake();
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}
@@ -528,12 +527,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		// Step 1: Start the handshake and send the initial message.
 		let initial_message = orchestrator.start().await?;
-		if initial_message.der().len() > self.limits().handshake_wire {
-			return Err(TransportError::InvalidMessage);
-		}
-
-		let wire_envelope = WireEnvelope::Cleartext(initial_message.into());
-		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
+		self.write_handshake(initial_message).await?;
 
 		// The phase moves to handshaking once the first message is out.
 		let now = self.clock().monotonic();
@@ -555,12 +549,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 4: Send the next message, if any, for a multi-round handshake.
 		if let Some(next_message) = next_message {
-			if next_message.der().len() > self.limits().handshake_wire {
-				return Err(TransportError::InvalidMessage);
-			}
-
-			let wire_envelope = WireEnvelope::Cleartext(next_message.into());
-			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
+			self.write_handshake(next_message).await?;
 		}
 
 		// Step 5: Complete the handshake, which hands over everything it
@@ -597,15 +586,55 @@ pub trait EncryptedMessageIO: MessageIO {
 		outcome
 	}
 
-	/// Drives the protocol-agnostic server handshake state machine.
+	/// Writes `message`, one handshake container, in cleartext within the
+	/// handshake wire ceiling of this endpoint.
 	///
-	/// The persisted orchestrator must already exist.
+	/// Every handshake message the drivers send passes through here, so the
+	/// ceiling binds each round at one site.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidState`] -- the slot holds no orchestrator, or
-	///   the session refuses the move to the handshaking phase.
-	/// - [`TransportError::InvalidMessage`] -- the response passes the wire ceiling.
+	/// - [`TransportError::InvalidMessage`] -- `message` passes the handshake
+	///   wire ceiling, and no byte of it is written.
+	/// - The encode failure, and the errors of [`write_envelope_bytes`](MessageIO::write_envelope_bytes).
+	///
+	/// # Examples
+	///
+	/// ```no_run
+	/// use tightbeam::transport::handshake::HandshakeMessage;
+	/// use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+	/// use tightbeam::transport::{EncryptedMessageIO, TransportResult};
+	///
+	/// /// Send `round` as the next handshake message of `link`.
+	/// async fn send(link: &mut TcpTransport<TokioStream>, round: HandshakeMessage) -> TransportResult<()> {
+	///     link.write_handshake(round).await
+	/// }
+	/// ```
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[allow(async_fn_in_trait)]
+	async fn write_handshake(&mut self, message: HandshakeMessage) -> TransportResult<()>
+	where
+		Self: Sized + EncryptedProtocolState,
+	{
+		self.limits().admit_handshake_wire(message.der().len())?;
+
+		let wire_envelope = WireEnvelope::Cleartext(message.into());
+		let wire_bytes = wire_envelope.to_der()?;
+		self.write_envelope_bytes(&wire_bytes).await
+	}
+
+	/// Drives the protocol-agnostic server handshake state machine through
+	/// one round.
+	///
+	/// The session admits the round before the orchestrator in the slot
+	/// advances, so a refused round leaves the orchestrator where it was. A
+	/// reply then goes out, and a completed handshake installs its session.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- the session refuses the round, or
+	///   the slot holds no orchestrator.
+	/// - [`TransportError::InvalidMessage`] -- the reply passes the handshake wire ceiling.
 	/// - The orchestrator, write, and install failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
@@ -613,33 +642,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState + ServerHandshakeSlot,
 	{
-		let orchestrator = self.server_handshake_mut().as_mut().ok_or(TransportError::InvalidState)?;
-		let response = orchestrator.handle_request(request).await?;
+		let now = self.clock().monotonic();
+		let round = self.session_state_mut().advance_handshake(request, now).await?;
 
-		// A response means another round follows.
-		if let Some(response) = response {
-			if response.der().len() > self.limits().handshake_wire {
-				return Err(TransportError::InvalidMessage);
-			}
-
-			// The driver writes the response only after the session accepts the
-			// move, because a write ahead of a refusal would send a handshake
-			// response on a session that already agreed one.
-			let now = self.clock().monotonic();
-			if !self.session_state_mut().begin_handshake(now) {
-				return Err(TransportError::InvalidState);
-			}
-
-			let wire_envelope = WireEnvelope::Cleartext(response.into());
-			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
-		} else {
-			// No response means the handshake is complete.
-			let orchestrator = self.server_handshake_mut().take().ok_or(TransportError::InvalidState)?;
-			let session = orchestrator.complete().await?;
-			self.install_established(session)?;
+		match round {
+			Round::Reply(reply) => self.write_handshake(reply).await,
+			Round::Complete(session) => self.install_established(session),
 		}
-
-		Ok(())
 	}
 
 	/// Performs the server-side handshake with the configured protocol.
@@ -654,7 +663,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidMessage`] -- the request passes the wire ceiling.
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::DeadlineExceeded`] -- the handshake timed out.
@@ -670,17 +678,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: HandshakeProvider,
 	{
-		if request.der().len() > self.limits().handshake_wire {
-			return Err(TransportError::InvalidMessage);
-		}
-
-		// The orchestrator persists across messages, so this method creates it
-		// once.
-		if self.server_handshake_mut().is_none() {
-			let orchestrator = self.session_state().endpoint().server_handshake()?;
-
-			*self.server_handshake_mut() = Some(orchestrator);
-		}
+		// The orchestrator persists across rounds, so the slot builds it once.
+		self.session_state_mut().occupy_handshake()?;
 
 		// A deadline that ends the handshake is its outcome, so the record of
 		// the outcome below files it.
@@ -727,25 +726,11 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let response_bytes = self.read_session_bytes().await?;
 		let response_envelope = self.decrypt_response(response_bytes).await?;
-		let (status, response) = match response_envelope {
-			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
-			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
-			TransportEnvelope::SignedData(_) | TransportEnvelope::AuthEnvelopedData(_) | TransportEnvelope::Data(_) => {
-				return Err(TransportError::InvalidMessage)
-			}
-			#[cfg(feature = "transport-multiplex")]
-			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
-		};
+		let ResponsePackage { status, message: response } = response_envelope.into_response()?;
 
 		// A refused cleartext request returns its frame for retry evaluation.
-		let returned_message = if status != TransitStatus::Ok {
-			match wire_envelope {
-				WireEnvelope::Cleartext(TransportEnvelope::Request(pkg)) => Some(pkg.message),
-				_ => None, // An encrypted request has no cleartext frame.
-			}
-		} else {
-			None
-		};
+		let refused = status != TransitStatus::Ok;
+		let returned_message = refused.then(|| wire_envelope.cleartext_request()).flatten();
 
 		let response_frame = response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
 		let returned_frame = returned_message.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
@@ -860,25 +845,6 @@ impl TransportRefusal {
 	}
 }
 
-impl TransportEnvelope {
-	/// Returns the application request frame inside a single-flight envelope.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::InvalidMessage`] -- the envelope is any kind other than a request.
-	pub(crate) fn into_request_frame(self) -> TransportResult<Arc<Frame>> {
-		match self {
-			TransportEnvelope::Request(msg) => Ok(msg.message),
-			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
-			TransportEnvelope::SignedData(_) | TransportEnvelope::AuthEnvelopedData(_) | TransportEnvelope::Data(_) => {
-				Err(TransportError::InvalidMessage)
-			}
-			#[cfg(feature = "transport-multiplex")]
-			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -886,7 +852,7 @@ mod tests {
 	use crate::testing::TestFrame;
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::transport::handshake::EstablishedSession;
-	use crate::transport::state::{EncryptionConfig, SessionState};
+	use crate::transport::state::{EncryptionConfig, SessionPhase, SessionState};
 	use crate::utils::time::ManualClock;
 	use crate::Version;
 
@@ -902,14 +868,22 @@ mod tests {
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	use crate::testing::FaultModel;
-	#[cfg(all(
-		feature = "instrument",
-		feature = "testing-fault",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	use crate::transport::handshake::HandshakeError;
 	#[cfg(feature = "instrument")]
 	use crate::urn::Urn;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	mod slot_fixtures {
+		pub use core::sync::atomic::{AtomicUsize, Ordering};
+
+		pub use crate::crypto::profiles::SecurityProfileDesc;
+		pub use crate::transport::handshake::tests::create_test_signed_data;
+		pub use crate::transport::handshake::{HandshakeError, ServerHandshakeProtocol};
+		pub use crate::transport::state::HandshakeSlot;
+		pub use crate::utils::marker::MaybeSendFuture;
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use slot_fixtures::*;
 
 	#[cfg(feature = "instrument")]
 	mod audit_fixtures {
@@ -954,6 +928,8 @@ mod tests {
 		limits: TransportLimits,
 		clock: ManualClock,
 		inbound: Option<Vec<u8>>,
+		/// Every buffer the probe wrote, in order.
+		sent: Vec<Vec<u8>>,
 		#[cfg(feature = "instrument")]
 		trace: Option<TraceCollector>,
 	}
@@ -963,7 +939,7 @@ mod tests {
 		/// stream is closed.
 		fn at(phase: SessionPhase) -> Self {
 			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-			let peer_authentication = PeerAuthentication::mutual([validator]);
+			let peer_authentication = PeerAuthentication::Anonymous.and(validator);
 			let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
 
 			Self {
@@ -971,6 +947,7 @@ mod tests {
 				limits: TransportLimits::default(),
 				clock: ManualClock::default(),
 				inbound: None,
+				sent: Vec::new(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1010,12 +987,78 @@ mod tests {
 			self.inbound.take().ok_or(TransportError::ConnectionClosed)
 		}
 
-		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
+		async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
+			self.sent.push(buffer.to_vec());
 			Ok(())
 		}
 	}
 
 	impl EncryptedMessageIO for StreamProbe {}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	impl ServerHandshakeSlot for StreamProbe {
+		fn handshake_slot(&mut self) -> &mut HandshakeSlot {
+			self.state.handshake_slot()
+		}
+
+		async fn within_budget<T, F>(_budget: core::time::Duration, operation: F) -> TransportResult<T>
+		where
+			F: Future<Output = TransportResult<T>>,
+		{
+			operation.await
+		}
+	}
+
+	/// A server orchestrator that answers every request with `reply`, and
+	/// counts the rounds it ran in `rounds`. Its completion fails with
+	/// `InvalidState`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	struct CountingServer {
+		rounds: Arc<AtomicUsize>,
+		reply: Option<HandshakeMessage>,
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	impl ServerHandshakeProtocol for CountingServer {
+		fn handle_request<'a>(
+			&'a mut self,
+			_msg: HandshakeMessage,
+		) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, HandshakeError>> {
+			self.rounds.fetch_add(1, Ordering::SeqCst);
+			let reply = self.reply.clone();
+			Box::pin(async move { Ok(reply) })
+		}
+
+		fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, HandshakeError>> {
+			Box::pin(async { Err(HandshakeError::InvalidState) })
+		}
+
+		fn is_complete(&self) -> bool {
+			false
+		}
+
+		fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+			None
+		}
+	}
+
+	/// A signed handshake container of one round.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn handshake_round() -> HandshakeMessage {
+		HandshakeMessage::try_from(create_test_signed_data(b"round")).expect("a signed container encodes")
+	}
+
+	/// A probe in `phase` whose slot holds a [`CountingServer`] that answers
+	/// each round with a signed container, beside the count of its rounds.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn counting_slot(phase: SessionPhase) -> (StreamProbe, Arc<AtomicUsize>) {
+		let rounds = Arc::new(AtomicUsize::new(0));
+		let server = CountingServer { rounds: Arc::clone(&rounds), reply: Some(handshake_round()) };
+		let mut probe = StreamProbe::at(phase);
+		probe.handshake_slot().install(Box::new(server));
+
+		(probe, rounds)
+	}
 
 	impl crate::transport::state::sealed::Sealed for StreamProbe {}
 
@@ -1454,6 +1497,56 @@ mod tests {
 		let established = matches!(probe.session_state().phase(), SessionPhase::Encrypted(_));
 		let leasable = probe.session_state().is_leasable();
 		assert_eq!((at_limit, established, leasable), (true, true, false));
+	}
+
+	/// A round that the session refuses leaves the orchestrator in the slot
+	/// where it was, so a cleartext session moves no handshake on.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_refused_round_leaves_the_slot_unadvanced() {
+		let (mut probe, rounds) = counting_slot(SessionPhase::Cleartext);
+
+		let refused = probe.drive_server_handshake(handshake_round()).await;
+		let invalid = matches!(refused, Err(TransportError::InvalidState));
+		assert_eq!((invalid, rounds.load(Ordering::SeqCst)), (true, 0));
+	}
+
+	/// A reset drops the orchestrator in flight with the phase, so the next
+	/// round finds the slot empty and advances no handshake the session
+	/// dropped.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_reset_mid_handshake_empties_the_slot() {
+		let (mut probe, rounds) = counting_slot(handshaking_phase());
+		probe.session_state_mut().reset();
+
+		let refused = probe.drive_server_handshake(handshake_round()).await;
+		let invalid = matches!(refused, Err(TransportError::InvalidState));
+		assert_eq!((invalid, rounds.load(Ordering::SeqCst)), (true, 0));
+	}
+
+	/// A handshake reply past the handshake wire ceiling is refused before
+	/// the endpoint writes a byte of it.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_handshake_reply_past_the_wire_ceiling_is_refused_before_the_write() {
+		let (mut probe, _rounds) = counting_slot(SessionPhase::Provisioned);
+		probe.limits.handshake_wire = 16;
+
+		let refused = probe.drive_server_handshake(handshake_round()).await;
+		let oversize = matches!(refused, Err(TransportError::InvalidMessage));
+		assert_eq!((oversize, probe.sent.len()), (true, 0));
+	}
+
+	/// An exchange takes a response as its answer, so a request that arrives
+	/// in its place is refused.
+	#[tokio::test]
+	async fn a_request_envelope_as_an_answer_is_refused() {
+		let answer = WireEnvelope::Cleartext(request_with(TestFrame::prioritized()));
+		let mut probe = StreamProbe::reading(SessionPhase::Cleartext, answer);
+
+		let refused = probe.perform_emit_cycle(TestFrame::prioritized()).await;
+		assert!(matches!(refused, Err(TransportError::InvalidMessage)));
 	}
 
 	/// A request around `frame`.

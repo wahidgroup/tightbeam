@@ -81,13 +81,21 @@ pub enum CertificateValidationError {
 
 	/// Two certificates of a presented path carry the issuer name of one
 	/// certificate as their subject, so the path names no single issuer above
-	/// that certificate. A self-issued certificate names itself as its issuer,
-	/// so a chain that sets another certificate of the same name above it
-	/// holds two.
+	/// that certificate.
 	#[error("Certificate path holds two issuers named {issuer}")]
 	AmbiguousIssuer {
 		/// The issuer name that two certificates carry.
 		issuer: String,
+	},
+
+	/// A presented chain sets a certificate above a self-issued one. A
+	/// self-issued certificate is its own issuer, so it ends the chain, and a
+	/// certificate above it issues no certificate of the chain.
+	#[error("Certificate chain sets an issuer above the self-issued certificate {subject}")]
+	SelfIssuedBelowIssuer {
+		/// The subject name of the self-issued certificate, which is also its
+		/// issuer name.
+		subject: String,
 	},
 
 	/// A presented path returns to a certificate it holds, so it reaches no
@@ -240,6 +248,7 @@ impl CertificateValidationError {
 			Self::CertificateNotTrusted => "certificate-not-trusted",
 			Self::InvalidChain { .. } => "invalid-chain",
 			Self::AmbiguousIssuer { .. } => "ambiguous-issuer",
+			Self::SelfIssuedBelowIssuer { .. } => "self-issued-below-issuer",
 			Self::PathCycle { .. } => "path-cycle",
 			Self::EmptyChain => "empty-chain",
 			Self::SkidCollision { .. } => "skid-collision",

@@ -29,22 +29,21 @@ mod tokio_rt {
 #[cfg(feature = "tokio")]
 use tokio_rt::*;
 
-use crate::builder::TypeBuilder;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::CryptoProvider;
 use crate::der::Decode;
 use crate::der::Encode;
 use crate::policy::GatePolicy;
 use crate::policy::TransitStatus;
+use crate::transport::builders::Sealing;
 use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::{ArrivalCause, ArrivalRefusal};
-use crate::transport::handshake::{BoxedServerHandshake, HandshakeProvider};
+use crate::transport::handshake::HandshakeProvider;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::policy::RestartPolicy;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
-use crate::transport::state::{EncryptedProtocolState, ReadPolicy, SettledExchange};
+use crate::transport::state::{ReadPolicy, SettledExchange};
 use crate::transport::EncryptedMessageIO;
-use crate::transport::ResponsePackage;
 use crate::transport::{
 	EnvelopeBuilder, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportLimits, TransportResult,
 	WireMode,
@@ -58,7 +57,7 @@ mod handshake_imports {
 	pub use core::future::Future;
 	pub use core::time::Duration;
 
-	pub use crate::transport::state::ServerHandshakeSlot;
+	pub use crate::transport::state::{HandshakeSlot, ServerHandshakeSlot};
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -72,7 +71,7 @@ mod mux_imports {
 	pub use crate::policy::SessionContext;
 	pub use crate::transport::handshake::negotiation::MuxSettings;
 	pub use crate::transport::handshake::negotiation::TransportOffer;
-	pub use crate::transport::state::SessionPhase;
+	pub use crate::transport::state::EncryptedProtocolState;
 	pub use crate::utils::marker::MaybeSend;
 	pub use crate::x509::Certificate;
 }
@@ -502,7 +501,7 @@ where
 			return Ok(None);
 		}
 
-		while !matches!(self.state.phase(), SessionPhase::Encrypted(_)) {
+		while !self.state.phase().requires_encryption() {
 			match self.collect_step().await? {
 				CollectStep::Handshake(request) => {
 					self.perform_server_handshake(request).await?;
@@ -553,8 +552,9 @@ impl SplitRecv {
 	}
 
 	/// The receive cipher of an encrypted half, under which the half admits an
-	/// arrival, or `None` for a cleartext half.
-	const fn cipher(&self) -> Option<&RecvCipher> {
+	/// arrival, or `None` for a cleartext half. The half lends it exclusively,
+	/// so one open runs on the key at a time.
+	const fn cipher(&mut self) -> Option<&mut RecvCipher> {
 		match self {
 			Self::Cleartext => None,
 			Self::Encrypted(recv_key) => Some(recv_key),
@@ -569,6 +569,16 @@ enum SplitSend {
 	Cleartext,
 	/// The send-direction cipher of the established session.
 	Encrypted(SendCipher),
+}
+
+impl SplitSend {
+	/// The sealing this half writes each envelope under.
+	const fn sealing(&self) -> Sealing<'_> {
+		match self {
+			Self::Cleartext => Sealing::Cleartext,
+			Self::Encrypted(send_key) => Sealing::Encrypted(send_key),
+		}
+	}
 }
 
 #[cfg(feature = "instrument")]
@@ -790,10 +800,7 @@ where
 	/// [`TRANSPORT_REKEY_REQUIRED`]: crate::instrumentation::events::TRANSPORT_REKEY_REQUIRED
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
 		let builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
-		let builder = match &self.mode {
-			SplitSend::Cleartext => builder.with_wire_mode(WireMode::Cleartext),
-			SplitSend::Encrypted(send_key) => builder.with_wire_mode(WireMode::Encrypted).with_encryptor(send_key),
-		};
+		let builder = builder.with_sealing(self.mode.sealing());
 
 		let sealed = builder.finish();
 
@@ -990,8 +997,8 @@ impl<S: AsyncProtocolStream, P: CryptoProvider> ServerHandshakeSlot for TcpTrans
 where
 	TransportError: From<S::Error>,
 {
-	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-		&mut self.server_handshake
+	fn handshake_slot(&mut self) -> &mut HandshakeSlot {
+		self.state.handshake_slot()
 	}
 
 	/// Bounds `operation` with the tokio timer, as the reads and writes are.
@@ -1037,14 +1044,7 @@ where
 	}
 
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let builder = EnvelopeBuilder::response(response_pkg).with_limits(self.limits);
-		let builder = self.apply_wire_mode(builder)?;
-
-		let wire_envelope = builder.build()?;
-		let wire_bytes = wire_envelope.to_der()?;
-		self.write_envelope_bytes(&wire_bytes).await?;
-		Ok(())
+		self.send_response_with_encryption(status, message).await
 	}
 }
 
@@ -1291,8 +1291,8 @@ mod tests {
 		}
 
 		/// The receive cipher of an encrypted half.
-		fn recv_key(reader: &TransportReader<NullStream>) -> &RecvCipher {
-			match &reader.mode {
+		fn recv_key(reader: &mut TransportReader<NullStream>) -> &mut RecvCipher {
+			match &mut reader.mode {
 				SplitRecv::Encrypted(recv_key) => recv_key,
 				SplitRecv::Cleartext => panic!("the fixture must be an encrypted half"),
 			}
@@ -1324,10 +1324,10 @@ mod tests {
 			let mut reader = reader(SplitRecv::Encrypted(recv_cipher));
 
 			let mut first = record_zero.clone();
-			recv_key(&reader).open(&mut first)?;
+			recv_key(&mut reader).open(&mut first)?;
 
 			let mut replayed = record_zero.clone();
-			let replay = recv_key(&reader).open(&mut replayed);
+			let replay = recv_key(&mut reader).open(&mut replayed);
 			assert!(replay.is_err());
 			assert_eq!(reader.remaining_records(), 1);
 
@@ -1339,7 +1339,7 @@ mod tests {
 			assert_eq!(reader.remaining_records(), 2);
 
 			let mut reopened = record_zero;
-			recv_key(&reader).open(&mut reopened)?;
+			recv_key(&mut reader).open(&mut reopened)?;
 			Ok(())
 		}
 
@@ -1821,7 +1821,7 @@ mod tests {
 	async fn hpke_server_without_identity_fails_closed() -> TransportResult<()> {
 		let (_listener, stream) = bind_and_connect().await?;
 		// Client validators provision the endpoint, which presents no identity.
-		let peer_authentication = PeerAuthentication::mutual([refusing_validator()]);
+		let peer_authentication = PeerAuthentication::Anonymous.and(refusing_validator());
 		let unconfigured = EncryptionConfig::<DefaultCryptoProvider>::unconfigured();
 		let encryption = EncryptionConfig { peer_authentication, ..unconfigured };
 		let encryption = DialableEncryption::new(encryption)?;

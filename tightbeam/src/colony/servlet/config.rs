@@ -1,3 +1,4 @@
+use core::any::TypeId;
 use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use crate::colony::hive::HiveContext;
 use crate::colony::servlet::runtime;
 use crate::colony::servlet::tracking::SharedGauge;
 use crate::colony::servlet::{UtilizationGauge, WorkerBox};
-use crate::colony::worker::{Worker, WorkerMetadata};
+use crate::colony::worker::Worker;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
 use crate::policy::GatePolicy;
@@ -28,7 +29,7 @@ use crate::transport::TransportEncryptionConfig;
 ///
 /// The handshake binds a multiplexing advertisement into its transcript, so
 /// only the encrypted arm carries one. A cleartext servlet that advertises
-/// multiplexing is unrepresentable, not silently ignored.
+/// multiplexing is unrepresentable.
 pub(crate) enum ServletAccept<C: CryptoProvider> {
 	/// The servlet accepts cleartext connections without multiplexing.
 	Cleartext,
@@ -84,7 +85,7 @@ where
 	pub(crate) accept: ServletAccept<C>,
 	pub(crate) servlet_config: Arc<Env>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
-	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
+	pub(crate) workers: HashMap<TypeId, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
@@ -182,7 +183,7 @@ where
 	accept: A,
 	servlet_config: Arc<Env>,
 	hive_context: Option<Arc<dyn HiveContext>>,
-	workers: HashMap<String, Box<dyn WorkerBox>>,
+	workers: HashMap<TypeId, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
@@ -226,10 +227,30 @@ where
 		cleartext.build()
 	}
 
-	/// Returns the worker registered under `name`, downcast to `W`.
-	pub fn worker<W: 'static>(&self, name: impl AsRef<str>) -> Option<&W> {
-		let name = name.as_ref();
-		self.workers.get(name)?.downcast_ref()
+	/// Returns the worker of type `W` that this config registers, if it
+	/// registers one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::servlet::ServletConfig;
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	/// use tightbeam::worker;
+	///
+	/// worker! {
+	///     name: Echo<TestMessage, usize>,
+	///     handle: |message, _trace| async move { message.content.len() }
+	/// }
+	///
+	/// let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_worker(Echo::new(()));
+	/// let config = builder.allow_cleartext().build();
+	///
+	/// assert!(config.worker::<Echo>().is_some());
+	/// ```
+	pub fn worker<W: 'static>(&self) -> Option<&W> {
+		let key = TypeId::of::<W>();
+		self.workers.get(&key)?.downcast_ref()
 	}
 
 	/// Returns the transport encryption config when this servlet presents a
@@ -257,9 +278,37 @@ where
 		&self.servlet_config
 	}
 
-	/// Takes ownership of the registered workers for servlet startup.
-	pub fn to_workers(self) -> HashMap<String, Box<dyn WorkerBox>> {
-		self.workers
+	/// Takes ownership of the registered workers for servlet startup, one of
+	/// each type.
+	///
+	/// [`ServletContext::new`] takes them and keys each by its type.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::{ServletConfig, ServletContext};
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	/// use tightbeam::worker;
+	///
+	/// worker! {
+	///     name: Echo<TestMessage, usize>,
+	///     handle: |message, _trace| async move { message.content.len() }
+	/// }
+	///
+	/// let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_worker(Echo::new(()));
+	/// let workers = builder.allow_cleartext().build().to_workers();
+	/// let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), workers, None);
+	///
+	/// assert!(ctx.worker::<Echo>().is_some());
+	/// ```
+	///
+	/// [`ServletContext::new`]: crate::colony::servlet::ServletContext::new
+	pub fn to_workers(self) -> impl Iterator<Item = Box<dyn WorkerBox>> {
+		self.workers.into_values()
 	}
 
 	/// Takes ownership of the collector gates for the accept loop.
@@ -374,13 +423,14 @@ where
 		self
 	}
 
-	/// Registers a worker under its [`WorkerMetadata`] name.
+	/// Registers `worker` under its type, so a handler reaches it as
+	/// `ctx.relay::<W>(..)`. A second worker of one type replaces the first.
 	pub fn with_worker<W>(mut self, worker: W) -> Self
 	where
-		W: Worker + WorkerMetadata + 'static,
+		W: Worker + 'static,
 	{
-		self.workers
-			.insert(W::name().to_string(), Box::new(worker) as Box<dyn WorkerBox>);
+		let worker: Box<dyn WorkerBox> = Box::new(worker);
+		self.workers.insert(worker.type_key(), worker);
 		self
 	}
 

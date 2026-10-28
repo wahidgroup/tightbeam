@@ -83,7 +83,7 @@ async fn an_outside_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::erro
 	let server_session = server.complete()?;
 
 	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
-	let opened = server_session.keys().recv().open(&mut record)?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }

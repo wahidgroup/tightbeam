@@ -26,13 +26,22 @@ struct TaskGroupState {
 	stopped: bool,
 }
 
+impl TaskGroupState {
+	/// Holds `handle`, and releases each handle whose task ended.
+	///
+	/// The sweep bounds the group by the tasks that still run, which keeps a
+	/// runtime that spawns per request at the size of its live work.
+	fn hold(&mut self, handle: rt::JoinHandle) {
+		self.running.retain(|task| !task.is_finished());
+		self.running.push(handle);
+	}
+}
+
 impl TaskGroup {
 	/// Takes ownership of `handle`, and releases each handle whose task ended.
 	///
 	/// A stopped group aborts `handle` on arrival, so work that starts while
-	/// the runtime stops ends with the stop (CWE-772). The sweep bounds
-	/// the group by the tasks that still run, which keeps a runtime that
-	/// spawns per request at the size of its live work.
+	/// the runtime stops ends with the stop (CWE-772).
 	pub fn adopt(&self, handle: rt::JoinHandle) {
 		let mut state = self.state();
 		if state.stopped {
@@ -40,22 +49,31 @@ impl TaskGroup {
 			return;
 		}
 
-		state.running.retain(|task| !task.is_finished());
-		state.running.push(handle);
+		state.hold(handle);
 	}
 
 	/// Runs `task` under this group's ownership.
+	///
+	/// The group reads its stop and starts the task under one hold of its
+	/// lock, so a task that a stopped group refuses drops unstarted
+	/// (CWE-367).
 	pub fn spawn<F>(&self, task: F)
 	where
 		F: Future<Output = ()> + Send + 'static,
 	{
-		self.adopt(rt::spawn(task));
+		let mut state = self.state();
+		if state.stopped {
+			return;
+		}
+
+		state.hold(rt::spawn(task));
 	}
 
 	/// Stops the group and aborts every task it still owns.
 	///
-	/// A stop is terminal: a later [`TaskGroup::spawn`] aborts on
-	/// arrival, so the stop reaches every task the group starts.
+	/// A stop is terminal: a later [`TaskGroup::spawn`] starts nothing, and a
+	/// later [`TaskGroup::adopt`] aborts on arrival, so the stop reaches every
+	/// task the group owns.
 	pub fn abort_all(&self) {
 		let mut state = self.state();
 		state.stopped = true;
@@ -77,6 +95,8 @@ mod tests {
 	use core::time::Duration;
 
 	use std::panic::{catch_unwind, AssertUnwindSafe};
+	use std::sync::mpsc;
+	use std::thread;
 
 	use super::TaskGroup;
 
@@ -205,6 +225,47 @@ mod tests {
 		advance_past(BEAT * 8).await;
 		assert!(!FINISHED.load(Ordering::SeqCst));
 		assert_eq!(owned(&group), 0);
+	}
+
+	/// The longest wait of [`hold_lock`] for a task to report that it ran.
+	const HOLD: Duration = Duration::from_millis(200);
+
+	/// Holds the lock of `group` on a thread of its own until `ran` reports
+	/// that a task ran, or until [`HOLD`] passes, and returns once that thread
+	/// holds the lock. The thread answers whether the report came.
+	fn hold_lock(group: &TaskGroup, ran: mpsc::Receiver<()>) -> thread::JoinHandle<bool> {
+		let group = group.clone();
+		let (held, holding) = mpsc::channel();
+		let holder = thread::spawn(move || {
+			let _guard = group.state();
+			held.send(()).expect("the test waits for the hold");
+			ran.recv_timeout(HOLD).is_ok()
+		});
+
+		holding.recv().expect("the holder takes the lock");
+		holder
+	}
+
+	/// A stopped group runs none of the body of a task it refuses, so the work
+	/// before the task's first await never happens (CWE-367). The group lock is
+	/// held while the spawn runs, so a task that starts before the group reads
+	/// its stop runs on the second worker and reports it.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_task_spawned_after_the_stop_does_no_work_before_its_first_await() -> Result<(), &'static str> {
+		let group = TaskGroup::default();
+		group.abort_all();
+		let (report, ran) = mpsc::channel();
+		let holder = hold_lock(&group, ran);
+
+		group.spawn(async move {
+			// The holder may have ended its wait, and then no one reads the
+			// report.
+			let _reported = report.send(());
+		});
+
+		let task_ran = holder.join().map_err(|_| "the lock holder panicked")?;
+		assert!(!task_ran);
+		Ok(())
 	}
 
 	/// The test runtime runs on one thread, so the yield runs the empty task

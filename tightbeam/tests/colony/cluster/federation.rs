@@ -234,9 +234,9 @@ pub async fn wait_for_type_routes(
 
 /// Floods fresh advertisement rumors that claim `claimed_addr` for
 /// `type_name` through `relay` until `trace` holds an installed relay trail,
-/// or the attempts run out. Fresh instances flood until the relay has promoted
-/// the gateway that installs the trail as a flood target. Each branch lives
-/// here, so each scenario reads as one straight line.
+/// or the attempts run out. The trail installs once the relay has promoted
+/// the installing gateway as a flood target. Each branch lives here, so each
+/// scenario reads as one straight line.
 ///
 /// - Each flood discards the relay's answer, because a refused rumor floods again under a fresh id.
 /// - The spec judges the count of [`events::CLUSTER_RELAY_TRAIL_INSTALLED`], so the wait returns no count.
@@ -846,7 +846,7 @@ tb_scenario! {
 
 			let config = PoolConfig {
 				idle_timeout: None,
-				max_connections: 1,
+				max_connections: NonZeroUsize::MIN,
 				mux_offer: Some(Arc::new(TransportOffer::mux(8)))
 			};
 			let pool = Arc::new(
@@ -871,8 +871,8 @@ tb_scenario! {
 }
 
 /// A balancer that pins the first pick to one route key, so a scenario
-/// deterministically dials a decoy before the bounded failover. An
-/// unset or excluded preference defers to the first candidate.
+/// deterministically dials a decoy before the bounded failover. An unset or
+/// excluded preference defers to the first candidate.
 struct DecoyFirstBalancer {
 	preferred: Arc<Mutex<Option<Vec<u8>>>>,
 }

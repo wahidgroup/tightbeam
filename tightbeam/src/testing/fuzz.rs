@@ -127,7 +127,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
@@ -371,14 +371,12 @@ impl CspOracle {
 		self.process.is_terminal(self.current_state)
 	}
 
-	/// The observable events that the current state enables.
-	///
-	/// A terminal state yields an empty list.
+	/// The observable events that the current state enables, or an empty list
+	/// at a terminal state.
 	///
 	/// [`Process::enabled`] sorts the list by event label, so the mapping from
 	/// a byte to an index in [`Self::fuzz_from_bytes`] picks the same event on
-	/// every run. AFL replay and corpus minimization rely on
-	/// that contract.
+	/// every run. AFL replay and corpus minimization rely on that contract.
 	pub fn valid_events(&self) -> Vec<Event> {
 		if self.is_terminal() {
 			return Vec::new();
@@ -406,7 +404,7 @@ impl CspOracle {
 	/// Takes the transition that `event` labels, and uses `choice` to pick
 	/// among nondeterministic targets.
 	///
-	/// The method sorts the targets by state name before it indexes them
+	/// It sorts the targets by state name before it indexes them
 	/// (`choice % targets`), so the same choice byte selects the same target
 	/// on every run.
 	pub fn step_with_target(&mut self, event: &Event, choice: u8) -> bool {
@@ -477,10 +475,7 @@ impl CspOracle {
 		self.trace.clear();
 	}
 
-	/// A hash of the current state, for IJON state tracking.
-	///
-	/// The hash is a stable 32-bit value. AFL's IJON `ijon_set!()` macro reads
-	/// it to guide fuzzing toward unexplored states.
+	/// A stable 32-bit hash of the current state, for IJON state tracking.
 	///
 	/// ## IJON Integration
 	/// ```ignore
@@ -517,8 +512,8 @@ impl CspOracle {
 	/// afl::ijon_max(loc, oracle.coverage_score());
 	/// ```
 	///
-	/// Through `ijon_max`, AFL favors inputs that raise the score, which are
-	/// inputs that reach new states or transitions.
+	/// Through `ijon_max`, AFL favors inputs that raise the score: inputs that
+	/// reach new states or transitions.
 	///
 	/// ## When to Use
 	/// - AFL needs to optimize for CSP coverage directly.
@@ -559,7 +554,7 @@ impl CspOracle {
 
 	/// Formats the run's context for triage of a failed fuzz run.
 	///
-	/// The text helps explain why a fuzz target crashed or failed. It holds:
+	/// The text holds:
 	/// - The current state, where execution stopped.
 	/// - The event trace, in the order the run took the events.
 	/// - The coverage statistics of the states and transitions explored.
@@ -593,8 +588,8 @@ impl CspOracle {
 
 	/// Runs the oracle over `input`, which holds the event choices.
 	///
-	/// AFL drives the oracle through this method, which reads each AFL byte
-	/// as the choice of event at the current state of the CSP process.
+	/// AFL drives the oracle through it, and each byte chooses the event at the
+	/// current state of the CSP process.
 	///
 	/// ## How It Works
 	/// 1. Reset the oracle to the initial state.
@@ -791,6 +786,12 @@ impl FuzzContext {
 		}
 	}
 
+	/// The guard of the context, or [`TestingError::FuzzInputLockPoisoned`]
+	/// when a panic poisoned it.
+	fn lock(&self) -> Result<MutexGuard<'_, FuzzContextInner>, TestingError> {
+		self.inner.lock().map_err(|_poisoned| TestingError::FuzzInputLockPoisoned)
+	}
+
 	/// Runs the oracle over the whole input buffer, whatever the cursor
 	/// position, as [`CspOracle::fuzz_from_bytes`] reads it.
 	///
@@ -805,7 +806,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzEventRejected`] -- the oracle refused an event it listed as valid.
 	/// - [`TestingError::FuzzInputExhausted`] -- the input ran out before a terminal state.
 	pub fn fuzz_from_bytes(&self) -> Result<(), TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 		let input = guard.input.clone();
 
 		guard.oracle.fuzz_from_bytes(&input)?;
@@ -837,8 +838,7 @@ impl FuzzContext {
 
 	/// Formats the oracle's context for triage of a failed fuzz target.
 	///
-	/// The text is the oracle's crash context, which explains what the run did
-	/// before the target failed, or a lock failure message.
+	/// The text is [`CspOracle::crash_context`], or a lock failure message.
 	pub fn crash_context(&self) -> String {
 		self.inner
 			.lock()
@@ -882,7 +882,7 @@ impl FuzzContext {
 	/// ## Errors
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	pub fn step_event(&self, event: &Event) -> Result<bool, TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 		Ok(guard.oracle.step(event))
 	}
 
@@ -893,7 +893,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- no input byte remains.
 	pub fn fuzz_u8(&self) -> Result<u8, TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 
 		Ok(u8::from_be_bytes(guard.take_array()?))
 	}
@@ -905,7 +905,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than two bytes remain.
 	pub fn fuzz_u16(&self) -> Result<u16, TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 
 		Ok(u16::from_be_bytes(guard.take_array()?))
 	}
@@ -917,7 +917,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than four bytes remain.
 	pub fn fuzz_u32(&self) -> Result<u32, TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 
 		Ok(u32::from_be_bytes(guard.take_array()?))
 	}
@@ -929,7 +929,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than eight bytes remain.
 	pub fn fuzz_u64(&self) -> Result<u64, TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 
 		Ok(u64::from_be_bytes(guard.take_array()?))
 	}
@@ -941,7 +941,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than `n` bytes remain.
 	pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
-		let mut guard = self.inner.lock()?;
+		let mut guard = self.lock()?;
 
 		Ok(guard.take(n)?.to_vec())
 	}
@@ -952,7 +952,7 @@ impl FuzzContext {
 	///
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	pub fn fuzz_input(&self) -> Result<Vec<u8>, TestingError> {
-		let guard = self.inner.lock()?;
+		let guard = self.lock()?;
 		Ok(guard.input.clone())
 	}
 
@@ -962,7 +962,7 @@ impl FuzzContext {
 	///
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	pub fn fuzz_has_bytes(&self, n: usize) -> Result<bool, TestingError> {
-		let guard = self.inner.lock()?;
+		let guard = self.lock()?;
 
 		Ok(guard.remaining() >= n)
 	}
@@ -973,7 +973,7 @@ impl FuzzContext {
 	///
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	pub fn fuzz_remaining(&self) -> Result<usize, TestingError> {
-		let guard = self.inner.lock()?;
+		let guard = self.lock()?;
 
 		Ok(guard.remaining())
 	}
@@ -985,7 +985,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- no input byte remains.
 	pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError> {
-		let guard = self.inner.lock()?;
+		let guard = self.lock()?;
 
 		Ok(guard.peek(1)?[0])
 	}
@@ -998,7 +998,7 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than `n` bytes remain.
 	pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
-		let guard = self.inner.lock()?;
+		let guard = self.lock()?;
 
 		Ok(guard.peek(n)?.to_vec())
 	}

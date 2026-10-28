@@ -24,6 +24,7 @@ use crate::crypto::policy::VerifiedSignature;
 #[cfg(feature = "std")]
 mod std_imports {
 	pub use core::borrow::Borrow;
+	pub use core::cmp::Reverse;
 	pub use core::iter;
 	pub use std::collections::{HashMap, HashSet};
 	pub use std::sync::Arc;
@@ -710,6 +711,8 @@ impl HeldCertificate {
 ///   current one that ranks first in the order of RFC 4158 §3.5.12.
 /// - Of candidates of one rank, a step takes the current certificate itself,
 ///   so a self-signed one ends the walk.
+/// - Of candidates of one rank otherwise, a step takes the one of the lower
+///   fingerprint, so one store gives one walk in every process.
 /// - A revisited certificate ends the walk (RFC 4158 §2.4.2).
 #[cfg(feature = "std")]
 struct IssuerWalk<'a> {
@@ -788,11 +791,13 @@ impl<'a> IssuerWalk<'a> {
 	}
 
 	/// Returns the certificate of [`Self::named`] that ranks first, beside its
-	/// fingerprint.
+	/// fingerprint. The fingerprint breaks a tie of rank, so the pick is the
+	/// same whatever order the store holds its certificates in.
 	fn issuer(&self) -> Option<(&'a Sha3Fingerprint, &'a HeldCertificate)> {
 		self.named().max_by_key(|&(fingerprint, held)| {
 			let itself = *fingerprint == self.anchor;
-			(held.identifiers.priority(self.authority), itself)
+			let lower = Reverse(fingerprint.as_slice());
+			(held.identifiers.priority(self.authority), itself, lower)
 		})
 	}
 }
@@ -1168,10 +1173,15 @@ impl CertificateValidation for CertificateTrustStore {
 	/// 2. No `subjectKeyIdentifier`, or no `authorityKeyIdentifier` to compare it with.
 	/// 3. A `subjectKeyIdentifier` that differs.
 	///
-	/// A self-signed certificate that omits its `authorityKeyIdentifier` names
-	/// its own `subjectKeyIdentifier` (RFC 5280 §4.2.1.1), and of the
-	/// candidates of one rank, the walk takes the certificate itself. The walk
-	/// commits to its candidate, and the signature check of the path decides.
+	/// Of the candidates of one rank, the walk takes the first of:
+	///
+	/// 1. The certificate itself, since a self-signed certificate that omits
+	///    its `authorityKeyIdentifier` names its own `subjectKeyIdentifier`
+	///    (RFC 5280 §4.2.1.1).
+	/// 2. The certificate of the lower fingerprint.
+	///
+	/// The walk commits to its candidate, and the signature check of the path
+	/// decides.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// The evaluation admits the certificate alone, so its anchor drops.
 		self.validate_to_anchor(iter::once(cert)).map(drop)
@@ -1784,6 +1794,51 @@ mod tests {
 
 		let anchor = store.trust_anchor(&leaf)?;
 		assert_eq!(anchor.as_ref(), &unnamed);
+		Ok(())
+	}
+
+	/// Returns the two authorities of the name `Rollover CA` of the keys of
+	/// the seeds 4 and 5, which state no key identifier, so the walk ranks
+	/// them alike below every leaf. Each comes beside its key, the authority
+	/// of the lower fingerprint first.
+	fn tied_authorities() -> [(Certificate, Secp256k1SigningKey); 2] {
+		let tied = |seed: u8| {
+			let key = SigningKey::from_bytes(&[seed; 32].into()).expect("a test seed is a scalar");
+			let authority = TestCertificate::authority(&key, "Rollover CA").expect("a test authority signs");
+			(TestCertificate::without_extension(authority, SubjectKeyIdentifier::OID), key)
+		};
+		let fingerprint = |authority: &Certificate| {
+			let fingerprint = Sha3Fingerprint::from_certificate(authority).expect("a test authority encodes");
+			fingerprint.as_slice().to_vec()
+		};
+
+		let mut tied = [tied(4), tied(5)];
+		tied.sort_by_cached_key(|(authority, _)| fingerprint(authority));
+		tied
+	}
+
+	/// Returns a store that holds `authorities`, added in the order given.
+	fn store_of(authorities: [&Certificate; 2]) -> CertificateTrustStore {
+		let [first, second] = authorities;
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let builder = builder.with_certificate(first.to_owned());
+		let builder = builder.expect("the store holds a test authority");
+		let builder = builder.with_certificate(second.to_owned());
+		builder.expect("the store holds a test authority").build()
+	}
+
+	/// Of two authorities of one subject name and one rank, the walk takes the
+	/// one of the lower fingerprint, whichever one the store took first, so
+	/// one store gives one path in every process.
+	#[test]
+	fn the_walk_takes_the_lower_fingerprint_of_two_equal_rank_authorities() -> TestResult {
+		let [(lower, lower_key), (higher, _)] = tied_authorities();
+		let leaf = rollover_leaf(&lower_key)?;
+		let lower_first = store_of([&lower, &higher]);
+		let higher_first = store_of([&higher, &lower]);
+
+		let anchors = (lower_first.trust_anchor(&leaf)?, higher_first.trust_anchor(&leaf)?);
+		assert_eq!((anchors.0.as_ref(), anchors.1.as_ref()), (&lower, &lower));
 		Ok(())
 	}
 

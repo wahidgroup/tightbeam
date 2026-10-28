@@ -356,7 +356,7 @@ pub enum ProcessExpr {
 	/// let expression = ProcessExpr::Parallel { operator: CompositionOperator::Interleaved, left, right };
 	///
 	/// assert_eq!(expression.name(), "(P ||| Q)");
-	/// assert_eq!(expression.evaluate()?.name, "(Ping ||| Ping)");
+	/// assert_eq!(expression.evaluate()?.name(), "(Ping ||| Ping)");
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	Parallel {

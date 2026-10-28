@@ -2,8 +2,8 @@
 //!
 //! A reader takes a DER envelope off a byte stream in stages: the tag octet,
 //! the first length octet, any long-form length octets, and then the content.
-//! The classification, canonicality, and reconstruction logic lives here, so
-//! both planes share one framing of the byte stream.
+//! [`FrameAssembler`] holds the stage order, the canonicality check, and the
+//! cap, so both planes share one framing of the byte stream.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -18,37 +18,58 @@ use std::io::ErrorKind;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::TransportResult;
 
+/// The octets a frame buffer holds before its content: the tag, the first
+/// length octet, and the longest length field a `usize` holds.
+const HEADER_CAPACITY: usize = mem::size_of::<usize>().saturating_add(2);
+
 /// The shape of a DER length field, classified from its first octet.
-pub(crate) enum LengthForm {
+///
+/// A long form counts from one octet up to as many as a `usize` holds, so a
+/// length field that classifies fits [`HEADER_CAPACITY`].
+enum LengthForm {
 	/// Short form: the octet itself is the content length.
 	Short(usize),
 	/// Long form: this many further octets carry the content length.
 	Long(usize),
 }
 
-impl From<u8> for LengthForm {
-	fn from(first_byte: u8) -> Self {
+impl TryFrom<u8> for LengthForm {
+	type Error = TransportError;
+
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the octet names the BER
+	///   indefinite form, or more length octets than a `usize` holds.
+	fn try_from(first_byte: u8) -> TransportResult<Self> {
 		if first_byte & 0x80 == 0 {
-			Self::Short(first_byte as usize)
-		} else {
-			Self::Long((first_byte & 0x7F) as usize)
+			return Ok(Self::Short(usize::from(first_byte)));
 		}
+
+		// A first octet of 0x80 is the BER indefinite-length marker, which DER
+		// forbids.
+		let count = usize::from(first_byte & 0x7F);
+		if count == 0 || count > mem::size_of::<usize>() {
+			return Err(TransportError::InvalidMessage);
+		}
+
+		Ok(Self::Long(count))
 	}
 }
 
 /// Parses a DER length field into its numeric value.
 ///
-/// Returns `None` for non-canonical or indefinite-length encodings.
+/// Returns `None` for a first octet that [`LengthForm`] refuses, and for a
+/// non-canonical encoding.
 fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<usize> {
 	let length_octets = length_octets.as_ref();
-	let octet_count = match LengthForm::from(first_byte) {
+	// The parse answers every refusal as `None`, the refusal of the first
+	// octet among them.
+	let octet_count = match LengthForm::try_from(first_byte).ok()? {
 		LengthForm::Short(length) => return Some(length),
 		LengthForm::Long(count) => count,
 	};
 
-	// A first octet of 0x80 is the BER indefinite-length marker, which DER
-	// forbids.
-	if octet_count == 0 || octet_count != length_octets.len() || octet_count > mem::size_of::<usize>() {
+	if octet_count != length_octets.len() {
 		return None;
 	}
 
@@ -75,10 +96,7 @@ fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<u
 ///
 /// The declared content length has passed no ceiling check, so its accessor
 /// lives on [`AdmittedHeader`] alone.
-pub(crate) struct FrameHeader {
-	tag: u8,
-	length_first: u8,
-	length_octets: Vec<u8>,
+struct FrameHeader {
 	declared_len: usize,
 }
 
@@ -87,35 +105,21 @@ pub(crate) struct FrameHeader {
 /// [`AdmittedHeader::content_len`] is the only source of a length to allocate
 /// with, so no code can size an allocation by an unchecked wire value
 /// (CWE-770).
-pub(crate) struct AdmittedHeader {
+struct AdmittedHeader {
 	header: FrameHeader,
 }
 
-/// The two leading octets of a DER frame, in the order the link reads them.
-///
-/// Both are bare octets, so a reader that holds them loose can exchange them
-/// and parse a header the peer never sent. The call site binds the named
-/// fields, so the exchange has no site at which to occur.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct HeaderPrefix {
-	/// The identifier octet that names the frame's ASN.1 tag.
-	pub(crate) tag: u8,
-	/// The first length octet, which decides the short or long form.
-	pub(crate) length_first: u8,
-}
-
 impl FrameHeader {
-	/// Parses a tag and a length field into a header.
+	/// Parses a length field, its first octet `length_first` and its
+	/// long-form `length_octets`, into a header.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::InvalidMessage`] -- the length field is
 	///   non-canonical or uses the BER indefinite form.
-	pub(crate) fn parse(prefix: HeaderPrefix, length_octets: impl Into<Vec<u8>>) -> TransportResult<Self> {
-		let HeaderPrefix { tag, length_first } = prefix;
-		let length_octets: Vec<u8> = length_octets.into();
-		let declared_len = parse_der_length(length_first, &length_octets).ok_or(TransportError::InvalidMessage)?;
-		Ok(Self { tag, length_first, length_octets, declared_len })
+	fn parse(length_first: u8, length_octets: impl AsRef<[u8]>) -> TransportResult<Self> {
+		let declared_len = parse_der_length(length_first, length_octets).ok_or(TransportError::InvalidMessage)?;
+		Ok(Self { declared_len })
 	}
 
 	/// Admits this header when its declared length fits within `cap`.
@@ -125,7 +129,7 @@ impl FrameHeader {
 	/// - [`TransportFailure::SizeExceeded`] -- the declared length exceeds
 	///   `cap`. The refusal comes before the reader reads the content or sizes
 	///   a buffer.
-	pub(crate) fn admit(self, cap: usize) -> TransportResult<AdmittedHeader> {
+	fn admit(self, cap: usize) -> TransportResult<AdmittedHeader> {
 		if self.declared_len > cap {
 			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 		}
@@ -136,14 +140,152 @@ impl FrameHeader {
 
 impl AdmittedHeader {
 	/// The content length that passed the ceiling check.
-	pub(crate) fn content_len(&self) -> usize {
+	fn content_len(&self) -> usize {
 		self.header.declared_len
 	}
+}
 
-	/// Rebuilds the complete DER encoding from this header and its content.
-	pub(crate) fn reconstruct(&self, content: impl AsRef<[u8]>) -> Vec<u8> {
-		let content = content.as_ref();
-		reconstruct_der_encoding(self.header.tag, self.header.length_first, &self.header.length_octets, content)
+/// The one sequence that takes each DER frame off a byte stream, which both
+/// planes drive with the reads of their own streams:
+///
+/// - Each read fills the region [`Self::wanted`] lends, in the buffer the frame assembles in.
+/// - [`Self::advance`] moves the stage, and the cap admits the declared length before the content (CWE-770).
+/// - A whole frame returns the assembler to the tag of the next frame, with nothing accepted.
+/// - [`Self::classify`] names an end of stream by the stage it interrupts.
+pub(crate) struct FrameAssembler {
+	cap: usize,
+	frame: Vec<u8>,
+	/// The octets of `frame` that the stages before this one accepted.
+	accepted: usize,
+	stage: Stage,
+}
+
+/// The part of a frame the assembler reads next.
+///
+/// The admitted header lives in the stage of the content alone, which the cap
+/// check enters.
+enum Stage {
+	/// The tag octet. An end of stream here falls between two frames.
+	Prefix,
+	/// The first length octet, after the tag.
+	Length,
+	/// The long-form length octets, as many as the first length octet named.
+	LongLength { octets: usize },
+	/// The content of the header that the cap admitted.
+	Content { header: AdmittedHeader },
+}
+
+impl Stage {
+	/// The count of octets this stage reads.
+	fn wanted(&self) -> usize {
+		match self {
+			Self::Prefix | Self::Length => 1,
+			Self::LongLength { octets } => *octets,
+			Self::Content { header } => header.content_len(),
+		}
+	}
+}
+
+/// What one read gives a [`FrameAssembler`].
+pub(crate) enum Step {
+	/// The frame wants more octets, which [`FrameAssembler::wanted`] lends.
+	More,
+	/// The frame is whole, as the DER it arrived as, and the assembler wants
+	/// the tag of the next frame.
+	Done(Vec<u8>),
+}
+
+impl FrameAssembler {
+	/// An assembler of the frames of one stream, each of whose declared
+	/// content lengths must fit `cap`.
+	pub(crate) fn new(cap: usize) -> Self {
+		let frame = Vec::with_capacity(HEADER_CAPACITY);
+		Self { cap, frame, accepted: 0, stage: Stage::Prefix }
+	}
+
+	/// The region that the next read fills: exactly the octets the frame
+	/// wants next, in the buffer the frame assembles in.
+	pub(crate) fn wanted(&mut self) -> &mut [u8] {
+		let end = self.accepted.saturating_add(self.stage.wanted());
+		self.frame.resize(end, 0);
+
+		self.frame.get_mut(self.accepted..).unwrap_or_default()
+	}
+
+	/// Accepts the octets that the last read filled into [`Self::wanted`], and
+	/// moves to the next stage. A whole frame moves the assembler to the tag
+	/// of the next frame.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- the region of [`Self::wanted`] was not lent for this stage.
+	/// - [`TransportError::InvalidMessage`] -- the length field is
+	///   non-canonical, uses the BER indefinite form, or is wider than a
+	///   `usize`. The first length octet refuses the last two.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::SizeExceeded`] -- the declared length passes the
+	///   cap, before a byte of the content is wanted.
+	pub(crate) fn advance(&mut self) -> TransportResult<Step> {
+		let filled = self.accepted.saturating_add(self.stage.wanted());
+		if self.frame.len() != filled {
+			return Err(TransportError::InvalidState);
+		}
+
+		self.accepted = filled;
+
+		let next = match &self.stage {
+			Stage::Prefix => Stage::Length,
+			Stage::Length => match LengthForm::try_from(self.length_first()?)? {
+				LengthForm::Short(_) => self.admitted()?,
+				LengthForm::Long(octets) => Stage::LongLength { octets },
+			},
+			Stage::LongLength { .. } => self.admitted()?,
+			Stage::Content { .. } => {
+				let frame = mem::take(&mut self.frame);
+				self.accepted = 0;
+				self.stage = Stage::Prefix;
+				return Ok(Step::Done(frame));
+			}
+		};
+
+		self.stage = next;
+		Ok(Step::More)
+	}
+
+	/// Names `error`, the failure of the read that [`Self::wanted`] lent, by
+	/// the stage it interrupts.
+	///
+	/// - Before the tag, an end of stream is a close between frames, [`TransportError::ConnectionClosed`].
+	/// - After the tag, an end of stream truncates the frame, [`TransportError::InvalidMessage`].
+	/// - Any other error passes through unchanged.
+	pub(crate) fn classify(&self, error: TransportError) -> TransportError {
+		match self.stage {
+			Stage::Prefix => error.at_frame_boundary(),
+			Stage::Length | Stage::LongLength { .. } | Stage::Content { .. } => error.inside_frame(),
+		}
+	}
+
+	/// The first length octet, which follows the tag.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- the frame holds no length octet yet.
+	fn length_first(&self) -> TransportResult<u8> {
+		self.frame.get(1).copied().ok_or(TransportError::InvalidState)
+	}
+
+	/// The stage of the content, once the cap admits the length field the
+	/// frame holds.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`FrameHeader::parse`] and [`FrameHeader::admit`].
+	fn admitted(&self) -> TransportResult<Stage> {
+		let length_octets = self.frame.get(2..).unwrap_or_default();
+		let header = FrameHeader::parse(self.length_first()?, length_octets)?;
+		let admitted = header.admit(self.cap)?;
+
+		Ok(Stage::Content { header: admitted })
 	}
 }
 
@@ -178,30 +320,6 @@ impl TransportError {
 	}
 }
 
-/// Reconstructs a full DER encoding from its parsed tag, length, and content
-/// parts.
-fn reconstruct_der_encoding(
-	tag: u8,
-	length_first: u8,
-	length_octets: impl AsRef<[u8]>,
-	content: impl AsRef<[u8]>,
-) -> Vec<u8> {
-	let length_octets = length_octets.as_ref();
-	let content = content.as_ref();
-	let header_len = length_octets.len().saturating_add(2);
-	let mut buffer = Vec::with_capacity(header_len.saturating_add(content.len()));
-	buffer.push(tag);
-	buffer.push(length_first);
-
-	if matches!(LengthForm::from(length_first), LengthForm::Long(_)) {
-		buffer.extend_from_slice(length_octets);
-	}
-
-	buffer.extend_from_slice(content);
-
-	buffer
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -229,7 +347,7 @@ mod tests {
 	// Each case is (first length octet, content length).
 	crate::tb_cases! {
 		fn length_form_classifies_a_short_first_octet((first, length): (u8, usize)) {
-			assert!(matches!(LengthForm::from(first), LengthForm::Short(len) if len == length));
+			assert!(matches!(LengthForm::try_from(first), Ok(LengthForm::Short(len)) if len == length));
 		}
 		cases {
 			zero => (0x00, 0),
@@ -237,16 +355,29 @@ mod tests {
 		}
 	}
 
-	// Each case is (first length octet, further length octet count).
+	// Each case is (first length octet, further length octet count). The
+	// widest long form counts as many octets as a `usize` holds.
 	crate::tb_cases! {
 		fn length_form_classifies_a_long_first_octet((first, count): (u8, usize)) {
-			assert!(matches!(LengthForm::from(first), LengthForm::Long(len) if len == count));
+			assert!(matches!(LengthForm::try_from(first), Ok(LengthForm::Long(len)) if len == count));
 		}
 		cases {
-			indefinite => (0x80, 0),
 			one_octet => (0x81, 1),
 			four_octets => (0x84, 4),
-			most => (0xFF, 127),
+			widest => (0x80 | mem::size_of::<usize>() as u8, mem::size_of::<usize>()),
+		}
+	}
+
+	// Each case is a first length octet that names a length field no reader
+	// takes: the BER indefinite form, or one wider than any `usize`.
+	crate::tb_cases! {
+		fn length_form_refuses_a_first_octet_it_cannot_read(first: u8) {
+			assert!(matches!(LengthForm::try_from(first), Err(TransportError::InvalidMessage)));
+		}
+		cases {
+			indefinite => 0x80,
+			nine_octets => 0x89,
+			most => 0xFF,
 		}
 	}
 
@@ -278,15 +409,111 @@ mod tests {
 		}
 	}
 
+	/// Fills the region `assembler` wants with `octets`, which hold exactly
+	/// that many octets, and advances it.
+	fn fed(assembler: &mut FrameAssembler, octets: &[u8]) -> TransportResult<Step> {
+		assembler.wanted().copy_from_slice(octets);
+		assembler.advance()
+	}
+
+	/// The frame that the reads of `stages` assemble under a cap of 256, one
+	/// read per stage, or `None` when the stages end before the frame is
+	/// whole.
+	fn assembled(stages: &[&[u8]]) -> TransportResult<Option<Vec<u8>>> {
+		assembled_by(&mut FrameAssembler::new(256), stages)
+	}
+
+	/// The frame that the reads of `stages` assemble on `assembler`, one read
+	/// per stage, or `None` when the stages end before the frame is whole.
+	fn assembled_by(assembler: &mut FrameAssembler, stages: &[&[u8]]) -> TransportResult<Option<Vec<u8>>> {
+		for stage in stages {
+			if let Step::Done(frame) = fed(assembler, stage)? {
+				return Ok(Some(frame));
+			}
+		}
+
+		Ok(None)
+	}
+
+	// Each case is the read of each stage of one frame. The frame assembles as
+	// the octets it arrived as, in the short and the long form of its length.
+	crate::tb_cases! {
+		fn a_frame_assembles_as_it_arrived(stages: &[&[u8]]) -> TransportResult<()> {
+			let arrived = stages.concat();
+			assert_eq!(assembled(stages)?, Some(arrived));
+			Ok(())
+		}
+		cases {
+			short_form => &[&[0x30], &[0x02], &[0x01, 0x02]],
+			long_form => &[&[0x30], &[0x81], &[0x80], &[0xAA; 128]],
+			empty_content => &[&[0x05], &[0x00], &[]],
+		}
+	}
+
+	/// The assembler admits the declared length under its cap before it
+	/// wants a byte of the content, so the header alone refuses a length
+	/// past the cap (CWE-770).
 	#[test]
-	fn reconstruct_round_trips_short_and_long_form() {
-		assert_eq!(
-			reconstruct_der_encoding(0x30, 0x02, [], [0x01, 0x02]),
-			vec![0x30, 0x02, 0x01, 0x02]
-		);
-		assert_eq!(
-			reconstruct_der_encoding(0x30, 0x81, [0x80], [0xAA]),
-			vec![0x30, 0x81, 0x80, 0xAA]
-		);
+	fn a_length_past_the_cap_is_refused_before_the_content_is_wanted() -> TransportResult<()> {
+		let mut assembler = FrameAssembler::new(16);
+		fed(&mut assembler, &[0x30])?;
+		fed(&mut assembler, &[0x82])?;
+
+		let refused = fed(&mut assembler, &[0x02, 0x58]);
+		assert!(matches!(
+			refused,
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
+		));
+		Ok(())
+	}
+
+	/// The first length octet names the count of the octets that follow it,
+	/// so the assembler refuses a length wider than a `usize` before it
+	/// buffers one octet past the first.
+	#[test]
+	fn a_length_wider_than_a_usize_is_refused_at_its_first_octet() -> TransportResult<()> {
+		let mut assembler = FrameAssembler::new(256);
+		fed(&mut assembler, &[0x30])?;
+
+		let refused = fed(&mut assembler, &[0xFF]);
+		let invalid = matches!(refused, Err(TransportError::InvalidMessage));
+		assert_eq!((invalid, assembler.frame.len()), (true, 2));
+		Ok(())
+	}
+
+	/// A whole frame returns the assembler to the tag of the next frame, so
+	/// one assembler frames each envelope of a stream in turn.
+	#[test]
+	fn one_assembler_frames_two_envelopes_in_a_row() -> TransportResult<()> {
+		let mut assembler = FrameAssembler::new(256);
+		let first = assembled_by(&mut assembler, &[&[0x30], &[0x02], &[0x01, 0x02]])?;
+		let second = assembled_by(&mut assembler, &[&[0x04], &[0x01], &[0xAA]])?;
+
+		let expected = (Some(vec![0x30, 0x02, 0x01, 0x02]), Some(vec![0x04, 0x01, 0xAA]));
+		assert_eq!((first, second), expected);
+		Ok(())
+	}
+
+	/// An end of stream before the tag falls between two frames, so it reads
+	/// as a close.
+	#[cfg(feature = "std")]
+	#[test]
+	fn an_eof_before_the_tag_is_a_close() {
+		let assembler = FrameAssembler::new(16);
+		let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
+
+		assert!(matches!(assembler.classify(eof), TransportError::ConnectionClosed));
+	}
+
+	/// An end of stream after the tag cuts a frame short, so it reads as a
+	/// truncation.
+	#[test]
+	fn an_eof_inside_the_frame_is_a_truncation() -> TransportResult<()> {
+		let mut assembler = FrameAssembler::new(16);
+		fed(&mut assembler, &[0x30])?;
+
+		let truncated = assembler.classify(TransportError::ConnectionClosed);
+		assert!(matches!(truncated, TransportError::InvalidMessage));
+		Ok(())
 	}
 }

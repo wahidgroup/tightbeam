@@ -302,7 +302,7 @@ where
 		// awaits the approver, so the scalar is gone before the first await of
 		// this step.
 		let salt = RandomsSalt::new(&client_random, &server_random);
-		let next_secret = epoch.next_secret::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt())?;
+		let next_secret = epoch.next_secret::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt()?)?;
 
 		let answer = receipt.approve(self.approver.as_deref()).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
@@ -321,7 +321,7 @@ where
 		let epoch = &mut self.materials.epoch;
 		let next_hash = epoch.advanced::<P::Digest>(&request_der, &response_der, &ack_der)?;
 
-		let rotated = epoch.install::<P>(next_secret, salt.as_kdf_salt(), next_hash)?;
+		let rotated = epoch.install::<P>(next_secret, salt.as_kdf_salt()?, next_hash)?;
 		let (send_cipher, recv_cipher) = SessionKeys::for_client(rotated).into_parts();
 
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
@@ -426,7 +426,7 @@ where
 		let salt = RandomsSalt::new(&client_random, &server_random);
 		let ephemeral = Box::new(EphemeralSecret::<P::Curve>::random(&mut OsRng));
 		let mut response = MuxRekeyResponsePackage::new(server_random, &ephemeral.public_key(), None)?;
-		let next_secret = epoch.next_secret::<P>(ephemeral, &client_ephemeral, salt.as_kdf_salt())?;
+		let next_secret = epoch.next_secret::<P>(ephemeral, &client_ephemeral, salt.as_kdf_salt()?)?;
 
 		// The pin covers the leg as the response carries it, read back with
 		// the reader the client runs.
@@ -526,7 +526,7 @@ where
 		let epoch = &mut self.materials.epoch;
 		let next_hash = epoch.advanced::<P::Digest>(&pending.request_der, &pending.response_der, &ack_der)?;
 		let salt = RandomsSalt::new(&pending.client_random, &pending.server_random);
-		let rotated = epoch.install::<P>(pending.next_secret, salt.as_kdf_salt(), next_hash)?;
+		let rotated = epoch.install::<P>(pending.next_secret, salt.as_kdf_salt()?, next_hash)?;
 		let (send_cipher, recv_cipher) = SessionKeys::for_server(rotated).into_parts();
 
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
@@ -839,6 +839,7 @@ pub(crate) mod tests {
 	use crate::crypto::aead::DirectionalCiphers;
 	use crate::crypto::cms::EnvelopeError;
 	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::kdf::KdfSalt;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -853,7 +854,7 @@ pub(crate) mod tests {
 	use crate::transport::handshake::negotiation::{
 		AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportOffer,
 	};
-	use crate::transport::handshake::primitives::{KdfSalt, TranscriptHash};
+	use crate::transport::handshake::primitives::TranscriptHash;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
 	use crate::transport::handshake::{CompressedPoint, EstablishedSession};
 	use crate::x509::Certificate;
@@ -946,7 +947,8 @@ pub(crate) mod tests {
 	/// The cipher a server would receive on under `secret` and `salt`, the
 	/// secret of epoch 1.
 	fn server_recv(secret: &EpochSecret, salt: &RandomsSalt) -> RecvCipher {
-		let directional = DirectionalCiphers::derive::<Provider, _>(secret, salt.as_kdf_salt(), 1);
+		let kdf_salt = salt.as_kdf_salt().expect("the sample randoms meet the salt floor");
+		let directional = DirectionalCiphers::derive::<Provider, _>(secret, kdf_salt, 1);
 		let directional = directional.expect("an epoch secret derives its directional ciphers");
 		let (_send, recv) = SessionKeys::for_server(directional).into_parts();
 		recv
@@ -956,7 +958,8 @@ pub(crate) mod tests {
 	/// sample chain root.
 	fn sample_epoch_from(fill: u8) -> Result<EpochMaterials, HandshakeError> {
 		let secret = fixture_handshake_secret(fill);
-		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&SAMPLE_SALT), sample_chain_root())
+		let salt = KdfSalt::try_from(SAMPLE_SALT.as_slice())?;
+		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, salt, sample_chain_root())
 	}
 
 	fn sample_epoch() -> Result<EpochMaterials, HandshakeError> {
@@ -1095,7 +1098,7 @@ pub(crate) mod tests {
 	#[tokio::test]
 	async fn exchange_rotates_both_endpoints() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
-		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
+		let (mut client_install, mut server_install) = run_exchange(&mut client, &mut server).await?;
 		assert_eq!(client_install.epoch, 1);
 		assert_eq!(server_install.epoch, 1);
 		assert_eq!(client.epoch(), 1);
@@ -1126,14 +1129,14 @@ pub(crate) mod tests {
 		let client_point = peer_static().server_ephemeral(&point_of(&client_scalar.public_key()))?;
 		let server_point = peer_static().server_ephemeral(&point_of(&server_scalar.public_key()))?;
 		let salt = sample_salt();
-		let kdf_salt = salt.as_kdf_salt();
+		let kdf_salt = salt.as_kdf_salt()?;
 		let first_next = first.next_secret::<Provider>(client_scalar, &server_point, kdf_salt)?;
 		let second_next = second.next_secret::<Provider>(server_scalar, &client_point, kdf_salt)?;
 
 		let first_rotated = first.install::<Provider>(first_next, kdf_salt, sample_chain_root())?;
 		let second_rotated = second.install::<Provider>(second_next, kdf_salt, sample_chain_root())?;
 		let (first_send, _first_recv) = SessionKeys::for_client(first_rotated).into_parts();
-		let (_second_send, second_recv) = SessionKeys::for_server(second_rotated).into_parts();
+		let (_second_send, mut second_recv) = SessionKeys::for_server(second_rotated).into_parts();
 
 		let mut record = first_send.encrypt_next(PLAINTEXT)?.to_der()?;
 		assert!(second_recv.open(&mut record).is_err());
@@ -1149,13 +1152,13 @@ pub(crate) mod tests {
 		let mut epoch = sample_epoch()?;
 		let salt = sample_salt();
 		let rotated_epoch = epoch.epoch() + 1;
-		let previous = DirectionalCiphers::derive::<Provider, _>(epoch.secret(), salt.as_kdf_salt(), rotated_epoch)?;
+		let previous = DirectionalCiphers::derive::<Provider, _>(epoch.secret(), salt.as_kdf_salt()?, rotated_epoch)?;
 		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
-		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt(), sample_chain_root())?;
-		let (_send, recv) = SessionKeys::for_server(rotated).into_parts();
+		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
+		let (_send, mut recv) = SessionKeys::for_server(rotated).into_parts();
 
 		let mut record = previous_send.encrypt_next(PLAINTEXT)?.to_der()?;
 		let refused = recv.open(&mut record);
@@ -1173,10 +1176,10 @@ pub(crate) mod tests {
 		let next_epoch = epoch.epoch() + 1;
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
-		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt(), next_epoch)?;
-		let (_peer_send, peer_recv) = SessionKeys::for_server(expected).into_parts();
-		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt(), sample_chain_root())?;
+		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt()?, next_epoch)?;
+		let (_peer_send, mut peer_recv) = SessionKeys::for_server(expected).into_parts();
+		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
 		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
 
 		let mut record = send.encrypt_next(PLAINTEXT)?.to_der()?;
@@ -1207,9 +1210,9 @@ pub(crate) mod tests {
 		let expected = [b"tb/session/record/kekid/v1".as_slice(), &[0x00], &next_epoch.to_be_bytes()].concat();
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
+		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
 
-		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt(), sample_chain_root())?;
+		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
 		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
 		let record = send.encrypt_next(PLAINTEXT)?;
 		assert_eq!(key_identifier_of(&record), expected);
@@ -1221,7 +1224,7 @@ pub(crate) mod tests {
 		let (mut client, mut server) = rekey_pair()?;
 		run_exchange(&mut client, &mut server).await?;
 
-		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
+		let (client_install, mut server_install) = run_exchange(&mut client, &mut server).await?;
 		assert_eq!(client_install.epoch, 2);
 		assert_eq!(server_install.epoch, 2);
 
@@ -1415,7 +1418,7 @@ pub(crate) mod tests {
 		let salt = RandomsSalt::new(&client_random, &server_random);
 
 		let (ack, client_install) = client.process_response(response).await?;
-		let server_install = server.process_ack(ack).await?.install;
+		let mut server_install = server.process_ack(ack).await?.install;
 		let record = client_install.send_cipher.encrypt_next(PLAINTEXT)?.to_der()?;
 
 		// Positive control: the server held a rekey scalar and opens the frame.
@@ -1427,8 +1430,8 @@ pub(crate) mod tests {
 		// draws a scalar of its own for each attempt.
 		let observed = sample_epoch()?;
 		let (first, second) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
-		let against_client = observed.next_secret::<Provider>(first, &wire_client, salt.as_kdf_salt())?;
-		let against_server = observed.next_secret::<Provider>(second, &wire_server, salt.as_kdf_salt())?;
+		let against_client = observed.next_secret::<Provider>(first, &wire_client, salt.as_kdf_salt()?)?;
+		let against_server = observed.next_secret::<Provider>(second, &wire_server, salt.as_kdf_salt()?)?;
 		assert!(server_recv(&against_client, &salt).open(&mut record.clone()).is_err());
 		assert!(server_recv(&against_server, &salt).open(&mut record.clone()).is_err());
 		Ok(())

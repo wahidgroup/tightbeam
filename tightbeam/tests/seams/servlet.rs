@@ -6,6 +6,9 @@
 //!
 //! An outside crate also writes the [`UtilizationGauge`] of a `servlet!`
 //! servlet here, which the hive reads when it scales the servlet.
+//!
+//! An outside [`ServletBox`] that keeps the default drain stops at the drain
+//! of its hive.
 
 #![cfg(all(
 	feature = "std",
@@ -17,6 +20,7 @@
 	feature = "colony"
 ))]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -34,6 +38,7 @@ use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::{ClusterEnv, SetupEnv, TestMessage};
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, Protocol};
 use tightbeam::urn::Urn;
@@ -71,9 +76,8 @@ cluster! {
 	protocol: TokioListener
 }
 
-/// A [`ServletBox`] an outside crate writes: it holds a live servlet, and
-/// its registration names `signer` as the identity that servlet answers
-/// under.
+/// A [`ServletBox`] an outside crate writes: it holds a live servlet, and its
+/// registration names `signer` as the identity that servlet answers under.
 struct OutsideServlet {
 	inner: SeamEchoServlet,
 	signer: SignerIdentifier,
@@ -136,7 +140,7 @@ async fn start_outside_hive(
 	let servlet = OutsideServlet { inner, signer: named.clone() };
 
 	let (spec, provider) = identity_of(&certs);
-	let hive_tls = HiveTlsConfig::new(spec, provider, vec![])?;
+	let hive_tls = HiveTlsConfig::new(spec, provider, PeerAuthentication::Anonymous)?;
 	let trust_store = Some(Arc::clone(&certs.trust));
 	let conf = HiveConfig { hive_tls: Some(Arc::new(hive_tls)), trust_store, ..Default::default() };
 
@@ -313,5 +317,48 @@ async fn a_hive_scales_up_a_servlet_on_its_outside_gauge() -> Result<(), TightBe
 	hive.stop();
 
 	assert!(scaled_up);
+	Ok(())
+}
+
+/// A [`ServletBox`] an outside crate writes with no house runtime under it.
+/// It keeps the default drain, and it marks its stop.
+struct StopMarking {
+	stopped: Arc<AtomicBool>,
+}
+
+impl ServletBox for StopMarking {
+	fn addr_bytes(&self) -> Arc<[u8]> {
+		Arc::from(b"127.0.0.1:7080".as_slice())
+	}
+
+	fn stop_boxed(self: Box<Self>) {
+		self.stopped.store(true, Ordering::SeqCst);
+	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		None
+	}
+}
+
+/// The type URN the stop-marking servlet registers under.
+fn marking_urn() -> Urn<'static> {
+	let urn = ColonyNamespace::default().servlet("stop-marking");
+	urn.expect("test names satisfy the mint grammar")
+}
+
+/// A hive's drain stops an outside servlet that keeps the default drain, so
+/// a servlet with no drain of its own still ends at the drain of its hive.
+#[tokio::test]
+async fn a_hive_drain_stops_an_outside_servlet_that_keeps_the_default_drain() -> Result<(), TightBeamError> {
+	let stopped = Arc::new(AtomicBool::new(false));
+	let servlet = StopMarking { stopped: Arc::clone(&stopped) };
+	let spawner = |_| async { Ok(StopMarking { stopped: Arc::default() }) };
+	let mut hive = SeamHive::new(None)?;
+	hive.register(marking_urn(), servlet, spawner)?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
+
+	hive.drain().await?;
+
+	assert!(stopped.load(Ordering::SeqCst));
 	Ok(())
 }

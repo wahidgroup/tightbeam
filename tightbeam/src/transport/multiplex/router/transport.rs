@@ -24,7 +24,7 @@ use crate::runtime::rt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::multiplex::MuxRekeyContext;
 
-/// Multiplexed transport assembled from split envelope halves and
+/// A multiplexed transport assembled from split envelope halves and
 /// [`MuxSettings`].
 pub struct MuxTransport<R, W>
 where
@@ -50,15 +50,15 @@ where
 	/// - On encrypted halves, `settings` MUST come from [`negotiated_mux`]. A
 	///   peer that never negotiated multiplexing rejects every muxed envelope
 	///   as invalid.
-	/// - On cleartext halves there is no negotiation, so both endpoints MUST
-	///   agree on the same settings out of band ([`MuxSettings::symmetric`]).
+	/// - Cleartext halves have no negotiation, so both endpoints MUST agree on
+	///   the settings out of band ([`MuxSettings::symmetric`]).
 	/// - The renewal deadline runs on the clock of `writer` ([`EnvelopeSink::clock`]), its endpoint's clock.
 	///
 	/// [`negotiated_mux`]: crate::transport::TcpTransport::negotiated_mux
 	pub fn new(reader: R, writer: W, role: MuxRole, settings: MuxSettings) -> Self {
 		let outbound_capacity =
-			cap_as_usize(settings.local_initiated_cap.saturating_add(settings.peer_initiated_cap)).max(1);
-		let inbound_capacity = cap_as_usize(settings.peer_initiated_cap).max(1);
+			cap_as_usize(settings.local_initiated_cap().saturating_add(settings.peer_initiated_cap())).max(1);
+		let inbound_capacity = cap_as_usize(settings.peer_initiated_cap()).max(1);
 		let (outbound_sender, outbound_receiver) = mpsc::channel(outbound_capacity);
 		let (inbound_sender, inbound_receiver) = mpsc::channel(inbound_capacity);
 
@@ -79,7 +79,7 @@ where
 		let (link, drained) = MuxLink::new(shared, outbound_sender);
 		let reader = MuxReaderDriver::new(reader, link.clone(), inbound_sender, drained, &settings);
 		let handle = MuxHandle::new(link.clone());
-		let responder = MuxResponder::new(inbound_receiver, link, settings.peer_initiated_cap);
+		let responder = MuxResponder::new(inbound_receiver, link, settings.peer_initiated_cap());
 
 		Self { handle, reader, writer, responder }
 	}
@@ -103,9 +103,9 @@ where
 	///
 	/// The renewal deadline (`with_renewal_deadline`, tokio-only) bounds how
 	/// long a peer that never answers a renewal can park this endpoint's data
-	/// at the hard floor. A build without tokio has no timer here, so the host
-	/// application MUST bound parked emits itself, with its own timeout around
-	/// each emit future. A cancelled emit frees its stream slot.
+	/// at the hard floor. A build without tokio has no timer, so the
+	/// application MUST put its own timeout around each emit future. A
+	/// cancelled emit frees its stream slot.
 	///
 	/// # Examples
 	///
@@ -248,9 +248,9 @@ where
 /// [`MuxTransport::spawn`] produces it.
 #[cfg(feature = "tokio")]
 pub struct SpawnedMux {
-	/// Client-side handle that emits on streams.
+	/// The client handle that emits on streams.
 	pub handle: MuxHandle,
-	/// Server-side dispatcher for peer-initiated streams.
+	/// The server dispatcher of peer-initiated streams.
 	pub responder: MuxResponder,
 	/// The two driver tasks of the connection. Their drop ends the
 	/// connection, so a holder keeps them for as long as it emits or serves.
@@ -311,7 +311,7 @@ impl MuxDrivers {
 	}
 }
 
-/// The drop aborts both tasks through the runtime seam.
+/// The drop aborts both tasks through the runtime interface.
 #[cfg(feature = "tokio")]
 impl Drop for MuxDrivers {
 	fn drop(&mut self) {

@@ -162,6 +162,7 @@ impl ClientMaterials {
 pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
 	let trust_chain = vec![certificate.to_owned()];
 	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
+	let data = data.expect("a test certificate encodes");
 	Arc::new(data)
 }
 
@@ -530,7 +531,7 @@ mod cms_pair {
 	pub struct CmsHandshakePair {
 		/// The client configuration, which presents the fresh identity.
 		pub client: ClientConfig<Cms, DefaultCryptoProvider>,
-		/// The server configuration.
+		/// The server configuration, which holds the fixture server identity.
 		pub server: ServerConfig<Cms, DefaultCryptoProvider>,
 		/// The certificate of the identity the client presents.
 		pub client_certificate: Arc<Certificate>,
@@ -615,8 +616,12 @@ mod cms_fixtures {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let pair =
-			cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::mutual([validator]))?;
+		let pair = cms_handshake_pair(
+			materials,
+			vec![profile],
+			vec![profile],
+			PeerAuthentication::Anonymous.and(validator),
+		)?;
 
 		let mut config = pair.client;
 		config.transport_offer = Some(offer.to_owned());

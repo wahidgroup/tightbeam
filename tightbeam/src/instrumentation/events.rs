@@ -565,10 +565,15 @@ pub const SESSION_CERT_REJECTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "even
 /// assert_eq!(HIVE_ESTABLISHED.to_string(), "urn:tightbeam:event:hive/established");
 /// ```
 pub const HIVE_ESTABLISHED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hive/established");
-/// Marks one registration that the anti-entropy beat of a hive sends to one
-/// gateway, so the gateway refreshes the hive's slate in its soft state. The
-/// beat sends one to each registered gateway every `reregister_interval`. It
-/// fires under `colony`.
+/// Marks one announcement of the slate of a hive to one gateway, so the
+/// gateway refreshes the hive's slate in its soft state. It fires under
+/// `colony`, for each registered gateway:
+///
+/// - The anti-entropy beat announces every `reregister_interval`.
+/// - A drain announces the emptied slate once.
+/// - A scaling update that a gateway did not take falls back to an announcement.
+///
+/// Each announcement carries three fields:
 ///
 /// - The label is the name of the status in the value.
 /// - The value is the status of the gateway's reply, or `Unavailable` when the registration failed.
@@ -608,13 +613,42 @@ pub const HIVE_COMMAND_ACCEPTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "even
 /// assert_eq!(HIVE_COMMAND_REFUSED.to_string(), "urn:tightbeam:event:hive/command-refused");
 /// ```
 pub const HIVE_COMMAND_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hive/command-refused");
+/// Marks one servlet instance that the scaling loop of a hive adds or
+/// removes, once the instance set holds the change. It fires under `colony`.
+///
+/// - The label is `Added` or `Removed`.
+/// - The value is the servlet type URN of the instance, as text.
+/// - The payload is the canonical bytes of the instance URN.
+///
+/// ```
+/// use tightbeam::instrumentation::events::HIVE_SCALED;
+///
+/// assert_eq!(HIVE_SCALED.to_string(), "urn:tightbeam:event:hive/scaled");
+/// ```
+pub const HIVE_SCALED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hive/scaled");
+/// Marks a scale that the scaling loop of a hive decides and that lands no
+/// change. It fires under `colony`.
+///
+/// - The label names why the scale landed no change:
+///   - `SpawnFailed`: the spawner of the type produced no servlet.
+///   - `AtCapacity`, `Draining`, `Unnameable`, or `Registry`: the instance set refused the new instance.
+///   - `Absent` or `AtFloor`: the instance set refused the removal.
+/// - The value is the servlet type URN of the scale, as text.
+///
+/// ```
+/// use tightbeam::instrumentation::events::HIVE_SCALE_REFUSED;
+///
+/// assert_eq!(HIVE_SCALE_REFUSED.to_string(), "urn:tightbeam:event:hive/scale-refused");
+/// ```
+pub const HIVE_SCALE_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:hive/scale-refused");
 
 // Cluster gateway events
 /// Marks a request or a stream open that a collector gate of the gateway
 /// refuses, before the gateway decodes the request envelope. The first policy
-/// that refuses decides. The value is its normalized verdict, the status the
-/// caller reads, and the label is the name of that status. It fires under
-/// `colony`.
+/// that refuses decides. It fires under `colony`.
+///
+/// - The label is the name of the status in the value.
+/// - The value is the normalized verdict of that policy, the status the caller reads.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_GATE_BLOCKED;
@@ -624,9 +658,10 @@ pub const HIVE_COMMAND_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 pub const CLUSTER_GATE_BLOCKED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/gate-blocked");
 /// Marks a hive registration that the gateway admits. The membership step
 /// installs the hive entry and its servlet slate, or replaces the rows of a
-/// hive that registers again. The value is the count of hives in the registry
-/// after the install, and the payload is the fingerprint of the signer whose
-/// signature the gateway verified. It fires under `colony`.
+/// hive that registers again. It fires under `colony`.
+///
+/// - The value is the count of hives in the registry after the install.
+/// - The payload is the fingerprint of the signer whose signature the gateway verified.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_HIVE_REGISTERED;
@@ -635,10 +670,13 @@ pub const CLUSTER_GATE_BLOCKED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event
 /// ```
 pub const CLUSTER_HIVE_REGISTERED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/hive-registered");
 /// Marks a hive registration that the gateway refuses, as the refusal reply
-/// leaves. The value is the status that the hive reads, and the label is the
-/// name of that status. A refusal after the signature verifies carries the
-/// fingerprint of the signer as its payload. It fires under `colony`, for one
-/// of these causes:
+/// leaves. It fires under `colony`.
+///
+/// - The label is the name of the status in the value.
+/// - The value is the status that the hive reads.
+/// - The payload is the fingerprint of the signer, for a refusal after the signature verifies.
+///
+/// The gateway refuses a registration for one of these causes:
 ///
 /// - The frame fails its signature or its freshness check.
 /// - The hive address names no hive identity, or the protocol cannot dial it.
@@ -653,9 +691,9 @@ pub const CLUSTER_HIVE_REGISTERED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "ev
 pub const CLUSTER_REGISTER_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/register-refused");
 /// Marks a servlet address update that the gateway applies for a registered
 /// hive. The membership step binds the frame's signer to the hive and writes
-/// the added and the removed routes in one step. The payload is the
-/// fingerprint of the signer whose signature the gateway verified. It fires
-/// under `colony`.
+/// the added and the removed routes in one step. It fires under `colony`.
+///
+/// - The payload is the fingerprint of the signer whose signature the gateway verified.
 ///
 /// ```
 /// use tightbeam::instrumentation::events::CLUSTER_UPDATE_ACCEPTED;
@@ -664,12 +702,17 @@ pub const CLUSTER_REGISTER_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "e
 /// ```
 pub const CLUSTER_UPDATE_ACCEPTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/update-accepted");
 /// Marks a servlet address update that the gateway refuses, as the refusal
-/// reply leaves. The label is the name of the status that the hive reads. A
-/// refusal after the signature verifies carries the fingerprint of the signer
-/// as its payload. It fires under `colony`, for one of these causes:
+/// reply leaves. It fires under `colony`.
+///
+/// - The label is the name of the status that the hive reads.
+/// - The payload is the fingerprint of the signer, for a refusal after the signature verifies.
+///
+/// The gateway refuses an update for one of these causes:
 ///
 /// - The frame fails its signature or its freshness check.
-/// - The update does not parse.
+/// - The update does not parse. The label then names the cause after the
+///   status, such as `PermissionDenied/invalid-urn` for a hive outside the
+///   namespace.
 /// - The membership step refuses the signer or the routes.
 ///
 /// ```
@@ -980,6 +1023,21 @@ pub const CLUSTER_PEER_EXPELLED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "even
 /// ```
 pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-advertise-refused");
+/// Marks a direct advertisement that a peer gateway answered with a refusal,
+/// on the gateway that sent it. The peer records its own side as
+/// [`CLUSTER_PEER_ADVERTISE_REFUSED`]. It fires under `colony`.
+///
+/// - The label is the name of the status in the value.
+/// - The value is the status of the peer's reply.
+/// - The payload is the dial address of the peer.
+///
+/// ```
+/// use tightbeam::instrumentation::events::CLUSTER_PEER_AD_REFUSED_BY_PEER;
+///
+/// assert_eq!(CLUSTER_PEER_AD_REFUSED_BY_PEER.to_string(), "urn:tightbeam:event:cluster/peer-ad-refused-by-peer");
+/// ```
+pub const CLUSTER_PEER_AD_REFUSED_BY_PEER: Urn<'static> =
+	crate::urn!(TIGHTBEAM_NID, "event:cluster/peer-ad-refused-by-peer");
 /// Marks the discovery hints that the gateway's peer table admits as
 /// unverified candidates, which a later probe can promote. It fires under
 /// `colony`, and only for a count above 0.

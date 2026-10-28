@@ -1,0 +1,5 @@
+error[E0616]: field `overflow` of struct `EvidenceArtifact` is private
+ --> tests/compile/evidence_artifact_field_write.rs:9:11
+  |
+9 |     artifact.overflow = false;
+  |              ^^^^^^^^ private field

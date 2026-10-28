@@ -3,9 +3,11 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::colony::hive::gates::CommandRefusal;
 use crate::colony::hive::runtime::{DrainMode, HiveContextImpl};
 use crate::colony::hive::{
-	HiveScalingConfig, RefusedRegistration, ServletBox, ServletPlacement, ServletRegistration, ServletRegistry,
+	HiveScalingConfig, RefusedRegistration, ReplacedServlet, ServletBox, ServletPlacement, ServletRegistration,
+	ServletRegistry,
 };
 use crate::transport::Protocol;
 use crate::urn::Urn;
@@ -37,6 +39,33 @@ pub enum InsertRefusal {
 	Registry(TightBeamError),
 }
 
+impl InsertRefusal {
+	/// The name of this refusal, the label of the scale record it draws.
+	pub(crate) fn as_str(&self) -> &'static str {
+		match self {
+			Self::Draining => "Draining",
+			Self::AtCapacity => "AtCapacity",
+			Self::Unnameable(_) => "Unnameable",
+			Self::Registry(_) => "Registry",
+		}
+	}
+}
+
+impl From<InsertRefusal> for TightBeamError {
+	/// The error of a registration that the instance set refused: the cause
+	/// of a refused address or registry, and the status a command answers for
+	/// a type at its bound or a hive that drains.
+	fn from(refusal: InsertRefusal) -> Self {
+		match refusal {
+			InsertRefusal::Unnameable(error) | InsertRefusal::Registry(error) => error,
+			InsertRefusal::Draining | InsertRefusal::AtCapacity => {
+				let status = CommandRefusal::from(refusal).status();
+				Self::WorkRefused(status)
+			}
+		}
+	}
+}
+
 /// Why [`HiveInstances::remove`] removed no instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Errorizable)]
 pub(crate) enum RemoveRefusal {
@@ -48,6 +77,16 @@ pub(crate) enum RemoveRefusal {
 	AtFloor,
 }
 
+impl RemoveRefusal {
+	/// The name of this refusal, the label of the scale record it draws.
+	pub(crate) fn as_str(&self) -> &'static str {
+		match self {
+			Self::Absent => "Absent",
+			Self::AtFloor => "AtFloor",
+		}
+	}
+}
+
 /// An instance that [`HiveInstances::remove`] took out, which the caller
 /// reports to the cluster.
 pub(crate) struct Removed {
@@ -57,18 +96,44 @@ pub(crate) struct Removed {
 	pub(crate) address: Arc<[u8]>,
 }
 
+/// A servlet that one move of the instance set took out, which stops once
+/// the admission lock drops.
+enum Retired {
+	/// A servlet that the move refused or removed, which stops through
+	/// [`ServletBox::stop_boxed`].
+	Servlet(Box<dyn ServletBox>),
+	/// A registration that the registry gave up for its replacement, which
+	/// stops its servlet as it drops.
+	Replaced(ReplacedServlet),
+}
+
+impl Retired {
+	/// Stops the servlet this value holds.
+	fn stop(self) {
+		match self {
+			Self::Servlet(servlet) => servlet.stop_boxed(),
+			Self::Replaced(replaced) => drop(replaced),
+		}
+	}
+}
+
 /// The outcome of one move of the instance set, and the servlet it took out,
 /// which stops once the admission lock drops.
 struct Settled<T> {
 	outcome: T,
-	retired: Option<Box<dyn ServletBox>>,
+	retired: Option<Retired>,
 }
 
 impl<T> Settled<T> {
+	/// The outcome of a move that takes `servlet` out of the hive.
+	fn retiring(outcome: T, servlet: Box<dyn ServletBox>) -> Self {
+		Self { outcome, retired: Some(Retired::Servlet(servlet)) }
+	}
+
 	/// Stops the servlet the move took out, and returns the outcome.
 	fn stop_retired(self) -> T {
-		if let Some(servlet) = self.retired {
-			servlet.stop_boxed();
+		if let Some(retired) = self.retired {
+			retired.stop();
 		}
 
 		self.outcome
@@ -130,7 +195,8 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	///
 	/// - A servlet that names no signer gets no route, because a sibling admits
 	///   a servlet's answer by that signer alone (CWE-346).
-	/// - A replaced instance retires as in [`Self::remove`]: its route leaves before the new one lands.
+	/// - A replacement's route takes over the route of the instance it
+	///   replaces in place, so its type keeps a route.
 	/// - Each servlet the insert refuses or replaces stops through
 	///   [`ServletBox::stop_boxed`] once the admission lock drops.
 	///
@@ -148,14 +214,14 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	/// and hands out each servlet the move stops.
 	fn place(&self, registration: ServletRegistration) -> Settled<Result<ServletPlacement, InsertRefusal>> {
 		if self.drain.is_draining() {
-			return Settled { outcome: Err(InsertRefusal::Draining), retired: Some(registration.servlet) };
+			return Settled::retiring(Err(InsertRefusal::Draining), registration.servlet);
 		}
 
 		let placement = match registration.placement() {
 			Ok(placement) => placement,
 			Err(error) => {
 				let outcome = Err(InsertRefusal::Unnameable(error));
-				return Settled { outcome, retired: Some(registration.servlet) };
+				return Settled::retiring(outcome, registration.servlet);
 			}
 		};
 
@@ -163,11 +229,12 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 		let current = self.instances_of(&registration.servlet_type, Some(&key_bytes));
 		let bounds = self.scaling.scale_config(&registration.servlet_type);
 		if !bounds.admits_instance(current) {
-			return Settled { outcome: Err(InsertRefusal::AtCapacity), retired: Some(registration.servlet) };
+			return Settled::retiring(Err(InsertRefusal::AtCapacity), registration.servlet);
 		}
 
+		// The registry takes the registration, so the route step keeps its own
+		// copy of the key and of the type key.
 		let type_key = registration.servlet_type.canonical_bytes();
-		// The route map and the registry each own a key, so the bytes clone.
 		let route_key = key_bytes.clone();
 
 		// The registry takes the instance first, so a route exists only for a
@@ -177,24 +244,28 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 			Err(refused) => {
 				let RefusedRegistration { error, registration } = *refused;
 				let outcome = Err(InsertRefusal::Registry(error));
-				return Settled { outcome, retired: Some(registration.servlet) };
+				return Settled::retiring(outcome, registration.servlet);
 			}
 		};
-		// A replaced instance shares its key, its type, and its address with
-		// its replacement, so the slate entry of that address stands. Its route
-		// leaves here, and its servlet stops once the admission lock drops.
-		let retired = replaced.and_then(|replaced| {
-			replaced.retire(|registration| {
-				let address = registration.servlet.addr_bytes();
-				self.leave(&route_key, &registration.servlet_type, &address);
-			})
-		});
 
-		if let Some(signer) = &placement.signer {
-			let address = Arc::clone(&placement.address);
-			self.routes.add_route(route_key, address, Arc::clone(signer), &type_key);
+		// A replaced instance shares its key, its type, and its address with
+		// its replacement, so the slate entry of that address stands, and its
+		// servlet stops once the admission lock drops.
+		let previous = replaced.as_ref().and_then(ReplacedServlet::registration);
+		match (&placement.signer, previous) {
+			// The new route takes the key and the type index over in place,
+			// so the type keeps a route throughout the replacement.
+			(Some(signer), _) => {
+				let address = Arc::clone(&placement.address);
+				self.routes.add_route(route_key, address, Arc::clone(signer), &type_key);
+			}
+			// A servlet that names no signer has no route, so the route of the
+			// instance it replaces leaves, under the type that instance names.
+			(None, Some(previous)) => self.leave(&route_key, &previous.servlet_type, &placement.address),
+			(None, None) => {}
 		}
 
+		let retired = replaced.map(Retired::Replaced);
 		Settled { outcome: Ok(placement), retired }
 	}
 
@@ -202,8 +273,7 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 	/// servlet itself, which stops once the admission lock drops.
 	///
 	/// Returns the removed type URN and address, which callers notify the
-	/// cluster with. A type that holds the fewest instances its bounds admit
-	/// keeps its instance.
+	/// cluster with.
 	///
 	/// # Errors
 	///
@@ -240,12 +310,12 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 
 		// 3. The servlet stops once nothing routes to it and the admission
 		//    lock drops.
-		Settled { outcome: Ok(Removed { servlet_type, address }), retired: Some(servlet) }
+		Settled::retiring(Ok(Removed { servlet_type, address }), servlet)
 	}
 
 	/// Enters drain and takes every instance out of the registry under one
 	/// hold of the admission lock, and returns each registration, so its
-	/// caller stops the servlets after the lock drops.
+	/// caller drains or stops the servlets after the lock drops.
 	///
 	/// An insert reads the drain state under the same lock, so a spawn that
 	/// outlives the drain adds no instance, whichever path drains the hive.
@@ -638,6 +708,23 @@ mod tests {
 		let inserted = admission.instances(&servlets, &routes).insert(registration);
 		assert!(matches!(inserted, Err(InsertRefusal::Draining)));
 		assert!(stopped.load(Ordering::SeqCst));
+	}
+
+	/// A replacement that names no signer has no route, so the route of the
+	/// signed instance it replaces leaves with it (CWE-346).
+	#[test]
+	fn an_unsigned_replacement_takes_the_route_of_the_instance_it_replaces_away() -> Result<(), Box<dyn Error>> {
+		let servlets = HashMapRegistry::default();
+		let routes = routes();
+		let admission = Admission::default();
+		let instances = admission.instances(&servlets, &routes);
+		let signed = probe_registration(echo_type(), &Arc::default(), Some(ServletInfo::fixture_signer()));
+		instances.insert(signed)?;
+
+		instances.insert(probe_registration(echo_type(), &Arc::default(), None))?;
+
+		assert!(!routes.resolves(&echo_type()));
+		Ok(())
 	}
 
 	/// A registration that replaces the instance at its own address takes no

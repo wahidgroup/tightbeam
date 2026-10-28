@@ -87,8 +87,7 @@ tb_scenario! {
 	name: test_wcet_constraint_passing,
 	config: wcet_config(|context, process| {
 				let constraints = process
-					.timing_constraints
-					.as_ref()
+					.timing_constraints()
 					.expect("the spec under test declares WCET constraints");
 
 				let timing_result = constraints
@@ -113,8 +112,7 @@ tb_scenario! {
 	name: test_wcet_constraint_at_limit,
 	config: wcet_config(|context, process| {
 				let constraints = process
-					.timing_constraints
-					.as_ref()
+					.timing_constraints()
 					.expect("the spec under test declares WCET constraints");
 
 				let timing_result = constraints
@@ -138,8 +136,7 @@ tb_scenario! {
 	name: test_wcet_constraint_violation,
 	config: wcet_config(|context, process| {
 				let constraints = process
-					.timing_constraints
-					.as_ref()
+					.timing_constraints()
 					.expect("the spec under test declares WCET constraints");
 
 				let timing_result = constraints

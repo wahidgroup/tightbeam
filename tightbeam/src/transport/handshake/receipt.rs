@@ -83,8 +83,8 @@ mod handshake {
 	pub use crate::cms::signed_data::{CertificateSet, SignedAttributes, SignerInfo};
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::profiles::SigningProvider;
-	pub(crate) use crate::crypto::sign::CertifiedSigner;
-	pub use crate::crypto::sign::{CmsSigner, SignedContent, SigningIdentity};
+	pub(crate) use crate::crypto::sign::{CertifiedSigner, SignedDataSigners};
+	pub use crate::crypto::sign::{CmsSigner, SignedContent, SignedDataExt, SigningIdentity};
 	pub use crate::crypto::x509::{PeerCertificate, Signing};
 	pub use crate::der::asn1::{ObjectIdentifier, SetOfVec};
 	pub use crate::der::{Any, Decode, Encode};
@@ -134,8 +134,8 @@ pub struct SessionReceipt {
 	/// The opaque settlement challenge of the server's authorizer, such as an
 	/// unsigned transaction or an invoice.
 	///
-	/// TightBeam treats it as opaque bytes. It travels in the cleartext
-	/// handshake response, so it is public data and never a secret.
+	/// It travels in the cleartext handshake response, so it is public data
+	/// and never a secret.
 	#[asn1(optional = "true")]
 	pub ancillary: Option<OctetString>,
 }
@@ -302,7 +302,7 @@ impl TryFrom<Signed<SignedData>> for StoredReceipt {
 
 		let server_role = ReceiptRole::Server;
 		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-		let server_certificate = CmsSigner::named_certificate(&artifact, server_signer)?;
+		let server_certificate = artifact.named_certificate(server_signer)?;
 		server_certificate.ok_or(HandshakeError::MissingServerCertificate)?;
 
 		let client_role = ReceiptRole::Client;
@@ -310,7 +310,7 @@ impl TryFrom<Signed<SignedData>> for StoredReceipt {
 			.signer_for_role(client_role)?
 			.ok_or(HandshakeError::CountersignatureMissing)?;
 
-		let client_certificate = CmsSigner::named_certificate(&artifact, client_signer)?;
+		let client_certificate = artifact.named_certificate(client_signer)?;
 		client_certificate.ok_or(HandshakeError::MissingClientCertificate)?;
 
 		let answer = signer_answer(client_signer)?;
@@ -335,8 +335,7 @@ impl StoredReceipt {
 	}
 
 	/// The application settlement answer that the client's signed attributes
-	/// bind. TightBeam treats it as opaque bytes. The answer is a bearer
-	/// secret, so `Debug` output redacts it.
+	/// bind. It is a bearer secret, so `Debug` output redacts it.
 	pub fn ancillary_response(&self) -> Option<&OctetString> {
 		self.ancillary_response.as_ref()
 	}
@@ -413,7 +412,7 @@ impl StoredReceipt {
 	/// ```
 	pub fn certificate(&self, role: ReceiptRole) -> Result<&Certificate, HandshakeError> {
 		let signer = self.signer(role)?;
-		let named = CmsSigner::named_certificate(&self.artifact, signer)?;
+		let named = self.artifact.named_certificate(signer)?;
 		named.ok_or(HandshakeError::ReceiptMismatch)
 	}
 
@@ -875,8 +874,8 @@ impl SessionReceipt {
 	///
 	/// # Without an approver
 	///
-	/// The function applies the fallback that [`ReceiptApprover`] documents, so
-	/// a challenge-free receipt passes unanswered as `Ok(None)`.
+	/// It applies the fallback that [`ReceiptApprover`] documents, so a
+	/// challenge-free receipt passes unanswered as `Ok(None)`.
 	///
 	/// # Normalization
 	///
@@ -950,7 +949,7 @@ impl ReceiptArtifact for SignedData {
 	/// The body is the content of the receipt content type, read through the
 	/// CMS signer's `SignedData` checks (RFC 5652 §5.1).
 	fn receipt(&self) -> Result<SessionReceipt, HandshakeError> {
-		let content = CmsSigner::content(self, SESSION_RECEIPT_CONTENT);
+		let content = self.content(SESSION_RECEIPT_CONTENT);
 		let body_bytes = content.map_err(|_| HandshakeError::ReceiptMismatch)?;
 
 		let receipt = SessionReceipt::from_der(body_bytes)?;
@@ -1260,7 +1259,7 @@ mod tests {
 			let server_signer = artifact.signer_for_role(ReceiptRole::Server)?;
 			let signer = server_signer.ok_or("the artifact holds a server signer")?;
 
-			let carried = CmsSigner::named_certificate(&artifact, signer)?;
+			let carried = artifact.named_certificate(signer)?;
 			assert_eq!(carried, Some(server.certificate()));
 			Ok(())
 		}

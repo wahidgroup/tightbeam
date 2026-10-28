@@ -49,9 +49,9 @@ use crate::instrumentation::events::{
 	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED, CLUSTER_PEER_EXPELLED,
 };
 use crate::instrumentation::events::{
-	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_PEER_HINTS_LEARNED,
-	CLUSTER_PEER_ROUTES_INSTALLED, CLUSTER_PEER_ROUTES_WITHDRAWN, CLUSTER_PEER_ROUTE_ABANDONED,
-	CLUSTER_RECONCILE_FAILED, CLUSTER_RELAY_TRAIL_INSTALLED, CLUSTER_RELAY_TRAIL_REFUSED,
+	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_PEER_AD_REFUSED_BY_PEER,
+	CLUSTER_PEER_HINTS_LEARNED, CLUSTER_PEER_ROUTES_INSTALLED, CLUSTER_PEER_ROUTES_WITHDRAWN,
+	CLUSTER_PEER_ROUTE_ABANDONED, CLUSTER_RECONCILE_FAILED, CLUSTER_RELAY_TRAIL_INSTALLED, CLUSTER_RELAY_TRAIL_REFUSED,
 };
 use crate::policy::TransitStatus;
 use crate::runtime::{rt, TaskGroup};
@@ -88,17 +88,6 @@ impl GossipOrigin {
 		match self {
 			Self::Relay => Some(sender),
 			Self::Origin => None,
-		}
-	}
-}
-
-impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// The plane this gateway dials peers on: the configured peer plane, which
-	/// keeps peer traffic off the hive pool, or else the hive pool.
-	pub(crate) fn peer_dial_plane(&self) -> PeerPlane<P> {
-		match self.peer_plane.as_ref() {
-			Some(peer_plane) => peer_plane.clone(),
-			None => self.hive_plane.peers(self.config.clone()),
 		}
 	}
 }
@@ -182,8 +171,9 @@ impl<P: Protocol> ColonyConfig<P> {
 
 impl ClusterConfig {
 	/// Whether `order` sits inside this colony's control freshness window. A
-	/// control frame passes a replay guard, and a rumor the journal's digest
-	/// deduplication. This bound makes both paths admit the same orders.
+	/// control frame passes a replay guard and a rumor passes the journal's
+	/// digest deduplication, so this bound makes both paths admit one set of
+	/// orders.
 	///
 	/// # Fail-closed
 	///
@@ -208,7 +198,7 @@ impl ClusterConfig {
 
 	/// Offers `hints` from `source` to the peer table, and records the count
 	/// it admits as [`CLUSTER_PEER_HINTS_LEARNED`] on `trace`, because the
-	/// table holds none. A learn that admits no hint records nothing.
+	/// table holds no trace. A learn that admits no hint records nothing.
 	///
 	/// # Errors
 	///
@@ -562,6 +552,37 @@ impl<P: ColonyDialProtocol> AdvertiseBeat<P> {
 		Ok(slate)
 	}
 
+	/// Records on `trace` the answer of `peer` to a direct advertisement, when
+	/// the peer answered and refused it.
+	///
+	/// - A refusal records [`CLUSTER_PEER_AD_REFUSED_BY_PEER`] with the status
+	///   as its label and its value, and the dial address of `peer` as its
+	///   payload.
+	/// - An `Ok` answer is the peer's admission, which the peer records.
+	/// - A dial that failed carries no answer to record. The reconcile round of
+	///   a flood member scores the failed dial.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- `trace` refused the record of the refusal.
+	fn settle_advertisement(
+		&self,
+		peer: &AdmittedDial,
+		answered: Result<TransitStatus, ClusterError>,
+		trace: &TraceCollector,
+	) -> Result<(), TightBeamError> {
+		let Ok(status) = answered else {
+			return Ok(());
+		};
+		if status == TransitStatus::Ok {
+			return Ok(());
+		}
+
+		let label = status.as_str();
+		let evidence = || Some(peer.to_string());
+		trace.emit_event_with_value_and_rendered_evidence(CLUSTER_PEER_AD_REFUSED_BY_PEER, label, status, evidence)
+	}
+
 	/// Advertises to each beat target, and hands each one to the flood arm when
 	/// this gateway has one. The one signed `advertisement` serves every dial.
 	async fn dial_targets(
@@ -580,9 +601,10 @@ impl<P: ColonyDialProtocol> AdvertiseBeat<P> {
 			};
 
 			if let Some(advertisement) = advertisement {
-				// The reconcile below reuses the address and scores a failed
-				// dial, so the address clones and the status goes unread.
-				let _advertised = self.advertiser.advertise(peer_addr.clone(), advertisement).await;
+				// The reconcile below reuses the address, so the address
+				// clones.
+				let answered = self.advertiser.advertise(peer_addr.clone(), advertisement).await;
+				self.settle_advertisement(peer, answered, trace)?;
 			}
 
 			let Some(flood) = flood else {
@@ -1101,12 +1123,10 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
 	/// Projects the gateway's runtime state onto what a rumor needs.
 	fn from(ctx: GatewayRuntimeCtx<P>) -> Self {
-		let peer_plane = ctx.peer_dial_plane();
-
 		Self {
 			servlet_registry: ctx.servlet_registry,
 			config: ctx.config,
-			peer_plane,
+			peer_plane: ctx.peer_plane,
 			hive_plane: ctx.hive_plane,
 			trace: ctx.trace,
 			tasks: ctx.tasks,
@@ -1171,9 +1191,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 		};
 
 		let choice = RouteChoice::of(entry);
-		let Ok(hop) = choice.hop(&self.hive_plane, None) else {
-			return Ok(());
-		};
+		let hop = choice.hop(&self.hive_plane, &self.peer_plane);
 		let Ok(_response) = hop.deliver_frame(rumor).await else {
 			return Ok(());
 		};
@@ -1629,7 +1647,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	pub(crate) fn spawn_advertise(self, gateway_addr: Arc<[u8]>) -> rt::JoinHandle {
 		// Repair delivery runs the gossip pipeline, so it reuses its context.
 		let delivery = GossipPipelineCtx::from(self.clone());
-		let peer_plane = self.peer_dial_plane();
+		let peer_plane = self.peer_plane.clone();
 		let beat = AdvertiseBeat {
 			config: self.config.clone(),
 			advertiser: peer_plane.advertiser(),

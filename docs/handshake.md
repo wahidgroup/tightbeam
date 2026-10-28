@@ -181,7 +181,7 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 - A mutual client presents its issuers the same way, in the `certificates` of its client Finished. Each client validator of the server reads them through `CertificateValidation::evaluate_presented`: the house store validates the path to one of its anchors, so a server's store can hold trust anchors alone too, and the default implementation reads the client certificate alone.
 - Each certificate a store holds anchors every path below it, so a presented intermediate is input the store never vetted. A path certificate that states `nameConstraints`, critical or not, is refused with `NameConstraintsUnapplied`, because the store's path validation does not apply name constraints (RFC 5280 § 6.1.4 (g)).
 - An HPKE client admits the signing certificate through its `LearnedTrust`. `LearnedTrust::anchored` validates the presented path through `CertificateTrust::verify_presented`, as the CMS client does, and a transport client anchors on its trust store in this form. `LearnedTrust::new` runs a validator on the signing certificate alone, such as a pin, so a store in that form must hold every intermediate between the signing certificate and its anchor.
-- Each side builds the path its peer presents once, from the certificate the `sid` names, then each issuer by name. A client builds it in `CmsSigner::signer_path`, and a server in `CmsSigner::take_signer_path`:
+- Each side builds the path its peer presents once, from the certificate the `sid` names, then each issuer by name. A client builds it in `WireDer<SignedData>::signer_path`, and a server in `Signed<SignedData>::take_signer_path`:
   - Each refuses a set of more than `MAX_PRESENTED_PATH` (8) certificates before it walks a path or checks a signature. The server refuses it before the decode of the client Finished sorts the set.
   - The walk refuses two certificates of one issuer name (`AmbiguousIssuer`) and a path that returns to a certificate it holds (`PathCycle`).
   - Both sides refuse a `SignedData` that is not the DER of the value it decodes to, such as one with a second `certificates` field or a certificate in another encoding than its DER. The client refuses it as it decodes the reply, and the server as it decodes the Finished.
@@ -542,7 +542,7 @@ The sender hashes the bytes it encoded, and the receiver hashes the bytes it rec
 | A container                             | `WireDer::der`                                                                                                       |
 | A CMS accept or ephemeral attribute     | `HandshakeAttribute::received_bytes`                                                                                 |
 | The HPKE reply content                  | The reply's `eContent` octets, as they arrived                                                                       |
-| The `certificates` field of either flow | `CmsSigner::signer_path`: the bytes of the field as they arrived, which hold the signing certificate and its issuers |
+| The `certificates` field of either flow | `WireDer<SignedData>::signer_path`: the bytes of the field as they arrived, which hold the signing certificate and its issuers |
 
 Both flows bind the whole `certificates` field, as RFC 9846 § 4.5.2 signs over the Certificate message, which carries the chain:
 

@@ -26,7 +26,7 @@ impl OutsideChecker {
 	/// Each state that `process` reaches within `depth` observable events,
 	/// paired with the trace that first reaches it, in breadth-first order.
 	fn reached(process: &Process, depth: usize) -> Vec<(State, Trace)> {
-		let mut reached = vec![(process.initial, Vec::new())];
+		let mut reached = vec![(process.initial(), Vec::new())];
 		let mut next = 0;
 		while let Some((state, trace)) = reached.get(next).cloned() {
 			next += 1;
@@ -48,8 +48,7 @@ impl OutsideChecker {
 		reached
 	}
 
-	/// The first item of `found` that `allowed` lacks, as a refinement
-	/// outcome.
+	/// The first item of `found` that `allowed` lacks, as a refinement outcome.
 	fn outcome<W: PartialEq>(found: Vec<W>, allowed: &[W]) -> RefinementOutcome<W> {
 		let missing = found.into_iter().find(|item| !allowed.contains(item));
 		match missing {
@@ -146,7 +145,7 @@ fn verdict_of(subject: &Process, spec: Process) -> FdrVerdict {
 	let config = Arc::new(FdrConfig { specs: vec![spec], fail_fast: false, ..Default::default() });
 	let engine = DefaultExplorationEngine::new(subject, Arc::clone(&config));
 	let mut explorer = FdrExplorer::new_with_arc(subject, config, engine, OutsideChecker);
-	explorer.explore()
+	explorer.explore().expect("the run asks for no FMEA report")
 }
 
 #[test]

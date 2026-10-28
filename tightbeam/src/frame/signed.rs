@@ -14,6 +14,8 @@ use crate::der::{
 };
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::{PresentedPath, SignerError};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::{AnyRef, Decode, Tagged};
 
 /// The `[0]` tag of the `certificates` field of a `SignedData`.
@@ -213,6 +215,22 @@ impl<'a> ArrivedCertificates<'a> {
 	/// The number of choices the set arrived with.
 	pub(crate) fn count(&self) -> usize {
 		self.choices.len()
+	}
+
+	/// Refuse `der`, the encoding of a `SignedData`, when its `certificates`
+	/// field arrived with more choices than a path holds, before a typed
+	/// decode sorts the set.
+	///
+	/// # Errors
+	///
+	/// - [`SignerError::Certificate`] -- the set holds more than
+	///   [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH) choices.
+	/// - [`SignerError::Encoding`] -- `der` is no SEQUENCE of elements, or it
+	///   carries a second `certificates` field.
+	pub(crate) fn bound_presented(der: &'a (impl AsRef<[u8]> + ?Sized)) -> Result<(), SignerError> {
+		let arrived = Self::read(der)?;
+		let count = arrived.as_ref().map_or(0, Self::count);
+		Ok(PresentedPath::bound(count)?)
 	}
 }
 

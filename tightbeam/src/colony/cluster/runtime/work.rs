@@ -6,9 +6,7 @@ use std::sync::Arc;
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::{HivePlane, Hop, PeerPlane};
 use crate::colony::cluster::servlet_registry::RoutePlane;
-use crate::colony::cluster::{
-	ClusterConfig, ClusterError, DialTarget, HopBudget, RouteKind, ServletEntry, ServletRegistry,
-};
+use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget, HopBudget, ServletEntry, ServletRegistry};
 use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
 use crate::colony::urn::ServletTypeKey;
 use crate::decode;
@@ -50,15 +48,7 @@ impl RouteChoice {
 	}
 
 	/// The hop this route dials, on the plane [`RoutePlane::hop`] names.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::ConnectFailed`] -- a peer route meets a gateway with no peer plane.
-	pub(crate) fn hop<'p, P: Protocol>(
-		&'p self,
-		hive: &'p HivePlane<P>,
-		peers: Option<&'p PeerPlane<P>>,
-	) -> Result<Hop<'p, P>, ClusterError> {
+	pub(crate) fn hop<'p, P: Protocol>(&'p self, hive: &'p HivePlane<P>, peers: &'p PeerPlane<P>) -> Hop<'p, P> {
 		let dial = self.dial.clone();
 		self.plane.hop(dial, hive, peers)
 	}
@@ -73,22 +63,15 @@ impl RoutePlane {
 	/// The hop that dials `dial` on this plane: on `hive` bound to the signer
 	/// a servlet's registration names, or on `peers` bound to the gateway a
 	/// peer route names.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::ConnectFailed`] -- a peer route meets a gateway with no peer plane.
 	pub(crate) fn hop<'p, P: Protocol>(
 		&'p self,
 		dial: DialTarget,
 		hive: &'p HivePlane<P>,
-		peers: Option<&'p PeerPlane<P>>,
-	) -> Result<Hop<'p, P>, ClusterError> {
+		peers: &'p PeerPlane<P>,
+	) -> Hop<'p, P> {
 		match self {
-			Self::Hive { signer } => Ok(hive.servlet(dial, Arc::clone(signer))),
-			Self::Peer { gateway_id } => {
-				let peers = peers.ok_or(ClusterError::ConnectFailed)?;
-				Ok(peers.hop(dial, gateway_id))
-			}
+			Self::Hive { signer } => hive.servlet(dial, Arc::clone(signer)),
+			Self::Peer { gateway_id } => peers.hop(dial, gateway_id),
 		}
 	}
 
@@ -137,20 +120,10 @@ impl RoutePlane {
 	/// The route a splice on this plane stamps on its open: local on the hive
 	/// plane, and relayed to `target` with `budget` decremented on the peer
 	/// plane.
-	///
-	/// # Errors
-	///
-	/// - [`TransitStatus::Unavailable`] -- a peer route meets a gateway with no peer plane.
-	pub(crate) fn stream_route<P: Protocol>(
-		&self,
-		target: &Urn<'static>,
-		budget: HopBudget,
-		peers: Option<&PeerPlane<P>>,
-	) -> Result<StreamRoute, TransitStatus> {
+	pub(crate) fn stream_route(&self, target: &Urn<'static>, budget: HopBudget) -> StreamRoute {
 		match self {
-			Self::Hive { .. } => Ok(StreamRoute::local()),
-			Self::Peer { .. } if peers.is_none() => Err(TransitStatus::Unavailable),
-			Self::Peer { .. } => Ok(budget.relayed_route(target)),
+			Self::Hive { .. } => StreamRoute::local(),
+			Self::Peer { .. } => budget.relayed_route(target),
 		}
 	}
 }
@@ -266,7 +239,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		frame_cache: &mut Option<Frame>,
 	) -> Result<Vec<u8>, ClusterError> {
 		let payload: Vec<u8> = payload.into();
-		let hop = choice.hop(&self.hive_plane, self.peer_plane.as_ref())?;
+		let hop = choice.hop(&self.hive_plane, &self.peer_plane);
 
 		choice.plane.deliver(hop, servlet_type, payload, budget, frame_cache).await
 	}
@@ -324,10 +297,9 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 		};
 
-		// The payload must decode as the client's end-to-end frame. Other bytes
-		// are a permanent caller fault, refused before route selection, so a
-		// malformed request never weakens a healthy trail, spends the failover
-		// retry, or reads as a retryable infrastructure fault.
+		// A payload that is not the client's frame is a permanent caller fault,
+		// so it never weakens a healthy trail, spends the failover retry, or
+		// reads as a retryable infrastructure fault.
 		let client_frame: Frame = match decode(&request.payload) {
 			Ok(client_frame) => client_frame,
 			Err(_) => {
@@ -450,7 +422,7 @@ impl ServletRegistry {
 
 		let entries: Vec<_> = entries
 			.into_iter()
-			.filter(|entry| entry.route_kind() != RouteKind::PeerRelay || budget.allows_relay_trail())
+			.filter(|entry| budget.affords(entry.route_kind()))
 			.filter(|entry| match exclude {
 				Some(failed) => entry.route_key().as_ref() != failed,
 				None => true,
@@ -524,7 +496,6 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::{TestCertificate, TestKey};
-	use crate::transport::TokioListener;
 	use crate::utils::time::ManualClock;
 
 	/// A registry on a clock only the test moves.
@@ -705,16 +676,17 @@ mod tests {
 	// A local splice opens a local route on the hive plane.
 	#[test]
 	fn a_local_splice_opens_a_local_route() {
-		let route = local_plane().stream_route::<TokioListener>(&ping_type(), HopBudget::for_test(2), None);
-		assert_eq!(route, Ok(StreamRoute::local()));
+		let route = local_plane().stream_route(&ping_type(), HopBudget::for_test(2));
+		assert_eq!(route, StreamRoute::local());
 	}
 
-	// A peer splice needs the peer plane to dial its gateway, so with none it
-	// is unavailable before any dial.
+	// A peer splice relays its route to the same target with one forward
+	// spent.
 	#[test]
-	fn a_peer_splice_with_no_peer_plane_is_unavailable() {
-		let route = peer_plane().stream_route::<TokioListener>(&ping_type(), HopBudget::for_test(2), None);
-		assert_eq!(route, Err(TransitStatus::Unavailable));
+	fn a_peer_splice_relays_its_route_with_one_forward_spent() -> Result<(), ClusterError> {
+		let route = peer_plane().stream_route(&ping_type(), HopBudget::for_test(2));
+		assert_eq!((route.hops_remaining(), route.target()), (1, Some(&ping_type())));
+		Ok(())
 	}
 
 	#[test]

@@ -1,8 +1,7 @@
 //! The reusable frame composition functions that the `job!` macro defines.
 //!
-//! A job is a stateless unit of work that transforms an input into an
-//! output. A job is sync or async, and its output is typically
-//! `Result<T, TightBeamError>`.
+//! A job transforms an input into an output, typically
+//! `Result<T, TightBeamError>`, and is sync or async.
 //!
 //! # Traits
 //!
@@ -36,6 +35,28 @@ pub trait Job {
 	/// The output type of this job, typically `Result<T, TightBeamError>`.
 	type Output;
 
+	/// The name of the job, the name of its struct, which a traced pipeline
+	/// step names its events by ([`TracedResult::then_job`]).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::utils::task::Job;
+	/// use tightbeam::{job, TightBeamError};
+	///
+	/// job! {
+	///     name: AddNumbers,
+	///     fn run((a, b): (u32, u32)) -> Result<u32, TightBeamError> {
+	///         Ok(a.saturating_add(b))
+	///     }
+	/// }
+	///
+	/// assert_eq!(<AddNumbers as Job>::NAME, "AddNumbers");
+	/// ```
+	///
+	/// [`TracedResult::then_job`]: crate::utils::task::TracedResult::then_job
+	const NAME: &'static str;
+
 	/// Runs the job on `input`.
 	fn run(input: Self::Input) -> Self::Output;
 }
@@ -49,6 +70,25 @@ pub trait AsyncJob {
 	type Input;
 	/// The output type of this job, typically `Result<T, TightBeamError>`.
 	type Output;
+
+	/// The name of the job, the name of its struct.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::utils::task::AsyncJob;
+	/// use tightbeam::{job, TightBeamError};
+	///
+	/// job! {
+	///     name: Ping,
+	///     async fn run() -> Result<&'static str, TightBeamError> {
+	///         Ok("pong")
+	///     }
+	/// }
+	///
+	/// assert_eq!(<Ping as AsyncJob>::NAME, "Ping");
+	/// ```
+	const NAME: &'static str;
 
 	/// Runs the job on `input` asynchronously.
 	fn run(input: Self::Input) -> impl core::future::Future<Output = Self::Output> + Send;
@@ -111,6 +151,8 @@ macro_rules! job {
 			type Input = $param_ty;
 			type Output = $return_ty;
 
+			const NAME: &'static str = stringify!($job_name);
+
 			fn run(($($param_inner)*): Self::Input) -> Self::Output $body
 		}
 
@@ -134,6 +176,8 @@ macro_rules! job {
 		impl $crate::utils::task::Job for $job_name {
 			type Input = ();
 			type Output = $return_ty;
+
+			const NAME: &'static str = stringify!($job_name);
 
 			fn run(_: Self::Input) -> Self::Output $body
 		}
@@ -159,6 +203,8 @@ macro_rules! job {
 			type Input = $param_ty;
 			type Output = $return_ty;
 
+			const NAME: &'static str = stringify!($job_name);
+
 			async fn run(($($param_inner)*): Self::Input) -> Self::Output $body
 		}
 
@@ -182,6 +228,8 @@ macro_rules! job {
 		impl $crate::utils::task::AsyncJob for $job_name {
 			type Input = ();
 			type Output = $return_ty;
+
+			const NAME: &'static str = stringify!($job_name);
 
 			async fn run(_: Self::Input) -> Self::Output $body
 		}

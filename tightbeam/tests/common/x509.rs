@@ -147,8 +147,8 @@ pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
 /// A client-certificate validator that anchors every certificate of `certs`.
 ///
 /// It serves the inbound mutual-TLS accept plane
-/// (`ClusterTlsConfig::client_validators`). Export scenarios turn it on so
-/// the gateway can recognize first-party origin sessions.
+/// (`ClusterTlsConfig::client_authentication`). Export scenarios turn it on
+/// so the gateway can recognize first-party origin sessions.
 pub fn combined_validator(certs: &[&Certificate]) -> Arc<dyn CertificateValidation> {
 	Arc::new(combined_trust_builder(certs).build())
 }

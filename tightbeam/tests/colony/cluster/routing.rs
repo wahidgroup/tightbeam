@@ -10,7 +10,6 @@ use tokio::task::JoinHandle;
 use tightbeam::colony::hive::{HiveContext, HiveContextImpl};
 use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::testing::TestDigest;
-use tightbeam::transport::TransportError;
 use tightbeam::{cluster, servlet};
 
 #[cfg(feature = "instrument")]
@@ -569,7 +568,7 @@ async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Re
 	let certs = cluster_certs();
 	let trace = payload_trace();
 	let mut tls = cluster_tls_config(&certs);
-	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
 
 	let mut conf = ClusterConfig::new(tls);
 	conf.edge_bind_addr = Some("127.0.0.1:0".into());
@@ -602,6 +601,15 @@ async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Re
 	Ok(())
 }
 
+/// Whether `started` failed on a bind address that names `octets`.
+fn refused_the_address<T>(started: &Result<T, TightBeamError>, octets: &[u8]) -> bool {
+	let Err(TightBeamError::ClusterError(error)) = started else {
+		return false;
+	};
+
+	matches!(error.as_ref(), ClusterError::InvalidAddress(named) if named.as_slice() == octets)
+}
+
 // A configured edge plane that cannot parse its bind address fails
 // Cluster::start closed: the call returns Err and no accept loop outlives it
 // (bind-then-spawn owns both listeners before spawn).
@@ -612,7 +620,7 @@ async fn cluster_edge_bind_failure_fails_start() -> Result<(), TightBeamError> {
 	conf.edge_bind_addr = Some("not-a-socket-addr".into());
 
 	let started = EdgeClusterGateway::start(Arc::new(TraceCollector::new()), conf).await;
-	let unparsed = matches!(started, Err(TightBeamError::TransportError(TransportError::InvalidMessage)));
+	let unparsed = refused_the_address(&started, b"not-a-socket-addr");
 	assert!(unparsed, "an unparsable edge bind address fails Cluster::start");
 	Ok(())
 }
@@ -972,6 +980,12 @@ servlet! {
 	}
 }
 
+/// The connection cap of the pool that [`sibling_routes`] dials through.
+const SIBLING_POOL_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(2) {
+	Some(cap) => cap,
+	None => panic!("a pool cap takes one connection or more"),
+};
+
 /// The routes a servlet under the [`cluster_certs`] identity calls its
 /// siblings through: one route to the sibling of type `sibling` at
 /// `address`, which answers under that identity too. A dial that the routes
@@ -979,7 +993,7 @@ servlet! {
 fn sibling_routes(trace: &TraceCollector, certs: &ClusterTestCerts, address: impl AsRef<str>) -> Arc<dyn HiveContext> {
 	let address = address.as_ref();
 	let mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	let config = PoolConfig { idle_timeout: None, max_connections: 2, mux_offer };
+	let config = PoolConfig { idle_timeout: None, max_connections: SIBLING_POOL_CONNECTIONS, mux_offer };
 	let pool = ConnectionPool::<TokioListener>::builder().with_config(config);
 	let pool = pool.with_trust_store(Arc::clone(&certs.trust)).build();
 

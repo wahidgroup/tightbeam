@@ -47,7 +47,7 @@ use crate::constants::TIGHTBEAM_OPENING_UKM_LABEL;
 use crate::crypto::cms::{AuthEnvelopedData, Opener, Recipient};
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::SecretKey;
-use crate::crypto::sign::{CmsSigner, Signed, SigningIdentity};
+use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{BitString, OctetString};
 use crate::der::{Choice, Decode, DecodeValue, Encode, Error as DerError, Sequence};
@@ -133,9 +133,9 @@ pub(crate) struct OpeningContent {
 /// Carriage of a public key as a CMS `OriginatorPublicKey`
 /// ([RFC 5652 §6.2.2][rfc5652-6.2.2]).
 ///
-/// The opening carries the client's agreement ephemeral this way from its
-/// SPKI, and the server Finished carries the server ephemeral the same way from
-/// the public key itself, so the mapping has one home.
+/// The opening carries the client's agreement ephemeral from its SPKI, and the
+/// server Finished carries the server ephemeral from the public key itself, so
+/// the mapping has one home.
 ///
 /// [rfc5652-6.2.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.2
 trait OriginatorKey {
@@ -325,7 +325,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		let receipt = received_artifact.map(|received| received.into_parts().0);
 
 		// 3. Build the path the Finished's signer presents, parsed from the bytes it arrived as.
-		let presented = CmsSigner::signer_path(&reply)?;
+		let presented = reply.signer_path()?;
 		let (signing, certificates) = presented.ok_or(HandshakeError::MissingServerCertificate)?;
 
 		// 4. Append the received encodings and seal the transcript. A tampered
@@ -577,13 +577,14 @@ mod tests {
 	use crate::crypto::cms::{EnvelopeError, GcmParameters, KemRecipient, KemRecipientInfo};
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::hpke::DhKemSecp256k1;
+	use crate::crypto::kdf::KdfSalt;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Signature};
 	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 	use crate::crypto::sign::elliptic_curve::PublicKey;
-	use crate::crypto::sign::{CmsSigner, SignedContent, SignerError};
+	use crate::crypto::sign::{CmsSigner, SignedContent, SignedDataExt, SignerError};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::crypto::x509::utils::CertificateExt;
@@ -599,7 +600,6 @@ mod tests {
 	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestAttributes, TestIdentity};
 	use crate::transport::envelopes::TransportEnvelope;
 	use crate::transport::handshake::negotiation::{RunnableProfile, SecurityOffer};
-	use crate::transport::handshake::primitives::KdfSalt;
 	use crate::transport::handshake::schedule::{KeyConfirmation, Sealer, SecretSeal, TrafficSecret};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{
@@ -847,7 +847,8 @@ mod tests {
 		let carried = signer.unsigned_attrs.iter().flat_map(|attrs| attrs.iter());
 		let kept = carried.filter(|attr| attr.oid != KeyConfirmation::OID);
 
-		let mut attributes: Vec<HandshakeAttribute> = kept.map(HandshakeAttribute::from).collect();
+		let admitted: Result<Vec<HandshakeAttribute>, _> = kept.map(HandshakeAttribute::try_from).collect();
+		let mut attributes = admitted.expect("each kept attribute carries one value");
 		attributes.push(attribute(confirmation));
 
 		with_unsigned_attrs(finished, Some(unsigned_attrs(attributes)))
@@ -922,7 +923,7 @@ mod tests {
 		let oid = parent.push_arc(arc).expect("the arc extends the OID");
 		let octets = OctetString::new(arc.to_be_bytes()).expect("four bytes fit an OCTET STRING");
 		let value = Any::encode_from(&octets).expect("an OCTET STRING encodes");
-		HandshakeAttribute::new_single(oid, value).expect("one value makes an attribute")
+		HandshakeAttribute::new(oid, value)
 	}
 
 	/// The DER of `sealed` with its two trailing unauthenticated attributes
@@ -1000,7 +1001,7 @@ mod tests {
 	/// The closing sealer of a fixture handshake secret, foreign to the
 	/// server, over `transcript_hash`.
 	fn foreign_closing_sealer(transcript_hash: &TranscriptHash) -> Sealer<DefaultCryptoProvider> {
-		let salt = KdfSalt::new(transcript_hash.as_bytes());
+		let salt = KdfSalt::try_from(transcript_hash.as_bytes()).expect("a transcript hash meets the salt floor");
 		let foreign = fixture_handshake_secret(0x42);
 		let sealer = foreign.sealer::<DefaultCryptoProvider>(SecretSeal::Closing, salt, transcript_hash);
 		sealer.expect("a fixture secret derives a closing key")
@@ -1081,7 +1082,7 @@ mod tests {
 	/// The content of `finished` once its one signer verifies under the
 	/// certificate of `signer`, admitted for signing.
 	fn verified_content(finished: &SignedData, signer: &TestCertificate) -> Result<Vec<u8>, SignerError> {
-		let content = CmsSigner::content(finished, DATA)?;
+		let content = finished.content(DATA)?;
 		let signer_info = finished.signer_infos.0.iter().next().ok_or(SignerError::Content)?;
 		let presented = signer.certificate.to_owned();
 		let purpose = KeyPurposes::HOUSE.server;
@@ -1331,7 +1332,7 @@ mod tests {
 		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
 		let finished = server_finished_over(&server.signing, &sent, &fresh_server_ephemeral());
-		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?)?;
+		let alert = HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, Any::encode_from(&4u8)?);
 		let alerted = with_unsigned_attrs(finished, Some(unsigned_attrs(vec![alert])));
 
 		let result = client.respond(reply(alerted)).await;
@@ -1706,7 +1707,7 @@ mod tests {
 		let (_, reply) = replied(&identity).await;
 
 		let finished = reply_signed_data(&reply);
-		let named = CmsSigner::signer_certificate(&finished)?;
+		let named = finished.signer_certificate()?;
 		assert_eq!(named, Some(&identity.signing.certificate));
 		Ok(())
 	}
@@ -1938,7 +1939,7 @@ mod tests {
 	async fn an_opening_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
 		let (mut server, server_certificate) = anonymous_server();
 		let code = Any::encode_from(&3u8)?;
-		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, code)?;
+		let alert = HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, code);
 		let sealed = with_unauth_attrs(build_test_opening(&server_certificate, &TEST_BASE_SECRET, []), [alert]);
 
 		let refusal = server.reply(opening(sealed)).await;
@@ -2066,7 +2067,7 @@ mod tests {
 		let mut awaiting = server_awaiting_finished().await;
 		let finished = build_test_client_finished(&client, awaiting.transcript_hash(), &awaiting.confirmation);
 		let short_tag = Any::encode_from(&OctetString::new([7u8; 31])?)?;
-		let short = HandshakeAttribute::new_single(KeyConfirmation::OID, short_tag)?;
+		let short = HandshakeAttribute::new(KeyConfirmation::OID, short_tag);
 		let shortened = with_unsigned_attrs(finished, Some(unsigned_attrs(vec![short])));
 		let closing = awaiting.sealed(&shortened);
 
@@ -2218,7 +2219,7 @@ mod tests {
 		let finished = build_test_client_finished(&client, awaiting.transcript_hash(), &awaiting.confirmation);
 		let sealer = foreign_closing_sealer(awaiting.transcript_hash());
 		let sealed = sealed_finished(sealer, &finished);
-		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, Any::encode_from(&5u8)?)?;
+		let alert = HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, Any::encode_from(&5u8)?);
 		let attrs = unsigned_attrs(vec![alert]);
 		let alerted = AuthEnvelopedData { unauth_attrs: Some(attrs), ..sealed };
 
@@ -2429,15 +2430,15 @@ mod tests {
 	/// salt and the session label over its agreement with the server
 	/// ephemeral followed by its base secret.
 	///
-	/// The expected bytes come from an independent ECDH (Python's
-	/// `cryptography`) and HKDF (Python's `hmac` and `hashlib`), so they are
-	/// independent of the crate's code.
+	/// The expected bytes come from Python's `cryptography` for the ECDH and
+	/// its `hmac` and `hashlib` for the HKDF, so they are independent of the
+	/// crate's code.
 	#[test]
 	fn the_cms_handshake_secret_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
 		let ephemeral = SecretKey::<Secp256k1>::from_slice(&[0x03u8; 32])?;
 		let pending = Box::new(CmsPending { base: test_base_secret(), ephemeral });
 		let server_ephemeral = PeerPoint::<Secp256k1>::parse(KNOWN_SERVER_EPHEMERAL)?;
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 
 		let agree = <Box<CmsPending<Secp256k1>> as ClientAgreement<DefaultCryptoProvider>>::agree;
 		let secret = agree(pending, &server_ephemeral, salt)?;
@@ -2637,7 +2638,7 @@ mod tests {
 		server.finish(closing).await.expect("the server finishes");
 
 		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
-		let salt = KdfSalt::new(&[0x99u8; 32]);
+		let salt = KdfSalt::try_from(FIXTURE_SALT).expect("the fixture salt meets the floor");
 		let secret = fixture_handshake_secret(0x42);
 		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Ack, salt, &transcript_hash);
 		let sealer = sealer.expect("the acknowledgement key derives");
