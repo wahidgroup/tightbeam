@@ -1415,10 +1415,9 @@ mod tests {
 	/// An established session whose send cipher holds a record limit of zero.
 	#[cfg(any(feature = "instrument", feature = "tcp", feature = "async-transport"))]
 	fn spent_phase() -> SessionPhase {
-		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
-
 		// A ceiling larger than the renewal volume sets the record limit of
 		// the send cipher to zero.
+		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
 		let keys = keys.with_envelope_ceiling(usize::MAX);
 		SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)))
 	}
