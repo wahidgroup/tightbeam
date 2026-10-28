@@ -119,6 +119,12 @@ impl Protocol for TcpListener {
 		TcpStream::connect(addr.0)
 	}
 
+	/// Connects within `budget` through `TcpStream::connect_timeout`. A
+	/// blocking connect holds its thread, so no race of the dial pre-empts it.
+	async fn connect_within(addr: Self::Address, budget: Duration) -> Result<Self::Stream, Self::Error> {
+		TcpStream::connect_timeout(&addr.0, budget)
+	}
+
 	fn create_transport(
 		stream: Self::Stream,
 		config: crate::transport::EndpointConfig<Self::CryptoProvider>,
@@ -243,7 +249,6 @@ macro_rules! impl_tcp_common {
 			pub(crate) state: $crate::transport::state::SessionState<P>,
 			pub(crate) limits: $crate::transport::TransportLimits,
 			pub(crate) clock: Arc<dyn $crate::utils::time::Clock>,
-			pub(crate) server_handshake: Option<$crate::transport::handshake::BoxedServerHandshake>,
 			/// The instrumentation collector of this connection.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
@@ -281,7 +286,6 @@ macro_rules! impl_tcp_common {
 					state: $crate::transport::state::SessionState::negotiating(encryption, negotiation),
 					limits,
 					clock,
-					server_handshake: None,
 					#[cfg(feature = "instrument")]
 					trace,
 					#[cfg(feature = "instrument")]

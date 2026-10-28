@@ -15,7 +15,8 @@ use tokio::net::TcpStream;
 
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::KeyCurves;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
@@ -69,7 +70,6 @@ async fn split_encrypted_roundtrip() -> Result<(), TightBeamError> {
 
 	let server_handle = tokio::spawn(async move {
 		let (mut reader, mut writer) = accept_handshaken_split(listener).await?;
-
 		let frame = request_of(reader.read_envelope().await?);
 
 		let response = ResponsePackage::new(TransitStatus::Ok, Some(frame));
@@ -80,6 +80,7 @@ async fn split_encrypted_roundtrip() -> Result<(), TightBeamError> {
 
 	let (mut reader, mut writer) = connect_handshaken_split(addr, &materials.certificate).await?;
 	let sent = request_frame();
+
 	writer.write_envelope(TransportEnvelope::new_request(sent.to_owned())).await?;
 
 	let package = response_of(reader.read_envelope().await?);
@@ -102,7 +103,7 @@ async fn split_rejects_pre_handshake() -> Result<(), TightBeamError> {
 	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 	let listen_addr = listener.local_addr()?;
 	let client_stream = TcpStream::connect(listen_addr).await?;
-	let data = CertificateTrustBuilder::from(Secp256k1Policy::default()).build();
+	let data = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation).build();
 	let client = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::new(data));
 	let transport = client.adopt(TokioStream::from(client_stream))?.into_transport();
 

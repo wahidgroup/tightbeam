@@ -26,6 +26,41 @@ use crate::testing::fdr::config::InjectedFaultRecord;
 /// finds the deadlocks and divergences that each seed reaches, and keeps the
 /// results.
 pub trait ExplorationCore {
+	/// The engine that [`Self::for_process`] builds for a process that lives
+	/// for `'p`.
+	type ForProcess<'p>: ExplorationCore;
+
+	/// The engine of `process` under the configuration of this engine, before
+	/// its first seed.
+	///
+	/// [`FdrExplorer`](super::FdrExplorer) runs each spec of a fault run on
+	/// the engine `for_process` builds, so every exploration of a run goes
+	/// through the kind of engine that the explorer holds.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig};
+	/// use tightbeam::testing::specs::csp::{Event, Process, State};
+	///
+	/// let subject = Process::builder("Send")
+	///     .initial_state(State("S0"))
+	///     .add_observable(Event("send"))
+	///     .add_transition(State("S0"), Event("send"), State("S1"))
+	///     .add_terminal(State("S1"))
+	///     .build()?;
+	/// let spec = Process::builder("Idle").initial_state(State("I0")).add_terminal(State("I0")).build()?;
+	///
+	/// let engine = DefaultExplorationEngine::new(&subject, Arc::new(FdrConfig::default()));
+	/// let mut spec_engine = engine.for_process(&spec);
+	/// spec_engine.explore_seeds(0..1);
+	/// assert_eq!(spec_engine.visited_states().len(), 1);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	fn for_process<'p>(&self, process: &'p Process) -> Self::ForProcess<'p>;
+
 	/// The process under exploration.
 	fn process(&self) -> &Process;
 
@@ -165,10 +200,8 @@ pub trait ExplorationCore {
 	/// ```
 	fn seed_results(&self) -> &[(u64, SeedResult)];
 
-	/// The number of exploration branches pruned for timing violations.
-	///
-	/// Timed exploration drops each branch that fails a WCET, deadline, or path
-	/// WCET constraint.
+	/// The number of exploration branches that timed exploration dropped for a
+	/// failed WCET, deadline, or path WCET constraint.
 	fn timing_pruned(&self) -> usize {
 		0
 	}
@@ -459,36 +492,39 @@ impl SeedResult {
 
 /// The state of one branch of a seed's exploration, which the seed's queue
 /// holds.
+///
+/// Its fields are private, so the record methods keep `internal_run` within
+/// the hidden events of the branch, and the readers lend each part.
 #[derive(Debug, Clone)]
 pub struct ExplorationState {
 	/// The process state that the branch reached.
-	pub process_state: State,
+	process_state: State,
 
 	/// The observable events of the branch so far.
-	pub trace: Trace,
+	trace: Trace,
 
 	/// The length of the current run of hidden (τ) events, which an observable
 	/// event resets.
-	pub internal_run: usize,
+	internal_run: usize,
 
 	/// Every state that the branch passed through, from the initial state.
-	pub state_path: Vec<State>,
+	state_path: Vec<State>,
 
 	/// Every hidden event that the branch took, across its runs.
-	pub hidden_events: Vec<Event>,
+	hidden_events: Vec<Event>,
 
 	/// The elapsed time of the branch, the sum of the worst-case execution
 	/// time (WCET) of each observable event.
 	#[cfg(feature = "testing-timing")]
-	pub elapsed_time: Duration,
+	elapsed_time: Duration,
 
 	/// Each observable event of the branch, with the elapsed time after it.
 	#[cfg(feature = "testing-timing")]
-	pub event_times: Vec<(Event, Duration)>,
+	event_times: Vec<(Event, Duration)>,
 
 	/// The value of each clock of timed CSP, by clock name.
 	#[cfg(feature = "testing-timing")]
-	pub clock_values: HashMap<String, Duration>,
+	clock_values: HashMap<String, Duration>,
 }
 
 impl ExplorationState {
@@ -512,6 +548,136 @@ impl ExplorationState {
 	/// A copy of this state for a new branch.
 	pub fn branch(&self) -> Self {
 		self.clone()
+	}
+
+	/// The process state that the branch reached.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert_eq!(branch.process_state(), State("S2"));
+	/// ```
+	pub fn process_state(&self) -> State {
+		self.process_state
+	}
+
+	/// The observable events of the branch so far.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert_eq!(branch.trace(), [Event("send")]);
+	/// ```
+	pub fn trace(&self) -> &[Event] {
+		&self.trace
+	}
+
+	/// Every state that the branch passed through, from the initial state.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert_eq!(branch.state_path(), [State("S0"), State("S1"), State("S2")]);
+	/// ```
+	pub fn state_path(&self) -> &[State] {
+		&self.state_path
+	}
+
+	/// Every hidden event that the branch took, across its runs.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert_eq!(branch.hidden_events(), [Event("tau")]);
+	/// ```
+	pub fn hidden_events(&self) -> &[Event] {
+		&self.hidden_events
+	}
+
+	/// The elapsed time of the branch, the sum of the worst-case execution
+	/// time (WCET) of each observable event.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert_eq!(branch.elapsed_time(), core::time::Duration::ZERO);
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	pub fn elapsed_time(&self) -> Duration {
+		self.elapsed_time
+	}
+
+	/// Each observable event of the branch, with the elapsed time after it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert!(branch.event_times().is_empty());
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	pub fn event_times(&self) -> &[(Event, Duration)] {
+		&self.event_times
+	}
+
+	/// The value of each clock of timed CSP, by clock name.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::fdr::ExplorationState;
+	/// use tightbeam::testing::specs::csp::{Event, State};
+	///
+	/// let mut branch = ExplorationState::initial(State("S0"));
+	/// branch.record_hidden(Event("tau"), State("S1"));
+	/// branch.record_observable(Event("send"), State("S2"));
+	///
+	/// assert!(branch.clock_values().is_empty());
+	/// ```
+	#[cfg(feature = "testing-timing")]
+	pub fn clock_values(&self) -> &HashMap<String, Duration> {
+		&self.clock_values
 	}
 
 	/// Takes the observable `event` to `next_state`, which ends the current

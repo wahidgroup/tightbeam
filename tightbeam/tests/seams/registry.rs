@@ -1,6 +1,8 @@
 //! A hive runs on an outside [`ServletRegistry`] over a [`BTreeMap`], which
 //! has no `Default`. The hive registers, replaces, stops, and refuses servlets
-//! through it, and refuses the registry when it holds a registration.
+//! through it, and refuses the registry when it holds a registration. The
+//! registry answers the type of an instance through the provided
+//! [`ServletRegistry::servlet_type`].
 
 #![cfg(all(feature = "std", feature = "colony", feature = "tcp"))]
 
@@ -172,6 +174,20 @@ fn a_hive_registers_its_servlet_in_an_outside_registry() -> Result<(), TightBeam
 	hive.register(outside_type(), servlet, no_spawn)?;
 
 	assert_eq!(registry.keys(), [INSTANCE_KEY]);
+	Ok(())
+}
+
+/// An outside registry on the provided `servlet_type` answers the type of each
+/// instance through the default walk of its registrations.
+#[test]
+fn an_outside_registry_answers_the_type_of_an_instance_through_the_provided_walk() -> Result<(), TightBeamError> {
+	let registry = OutsideRegistry::holding(usize::MAX);
+	let mut hive = outside_hive(&registry)?;
+	let (servlet, _stopped) = probe();
+
+	hive.register(outside_type(), servlet, no_spawn)?;
+
+	assert_eq!(registry.servlet_type(INSTANCE_KEY), Some(outside_type()));
 	Ok(())
 }
 

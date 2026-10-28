@@ -10,11 +10,10 @@ use std::borrow::Cow;
 
 use super::error::UrnValidationError;
 
-/// Trait for providing access to URN components
+/// Read and write access to URN components.
 ///
-/// This abstraction allows `UrnSpec` to work with any type that provides
-/// component access, not just `UrnBuilder`. Provides both read and write
-/// capabilities for validation and transformation.
+/// `UrnSpec` validates and transforms components through it, so a spec works
+/// with any type that holds components, not only `UrnBuilder`.
 pub trait UrnComponents<'a> {
 	/// Get a component value by key
 	fn get_component(&self, key: &'static str) -> Option<&Cow<'a, str>>;
@@ -25,59 +24,110 @@ pub trait UrnComponents<'a> {
 	/// Remove a component by key (for transformation)
 	fn remove_component(&mut self, key: &'static str) -> Option<Cow<'a, str>>;
 
-	/// Iterate over all components (immutable)
+	/// Iterate over all components (immutable).
 	///
-	/// Returns a boxed iterator for dyn-compatibility. Implementations should
-	/// minimize allocation overhead where possible.
+	/// The iterator is boxed so the trait stays dyn-compatible. An
+	/// implementation should allocate as little as it can.
 	#[cfg(feature = "std")]
 	fn iter(&self) -> Box<dyn Iterator<Item = (&'static str, &Cow<'a, str>)> + '_>;
 
-	/// Iterate over all components (immutable) - alloc version
+	/// Iterate over all components (immutable), under `alloc` alone.
 	#[cfg(not(feature = "std"))]
 	fn iter(&self) -> alloc::boxed::Box<dyn Iterator<Item = (&'static str, &Cow<'a, str>)> + '_>;
 
-	/// Iterate over all components (mutable)
+	/// Iterate over all components (mutable).
 	///
-	/// Returns a boxed iterator for dyn-compatibility. Implementations should
-	/// minimize allocation overhead where possible.
+	/// The iterator is boxed so the trait stays dyn-compatible. An
+	/// implementation should allocate as little as it can.
 	#[cfg(feature = "std")]
 	fn iter_mut(&mut self) -> Box<dyn Iterator<Item = (&'static str, &mut Cow<'a, str>)> + '_>;
 
-	/// Iterate over all components (mutable) - alloc version
+	/// Iterate over all components (mutable), under `alloc` alone.
 	#[cfg(not(feature = "std"))]
 	fn iter_mut(&mut self) -> alloc::boxed::Box<dyn Iterator<Item = (&'static str, &mut Cow<'a, str>)> + '_>;
 }
 
-/// Trait defining a URN namespace specification
+/// The specification of a URN namespace.
 ///
-/// Implementors define validation rules, transformations, and NSS structure
-/// for a specific URN namespace according to RFC 8141.
+/// An implementor defines the validation rules, transformations, and NSS
+/// structure of one URN namespace, by RFC 8141.
 pub trait UrnSpec {
-	/// Namespace Identifier (NID)
+	/// The Namespace Identifier (NID), such as "tightbeam", "isbn", or "uuid".
 	///
-	/// Must be 2-32 characters, alphanumeric plus hyphens, starting with a
-	/// letter.
-	/// Examples: "tightbeam", "isbn", "uuid"
+	/// It holds 2 to 32 ASCII letters, digits, and hyphens. It starts with a
+	/// letter and ends with a letter or a digit
+	/// ([`Urn::validate_nid`](crate::urn::Urn::validate_nid)).
 	const NID: &'static str;
 
-	/// Transform components (apply defaults, normalizations)
+	/// The components this spec reads an NSS into, borrowed from the NSS.
 	///
-	/// Called before validation to allow specs to apply transformations like
-	/// upper-casing, default values, etc. via the UrnComponents trait
-	/// interface.
+	/// A spec of [`urn_spec!`](crate::urn_spec!) reads its NSS into a
+	/// [`UrnBuilder`](crate::urn::UrnBuilder), and a spec written by hand
+	/// names a type of its own.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::urn::{UrnBuilder, UrnSpec, UrnValidationError};
+	///
+	/// tightbeam::urn_spec! {
+	///     /// The spec of `urn:example:<id>`, for an id of `one` or `two`.
+	///     ExampleSpec,
+	///     nid: "example",
+	///     nss_structure {
+	///         id: { values: ["one", "two"] }
+	///     }
+	/// }
+	///
+	/// let components: <ExampleSpec as UrnSpec>::Components<'_> = ExampleSpec::components("one")?;
+	/// let _: UrnBuilder<'_> = components;
+	/// # Ok::<(), UrnValidationError>(())
+	/// ```
+	type Components<'a>: UrnComponents<'a>;
+
+	/// Read `nss` into the components this spec builds it from, each borrowed
+	/// from `nss`.
+	///
+	/// [`Urn::verify`](crate::urn::Urn::verify) reads a URN through it, then
+	/// transforms, validates, and builds the NSS from the components again, so
+	/// the grammar of the spec decides each URN it admits.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError`] -- `nss` does not follow the grammar of this spec.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::urn::{UrnComponents, UrnSpec, UrnValidationError};
+	///
+	/// tightbeam::urn_spec! {
+	///     /// The spec of `urn:example:<id>`, for an id of `one` or `two`.
+	///     ExampleSpec,
+	///     nid: "example",
+	///     nss_structure {
+	///         id: { values: ["one", "two"] }
+	///     }
+	/// }
+	///
+	/// let components = ExampleSpec::components("one")?;
+	/// assert_eq!(components.get_component("id").map(|id| id.as_ref()), Some("one"));
+	/// # Ok::<(), UrnValidationError>(())
+	/// ```
+	fn components<'a>(nss: &'a str) -> Result<Self::Components<'a>, UrnValidationError>;
+
+	/// Transform components before validation, such as to upper-case a value
+	/// or to set a default.
 	fn transform<'a>(components: &mut dyn UrnComponents<'a>) {
-		// Default no-op - specs can override to mutate components
+		// The default leaves the components as they are.
 		let _ = components;
 	}
 
-	/// Validate components
-	///
-	/// Checks that all required fields are present and satisfy constraints.
+	/// Validate components: every required field is present and meets its
+	/// constraints.
 	fn validate<'a>(components: &dyn UrnComponents<'a>) -> Result<(), UrnValidationError>;
 
-	/// Build NSS string from structured components
-	///
-	/// Constructs the Namespace-Specific String from the components
-	/// according to the spec's defined structure.
+	/// Build the Namespace-Specific String from the components, by the
+	/// structure of the spec.
 	fn build_nss<'a>(components: &dyn UrnComponents<'a>) -> Result<Cow<'static, str>, UrnValidationError>;
 }

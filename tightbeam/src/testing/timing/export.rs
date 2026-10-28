@@ -1,4 +1,4 @@
-//! ASN.1 export for timing verification results
+//! The ASN.1 export of timing verification results.
 
 use super::statistics::StatisticalMeasures;
 use crate::der::Sequence;
@@ -6,24 +6,23 @@ use crate::instrumentation::EvidenceArtifact;
 use crate::testing::timing::verification::TimingVerificationResult;
 use crate::Beamable;
 
-/// Timing verification artifact in ASN.1 format
+/// The ASN.1 artifact of a timing verification.
 ///
-/// Combines evidence artifact (trace, spec hash, etc.) with timing
-/// verification results and optional statistical analysis for standards
-/// compliance and tool integration.
+/// It joins the evidence of the run to the timing results and an optional
+/// statistical analysis, for standards compliance and tool integration.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct TimingVerificationArtifact {
-	/// Base evidence artifact (trace, spec hash, etc.)
+	/// The evidence of the run: its spec hash, trace hashes, and events.
 	pub evidence: EvidenceArtifact,
-	/// Timing verification results
+	/// The results of the timing verification.
 	pub timing_results: TimingVerificationResult,
-	/// Statistical analysis results (if performed)
+	/// The statistical analysis of the timing samples, when one ran.
 	#[asn1(optional = "true")]
 	pub statistical_analysis: Option<StatisticalMeasures>,
 }
 
 impl TimingVerificationArtifact {
-	/// Create a new timing verification artifact
+	/// The artifact of `evidence` with its timing results and analysis.
 	pub fn new(
 		evidence: EvidenceArtifact,
 		timing_results: TimingVerificationResult,
@@ -36,28 +35,21 @@ impl TimingVerificationArtifact {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::der::asn1::OctetString;
 	use crate::instrumentation::EvidenceArtifact;
 	use crate::testing::specs::csp::Event;
 	use crate::testing::timing::violations::{DeadlineMiss, JitterViolation, TimingSlackViolation, TimingViolation};
 	use crate::testing::timing::{ConfidenceIntervals, Percentile, PercentileValue};
+	use crate::trace::ConsumedTrace;
 	use crate::utils::{decode, encode};
 	use crate::TightBeamError;
 
 	#[ignore]
 	#[test]
 	fn test_timing_verification_artifact_asn1_round_trip() -> Result<(), TightBeamError> {
-		// Create test evidence artifact
-		let spec_hash = [0u8; 32];
-		let evidence = EvidenceArtifact {
-			spec_hash: OctetString::new(spec_hash)?,
-			trace_hash: OctetString::new(spec_hash)?,
-			evidence_hash: OctetString::new(spec_hash)?,
-			events: vec![],
-			overflow: false,
-		};
+		// The evidence is that of an empty trace.
+		let evidence = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::new())?;
 
-		// Create test timing verification result
+		// The result holds one WCET, deadline, jitter, and slack violation.
 		let timing_results = TimingVerificationResult {
 			passed: true,
 			wcet_violations: vec![TimingViolation {
@@ -93,7 +85,7 @@ mod tests {
 			path_wcet_violations: vec![],
 		};
 
-		// Create test statistical measures
+		// The analysis holds two percentiles and a confidence interval.
 		let statistical_analysis = Some(StatisticalMeasures {
 			count: 100,
 			mean: 50_000_000,
@@ -108,13 +100,15 @@ mod tests {
 
 		let artifact = TimingVerificationArtifact::new(evidence, timing_results, statistical_analysis);
 
-		// Encode to DER
+		// The artifact goes through DER and back.
 		let encoded = encode(&artifact)?;
-		// Decode from DER
 		let decoded: TimingVerificationArtifact = decode(&encoded)?;
 
-		// Verify round-trip
-		assert_eq!(artifact.evidence.spec_hash.as_bytes(), decoded.evidence.spec_hash.as_bytes());
+		// The decoded artifact keeps the hash, the verdict, and each count.
+		assert_eq!(
+			artifact.evidence.spec_hash().as_bytes(),
+			decoded.evidence.spec_hash().as_bytes()
+		);
 		assert_eq!(artifact.timing_results.passed, decoded.timing_results.passed);
 		assert_eq!(
 			artifact.timing_results.wcet_violations.len(),

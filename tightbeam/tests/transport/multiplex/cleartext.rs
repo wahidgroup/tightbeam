@@ -112,10 +112,7 @@ tb_scenario! {
 /// The mux settings of the cleartext tests: a cap of 4 and 1 KiB chunks, with
 /// the budgets the symmetric settings leave unmetered.
 fn chunked_cleartext_settings() -> MuxSettings {
-	let mut settings = MuxSettings::symmetric(4);
-	settings.send_chunk_size = 1024;
-	settings.recv_chunk_size = 1024;
-	settings
+	MuxSettings::symmetric(4).with_chunk_size(1024)
 }
 
 /// Symmetric cleartext settings leave both budgets unmetered, because the link
@@ -123,7 +120,7 @@ fn chunked_cleartext_settings() -> MuxSettings {
 #[test]
 fn mux_cleartext_budgets_unmetered() {
 	let settings = chunked_cleartext_settings();
-	let unmetered = settings.send_budget.is_none() && settings.recv_budget.is_none();
+	let unmetered = settings.send_budget().is_none() && settings.recv_budget().is_none();
 	assert!(unmetered, "symmetric cleartext settings must leave both budgets unmetered");
 }
 

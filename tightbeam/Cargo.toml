@@ -183,7 +183,7 @@ testing-fuzz = ["testing", "testing-csp", "dep:afl"]
 testing-property = ["testing", "dep:proptest"]
 testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3", "digest"]
-logging = []
+logging = ["std"]
 
 # TODO
 bitcoin = ["dep:k256"]

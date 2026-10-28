@@ -85,12 +85,11 @@ use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 /// "urn:nid:nss".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Urn<'a> {
-	/// The Namespace Identifier, 2 to 32 ASCII letters, digits, or hyphens
-	/// with a letter first and a letter or digit last.
+	/// The Namespace Identifier.
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	nid: Cow<'a, str>,
 
-	/// The Namespace-Specific String, whose structure the namespace defines.
+	/// The Namespace-Specific String.
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.2>`
 	nss: Cow<'a, str>,
 }
@@ -98,9 +97,9 @@ pub struct Urn<'a> {
 impl<'a> Urn<'a> {
 	/// Builds a URN from static parts and skips every check.
 	///
-	/// It exists for [`urn!`](crate::urn!), which validates both parts in a
-	/// `const` block before it calls this function, and it has to be `pub`
-	/// because the macro expands in downstream crates. Write `urn!` instead.
+	/// It serves [`urn!`](crate::urn!), which validates both parts in a `const`
+	/// block first, and it is `pub` because the macro expands in downstream
+	/// crates. Write `urn!` instead.
 	#[doc(hidden)]
 	pub const fn new_unchecked(nid: &'static str, nss: &'static str) -> Urn<'static> {
 		Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) }
@@ -136,11 +135,20 @@ impl<'a> Urn<'a> {
 
 	/// Verifies this URN against the spec `S`.
 	///
+	/// The spec reads the NSS into its components, transforms them, validates
+	/// them, and builds the NSS from them again, as [`UrnBuilder::build`] does
+	/// under `S`. A URN passes when that NSS is its own, so `verify` admits
+	/// each URN that `S` builds, and refuses a form of it that `S` writes
+	/// another way.
+	///
 	/// # Errors
 	///
 	/// - [`UrnValidationError::NidMismatch`] -- the NID differs from `S::NID`.
 	/// - The errors of [`Urn::validate_nid`] -- the NID has an invalid format.
+	/// - The errors of [`UrnSpec::components`] -- the NSS does not follow the grammar of `S`.
 	/// - The errors of [`UrnSpec::validate`] -- the NSS structure breaks the spec's requirements.
+	/// - The errors of [`UrnSpec::build_nss`] -- the components build no NSS.
+	/// - [`UrnValidationError::NssMismatch`] -- `S` builds another NSS from the components.
 	pub fn verify<S: UrnSpec>(&self) -> Result<(), UrnValidationError> {
 		if self.nid.as_ref() != S::NID {
 			return Err(UrnValidationError::NidMismatch);
@@ -148,10 +156,20 @@ impl<'a> Urn<'a> {
 
 		Self::validate_nid(self.nid.as_ref())?;
 
-		// The spec reads the URN's parts through a builder's `UrnComponents`.
-		let builder = UrnBuilder::default().with_nid(self.nid.as_ref()).with_nss(self.nss.as_ref());
+		// 1. Read the NSS with the grammar of the spec, then run the steps that
+		//    the builder runs under it.
+		let mut components = S::components(self.nss.as_ref())?;
+		S::transform(&mut components);
+		S::validate(&components)?;
 
-		S::validate(&builder as &dyn UrnComponents)
+		// 2. Refuse a parse, or a form of the NSS, that the spec builds
+		//    otherwise.
+		let rebuilt = S::build_nss(&components)?;
+		if rebuilt.as_ref() != self.nss.as_ref() {
+			return Err(UrnValidationError::NssMismatch);
+		}
+
+		Ok(())
 	}
 
 	/// Validates the NID against RFC 8141 § 2.1.
@@ -237,10 +255,8 @@ impl<'a> Urn<'a> {
 		Ok(Urn { nid, nss })
 	}
 
-	/// Converts the URN into an owned version with the `'static` lifetime.
-	///
-	/// The borrowed strings become owned strings, so the URN can outlive the
-	/// data it borrowed, as with `Cow::into_owned()`.
+	/// Converts the URN into an owned `'static` one that can outlive the data
+	/// it borrowed, as `Cow::into_owned()` does.
 	#[inline]
 	pub fn into_owned(self) -> Urn<'static> {
 		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
@@ -253,8 +269,8 @@ impl<'a> fmt::Display for Urn<'a> {
 	}
 }
 
-// The parser always returns owned data. The URN can outlive the input
-// string, so the parser copies both components into `'static` Cows.
+// The parser copies both components into `'static` Cows, so the URN can
+// outlive the input string.
 impl FromStr for Urn<'static> {
 	type Err = UrnValidationError;
 
@@ -335,8 +351,50 @@ mod tests {
 	#[test]
 	fn validate_nid_follows_the_rfc_8141_production() {
 		let outcomes = NID_CASES.map(|(nid, _)| (nid, Urn::validate_nid(nid)));
-
 		assert_eq!(outcomes, NID_CASES);
+	}
+
+	crate::urn_spec! {
+		/// A spec of one required field, `urn:probe:<kind>`.
+		ProbeSpec,
+		nid: "probe",
+		nss_structure {
+			kind: { values: ["a", "b"] }
+		}
+	}
+
+	/// A spec verifies the URN it built itself, so `verify` reads the
+	/// components the NSS carries.
+	#[test]
+	fn urn_verify_admits_the_urn_its_own_spec_built() -> Result<(), UrnValidationError> {
+		let urn = UrnBuilder::from(ProbeSpec).set("kind", "a").build()?;
+		urn.verify::<ProbeSpec>()
+	}
+
+	/// A spec of a custom format verifies the URN it built, through the
+	/// literals of its format.
+	#[test]
+	fn urn_verify_admits_a_urn_of_a_custom_format() -> Result<(), UrnValidationError> {
+		let urn: Urn<'static> = "urn:tightbeam:instrumentation:trace/abc-123".parse()?;
+		urn.verify::<specs::TightbeamUrnSpec>()
+	}
+
+	/// The spec lowercases a resource type, so it builds another NSS from the
+	/// components of an uppercase one, and `verify` refuses it.
+	#[test]
+	fn urn_verify_refuses_a_form_its_spec_writes_another_way() -> Result<(), UrnValidationError> {
+		let urn: Urn<'static> = "urn:tightbeam:instrumentation:TRACE/abc-123".parse()?;
+		assert_eq!(urn.verify::<specs::TightbeamUrnSpec>(), Err(UrnValidationError::NssMismatch));
+		Ok(())
+	}
+
+	/// The format of the spec places a `/` before the resource id, so it
+	/// refuses an NSS without one.
+	#[test]
+	fn urn_verify_refuses_an_nss_without_a_literal_of_its_format() -> Result<(), UrnValidationError> {
+		let urn: Urn<'static> = "urn:tightbeam:instrumentation:trace".parse()?;
+		assert_eq!(urn.verify::<specs::TightbeamUrnSpec>(), Err(UrnValidationError::NssMismatch));
+		Ok(())
 	}
 
 	// Each case is (input, nid, nss).

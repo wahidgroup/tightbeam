@@ -8,7 +8,6 @@
 use core::time::Duration;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::testing::fdr::verdict::Trace;
 use crate::testing::specs::csp::{Action, Event, Process, State};
 use crate::testing::timing::{saturating_nanos, PathWcet, TimingConstraint, TimingConstraints};
 
@@ -22,10 +21,11 @@ impl TimingConstraints {
 	/// generates the successors.
 	pub fn violated_by(
 		&self,
-		trace: &Trace,
+		trace: impl AsRef<[Event]>,
 		elapsed_time: Duration,
 		event_times: impl AsRef<[(Event, Duration)]>,
 	) -> bool {
+		let trace = trace.as_ref();
 		let event_times = event_times.as_ref();
 		self.deadline_violated(event_times) || self.path_wcet_violated(trace, elapsed_time)
 	}
@@ -68,7 +68,7 @@ impl TimingConstraints {
 	///
 	/// A path matches only a trace of its exact event sequence, so its limit
 	/// binds that trace alone.
-	fn path_wcet_violated(&self, trace: &Trace, elapsed_time: Duration) -> bool {
+	fn path_wcet_violated(&self, trace: &[Event], elapsed_time: Duration) -> bool {
 		let elapsed_ns = saturating_nanos(elapsed_time);
 		let exceeds = |path_wcet: &PathWcet| path_wcet.excess(trace, elapsed_ns).is_some();
 		self.path_wcets().iter().any(exceeds)
@@ -203,6 +203,7 @@ mod tests {
 	use super::*;
 	use crate::builder::TypeBuilder;
 	use crate::testing::error::TestingError;
+	use crate::testing::fdr::verdict::Trace;
 	use crate::testing::timing::{Deadline, DeadlineBuilder, PathWcet, WcetConfigBuilder};
 
 	/// A deadline of `ms` milliseconds from `start` to `end`.

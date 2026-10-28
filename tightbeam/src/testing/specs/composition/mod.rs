@@ -203,6 +203,7 @@ impl CompositionProperties {
 /// A property that a composition spec can claim of its process.
 ///
 /// Each property has the checker that decides it:
+///
 /// - [`DeadlockChecker`] decides [`Self::DeadlockFree`].
 /// - [`LivelockChecker`] decides [`Self::LivelockFree`].
 /// - [`DeterminismChecker`] decides [`Self::Deterministic`].
@@ -223,7 +224,8 @@ pub enum CompositionProperty {
 	/// Each state that the process reaches is free of divergence.
 	LivelockFree,
 
-	/// Each event of each state leads to one state at most.
+	/// No state enables a hidden action, and each event of each state leads to
+	/// one state at most.
 	Deterministic,
 }
 
@@ -354,7 +356,7 @@ pub enum ProcessExpr {
 	/// let expression = ProcessExpr::Parallel { operator: CompositionOperator::Interleaved, left, right };
 	///
 	/// assert_eq!(expression.name(), "(P ||| Q)");
-	/// assert_eq!(expression.evaluate()?.name, "(Ping ||| Ping)");
+	/// assert_eq!(expression.evaluate()?.name(), "(Ping ||| Ping)");
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	Parallel {

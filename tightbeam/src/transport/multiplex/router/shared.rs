@@ -3,6 +3,7 @@
 //! and the rekey phase.
 
 use core::future::{poll_fn, Future};
+use core::num::NonZeroU32;
 use core::pin::Pin;
 #[cfg(not(all(test, tightbeam_loom)))]
 use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -362,7 +363,7 @@ pub struct MuxShared {
 	/// advertised.
 	pub send_chunk_size: ChunkSize,
 	/// The bytes per session-budget credit, negotiated for both directions.
-	pub credit_unit: u32,
+	pub credit_unit: NonZeroU32,
 	/// The initial per-stream chunk limit for outbound data, as the peer
 	/// advertised.
 	initial_send_credit: u64,
@@ -410,16 +411,16 @@ impl MuxShared {
 	pub fn new(role: MuxRole, settings: &MuxSettings) -> Self {
 		Self {
 			role,
-			local_cap: settings.local_initiated_cap,
-			send_chunk_size: ChunkSize::new(cap_as_usize(settings.send_chunk_size)),
-			credit_unit: settings.credit_unit.max(1),
-			initial_send_credit: settings.initial_send_credit.max(1),
-			initial_recv_credit: settings.initial_recv_credit.max(1),
+			local_cap: settings.local_initiated_cap(),
+			send_chunk_size: ChunkSize::new(cap_as_usize(settings.send_chunk_size())),
+			credit_unit: settings.credit_unit(),
+			initial_send_credit: settings.initial_send_credit(),
+			initial_recv_credit: settings.initial_recv_credit(),
 			duplex_recv: Mutex::new(HashMap::new()),
 			reassembly_budget: Arc::new(ReassemblyBudget::default()),
 			budget_drain_headroom: settings.send_budget_reserve(),
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			initial_send_budget: settings.send_budget,
+			initial_send_budget: settings.send_budget(),
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			session_receipt: Mutex::new(None),
 			#[cfg(feature = "instrument")]
@@ -430,7 +431,7 @@ impl MuxShared {
 				pending: PendingReplies::default(),
 				next_ping_opaque: 0,
 				send_streams: HashMap::new(),
-				send_budget: settings.send_budget,
+				send_budget: settings.send_budget(),
 				unsent_chunks: 0,
 				goaway_sent: None,
 				goaway_received: None,
@@ -2317,20 +2318,15 @@ mod tests {
 	}
 
 	fn metered_settings(initial_send_credit: u64, send_budget: Option<u64>) -> MuxSettings {
-		let mut settings = MuxSettings::symmetric(4);
-		settings.initial_send_credit = initial_send_credit;
-		settings.send_budget = send_budget;
-		settings
+		let settings = MuxSettings::symmetric(4).with_initial_credit(initial_send_credit);
+		settings.with_send_budget(send_budget)
 	}
 
-	/// Caps of 1 and 1, a chunk of 1024, and a unit of 1024 give a drain
-	/// headroom of 5 records at 1 credit each.
+	/// Caps of 1 and 1, a chunk of 1024, and the default unit of 1024 give a
+	/// drain headroom of 5 records at 1 credit each.
 	fn budget_settings(send_budget: u64) -> MuxSettings {
-		let mut settings = MuxSettings::symmetric(1);
-		settings.send_chunk_size = 1024;
-		settings.credit_unit = 1024;
-		settings.send_budget = Some(send_budget);
-		settings
+		let settings = MuxSettings::symmetric(1).with_chunk_size(1024);
+		settings.with_send_budget(Some(send_budget))
 	}
 
 	#[test]

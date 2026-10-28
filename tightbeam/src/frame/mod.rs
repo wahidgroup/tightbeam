@@ -37,7 +37,7 @@ mod signature;
 
 #[cfg(feature = "digest")]
 pub(crate) use scaffold::FrameIntegrityScaffold;
-#[cfg(feature = "signature")]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use signed::ArrivedCertificates;
 pub use signed::Signed;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -297,11 +297,69 @@ impl fmt::Debug for Frame {
 /// own policy: the router refuses, and a servlet applies the transform.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BodyTransform {
-	/// The body is encrypted. Decrypting also inflates a body that was
+	/// The body is encrypted. The decrypt also inflates a body that was
 	/// compressed before encryption.
 	Decrypt,
 	/// The body is compressed and in cleartext.
 	Inflate,
+}
+
+/// The Frame Integrity (FI) digest and the signature that an open in place
+/// takes out of a frame.
+///
+/// An open rewrites the body and the metadata field that described it. The
+/// FI digest covers that metadata, and the signature covers the frame as it
+/// arrived, so neither verifies after the open. A caller verifies both before
+/// the open, and reads them here after it, such as to name the signer.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::compose;
+/// use tightbeam::crypto::hash::Sha3_256;
+/// use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
+/// use tightbeam::testing::{TestIdentity, TestKey, TestMessage};
+///
+/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+/// # runtime.block_on(async {
+/// let (_, sealer) = TestKey::insecure_fixed_cipher();
+/// let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+/// let mut frame = compose! {
+///     V1: id: "opened",
+///         order: 1u64,
+///         message: TestMessage::sample(None),
+///         confidentiality: sealer,
+///         nonrepudiation<Secp256k1Signature, _>: signer,
+///         frame_integrity: type Sha3_256
+/// }?;
+/// let signature = frame.nonrepudiation().cloned();
+///
+/// let (_, opener) = TestKey::insecure_fixed_cipher();
+/// let opened = frame.decrypt_in_place(&opener, None).await?;
+/// assert_eq!((frame.integrity(), frame.nonrepudiation()), (None, None));
+/// assert_eq!(opened.nonrepudiation(), signature.as_ref());
+/// assert!(opened.integrity().is_some());
+/// # Ok::<(), tightbeam::TightBeamError>(())
+/// # })?;
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[must_use = "the open takes the FI digest and the signature out of the frame"]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Opened {
+	integrity: Option<DigestInfo>,
+	nonrepudiation: Option<Signed<SignerInfo>>,
+}
+
+impl Opened {
+	/// The FI digest the frame carried, over the metadata as it arrived.
+	pub fn integrity(&self) -> Option<&DigestInfo> {
+		self.integrity.as_ref()
+	}
+
+	/// The signature the frame carried, over the frame as it arrived.
+	pub fn nonrepudiation(&self) -> Option<&Signed<SignerInfo>> {
+		self.nonrepudiation.as_ref()
+	}
 }
 
 impl AsRef<Frame> for Frame {
@@ -380,6 +438,30 @@ impl Frame {
 		self.nonrepudiation.as_ref()
 	}
 
+	/// Take out the FI digest and the signature, which fail to verify once
+	/// the body opens in place.
+	fn take_opened(&mut self) -> Opened {
+		let integrity = self.integrity.take();
+		let nonrepudiation = self.nonrepudiation.take();
+		Opened { integrity, nonrepudiation }
+	}
+
+	/// Refuse a seal of a frame whose FI digest or signature covers the frame
+	/// as it is before the seal.
+	///
+	/// # Errors
+	///
+	/// - [`crate::TightBeamError::CoveredBeforeSeal`] -- the frame carries an FI digest or a signature.
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	fn ensure_uncovered(&self) -> crate::error::Result<()> {
+		let covered = self.integrity.is_some() || self.nonrepudiation.is_some();
+		if covered {
+			return Err(crate::TightBeamError::CoveredBeforeSeal);
+		}
+
+		Ok(())
+	}
+
 	/// The transform this body still needs before a decode.
 	///
 	/// [`None`] means the body is already decodable. Confidentiality is
@@ -397,12 +479,12 @@ impl Frame {
 		None
 	}
 
-	/// DER encoding of the `SignerIdentifier` this frame claims.
+	/// The DER encoding of the `SignerIdentifier` this frame claims.
 	///
 	/// Per-signer budgets, replay slots, refusal journals, and gossip
-	/// attribution all key on the signer, so they key on these bytes and
-	/// agree on what one signer is. It returns [`None`] when the frame carries
-	/// no signature or the identifier fails to encode.
+	/// attribution all key on these bytes, so they agree on what one signer
+	/// is. It returns [`None`] when the frame carries no signature or the
+	/// identifier fails to encode.
 	#[must_use]
 	pub fn signer_id(&self) -> Option<Vec<u8>> {
 		let signer_info = self.nonrepudiation.as_ref()?;
@@ -451,8 +533,8 @@ impl Frame {
 		Err(crate::TightBeamError::UnsupportedVersion(versions))
 	}
 
-	/// The decoder check that rejects a frame carrying a forbidden field, as
-	/// §5.6 requires.
+	/// The decoder check that rejects a frame that carries a forbidden field,
+	/// as §5.6 requires.
 	fn refuse_forbidden(&self) -> crate::der::Result<()> {
 		match self.forbidden_field() {
 			Some(_) => Err(Tag::Sequence.value_error()),

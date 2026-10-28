@@ -23,8 +23,8 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, MuxSettings, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::multiplex::{
-	CreditGrantor, MuxAcceptor, MuxConnector, MuxHandle, MuxResponder, MuxRole, MuxTransport, ReplySink, RequestSink,
-	SpawnedMux, StreamBody, StreamId,
+	CreditGrantor, MuxAcceptor, MuxConnector, MuxDrivers, MuxHandle, MuxResponder, MuxRole, MuxTransport, ReplySink,
+	RequestSink, SpawnedMux, StreamBody, StreamId,
 };
 use tightbeam::transport::tcp::r#async::{
 	TcpTransport, TokioListener, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader, TransportWriter,
@@ -120,8 +120,9 @@ pub async fn establish_transports(
 pub struct MuxEndpoint {
 	/// The handle that opens streams and emits on them.
 	pub handle: MuxHandle,
-	/// The reader driver task, which runs until the connection ends.
-	pub _reader_task: JoinHandle<()>,
+	/// The driver tasks, which run until the connection ends or the endpoint
+	/// drops.
+	pub _drivers: MuxDrivers,
 }
 
 /// Per-endpoint limits for the scenarios that harden an endpoint.
@@ -150,8 +151,8 @@ where
 		mux = mux.with_cancel_budget(budget);
 	}
 
-	let SpawnedMux { handle, responder, reader_task } = mux.spawn();
-	let endpoint = MuxEndpoint { handle, _reader_task: reader_task };
+	let SpawnedMux { handle, responder, drivers } = mux.spawn();
+	let endpoint = MuxEndpoint { handle, _drivers: drivers };
 
 	(endpoint, responder)
 }
@@ -255,10 +256,9 @@ pub async fn establish_cleartext_transports(
 	Ok((client, server))
 }
 
-/// Accepts one encrypted mux server as the server-side trace entrypoint.
-///
-/// The accepted connection carries the collector, and every downstream plane
-/// inherits it.
+/// Accepts one encrypted mux server as the server-side trace entrypoint. The
+/// accepted connection carries the collector, which every downstream plane
+/// inherits.
 ///
 /// # Errors
 ///
@@ -324,10 +324,8 @@ impl MuxClient {
 	}
 }
 
-/// Connects one encrypted mux client as the client-side trace entrypoint.
-///
-/// The connection carries the collector, and every downstream plane inherits
-/// it.
+/// Connects one encrypted mux client as the client-side trace entrypoint. The
+/// connection carries the collector, which every downstream plane inherits.
 ///
 /// # Errors
 ///

@@ -197,8 +197,6 @@ impl Default for DtnScenarioConfig {
 	fn default() -> Self {
 		let storage = StorageRoot::create().expect("Failed to create the storage root");
 
-		// The rover servlet and the mission loop client share this chain
-		// processor.
 		let rover_chain = NodeChain::open(&storage, DtnRole::Rover.node_name());
 		let rover_chain_proc = rover_chain.expect("Failed to create rover storage").processor;
 
@@ -657,6 +655,7 @@ async fn await_completed_rounds(state: &RwLock<MissionState>, rounds: usize) -> 
 /// Builds the FDR configuration of the DTN test.
 ///
 /// The framework's FDR runs in two modes:
+///
 /// 1. CSP spec exploration: the framework explores the state space of `DtnComposedSystem`.
 /// 2. Trace refinement: the framework checks the runtime trace against the spec in `specs`.
 fn build_dtn_fdr_config_refinement(process: Process) -> FdrConfig {
@@ -667,9 +666,7 @@ fn build_dtn_fdr_config_refinement(process: Process) -> FdrConfig {
 		timeout_ms: 15000,
 		specs: vec![process], // It turns on trace refinement.
 		fail_fast: true,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
+		scheduler: None,
 		fault_model: None,
 		#[cfg(feature = "testing-fmea")]
 		fmea_config: None,
@@ -689,8 +686,7 @@ fn dtn_config(trace: TraceCollector) -> Result<ScenarioConfig, Box<dyn core::err
 
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	config: dtn_config(TraceConfig::builder()
-			.with_instrumentation(TbInstrumentationConfig {
+	config: dtn_config(TraceConfig::with_instrumentation(TbInstrumentationConfig {
 				enable_payloads: false,
 				enable_internal_detail: true,
 				sample_enabled_sets: true,
@@ -703,7 +699,6 @@ tb_scenario! {
 				StdoutBackend,
 				LogFilter::new(LogLevel::Error)
 			).with_default_level(LogLevel::Debug))
-			.build()
 			.into()
 		),
 	environment Servlet {

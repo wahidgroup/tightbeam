@@ -2,6 +2,7 @@
 //! identity.
 //!
 //! - [`CmsSigner`] builds and verifies every `SignerInfo`, and every `SignedData` that holds one.
+//! - [`SignedDataExt`] reads the content of a `SignedData` and the certificate its signer names.
 //! - [`SigningIdentity`] pairs a signing certificate with the key provider that proves it.
 //! - [`CertifiedKey`] pairs a certificate with a key that signs in place.
 //! - [`VerifiedSignature`] is what a successful verification returns, in its canonical form.
@@ -47,21 +48,22 @@ mod signer;
 pub use error::SignerError;
 pub use identity::{CertifiedKey, SigningIdentity};
 pub(crate) use signer::SignerSeal;
-pub use signer::{CmsSigner, SignedContent, SignerInfoDraft};
+pub use signer::{CmsSigner, SignedContent, SignedDataExt, SignerInfoDraft};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use path::{PresentedCertificates, PresentedIssuers, PresentedPath};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) use signer::CertifiedSigner;
 #[cfg(test)]
 pub(crate) use signer::CmsAlgorithmProtection;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) use signer::{CertifiedSigner, SignedDataSigners};
 
 use crate::crypto::hash::Digest;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
 use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 
-/// Create a SignatureInfo by signing data.
+/// Sign the DER encoding of `$data` with `$signer`, and return what `$signer`
+/// returns. An encode error returns from the enclosing function through `?`.
 #[macro_export]
 #[cfg(feature = "signature")]
 macro_rules! sign {

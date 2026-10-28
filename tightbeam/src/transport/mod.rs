@@ -14,6 +14,8 @@ compile_error!(
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::time::Duration;
+
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
@@ -122,10 +124,9 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 	/// The one place a server's configuration becomes provisioning.
 	///
 	/// [`DialableEncryption::new`] admits the identity for the server purpose
-	/// once. A server presents a certificate, which answers for the peer, so
-	/// every configuration of this shape holds the dialer rule.
-	/// [`EndpointConfig`] carries `limits` beside this value, outside
-	/// provisioning.
+	/// once. A server presents a certificate that answers for the peer, so
+	/// every such configuration holds the dialer rule. `limits` stay outside
+	/// provisioning, beside this value on [`EndpointConfig`].
 	///
 	/// # Errors
 	///
@@ -205,6 +206,18 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
+	/// Replaces the operation timeout of this endpoint when `timeout` is set,
+	/// so a dial and every transport built from this configuration run under
+	/// it.
+	#[must_use]
+	pub(crate) fn with_operation_timeout(mut self, timeout: Option<Duration>) -> Self {
+		if let Some(timeout) = timeout {
+			self.limits.operation_timeout = timeout;
+		}
+
+		self
+	}
+
 	/// Attaches the production instrumentation collector each transport built
 	/// from this configuration shares.
 	#[cfg(feature = "instrument")]
@@ -277,7 +290,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	///
 	/// # Empty set
 	///
-	/// An empty set demands nothing, by the rule of
+	/// An empty set names no demand, by the rule of
 	/// [`PeerAuthentication::mutual`], so it leaves the endpoint as it is. An
 	/// endpoint that demands mutual authentication keeps that demand.
 	#[must_use]
@@ -285,11 +298,35 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		mut self,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Self {
-		let demanded = PeerAuthentication::mutual(validators);
-		if demanded.requires_certificate() {
+		if let Some(demanded) = PeerAuthentication::mutual(validators) {
 			self.peer_authentication = demanded;
 		}
 
+		self
+	}
+
+	/// Names `authentication` as the rule by which this server authenticates
+	/// its client, in place of the rule named before.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::crypto::x509::policy::ExpiryValidator;
+	/// use tightbeam::testing::TestIdentity;
+	/// use tightbeam::transport::handshake::PeerAuthentication;
+	/// use tightbeam::transport::TransportEncryptionConfig;
+	///
+	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(TestIdentity::insecure_fixed());
+	/// let mutual = config.with_peer_authentication(authentication);
+	/// # drop(mutual);
+	/// ```
+	#[must_use]
+	pub fn with_peer_authentication(mut self, authentication: impl Into<PeerAuthentication>) -> Self {
+		self.peer_authentication = authentication.into();
 		self
 	}
 
@@ -539,8 +576,7 @@ mod tests {
 
 		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame)
-			.with_wire_mode(WireMode::Encrypted)
-			.with_encryptor(&encryptor)
+			.sealed_by(&encryptor)
 			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() })
 			.finish();
 		assert!(matches!(
@@ -561,8 +597,7 @@ mod tests {
 
 		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame.clone())
-			.with_wire_mode(WireMode::Encrypted)
-			.with_encryptor(&encryptor)
+			.sealed_by(&encryptor)
 			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() })
 			.finish();
 		assert!(matches!(

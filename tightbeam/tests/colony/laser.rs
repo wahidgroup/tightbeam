@@ -14,6 +14,7 @@
 	feature = "signature"
 ))]
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer,
+		handshake::PeerAuthentication,
 		multiplex::{CallContext, MuxService, StreamBody},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
@@ -107,10 +109,10 @@ fn laser_certs() -> GatewayCerts {
 	GatewayCerts::generate("CN=Laser Gateway")
 }
 
-/// The restart scenario's certificates and the clock its hive beats on. The
-/// hive and both gateways share the clock, and only the test moves it, so
-/// the replacement routes only after the test lets one interval pass, and the
-/// frames the beat signs stay fresh at the gateway.
+/// The restart scenario's certificates and the clock its hive beats on.
+///
+/// - The hive and both gateways share the clock, so the frames the beat signs stay fresh at the gateway.
+/// - Only the test moves the clock, so the replacement routes only after the test lets one interval pass.
 struct LaserRestartCtx {
 	certs: Arc<GatewayCerts>,
 	clock: Arc<ManualClock>,
@@ -145,7 +147,7 @@ fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
 		HiveTlsConfig::new(
 			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
 			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-			vec![],
+			PeerAuthentication::Anonymous,
 		)
 		.expect("the hive TLS material must decode"),
 	);
@@ -300,7 +302,7 @@ tb_scenario! {
 				ConnectionPool::<LaserListener>::builder()
 					.with_config(PoolConfig {
 						idle_timeout: None,
-						max_connections: 1,
+						max_connections: NonZeroUsize::MIN,
 						mux_offer: Some(Arc::new(TransportOffer::mux(8)))
 					})
 					.with_trust_store(Arc::clone(&certs.trust))
@@ -425,4 +427,34 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// An outside protocol over the TCP transport keeps the lease contract of
+/// the house pool: a connection whose emit was dropped before its answer is
+/// not leased again, though its stream is still open.
+#[tokio::test]
+async fn a_laser_lease_whose_emit_was_dropped_is_not_leased_again() -> Result<(), Box<dyn std::error::Error>> {
+	use tightbeam::testing::TestFrame;
+	use tightbeam::transport::{MessageCollector, PersistentConnection, Protocol};
+
+	// The server reads the request and never answers, so the emit stays in
+	// flight while the stream stays open.
+	let (listener, addr) = <LaserListener as Protocol>::bind_cleartext(LaserAddr::ANY).await?;
+	tokio::spawn(async move {
+		let Ok((mut transport, _)) = listener.accept().await else {
+			return;
+		};
+
+		let _request = transport.collect_message().await;
+		core::future::pending::<()>().await;
+	});
+
+	let pool = Arc::new(ConnectionPool::<LaserListener>::builder().allow_cleartext().build());
+	let mut lease = pool.connect(addr).await?;
+	let emit = lease.emit(TestFrame::v0(Some("request"), None), None);
+	let abandoned = tokio::time::timeout(Duration::from_millis(100), emit).await;
+
+	let leasable = <LaserListener as PersistentConnection>::is_connected(lease.conn()?.transport());
+	assert_eq!((abandoned.is_err(), leasable), (true, false));
+	Ok(())
 }

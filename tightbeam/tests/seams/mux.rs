@@ -1,8 +1,9 @@
-//! The seams of the multiplexed transport, served end to end over a
-//! cleartext connection:
+//! The seams of the multiplexed transport, served end to end. The first two
+//! run over a cleartext connection:
 //!
-//! - a [`MuxDispatch`] an outside crate writes, which answers the streams the server receives, and
-//! - a [`CreditGrantor`] an outside crate writes, which raises the credit of each stream the server receives.
+//! - a [`MuxDispatch`] an outside crate writes, which answers the streams the server receives,
+//! - a [`CreditGrantor`] an outside crate writes, which raises the credit of each stream it serves, and
+//! - a [`MuxAcceptor`] an outside crate writes over the house transport, whose gate sees its mutual peer.
 
 use core::time::Duration;
 use std::error::Error;
@@ -16,7 +17,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::testing::TestMessage;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::{
-	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxRole, MuxTransport, SpawnedMux, StreamId,
+	BufferedGrantor, CreditGrantor, MuxDispatch, MuxDrivers, MuxHandle, MuxRole, MuxTransport, SpawnedMux, StreamId,
 };
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{EndpointConfig, ResponsePackage, TransportError, TransportFailure, TransportResult};
@@ -24,6 +25,25 @@ use tightbeam::{Frame, TightBeamError, Version};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+
+#[cfg(feature = "transport-hpke")]
+mod acceptor_seam {
+	pub use core::future::Future;
+
+	pub use tightbeam::policy::{GatePolicy, SessionContext};
+	pub use tightbeam::transport::handshake::negotiation::TransportOffer;
+	pub use tightbeam::transport::multiplex::{
+		CallContext, GatedHalves, MuxAcceptor, MuxCapable, MuxRekeyContext, MuxService,
+	};
+	pub use tightbeam::transport::policy::CollectorGateConfig;
+	pub use tightbeam::utils::marker::MaybeSend;
+	pub use tightbeam::x509::Certificate;
+
+	pub use crate::transport::support::{establish_mutual_transports, MutualSessionHooks};
+}
+
+#[cfg(feature = "transport-hpke")]
+use acceptor_seam::*;
 
 /// The id of a frame the outside dispatch refuses.
 const REFUSED_ID: &[u8] = b"outside-refused";
@@ -75,10 +95,10 @@ impl CreditGrantor for OneAhead {
 }
 
 /// The client end of a connection whose server runs [`OutsideDispatch`],
-/// with the tasks that keep both ends running.
+/// with the drivers and the task that keep both ends running.
 struct Served {
 	handle: MuxHandle,
-	_tasks: [JoinHandle<()>; 2],
+	_drivers: [MuxDrivers; 2],
 	_serving: JoinHandle<TransportResult<()>>,
 }
 
@@ -97,14 +117,14 @@ async fn serve_outside_dispatch_under(settings: MuxSettings, grantor: Arc<dyn Cr
 	let (server, _) = joined.expect("the listener accepts the client");
 
 	let (reader, writer) = client.into_split().expect("a cleartext transport splits");
-	let SpawnedMux { handle, reader_task: client_reader, .. } =
+	let SpawnedMux { handle, drivers: client_drivers, .. } =
 		MuxTransport::new(reader, writer, MuxRole::Client, settings).spawn();
 	let (reader, writer) = server.into_split().expect("a cleartext transport splits");
 	let server = MuxTransport::new(reader, writer, MuxRole::Server, settings).with_credit_grantor(grantor);
-	let SpawnedMux { responder, reader_task: server_reader, .. } = server.spawn();
+	let SpawnedMux { responder, drivers: server_drivers, .. } = server.spawn();
 	let serving = tokio::spawn(responder.serve_with(OutsideDispatch));
 
-	Served { handle, _tasks: [client_reader, server_reader], _serving: serving }
+	Served { handle, _drivers: [client_drivers, server_drivers], _serving: serving }
 }
 
 /// Serve [`OutsideDispatch`] as [`serve_outside_dispatch_under`] does, under
@@ -117,12 +137,8 @@ async fn serve_outside_dispatch() -> Served {
 /// The settings of a narrow link: the smallest chunk a link negotiates, and
 /// one chunk of initial credit on each stream.
 fn narrow_settings() -> MuxSettings {
-	let mut settings = MuxSettings::symmetric(4);
-	settings.send_chunk_size = MIN_MUX_CHUNK_SIZE;
-	settings.recv_chunk_size = MIN_MUX_CHUNK_SIZE;
-	settings.initial_send_credit = 1;
-	settings.initial_recv_credit = 1;
-	settings
+	let settings = MuxSettings::symmetric(4).with_chunk_size(MIN_MUX_CHUNK_SIZE);
+	settings.with_initial_credit(1)
 }
 
 /// A frame whose id is `id`.
@@ -182,5 +198,104 @@ async fn an_outside_grantor_raises_the_credit_of_a_stream() -> Result<(), Box<dy
 	let echoed = timeout(CREDIT_BOUND, served.handle.emit_on_stream(&frame)).await??;
 	let first_asked = grantor.first_asked();
 	assert_eq!((echoed, first_asked), (Some(frame), Some((StreamId::new(1), 1))));
+	Ok(())
+}
+
+/// An acceptor an outside crate writes over the house transport. It takes
+/// each part of the seam from the transport it wraps, its session context
+/// among them.
+#[cfg(feature = "transport-hpke")]
+struct OutsideAcceptor(TcpTransport<TokioStream>);
+
+#[cfg(feature = "transport-hpke")]
+impl MuxCapable for OutsideAcceptor {
+	fn with_mux_offer(self, offer: Option<Arc<TransportOffer>>) -> Self {
+		Self(MuxCapable::with_mux_offer(self.0, offer))
+	}
+
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		MuxCapable::negotiated_mux(&self.0)
+	}
+}
+
+#[cfg(feature = "transport-hpke")]
+impl MuxAcceptor for OutsideAcceptor {
+	type EnvelopeReader = <TcpTransport<TokioStream> as MuxAcceptor>::EnvelopeReader;
+	type EnvelopeWriter = <TcpTransport<TokioStream> as MuxAcceptor>::EnvelopeWriter;
+
+	fn negotiate_mux(&mut self) -> impl Future<Output = TransportResult<Option<MuxSettings>>> + MaybeSend {
+		self.0.negotiate_mux()
+	}
+
+	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
+		MuxAcceptor::take_rekey(&mut self.0)
+	}
+
+	fn session_context(&self) -> SessionContext {
+		MuxAcceptor::session_context(&self.0)
+	}
+
+	fn into_gated_halves(self) -> TransportResult<GatedHalves<Self>> {
+		self.0.into_gated_halves()
+	}
+
+	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)> {
+		MuxAcceptor::into_envelope_halves(self.0)
+	}
+}
+
+/// A gate an outside crate writes. It admits every request and records the
+/// peer certificate of the session it gates.
+#[cfg(feature = "transport-hpke")]
+#[derive(Clone, Default)]
+struct PeerRecord(Arc<Mutex<Option<Certificate>>>);
+
+#[cfg(feature = "transport-hpke")]
+impl PeerRecord {
+	/// The peer certificate of the last session the gate saw, or `None`
+	/// before a gated request or for a session that named no peer.
+	fn seen(&self) -> Option<Certificate> {
+		let seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+		seen.clone()
+	}
+}
+
+#[cfg(feature = "transport-hpke")]
+impl GatePolicy for PeerRecord {
+	fn evaluate(&self, _message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
+		let mut seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+		*seen = session.peer_certificate().cloned();
+		TransitStatus::Ok
+	}
+}
+
+/// A service that echoes each unary frame.
+#[cfg(feature = "transport-hpke")]
+struct Echo;
+
+#[cfg(feature = "transport-hpke")]
+impl MuxService for Echo {
+	async fn unary(&self, frame: Frame, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
+		Ok(Some(frame))
+	}
+}
+
+/// An outside acceptor serves its collector gate the client that the mutual
+/// session authenticated, as the house transport names it.
+#[cfg(feature = "transport-hpke")]
+#[tokio::test]
+async fn an_outside_acceptor_serves_its_gate_the_peer_it_names() -> Result<(), Box<dyn Error>> {
+	let offer = TransportOffer::mux(4);
+	let session = establish_mutual_transports(offer.clone(), offer, MutualSessionHooks::default()).await?;
+	let record = PeerRecord::default();
+	let server = OutsideAcceptor(session.server.with_collector_gate(record.clone()));
+	let settings = server.negotiated_mux().ok_or("the session negotiated multiplexing")?;
+	let _serving = tokio::spawn(server.serve(settings, Echo, None));
+	let SpawnedMux { handle, drivers: _drivers, .. } = session.client.into_mux(MuxRole::Client)?.spawn();
+	let client = Certificate::clone(&session.client_certificate);
+	let frame = frame_of(SERVED_ID);
+
+	let echoed = handle.emit_on_stream(&frame).await?;
+	assert_eq!((echoed, record.seen()), (Some(frame), Some(client)));
 	Ok(())
 }

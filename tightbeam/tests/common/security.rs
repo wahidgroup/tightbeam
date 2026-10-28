@@ -13,7 +13,8 @@ use tightbeam::{
 		profiles::{SecurityProfileDesc, TightbeamProfile},
 		sign::{ecdsa::Secp256k1SigningKey, SigningIdentity},
 		x509::policy::{CertificateValidation, DirectTrustValidator},
-		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+		x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
+		x509::KeyCurves,
 	},
 	der::asn1::ObjectIdentifier,
 	oids::{AES_128_GCM, AES_128_WRAP},
@@ -161,12 +162,13 @@ impl ClientMaterials {
 pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
 	let trust_chain = vec![certificate.to_owned()];
 	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
+	let data = data.expect("a test certificate encodes");
 	Arc::new(data)
 }
 
 /// A trust store that pins the given server certificate, for a CMS client.
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+	let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 		.with_certificate(certificate.to_owned())?
 		.build();
 	Ok(Arc::new(store))
@@ -215,8 +217,7 @@ pub fn weak_security_profile() -> SecurityProfileDesc {
 	feature = "transport-multiplex"
 ))]
 mod receipt_fixtures {
-	use std::sync::atomic::{AtomicUsize, Ordering};
-	use std::sync::{Arc, Mutex};
+	use std::sync::Mutex;
 
 	use tightbeam::asn1::OctetString;
 	use tightbeam::transport::handshake::negotiation::{
@@ -226,6 +227,7 @@ mod receipt_fixtures {
 		ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
 	};
 	use tightbeam::utils::marker::MaybeSendFuture;
+	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
 	/// Whether `needle` appears as a contiguous window inside `haystack`.
@@ -269,26 +271,31 @@ mod receipt_fixtures {
 		}
 	}
 
-	/// An authorizer that grants budgets with a settlement challenge and counts
-	/// every call to `settle`, so a scenario can prove whether the hook fired.
+	/// An authorizer that grants budgets with a settlement challenge and
+	/// records the client of every call to `settle`, so a scenario can prove
+	/// whether the hook fired, and for which client.
 	pub struct SettleSpyAuthorizer {
 		challenge: OctetString,
-		settle_calls: Arc<AtomicUsize>,
+		settled_clients: Mutex<Vec<Certificate>>,
 	}
 
 	impl SettleSpyAuthorizer {
 		/// A spy that grants budgets with the given settlement challenge.
 		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
 			let challenge = challenge.as_ref();
-			Ok(Self {
-				challenge: OctetString::new(challenge)?,
-				settle_calls: Arc::new(AtomicUsize::new(0)),
-			})
+			Ok(Self { challenge: OctetString::new(challenge)?, settled_clients: Mutex::default() })
 		}
 
 		/// The number of calls that the `settle` hook received so far.
 		pub fn settle_calls(&self) -> usize {
-			self.settle_calls.load(Ordering::SeqCst)
+			self.settled_clients().len()
+		}
+
+		/// The client certificate that each call to the `settle` hook
+		/// received, in order.
+		pub fn settled_clients(&self) -> Vec<Certificate> {
+			let settled = self.settled_clients.lock();
+			settled.expect("no settlement panicked while holding the record").to_owned()
 		}
 	}
 
@@ -306,8 +313,11 @@ mod receipt_fixtures {
 			&'a self,
 			_receipt: &'a SessionReceipt,
 			_response: Option<&'a [u8]>,
+			client: &'a Certificate,
 		) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
-			self.settle_calls.fetch_add(1, Ordering::SeqCst);
+			let settled = self.settled_clients.lock();
+			let mut settled = settled.expect("no settlement panicked while holding the record");
+			settled.push(client.to_owned());
 			Box::pin(async move { Ok(()) })
 		}
 	}
@@ -521,7 +531,7 @@ mod cms_pair {
 	pub struct CmsHandshakePair {
 		/// The client configuration, which presents the fresh identity.
 		pub client: ClientConfig<Cms, DefaultCryptoProvider>,
-		/// The server configuration.
+		/// The server configuration, which holds the fixture server identity.
 		pub server: ServerConfig<Cms, DefaultCryptoProvider>,
 		/// The certificate of the identity the client presents.
 		pub client_certificate: Arc<Certificate>,
@@ -606,8 +616,12 @@ mod cms_fixtures {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let pair =
-			cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::mutual([validator]))?;
+		let pair = cms_handshake_pair(
+			materials,
+			vec![profile],
+			vec![profile],
+			PeerAuthentication::Anonymous.and(validator),
+		)?;
 
 		let mut config = pair.client;
 		config.transport_offer = Some(offer.to_owned());

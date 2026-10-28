@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	colony::servlet::ServletConfig,
+	colony::{
+		hive::ServletBox,
+		servlet::{LatencyTracker, ServletConfig},
+	},
 	compose,
 	compress::ZstdCompression,
 	crypto::{
@@ -22,6 +25,7 @@ use tightbeam::{
 	testing::{
 		fixtures::TestTrace, ClientEnv, ScenarioConfig, ServletEnv, SetupEnv, TestCertificate, TestIdentity, TestKey,
 	},
+	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
@@ -275,4 +279,35 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+servlet! {
+	/// A servlet that echoes each frame, under a configured load gauge.
+	GaugedServlet<CalcRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: raw |frame, _ctx| async move {
+		Ok(Some(frame))
+	}
+}
+
+/// A tracker whose average is each sample it records, so one sample of a
+/// quarter of its target reads as 2500 basis points.
+fn quarter_loaded_tracker() -> Arc<LatencyTracker> {
+	let tracker = Arc::new(LatencyTracker::new(tightbeam::bps!(10000), 100_000));
+	tracker.record(25_000);
+	tracker
+}
+
+/// A `servlet!` servlet reports the load of the gauge its configuration
+/// installed, which the hive reads when it scales.
+#[tokio::test]
+async fn a_servlet_declared_with_servlet_reports_the_load_of_its_gauge() -> Result<(), TightBeamError> {
+	let builder = ServletConfig::<TokioListener, CalcRequest>::builder().with_utilization(quarter_loaded_tracker());
+	let config = builder.allow_cleartext().build();
+	let servlet = GaugedServlet::start(Arc::new(TraceCollector::default()), config).await?;
+
+	let reported = ServletBox::utilization(&servlet);
+	servlet.stop();
+	assert_eq!(reported, Some(tightbeam::bps!(2500)));
+	Ok(())
 }

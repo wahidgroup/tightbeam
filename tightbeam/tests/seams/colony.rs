@@ -40,14 +40,15 @@ use tightbeam::crypto::hash::Sha3_512;
 use tightbeam::crypto::k256::ecdsa::SigningKey;
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::utils::Fingerprint;
-use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::crypto::x509::{KeyCurves, KeyPurposes};
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::random::OsRng;
 use tightbeam::testing::{HiveEnv, SetupEnv, TestCertificate, TestMessage};
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
 use tightbeam::urn::Urn;
@@ -190,7 +191,7 @@ impl OutsideColony {
 	/// The configuration of the hive, which trusts both gateways and its own
 	/// servlet.
 	fn hive_conf(&self) -> HiveConfig {
-		let tls = HiveTlsConfig::from_identity(self.hive.identity(), Vec::new(), KeyPurposes::HOUSE);
+		let tls = HiveTlsConfig::from_identity(self.hive.identity(), PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
 		let tls = tls.expect("an outside certificate with no extended key usage signs for the hive");
 
 		let hive_tls = Some(Arc::new(tls));
@@ -210,7 +211,8 @@ impl OutsideColony {
 /// A store under the outside policy that anchors the certificate of each of
 /// `parties`.
 fn outside_trust(parties: &[&Party]) -> Arc<dyn CertificateTrust> {
-	let builder = CertificateTrustBuilder::from(ProviderPolicy::<OutsideProvider>::default());
+	let policy = ProviderPolicy::<OutsideProvider>::default();
+	let builder = CertificateTrustBuilder::new(policy, KeyCurves::HOUSE, NoRevocation);
 	let anchor = |builder: CertificateTrustBuilder, party: &&Party| builder.with_certificate(party.certificate.clone());
 	let builder = parties.iter().try_fold(builder, anchor);
 	Arc::new(builder.expect("an outside certificate anchors").build())

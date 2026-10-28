@@ -4,6 +4,7 @@
 //! connection, and the pooled client consumes them alongside unary
 //! requests.
 
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tightbeam::{
@@ -111,7 +112,7 @@ async fn pooled_lease(
 	let trust_store = pinning_trust_store(&materials.certificate)?;
 	let config = PoolConfig {
 		idle_timeout: None,
-		max_connections: 1,
+		max_connections: NonZeroUsize::MIN,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 	};
 

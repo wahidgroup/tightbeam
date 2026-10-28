@@ -101,7 +101,7 @@ impl IssuedReceipt {
 	/// Open the client's sealed countersignature, verify it, settle with the
 	/// authorizer, and record the outcome.
 	///
-	/// The step runs in that order, and it fails closed. A missing or invalid
+	/// It runs in that order and fails closed. A missing or invalid
 	/// countersignature aborts the handshake, and so does a settlement refusal.
 	/// Every concluded exchange reaches the observer first.
 	///
@@ -178,15 +178,16 @@ impl IssuedReceipt {
 			client_certificate,
 			verdict,
 		};
-		outcome.record(observer).await
+		let settled = outcome.record(observer).await?;
+		settled.activated()
 	}
 
 	/// Settle the receipt of a session, when the session issued one.
 	///
-	/// A session that issued no receipt owes no acknowledgement, so this
-	/// function refuses one that arrives instead of dropping it. The secret
-	/// is a [`ConfirmedSecret`], so no settlement runs for a client that did
-	/// not prove it holds the handshake secret.
+	/// A session that issued no receipt owes no acknowledgement, so it refuses
+	/// one that arrives and does not drop it. The secret is a
+	/// [`ConfirmedSecret`], so no settlement runs for a client that did not
+	/// prove it holds the handshake secret.
 	///
 	/// # Errors
 	///
@@ -343,10 +344,9 @@ impl CountersignedReceipt {
 		let sealer = terms.sealer(secret, SecretSeal::Ack)?;
 		let sealed_ack = sealer.seal(DATA, core::mem::take(&mut *ack_der))?.to_der()?;
 
-		// Both endpoints retain the identical completed artifact, which
-		// carries the client's certificate beside the countersignature. A
-		// `CertificateSet` owns each certificate it holds, so the artifact
-		// takes its own copy.
+		// The completed artifact carries the client's certificate beside the
+		// countersignature. A `CertificateSet` owns each certificate it holds,
+		// so the artifact takes its own copy.
 		let completed = artifact.with_certified_signer(countersignature)?;
 		let stored = StoredReceipt::try_from(completed)?;
 		Ok((sealed_ack, stored))

@@ -2,8 +2,9 @@
 //!
 //! Each test checks that one client connection sends three messages without a
 //! reconnect (connection keep-alive), in two cases:
-//! - the reuse of a cleartext TCP connection, and
-//! - the reuse of a TLS connection, whose one session carries all three.
+//!
+//! - The reuse of a cleartext TCP connection.
+//! - The reuse of a TLS connection, whose one session carries all three.
 
 #![cfg(all(
 	feature = "std",
@@ -41,8 +42,8 @@ use tightbeam::{
 		sign::ecdsa::Secp256k1,
 		x509::{
 			policy::CertificateValidation,
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			Certificate,
+			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
+			Certificate, KeyCurves,
 		},
 	},
 	error::TightBeamError,
@@ -61,7 +62,7 @@ struct TestMessage {
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(server_cert)?
 			.build(),
 	))

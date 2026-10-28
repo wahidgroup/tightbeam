@@ -11,6 +11,12 @@
 /// - The method takes the leftmost 160 bits of the SHA-256 of the `subjectPublicKey` BIT STRING.
 /// - An issued certificate also carries the issuer's `authorityKeyIdentifier` by the same method.
 ///
+/// # Signature type
+///
+/// The optional `signature:` key names the type the signer signs under, such
+/// as `p256::ecdsa::DerSignature` for a P-256 signer. Without the key, the
+/// certificate carries an ECDSA signature over secp256k1 in DER form.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -78,6 +84,7 @@ macro_rules! cert {
 		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr,
+		signature: $sig:ty,
 		extensions: [$($ext:expr),* $(,)?]
 	) => {{
 		use $crate::crypto::x509::builder::Builder;
@@ -98,10 +105,10 @@ macro_rules! cert {
 		builder.add_extension(&key_identifier)?;
 		$( builder.add_extension(&$ext)?; )*
 
-		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
+		builder.build::<$sig>()
 	}};
 
-	// Root CA certificate with an explicit pathLenConstraint (RFC 5280 §4.2.1.9).
+	// A root CA certificate that sets pathLenConstraint (RFC 5280 §4.2.1.9).
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -110,6 +117,7 @@ macro_rules! cert {
 		signer: $signer:expr,
 		subject_public_key: $spki:expr,
 		path_len: $path_len:expr
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: None,
@@ -118,6 +126,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: true, path_len_constraint: Some($path_len) },
 				$crate::cert!(@ca_usage),
@@ -125,7 +134,7 @@ macro_rules! cert {
 		)
 	}};
 
-	// Root CA certificate (requires subject_public_key)
+	// A root CA certificate with an unbounded path length.
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -133,6 +142,7 @@ macro_rules! cert {
 		duration: $duration:expr,
 		signer: $signer:expr,
 		subject_public_key: $spki:expr
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: None,
@@ -141,6 +151,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: true, path_len_constraint: None },
 				$crate::cert!(@ca_usage),
@@ -148,7 +159,7 @@ macro_rules! cert {
 		)
 	}};
 
-	// Root CA certificate (no SPKI provided -> clearer error)
+	// A root CA certificate with no `subject_public_key:` is a compile error.
 	(
 		profile: Root,
 		subject: $subject:expr,
@@ -163,9 +174,9 @@ macro_rules! cert {
 		);
 	}};
 
-	// Leaf certificate. `key_usage:` replaces the default `keyUsage` of
-	// `digitalSignature | nonRepudiation`, such as with `digitalSignature |
-	// keyAgreement` for a certificate a KEM encapsulates to.
+	// A leaf certificate. `key_usage:` replaces the default `keyUsage`, as
+	// `digitalSignature | keyAgreement` does for a certificate a KEM
+	// encapsulates to.
 	(
 		profile: Leaf,
 		subject: $subject:expr,
@@ -176,6 +187,7 @@ macro_rules! cert {
 		signer: $signer:expr
 		$(, key_usage: $key_usage:expr)?
 		$(, extensions: [$($ext:expr),* $(,)?])?
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: Some($crate::cert!(@name $issuer)),
@@ -184,6 +196,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::cert!(@authority $signer),
 				$crate::crypto::x509::ext::pkix::BasicConstraints { ca: false, path_len_constraint: None },
@@ -193,7 +206,7 @@ macro_rules! cert {
 		)
 	}};
 
-	// SubCA certificate
+	// A subordinate CA certificate, with an optional pathLenConstraint.
 	(
 		profile: SubCA,
 		subject: $subject:expr,
@@ -203,6 +216,7 @@ macro_rules! cert {
 		subject_public_key: $spki:expr,
 		signer: $signer:expr
 		$(, path_len: $path_len:expr)?
+		$(, signature: $sig:ty)?
 	) => {{
 		$crate::cert!(@build
 			issuer: Some($crate::cert!(@name $issuer)),
@@ -211,6 +225,7 @@ macro_rules! cert {
 			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
+			signature: $crate::cert!(@signature $($sig)?),
 			extensions: [
 				$crate::cert!(@authority $signer),
 				$crate::crypto::x509::ext::pkix::BasicConstraints {
@@ -221,6 +236,15 @@ macro_rules! cert {
 			]
 		)
 	}};
+
+	// Resolve the signature type: the `signature:` key, or ECDSA over
+	// secp256k1 in DER when the key is absent.
+	(@signature) => {
+		$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>
+	};
+	(@signature $sig:ty) => {
+		$sig
+	};
 
 	// Resolve an optional pathLenConstraint: absent yields an unbounded path.
 	(@path_len) => {
@@ -241,17 +265,27 @@ macro_rules! cert {
 	};
 }
 
-/// Create an X.509 Certificate Signing Request using the builder pattern
+/// Builds a PKCS #10 certificate signing request (RFC 2986) for `subject`,
+/// signed by `signer`.
+///
+/// The optional `signature:` key names the signature type, as it does for
+/// [`cert!`](crate::cert). The default is an ECDSA signature over secp256k1 in
+/// DER form. Each entry of `extensions:` goes into the extensionRequest
+/// attribute of the request (RFC 2985 §5.4.2).
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+/// use tightbeam::crypto::sign::Sha3Signer;
 /// use tightbeam::csr;
 ///
-/// let csr = csr!(
-///     subject: "CN=example.com",
-///     signer: &signing_key
-/// )?;
+/// let signing_key = Secp256k1SigningKey::from_bytes(&[7; 32].into())?;
+/// let signer = Sha3Signer::from(&signing_key);
+///
+/// let request = csr!(subject: "CN=example.com", signer: &signer)?;
+/// assert_eq!(request.info.subject.to_string(), "CN=example.com");
+/// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[cfg(feature = "x509")]
 #[macro_export]
@@ -260,12 +294,12 @@ macro_rules! csr {
 		subject: $subject:expr,
 		signer: $signer:expr
 		$(, extensions: [$($ext:expr),* $(,)?])?
+		$(, signature: $sig:ty)?
 	) => {{
 		use core::str::FromStr;
 
-		use $crate::crypto::x509::builder::RequestBuilder;
+		use $crate::crypto::x509::builder::{Builder, RequestBuilder};
 		use $crate::crypto::x509::name::Name;
-		use $crate::der::Encode;
 
 		let subject = Name::from_str($subject)?;
 		let mut builder = RequestBuilder::new(subject, $signer)?;
@@ -276,7 +310,7 @@ macro_rules! csr {
 			)*
 		)?
 
-		builder.build::<$crate::crypto::sign::Signer>()
+		builder.build::<$crate::cert!(@signature $($sig)?)>()
 	}};
 }
 
@@ -288,8 +322,9 @@ mod tests {
 	use crate::crypto::x509::ext::pkix::{
 		AuthorityKeyIdentifier, BasicConstraints, KeyUsage, KeyUsages, SubjectKeyIdentifier,
 	};
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
+	use crate::crypto::x509::KeyCurves;
 	use crate::der::asn1::OctetString;
 	use crate::der::Encode;
 	use crate::spki::SubjectPublicKeyInfoOwned;
@@ -440,7 +475,7 @@ mod tests {
 	fn a_cert_macro_chain_validates_under_the_secp256k1_policy() -> TestResult {
 		let (root_key, root_certificate) = root(1)?;
 		let leaf = leaf_of(&root_key)?;
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(root_certificate.clone())?
 			.build();
 

@@ -7,7 +7,9 @@
 //! - a key-encryption key an outside crate holds, as an
 //!   [`EncryptingKeyProvider`] that keeps the provided `decrypt_into`,
 //! - a frame cipher an outside crate writes, as an [`Encryptor`] and a [`Decryptor`],
-//! - a frame decryptor an outside crate writes, which opens the parts of a [`CheckedContent`] itself,
+//! - a frame decryptor an outside crate writes, which opens the parts of a
+//!   [`CheckedContent`] itself and refuses a frame whose envelope carries
+//!   `unauthAttrs`,
 //! - a codec an outside crate writes, as a [`Compressor`] and an [`Inflator`], and
 //! - the single-shot HPKE API under a suite whose KDF the outside crate defines.
 
@@ -42,13 +44,14 @@ use tightbeam::crypto::kdf::{Hkdf, KdfError};
 use tightbeam::crypto::key::{EncryptingKeyProvider, InMemoryEncryptingKeyProvider, KeyError};
 use tightbeam::crypto::profiles::Kek;
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
-use tightbeam::der::asn1::ObjectIdentifier;
-use tightbeam::der::{Decode, Encode};
+use tightbeam::der::asn1::{Null, ObjectIdentifier, SetOfVec};
+use tightbeam::der::{Any, Decode, Encode, ErrorKind, Tag as DerTag, TagNumber};
 use tightbeam::error::CompressionResult;
 use tightbeam::oids::{AES_128_GCM, AES_128_WRAP, AES_256_WRAP, DATA, ORI_KEM};
 use tightbeam::random::CryptoRngCore;
 use tightbeam::testing::{unhex, SeededStream, TestMessage};
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::x509::attr::Attribute;
 use tightbeam::zeroize::Zeroizing;
 use tightbeam::{compose, Frame, TightBeamError, ZeroizingBytes};
 
@@ -204,7 +207,7 @@ fn a_record_under_the_outside_provider_opens() -> Result<(), TightBeamError> {
 	let sender = SendCipher::new(outside_record_key(0x21), 0, RecordDirection::ClientToServer);
 	let mut record = sender.encrypt_next(b"outside record".to_vec())?.to_der()?;
 
-	let receiver = RecvCipher::new(outside_record_key(0x21), 0, RecordDirection::ClientToServer);
+	let mut receiver = RecvCipher::new(outside_record_key(0x21), 0, RecordDirection::ClientToServer);
 	let opened = receiver.open(&mut record)?;
 	assert_eq!(opened, b"outside record");
 	Ok(())
@@ -265,7 +268,7 @@ async fn a_frame_sealed_through_an_outside_kek_holder_opens_through_it() -> Resu
 	let mut frame = compose! { V1: id: "outside-holder", order: 1u64, message: message.clone() }?;
 
 	frame.encrypt_with_provider::<OutsideProvider>(&holder).await?;
-	frame.decrypt_with_provider::<OutsideProvider>(&holder).await?;
+	let _opened = frame.decrypt_with_provider::<OutsideProvider>(&holder).await?;
 	assert_eq!(tightbeam::decode::<TestMessage>(frame.message())?, message);
 	Ok(())
 }
@@ -421,6 +424,51 @@ async fn an_outside_decryptor_opens_a_frame_from_its_parts() -> Result<(), Tight
 	Ok(())
 }
 
+/// The attribute that [`UnauthenticatedAttributeCipher`] attaches, under an
+/// arc of the outside crate.
+const OUTSIDE_UNAUTHENTICATED_ATTRIBUTE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.4");
+
+/// A frame cipher an outside crate writes that seals as
+/// [`OutsideFrameCipher`] seals, then attaches one `unauthAttrs` attribute,
+/// which the tag does not cover, as a party outside the seal would.
+struct UnauthenticatedAttributeCipher(OutsideFrameCipher);
+
+impl Encryptor<Aes128GcmOid> for UnauthenticatedAttributeCipher {
+	fn encrypt_content(
+		&self,
+		content: impl Into<Vec<u8>>,
+		content_type: Option<ObjectIdentifier>,
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> Result<AuthEnvelopedData, TightBeamError> {
+		let mut sealed = self.0.encrypt_content(content, content_type, rng)?;
+		let values = SetOfVec::try_from(vec![Any::encode_from(&Null)?])?;
+		let attribute = Attribute { oid: OUTSIDE_UNAUTHENTICATED_ATTRIBUTE, values };
+		sealed.unauth_attrs = Some(SetOfVec::try_from(vec![attribute])?);
+		Ok(sealed)
+	}
+}
+
+/// The outside decryptor that opens from the parts of a [`CheckedContent`]
+/// refuses a frame whose envelope carries `unauthAttrs`, because the check
+/// reads the envelope as it arrived before any decryptor sees its parts
+/// (RFC 5083 §2.1).
+#[tokio::test]
+async fn an_outside_parts_decryptor_refuses_an_envelope_that_carries_unauthenticated_attributes(
+) -> Result<(), TightBeamError> {
+	let message = TestMessage::sample(Some("outside unauthenticated"));
+	let cipher = UnauthenticatedAttributeCipher(OutsideFrameCipher { kek: [0x52; 16].into() });
+	let mut frame = compose! { V1: id: "outside-unauth", order: 1u64, message: message, confidentiality: cipher }?;
+
+	let refused = frame.decrypt_in_place(&OutsidePartsDecryptor { kek: [0x52; 16] }, None).await;
+	let unauthenticated = DerTag::ContextSpecific { constructed: true, number: TagNumber::N2 };
+	assert!(matches!(
+		refused,
+		Err(TightBeamError::EnvelopeError(EnvelopeError::Encoding(error)))
+			if error.kind() == ErrorKind::Value { tag: unauthenticated }
+	));
+	Ok(())
+}
+
 /// The compression algorithm of the outside codec, under an arc of its own.
 const OUTSIDE_CODEC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.3");
 
@@ -501,7 +549,7 @@ impl HpkeSuite for OutsideSuite {
 /// The `info` of the single-shot seals under the outside suite.
 const OUTSIDE_INFO: &[u8] = b"tb/test/outside/hpke";
 
-/// The `enc` of `outside suite` sealed under the AAD `aad` and
+/// The `enc` of the plaintext `outside suite`, sealed under the AAD `aad` and
 /// [`OUTSIDE_INFO`] to the recipient key `0x2a` repeated 32 times, with the
 /// ephemeral key `0x01` repeated 32 times that `SeededStream(0)` draws. An
 /// independent RFC 9180 implementation in Python, which reproduces

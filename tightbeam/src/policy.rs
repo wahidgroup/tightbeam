@@ -23,8 +23,8 @@ use crate::x509::Certificate;
 
 /// A transport response status code.
 ///
-/// The variants adopt the gRPC canonical status registry (`google.rpc.Code`)
-/// as-is, so wire values match the registry.
+/// The variants and their wire values are those of the gRPC canonical status
+/// registry (`google.rpc.Code`).
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransitStatus {
@@ -70,11 +70,11 @@ pub enum TransitStatus {
 impl TransitStatus {
 	/// Normalizes a gate verdict for [`GatePolicy`] and export-gate loops.
 	///
-	/// [`TransitStatus::Unknown`] is a local bug, not a verdict, so it
-	/// maps to [`TransitStatus::Internal`]. The peer then sees a server
-	/// fault. Call sites apply this to a configured gate's status before it
-	/// reaches the wire or the export audit trail. The built-in export
-	/// allowlist's verdict goes out as it stands.
+	/// [`TransitStatus::Unknown`] is a local bug, not a verdict, so it maps to
+	/// [`TransitStatus::Internal`], which the peer reads as a server fault.
+	/// Call sites apply this to the status of a configured gate before it
+	/// reaches the wire or the export audit trail. The verdict of the built-in
+	/// export allowlist goes out as it stands.
 	#[cfg(feature = "transport-policy")]
 	#[must_use]
 	pub(crate) const fn normalized_verdict(self) -> Self {
@@ -125,17 +125,15 @@ impl TransitStatus {
 /// - The [`CanonicalKey`] of the peer's key.
 /// - The dual-signed session receipt, when the session is budget-bearing.
 ///
-/// The empty (default) context means no authenticated facts. Cleartext
-/// connections, client-side emit paths, and in-process evaluation all
-/// answer it.
+/// The default context holds no authenticated fact. Cleartext connections,
+/// client-side emit paths, and in-process evaluation pass it.
 ///
 /// # Rekey
 ///
-/// On the mux serving path (`MuxAcceptor::serve`) the context is assembled
-/// per invocation with the live receipt, so gates and handlers observe
-/// post-rekey rotations. A single-flight session keeps the keys of its
-/// handshake for its whole life, so a one-shot [`SessionContext::capture`] is
-/// exact there.
+/// On the mux serving path (`MuxAcceptor::serve`), each invocation builds the
+/// context with the live receipt, so gates and handlers see the receipt of
+/// each rekey. A single-flight session keeps the keys of its handshake for
+/// its whole life, so one [`SessionContext::capture`] is exact there.
 #[derive(Clone, Debug, Default)]
 pub struct SessionContext {
 	/// The record of the peer the session holds: the certificate, and the DER
@@ -215,9 +213,8 @@ impl SessionContext {
 		Self { peer: Some(Arc::new(peer)), session_receipt: None }
 	}
 
-	/// The identity this session's handshake proved.
-	///
-	/// It returns [`None`] when the transport authenticated no peer.
+	/// The identity this session's handshake proved, or [`None`] when the
+	/// transport authenticated no peer.
 	///
 	/// A per-identity budget MUST NOT fall back to a shared stand-in:
 	/// every unauthenticated caller would key on the same row, so one
@@ -252,8 +249,8 @@ impl<'a> ProvenPeer<'a> {
 	/// The key identity of the peer, as the [`CanonicalKey`] of its key.
 	///
 	/// A gate keys its per-identity state on this value. It comes from the
-	/// transport handshake, so a sender cannot pick which budget its frames
-	/// are counted against.
+	/// transport handshake, so a sender cannot pick the budget that its frames
+	/// count against.
 	///
 	/// # Examples
 	///
@@ -287,10 +284,8 @@ impl<'a> ProvenPeer<'a> {
 
 /// The policy trait a user implements to decide message acceptance.
 ///
-/// A gate policy is a stateless procedure that decides whether to accept or
-/// reject a message. Every evaluation carries the connection's
-/// [`SessionContext`], and a site without authenticated facts passes the
-/// empty context:
+/// Every evaluation carries the connection's [`SessionContext`], and a site
+/// without authenticated facts passes the empty context:
 ///
 /// - An identity-blind gate ignores the context.
 /// - An identity gate, such as an allow or deny list or a receipt check, keys on it.
@@ -321,9 +316,8 @@ pub trait ReceptorPolicy<T: Message>: Send + Sync {
 
 /// A middleware wrapper for receptor policies that observes evaluations.
 ///
-/// It wraps any [`ReceptorPolicy`] and calls a closure with the evaluation
-/// result. The middleware is transparent and passes through the policy's
-/// decision unchanged.
+/// It calls a closure with each evaluation result and returns the decision of
+/// the wrapped [`ReceptorPolicy`] unchanged.
 pub struct ReceptorMiddleware<T: Message, R: ReceptorPolicy<T>, F>
 where
 	F: Fn(&T, &TransitStatus) + Send + Sync,
@@ -337,11 +331,12 @@ impl<T: Message, R: ReceptorPolicy<T>, F> ReceptorMiddleware<T, R, F>
 where
 	F: Fn(&T, &TransitStatus) + Send + Sync,
 {
-	/// Create a new middleware wrapper around a receptor policy.
+	/// Wrap a receptor policy in a middleware.
 	///
 	/// # Arguments
-	/// * `inner` - The underlying receptor policy to wrap.
-	/// * `observer` - The closure the middleware calls with the message and the evaluation result.
+	///
+	/// - `inner`: the receptor policy whose decision the middleware returns.
+	/// - `observer`: the closure the middleware calls with the message and the evaluation result.
 	pub fn new(inner: R, observer: F) -> Self {
 		Self { inner, observer, _phantom: PhantomData }
 	}
@@ -400,11 +395,21 @@ impl GatePolicy for GateChain {
 	}
 }
 
+/// A shared gate evaluates as the gate it points to, so a chain or a builder
+/// holds one gate behind an `Arc`.
+#[cfg(feature = "transport")]
+impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
+	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
+		(**self).evaluate(message, session)
+	}
+}
+
 /// A gate that requires a valid frame integrity (FI) digest on every frame.
 ///
-/// A frame is [`TransitStatus::Ok`] only when it carries an FI value that
-/// recomputes to the same digest under `D`. Every other case is rejected with
-/// [`TransitStatus::PermissionDenied`].
+/// A frame passes as [`TransitStatus::Ok`] only when it carries an FI value
+/// that recomputes to the same digest under `D`. The gate refuses every other
+/// frame with [`TransitStatus::PermissionDenied`], and a stream open with no
+/// request frame passes.
 #[cfg(feature = "digest")]
 pub struct FrameIntegrityGate<D> {
 	_marker: PhantomData<fn() -> D>,
@@ -438,9 +443,8 @@ where
 
 /// A middleware wrapper for gate policies that observes evaluations.
 ///
-/// It wraps any [`GatePolicy`] and calls a closure with the evaluation result.
-/// The middleware is transparent and passes through the gate's decision
-/// unchanged.
+/// It calls a closure with each evaluation result and returns the decision of
+/// the wrapped [`GatePolicy`] unchanged.
 #[derive(Debug, Clone)]
 pub struct GateMiddleware<G: GatePolicy, F>
 where
@@ -454,11 +458,12 @@ impl<G: GatePolicy, F> GateMiddleware<G, F>
 where
 	F: Fn(Option<&Frame>, &TransitStatus) + Send + Sync,
 {
-	/// Create a new middleware wrapper around a gate policy.
+	/// Wrap a gate policy in a middleware.
 	///
 	/// # Arguments
-	/// * `inner` - The underlying gate policy to wrap.
-	/// * `observer` - The closure the middleware calls with the message and the evaluation result.
+	///
+	/// - `inner`: the gate policy whose decision the middleware returns.
+	/// - `observer`: the closure the middleware calls with the message and the evaluation result.
 	pub fn new(inner: G, observer: F) -> Self {
 		Self { inner, observer }
 	}

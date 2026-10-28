@@ -1,3 +1,4 @@
+use core::any::TypeId;
 use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -5,8 +6,9 @@ use std::sync::Arc;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::HiveContext;
 use crate::colony::servlet::runtime;
-use crate::colony::servlet::WorkerBox;
-use crate::colony::worker::{Worker, WorkerMetadata};
+use crate::colony::servlet::tracking::SharedGauge;
+use crate::colony::servlet::{UtilizationGauge, WorkerBox};
+use crate::colony::worker::Worker;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
 use crate::policy::GatePolicy;
@@ -26,9 +28,8 @@ use crate::transport::TransportEncryptionConfig;
 /// How a servlet accepts connections.
 ///
 /// The handshake binds a multiplexing advertisement into its transcript, so
-/// the advertisement exists only where a handshake exists. The encrypted arm
-/// carries it, so a cleartext servlet that advertises multiplexing is
-/// unrepresentable rather than silently ignored.
+/// only the encrypted arm carries one. A cleartext servlet that advertises
+/// multiplexing is unrepresentable.
 pub(crate) enum ServletAccept<C: CryptoProvider> {
 	/// The servlet accepts cleartext connections without multiplexing.
 	Cleartext,
@@ -71,9 +72,8 @@ impl<C: CryptoProvider> ServletAccept<C> {
 /// Servlet bind and handler configuration, transport encryption included.
 ///
 /// `Env` is the application configuration the handlers read. It is a type
-/// parameter rather than an erased value, so the config a servlet is
-/// started with and the env its handlers name are the same type by
-/// construction.
+/// parameter, not an erased value, so the config a servlet starts with and the
+/// env its handlers name are one type by construction.
 pub struct ServletConfig<P, M, C: CryptoProvider = DefaultCryptoProvider, Env = ()>
 where
 	P: Protocol,
@@ -85,10 +85,11 @@ where
 	pub(crate) accept: ServletAccept<C>,
 	pub(crate) servlet_config: Arc<Env>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
-	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
+	pub(crate) workers: HashMap<TypeId, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
+	pub(crate) utilization: Option<Box<dyn UtilizationGauge>>,
 	pub(crate) clock: Arc<dyn Clock>,
 }
 
@@ -111,9 +112,9 @@ pub(crate) mod sealed {
 /// One of the two accept states a [`ServletConfigBuilder`] builds from:
 /// [`Cleartext`] and [`WithCertificate`].
 ///
-/// The state carries the accept material itself, so the builder holds the
-/// certificate and the mux offer in exactly one place, and
-/// [`ServletConfigBuilder::build`] reads the material from that place.
+/// The state carries the accept material, so the builder holds the
+/// certificate and the mux offer in one place, which
+/// [`ServletConfigBuilder::build`] reads.
 pub trait AcceptState<C: CryptoProvider>: sealed::Sealed<C> {}
 
 /// The state of a fresh builder, before it names a certificate or cleartext.
@@ -163,18 +164,17 @@ impl<C: CryptoProvider> AcceptState<C> for WithCertificate<C> {}
 
 /// Builder for [`ServletConfig`].
 ///
-/// `A` is the accept state, and it holds the accept material. A fresh builder
+/// `A` is the accept state, which holds the accept material. A fresh builder
 /// is in [`NoAcceptState`], and one of three calls moves it to a state that
 /// builds:
 ///
 /// - [`ServletConfigBuilder::with_certificate`] or
 ///   [`ServletConfigBuilder::with_identity`] moves it to [`WithCertificate`],
-///   where [`ServletConfigBuilder::with_mux_offer`] exists. The offer has its
-///   one place beside the certificate, so the pair stays together.
+///   where [`ServletConfigBuilder::with_mux_offer`] exists.
 /// - [`ServletConfigBuilder::allow_cleartext`] moves it to [`Cleartext`].
 ///
-/// A servlet therefore serves in the clear only where its configuration says
-/// so (CWE-319).
+/// A servlet serves in the clear only where its configuration says so
+/// (CWE-319).
 pub struct ServletConfigBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider, Env = (), A = NoAcceptState>
 where
 	P: Protocol,
@@ -183,10 +183,11 @@ where
 	accept: A,
 	servlet_config: Arc<Env>,
 	hive_context: Option<Arc<dyn HiveContext>>,
-	workers: HashMap<String, Box<dyn WorkerBox>>,
+	workers: HashMap<TypeId, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
+	utilization: Option<Box<dyn UtilizationGauge>>,
 	clock: Arc<dyn Clock>,
 	_phantom: PhantomData<(P, M, C)>,
 }
@@ -226,10 +227,30 @@ where
 		cleartext.build()
 	}
 
-	/// Returns the worker registered under `name`, downcast to `W`.
-	pub fn worker<W: 'static>(&self, name: impl AsRef<str>) -> Option<&W> {
-		let name = name.as_ref();
-		self.workers.get(name)?.downcast_ref()
+	/// Returns the worker of type `W` that this config registers, if it
+	/// registers one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::servlet::ServletConfig;
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	/// use tightbeam::worker;
+	///
+	/// worker! {
+	///     name: Echo<TestMessage, usize>,
+	///     handle: |message, _trace| async move { message.content.len() }
+	/// }
+	///
+	/// let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_worker(Echo::new(()));
+	/// let config = builder.allow_cleartext().build();
+	///
+	/// assert!(config.worker::<Echo>().is_some());
+	/// ```
+	pub fn worker<W: 'static>(&self) -> Option<&W> {
+		let key = TypeId::of::<W>();
+		self.workers.get(&key)?.downcast_ref()
 	}
 
 	/// Returns the transport encryption config when this servlet presents a
@@ -241,11 +262,9 @@ where
 		}
 	}
 
-	/// Returns the multiplexing advertisement applied to accepted
-	/// connections.
-	///
-	/// It is always [`None`] on a cleartext servlet, which has no handshake
-	/// to bind an offer into.
+	/// Returns the multiplexing advertisement applied to accepted connections.
+	/// It is always [`None`] on a cleartext servlet, which has no handshake to
+	/// bind an offer into.
 	pub fn mux_offer(&self) -> Option<Arc<TransportOffer>> {
 		match &self.accept {
 			ServletAccept::Cleartext => None,
@@ -259,9 +278,37 @@ where
 		&self.servlet_config
 	}
 
-	/// Takes ownership of the registered workers for servlet startup.
-	pub fn to_workers(self) -> HashMap<String, Box<dyn WorkerBox>> {
-		self.workers
+	/// Takes ownership of the registered workers for servlet startup, one of
+	/// each type.
+	///
+	/// [`ServletContext::new`] takes them and keys each by its type.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::{ServletConfig, ServletContext};
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	/// use tightbeam::worker;
+	///
+	/// worker! {
+	///     name: Echo<TestMessage, usize>,
+	///     handle: |message, _trace| async move { message.content.len() }
+	/// }
+	///
+	/// let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_worker(Echo::new(()));
+	/// let workers = builder.allow_cleartext().build().to_workers();
+	/// let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), workers, None);
+	///
+	/// assert!(ctx.worker::<Echo>().is_some());
+	/// ```
+	///
+	/// [`ServletContext::new`]: crate::colony::servlet::ServletContext::new
+	pub fn to_workers(self) -> impl Iterator<Item = Box<dyn WorkerBox>> {
+		self.workers.into_values()
 	}
 
 	/// Takes ownership of the collector gates for the accept loop.
@@ -307,6 +354,7 @@ where
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
 			workers: self.workers,
+			utilization: self.utilization,
 			clock: self.clock,
 		};
 
@@ -314,8 +362,8 @@ where
 	}
 }
 
-/// A fresh builder serves the unit env and is in [`NoAcceptState`]. These are
-/// the states the builder supplies on its own, and four calls leave them:
+/// A fresh builder serves the unit env and is in [`NoAcceptState`]. Four calls
+/// leave these defaults:
 ///
 /// - [`ServletConfigBuilder::with_config`] for the env.
 /// - [`ServletConfigBuilder::with_certificate`],
@@ -336,6 +384,7 @@ where
 			collector_gates: Vec::new(),
 			message_decryptor: None,
 			message_inflator: None,
+			utilization: None,
 			clock: Arc::new(SystemClock),
 			_phantom: PhantomData,
 		}
@@ -348,10 +397,8 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Sets the application env config.
-	///
-	/// This names the servlet's env type, so the compiler checks the handlers
-	/// that read it against the config that carries it.
+	/// Sets the application env config, which names the servlet's env type, so
+	/// the compiler checks the handlers that read it against the config.
 	#[must_use]
 	pub fn with_config<NewEnv>(self, config: Arc<NewEnv>) -> ServletConfigBuilder<P, M, C, NewEnv, A> {
 		ServletConfigBuilder {
@@ -362,27 +409,28 @@ where
 			collector_gates: self.collector_gates,
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
+			utilization: self.utilization,
 			clock: self.clock,
 			_phantom: PhantomData,
 		}
 	}
 
-	/// Sets the clock the servlet's accept loop paces its retries on.
-	///
-	/// The clock defaults to [`SystemClock`].
+	/// Sets the clock the servlet's accept loop paces its retries on,
+	/// [`SystemClock`] by default.
 	#[must_use]
 	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
 		self.clock = clock;
 		self
 	}
 
-	/// Registers a worker under its [`WorkerMetadata`] name.
+	/// Registers `worker` under its type, so a handler reaches it as
+	/// `ctx.relay::<W>(..)`. A second worker of one type replaces the first.
 	pub fn with_worker<W>(mut self, worker: W) -> Self
 	where
-		W: Worker + WorkerMetadata + 'static,
+		W: Worker + 'static,
 	{
-		self.workers
-			.insert(W::name().to_string(), Box::new(worker) as Box<dyn WorkerBox>);
+		let worker: Box<dyn WorkerBox> = Box::new(worker);
+		self.workers.insert(worker.type_key(), worker);
 		self
 	}
 
@@ -420,6 +468,43 @@ where
 		self
 	}
 
+	/// Installs `gauge` as the load the hive reads for this servlet when it
+	/// scales.
+	///
+	/// The servlet's handlers keep their own handle on the gauge to record
+	/// into, so the gauge arrives shared. `G` may be the erased
+	/// `dyn UtilizationGauge`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::{ServletConfig, UtilizationReporter};
+	/// use tightbeam::der::Sequence;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	/// use tightbeam::Beamable;
+	///
+	/// /// The request the servlet serves.
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// struct Ping {
+	///     n: u64,
+	/// }
+	///
+	/// let reporter = Arc::new(UtilizationReporter::default());
+	/// let builder = ServletConfig::<TokioListener, Ping>::builder().with_utilization(Arc::clone(&reporter));
+	/// let config: ServletConfig<TokioListener, Ping> = builder.allow_cleartext().build();
+	/// # drop(config);
+	/// ```
+	#[must_use]
+	pub fn with_utilization<G>(mut self, gauge: Arc<G>) -> Self
+	where
+		G: UtilizationGauge + ?Sized + 'static,
+	{
+		self.utilization = Some(Box::new(SharedGauge(gauge)));
+		self
+	}
+
 	/// This builder in the accept state `accept`, with everything else it
 	/// holds.
 	fn with_accept<B>(self, accept: B) -> ServletConfigBuilder<P, M, C, Env, B> {
@@ -431,6 +516,7 @@ where
 			collector_gates: self.collector_gates,
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
+			utilization: self.utilization,
 			clock: self.clock,
 			_phantom: PhantomData,
 		}
@@ -468,6 +554,7 @@ where
 			collector_gates: self.collector_gates,
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
+			utilization: self.utilization,
 			clock: self.clock,
 		}
 	}
@@ -500,9 +587,6 @@ where
 	/// - A non-empty `validators` turns on mutual authentication, and every
 	///   validator must accept the client certificate.
 	/// - An empty `validators` turns off client authentication.
-	///
-	/// `validators` accepts any iterator of shared [`CertificateValidation`]
-	/// values.
 	///
 	/// # Errors
 	///
@@ -544,11 +628,8 @@ where
 {
 	/// Advertises multiplexing on accepted connections.
 	///
-	/// The handshake binds the offer into its transcript, so this exists
-	/// only after [`ServletConfigBuilder::with_certificate`] or
-	/// [`ServletConfigBuilder::with_identity`] has put the builder in the
-	/// [`WithCertificate`] state, and it lands beside the certificate it binds
-	/// to.
+	/// The handshake binds the offer into its transcript, so this exists only
+	/// in the [`WithCertificate`] state, beside the certificate it binds to.
 	#[must_use]
 	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
 		self.accept.mux_offer = offer.into_mux_offer();

@@ -113,8 +113,6 @@ impl RequestPathState {
 /// refinement checking, out of the events it captured under its
 /// [`TbInstrumentationConfig`].
 ///
-/// - `FullInstrumentation` reads the hidden events, which a trace captures
-///   when its [`TbInstrumentationConfig`] sets `enable_internal_detail`.
 /// - The two instrumentation modes read each event from its one record, in
 ///   recorded order. An event that [`TraceCollector::event`] records enters as
 ///   `assert/label`, `assert/payload`, or `timing/wcet`.
@@ -156,10 +154,10 @@ impl TraceProcessMode {
 	/// alphabet, in the order that the trace recorded them.
 	fn chain(self, trace: &ConsumedTrace) -> Vec<Action> {
 		match self {
-			Self::AssertionsOnly => trace.assertions.iter().map(Self::assertion_action).collect(),
+			Self::AssertionsOnly => trace.assertions().iter().map(Self::assertion_action).collect(),
 			#[cfg(feature = "instrument")]
 			Self::WithObservableInstrumentation | Self::FullInstrumentation => {
-				let records = trace.instrument_events.iter();
+				let records = trace.instrument_events().iter();
 				let selected = records.filter_map(|record| self.action_of(record));
 				selected.collect()
 			}
@@ -308,7 +306,7 @@ impl FdrTraceExt for ConsumedTrace {
 		// A run whose gate accepted is valid when it shows an assertion or a
 		// response. A run with no gate decision takes no gate, so it passes.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
-			&& self.assertions.is_empty()
+			&& self.assertions().is_empty()
 			&& self.response().is_none()
 		{
 			return false;
@@ -321,7 +319,7 @@ impl FdrTraceExt for ConsumedTrace {
 		match self.gate_decision {
 			// An accepted run ends validly when the handler leaves a response
 			// or an assertion.
-			Some(TransitStatus::Ok) => self.response().is_some() || !self.assertions.is_empty(),
+			Some(TransitStatus::Ok) => self.response().is_some() || !self.assertions().is_empty(),
 			// A gate whose status is unknown leaves the run unterminated.
 			Some(TransitStatus::Unknown) => false,
 			// Every other status is a rejection, which is terminal.
@@ -334,7 +332,7 @@ impl FdrTraceExt for ConsumedTrace {
 
 	fn assertion_count(&self, label: impl AsRef<str>) -> usize {
 		let label = label.as_ref();
-		self.assertions
+		self.assertions()
 			.iter()
 			.filter(|a| matches!(&a.label, AssertionLabel::Custom(l) if l.as_ref() == label))
 			.count()
@@ -342,7 +340,7 @@ impl FdrTraceExt for ConsumedTrace {
 
 	#[cfg(feature = "instrument")]
 	fn project_to_observable(&self) -> Vec<String> {
-		self.instrument_events
+		self.instrument_events()
 			.iter()
 			.filter(|e| Record::of(e) == Some(Record::Observable))
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
@@ -351,7 +349,7 @@ impl FdrTraceExt for ConsumedTrace {
 
 	#[cfg(feature = "instrument")]
 	fn project_to_hidden(&self) -> Vec<String> {
-		self.instrument_events
+		self.instrument_events()
 			.iter()
 			.filter(|e| Record::of(e) == Some(Record::Hidden))
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
@@ -546,12 +544,13 @@ mod tests {
 	}
 
 	#[test]
-	fn a_trace_with_no_event_converts_to_a_process_free_of_deadlock() {
+	fn a_trace_with_no_event_converts_to_a_process_free_of_deadlock() -> Result<(), TightBeamError> {
 		let process = ConsumedTrace::new().to_process();
 		let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
 
-		let verdict = explorer.explore();
+		let verdict = explorer.explore()?;
 		assert_eq!(verdict.deadlock_free, Decision::Holds, "the run ended where it started");
+		Ok(())
 	}
 
 	#[cfg(feature = "instrument")]

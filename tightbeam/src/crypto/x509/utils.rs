@@ -15,7 +15,7 @@ use crate::cms::cert::IssuerAndSerialNumber;
 use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::common::Output;
-use crate::crypto::hash::{Digest, OutputSizeUser};
+use crate::crypto::hash::{Digest, DigestWriter, OutputSizeUser};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::{
 	BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, NameConstraints, SubjectAltName, SubjectKeyIdentifier,
@@ -24,7 +24,7 @@ use crate::crypto::x509::Certificate;
 use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString, OctetStringRef};
 use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
 use crate::der::oid::AssociatedOid;
-use crate::der::{Decode, Encode, Reader, Writer};
+use crate::der::{Decode, Encode, Reader};
 use crate::error::ReceivedExpectedError;
 use crate::x509::certificate::{CertificateInner, Profile};
 use crate::x509::serial_number::SerialNumber;
@@ -133,16 +133,6 @@ impl<D: OutputSizeUser> TryFrom<&[u8]> for Fingerprint<D> {
 
 		let bytes = read.ok_or(CertificateValidationError::FingerprintLength(width))?;
 		Ok(Self { bytes })
-	}
-}
-
-/// A DER writer that feeds each encoded octet to the digest it holds.
-struct DigestWriter<D>(D);
-
-impl<D: Digest> Writer for DigestWriter<D> {
-	fn write(&mut self, slice: &[u8]) -> crate::der::Result<()> {
-		self.0.update(slice);
-		Ok(())
 	}
 }
 

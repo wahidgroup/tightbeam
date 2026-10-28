@@ -1114,13 +1114,13 @@ impl From<&crate::crypto::k256::SecretKey> for SecretSlice<u8> {
 /// ```
 /// use std::sync::Arc;
 ///
+/// use tightbeam::asn1::WireDer;
 /// use tightbeam::crypto::aead::{DecryptContent, Encryptor};
 /// use tightbeam::crypto::cms::{BareKemKey, KemRecipient};
 /// use tightbeam::crypto::hpke::{HpkeDecryptor, HpkeEncryptor};
 /// use tightbeam::crypto::k256::{PublicKey, Secp256k1};
 /// use tightbeam::crypto::key::{DiffieHellman, KeyBackend, Secp256k1KeyProvider};
 /// use tightbeam::crypto::profiles::DefaultCryptoProvider;
-/// use tightbeam::der::Encode;
 /// use tightbeam::random::OsRng;
 /// use tightbeam::SigningKey;
 ///
@@ -1130,13 +1130,13 @@ impl From<&crate::crypto::k256::SecretKey> for SecretSlice<u8> {
 /// let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
 ///
 /// let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
-/// let mut sealed = encryptor.encrypt_content(b"hello".to_vec(), None, None)?;
-/// let mut content = sealed.take_content()?;
-/// let arrived = sealed.to_der()?;
+/// let mut envelope = encryptor.encrypt_content(b"hello".to_vec(), None, None)?;
+/// let mut content = envelope.take_content()?;
+/// let sealed = WireDer::new(envelope)?;
 ///
 /// let decryptor = HpkeDecryptor::<DefaultCryptoProvider>::new(BareKemKey::new(public, backend)?);
 /// let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-/// runtime.block_on(decryptor.decrypt_content(&sealed, &arrived, &mut content))?;
+/// runtime.block_on(decryptor.decrypt_content(&sealed, &mut content))?;
 /// assert_eq!(&content[..], b"hello");
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
@@ -2110,6 +2110,7 @@ mod tests {
 	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 	mod frames {
 		use super::*;
+		use crate::asn1::WireDer;
 		use crate::cms::enveloped_data::RecipientInfo;
 		use crate::crypto::aead::{DecryptContent, Encryptor};
 		use crate::crypto::cms::{BareKemKey, KemRecipientInfo, KeyAgreementIdentity};
@@ -2158,9 +2159,10 @@ mod tests {
 
 		/// `sealed` as a frame carries it: the envelope with its content
 		/// detached, beside the content.
-		fn detached(mut sealed: AuthEnvelopedData) -> (AuthEnvelopedData, ZeroizingBytes) {
+		fn detached(mut sealed: AuthEnvelopedData) -> (WireDer<AuthEnvelopedData>, ZeroizingBytes) {
 			let content = sealed.take_content().expect("the seal carries its content");
-			(sealed, content)
+			let envelope = WireDer::new(sealed).expect("the detached envelope encodes");
+			(envelope, content)
 		}
 
 		/// The `KEMRecipientInfo` of `sealed`.
@@ -2178,11 +2180,11 @@ mod tests {
 		#[tokio::test]
 		async fn a_frame_sealed_to_a_bare_key_opens_through_its_bare_kem_key() -> crate::error::Result<()> {
 			let (public, backend) = key_with_backend();
-			let (sealed, arrived) = sealed_to(bare_recipient(&backend));
+			let (sealed, _) = sealed_to(bare_recipient(&backend));
 			let (envelope, mut content) = detached(sealed);
 
 			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+			decryptor.decrypt_content(&envelope, &mut content).await?;
 			assert_eq!(&content[..], FRAMED);
 			Ok(())
 		}
@@ -2192,11 +2194,11 @@ mod tests {
 			let key = Secp256k1SigningKey::random(&mut OsRng);
 			let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(Secp256k1KeyProvider::from(key.to_owned()));
 			let identity = KeyAgreementIdentity::<DhKemSecp256k1>::new(TestCertificate::self_signed(&key), backend)?;
-			let (sealed, arrived) = sealed_to(identity.recipient().clone());
+			let (sealed, _) = sealed_to(identity.recipient().clone());
 			let (envelope, mut content) = detached(sealed);
 
 			let decryptor = HpkeDecryptor::<House>::new(identity);
-			decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+			decryptor.decrypt_content(&envelope, &mut content).await?;
 			assert_eq!(&content[..], FRAMED);
 			Ok(())
 		}
@@ -2205,11 +2207,11 @@ mod tests {
 		async fn a_frame_whose_rid_names_another_key_is_refused() -> crate::error::Result<()> {
 			let (_, sealed_backend) = key_with_backend();
 			let (public, backend) = key_with_backend();
-			let (sealed, arrived) = sealed_to(bare_recipient(&sealed_backend));
+			let (sealed, _) = sealed_to(bare_recipient(&sealed_backend));
 			let (envelope, mut content) = detached(sealed);
 
 			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			let refused = decryptor.decrypt_content(&envelope, &arrived, &mut content).await;
+			let refused = decryptor.decrypt_content(&envelope, &mut content).await;
 			assert!(matches!(
 				refused,
 				Err(crate::TightBeamError::EnvelopeError(EnvelopeError::RecipientIdentifier))
@@ -2225,11 +2227,10 @@ mod tests {
 			let recipient = bare_recipient(&backend);
 			let opening = Recipient::Kem { recipient: &recipient, ukm_label: b"tb/handshake/opening/ukm/v1" };
 			let sealed = AuthEnvelopedData::seal::<House>(opening, DATA, FRAMED, [], None)?;
-			let arrived = sealed.to_der()?;
 			let (envelope, mut content) = detached(sealed);
 
 			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			let refused = decryptor.decrypt_content(&envelope, &arrived, &mut content).await;
+			let refused = decryptor.decrypt_content(&envelope, &mut content).await;
 			assert!(matches!(refused, Err(crate::TightBeamError::EnvelopeError(EnvelopeError::Ukm))));
 			Ok(())
 		}
@@ -2282,11 +2283,10 @@ mod tests {
 			let (public, backend) = key_with_backend();
 			let encryptor = HpkeEncryptor::<House>::new(bare_recipient(&backend));
 			let sealed = encryptor.encrypt_content(FRAMED, Some(ID_SIGNED_DATA), None)?;
-			let arrived = sealed.to_der()?;
 			let (envelope, mut content) = detached(sealed);
 
 			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			decryptor.decrypt_content(&envelope, &arrived, &mut content).await?;
+			decryptor.decrypt_content(&envelope, &mut content).await?;
 			assert_eq!(&content[..], FRAMED);
 			Ok(())
 		}

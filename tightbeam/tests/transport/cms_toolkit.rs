@@ -22,7 +22,7 @@ use tightbeam::crypto::cms::{AuthEnvelopedData, KemRecipientInfo, Opener, Recipi
 use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-use tightbeam::crypto::sign::{CmsSigner, Signed, SignedContent};
+use tightbeam::crypto::sign::{CmsSigner, Signed, SignedContent, SignedDataExt};
 use tightbeam::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::oids::DATA;
@@ -130,7 +130,7 @@ async fn a_tampered_wrapped_key_is_refused() -> Result<(), TightBeamError> {
 #[tokio::test]
 async fn auth_enveloped_data_roundtrip() -> Result<(), TightBeamError> {
 	let attr_value = Any::encode_from(&OctetStringRef::new(b"toolkit-attr")?)?;
-	let attr = Attribute::try_from(HandshakeAttribute::new_single(TOOLKIT_ATTR, attr_value)?)?;
+	let attr = Attribute::try_from(HandshakeAttribute::new(TOOLKIT_ATTR, attr_value))?;
 
 	let plaintext = b"cms toolkit sealed payload";
 	let kek = Kek::try_from(TOOLKIT_KEK.as_slice())?;
@@ -179,7 +179,7 @@ fn signed_wire() -> Result<(Secp256k1SigningKey, Vec<u8>), TightBeamError> {
 fn the_signer_key_verifies_the_signed_content() -> Result<(), TightBeamError> {
 	let (signing_key, wire) = signed_wire()?;
 	let received = Signed::<SignedData>::from_der(&wire)?;
-	let recovered = CmsSigner::content(&received, DATA)?;
+	let recovered = received.content(DATA)?;
 	let signer_info = received
 		.signer_infos
 		.0
@@ -200,7 +200,7 @@ fn a_foreign_key_rejects_the_signature() -> Result<(), TightBeamError> {
 	let foreign_key = Secp256k1SigningKey::random(&mut OsRng);
 
 	let received = Signed::<SignedData>::from_der(&wire)?;
-	let recovered = CmsSigner::content(&received, DATA)?;
+	let recovered = received.content(DATA)?;
 	let signer_info = received
 		.signer_infos
 		.0

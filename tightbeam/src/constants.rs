@@ -6,7 +6,8 @@
 //! - **Accept loops.** The connection cap and retry delay of the servlet, hive, gateway, and `server!` loops.
 //! - **Testing and verification.** Generator constants and seeds for
 //!   deterministic exploration and fault injection.
-//! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
+//! - **Configuration.** Backpressure, mux, envelope, timeout, pool, colony,
+//!   gossip, and peer discovery bounds.
 
 /// KDF info string for the handshake secret (HKDF), which both protocols
 /// extract under the protocol salt:
@@ -191,8 +192,8 @@ const _: () = assert!(prefix_free(TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_CL
 
 /// Minimum salt entropy in bytes for secure key derivation (HKDF).
 ///
-/// CMS and HPKE both read it when they derive session keys through HKDF, and
-/// the salt must carry at least this many bytes of randomness.
+/// The salt of every CMS and HPKE session key derivation must carry at least
+/// this many bytes of randomness.
 pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
 
 /// Maximum HKDF output size in bytes for one expansion, a dual-key expansion
@@ -386,9 +387,9 @@ pub const SPLITMIX64_MIX_2: u64 = 0x94D049BB133111EB;
 
 /// Default seed of the random fault injection strategy, so a run repeats.
 ///
-/// The value `0xDEADBEEF` is the debug marker systems programming uses for
-/// test, debug, or uninitialized state. Override it in production fault tests
-/// through `FaultModel::with_seed(custom_seed)`.
+/// The value `0xDEADBEEF` is the common debug marker for test or uninitialized
+/// state. Override it in production fault tests through
+/// `FaultModel::with_seed(custom_seed)`.
 ///
 /// # Used by
 ///
@@ -661,12 +662,44 @@ pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const MAX_MUX_CONNECTION_REASSEMBLY_BYTES: usize = 4 * MAX_MUX_REASSEMBLY_BYTES;
 
+/// Default cap on the live connections of one [`ConnectionPool`], across
+/// every destination.
+///
+/// [`PoolConfig`] takes it as its default `max_connections`. A dial past the
+/// cap fails with `ResourceExhausted` before it opens a socket.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(all(feature = "std", feature = "transport"))]
+/// # {
+/// use core::time::Duration;
+///
+/// use tightbeam::constants::DEFAULT_MAX_POOL_CONNECTIONS;
+/// use tightbeam::transport::PoolConfig;
+///
+/// let idle_timeout = Some(Duration::from_secs(30));
+/// let config = PoolConfig { idle_timeout, ..PoolConfig::default() };
+/// assert_eq!(config.max_connections, DEFAULT_MAX_POOL_CONNECTIONS);
+/// # }
+/// ```
+///
+/// # Sources
+///
+/// - CWE-400, uncontrolled resource consumption: <https://cwe.mitre.org/data/definitions/400.html>
+///
+/// [`ConnectionPool`]: crate::transport::ConnectionPool
+/// [`PoolConfig`]: crate::transport::PoolConfig
+pub const DEFAULT_MAX_POOL_CONNECTIONS: core::num::NonZeroUsize = match core::num::NonZeroUsize::new(64) {
+	Some(cap) => cap,
+	None => panic!("the default pool cap takes one connection or more"),
+};
+
 /// Ceiling on servlet types carried in one peer advertisement.
 ///
 /// A peer gateway advertisement lists the servlet types its colony exports.
-/// The bound refuses an oversized advertisement before it installs unbounded
-/// peer routes. Gossip meshes apply the same control-message flood bound to
-/// their advertisement path.
+/// A gateway refuses an oversized advertisement before it installs any of its
+/// routes, and the slate it advertises and floods takes the same cap.
 ///
 /// # Sources
 ///

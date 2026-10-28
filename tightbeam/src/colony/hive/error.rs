@@ -10,10 +10,6 @@ use crate::{Errorizable, TightBeamError};
 /// [`core::error::Error::source`].
 #[derive(Errorizable, Debug)]
 pub enum HiveError {
-	/// The servlet ID is not valid. The variant carries the ID bytes.
-	#[error("Invalid servlet ID: {:#?}")]
-	InvalidServletId(Vec<u8>),
-
 	/// An I/O operation of the transport failed.
 	#[error("IO error: {0}")]
 	#[from]
@@ -32,10 +28,6 @@ pub enum HiveError {
 	/// The hive failed to emit a message.
 	#[error("Message emission failed")]
 	EmitFailed,
-
-	/// The exchange ended before a response arrived.
-	#[error("No response received")]
-	NoResponse,
 
 	/// A message failed to decode.
 	#[error("Message decoding failed")]

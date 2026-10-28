@@ -1,7 +1,7 @@
-//! Worker framework for message processing.
+//! The worker framework for message processing.
 //!
-//! Workers are the fundamental processing units in the colony architecture.
-//! They receive messages, apply policies, and produce responses.
+//! A worker is the processing unit of the colony. It receives a message,
+//! applies its receptor policies, and produces a response.
 //!
 //! # Macro path
 //!
@@ -18,8 +18,8 @@
 //!
 //! # Macro-free path
 //!
-//! Use [`WorkerRuntime`] and implement [`Worker`] + [`WorkerMetadata`] on a
-//! thin wrapper. See the [`Worker`] trait docs.
+//! Use [`WorkerRuntime`] and implement [`Worker`] on a thin wrapper. See the
+//! [`Worker`] trait docs.
 
 use std::sync::Arc;
 
@@ -62,73 +62,81 @@ pub type WorkerKillFuture = Pin<Box<dyn Future<Output = Result<(), crate::error:
 ///
 /// A worker owns a bounded request queue and a spawned run loop that
 /// evaluates receptor policies, invokes the handler, and responds through a
-/// oneshot channel per request. Servlets look workers up by
-/// [`WorkerMetadata::name`].
+/// oneshot channel per request. A servlet holds one worker of each type, and
+/// looks a worker up by its type.
 ///
 /// # Macro-free path
 ///
 /// Wrap [`WorkerRuntime`]: call [`WorkerRuntime::new`], then
 /// [`WorkerRuntime::start`] with policies and a handler, and implement
-/// [`Worker`] + [`WorkerMetadata`] by delegating to the runtime (the same
-/// shape `worker!` expands to). `Config` may be `()` or any owned struct.
+/// [`Worker`] by delegating to the runtime (the same shape `worker!` expands
+/// to). `Config` may be `()` or any owned struct.
 ///
 /// # Lifecycle
 ///
-/// [`new`](Worker::new) -> [`start`](Worker::start) ->
-/// [`relay`](Worker::relay) (any number of times) -> [`kill`](Worker::kill).
-/// Dropping a started worker without killing it aborts the run loop instead
-/// of draining it.
+/// [`new`](Worker::new), then [`start`](Worker::start), then
+/// [`relay`](Worker::relay) any number of times, then [`kill`](Worker::kill).
+/// A started worker that drops before its kill aborts the run loop, which
+/// then drains nothing.
+///
+/// A servlet that drains ([`ServletRuntime::drain`]) kills each of its
+/// workers, and a servlet that stops drops them.
+///
+/// [`ServletRuntime::drain`]: crate::colony::servlet::ServletRuntime::drain
 pub trait Worker: Send + Sync + Sized {
-	/// Message type consumed by the handler
+	/// The message type that the handler consumes.
 	type Input: Send + Sync + 'static;
-	/// Response type produced by the handler
+	/// The response type that the handler produces.
 	type Output: Send + 'static;
-	/// Construction-time configuration, exposed to the handler by
-	/// reference; `()` for workers declared without a `config` block
+	/// The configuration the worker takes at construction, which the handler
+	/// reads by reference. It is `()` for a worker declared with no `config`
+	/// block.
 	type Config: Send + Sync + 'static;
 
-	/// Construct an unstarted worker: no queue, no run loop
+	/// Construct an unstarted worker, with no queue and no run loop.
 	///
 	/// [`relay`](Worker::relay) before [`start`](Worker::start) fails with
 	/// [`WorkerRelayError::QueueClosed`].
 	fn new(config: Self::Config) -> Self;
 
-	/// Open the request queue and spawn the run loop
+	/// Open the request queue and spawn the run loop.
 	///
-	/// Consumes the unstarted worker and resolves to the started one.
-	/// Starting an already-started worker is a no-op that returns it
-	/// unchanged. The `trace` collector is attached to every relayed
-	/// request.
+	/// It consumes the unstarted worker and resolves to the started one. A
+	/// start of a started worker returns it unchanged. Each relayed request
+	/// carries `trace`.
 	fn start(self, trace: Arc<TraceCollector>) -> WorkerStartFuture<Self>;
 
-	/// Gracefully stop the worker
+	/// Stop the worker gracefully.
 	///
-	/// Closes the queue so the run loop drains in-flight requests and
-	/// exits, then awaits the join. Fails with
-	/// [`TightBeamError::JoinError`](crate::error::TightBeamError::JoinError)
-	/// if the run loop task cannot be joined.
-	fn kill(self) -> WorkerKillFuture;
+	/// It closes the queue, so the run loop drains the requests in flight and
+	/// exits, then awaits the join.
+	///
+	/// - It takes the worker by reference, so a servlet that shares its workers
+	///   with its handlers kills each one in place.
+	/// - A relay after the kill fails with [`WorkerRelayError::QueueClosed`].
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::JoinError`] -- the run loop task fails to join.
+	///
+	/// [`TightBeamError::JoinError`]: crate::error::TightBeamError::JoinError
+	fn kill(&self) -> WorkerKillFuture;
 
-	/// Enqueue a message and await the handler's response
+	/// Enqueue a message and await the handler's response.
 	///
-	/// Fails with [`WorkerRelayError::QueueClosed`] if the worker was never
-	/// started or already killed, [`WorkerRelayError::Rejected`] if a
-	/// receptor gate refuses the message, and
-	/// [`WorkerRelayError::ResponseDropped`] if the run loop dies before
-	/// responding.
+	/// # Errors
+	///
+	/// - [`WorkerRelayError::QueueClosed`] -- the worker never started, or a kill closed it.
+	/// - [`WorkerRelayError::Rejected`] -- a receptor gate refuses the message.
+	/// - [`WorkerRelayError::ResponseDropped`] -- the run loop ends before it responds.
 	fn relay(&self, message: Arc<Self::Input>) -> WorkerRelayFuture<Self::Output>;
 
-	/// Bound of the request queue
+	/// Returns the bound of the request queue.
 	///
-	/// `0` before [`start`](Worker::start); afterwards the `queue:` value
-	/// from the `worker!` declaration (default 64).
+	/// It is the `queue:` value of the `worker!` declaration (64 by default)
+	/// while the worker runs, and `0` before [`start`](Worker::start) and after
+	/// [`kill`](Worker::kill).
 	fn queue_capacity(&self) -> usize;
-}
-
-/// Provides static metadata about a worker type
-pub trait WorkerMetadata {
-	/// Returns the registration name for this worker
-	fn name() -> &'static str;
 }
 
 pub struct WorkerPolicies<I: Send> {
@@ -148,7 +156,7 @@ impl<I: Send> WorkerPolicies<I> {
 	///
 	/// # Errors
 	///
-	/// The refusing gate's own [`TransitStatus`].
+	/// - [`TransitStatus`] -- a gate refuses the message, under its own status.
 	pub(crate) fn admits(&self, message: &I) -> Result<(), TransitStatus>
 	where
 		I: Message,
@@ -284,7 +292,7 @@ mod tests {
 			PingPongWorker::new(())
 		},
 		assertions: |worker| async move {
-			// Test accepted message
+			// The gate admits a PING, and the handler answers PONG.
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
@@ -292,7 +300,7 @@ mod tests {
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			assert_eq!(response, PongMessage { result: "PONG".to_string() });
 
-			// Test rejected message
+			// The gate refuses other content, so the relay reads `Rejected`.
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
 				lucky_number: 42,

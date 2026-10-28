@@ -89,6 +89,7 @@ mod cms_server {
 	pub use crate::crypto::x509::store::{
 		CertificateTrustBuilder, CertificateTrustStore, NoRevocation, RevocationChecker, TrustBuilder,
 	};
+	pub use crate::crypto::x509::KeyCurves;
 	pub use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 }
 
@@ -1586,7 +1587,7 @@ impl TestCmsServer {
 	/// A store that holds the authority of both certificates and consults
 	/// `checker` on revocation.
 	pub fn store_with(&self, checker: impl RevocationChecker + 'static) -> CertificateTrustStore {
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_revocation_checker(checker);
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, checker);
 		let builder = builder.with_certificate(self.authority.to_owned());
 		builder.expect("the store takes the test authority").build()
 	}

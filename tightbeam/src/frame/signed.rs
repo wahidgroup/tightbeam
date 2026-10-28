@@ -1,19 +1,22 @@
 //! The signed CMS structures the crate holds at its wire slots, and the
 //! reader of the certificates a `SignedData` carries as they arrived.
 
-#[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-hpke")))]
+use alloc::vec::Vec;
 
 use core::ops::Deref;
 
-use crate::asn1::admission::DerAdmission;
-use crate::cms::cert::x509::Certificate;
-use crate::cms::cert::CertificateChoices;
-use crate::cms::signed_data::{CertificateSet, SignedData, SignerInfo};
+use crate::asn1::admission::{Canonical, DerAdmission};
+use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::der::{
-	AnyRef, Decode, DecodeValue, Encode, EncodeValue, Header, Length, Reader, Result as DerResult, Sequence,
-	SliceReader, SliceWriter, Tag, TagNumber, Tagged, Writer,
+	DecodeValue, EncodeValue, Header, Length, Reader, Result as DerResult, Sequence, SliceReader, Tag, TagNumber,
+	Writer,
 };
+
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::sign::{PresentedPath, SignerError};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::der::{AnyRef, Decode, Tagged};
 
 /// The `[0]` tag of the `certificates` field of a `SignedData`.
 pub(crate) const CERTIFICATES_TAG: Tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
@@ -25,8 +28,8 @@ const CRLS_TAG: Tag = Tag::ContextSpecific { constructed: true, number: TagNumbe
 /// crate.
 ///
 /// The signer of `crypto::sign` builds every value the crate emits, and the
-/// DER decoder yields every value it reads. The value reads as `T`, it
-/// encodes as `T` with every SET in DER order, and it is immutable.
+/// DER decoder yields every value it reads. The value reads as `T`, encodes
+/// as `T` with every SET in DER order, and is immutable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signed<T>(T);
 
@@ -42,19 +45,27 @@ impl<T> Signed<T> {
 		self.0
 	}
 
-	/// Decode `contents`, the contents octets of the element `header` heads,
-	/// as `T`, and refuse octets past the value.
+	/// Read the contents of the element `header` heads from `reader`, admit
+	/// them under the CMS rules of the admission walk, decode them as `T`, and
+	/// hold the value to them.
 	///
 	/// # Errors
 	///
-	/// - The decode error of `T`, or [`crate::der::ErrorKind::TrailingData`] -- `contents` is no single `T`.
-	fn decode_contents<'a>(contents: &'a [u8], header: Header) -> DerResult<Self>
+	/// - The errors of the admission walk.
+	/// - The decode error of `T`, or [`crate::der::ErrorKind::TrailingData`] -- they are no single `T`.
+	/// - [`crate::der::ErrorKind::Noncanonical`] -- they are not the DER of the value.
+	fn decode_arrived<'a, R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self>
 	where
-		T: DecodeValue<'a>,
+		T: DecodeValue<'a> + Canonical,
 	{
+		let contents = reader.read_slice(header.length)?;
+		DerAdmission::Cms.admit(contents)?;
+
 		let mut contents_reader = SliceReader::new(contents)?;
 		let value = T::decode_value(&mut contents_reader, header)?;
-		contents_reader.finish(Self(value))
+		let value = contents_reader.finish(value)?;
+		DerAdmission::arrived_as(&value, contents)?;
+		Ok(Self(value))
 	}
 }
 
@@ -72,69 +83,63 @@ impl<T> AsRef<T> for Signed<T> {
 	}
 }
 
-/// The value encodes in place. `der` 0.7 orders each universal SET of a
-/// `SignerInfo` by its octets, as DER does: the RDNs of an
-/// `IssuerAndSerialNumber`, the attributes, and their values.
-impl EncodeValue for Signed<SignerInfo> {
-	fn value_len(&self) -> DerResult<Length> {
-		self.0.value_len()
-	}
-
-	fn encode_value(&self, writer: &mut impl Writer) -> DerResult<()> {
-		self.0.encode_value(writer)
-	}
-}
+/// `der` 0.7 orders each universal SET of a `SignerInfo` by its octets, as
+/// DER does: the RDNs of an `IssuerAndSerialNumber`, the attributes, and
+/// their values. Its order reads the header of an element before the
+/// contents, so the value of an RDN with the shorter encoding sorts first, as
+/// X.690 § 11.6 sorts it.
+impl Canonical for SignerInfo {}
 
 /// The contents go out with every SET in DER order (X.690 § 11.6). `der` 0.7
 /// sorts a SET OF a CHOICE in another order: the `SignerInfos` of a
 /// countersigned `SignedData`, and the `certificates` and `crls` that its
 /// schema tags IMPLICIT. The contents therefore pass through one buffer that
 /// `DerAdmission` arranges.
+impl Canonical for SignedData {
+	fn encode_canonical(&self, writer: &mut impl Writer) -> DerResult<()> {
+		DerAdmission::write_arranged(self, &[CERTIFICATES_TAG, CRLS_TAG], writer)
+	}
+}
+
+/// The value encodes in its canonical form, the form a decode holds an
+/// arrival to.
+impl EncodeValue for Signed<SignerInfo> {
+	fn value_len(&self) -> DerResult<Length> {
+		self.0.value_len()
+	}
+
+	fn encode_value(&self, writer: &mut impl Writer) -> DerResult<()> {
+		self.0.encode_canonical(writer)
+	}
+}
+
+/// The value encodes in its canonical form, the form a decode holds an
+/// arrival to.
 impl EncodeValue for Signed<SignedData> {
 	fn value_len(&self) -> DerResult<Length> {
 		self.0.value_len()
 	}
 
 	fn encode_value(&self, writer: &mut impl Writer) -> DerResult<()> {
-		let contents_len = usize::try_from(self.0.value_len()?)?;
-		let mut contents = vec![0u8; contents_len];
-
-		let mut contents_writer = SliceWriter::new(&mut contents);
-		self.0.encode_value(&mut contents_writer)?;
-		let written = contents_writer.finish()?.len();
-		contents.truncate(written);
-
-		DerAdmission::arrange(&mut contents)?;
-		DerAdmission::arrange_fields(&mut contents, &[CERTIFICATES_TAG, CRLS_TAG])?;
-		writer.write(&contents)
+		self.0.encode_canonical(writer)
 	}
 }
 
 /// The contents pass the CMS rules of the admission walk before the
-/// `SignerInfo` decodes them.
+/// `SignerInfo` decodes them, and the decode holds the value to them, so
+/// they are its DER.
 impl<'a> DecodeValue<'a> for Signed<SignerInfo> {
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self> {
-		let contents = reader.read_slice(header.length)?;
-		DerAdmission::Cms.admit(contents)?;
-		Self::decode_contents(contents, header)
+		Self::decode_arrived(reader, header)
 	}
 }
 
 /// The contents pass the CMS rules of the admission walk before the
-/// `SignedData` decodes them, and each certificate of the decoded set is then
-/// the DER one choice of the set arrived as.
+/// `SignedData` decodes them, and the decode holds the value to them, so they
+/// are its DER and each certificate of its set is the DER it arrived as.
 impl<'a> DecodeValue<'a> for Signed<SignedData> {
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self> {
-		// 1. Walk the contents, and read the `certificates` field as it arrived.
-		let contents = reader.read_slice(header.length)?;
-		DerAdmission::Cms.admit(contents)?;
-		let arrived = ArrivedCertificates::of_fields(contents)?;
-
-		// 2. Decode the contents, and hold each certificate to the bytes it arrived as.
-		let signed = Self::decode_contents(contents, header)?;
-		let certificates = signed.0.certificates.as_ref();
-		arrived.map(|arrived| arrived.admit(certificates)).transpose()?;
-		Ok(signed)
+		Self::decode_arrived(reader, header)
 	}
 }
 
@@ -147,40 +152,31 @@ impl<'a> Sequence<'a> for Signed<SignedData> {}
 /// The `certificates` field of a `SignedData` as it arrived, and the bytes
 /// each of its choices arrived as.
 ///
-/// It is the one reader of a presented set. The decode of a
-/// [`Signed<SignedData>`], and the client's read of a reply, hold each
-/// certificate of the typed set to it.
+/// It is the one reader of a presented set as it arrived: its field, which a
+/// handshake transcript binds, and its count, which a reader bounds before a
+/// typed decode sorts the set.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) struct ArrivedCertificates<'a> {
 	/// The field, from its `[0]` tag on.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	field: &'a [u8],
 	/// The bytes of each choice of the set, in the order they arrived.
 	choices: Vec<&'a [u8]>,
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a> ArrivedCertificates<'a> {
 	/// The `certificates` field of `der`, the encoding of a `SignedData` from
 	/// its tag on, or `None` when `der` carries no such field.
 	///
 	/// # Errors
 	///
-	/// - The errors of [`Self::of_fields`], or the header error -- `der` starts with no DER header.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	/// - [`crate::der::ErrorKind::TagUnexpected`] -- `der` carries a second `certificates` field.
+	/// - The header error -- `der`, its fields, or the field is no run of DER elements.
 	pub(crate) fn read(der: &'a (impl AsRef<[u8]> + ?Sized)) -> DerResult<Option<Self>> {
 		let mut reader = SliceReader::new(der.as_ref())?;
 		let header = Header::decode(&mut reader)?;
 		let fields = reader.read_slice(header.length)?;
-		Self::of_fields(fields)
-	}
 
-	/// The `certificates` field of `fields`, the contents of a `SignedData`,
-	/// or `None` when they carry no such field.
-	///
-	/// # Errors
-	///
-	/// - [`crate::der::ErrorKind::TagUnexpected`] -- `fields` carries a second `certificates` field.
-	/// - The header error -- `fields` or the field is no run of DER elements.
-	fn of_fields(fields: &'a [u8]) -> DerResult<Option<Self>> {
 		// 1. Find the `certificates` field as it arrived.
 		let mut reader = SliceReader::new(fields)?;
 		let mut field = None;
@@ -207,166 +203,104 @@ impl<'a> ArrivedCertificates<'a> {
 			choices.push(elements.tlv_bytes()?);
 		}
 
-		Ok(Some(Self {
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			field,
-			choices,
-		}))
+		Ok(Some(Self { field, choices }))
 	}
 
 	/// The field as it arrived, from its `[0]` tag on, which a handshake
 	/// transcript binds.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn field(&self) -> &'a [u8] {
 		self.field
 	}
 
 	/// The number of choices the set arrived with.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn count(&self) -> usize {
 		self.choices.len()
 	}
 
-	/// Hold each certificate of `typed`, the set decoded from the bytes this
-	/// field was read from, to the bytes one choice arrived as.
-	///
-	/// - A store verifies a signature over the DER of the TBS
-	///   (RFC 5280 § 4.1.1.3), so a certificate in another encoding would
-	///   validate as the certificate its CA signed.
-	/// - The typed decode of a SET refuses two equal elements, so each
-	///   certificate of a set matches a choice of its own.
+	/// Refuse `der`, the encoding of a `SignedData`, when its `certificates`
+	/// field arrived with more choices than a path holds, before a typed
+	/// decode sorts the set.
 	///
 	/// # Errors
 	///
-	/// - [`crate::der::ErrorKind::Noncanonical`] -- a certificate arrived in
-	///   another encoding than its DER (X.690 § 11.5).
-	/// - The encode error of a certificate.
-	pub(crate) fn admit(&self, typed: Option<&CertificateSet>) -> DerResult<()> {
-		let certificates = typed.into_iter().flat_map(|set| set.0.iter()).filter_map(Self::named);
-		for certificate in certificates {
-			if !self.arrived_as(certificate)? {
-				return Err(Tag::Sequence.non_canonical_error());
-			}
-		}
-
-		Ok(())
-	}
-
-	/// Whether one choice of the set arrived as the DER of `certificate`.
-	///
-	/// # Errors
-	///
-	/// - The encode error of `certificate`.
-	fn arrived_as(&self, certificate: &Certificate) -> DerResult<bool> {
-		let len = usize::try_from(certificate.encoded_len()?)?;
-		for arrived in self.choices.iter().filter(|arrived| arrived.len() == len) {
-			if Comparing::encodes_as(certificate, arrived)? {
-				return Ok(true);
-			}
-		}
-
-		Ok(false)
-	}
-
-	/// The certificate `choice` carries, or `None` for a choice of another
-	/// format, which names no certificate (RFC 5652 § 10.2.2).
-	pub(crate) fn named(choice: &CertificateChoices) -> Option<&Certificate> {
-		match choice {
-			CertificateChoices::Certificate(certificate) => Some(certificate),
-			CertificateChoices::Other(_) => None,
-		}
-	}
-
-	/// The certificate `choice` carries, moved out of it, as
-	/// [`Self::named`] reads it.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn into_named(choice: CertificateChoices) -> Option<Certificate> {
-		match choice {
-			CertificateChoices::Certificate(certificate) => Some(certificate),
-			CertificateChoices::Other(_) => None,
-		}
-	}
-}
-
-/// A [`Writer`] that compares the octets an encoder writes with the octets
-/// it expects, run by run, and holds no copy of them.
-struct Comparing<'a> {
-	/// The expected octets the encoder has yet to write, or `None` once a run
-	/// differs from them.
-	rest: Option<&'a [u8]>,
-}
-
-impl<'a> Comparing<'a> {
-	/// Whether `value` encodes as exactly `expected`.
-	///
-	/// # Errors
-	///
-	/// - The encode error of `value`.
-	fn encodes_as(value: &impl Encode, expected: &'a [u8]) -> DerResult<bool> {
-		let mut comparing = Self { rest: Some(expected) };
-		value.encode(&mut comparing)?;
-		Ok(comparing.rest.is_some_and(<[u8]>::is_empty))
-	}
-}
-
-impl Writer for Comparing<'_> {
-	fn write(&mut self, slice: &[u8]) -> DerResult<()> {
-		self.rest = self.rest.and_then(|rest| rest.strip_prefix(slice));
-		Ok(())
+	/// - [`SignerError::Certificate`] -- the set holds more than
+	///   [`MAX_PRESENTED_PATH`](crate::constants::MAX_PRESENTED_PATH) choices.
+	/// - [`SignerError::Encoding`] -- `der` is no SEQUENCE of elements, or it
+	///   carries a second `certificates` field.
+	pub(crate) fn bound_presented(der: &'a (impl AsRef<[u8]> + ?Sized)) -> Result<(), SignerError> {
+		let arrived = Self::read(der)?;
+		let count = arrived.as_ref().map_or(0, Self::count);
+		Ok(PresentedPath::bound(count)?)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::admission::fixtures::descending_attribute;
-	use crate::der::asn1::OctetString;
-	use crate::der::ErrorKind;
+	use crate::asn1::admission::fixtures::{descending_attribute, tlv};
+	use crate::der::asn1::ObjectIdentifier;
+	use crate::der::oid::db::rfc4519::{CN, OU};
+	use crate::der::{Decode, Encode, ErrorKind};
+	use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256};
 
-	/// The DER of an OCTET STRING of `octets`.
-	fn octet_string(octets: &[u8]) -> Vec<u8> {
-		let value = OctetString::new(octets).expect("a test OCTET STRING fits a DER length");
-		value.to_der().expect("a test OCTET STRING encodes")
-	}
-
-	/// The wrapper admits its contents before the typed decode reads them, so
-	/// an `Attribute` of descending values is refused at the walk, before the
-	/// `SignerInfo` decode reads it.
+	/// The wrapper admits its contents before the typed decode, so the walk
+	/// refuses an `Attribute` of descending values before the `SignerInfo`
+	/// decode reads it.
 	#[test]
 	fn a_descending_set_is_refused() {
 		let refused = Signed::<SignerInfo>::from_der(&descending_attribute());
 		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
 	}
 
+	/// The DER of an `AttributeTypeAndValue` of `oid` whose value is the
+	/// UTF8String `value`.
+	fn type_and_value(oid: ObjectIdentifier, value: &str) -> Vec<u8> {
+		let oid = oid.to_der().expect("a test OID encodes");
+		tlv(Tag::Sequence, &[oid, tlv(Tag::Utf8String, value.as_bytes())].concat())
+	}
+
+	/// The `OU` of a two-valued RDN. Its OID sorts after the OID of `CN`, and
+	/// its encoding is the shorter of the two.
+	fn unit() -> Vec<u8> {
+		type_and_value(OU, "a")
+	}
+
+	/// The `CN` of a two-valued RDN, the longer of the two encodings.
+	fn common_name() -> Vec<u8> {
+		type_and_value(CN, "a longer common name")
+	}
+
+	/// The DER of a `SignerInfo` (RFC 5652 § 5.3) as a client of another
+	/// implementation writes it: its `sid` names an issuer of one RDN that
+	/// holds `values` in the order given.
+	fn signer_info_issued_by(values: [Vec<u8>; 2]) -> Vec<u8> {
+		let algorithm = |oid: ObjectIdentifier| tlv(Tag::Sequence, &oid.to_der().expect("a test OID encodes"));
+		let one = tlv(Tag::Integer, &[0x01]);
+		let issuer = tlv(Tag::Sequence, &tlv(Tag::Set, &values.concat()));
+		let sid = tlv(Tag::Sequence, &[issuer, one.clone()].concat());
+		let digest = algorithm(HASH_SHA3_256);
+		let signature_algorithm = algorithm(SIGNER_ECDSA_WITH_SHA256);
+		let signature = tlv(Tag::OctetString, &[0x00; 8]);
+
+		tlv(Tag::Sequence, &[one, sid, digest, signature_algorithm, signature].concat())
+	}
+
+	/// X.690 § 11.6 orders the values of an RDN by their encodings, so the
+	/// shorter `OU` goes first, though the OID of `CN` sorts first. `der`
+	/// writes that order back, so the hold admits it.
 	#[test]
-	fn an_encoding_equal_to_the_expected_octets_matches() -> DerResult<()> {
-		let expected = octet_string(b"abc");
-		let matches = Comparing::encodes_as(&OctetString::new(*b"abc")?, &expected)?;
-		assert!(matches);
+	fn a_signer_whose_issuer_holds_a_two_valued_rdn_in_der_order_is_admitted() -> DerResult<()> {
+		let arrived = signer_info_issued_by([unit(), common_name()]);
+		let admitted = Signed::<SignerInfo>::from_der(&arrived)?;
+		assert_eq!(admitted.to_der()?, arrived);
 		Ok(())
 	}
 
+	/// The same RDN in the order of its OIDs is not its DER.
 	#[test]
-	fn an_encoding_that_differs_in_its_last_octet_is_refused() -> DerResult<()> {
-		let expected = octet_string(b"abx");
-		let matches = Comparing::encodes_as(&OctetString::new(*b"abc")?, &expected)?;
-		assert!(!matches);
-		Ok(())
-	}
-
-	#[test]
-	fn an_encoding_that_ends_short_of_the_expected_octets_is_refused() -> DerResult<()> {
-		let expected = [octet_string(b"abc"), vec![0x00]].concat();
-		let matches = Comparing::encodes_as(&OctetString::new(*b"abc")?, &expected)?;
-		assert!(!matches);
-		Ok(())
-	}
-
-	#[test]
-	fn an_encoding_that_runs_past_the_expected_octets_is_refused() -> DerResult<()> {
-		let expected = octet_string(b"abc");
-		let matches = Comparing::encodes_as(&OctetString::new(*b"abc")?, &expected[..expected.len() - 1])?;
-		assert!(!matches);
-		Ok(())
+	fn a_two_valued_rdn_in_the_order_of_its_oids_is_refused() {
+		let arrived = signer_info_issued_by([common_name(), unit()]);
+		let refused = Signed::<SignerInfo>::from_der(&arrived);
+		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
 	}
 }

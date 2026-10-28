@@ -1,27 +1,49 @@
 use crate::core::Inflator;
 use crate::error::Result;
+use crate::frame::Opened;
 use crate::Frame;
 
 impl Frame {
 	/// Decompress the message body in place for a frame that is cleartext but
 	/// compressed, and clear `compactness` on success.
 	///
-	/// A frame with no `compactness` stays as it is. A failed decompression
-	/// restores the frame to its state before the call.
+	/// - A successful inflate moves the FI digest and the signature into the [`Opened`] it returns.
+	/// - A frame with no `compactness` stays as it is, and its [`Opened`] holds neither.
+	/// - A failed decompression restores the frame to its state before the call.
 	///
 	/// # Errors
 	///
 	/// - The error of [`Inflator::decompress`], when the codec rejects the body.
-	pub fn inflate_in_place(&mut self, inflator: &dyn Inflator) -> Result<()> {
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # #[cfg(feature = "zstd")]
+	/// # {
+	/// use tightbeam::compose;
+	/// use tightbeam::compress::ZstdCompression;
+	/// use tightbeam::testing::TestMessage;
+	///
+	/// let message = TestMessage::sample(None);
+	/// let mut frame = compose! {
+	///     V1: id: "packed", order: 1u64, message: message.clone(), compactness: ZstdCompression::default()
+	/// }?;
+	///
+	/// let _opened = frame.inflate_in_place(&ZstdCompression::default())?;
+	/// assert_eq!(tightbeam::decode::<TestMessage>(frame.message())?, message);
+	/// # }
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
+	pub fn inflate_in_place(&mut self, inflator: &dyn Inflator) -> Result<Opened> {
 		let Some(compactness) = self.metadata.compactness.take() else {
-			return Ok(());
+			return Ok(Opened { integrity: None, nonrepudiation: None });
 		};
 
 		let compressed = core::mem::take(&mut self.message);
 		match inflator.decompress(&compressed) {
 			Ok(plaintext) => {
 				self.message = plaintext;
-				Ok(())
+				Ok(self.take_opened())
 			}
 			Err(err) => {
 				self.message = compressed;
@@ -61,7 +83,7 @@ mod tests {
 	fn restores_original_body_and_clears_compactness() -> Result<()> {
 		let body = b"inflate me".repeat(64);
 		let mut frame = compressed_frame(&body)?;
-		frame.inflate_in_place(&ZstdCompression::default())?;
+		let _opened = frame.inflate_in_place(&ZstdCompression::default())?;
 		assert!(frame.metadata.compactness.is_none());
 		assert_eq!(frame.message, body);
 		Ok(())
@@ -85,8 +107,36 @@ mod tests {
 
 		let mut frame = compose! { V0: id: "inf-002", order: 1u64, message: message }?;
 		let original = frame.clone();
-		frame.inflate_in_place(&ZstdCompression::default())?;
+		let _opened = frame.inflate_in_place(&ZstdCompression::default())?;
 		assert_eq!(frame, original);
 		Ok(())
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "signature"))]
+	mod opened {
+		use super::*;
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::testing::{TestIdentity, TestKey};
+		use crate::TightBeamError;
+
+		/// The signature covers the compressed body, so the inflate moves it
+		/// out of the frame and into the product it returns.
+		#[test]
+		fn an_inflate_moves_the_signature_out_of_the_frame() -> Result<()> {
+			let message = TestMessage::sample(None);
+			let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+			let mut frame = compose! {
+				V1: id: "inf-003",
+					order: 1u64,
+					message: message,
+					compactness: ZstdCompression::default(),
+					nonrepudiation<Secp256k1Signature, _>: signer
+			}?;
+			let signature = frame.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignatureInfo)?;
+
+			let opened = frame.inflate_in_place(&ZstdCompression::default())?;
+			assert_eq!((frame.nonrepudiation(), opened.nonrepudiation()), (None, Some(&signature)));
+			Ok(())
+		}
 	}
 }

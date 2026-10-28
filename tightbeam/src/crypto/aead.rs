@@ -24,7 +24,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::asn1::{AuthEnvelopedData, ObjectIdentifier};
+use crate::asn1::{AuthEnvelopedData, ObjectIdentifier, WireDer};
 use crate::der::oid::AssociatedOid;
 use crate::error::Result as TbResult;
 use crate::random::CryptoRngCore;
@@ -38,7 +38,7 @@ use crate::constants::{
 #[cfg(all(feature = "hpke", feature = "signature"))]
 use crate::crypto::cms::Opener;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-use crate::crypto::cms::{AttributesExt, ContentEncryption, Detached, EnvelopeError, OwnedKek};
+use crate::crypto::cms::{ArrivedEnvelope, AttributesExt, ContentEncryption, Detached, EnvelopeError, OwnedKek};
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::profiles::{CryptoProvider, Kek};
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -78,7 +78,6 @@ pub use oid_wrappers::*;
 ///
 /// The cipher type is the one home for both facts a peer needs about it: the
 /// OID stamped on each ciphertext and, through [`KeySizeUser`], the key length.
-/// Every other view of an AEAD algorithm reads them from here.
 pub trait AeadAlgorithm: Aead + KeySizeUser {
 	/// The algorithm identifier this cipher encrypts under.
 	type Oid: AssociatedOid;
@@ -289,42 +288,61 @@ where
 
 /// An envelope whose content-encryption algorithm matches the decryptor that
 /// opens it, beside the encoding it arrived as and the buffer of its
-/// encrypted content, which the open decrypts in place.
+/// encrypted content, which the open decrypts in place. The envelope and its
+/// encoding come from one [`WireDer`].
 ///
-/// Only this crate creates one, and only after it checks the algorithm, so a
-/// [`Decryptor::open`] call always follows that check (CWE-345).
+/// Only this crate creates one, and only after two checks, so every
+/// [`Decryptor::open`] call follows both (CWE-345):
+///
+/// - The envelope names the algorithm of the decryptor.
+/// - With `aead`, `signature`, `kdf`, and `ecdh`, the encoding it arrived as
+///   carries no `originatorInfo` or `unauthAttrs` (RFC 5083 §2.1).
 pub struct CheckedContent<'a> {
-	envelope: &'a AuthEnvelopedData,
-	arrived: &'a [u8],
+	sealed: &'a WireDer<AuthEnvelopedData>,
+	/// The view of the encoding of `sealed` that the read of [`Self::check`]
+	/// parsed. The house opens read the authenticated attributes from it.
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	arrived: ArrivedEnvelope<'a>,
 	content: &'a mut [u8],
 }
 
 impl<'a> CheckedContent<'a> {
-	/// Admit `envelope`, whose encoding is `arrived` and whose encrypted
-	/// content is in `content`, when it names the `expected` algorithm.
+	/// Admit `sealed`, whose encrypted content is in `content`, when it names
+	/// the `expected` algorithm. With `aead`, `signature`, `kdf`, and `ecdh`,
+	/// the encoding of `sealed` must also pass the read of an arrived
+	/// envelope.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnexpectedAlgorithm`] -- `envelope` names another algorithm.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] -- `sealed` names another algorithm.
+	/// - [`TightBeamError::EnvelopeError`] -- with `aead`, `signature`, `kdf`,
+	///   and `ecdh`, the errors of [`ArrivedEnvelope::read`].
 	pub(crate) fn check(
-		envelope: &'a AuthEnvelopedData,
-		arrived: &'a [u8],
+		sealed: &'a WireDer<AuthEnvelopedData>,
 		content: &'a mut [u8],
 		expected: ObjectIdentifier,
 	) -> TbResult<Self> {
-		let received = envelope.auth_encrypted_content_info.content_enc_alg.oid;
+		let received = sealed.value().auth_encrypted_content_info.content_enc_alg.oid;
 		if received != expected {
 			return Err(TightBeamError::UnexpectedAlgorithm((received, expected).into()));
 		}
 
-		Ok(Self { envelope, arrived, content })
+		#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+		let arrived = ArrivedEnvelope::read(sealed.der())?;
+
+		Ok(Self {
+			sealed,
+			#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+			arrived,
+			content,
+		})
 	}
 
 	/// Returns the envelope, the encoding it arrived as, and the buffer of the
 	/// encrypted content. An open holds the authenticated attributes to that
 	/// encoding.
 	pub fn into_parts(self) -> (&'a AuthEnvelopedData, &'a [u8], &'a mut [u8]) {
-		(self.envelope, self.arrived, self.content)
+		(self.sealed.value(), self.sealed.der(), self.content)
 	}
 
 	/// Open the content in its buffer with `opener` under the algorithms of
@@ -370,9 +388,10 @@ impl<'a> CheckedContent<'a> {
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
-		let Self { envelope, arrived, content } = self;
+		let Self { sealed, arrived, content } = self;
+		let envelope = sealed.value();
 		let content_type = envelope.auth_encrypted_content_info.content_type;
-		Ok(envelope.open_detached::<P>(arrived, content, opener, content_type).await?)
+		Ok(envelope.open_detached::<P>(&arrived, content, opener, content_type).await?)
 	}
 
 	/// Open the content in its buffer under the AEAD of `P` and `kek`, which
@@ -387,9 +406,10 @@ impl<'a> CheckedContent<'a> {
 	where
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
-		let Self { envelope, arrived, content } = self;
+		let Self { sealed, arrived, content } = self;
+		let envelope = sealed.value();
 		let content_type = envelope.auth_encrypted_content_info.content_type;
-		Ok(envelope.open_detached_kek::<P>(arrived, content, kek, key_identifier, content_type)?)
+		Ok(envelope.open_detached_kek::<P>(&arrived, content, kek, key_identifier, content_type)?)
 	}
 }
 
@@ -397,14 +417,16 @@ impl<'a> CheckedContent<'a> {
 /// algorithm.
 ///
 /// Callers decrypt through [`DecryptContent::decrypt_content`], which checks
-/// the algorithm before it calls [`Decryptor::open`]. The open is async,
-/// because a KEM recipient decapsulates through a key backend.
+/// the algorithm before it calls [`Decryptor::open`] ([`CheckedContent`]).
+/// With `aead`, `signature`, `kdf`, and `ecdh`, it also reads the envelope as
+/// it arrived before the open.
 pub trait Decryptor {
 	/// The content-encryption algorithm this decryptor opens.
 	fn algorithm_oid(&self) -> ObjectIdentifier;
 
 	/// Open content that names this decryptor's algorithm in its buffer, so
-	/// the buffer holds the plaintext once the open returns.
+	/// the buffer holds the plaintext once the open returns. The open is
+	/// async, because a KEM recipient decapsulates through a key backend.
 	///
 	/// A refused open MUST leave the buffer unchanged, so a frame that lends
 	/// its body keeps it. The house decryptors keep this, because every check
@@ -430,23 +452,28 @@ impl<D: Decryptor + ?Sized> Decryptor for Arc<D> {
 /// The decryption of [`AuthEnvelopedData`] through any [`Decryptor`].
 ///
 /// The blanket implementation is the only one, so every decryptor refuses an
-/// envelope that names another algorithm.
+/// envelope that names another algorithm. With `aead`, `signature`, `kdf`,
+/// and `ecdh`, every decryptor also refuses an envelope that carries a field
+/// outside the tag ([`CheckedContent`]).
 pub trait DecryptContent {
-	/// Decrypt `content`, the encrypted content of `envelope`, whose encoding
-	/// is `arrived`, in place, so `content` holds the plaintext once the
-	/// decryption returns.
+	/// Decrypt `content`, the encrypted content of the envelope in `sealed`, in
+	/// place, so `content` holds the plaintext once the decryption returns.
 	///
 	/// The check against [`Decryptor::algorithm_oid`] runs before any
-	/// decryption, and a refused decryption leaves `content` unchanged.
+	/// decryption, and with `aead`, `signature`, `kdf`, and `ecdh`, so does
+	/// the read of the encoding of `sealed`. A refused decryption leaves
+	/// `content` unchanged.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnexpectedAlgorithm`] -- `envelope` names another algorithm.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] -- `sealed` names another algorithm.
+	/// - [`TightBeamError::EnvelopeError`] -- with `aead`, `signature`, `kdf`,
+	///   and `ecdh`, the encoding of `sealed` is no DER `AuthEnvelopedData`, or
+	///   it carries `originatorInfo` or `unauthAttrs`.
 	/// - The errors of [`Decryptor::open`].
 	fn decrypt_content<'a>(
 		&'a self,
-		envelope: &'a AuthEnvelopedData,
-		arrived: &'a [u8],
+		sealed: &'a WireDer<AuthEnvelopedData>,
 		content: &'a mut [u8],
 	) -> MaybeSendFuture<'a, TbResult<()>>;
 }
@@ -454,11 +481,10 @@ pub trait DecryptContent {
 impl<D: Decryptor + ?Sized> DecryptContent for D {
 	fn decrypt_content<'a>(
 		&'a self,
-		envelope: &'a AuthEnvelopedData,
-		arrived: &'a [u8],
+		sealed: &'a WireDer<AuthEnvelopedData>,
 		content: &'a mut [u8],
 	) -> MaybeSendFuture<'a, TbResult<()>> {
-		match CheckedContent::check(envelope, arrived, content, self.algorithm_oid()) {
+		match CheckedContent::check(sealed, content, self.algorithm_oid()) {
 			Ok(content) => self.open(content),
 			Err(error) => Box::pin(core::future::ready(Err(error))),
 		}
@@ -606,6 +632,12 @@ impl SendCipher {
 		self.rekey_limit.saturating_sub(used)
 	}
 
+	/// Whether this cipher has no record left to seal, so every seal fails
+	/// with [`TightBeamError::RekeyRequired`].
+	pub fn is_spent(&self) -> bool {
+		self.remaining_records() == 0
+	}
+
 	/// Seal `payload`, the encoded envelope of one record, as the next record.
 	///
 	/// The payload moves in, and the envelope encrypts it in place, so its
@@ -741,9 +773,9 @@ pub struct RecvCipher {
 	epoch: u32,
 	/// The `kekid` every record of this key names, built once.
 	key_identifier: Vec<u8>,
-	/// The packed [`Progress`] of this key. One word holds both facts, so
-	/// one compare-exchange advances them together.
-	progress: AtomicU64,
+	/// How far this key has read. An open takes the key exclusively, so the
+	/// two facts advance together in one assignment.
+	progress: Progress,
 	rekey_limit: u64,
 }
 
@@ -756,31 +788,6 @@ struct Progress {
 	/// The ciphertext bytes the key has opened, which the volume bound caps.
 	opened_bytes: u64,
 }
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl Progress {
-	/// The bits of the packed word that hold the counter. The opened bytes take
-	/// the rest.
-	const COUNTER_BITS: u32 = 24;
-
-	/// Packs both facts into one word, with the opened bytes above the counter.
-	const fn pack(self) -> u64 {
-		(self.opened_bytes << Self::COUNTER_BITS) | self.counter
-	}
-
-	/// Unpacks the facts that a packed word holds.
-	const fn unpack(word: u64) -> Self {
-		let counter = word & ((1 << Self::COUNTER_BITS) - 1);
-		let opened_bytes = word >> Self::COUNTER_BITS;
-		Self { counter, opened_bytes }
-	}
-}
-
-// The largest counter and the largest volume each fit their share of the word.
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT < 1 << Progress::COUNTER_BITS);
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-const _: () = assert!(RENEWAL_VOLUME_BYTES < 1 << (u64::BITS - Progress::COUNTER_BITS));
 
 // AES wipes its round keys on drop under the `zeroize` feature of the `aes`
 // crate alone (CWE-226), so a feature graph that leaves it off fails here.
@@ -802,7 +809,7 @@ impl RecvCipher {
 			aead,
 			epoch,
 			key_identifier,
-			progress: AtomicU64::new(0),
+			progress: Progress { counter: 0, opened_bytes: 0 },
 			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
 		}
 	}
@@ -837,8 +844,7 @@ impl RecvCipher {
 	/// rekey initiator watches the receive direction through the record
 	/// sequence alone.
 	pub fn remaining_records(&self) -> u64 {
-		let progress = Progress::unpack(self.progress.load(Ordering::Relaxed));
-		self.rekey_limit.saturating_sub(progress.counter)
+		self.rekey_limit.saturating_sub(self.progress.counter)
 	}
 
 	/// Open `record`, the DER of one record's `AuthEnvelopedData`, in the
@@ -846,7 +852,8 @@ impl RecvCipher {
 	///
 	/// It checks the record's epoch and sequence number before the content key
 	/// unwraps, and advances the sequence once the tag passes. A refused record
-	/// leaves the sequence unchanged.
+	/// leaves the sequence unchanged. The open takes the key exclusively, so
+	/// two opens on one key run one after the other.
 	///
 	/// # Errors
 	///
@@ -856,7 +863,7 @@ impl RecvCipher {
 	/// - [`TightBeamError::RecordEpoch`] -- the record carries another epoch.
 	/// - [`TightBeamError::NonceReplayed`] -- the record carries another sequence number than the next.
 	/// - [`TightBeamError::RekeyRequired`] -- the record meets either renewal bound.
-	pub fn open<'a>(&self, record: &'a mut [u8]) -> TbResult<&'a [u8]> {
+	pub fn open<'a>(&mut self, record: &'a mut [u8]) -> TbResult<&'a [u8]> {
 		// 1. Decode the record with its content left where it arrived, and read the position it claims.
 		let record = AuthEnvelopedData::detach(record, RECORD_CONTENT_TYPE)?;
 		let carried = RecordSequence::carried_by(record.envelope())?;
@@ -870,10 +877,8 @@ impl RecvCipher {
 			return Err(TightBeamError::RekeyRequired);
 		}
 
-		// This pre-check lets only plausible records reach the key. The
-		// compare-exchange after authentication is the authoritative check.
-		let word = self.progress.load(Ordering::Relaxed);
-		let progress = Progress::unpack(word);
+		// This check lets only plausible records reach the key.
+		let progress = self.progress;
 		if counter != progress.counter {
 			return Err(TightBeamError::NonceReplayed((counter, progress.counter).into()));
 		}
@@ -890,13 +895,8 @@ impl RecvCipher {
 		let opened = self.aead.open(record, &self.key_identifier)?;
 
 		// Advance only after the tag passes, because a forged record could
-		// otherwise block every later legitimate one. The counter is below the
-		// record limit, so the next one fits its share of the word.
-		let next = Progress { counter: counter.saturating_add(1), opened_bytes };
-		self.progress
-			.compare_exchange(word, next.pack(), Ordering::Relaxed, Ordering::Relaxed)
-			.map_err(|current| TightBeamError::NonceReplayed((counter, Progress::unpack(current).counter).into()))?;
-
+		// otherwise block every later legitimate one.
+		self.progress = Progress { counter: counter.saturating_add(1), opened_bytes };
 		Ok(opened)
 	}
 
@@ -915,7 +915,7 @@ impl RecvCipher {
 			aead,
 			epoch: 0,
 			key_identifier,
-			progress: AtomicU64::new(progress.pack()),
+			progress,
 			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
 		}
 	}
@@ -996,6 +996,28 @@ impl SessionKeys {
 	/// Returns the receive-direction cipher.
 	pub fn recv(&self) -> &RecvCipher {
 		&self.recv
+	}
+
+	/// Returns the receive-direction cipher exclusively, which
+	/// [`RecvCipher::open`] takes.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::aead::SessionKeys;
+	/// use tightbeam::der::Encode;
+	/// use tightbeam::testing::TestKey;
+	///
+	/// let mut client = SessionKeys::for_client(TestKey::insecure_directional_keys());
+	/// let server = SessionKeys::for_server(TestKey::insecure_directional_keys());
+	/// let mut record = server.send().encrypt_next(b"to the client".to_vec())?.to_der()?;
+	///
+	/// let opened = client.recv_mut().open(&mut record)?;
+	/// assert_eq!(opened, b"to the client");
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn recv_mut(&mut self) -> &mut RecvCipher {
+		&mut self.recv
 	}
 
 	/// Split into exclusive send and receive halves for transport ownership.
@@ -1122,6 +1144,7 @@ mod tests {
 		let mut second = first.clone();
 		let last = second.last_mut().expect("a recipient ends with its wrapped key");
 		*last ^= 0x01;
+
 		let mut both = [first, second];
 		both.sort();
 
@@ -1134,6 +1157,20 @@ mod tests {
 	fn with_originator_info(record: &[u8]) -> Vec<u8> {
 		let (version, rest) = fields_of(record).split_at(3);
 		tlv(DerTag::Sequence, &[version, &[0xa0, 0x00], rest].concat())
+	}
+
+	/// Returns `record` with a stray `[0] { NULL }` between its
+	/// `authEncryptedContentInfo` and its `[1] authAttrs`, where RFC 5083 §2.1
+	/// places no field.
+	fn with_stray_before_attributes(record: &[u8]) -> Vec<u8> {
+		let mut reader = SliceReader::new(fields_of(record)).expect("a record fits a DER length");
+		let mut fields = Vec::new();
+		while !reader.is_finished() {
+			fields.push(reader.tlv_bytes().expect("a record is a run of DER elements"));
+		}
+
+		fields.insert(3, &[0xa0, 0x02, 0x05, 0x00]);
+		tlv(DerTag::Sequence, &fields.concat())
 	}
 
 	/// Returns `record` with its tag changed in its last octet, the last of
@@ -1205,6 +1242,7 @@ mod tests {
 		let attributes = attributes.into_vec();
 		let rest = attributes.into_iter().filter(|attribute| attribute.oid != RECORD_SEQUENCE);
 		let attributes = SetOfVec::try_from(rest.chain([attribute]).collect::<Vec<_>>());
+
 		envelope.auth_attrs = Some(attributes.expect("distinct attributes are a SET"));
 		envelope.to_der().expect("the record encodes")
 	}
@@ -1215,7 +1253,7 @@ mod tests {
 		let mut first = record_of(&sender);
 		let mut second = record_of(&sender);
 
-		let receiver = test_receiver(0);
+		let mut receiver = test_receiver(0);
 		let first_plain = receiver.open(&mut first)?.to_vec();
 		let second_plain = receiver.open(&mut second)?.to_vec();
 		assert_eq!(first_plain, PLAINTEXT);
@@ -1239,10 +1277,10 @@ mod tests {
 	#[test]
 	fn a_record_carries_its_epoch_and_sequence_in_its_authenticated_attributes() {
 		let sender = test_sender(3);
+
 		// The first record takes sequence 0, so the second carries 1.
 		let _first = record_of(&sender);
 		let second = record_of(&sender);
-
 		assert_eq!(position_of(&second), RecordSequence { epoch: 3, sequence: 1 });
 	}
 
@@ -1261,7 +1299,6 @@ mod tests {
 	fn a_record_declares_id_data() -> TbResult<()> {
 		let sender = test_sender(0);
 		let record = sender.encrypt_next(PLAINTEXT)?;
-
 		assert_eq!(TestAttributes::declared_content_types(&record), (ID_DATA, ID_DATA));
 		Ok(())
 	}
@@ -1274,7 +1311,7 @@ mod tests {
 		let sender = SendCipher::new(test_runtime(), 0, RecordDirection::ClientToServer);
 		let mut record = record_of(&sender);
 
-		let receiver = RecvCipher::new(test_runtime(), 0, RecordDirection::ServerToClient);
+		let mut receiver = RecvCipher::new(test_runtime(), 0, RecordDirection::ServerToClient);
 		let refused = receiver.open(&mut record);
 		assert!(matches!(
 			refused,
@@ -1381,6 +1418,19 @@ mod tests {
 		assert_eq!(encoding_refusal(refused), Some(ErrorKind::Value { tag: originator_tag }));
 	}
 
+	/// `der` skips a context-specific element whose number is below the one
+	/// it looks for, so the receiver holds the decoded record to its arrival
+	/// and refuses a stray `[0]` before `authAttrs`, even under a tag that
+	/// passes (X.690 § 8.9.2).
+	#[test]
+	fn a_record_with_a_stray_context_tag_is_refused() {
+		let mut record = with_stray_before_attributes(&record_of(&test_sender(0)));
+
+		let refused = test_receiver(0).open(&mut record);
+		let noncanonical = ErrorKind::Noncanonical { tag: DerTag::Sequence };
+		assert_eq!(encoding_refusal(refused), Some(noncanonical));
+	}
+
 	/// Each record draws its own content key, and AES key wrap is
 	/// deterministic, so two records under one key-encryption key carry two
 	/// wrapped keys only when their content keys differ.
@@ -1400,7 +1450,7 @@ mod tests {
 		let mut replay = record.clone();
 		let mut original = record;
 
-		let receiver = test_receiver(0);
+		let mut receiver = test_receiver(0);
 		receiver.open(&mut original)?;
 
 		let replayed = receiver.open(&mut replay);
@@ -1431,12 +1481,26 @@ mod tests {
 
 		// The early record fails, as `a_reordered_record_is_refused` shows, and
 		// the refusal is the step under test.
-		let receiver = test_receiver(0);
+		let mut receiver = test_receiver(0);
 		let _refused = receiver.open(&mut early);
 		receiver.open(&mut first)?;
 
 		let opened = receiver.open(&mut second)?;
 		assert_eq!(opened, PLAINTEXT);
+		Ok(())
+	}
+
+	/// A record of the next sequence whose tag fails leaves the sequence, so
+	/// the genuine record of that sequence still opens after it (CWE-345).
+	#[test]
+	fn a_record_whose_tag_fails_leaves_the_sequence() -> TbResult<()> {
+		let mut first = record_of(&test_sender(0));
+		let mut forged = with_forged_tag(&first);
+		let mut receiver = test_receiver(0);
+		let refused = receiver.open(&mut forged).is_err();
+
+		let opened = receiver.open(&mut first)?;
+		assert_eq!((refused, opened), (true, PLAINTEXT));
 		Ok(())
 	}
 
@@ -1447,7 +1511,7 @@ mod tests {
 		let _deleted = record_of(&sender);
 		let mut third = record_of(&sender);
 
-		let receiver = test_receiver(0);
+		let mut receiver = test_receiver(0);
 		receiver.open(&mut first)?;
 
 		// An attacker who excises the middle record desynchronizes the
@@ -1467,7 +1531,7 @@ mod tests {
 		let mut first = record_of(&sender);
 		let mut replay = relabelled(&first, RecordSequence { epoch: 0, sequence: 1 });
 
-		let receiver = test_receiver(0);
+		let mut receiver = test_receiver(0);
 		receiver.open(&mut first)?;
 
 		let refused = receiver.open(&mut replay);
@@ -1569,7 +1633,7 @@ mod tests {
 		let mut first = record_of(&sender);
 		let mut second = record_of(&sender);
 
-		let receiver = test_receiver(0).with_rekey_limit(1);
+		let mut receiver = test_receiver(0).with_rekey_limit(1);
 		receiver.open(&mut first)?;
 		assert_eq!(receiver.remaining_records(), 0);
 
@@ -1581,17 +1645,9 @@ mod tests {
 	fn recv_cipher_fails_closed_at_the_record_limit() {
 		let mut over_bound = record_at(DEFAULT_REKEY_RECORD_LIMIT);
 
-		let receiver = RecvCipher::with_expected_counter(test_runtime(), DEFAULT_REKEY_RECORD_LIMIT);
+		let mut receiver = RecvCipher::with_expected_counter(test_runtime(), DEFAULT_REKEY_RECORD_LIMIT);
 		let refused = receiver.open(&mut over_bound);
 		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
-	}
-
-	/// The packed word holds the largest counter and the largest volume
-	/// together, and reads both back.
-	#[test]
-	fn progress_packs_the_largest_counter_and_volume() {
-		let largest = Progress { counter: DEFAULT_REKEY_RECORD_LIMIT, opened_bytes: RENEWAL_VOLUME_BYTES };
-		assert_eq!(Progress::unpack(largest.pack()), largest);
 	}
 
 	/// A key that has opened the whole renewal volume refuses the next
@@ -1600,7 +1656,7 @@ mod tests {
 	fn recv_cipher_fails_closed_at_the_byte_volume() {
 		let mut record = record_of(&test_sender(0));
 
-		let receiver = RecvCipher::with_progress(test_runtime(), 0, RENEWAL_VOLUME_BYTES);
+		let mut receiver = RecvCipher::with_progress(test_runtime(), 0, RENEWAL_VOLUME_BYTES);
 		let refused = receiver.open(&mut record);
 		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
 	}
@@ -1613,7 +1669,7 @@ mod tests {
 		let mut record = record_of(&test_sender(0));
 		let already_opened = RENEWAL_VOLUME_BYTES - PLAINTEXT_LEN;
 
-		let receiver = RecvCipher::with_progress(test_runtime(), 0, already_opened);
+		let mut receiver = RecvCipher::with_progress(test_runtime(), 0, already_opened);
 		let opened = receiver.open(&mut record)?;
 		assert_eq!(opened, PLAINTEXT);
 		Ok(())
@@ -1628,7 +1684,7 @@ mod tests {
 		let mut second = record_of(&sender);
 		let room_for_one = RENEWAL_VOLUME_BYTES - PLAINTEXT_LEN;
 
-		let receiver = RecvCipher::with_progress(test_runtime(), 0, room_for_one);
+		let mut receiver = RecvCipher::with_progress(test_runtime(), 0, room_for_one);
 		receiver.open(&mut first)?;
 
 		let refused = receiver.open(&mut second);
@@ -1651,17 +1707,17 @@ mod tests {
 		let mut to_default = last.clone();
 		let mut to_raised = last;
 
-		let default_receiver = RecvCipher::with_expected_counter(test_runtime(), last_counter);
+		let mut default_receiver = RecvCipher::with_expected_counter(test_runtime(), last_counter);
 		default_receiver.open(&mut to_default)?;
 
 		let doubled = DEFAULT_MAX_ENCRYPTED_ENVELOPE * 2;
-		let raised = SessionKeys {
+		let mut raised = SessionKeys {
 			send: test_sender(0),
 			recv: RecvCipher::with_expected_counter(test_runtime(), last_counter),
 		}
 		.with_envelope_ceiling(doubled);
 		assert_eq!(raised.recv().rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
-		raised.recv().open(&mut to_raised)?;
+		raised.recv_mut().open(&mut to_raised)?;
 		Ok(())
 	}
 
@@ -1695,14 +1751,15 @@ mod tests {
 
 	#[test]
 	fn session_keys_role_map_is_complementary() -> TbResult<()> {
-		let (client, server) = (SessionKeys::for_client(directional(0)), SessionKeys::for_server(directional(0)));
+		let mut client = SessionKeys::for_client(directional(0));
+		let mut server = SessionKeys::for_server(directional(0));
 
 		let mut request = client.send().encrypt_next(PLAINTEXT)?.to_der()?;
-		let request_plain = server.recv().open(&mut request)?.to_vec();
+		let request_plain = server.recv_mut().open(&mut request)?.to_vec();
 		assert_eq!(request_plain, PLAINTEXT);
 
 		let mut response = server.send().encrypt_next(PLAINTEXT)?.to_der()?;
-		let response_plain = client.recv().open(&mut response)?.to_vec();
+		let response_plain = client.recv_mut().open(&mut response)?.to_vec();
 		assert_eq!(response_plain, PLAINTEXT);
 		Ok(())
 	}
@@ -1711,16 +1768,16 @@ mod tests {
 	/// session carries it, and opens on the peer of the same epoch alone.
 	#[test]
 	fn session_keys_carry_their_epoch_into_both_ciphers() -> TbResult<()> {
-		let client = SessionKeys::for_client(directional(4));
-		let server = SessionKeys::for_server(directional(4));
+		let mut client = SessionKeys::for_client(directional(4));
+		let mut server = SessionKeys::for_server(directional(4));
 
 		let mut request = client.send().encrypt_next(PLAINTEXT)?.to_der()?;
 		let mut response = server.send().encrypt_next(PLAINTEXT)?.to_der()?;
 		assert_eq!(position_of(&request), RecordSequence { epoch: 4, sequence: 0 });
 		assert_eq!(position_of(&response), RecordSequence { epoch: 4, sequence: 0 });
 
-		let request = server.recv().open(&mut request)?.to_vec();
-		let response = client.recv().open(&mut response)?.to_vec();
+		let request = server.recv_mut().open(&mut request)?.to_vec();
+		let response = client.recv_mut().open(&mut response)?.to_vec();
 		assert_eq!((request, response), (PLAINTEXT.to_vec(), PLAINTEXT.to_vec()));
 		Ok(())
 	}
@@ -1746,16 +1803,17 @@ mod tests {
 
 	#[test]
 	fn session_keys_directions_use_distinct_keys() -> TbResult<()> {
-		let (client, server) = (SessionKeys::for_client(directional(0)), SessionKeys::for_server(directional(0)));
+		let mut client = SessionKeys::for_client(directional(0));
+		let mut server = SessionKeys::for_server(directional(0));
 
 		// A request must not open under the response direction even though
 		// both start at sequence zero.
 		let mut request = client.send().encrypt_next(PLAINTEXT)?.to_der()?;
-		let crossed = client.recv().open(&mut request);
+		let crossed = client.recv_mut().open(&mut request);
 		assert!(crossed.is_err());
 
 		let mut response = server.send().encrypt_next(PLAINTEXT)?.to_der()?;
-		let crossed = server.recv().open(&mut response);
+		let crossed = server.recv_mut().open(&mut response);
 		assert!(crossed.is_err());
 		Ok(())
 	}

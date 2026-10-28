@@ -14,7 +14,7 @@ pub(crate) mod transcript;
 #[cfg(feature = "unstable-pqxdh")]
 mod prekeys;
 
-pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
+pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfStage};
 pub use transcript::{transcript_hash, TranscriptHash};
 
 #[cfg(any(feature = "transport-hpke", mux_rekey))]

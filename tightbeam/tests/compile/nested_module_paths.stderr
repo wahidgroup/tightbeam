@@ -37,7 +37,7 @@ note: the module `pool` is defined here
 error[E0603]: module `kdf` is private
  --> tests/compile/nested_module_paths.rs:8:50
   |
-8 | use tightbeam::transport::handshake::primitives::kdf::KdfSalt;
+8 | use tightbeam::transport::handshake::primitives::kdf::KdfInfo;
   |                                                  ^^^ private module
   |
 note: the module `kdf` is defined here

@@ -242,7 +242,7 @@ pub trait TBSpec {
 
 		// 3. Verify every assertion contract.
 		for contract in self.required_assertions() {
-			if !contract.is_satisfied_by(&trace.assertions) {
+			if !contract.is_satisfied_by(trace.assertions()) {
 				let actual_count = trace.count_assertions(&contract.label, contract.tag_filter.as_deref());
 				return Err(SpecViolation::AssertionViolation(AssertionViolationDetail {
 					label: contract.label.clone(),
@@ -261,7 +261,7 @@ pub trait TBSpec {
 		{
 			let required_kinds = self.required_events();
 			let missing =
-				first_missing_in_order(required_kinds, &trace.instrument_events, |event, kind| event.urn == *kind);
+				first_missing_in_order(required_kinds, trace.instrument_events(), |event, kind| event.urn == *kind);
 			if let Some((position, expected)) = missing {
 				let detail = EventOrderViolationDetail { expected_kind: expected.clone(), position };
 				return Err(SpecViolation::EventOrderViolation(detail));
@@ -370,7 +370,7 @@ impl AssertionOrderContract {
 		self.labels.iter().map(|(urn, _)| urn)
 	}
 
-	/// Whether the contract holds no label, so that it admits every trace.
+	/// Whether the contract holds no label, so it admits every trace.
 	///
 	/// # Examples
 	///
@@ -416,7 +416,7 @@ impl AssertionOrderContract {
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	pub fn check(&self, trace: &ConsumedTrace) -> Result<(), SpecViolation> {
-		let unordered = first_missing_in_order(&self.labels, &trace.assertions, |assertion, (_, label)| {
+		let unordered = first_missing_in_order(&self.labels, trace.assertions(), |assertion, (_, label)| {
 			assertion.label.matches(label)
 		});
 		if let Some((position, (expected, _))) = unordered {
@@ -605,11 +605,10 @@ mod tests {
 
 	use super::TBSpec;
 	use crate::error::TightBeamError;
-	use crate::testing::assertions::{Assertion, AssertionLabel};
 	use crate::testing::macros::{AssertSpecBuilder, BuiltAssertSpec};
 	use crate::testing::specs::{EventOrderViolationDetail, SpecViolation};
 	use crate::testing::TestFrame;
-	use crate::trace::{ConsumedTrace, ExecutionMode, IntoEventLabel};
+	use crate::trace::{ConsumedTrace, ExecutionMode, TraceCollector};
 	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec};
 
@@ -618,7 +617,7 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	use crate::testing::specs::EventCountMismatchDetail;
 	#[cfg(feature = "instrument")]
-	use crate::trace::{TraceCollector, TraceConfig};
+	use crate::trace::TraceConfig;
 
 	const STEP: Urn<'static> = crate::urn!("test", "event:assert/step");
 	const FIRST: Urn<'static> = crate::urn!("test", "event:assert/first");
@@ -676,24 +675,18 @@ mod tests {
 
 	/// A trace that records `STEP` `count` times.
 	fn steps(count: usize) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		let label = AssertionLabel::Custom(STEP.into_label());
-		let recorded = (0..count).map(|seq| Assertion::new(seq, label.clone(), Vec::new(), None));
-
-		trace.assertions.extend(recorded);
-		trace
+		let labels = vec![STEP; count];
+		recorded(&labels)
 	}
 
 	/// A trace that records each label of `labels` once, in that order.
 	fn recorded(labels: &[Urn<'static>]) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		let assertions = labels.iter().enumerate().map(|(seq, label)| {
-			let label = AssertionLabel::Custom(label.clone().into_label());
-			Assertion::new(seq, label, Vec::new(), None)
-		});
+		let collector = TraceCollector::new();
+		for label in labels {
+			collector.event(label).expect("the run injects no fault").emit();
+		}
 
-		trace.assertions.extend(assertions);
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
 	/// A spec that requires `FIRST` and then `SECOND`, once each.

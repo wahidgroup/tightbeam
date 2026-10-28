@@ -41,8 +41,8 @@ use tightbeam::{
 			CertifiedKey,
 		},
 		x509::{
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			Certificate, CertificateSpec,
+			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
+			Certificate, CertificateSpec, KeyCurves,
 		},
 	},
 	decode,
@@ -56,6 +56,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer,
+		handshake::PeerAuthentication,
 		tcp::{r#async::TokioListener, TightBeamSocketAddr},
 		ClientBuilder, ConnectionBuilder, GenericClient, TransportError,
 	},
@@ -105,7 +106,7 @@ impl TestCerts {
 		let (cluster_cert, cluster_key) =
 			create_test_cert_with_key("CN=Payment Gateway", 365).expect("Failed to create cluster cert");
 		let cluster_trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::from(Secp256k1Policy::default())
+			CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 				.with_chain(vec![cluster_cert.to_owned()])
 				.expect("Failed to build cluster trust")
 				.build(),
@@ -114,7 +115,7 @@ impl TestCerts {
 		let (hive_cert, hive_key) =
 			create_test_cert_with_key("CN=Payment Hive", 365).expect("Failed to create hive cert");
 		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::from(Secp256k1Policy::default())
+			CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 				.with_chain(vec![hive_cert.to_owned()])
 				.expect("Failed to build hive trust")
 				.build(),
@@ -143,7 +144,8 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 
 fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 	let (certificate, key) = certs.hive_identity();
-	let hive_tls = HiveTlsConfig::new(certificate, key, vec![]).expect("the hive TLS material must decode");
+	let hive_tls = HiveTlsConfig::new(certificate, key, PeerAuthentication::Anonymous);
+	let hive_tls = hive_tls.expect("the hive TLS material must decode");
 	HiveConfig {
 		hive_tls: Some(Arc::new(hive_tls)),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),
@@ -246,7 +248,7 @@ async fn hive_client(certs: &TestCerts, addr: TightBeamSocketAddr) -> GenericCli
 	builder.connect(addr).await.expect("a client of the hive certificate connects")
 }
 
-/// The capture of `capture`, linked to the authorization of `authorized`
+/// The frame that carries `capture`, linked to the authorization `authorized`
 /// through the digest of its body.
 fn capture_frame(certs: &TestCerts, capture: CaptureTransaction, authorized: &CreditTransferTransaction) -> Frame {
 	let body = encode(authorized).expect("a credit transfer encodes");

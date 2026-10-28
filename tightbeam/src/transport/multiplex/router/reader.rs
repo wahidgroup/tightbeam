@@ -270,8 +270,8 @@ impl ReaderEvent {
 ///
 /// A returned [`drive`](MuxReaderDriver::drive), a `drive` future dropped in
 /// the middle of a read, and a driver that never ran all leave nothing to
-/// resolve a stream or a ping. The sweep runs here so that each of them
-/// records the end.
+/// resolve a stream or a ping. The sweep runs here, so each of them records
+/// the end.
 impl<R> Drop for MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
@@ -301,10 +301,10 @@ where
 			link,
 			inbound,
 			grantor: Arc::new(BufferedGrantor::default()),
-			peer_cap: settings.peer_initiated_cap,
-			recv_chunk_size: ChunkSize::new(cap_as_usize(settings.recv_chunk_size)),
-			initial_recv_credit: settings.initial_recv_credit.max(1),
-			recv_budget: settings.recv_budget,
+			peer_cap: settings.peer_initiated_cap(),
+			recv_chunk_size: ChunkSize::new(cap_as_usize(settings.recv_chunk_size())),
+			initial_recv_credit: settings.initial_recv_credit(),
+			recv_budget: settings.recv_budget(),
 			peer_reassembly: HashMap::new(),
 			peer_bodies: HashMap::new(),
 			local_reassembly: HashMap::new(),
@@ -315,7 +315,7 @@ where
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			pending_install: None,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			initial_recv_budget: settings.recv_budget,
+			initial_recv_budget: settings.recv_budget(),
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			renewal_floor: renewal_floor(settings.drain_reserve_records()),
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]

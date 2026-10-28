@@ -3,53 +3,53 @@
 //! They drive the Hive lifecycle through its public interface, over TLS.
 
 use core::time::Duration;
-use std::sync::Arc;
-use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::utils::time::UnixMillis;
-
-use tightbeam::crypto::x509::policy::DirectTrustValidator;
+use std::sync::{Arc, Barrier};
 
 use sha3::Sha3_256;
+use tokio::sync::{AcquireError, Notify, Semaphore, SemaphorePermit};
+
+use tightbeam::builder::frame::FrameBuilder;
+use tightbeam::builder::{CheckDigestOid, TypeBuilder};
 use tightbeam::cms::signed_data::SignerIdentifier;
+use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox, ServletScaleConfig};
+use tightbeam::colony::protocol::{
+	ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HiveManagement, HiveManagementOutcome,
+	ListServletsParams, SpawnServletParams, StopServletParams,
+};
+use tightbeam::colony::servlet::{ServletConfig, UtilizationGauge};
+use tightbeam::colony::urn::ColonyNamespace;
+use tightbeam::crypto::key::Secp256k1KeyProvider;
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+use tightbeam::crypto::sign::SigningIdentity;
+use tightbeam::crypto::x509::policy::DirectTrustValidator;
+use tightbeam::crypto::x509::{Certificate, CertificateSpec, KeyPurposes, PeerCertificate, Signing};
+use tightbeam::der::Sequence;
+use tightbeam::instrumentation::{events, TbInstrumentationConfig};
+use tightbeam::policy::TransitStatus;
+use tightbeam::testing::fixtures::TestTrace;
+use tightbeam::testing::{HiveEnv, SetupEnv, TestCertificate, TestDigest, TestIdentity, TestKey};
+use tightbeam::trace::{TraceCollector, TraceConfig};
+use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::handshake::PeerAuthentication;
+use tightbeam::transport::tcp::r#async::TokioListener;
+use tightbeam::transport::{
+	ClientBuilder, ConnectionBuilder, GenericClient, Protocol, TransportError, TransportFailure,
+};
+use tightbeam::urn::Urn;
+use tightbeam::utils::time::{Clock, ManualClock, UnixMillis};
+use tightbeam::utils::BasisPoints;
 use tightbeam::{
-	absent,
-	builder::{frame::FrameBuilder, CheckDigestOid, TypeBuilder},
-	colony::{
-		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
-		protocol::{
-			ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HiveManagement,
-			HiveManagementOutcome, ListServletsParams, SpawnServletParams, StopServletParams,
-		},
-		servlet::ServletConfig,
-		urn::ColonyNamespace,
-	},
-	compose,
-	crypto::{
-		key::Secp256k1KeyProvider,
-		profiles::DefaultCryptoProvider,
-		sign::ecdsa::Secp256k1SigningKey,
-		x509::{Certificate, CertificateSpec, KeyPurposes, PeerCertificate, Signing},
-	},
-	decode,
-	der::Sequence,
-	exactly, hive,
-	instrumentation::{events, TbInstrumentationConfig},
-	policy::TransitStatus,
-	servlet, tb_assert_spec, tb_scenario,
-	testing::{fixtures::TestTrace, HiveEnv, SetupEnv, TestCertificate, TestDigest, TestIdentity, TestKey},
-	trace::{TraceCollector, TraceConfig},
-	transport::{
-		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
-		GenericClient, Protocol,
-	},
-	urn::Urn,
-	utils::BasisPoints,
-	Beamable, Frame, Message, TightBeamError, Version,
+	absent, compose, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, Beamable, Frame, Message,
+	TightBeamError, Version,
 };
 
 use crate::common::poll::poll_until;
 use crate::common::security::{expectation_failure, pinning_trust_store, ServerMaterials};
 use crate::common::x509::{create_test_cert_with_key, signing_identity};
+
+#[cfg(feature = "instrument")]
+use crate::common::hive::recorded_labels;
 
 fn colony_ns() -> ColonyNamespace {
 	ColonyNamespace::default()
@@ -123,7 +123,7 @@ fn hive_tls() -> HiveTlsConfig {
 	HiveTlsConfig::new(
 		CertificateSpec::Built(Box::new(cert)),
 		Arc::new(Secp256k1KeyProvider::from(signing_key)),
-		vec![],
+		PeerAuthentication::Anonymous,
 	)
 	.expect("the hive TLS material must decode")
 }
@@ -305,11 +305,12 @@ impl TrustedSignerContext {
 	/// key on.
 	fn control_tls(&self) -> HiveTlsConfig {
 		let anchor = DirectTrustValidator::default().with_trust_chain([self.certificate.to_owned()]);
+		let anchor = anchor.expect("a test certificate encodes");
 
 		HiveTlsConfig::new(
 			CertificateSpec::Built(Box::new(self.certificate.to_owned())),
 			self.identity.provider_arc(),
-			vec![Arc::new(anchor)],
+			PeerAuthentication::Anonymous.and(Arc::new(anchor)),
 		)
 		.expect("the hive TLS material must decode")
 	}
@@ -337,10 +338,8 @@ async fn start_trusted_hive(
 	Ok(hive)
 }
 
-/// Dials the hive control plane as the trusted signer.
-///
-/// The client presents `ctx` as its certificate, so the accept side proves
-/// a peer and the security gate has an identity to key its breaker on.
+/// Dials the hive control plane as the trusted signer. The client presents
+/// `ctx` as its certificate, so the security gate has a proven peer to key on.
 async fn connect_hive(
 	hive: &HiveX509Test,
 	ctx: &TrustedSignerContext,
@@ -481,6 +480,15 @@ fn spawned_instance(response: ClusterCommandResponse) -> Result<(TransitStatus, 
 	Ok((spawn.status, instance))
 }
 
+/// The configuration of a hive that pins the context signer in its trust
+/// store and presents the signer's control-plane TLS.
+fn serving_conf(ctx: &TrustedSignerContext) -> Result<HiveConfig, TightBeamError> {
+	let trust_store = Some(pinning_trust_store(&ctx.certificate)?);
+	let hive_tls = Some(Arc::new(ctx.control_tls()));
+
+	Ok(HiveConfig { trust_store, hive_tls, ..Default::default() })
+}
+
 /// Starts an established hive that pins the context signer in its trust
 /// store and registers one [`HiveTestServlet`] under `test_servlet`, so the
 /// signer can spawn and stop instances of that type.
@@ -488,12 +496,14 @@ async fn start_serving_hive(
 	trace: &TraceCollector,
 	ctx: &TrustedSignerContext,
 ) -> Result<HiveX509Test, TightBeamError> {
+	let conf = serving_conf(ctx)?;
+	start_serving_hive_under(trace, conf).await
+}
+
+/// Starts an established hive under `conf` that registers one
+/// [`HiveTestServlet`] under `test_servlet`.
+async fn start_serving_hive_under(trace: &TraceCollector, conf: HiveConfig) -> Result<HiveX509Test, TightBeamError> {
 	let servlet = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
-	let conf = HiveConfig {
-		trust_store: Some(pinning_trust_store(&ctx.certificate)?),
-		hive_tls: Some(Arc::new(ctx.control_tls())),
-		..Default::default()
-	};
 
 	let mut hive = HiveX509Test::new(Some(conf))?;
 	hive.register(servlet_urn("test_servlet"), servlet, |t| {
@@ -978,10 +988,582 @@ tb_scenario! {
 	}
 }
 
+/// Starts a serving hive whose `test_servlet` type holds one instance at
+/// most and at least.
+async fn start_single_instance_hive(ctx: &TrustedSignerContext) -> Result<HiveX509Test, TightBeamError> {
+	let bounds = ServletScaleConfig::new(1, 1, tightbeam::bps!(8000), tightbeam::bps!(2000));
+	let bounds = bounds.expect("one instance is a legal range");
+	let mut conf = serving_conf(ctx)?;
+	conf.scaling.overrides.insert(servlet_urn("test_servlet"), bounds);
+
+	start_serving_hive_under(&TraceCollector::new(), conf).await
+}
+
+/// The instance of the one servlet that `hive` registered.
+fn registered_instance(hive: &HiveX509Test) -> Urn<'static> {
+	let registered = hive.servlet_addresses().into_iter().next();
+	let (servlet_type, address) = registered.expect("the hive registers one servlet");
+
+	let instance = servlet_type.instance_urn(address);
+	instance.expect("the servlet's address names an instance")
+}
+
+/// A spawn past the most instances of its type is refused at capacity, so
+/// the type stays within its bounds (CWE-770).
+#[tokio::test]
+async fn a_manage_spawn_past_max_instances_is_refused_at_capacity() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive At Capacity");
+	let hive = start_single_instance_hive(&signer).await?;
+	let mut client = connect_hive(&hive, &signer).await?;
+
+	let spawn = signed_spawn_frame(&signer.identity, b"spawn-past-max", "test_servlet").await?;
+	let status = manage_spawn_shape_status(emit_command(&mut client, spawn).await?)?;
+	hive.stop();
+
+	assert_eq!(status, TransitStatus::ResourceExhausted);
+	Ok(())
+}
+
+/// A stop of the last instance of a type is refused under its floor, so the
+/// type keeps the fewest instances its bounds name.
+#[tokio::test]
+async fn a_manage_stop_under_min_instances_is_refused() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive Below Floor");
+	let hive = start_serving_hive(&TraceCollector::new(), &signer).await?;
+	let mut client = connect_hive(&hive, &signer).await?;
+
+	let instance = registered_instance(&hive);
+	let stop = signed_stop_instance_frame(&signer.identity, b"stop-the-floor", instance).await?;
+	let status = manage_stop_shape_status(emit_command(&mut client, stop).await?)?;
+	hive.stop();
+
+	assert_eq!(status, TransitStatus::FailedPrecondition);
+	Ok(())
+}
+
+/// A servlet at a fixed locator that reports itself unhealthy.
+struct UnhealthyServlet;
+
+impl ServletBox for UnhealthyServlet {
+	fn addr_bytes(&self) -> Arc<[u8]> {
+		Arc::from(b"127.0.0.1:7060".as_slice())
+	}
+
+	fn stop_boxed(self: Box<Self>) {}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		None
+	}
+
+	fn is_healthy(&self) -> bool {
+		false
+	}
+}
+
+/// Starts a serving hive that registers an [`UnhealthyServlet`] beside its
+/// one [`HiveTestServlet`].
+async fn start_hive_with_an_unhealthy_servlet(ctx: &TrustedSignerContext) -> Result<HiveX509Test, TightBeamError> {
+	let trace = TraceCollector::new();
+	let servlet = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::cleartext()).await?;
+
+	let mut hive = HiveX509Test::new(Some(serving_conf(ctx)?))?;
+	hive.register(servlet_urn("test_servlet"), servlet, |t| {
+		HiveTestServlet::start(t, ServletConfig::cleartext())
+	})?;
+	hive.register(servlet_urn("unhealthy"), UnhealthyServlet, |_| async { Ok(UnhealthyServlet) })?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// Requires the response to name the heartbeat alternative, and returns the
+/// count of servlets it reports.
+fn heartbeat_active_servlets(response: ClusterCommandResponse) -> Result<u32, TightBeamError> {
+	let ClusterCommandResponse::Heartbeat(heartbeat) = response else {
+		return Err(expectation_failure("heartbeat response must not use the manage shape"));
+	};
+
+	Ok(heartbeat.active_servlets)
+}
+
+/// A heartbeat counts the servlets that report themselves healthy, so a
+/// gateway reads the capacity that serves.
+#[tokio::test]
+async fn a_heartbeat_counts_only_the_servlets_that_report_healthy() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive Healthy Count");
+	let hive = start_hive_with_an_unhealthy_servlet(&signer).await?;
+	let mut client = connect_hive(&hive, &signer).await?;
+
+	let beat = signed_heartbeat_frame(&signer.identity, b"beat-healthy-count").await?;
+	let active = heartbeat_active_servlets(emit_command(&mut client, beat).await?)?;
+	hive.stop();
+
+	assert_eq!(active, 1);
+	Ok(())
+}
+
+/// The scaling cadence of the loaded hive, on its manual clock.
+const SCALING_PERIOD: Duration = Duration::from_secs(5);
+
+/// A gauge that reads full load, so the hive scales up the servlet that
+/// holds it.
+struct FullLoad;
+
+impl UtilizationGauge for FullLoad {
+	fn utilization(&self) -> BasisPoints {
+		BasisPoints::MAX
+	}
+}
+
+/// A gauge that reads no load, so the hive scales down the servlets that
+/// hold it.
+#[cfg(feature = "instrument")]
+struct NoLoad;
+
+#[cfg(feature = "instrument")]
+impl UtilizationGauge for NoLoad {
+	fn utilization(&self) -> BasisPoints {
+		BasisPoints::MIN
+	}
+}
+
+/// The configuration of a hive on `clock` that decides its scale once each
+/// [`SCALING_PERIOD`].
+fn scaling_conf(clock: &Arc<ManualClock>) -> HiveConfig {
+	let mut conf = HiveConfig { clock: Arc::clone(clock) as Arc<dyn Clock>, ..Default::default() };
+	conf.scaling.cooldown = SCALING_PERIOD;
+
+	conf
+}
+
+/// Starts a servlet that reads `gauge` and records on `trace`.
+async fn gauged_servlet(
+	trace: &TraceCollector,
+	gauge: Arc<dyn UtilizationGauge>,
+) -> Result<HiveTestServlet, TightBeamError> {
+	let builder = ServletConfig::<TokioListener, HiveTestRequest>::builder().with_utilization(gauge);
+	HiveTestServlet::start(Arc::new(trace.share()), builder.allow_cleartext().build()).await
+}
+
+/// Starts a hive on `clock` with no control plane, whose one servlet holds a
+/// [`FullLoad`] gauge, and which records on `trace`.
+async fn start_loaded_hive(trace: &TraceCollector, clock: &Arc<ManualClock>) -> Result<HiveX509Test, TightBeamError> {
+	let servlet = gauged_servlet(trace, Arc::new(FullLoad)).await?;
+
+	let mut hive = HiveX509Test::new(Some(scaling_conf(clock)))?;
+	hive.register(servlet_urn("loaded"), servlet, |t| {
+		HiveTestServlet::start(t, ServletConfig::cleartext())
+	})?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// The scaling loop records each instance it adds, so the trail shows every
+/// scale (CWE-778). Each poll moves the hive clock one scaling period.
+#[tokio::test]
+async fn a_scale_up_records_hive_scaled() -> Result<(), TightBeamError> {
+	let trace = TraceCollector::new();
+	let clock = Arc::new(ManualClock::default());
+	let hive = start_loaded_hive(&trace, &clock).await?;
+
+	let recorded = poll_until(100, Duration::from_millis(50), || {
+		clock.advance(SCALING_PERIOD);
+		trace.recorded(events::HIVE_SCALED) > 0
+	})
+	.await;
+	hive.stop();
+
+	assert!(recorded);
+	Ok(())
+}
+
+/// The configuration of a serving hive on `clock` that decides its scale once
+/// each [`SCALING_PERIOD`], and whose `gated` type holds two instances at most.
+#[cfg(feature = "instrument")]
+fn contended_conf(ctx: &TrustedSignerContext, clock: &Arc<ManualClock>) -> Result<HiveConfig, TightBeamError> {
+	let bounds = ServletScaleConfig::new(1, 2, tightbeam::bps!(8000), tightbeam::bps!(2000));
+	let bounds = bounds.expect("two instances is a legal range");
+	let mut conf = serving_conf(ctx)?;
+	conf.clock = Arc::clone(clock) as Arc<dyn Clock>;
+	conf.scaling.cooldown = SCALING_PERIOD;
+	conf.scaling.overrides.insert(servlet_urn("gated"), bounds);
+
+	Ok(conf)
+}
+
+/// Starts a serving hive under `conf` whose `gated` servlet holds a
+/// [`FullLoad`] gauge, and whose type spawns each instance only once `gate`
+/// releases it. The hive records on `trace`.
+#[cfg(feature = "instrument")]
+async fn start_contended_hive(
+	trace: &TraceCollector,
+	conf: HiveConfig,
+	gate: &SpawnGate,
+) -> Result<HiveX509Test, TightBeamError> {
+	let servlet = gauged_servlet(trace, Arc::new(FullLoad)).await?;
+
+	let mut hive = HiveX509Test::new(Some(conf))?;
+	let gate = gate.clone();
+	hive.register(servlet_urn("gated"), servlet, move |t| {
+		let gate = gate.clone();
+		async move {
+			gate.pass().await?;
+			HiveTestServlet::start(t, ServletConfig::cleartext()).await
+		}
+	})?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// Moves `clock` one scaling period per poll until a scale-up waits at `gate`.
+///
+/// The wait is bounded, so a hive that starts no scale-up fails the test with
+/// a message.
+#[cfg(feature = "instrument")]
+async fn scale_up_into(gate: &SpawnGate, clock: &ManualClock) -> Result<(), TightBeamError> {
+	let waiting = poll_until(100, Duration::from_millis(50), || {
+		clock.advance(SCALING_PERIOD);
+		gate.is_entered()
+	})
+	.await;
+	let unscaled = || expectation_failure("a loaded type below its bound scales up");
+
+	waiting.then_some(()).ok_or_else(unscaled)
+}
+
+/// A scale-up that a spawn command beats to the bound of its type records its
+/// refusal at capacity, so the trail shows a scale that added no instance
+/// (CWE-778).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_scale_up_beaten_to_the_bound_records_hive_scale_refused() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive Scale Refused");
+	let trace = TraceCollector::new();
+	let clock = Arc::new(ManualClock::default());
+	let gate = SpawnGate::default();
+	let hive = start_contended_hive(&trace, contended_conf(&signer, &clock)?, &gate).await?;
+
+	// 1. The command waits at the gate ahead of the scale-up, so the first
+	//    permit lets the command alone through.
+	let release_the_command = async {
+		gate.entered_by(1).await?;
+		scale_up_into(&gate, &clock).await?;
+		gate.release(1);
+		Ok::<(), TightBeamError>(())
+	};
+	let command = spawn_gated(&hive, &signer, b"spawn-ahead");
+	let (spawned, ()) = tokio::try_join!(command, release_the_command)?;
+
+	// 2. The command holds the last slot of the type, so the scale-up meets
+	//    the bound.
+	gate.release(1);
+	let refused = || trace.recorded(events::HIVE_SCALE_REFUSED) > 0;
+	let recorded = poll_until(100, Duration::from_millis(50), refused).await;
+	hive.stop();
+
+	let labels = recorded_labels(&trace, events::HIVE_SCALE_REFUSED);
+	let at_capacity = (TransitStatus::Ok, true, vec![Some(String::from("AtCapacity"))]);
+	assert_eq!((spawned, recorded, labels), at_capacity);
+	Ok(())
+}
+
+/// Starts a hive on `clock` with no control plane, whose `idle` type holds
+/// two servlets that read no load, and which records on `trace`.
+#[cfg(feature = "instrument")]
+async fn start_idle_hive(trace: &TraceCollector, clock: &Arc<ManualClock>) -> Result<HiveX509Test, TightBeamError> {
+	let first = gauged_servlet(trace, Arc::new(NoLoad)).await?;
+	let second = gauged_servlet(trace, Arc::new(NoLoad)).await?;
+	let spawn = |t: Arc<TraceCollector>| HiveTestServlet::start(t, ServletConfig::cleartext());
+
+	let mut hive = HiveX509Test::new(Some(scaling_conf(clock)))?;
+	hive.register(servlet_urn("idle"), first, spawn)?;
+	hive.register(servlet_urn("idle"), second, spawn)?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// The scaling loop records each instance it takes out of an idle type above
+/// its floor, so the trail shows every scale (CWE-778). Each poll moves the
+/// hive clock one scaling period.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_scale_down_records_hive_scaled_removed() -> Result<(), TightBeamError> {
+	let trace = TraceCollector::new();
+	let clock = Arc::new(ManualClock::default());
+	let hive = start_idle_hive(&trace, &clock).await?;
+
+	let recorded = poll_until(100, Duration::from_millis(50), || {
+		clock.advance(SCALING_PERIOD);
+		trace.recorded(events::HIVE_SCALED) > 0
+	})
+	.await;
+	hive.stop();
+
+	let labels = recorded_labels(&trace, events::HIVE_SCALED);
+	assert_eq!((recorded, labels), (true, vec![Some(String::from("Removed"))]));
+	Ok(())
+}
+
+/// The drain timeout of the gated hive, on its manual clock.
+const GATED_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The two signals of a spawner that waits: the permit it adds when it starts,
+/// and the permit it takes before its servlet starts. Permits add up, so one
+/// gate holds any count of spawns.
+#[derive(Clone)]
+struct SpawnGate {
+	entered: Arc<Semaphore>,
+	release: Arc<Semaphore>,
+}
+
+impl Default for SpawnGate {
+	fn default() -> Self {
+		Self { entered: Arc::new(Semaphore::new(0)), release: Arc::new(Semaphore::new(0)) }
+	}
+}
+
+impl SpawnGate {
+	/// Waits at the gate, from inside a spawner, until the test releases it.
+	async fn pass(&self) -> Result<(), TightBeamError> {
+		self.entered.add_permits(1);
+		let released = self.release.acquire().await;
+
+		released.map(SemaphorePermit::forget).map_err(Self::closed)
+	}
+
+	/// Resolves once `spawns` spawners wait at the gate.
+	async fn entered_by(&self, spawns: u32) -> Result<(), TightBeamError> {
+		let entered = self.entered.acquire_many(spawns).await;
+
+		entered.map(SemaphorePermit::forget).map_err(Self::closed)
+	}
+
+	/// Whether a spawner waits at the gate that no [`Self::entered_by`] has
+	/// counted yet.
+	#[cfg(feature = "instrument")]
+	fn is_entered(&self) -> bool {
+		self.entered.available_permits() > 0
+	}
+
+	/// The failure of a wait on a gate that closed.
+	fn closed(_closed: AcquireError) -> TightBeamError {
+		expectation_failure("a spawn gate stays open")
+	}
+
+	/// Lets `spawns` spawners that wait at the gate start their servlets.
+	fn release(&self, spawns: usize) {
+		self.release.add_permits(spawns);
+	}
+}
+
+/// The configuration of a serving hive on `clock` that drains within
+/// [`GATED_DRAIN_TIMEOUT`].
+fn gated_drain_conf(ctx: &TrustedSignerContext, clock: &Arc<ManualClock>) -> Result<HiveConfig, TightBeamError> {
+	let mut conf = serving_conf(ctx)?;
+	conf.clock = Arc::clone(clock) as Arc<dyn Clock>;
+	conf.control.drain_timeout = GATED_DRAIN_TIMEOUT;
+
+	Ok(conf)
+}
+
+/// Starts a serving hive under `conf` whose `gated` type spawns each instance
+/// only once `gate` releases it.
+async fn start_gated_hive(conf: HiveConfig, gate: &SpawnGate) -> Result<HiveX509Test, TightBeamError> {
+	let trace = Arc::new(TraceCollector::new());
+	let servlet = HiveTestServlet::start(Arc::clone(&trace), ServletConfig::cleartext()).await?;
+
+	let mut hive = HiveX509Test::new(Some(conf))?;
+	let gate = gate.clone();
+	hive.register(servlet_urn("gated"), servlet, move |t| {
+		let gate = gate.clone();
+		async move {
+			gate.pass().await?;
+			HiveTestServlet::start(t, ServletConfig::cleartext()).await
+		}
+	})?;
+	hive.establish(trace).await?;
+	Ok(hive)
+}
+
+/// Drains `hive` with a command in flight, and moves `clock` past the drain
+/// timeout once the drain waits on it, so the drain aborts each registered
+/// servlet and reports its deadline.
+///
+/// The wait for the drain to begin is bounded, so a hive that stays out of
+/// drain fails the test with a message.
+async fn drain_past_the_timeout(hive: &HiveX509Test, clock: &ManualClock) -> Result<(), TightBeamError> {
+	let expire = async {
+		let draining = poll_until(50, Duration::from_millis(100), || hive.is_draining()).await;
+		let unbegun = || expectation_failure("the hive reports draining once its drain begins");
+		draining.then_some(()).ok_or_else(unbegun)?;
+
+		clock.advance(GATED_DRAIN_TIMEOUT);
+		Ok::<(), TightBeamError>(())
+	};
+
+	let (drained, expired) = tokio::join!(hive.drain(), expire);
+	expired?;
+
+	let unreported = || expectation_failure("a drain past its timeout reports its deadline");
+	let reported = matches!(
+		drained,
+		Err(TightBeamError::TransportError(TransportError::OperationFailed(
+			TransportFailure::DeadlineExceeded
+		)))
+	);
+	reported.then_some(()).ok_or_else(unreported)
+}
+
+/// A spawn whose spawner outlives the drain timeout lands in a drained hive,
+/// which registers no servlet for it (CWE-362).
+#[tokio::test]
+async fn a_spawn_that_outlives_the_drain_timeout_registers_no_servlet() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive Late Spawn");
+	let clock = Arc::new(ManualClock::default());
+	let gate = SpawnGate::default();
+	let hive = start_gated_hive(gated_drain_conf(&signer, &clock)?, &gate).await?;
+	let mut client = connect_hive(&hive, &signer).await?;
+	let spawn = signed_spawn_frame(&signer.identity, b"spawn-late", "gated").await?;
+	let spawned = tokio::spawn(async move { emit_command(&mut client, spawn).await });
+
+	gate.entered_by(1).await?;
+	drain_past_the_timeout(&hive, &clock).await?;
+	gate.release(1);
+
+	let reply = spawned.await.map_err(|_| TightBeamError::JoinError)?;
+	reply?;
+
+	let registered = hive.servlet_addresses();
+	hive.stop();
+	assert!(registered.is_empty());
+	Ok(())
+}
+
+/// Starts a serving hive whose `gated` type holds two instances at most, the
+/// one it registers among them, and spawns each instance only once `gate`
+/// releases it.
+async fn start_gated_hive_short_of_its_bound(
+	ctx: &TrustedSignerContext,
+	gate: &SpawnGate,
+) -> Result<HiveX509Test, TightBeamError> {
+	let bounds = ServletScaleConfig::new(1, 2, tightbeam::bps!(8000), tightbeam::bps!(2000));
+	let bounds = bounds.expect("two instances is a legal range");
+	let mut conf = serving_conf(ctx)?;
+	conf.scaling.overrides.insert(servlet_urn("gated"), bounds);
+
+	start_gated_hive(conf, gate).await
+}
+
+/// Spawns one `gated` instance on `hive` as the context signer, on a
+/// connection of its own, and returns the status of the reply.
+async fn spawn_gated(
+	hive: &HiveX509Test,
+	signer: &TrustedSignerContext,
+	id: impl AsRef<[u8]>,
+) -> Result<TransitStatus, TightBeamError> {
+	let mut client = connect_hive(hive, signer).await?;
+	let spawn = signed_spawn_frame(&signer.identity, id, "gated").await?;
+	manage_spawn_shape_status(emit_command(&mut client, spawn).await?)
+}
+
+/// Two spawns that overlap one short of the bound of their type admit one
+/// instance and refuse the other at capacity, so the bound holds for commands
+/// in flight together (CWE-362, CWE-770).
+#[tokio::test]
+async fn two_spawns_that_overlap_at_the_bound_admit_one() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive Overlapping Spawns");
+	let gate = SpawnGate::default();
+	let hive = start_gated_hive_short_of_its_bound(&signer, &gate).await?;
+	let release_both = async {
+		gate.entered_by(2).await?;
+		gate.release(2);
+		Ok::<(), TightBeamError>(())
+	};
+
+	let first = spawn_gated(&hive, &signer, b"spawn-first");
+	let second = spawn_gated(&hive, &signer, b"spawn-second");
+	let (first, second, ()) = tokio::try_join!(first, second, release_both)?;
+
+	hive.stop();
+
+	let statuses = [first, second];
+	assert!(statuses.contains(&TransitStatus::Ok), "{statuses:?}");
+	assert!(statuses.contains(&TransitStatus::ResourceExhausted), "{statuses:?}");
+	Ok(())
+}
+
+/// The two signals of a spawner that holds its worker thread: the one it
+/// sends when it starts, and the barrier it waits at before its servlet
+/// starts.
+///
+/// The spawner blocks where a [`SpawnGate`] spawner awaits, so the control
+/// task that runs it is mid-poll while the test drops the hive, and the abort
+/// of the control plane lands once that poll ends.
+#[derive(Clone)]
+struct BlockingGate {
+	entered: Arc<Notify>,
+	release: Arc<Barrier>,
+}
+
+impl Default for BlockingGate {
+	fn default() -> Self {
+		Self { entered: Arc::default(), release: Arc::new(Barrier::new(2)) }
+	}
+}
+
+/// Starts a serving hive whose `blocking` type spawns each instance behind
+/// `gate`. Each instance it spawns records its stop on `stops`, and the
+/// instance it registers records nothing.
+async fn start_blocking_hive(
+	ctx: &TrustedSignerContext,
+	gate: &BlockingGate,
+	stops: &TraceCollector,
+) -> Result<HiveX509Test, TightBeamError> {
+	let registered = LocatorStopProbe { trace: stops.share(), addr: b"127.0.0.1:7200".to_vec(), report_stop: false };
+	let gate = gate.clone();
+	let stops = stops.share();
+
+	let mut hive = HiveX509Test::new(Some(serving_conf(ctx)?))?;
+	hive.register(servlet_urn("blocking"), registered, move |_| {
+		let gate = gate.clone();
+		let trace = stops.share();
+		async move {
+			gate.entered.notify_one();
+			gate.release.wait();
+			Ok(LocatorStopProbe { trace, addr: b"127.0.0.1:7201".to_vec(), report_stop: true })
+		}
+	})?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
+	Ok(hive)
+}
+
+/// A spawn that lands after its hive drops registers no servlet, and the hive
+/// stops the servlet that the spawner started (CWE-362, CWE-772).
+///
+/// The runtime has two workers, so the spawner holds one of them while the
+/// test drops the hive on its own thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_that_lands_after_the_hive_drops_registers_no_servlet() -> Result<(), TightBeamError> {
+	let signer = trusted_signer("CN=Hive Dropped Spawn");
+	let gate = BlockingGate::default();
+	let stops = TraceCollector::new();
+	let hive = start_blocking_hive(&signer, &gate, &stops).await?;
+	let mut client = connect_hive(&hive, &signer).await?;
+	let spawn = signed_spawn_frame(&signer.identity, b"spawn-dropped", "blocking").await?;
+	// The drop of the hive ends the connection, so the stop of the servlet is
+	// the observable and the reply goes unread.
+	let _reply = tokio::spawn(async move { emit_command(&mut client, spawn).await });
+	gate.entered.notified().await;
+
+	drop(hive);
+	gate.release.wait();
+
+	let stopped = poll_until(50, Duration::from_millis(100), || stops.recorded(SERVLET_STOPPED) == 1).await;
+	assert!(stopped, "the hive stops the servlet of a spawn that lands after its drop");
+	Ok(())
+}
+
 /// A probe servlet with a caller-chosen locator. It emits [`SERVLET_STOPPED`]
-/// on teardown when `report_stop` is set. The non-UTF-8 spawn scenario seeds it
-/// with a UTF-8 locator, so `register` succeeds, and spawns it with a non-UTF-8
-/// locator, so the instance URN fails to build.
+/// on teardown when `report_stop` is set.
 struct LocatorStopProbe {
 	trace: TraceCollector,
 	addr: Vec<u8>,
@@ -1017,8 +1599,9 @@ tb_assert_spec! {
 	}
 }
 
-// The hive must refuse registration of a manage spawn whose locator is not
-// UTF-8, and tear the orphaned servlet down through `stop_boxed`.
+// The hive must refuse to register a manage spawn whose locator is not UTF-8,
+// since its instance URN fails to build, and stop the orphan through
+// `stop_boxed`. The seed holds a UTF-8 locator, so `register` succeeds.
 tb_scenario! {
 	name: hive_manage_spawn_non_utf8_stops_orphan,
 	spec: HiveSpawnNonUtf8Spec,
@@ -1193,8 +1776,7 @@ async fn sign_contract_frame(mut frame: Frame) -> Result<Frame, TightBeamError> 
 }
 
 /// Whether the signature on `frame` verifies against the certificate of the
-/// shared contract key. A verified signature proves byte fidelity end to
-/// end.
+/// shared contract key. A verified signature proves byte fidelity end to end.
 fn contract_signature_verifies(frame: &Frame) -> bool {
 	let certificate = TestCertificate::self_signed(&contract_signing_key());
 	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
@@ -1399,7 +1981,6 @@ async fn carried_out_records(
 #[tokio::test]
 async fn a_hive_names_each_command_it_carries_out() -> Result<(), TightBeamError> {
 	let (records, instance) = carried_out_records(&trusted_signer("CN=Hive Carried Out Cluster")).await?;
-
 	let labels: Vec<Option<String>> = records
 		.into_iter()
 		.map(|event| event.label.as_deref().map(String::from))
@@ -1422,7 +2003,6 @@ async fn a_hive_names_the_peer_of_each_command_it_carries_out() -> Result<(), Ti
 	let expected: [u8; 32] = Sha3_256::digest(key.as_der()).into();
 
 	let (records, _) = carried_out_records(&signer).await?;
-
 	let payloads: Vec<Option<[u8; 32]>> = records.iter().map(|event| event.payload_hash).collect();
 	assert_eq!(payloads, [Some(expected), Some(expected)]);
 	Ok(())
@@ -1451,8 +2031,8 @@ async fn dial_as_stranger(
 }
 
 /// What a hive records after [`REFUSED_PEERS`] strangers fail its
-/// control-plane handshake and it records one event of its own: its own events
-/// that its trace keeps, that trace's overflow latch, and the count of refused
+/// control-plane handshake and it records one event of its own: the hive's own
+/// events its trace keeps, its overflow latch, and the count of refused
 /// certificates on its connection trace. Each trace holds at most
 /// [`REFUSED_PEERS`] events.
 async fn hive_traces_after_refused_peers() -> Result<(Vec<Urn<'static>>, bool, usize), TightBeamError> {
@@ -1504,7 +2084,7 @@ async fn hive_traces_after_anonymous_commands() -> Result<(Vec<Urn<'static>>, bo
 	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
 	let signer = trusted_signer("CN=Hive Anonymous Cluster");
 	let certificate = CertificateSpec::Built(Box::new(signer.certificate.to_owned()));
-	let hive_tls = HiveTlsConfig::new(certificate, signer.identity.provider_arc(), vec![])?;
+	let hive_tls = HiveTlsConfig::new(certificate, signer.identity.provider_arc(), PeerAuthentication::Anonymous)?;
 	let mut hive = HiveX509Test::new(Some(HiveConfig { hive_tls: Some(Arc::new(hive_tls)), ..Default::default() }))?;
 	hive.establish(Arc::new(trace.share())).await?;
 
@@ -1576,10 +2156,8 @@ impl tightbeam::instrumentation::EventSink for Forwarded {
 /// trusted signer sends a heartbeat.
 #[cfg(feature = "instrument")]
 async fn forwarded_connections_of_a_hive() -> Result<usize, TightBeamError> {
-	use tightbeam::trace::TraceConfigBuilder;
-
 	let forwarded = Forwarded::default();
-	let trace = TraceCollector::from(TraceConfigBuilder::default().with_sink(forwarded.clone()).build());
+	let trace = TraceCollector::from(TraceConfig::default().with_sink(forwarded.clone()));
 	let signer = trusted_signer("CN=Hive Forward Cluster");
 	let hive = start_trusted_hive(&trace, &signer, HiveConfig::default()).await?;
 	let mut client = connect_hive(&hive, &signer).await?;

@@ -229,7 +229,9 @@ impl ClusterConfigBuilder {
 	/// - An empty list advertises nothing and refuses every target for external peers and relayed requests.
 	///
 	/// First-party recognition of unexported origin traffic requires mutual TLS
-	/// ([`ClusterTlsConfig::client_validators`](super::ClusterTlsConfig)).
+	/// ([`ClusterTlsConfig::client_authentication`]).
+	///
+	/// [`ClusterTlsConfig::client_authentication`]: super::ClusterTlsConfig::client_authentication
 	pub fn with_exported_types(mut self, exported: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		self.peer.exported_types = Some(Arc::new(StaticExportList::new(exported)));
 		self
@@ -325,11 +327,10 @@ impl ClusterConfigBuilder {
 
 	/// Set the peer gateways this gateway dials to advertise exported types.
 	///
-	/// It takes any iterator of values that convert into [`String`], such as a
-	/// `&str` array. The dial list names whom to dial, and peer trust decides
-	/// which identities federate, so a federation graph can be partial or
-	/// asymmetric. An empty list sets no anchor, so the beat advertises only to
-	/// learned peers its probes proved.
+	/// The dial list names whom to dial, and peer trust decides which
+	/// identities federate, so a federation graph can be partial or asymmetric.
+	/// An empty list sets no anchor, so the beat advertises only to learned
+	/// peers its probes proved.
 	///
 	/// # Errors
 	///
@@ -371,7 +372,6 @@ impl ClusterConfigBuilder {
 
 	/// Restrict claimed peer dial addresses to this allowlist.
 	///
-	/// It takes any iterator of values that convert into [`String`].
 	/// Peer-exchange hints pass the same gate before the discovery table learns
 	/// them. Entries are parsed sockets, so two spellings of one address are
 	/// one entry.

@@ -6,6 +6,7 @@
 //! beats stay disabled, so routes install only through one-shot
 //! [`tightbeam::colony::protocol::ClusterRequest::AdvertisePeer`] actions.
 
+use core::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use tightbeam::policy::GatePolicy;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::client::PoolConfig;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
@@ -64,7 +66,7 @@ pub(crate) struct OrgNode {
 	pub hive: ColonyFuzzHive,
 	/// The CSR issuer handle, when this org serves CSR.
 	pub csr_issuer: Option<Arc<CsrIssuer>>,
-	/// Independent oracle over harness-owned state. The oracle compares its
+	/// The independent oracle over harness-owned state. It compares its
 	/// prediction with the live wire, and a drift between the two flags a
 	/// defect.
 	pub shadow: GatewayShadow,
@@ -185,6 +187,12 @@ pub(crate) fn gateway_bundle(cert: Certificate, key: Secp256k1SigningKey) -> Gat
 	GatewayCerts::new(cert, key, trust)
 }
 
+/// The connection cap of the gateway pool of each org that [`boot_org`] starts.
+const ORG_POOL_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(32) {
+	Some(cap) => cap,
+	None => panic!("a pool cap takes one connection or more"),
+};
+
 /// Per-org boot options for [`boot_org`].
 struct BootOrg {
 	name: &'static str,
@@ -218,11 +226,11 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 	// Mutual-TLS posture: a configured validator makes the accept plane
 	// capture possession-verified client identities, so grants, deny
 	// gates, and first-party origin stay live under the oracle.
-	tls.client_validators = vec![Arc::new(ExpiryValidator)];
+	tls.client_authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
 
 	let pool = PoolConfig {
 		idle_timeout: None,
-		max_connections: 32,
+		max_connections: ORG_POOL_CONNECTIONS,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 	};
 

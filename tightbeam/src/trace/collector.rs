@@ -1,22 +1,21 @@
 use core::cell::Cell;
-#[cfg(feature = "instrument")]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::fmt;
 use core::time::Duration;
-
 use std::borrow::Cow;
 use std::sync::Arc;
-#[cfg(feature = "instrument")]
-use std::sync::{Once, RwLock};
 
-use core::fmt;
+#[cfg(feature = "instrument")]
+use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(any(test, feature = "testing", feature = "testing-fault"))]
 use std::sync::Mutex;
 #[cfg(feature = "testing-fault")]
 use std::sync::OnceLock;
 #[cfg(any(test, feature = "testing", feature = "instrument"))]
 use std::sync::PoisonError;
+#[cfg(feature = "instrument")]
+use std::sync::{Once, RwLock};
 
-use crate::trace::{AssertionValue, TraceConfigBuilder};
+use crate::trace::AssertionValue;
 use crate::urn::Urn;
 
 #[cfg(feature = "instrument")]
@@ -72,10 +71,9 @@ impl IntoEventLabel for &Urn<'_> {
 /// in [`events`] and to its label, the name the event taxonomy gives the step.
 ///
 /// [`enable_internal_detail`]: crate::instrumentation::TbInstrumentationConfig::enable_internal_detail
-// The emit sites sit in the transport, the mux, and the servlet, and `colony`
-// turns on all of them. A build without `colony` leaves out some sites, and a
-// build without `instrument` reads the labels alone, so some variants and the
-// reader have no caller there.
+// `colony` turns on the emit sites in the transport, the mux, and the servlet.
+// A build without it leaves out some sites, and one without `instrument` reads
+// the labels alone, so some variants and the reader have no caller there.
 #[cfg(any(feature = "instrument", feature = "testing-fdr"))]
 #[cfg_attr(not(all(feature = "colony", feature = "instrument")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,20 +145,36 @@ impl InternalEvent {
 	}
 }
 
-/// The configuration of trace collection.
+/// The configuration of trace collection, which a [`TraceCollector`] takes
+/// through [`From`].
+///
+/// - A collector of the [`Default`] configuration records under the default settings into a bounded sink.
+/// - [`Self::with_instrumentation`] starts a configuration of the given settings.
+/// - [`Self::with_sink`] and [`Self::with_logger`] set the sink and the log backend.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig};
+///
+/// let logger = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Error));
+/// let trace = TraceCollector::from(TraceConfig::default().with_logger(logger));
+/// trace.event(tightbeam::instrumentation::events::GATE_ACCEPT)?.emit();
+/// # Ok::<(), tightbeam::TightBeamError>(())
+/// ```
 #[derive(Default)]
 pub struct TraceConfig {
 	/// The instrumentation settings. `None` uses the default settings.
 	#[cfg(feature = "instrument")]
-	pub instrumentation: Option<TbInstrumentationConfig>,
+	instrumentation: Option<TbInstrumentationConfig>,
 	/// The sink that retains and exports events. `None` uses the default
 	/// bounded in-memory buffer ([`BoundedMemorySink`]) sized by
 	/// `instrumentation.max_events`.
 	#[cfg(feature = "instrument")]
-	pub sink: Option<Arc<dyn EventSink>>,
+	sink: Option<Arc<dyn EventSink>>,
 	/// The log backend configuration. `None` leaves events off the log backend.
 	#[cfg(feature = "logging")]
-	pub logger: Option<super::logging::LoggerConfig>,
+	logger: Option<super::logging::LoggerConfig>,
 }
 
 impl fmt::Debug for TraceConfig {
@@ -177,10 +191,25 @@ impl fmt::Debug for TraceConfig {
 }
 
 impl TraceConfig {
-	pub fn builder() -> TraceConfigBuilder {
-		TraceConfigBuilder::default()
-	}
-
+	/// A configuration of `config` as its instrumentation settings, with the
+	/// default sink and no log backend.
+	///
+	/// It starts a configuration, so [`Self::with_sink`] and
+	/// [`Self::with_logger`] follow it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::{events, TbInstrumentationConfig};
+	/// use tightbeam::trace::{TraceCollector, TraceConfig};
+	///
+	/// let settings = TbInstrumentationConfig { max_events: 1, ..Default::default() };
+	/// let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
+	/// trace.emit(events::GATE_ACCEPT, "kept");
+	/// trace.emit(events::GATE_ACCEPT, "dropped");
+	///
+	/// assert_eq!(trace.drain_events().len(), 1);
+	/// ```
 	#[cfg(feature = "instrument")]
 	pub fn with_instrumentation(config: TbInstrumentationConfig) -> Self {
 		Self {
@@ -191,9 +220,80 @@ impl TraceConfig {
 		}
 	}
 
+	/// The instrumentation settings of this configuration. A configuration
+	/// that names none, such as the [`Default`] one, has the default settings.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::TbInstrumentationConfig;
+	/// use tightbeam::trace::TraceConfig;
+	///
+	/// let settings = TbInstrumentationConfig { max_events: 8, ..Default::default() };
+	///
+	/// assert_eq!(TraceConfig::with_instrumentation(settings).instrumentation().max_events, 8);
+	/// assert_eq!(TraceConfig::default().instrumentation().max_events, 1024);
+	/// ```
 	#[cfg(feature = "instrument")]
 	pub fn instrumentation(&self) -> TbInstrumentationConfig {
 		self.instrumentation.unwrap_or_default()
+	}
+
+	/// This configuration with `sink` in place of the default bounded
+	/// in-memory buffer, so the sink decides which events the trace retains.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent};
+	/// use tightbeam::trace::{TraceCollector, TraceConfig};
+	///
+	/// /// A sink that forwards each event to a shared destination.
+	/// struct Forwarding(Arc<BoundedMemorySink>);
+	///
+	/// impl EventSink for Forwarding {
+	///     fn emit(&self, event: TbEvent) {
+	///         self.0.emit(event);
+	///     }
+	///
+	///     fn drain(&self) -> Vec<TbEvent> {
+	///         Vec::new()
+	///     }
+	///
+	///     fn overflowed(&self) -> bool {
+	///         self.0.overflowed()
+	///     }
+	/// }
+	///
+	/// let destination = Arc::new(BoundedMemorySink::default());
+	/// let config = TraceConfig::default().with_sink(Forwarding(Arc::clone(&destination)));
+	/// TraceCollector::from(config).emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// assert_eq!(destination.drain().len(), 1);
+	/// ```
+	#[cfg(feature = "instrument")]
+	pub fn with_sink(mut self, sink: impl EventSink + 'static) -> Self {
+		self.sink = Some(Arc::new(sink));
+		self
+	}
+
+	/// This configuration with `config` as the log backend of the trace.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig};
+	///
+	/// let logger = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Warning));
+	/// let config = TraceConfig::default().with_logger(logger.with_default_level(LogLevel::Informational));
+	/// let trace = TraceCollector::from(config);
+	/// ```
+	#[cfg(feature = "logging")]
+	pub fn with_logger(mut self, config: super::logging::LoggerConfig) -> Self {
+		self.logger = Some(config);
+		self
 	}
 }
 
@@ -249,6 +349,9 @@ pub struct EventBuilder<'a, V: Into<EventValue> = ()> {
 	instrumented: bool,
 	#[cfg(feature = "logging")]
 	log_level: Option<super::logging::LogLevel>,
+	/// The component that the log record of the event names.
+	#[cfg(feature = "logging")]
+	component: Option<Cow<'static, str>>,
 	emitted: Cell<bool>,
 }
 
@@ -272,6 +375,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 			instrumented: true,
 			#[cfg(feature = "logging")]
 			log_level: None,
+			#[cfg(feature = "logging")]
+			component: None,
 			emitted: Cell::new(false),
 		}
 	}
@@ -279,7 +384,7 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 	/// Adds timing information to the event.
 	#[cfg(any(feature = "instrument", feature = "logging"))]
 	pub fn with_timing(mut self, duration: Duration) -> Self {
-		self.duration_ns = Some(duration.as_nanos() as u64);
+		self.duration_ns = Some(saturating_nanos(duration));
 		self
 	}
 
@@ -288,10 +393,8 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 		self
 	}
 
-	/// Sets the log level for this event.
-	///
-	/// With a log level set, the event also goes to the log backend, when the
-	/// collector has one and its filter admits the level.
+	/// Sets the log level of this event, so the event also goes to the log
+	/// backend when the collector has one and its filter admits the level.
 	#[cfg(feature = "logging")]
 	pub fn with_log_level(mut self, level: super::logging::LogLevel) -> Self {
 		self.log_level = Some(level);
@@ -300,6 +403,39 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 	#[cfg(not(feature = "logging"))]
 	pub fn with_log_level(self, _level: ()) -> Self {
+		self
+	}
+
+	/// Names the component of this event. The log record of the event carries
+	/// it, and the logger's filter reads the level against the override of
+	/// that component.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector};
+	/// use tightbeam::urn::Urn;
+	///
+	/// const LOGIN: Urn<'static> = tightbeam::urn!("doc", "event:security/login");
+	///
+	/// let filter = LogFilter::new(LogLevel::Warning).with_component("security", LogLevel::Debug);
+	/// let trace = TraceCollector::default().with_logger(LoggerConfig::new(StdoutBackend, filter))?;
+	///
+	/// // The override of `security` admits this debug record.
+	/// let login = trace.event(LOGIN)?.with_component("security");
+	/// login.with_log_level(LogLevel::Debug).emit();
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[cfg(feature = "logging")]
+	pub fn with_component(mut self, component: impl Into<Cow<'static, str>>) -> Self {
+		self.component = Some(component.into());
+		self
+	}
+
+	/// Names the component of this event, which a build with `logging`
+	/// carries to the log record of the event.
+	#[cfg(not(feature = "logging"))]
+	pub fn with_component(self, _component: impl Into<Cow<'static, str>>) -> Self {
 		self
 	}
 
@@ -320,28 +456,25 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 		// The log backend reads the label before the label moves out below.
 		#[cfg(feature = "logging")]
 		if let Some(logger_config) = &self.collector.state.logger_config {
-			let effective_level = self.log_level.or(logger_config.default_level);
-			if let Some(level) = effective_level {
-				if logger_config.filter.should_log(level, None) {
-					let label_str = match &self.label {
-						Cow::Borrowed(s) => *s,
-						Cow::Owned(s) => s.as_str(),
-					};
+			let component = self.component.as_deref();
+			if let Some(level) = logger_config.admit(self.log_level, component) {
+				let label_str = match &self.label {
+					Cow::Borrowed(s) => *s,
+					Cow::Owned(s) => s.as_str(),
+				};
 
-					let record = LogRecord {
-						level,
-						timestamp: self.collector.log_timestamp(),
-						component: None, // TODO: Extract from tags
-						message: label_str,
-						metadata: None, // TODO: Extract from value
-					};
+				let record = LogRecord {
+					level,
+					timestamp: self.collector.log_timestamp(),
+					component,
+					message: label_str,
+					metadata: None,
+				};
 
-					// The trace is the evidence and the log is a convenience,
-					// so the event reaches the trace even when the backend
-					// refuses the log record. The outcome of the log write
-					// stops here, because `emit` and the drop return `()`.
-					let _unlogged = logger_config.backend.emit(&record);
-				}
+				// The trace is the evidence and the log a convenience, so a
+				// refused log record still leaves the event on the trace. The
+				// log outcome stops here, because `emit` and drop return `()`.
+				let _unlogged = logger_config.backend.emit(&record);
 			}
 		}
 
@@ -486,6 +619,12 @@ impl SinkHandle {
 	}
 }
 
+/// The nanoseconds of `span`, saturated to the range of a `u64`.
+#[cfg(any(feature = "instrument", feature = "logging"))]
+fn saturating_nanos(span: Duration) -> u64 {
+	u64::try_from(span.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// A clock beside the readings it gave when a collector adopted it, and
 /// whether an event recorded them.
 #[cfg(feature = "instrument")]
@@ -516,7 +655,7 @@ impl TraceOrigin {
 	/// a `u64`.
 	fn offset_ns(&self) -> u64 {
 		let since = self.clock.monotonic().saturating_duration_since(self.monotonic);
-		u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+		saturating_nanos(since)
 	}
 
 	/// The origin as Unix-epoch nanoseconds, at the millisecond precision of
@@ -539,15 +678,16 @@ impl TraceOrigin {
 #[cfg(feature = "instrument")]
 #[derive(Debug)]
 struct TraceClock {
-	/// The adopted clock with its origin.
-	origin: RwLock<Option<TraceOrigin>>,
+	/// The adopted clock with its origin, which each event clones out from
+	/// under the read guard.
+	origin: RwLock<Option<Arc<TraceOrigin>>>,
 }
 
 #[cfg(feature = "instrument")]
 impl Default for TraceClock {
 	fn default() -> Self {
 		#[cfg(host_clock)]
-		let origin = Some(TraceOrigin::of(Arc::new(SystemClock)));
+		let origin = Some(Arc::new(TraceOrigin::of(Arc::new(SystemClock))));
 		#[cfg(not(host_clock))]
 		let origin = None;
 		Self { origin: RwLock::new(origin) }
@@ -574,7 +714,7 @@ impl TraceClock {
 	#[cfg(any(feature = "testing-fdr", feature = "colony"))]
 	fn split(&self) -> Self {
 		let origin = self.clock().map(TraceOrigin::of);
-		Self { origin: RwLock::new(origin) }
+		Self { origin: RwLock::new(origin.map(Arc::new)) }
 	}
 
 	/// Adopts `clock` with a new origin, which the next event records.
@@ -582,23 +722,29 @@ impl TraceClock {
 	/// A write under the lock replaces the origin whole, so a poisoned lock
 	/// takes the new origin too.
 	fn adopt(&self, clock: Arc<dyn Clock>) {
-		let origin = TraceOrigin::of(clock);
+		let origin = Arc::new(TraceOrigin::of(clock));
 		let mut slot = self.origin.write().unwrap_or_else(PoisonError::into_inner);
 		*slot = Some(origin);
 	}
 
-	/// Stamps one event on the adopted clock under one read guard.
+	/// Stamps one event on the adopted clock.
 	///
 	/// - `record` receives the origin as Unix-epoch nanoseconds when the event is the first on it.
 	/// - `emit` then receives the nanoseconds on the clock since the origin, or `None` with no clock adopted.
 	///
-	/// An adoption takes the write lock, so it lands before the origin record
-	/// or after the event. Each other event on the origin waits for its
-	/// record, so every event counts from an origin the trace recorded before
-	/// it.
+	/// # Order
+	///
+	/// - The event stamps on the origin it clones under the read guard, which
+	///   drops before `record` and `emit`.
+	/// - The `Once` of the origin lands its record before the event, and holds
+	///   each other event on it until then.
+	/// - An adoption between the clone and the event moves the origin of later events alone.
 	fn stamp(&self, record: impl FnOnce(u128), emit: impl FnOnce(Option<u64>)) {
 		let guard = self.origin.read().unwrap_or_else(PoisonError::into_inner);
-		let Some(origin) = guard.as_ref() else {
+		let origin = guard.as_ref().map(Arc::clone);
+		drop(guard);
+
+		let Some(origin) = origin else {
 			emit(None);
 			return;
 		};
@@ -665,7 +811,7 @@ struct TraceState {
 	exchanges: Mutex<ExchangeRecord>,
 	/// The sink owns event retention. The default is a bounded in-memory
 	/// buffer ([`BoundedMemorySink`]), and consumers may inject their own
-	/// through [`TraceConfig::sink`].
+	/// through [`TraceConfig::with_sink`].
 	#[cfg(feature = "instrument")]
 	sink: SinkHandle,
 	#[cfg(feature = "instrument")]
@@ -713,10 +859,8 @@ impl TraceState {
 		}
 	}
 
-	/// A state for the connections of a plane that this state audits.
-	///
-	/// It shares the logger, the fault slot, and the assertion log. Its sink is
-	/// the one that [`EventSink::sibling`] names.
+	/// The state of [`TraceCollector::connections`], for the connections of a
+	/// plane that this state audits.
 	#[cfg(feature = "colony")]
 	fn for_connections(&self) -> Self {
 		Self {
@@ -863,7 +1007,8 @@ impl TraceCollector {
 	/// # Errors
 	///
 	/// - [`TraceStateShared`] -- another handle shares the state of this
-	///   collector. The call drops the config and this handle.
+	///   collector. The call drops the config, and the refusal holds this
+	///   handle ([`TraceStateShared::into_collector`]).
 	///
 	/// # Examples
 	///
@@ -875,17 +1020,36 @@ impl TraceCollector {
 	/// let trace = TraceCollector::new().with_logger(config())?;
 	/// let _shared = trace.share();
 	///
-	/// assert!(matches!(trace.with_logger(config()), Err(TraceStateShared)));
+	/// assert!(matches!(trace.with_logger(config()), Err(TraceStateShared { .. })));
 	/// # Ok::<(), TraceStateShared>(())
 	/// ```
 	#[cfg(feature = "logging")]
 	pub fn with_logger(mut self, config: super::logging::LoggerConfig) -> Result<Self, TraceStateShared> {
 		let Some(state) = Arc::get_mut(&mut self.state) else {
-			return Err(TraceStateShared);
+			return Err(TraceStateShared { collector: self });
 		};
 
 		state.logger_config = Some(Arc::new(config));
 		Ok(self)
+	}
+
+	/// Whether this collector records instrumentation events, which a build
+	/// with the `instrument` feature does.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events;
+	/// use tightbeam::trace::TraceCollector;
+	///
+	/// let trace = TraceCollector::new();
+	/// trace.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// // A collector that instruments holds the event it recorded.
+	/// assert_eq!(trace.instrumented(), trace.drain_events().len() == 1);
+	/// ```
+	pub fn instrumented(&self) -> bool {
+		cfg!(feature = "instrument")
 	}
 
 	/// Adopts `clock` as the clock this collector stamps its events on, with
@@ -1113,8 +1277,7 @@ impl TraceCollector {
 
 	/// Writes one event to the sink. `label` renders its label, and runs only
 	/// when the sink retains the event. `evidence` renders its payload, and
-	/// runs only when the sink retains the event and the config keeps
-	/// payloads. A dropped event renders nothing.
+	/// runs only when the sink retains the event and the config keeps payloads.
 	#[cfg(feature = "instrument")]
 	fn emit_internal<E: AsRef<[u8]>>(
 		&self,
@@ -1140,10 +1303,9 @@ impl TraceCollector {
 		timestamp_ns: Option<u64>,
 		flags: u32,
 	) {
-		// The sink owns retention. An event that a bounded sink drops takes a
-		// sequence number too, so gaps in `seq` show where truncation
-		// occurred. The write asks the sink before it builds the event, so a
-		// dropped event costs no allocation.
+		// A dropped event takes a sequence number too, so gaps in `seq` show
+		// where truncation occurred. The write asks the sink before it builds
+		// the event, so a dropped event costs no allocation.
 		let seq = self.next_seq();
 		let sink = &self.state.sink.0;
 		if !sink.retains() {
@@ -1359,7 +1521,7 @@ impl TraceCollector {
 	/// payload in hand.
 	///
 	/// The trace runs `evidence` only when its sink retains the event and its
-	/// config keeps payloads, so a dropped payload renders nothing.
+	/// config keeps payloads.
 	///
 	/// # Errors
 	///
@@ -1382,8 +1544,7 @@ impl TraceCollector {
 	/// Dual-writes `event` with `value`, and with the label that `label`
 	/// renders, as [`Self::emit_event_with_value`] writes a label in hand.
 	///
-	/// The trace runs `label` only when its sink retains the event, so a
-	/// dropped record renders no label.
+	/// The trace runs `label` only when its sink retains the event.
 	///
 	/// # Errors
 	///
@@ -1489,7 +1650,7 @@ impl TraceCollector {
 			event_urn,
 			|| Some(label.into()),
 			no_evidence,
-			Some(duration.as_nanos() as u64),
+			Some(saturating_nanos(duration)),
 			None,
 		);
 	}
@@ -1511,7 +1672,7 @@ impl TraceCollector {
 			|| Some(label.into()),
 			no_evidence,
 			None,
-			Some(timestamp.as_nanos() as u64),
+			Some(saturating_nanos(timestamp)),
 		);
 	}
 
@@ -1577,9 +1738,9 @@ impl TraceCollector {
 
 	/// Reports whether the configured sink dropped any event, as a sticky flag.
 	///
-	/// Feed this into
-	/// [`crate::instrumentation::EvidenceArtifact::finalize`], so evidence
-	/// built from a truncated trace reports `overflow = true`.
+	/// [`ConsumedTrace::populate_from_collector`] reads it, so the evidence of
+	/// a truncated trace ([`crate::instrumentation::EvidenceArtifact::of`])
+	/// reports `overflow = true`.
 	#[cfg(feature = "instrument")]
 	pub fn overflowed(&self) -> bool {
 		self.state.sink.0.overflowed()
@@ -1789,7 +1950,8 @@ impl core::error::Error for EventRecordTruncated {}
 /// another handle shares ([`TraceCollector::share`]).
 ///
 /// The logger config sits in the state that every handle reads, and only the
-/// sole owner of that state can set it.
+/// sole owner of that state can set it. The refusal holds the collector it
+/// refused, which [`Self::into_collector`] hands back.
 ///
 /// # Examples
 ///
@@ -1801,11 +1963,41 @@ impl core::error::Error for EventRecordTruncated {}
 /// let _shared = trace.share();
 /// let config = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Error));
 ///
-/// assert!(matches!(trace.with_logger(config), Err(TraceStateShared)));
+/// assert!(matches!(trace.with_logger(config), Err(TraceStateShared { .. })));
 /// ```
 #[cfg(feature = "logging")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TraceStateShared;
+#[derive(Debug)]
+pub struct TraceStateShared {
+	/// The collector that the call refused.
+	collector: TraceCollector,
+}
+
+#[cfg(feature = "logging")]
+impl TraceStateShared {
+	/// The collector that [`TraceCollector::with_logger`] refused, which still
+	/// shares its state with the other handles.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector};
+	///
+	/// const SEND: tightbeam::urn::Urn<'static> = tightbeam::urn!("doc", "event:example/send");
+	///
+	/// let trace = TraceCollector::new();
+	/// let shared = trace.share();
+	/// let config = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Error));
+	///
+	/// let refused = trace.with_logger(config).err().ok_or("a shared state refuses the config")?;
+	/// refused.into_collector().event(SEND)?.emit();
+	///
+	/// assert_eq!(shared.recorded(SEND), 1);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn into_collector(self) -> TraceCollector {
+		self.collector
+	}
+}
 
 #[cfg(feature = "logging")]
 impl fmt::Display for TraceStateShared {
@@ -1821,15 +2013,16 @@ impl core::error::Error for TraceStateShared {}
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct ConsumedTrace {
-	/// The assertions the run recorded.
-	pub assertions: Vec<Assertion>,
+	/// The assertions the run recorded, which [`Self::assertions`] lends.
+	assertions: Vec<Assertion>,
 	/// The frames of the exchanges that the run reported, which
 	/// [`Self::record_accepted`] and [`Self::record_rejected`] fill.
 	exchanges: ExchangeRecord,
 
-	/// The instrumentation events the run emitted.
+	/// The instrumentation events the run emitted, which
+	/// [`Self::instrument_events`] lends.
 	#[cfg(feature = "instrument")]
-	pub instrument_events: Vec<TbEvent>,
+	instrument_events: Vec<TbEvent>,
 	/// Whether the record of a collector that this trace drained misses
 	/// events, which [`Self::is_complete`] reads.
 	#[cfg(feature = "instrument")]
@@ -1903,9 +2096,8 @@ impl ConsumedTrace {
 	/// Records that the peer of the run accepted `request` and answered with
 	/// `response`, or with no frame when `response` is `None`.
 	///
-	/// Each frame slot keeps the first frame that an exchange gives it, so the
-	/// response of a run with more than one exchange is the first response
-	/// that arrived.
+	/// Each frame slot keeps its first frame, so the response of a run with
+	/// more than one exchange is the first that arrived.
 	///
 	/// # Examples
 	///
@@ -2028,6 +2220,51 @@ impl ConsumedTrace {
 		self.exchanges.response.is_some()
 	}
 
+	/// The assertions that the run recorded, in the order it recorded them.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector};
+	///
+	/// const SEND: tightbeam::urn::Urn<'static> = tightbeam::urn!("doc", "event:example/send");
+	///
+	/// let collector = TraceCollector::new();
+	/// collector.event(SEND)?.emit();
+	///
+	/// let mut trace = ConsumedTrace::new();
+	/// trace.populate_from_collector(&collector);
+	///
+	/// assert_eq!(trace.assertions().len(), 1);
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
+	pub fn assertions(&self) -> &[Assertion] {
+		&self.assertions
+	}
+
+	/// The instrumentation events that the run emitted, in the order that
+	/// the trace drained them.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::events;
+	/// use tightbeam::trace::{ConsumedTrace, TraceCollector};
+	///
+	/// let collector = TraceCollector::new();
+	/// collector.emit(events::GATE_ACCEPT, "Ok");
+	///
+	/// let mut trace = ConsumedTrace::new();
+	/// trace.populate_from_collector(&collector);
+	///
+	/// let urns: Vec<_> = trace.instrument_events().iter().map(|event| &event.urn).collect();
+	/// assert_eq!(urns, [&events::GATE_ACCEPT]);
+	/// ```
+	#[cfg(feature = "instrument")]
+	pub fn instrument_events(&self) -> &[TbEvent] {
+		&self.instrument_events
+	}
+
 	/// Whether the instrumentation record of this trace holds every event of
 	/// its run.
 	///
@@ -2057,7 +2294,7 @@ impl ConsumedTrace {
 	///     }
 	/// }
 	///
-	/// let collector = TraceCollector::from(TraceConfig::builder().with_sink(Forwarding).build());
+	/// let collector = TraceCollector::from(TraceConfig::default().with_sink(Forwarding));
 	/// collector.emit(events::GATE_ACCEPT, "Ok");
 	///
 	/// let mut trace = ConsumedTrace::new();
@@ -2075,6 +2312,15 @@ impl ConsumedTrace {
 		{
 			true
 		}
+	}
+
+	/// The trace that drains `collector`, as a scenario takes it once its run
+	/// completes ([`Self::populate_from_collector`]).
+	#[cfg(test)]
+	pub(crate) fn drained_from(collector: &TraceCollector) -> Self {
+		let mut trace = Self::new();
+		trace.populate_from_collector(collector);
+		trace
 	}
 
 	/// Marks the trace as one whose sink dropped events, so a test of a
@@ -2569,12 +2815,8 @@ mod tests {
 		#[test]
 		fn consumer_sink_replaces_bounded_buffer() {
 			let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
-			let collector = TraceCollector::from(
-				TraceConfig::builder()
-					.with_instrumentation(config)
-					.with_sink(UnboundedSink::default())
-					.build(),
-			);
+			let collector =
+				TraceCollector::from(TraceConfig::with_instrumentation(config).with_sink(UnboundedSink::default()));
 
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
@@ -2586,7 +2828,7 @@ mod tests {
 
 		#[test]
 		fn sink_without_instrumentation_config_still_receives_events() {
-			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(UnboundedSink::default()));
 			collector.emit(events::START, "only");
 			assert_eq!(collector.drain_events().len(), 1);
 		}
@@ -2618,7 +2860,7 @@ mod tests {
 
 		/// The trace that drains a collector over `sink` after one event.
 		fn consumed_over(sink: Lossy) -> ConsumedTrace {
-			let collector = TraceCollector::from(TraceConfig::builder().with_sink(sink).build());
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(sink));
 			collector.emit(events::START, "only");
 
 			let mut consumed = ConsumedTrace::new();
@@ -2645,7 +2887,7 @@ mod tests {
 
 		#[test]
 		fn sink_events_carry_contiguous_seq() {
-			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(UnboundedSink::default()));
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
 
@@ -2658,11 +2900,11 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	mod clock {
 		use core::time::Duration;
-		use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+		use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-		use super::super::TraceState;
 		use crate::instrumentation::{events, EventSink, TbEvent};
 		use crate::trace::{TraceCollector, TraceConfig};
+		use crate::urn::Urn;
 		use crate::utils::time::{Clock, ManualClock};
 		use crate::TightBeamError;
 
@@ -2672,66 +2914,6 @@ mod tests {
 			let clock = Arc::new(ManualClock::default());
 			clock.advance(Duration::from_secs(3600));
 			clock
-		}
-
-		/// Notes, as each event stamped on the trace clock lands in its sink,
-		/// whether a collector could adopt a clock at that moment.
-		#[derive(Default)]
-		struct AdoptionProbe {
-			/// The state whose trace clock an adoption would take.
-			state: OnceLock<Weak<TraceState>>,
-			/// One answer for each event, in the order the events landed.
-			adoptable: Mutex<Vec<bool>>,
-		}
-
-		impl AdoptionProbe {
-			/// Notes whether an adoption's write lock is free at this moment.
-			fn note(&self) {
-				let state = self.state.get().and_then(Weak::upgrade);
-				let state = state.expect("the probe watches a live collector");
-				let attempt = state.clock.origin.try_write();
-				let free = attempt.is_ok();
-				drop(attempt);
-
-				let mut adoptable = self.adoptable.lock().unwrap_or_else(PoisonError::into_inner);
-				adoptable.push(free);
-			}
-
-			/// The answers noted so far.
-			fn noted(&self) -> Vec<bool> {
-				let adoptable = self.adoptable.lock().unwrap_or_else(PoisonError::into_inner);
-				adoptable.clone()
-			}
-		}
-
-		/// The sink of a probed collector, which notes each event it receives
-		/// that carries a timestamp.
-		struct ProbingSink(Arc<AdoptionProbe>);
-
-		impl EventSink for ProbingSink {
-			fn emit(&self, event: TbEvent) {
-				if event.timestamp_ns.is_some() {
-					self.0.note();
-				}
-			}
-
-			fn drain(&self) -> Vec<TbEvent> {
-				Vec::new()
-			}
-
-			fn overflowed(&self) -> bool {
-				false
-			}
-		}
-
-		/// A collector on an advanced clock whose sink notes for `probe`.
-		fn probed_collector(probe: &Arc<AdoptionProbe>) -> TraceCollector {
-			let sink = ProbingSink(Arc::clone(probe));
-			let config = TraceConfig::builder().with_sink(sink).build();
-			let trace = TraceCollector::from(config).with_clock(advanced_clock() as Arc<dyn Clock>);
-			let watched = probe.state.set(Arc::downgrade(&trace.state));
-			watched.expect("a probe watches one collector");
-			trace
 		}
 
 		/// A collector records as its origin the reading of the clock it
@@ -2785,18 +2967,84 @@ mod tests {
 			Ok(())
 		}
 
-		/// An event and the record of its origin land under one read guard of
-		/// the trace clock, so an adoption on another handle lands before the
-		/// record or after the event.
-		#[test]
-		fn an_event_and_its_origin_record_land_before_an_adoption() -> Result<(), TightBeamError> {
-			let probe = Arc::new(AdoptionProbe::default());
-			let trace = probed_collector(&probe);
-			trace.emit_event(events::START)?;
+		/// The events that an [`AdoptingSink`] keeps, and the handle of the
+		/// collector whose clock it adopts on the first event it receives.
+		#[derive(Default)]
+		struct Adoption {
+			/// A handle of the collector that the sink adopts a clock for.
+			trace: OnceLock<TraceCollector>,
+			/// The events that the sink kept, in the order they landed.
+			kept: Mutex<Vec<TbEvent>>,
+		}
 
-			let adoptable = probe.noted();
-			assert_eq!(adoptable, [false, false]);
-			Ok(())
+		/// A sink that keeps each event, and adopts an advanced clock on its
+		/// collector when it receives its first event.
+		struct AdoptingSink(Arc<Adoption>);
+
+		impl EventSink for AdoptingSink {
+			fn emit(&self, event: TbEvent) {
+				let mut kept = self.0.kept.lock().unwrap_or_else(PoisonError::into_inner);
+				kept.push(event);
+				let first = kept.len() == 1;
+				drop(kept);
+
+				if let Some(trace) = self.0.trace.get().filter(|_| first) {
+					let _adopted = trace.share().with_clock(advanced_clock() as Arc<dyn Clock>);
+				}
+			}
+
+			fn drain(&self) -> Vec<TbEvent> {
+				let mut kept = self.0.kept.lock().unwrap_or_else(PoisonError::into_inner);
+				core::mem::take(&mut *kept)
+			}
+
+			fn overflowed(&self) -> bool {
+				false
+			}
+		}
+
+		/// A collector on an advanced clock whose sink adopts another clock on
+		/// its first event.
+		fn adopting_collector() -> TraceCollector {
+			let adoption = Arc::new(Adoption::default());
+			let config = TraceConfig::default().with_sink(AdoptingSink(Arc::clone(&adoption)));
+			let trace = TraceCollector::from(config).with_clock(advanced_clock() as Arc<dyn Clock>);
+			let watched = adoption.trace.set(trace.share());
+			assert!(watched.is_ok(), "the sink adopts for one collector");
+			trace
+		}
+
+		/// The emit of two events on `trace`, on a thread of its own, and the
+		/// URNs the trace then drained, or `None` when the emit did not return
+		/// within ten seconds.
+		fn emitted_within_a_bound(trace: TraceCollector) -> Option<Vec<Urn<'static>>> {
+			let (sent, received) = std::sync::mpsc::channel();
+			std::thread::spawn(move || {
+				let start = trace.emit_event(events::START);
+				let end = trace.emit_event(events::END);
+				let recorded = trace.drain_events().into_iter().map(|event| event.urn).collect::<Vec<_>>();
+				let _receiver_left = sent.send(start.and(end).map(|()| recorded));
+			});
+
+			received.recv_timeout(Duration::from_secs(10)).ok()?.ok()
+		}
+
+		/// A sink that adopts a clock on the first event it receives runs after
+		/// the trace clock releases its lock, so the adoption returns, and the
+		/// later event counts from the adopted origin.
+		#[test]
+		fn a_sink_that_adopts_a_clock_on_its_first_event_does_not_deadlock() {
+			let trace = adopting_collector();
+
+			let recorded = emitted_within_a_bound(trace);
+
+			let urns = vec![
+				events::TRACE_CLOCK_ORIGIN,
+				events::START,
+				events::TRACE_CLOCK_ORIGIN,
+				events::END,
+			];
+			assert_eq!(recorded, Some(urns));
 		}
 	}
 
@@ -2925,6 +3173,47 @@ mod tests {
 		}
 	}
 
+	/// Whether a collector instruments, which its build decides.
+	mod instrumented {
+		use crate::trace::TraceCollector;
+
+		/// A build with `instrument` records the events of a collector.
+		#[cfg(feature = "instrument")]
+		#[test]
+		fn a_collector_reports_whether_it_instruments() {
+			assert!(TraceCollector::new().instrumented());
+		}
+
+		/// A build without `instrument` records no event of a collector.
+		#[cfg(not(feature = "instrument"))]
+		#[test]
+		fn a_collector_reports_whether_it_instruments() {
+			assert!(!TraceCollector::new().instrumented());
+		}
+	}
+
+	/// The span that an event records.
+	#[cfg(feature = "instrument")]
+	mod spans {
+		use core::time::Duration;
+
+		use super::ALPHA;
+		use crate::instrumentation::TbInstrumentationConfig;
+		use crate::trace::{TraceCollector, TraceConfig};
+
+		/// A span past the `u64` range of nanoseconds records as `u64::MAX`.
+		#[test]
+		fn a_span_past_u64_nanoseconds_saturates() {
+			let config = TbInstrumentationConfig { record_durations: true, ..TbInstrumentationConfig::default() };
+			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+
+			trace.emit_with_timing(ALPHA, "long", Duration::from_secs(u64::MAX));
+
+			let durations: Vec<Option<u64>> = trace.drain_events().iter().map(|event| event.duration_ns).collect();
+			assert_eq!(durations, [Some(u64::MAX)]);
+		}
+	}
+
 	/// The record that an event hands to the log backend.
 	#[cfg(all(feature = "instrument", feature = "logging"))]
 	mod log_records {
@@ -2958,7 +3247,8 @@ mod tests {
 			let clock = Arc::new(ManualClock::default());
 			let stamps = Arc::new(Mutex::new(Vec::new()));
 			let filter = LogFilter::new(LogLevel::Debug);
-			let config = LoggerConfig::new(Stamps(Arc::clone(&stamps)), filter).with_default_level(LogLevel::Info);
+			let config =
+				LoggerConfig::new(Stamps(Arc::clone(&stamps)), filter).with_default_level(LogLevel::Informational);
 			let trace = TraceCollector::new()
 				.with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
 				.with_logger(config)?;
@@ -3106,7 +3396,8 @@ mod tests {
 
 			let logged = Arc::new(AtomicUsize::new(0));
 			let filter = LogFilter::new(LogLevel::Debug);
-			let config = LoggerConfig::new(Counting(Arc::clone(&logged)), filter).with_default_level(LogLevel::Info);
+			let config =
+				LoggerConfig::new(Counting(Arc::clone(&logged)), filter).with_default_level(LogLevel::Informational);
 			let parent = TraceCollector::new().with_logger(config)?;
 
 			parent.connections().event(ALPHA)?.emit();
@@ -3146,7 +3437,7 @@ mod tests {
 			}
 
 			let destination = Arc::new(BoundedMemorySink::default());
-			let config = TraceConfig::builder().with_sink(Forwarding(Arc::clone(&destination))).build();
+			let config = TraceConfig::default().with_sink(Forwarding(Arc::clone(&destination)));
 			let parent = TraceCollector::from(config);
 
 			parent.connections().emit_event(ALPHA)?;

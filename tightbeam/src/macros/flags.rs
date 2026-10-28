@@ -11,10 +11,10 @@ macro_rules! flags {
 
 /// Define a named flag set over an ordered list of flag types.
 ///
-/// Each registered type is assigned the slot matching its position in the
-/// declaration, and gets its own [`FlagSet`](crate::flags::FlagSet)
-/// implementation, so flag lookups are resolved at compile time. Setting a
-/// flag of an unregistered type is rejected by the compiler:
+/// Each registered type takes the slot of its position in the declaration and
+/// gets its own [`FlagSet`](crate::flags::FlagSet) implementation, so the
+/// compiler resolves each flag lookup. The compiler refuses a flag of an
+/// unregistered type:
 ///
 /// ```compile_fail
 /// use tightbeam::flags::FlagSet;
@@ -87,11 +87,14 @@ macro_rules! flagset {
 			flags: $crate::flags::Flags<{ $crate::flagset!(@count $first $(, $rest)*) }>,
 		}
 
+		// Each slot holds the default of its type, as `FlagSet::unset` writes
+		// it, so a never-set slot reads as that variant alone.
 		impl Default for $name {
 			fn default() -> Self {
-				Self {
-					flags: $crate::flags::Flags::default(),
-				}
+				let mut flagset = Self { flags: $crate::flags::Flags::default() };
+				<Self as $crate::flags::FlagSet<$first>>::unset(&mut flagset);
+				$( <Self as $crate::flags::FlagSet<$rest>>::unset(&mut flagset); )*
+				flagset
 			}
 		}
 
@@ -106,8 +109,8 @@ macro_rules! flagset {
 
 			/// # Errors
 			///
-			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) when
-			///   the slice does not name exactly this set's flags.
+			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) -- the
+			///   slice does not name exactly this set's flags.
 			fn try_from(bytes: &[u8]) -> ::core::result::Result<Self, Self::Error> {
 				::core::result::Result::Ok(Self { flags: ::core::convert::TryFrom::try_from(bytes)? })
 			}
@@ -118,8 +121,8 @@ macro_rules! flagset {
 
 			/// # Errors
 			///
-			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) when
-			///   the bytes do not name exactly this set's flags.
+			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) -- the
+			///   bytes do not name exactly this set's flags.
 			fn try_from(bytes: Vec<u8>) -> ::core::result::Result<Self, Self::Error> {
 				::core::convert::TryFrom::try_from(bytes.as_slice())
 			}
@@ -133,7 +136,7 @@ macro_rules! flagset {
 			///
 			/// # Errors
 			///
-			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) when
+			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) --
 			///   present bytes do not name exactly this set's flags.
 			fn try_from(bytes: Option<Vec<u8>>) -> ::core::result::Result<Self, Self::Error> {
 				match bytes {
@@ -264,17 +267,7 @@ macro_rules! flagset {
 			fn contains(&self, flag: $ty) -> bool {
 				let stored_value = self.flags.get_at($pos);
 				let flag_value: u8 = flag.into();
-				let default_value: u8 = <$ty as Default>::default().into();
-
-				// A zero slot means "never set", which matches the type's
-				// default value.
-				if stored_value == flag_value {
-					true
-				} else if stored_value == 0 {
-					flag_value == default_value
-				} else {
-					false
-				}
+				stored_value == flag_value
 			}
 		}
 	};
@@ -364,5 +357,38 @@ mod tests {
 
 		assert!(FlagSet::contains(&set, Status::Enabled));
 		assert!(!FlagSet::contains(&set, SubStatus::Active));
+	}
+
+	/// A flag type whose default is the variant with the non-zero value.
+	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+	enum Mode {
+		Zero = 0,
+		#[default]
+		One = 1,
+	}
+
+	impl From<Mode> for u8 {
+		fn from(flag: Mode) -> u8 {
+			flag as u8
+		}
+	}
+
+	crate::flagset!(ModeFlags: Mode);
+
+	#[test]
+	fn a_never_set_slot_holds_the_default_variant_alone() {
+		let flags = ModeFlags::default();
+		let held = [Mode::Zero, Mode::One].map(|mode| FlagSet::contains(&flags, mode));
+		assert_eq!(held, [false, true]);
+	}
+
+	/// A slot set to the variant whose value is zero holds that variant alone.
+	#[test]
+	fn a_slot_set_to_the_zero_variant_holds_it_alone() {
+		let mut flags = ModeFlags::default();
+		FlagSet::set(&mut flags, Mode::Zero);
+
+		let held = [Mode::Zero, Mode::One].map(|mode| FlagSet::contains(&flags, mode));
+		assert_eq!(held, [true, false]);
 	}
 }

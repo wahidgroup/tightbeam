@@ -77,7 +77,7 @@ async fn receipt_budgets_bound_to_enforcement() -> Result<(), TightBeamError> {
 	// budget is the server-to-client direction.
 	assert_eq!(
 		(Some(budgets.client_to_server), Some(budgets.server_to_client)),
-		(settings.send_budget, settings.recv_budget),
+		(settings.send_budget(), settings.recv_budget()),
 		"the receipt and the enforced budgets differ"
 	);
 	Ok(())

@@ -72,11 +72,15 @@ impl<P: Protocol> HivePlane<P> {
 		Hop { pool: &self.pool, dial: hive.bound_dial(), trace: &self.trace }
 	}
 
-	/// The peer plane over this plane's pool, for a gateway that configures
-	/// no peer pool. It names each gateway that answers by `config`'s hive
-	/// trust, through [`ColonyConfig::peer_identity`].
-	pub(crate) fn peers(&self, config: ColonyConfig<P>) -> PeerPlane<P> {
-		PeerPlane::new(Arc::clone(&self.pool), config, Arc::clone(&self.trace))
+	/// The plane this gateway dials its peers on: `peer_pool`, which keeps
+	/// peer traffic off the hive pool, or this plane's pool for a gateway that
+	/// configures no peer pool. It names each gateway that answers through
+	/// [`ColonyConfig::peer_identity`] of `config`.
+	///
+	/// The gateway resolves its peer plane here once, as it starts.
+	pub(crate) fn peers(&self, peer_pool: Option<Arc<ClusterPool<P>>>, config: ColonyConfig<P>) -> PeerPlane<P> {
+		let pool = peer_pool.unwrap_or_else(|| Arc::clone(&self.pool));
+		PeerPlane::new(pool, config, Arc::clone(&self.trace))
 	}
 }
 
@@ -188,8 +192,8 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 	///
 	/// - A cold connection defers its handshake to the first emit, so the
 	///   handshake completes here, before the caller can send anything.
-	/// - `None` means a gateway outside the flood answered, an answer about
-	///   the address, where an `Err` is a failed dial.
+	/// - `None` means a gateway outside the flood answered, which is an answer
+	///   about the address. An `Err` is a failed dial.
 	/// - It asks for the proof on every call, so a pooled connection to a
 	///   gateway the trust store has since dropped yields `None`.
 	/// - An answer outside the flood takes its connection out of the pool, so a
@@ -277,6 +281,8 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 
 #[cfg(test)]
 mod tests {
+	use core::num::NonZeroUsize;
+
 	use super::*;
 	use crate::colony::cluster::peer::ColonyCertificate;
 	use crate::colony::cluster::runtime::advertise::SignedAdvertisement;
@@ -287,8 +293,9 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use crate::crypto::x509::utils::CertificateExt;
+	use crate::crypto::x509::KeyCurves;
 	#[cfg(feature = "testing")]
 	use crate::instrumentation::events::CLUSTER_DIAL_REFUSED;
 	use crate::testing::TestCertificate;
@@ -365,7 +372,7 @@ mod tests {
 			let stranger = identity(4, "Stranger Gateway", &[]);
 			let dialing = identity(5, "Dialing Gateway", &[&colony]);
 
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 			let builder = builder.with_certificate(member.0.clone()).expect("the store admits it");
 			let builder = builder.with_certificate(stranger.0.clone()).expect("the store admits it");
 			let hive_trust: Arc<dyn CertificateTrust> = Arc::new(builder.build());
@@ -392,12 +399,12 @@ mod tests {
 		/// offers for multiplexing when `multiplexed` holds.
 		fn one_connection(multiplexed: bool) -> PoolConfig {
 			let mux_offer = multiplexed.then(|| Arc::new(TransportOffer::mux(8)));
-			PoolConfig { idle_timeout: None, max_connections: 1, mux_offer }
+			PoolConfig { idle_timeout: None, max_connections: NonZeroUsize::MIN, mux_offer }
 		}
 
 		/// The plane this gateway dials its peers on, which is its hive pool.
 		fn peers(&self) -> PeerPlane<TokioListener> {
-			self.plane.peers(self.config.clone())
+			self.plane.peers(None, self.config.clone())
 		}
 
 		/// A servlet hop to `gateway`, bound to the signer that a registration

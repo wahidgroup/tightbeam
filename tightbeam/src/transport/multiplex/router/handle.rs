@@ -123,8 +123,7 @@ impl GateAudit for MuxHandle {
 }
 
 impl MuxHandle {
-	/// Assemble a handle over the connection's shared state and
-	/// queues (refcount bumps only, no data copies).
+	/// Assemble a handle over the connection's shared state and queues.
 	pub(crate) fn new(link: MuxLink) -> Self {
 		Self { link }
 	}
@@ -482,11 +481,18 @@ impl MuxHandle {
 		self.link.announce_goaway(reason).await?;
 		self.link.shared().drain_pending().await;
 
+		self.close().await;
+		Ok(())
+	}
+
+	/// Closes the writer driver once it writes every envelope queued before
+	/// the call, so a GoAway that a responder queued reaches the peer ahead of
+	/// the close.
+	pub(crate) async fn close(&self) {
 		let mut outbound = self.link.sender();
 		// A writer that already ended with the connection has closed the
 		// queue, which is the outcome Close asks for.
 		let _ = outbound.send(Outbound::Close).await;
-		Ok(())
 	}
 }
 

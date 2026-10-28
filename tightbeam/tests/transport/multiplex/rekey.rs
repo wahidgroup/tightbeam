@@ -21,6 +21,7 @@ use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover,
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxHandle, MuxRole};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 use tokio::time::timeout;
 
@@ -144,7 +145,6 @@ async fn await_matching_receipt(handle: &MuxHandle, expected: &StoredReceipt) ->
 /// fresh ephemeral point.
 fn rekey_request_envelope(seed: u8) -> Result<TransportEnvelope, TightBeamError> {
 	let ephemeral = k256::SecretKey::random(&mut rand_core::OsRng).public_key();
-
 	let package = MuxRekeyRequestPackage::new(vec![seed; 32], &ephemeral)?;
 	Ok(MuxEnvelope::RekeyRequest(package).into())
 }
@@ -222,6 +222,7 @@ impl TransportAuthorizer for RenewalAuthorizer {
 		&'a self,
 		receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if receipt.ancillary.is_none() {
@@ -367,7 +368,7 @@ tb_scenario! {
 			let client_transport = session.client.with_trace(trace.share());
 			let (client_end, _) = spawn_mux_endpoint_with(client_transport, MuxRole::Client, client_config)?;
 			let server_transport = session.server.with_trace(trace.share());
-			let (_, responder) = spawn_mux_endpoint_with(server_transport, MuxRole::Server, rekey_config())?;
+			let (_server_end, responder) = spawn_mux_endpoint_with(server_transport, MuxRole::Server, rekey_config())?;
 
 			let chunks_seen = Arc::new(AtomicUsize::new(0));
 			let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
@@ -488,6 +489,7 @@ tb_scenario! {
 				observer: None,
 				trace: None,
 			};
+
 			let session = establish_renewal_session(hooks).await?;
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
@@ -535,6 +537,7 @@ tb_scenario! {
 				observer: None,
 				trace: None,
 			};
+
 			let session = establish_renewal_session(hooks).await?;
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
@@ -580,6 +583,7 @@ tb_scenario! {
 				observer: None,
 				trace: None,
 			};
+
 			let session = establish_renewal_session(hooks).await?;
 			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
 
@@ -623,9 +627,9 @@ tb_scenario! {
 			let _server_serve = spawn_immediate_echo(link.responder);
 
 			link.client_writer.write_envelope(rekey_request_envelope(7)?).await?;
+
 			let violated = read_until_goaway(&mut link.client_reader, GoAwayReason::ProtocolError).await?;
 			assert!(violated, "a request below the minimum spend must draw a ProtocolError GoAway");
-
 			Ok(())
 		}
 	}
@@ -663,8 +667,8 @@ tb_scenario! {
 
 			link.client_writer.write_envelope(rekey_request_envelope(7)?).await?;
 			read_until_rekey_response(&mut link.client_reader).await?;
-
 			link.client_writer.write_envelope(rekey_request_envelope(9)?).await?;
+
 			let violated = read_until_goaway(&mut link.client_reader, GoAwayReason::ProtocolError).await?;
 			assert!(violated, "a duplicate request must draw a ProtocolError GoAway");
 
@@ -703,6 +707,7 @@ tb_scenario! {
 				renewal_deadline: Some(Duration::from_millis(200)),
 				..rekey_config()
 			};
+
 			let endpoint_pair = spawn_mux_endpoint_with(session.client.with_trace(trace.share()), MuxRole::Client, client_config)?;
 			let (client_end, _client_responder) = endpoint_pair;
 			let server_halves = session.server.into_split()?;

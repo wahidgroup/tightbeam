@@ -31,13 +31,12 @@ pub(crate) use verify::{VerifiedControlFrame, VerifiedSignerId};
 pub(crate) use bounds::ColonyDigest;
 
 use core::future::Future;
-use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use self::bounds::{GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
-use self::hop::{HivePlane, PeerPlane};
+use self::hop::HivePlane;
 use self::verify::RequestAudit;
 use crate::colony::cluster::export::ExportScope;
 use crate::colony::cluster::peer::WireHopBudget;
@@ -46,7 +45,7 @@ use crate::colony::cluster::{
 	ServletRegistry, SharedId,
 };
 use crate::colony::protocol::HeartbeatResult;
-use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
+use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::crypto::x509::CanonicalKey;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::{SessionContext, TransitStatus};
@@ -55,7 +54,7 @@ use crate::trace::{TraceCollector, TraceHandle};
 use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::multiplex::{CallContext, MuxCapable, MuxService, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{AsyncListenerTrait, Protocol, TransportError};
+use crate::transport::{AsyncListenerTrait, Protocol};
 use crate::urn::Urn;
 use crate::utils::time::Clock;
 use crate::Frame;
@@ -271,8 +270,8 @@ where
 
 		// The `colony` feature enables `x509`, so the gateway always serves
 		// TLS.
-		let bind_addr = match config.bind_addr.as_deref() {
-			Some(raw) => raw.parse().map_err(|_| TransportError::InvalidMessage)?,
+		let bind_addr = match config.bind_address()? {
+			Some(bind_addr) => bind_addr,
 			None => P::default_bind_address().map_err(TightBeamError::transport)?,
 		};
 
@@ -288,8 +287,7 @@ where
 		let servlet_registry = Arc::new(routes);
 		let pools = config.tls.pools::<P>(&config.pool_config, &config.clock, &trace);
 		let hive_plane = HivePlane::new(pools.hive, Arc::clone(&trace));
-		let build_peer_plane = |peer_pool| PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
-		let peer_plane = pools.peer.map(build_peer_plane);
+		let peer_plane = hive_plane.peers(pools.peer, config.clone());
 
 		let replay_guard_for_server = GatewayReplayGuard::new(control_window, Arc::clone(&config.clock));
 		let tasks = TaskGroup::default();
@@ -313,9 +311,8 @@ where
 		// Bind every configured accept plane before any accept loop spawns.
 		// An edge parse or bind failure then returns `Err` before the colony
 		// listener leaves here, so a failed start spawns no accept task.
-		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
-			Some(raw) => {
-				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
+		let (edge_listener, edge_addr) = match config.edge_bind_address::<E::Address>()? {
+			Some(edge_bind) => {
 				let (edge_listener, edge_addr) = E::bind_with(edge_bind, config.tls.accept_encryption())
 					.await
 					.map_err(TightBeamError::transport)?;
@@ -346,13 +343,7 @@ where
 
 		tasks.adopt(ctx.clone().spawn_heartbeat());
 
-		// Three missed refreshes retire a relay trail: one miss is churn, and
-		// three mean the refresh path died. The default interval floors the
-		// TTL, so an aggressive `rumor_refresh` keeps a healthy fallback.
-		let relay_trail_ttl = config
-			.rumor_refresh()
-			.saturating_mul(3)
-			.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS));
+		let relay_trail_ttl = config.relay_trail_ttl();
 
 		tasks.adopt(ctx.clone().spawn_evaporation(relay_trail_ttl));
 		tasks.adopt(ctx.clone().spawn_advertise(gateway_addr));
@@ -613,8 +604,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	///
 	/// 1. Run [`ClusterConfig::evaluate_gates`] with no request frame.
 	/// 2. Resolve the servlet target from the call context.
-	/// 3. Derive `relayed` from [`HopBudget::is_relayed`].
-	/// 4. Run [`ColonyConfig::evaluate_export_gates`] on that target and session.
+	/// 3. Run [`ColonyConfig::admit_target`] on that target, the hop budget of
+	///    the open, and the session.
 	///
 	/// An unrouted open names no servlet type, so it fails with
 	/// `Unimplemented`.
@@ -633,15 +624,9 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Err(TightBeamError::unimplemented());
 		};
 
-		let budget = HopBudget::from_wire(WireHopBudget::new(cx.hops_remaining()), self.config.peer.max_hops);
-		let is_relayed = budget.is_relayed();
-		let session = cx.session();
-		let config = &self.config;
-
-		let export_status = config.evaluate_export_gates(&target, session, is_relayed, trace)?;
-		if export_status != TransitStatus::Ok {
-			return Err(export_status.refusal());
-		}
+		let wire = WireHopBudget::new(cx.hops_remaining());
+		let admitted = self.config.admit_target(&target, wire, cx.session(), trace)?;
+		let budget = admitted.map_err(TransitStatus::refusal)?;
 
 		Ok((target, budget))
 	}
@@ -736,6 +721,34 @@ mod tests {
 
 		let accept = tls.accept_encryption::<DefaultCryptoProvider>();
 		assert_eq!(accept.key_purposes, configured);
+		Ok(())
+	}
+
+	/// Whether `started` failed on a bind address that names `octets`.
+	fn refused_the_address<T>(started: &Result<T, TightBeamError>, octets: &[u8]) -> bool {
+		let Err(TightBeamError::ClusterError(error)) = started else {
+			return false;
+		};
+
+		matches!(error.as_ref(), ClusterError::InvalidAddress(named) if named.as_slice() == octets)
+	}
+
+	// A bind address that does not parse is a fault of the operator's
+	// configuration, so the start names it as a cluster error with the
+	// octets it refused.
+	#[tokio::test]
+	async fn a_malformed_bind_address_is_a_cluster_error() -> Result<(), TightBeamError> {
+		use crate::colony::cluster::CertificateSpec;
+		use crate::transport::TokioListener;
+
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)))?;
+		let config = ClusterConfig { bind_addr: Some(String::from("not-a-socket")), ..ClusterConfig::new(tls) };
+
+		let started = ClusterGateway::<TokioListener>::start(Arc::new(TraceCollector::new()), config).await;
+
+		assert!(refused_the_address(&started, b"not-a-socket"));
 		Ok(())
 	}
 

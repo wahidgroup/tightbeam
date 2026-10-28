@@ -1,14 +1,12 @@
 //! The TightBeam handshake protocols, which establish an encrypted session.
 //!
-//! This module implements two handshake protocols:
+//! Both protocols authenticate the session and negotiate its cryptographic
+//! algorithms between the client and the server:
 //!
 //! - **HPKE**: the shape of the TLS 1.3 handshake (RFC 9846) in CMS
 //!   containers. The server's key signs its reply, and the handshake secret
 //!   derives from the two ephemerals alone.
 //! - **CMS-based**: X.509 PKI on both endpoints, with signed and authenticated-enveloped data.
-//!
-//! Both protocols establish authenticated, encrypted sessions and negotiate
-//! the cryptographic algorithms between the client and the server.
 //!
 //! # Protocol Capabilities
 //!
@@ -321,7 +319,7 @@ impl<C> HandshakeCurve for C where C: DhKemCurve + AssociatedOid + Send + Sync +
 
 /// A [`CryptoProvider`] the handshake layer runs on.
 ///
-/// This is the one bound the layer states about a provider. The bounds sit on
+/// It is the one bound the layer states about a provider. The bounds sit on
 /// the supertrait, so `P: HandshakeProvider` gives a caller every one of them:
 ///
 /// - the curve is a [`HandshakeCurve`],
@@ -580,9 +578,8 @@ impl TryFrom<ContentInfo> for HandshakeMessage {
 
 /// The terms a completed handshake agreed, handed over in one value.
 ///
-/// A handshake settles the keys and the terms that go with them at the same
-/// moment, so they travel together and a transport that installs the keys
-/// installs the rest with them.
+/// A handshake settles the keys and their terms at one moment, so a transport
+/// that installs the keys installs the terms with them.
 #[non_exhaustive]
 pub struct EstablishedSession {
 	/// The role-mapped directional keys. Each side sends on one key and
@@ -629,11 +626,10 @@ impl EstablishedSession {
 	/// Returns this session with `epoch`, the epoch-0 rekey materials, which
 	/// it keeps exactly while a rekey could use them.
 	///
-	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
-	/// session receipt and the peer identity. A session renews only when it
-	/// holds both, so this method treats the epoch secret in two ways:
+	/// A rekey re-signs against the session receipt and the peer identity, so
+	/// a session renews only when it holds both:
 	///
-	/// - A session with a receipt and a peer keeps it.
+	/// - A session with a receipt and a peer keeps the epoch secret.
 	/// - Every other session releases it at once.
 	#[cfg(mux_rekey)]
 	fn with_epoch(self, epoch: EpochMaterials) -> Self {
@@ -697,6 +693,12 @@ impl EstablishedSession {
 	/// The role-mapped directional keys of this session.
 	pub fn keys(&self) -> &SessionKeys {
 		&self.keys
+	}
+
+	/// The role-mapped directional keys of this session, lent exclusively to
+	/// the reader that opens records under the receive key.
+	pub(crate) fn keys_mut(&mut self) -> &mut SessionKeys {
+		&mut self.keys
 	}
 
 	/// The multiplexing terms both sides agreed, if any.
@@ -820,9 +822,8 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 /// The identity a handshake server holds, which hands the orchestrator the
 /// half that signs the reply and its receipt.
 ///
-/// Each flow of this crate names the identity type it runs with, and the
-/// flows are sealed, so this trait is sealed too, and an identity of another
-/// type fails to compile:
+/// The flows are sealed, and each names the identity type it runs with, so
+/// this trait is sealed too. An identity of another type fails to compile:
 ///
 /// ```compile_fail,E0277
 /// use tightbeam::crypto::sign::SigningIdentity;

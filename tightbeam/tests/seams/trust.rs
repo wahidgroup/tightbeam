@@ -1,22 +1,18 @@
-//! A trust store an outside crate defines through [`CertificateTrust`]
-//! alone, and a server policy it defines through [`CertificateValidation`].
+//! A trust store an outside crate defines through [`CertificateTrust`] alone,
+//! and a server policy it defines through [`CertificateValidation`].
 //!
-//! [`PinningTrust`] trusts the certificates its operator pins and names the
-//! trust anchor of each:
+//! [`PinningTrust`] trusts the certificates its operator pins, and names the
+//! trust anchor of each. The crate's defaults run over it:
 //!
-//! - It resolves a frame signer among them admitted for the signer purpose,
-//!   so the crate's default `verify_frame` runs over it and returns the
-//!   admitted certificate in [`TrustVerification::Verified`].
-//! - An HPKE client anchors on it through `LearnedTrust::anchored`, which
-//!   reads the crate's default `verify_presented` over its `verify_chain`.
-//! - A mutual server admits its client through it, which reads the crate's
-//!   default `evaluate_presented` over its `evaluate`.
-//! - A session's canonical key finds its pin through the crate's default `find_by_canonical_key`.
+//! - `verify_frame` returns a pin the signer purpose admits, in [`TrustVerification::Verified`].
+//! - `verify_presented`, over its `verify_chain`, anchors an HPKE client through `LearnedTrust::anchored`.
+//! - `evaluate_presented`, over its `evaluate`, admits the client of a mutual server.
+//! - `find_by_canonical_key` finds the pin of a session's canonical key.
 //!
-//! It reads a key by its [`CanonicalKey`], the rule that the contract of
-//! [`CertificateTrust`] names. [`IndexedTrust`] finds the same pins through a
-//! [`KeyIndex`] of its own, so a session's canonical key finds its pin with no
-//! decode, as the built-in store finds it.
+//! It reads a key by its [`CanonicalKey`], as the contract of
+//! [`CertificateTrust`] names. [`IndexedTrust`] keeps the same pins in a
+//! [`KeyIndex`] of its own, so it finds a canonical key with no decode, as the
+//! built-in store does.
 
 use std::sync::Arc;
 
@@ -27,7 +23,7 @@ use tightbeam::crypto::k256::ecdsa::SigningKey;
 use tightbeam::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::error::CertificateValidationError;
-use tightbeam::crypto::x509::policy::CertificateValidation;
+use tightbeam::crypto::x509::policy::{CertificateValidation, ChainValidator};
 use tightbeam::crypto::x509::store::{CertificateTrust, TrustVerification};
 use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::{CanonicalKey, ErasedSigning, KeyIndex, KeyPurposes, PeerCertificate};
@@ -309,6 +305,44 @@ async fn an_outside_trust_resolves_no_signer_of_another_purpose() {
 	assert!(matches!(verification, TrustVerification::UnknownSigner));
 }
 
+/// A server policy an outside crate defines: it admits a client only beside
+/// the issuer its operator names.
+struct IssuedBy {
+	/// The issuer that a client presents beside its certificate.
+	issuer: Certificate,
+}
+
+impl CertificateValidation for IssuedBy {
+	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		// The policy admits a client by the issuers it presents, so it
+		// refuses a certificate read alone, whose contents drop here.
+		let _ = cert;
+		Err(CertificateValidationError::CertificateNotTrusted)
+	}
+
+	fn evaluate_presented(
+		&self,
+		issuers: &[Certificate],
+		leaf: &Certificate,
+	) -> Result<(), CertificateValidationError> {
+		// The policy reads the issuers alone, so the leaf drops here.
+		let _ = leaf;
+		let presented = issuers.contains(&self.issuer);
+		presented.then_some(()).ok_or(CertificateValidationError::CertificateNotTrusted)
+	}
+}
+
+/// A chain that holds the outside policy hands it the issuers a client
+/// presents, so the chain admits the client beside them.
+#[test]
+fn an_outside_policy_in_a_chain_admits_a_client_beside_its_issuers() -> Result<(), Box<dyn std::error::Error>> {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let policy = ChainValidator::default().add(IssuedBy { issuer: chain.intermediate.to_owned() });
+
+	policy.evaluate_presented(&[chain.intermediate], &chain.leaf)?;
+	Ok(())
+}
+
 /// A server policy an outside crate defines: it admits the one certificate
 /// whose SubjectPublicKeyInfo it pins. A client runs it under each flow on
 /// the server's identity certificate, through `with_server_policy`.
@@ -353,6 +387,7 @@ fn hpke_endpoints(
 	policy: Arc<dyn CertificateValidation>,
 ) -> (HouseClient<Hpke>, HouseServer<Hpke>) {
 	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let trust = trust.expect("an outside certificate encodes");
 	let client = hpke_client(LearnedTrust::new(trust));
 	let client = Handshake::client(client.with_server_policy([policy]));
 	(client, hpke_server(server))
@@ -438,8 +473,7 @@ async fn an_outside_policy_refuses_an_hpke_server_it_does_not_pin() -> Result<()
 }
 
 /// An HPKE client anchored on the outside store admits the server whose
-/// certificate the store pins, through the path validation the store
-/// defines.
+/// certificate the store pins, through the path validation the store defines.
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
 async fn an_outside_store_anchors_an_hpke_client_on_the_server_it_pins() -> Result<(), HandshakeError> {
@@ -508,27 +542,30 @@ fn an_outside_policy_refuses_a_cms_server_before_the_opening() {
 }
 
 /// A mutual HPKE server whose one client validator is the outside store
-/// admits the client it pins, through the default `evaluate_presented`,
-/// which reads the client's certificate alone beside the issuers its
-/// Finished presents.
+/// admits the client it pins. The default `evaluate_presented` reads the
+/// client's certificate and drops the issuers its Finished presents.
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
 async fn an_outside_store_admits_the_client_it_pins_beside_its_presented_issuers() -> Result<(), HandshakeError> {
 	let chain = TestCertificate::insecure_fixed_chain()?;
 	let identity = TestIdentity::presenting(chain.leaf.to_owned(), &chain.leaf_key).with_chain([chain.intermediate])?;
 	let server = TestIdentity::of(&TestKey::insecure_fixed_signing());
-	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let trust = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()])?;
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(trust));
 	settings.identity = Some(identity);
+
 	let client = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
 	let mut server = hpke_server_config(server);
 	let validator: Arc<dyn CertificateValidation> = Arc::new(PinningTrust::of(vec![chain.leaf.to_owned()]));
-	server.peer_authentication = PeerAuthentication::mutual([validator]);
-	let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
 
+	server.peer_authentication = PeerAuthentication::Anonymous.and(validator);
+
+	let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
 	let reply = server.reply(client.start()?).await?;
 	let closing = client.respond(reply).await?;
+
 	server.finish(closing).await?;
+
 	let session = server.complete()?;
 	assert_eq!(session.peer(), Some(&chain.leaf));
 	Ok(())

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use super::runtime::VerifiedControlFrame;
 use super::{
-	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry,
-	SharedId,
+	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, RouteKind,
+	ServletEntry, SharedId,
 };
 use crate::colony::protocol::IssuedAt;
 use crate::colony::protocol::{ClusterWorkRequest, PeerAdvertisement};
@@ -26,10 +26,10 @@ use crate::x509::ext::pkix::SubjectAltName;
 
 /// The forwards that a work request or a routed stream open has left to spend.
 ///
-/// The wire carries a raw count, which the gateway parses once at its
-/// boundary through [`HopBudget::from_wire`], clamped to the operator's
-/// [`PeerConfig::max_hops`]. Every later rule reads the clamped value, so the
-/// operator's cap bounds the forwards a peer can spend (CWE-770).
+/// The gateway parses the raw wire count once at its boundary through
+/// [`HopBudget::from_wire`], clamped to [`PeerConfig::max_hops`]. Every later
+/// rule reads the clamped value, so the operator's cap bounds the forwards a
+/// peer can spend (CWE-770).
 ///
 /// [`PeerConfig::max_hops`]: super::PeerConfig::max_hops
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,19 +96,42 @@ impl HopBudget {
 		self.relayed
 	}
 
-	/// Whether the budget affords a forward to a peer gateway.
+	/// Whether the budget affords the forwards that a route of `kind` spends.
+	///
+	/// - A local route spends no forward.
+	/// - A peer route spends one forward.
+	/// - A relay trail spends one forward at the relay before it reaches the owner, so it needs two.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::cluster::{HopBudget, RouteKind, WireHopBudget};
+	///
+	/// let budget = HopBudget::from_wire(WireHopBudget::new(1), 4);
+	/// assert!(budget.affords(RouteKind::Peer));
+	/// assert!(!budget.affords(RouteKind::PeerRelay));
+	/// ```
 	#[must_use]
-	pub fn allows_forward(&self) -> bool {
-		self.remaining > 0
+	pub fn affords(&self, kind: RouteKind) -> bool {
+		match kind {
+			RouteKind::Local => true,
+			RouteKind::Peer => self.remaining > 0,
+			RouteKind::PeerRelay => self.remaining >= 2,
+		}
 	}
 
-	/// Whether the budget affords the two forwards a relay trail needs.
-	///
-	/// A relay trail spends one hop at the relay before it reaches the owner,
-	/// so only a budget of two or more can select it.
+	/// Whether the budget affords a forward to a peer gateway, as
+	/// [`Self::affords`] decides for [`RouteKind::Peer`].
+	#[must_use]
+	pub fn allows_forward(&self) -> bool {
+		self.affords(RouteKind::Peer)
+	}
+
+	/// Whether the budget affords the two forwards a relay trail needs, as
+	/// [`Self::affords`] decides for [`RouteKind::PeerRelay`].
 	#[must_use]
 	pub fn allows_relay_trail(&self) -> bool {
-		self.remaining >= 2
+		self.affords(RouteKind::PeerRelay)
 	}
 
 	/// The count this budget puts back on the wire.
@@ -152,12 +175,9 @@ impl HopBudget {
 pub struct AdmittedPeerAd {
 	/// The fingerprint of the signer certificate, which keys the slate.
 	pub(super) peer_hive_id: SharedId,
-	/// The claimed gateway socket that every slate entry dials, parsed and
-	/// admitted once.
-	///
-	/// The slate entries carry this value, so a score lookup and a stored
-	/// route agree on one socket. The discovery hint carries the proof that the
-	/// dial policy admitted it.
+	/// The claimed gateway socket, parsed and admitted once. Every slate entry
+	/// dials it, so a score lookup and a stored route agree on one socket. The
+	/// discovery hint carries it as the proof that the dial policy admitted it.
 	pub(super) dial: AdmittedDial,
 	/// The peer-routed entries, keyed by `peer_hive_id NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
@@ -168,11 +188,11 @@ pub struct AdmittedPeerAd {
 
 /// The fallback trails of one admitted advertisement through one relay.
 ///
-/// The slate reconciles under the composite `origin NUL relay` bucket,
-/// so a relay trail outlives a replacement of the origin's direct slate. An
-/// empty direct advertisement removes it with the direct routes. A trail also
-/// leaves when the relay it dials is evicted, and the stale-trail prune drops
-/// an idle trail.
+/// The slate reconciles under the composite `origin NUL relay` bucket
+/// (`ServletRegistry::reconcile_relay_trail`), so a trail outlives a new direct
+/// slate from the origin. An empty direct advertisement removes it with the
+/// direct routes. It also leaves when the relay it dials is evicted, and the
+/// stale-trail prune drops an idle trail.
 pub struct RelayTrail {
 	/// The composite `origin NUL relay` bucket this slate reconciles under.
 	pub(super) bucket: SharedId,
@@ -239,24 +259,14 @@ impl AdmittedPeerAd {
 
 	/// The relay trails through `relay_id`, the gateway that relayed this
 	/// advertisement: one trail per advertised type, each to `relay_dial`, the
-	/// relay's admitted gateway socket.
-	///
-	/// Returns `None` when the relay is the origin itself or the slate is
-	/// empty.
+	/// relay's admitted gateway socket. It is `None` when the relay is the
+	/// origin itself or the slate is empty.
 	///
 	/// # Failover
 	///
 	/// The route registry then holds two trails per type: the direct trail to
-	/// the origin, and a relay trail through the relaying peer. Pheromone
-	/// feedback can then fail over to the relay when the origin is
-	/// unreachable.
-	///
-	/// # Bucket
-	///
-	/// The trails reconcile under their own `origin NUL relay` bucket
-	/// (`ServletRegistry::reconcile_relay_trail`), so a new direct slate from
-	/// the origin leaves the fallback in place. An empty direct advertisement
-	/// removes both.
+	/// the origin and a relay trail through the relaying peer. Pheromone
+	/// feedback can fail over to the relay when the origin is unreachable.
 	#[must_use]
 	pub fn relay_trail(
 		&self,
@@ -336,16 +346,14 @@ fn peer_advertisement_wire_ok(
 /// The flood this gateway gossips in: the scope a rumor, a reconcile round,
 /// a repair, and a peer exchange travel inside.
 ///
-/// [`ClusterConfig::flood`] builds one, and only for a gateway whose own
-/// certificate carries a colony URN.
+/// [`ClusterConfig::flood`] builds one.
 ///
 /// # Scope
 ///
 /// The flood is the namespace. A member is a gateway whose key the peer trust
-/// store holds, and whose certificate in that store carries a colony URN of
-/// this namespace, whichever colony it names. Every inbound gossip frame and
-/// outbound gossip dial asks [`Self::member`], so this type is the one home of
-/// that rule.
+/// store holds, with a certificate there that carries a colony URN of this
+/// namespace, whichever colony it names. Every inbound gossip frame and
+/// outbound gossip dial asks [`Self::member`], the one home of that rule.
 ///
 /// - Colonies are the parties, and the flood is the state they share. Work
 ///   federation admits the same set, so one rule decides both planes.
@@ -510,6 +518,23 @@ mod tests {
 		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let id = certificate.fingerprint_id::<ColonyDigest<TokioListener>>();
 		assert_eq!(id.as_deref(), Some(unhex(HOUSE_GATEWAY_ID).as_slice()));
+	}
+
+	// A budget of one forward reaches a local servlet and a peer gateway, and a
+	// relay trail needs the second forward that the relay spends.
+	crate::tb_cases! {
+		fn a_budget_of_one_affords_a_peer_route_and_not_a_relay_trail(
+			(kind, afforded): (RouteKind, bool)
+		) -> Result<(), Box<dyn core::error::Error>> {
+			let budget = HopBudget::for_test(1);
+			assert_eq!(budget.affords(kind), afforded);
+			Ok(())
+		}
+		cases {
+			a_local_route => (RouteKind::Local, true),
+			a_peer_route => (RouteKind::Peer, true),
+			a_relay_trail => (RouteKind::PeerRelay, false),
+		}
 	}
 
 	/// A colony URN under another naming authority.
@@ -710,7 +735,8 @@ mod tests {
 		use super::*;
 		use crate::crypto::policy::Secp256k1Policy;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, CertificateTrustStore, TrustBuilder};
+		use crate::crypto::x509::store::{CertificateTrustBuilder, CertificateTrustStore, NoRevocation, TrustBuilder};
+		use crate::crypto::x509::KeyCurves;
 		use crate::tb_cases;
 		use crate::testing::fixtures::{TestCertificate, TestKey};
 
@@ -739,7 +765,8 @@ mod tests {
 
 		/// A peer trust store that holds `cert` alone.
 		fn store_holding(cert: &Certificate) -> CertificateTrustStore {
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(cert.clone());
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+			let builder = builder.with_certificate(cert.clone());
 			builder.expect("the test certificate satisfies the trust builder").build()
 		}
 

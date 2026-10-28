@@ -37,6 +37,7 @@ use tightbeam::transport::handshake::negotiation::{
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{contains_window, ClientMaterials, PayingApprover, ServerMaterials};
@@ -70,6 +71,7 @@ impl TransportAuthorizer for SettlingAuthorizer {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			self.settle_calls.fetch_add(1, Ordering::SeqCst);
@@ -138,10 +140,10 @@ tb_scenario! {
 			let (client, server) = outcome.established()?;
 			let client_receipt = client.session_receipt();
 			let server_receipt = server.session_receipt();
+
 			let expected_answer = OctetString::new(RESPONSE)?;
 			let answer_recovered =
 				server_receipt.is_some_and(|stored| stored.ancillary_response() == Some(&expected_answer));
-
 			assert!(answer_recovered, "the server receipt lost the settlement answer");
 			assert!(
 				client_receipt.is_some() && client_receipt == server_receipt,

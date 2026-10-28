@@ -4,31 +4,28 @@ use std::sync::Arc;
 
 use crate::colony::servlet::{ServletConfig, ServletContext};
 use crate::core::Message;
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::multiplex::{ReplySink, StreamBody};
 use crate::transport::{Protocol, TightBeamAddress};
-use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
-
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-
-use crate::runtime::rt;
 
 /// A servlet configuration, and the application env it carries.
 ///
-/// [`Servlet`] bounds its `Conf` on this so its `Env` parameter names the
-/// env the configuration actually holds, rather than a second type a
-/// caller could set independently.
+/// [`Servlet`] bounds its `Conf` on this, so its `Env` parameter names the
+/// env the configuration holds, not a second type a caller sets apart.
 pub trait ServletConf {
 	/// Application configuration this carries to the handlers.
 	type Env;
 }
 
-/// Lifecycle interface for named servlets and [`crate::colony::servlet::ServletRuntime`].
+/// Lifecycle interface for named servlets and
+/// [`crate::colony::servlet::ServletRuntime`].
 ///
-/// Generic over input message type `I`. Workers attached to a servlet share
-/// that same input type. `servlet!` implements this for the generated type;
-/// macro-free code uses [`crate::colony::servlet::ServletRuntime`] with [`RuntimeServletConf`].
+/// Generic over the input message type `I`, which the workers of a servlet
+/// share. `servlet!` implements it for the generated type. Code without the
+/// macro uses `ServletRuntime` with [`RuntimeServletConf`].
 pub trait Servlet<I, Env = ()> {
 	/// Configuration type (typically [`ServletConfig`]).
 	///
@@ -41,9 +38,9 @@ pub trait Servlet<I, Env = ()> {
 
 	/// Bind, start workers, and spawn the accept loop.
 	///
-	/// The config is taken by value: a servlet whose env has no default
-	/// cannot be started without one, so the env a handler reads and the
-	/// env the caller supplied are the same type.
+	/// It takes the config by value, so a servlet whose env has no default
+	/// cannot start without one, and a handler reads the env type the caller
+	/// supplied.
 	fn start(
 		trace: Arc<TraceCollector>,
 		config: Self::Conf,
@@ -51,7 +48,7 @@ pub trait Servlet<I, Env = ()> {
 	where
 		Self: Sized;
 
-	/// Bound listen address (borrowed; no clone).
+	/// Bound listen address, borrowed with no clone.
 	fn addr(&self) -> &Self::Address;
 
 	/// Stop accepting connections and abort in-flight accept work.
@@ -59,14 +56,6 @@ pub trait Servlet<I, Env = ()> {
 
 	/// Block until the accept loop task has exited.
 	fn join(self) -> impl Future<Output = Result<(), rt::JoinError>> + Send;
-
-	/// Utilization in basis points (`0..=10000`) for hive balancing.
-	///
-	/// Default `None` means no metrics. Override (for example with
-	/// [`crate::colony::servlet::LatencyTracker`]) when the hive should read load.
-	fn utilization(&self) -> Option<BasisPoints> {
-		None
-	}
 }
 
 /// Dispatch contract for unary, streaming, and duplex servlet traffic.
@@ -183,7 +172,8 @@ impl<Env: Send + Sync + 'static> ServletHandlers<Env> {
 		self
 	}
 
-	/// Decode message type `I` after [`crate::Frame::prepare_typed`], then run `handler`.
+	/// Decode message type `I` after [`crate::Frame::prepare_typed`], then run
+	/// `handler`.
 	pub fn on_typed_unary<I, F, Fut>(self, handler: F) -> Self
 	where
 		I: Message + Send + 'static,
@@ -240,11 +230,12 @@ impl<Env: Send + Sync + 'static> ServletService for ServletHandlers<Env> {
 	}
 }
 
-/// Config + handlers for [`Servlet`] on [`crate::colony::servlet::ServletRuntime`].
+/// Config and handlers for [`Servlet`] on
+/// [`crate::colony::servlet::ServletRuntime`].
 ///
-/// Use this when a call site needs [`Servlet::start`] without `servlet!`.
-/// Hive registration only needs [`crate::colony::hive::ServletBox`], which [`crate::colony::servlet::ServletRuntime`]
-/// already implements.
+/// Use it when a call site needs [`Servlet::start`] without `servlet!`. Hive
+/// registration needs only [`crate::colony::hive::ServletBox`], which
+/// `ServletRuntime` already implements.
 pub struct RuntimeServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider, Env = ()>
 where
 	P: Protocol,

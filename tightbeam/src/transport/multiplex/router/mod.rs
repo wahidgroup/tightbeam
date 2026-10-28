@@ -30,4 +30,4 @@ pub use transport::MuxTransport;
 pub use writer::MuxWriterDriver;
 
 #[cfg(feature = "tokio")]
-pub use transport::SpawnedMux;
+pub use transport::{MuxDrivers, SpawnedMux};

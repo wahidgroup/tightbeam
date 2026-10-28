@@ -532,15 +532,13 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-	use std::borrow::Cow;
-
 	#[cfg(feature = "testing-timing")]
 	use core::time::Duration;
 
 	use super::*;
-	use crate::testing::assertions::{Assertion, AssertionLabel};
 	use crate::testing::specs::csp::{Event, Process, State};
-	use crate::trace::ConsumedTrace;
+	use crate::trace::{ConsumedTrace, TraceCollector};
+	use crate::urn::Urn;
 
 	#[cfg(feature = "testing-timing")]
 	use crate::builder::TypeBuilder;
@@ -549,18 +547,17 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	use crate::testing::timing::{TimingConstraint, TimingConstraints, TimingGuard, WcetConfigBuilder};
 
-	fn trace_of(labels: &[&'static str]) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		for (seq, label) in labels.iter().enumerate() {
-			trace.assertions.push(Assertion::new(
-				seq,
-				AssertionLabel::Custom(Cow::Borrowed(label)),
-				Vec::new(),
-				None,
-			));
+	const A: Urn<'static> = crate::urn!("test", "event:algebra/a");
+	const B: Urn<'static> = crate::urn!("test", "event:algebra/b");
+
+	/// The trace of a run that records each of `labels` once, in order.
+	fn trace_of(labels: &[Urn<'static>]) -> ConsumedTrace {
+		let collector = TraceCollector::new();
+		for label in labels {
+			collector.event(label).expect("the run injects no fault").emit();
 		}
 
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
 	fn simple_process() -> Process {
@@ -569,10 +566,10 @@ mod tests {
 			.add_state(State("s0"))
 			.add_state(State("s1"))
 			.add_state(State("s2"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("s0"), Event("a"), State("s1"))
-			.add_transition(State("s1"), Event("b"), State("s2"))
+			.add_observable(A)
+			.add_observable(B)
+			.add_transition(State("s0"), A, State("s1"))
+			.add_transition(State("s1"), B, State("s2"))
 			.add_terminal(State("s2"))
 			.build()
 			.expect("Failed to build process")
@@ -581,12 +578,12 @@ mod tests {
 	#[test]
 	fn test_hiding_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
-		let hidden_events = [Event("a")].iter().copied().collect();
+		let hidden_events = [Event::from(A)].iter().copied().collect();
 
 		let result = p.hide(hidden_events);
-		assert!(result.hidden.contains(&Event("a")));
-		assert!(!result.observable.contains(&Event("a")));
-		assert!(result.observable.contains(&Event("b")));
+		assert!(result.hidden.contains(&Event::from(A)));
+		assert!(!result.observable.contains(&Event::from(A)));
+		assert!(result.observable.contains(&Event::from(B)));
 		Ok(())
 	}
 
@@ -594,11 +591,11 @@ mod tests {
 	fn test_renaming_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
 		let mut mapping = HashMap::new();
-		mapping.insert(Event("a"), Event("x"));
+		mapping.insert(Event::from(A), Event("x"));
 
 		let result = p.rename(mapping)?;
 		assert!(result.observable.contains(&Event("x")));
-		assert!(!result.observable.contains(&Event("a")));
+		assert!(!result.observable.contains(&Event::from(A)));
 
 		Ok(())
 	}
@@ -644,7 +641,7 @@ mod tests {
 		let q = simple_process();
 		let composed = Process::internal_choice(&p, &q)?;
 
-		let result = composed.validate_trace(&trace_of(&["a", "b"]));
+		let result = composed.validate_trace(&trace_of(&[A, B]));
 		assert!(result.valid);
 		Ok(())
 	}
@@ -655,7 +652,7 @@ mod tests {
 		let q = simple_process();
 		let composed = Process::sequential(&p, &q)?;
 
-		let result = composed.validate_trace(&trace_of(&["a", "b", "a", "b"]));
+		let result = composed.validate_trace(&trace_of(&[A, B, A, B]));
 		assert!(result.valid);
 		Ok(())
 	}
@@ -807,9 +804,9 @@ mod tests {
 	fn an_observable_first_event_commits_the_choice() -> Result<(), Box<dyn core::error::Error>> {
 		let choice = Process::external_choice(&simple_process(), &c_once())?;
 
-		let after_a = choice.step(choice.initial, &Event("a"));
+		let after_a = choice.step(choice.initial, &Event::from(A));
 		let offered: Vec<HashSet<Event>> = after_a.iter().map(|state| choice.offers(*state)).collect();
-		assert_eq!(offered, [HashSet::from([Event("b")])]);
+		assert_eq!(offered, [HashSet::from([Event::from(B)])]);
 		Ok(())
 	}
 

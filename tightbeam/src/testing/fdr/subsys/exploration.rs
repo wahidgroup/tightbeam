@@ -108,13 +108,16 @@ impl<'a> DefaultExplorationEngine<'a> {
 		let mut queue = VecDeque::new();
 
 		// A run starts each clock that the process names at zero.
+		#[cfg_attr(
+			not(feature = "testing-timing"),
+			expect(unused_mut, reason = "only a timed run starts clocks")
+		)]
+		let mut initial = ExplorationState::initial(process.initial);
 		#[cfg(feature = "testing-timing")]
-		let initial = ExplorationState {
-			clock_values: process.initial_clocks(),
-			..ExplorationState::initial(process.initial)
-		};
-		#[cfg(not(feature = "testing-timing"))]
-		let initial = ExplorationState::initial(process.initial);
+		{
+			let clocks: Vec<String> = process.initial_clocks().into_keys().collect();
+			initial.reset_clocks(clocks);
+		}
 		queue.push_back(initial);
 
 		// The seed reports the longest trace that it reaches.
@@ -124,73 +127,73 @@ impl<'a> DefaultExplorationEngine<'a> {
 		let mut injected_faults: Vec<InjectedFaultRecord> = Vec::new();
 
 		while let Some(state) = queue.pop_front() {
-			visited.insert(state.process_state);
+			visited.insert(state.process_state());
 
 			// A state from which a run of hidden events reaches a cycle of
 			// hidden events diverges, so the seed ends with a divergence.
 			if let Some(run) = process.divergence_at(self.divergent(), &state) {
 				#[cfg(feature = "testing-fault")]
-				return SeedResult::Divergence(state.trace.clone(), state.process_state, run, injected_faults);
+				return SeedResult::Divergence(state.trace().to_vec(), state.process_state(), run, injected_faults);
 				#[cfg(not(feature = "testing-fault"))]
-				return SeedResult::Divergence(state.trace.clone(), state.process_state, run);
+				return SeedResult::Divergence(state.trace().to_vec(), state.process_state(), run);
 			}
 
 			// Exploration cuts a trace off at the maximum depth. An unstable
 			// state at the bound takes its hidden steps, so the walk reaches
 			// the failure behind them.
-			if state.trace.len() >= config.max_depth {
-				if state.trace.len() > longest_trace.len() {
-					longest_trace = state.trace.clone();
+			if state.trace().len() >= config.max_depth {
+				if state.trace().len() > longest_trace.len() {
+					longest_trace = state.trace().to_vec();
 				}
 
 				// A stable or accepting cut-off state records its refusals as a
 				// failure, and the walk ends there.
-				if let Some(refusals) = self.compute_refusals(process, state.process_state) {
-					failures.push((state.trace.clone(), refusals));
+				if let Some(refusals) = self.compute_refusals(process, state.process_state()) {
+					failures.push((state.trace().to_vec(), refusals));
 					continue;
 				}
 			}
 
 			// A run of hidden events past the limit is a divergence.
-			if state.internal_run > config.max_internal_run {
+			if state.current_run().len() > config.max_internal_run {
 				let run = state.current_run().to_vec();
 				#[cfg(feature = "testing-fault")]
-				return SeedResult::Divergence(state.trace.clone(), state.process_state, run, injected_faults);
+				return SeedResult::Divergence(state.trace().to_vec(), state.process_state(), run, injected_faults);
 				#[cfg(not(feature = "testing-fault"))]
-				return SeedResult::Divergence(state.trace.clone(), state.process_state, run);
+				return SeedResult::Divergence(state.trace().to_vec(), state.process_state(), run);
 			}
 
 			// An accepting state can end the trace successfully, and the walk
 			// goes on through each action it enables.
-			let accepting = process.is_terminal(state.process_state);
-			if accepting && state.trace.len() > longest_trace.len() {
-				longest_trace = state.trace.clone();
+			let accepting = process.is_terminal(state.process_state());
+			if accepting && state.trace().len() > longest_trace.len() {
+				longest_trace = state.trace().to_vec();
 			}
 
 			// An action is enabled at these clocks when one of its edges has no
 			// guard or a guard that holds.
 			#[cfg(feature = "testing-timing")]
-			let mut actions = process.enabled_under(state.process_state, &state.clock_values);
+			let mut actions = process.enabled_under(state.process_state(), state.clock_values());
 			#[cfg(not(feature = "testing-timing"))]
-			let mut actions = process.enabled(state.process_state);
+			let mut actions = process.enabled(state.process_state());
 			if actions.is_empty() && !accepting {
 				// A state that can neither terminate nor act is a deadlock.
 				#[cfg(feature = "testing-fault")]
-				return SeedResult::Deadlock(state.trace.clone(), state.process_state, injected_faults);
+				return SeedResult::Deadlock(state.trace().to_vec(), state.process_state(), injected_faults);
 				#[cfg(not(feature = "testing-fault"))]
-				return SeedResult::Deadlock(state.trace.clone(), state.process_state);
+				return SeedResult::Deadlock(state.trace().to_vec(), state.process_state());
 			}
 
 			// A stable or accepting state records its refusals before it takes
 			// an action.
-			if let Some(refusals) = self.compute_refusals(process, state.process_state) {
-				failures.push((state.trace.clone(), refusals));
+			if let Some(refusals) = self.compute_refusals(process, state.process_state()) {
+				failures.push((state.trace().to_vec(), refusals));
 			}
 
 			// A state at the bound takes its hidden steps alone, as
 			// `Action::keeps_within` decides, and a state left with no step
 			// ends the walk.
-			actions.retain(|action| action.keeps_within(&state.trace, config.max_depth));
+			actions.retain(|action| action.keeps_within(state.trace(), config.max_depth));
 			if actions.is_empty() {
 				continue;
 			}
@@ -203,12 +206,12 @@ impl<'a> DefaultExplorationEngine<'a> {
 				let mut candidates: Vec<&Action> = actions.iter().collect();
 				loop {
 					let candidate =
-						Self::select_action_helper_from(&mut rng, process, state.process_state, &candidates);
+						Self::select_action_helper_from(&mut rng, process, state.process_state(), &candidates);
 					let fault = config.fault_model.as_ref().and_then(|fault_model| {
 						Self::check_fault_injection(
 							fault_model,
 							process,
-							state.process_state,
+							state.process_state(),
 							&candidate.event,
 							&mut rng,
 						)
@@ -222,12 +225,12 @@ impl<'a> DefaultExplorationEngine<'a> {
 					candidates.retain(|a| a.event != candidate.event);
 
 					if candidates.is_empty() {
-						return SeedResult::Deadlock(state.trace.clone(), state.process_state, injected_faults);
+						return SeedResult::Deadlock(state.trace().to_vec(), state.process_state(), injected_faults);
 					}
 				}
 			};
 			#[cfg(not(feature = "testing-fault"))]
-			let action = Self::select_action_helper(&mut rng, process, state.process_state, &actions);
+			let action = Self::select_action_helper(&mut rng, process, state.process_state(), &actions);
 
 			Self::execute_transition_helper(process, &state, action, &mut queue, timing_pruned);
 		}
@@ -245,6 +248,13 @@ impl<'a> DefaultExplorationEngine<'a> {
 }
 
 impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
+	type ForProcess<'p> = DefaultExplorationEngine<'p>;
+
+	fn for_process<'p>(&self, process: &'p Process) -> DefaultExplorationEngine<'p> {
+		let config = Arc::clone(&self.config);
+		DefaultExplorationEngine::new(process, config)
+	}
+
 	fn process(&self) -> &Process {
 		self.process
 	}
@@ -400,7 +410,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 		// Each edge that the clocks allow is a branch, which resets the clocks
 		// that the edge names.
 		#[cfg(feature = "testing-timing")]
-		let successors = process.successors(state.process_state, &action.event, &state.clock_values);
+		let successors = process.successors(state.process_state(), &action.event, state.clock_values());
 		#[cfg(feature = "testing-timing")]
 		let branches = successors.map(|successor| {
 			let mut branch = state.branch();
@@ -408,7 +418,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 			(branch, successor.to)
 		});
 		#[cfg(not(feature = "testing-timing"))]
-		let targets = process.step(state.process_state, &action.event);
+		let targets = process.step(state.process_state(), &action.event);
 		#[cfg(not(feature = "testing-timing"))]
 		let branches = targets.into_iter().map(|to| (state.branch(), to));
 
@@ -448,7 +458,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 	/// Whether `state` violates the timing constraints.
 	#[cfg(feature = "testing-timing")]
 	fn check_timing_violations(state: &ExplorationState, constraints: &TimingConstraints) -> bool {
-		constraints.violated_by(&state.trace, state.elapsed_time, &state.event_times)
+		constraints.violated_by(state.trace(), state.elapsed_time(), state.event_times())
 	}
 }
 
@@ -461,16 +471,16 @@ impl Process {
 	/// transition. A guard can block a hidden edge, so the clocks of `branch`
 	/// decide a timed process, through `Process::divergence_under`.
 	fn divergence_at(&self, divergent: &DivergentStates, branch: &ExplorationState) -> Option<Vec<Event>> {
-		if !divergent.contains(branch.process_state) {
+		if !divergent.contains(branch.process_state()) {
 			return None;
 		}
 
 		#[cfg(feature = "testing-timing")]
 		if self.has_timed_transitions() {
-			return self.divergence_under(branch.process_state, &branch.clock_values);
+			return self.divergence_under(branch.process_state(), branch.clock_values());
 		}
 
-		divergent.witness(branch.process_state)
+		divergent.witness(branch.process_state())
 	}
 }
 

@@ -1,7 +1,7 @@
 //! Shared test utilities for handshake protocol tests.
 //!
-//! The module holds the fixtures, the functions, and the data structures that
-//! every handshake test module shares, so each setup has one home.
+//! It holds the fixtures, functions, and data structures that every handshake
+//! test module shares, so each setup has one home.
 #![allow(unused)]
 
 #[cfg(not(feature = "std"))]
@@ -29,7 +29,7 @@ use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecordDirection, RecvCiph
 use crate::crypto::cms::{AuthEnvelopedData, Opener};
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::{Digest, Sha3_256};
-use crate::crypto::kdf::{EcdhSecret, KdfFunction};
+use crate::crypto::kdf::{EcdhSecret, KdfFunction, KdfSalt};
 use crate::crypto::key::{KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::policy::VerificationPolicy;
@@ -40,7 +40,7 @@ use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use crate::crypto::sign::elliptic_curve::sec1::{CompressedPoint as Sec1CompressedPoint, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::PublicKey;
-use crate::crypto::sign::{CanonicalSigner, CmsSigner, Signed, SignedContent, SigningIdentity};
+use crate::crypto::sign::{CanonicalSigner, CmsSigner, Signed, SignedContent, SignedDataExt, SigningIdentity};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
@@ -63,7 +63,7 @@ use crate::transport::handshake::flow::ClientFlow;
 use crate::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, RunnableProfile, TransportAuthorizer, TransportOffer,
 };
-use crate::transport::handshake::primitives::{KdfSalt, TranscriptHash};
+use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
 	ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
 };
@@ -465,8 +465,8 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 }
 
 /// A fresh server ephemeral public key as the compressed SEC 1 point the
-/// `ServerHandshake` carries. The function discards the private half, so a
-/// client that completes against it derives keys nobody else holds.
+/// `ServerHandshake` carries. It discards the private half, so a client that
+/// completes against it derives keys nobody else holds.
 #[cfg(feature = "transport-hpke")]
 pub fn create_test_server_ephemeral() -> Sec1CompressedPoint<Secp256k1> {
 	let public_key = SecretKey::random(&mut OsRng).public_key();
@@ -573,14 +573,18 @@ pub fn fixture_agreement(fill: u8) -> EcdhSecret<Secp256k1> {
 	EcdhSecret::try_from(octets).expect("32 bytes make a secp256k1 shared secret")
 }
 
+/// The salt of the fixture derivations, 32 octets of `0x99`.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub const FIXTURE_SALT: &[u8] = &[0x99u8; 32];
+
 /// A handshake secret derived from a fixture ephemeral-ephemeral secret, a
-/// fixture base secret of `fill` bytes, and a fixture salt.
+/// fixture base secret of `fill` bytes, and [`FIXTURE_SALT`].
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 	let base = BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret");
 	let shared = fixture_agreement(0x11);
-	derive_handshake_secret(&shared, Some(&base), KdfSalt::new(&[0x99u8; 32]))
-		.expect("fixture inputs derive a handshake secret")
+	let salt = KdfSalt::try_from(FIXTURE_SALT).expect("the fixture salt meets the floor");
+	derive_handshake_secret(&shared, Some(&base), salt).expect("fixture inputs derive a handshake secret")
 }
 
 /// The salt and the transcript hash of [`fixture_confirmation`].
@@ -602,7 +606,8 @@ pub fn fixture_confirmation() -> KeyConfirmation {
 	let secret = fixture_handshake_secret(0x42);
 	let transcript = fixture_transcript::<Sha3_256>(FIXTURE_CONFIRMED);
 
-	let derived = secret.confirmation::<DefaultCryptoProvider>(KdfSalt::new(&FIXTURE_CONFIRMED), &transcript);
+	let salt = KdfSalt::try_from(FIXTURE_CONFIRMED.as_slice()).expect("the fixture salt meets the floor");
+	let derived = secret.confirmation::<DefaultCryptoProvider>(salt, &transcript);
 	derived.expect("a fixture secret derives a tag")
 }
 
@@ -627,7 +632,7 @@ impl Confirming {
 	/// with the server ephemeral, so an honest hand-built closing confirms the
 	/// secret the server derives.
 	pub fn tag(&self, base: Option<&BaseSecret>, ephemeral: &SecretKey) -> KeyConfirmation {
-		let salt = KdfSalt::new(&self.salt);
+		let salt = KdfSalt::try_from(self.salt.as_slice()).expect("the handshake salt meets the floor");
 		let secret = self.secret(base, ephemeral);
 
 		let derived = secret.confirmation::<DefaultCryptoProvider>(salt, &self.transcript_hash);
@@ -637,7 +642,7 @@ impl Confirming {
 	/// The closing sealer of a client that drew `ephemeral`, and `base` when
 	/// the flow carries one.
 	pub fn closing_sealer(&self, base: Option<&BaseSecret>, ephemeral: &SecretKey) -> Sealer<DefaultCryptoProvider> {
-		let salt = KdfSalt::new(&self.salt);
+		let salt = KdfSalt::try_from(self.salt.as_slice()).expect("the handshake salt meets the floor");
 		let secret = self.secret(base, ephemeral);
 
 		let sealer = secret.sealer::<DefaultCryptoProvider>(SecretSeal::Closing, salt, &self.transcript_hash);
@@ -647,7 +652,7 @@ impl Confirming {
 	/// The handshake secret of the production agreement of `ephemeral` with
 	/// the server ephemeral, under `base` when the flow carries one.
 	pub fn secret(&self, base: Option<&BaseSecret>, ephemeral: &SecretKey) -> HandshakeSecret {
-		let salt = KdfSalt::new(&self.salt);
+		let salt = KdfSalt::try_from(self.salt.as_slice()).expect("the handshake salt meets the floor");
 		let server_ephemeral = admitted(&self.server_ephemeral);
 		let agreement = agreement_of(&server_ephemeral, base);
 
@@ -786,7 +791,7 @@ impl StaticKeyObserver {
 	pub fn record_attempts(&self, record: &[u8]) -> Result<RecordAttempts, Box<dyn Error>> {
 		let mut attempts = Vec::new();
 		for secret in self.handshake_secrets()? {
-			let salt = KdfSalt::new(&self.salt);
+			let salt = KdfSalt::try_from(self.salt.as_slice())?;
 			let ciphers = DirectionalCiphers::derive::<DefaultCryptoProvider, _>(&secret, salt, 0)?;
 			attempts.push(opened_record(ciphers.client_to_server, record));
 			attempts.push(opened_record(ciphers.server_to_client, record));
@@ -818,7 +823,7 @@ impl StaticKeyObserver {
 		// server opens it, so each attempt fails at the key alone.
 		let envelope = AuthEnvelopedData::from_der(sealed)?;
 		let content_type = envelope.auth_encrypted_content_info.content_type;
-		let salt = KdfSalt::new(&self.salt);
+		let salt = KdfSalt::try_from(self.salt.as_slice())?;
 		let mut attempts = Vec::new();
 
 		for secret in self.handshake_secrets()? {
@@ -844,7 +849,7 @@ impl StaticKeyObserver {
 	/// The handshake secret each candidate yields through the production
 	/// derivation.
 	fn handshake_secrets(&self) -> Result<Vec<HandshakeSecret>, HandshakeError> {
-		let salt = KdfSalt::new(&self.salt);
+		let salt = KdfSalt::try_from(self.salt.as_slice())?;
 		let derive = |shared| derive_handshake_secret(shared, self.base.as_ref(), salt);
 		self.candidates.iter().map(derive).collect()
 	}
@@ -859,7 +864,8 @@ impl StaticKeyObserver {
 	/// The key-encryption key that `base` alone derives under `label`, with
 	/// no ephemeral-ephemeral input.
 	fn pre_change_kek(&self, base: &BaseSecret, label: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
-		let kek = ObserverKdf::derive_dynamic_key(base.as_bytes(), label, Some(&self.salt), OBSERVER_KEK_SIZE)?;
+		let salt = KdfSalt::try_from(self.salt.as_slice())?;
+		let kek = ObserverKdf::derive_dynamic_key(base.as_bytes(), label, Some(salt), OBSERVER_KEK_SIZE)?;
 		Ok(kek)
 	}
 }
@@ -902,7 +908,7 @@ pub fn create_test_signed_data(content: impl AsRef<[u8]>) -> SignedData {
 
 /// Create test key pairs for cryptographic operations.
 ///
-/// The function returns a tuple with these parts, in order:
+/// It returns a tuple of these parts, in order:
 ///
 /// 1. the sender private key,
 /// 2. the sender SPKI,
@@ -1014,7 +1020,7 @@ impl SigningKeyProvider for RecordingProvider {
 /// Mutual authentication against `validator` alone.
 pub fn mutual_with(validator: impl CertificateValidation + 'static) -> PeerAuthentication {
 	let validator: Arc<dyn CertificateValidation> = Arc::new(validator);
-	PeerAuthentication::mutual([validator])
+	PeerAuthentication::Anonymous.and(validator)
 }
 
 /// The budgets a budget-bearing test session requests.
@@ -1050,6 +1056,7 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		_response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move { Ok(()) })
 	}
@@ -1131,6 +1138,7 @@ pub fn client_identity(identity: &TestCertificate) -> SigningIdentity {
 #[cfg(feature = "transport-hpke")]
 pub fn hpke_client_settings(server: &Certificate, identity: Option<SigningIdentity>) -> HpkeClientSettings {
 	let validator = DirectTrustValidator::default().with_trust_chain(vec![server.to_owned()]);
+	let validator = validator.expect("a test certificate encodes");
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(validator));
 	settings.identity = identity;
 	settings
@@ -1185,7 +1193,7 @@ pub fn reply_signed_data(reply: &HandshakeMessage) -> SignedData {
 #[cfg(feature = "transport-hpke")]
 pub fn signed_handshake(reply: &HandshakeMessage) -> ServerHandshake {
 	let signed_data = reply_signed_data(reply);
-	let content = CmsSigner::content(&signed_data, HANDSHAKE_REPLY_CONTENT);
+	let content = signed_data.content(HANDSHAKE_REPLY_CONTENT);
 	let content = content.expect("an HPKE reply signs a ServerHandshake");
 	ServerHandshake::from_der(content).expect("the content is a ServerHandshake")
 }

@@ -10,19 +10,25 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::asn1::admission::DerAdmission;
+use crate::asn1::admission::{Canonical, Comparing, DerAdmission};
+use crate::asn1::{AuthEnvelopedData, ContentInfo};
 use crate::der::{
 	Decode, DecodeValue, Encode, EncodeValue, Header, Length, Reader, Result as DerResult, Sequence, SliceReader, Tag,
 	Writer,
 };
+
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::frame::Signed;
+#[cfg(feature = "transport")]
+use crate::transport::handshake::negotiation::{SecurityAccept, TransportAccept};
 
 /// A `SEQUENCE` value together with the DER bytes that carry it.
 ///
 /// Encoding a `WireDer` writes the stored bytes, so the bytes a sender hashed
-/// are the bytes the receiver reads. Every handshake container and the frame
-/// envelope is a `SEQUENCE`, so the type carries that tag.
+/// are the bytes the receiver reads. Each decode holds the value to the bytes
+/// it arrived as, so a received value names every element its bytes carry.
+/// Every handshake container and the frame envelope is a `SEQUENCE`, so the
+/// type carries that tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireDer<T> {
 	der: Vec<u8>,
@@ -96,25 +102,28 @@ impl<T> WireDer<T> {
 
 impl<T> TryFrom<&[u8]> for WireDer<T>
 where
-	T: for<'a> Decode<'a>,
+	T: for<'a> Decode<'a> + Canonical,
 {
 	type Error = crate::der::Error;
 
-	/// Admit `der` under the CMS rules of the admission walk, then decode it
-	/// once and keep it as received.
+	/// Admit `der` under the CMS rules of the admission walk, decode it once,
+	/// hold the value to the bytes it arrived as, and keep them.
 	fn try_from(der: &[u8]) -> DerResult<Self> {
 		DerAdmission::Cms.admit(der)?;
 		let value = T::from_der(der)?;
 		let contents_at = contents_offset(der)?;
-		Ok(Self { der: der.to_vec(), contents_at, value })
+
+		let received = Self { der: der.to_vec(), contents_at, value };
+		DerAdmission::arrived_as(&received.value, received.contents())?;
+		Ok(received)
 	}
 }
 
-impl<'a, T> Sequence<'a> for WireDer<T> where T: for<'b> Sequence<'b> {}
+impl<'a, T> Sequence<'a> for WireDer<T> where T: for<'b> Sequence<'b> + Canonical {}
 
 impl<'a, T> DecodeValue<'a> for WireDer<T>
 where
-	T: for<'b> Sequence<'b>,
+	T: for<'b> Sequence<'b> + Canonical,
 {
 	/// Keep the contents octets as received under the `SEQUENCE` tag.
 	///
@@ -126,6 +135,7 @@ where
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> DerResult<Self> {
 		let contents = reader.read_slice(header.length)?;
 		DerAdmission::Cms.admit(contents)?;
+
 		let own_header = Header::new(Tag::Sequence, header.length)?;
 		let contents_at = usize::try_from(own_header.encoded_len()?)?;
 		let mut der = Vec::with_capacity(contents_at.saturating_add(contents.len()));
@@ -134,9 +144,45 @@ where
 		der.extend_from_slice(contents);
 
 		let value = T::from_der(&der)?;
+		DerAdmission::arrived_as(&value, contents)?;
 		Ok(Self { der, contents_at, value })
 	}
 }
+
+/// `der` 0.7 sorts the `recipientInfos` of an `AuthEnvelopedData`, a SET OF a
+/// CHOICE, in another order than X.690 § 11.6, so the contents go out with
+/// every universal SET in DER order. Its attributes are a SET OF a SEQUENCE,
+/// which `der` orders as DER does.
+impl Canonical for AuthEnvelopedData {
+	fn encode_canonical(&self, writer: &mut impl Writer) -> DerResult<()> {
+		DerAdmission::write_arranged(self, &[], writer)
+	}
+
+	/// Rule A admitted every universal SET of `arrived` in DER order, and the
+	/// canonical encoding moves no other element, so `arrived` is that encoding
+	/// when the `der` encoding streams equal to it.
+	fn is_encoded_as(&self, arrived: &[u8]) -> DerResult<bool> {
+		let is_der_order = Comparing::is_written_by(arrived, |writer| self.encode_value(writer))?;
+		if is_der_order {
+			return Ok(true);
+		}
+
+		Comparing::is_written_by(arrived, |writer| self.encode_canonical(writer))
+	}
+}
+
+/// `der` 0.7 writes a `ContentInfo` in DER: its content type, and its content
+/// as it arrived.
+impl Canonical for ContentInfo {}
+
+/// `der` 0.7 writes a `SecurityAccept`, the profile a server selected, in DER.
+#[cfg(feature = "transport")]
+impl Canonical for SecurityAccept {}
+
+/// `der` 0.7 writes a `TransportAccept`, a SEQUENCE of a flag, integers, and
+/// budgets, in DER.
+#[cfg(feature = "transport")]
+impl Canonical for TransportAccept {}
 
 impl<T> EncodeValue for WireDer<T>
 where
@@ -169,6 +215,9 @@ mod tests {
 	use crate::x509::attr::Attribute;
 
 	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.3.4");
+
+	/// `der` 0.7 orders the values of an `Attribute` as DER does.
+	impl Canonical for Attribute {}
 
 	#[test]
 	fn a_decoded_value_keeps_the_bytes_it_arrived_as() -> DerResult<()> {
@@ -207,5 +256,82 @@ mod tests {
 	fn a_descending_set_is_refused_as_a_value() {
 		let refused = WireDer::<Attribute>::from_der(&descending_attribute());
 		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
+	}
+
+	/// The fields of `AuthEnvelopedData` (RFC 5083 § 2.1), with its
+	/// context-specific tags, over placeholder values.
+	#[derive(Clone, Debug, PartialEq, Eq, Sequence)]
+	struct EnvelopeLayout {
+		version: u8,
+		#[asn1(
+			context_specific = "0",
+			tag_mode = "IMPLICIT",
+			constructed = "true",
+			optional = "true"
+		)]
+		originator_info: Option<Any>,
+		recipient_infos: Any,
+		content_info: OctetString,
+		#[asn1(
+			context_specific = "1",
+			tag_mode = "IMPLICIT",
+			constructed = "true",
+			optional = "true"
+		)]
+		auth_attrs: Option<Any>,
+		mac: OctetString,
+		#[asn1(
+			context_specific = "2",
+			tag_mode = "IMPLICIT",
+			constructed = "true",
+			optional = "true"
+		)]
+		unauth_attrs: Option<Any>,
+	}
+
+	/// `der` 0.7 writes the layout in DER.
+	impl Canonical for EnvelopeLayout {}
+
+	/// `SEQUENCE { 0, SET {}, "", [1] {}, "" }`, the DER of an
+	/// [`EnvelopeLayout`].
+	const CANONICAL_LAYOUT: [u8; 13] = [0x30, 0x0b, 0x02, 0x01, 0x00, 0x31, 0x00, 0x04, 0x00, 0xa1, 0x00, 0x04, 0x00];
+
+	/// [`CANONICAL_LAYOUT`] with a stray `[0] { NULL }` before `[1]`, where
+	/// X.690 § 8.9.2 admits no element.
+	const STRAY_BEFORE_ATTRIBUTES: [u8; 17] = [
+		0x30, 0x0f, 0x02, 0x01, 0x00, 0x31, 0x00, 0x04, 0x00, 0xa0, 0x02, 0x05, 0x00, 0xa1, 0x00, 0x04, 0x00,
+	];
+
+	/// [`CANONICAL_LAYOUT`] with a stray `[1] { NULL }` after `mac`, where
+	/// only `[2]` may follow.
+	const STRAY_AFTER_MAC: [u8; 17] = [
+		0x30, 0x0f, 0x02, 0x01, 0x00, 0x31, 0x00, 0x04, 0x00, 0xa1, 0x00, 0x04, 0x00, 0xa1, 0x02, 0x05, 0x00,
+	];
+
+	/// The refusal of a value that arrived in another encoding than its DER.
+	const NONCANONICAL: ErrorKind = ErrorKind::Noncanonical { tag: Tag::Sequence };
+
+	#[test]
+	fn a_value_in_its_der_is_admitted() -> DerResult<()> {
+		let admitted = WireDer::<EnvelopeLayout>::try_from(&CANONICAL_LAYOUT[..])?;
+		assert_eq!(admitted.der(), CANONICAL_LAYOUT);
+		Ok(())
+	}
+
+	/// `der` skips a context-specific element whose number is below the one
+	/// it looks for, so the hold of the decoded value to its arrival refuses
+	/// the stray `[0]`.
+	#[test]
+	fn a_stray_context_tag_is_refused_as_bytes() {
+		let refused = WireDer::<EnvelopeLayout>::try_from(&STRAY_BEFORE_ATTRIBUTES[..]);
+		assert_eq!(refused.map_err(|error| error.kind()), Err(NONCANONICAL));
+	}
+
+	/// The decode under an enclosing tag holds the value to its arrival as
+	/// the decode of the bytes alone does.
+	#[test]
+	fn a_stray_context_tag_is_refused_as_a_value() {
+		let refused = WireDer::<EnvelopeLayout>::from_der(&STRAY_AFTER_MAC);
+		assert_eq!(refused.map_err(|error| error.kind()), Err(NONCANONICAL));
 	}
 }

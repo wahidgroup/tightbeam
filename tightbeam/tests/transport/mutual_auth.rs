@@ -29,8 +29,8 @@ use tightbeam::{
 		sign::ecdsa::Secp256k1,
 		x509::{
 			policy::CertificateValidation,
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			Certificate, CertificateSpec,
+			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
+			Certificate, CertificateSpec, KeyCurves,
 		},
 	},
 	decode, exactly,
@@ -47,7 +47,7 @@ use tightbeam::{
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(server_cert)?
 			.build(),
 	))
@@ -140,7 +140,6 @@ tb_scenario! {
 			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
 			let response: AuthResponse = decode(response_frame.message())?;
-
 			assert_eq!(response.server_id, "mutual-auth-server", "the reply must name the servlet");
 			assert!(response.authenticated, "the servlet must accept the client id");
 			Ok(())
@@ -148,11 +147,11 @@ tb_scenario! {
 	}
 }
 
-/// Drives the lazy encryption handshake to a verdict, and returns whether it
-/// refused: `connect` only dials, so a certificate rejection surfaces on the
+/// Drives the lazy encryption handshake to a verdict and returns whether it
+/// refused. `connect` only dials, so a certificate rejection shows on the
 /// first exchange. The probe is a well-formed request, so a decode failure
-/// cannot masquerade as a handshake refusal. The client transport carries the
-/// scenario collector, so the collector records its own handshake verdicts.
+/// cannot pass as a handshake refusal. The client transport carries the
+/// scenario collector, which records the client's handshake verdicts.
 async fn handshake_rejected(
 	builder: ClientBuilder<TokioListener>,
 	addr: TightBeamSocketAddr,
@@ -174,8 +173,8 @@ async fn handshake_rejected(
 }
 
 // Negative test A: the server refuses an invalid client certificate. The
-// servlet's pinning validator records the refusal, and the HPKE client, which
-// completes when it sends the closing, records its completion.
+// servlet's pinning validator records the refusal. The HPKE client completes
+// when it sends the closing, and records that completion.
 tb_assert_spec! {
 	pub InvalidClientSpec,
 	V(1,0,0): {
@@ -207,8 +206,8 @@ tb_scenario! {
 			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
 			// The client identity sits outside the server's pin set. Its
-			// certificate and signing provider share one fresh key, so the
-			// rejection is the pin check and not a key/certificate mismatch.
+			// certificate and signing provider share one key, so the rejection
+			// is the pin check and not a key/certificate mismatch.
 			let invalid_key = TestKey::insecure_fixed_signing();
 			let invalid_cert = TestCertificate::self_signed(&invalid_key);
 
@@ -252,8 +251,8 @@ tb_scenario! {
 			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
 			// The server certificate sits outside the client's trust store. Its
-			// certificate and signing provider share one fresh key, so the
-			// rejection is the trust check and not a key/certificate mismatch.
+			// certificate and signing provider share one key, so the rejection
+			// is the trust check and not a key/certificate mismatch.
 			let invalid_server_key = TestKey::insecure_fixed_signing();
 			let invalid_server_cert = TestCertificate::self_signed(&invalid_server_key);
 

@@ -1,13 +1,18 @@
 //! The tests of registration, control-plane refusal, and the hive lifecycle.
 
-use super::common::*;
+use tokio::sync::Notify;
+
 use tightbeam::colony::cluster::ClusterHeartbeat;
+use tightbeam::colony::hive::ServletDrainFuture;
 use tightbeam::crypto::x509::store::TrustVerification;
 use tightbeam::testing::TestFrame;
 use tightbeam::trace::AssertionValue;
+use tightbeam::transport::{TransportError, TransportFailure};
 
 #[cfg(feature = "instrument")]
 use tightbeam::testing::fixtures::TestTrace;
+
+use super::common::*;
 
 tb_assert_spec! {
 	pub ClusterTeardownSpec,
@@ -176,7 +181,7 @@ tb_assert_spec! {
 fn untrusted_hive_identity() -> (Arc<HiveTlsConfig>, Arc<dyn CertificateTrust>) {
 	let (hive_cert, hive_key) = colony_identity("CN=Untrusted Hive", &test_colony_urn());
 	let admits_hive: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(hive_cert.to_owned())
 			.expect("the hive certificate builds a trust store")
 			.build(),
@@ -184,7 +189,7 @@ fn untrusted_hive_identity() -> (Arc<HiveTlsConfig>, Arc<dyn CertificateTrust>) 
 	let hive_tls = HiveTlsConfig::new(
 		CertificateSpec::Built(Box::new(hive_cert)),
 		Arc::new(Secp256k1KeyProvider::from(hive_key)),
-		vec![],
+		PeerAuthentication::Anonymous,
 	)
 	.expect("the hive TLS material must decode");
 
@@ -210,8 +215,8 @@ tb_scenario! {
 			// run, because it reads the clock the test advances.
 			let mut accepting_conf = ClusterConfig::new(cluster_tls_config_with_trust(&certs, Some(admits_hive)));
 			accepting_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
-			let accepting = start_cluster(&trace, accepting_conf).await?;
 
+			let accepting = start_cluster(&trace, accepting_conf).await?;
 			let mut hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
 				hive_tls: Some(hive_tls),
@@ -501,11 +506,9 @@ tb_assert_spec! {
 	}
 }
 
-// A capture with `s` flipped to `n - s` verifies under the hive trust the
-// gateway holds (SEC 1 v2.0 §4.1.4), to the value of its original. The replay
-// ledger keys on the canonical signature, so the rewritten capture finds the
-// slot its original spent (CWE-294), and the gateway refuses it as a replay and
-// not as a forgery.
+// A capture with `s` flipped to `n - s` verifies to the value of its original
+// (SEC 1 v2.0 §4.1.4). The replay ledger keys on that value, so the gateway
+// refuses the capture as a replay of the spent slot, not a forgery (CWE-294).
 tb_scenario! {
 	name: cluster_refuses_registration_replayed_with_its_s_flipped,
 	spec: ClusterFlippedReplaySpec,
@@ -666,7 +669,7 @@ fn dual_hive_certs() -> DualHiveCerts {
 	let key_a = Secp256k1SigningKey::from(raw_a);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(cert_a.to_owned())
 			.expect("hive A trust")
 			.with_certificate(cert_b.to_owned())
@@ -682,7 +685,8 @@ fn dual_hive_certs() -> DualHiveCerts {
 async fn start_hive_b(certs: &DualHiveCerts, trace: &TraceCollector) -> Result<ClusterTestHive, TightBeamError> {
 	let (cert, key) = &certs.hive_b;
 	let spec = CertificateSpec::Built(Box::new(cert.to_owned()));
-	let hive_tls = HiveTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key.to_owned())), vec![])?;
+	let provider = Arc::new(Secp256k1KeyProvider::from(key.to_owned()));
+	let hive_tls = HiveTlsConfig::new(spec, provider, PeerAuthentication::Anonymous)?;
 	let trust_store = Some(Arc::clone(&certs.gateway.trust));
 	let conf = HiveConfig { hive_tls: Some(Arc::new(hive_tls)), trust_store, ..Default::default() };
 
@@ -715,10 +719,9 @@ tb_assert_spec! {
 	}
 }
 
-// A heartbeat is bound to the identity that signed the hive's registration
-// (CWE-346). Hive A registers the control address where hive B answers, so
-// the heartbeat finds another identity there and ends before its command
-// leaves.
+// A heartbeat binds to the identity that signed the hive's registration
+// (CWE-346). Hive A registers the address where hive B answers, so the
+// heartbeat finds another identity and ends before its command leaves.
 tb_scenario! {
 	name: cluster_heartbeat_refuses_a_hive_answering_under_another_identity,
 	spec: ClusterHeartbeatBindingSpec,
@@ -755,10 +758,9 @@ tb_assert_spec! {
 	}
 }
 
-// A heartbeat names the hive by its registration, so the gateway refuses a
-// heartbeat to an address with no registration before any dial. A registered
-// hive proves that the trace reaches the gateway, so the dial count of 0 reads
-// the gateway's own record.
+// A heartbeat names the hive by its registration, so one to an unregistered
+// address refuses before any dial. The registered hive proves the trace
+// reaches the gateway, so the dial count of 0 is the gateway's own record.
 tb_scenario! {
 	name: cluster_heartbeat_refuses_an_address_no_hive_registered,
 	spec: ClusterHeartbeatUnregisteredSpec,
@@ -795,10 +797,9 @@ tb_assert_spec! {
 }
 
 // The background beat keeps a hive alive on its own identity's answer alone.
-// Hive B admits the gateway's heartbeat, and the beat ends each dial to it
-// before the command leaves, so the hive leaves at its first failed beat. The
-// failure carries `Unavailable`, the status of a beat that never reached the
-// hive, where an answered rejection would carry the hive's own status.
+// Hive B admits the heartbeat, but the beat ends each dial before the command
+// leaves, so the hive leaves at its first failed beat. The failure carries
+// `Unavailable`, the status of a beat that never reached the hive.
 tb_scenario! {
 	name: cluster_heartbeat_keeps_no_hive_alive_on_another_identity,
 	spec: ClusterHeartbeatBindingEvictionSpec,
@@ -915,9 +916,110 @@ fn a_beat_capped_at_one_dial_reaches_every_hive() -> Result<(), TightBeamError> 
 	let mut builder = tokio::runtime::Builder::new_multi_thread();
 	let runtime = builder.worker_threads(2).enable_all().build()?;
 	let evicted = runtime.block_on(evictions_of_a_beat_capped_at_one_dial());
+
 	runtime.shutdown_background();
 
 	assert_eq!(evicted?, 2);
+	Ok(())
+}
+
+// An admitted registration names the signer whose signature the gateway
+// verified, so the audit trail answers who registered the hive (CWE-778).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn an_admitted_registration_names_its_signer() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = payload_trace();
+	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
+	register_signed_hive(&mut client, &certs.key, b"named-reg", b"127.0.0.1:65210").await?;
+	cluster.stop();
+
+	let principals = payload_digests(&trace, events::CLUSTER_HIVE_REGISTERED);
+	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
+	Ok(())
+}
+
+// An admitted address update names the signer whose signature the gateway
+// verified, so the audit trail answers who moved a servlet route (CWE-778).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn an_admitted_update_names_its_signer() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = payload_trace();
+	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
+	register_signed_hive(&mut client, &certs.key, b"update-reg", b"127.0.0.1:65211").await?;
+
+	let added = servlet_info(&certs, "ping", b"127.0.0.1:65212");
+	let update = servlet_address_update(b"127.0.0.1:65211", vec![added], vec![]);
+
+	emit_servlet_update(&mut client, &certs.key, b"named-update", update).await?;
+	cluster.stop();
+
+	let principals = payload_digests(&trace, events::CLUSTER_UPDATE_ACCEPTED);
+	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
+	Ok(())
+}
+
+// A registration that the gateway refuses after the signature verifies names
+// its signer, so the audit trail answers who sent it (CWE-778). Its hive
+// address is not UTF-8, so the gateway refuses it as `PermissionDenied`.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_refused_registration_names_its_signer() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = payload_trace();
+	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
+	register_signed_hive(&mut client, &certs.key, b"named-refusal", [0xff, 0xfe, 0xfd]).await?;
+	cluster.stop();
+
+	let principals = payload_digests(&trace, events::CLUSTER_REGISTER_REFUSED);
+	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
+	Ok(())
+}
+
+// An address update that the gateway refuses after the signature verifies
+// names its signer (CWE-778). It removes a bare servlet type where an
+// instance belongs, so the gateway refuses it as `PermissionDenied`.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_refused_update_names_its_signer() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = payload_trace();
+	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+	let update = servlet_address_update(b"127.0.0.1:65214", vec![], vec![servlet_urn("ping")]);
+
+	emit_servlet_update(&mut client, &certs.key, b"named-update-refusal", update).await?;
+	cluster.stop();
+
+	let principals = payload_digests(&trace, events::CLUSTER_UPDATE_REFUSED);
+	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
+	Ok(())
+}
+
+// A replayed registration names the signer whose signature the gateway
+// verified before its freshness gate refused the replay (CWE-778).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_replayed_registration_names_its_signer() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = payload_trace();
+	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+	let fresh = signed_control_frame(&certs, b"named-replay", registration_request(b"127.0.0.1:65215")).await?;
+
+	emit_frame(&mut client, fresh.to_owned()).await?;
+	emit_frame(&mut client, fresh).await?;
+	cluster.stop();
+
+	let principals = payload_digests(&trace, events::CLUSTER_REGISTER_REFUSED);
+	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
 	Ok(())
 }
 
@@ -1011,11 +1113,9 @@ tb_assert_spec! {
 	}
 }
 
-// A second hive that registers a servlet address the first hive already
-// serves meets a whole refusal, so the first hive keeps its route (CWE-639).
-// The first hive then removes that address under its own signature, which
-// only the route's owner may do, so the accepted removal is the proof it
-// kept the route.
+// A second hive that registers a servlet address the first hive serves meets
+// a whole refusal, so the first keeps its route (CWE-639). Only the route's
+// owner may remove it, so the accepted removal proves the first hive kept it.
 tb_scenario! {
 	name: cluster_rejects_a_registration_that_takes_another_hives_servlet,
 	spec: ClusterServletTakeoverSpec,
@@ -1228,8 +1328,9 @@ tb_assert_spec! {
 	}
 }
 
-// A gateway that admitted a hive the heartbeat cannot dial would leave it to
-// expire at the lease timeout with no refusal to show for it.
+// The gateway refuses a hive whose control address the heartbeat cannot
+// dial, because an admitted one would expire at the lease timeout with no
+// refusal to show for it.
 tb_scenario! {
 	name: cluster_refuses_a_hive_whose_control_address_the_protocol_cannot_dial,
 	spec: ClusterUndialableHiveSpec,
@@ -1328,10 +1429,9 @@ async fn dial_as_stranger(
 }
 
 /// What a gateway records after [`REFUSED_STRANGERS`] strangers fail the
-/// handshake of its colony plane and it then records an event of its own: its
-/// own events that its trace keeps, that trace's overflow latch, and the count
-/// of refused certificates on its connection trace. Each trace holds
-/// [`REFUSED_STRANGERS`] events.
+/// handshake of its colony plane, then one event of its own: its own events in
+/// its trace, that trace's overflow latch, and the refused certificates on its
+/// connection trace. Each trace holds [`REFUSED_STRANGERS`] events.
 #[cfg(feature = "instrument")]
 async fn gateway_traces_after_refused_strangers() -> Result<(Vec<Urn<'static>>, bool, usize), TightBeamError> {
 	use tightbeam::instrumentation::TbInstrumentationConfig;
@@ -1342,7 +1442,7 @@ async fn gateway_traces_after_refused_strangers() -> Result<(Vec<Urn<'static>>, 
 	let certs = cluster_certs();
 	let stranger = cluster_certs();
 	let mut tls = cluster_tls_config(&certs);
-	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
 	let mut conf = ClusterConfig::new(tls);
 	conf.heartbeat.interval = Duration::from_secs(3_600);
 	let gateway = start_cluster(&trace, conf).await?;
@@ -1434,7 +1534,7 @@ async fn records_of_certified_work() -> Result<(usize, usize), TightBeamError> {
 	let trace = TraceCollector::new();
 	let certs = cluster_certs();
 	let mut tls = cluster_tls_config(&certs);
-	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
 
 	let gateway = start_cluster(&trace, ClusterConfig::new(tls)).await?;
 	let connections = gateway.connection_trace();
@@ -1500,15 +1600,15 @@ impl tightbeam::instrumentation::EventSink for Forwarded {
 /// [`REFUSED_STRANGERS`] strangers fail the handshake of its colony plane.
 #[cfg(feature = "instrument")]
 async fn forwarded_refusals_of_strangers() -> Result<usize, TightBeamError> {
-	use tightbeam::trace::{TraceConfig, TraceConfigBuilder};
+	use tightbeam::trace::TraceConfig;
 
 	let forwarded = Forwarded::default();
-	let config: TraceConfig = TraceConfigBuilder::default().with_sink(forwarded.clone()).build();
+	let config = TraceConfig::default().with_sink(forwarded.clone());
 	let trace = TraceCollector::from(config);
 	let certs = cluster_certs();
 	let stranger = cluster_certs();
 	let mut tls = cluster_tls_config(&certs);
-	tls.client_validators = vec![combined_validator(&[&certs.cert])];
+	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
 
 	let gateway = start_cluster(&trace, ClusterConfig::new(tls)).await?;
 	let connections = gateway.connection_trace();
@@ -1531,5 +1631,128 @@ async fn forwarded_refusals_of_strangers() -> Result<usize, TightBeamError> {
 #[tokio::test]
 async fn a_refused_handshake_reaches_the_sink_of_the_trace_of_a_gateway() -> Result<(), TightBeamError> {
 	assert_eq!(forwarded_refusals_of_strangers().await?, REFUSED_STRANGERS);
+	Ok(())
+}
+
+// A drain announces the emptied slate to each gateway, and records the answer
+// of each one, so a gateway that refuses it leaves a record (CWE-778). The
+// gateway's hive trust turns to a store that holds a stranger alone, so it
+// refuses the drain's registration.
+#[tokio::test]
+async fn a_drain_whose_gateway_refuses_the_emptied_slate_records_it() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let switch = SwitchTrust::new(Arc::clone(&certs.trust), stranger_gateway_certs().trust);
+	let hive_trust: Arc<dyn CertificateTrust> = switch.clone();
+	let gateway_conf = ClusterConfig::new(cluster_tls_config_with_trust(&certs, Some(hive_trust)));
+	let cluster = start_cluster(&TraceCollector::new(), gateway_conf).await?;
+
+	let trace = TraceCollector::new();
+	let mut hive_conf = hive_tls_config(&certs);
+	hive_conf.control.reregister_interval = None;
+	let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+	hive.establish(Arc::new(trace.share())).await?;
+	hive.register_with_cluster(cluster.addr()).await?;
+
+	switch.switch();
+	hive.drain().await?;
+	hive.stop();
+	cluster.stop();
+
+	let answers = recorded_values(&trace, events::HIVE_REREGISTERED);
+	assert_eq!(answers, [Some(AssertionValue::TransitStatus(TransitStatus::PermissionDenied))]);
+	Ok(())
+}
+
+/// The drain timeout of the hive whose servlet never ends its drain, on the
+/// hive's manual clock. The gateway reads the system clock, so a short timeout
+/// keeps the hive's signed slate inside the freshness window of the gateway.
+const STALLED_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A [`ServletBox`] whose drain never ends. Its drain wakes `entered` once the
+/// hive calls it.
+struct StalledDrain {
+	entered: Arc<Notify>,
+}
+
+impl ServletBox for StalledDrain {
+	fn addr_bytes(&self) -> Arc<[u8]> {
+		Arc::from(b"127.0.0.1:7090".as_slice())
+	}
+
+	fn stop_boxed(self: Box<Self>) {}
+
+	fn drain_boxed(self: Box<Self>) -> ServletDrainFuture {
+		Box::pin(async move {
+			self.entered.notify_one();
+			core::future::pending::<Result<(), TightBeamError>>().await
+		})
+	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		None
+	}
+}
+
+// A drain past its timeout still announces the emptied slate, so each gateway
+// retires the routes of the hive at once. The one servlet of the hive never
+// ends its drain, and the hive clock moves past the timeout once that drain
+// begins.
+#[tokio::test]
+async fn a_drain_past_its_timeout_still_announces_the_emptied_slate() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let cluster = start_cluster(&TraceCollector::new(), ClusterConfig::new(cluster_tls_config(&certs))).await?;
+
+	let trace = TraceCollector::new();
+	let clock = Arc::new(ManualClock::default());
+	let entered = Arc::new(Notify::new());
+	let mut hive_conf = hive_tls_config(&certs);
+	hive_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+	hive_conf.control.drain_timeout = STALLED_DRAIN_TIMEOUT;
+	let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+	let servlet = StalledDrain { entered: Arc::clone(&entered) };
+	let spawner = |_| async { Ok(StalledDrain { entered: Arc::default() }) };
+	hive.register(servlet_urn("stalled"), servlet, spawner)?;
+	hive.establish(Arc::new(trace.share())).await?;
+	hive.register_with_cluster(cluster.addr()).await?;
+
+	let expire = async {
+		entered.notified().await;
+		clock.advance(STALLED_DRAIN_TIMEOUT);
+	};
+	let (drained, ()) = tokio::join!(hive.drain(), expire);
+	hive.stop();
+	cluster.stop();
+
+	let expired = matches!(
+		drained,
+		Err(TightBeamError::TransportError(TransportError::OperationFailed(
+			TransportFailure::DeadlineExceeded
+		)))
+	);
+	let answers = recorded_values(&trace, events::HIVE_REREGISTERED);
+	let announced = (true, vec![Some(AssertionValue::TransitStatus(TransitStatus::Ok))]);
+	assert_eq!((expired, answers), announced);
+	Ok(())
+}
+
+// An address update that names a hive outside the namespace refuses with its
+// cause in the label, so the trail tells a foreign identity from a refused
+// route (CWE-778).
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn an_address_update_outside_the_namespace_refuses_with_its_cause() -> Result<(), TightBeamError> {
+	let certs = cluster_certs();
+	let trace = TraceCollector::new();
+	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+	let hive_id = ColonyNamespace::new("tightbeam", "elsewhere")?.hive("127.0.0.1:65216")?;
+	let update = ServletAddressUpdate { hive_id, added: Vec::new(), removed: Vec::new() };
+
+	let request = ClusterRequest::ServletAddressUpdate(update);
+	emit_servlet_update(&mut client, &certs.key, b"foreign-update", request).await?;
+	cluster.stop();
+
+	let labels = recorded_labels(&trace, events::CLUSTER_UPDATE_REFUSED);
+	assert_eq!(labels, [Some(String::from("PermissionDenied/invalid-urn"))]);
 	Ok(())
 }

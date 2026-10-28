@@ -22,6 +22,9 @@ use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 use tightbeam::trace::{TraceCollector, TraceConfig};
 use tightbeam::urn::Urn;
 
+#[cfg(feature = "testing-fault")]
+use tightbeam::testing::fdr::FaultModel;
+
 /// An exploration engine with a visited set of its own.
 struct OutsideEngine<'a> {
 	/// The process under exploration.
@@ -45,6 +48,12 @@ impl<'a> OutsideEngine<'a> {
 }
 
 impl ExplorationCore for OutsideEngine<'_> {
+	type ForProcess<'p> = OutsideEngine<'p>;
+
+	fn for_process<'p>(&self, process: &'p Process) -> OutsideEngine<'p> {
+		OutsideEngine::new(process, Arc::clone(&self.config))
+	}
+
 	fn process(&self) -> &Process {
 		self.process
 	}
@@ -76,6 +85,19 @@ impl ExplorationCore for OutsideEngine<'_> {
 	}
 }
 
+/// An explorer of `process` under `config` that explores through `engine`
+/// and checks refinement through the house checker.
+fn explorer_over<'a, E: ExplorationCore>(
+	process: &'a Process,
+	config: Arc<FdrConfig>,
+	engine: E,
+) -> FdrExplorer<'a, E, DefaultRefinementChecker<'a, DefaultCache>> {
+	let cache = Rc::new(RefCell::new(DefaultCache::new()));
+	let checker = DefaultRefinementChecker::new(process, Arc::clone(&config), cache);
+
+	FdrExplorer::new_with_arc(process, config, engine, checker)
+}
+
 /// The labels of the `urn` events that `trace` recorded, in order.
 fn labels_of(trace: &TraceCollector, urn: Urn<'static>) -> Vec<String> {
 	let events = trace.drain_events();
@@ -98,11 +120,9 @@ fn an_outside_engine_hands_its_visited_states_to_the_recorded_events() -> Result
 	let process = ready()?;
 	let config = Arc::new(FdrConfig::default());
 	let engine = OutsideEngine::new(&process, Arc::clone(&config));
-	let cache = Rc::new(RefCell::new(DefaultCache::new()));
-	let checker = DefaultRefinementChecker::new(&process, Arc::clone(&config), cache);
 	let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
 	let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
-	let mut explorer = FdrExplorer::new_with_arc(&process, config, engine, checker);
+	let mut explorer = explorer_over(&process, config, engine);
 
 	explorer.explore_into(&trace)?;
 
@@ -119,6 +139,12 @@ struct OverReportingEngine<'a> {
 }
 
 impl ExplorationCore for OverReportingEngine<'_> {
+	type ForProcess<'p> = OverReportingEngine<'p>;
+
+	fn for_process<'p>(&self, process: &'p Process) -> OverReportingEngine<'p> {
+		OverReportingEngine { inner: self.inner.for_process(process) }
+	}
+
 	fn process(&self) -> &Process {
 		self.inner.process
 	}
@@ -136,7 +162,7 @@ impl ExplorationCore for OverReportingEngine<'_> {
 	}
 
 	fn visited_states(&self) -> &HashSet<State> {
-		&self.inner.process.states
+		self.inner.process.states()
 	}
 
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
@@ -148,7 +174,8 @@ impl ExplorationCore for OverReportingEngine<'_> {
 	}
 }
 
-/// An exploration engine that counts the seeds it walks.
+/// An exploration engine that counts the seeds it walks, and shares the count
+/// with each engine that its `for_process` builds.
 struct CountingEngine<'a> {
 	/// The engine that explores each seed.
 	inner: OutsideEngine<'a>,
@@ -157,6 +184,12 @@ struct CountingEngine<'a> {
 }
 
 impl ExplorationCore for CountingEngine<'_> {
+	type ForProcess<'p> = CountingEngine<'p>;
+
+	fn for_process<'p>(&self, process: &'p Process) -> CountingEngine<'p> {
+		CountingEngine { inner: self.inner.for_process(process), walked: Rc::clone(&self.walked) }
+	}
+
 	fn process(&self) -> &Process {
 		self.inner.process
 	}
@@ -188,7 +221,7 @@ impl ExplorationCore for CountingEngine<'_> {
 }
 
 #[test]
-fn an_outside_engine_walks_every_seed() -> Result<(), ProcessBuildError> {
+fn an_outside_engine_walks_every_seed() -> Result<(), Box<dyn std::error::Error>> {
 	let process = ready()?;
 	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
 	let walked = Rc::new(Cell::new(0));
@@ -197,26 +230,42 @@ fn an_outside_engine_walks_every_seed() -> Result<(), ProcessBuildError> {
 		walked: Rc::clone(&walked),
 	};
 
-	let cache = Rc::new(RefCell::new(DefaultCache::new()));
-	let checker = DefaultRefinementChecker::new(&process, Arc::clone(&config), cache);
-	let mut explorer = FdrExplorer::new_with_arc(&process, config, engine, checker);
+	let mut explorer = explorer_over(&process, config, engine);
 
-	explorer.explore();
+	explorer.explore()?;
 
 	assert_eq!(walked.get(), 4, "the explorer hands each of the four seeds to the engine");
 	Ok(())
 }
 
+#[cfg(feature = "testing-fault")]
 #[test]
-fn the_verdict_reads_each_result_that_an_outside_engine_records() -> Result<(), ProcessBuildError> {
+fn mode_one_explores_each_spec_through_the_outside_engine() -> Result<(), Box<dyn std::error::Error>> {
+	let process = ready()?;
+	let specs = vec![ready()?, ready()?];
+	let fault_model = Some(FaultModel::default());
+	let config = Arc::new(FdrConfig { seeds: 3, specs, fault_model, ..Default::default() });
+	let walked = Rc::new(Cell::new(0));
+	let engine = CountingEngine {
+		inner: OutsideEngine::new(&process, Arc::clone(&config)),
+		walked: Rc::clone(&walked),
+	};
+	let mut explorer = explorer_over(&process, config, engine);
+
+	explorer.explore()?;
+
+	assert_eq!(walked.get(), 6, "each of the two specs runs its three seeds through the engine");
+	Ok(())
+}
+
+#[test]
+fn the_verdict_reads_each_result_that_an_outside_engine_records() -> Result<(), Box<dyn std::error::Error>> {
 	let process = ready()?;
 	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
 	let engine = OutsideEngine::new(&process, Arc::clone(&config));
-	let cache = Rc::new(RefCell::new(DefaultCache::new()));
-	let checker = DefaultRefinementChecker::new(&process, Arc::clone(&config), cache);
-	let mut explorer = FdrExplorer::new_with_arc(&process, config, engine, checker);
+	let mut explorer = explorer_over(&process, config, engine);
 
-	let verdict = explorer.explore();
+	let verdict = explorer.explore()?;
 
 	assert_eq!(
 		verdict.seeds_completed, 4,
@@ -247,11 +296,9 @@ fn a_divergence_event_names_a_state_where_a_seed_diverged() -> Result<(), Box<dy
 	let process = spinning()?;
 	let config = Arc::new(FdrConfig::default());
 	let engine = OverReportingEngine { inner: OutsideEngine::new(&process, Arc::clone(&config)) };
-	let cache = Rc::new(RefCell::new(DefaultCache::new()));
-	let checker = DefaultRefinementChecker::new(&process, Arc::clone(&config), cache);
 	let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
 	let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
-	let mut explorer = FdrExplorer::new_with_arc(&process, config, engine, checker);
+	let mut explorer = explorer_over(&process, config, engine);
 
 	explorer.explore_into(&trace)?;
 

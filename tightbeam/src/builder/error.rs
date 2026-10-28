@@ -15,14 +15,6 @@ pub enum MetadataError {
 	#[error("Missing required field: order")]
 	MissingOrder,
 
-	/// Missing required hash field (V2+)
-	#[error("Missing required field: hash (required for V2)")]
-	MissingHash,
-
-	/// Missing required encryption info (V1+)
-	#[error("Missing required field: encryption (required for V1+)")]
-	MissingEncryption,
-
 	/// Field not supported in this protocol version
 	#[error("Field {field} is not supported in protocol version {version:?}")]
 	UnsupportedField { field: GatedField, version: Version },

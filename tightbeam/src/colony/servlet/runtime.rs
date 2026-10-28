@@ -3,13 +3,18 @@
 //! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and calls [`ServletRuntime::start`].
 //! - A [`ServletService`] written without the macro uses the same entry point.
 
+use core::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::future::join_all;
+
 use crate::cms::signed_data::SignerIdentifier;
-use crate::colony::hive::{HiveContext, ServletBox};
+use crate::colony::hive::{HiveContext, ServletBox, ServletDrainFuture};
 use crate::colony::servlet::serve::ContextService;
-use crate::colony::servlet::{RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox};
+use crate::colony::servlet::{
+	RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, UtilizationGauge, WorkerBox,
+};
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
@@ -24,6 +29,7 @@ use crate::transport::policy::{CollectorGateConfig, PolicyConfig};
 use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
 use crate::utils::time::Clock;
+use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 use crate::crypto::profiles::CryptoProvider;
@@ -41,7 +47,9 @@ pub(crate) struct ServletRuntimeParts<Env> {
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
-	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
+	pub(crate) workers: HashMap<TypeId, Box<dyn WorkerBox>>,
+	/// The gauge the hive reads as this servlet's utilization, if one is set.
+	pub(crate) utilization: Option<Box<dyn UtilizationGauge>>,
 	/// The accept loop paces its retries on this clock.
 	pub(crate) clock: Arc<dyn Clock>,
 }
@@ -50,12 +58,18 @@ pub(crate) struct ServletRuntimeParts<Env> {
 ///
 /// - The runtime owns the accept-loop task handle and a replaceable trace handle.
 /// - The runtime retains the address bytes as [`Arc<[u8]>`] for hive registration and scaling.
+/// - The runtime shares the started workers with the context of its
+///   handlers, so [`Self::drain`] kills each one.
 pub struct ServletRuntime<P: Protocol> {
 	server_handle: Option<rt::JoinHandle>,
 	addr: P::Address,
 	addr_bytes: Arc<[u8]>,
 	/// The signer of the certificate the listener presents, recorded at start.
 	signer: Option<SignerIdentifier>,
+	/// The gauge that [`ServletBox::utilization`] reads, if the config set one.
+	utilization: Option<Box<dyn UtilizationGauge>>,
+	/// The started workers, which the handlers' context shares.
+	workers: Arc<HashMap<TypeId, Box<dyn WorkerBox>>>,
 	trace_handle: TraceHandle,
 }
 
@@ -125,18 +139,21 @@ where
 			message_decryptor,
 			message_inflator,
 			workers,
+			utilization,
 			clock,
 		} = parts;
 
 		let mut started_workers = HashMap::new();
-		for (name, worker_box) in workers {
+		for worker_box in workers.into_values() {
 			let started = worker_box.start_boxed(Arc::clone(&trace)).await?;
-			started_workers.insert(name, started);
+			started_workers.insert(started.type_key(), started);
 		}
 
+		let workers = Arc::new(started_workers);
 		let trace_handle = TraceHandle::new(trace);
+		let shared_workers = Arc::clone(&workers);
 		let servlet_context = Arc::new(
-			ServletContext::sharing_trace(trace_handle.clone(), env_config, started_workers, hive_context)
+			ServletContext::sharing_trace(trace_handle.clone(), env_config, shared_workers, hive_context)
 				.with_message_decryptor(message_decryptor)
 				.with_message_inflator(message_inflator),
 		);
@@ -155,12 +172,12 @@ where
 			let service = Arc::clone(&service);
 			async move { serve_connection_service(transport, service, None, None).await }
 		};
-		let accept_loop = plane.accept_owned(listener, terms, serve);
 
-		let server_handle = rt::spawn(accept_loop);
+		let accept_loop = plane.accept_owned(listener, terms, serve);
+		let server_handle = Some(rt::spawn(accept_loop));
 		let addr_bytes: Arc<[u8]> = Arc::from(addr.clone().into());
 
-		let runtime = Self { server_handle: Some(server_handle), addr, addr_bytes, signer, trace_handle };
+		let runtime = Self { server_handle, addr, addr_bytes, signer, utilization, workers, trace_handle };
 		Ok(runtime)
 	}
 }
@@ -224,6 +241,44 @@ impl<P: Protocol> ServletRuntime<P> {
 
 		Ok(())
 	}
+
+	/// Ends the accept loop, then ends each worker through its kill, so each
+	/// worker answers every message its queue holds before the drain returns.
+	///
+	/// The drain aborts the accept loop, so a handler in flight ends where it
+	/// stands, and waits for the loop to end. Then it kills every worker at
+	/// once. [`Self::stop`] ends the workers by abort instead.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::JoinError`] -- the run loop of a worker panicked.
+	///   Every other worker still ends through its kill.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::colony::servlet::ServletRuntime;
+	/// use tightbeam::transport::tcp::r#async::TokioListener;
+	/// use tightbeam::TightBeamError;
+	///
+	/// /// Ends `runtime` once its workers answer every message they hold.
+	/// async fn retire(runtime: ServletRuntime<TokioListener>) -> Result<(), TightBeamError> {
+	///     runtime.drain().await
+	/// }
+	/// ```
+	pub async fn drain(mut self) -> Result<(), TightBeamError> {
+		if let Some(handle) = self.server_handle.take() {
+			rt::abort(&handle);
+			// The loop ends cancelled, the end this drain asks for, so the
+			// join waits for that end and reads no outcome from it.
+			let ended = rt::join(handle).await;
+			drop(ended);
+		}
+
+		let kills = self.workers.values().map(|worker| worker.kill_shared());
+		let killed = join_all(kills).await;
+		killed.into_iter().collect()
+	}
 }
 
 impl<P: Protocol> Drop for ServletRuntime<P> {
@@ -247,6 +302,20 @@ where
 
 	fn signer(&self) -> Option<&SignerIdentifier> {
 		self.signer.as_ref()
+	}
+
+	/// Reads the gauge that [`ServletConfigBuilder::with_utilization`]
+	/// installed, and reports no sample for a servlet with no gauge.
+	///
+	/// [`ServletConfigBuilder::with_utilization`]: crate::colony::servlet::ServletConfigBuilder::with_utilization
+	fn utilization(&self) -> Option<BasisPoints> {
+		self.utilization.as_ref().map(|gauge| gauge.utilization())
+	}
+
+	/// Drains the servlet through [`ServletRuntime::drain`], so each worker
+	/// ends through its kill.
+	fn drain_boxed(self: Box<Self>) -> ServletDrainFuture {
+		Box::pin((*self).drain())
 	}
 }
 

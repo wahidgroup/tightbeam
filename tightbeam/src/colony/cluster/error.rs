@@ -4,6 +4,7 @@ use core::net::AddrParseError;
 
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportError;
+use crate::urn::UrnValidationError;
 use crate::{Errorizable, TightBeamError};
 
 /// The errors of a cluster gateway.
@@ -35,7 +36,7 @@ pub enum ClusterError {
 	NoHivesAvailable(Vec<u8>),
 
 	/// The dial or the handshake to the selected hive, servlet, or peer gateway
-	/// failed, or a peer route met a gateway with no peer plane.
+	/// failed.
 	#[error("Connect failed")]
 	ConnectFailed,
 
@@ -75,9 +76,9 @@ pub enum ClusterError {
 	#[error("Registration failed")]
 	RegistrationFailed,
 
-	/// An address is not one the protocol can dial, a servlet locator names an
-	/// address other than the one beside it, or a heartbeat names an address
-	/// that no hive registered.
+	/// An address does not parse as one the protocol binds or dials, a servlet
+	/// locator names an address other than the one beside it, or a heartbeat
+	/// names an address that no hive registered.
 	#[error("Invalid address: {:#?}")]
 	InvalidAddress(Vec<u8>),
 
@@ -122,6 +123,13 @@ pub enum ClusterError {
 	/// A reconcile reply exceeded the want-list cap or the peer-exchange cap.
 	#[error("Oversized reconcile reply")]
 	OversizedReconcileReply,
+
+	/// A URN that a hive sent names no resource of the kind its field needs
+	/// in this gateway's namespace, such as a hive of a foreign realm. The
+	/// variant carries the cause.
+	#[error("Invalid URN: {0}")]
+	#[source]
+	InvalidUrn(UrnValidationError),
 }
 
 impl From<AddrParseError> for ClusterError {
@@ -219,12 +227,28 @@ impl ClusterError {
 			| Self::SignerMismatch
 			| Self::GossipJournalAtCapacity
 			| Self::GossipJournalUnavailable
-			| Self::OversizedReconcileReply => false,
+			| Self::OversizedReconcileReply
+			| Self::InvalidUrn(_) => false,
 		}
+	}
+
+	/// The label of a refused hive registration or address update for this
+	/// error: the name of [`Self::transit_status`], a slash, and the error's
+	/// stable kebab-case name, such as `PermissionDenied/invalid-urn`.
+	///
+	/// The name leaves out the error's fields, so one cause reads as one
+	/// label whatever it names.
+	#[must_use]
+	pub(crate) fn refusal_label(&self) -> String {
+		let status = self.transit_status();
+		format!("{}/{}", status.as_str(), self.as_str())
 	}
 
 	crate::macros::names::refusal_names! {
 		[
+			/// The stable kebab-case name of this error, for audit labels.
+			#[must_use]
+			fn as_str = "";
 			/// The label of an [`TransitStatus::Unavailable`] refusal for this
 			/// error, a fault of the gateway's own: `Unavailable/` and the
 			/// error's stable kebab-case name.
@@ -258,6 +282,7 @@ impl ClusterError {
 			Self::GossipJournalAtCapacity => "gossip-journal-at-capacity",
 			Self::GossipJournalUnavailable => "gossip-journal-unavailable",
 			Self::OversizedReconcileReply => "oversized-reconcile-reply",
+			Self::InvalidUrn(_) => "invalid-urn",
 		}
 	}
 }

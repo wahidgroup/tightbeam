@@ -78,7 +78,7 @@ mod provisioned {
 use provisioned::*;
 
 /// How a handshake server authenticates its client.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum PeerAuthentication {
 	/// Only the server authenticates. The session peer stays empty, even for a
 	/// client that offers a certificate.
@@ -101,7 +101,8 @@ mod chain {
 	/// The non-empty chain of validators a policy runs: a mutual server's
 	/// policy of its client, or a client's policy of its server.
 	///
-	/// [`Self::new`] alone builds a chain, so every chain runs at least one
+	/// [`Self::new`] builds a chain of a non-empty set, and [`Self::with`]
+	/// builds one around the check it adds, so every chain runs at least one
 	/// check. In a build without a handshake protocol, the chain records only
 	/// that a policy is set.
 	#[derive(Clone)]
@@ -111,8 +112,8 @@ mod chain {
 
 	impl ValidatorChain {
 		/// The chain of `validators`, or `None` for an empty set, which names
-		/// no check to run. This is the one definition of that rule, for the
-		/// policy of a client and the policy of a server alike.
+		/// no check to run. It is the one definition of that rule, for client
+		/// and server policies alike.
 		pub(crate) fn new(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Option<Self> {
 			let validators = validators.into_iter().collect::<Arc<[_]>>();
 			if validators.is_empty() {
@@ -125,6 +126,20 @@ mod chain {
 			let chain = Self();
 
 			Some(chain)
+		}
+
+		/// The chain that runs every check of `prior`, then `validator`.
+		pub(super) fn with(prior: Option<Self>, validator: Arc<dyn CertificateValidation>) -> Self {
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			{
+				let held = prior.iter().flat_map(|chain| chain.0.iter().map(Arc::clone));
+				Self(held.chain([validator]).collect())
+			}
+			#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
+			{
+				drop((prior, validator));
+				Self()
+			}
 		}
 
 		/// Run every validator against `certificate` until the first refusal.
@@ -193,17 +208,78 @@ mod chain {
 			self.evaluate(signing.certificate())
 		}
 	}
+
+	/// The chain writes the count of the validators it runs. A build without a
+	/// handshake protocol holds the mark of a policy alone, so there the chain
+	/// writes its name.
+	impl core::fmt::Debug for ValidatorChain {
+		fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			{
+				f.debug_struct("ValidatorChain").field("validators", &self.0.len()).finish()
+			}
+			#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
+			{
+				f.debug_struct("ValidatorChain").finish_non_exhaustive()
+			}
+		}
+	}
 }
 
 impl PeerAuthentication {
-	/// Build mutual authentication against `validators`.
+	/// Builds mutual authentication against `validators`, or answers `None`
+	/// for an empty set, which names no check to run.
 	///
-	/// An empty set names no check to run, so it yields [`Self::Anonymous`].
-	/// `ValidatorChain::new` is the one definition of that rule, so a caller
-	/// that holds a possibly empty collection passes it here and lets this
-	/// method decide.
-	pub fn mutual(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Self {
-		ValidatorChain::new(validators).map_or(Self::Anonymous, Self::Mutual)
+	/// The caller names its own fallback for an empty set, so anonymous
+	/// clients follow only from its word (CWE-1188). For one validator,
+	/// [`Self::Anonymous`] with [`Self::and`] names the same demand.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	/// use tightbeam::transport::handshake::PeerAuthentication;
+	///
+	/// let validators: Vec<Arc<dyn CertificateValidation>> = vec![Arc::new(ExpiryValidator)];
+	/// let mutual = PeerAuthentication::mutual(validators).ok_or("an empty validator set")?;
+	/// assert!(mutual.requires_certificate());
+	///
+	/// assert!(PeerAuthentication::mutual(Vec::new()).is_none());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn mutual(validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>) -> Option<Self> {
+		ValidatorChain::new(validators).map(Self::Mutual)
+	}
+
+	/// Adds `validator` to the checks a client's certificate MUST pass.
+	///
+	/// - [`Self::Anonymous`] becomes [`Self::Mutual`] over `validator` alone,
+	///   so the server demands a certificate.
+	/// - [`Self::Mutual`] runs `validator` after every check it holds.
+	///
+	/// Both cases give [`Self::Mutual`], so a server that adds its own trust to
+	/// the authentication an operator named always demands a certificate.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::crypto::x509::policy::ExpiryValidator;
+	/// use tightbeam::transport::handshake::PeerAuthentication;
+	///
+	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// assert!(authentication.requires_certificate());
+	/// ```
+	#[must_use]
+	pub fn and(self, validator: Arc<dyn CertificateValidation>) -> Self {
+		let prior = match self {
+			Self::Anonymous => None,
+			Self::Mutual(chain) => Some(chain),
+		};
+		Self::Mutual(ValidatorChain::with(prior, validator))
 	}
 
 	/// Whether the client MUST present a certificate.
@@ -223,9 +299,9 @@ impl PeerAuthentication {
 	///   validator run before the Finished. Each validator reads the
 	///   certificate beside the issuers the Finished presents, through
 	///   [`CertificateValidation::evaluate_presented`].
-	/// - This method verifies the Finished whenever the client offers a
-	///   certificate, so an anonymous server also refuses a certificate the
-	///   client cannot prove.
+	/// - It verifies the Finished whenever the client offers a certificate,
+	///   so an anonymous server also refuses a certificate the client cannot
+	///   prove.
 	///
 	/// # Errors
 	///
@@ -720,8 +796,8 @@ pub struct ProvisionedTrust {
 	/// The server's key-agreement certificate, a leaf or a chain.
 	key_agreement: CmsServerIdentity,
 	/// The store that runs path validation and revocation on both of the
-	/// server's certificates alike, whatever the role of each. The server
-	/// policy reads the key-agreement certificate at its own leg.
+	/// server's certificates. The server policy reads the key-agreement
+	/// certificate at its own leg.
 	store: Arc<dyn CertificateTrust>,
 }
 
@@ -730,9 +806,9 @@ impl ProvisionedTrust {
 	/// Trust in the server whose key-agreement certificate is
 	/// `key_agreement`, as `store` authenticates it.
 	///
-	/// This constructor admits the certificate against the store once, and
-	/// each handshake admits it again, because its validity period and the
-	/// store's verdict change after construction.
+	/// It admits the certificate against the store once, and each handshake
+	/// admits it again, because its validity period and the store's verdict
+	/// change after construction.
 	///
 	/// # Errors
 	///
@@ -743,8 +819,8 @@ impl ProvisionedTrust {
 		store: Arc<dyn CertificateTrust>,
 	) -> Result<Self, HandshakeError> {
 		let key_agreement = key_agreement.into();
-		// The admission here refuses a certificate the store refuses, and each
-		// handshake admits it again, so its leaf and anchor drop here.
+		// Each handshake admits the certificate again, so its leaf and anchor
+		// drop here.
 		key_agreement.admit(store.as_ref())?;
 		Ok(Self { key_agreement, store })
 	}
@@ -845,10 +921,10 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 		ProvisionedKeyAgreement::new(admitted, anchor, admission.policy)
 	}
 
-	/// Admit the server the reply names: its signing certificate for signing
-	/// under the server's purpose, with the path the reply presents validated
-	/// to an anchor of the store (RFC 5280 §6.1), then the pair it makes with
-	/// the key-agreement certificate the opening sealed to, which the server
+	/// Admit the server the reply names. Its signing certificate passes for
+	/// signing under the server's purpose, its presented path validated to an
+	/// anchor of the store (RFC 5280 §6.1). It then pairs with the
+	/// key-agreement certificate that the opening sealed to and the server
 	/// policy admitted.
 	///
 	/// # Errors
@@ -914,8 +990,8 @@ impl LearnedTrust {
 	///
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::{KeyCurves, KeyPurposes};
 	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
 	/// use tightbeam::transport::handshake::{ClientConfig, Hpke, HpkeClientSettings, LearnedTrust};
 	///
@@ -925,7 +1001,7 @@ impl LearnedTrust {
 	///
 	/// // The store holds the root alone, and each reply presents the path
 	/// // below it.
-	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	/// let store = builder.with_certificate(root)?.build();
 	/// let settings = HpkeClientSettings::new(LearnedTrust::anchored(Arc::new(store)));
 	/// let _config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
@@ -1081,11 +1157,26 @@ mod tests {
 		path.expect("a lone certificate is a path")
 	}
 
+	/// An empty validator set names no demand, so the caller names its
+	/// fallback (CWE-1188).
 	#[test]
-	fn an_empty_validator_set_demands_nothing() {
-		let authentication = PeerAuthentication::mutual([]);
-		assert!(matches!(authentication, PeerAuthentication::Anonymous));
-		assert!(!authentication.requires_certificate());
+	fn an_empty_validator_set_names_no_authentication() {
+		assert!(PeerAuthentication::mutual([]).is_none());
+	}
+
+	/// A rule writes its name, and a mutual rule the count of the validators
+	/// its chain runs, so a config that holds the rule writes it whole.
+	#[test]
+	fn a_rule_writes_its_name_and_the_count_of_its_validators() {
+		let certificate = create_test_certificate().certificate;
+		let mutual = PeerAuthentication::Anonymous
+			.and(pin_of(&certificate))
+			.and(pin_of(&certificate));
+
+		let anonymous = format!("{:?}", PeerAuthentication::Anonymous);
+		let mutual = format!("{mutual:?}");
+		let expected = ("Anonymous", "Mutual(ValidatorChain { validators: 2 })");
+		assert_eq!((anonymous.as_str(), mutual.as_str()), expected);
 	}
 
 	/// The signing use decodes the key of a reply's signer before the trust's
@@ -1118,8 +1209,8 @@ mod tests {
 			CertificateNotPinned, CertificateRevoked, Expired,
 		};
 		use crate::crypto::x509::ext::pkix::AuthorityKeyIdentifier;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, StaticRevocationList, TrustBuilder};
-		use crate::crypto::x509::ErasedSigning;
+		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, StaticRevocationList, TrustBuilder};
+		use crate::crypto::x509::{ErasedSigning, KeyCurves};
 		use crate::der::asn1::{BitString, ObjectIdentifier};
 		use crate::der::oid::AssociatedOid;
 		use crate::der::Any;
@@ -1196,7 +1287,7 @@ mod tests {
 
 		/// The built-in store that holds `trusted`.
 		fn store_holding(trusted: impl IntoIterator<Item = Certificate>) -> Arc<dyn CertificateTrust> {
-			let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 			let builder = trusted.into_iter().try_fold(builder, TrustBuilder::with_certificate);
 			Arc::new(builder.expect("the store takes valid test certificates").build())
 		}

@@ -16,9 +16,9 @@
 //! ## Expected control
 //! The server reads every handshake attribute of the client Finished from
 //! inside the seal, where the handshake secret authenticates it. Beside the
-//! seal, it reads only an abort alert. The server therefore never consumes the
-//! forged value, the closing settles on the client's own countersignature, and
-//! the session activates.
+//! seal, it reads an abort alert alone, and the open refuses any other
+//! unauthenticated attribute. The server refuses the closing before it reads
+//! the forged value, and the session stays inactive.
 //!
 //! Inside the seal, every handshake attribute is single-use, so a client that
 //! sends a duplicate fails closed. The CMS flow tests cover that case.
@@ -82,15 +82,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
-			(events::SESSION_CERT_REJECTED, absent!()),
-			(events::SESSION_RECEIPT_SETTLED, exactly!(1))
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("sealed-closing/encoding")),
+			(events::SESSION_HANDSHAKE_COMPLETE, absent!()),
+			(events::SESSION_RECEIPT_SETTLED, absent!())
 		]
 	}
 }
 
-// The injected acknowledgement travels beside the seal unchanged, and the
-// closing settles on the client's own acknowledgement.
+// The injected acknowledgement travels beside the seal, and the open of the
+// seal refuses the closing that carries it.
 tb_scenario! {
 	name: cms_injected_receipt_attribute_is_never_consumed,
 	spec: AttributeInjectionSpec,
@@ -108,7 +108,7 @@ tb_scenario! {
 			let kind = HandshakeBackendKind::Cms;
 			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
 			let outcome = handshake.audit_server(&trace).with_step(injection).run().await?;
-			let (_client, _server) = outcome.established()?;
+			outcome.refused_by_server("server accepted a closing that carries an unauthenticated attribute")?;
 
 			Ok::<(), TightBeamError>(())
 		}

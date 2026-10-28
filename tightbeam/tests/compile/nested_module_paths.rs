@@ -5,7 +5,7 @@
 use tightbeam::transport::builders::envelope::EnvelopeBuilder;
 use tightbeam::transport::client::builder::ClientBuilder;
 use tightbeam::transport::client::pool::ConnectionPool;
-use tightbeam::transport::handshake::primitives::kdf::KdfSalt;
+use tightbeam::transport::handshake::primitives::kdf::KdfInfo;
 use tightbeam::transport::handshake::primitives::transcript::transcript_hash;
 
 // The parent paths resolve, including the four items the parents re-export.

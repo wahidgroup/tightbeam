@@ -11,6 +11,7 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::servlet_registry::{DialTarget, HiveSlate, ServletRegistry};
 use crate::colony::protocol::RegisterHiveRequest;
+use crate::policy::TransitStatus;
 use crate::utils::time::{Clock, MonotonicInstant};
 use crate::utils::BasisPoints;
 
@@ -99,42 +100,12 @@ impl Members {
 		self.hives.get(hive_id).cloned()
 	}
 
-	/// Records a heartbeat seen at `now`, and answers whether the hive holds a
-	/// registration to record it against.
-	fn record_utilization(
-		&mut self,
-		hive_id: impl AsRef<[u8]>,
-		utilization: BasisPoints,
-		now: MonotonicInstant,
-	) -> bool {
-		let hive_id = hive_id.as_ref();
-		let Some(entry) = self.hives.get_mut(hive_id) else {
-			return false;
-		};
-
-		entry.utilization = utilization;
-		entry.last_seen = now;
-
-		true
-	}
-
-	fn increment_failure(&mut self, hive_id: impl AsRef<[u8]>) -> u32 {
-		self.increment_member_failure(hive_id).unwrap_or(0)
-	}
-
 	/// Counts one failure of a registered hive and returns its new count, or
 	/// `None` for a hive that holds no entry.
 	fn increment_member_failure(&mut self, hive_id: impl AsRef<[u8]>) -> Option<u32> {
 		let entry = self.hives.get_mut(hive_id.as_ref())?;
 		entry.failure_count = entry.failure_count.saturating_add(1);
 		Some(entry.failure_count)
-	}
-
-	fn reset_failure(&mut self, hive_id: impl AsRef<[u8]>) {
-		let hive_id = hive_id.as_ref();
-		if let Some(entry) = self.hives.get_mut(hive_id) {
-			entry.failure_count = 0;
-		}
 	}
 
 	fn touch(&mut self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints, now: MonotonicInstant) {
@@ -213,7 +184,7 @@ impl HiveRegistry {
 	///
 	/// - [`ClusterError::SignerMismatch`] -- a different signer already holds this hive id.
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub(crate) fn register(
+	fn register(
 		&self,
 		request: RegisterHiveRequest,
 		signer: Arc<SignerIdentifier>,
@@ -253,7 +224,7 @@ impl HiveRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub(crate) fn restore(&self, hive_id: SharedId, entry: HiveEntry) -> Result<(), ClusterError> {
+	fn restore(&self, hive_id: SharedId, entry: HiveEntry) -> Result<(), ClusterError> {
 		let mut members = self.members.write()?;
 		let claimed = Arc::clone(&entry.signer);
 		if members.admits_signer(hive_id.as_ref(), &claimed) {
@@ -295,11 +266,7 @@ impl HiveRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub(crate) fn binds_signer(
-		&self,
-		hive_id: impl AsRef<[u8]>,
-		claimed: &SignerIdentifier,
-	) -> Result<bool, ClusterError> {
+	fn binds_signer(&self, hive_id: impl AsRef<[u8]>, claimed: &SignerIdentifier) -> Result<bool, ClusterError> {
 		let hive_id = hive_id.as_ref();
 		let bound = self.signer_for(hive_id)?;
 		Ok(bound.is_some_and(|signer| signer.as_ref() == claimed))
@@ -310,35 +277,9 @@ impl HiveRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub(crate) fn unregister(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<HiveEntry>, ClusterError> {
+	fn unregister(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<HiveEntry>, ClusterError> {
 		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.remove(hive_id))
-	}
-
-	/// Records the utilization a heartbeat reported, and answers whether the
-	/// hive holds a registration to record it against.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub fn update_utilization(
-		&self,
-		hive_id: impl AsRef<[u8]>,
-		utilization: BasisPoints,
-	) -> Result<bool, ClusterError> {
-		let hive_id = hive_id.as_ref();
-		let now = self.clock.monotonic();
-		Ok(self.members.write()?.record_utilization(hive_id, utilization, now))
-	}
-
-	/// Counts one more heartbeat failure for a hive and returns the new count.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub fn increment_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<u32, ClusterError> {
-		let hive_id = hive_id.as_ref();
-		Ok(self.members.write()?.increment_failure(hive_id))
 	}
 
 	/// Counts one more heartbeat failure for a registered hive and returns the
@@ -347,20 +288,9 @@ impl HiveRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub(crate) fn increment_member_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<u32>, ClusterError> {
+	fn increment_member_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<u32>, ClusterError> {
 		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.increment_member_failure(hive_id))
-	}
-
-	/// Clears a hive's heartbeat failure count.
-	///
-	/// # Errors
-	///
-	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub fn reset_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<(), ClusterError> {
-		let hive_id = hive_id.as_ref();
-		self.members.write()?.reset_failure(hive_id);
-		Ok(())
 	}
 
 	/// Records a live heartbeat. It renews the lease on the registry's clock,
@@ -369,7 +299,7 @@ impl HiveRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub fn touch(&self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints) -> Result<(), ClusterError> {
+	fn touch(&self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints) -> Result<(), ClusterError> {
 		let hive_id = hive_id.as_ref();
 		let now = self.clock.monotonic();
 		self.members.write()?.touch(hive_id, utilization, now);
@@ -384,7 +314,7 @@ impl HiveRegistry {
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub(crate) fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
+	fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
 		let now = self.clock.monotonic();
 		let mut members = self.members.write()?;
 
@@ -437,6 +367,20 @@ pub(crate) enum FailureCount {
 	Unregistered,
 }
 
+/// What one heartbeat answer does to the membership of its hive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeatOutcome {
+	/// The hive answered alive, so its lease renewed and its count cleared.
+	Live,
+	/// The hive answered dead or refused, so the beat counted one failure.
+	Failed {
+		/// The hive's status, or the status that a dial fault forwards as.
+		status: TransitStatus,
+		/// What the counted failure did to the membership.
+		failures: FailureCount,
+	},
+}
+
 /// One hive that a lease sweep retired, beside the count of hives in the
 /// registry after its retire.
 #[derive(Debug, Clone)]
@@ -472,9 +416,8 @@ impl<'a> ColonyMembership<'a> {
 
 	/// Holds the admission path for one whole membership move.
 	///
-	/// The guarded value is `()`, so a poisoned lock carries no damaged
-	/// state and this method recovers the guard rather than refuse the
-	/// caller.
+	/// The guarded value is `()`, so a poisoned lock carries no damaged state,
+	/// and the guard recovers rather than refuse the caller.
 	fn hold_admission(&self) -> MutexGuard<'_, ()> {
 		self.admission.lock().unwrap_or_else(PoisonError::into_inner)
 	}
@@ -543,22 +486,46 @@ impl<'a> ColonyMembership<'a> {
 		self.servlets.apply_address_update(added, removed)
 	}
 
-	/// Counts one heartbeat failure for the hive at `hive_addr`, and retires it
-	/// with every route it owned once its count reaches `max_failures`.
+	/// Settles one heartbeat answer of the hive at `hive_addr`.
 	///
-	/// The count, the retire, and the read of the remaining hives hold one
-	/// admission, so a retire's count names the registry it left.
+	/// - A live answer renews the lease, stores the utilization it carries, and clears the failure count.
+	/// - A dead or refused answer counts one failure, and the failure that
+	///   reaches `max_failures` retires the hive with every route it owned.
+	///
+	/// The lease or the count, the retire, and the read of the remaining hives
+	/// hold one admission, so a retire's count names the registry it left.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- either registry is poisoned.
-	pub(crate) fn count_failure(
+	pub(crate) fn settle_beat(
 		&self,
 		hive_addr: impl AsRef<[u8]>,
+		answer: Result<BasisPoints, TransitStatus>,
 		max_failures: u32,
-	) -> Result<FailureCount, ClusterError> {
+	) -> Result<BeatOutcome, ClusterError> {
 		let hive_addr = hive_addr.as_ref();
 		let _admission = self.hold_admission();
+
+		let outcome = match answer {
+			Ok(utilization) => {
+				self.hives.touch(hive_addr, utilization)?;
+				BeatOutcome::Live
+			}
+			Err(status) => {
+				let failures = self.count_failure(hive_addr, max_failures)?;
+				BeatOutcome::Failed { status, failures }
+			}
+		};
+
+		Ok(outcome)
+	}
+
+	/// Counts one heartbeat failure for the hive at `hive_addr`, for a caller
+	/// that already holds `admission`, and retires the hive with every route
+	/// it owned once its count reaches `max_failures`.
+	fn count_failure(&self, hive_addr: impl AsRef<[u8]>, max_failures: u32) -> Result<FailureCount, ClusterError> {
+		let hive_addr = hive_addr.as_ref();
 
 		let Some(failures) = self.hives.increment_member_failure(hive_addr)? else {
 			return Ok(FailureCount::Unregistered);
@@ -718,24 +685,6 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn retiring_a_hive_drops_the_routes_it_owned() -> Result<(), ClusterError> {
-		let colony = Colony::new();
-		let hive_addr: SharedId = Arc::from(b"hive1".as_slice());
-
-		colony
-			.membership()
-			.admit(request(b"hive1", &["ping"]), test_signer(), slate(&hive_addr, "ping"))?;
-		assert_eq!(colony.hives.len()?, 1);
-		assert_eq!(colony.servlets.len()?, 1);
-
-		let counted = colony.membership().count_failure(&hive_addr, 1)?;
-		assert_eq!(counted, FailureCount::Retired { remaining: 0 });
-		assert_eq!(colony.hives.len()?, 0);
-		assert_eq!(colony.servlets.len()?, 0);
-		Ok(())
-	}
-
 	/// Admits a hive at each of `addrs` into `colony`, each with one route.
 	fn admit_hives(colony: &Colony, addrs: &[&[u8]]) -> Result<(), ClusterError> {
 		addrs.iter().try_for_each(|addr| {
@@ -746,6 +695,30 @@ mod tests {
 		})
 	}
 
+	/// The status of a beat that the hive refused.
+	const REFUSED: TransitStatus = TransitStatus::Unavailable;
+
+	/// The outcome of a refused beat whose failure did what `failures` names.
+	fn refused_beat(failures: FailureCount) -> BeatOutcome {
+		BeatOutcome::Failed { status: REFUSED, failures }
+	}
+
+	/// A hive whose beats fail `max_failures` times in a row leaves the
+	/// registry with every route it owned.
+	#[test]
+	fn a_hive_whose_beats_fail_max_failures_times_leaves_with_its_routes() -> Result<(), ClusterError> {
+		let colony = Colony::new();
+		admit_hives(&colony, &[b"hive1"])?;
+
+		let membership = colony.membership();
+		membership.settle_beat(b"hive1", Err(REFUSED), 2)?;
+		membership.settle_beat(b"hive1", Err(REFUSED), 2)?;
+
+		assert_eq!(colony.hives.len()?, 0);
+		assert_eq!(colony.servlets.len()?, 0);
+		Ok(())
+	}
+
 	// A failure below the bound counts and keeps the hive. The failure that
 	// reaches it retires the hive, and names the hives that the retire left.
 	tb_cases! {
@@ -753,8 +726,8 @@ mod tests {
 			let colony = Colony::new();
 			admit_hives(&colony, &[b"hive1", b"hive2"])?;
 
-			let counted = colony.membership().count_failure(b"hive1", max_failures)?;
-			assert_eq!(counted, expected);
+			let settled = colony.membership().settle_beat(b"hive1", Err(REFUSED), max_failures)?;
+			assert_eq!(settled, refused_beat(expected));
 			assert_eq!(colony.hives.len()?, hives_after);
 			Ok(())
 		}
@@ -769,9 +742,78 @@ mod tests {
 		let colony = Colony::new();
 		admit_hives(&colony, &[b"hive1"])?;
 
-		let counted = colony.membership().count_failure(b"hive9", 0)?;
-		assert_eq!(counted, FailureCount::Unregistered);
+		let settled = colony.membership().settle_beat(b"hive9", Err(REFUSED), 0)?;
+		assert_eq!(settled, refused_beat(FailureCount::Unregistered));
 		assert_eq!(colony.hives.len()?, 1);
+		Ok(())
+	}
+
+	/// A live beat stores the utilization that the hive reported.
+	#[test]
+	fn a_live_beat_records_the_utilization_it_reported() -> Result<(), ClusterError> {
+		let colony = Colony::new();
+		admit_hives(&colony, &[b"hive1"])?;
+
+		colony.membership().settle_beat(b"hive1", Ok(crate::bps!(5000)), 2)?;
+
+		let hives = colony.hives.all_hives()?.into_iter();
+		let utilization: Vec<BasisPoints> = hives.map(|hive| hive.utilization).collect();
+		assert_eq!(utilization, [crate::bps!(5000)]);
+		Ok(())
+	}
+
+	/// A live beat clears the failures counted before it, so the next refused
+	/// beat counts from one.
+	#[test]
+	fn a_live_beat_clears_the_failures_counted_before_it() -> Result<(), ClusterError> {
+		let colony = Colony::new();
+		admit_hives(&colony, &[b"hive1"])?;
+
+		let membership = colony.membership();
+		membership.settle_beat(b"hive1", Err(REFUSED), 3)?;
+		membership.settle_beat(b"hive1", Ok(BasisPoints::default()), 3)?;
+
+		let settled = membership.settle_beat(b"hive1", Err(REFUSED), 3)?;
+		assert_eq!(settled, refused_beat(FailureCount::Counted(1)));
+		Ok(())
+	}
+
+	#[test]
+	fn registry_register_and_lookup() -> Result<(), ClusterError> {
+		let registry = hive_registry();
+		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]), test_signer())?;
+
+		let hives = registry.all_hives()?.into_iter();
+		let addresses: Vec<SharedId> = hives.map(|hive| hive.address).collect();
+		assert_eq!(addresses, [SharedId::from(b"127.0.0.1:8080".as_slice())]);
+		Ok(())
+	}
+
+	#[test]
+	fn registry_unregister() -> Result<(), ClusterError> {
+		let registry = hive_registry();
+		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
+		assert_eq!(registry.len()?, 1);
+		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
+		assert_eq!(registry.len()?, 0);
+		Ok(())
+	}
+
+	#[test]
+	fn registry_all_hives() -> Result<(), ClusterError> {
+		let registry = hive_registry();
+		let mut described = request(b"hive2", &["calc"]);
+		described.metadata = Some(b"metadata".to_vec());
+		registry.register(request(b"hive1", &["ping"]), test_signer())?;
+		registry.register(described, test_signer())?;
+
+		let all = registry.all_hives()?;
+		assert_eq!(all.len(), 2);
+
+		let addrs: Vec<_> = all.iter().map(|e| e.address.as_ref()).collect();
+		assert!(addrs.contains(&b"hive1".as_slice()));
+		assert!(addrs.contains(&b"hive2".as_slice()));
+
 		Ok(())
 	}
 
@@ -784,6 +826,7 @@ mod tests {
 		let servlets = ServletRegistry::new(PheromoneConfig::default(), manual_clock());
 		let admission = Mutex::new(());
 		let membership = ColonyMembership::new(&hives, &servlets, &admission);
+
 		hives.register(request(b"hive1", &["ping"]), test_signer())?;
 		hives.register(request(b"hive2", &["ping"]), test_signer())?;
 

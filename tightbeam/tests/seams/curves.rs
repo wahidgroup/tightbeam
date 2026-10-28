@@ -1,15 +1,15 @@
 //! A curve an outside crate brings through [`CurvePoints`], which refuses the
 //! off-curve encodings of its curve at each reader of operator material.
 //!
-//! [`ListedP256`] accepts the P-256 key of RFC 6979 §A.2.5 alone, and stands
-//! in for the decoder of P-256 an outside crate writes. The alias keeps the
-//! x-coordinate and the y parity of that key, and the decoder refuses it, so
-//! a reader that holds the decoder reads the alias as its bits.
+//! [`ListedP256`] stands in for the decoder of P-256 an outside crate writes.
+//! It refuses the alias, which keeps the x-coordinate and the y parity of the
+//! RFC 6979 §A.2.5 key, so a reader that holds the decoder reads the alias as
+//! its bits.
 
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::{Certificate, CurvePoints, KeyCurves, KeyIndex, KeyListError};
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::{Encode, Error};
@@ -21,9 +21,8 @@ use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 use tightbeam::colony::hive::{PeerListGate, PeerListMode};
 
 /// The decoder of P-256 an outside crate brings, which accepts the two SEC 1
-/// forms of the RFC 6979 key alone. It keeps the contract of [`CurvePoints`]
-/// on every encoding these tests read: the two forms of that key, which it
-/// accepts, and the alias, which it refuses.
+/// forms of the RFC 6979 key alone, so it keeps the contract of
+/// [`CurvePoints`] on every encoding these tests read.
 #[derive(Debug)]
 struct ListedP256;
 
@@ -63,7 +62,7 @@ fn spki_of(point: &[u8]) -> SubjectPublicKeyInfoOwned {
 /// A store built under the outside decoder that holds the certificate of
 /// `point`.
 fn store_of(point: &[u8]) -> Result<impl CertificateTrust, CertificateValidationError> {
-	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), CURVES);
+	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), CURVES, NoRevocation);
 	Ok(builder.with_certificate(certificate_of(point))?.build())
 }
 

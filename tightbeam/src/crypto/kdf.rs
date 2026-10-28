@@ -1,19 +1,18 @@
 //! The key derivation functions (KDF).
 //!
-//! The module derives keys through HKDF per [RFC 5869][rfc5869], with
-//! SHA3-256 as the default hash. It serves as a general-purpose KDF and as the
-//! KDF of ECIES constructions that require distinct encryption and MAC keys.
+//! The module derives keys through HKDF ([RFC 5869][rfc5869]) for general use
+//! and for the ECIES constructions that require distinct encryption and MAC
+//! keys.
 //!
 //! # Properties
 //!
 //! - The default provider is HKDF ([RFC 5869][rfc5869]) with SHA3-256.
 //! - Derivation is deterministic, and the `info` parameter separates domains ([RFC 5869 §3.2][rfc5869-3.2]).
-//! - Key material stays in buffers that wipe on drop. The keys and outputs
-//!   are `Zeroizing` and `ZeroizingArray` buffers. HKDF and X9.63 hash
-//!   through the core of the digest with a buffer of their own, so the
-//!   pseudorandom key, each output block, and each input that a hash buffers
-//!   wipe as well. The digest core wipes its own state, as the contract of
-//!   [`DigestProvider::Digest`] asks and the house SHA3 cores hold.
+//! - Key material stays in buffers that wipe on drop: the keys and outputs
+//!   are `Zeroizing` and `ZeroizingArray`. HKDF and X9.63 drive the digest
+//!   core with a buffer of their own, so the pseudorandom key, each output
+//!   block, and each input that a hash buffers wipe too. The core wipes its
+//!   own state, as [`DigestProvider::Digest`] asks and the house SHA3 cores do.
 //! - Input validation covers the shared secret, which [`EcdhSecret`] fixes at
 //!   the field width of its curve, and the output length, which each provider
 //!   bounds.
@@ -21,9 +20,8 @@
 //! # Providers
 //!
 //! - HKDF providers honor the optional `salt` parameter per [RFC 5869 §2.2][rfc5869-2.2].
-//! - ANSI X9.63 providers ignore `salt`. Their derivation depends on the shared
-//!   secret Z and the `info` (SharedInfo) context bytes only
-//!   ([SECG SEC 1 v2.0 §3.6][sec1-3.6]).
+//! - ANSI X9.63 providers ignore `salt` and derive from the shared secret Z
+//!   and the `info` (SharedInfo) alone ([SECG SEC 1 v2.0 §3.6][sec1-3.6]).
 //!
 //! # ECIES
 //!
@@ -74,7 +72,7 @@ pub use crate::crypto::hkdf::Hkdf;
 pub(crate) use zeroizing::ZeroizingHmac;
 pub(crate) use zeroizing::{ZeroizingHash, ZeroizingHkdf};
 
-use crate::constants::{MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE};
+use crate::constants::{MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE, MIN_SALT_ENTROPY_BYTES};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::hkdf::InvalidLength;
 use crate::crypto::secret::{Secret, SecretSlice};
@@ -95,13 +93,67 @@ use elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 /// The result of a KDF operation.
 pub type Result<T> = ::core::result::Result<T, KdfError>;
 
+/// The salt of one key derivation, which the KDF mixes into its extract step.
+///
+/// Its one constructor is `TryFrom<&[u8]>`, which refuses a salt shorter than
+/// [`MIN_SALT_ENTROPY_BYTES`], so every [`KdfFunction`] receives a salt at
+/// that floor. The salt and the `info` label arrive as distinct types, so a
+/// call that exchanges the two fails to compile.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::kdf::{KdfError, KdfSalt};
+///
+/// // A salt of 32 octets meets the floor of 16.
+/// let salt = KdfSalt::try_from([0x99u8; 32].as_slice())?;
+/// assert_eq!(salt.as_bytes().len(), 32);
+///
+/// let short = KdfSalt::try_from(b"ab".as_slice());
+/// assert!(matches!(short, Err(KdfError::SaltTooShort { actual: 2, minimum: 16 })));
+/// # Ok::<(), KdfError>(())
+/// ```
+///
+/// # Sources
+///
+/// - RFC 5869 § 2.2, the extract step and its salt:
+///   <https://datatracker.ietf.org/doc/html/rfc5869#section-2.2>
+#[derive(Clone, Copy, Debug)]
+pub struct KdfSalt<'a>(&'a [u8]);
+
+impl<'a> KdfSalt<'a> {
+	/// The salt bytes, for the derivation that consumes them.
+	#[must_use]
+	pub fn as_bytes(&self) -> &'a [u8] {
+		self.0
+	}
+}
+
+impl<'a> TryFrom<&'a [u8]> for KdfSalt<'a> {
+	type Error = KdfError;
+
+	/// Admits `salt` as the salt of one derivation.
+	///
+	/// # Errors
+	///
+	/// - [`KdfError::SaltTooShort`] -- `salt` is shorter than [`MIN_SALT_ENTROPY_BYTES`].
+	fn try_from(salt: &'a [u8]) -> Result<Self> {
+		let actual = salt.len();
+		if actual < MIN_SALT_ENTROPY_BYTES {
+			return Err(KdfError::SaltTooShort { actual, minimum: MIN_SALT_ENTROPY_BYTES });
+		}
+
+		Ok(Self(salt))
+	}
+}
+
 /// A key derivation function that a provider type implements.
 ///
-/// A consumer plugs in a RustCrypto KDF or a custom KDF through this trait.
-/// The contract of an implementation is to wipe the pseudorandom key, each
-/// output block it chains, and each input that a hash buffers, once the
-/// derivation ends (NIST SP 800-56C Rev. 2 §5.1). The house providers hold
-/// it through hashes whose buffers wipe on drop.
+/// A consumer plugs in a RustCrypto or a custom KDF through this trait. The
+/// contract of an implementation is to wipe the pseudorandom key, each output
+/// block it chains, and each input that a hash buffers once the derivation
+/// ends (NIST SP 800-56C Rev. 2 §5.1). The house providers hash through
+/// buffers that wipe on drop.
 pub trait KdfFunction {
 	/// Derives a key whose size is known only at run time.
 	///
@@ -110,13 +162,18 @@ pub trait KdfFunction {
 	///
 	/// - `ikm`: the input key material.
 	/// - `info`: the context string for domain separation.
-	/// - `salt`: an optional salt, 16 bytes or more when present.
+	/// - `salt`: an optional salt, which [`KdfSalt`] holds at [`MIN_SALT_ENTROPY_BYTES`] bytes or more.
 	/// - `key_size`: the output key size in bytes.
 	///
 	/// # Errors
 	///
 	/// - [`KdfError::DerivationFailed`] -- `key_size` is outside the valid range.
-	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes>;
+	fn derive_dynamic_key(
+		ikm: &[u8],
+		info: &[u8],
+		salt: Option<KdfSalt<'_>>,
+		key_size: usize,
+	) -> Result<ZeroizingBytes>;
 }
 
 /// The dual-key derivation through any [`KdfFunction`].
@@ -129,8 +186,7 @@ pub trait DualKeyKdf: KdfFunction {
 	/// ECIES standards such as [SECG SEC 1 v2.0 §5.1][sec1-5.1],
 	/// [IEEE Std 1363a-2004][ieee1363a], and [ISO/IEC 18033-2:2006][iso18033]
 	/// require distinct symmetric keys for encryption and for message
-	/// authentication, so each primitive holds a key of its own. One
-	/// construction serves every KDF:
+	/// authentication. One construction serves every KDF:
 	///
 	/// 1. Expand `2 * N` bytes once through [`KdfFunction::derive_dynamic_key`].
 	/// 2. Split the output into two disjoint keys ([SECG SEC 1 v2.0 §5.1.3][sec1-5.1.3]).
@@ -155,7 +211,7 @@ pub trait DualKeyKdf: KdfFunction {
 	fn derive_dual_keys<const N: usize>(
 		ikm: &[u8],
 		info: &[u8],
-		salt: Option<&[u8]>,
+		salt: Option<KdfSalt<'_>>,
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)>;
 }
 
@@ -163,7 +219,7 @@ impl<K: KdfFunction> DualKeyKdf for K {
 	fn derive_dual_keys<const N: usize>(
 		ikm: &[u8],
 		info: &[u8],
-		salt: Option<&[u8]>,
+		salt: Option<KdfSalt<'_>>,
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
 		assert_min_key_size(N)?;
 
@@ -198,8 +254,7 @@ impl AssociatedOid for HkdfSha3_256 {
 /// Rejects a key size below [`MIN_KEY_SIZE`], which is too weak for
 /// cryptographic use.
 ///
-/// The X9.63 provider and the dual-key derivation share this check, so the
-/// two apply one validation.
+/// The X9.63 provider and the dual-key derivation share this check.
 #[inline]
 fn assert_min_key_size(key_size: usize) -> Result<()> {
 	if key_size < MIN_KEY_SIZE {
@@ -223,10 +278,16 @@ fn assert_hkdf_key_size(key_size: usize) -> Result<()> {
 }
 
 impl KdfFunction for HkdfSha3_256 {
-	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
+	fn derive_dynamic_key(
+		ikm: &[u8],
+		info: &[u8],
+		salt: Option<KdfSalt<'_>>,
+		key_size: usize,
+	) -> Result<ZeroizingBytes> {
 		assert_hkdf_key_size(key_size)?;
 
-		let hkdf = ZeroizingHkdf::<Sha3_256>::new(salt.unwrap_or_default(), ikm);
+		let salt = salt.map(|salt| salt.as_bytes()).unwrap_or_default();
+		let hkdf = ZeroizingHkdf::<Sha3_256>::new(salt, ikm);
 		let mut okm = Zeroizing::new(vec![0u8; key_size]);
 		hkdf.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
 
@@ -235,10 +296,20 @@ impl KdfFunction for HkdfSha3_256 {
 }
 
 /// The ANSI X9.63 concatenation KDF over SHA3-256.
+///
+/// It derives from the shared secret and the `info` alone, so its output is
+/// the same under any salt ([SECG SEC 1 v2.0 §3.6][sec1-3.6]).
+///
+/// [sec1-3.6]: https://www.secg.org/sec1-v2.pdf#page=37
 pub struct X963Sha3_256;
 
 impl KdfFunction for X963Sha3_256 {
-	fn derive_dynamic_key(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
+	fn derive_dynamic_key(
+		ikm: &[u8],
+		info: &[u8],
+		_salt: Option<KdfSalt<'_>>,
+		key_size: usize,
+	) -> Result<ZeroizingBytes> {
 		assert_min_key_size(key_size)?;
 
 		// The output wipes from its first derived byte, so a refused expansion
@@ -287,6 +358,15 @@ pub enum KdfError {
 	/// holds the received and the expected length.
 	#[error("Invalid shared secret length: {0}")]
 	InvalidSharedSecretLength(ReceivedExpectedError<usize, usize>),
+
+	/// A salt is shorter than the floor of [`KdfSalt`].
+	#[error("KDF salt too short: {actual} bytes, below the minimum of {minimum}")]
+	SaltTooShort {
+		/// The length of the salt in bytes.
+		actual: usize,
+		/// The floor in bytes, [`MIN_SALT_ENTROPY_BYTES`].
+		minimum: usize,
+	},
 }
 
 /// An ECDH shared secret on the curve `C`: the x-coordinate of the product of
@@ -466,6 +546,11 @@ mod tests {
 	const INFO_V2: &[u8] = b"protocol-v2";
 	const SALT: &[u8] = b"random_salt_value";
 
+	/// [`SALT`] as the salt of one derivation.
+	fn salt() -> KdfSalt<'static> {
+		KdfSalt::try_from(SALT).expect("the test salt meets the floor")
+	}
+
 	// `EcdhSecret` refuses a shared secret of another width than the field of
 	// its curve, so every derivation runs on exactly that width: 32 bytes on
 	// secp256k1, and 66 on P-521.
@@ -531,7 +616,7 @@ mod tests {
 		let key1_again = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, None, 32)?;
 		let key_diff_info = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V2, None, 32)?;
 		// X9.63 ignores the salt, so a salted key equals the unsalted key.
-		let key_with_salt = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, Some(SALT), 32)?;
+		let key_with_salt = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, Some(salt()), 32)?;
 		assert_key_length(&key1, 32);
 		assert_keys_equal(&key1, &key1_again);
 		assert_keys_different(&key1, &key_diff_info);
@@ -585,7 +670,7 @@ mod tests {
 			.expand(INFO_V1, &mut expected)
 			.map_err(KdfError::DerivationFailed)?;
 
-		let (k_enc, k_mac) = HkdfSha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, Some(SALT))?;
+		let (k_enc, k_mac) = HkdfSha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, Some(salt()))?;
 		assert_eq!(k_enc[..], expected[..32]);
 		assert_eq!(k_mac[..], expected[32..]);
 		Ok(())
@@ -623,6 +708,14 @@ mod tests {
 		assert_eq!(k_enc[..], expected[..32]);
 		assert_eq!(k_mac[..], expected[32..]);
 		Ok(())
+	}
+
+	// A salt below `MIN_SALT_ENTROPY_BYTES` is refused where its `KdfSalt` is
+	// built, before any KDF reads it, and the refusal names both lengths.
+	#[test]
+	fn a_salt_below_the_floor_is_refused_at_kdf_salt() {
+		let refused = KdfSalt::try_from(b"ab".as_slice());
+		assert!(matches!(refused, Err(KdfError::SaltTooShort { actual: 2, minimum: 16 })));
 	}
 
 	#[test]

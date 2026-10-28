@@ -37,7 +37,7 @@ use crate::transport::ConnectionBuilder;
 use crate::utils::time::SystemClock;
 
 use crate::transport::policy::{
-	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction, TimeoutConfig,
+	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction,
 };
 
 #[derive(Default)]
@@ -98,11 +98,22 @@ impl ClientPolicies {
 		self
 	}
 
+	/// Sets the operation timeout, which caps a connect and each I/O wait.
+	///
+	/// [`ClientBuilder`] writes it into the [`TransportLimits`] of the
+	/// endpoint before the dial, so the dial and the transport both run under
+	/// it.
+	///
+	/// [`TransportLimits`]: crate::transport::TransportLimits
 	pub fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
 		self
 	}
 
+	/// Applies the restart policy and the gates to `transport`.
+	///
+	/// The transport keeps the limits of its endpoint, where [`ClientBuilder`]
+	/// wrote the timeout of [`Self::with_timeout`] before the dial.
 	pub fn apply<P>(self, mut transport: P::Transport) -> P::Transport
 	where
 		P: Protocol,
@@ -116,9 +127,6 @@ impl ClientPolicies {
 		}
 		for g in self.collector_gates.into_iter() {
 			transport = transport.with_collector_gate(g);
-		}
-		if let Some(timeout) = self.timeout {
-			transport = transport.with_timeout(timeout);
 		}
 		transport
 	}
@@ -184,6 +192,10 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
+	/// Sets the trust anchors that validate the certificate of the server.
+	///
+	/// It is the one setter of the trust store, which
+	/// [`ConnectionBuilder::with_trust_store`] calls.
 	pub fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
 		self.encryption.trust_store = Some(store);
 		self
@@ -207,10 +219,9 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	/// Sets the server policy, which every validator of `validators` runs on
-	/// the identity certificate of the server under either flow, as
-	/// [`ClientConfig::with_server_policy`] states. An empty set sets no
-	/// policy.
+	/// Sets the server policy: every validator of `validators` runs on the
+	/// identity certificate of the server under either flow
+	/// ([`ClientConfig::with_server_policy`]). An empty set sets no policy.
 	///
 	/// # Examples
 	///
@@ -219,11 +230,13 @@ impl<P: Protocol> ClientBuilder<P> {
 	///
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyCurves;
 	/// use tightbeam::transport::client::{ClientBuilder, ConnectionBuilder};
 	/// use tightbeam::transport::tcp::r#async::TokioListener;
 	///
-	/// let store = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy::default()).build());
+	/// let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	/// let store = Arc::new(trust.build());
 	/// let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(store);
 	///
 	/// // The policy narrows which server the store admits.
@@ -257,22 +270,23 @@ impl<P: Protocol> ClientBuilder<P> {
 	}
 
 	/// Collects everything the transport is built from, once the dialer rule
-	/// has answered.
+	/// has answered, with `timeout` as its operation timeout when it is set.
 	///
 	/// # Errors
 	///
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
 	///   the client holds no trust store and did not call
-	///   [`Self::allow_cleartext`], so it would have accepted any peer, or it
-	///   sets a server policy and holds no trust in a server, whether or not it
-	///   names cleartext.
+	///   [`Self::allow_cleartext`], so it would accept any peer, or it sets a
+	///   server policy with no trust in a server, with or without cleartext.
 	fn endpoint(
 		encryption: EncryptionConfig<P::CryptoProvider>,
 		negotiation: Negotiation,
 		clock: Arc<dyn Clock>,
+		timeout: Option<Duration>,
 	) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let encryption = DialableEncryption::new(encryption)?;
-		Ok(EndpointConfig::new(encryption, clock).with_negotiation(negotiation))
+		let endpoint = EndpointConfig::new(encryption, clock).with_negotiation(negotiation);
+		Ok(endpoint.with_operation_timeout(timeout))
 	}
 }
 
@@ -290,13 +304,12 @@ where
 	///
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
 	///   the client holds no trust store and did not call
-	///   [`Self::allow_cleartext`], so it would have accepted any peer, or it
-	///   sets a server policy and holds no trust in a server, whether or not it
-	///   names cleartext.
+	///   [`Self::allow_cleartext`], so it would accept any peer, or it sets a
+	///   server policy with no trust in a server, with or without cleartext.
 	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
 		let destination = addr.into();
-		let stream = P::connect(destination).await.map_err(|e| e.into())?;
+		let stream = endpoint.dial::<P>(destination).await?;
 
 		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);
@@ -312,10 +325,10 @@ where
 	///
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
 	///   the client holds no trust store and did not call
-	///   [`Self::allow_cleartext`], or it sets a server policy and holds no
-	///   trust in a server, whether or not it names cleartext.
+	///   [`Self::allow_cleartext`], or it sets a server policy with no trust in
+	///   a server, with or without cleartext.
 	pub fn adopt(self, stream: P::Stream) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
 
 		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);
@@ -339,9 +352,10 @@ where
 		self
 	}
 
-	fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
-		self.encryption.trust_store = Some(store);
-		self
+	// `Self::with_trust_store` resolves to the inherent setter ahead of this
+	// method, so the call forwards to the one setter of the trust store.
+	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self {
+		Self::with_trust_store(self, store)
 	}
 
 	fn with_client_identity(mut self, identity: SigningIdentity) -> Self {
@@ -354,18 +368,15 @@ where
 	}
 }
 
-impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
-	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
-		(**self).evaluate(message, session)
-	}
-}
-
 #[cfg(all(test, feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
 mod tests {
 	use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 	use super::*;
+	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::transport::error::TransportError;
 	use crate::transport::tcp::r#async::{TokioListener, TokioStream};
 	use crate::transport::tcp::TightBeamSocketAddr;
@@ -411,6 +422,20 @@ mod tests {
 		let refused = ClientBuilder::<TokioListener>::builder().adopt(TokioStream::from(stream));
 		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
 		Ok(())
+	}
+
+	/// A trust store set through [`ConnectionBuilder`] authenticates the
+	/// server as the inherent setter does, so the client passes the dialer
+	/// rule and fails at the address instead.
+	#[tokio::test]
+	async fn a_trust_store_set_through_the_connection_builder_admits_the_client() {
+		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let store: Arc<dyn CertificateTrust> = Arc::new(trust.build());
+		let builder = ClientBuilder::<TokioListener>::builder();
+
+		let trusting = ConnectionBuilder::with_trust_store(builder, store);
+		let admitted = trusting.connect(UNREACHABLE).await;
+		assert!(!matches!(admitted, Err(TransportError::PeerAuthenticationUnconfigured)));
 	}
 
 	/// A client that names cleartext passes the same rule, so it reaches the

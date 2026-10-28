@@ -361,9 +361,8 @@ macro_rules! tb_process_spec {
 	};
 
 	// The `@parse_timing` arms read the `wcet`, `jitter`, and `deadline`
-	// blocks one at a time, so each block may stand alone or follow another
-	// after a comma. `add` refuses only a bound that disagrees with the bound
-	// its event holds, so each refusal is a conflict of that event.
+	// blocks one at a time, so a block stands alone or follows a comma. Each
+	// refusal of `add` is a conflict with the bound that its event holds.
 	(@parse_timing
 		$constraints:ident,
 		wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? }
@@ -673,16 +672,14 @@ macro_rules! tb_process_spec {
 #[cfg(all(test, feature = "testing-csp"))]
 mod tests {
 	use core::error::Error;
-	use std::borrow::Cow;
 
 	#[cfg(feature = "testing-timing")]
 	use core::time::Duration;
 	#[cfg(feature = "testing-timing")]
 	use std::collections::HashMap;
 
-	use crate::testing::assertions::{Assertion, AssertionLabel};
 	use crate::testing::specs::csp::ProcessSpec;
-	use crate::trace::ConsumedTrace;
+	use crate::trace::{ConsumedTrace, TraceCollector};
 	use crate::urn::Urn;
 
 	#[cfg(feature = "testing-timing")]
@@ -787,13 +784,12 @@ mod tests {
 
 	/// A trace that records each of `events` once, in order.
 	fn trace_of(events: &[Urn<'static>]) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		for (seq, event) in events.iter().enumerate() {
-			let label = AssertionLabel::Custom(Cow::Owned(event.to_string()));
-			trace.assertions.push(Assertion::new(seq, label, Vec::new(), None));
+		let collector = TraceCollector::new();
+		for event in events {
+			collector.event(event).expect("the run injects no fault").emit();
 		}
 
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
 	/// The timed transition that `event` labels from `from`.

@@ -1,44 +1,57 @@
-//! This module builds each seam an outside crate fills as such a crate must
-//! build it, through the public API of tightbeam alone.
+//! Each seam an outside crate fills, built as that crate must build it,
+//! through the public API of tightbeam alone.
 //!
-//! The outside crate writes these parts itself:
+//! The outside provider writes its own parts, and takes the house AES-128 key
+//! wrap through [`KeyWrapProvider`]:
 //!
-//! - a signature, ECDSA over secp256k1 under `ecdsa-with-SHA3-512`, whose
-//!   canonical form refuses a high `s`, as a [`SigningProvider`],
-//! - a KDF, HKDF over SHA3-512 under an identifier of its own arc, as a [`KdfProvider`],
-//! - a KEM, the DHKEM over secp256k1 under a KEM identifier of its own, through [`RecipientKem`],
-//! - a signing backend, as a [`SigningKeyProvider`],
-//! - a key-agreement backend that runs its own scalar product, as a [`DiffieHellman`] backend,
-//! - an AEAD, AES-128-GCM under a cipher type of its own, as a [`ContentEncryption`], and
-//! - a key wrap that brings `wrap` and `unwrap` alone, as a [`KeyWrapAlgorithm`].
+//! | Part | Seam |
+//! | --- | --- |
+//! | ECDSA over secp256k1 under `ecdsa-with-SHA3-512`, which refuses a high `s` | [`SigningProvider`] |
+//! | HKDF over SHA3-512 under an identifier of its own arc | [`KdfProvider`] |
+//! | The DHKEM over secp256k1 under a KEM identifier of its own | [`RecipientKem`] |
+//! | A signing backend | [`SigningKeyProvider`] |
+//! | A key-agreement backend that runs its own scalar product | [`DiffieHellman`] |
+//! | AES-128-GCM under a cipher type of its own | [`ContentEncryption`] |
+//! | A key wrap with `wrap` and `unwrap` alone | [`KeyWrapAlgorithm`] |
 //!
-//! The outside provider selects one house type through [`KeyWrapProvider`]:
-//! the AES-128 key wrap.
-//!
-//! These suites run under it:
+//! These suites run under the outside provider:
 //!
 //! - [`hpke`] and [`cms`] run both handshakes, under a provider that names no HPKE suite.
 //! - [`kem`] brings a KEM whose private-key operation is not Diffie-Hellman.
-//! - [`curves`] brings the decoder of a curve, which refuses its off-curve encodings at each reader of keys.
-//! - [`colony`] runs two gateways, a hive, and its servlet, which each sign and verify under the provider.
-//! - [`floor`] holds the strength floor of a provider at the TCP transport, and refuses a mixed pair.
+//! - [`curves`] brings a curve decoder, which refuses its off-curve encodings at each key reader.
+//! - [`colony`] runs two gateways, a hive, and its servlet, which each sign and verify under it.
+//! - [`floor`] holds its strength floor at the TCP transport, and refuses a mixed pair.
 //! - [`blocking`] runs a handshake and one exchange over the blocking TCP transport.
-//! - [`curve`] brings providers on P-256, P-384, and P-521, which run both handshakes and a renewal.
+//! - [`curve`] brings providers on P-256, P-384, and P-521, which run both
+//!   handshakes and a renewal. Its P-256 key signs a certificate that `cert!`
+//!   issues under a P-256 signature type.
 //!
-//! Other suites bring a part of the transport or of the colony:
+//! These suites bring one part of the transport or the colony:
 //!
-//! - [`handshake`] brings a client and a server orchestrator, which the TCP transport drives.
-//! - [`listener`] brings a blocking listener backend, which the house TCP listener serves.
-//! - [`mux`] brings a dispatch and a credit grantor, which the multiplexed transport runs.
-//! - [`registry`] brings the servlet registry a hive runs on, which hands back each registration it replaces.
-//! - [`restart`] brings a restart policy and a jitter strategy, which a transport and a house backoff run.
-//! - [`retry`] brings the retry policy of the scaling updates of a hive.
+//! - [`handshake`]: a client and a server orchestrator, which the TCP transport drives.
+//! - [`listener`]: a blocking listener backend, which the house TCP listener serves.
+//! - [`mux`]: a dispatch and a credit grantor, which the multiplexed transport runs.
+//! - [`registry`]: the hive's servlet registry, which hands back each registration it replaces.
+//! - [`restart`]: a restart policy and a jitter strategy, which a transport and a house backoff run.
+//! - [`retry`]: the retry policy of a hive's scaling updates.
+//! - [`urn`]: a URN spec with components of its own, which `Urn::verify` reads a URN through.
+//! - [`worker`]: a worker with no house runtime, which a servlet that drains ends through its kill.
+//!
+//! These suites bring one part of the trace or the test harness:
+//!
+//! - [`clock`]: a clock, which a trace stamps its events on.
+//! - [`csp`]: a process spec and a composition, which a scenario checks its run against.
+//! - [`logging`]: a log backend, which a trace hands each record that its filter admits.
 
 #[cfg(all(feature = "transport-hpke", feature = "tcp"))]
 mod blocking;
+#[cfg(feature = "instrument")]
+mod clock;
 #[cfg(feature = "transport-cms")]
 mod cms;
 mod colony;
+#[cfg(feature = "testing-csp")]
+mod csp;
 #[cfg(all(feature = "transport-cms", feature = "transport-hpke"))]
 mod curve;
 mod curves;
@@ -52,6 +65,8 @@ mod hpke;
 mod kem;
 #[cfg(all(feature = "transport-hpke", feature = "tcp"))]
 mod listener;
+#[cfg(feature = "logging")]
+mod logging;
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 mod mux;
 mod registry;
@@ -61,6 +76,8 @@ mod retry;
 mod servlet;
 mod spec;
 mod trust;
+mod urn;
+mod worker;
 
 use std::sync::Arc;
 
@@ -82,7 +99,7 @@ use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
 use tightbeam::crypto::k256::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
 use tightbeam::crypto::k256::elliptic_curve::point::AffineCoordinates;
 use tightbeam::crypto::k256::{AffinePoint, NonZeroScalar, PublicKey, Secp256k1};
-use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction};
+use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction, KdfSalt};
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
@@ -247,10 +264,11 @@ impl KdfFunction for OutsideKdf {
 	fn derive_dynamic_key(
 		ikm: &[u8],
 		info: &[u8],
-		salt: Option<&[u8]>,
+		salt: Option<KdfSalt<'_>>,
 		key_size: usize,
 	) -> Result<ZeroizingBytes, KdfError> {
 		let mut key = Zeroizing::new(vec![0u8; key_size]);
+		let salt = salt.map(|salt| salt.as_bytes());
 		let expanded = Hkdf::<Sha3_512>::new(salt, ikm).expand(info, key.as_mut_slice());
 		expanded.map_err(KdfError::DerivationFailed)?;
 		Ok(key)

@@ -2,7 +2,6 @@
 //! `runtime::rt` on `std`, without `tokio`.
 
 use std::error::Error;
-use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -19,7 +18,7 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::TimeoutConfig;
 use tightbeam::transport::tcp::sync::{TcpListener, TcpTransport};
 use tightbeam::transport::tcp::TightBeamSocketAddr;
-use tightbeam::transport::{EndpointConfig, MessageEmitter, TransportError, TransportResult};
+use tightbeam::transport::{EndpointConfig, MessageEmitter, TransportError, TransportFailure, TransportResult};
 use tightbeam::urn::Urn;
 use tightbeam::Frame;
 
@@ -42,8 +41,7 @@ fn gate_accepts(trace: &TraceCollector) -> usize {
 		.count()
 }
 
-/// One frame round-trips through the sync accept loop: the server thread
-/// echoes and the client observes the same frame back.
+/// One frame round-trips through the sync accept loop.
 #[test]
 fn sync_server_echoes_over_std_tcp() -> TransportResult<()> {
 	let listener = NetTcpListener::bind("127.0.0.1:0")?;
@@ -347,8 +345,9 @@ fn sync_server_serves_after_a_failed_accept() -> TransportResult<()> {
 }
 
 /// With `max_connections: [ 1 ]` the loop serves one connection at a time, so
-/// a second one waits unanswered in the backlog while the first lives. The
-/// first gets its echo, so the loop serves.
+/// a second waits unanswered in the backlog while the first lives and gets its
+/// echo. The timed-out exchange leaves the stream at an unknown position, so
+/// the transport fails the session and refuses the next emit before it writes.
 #[test]
 fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 	let listener = NetTcpListener::bind("127.0.0.1:0")?;
@@ -367,6 +366,7 @@ fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 		NetTcpStream::connect(addr)?,
 		EndpointConfig::<DefaultCryptoProvider>::cleartext(),
 	);
+
 	let admitted = TestFrame::v0(Some("sync-within-cap"), None);
 	let echoed = rt::block_on(held.emit(admitted.to_owned(), None))?;
 
@@ -375,17 +375,21 @@ fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 	let mut queued = queued.with_timeout(CAP_WAIT);
 	let frame = TestFrame::v0(Some("sync-past-cap"), None);
 	let starved = rt::block_on(queued.emit(frame, None));
+	let after_starved = TestFrame::v0(Some("sync-after-starved"), None);
+	let refused = rt::block_on(queued.emit(after_starved, None));
 
-	// A read past the timeout of a std socket fails with `WouldBlock` on Unix
-	// and with `TimedOut` on Windows.
 	let timed_out = matches!(
 		&starved,
-		Err(TransportError::IoError(error)) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+		Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
 	);
 	assert_eq!(echoed, Some(admitted), "the connection within the cap must get its echo");
 	assert!(
 		timed_out,
 		"the connection past the cap must time out unanswered, got {starved:?}"
+	);
+	assert!(
+		matches!(refused, Err(TransportError::ConnectionFailed)),
+		"the connection whose exchange broke must refuse the next emit, got {refused:?}"
 	);
 	Ok(())
 }
@@ -396,11 +400,11 @@ fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 fn the_std_runtime_spawns_a_closure_on_a_thread_of_its_own() -> Result<(), Box<dyn Error>> {
 	let caller = thread::current().id();
 	let (sender, receiver) = mpsc::channel();
-
 	let handle = rt::spawn(move || {
 		// The receiver lives until the test reads it, so the send lands.
 		let _sent = sender.send(thread::current().id());
 	})?;
+
 	rt::join(handle)?;
 
 	assert_ne!(receiver.recv()?, caller);

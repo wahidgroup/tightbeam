@@ -550,6 +550,7 @@ fn hpke_pair<P: HandshakeProvider>(
 	server: SigningIdentity,
 ) -> (Handshake<Client, Hpke, P>, Handshake<Server, Hpke, P>) {
 	let pinned = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let pinned = pinned.expect("an outside certificate encodes");
 	let settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
 	let client = ClientConfig::<Hpke, P>::new(settings, KeyPurposes::HOUSE);
 	let client = client.expect("an outside client serves the client role");
@@ -699,7 +700,7 @@ where
 	let server_session = server.complete()?;
 
 	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
-	let opened = server_session.keys().recv().open(&mut record)?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
 	Ok(opened.to_vec())
 }
 
@@ -793,14 +794,17 @@ mod renewal {
 	use tightbeam::crypto::policy::Secp256k1Policy;
 	use tightbeam::crypto::sign::SigningIdentity;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
-	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use tightbeam::crypto::x509::KeyCurves;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::prelude::TightBeamSocketAddr;
 	use tightbeam::testing::TestFrame;
 	use tightbeam::transport::client::{ClientBuilder, ConnectionBuilder};
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportOffer};
 	use tightbeam::transport::handshake::HandshakeProvider;
-	use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxDispatch, MuxHandle, MuxRole, SpawnedMux};
+	use tightbeam::transport::multiplex::{
+		MuxAcceptor, MuxConnector, MuxDispatch, MuxDrivers, MuxHandle, MuxRole, SpawnedMux,
+	};
 	use tightbeam::transport::tcp::r#async::{TokioListener, TokioStream};
 	use tightbeam::transport::{EncryptedProtocol, ResponsePackage, TransportEncryptionConfig, TransportResult};
 	use tightbeam::Frame;
@@ -830,11 +834,11 @@ mod renewal {
 		}
 	}
 
-	/// The client end of a session that renews its epoch, with the tasks that
-	/// run both ends.
+	/// The client end of a session that renews its epoch, with the drivers
+	/// and the task that run both ends.
 	struct RenewingSession {
 		handle: MuxHandle,
-		_tasks: [JoinHandle<()>; 2],
+		_drivers: [MuxDrivers; 2],
 		_serving: JoinHandle<TransportResult<()>>,
 	}
 
@@ -854,7 +858,7 @@ mod renewal {
 		let server_identity = identity();
 		let client_identity = identity();
 		let server_certificate = server_identity.certificate().to_owned();
-		let pinned = DirectTrustValidator::default().with_trust_chain([client_identity.certificate().to_owned()]);
+		let pinned = DirectTrustValidator::default().with_trust_chain([client_identity.certificate().to_owned()])?;
 		let validators: [Arc<dyn CertificateValidation>; 1] = [Arc::new(pinned)];
 
 		let config = TransportEncryptionConfig::<P>::new(server_identity).with_client_validators(validators);
@@ -867,7 +871,8 @@ mod renewal {
 			transport.into_mux(MuxRole::Server)
 		});
 
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(server_certificate)?;
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let store = store.with_certificate(server_certificate)?;
 		let builder = ClientBuilder::<TokioListener<P>>::builder().with_trust_store(Arc::new(store.build()));
 		let builder = builder.with_client_identity(client_identity);
 		let stream = TcpStream::connect(*addr).await?;
@@ -875,11 +880,11 @@ mod renewal {
 		let mut client = client.with_mux_offer(Some(renewing_offer()));
 		MuxConnector::complete_client_handshake(&mut client).await?;
 
-		let SpawnedMux { handle, reader_task: client_reader, .. } = client.into_mux(MuxRole::Client)?.spawn();
+		let SpawnedMux { handle, drivers: client_drivers, .. } = client.into_mux(MuxRole::Client)?.spawn();
 		let server = accepting.await??;
-		let SpawnedMux { responder, reader_task: server_reader, .. } = server.spawn();
+		let SpawnedMux { responder, drivers: server_drivers, .. } = server.spawn();
 		let serving = tokio::spawn(responder.serve_with(EchoDispatch));
-		Ok(RenewingSession { handle, _tasks: [client_reader, server_reader], _serving: serving })
+		Ok(RenewingSession { handle, _drivers: [client_drivers, server_drivers], _serving: serving })
 	}
 
 	/// Emits [`EMITS`] frames on `handle`, each on a stream of its own.
@@ -932,6 +937,48 @@ mod blocking {
 	async fn a_p256_provider_runs_the_blocking_transport() -> Result<(), Box<dyn std::error::Error>> {
 		let exchange = blocking_exchange::<P256Provider>(p256_identity(), "p256-blocking").await?;
 		assert_eq!(exchange.received, exchange.sent);
+		Ok(())
+	}
+}
+
+/// `cert!` issues a certificate under the signature type that its
+/// `signature:` key names.
+mod certificate {
+	use core::time::Duration;
+
+	use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+	use p256::ecdsa::{DerSignature, Signature, SigningKey};
+	use tightbeam::crypto::hash::{Digest, Sha3_256};
+	use tightbeam::crypto::sign::Sha3Signer;
+	use tightbeam::der::Encode;
+	use tightbeam::oids::SIGNER_ECDSA_WITH_SHA3_256;
+	use tightbeam::random::OsRng;
+	use tightbeam::spki::SubjectPublicKeyInfoOwned;
+
+	/// `cert!` signs a root certificate under the P-256 signature type of its
+	/// `signature:` key, so the P-256 key verifies it under
+	/// `ecdsa-with-SHA3-256`.
+	#[test]
+	fn cert_issues_a_p256_certificate_under_a_p256_signature_type() -> Result<(), Box<dyn std::error::Error>> {
+		let key = SigningKey::random(&mut OsRng);
+		let signer = Sha3Signer::from(&key);
+		let spki = SubjectPublicKeyInfoOwned::from_key(*key.verifying_key())?;
+
+		let certificate = tightbeam::cert!(
+			profile: Root,
+			subject: "CN=P-256 Root",
+			serial: 1u32,
+			duration: Duration::from_secs(3600),
+			signer: &signer,
+			subject_public_key: spki,
+			signature: DerSignature
+		)?;
+
+		let prehash = Sha3_256::digest(certificate.tbs_certificate.to_der()?);
+		let signature = Signature::from_der(certificate.signature.raw_bytes())?;
+		let verified = key.verifying_key().verify_prehash(&prehash, &signature).is_ok();
+		let algorithm = certificate.signature_algorithm.oid;
+		assert_eq!((algorithm, verified), (SIGNER_ECDSA_WITH_SHA3_256, true));
 		Ok(())
 	}
 }

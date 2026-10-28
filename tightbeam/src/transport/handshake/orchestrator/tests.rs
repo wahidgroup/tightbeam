@@ -20,15 +20,16 @@ use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::Secp256k1;
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
-use crate::crypto::sign::CmsSigner;
+use crate::crypto::sign::SignedDataSigners;
 use crate::crypto::x509::error::CertificateValidationError::{
 	AmbiguousIssuer, CertificateNotPinned, CertificateNotTrusted, Expired, PathCycle, PathLenExceeded,
 };
 use crate::crypto::x509::policy::{
 	CertificateValidation, DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning,
 };
-use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use crate::crypto::x509::utils::Skid;
+use crate::crypto::x509::KeyCurves;
 use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
 use crate::oids::{AES_128_GCM, SESSION_RECEIPT};
@@ -251,7 +252,7 @@ async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> Result<()
 
 	let record = server_session.keys().send().encrypt_next(b"server to client".to_vec())?;
 	let mut to_client = record.to_der()?;
-	let opened = client_session.keys().recv().open(&mut to_client)?;
+	let opened = client_session.into_keys().recv_mut().open(&mut to_client)?;
 	assert_eq!(opened, b"server to client");
 	Ok(())
 }
@@ -262,7 +263,7 @@ async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow
 	let Established { client_session, server_session, .. } = established::<F>(mutual_with(ExpiryValidator)).await;
 
 	let mut record = sealed_record(&client_session)?;
-	let opened = server_session.keys().recv().open(&mut record)?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
 	assert_eq!(opened, RECORD_PLAINTEXT);
 	Ok(())
 }
@@ -449,7 +450,7 @@ fn with_forged_server_finished(reply: HandshakeMessage) -> HandshakeMessage {
 /// so it still verifies.
 fn with_receipt_of(reply: HandshakeMessage, other: HandshakeMessage) -> HandshakeMessage {
 	let other = other.signed().expect("a reply is a SignedData").into_value();
-	let signer = CmsSigner::sole_signer(&other).expect("a reply has one signer");
+	let signer = other.sole_signer().expect("a reply has one signer");
 	let mut carried = signer.unsigned_attrs.iter().flat_map(|attributes| attributes.iter());
 	let receipt = carried.find(|attribute| attribute.oid == SESSION_RECEIPT);
 	let receipt = receipt.expect("a budget-bearing reply carries its receipt");
@@ -551,7 +552,7 @@ async fn an_anonymous_server_records_no_peer<F: TestFlow>() -> Result<(), Box<dy
 /// A mutual server records the certificate every validator accepted.
 async fn a_mutual_server_records_the_accepted_peer<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let Parties { client_identity, client, mut server, .. } = parties::<F>(PeerAuthentication::Anonymous);
-	let pinned = DirectTrustValidator::default().with_trust_chain([client_identity.certificate.to_owned()]);
+	let pinned = DirectTrustValidator::default().with_trust_chain([client_identity.certificate.to_owned()])?;
 	server.peer_authentication = mutual_with(pinned);
 
 	let mut run = run(client, server).await;
@@ -650,7 +651,7 @@ async fn multiplexing_negotiates_when_offered_and_enabled<F: TestFlow>() -> Resu
 
 	let run = run(client, server).await;
 
-	let caps = |mux: MuxSettings| (mux.local_initiated_cap, mux.peer_initiated_cap);
+	let caps = |mux: MuxSettings| (mux.local_initiated_cap(), mux.peer_initiated_cap());
 	let server_caps = run.server.negotiated_mux().map(caps);
 	assert_eq!(server_caps, Some((8, 4)));
 
@@ -697,7 +698,6 @@ fn chained_pair<F: TestFlow>() -> (ChainedTestServer, TestClient<F>, TestServer<
 /// certificate (RFC 5652 §5.1).
 async fn a_reply_carries_the_intermediate_its_server_presents<F: TestFlow>() -> Result<(), Box<dyn Error>> {
 	let (chained, mut client, mut server) = chained_pair::<F>();
-
 	let reply = server.reply(client.start()?).await?;
 	assert!(presented_certificates(&reply).contains(&chained.intermediate));
 	Ok(())
@@ -773,7 +773,8 @@ fn root_anchored_mutual<F: TestFlow>(
 	let server_identity = create_test_server();
 	let client = F::client_presenting(&server_identity, identity);
 
-	let store = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(chain.root.to_owned());
+	let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	let store = store.with_certificate(chain.root.to_owned());
 	let store = store.expect("the root is within its validity period").build();
 	let mut server = F::server(&server_identity);
 	server.peer_authentication = mutual_with(store);

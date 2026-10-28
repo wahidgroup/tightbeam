@@ -137,7 +137,9 @@ fn echo_one(
 ) -> JoinHandle<TransportResult<()>> {
 	tokio::spawn(async move {
 		let (mut transport, _) = listener.accept().await?;
-		*transport.server_handshake_mut() = handshake;
+		if let Some(handshake) = handshake {
+			transport.handshake_slot().install(handshake);
+		}
 
 		let (frame, status) = transport.collect_message().await?;
 		transport.send_response(status, Some(Frame::clone(&frame))).await

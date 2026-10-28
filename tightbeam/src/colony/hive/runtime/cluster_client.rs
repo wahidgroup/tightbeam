@@ -43,16 +43,16 @@ use crate::{Frame, Message, TightBeamError, Version};
 /// # Warning
 ///
 /// Each transport the link dials records into the hive's trace, so the trace
-/// holds the session of each dial, a session that the gateway fails
-/// included. The default `BoundedMemorySink` drops each event past
-/// `max_events`, the hive's own included, so a long-lived hive needs an
-/// `EventSink` that forwards each event, or a reader that drains the trace.
+/// holds the session of each dial, a failed one included. The default
+/// `BoundedMemorySink` drops each event past `max_events`, the hive's own
+/// included, so a long-lived hive needs an `EventSink` that forwards each
+/// event, or a reader that drains the trace.
 pub struct ClusterLink<P: Protocol, R: ServletRegistry> {
 	servlets: Arc<R>,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_addr: P::Address,
 	config: Arc<HiveConfig>,
-	/// The hive's trace, which the re-announce beat records into.
+	/// The hive's trace, which each announcement records into.
 	trace: Arc<TraceCollector>,
 	/// The terms the link sets on each transport it dials: the hive's trace,
 	/// and no mux offer, because each control exchange is one request.
@@ -158,14 +158,39 @@ where
 		decode::<RegisterHiveResponse>(response_frame.message())
 	}
 
-	/// Re-announces the current slate to every registered gateway.
+	/// Announces the current slate to `gateway`, and records its answer as
+	/// [`HIVE_REREGISTERED`]: the status it replies, or `Unavailable` for a
+	/// registration that failed.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
+	async fn announce_to(&self, gateway: P::Address) -> Result<(), TightBeamError> {
+		let outcome = self.register(gateway).await;
+		let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
+		let label = status.as_str();
+		let evidence = || -> Option<Vec<u8>> { Some(gateway.into()) };
+		let trace = &self.trace;
+		trace.emit_event_with_value_and_rendered_evidence(HIVE_REREGISTERED, label, status, evidence)
+	}
+
+	/// Re-announces the current slate to every registered gateway, and
+	/// records the answer of each one.
 	///
 	/// Gateway registries are soft state, so a gateway that misses this
 	/// announcement stays divergent until the next beat re-announces.
-	pub async fn announce_slate(&self) {
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the record of an answer, the
+	///   fault the `testing-fault` feature injects. The gateways after it hear
+	///   no announcement.
+	pub(crate) async fn announce_slate(&self) -> Result<(), TightBeamError> {
 		for gateway in self.gateways() {
-			let _ = self.register(gateway).await;
+			self.announce_to(gateway).await?;
 		}
+
+		Ok(())
 	}
 
 	/// Runs the anti-entropy beat that re-announces the slate on an interval.
@@ -174,7 +199,6 @@ where
 	/// advertisements, and the drain announces its emptied slate once.
 	pub fn spawn_reregister(&self) -> rt::JoinHandle {
 		let link = self.clone();
-		let trace = Arc::clone(&self.trace);
 		rt::spawn(async move {
 			let Some(interval) = link.config.control.reregister_interval else {
 				return;
@@ -184,19 +208,7 @@ where
 			let beat: Result<(), TightBeamError> = async move {
 				loop {
 					clock.sleep(interval).await;
-
-					for gateway in link.gateways() {
-						let outcome = link.register(gateway).await;
-						let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
-						let label = status.as_str();
-						let evidence = || -> Option<Vec<u8>> { Some(gateway.into()) };
-						trace.emit_event_with_value_and_rendered_evidence(
-							HIVE_REREGISTERED,
-							label,
-							status,
-							evidence,
-						)?;
-					}
+					link.announce_slate().await?;
 				}
 			}
 			.await;
@@ -207,14 +219,12 @@ where
 		})
 	}
 
-	/// Fans out one scaling add/remove update to every registered gateway.
+	/// Fans out one scaling update, an add or a removal, to every registered
+	/// gateway.
 	///
-	/// A hive whose URN failed to derive withholds the update, because
-	/// the change needs an identity to attribute it to.
-	///
-	/// The fan-out runs under `tasks`, so a hive stop also stops an update that
-	/// retries against an unreachable gateway. When the retries run out, the
-	/// link announces the full slate.
+	/// - A hive whose URN failed to derive withholds the update, because the update names the hive.
+	/// - The fan-out runs under `tasks`, so a hive stop also stops its retries.
+	/// - A spent retry or an unbuilt frame falls back to the full slate, which records each gateway's answer.
 	pub(crate) fn notify_scaling(
 		&self,
 		tasks: &TaskGroup,
@@ -233,14 +243,20 @@ where
 			}
 
 			let update = ClusterRequest::ServletAddressUpdate(change.into_update(hive_urn.as_ref().clone()));
-			let Ok(frame) = link.control_frame(b"scaling-update", update).await else {
-				return;
+			let any_failed = match link.control_frame(b"scaling-update", update).await {
+				Ok(frame) => link.fanout_scaling_update(&gateways, &frame).await,
+				// A frame that fails to build reaches no gateway, so the slate
+				// announcement takes its place.
+				Err(_unbuilt) => true,
 			};
-
-			let any_failed = link.fanout_scaling_update(&gateways, &frame).await;
-			if any_failed {
-				link.announce_slate().await;
+			if !any_failed {
+				return;
 			}
+
+			// A trace fault ends the fallback, which is the effect a
+			// `testing-fault` injection observes.
+			let announced = link.announce_slate().await;
+			drop(announced);
 		});
 	}
 
@@ -263,15 +279,15 @@ where
 		Ok(transport)
 	}
 
-	/// Connects to `gateway` under `endpoint`, and sets the link's terms on
-	/// the transport before its handshake. Every dial of the link connects
-	/// here.
+	/// Connects to `gateway` under `endpoint`, within its operation timeout,
+	/// and sets the link's terms on the transport before its handshake. Every
+	/// dial of the link connects here.
 	async fn connect(
 		&self,
 		gateway: P::Address,
 		endpoint: EndpointConfig<P::CryptoProvider>,
-	) -> Result<P::Transport, P::Error> {
-		let stream = P::connect(gateway).await?;
+	) -> TransportResult<P::Transport> {
+		let stream = endpoint.dial::<P>(gateway).await?;
 		let transport = P::create_transport(stream, endpoint);
 		Ok(self.terms.apply(transport))
 	}

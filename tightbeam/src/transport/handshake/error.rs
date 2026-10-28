@@ -108,7 +108,7 @@ pub enum HandshakeError {
 	AnchorMismatch,
 
 	/// The signing and the key-agreement certificate of a CMS server hold one
-	/// key, which would serve two purposes (NIST SP 800-57 Part 1 Rev. 5 §5.2).
+	/// key for two purposes (NIST SP 800-57 Part 1 Rev. 5 §5.2).
 	#[error("The two server certificates hold one key")]
 	KeyReuse,
 
@@ -175,8 +175,8 @@ pub enum HandshakeError {
 	#[error("Key confirmation failed")]
 	KeyConfirmationFailed,
 
-	/// The KDF salt of a traffic-key derivation is `actual` bytes, below the
-	/// `minimum` bytes the entropy requirement sets.
+	/// The KDF salt of a derivation is `actual` bytes, below the `minimum`
+	/// bytes that [`KdfSalt`](crate::crypto::kdf::KdfSalt) admits.
 	#[error("KDF salt too short: {actual} bytes (minimum {minimum} required)")]
 	InsufficientSaltEntropy { actual: usize, minimum: usize },
 
@@ -233,7 +233,7 @@ pub enum HandshakeError {
 
 	/// A KDF operation failed.
 	#[error("KDF operation failed: {0}")]
-	#[from]
+	#[source]
 	KdfError(crate::crypto::kdf::KdfError),
 	/// A key has an invalid size: `received` bytes, not the `expected` bytes.
 	#[error("Invalid key size: expected {expected}, got {received}")]
@@ -347,7 +347,7 @@ impl HandshakeError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HandshakeAudit {
 	/// The receipt failed for `reason`, with the code of a refusal that
-	/// carries one, which files [`SESSION_RECEIPT_REFUSED`].
+	/// carries one. It files [`SESSION_RECEIPT_REFUSED`].
 	///
 	/// [`SESSION_RECEIPT_REFUSED`]: events::SESSION_RECEIPT_REFUSED
 	ReceiptRefused {
@@ -357,12 +357,12 @@ pub(crate) enum HandshakeAudit {
 		code: Option<u32>,
 	},
 	/// The handshake refused the identity of its peer for the reason it holds,
-	/// such as `signature`, which files [`SESSION_CERT_REJECTED`].
+	/// such as `signature`. It files [`SESSION_CERT_REJECTED`].
 	///
 	/// [`SESSION_CERT_REJECTED`]: events::SESSION_CERT_REJECTED
 	IdentityRefused(&'static str),
-	/// The transport authorizer refused the session with the code it holds,
-	/// which files [`SESSION_AUTHORIZATION_REFUSED`].
+	/// The transport authorizer refused the session with the code it holds. It
+	/// files [`SESSION_AUTHORIZATION_REFUSED`].
 	///
 	/// [`SESSION_AUTHORIZATION_REFUSED`]: events::SESSION_AUTHORIZATION_REFUSED
 	AuthorizationRefused(u32),
@@ -370,7 +370,7 @@ pub(crate) enum HandshakeAudit {
 	///
 	/// [`SESSION_HANDSHAKE_EXPIRED`]: events::SESSION_HANDSHAKE_EXPIRED
 	Expired,
-	/// A crate error that names no handshake fault ended the handshake, which
+	/// A crate error that names no handshake fault ended the handshake. It
 	/// files [`ERROR`](events::ERROR).
 	Failed,
 }
@@ -426,7 +426,7 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 			TightBeamError::SignatureEncodingError => HandshakeError::SignatureVerificationFailed,
 			TightBeamError::Signer(e) => HandshakeError::from(e),
 			TightBeamError::EllipticCurveError(e) => HandshakeError::InvalidPublicKey(e),
-			TightBeamError::KeyDerivationError(e) => HandshakeError::KdfError(e),
+			TightBeamError::KeyDerivationError(e) => HandshakeError::from(e),
 			TightBeamError::InvalidKeyLength(e) => HandshakeError::InvalidKeyMaterialLength(e),
 			#[cfg(feature = "hpke")]
 			TightBeamError::HpkeError(e) => HandshakeError::HpkeError(e),
@@ -454,6 +454,22 @@ impl From<crate::crypto::sign::SignerError> for HandshakeError {
 			SignerError::Key(e) => HandshakeError::KeyError(e),
 			SignerError::Certificate(e) => HandshakeError::CertificateValidationError(e),
 			_ => HandshakeError::SignatureVerificationFailed,
+		}
+	}
+}
+
+/// Narrows a KDF error into [`HandshakeError`].
+///
+/// A salt under the floor is [`HandshakeError::InsufficientSaltEntropy`], the
+/// name the handshake gives that refusal. Every other refusal is
+/// [`HandshakeError::KdfError`].
+impl From<crate::crypto::kdf::KdfError> for HandshakeError {
+	fn from(err: crate::crypto::kdf::KdfError) -> Self {
+		use crate::crypto::kdf::KdfError;
+
+		match err {
+			KdfError::SaltTooShort { actual, minimum } => HandshakeError::InsufficientSaltEntropy { actual, minimum },
+			other => HandshakeError::KdfError(other),
 		}
 	}
 }

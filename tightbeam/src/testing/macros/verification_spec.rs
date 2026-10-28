@@ -1052,10 +1052,8 @@ macro_rules! __tb_assert_spec_add_event_counts {
 // Attaches a schedulability assertion to the spec under construction.
 //
 // Every configuration defines the name and the feature selects the body, so an
-// expansion calls this with no guard of its own. A definition gated whole would
-// make a missed guard fail name resolution in one feature column alone. A build
-// without `testing-timing` stops at the block, so a spec keeps every
-// schedulability assertion it states.
+// expansion needs no guard, and name resolution holds in every feature column.
+// A build without `testing-timing` stops at the block and drops no assertion.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_parse_schedulability {
@@ -1208,10 +1206,9 @@ macro_rules! tb_assert_spec {
 					desc_opt,
 					$(
 						$maj, $min, $patch, $mode,
-						// One place decides the expected gate and the expected
-						// response. A block that omits `gate:` or `response:`
-						// requires neither, and every macro below passes these
-						// values on without reading them.
+						// One place decides the expected gate and response. A
+						// block that omits `gate:` or `response:` requires
+						// neither, and the macros below only pass them on.
 						::core::option::Option::None $( .or(Some($crate::policy::TransitStatus::$gate)) )?,
 						::core::option::Option::None $( .or(Some($crate::trace::Presence::$response)) )?,
 						assertions: [ $( $assertion ),* ],
@@ -1289,7 +1286,7 @@ mod tests {
 	use std::borrow::Cow;
 
 	use super::*;
-	use crate::trace::Assertion;
+	use crate::trace::TraceCollector;
 
 	const OLDER_KEY: Urn<'static> = crate::urn!("test", "event:spec/older-key");
 	const NEWER_KEY: Urn<'static> = crate::urn!("test", "event:spec/newer-key");
@@ -1383,9 +1380,9 @@ mod tests {
 		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
 		let spec = builder.assertion(OLDER_KEY, vec!["hot"], exactly!(1))?.build();
 
-		let mut trace = ConsumedTrace::new();
-		let label = AssertionLabel::Custom(OLDER_KEY.into_label());
-		trace.assertions.push(Assertion::new(0, label, vec!["cold"], None));
+		let collector = TraceCollector::new();
+		collector.event_with(OLDER_KEY, &["cold"], ())?.emit();
+		let trace = ConsumedTrace::drained_from(&collector);
 
 		let verdict = spec.verify(&trace, &Ok(()));
 		assert!(matches!(verdict, Err(SpecViolation::AssertionViolation(_))));

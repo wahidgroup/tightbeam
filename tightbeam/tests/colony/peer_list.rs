@@ -7,6 +7,7 @@
 
 #![cfg(all(feature = "tcp", feature = "testing", feature = "instrument"))]
 
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tightbeam::colony::hive::PeerListGate;
@@ -94,7 +95,7 @@ fn doorman_pool(
 	let client_provider = Arc::clone(&ctx.client_provider);
 	let config = PoolConfig {
 		idle_timeout: None,
-		max_connections: 1,
+		max_connections: NonZeroUsize::MIN,
 		mux_offer: Some(Arc::new(TransportOffer::mux(1))),
 	};
 

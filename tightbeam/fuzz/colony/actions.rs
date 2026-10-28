@@ -1,6 +1,7 @@
 //! The oracle-driven action loop of the colony AFL harness.
 
 use core::future::Future;
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,8 +125,7 @@ fn ijon_action(opcode: u8, selector: u8) {
 }
 
 /// The IJON code of a shadow prediction. `Unmodeled` gets a neutral value,
-/// so the coverage map keeps those runs apart from both oracle
-/// directions.
+/// so the coverage map keeps those runs apart from both oracle directions.
 fn prediction_code(predicted: Prediction) -> u32 {
 	match predicted {
 		Prediction::Deny => 0,
@@ -161,10 +161,10 @@ fn pick_org_ref(topo: &ColonyTopology, idx: u8) -> &OrgNode {
 	}
 }
 
-/// The canonical key the fixtures read once, borrowed from the identity
-/// bundle, or `None` for an identity whose key the fixtures could not read.
-/// Such an identity matches no session, so a mutation of its grants or its
-/// gate changes no verdict.
+/// The canonical key of `org`, borrowed from the identity bundle, or `None`
+/// for an identity whose key the fixtures could not read. Such an identity
+/// matches no session, so a mutation of its grants or its gate changes no
+/// verdict.
 fn org_key(org: &OrgNode) -> Option<&CanonicalKey> {
 	org.certs.canonical.as_ref()
 }
@@ -251,7 +251,7 @@ async fn pooled_client(
 	addr: &<TokioListener as Protocol>::Address,
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let offer = Arc::new(TransportOffer::mux(8));
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(offer) };
+	let config = PoolConfig { idle_timeout: None, max_connections: NonZeroUsize::MIN, mux_offer: Some(offer) };
 
 	let cert = CertificateSpec::Built(Box::new(identity.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned()));
@@ -295,10 +295,11 @@ fn classify_work_message(message: impl AsRef<[u8]>, payload_ok: impl FnOnce(&[u8
 /// Compares a shadow prediction against the wire outcome and emits the
 /// outcome plus any oracle divergence.
 ///
-/// Only `Allow` and `Deny` take part in the oracle. A predicted `Deny` that
-/// the wire allowed is a `SHADOW_VIOLATION`, and a predicted `Allow` that
-/// the wire refused is `SHADOW_TOO_CLOSED`. `Unmodeled` skips both
-/// directions while the plain outcome event still emits.
+/// Only `Allow` and `Deny` take part in the oracle:
+///
+/// - A predicted `Deny` that the wire allowed is a `SHADOW_VIOLATION`.
+/// - A predicted `Allow` that the wire refused is a `SHADOW_TOO_CLOSED`.
+/// - `Unmodeled` skips both directions, and the plain outcome event still emits.
 fn record_authz_oracle(
 	trace: &TraceCollector,
 	predicted: Prediction,
@@ -393,10 +394,9 @@ async fn emit_cluster_work(
 	record_authz_oracle(trace, work.predicted, class, work.ok, work.denied)
 }
 
-/// Predicts one hop against `org`'s export boundary through its shadow.
-///
-/// It borrows the canonical key from the identity bundle, which the
-/// fixtures read once for every prediction.
+/// Predicts one hop against `org`'s export boundary through its shadow. It
+/// borrows the caller's canonical key from `identity`, which the fixtures
+/// read once.
 fn shadow_predict(
 	org: &OrgNode,
 	target: &Urn<'static>,

@@ -5,6 +5,7 @@
 //! - [`PathSide`] names the side of a node that a frame arrives from.
 //! - [`DtnPath`] holds what every node of one path shares, and starts each servlet with its workers.
 
+use core::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1SigningKey};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::{Certificate, CertificateSpec};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{Certificate, CertificateSpec, KeyCurves};
 use tightbeam::der::Enumerated;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::trace::TraceCollector;
@@ -55,6 +56,12 @@ type NodeConfigBuilder<Env> = ServletConfigBuilder<
 	Env,
 	WithCertificate<DefaultCryptoProvider>,
 >;
+
+/// The connection cap of the pool that [`DtnRole::dial_pool`] builds.
+const DIAL_POOL_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(3) {
+	Some(cap) => cap,
+	None => panic!("a pool cap takes one connection or more"),
+};
 
 /// One node of the DTN path, which encodes as an ENUMERATED.
 #[derive(Enumerated, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -134,7 +141,7 @@ impl DtnRole {
 	/// A trust store that admits the certificate of this node alone.
 	pub fn trust_store(self) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 		let certificate = Certificate::try_from(self.certificate())?;
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		Ok(Arc::new(builder.with_certificate(certificate)?.build()))
 	}
 
@@ -147,7 +154,7 @@ impl DtnRole {
 	/// A pool that dials `peer` as this node over mutual TLS, with at most
 	/// 3 connections to each destination.
 	pub fn dial_pool(self, peer: Self) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
-		let config = PoolConfig { max_connections: 3, ..PoolConfig::default() };
+		let config = PoolConfig { max_connections: DIAL_POOL_CONNECTIONS, ..PoolConfig::default() };
 		let pool = ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
 			.with_trust_store(peer.trust_store()?)

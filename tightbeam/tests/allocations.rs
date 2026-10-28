@@ -11,27 +11,29 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
 
+use tightbeam::asn1::{AuthEnvelopedData, WireDer};
 use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest, WantList};
 use tightbeam::colony::protocol::GossipRumor;
 use tightbeam::colony::servlet::ServletContext;
 use tightbeam::compress::ZstdCompression;
 use tightbeam::core::Inflator;
+use tightbeam::crypto::cms::Recipient;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::utils::CertificateExt;
-use tightbeam::crypto::x509::{CanonicalKey, KeyIndex};
+use tightbeam::crypto::x509::{CanonicalKey, KeyCurves, KeyIndex};
 use tightbeam::decode;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
-use tightbeam::der::Encode;
+use tightbeam::der::{Decode, Encode};
 use tightbeam::instrumentation::{events, TbInstrumentationConfig};
 use tightbeam::macros::server::SingleFlightAnswer;
-use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521};
+use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521, DATA};
 use tightbeam::policy::TransitStatus;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
@@ -41,6 +43,7 @@ use tightbeam::testing::{TestFrame, TestMessage};
 use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
 use tightbeam::transport::EndpointConfig;
+use tightbeam::urn::{UrnSpecBuilder, UrnValidationError};
 use tightbeam::utils::time::UnixMillis;
 use tightbeam::{compose, Frame, TightBeamError};
 
@@ -88,8 +91,7 @@ fn house_key() -> SubjectPublicKeyInfoOwned {
 	certificate.tbs_certificate.subject_public_key_info
 }
 
-/// An Ed25519 key of 300 octets, whose canonical form exceeds the stack
-/// buffer.
+/// An Ed25519 key of 300 octets, whose canonical form exceeds the stack buffer.
 fn long_key() -> SubjectPublicKeyInfoOwned {
 	let mut spki = house_key();
 	spki.algorithm.oid = ID_ED_25519;
@@ -146,7 +148,8 @@ fn canonical_lookup_on_the_house_store() -> (bool, usize) {
 	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 	let key = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info);
 	let key = key.expect("a house key has a canonical form");
-	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate);
+	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	let builder = builder.with_certificate(certificate);
 	let store = builder.expect("the fixed certificate enrols").build();
 
 	let before = ALLOCATIONS.with(Cell::get);
@@ -186,7 +189,7 @@ fn a_key_identifier_names_its_certificate_with_no_allocation() {
 /// validates the fixed path, as one chain and as a presented path.
 fn validations_of_the_fixed_path() -> (usize, usize) {
 	let chain = TestCertificate::insecure_fixed_chain().expect("the fixed test chain issues");
-	let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	let builder = builder.with_certificate(chain.root);
 	let store = builder.expect("the root is within its validity period").build();
 	let whole = [chain.intermediate.to_owned(), chain.leaf.to_owned()];
@@ -330,7 +333,7 @@ fn compressed_frame() -> Result<Frame, TightBeamError> {
 /// `enable_internal_detail` off.
 fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
 	let inflator: Arc<dyn Inflator + Send + Sync> = Arc::new(CopyInflator);
-	let ctx = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), HashMap::new(), None);
+	let ctx = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), [], None);
 	let ctx = ctx.with_message_inflator(Some(inflator));
 	let mut alone = compressed_frame()?;
 	let mut delivered = compressed_frame()?;
@@ -342,7 +345,7 @@ fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
 	let delivery = pin!(delivered.prepare_typed(&ctx)).poll(&mut cx);
 	let after = ALLOCATIONS.with(Cell::get);
 
-	inflated?;
+	let _opened = inflated?;
 
 	let Poll::Ready(prepared) = delivery else {
 		panic!("the inflate of a typed delivery completes on its first poll");
@@ -455,10 +458,10 @@ fn allocations_of_one_seed(process: &Process, bound: usize) -> usize {
 	let mut explorer = DefaultFdrExplorer::with_defaults(process, config);
 	// A first exploration fills the lazy state of the thread, which the count
 	// leaves out.
-	explorer.explore();
+	explorer.explore().expect("the run asks for no FMEA report");
 
 	let before = ALLOCATIONS.with(Cell::get);
-	explorer.explore();
+	explorer.explore().expect("the run asks for no FMEA report");
 
 	let after = ALLOCATIONS.with(Cell::get);
 	after - before
@@ -476,8 +479,7 @@ fn a_process_with_no_hidden_event_allocates_the_same_at_any_hidden_run_bound() -
 	Ok(())
 }
 
-/// The divergent states of a process with no hidden event cost no
-/// allocation.
+/// The divergent states of a process with no hidden event cost no allocation.
 #[test]
 fn a_process_with_no_hidden_event_computes_its_divergent_states_with_no_allocation() -> Result<(), ProcessBuildError> {
 	let process = ring()?;
@@ -525,25 +527,18 @@ fn a_state_with_no_hidden_step_answers_with_no_allocation() -> Result<(), Proces
 /// The allocation count of the conversion of a trace into a process, when the
 /// trace holds one gate acceptance and `extra` records the chain leaves out.
 fn chain_with_records_left_out(extra: u32) -> usize {
-	use tightbeam::instrumentation::TbEvent;
 	use tightbeam::testing::fdr::TraceProcessMode;
 
 	const PLAIN: tightbeam::urn::Urn<'static> = tightbeam::urn!("test", "event:allocations/plain");
 
-	let record = |seq, urn| TbEvent {
-		seq,
-		urn,
-		label: Some("Ok".into()),
-		payload_hash: None,
-		duration_ns: None,
-		timestamp_ns: None,
-		flags: 0,
-		extras: None,
-	};
+	let collector = TraceCollector::new();
+	collector.emit(events::GATE_ACCEPT, "Ok");
+	for _ in 0..extra {
+		collector.emit(PLAIN, "Ok");
+	}
 
-	let left_out = (1..=extra).map(|seq| record(seq, PLAIN));
 	let mut trace = ConsumedTrace::new();
-	trace.instrument_events = core::iter::once(record(0, events::GATE_ACCEPT)).chain(left_out).collect();
+	trace.populate_from_collector(&collector);
 
 	// The first conversion interns the names of the chain, which the intern
 	// pool keeps, so the count reads the second.
@@ -561,4 +556,69 @@ fn chain_with_records_left_out(extra: u32) -> usize {
 #[test]
 fn a_record_that_the_chain_leaves_out_renders_nothing() {
 	assert_eq!(chain_with_records_left_out(3), chain_with_records_left_out(0));
+}
+
+/// The DER of a frame envelope: a content sealed to one KEK recipient.
+fn sealed_envelope() -> Result<Vec<u8>, Box<dyn Error>> {
+	let key = [0x5au8; 32];
+	let kek = Kek::try_from(key.as_slice())?;
+	let recipient: Recipient<'_, DefaultCryptoProvider> = Recipient::Kek { kek, key_identifier: b"allocations" };
+	let sealed = AuthEnvelopedData::seal(recipient, DATA, b"content".to_vec(), [], None)?;
+	Ok(sealed.to_der()?)
+}
+
+/// The counts of the allocations that the decode of a frame envelope makes
+/// through its `WireDer`, which holds the value to its arrival, and through a
+/// plain decode beside the one copy of its bytes that a `WireDer` keeps.
+fn decodes_of_a_frame_envelope() -> Result<(usize, usize), Box<dyn Error>> {
+	let arrived = sealed_envelope()?;
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let held = WireDer::<AuthEnvelopedData>::try_from(arrived.as_slice());
+	let between = ALLOCATIONS.with(Cell::get);
+	let decoded = AuthEnvelopedData::from_der(&arrived);
+	let kept = arrived.to_vec();
+	let after = ALLOCATIONS.with(Cell::get);
+
+	held?;
+	decoded?;
+	drop(kept);
+	Ok((between - before, after - between))
+}
+
+/// The hold of a frame envelope streams its encoding against its arrival, so
+/// its decode allocates what a plain decode and the kept copy allocate.
+#[test]
+fn a_frame_envelope_holds_its_arrival_with_no_allocation() -> Result<(), Box<dyn Error>> {
+	let (held, decoded) = decodes_of_a_frame_envelope()?;
+	assert_eq!(held, decoded);
+	Ok(())
+}
+
+/// The counts of the allocations that two specs of the fields `kind` and `id`
+/// make as each reads the NSS `trace/abc`: one that joins the fields at `/`,
+/// and one whose format places the `/`.
+fn reads_of_one_nss() -> Result<(usize, usize), UrnValidationError> {
+	let spec = UrnSpecBuilder::from("example").field_required("kind").field_required("id");
+	let joined = spec.clone().field_nss_separator("id", "/");
+	let formatted = spec.nss_format("{}/{}");
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let joined_read = joined.parse_nss("trace/abc");
+	let between = ALLOCATIONS.with(Cell::get);
+	let formatted_read = formatted.parse_nss("trace/abc");
+	let after = ALLOCATIONS.with(Cell::get);
+
+	joined_read?;
+	formatted_read?;
+	Ok((between - before, after - between))
+}
+
+/// A join format reads each separator from the fields of its spec, so it
+/// reads an NSS with the allocations of a custom format of the same values.
+#[test]
+fn a_joined_nss_reads_with_the_allocations_of_a_formatted_one() -> Result<(), UrnValidationError> {
+	let (joined, formatted) = reads_of_one_nss()?;
+	assert_eq!(joined, formatted);
+	Ok(())
 }

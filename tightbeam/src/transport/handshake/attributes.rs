@@ -8,8 +8,8 @@ use core::cmp::{Ord, Ordering, PartialOrd};
 
 use super::HandshakeError;
 use crate::crypto::x509::attr::Attribute;
-use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec};
-use crate::der::{Sequence, Tagged};
+use crate::der::asn1::{Any, AnyRef, ObjectIdentifier, SetOf, SetOfVec};
+use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Sequence, Tag, Tagged, Writer};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::HandshakeAlert;
@@ -43,19 +43,19 @@ use crate::transport::handshake::schedule::KeyConfirmation;
 
 /// A CMS attribute that carries one value, as the handshake profile requires.
 ///
-/// The shape follows the RFC 5652 § 5.3 `Attribute`. The profile narrows
-/// `attrValues` to exactly one element, and [`Self::value`] enforces it.
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+/// Its DER is the RFC 5652 § 5.3 `Attribute`, with `attrValues` narrowed to
+/// one element. A received attribute and the DER decode both enter through
+/// [`TryFrom<&Attribute>`], which refuses any other arity.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
 	/// OID that names the attribute (RFC 5652 § 5.3 `attrType`).
-	pub attr_type: ObjectIdentifier,
-	/// Values of the attribute. The profile requires exactly one element.
-	pub attr_values: Vec<Any>,
+	attr_type: ObjectIdentifier,
+	/// The one value of the attribute (RFC 5652 § 5.3 `attrValues`).
+	value: Any,
 }
 
 // A canonical DER SET OF encoding needs a total order. Attributes order by the
-// `attr_type` OID bytes, then lexicographically by the encoding of each value:
-// the tag octet, then the content octets.
+// `attr_type` OID bytes, then by the `any_encoding_key` of each value.
 impl PartialOrd for HandshakeAttribute {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
@@ -69,9 +69,7 @@ impl Ord for HandshakeAttribute {
 			return oid_ord;
 		}
 
-		let lhs = self.attr_values.iter().map(any_encoding_key);
-		let rhs = other.attr_values.iter().map(any_encoding_key);
-		lhs.cmp(rhs)
+		any_encoding_key(&self.value).cmp(&any_encoding_key(&other.value))
 	}
 }
 
@@ -82,32 +80,79 @@ fn any_encoding_key(any: &Any) -> (u8, &[u8]) {
 }
 
 impl HandshakeAttribute {
-	/// Creates an attribute that carries `value` as its one value.
+	/// Creates an attribute of type `attr_type` that carries `value` as its
+	/// one value.
 	///
-	/// The result is always `Ok`.
-	pub fn new_single(attr_type: ObjectIdentifier, value: Any) -> Result<Self, HandshakeError> {
-		Ok(Self { attr_type, attr_values: vec![value] })
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::der::asn1::{Any, ObjectIdentifier};
+	/// use tightbeam::transport::handshake::HandshakeAttribute;
+	///
+	/// let attr_type = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.99");
+	/// let attribute = HandshakeAttribute::new(attr_type, Any::encode_from(&7u8)?);
+	/// assert_eq!(attribute.attr_type(), attr_type);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn new(attr_type: ObjectIdentifier, value: Any) -> Self {
+		Self { attr_type, value }
+	}
+
+	/// Returns the OID that names this attribute (RFC 5652 § 5.3 `attrType`).
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::der::asn1::{Any, ObjectIdentifier};
+	/// use tightbeam::transport::handshake::HandshakeAttribute;
+	///
+	/// let attr_type = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.99");
+	/// let attribute = HandshakeAttribute::new(attr_type, Any::encode_from(&7u8)?);
+	/// assert_eq!(attribute.attr_type(), attr_type);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn attr_type(&self) -> ObjectIdentifier {
+		self.attr_type
 	}
 
 	/// Returns the one value this attribute carries.
 	///
-	/// # Errors
+	/// # Examples
 	///
-	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
-	pub fn value(&self) -> Result<&Any, HandshakeError> {
-		match self.attr_values.as_slice() {
-			[value] => Ok(value),
-			_ => Err(HandshakeError::InvalidAttributeArity),
-		}
+	/// ```
+	/// use tightbeam::der::asn1::{Any, ObjectIdentifier};
+	/// use tightbeam::transport::handshake::HandshakeAttribute;
+	///
+	/// let value = Any::encode_from(&7u8)?;
+	/// let attribute = HandshakeAttribute::new(ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.99"), value.clone());
+	/// assert_eq!(attribute.value(), &value);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn value(&self) -> &Any {
+		&self.value
+	}
+
+	/// The `attrValues` of this attribute: a SET OF that borrows its one value.
+	fn attr_values(&self) -> crate::der::Result<SetOf<AnyRef<'_>, 1>> {
+		SetOf::try_from([AnyRef::from(&self.value)])
 	}
 }
 
-/// Copies the OID and every value of an X.509 attribute.
-///
-/// The copy keeps any arity, so [`HandshakeAttribute::value`] checks it later.
-impl From<&Attribute> for HandshakeAttribute {
-	fn from(attr: &Attribute) -> Self {
-		HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() }
+/// Admits an X.509 attribute that carries exactly one value, as the handshake
+/// profile requires. It is the one arity check, where an attribute arrives.
+impl TryFrom<&Attribute> for HandshakeAttribute {
+	type Error = HandshakeError;
+
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
+	fn try_from(attr: &Attribute) -> Result<Self, Self::Error> {
+		let mut values = attr.values.iter();
+		let (Some(value), None) = (values.next(), values.next()) else {
+			return Err(HandshakeError::InvalidAttributeArity);
+		};
+
+		Ok(Self { attr_type: attr.oid, value: value.clone() })
 	}
 }
 
@@ -117,8 +162,38 @@ impl TryFrom<HandshakeAttribute> for Attribute {
 	type Error = HandshakeError;
 
 	fn try_from(attr: HandshakeAttribute) -> Result<Self, Self::Error> {
-		let values = SetOfVec::try_from(attr.attr_values)?;
+		let values = SetOfVec::try_from(vec![attr.value])?;
 		Ok(Self { oid: attr.attr_type, values })
+	}
+}
+
+// The DER traits are written by hand, so a decode reads an RFC 5652 § 5.3
+// `Attribute` and passes the one arity check of `TryFrom<&Attribute>`. The
+// `Sequence` marker gives the SEQUENCE tag.
+impl<'a> Sequence<'a> for HandshakeAttribute {}
+
+impl EncodeValue for HandshakeAttribute {
+	fn value_len(&self) -> crate::der::Result<Length> {
+		use crate::der::Encode;
+
+		self.attr_type.encoded_len()? + self.attr_values()?.encoded_len()?
+	}
+
+	fn encode_value(&self, writer: &mut impl Writer) -> crate::der::Result<()> {
+		use crate::der::Encode;
+
+		self.attr_type.encode(writer)?;
+		self.attr_values()?.encode(writer)
+	}
+}
+
+impl<'a> DecodeValue<'a> for HandshakeAttribute {
+	// An attribute of any arity but one is a value error of its SET OF, which
+	// names the DER that failed. The refusal of the arity check names the same
+	// cause.
+	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> crate::der::Result<Self> {
+		let attribute = Attribute::decode_value(reader, header)?;
+		Self::try_from(&attribute).map_err(|_arity| Tag::Set.value_error())
 	}
 }
 
@@ -188,19 +263,18 @@ impl HandshakeAttribute {
 	where
 		T: AttributePayload + Tagged + crate::der::EncodeValue,
 	{
-		Self::new_single(T::OID, Any::encode_from(payload)?)
+		let value = Any::encode_from(payload)?;
+		Ok(Self::new(T::OID, value))
 	}
 
 	/// Decodes this attribute as `T`, when it carries the OID of `T`.
 	///
-	/// An attribute of another type yields
-	/// [`HandshakeError::MissingAttribute`], so a peer cannot substitute one
+	/// An attribute of another type is refused, so a peer cannot substitute one
 	/// negotiated value for another.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::MissingAttribute`] -- the OID differs from `T::OID`.
-	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
 	/// - [`HandshakeError::DerError`] -- the value fails to decode as `T`.
 	pub fn decode<'a, T>(&'a self) -> Result<T, HandshakeError>
 	where
@@ -210,32 +284,29 @@ impl HandshakeAttribute {
 			return Err(HandshakeError::MissingAttribute);
 		}
 
-		Ok(self.value()?.decode_as()?)
+		Ok(self.value.decode_as()?)
 	}
 
 	/// Returns the bytes that the value of this attribute arrived as.
 	///
-	/// A receiver binds what the peer sent. Re-encoding the decoded value
-	/// instead would erase any difference the decoder normalised away: `der`
-	/// sorts a `SET OF` before it validates the set, so a reordered set would
-	/// hash the same as the well-ordered one and pass unseen (CWE-345).
+	/// A receiver binds what the peer sent. `der` sorts a `SET OF` before it
+	/// validates the set, so a re-encoding would hash a reordered set the same
+	/// as the well-ordered one and let it pass unseen (CWE-345).
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
 	/// - [`HandshakeError::DerError`] -- the value fails to encode.
 	pub fn received_bytes(&self) -> Result<Vec<u8>, HandshakeError> {
 		use crate::der::Encode;
 
-		Ok(self.value()?.to_der()?)
+		Ok(self.value.to_der()?)
 	}
 
 	/// Returns the canonical DER bytes of `payload` for transcript binding.
 	///
-	/// The sender calls this and the receiver calls [`Self::received_bytes`].
-	/// These are the bytes the sender is about to transmit, so both sides hash
-	/// the same encoding and a tampered attribute makes the two transcript
-	/// hashes differ (CWE-345).
+	/// The sender calls this, and the receiver calls [`Self::received_bytes`].
+	/// Both hash the transmitted bytes, so a tampered attribute makes the two
+	/// transcript hashes differ (CWE-345).
 	///
 	/// # Errors
 	///
@@ -263,8 +334,8 @@ fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 
 /// Decode an alert code from a single INTEGER-bearing `Any`.
 ///
-/// Alert codes occupy the u8 domain. A wider value is refused, so a two-byte
-/// code can never alias a valid alert through truncation.
+/// A code above `u8::MAX` is refused, so a two-byte code never aliases a
+/// valid alert through truncation.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	let code = u16_from_any(any)?;
@@ -292,13 +363,14 @@ pub trait HandshakeAttributes {
 	///
 	/// # Duplicates
 	///
-	/// RFC 5652 § 11.4 permits repeated unsigned attributes, but every
-	/// TightBeam handshake attribute is single-use: a duplicate is either a
-	/// builder bug or an injection attempt, and fails closed.
+	/// RFC 5652 § 11.4 permits repeated unsigned attributes. Every TightBeam
+	/// handshake attribute is single-use, so a duplicate, from a builder bug or
+	/// an injection attempt, fails closed.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::DuplicateAttribute`] -- the OID appears more than once.
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
 	///
 	/// # Sources
 	///
@@ -333,7 +405,7 @@ pub trait HandshakeAttributes {
 impl HandshakeAttributes for Attributes {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
 		let found = self.single(oid, HandshakeError::DuplicateAttribute)?;
-		Ok(found.map(HandshakeAttribute::from))
+		found.map(HandshakeAttribute::try_from).transpose()
 	}
 }
 
@@ -377,11 +449,8 @@ impl HandshakeAttributes for Option<Attributes> {
 pub trait HandshakeAlertAttribute {
 	/// Returns the alert code this attribute carries.
 	///
-	/// The profile admits one value, so any other arity is refused.
-	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidAttributeArity`] -- the arity is other than one.
 	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the value is not an INTEGER.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- the code is empty or above `u8::MAX`.
 	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
@@ -391,7 +460,7 @@ pub trait HandshakeAlertAttribute {
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl HandshakeAlertAttribute for HandshakeAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError> {
-		alert_from_any(self.value()?)
+		alert_from_any(self.value())
 	}
 }
 
@@ -418,8 +487,7 @@ mod tests {
 
 	fn mk_alert_attr(bytes: impl AsRef<[u8]>) -> Result<HandshakeAttribute, der::Error> {
 		let bytes = bytes.as_ref();
-		let attribute = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer(bytes)?)?;
-		Ok(HandshakeAttribute::from(&attribute))
+		Ok(HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, mk_integer(bytes)?))
 	}
 
 	fn mk_attr(oid: ObjectIdentifier, value: Any) -> Result<Attribute, der::Error> {
@@ -440,10 +508,8 @@ mod tests {
 		signer
 	}
 
-	/// A receiver binds what arrived. `der` sorts a `SET OF` before it
-	/// validates one, so a value that re-encodes to different bytes than it
-	/// arrived as would let that normalisation erase tamper evidence
-	/// (CWE-345).
+	/// A receiver binds the bytes that arrived. `der` sorts a `SET OF` at
+	/// decode, so a re-encoding would erase tamper evidence (CWE-345).
 	#[test]
 	fn the_transcript_binds_the_bytes_an_attribute_arrived_as() -> Result<(), HandshakeError> {
 		use crate::der::{Decode, Encode};
@@ -451,7 +517,7 @@ mod tests {
 		// The members of this SET OF are out of DER order. Decoding sorts
 		// them, so the decoded value differs from what was sent.
 		let unsorted = Any::from_der(&[0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01])?;
-		let attribute = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, unsorted.to_owned())?;
+		let attribute = HandshakeAttribute::new(HANDSHAKE_SECURITY_ACCEPT, unsorted.to_owned());
 		assert_eq!(attribute.received_bytes()?, unsorted.to_der()?);
 		Ok(())
 	}
@@ -467,9 +533,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A repeated abort alert fails closed as a duplicate attribute rather
-	/// than reading as no alert and letting processing continue into the
-	/// message body.
+	/// A repeated abort alert fails closed as a duplicate attribute. Read as
+	/// no alert, it would let processing continue into the message body.
 	#[test]
 	fn a_duplicate_abort_alert_fails_closed() -> Result<(), HandshakeError> {
 		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
@@ -533,19 +598,56 @@ mod tests {
 		Ok(())
 	}
 
+	/// A received attribute carries one value, so the boundary refuses an
+	/// attribute of two values before any reader sees it (RFC 5652 § 5.3).
 	#[test]
-	fn invalid_attribute_arity() -> Result<(), der::Error> {
-		let any = mk_octet([0x33u8; 32])?;
-		let attr = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![any.to_owned(), any] };
-		assert!(matches!(attr.value(), Err(HandshakeError::InvalidAttributeArity)));
+	fn an_attribute_with_two_values_is_refused_at_the_boundary() -> Result<(), der::Error> {
+		let values = vec![mk_octet([0x33u8; 32])?, mk_octet([0x34u8; 32])?];
+		let attribute = Attribute { oid: HANDSHAKE_SECURITY_OFFER, values: SetOfVec::try_from(values)? };
+
+		let refused = HandshakeAttribute::try_from(&attribute);
+		assert!(matches!(refused, Err(HandshakeError::InvalidAttributeArity)));
 		Ok(())
 	}
 
+	/// The DER decode of a handshake attribute reads an RFC 5652 § 5.3
+	/// `Attribute` and passes its arity check, so an attribute of two values
+	/// is a value error of its SET OF.
 	#[test]
-	fn multi_valued_alert_rejected() -> Result<(), der::Error> {
-		let attr_values = vec![mk_integer([0x01])?, mk_integer([0x02])?];
-		let alert = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT, attr_values };
-		assert!(matches!(alert.handshake_alert(), Err(HandshakeError::InvalidAttributeArity)));
+	fn an_attribute_with_two_values_does_not_decode() -> Result<(), der::Error> {
+		use crate::der::{Decode, Encode, ErrorKind, Tag};
+
+		let values = vec![mk_octet([0x33u8; 32])?, mk_octet([0x34u8; 32])?];
+		let attribute = Attribute { oid: HANDSHAKE_SECURITY_OFFER, values: SetOfVec::try_from(values)? };
+
+		let refused = HandshakeAttribute::from_der(&attribute.to_der()?).map_err(|error| error.kind());
+		assert!(matches!(refused, Err(ErrorKind::Value { tag: Tag::Set })));
+		Ok(())
+	}
+
+	/// A handshake attribute encodes as the RFC 5652 § 5.3 `Attribute` of its
+	/// one value.
+	#[test]
+	fn a_handshake_attribute_encodes_as_an_rfc_attribute() -> Result<(), der::Error> {
+		use crate::der::{Decode, Encode};
+
+		let value = mk_octet([0x35u8; 32])?;
+		let attribute = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, value.clone());
+
+		let decoded = Attribute::from_der(&attribute.to_der()?)?;
+		assert_eq!(decoded, mk_attr(HANDSHAKE_SECURITY_OFFER, value)?);
+		Ok(())
+	}
+
+	/// An alert of two values is refused at the boundary of its set, as any
+	/// attribute of the handshake profile is.
+	#[test]
+	fn a_multi_valued_alert_is_refused_at_the_boundary() -> Result<(), der::Error> {
+		let values = vec![mk_integer([0x01])?, mk_integer([0x02])?];
+		let alert = Attribute { oid: HANDSHAKE_ABORT_ALERT, values: SetOfVec::try_from(values)? };
+		let attrs = Attributes::try_from(vec![alert])?;
+
+		assert!(matches!(attrs.refuse_alert(), Err(HandshakeError::InvalidAttributeArity)));
 		Ok(())
 	}
 
@@ -593,8 +695,8 @@ mod tests {
 
 	#[test]
 	fn attribute_ord_tiebreaks_on_value() -> Result<(), der::Error> {
-		let low = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![mk_integer([0x01])?] };
-		let high = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![mk_integer([0x02])?] };
+		let low = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, mk_integer([0x01])?);
+		let high = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, mk_integer([0x02])?);
 		assert_eq!(low.cmp(&high), Ordering::Less);
 		assert_eq!(high.cmp(&low), Ordering::Greater);
 		assert_eq!(low.cmp(&low.to_owned()), Ordering::Equal);

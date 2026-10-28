@@ -12,6 +12,7 @@
 ))]
 
 use core::future::Future;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,8 +27,8 @@ use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::error::CertificateValidationError;
-use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{CertificateSpec, KeyCurves};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
@@ -67,6 +68,19 @@ use crate::transport::support::{
 };
 
 type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
+
+/// A pool cap that admits a second connection, to a failover or to a second
+/// peer.
+const TWO_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(2) {
+	Some(cap) => cap,
+	None => panic!("a pool cap takes one connection or more"),
+};
+
+/// A pool cap above the count of connections that the eviction scenario dials.
+const FOUR_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(4) {
+	Some(cap) => cap,
+	None => panic!("a pool cap takes one connection or more"),
+};
 
 async fn bind_pool_listener(
 	materials: &ServerMaterials,
@@ -201,7 +215,7 @@ struct IdlePrune {
 fn mux_pool_with_idle_timeout(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
-	max_connections: usize,
+	max_connections: NonZeroUsize,
 	idle: Option<IdlePrune>,
 	trace: &TraceCollector,
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
@@ -212,6 +226,7 @@ fn mux_pool_with_idle_timeout(
 		config.idle_timeout = Some(timeout);
 		builder = builder.with_clock(clock);
 	}
+
 	let pool = Arc::new(
 		builder
 			.with_config(config)
@@ -219,14 +234,13 @@ fn mux_pool_with_idle_timeout(
 			.with_trace(trace.share())
 			.build(),
 	);
-
 	Ok(pool)
 }
 
 fn mux_pool(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
-	max_connections: usize,
+	max_connections: NonZeroUsize,
 	trace: &TraceCollector,
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
 	mux_pool_with_idle_timeout(materials, offer, max_connections, None, trace)
@@ -238,6 +252,7 @@ async fn echo_roundtrip(
 ) -> Result<bool, TightBeamError> {
 	let label = label.as_ref();
 	let frame = mux_frame(label);
+
 	let reply = client.emit(frame.to_owned(), None).await?;
 	Ok(reply == Some(frame))
 }
@@ -261,7 +276,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_echo_server(&env.context, Some(mux_offer(8))).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 
 			let mut lease_one = pool.connect(addr).await?;
 			let mut lease_two = pool.connect(addr).await?;
@@ -297,14 +312,14 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), LengthService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let lease = pool.connect(addr).await?;
 
 			let (mut sink, response) = lease.open_stream()?;
 			sink.push(b"abcd").await?;
 			sink.close_with(b"efgh").await?;
-			let reply = response.await?;
 
+			let reply = response.await?;
 			assert_eq!(
 				reply.map(|frame| frame.message().to_owned()),
 				Some(mux_frame("8").message().to_owned()),
@@ -334,19 +349,16 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), DuplexEchoService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let lease = pool.connect(addr).await?;
 			let (mut sink, mut body) = lease.open_duplex()?;
 
 			sink.push(b"ping").await?;
-
 			let first = body.chunk().await?;
-
 			sink.close_with(b"pong").await?;
 
 			let second = body.chunk().await?;
 			let terminal = body.chunk().await?;
-
 			assert_eq!(first.as_deref(), Some(b"ping".as_ref()), "the duplex must echo the first chunk");
 			assert_eq!(second.as_deref(), Some(b"pong".as_ref()), "the duplex must echo the closing chunk");
 			assert!(terminal.is_none(), "the duplex must end after its last echo");
@@ -375,7 +387,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), MixedService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			// Leases are exclusive per in-flight interaction, and one pooled
 			// connection carries all three.
 			let mut unary_lease = pool.connect(addr).await?;
@@ -395,10 +407,10 @@ tb_scenario! {
 				duplex_sink.push(b"ping").await?;
 				let echoed = duplex_body.chunk().await?;
 				duplex_sink.close().await?;
+
 				let terminal = duplex_body.chunk().await?;
 				Ok::<_, TransportError>((echoed, terminal))
 			};
-
 			let (unary_reply, stream_reply, duplex_reply) =
 				tokio::join!(unary_lease.emit(unary_frame.to_owned(), None), streaming, duplex);
 
@@ -435,7 +447,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), LengthService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let mut lease = pool.connect(addr).await?;
 
 			// Duplex against the streaming-only service: the trailer
@@ -486,7 +498,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_echo_server(&env.context, Some(mux_offer(8))).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let lease = pool.connect(addr).await?;
 
 			let pinned = lease.peer_certificate() == Some(&materials.certificate);
@@ -501,11 +513,10 @@ tb_scenario! {
 async fn mux_lease_conn_reports_invalid_state() -> Result<(), TightBeamError> {
 	let materials = ServerMaterials::generate();
 	let (_server, addr) = start_echo_server(&materials, Some(mux_offer(8))).await?;
-	let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &TraceCollector::default())?;
+	let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &TraceCollector::default())?;
 
 	let mut lease = pool.connect(addr).await?;
 	let conn = lease.conn();
-
 	assert!(
 		matches!(conn, Err(TransportError::InvalidState)),
 		"a mux lease must refuse conn() with InvalidState"
@@ -591,7 +602,7 @@ tb_scenario! {
 		context: GatedContext::generate(),
 		server: |env| async move { start_gated_echo_server(&env.context, Some(mux_offer(1))).await },
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), 2, &trace)?;
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), TWO_CONNECTIONS, &trace)?;
 
 			let held_lease = pool.connect(addr).await?;
 			let mut second_lease = pool.connect(addr).await?;
@@ -631,12 +642,12 @@ impl IdentityFlipContext {
 	/// A pool that trusts both identities, as a peer trust store that holds
 	/// two peers' certificates does.
 	fn pool_trusting_both(&self, trace: &TraceCollector) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
-		let trust_store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let trust_store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(Certificate::clone(&self.gate.materials.certificate))?
 			.with_certificate(self.second.certificate().clone())?
 			.build();
 		let config = PoolConfig {
-			max_connections: 2,
+			max_connections: TWO_CONNECTIONS,
 			mux_offer: Some(Arc::new(mux_offer(4))),
 			..PoolConfig::default()
 		};
@@ -784,17 +795,17 @@ tb_assert_spec! {
 	}
 }
 
-// A lease pins the identity of the handshake on its connection. The cap-full
-// connection fails an emit over to a fresh dial, which another trusted
-// identity answers, so the emit fails and the frame stays with the caller.
+// A lease pins the identity of its handshake. The cap-full connection fails
+// an emit over to a fresh dial that another trusted identity answers, so the
+// emit fails and the frame stays with the caller.
 //
 // - The second emit fails over onto the pooled connection of the other
-//   identity, so the pool counts two failovers, two refusals, and two reuses
-//   against two dials.
-// - The server of the second identity records a gate verdict per frame it
-//   collects, so zero verdicts mean it collected none.
-// - The three handshakes are the two pool dials and the server of the second
-//   identity, the one server that holds the trace.
+//   identity, so the pool counts two failovers, refusals, and reuses against
+//   two dials.
+// - The second server records a gate verdict per frame it collects, so zero
+//   verdicts mean it collected none.
+// - The three handshakes are the two pool dials and the second server, the
+//   one server that holds the trace.
 tb_scenario! {
 	name: pooled_mux_failover_refuses_another_identity,
 	spec: MuxFailoverIdentitySpec,
@@ -811,7 +822,6 @@ tb_scenario! {
 
 			let refused = pinned_lease.emit(mux_frame("mux-after-pin"), None).await;
 			let refused_again = pinned_lease.emit(mux_frame("mux-after-refusal"), None).await;
-
 			assert!(pinned_first, "the lease must pin the certificate of the first identity");
 			assert!(
 				matches!(refused, Err(TransportError::InvalidCertificate(CertificateValidationError::CertificateNotPinned))),
@@ -857,7 +867,7 @@ tb_scenario! {
 		context: GatedContext::generate(),
 		server: |env| async move { start_gated_echo_server(&env.context, Some(mux_offer(1))).await },
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), 2, &trace)?;
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), TWO_CONNECTIONS, &trace)?;
 
 			// Three leases land on connection one, the only pool entry.
 			let held_lease = pool.connect(addr).await?;
@@ -899,7 +909,7 @@ tb_scenario! {
 		context: GatedContext::generate(),
 		server: |env| async move { start_gated_echo_server(&env.context, Some(mux_offer(1))).await },
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), 1, &trace)?;
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), NonZeroUsize::MIN, &trace)?;
 
 			let held_lease = pool.connect(addr).await?;
 			let mut second_lease = pool.connect(addr).await?;
@@ -937,7 +947,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_echo_server(&env.context, None).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let mut lease = pool.connect(addr).await?;
 
 			let echoed = echo_roundtrip(&mut lease, "mux-declined").await?;
@@ -969,7 +979,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		server: |env| async move { start_echo_server(&env.context, None).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 
 			let first_lease = pool.connect(addr).await?;
 			drop(first_lease);
@@ -1050,7 +1060,6 @@ async fn start_manual_mux_echo_server(
 	ctx: &Arc<ManualContext>,
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
 	let (listener, addr) = bind_pool_listener(&ctx.materials).await?;
-
 	let acceptor_ctx = Arc::clone(ctx);
 	let acceptor = tokio::spawn(async move {
 		while let Ok((transport, _)) = listener.accept().await {
@@ -1080,7 +1089,7 @@ tb_scenario! {
 		context: ManualContext::generate(),
 		server: |env| async move { start_manual_mux_echo_server(&env.context).await },
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), 4, &trace)?;
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), FOUR_CONNECTIONS, &trace)?;
 
 			let mut lease = pool.connect(addr).await?;
 			let echoed_before = echo_roundtrip(&mut lease, "mux-before").await?;
@@ -1122,7 +1131,7 @@ tb_scenario! {
 			let idle_timeout = Duration::from_millis(50);
 			let clock = Arc::new(ManualClock::default());
 			let idle = IdlePrune { timeout: idle_timeout, clock: Arc::clone(&clock) as Arc<dyn Clock> };
-			let pool = mux_pool_with_idle_timeout(&ctx.materials, Some(mux_offer(4)), 1, Some(idle), &trace)?;
+			let pool = mux_pool_with_idle_timeout(&ctx.materials, Some(mux_offer(4)), NonZeroUsize::MIN, Some(idle), &trace)?;
 
 			let mut lease = pool.connect(addr).await?;
 			let echoed_before = echo_roundtrip(&mut lease, "mux-idle-before").await?;
@@ -1137,6 +1146,42 @@ tb_scenario! {
 			Ok(())
 		}
 	}
+}
+
+/// Serves the first connection on `listener` as a multiplexed server that
+/// holds its writer and its responder, so the server never closes the
+/// connection, and returns once its reader reads the close of the client.
+async fn serve_until_the_client_closes(listener: TokioListener) -> Result<(), TransportError> {
+	let (transport, _) = listener.accept().await?;
+	let mut transport = transport.with_mux_offer(Some(mux_offer(4)));
+	let negotiated = transport.negotiate_mux().await?;
+	let settings = negotiated.ok_or(TransportError::InvalidState)?;
+
+	let (reader, writer) = transport.into_split()?;
+	let mux = MuxTransport::new(reader, writer, MuxRole::Server, settings);
+	let (_handle, reader_driver, _writer_driver, _responder) = mux.into_parts();
+
+	// The reader ends on the close of the client, and either answer of the
+	// drive is that close.
+	let _closed = reader_driver.drive().await;
+	Ok(())
+}
+
+/// A dropped pool ends the driver tasks of each multiplexed connection it
+/// held, so the peer reads the close (CWE-772).
+#[tokio::test]
+async fn dropping_a_pool_ends_its_multiplexed_connections() -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let (listener, addr) = bind_pool_listener(&materials).await?;
+	let served = tokio::spawn(serve_until_the_client_closes(listener));
+	let pool = mux_pool(&materials, Some(mux_offer(4)), NonZeroUsize::MIN, &TraceCollector::new())?;
+
+	drop(pool.connect(addr).await?);
+	drop(pool);
+
+	let ended = await_within_deadline(served, "the peer of the dropped pool must read its close").await?;
+	assert!(ended.is_ok_and(|served| served.is_ok()));
+	Ok(())
 }
 
 /// A server that offers multiplexing serves a single-flight client through its
@@ -1274,7 +1319,7 @@ tb_scenario! {
 			Ok((handle, addr))
 		},
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let mut client = pool.connect(addr).await?;
 
 			let outcome = client.emit(mux_frame("gated"), None).await;
@@ -1311,7 +1356,7 @@ tb_scenario! {
 			start_gated_service_server(&materials, trace.share(), LengthService, ForbidAllGate).await
 		},
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let lease = pool.connect(addr).await?;
 			let (sink, response) = lease.open_stream()?;
 
@@ -1351,7 +1396,7 @@ tb_scenario! {
 			start_gated_service_server(&materials, trace.share(), DuplexEchoService, ForbidAllGate).await
 		},
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let lease = pool.connect(addr).await?;
 
 			let (sink, mut body) = lease.open_duplex()?;
@@ -1401,7 +1446,7 @@ tb_scenario! {
 			Ok((handle, addr))
 		},
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let mut client = pool.connect(addr).await?;
 
 			let outcome = client.emit(mux_frame("gate-list"), None).await;
@@ -1449,7 +1494,7 @@ tb_scenario! {
 			Ok((handle, addr))
 		},
 		client: |ClientEnv { trace, context: materials, addr }| async move {
-			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let mut client = pool.connect(addr).await?;
 
 			let outcome = client.emit(mux_frame("unknown-gate"), None).await;
@@ -1504,7 +1549,7 @@ tb_scenario! {
 			Ok((handle, addr))
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
 			let mut client = pool.connect(addr).await?;
 
 			let failed = client.emit(mux_frame("poison"), None).await;
@@ -1581,6 +1626,7 @@ impl TransportAuthorizer for MeteredAuthorizer {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if response == Some(self.expected_response.as_bytes()) {
@@ -1634,7 +1680,11 @@ fn metered_pool(
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
 	let receipt_approver = Arc::new(PayingApprover::answering(METERED_RESPONSE)?);
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: metered_offer().map(Arc::new) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: NonZeroUsize::MIN,
+		mux_offer: metered_offer().map(Arc::new),
+	};
 	let builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)

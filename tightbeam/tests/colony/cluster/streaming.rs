@@ -78,7 +78,7 @@ pub async fn pooled_cluster_client(
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let config = PoolConfig {
 		idle_timeout: None,
-		max_connections: 1,
+		max_connections: NonZeroUsize::MIN,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 	};
 	let pool = Arc::new(
@@ -419,8 +419,7 @@ tb_assert_spec! {
 // gateway records its splice end as a failed forward, so two records prove the
 // cancel crossed both hops. The servlet's duplex handler then fails, and each
 // of the three handlers on the path records `Internal`. The client waits for
-// every record before teardown, so a shutdown cannot satisfy the spec by
-// accident.
+// every record before teardown, so a shutdown cannot pass the spec by chance.
 tb_scenario! {
 	name: cluster_duplex_cancel_propagates_to_peer,
 	spec: ClusterDuplexCancelSpec,

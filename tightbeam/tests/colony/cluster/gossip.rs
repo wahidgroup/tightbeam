@@ -5,10 +5,8 @@
 //! [`hive_plane_certs`] with [`split_hive_trust`]. The hive-plane signer then
 //! stays outside `peer_trust`, and the hive plane admits it.
 
-use super::common::*;
-use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor};
-use crate::seams::outside_identity_of;
 use std::sync::PoisonError;
+
 use tightbeam::colony::cluster::{PeerRecord, PeerStore};
 use tightbeam::colony::protocol::PeerGossip;
 use tightbeam::constants::{MAX_PEER_TRIED_FAILURES, MAX_PEX_SAMPLE};
@@ -24,12 +22,12 @@ use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::utils::time::{Clock, ManualClock};
 use tightbeam::{compose, server};
 
+use super::common::*;
+use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor};
+use crate::seams::outside_identity_of;
+
 /// A peering configuration that refloods to `peers`, and the journal handle
 /// that a scenario reads through the public journal trait.
-///
-/// The hive plane refuses a signer that `peer_trust` also holds, so the hive
-/// trust splits off the hive-plane identity ([`hive_plane_certs`]) beside the
-/// shared gateway identity.
 fn gossip_cluster_conf(
 	certs: &ClusterTestCerts,
 	peers: impl IntoIterator<Item = String>,
@@ -144,11 +142,8 @@ pub async fn send_gossip_frame(
 	Ok(response.status)
 }
 
-/// Relays one ping application rumor to `cluster`.
-///
-/// `origin_key` signs the rumor, and `relay_key` signs the zero-hop relay
-/// envelope that wraps it. Frame ids derive from `label`, so each call floods
-/// a distinct digest.
+/// Relays one ping application rumor to `cluster` through [`RumorRelay::send`],
+/// with `origin_key` signing the rumor and `relay_key` its envelope.
 pub async fn relay_application_rumor(
 	connect_certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
@@ -172,9 +167,6 @@ impl RumorRelay<'_> {
 	/// Relays the rumor to `cluster` in a zero-hop envelope, and returns the
 	/// status of the gateway's reply. Frame ids derive from `label`, so each
 	/// call floods a distinct digest.
-	///
-	/// The gateway also records its verdict as an event on the scenario
-	/// trace, so the spec pins the gateway's side.
 	pub async fn send(
 		self,
 		connect_certs: &ClusterTestCerts,
@@ -535,7 +527,7 @@ fn gossip_plane_ctx() -> GossipPlaneCtx {
 	let peer_cert = TestCertificate::self_signed(&raw);
 	let peer_key = Secp256k1SigningKey::from(raw);
 	let peer_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(peer_cert)
 			.expect("peer trust")
 			.build(),
@@ -914,10 +906,8 @@ tb_assert_spec! {
 }
 
 // The gateway clamps the freshness window (seen_ttl) to the journal's
-// retention horizon at start, so it refuses a replay after the prune as stale.
-//
-// - The scenario issues the rumor at the reading of the gateway's manual clock, which it alone moves.
-// - Without the clamp the replay reads as fresh, so the gateway records it as New and delivers it twice.
+// retention at start, so it refuses a replay after the prune as stale. Without
+// the clamp it records the replay as New and delivers it twice.
 //
 // Sources:
 //
@@ -1860,8 +1850,6 @@ async fn place_origin_rumor(
 }
 
 /// Polls until a peer has refused `count` origins, or five seconds pass.
-///
-/// The spec judges the count, so the wait leaves the verdict to the spec.
 pub async fn wait_for_refused_origins(trace: &TraceCollector, count: usize) {
 	wait_for_recorded(trace, events::CLUSTER_GOSSIP_ORIGIN_REFUSED_BY_PEER, count, 50).await;
 }
@@ -1976,10 +1964,9 @@ tb_assert_spec! {
 	}
 }
 
-// A neighbor colony is inside the flood, and a trusted stranger is outside it.
-// The neighbor of colony "other" gossips and federates the work routes that
-// its advertisement installs, and the stranger, a trusted identity with no
-// colony URN, draws PermissionDenied.
+// A neighbor colony is inside the flood, and a trusted stranger with no colony
+// URN is outside it. The neighbor of colony "other" gossips and federates its
+// advertised work routes, and the stranger draws PermissionDenied.
 //
 // - Admitted: a rumor of colony "main" that the neighbor relays, and a rumor the neighbor signed itself.
 // - Refused: a rumor that the stranger signs, relays, or both.

@@ -104,7 +104,7 @@ impl Record {
 
 	/// Reads the wire envelope in `wire` and opens its record in place, and
 	/// returns the length of the payload.
-	fn open(&self, wire: &mut [u8]) -> usize {
+	fn open(&mut self, wire: &mut [u8]) -> usize {
 		let Ok(Arrived::Encrypted(record)) = WireEnvelope::arrive(wire) else {
 			panic!("the wire envelope arrives as an encrypted record");
 		};
@@ -113,7 +113,7 @@ impl Record {
 	}
 
 	/// Prints the row of a payload of `size` octets.
-	fn row(&self, size: usize) {
+	fn row(&mut self, size: usize) {
 		let payload = vec![0x5Au8; size];
 		let (mut wire, seal_allocs) = counted(|| self.seal(&payload));
 		let wire_len = wire.len();
@@ -170,7 +170,9 @@ impl Sealing {
 	/// Opens the body of `frame` in place.
 	fn open(&self, frame: &mut Frame) {
 		let opened = frame.decrypt_in_place(&self.key, None);
-		self.runtime.block_on(opened).expect("the frame opens");
+		// The bench frame carries no digest and no signature, so the open
+		// takes out nothing to keep.
+		let _opened = self.runtime.block_on(opened).expect("the frame opens");
 	}
 
 	/// Prints the row of a message of `size` characters.
@@ -197,7 +199,7 @@ impl Sealing {
 }
 
 fn main() {
-	let record = Record::new();
+	let mut record = Record::new();
 	for size in RECORD_SIZES {
 		record.row(size);
 	}

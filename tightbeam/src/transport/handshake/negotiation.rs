@@ -7,6 +7,7 @@
 //! [`ProfileStrengthPolicy`].
 
 use core::marker::PhantomData;
+use core::num::NonZeroU32;
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -22,7 +23,8 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::constants::{
-	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_STREAM_CAP,
+	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_CHUNK_SIZE,
+	MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CAP, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE,
 };
 use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::common::KeySizeUser;
@@ -33,12 +35,11 @@ use crate::der::Error as DerDecodeError;
 use crate::der::Sequence;
 use crate::transport::handshake::receipt::SessionReceipt;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
+use crate::x509::Certificate;
 use crate::Beamable;
 use crate::Errorizable;
 use elliptic_curve::FieldBytesSize;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::ProfileStrengthPolicy;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -171,7 +172,12 @@ pub struct TransportOffer {
 	#[asn1(optional = "true")]
 	pub requested_budgets: Option<MuxBudgets>,
 	/// Opaque settlement token that the transcript binds and the server's
-	/// [`TransportAuthorizer`] consumes. TightBeam treats it as opaque bytes.
+	/// [`TransportAuthorizer`] consumes.
+	///
+	/// It travels in the cleartext opening of the client, so it is public data
+	/// and never a secret. A replay of it by another client is the
+	/// application's to refuse in [`TransportAuthorizer::settle`], which
+	/// receives the certificate of the client that spends it (CWE-294).
 	#[asn1(optional = "true")]
 	pub authorization: Option<OctetString>,
 }
@@ -266,6 +272,11 @@ pub struct TransportAccept {
 /// enforces what it advertised and respects what its peer advertised, so
 /// the settings keep both values instead of a symmetric minimum.
 ///
+/// # Clamps
+///
+/// The fields are private, and each constructor and setter clamps every term
+/// it writes, so each value a reader takes is in its range (CWE-770).
+///
 /// # Sources
 ///
 /// - RFC 9113 § 5.1.2, stream concurrency: <https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2>
@@ -273,30 +284,30 @@ pub struct TransportAccept {
 pub struct MuxSettings {
 	/// Maximum concurrent streams this endpoint may initiate, as the peer
 	/// advertised.
-	pub local_initiated_cap: u32,
+	local_initiated_cap: u32,
 	/// Maximum concurrent streams the peer may initiate, as this endpoint
 	/// advertised.
-	pub peer_initiated_cap: u32,
+	peer_initiated_cap: u32,
 	/// Largest chunk payload this endpoint may send, from the receive size
 	/// the peer advertised.
-	pub send_chunk_size: u32,
+	send_chunk_size: u32,
 	/// Largest inbound chunk payload this endpoint accepts, as it
 	/// advertised.
-	pub recv_chunk_size: u32,
+	recv_chunk_size: u32,
 	/// Bytes per session-budget credit in both directions, from the accept.
-	pub credit_unit: u32,
+	credit_unit: NonZeroU32,
 	/// Initial chunk allowance on each stream this endpoint initiates or
 	/// answers toward the peer, as the peer advertised.
-	pub initial_send_credit: u64,
+	initial_send_credit: u64,
 	/// Initial chunk allowance this endpoint grants to each inbound stream,
 	/// as it advertised.
-	pub initial_recv_credit: u64,
+	initial_recv_credit: u64,
 	/// Credits spendable on outbound data this epoch. `None` means the
 	/// session is unmetered.
-	pub send_budget: Option<u64>,
+	send_budget: Option<u64>,
 	/// Credits the peer may spend on inbound data this epoch, enforced
 	/// locally. `None` means the session is unmetered.
-	pub recv_budget: Option<u64>,
+	recv_budget: Option<u64>,
 }
 
 impl MuxSettings {
@@ -306,13 +317,13 @@ impl MuxSettings {
 	///
 	/// # Budgets
 	///
-	/// The settings are always unmetered. A cleartext link has no key epoch
-	/// to renew, so a spent bound could never recover.
+	/// The settings start unmetered. A cleartext link has no key epoch to
+	/// renew, so a spent bound could never recover.
 	///
 	/// # Contract
 	///
 	/// Both endpoints MUST configure the same `cap`, or enforcement diverges.
-	/// This call clamps the cap to [`MAX_MUX_STREAM_CAP`].
+	/// It clamps the cap to [`MAX_MUX_STREAM_CAP`].
 	pub fn symmetric(cap: u32) -> Self {
 		let cap = clamp_stream_cap(cap);
 		Self {
@@ -320,12 +331,200 @@ impl MuxSettings {
 			peer_initiated_cap: cap,
 			send_chunk_size: DEFAULT_MUX_CHUNK_SIZE,
 			recv_chunk_size: DEFAULT_MUX_CHUNK_SIZE,
-			credit_unit: DEFAULT_MUX_CREDIT_UNIT,
+			credit_unit: clamp_credit_unit(DEFAULT_MUX_CREDIT_UNIT),
 			initial_send_credit: DEFAULT_MUX_STREAM_CREDIT,
 			initial_recv_credit: DEFAULT_MUX_STREAM_CREDIT,
 			send_budget: None,
 			recv_budget: None,
 		}
+	}
+
+	/// Sets the chunk payload size of both directions to `size`, clamped into
+	/// `MIN_MUX_CHUNK_SIZE..=MAX_MUX_CHUNK_SIZE`, for a link that skips the
+	/// handshake negotiation. Both endpoints MUST set the same size.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::MIN_MUX_CHUNK_SIZE;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// let settings = MuxSettings::symmetric(4).with_chunk_size(1);
+	/// assert_eq!(settings.send_chunk_size(), MIN_MUX_CHUNK_SIZE);
+	/// ```
+	pub fn with_chunk_size(mut self, size: u32) -> Self {
+		let size = clamp_chunk_size(size);
+		self.send_chunk_size = size;
+		self.recv_chunk_size = size;
+		self
+	}
+
+	/// Sets the initial chunk allowance of each stream in both directions to
+	/// `credit`, clamped into `1..=MAX_MUX_STREAM_CREDIT`, for a link that
+	/// skips the handshake negotiation. Both endpoints MUST set the same
+	/// allowance.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// let settings = MuxSettings::symmetric(4).with_initial_credit(0);
+	/// assert_eq!(settings.initial_send_credit(), 1);
+	/// ```
+	pub fn with_initial_credit(mut self, credit: u64) -> Self {
+		let credit = clamp_stream_credit(credit);
+		self.initial_send_credit = credit;
+		self.initial_recv_credit = credit;
+		self
+	}
+
+	/// Sets the credits this endpoint may spend on outbound data this epoch
+	/// to `budget`, clamped to [`MAX_MUX_SESSION_BUDGET`]. `None` leaves the
+	/// session unmetered.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::MAX_MUX_SESSION_BUDGET;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// let settings = MuxSettings::symmetric(4).with_send_budget(Some(u64::MAX));
+	/// assert_eq!(settings.send_budget(), Some(MAX_MUX_SESSION_BUDGET));
+	/// ```
+	pub fn with_send_budget(mut self, budget: Option<u64>) -> Self {
+		self.send_budget = budget.map(|budget| budget.min(MAX_MUX_SESSION_BUDGET));
+		self
+	}
+
+	/// Maximum concurrent streams this endpoint may initiate, as the peer
+	/// advertised.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).local_initiated_cap(), 4);
+	/// ```
+	pub const fn local_initiated_cap(&self) -> u32 {
+		self.local_initiated_cap
+	}
+
+	/// Maximum concurrent streams the peer may initiate, as this endpoint
+	/// advertised.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).peer_initiated_cap(), 4);
+	/// ```
+	pub const fn peer_initiated_cap(&self) -> u32 {
+		self.peer_initiated_cap
+	}
+
+	/// Largest chunk payload this endpoint may send, from the receive size
+	/// the peer advertised.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::DEFAULT_MUX_CHUNK_SIZE;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).send_chunk_size(), DEFAULT_MUX_CHUNK_SIZE);
+	/// ```
+	pub const fn send_chunk_size(&self) -> u32 {
+		self.send_chunk_size
+	}
+
+	/// Largest inbound chunk payload this endpoint accepts, as it advertised.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::DEFAULT_MUX_CHUNK_SIZE;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).recv_chunk_size(), DEFAULT_MUX_CHUNK_SIZE);
+	/// ```
+	pub const fn recv_chunk_size(&self) -> u32 {
+		self.recv_chunk_size
+	}
+
+	/// Bytes per session-budget credit in both directions, from the accept.
+	/// The unit is at least one byte, so the debit of a chunk always divides.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::DEFAULT_MUX_CREDIT_UNIT;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).credit_unit().get(), DEFAULT_MUX_CREDIT_UNIT);
+	/// ```
+	pub const fn credit_unit(&self) -> NonZeroU32 {
+		self.credit_unit
+	}
+
+	/// Initial chunk allowance on each stream this endpoint initiates or
+	/// answers toward the peer, as the peer advertised.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::DEFAULT_MUX_STREAM_CREDIT;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).initial_send_credit(), DEFAULT_MUX_STREAM_CREDIT);
+	/// ```
+	pub const fn initial_send_credit(&self) -> u64 {
+		self.initial_send_credit
+	}
+
+	/// Initial chunk allowance this endpoint grants to each inbound stream,
+	/// as it advertised.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::constants::DEFAULT_MUX_STREAM_CREDIT;
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).initial_recv_credit(), DEFAULT_MUX_STREAM_CREDIT);
+	/// ```
+	pub const fn initial_recv_credit(&self) -> u64 {
+		self.initial_recv_credit
+	}
+
+	/// Credits spendable on outbound data this epoch, or `None` for an
+	/// unmetered session.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).send_budget(), None);
+	/// ```
+	pub const fn send_budget(&self) -> Option<u64> {
+		self.send_budget
+	}
+
+	/// Credits the peer may spend on inbound data this epoch, enforced
+	/// locally, or `None` for an unmetered session.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::transport::handshake::negotiation::MuxSettings;
+	///
+	/// assert_eq!(MuxSettings::symmetric(4).recv_budget(), None);
+	/// ```
+	pub const fn recv_budget(&self) -> Option<u64> {
+		self.recv_budget
 	}
 
 	/// Static records this endpoint reserves so the drain can finish after the
@@ -358,8 +557,8 @@ impl MuxSettings {
 	/// The reserve is [`Self::drain_reserve_records`] priced at the worst-case
 	/// per-chunk debit, `ceil(send_chunk_size / credit_unit)`.
 	pub fn send_budget_reserve(&self) -> u64 {
-		let chunk = u64::from(self.send_chunk_size.max(1));
-		let unit = u64::from(self.credit_unit.max(1));
+		let chunk = u64::from(self.send_chunk_size);
+		let unit = u64::from(self.credit_unit.get());
 		self.drain_reserve_records().saturating_mul(chunk.div_ceil(unit))
 	}
 
@@ -391,16 +590,14 @@ fn clamp_stream_cap(cap: u32) -> u32 {
 /// The floor bounds the records a tiny advertisement could consume
 /// (CWE-770). Chunking is the only send path, so every value clamps into the
 /// range.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_chunk_size(size: u32) -> u32 {
 	size.clamp(MIN_MUX_CHUNK_SIZE, MAX_MUX_CHUNK_SIZE)
 }
 
-/// Clamp an advertised credit unit to at least one byte so debit arithmetic
-/// never divides by zero.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn clamp_credit_unit(unit: u32) -> u32 {
-	unit.max(1)
+/// Clamp an advertised credit unit to at least one byte, the type that debit
+/// arithmetic divides by.
+fn clamp_credit_unit(unit: u32) -> NonZeroU32 {
+	NonZeroU32::new(unit).unwrap_or(NonZeroU32::MIN)
 }
 
 /// Clamp an advertised initial stream credit window into
@@ -409,7 +606,6 @@ fn clamp_credit_unit(unit: u32) -> u32 {
 /// The ceiling bounds receive memory (CWE-770). The floor of one chunk keeps
 /// every stream startable, because credit grants flow only after a first
 /// chunk arrives.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn clamp_stream_credit(credit: u64) -> u64 {
 	credit.clamp(1, MAX_MUX_STREAM_CREDIT)
 }
@@ -466,7 +662,7 @@ impl<'a> TransportNegotiation<'a> {
 			mux: true,
 			max_peer_initiated_streams: local.max_peer_initiated_streams,
 			chunk_payload_size: local.chunk_payload_size,
-			credit_unit: clamp_credit_unit(local.credit_unit),
+			credit_unit: clamp_credit_unit(local.credit_unit).get(),
 			initial_stream_credit: local.initial_stream_credit,
 			granted_budgets,
 		};
@@ -482,8 +678,8 @@ impl<'a> TransportNegotiation<'a> {
 	/// # Budgets
 	///
 	/// When an authorizer is present, its grant replaces the local-config
-	/// budget. This method still clamps the grant to the componentwise minimum
-	/// with the client's request before the accept and the receipt bind it.
+	/// budget. It still clamps the grant to the componentwise minimum with the
+	/// client's request before the accept and the receipt bind it.
 	///
 	/// # Errors
 	///
@@ -557,7 +753,6 @@ pub struct AuthorizationGrant {
 	/// Per-direction budgets granted. `None` grants an unmetered session.
 	pub budgets: Option<MuxBudgets>,
 	/// Opaque settlement challenge bound into the session receipt.
-	/// TightBeam treats it as opaque bytes.
 	pub challenge: Option<OctetString>,
 }
 
@@ -606,10 +801,9 @@ impl From<Option<MuxBudgets>> for AuthorizationGrant {
 pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 	/// Grant budgets and an optional settlement challenge for `offer`.
 	///
-	/// The hook inspects [`TransportOffer::requested_budgets`] and the opaque
-	/// [`TransportOffer::authorization`] token, and it returns an
-	/// [`AuthorizationGrant`] or an [`AuthorizationRefusal`]. The server's
-	/// signature over its reply covers the grant.
+	/// The hook reads [`TransportOffer::requested_budgets`] and the opaque
+	/// [`TransportOffer::authorization`] token. The server's signature over its
+	/// reply covers the grant.
 	///
 	/// # Errors
 	///
@@ -621,9 +815,11 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 
 	/// Settle the countersigned receipt when the client's closing arrives.
 	///
-	/// The handshake calls this hook with the receipt body and the client's
-	/// ancillary response after the countersignature verifies. The session
-	/// activates only on `Ok`.
+	/// The handshake calls this hook after the countersignature verifies, with
+	/// the receipt body, the client's ancillary response, and `client`, the
+	/// certificate the countersignature verified under. The session activates
+	/// only on `Ok`, so an authorizer that binds a token to the client it
+	/// issued the token to refuses any other `client` here (CWE-294).
 	///
 	/// # Default
 	///
@@ -638,6 +834,7 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 		&'a self,
 		receipt: &'a SessionReceipt,
 		_response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if receipt.ancillary.is_some() {
@@ -1252,6 +1449,7 @@ mod tests {
 		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 	};
+	use crate::testing::{TestCertificate, TestKey};
 
 	fn sample_profile(id: u8) -> SecurityProfileDesc {
 		let key_wrap = match id {
@@ -1278,14 +1476,11 @@ mod tests {
 		assert_eq!(offer.profiles[0], profile);
 	}
 
-	/// Settings with a cap of 1 in each direction, a 1024-byte chunk, and a
-	/// 1024-byte credit unit, so the drain reserve is 5 records priced at 1
-	/// credit each.
+	/// Settings with a cap of 1 in each direction, a 1024-byte chunk, and the
+	/// default 1024-byte credit unit, so the drain reserve is 5 records priced
+	/// at 1 credit each.
 	fn reserve_settings() -> MuxSettings {
-		let mut settings = MuxSettings::symmetric(1);
-		settings.send_chunk_size = 1024;
-		settings.credit_unit = 1024;
-		settings
+		MuxSettings::symmetric(1).with_chunk_size(1024)
 	}
 
 	#[test]
@@ -1299,7 +1494,7 @@ mod tests {
 		let mut settings = reserve_settings();
 		assert_eq!(settings.send_budget_reserve(), 5);
 
-		settings.credit_unit = 512;
+		settings.credit_unit = clamp_credit_unit(512);
 		assert_eq!(settings.send_budget_reserve(), 10);
 	}
 
@@ -1673,11 +1868,16 @@ mod tests {
 		})
 	}
 
+	/// The certificate of the client a settlement test names.
+	fn settling_client() -> Certificate {
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+	}
+
 	#[tokio::test]
 	async fn test_default_settle_accepts_challenge_free_receipt() -> Result<(), DerDecodeError> {
 		let authorizer = FixedAuthorizer::budgets(Ok(None));
 		let receipt = settle_receipt(None)?;
-		assert_eq!(authorizer.settle(&receipt, None).await, Ok(()));
+		assert_eq!(authorizer.settle(&receipt, None, &settling_client()).await, Ok(()));
 		Ok(())
 	}
 
@@ -1685,7 +1885,7 @@ mod tests {
 	async fn test_default_settle_refuses_challenge_bearing_receipt() -> Result<(), DerDecodeError> {
 		let authorizer = FixedAuthorizer::budgets(Ok(None));
 		let receipt = settle_receipt(Some(OctetString::new(b"invoice".as_slice())?))?;
-		let settled = authorizer.settle(&receipt, None).await;
+		let settled = authorizer.settle(&receipt, None, &settling_client()).await;
 		assert_eq!(settled, Err(AuthorizationRefusal { code: SETTLEMENT_UNSUPPORTED_CODE }));
 		Ok(())
 	}
@@ -1722,14 +1922,14 @@ mod tests {
 		let client = require_client_mux(&offer, &accept)?;
 		assert_eq!(client.send_chunk_size, 32 * 1024);
 		assert_eq!(client.recv_chunk_size, 8 * 1024);
-		assert_eq!(client.credit_unit, 2048);
+		assert_eq!(client.credit_unit().get(), 2048);
 		assert_eq!(client.initial_send_credit, 32);
 		assert_eq!(client.initial_recv_credit, 16);
 
 		let server = MuxSettings::for_server(&offer, &accept);
 		assert_eq!(server.send_chunk_size, 8 * 1024);
 		assert_eq!(server.recv_chunk_size, 32 * 1024);
-		assert_eq!(server.credit_unit, 2048);
+		assert_eq!(server.credit_unit().get(), 2048);
 		assert_eq!(server.initial_send_credit, 16);
 		assert_eq!(server.initial_recv_credit, 32);
 
@@ -1816,7 +2016,7 @@ mod tests {
 		let client = require_client_mux(&offer, &accept)?;
 		assert_eq!(client.send_chunk_size, MAX_MUX_CHUNK_SIZE);
 		assert_eq!(client.recv_chunk_size, MIN_MUX_CHUNK_SIZE);
-		assert_eq!(client.credit_unit, 1);
+		assert_eq!(client.credit_unit().get(), 1);
 		assert_eq!(client.initial_send_credit, MAX_MUX_STREAM_CREDIT);
 		assert_eq!(client.initial_recv_credit, MAX_MUX_STREAM_CREDIT);
 		assert_eq!(client.send_budget, Some(MAX_MUX_SESSION_BUDGET));
@@ -1837,11 +2037,21 @@ mod tests {
 		let settings = MuxSettings::symmetric(8);
 		assert_eq!(settings.send_chunk_size, DEFAULT_MUX_CHUNK_SIZE);
 		assert_eq!(settings.recv_chunk_size, DEFAULT_MUX_CHUNK_SIZE);
-		assert_eq!(settings.credit_unit, DEFAULT_MUX_CREDIT_UNIT);
+		assert_eq!(settings.credit_unit().get(), DEFAULT_MUX_CREDIT_UNIT);
 		assert_eq!(settings.initial_send_credit, DEFAULT_MUX_STREAM_CREDIT);
 		assert_eq!(settings.initial_recv_credit, DEFAULT_MUX_STREAM_CREDIT);
 		assert_eq!(settings.send_budget, None);
 		assert_eq!(settings.recv_budget, None);
+	}
+
+	/// A chunk size below the floor clamps to it on a link that skips the
+	/// negotiation, as it does on a negotiated link (CWE-770).
+	#[test]
+	fn a_chunk_size_below_the_floor_clamps_to_it() {
+		let settings = MuxSettings::symmetric(4).with_chunk_size(1);
+
+		let chunk_sizes = (settings.send_chunk_size(), settings.recv_chunk_size());
+		assert_eq!(chunk_sizes, (MIN_MUX_CHUNK_SIZE, MIN_MUX_CHUNK_SIZE));
 	}
 
 	#[test]

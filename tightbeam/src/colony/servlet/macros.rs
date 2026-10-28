@@ -62,8 +62,7 @@ macro_rules! __servlet_define {
 		}
 
 		impl $servlet_name {
-			/// Start the servlet. This inherent method needs no [`Servlet`]
-			/// import at the call site.
+			/// Start the servlet, with no [`Servlet`] import at the call site.
 			#[allow(dead_code)]
 			$vis async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
@@ -77,15 +76,15 @@ macro_rules! __servlet_define {
 				<Self as $crate::colony::servlet::Servlet<$input, $env_config>>::start(trace, config).await
 			}
 
-			/// Stop the servlet by value. This inherent method needs no
-			/// [`Servlet`] import at the call site.
+			/// Stop the servlet by value, with no [`Servlet`] import at the
+			/// call site.
 			#[allow(dead_code)]
 			pub fn stop(self) {
 				self.runtime.stop();
 			}
 
-			/// Wait for the accept loop to finish. `Deref` cannot forward the
-			/// by-value [`ServletRuntime::join`], so this method calls it.
+			/// Wait for the accept loop to finish, through the by-value
+			/// [`ServletRuntime::join`] that `Deref` cannot forward.
 			#[allow(dead_code)]
 			pub async fn join(
 				self,
@@ -148,8 +147,11 @@ macro_rules! __servlet_define {
 			}
 
 			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
-				use $crate::colony::servlet::Servlet;
-				<Self as Servlet<_, _>>::utilization(self)
+				$crate::colony::hive::ServletBox::utilization(&self.runtime)
+			}
+
+			fn drain_boxed(self: Box<Self>) -> $crate::colony::hive::ServletDrainFuture {
+				Box::pin(self.runtime.drain())
 			}
 		}
 	};

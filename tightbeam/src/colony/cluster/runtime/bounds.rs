@@ -13,10 +13,10 @@ use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::gossip_tasks::PeerLedgers;
 use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
 use crate::colony::cluster::runtime::verify::RequestAudit;
-use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
+use crate::colony::cluster::{ClusterConfig, HiveRegistry, HopBudget, ServletRegistry, WireHopBudget};
 use crate::crypto::profiles::DigestProvider;
 use crate::macros::server::AcceptedConnection;
-use crate::policy::SessionContext;
+use crate::policy::{SessionContext, TransitStatus};
 use crate::runtime::TaskGroup;
 use crate::trace::TraceCollector;
 use crate::transport::client::ConnectionPool;
@@ -26,7 +26,8 @@ use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol};
-use crate::Message;
+use crate::urn::Urn;
+use crate::{Message, TightBeamError};
 
 pub(crate) type ClusterPool<P> = ConnectionPool<P>;
 
@@ -131,8 +132,9 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	/// The plane this gateway dials its hives and their servlets on, which
 	/// holds the hive pool and hands out bound dials alone.
 	pub(crate) hive_plane: HivePlane<P>,
-	/// The plane this gateway dials peer gateways on, when one is configured.
-	pub(crate) peer_plane: Option<PeerPlane<P>>,
+	/// The plane this gateway dials peer gateways on: the peer pool, or the
+	/// hive pool for a gateway that configures no peer trust.
+	pub(crate) peer_plane: PeerPlane<P>,
 	/// The instrumentation collector for the gateway's control-plane events.
 	pub(crate) trace: Arc<TraceCollector>,
 	/// The trace of the accept planes, and of each record no credential backs.
@@ -149,8 +151,8 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// The two registries one hive's membership spans.
 	///
-	/// Admission and retirement move both, so they run here rather than as
-	/// a sequence each call site repeats.
+	/// Admission and retirement move both, so they run on the returned
+	/// `ColonyMembership` and not at each call site.
 	pub(crate) fn membership(&self) -> ColonyMembership<'_> {
 		ColonyMembership::new(&self.registry, &self.servlet_registry, &self.admission)
 	}
@@ -189,9 +191,8 @@ pub(crate) type ColonyDigest<P> = <<P as Protocol>::CryptoProvider as DigestProv
 /// names the colony digest.
 ///
 /// Each operation that names a gateway, or digests a rumor or a frame
-/// witness, is a method here under [`ColonyDigest`] of `P`, so a gateway names
-/// its peers and digests its rumors under one digest. The configuration is
-/// shared, and this type dereferences to it.
+/// witness, is a method here under [`ColonyDigest`] of `P`, so all of them
+/// use one digest. It shares the configuration and dereferences to it.
 pub(crate) struct ColonyConfig<P> {
 	config: Arc<ClusterConfig>,
 	protocol: PhantomData<fn() -> P>,
@@ -220,6 +221,36 @@ impl<P> Deref for ColonyConfig<P> {
 	}
 }
 
+impl<P: Protocol> ColonyConfig<P> {
+	/// Admits a work request or a routed stream open to `target`: it clamps
+	/// the `wire` budget to the operator's cap and runs the export gates, which
+	/// read whether a peer relayed the request.
+	///
+	/// The unary work arm and the stream gate both admit through it, so the
+	/// two read one clamp of one octet and one export verdict. A refusal that
+	/// the caller answers comes back as the inner `Err`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- `trace` refused the record of the export verdict.
+	pub(crate) fn admit_target(
+		&self,
+		target: &Urn<'_>,
+		wire: WireHopBudget,
+		session: &SessionContext,
+		trace: &TraceCollector,
+	) -> Result<Result<HopBudget, TransitStatus>, TightBeamError> {
+		let budget = HopBudget::from_wire(wire, self.peer.max_hops);
+		let relayed = budget.is_relayed();
+		let status = self.evaluate_export_gates(target, session, relayed, trace)?;
+		if status != TransitStatus::Ok {
+			return Ok(Err(status));
+		}
+
+		Ok(Ok(budget))
+	}
+}
+
 impl<P: ColonyDialProtocol> ColonyConfig<P> {
 	/// `builder`, set to digest its frame witness under the colony digest.
 	pub(crate) fn witnessed<T>(&self, builder: FrameBuilder<T>) -> FrameBuilder<T>
@@ -243,7 +274,8 @@ pub(crate) mod fixtures {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::KeyCurves;
 	use crate::runtime::TaskGroup;
 	use crate::testing::{TestCertificate, TestKey};
 	use crate::trace::TraceCollector;
@@ -255,7 +287,8 @@ pub(crate) mod fixtures {
 		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let colony = ColonyNamespace::default().colony("main").expect("a literal colony name");
 		let certificate = TestCertificate::with_uri_sans(&key, &[&colony.to_string()]);
-		let enrolled = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(certificate.clone());
+		let enrolled = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let enrolled = enrolled.with_certificate(certificate.clone());
 		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the member enrolls").build());
 		let spec = CertificateSpec::Built(Box::new(certificate));
 		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
@@ -279,13 +312,15 @@ pub(crate) mod fixtures {
 			let clock = Arc::clone(&config.clock);
 			let registry = HiveRegistry::new(config.heartbeat.timeout, Arc::clone(&clock));
 			let servlet_registry = ServletRegistry::new(config.pheromone.clone(), Arc::clone(&clock));
+			let hive_plane = HivePlane::new(pools.hive, Arc::clone(trace));
+			let peer_plane = hive_plane.peers(pools.peer, config.clone());
 
 			Self {
 				registry: Arc::new(registry),
 				servlet_registry: Arc::new(servlet_registry),
 				admission: Arc::default(),
-				hive_plane: HivePlane::new(pools.hive, Arc::clone(trace)),
-				peer_plane: None,
+				hive_plane,
+				peer_plane,
 				trace: Arc::clone(trace),
 				connections: Arc::clone(connections),
 				replay_guard: GatewayReplayGuard::new(config.control_freshness_window, clock),

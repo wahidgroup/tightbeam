@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 
+use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::export::{ExportDecision, ExportPolicy, Party, TrustPlanes};
 use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDigest};
@@ -226,20 +227,14 @@ impl VerifyRefusal {
 	/// and returns the status that answers the relay.
 	///
 	/// Trust stores need not agree, so an origin this gateway does not hold
-	/// is the edge of a subnet and no fault of the relay.
+	/// marks the edge of a subnet, not a fault of the relay.
 	///
-	/// - [`Self::UnknownSigner`] drops the rumor and spends one token of the
-	///   relay's own rate bucket, so made-up origins cost a relay the budget
-	///   of its own rumors (CWE-770).
-	/// - With a token it answers [`TransitStatus::Unauthenticated`], which
-	///   tells the relay to stop offering that origin here, and with the bucket
-	///   empty [`TransitStatus::ResourceExhausted`]. An admission backend fault
-	///   is this gateway's own and returns as [`LoopFault::Registry`] with its
-	///   cause.
-	/// - Every other refusal marks a rumor the relay should have refused, so the gateway scores the relay.
-	/// - `frame` is the relay's own signed frame, whose signer keys that
-	///   bucket. A frame that names no signer has no bucket to spend, so the
-	///   gateway scores its relay too.
+	/// - [`Self::UnknownSigner`] drops the rumor and spends one token of the relay's rate bucket (CWE-770).
+	/// - With a token, it answers [`TransitStatus::Unauthenticated`], so the relay stops offering the origin.
+	/// - With the bucket empty, it answers [`TransitStatus::ResourceExhausted`].
+	/// - The signer of `frame`, the relay's own signed frame, keys the bucket.
+	/// - Every other refusal scores the relay, which should have refused the
+	///   rumor, and so does a `frame` that names no signer.
 	///
 	/// # Errors
 	///
@@ -285,6 +280,8 @@ impl VerifyRefusal {
 pub(crate) struct VerifiedControlFrame<'a> {
 	frame: &'a Frame,
 	signer_cert: &'a Certificate,
+	/// The signer that the verified SignerInfo names (RFC 5652 §5.3).
+	signer_identifier: &'a SignerIdentifier,
 	signature: VerifiedSignature,
 	party: Party,
 	fingerprint: VerifiedSignerId,
@@ -301,6 +298,13 @@ impl<'a> VerifiedControlFrame<'a> {
 	#[must_use]
 	pub(crate) fn signer_cert(&self) -> &'a Certificate {
 		self.signer_cert
+	}
+
+	/// The signer that the verified SignerInfo names (RFC 5652 §5.3), which a
+	/// hive registration binds to its hive.
+	#[must_use]
+	pub(crate) fn signer_identifier(&self) -> &'a SignerIdentifier {
+		self.signer_identifier
 	}
 
 	/// The signature that verified, the frame's replay key.
@@ -343,7 +347,7 @@ impl ClusterConfig {
 		Ok(())
 	}
 
-	/// Run collector gate policies before the gateway decodes the request
+	/// Run the configured gate policies before the gateway decodes the request
 	/// envelope.
 	///
 	/// Each configured policy must return [`TransitStatus::Ok`], so the first
@@ -372,10 +376,8 @@ impl ClusterConfig {
 impl<P: Protocol> ColonyConfig<P> {
 	/// Verify `frame` once on `required` and classify the resolved certificate.
 	///
-	/// Peer membership wins: a public key enrolled in `tls.peer_trust` is
-	/// [`Party::Peer`], so a hive-plane parse refuses it even when the
-	/// presented certificate object lives only in `hive_trust`. An absent store
-	/// or a failed signature refuses, and a frame without a signature is
+	/// Peer membership wins ([`Self::verify_hive`]). An absent store or a
+	/// failed signature refuses, and a frame without a signature is
 	/// unauthenticated.
 	fn verify_plane<'a>(
 		&'a self,
@@ -394,6 +396,9 @@ impl<P: Protocol> ColonyConfig<P> {
 		};
 
 		let signer_cert = signer.certificate().as_ref();
+		let Some(signer_info) = frame.nonrepudiation() else {
+			return Err(VerifyRefusal::Unsigned);
+		};
 
 		let party = planes.classify(Some(signer_cert));
 		if party != required {
@@ -402,7 +407,8 @@ impl<P: Protocol> ColonyConfig<P> {
 
 		let fingerprint = planes.signer_id::<ColonyDigest<P>>(party, signer_cert);
 		let fingerprint = fingerprint.map(VerifiedSignerId).ok_or(VerifyRefusal::Unidentifiable)?;
-		Ok(VerifiedControlFrame { frame, signer_cert, signature, party, fingerprint })
+		let signer_identifier = &signer_info.sid;
+		Ok(VerifiedControlFrame { frame, signer_cert, signer_identifier, signature, party, fingerprint })
 	}
 
 	/// The slate key of the gateway that holds `cert`'s key, under the colony
@@ -417,7 +423,7 @@ impl<P: Protocol> ColonyConfig<P> {
 	///
 	/// The verdict algebra is in [`ExportPolicy`], read from the live
 	/// configuration, so enforcement stays aligned with the advertise filter.
-	/// This wrapper adds the audit plane.
+	/// It adds the audit plane.
 	///
 	/// 1. Run [`ExportPolicy::verdict`] (the allowlist, the grants, then the deny gates).
 	/// 2. Trace [`CLUSTER_EXPORT_REFUSED`] or [`CLUSTER_EXPORT_GRANTED`] with
@@ -434,8 +440,9 @@ impl<P: Protocol> ColonyConfig<P> {
 	///
 	/// # Call sites
 	///
-	/// - The unary work arm in [`super::dispatch`]
-	/// - The streaming and duplex open handlers in [`super`]
+	/// [`ColonyConfig::admit_target`] alone calls it, for the unary work arm
+	/// in [`super::dispatch`] and the streaming and duplex open handlers in
+	/// [`super`].
 	///
 	/// # Sources
 	///
@@ -506,9 +513,9 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::crypto::sign::PrehashSigner;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use crate::crypto::x509::utils::Fingerprint;
-	use crate::crypto::x509::Certificate;
+	use crate::crypto::x509::{Certificate, KeyCurves};
 	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey, TestMessage};
 	use crate::transport::TokioListener;
@@ -542,7 +549,8 @@ mod tests {
 
 	/// A config whose peer plane enrolls `enrolled` alone.
 	fn config_enrolling(enrolled: &Certificate) -> ClusterConfig {
-		let builder = CertificateTrustBuilder::from(Secp256k1Policy::default()).with_certificate(enrolled.clone());
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let builder = builder.with_certificate(enrolled.clone());
 		let store = builder.expect("the test certificate satisfies the trust builder").build();
 
 		let mut config = exporting_config();
@@ -617,7 +625,7 @@ mod tests {
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::from(Secp256k1Policy::default())
+		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();

@@ -8,7 +8,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::crypto::hash::{Digest, OutputSizeUser};
+use crate::crypto::hash::{Digest, OutputSizeUser, Sha3_256};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
@@ -35,9 +35,9 @@ pub trait CertificateValidation: Send + Sync {
 	/// - [`CertificateValidationError`] -- `cert` fails a check of this policy.
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError>;
 
-	/// Validate `leaf`, the certificate a peer presents, beside `issuers`,
-	/// the issuers above it that the peer presents, the top first, so each
-	/// issues the one after it and the last issues `leaf`.
+	/// Validate `leaf`, the certificate a peer presents, beside the `issuers`
+	/// it presents above it. They run from the top down, so each issues the
+	/// next and the last issues `leaf`.
 	///
 	/// A mutual server admits its client here, with the issuers its client
 	/// Finished presents (RFC 5652 §5.1):
@@ -45,6 +45,7 @@ pub trait CertificateValidation: Send + Sync {
 	/// - The default runs [`Self::evaluate`] on `leaf` alone.
 	/// - [`CertificateTrustStore`] overrides it, and validates the path of
 	///   `leaf` under `issuers` to one of its trust anchors (RFC 5280 §6.1).
+	/// - `ChainValidator` overrides it, and runs it on each validator it holds.
 	///
 	/// # Errors
 	///
@@ -55,7 +56,8 @@ pub trait CertificateValidation: Send + Sync {
 	/// ```
 	/// use tightbeam::crypto::policy::Secp256k1Policy;
 	/// use tightbeam::crypto::x509::policy::CertificateValidation;
-	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
+	/// use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyCurves;
 	/// use tightbeam::testing::fixtures::{TestCertificate, TestCertificateChain};
 	///
 	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +67,7 @@ pub trait CertificateValidation: Send + Sync {
 	///
 	/// // The store holds the root alone, and the peer presents the
 	/// // intermediate beside its certificate.
-	/// let builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	/// let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	/// let store = builder.with_certificate(root)?.build();
 	/// store.evaluate_presented(&[intermediate], &leaf)?;
 	/// # Ok(())
@@ -85,11 +87,8 @@ pub trait CertificateValidation: Send + Sync {
 	}
 }
 
-/// A certificate validation strategy that also verifies the cryptographic
-/// signature of the certificate.
-///
-/// It extends [`CertificateValidation`] with a check of the certificate's
-/// signature under a verification policy the caller supplies.
+/// A certificate validation strategy that also verifies the signature of the
+/// certificate, under a verification policy the caller supplies.
 pub trait SignatureVerification: CertificateValidation {
 	/// Validate `cert` in full, with a check of its signature under the
 	/// issuer's public key through `policy`.
@@ -116,8 +115,7 @@ pub trait SignatureVerification: CertificateValidation {
 
 /// A validator that checks certificate expiry alone.
 ///
-/// Its one check is that the certificate is within its validity period, so a
-/// signature check belongs to a [`SignatureVerification`] validator.
+/// A signature check belongs to a [`SignatureVerification`] validator.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExpiryValidator;
 
@@ -426,18 +424,17 @@ where
 	}
 }
 
-/// A validator that trusts a certificate when the certificate is itself a
-/// configured trust anchor (direct trust, RFC 5280 §6.1.1).
+/// A validator that trusts a certificate when it is itself a configured trust
+/// anchor (direct trust, RFC 5280 §6.1.1).
 ///
 /// It checks the presented certificate alone. Path building, name chaining,
 /// and the `basicConstraints` and `keyUsage` checks of RFC 5280 §6.1 belong
 /// to the certification-path validation of [`CertificateTrustStore`].
 ///
 /// - [`CertificateValidation::evaluate`] checks the validity period
-///   (RFC 5280 §6.1.3(a)(2)) and requires the presented certificate to be a
-///   configured trust anchor. With no anchors configured, as under `Default`,
-///   it refuses every certificate. [`Self::with_trust_chain`] configures the
-///   anchors.
+///   (RFC 5280 §6.1.3(a)(2)) and admits a configured trust anchor alone, by
+///   its SHA3-256 fingerprint. With no anchor, as under `Default`, it refuses
+///   every certificate. [`Self::with_trust_chain`] configures the anchors.
 /// - [`SignatureVerification::verify_with_policy`] checks the validity of one
 ///   certificate, the consistency of its algorithm identifiers
 ///   (RFC 5280 §4.1.1.2), and its signature under an issuer key that the
@@ -451,19 +448,45 @@ where
 /// [`CertificateTrustStore`]: crate::crypto::x509::store::CertificateTrustStore
 #[derive(Default, Clone)]
 pub struct DirectTrustValidator {
-	trust_chain: Vec<Certificate>,
+	/// The fingerprint of each trust anchor, which the install decides once.
+	anchors: Vec<Fingerprint<Sha3_256>>,
 }
 
 impl DirectTrustValidator {
 	/// Replace the trust anchors of the validator with the certificates of
-	/// `trust_chain`.
+	/// `trust_chain`, each held by its SHA3-256 fingerprint.
 	///
 	/// An empty chain leaves the validator with no anchor, so
 	/// [`CertificateValidation::evaluate`] refuses every certificate, as under
 	/// `Default`.
-	pub fn with_trust_chain(mut self, trust_chain: impl IntoIterator<Item = Certificate>) -> Self {
-		self.trust_chain = trust_chain.into_iter().collect();
-		self
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- a certificate fails to DER-encode.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
+	/// use tightbeam::random::OsRng;
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// let anchor = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let other = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
+	/// let validator = DirectTrustValidator::default().with_trust_chain([anchor.clone()])?;
+	///
+	/// validator.evaluate(&anchor)?;
+	/// assert!(validator.evaluate(&other).is_err());
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn with_trust_chain(
+		mut self,
+		trust_chain: impl IntoIterator<Item = Certificate>,
+	) -> Result<Self, CertificateValidationError> {
+		let anchors = trust_chain.into_iter().map(|anchor| Fingerprint::from_certificate(&anchor));
+		self.anchors = anchors.collect::<Result<Vec<_>, _>>()?;
+		Ok(self)
 	}
 }
 
@@ -478,19 +501,12 @@ impl CertificateValidation for DirectTrustValidator {
 		cert.ensure_unique_extensions()?;
 		cert.ensure_critical_extensions_processed()?;
 
-		// RFC 5280 §6.1.1 direct trust: the presented certificate must itself
-		// be a configured trust anchor, a path of one certificate. An empty
-		// anchor set therefore trusts nothing, so the validator fails closed
-		// and never degrades to an expiry-only check (CWE-1188, insecure
-		// default). `ExpiryValidator` is the deliberate expiry-only check.
-		let cert_der = cert.to_der()?;
-		for anchor in &self.trust_chain {
-			if anchor.to_der()? == cert_der {
-				return Ok(());
-			}
-		}
-
-		Err(CertificateValidationError::CertificateNotTrusted)
+		// RFC 5280 §6.1.1 direct trust is a path of one certificate. An empty
+		// anchor set fails closed and never degrades to the expiry-only check
+		// of `ExpiryValidator` (CWE-1188, insecure default).
+		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(cert)?;
+		let anchored = self.anchors.contains(&fingerprint);
+		anchored.then_some(()).ok_or(CertificateValidationError::CertificateNotTrusted)
 	}
 }
 
@@ -535,8 +551,8 @@ impl SignatureVerification for DirectTrustValidator {
 /// A validator that chains other validators.
 ///
 /// The validators run in order, and the certificate passes only when every
-/// one of them succeeds. The chain runs [`CertificateValidation::evaluate`]
-/// alone, so signature verification belongs to a [`SignatureVerification`]
+/// one of them succeeds. The chain runs each check it is asked on each
+/// validator. Signature verification belongs to a [`SignatureVerification`]
 /// validator outside it.
 #[cfg(feature = "std")]
 #[derive(Default)]
@@ -560,6 +576,17 @@ impl ChainValidator {
 impl CertificateValidation for ChainValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		self.validators.iter().try_for_each(|v| v.evaluate(cert))
+	}
+
+	/// Each validator runs its own `evaluate_presented` on `leaf` beside
+	/// `issuers`, so a store in the chain validates the path the peer
+	/// presents.
+	fn evaluate_presented(
+		&self,
+		issuers: &[Certificate],
+		leaf: &Certificate,
+	) -> Result<(), CertificateValidationError> {
+		self.validators.iter().try_for_each(|v| v.evaluate_presented(issuers, leaf))
 	}
 }
 
@@ -616,6 +643,29 @@ mod tests {
 
 			let refused = FingerprintPinning::new([pin]).evaluate(&other);
 			assert!(matches!(refused, Err(CertificateValidationError::CertificateNotPinned)));
+			Ok(())
+		}
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	mod chain {
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::policy::{CertificateValidation, ChainValidator, ExpiryValidator};
+		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+		use crate::crypto::x509::KeyCurves;
+		use crate::testing::fixtures::{TestCertificate, TestCertificateChain};
+
+		/// A chain that holds a store of the root alone admits a leaf beside
+		/// the intermediate it presents, so the chain hands each validator the
+		/// presented issuers.
+		#[test]
+		fn a_chained_store_admits_a_client_beside_its_presented_issuers() -> Result<(), Box<dyn core::error::Error>> {
+			let TestCertificateChain { root, intermediate, leaf, .. } = TestCertificate::insecure_fixed_chain()?;
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+			let store = builder.with_certificate(root)?.build();
+			let chain = ChainValidator::default().add(ExpiryValidator).add(store);
+
+			chain.evaluate_presented(&[intermediate], &leaf)?;
 			Ok(())
 		}
 	}
@@ -755,16 +805,17 @@ mod tests {
 		}
 
 		#[test]
-		fn accepts_configured_anchor() {
+		fn accepts_configured_anchor() -> Result<(), CertificateValidationError> {
 			let cert = test_cert();
 			let trust_chain = vec![cert.clone()];
-			let validator = DirectTrustValidator::default().with_trust_chain(trust_chain);
+			let validator = DirectTrustValidator::default().with_trust_chain(trust_chain)?;
 			assert!(validator.evaluate(&cert).is_ok());
+			Ok(())
 		}
 
 		#[test]
 		fn rejects_non_anchor() -> Result<(), Box<dyn core::error::Error>> {
-			let validator = DirectTrustValidator::default().with_trust_chain(vec![test_cert()]);
+			let validator = DirectTrustValidator::default().with_trust_chain(vec![test_cert()])?;
 			let other = TestCertificate::self_signed(&SigningKey::from_bytes(&[7u8; 32].into())?);
 			assert!(matches!(
 				validator.evaluate(&other),
@@ -830,24 +881,26 @@ mod tests {
 		/// anchor match does not stand in for the extension rules
 		/// (RFC 5280 §4.2).
 		#[test]
-		fn evaluate_refuses_an_anchor_that_repeats_an_extension() {
+		fn evaluate_refuses_an_anchor_that_repeats_an_extension() -> Result<(), CertificateValidationError> {
 			let cert = with_repeated("2.5.29.30");
-			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()]);
+			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()])?;
 
 			let refused = validator.evaluate(&cert);
 			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
+			Ok(())
 		}
 
 		#[test]
-		fn evaluate_refuses_an_anchor_with_an_unknown_critical_extension() {
+		fn evaluate_refuses_an_anchor_with_an_unknown_critical_extension() -> Result<(), CertificateValidationError> {
 			let cert = with_unknown_critical();
-			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()]);
+			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()])?;
 
 			let refused = validator.evaluate(&cert);
 			assert!(matches!(
 				refused,
 				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
 			));
+			Ok(())
 		}
 
 		#[test]

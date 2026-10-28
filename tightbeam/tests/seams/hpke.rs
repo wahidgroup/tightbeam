@@ -31,6 +31,7 @@ pub(super) type OutsideServer = Handshake<Server, Hpke, OutsideProvider>;
 /// of its server, and presents `identity`.
 pub(super) fn outside_client(server: &Certificate, identity: Option<SigningIdentity>) -> OutsideClient {
 	let pinned = DirectTrustValidator::default().with_trust_chain([server.to_owned()]);
+	let pinned = pinned.expect("an outside certificate encodes");
 	let mut settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
 	settings.identity = identity;
 	let client = ClientConfig::<Hpke, OutsideProvider>::new(settings, KeyPurposes::HOUSE);
@@ -74,7 +75,7 @@ async fn an_outside_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::err
 	let server_session = server.complete()?;
 
 	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
-	let opened = server_session.keys().recv().open(&mut record)?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -99,7 +100,7 @@ async fn the_hpke_flow_agrees_on_the_outside_algorithms() -> Result<(), Box<dyn 
 async fn an_outside_server_admits_an_outside_client_over_hpke() {
 	let client_identity = outside_identity();
 	let expected = client_identity.certificate().to_owned();
-	let mutual = PeerAuthentication::mutual([Arc::new(ExpiryValidator) as _]);
+	let mutual = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
 	let (mut client, mut server) = outside_pair(outside_identity(), Some(client_identity), mutual);
 	run_legs(&mut client, &mut server).await;
 

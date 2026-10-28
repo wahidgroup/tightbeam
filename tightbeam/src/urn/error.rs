@@ -69,4 +69,34 @@ pub enum UrnValidationError {
 	/// [`UrnBuilder`]: crate::urn::UrnBuilder
 	#[error("The builder holds both a direct NSS and a spec")]
 	ConflictingNssModes,
+
+	/// The NSS is not the one the spec builds from the components it reads
+	/// from it, so the spec writes the URN another way.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::urn::{Urn, UrnComponents, UrnValidationError};
+	///
+	/// tightbeam::urn_spec! {
+	///     /// The spec of `urn:example:<kind>`, which writes the kind in lowercase.
+	///     ExampleSpec,
+	///     nid: "example",
+	///     nss_structure {
+	///         kind: { values: ["trace", "event"] }
+	///     },
+	///     transform: |components| {
+	///         for (_, value) in components.iter_mut() {
+	///             *value = value.to_lowercase().into();
+	///         }
+	///     }
+	/// }
+	///
+	/// let urn = Urn::from_parts("example", "TRACE")?;
+	///
+	/// assert_eq!(urn.verify::<ExampleSpec>(), Err(UrnValidationError::NssMismatch));
+	/// # Ok::<(), UrnValidationError>(())
+	/// ```
+	#[error("The NSS is not the one the spec builds from its components")]
+	NssMismatch,
 }

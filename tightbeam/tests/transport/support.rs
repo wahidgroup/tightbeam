@@ -16,8 +16,8 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{KeyCurves, KeyPurposes};
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::TestFrame;
@@ -408,7 +408,7 @@ pub async fn connect_pinned_client(
 /// A client builder that trusts `server_certificate` alone.
 fn pinned_client(server_certificate: &Certificate) -> Result<ClientBuilder<TokioListener>, TightBeamError> {
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::from(Secp256k1Policy::default())
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
 			.with_certificate(server_certificate.to_owned())?
 			.build(),
 	);

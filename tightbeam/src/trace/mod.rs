@@ -1,7 +1,6 @@
 //! The subsystem that collects traces and, under `logging`, writes log records.
 
 mod assertion;
-mod builder;
 mod collector;
 
 #[cfg(feature = "colony")]
@@ -10,7 +9,6 @@ mod handle;
 mod logging;
 
 pub use assertion::{AssertionValue, IsNone, IsSome, Presence, RatioLimit};
-pub use builder::TraceConfigBuilder;
 pub use collector::{EventBuilder, EventValue, IntoEventLabel, TraceCollector, TraceConfig};
 
 #[cfg(any(all(feature = "instrument", feature = "transport"), feature = "testing-fdr"))]

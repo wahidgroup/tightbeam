@@ -1,7 +1,7 @@
 //! The transcript hash of a handshake protocol.
 //!
-//! The module hashes the message sequence of a handshake, which protects the
-//! integrity of its transcript.
+//! The hash covers the message sequence of a handshake, so it protects the
+//! integrity of the transcript.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -20,9 +20,11 @@ use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::asn1::DigestInfo;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::hash::DigestWriter;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::{Any, OctetString, SetOfVec};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::der::{Encode, Writer};
+use crate::der::Encode;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -92,19 +94,6 @@ impl DigestOutput {
 	)]
 	pub(crate) fn as_bytes(&self) -> &[u8] {
 		&self.bytes[..self.len]
-	}
-}
-
-/// A DER writer that feeds digest `D`, so a value hashes as its encoding
-/// with no buffer between the two.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-struct DigestWriter<D>(D);
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<D: Digest> Writer for DigestWriter<D> {
-	fn write(&mut self, slice: &[u8]) -> crate::der::Result<()> {
-		self.0.update(slice);
-		Ok(())
 	}
 }
 
@@ -201,8 +190,8 @@ impl AsRef<[u8]> for TranscriptHash {
 
 /// Compute a transcript hash over a sequence of messages.
 ///
-/// The function hashes `messages` in chronological order with the digest
-/// algorithm of the provider and returns the whole digest output.
+/// It hashes `messages` in chronological order under the provider's digest
+/// and returns the whole digest output.
 ///
 /// # Errors
 ///

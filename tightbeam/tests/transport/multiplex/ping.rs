@@ -48,12 +48,15 @@ tb_scenario! {
 				};
 
 				let handler = |frame: Arc<Frame>| core::future::ready(echo_response(&frame));
-				let _serve = tokio::spawn(responder.serve(handler));
-
+				let serving = tokio::spawn(responder.serve(handler));
 				let acked = server.handle.ping().await.is_ok();
-				ping.server_ping_acked.store(acked, Ordering::SeqCst);
 
+				ping.server_ping_acked.store(acked, Ordering::SeqCst);
 				ping.server_ping_done.raise();
+
+				// The endpoint holds the drivers of the connection, so the task
+				// holds the endpoint until the serve ends with the connection.
+				let _served = serving.await;
 			});
 			Ok((task, addr))
 		},
@@ -62,6 +65,7 @@ tb_scenario! {
 			assert!(client.handle().ping().await.is_ok(), "the client ping must resolve with the server's ack");
 
 			ping.server_ping_done.wait("the server ping must finish").await?;
+
 			assert!(
 				ping.server_ping_acked.load(Ordering::SeqCst),
 				"the server ping must resolve with the client reader's ack"

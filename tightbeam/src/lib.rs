@@ -164,7 +164,7 @@ pub mod random;
 pub mod router;
 #[cfg(feature = "std")]
 pub mod runtime;
-#[cfg(feature = "standards")]
+#[cfg(any(feature = "standards", feature = "logging"))]
 pub mod standards;
 #[cfg(feature = "std")]
 pub mod trace;

@@ -12,10 +12,11 @@ use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::crypto::x509::{CanonicalKey, Certificate, CertificateSpec};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::{CanonicalKey, Certificate, CertificateSpec, KeyCurves};
 use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::urn::Urn;
 
 /// The gateway identity bundle that the colony fuzz topology uses.
@@ -36,8 +37,8 @@ pub(crate) struct GatewayCerts {
 
 impl GatewayCerts {
 	/// Build a bundle from a certificate and its key, and read the canonical
-	/// key once. For a certificate whose key the encoder refuses, the bundle
-	/// holds `None`, which the shadow treats as an unmatched identity.
+	/// key once. A certificate whose key the encoder refuses gets `None`,
+	/// which the shadow treats as an unmatched identity.
 	pub fn new(cert: Arc<Certificate>, key: Secp256k1SigningKey, trust: Arc<dyn CertificateTrust>) -> Self {
 		let canonical = CanonicalKey::of(&cert.tbs_certificate.subject_public_key_info).ok();
 		Self { cert, key, trust, canonical }
@@ -95,7 +96,7 @@ pub(crate) fn colony_identity(
 }
 
 fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
-	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy::default());
+	let mut builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())
@@ -121,7 +122,8 @@ pub(crate) fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
 pub(crate) fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConfig {
 	let certificate = CertificateSpec::Built(Box::new(certs.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
-	let hive_tls = Arc::new(HiveTlsConfig::new(certificate, key, vec![]).expect("hive TLS material must decode"));
+	let hive_tls = HiveTlsConfig::new(certificate, key, PeerAuthentication::Anonymous);
+	let hive_tls = Arc::new(hive_tls.expect("hive TLS material must decode"));
 	let offer = Arc::new(TransportOffer::mux(8));
 	let mut conf = HiveConfig {
 		hive_tls: Some(hive_tls),

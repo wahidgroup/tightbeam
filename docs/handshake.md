@@ -181,7 +181,11 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 - A mutual client presents its issuers the same way, in the `certificates` of its client Finished. Each client validator of the server reads them through `CertificateValidation::evaluate_presented`: the house store validates the path to one of its anchors, so a server's store can hold trust anchors alone too, and the default implementation reads the client certificate alone.
 - Each certificate a store holds anchors every path below it, so a presented intermediate is input the store never vetted. A path certificate that states `nameConstraints`, critical or not, is refused with `NameConstraintsUnapplied`, because the store's path validation does not apply name constraints (RFC 5280 § 6.1.4 (g)).
 - An HPKE client admits the signing certificate through its `LearnedTrust`. `LearnedTrust::anchored` validates the presented path through `CertificateTrust::verify_presented`, as the CMS client does, and a transport client anchors on its trust store in this form. `LearnedTrust::new` runs a validator on the signing certificate alone, such as a pin, so a store in that form must hold every intermediate between the signing certificate and its anchor.
-- Each side builds the path its peer presents once: a client in `CmsSigner::signer_path` and a server in `CmsSigner::take_signer_path`, from the certificate the `sid` names, then each issuer by name. Each refuses a set of more than `MAX_PRESENTED_PATH` (8) certificates before it walks a path or checks a signature, and the server refuses it before the decode of the client Finished sorts the set. The walk refuses two certificates of one issuer name (`AmbiguousIssuer`) and a path that returns to a certificate it holds (`PathCycle`). Both sides also refuse a `SignedData` that carries a second `certificates` field, and a certificate that arrives in another encoding than its DER: the client as it reads the reply, and the server as it decodes the Finished. A handshake caller sees either refusal as `HandshakeError::DerError`.
+- Each side builds the path its peer presents once, from the certificate the `sid` names, then each issuer by name. A client builds it in `WireDer<SignedData>::signer_path`, and a server in `Signed<SignedData>::take_signer_path`:
+  - Each refuses a set of more than `MAX_PRESENTED_PATH` (8) certificates before it walks a path or checks a signature. The server refuses it before the decode of the client Finished sorts the set.
+  - The walk refuses two certificates of one issuer name (`AmbiguousIssuer`) and a path that returns to a certificate it holds (`PathCycle`).
+  - Both sides refuse a `SignedData` that is not the DER of the value it decodes to, such as one with a second `certificates` field or a certificate in another encoding than its DER. The client refuses it as it decodes the reply, and the server as it decodes the Finished.
+  - The server's caller sees the refusal as `HandshakeError::DerError`, and the client's as the `DerError` of the transport that decoded the reply.
 - Of the held certificates of one name, the walk takes the first in the order of RFC 4158 § 3.5.12, and the signature check decides:
   1. A `subjectKeyIdentifier` equal to the `authorityKeyIdentifier` of the certificate below.
   2. No `subjectKeyIdentifier`, or no `authorityKeyIdentifier` to compare it with.
@@ -226,8 +230,8 @@ Every other key reads as its bits: an encoding that the decoder of its curve ref
 A reader holds its decoders in a `KeyCurves`, and the first decoder of a curve decides:
 
 - A decoder only refuses, so a valid point reads alike under every set and every reader agrees on it.
-- `KeyCurves::HOUSE`, the default of each reader, holds the decoder of secp256k1 in a build with the `secp256k1` feature, which the `transport` feature enables. A session reads its peer's key under it.
-- `PublicKeyPinning::with_curves`, `CertificateTrustBuilder::new`, `PeerListGate::new`, and `KeyIndex::new` take another set.
+- `KeyCurves::HOUSE` holds the decoder of secp256k1 in a build with the `secp256k1` feature, which the `transport` feature enables. It is the default of `PublicKeyPinning`, `PeerListGate`, and `KeyIndex`. A session reads its peer's key under it.
+- `PublicKeyPinning::with_curves`, `PeerListGate::new`, and `KeyIndex::new` take another set, and `CertificateTrustBuilder::new` takes the set of each store.
 - An outside crate brings its curve as a `CurvePoints` implementation or a `Sec1Curve<C>`.
 
 The handshake and its identities read each elliptic-curve key as a point:
@@ -261,10 +265,10 @@ An endpoint must be able to authenticate its peer before it dials, or it must na
 
 A frame leaves through one of two writers, and each reads the session phase:
 
-| Writer            | Rule                                                                                                                                                       |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apply_wire_mode` | `Encrypted` sends under the session key, `Cleartext` sends in clear, and a pending handshake fails with `EncryptorUnavailable`                             |
-| `TransportWriter` | Takes its mode at `into_split`. An encrypted half owns the send key, a cleartext half needs a `Cleartext` phase, and a pending handshake refuses the split |
+| Writer            | Rule                                                                                                                                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apply_wire_mode` | `Encrypted` sends under the session key, `Cleartext` sends in clear, a pending handshake fails with `EncryptorUnavailable`, and `Failed` fails with `ConnectionFailed` |
+| `TransportWriter` | Takes its mode at `into_split`. An encrypted half owns the send key, a cleartext half needs a `Cleartext` phase, and a pending handshake or `Failed` refuses the split |
 
 ### Admit a client
 
@@ -538,7 +542,7 @@ The sender hashes the bytes it encoded, and the receiver hashes the bytes it rec
 | A container                             | `WireDer::der`                                                                                                       |
 | A CMS accept or ephemeral attribute     | `HandshakeAttribute::received_bytes`                                                                                 |
 | The HPKE reply content                  | The reply's `eContent` octets, as they arrived                                                                       |
-| The `certificates` field of either flow | `CmsSigner::signer_path`: the bytes of the field as they arrived, which hold the signing certificate and its issuers |
+| The `certificates` field of either flow | `WireDer<SignedData>::signer_path`: the bytes of the field as they arrived, which hold the signing certificate and its issuers |
 
 Both flows bind the whole `certificates` field, as RFC 9846 § 4.5.2 signs over the Certificate message, which carries the chain:
 
@@ -654,6 +658,7 @@ pub enum SessionPhase {
     Provisioned,
     Handshaking { initiated_at: MonotonicInstant },
     Encrypted(Box<EstablishedSession>),
+    Failed,
 }
 ```
 
@@ -668,11 +673,20 @@ stateDiagram-v2
     Handshaking --> Provisioned: reset()
     Provisioned --> Provisioned: reset()
     Cleartext --> Cleartext: reset()
+    Cleartext --> Failed: settle_exchange(Err) where proves_unsent does not name the error
+    Provisioned --> Failed: settle_exchange(Err) where proves_unsent does not name the error
+    Handshaking --> Failed: settle_exchange(Err) where proves_unsent does not name the error
+    Encrypted --> Failed: settle_exchange(Err) where proves_unsent does not name the error
+    Failed --> [*]: the pool discards, apply_wire_mode and admit_arrival refuse
 ```
 
 - The session lives inside the phase, so a half-installed session cannot exist, and leaving the phase drops every term together.
 - `SessionState::apply` is the one writer of the phase, and `SessionPhase::admits` decides each move. A move the diagram does not name leaves the phase unchanged, and an out-of-order install fails with `TransportError::InvalidState`.
 - A further handshake round keeps the first round's `initiated_at`, so a slow peer cannot extend the deadline by one allowance per round.
+- `settle_exchange` settles each exchange of an emit under one rule: every phase but `Failed` moves to `Failed` on each error that `proves_unsent` does not name, a handshake error included.
+  - The stream position is then unknown, so `Failed` admits no event, a reset included.
+  - Every later write and arrival fails with `ConnectionFailed`.
+- `begin_exchange` marks the exchange in flight before its first write, and `settle_exchange` clears the mark. A pool leases a connection only in a writable phase with no exchange in flight, so a connection whose emit a caller dropped leaves the pool.
 
 ### Completion
 
@@ -685,7 +699,9 @@ stateDiagram-v2
 
 ### Reset and disconnect
 
-`SessionState::reset` returns a session to its start, and drops the keys, the receipt, the peer certificate, the mux terms, and the epoch materials together. The colony gates and the cluster export rules authorize by the peer certificate, so a torn-down session leaves no identity readable.
+`SessionState::reset` returns a session to its start from every phase but `Failed`, and drops the keys, the receipt, the peer certificate, the mux terms, and the epoch materials together.
+
+The colony gates and the cluster export rules authorize by the peer certificate, so a torn-down session leaves no identity readable.
 
 ```mermaid
 flowchart TD

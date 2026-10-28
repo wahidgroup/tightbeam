@@ -21,7 +21,8 @@ use tightbeam::crypto::profiles::{
 	KeyWrapProvider, SigningProvider,
 };
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::KeyCurves;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::transport::handshake::negotiation::NegotiationError;
@@ -97,7 +98,8 @@ pub(super) async fn client_under<P: HandshakeProvider>(
 	addr: SocketAddr,
 	server: &SigningIdentity,
 ) -> TcpTransport<TokioStream, P> {
-	let builder = CertificateTrustBuilder::from(ProviderPolicy::<OutsideProvider>::default());
+	let policy = ProviderPolicy::<OutsideProvider>::default();
+	let builder = CertificateTrustBuilder::new(policy, KeyCurves::HOUSE, NoRevocation);
 	let anchored = builder.with_certificate(server.certificate().to_owned());
 	let store = anchored.expect("the server certificate anchors");
 	let store: Arc<dyn CertificateTrust> = Arc::new(store.build());
@@ -158,9 +160,8 @@ async fn a_server_of_the_default_floor_refuses_a_profile_below_it() -> Result<()
 	Ok(())
 }
 
-/// A client of the house provider refuses an outside server: the server signs
-/// its reply under the outside signature, over a transcript under the outside
-/// digest, so the house client's check of the reply signature fails.
+/// A house client refuses an outside server. The server signs its reply under
+/// the outside signature and digest, so the house check of the signature fails.
 #[tokio::test]
 async fn a_house_client_refuses_an_outside_server() -> Result<(), Box<dyn Error>> {
 	let server = outside_identity();

@@ -1,6 +1,6 @@
 //! The in-band rekey exchange of a multiplexed session.
 //!
-//! This module builds and verifies the messages of the three-leg renewal:
+//! It builds and verifies the messages of the three-leg renewal:
 //! - `RekeyRequest`
 //! - `RekeyResponse`
 //! - `RekeyAck`
@@ -26,14 +26,16 @@
 //! epoch secret takes the previous one and the agreement between them:
 //!
 //! ```text
-//! epoch_next = HKDF(u32be(32) || epoch || u32be(32) || ee, salt = client_random || server_random)
+//! epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt = client_random || server_random)
 //! ```
 //!
-//! A holder of one epoch secret who records the renewal therefore still needs
-//! a rekey scalar to derive the next epoch. Each side refuses a peer ephemeral
-//! that is off the curve, or that equals a static key of the peer or its
-//! negation: the client's one key, or either key of a CMS server, as the
-//! handshake refuses it.
+//! `Ndh` is the width of `ee`, the field width of the session's curve.
+//!
+//! So a holder of one epoch secret who records the renewal still needs a rekey
+//! scalar to derive the next epoch. Each side refuses a peer ephemeral that is
+//! off the curve, or that equals a static key of the peer or its negation: the
+//! client's one key, or either key of a CMS server, as the handshake refuses
+//! it.
 //!
 //! # Bindings
 //!
@@ -58,7 +60,7 @@ use std::sync::Arc;
 use futures::lock::Mutex as FuturesMutex;
 
 use crate::cms::signed_data::SignedData;
-use crate::crypto::aead::{DirectionalCiphers, RecvCipher, RuntimeAead, SendCipher, SessionKeys};
+use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
@@ -68,10 +70,10 @@ use crate::der::Encode;
 use crate::random::{generate_nonce, OsRng};
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
-use crate::transport::handshake::primitives::{RandomsSalt, TranscriptHash};
+use crate::transport::handshake::primitives::RandomsSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
-	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
+	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, StoredReceipt,
 };
 use crate::transport::handshake::{
 	AgreementCertificate, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError, HandshakeOctets,
@@ -174,32 +176,7 @@ where
 
 	/// The current epoch number.
 	pub(crate) fn epoch(&self) -> u32 {
-		self.epoch.epoch
-	}
-
-	/// Install `next_secret` as the current epoch, with `next_hash` as its
-	/// chain root, and derive its directional ciphers under `salt`, the salt
-	/// that derived it.
-	///
-	/// - The traffic keys come from `next_secret` under the directional labels
-	///   that the handshake finalization uses, and both ciphers take the next
-	///   epoch.
-	/// - The assignment of the next secret drops the prior one, which zeroizes on drop (RFC 9846 § 7.2).
-	/// - Each half maps the ciphers to its own role.
-	fn rotate(
-		&mut self,
-		next_secret: EpochSecret,
-		salt: &RandomsSalt,
-		next_hash: TranscriptHash,
-	) -> Result<DirectionalCiphers<RuntimeAead>, HandshakeError> {
-		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
-		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt(), next_epoch)?;
-
-		self.epoch.secret = next_secret;
-		self.epoch.epoch = next_epoch;
-		self.epoch.transcript_hash = next_hash;
-
-		Ok(directional)
+		self.epoch.epoch()
 	}
 }
 
@@ -303,10 +280,9 @@ where
 		let epoch_receipt = epoch_receipt.ok_or(HandshakeError::ReceiptMissing)?;
 		let artifact = *epoch_receipt;
 
-		// The client parses the leg before the pin hashes it, and the parse
-		// refuses a leg that equals a static key of the server or its negation.
-		// The receipt the server signed pins the leg, so the signature and pin
-		// checks below authenticate the point before the agreement runs.
+		// The parse refuses a leg that is a static key of the server or its
+		// negation. The signed receipt pins the leg, so the checks below
+		// authenticate the point before the agreement runs.
 		let keys = self.materials.peer.server_keys();
 		let server_ephemeral = keys.server_ephemeral(&server_point)?;
 
@@ -326,29 +302,26 @@ where
 		// awaits the approver, so the scalar is gone before the first await of
 		// this step.
 		let salt = RandomsSalt::new(&client_random, &server_random);
-		let next_secret = epoch.secret.next::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt())?;
+		let next_secret = epoch.next_secret::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt()?)?;
 
 		let answer = receipt.approve(self.approver.as_deref()).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
 		let identity = &self.materials.identity;
 		let countersignature = receipt.countersign(answer_bytes, identity).await?;
 
-		// The countersignature has two owners by design. One copy folds into
-		// the retained artifact, and the ack encodes the other in DER. The
-		// artifact carries its own copy of the client's certificate, because a
-		// `CertificateSet` owns each certificate it holds.
+		// The countersignature has two owners: the retained artifact and the
+		// ack DER. The artifact holds its own copy of the client's certificate,
+		// because a `CertificateSet` owns each certificate it holds.
 		let signer = countersignature.signer().clone();
 		let completed = artifact.with_certified_signer(countersignature)?;
 		let stored = StoredReceipt::try_from(completed)?;
 
 		let ack = MuxRekeyAckPackage::new(Some(signer));
 		let ack_der = ack.to_der()?;
-		let next_hash = self
-			.materials
-			.epoch
-			.advanced::<P::Digest>(&request_der, &response_der, &ack_der)?;
+		let epoch = &mut self.materials.epoch;
+		let next_hash = epoch.advanced::<P::Digest>(&request_der, &response_der, &ack_der)?;
 
-		let rotated = self.materials.rotate(next_secret, &salt, next_hash)?;
+		let rotated = epoch.install::<P>(next_secret, salt.as_kdf_salt()?, next_hash)?;
 		let (send_cipher, recv_cipher) = SessionKeys::for_client(rotated).into_parts();
 
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
@@ -453,7 +426,7 @@ where
 		let salt = RandomsSalt::new(&client_random, &server_random);
 		let ephemeral = Box::new(EphemeralSecret::<P::Curve>::random(&mut OsRng));
 		let mut response = MuxRekeyResponsePackage::new(server_random, &ephemeral.public_key(), None)?;
-		let next_secret = epoch.secret.next::<P>(ephemeral, &client_ephemeral, salt.as_kdf_salt())?;
+		let next_secret = epoch.next_secret::<P>(ephemeral, &client_ephemeral, salt.as_kdf_salt()?)?;
 
 		// The pin covers the leg as the response carries it, read back with
 		// the reader the client runs.
@@ -536,13 +509,6 @@ where
 			None => pending.artifact,
 		};
 
-		// The refusal path still needs the dual-signed view after the
-		// outcome consumes the artifact (dual ownership by design).
-		let refused_artifact = match verdict {
-			SessionVerdict::SettlementRejected { .. } => Some(artifact.clone()),
-			_ => None,
-		};
-
 		let countersignature_octet = countersignature_der.map(OctetString::new).transpose()?;
 		let client_certificate = Some(Arc::clone(self.materials.peer.signing.certificate()));
 		let outcome = SessionOutcome {
@@ -554,19 +520,13 @@ where
 			verdict,
 		};
 
-		let recorded = outcome.record(self.observer.as_deref()).await;
-		let (stored, rejection) = match (recorded, refused_artifact) {
-			(Ok(stored), _) => (stored, None),
-			(Err(HandshakeError::SettlementRejected { code }), Some(refused)) => {
-				(StoredReceipt::try_from(refused)?, Some(code))
-			}
-			(Err(err), _) => return Err(err),
-		};
+		let settled = outcome.record(self.observer.as_deref()).await?;
+		let (stored, rejection) = settled.installable();
 
-		let epoch = &self.materials.epoch;
+		let epoch = &mut self.materials.epoch;
 		let next_hash = epoch.advanced::<P::Digest>(&pending.request_der, &pending.response_der, &ack_der)?;
 		let salt = RandomsSalt::new(&pending.client_random, &pending.server_random);
-		let rotated = self.materials.rotate(pending.next_secret, &salt, next_hash)?;
+		let rotated = epoch.install::<P>(pending.next_secret, salt.as_kdf_salt()?, next_hash)?;
 		let (send_cipher, recv_cipher) = SessionKeys::for_server(rotated).into_parts();
 
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
@@ -712,8 +672,6 @@ impl RekeyDriver {
 
 	/// Answer `request` through the server's half, the server's step, with
 	/// the epoch receipt as the second leg.
-	///
-	/// It returns `None` for the client's half.
 	pub(crate) async fn process_request(
 		&mut self,
 		request: &MuxRekeyRequestPackage,
@@ -730,8 +688,8 @@ impl RekeyDriver {
 	/// Verify, countersign, and rotate on the server's `response`, the
 	/// client's step.
 	///
-	/// The receiver is exclusive so that the future is `Send`: the server's
-	/// half is `Send` alone, and a shared borrow across an await needs `Sync`.
+	/// The receiver is exclusive for a `Send` future: the server's half is
+	/// `Send` alone, and a shared borrow across an await needs `Sync`.
 	pub(crate) async fn process_response(
 		&mut self,
 		response: MuxRekeyResponsePackage,
@@ -878,8 +836,10 @@ pub(crate) mod tests {
 	use super::*;
 	use crate::asn1::{AlgorithmIdentifier, AuthEnvelopedData, DigestInfo};
 	use crate::cms::enveloped_data::RecipientInfo;
+	use crate::crypto::aead::DirectionalCiphers;
 	use crate::crypto::cms::EnvelopeError;
 	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::kdf::KdfSalt;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -890,8 +850,11 @@ pub(crate) mod tests {
 	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
 	use crate::testing::{TestCertificate, TestIdentity, TestKey};
-	use crate::transport::handshake::negotiation::MuxBudgets;
-	use crate::transport::handshake::primitives::KdfSalt;
+	use crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
+	use crate::transport::handshake::negotiation::{
+		AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportOffer,
+	};
+	use crate::transport::handshake::primitives::TranscriptHash;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
 	use crate::transport::handshake::{CompressedPoint, EstablishedSession};
 	use crate::x509::Certificate;
@@ -984,7 +947,8 @@ pub(crate) mod tests {
 	/// The cipher a server would receive on under `secret` and `salt`, the
 	/// secret of epoch 1.
 	fn server_recv(secret: &EpochSecret, salt: &RandomsSalt) -> RecvCipher {
-		let directional = DirectionalCiphers::derive::<Provider, _>(secret, salt.as_kdf_salt(), 1);
+		let kdf_salt = salt.as_kdf_salt().expect("the sample randoms meet the salt floor");
+		let directional = DirectionalCiphers::derive::<Provider, _>(secret, kdf_salt, 1);
 		let directional = directional.expect("an epoch secret derives its directional ciphers");
 		let (_send, recv) = SessionKeys::for_server(directional).into_parts();
 		recv
@@ -994,20 +958,12 @@ pub(crate) mod tests {
 	/// sample chain root.
 	fn sample_epoch_from(fill: u8) -> Result<EpochMaterials, HandshakeError> {
 		let secret = fixture_handshake_secret(fill);
-		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&SAMPLE_SALT), sample_chain_root())
+		let salt = KdfSalt::try_from(SAMPLE_SALT.as_slice())?;
+		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, salt, sample_chain_root())
 	}
 
 	fn sample_epoch() -> Result<EpochMaterials, HandshakeError> {
 		sample_epoch_from(SAMPLE_BASE)
-	}
-
-	/// Rekey materials over `epoch` for a fresh identity and a fresh peer.
-	fn materials_with(epoch: EpochMaterials) -> Result<RekeyMaterials<DefaultCryptoProvider>, HandshakeError> {
-		let identity = test_identity()?;
-		let peer = test_identity()?;
-		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
-		let peer = RekeyPeer::admit(&peer.peer()?, KeyPurposes::HOUSE.server)?;
-		Ok(RekeyMaterials::new(epoch, reference, identity.signing, peer))
 	}
 
 	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
@@ -1142,7 +1098,7 @@ pub(crate) mod tests {
 	#[tokio::test]
 	async fn exchange_rotates_both_endpoints() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
-		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
+		let (mut client_install, mut server_install) = run_exchange(&mut client, &mut server).await?;
 		assert_eq!(client_install.epoch, 1);
 		assert_eq!(server_install.epoch, 1);
 		assert_eq!(client.epoch(), 1);
@@ -1167,20 +1123,20 @@ pub(crate) mod tests {
 	/// secret as well as on the agreement.
 	#[test]
 	fn the_next_epoch_depends_on_the_previous_epoch_secret() -> Result<(), Box<dyn std::error::Error>> {
-		let mut first = materials_with(sample_epoch_from(SAMPLE_BASE)?)?;
-		let mut second = materials_with(sample_epoch_from(SAMPLE_BASE + 1)?)?;
+		let mut first = sample_epoch_from(SAMPLE_BASE)?;
+		let mut second = sample_epoch_from(SAMPLE_BASE + 1)?;
 		let (client_scalar, server_scalar) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
 		let client_point = peer_static().server_ephemeral(&point_of(&client_scalar.public_key()))?;
 		let server_point = peer_static().server_ephemeral(&point_of(&server_scalar.public_key()))?;
 		let salt = sample_salt();
-		let kdf_salt = salt.as_kdf_salt();
-		let first_next = first.epoch.secret.next::<Provider>(client_scalar, &server_point, kdf_salt)?;
-		let second_next = second.epoch.secret.next::<Provider>(server_scalar, &client_point, kdf_salt)?;
+		let kdf_salt = salt.as_kdf_salt()?;
+		let first_next = first.next_secret::<Provider>(client_scalar, &server_point, kdf_salt)?;
+		let second_next = second.next_secret::<Provider>(server_scalar, &client_point, kdf_salt)?;
 
-		let first_rotated = first.rotate(first_next, &salt, sample_chain_root())?;
-		let second_rotated = second.rotate(second_next, &salt, sample_chain_root())?;
+		let first_rotated = first.install::<Provider>(first_next, kdf_salt, sample_chain_root())?;
+		let second_rotated = second.install::<Provider>(second_next, kdf_salt, sample_chain_root())?;
 		let (first_send, _first_recv) = SessionKeys::for_client(first_rotated).into_parts();
-		let (_second_send, second_recv) = SessionKeys::for_server(second_rotated).into_parts();
+		let (_second_send, mut second_recv) = SessionKeys::for_server(second_rotated).into_parts();
 
 		let mut record = first_send.encrypt_next(PLAINTEXT)?.to_der()?;
 		assert!(second_recv.open(&mut record).is_err());
@@ -1193,17 +1149,16 @@ pub(crate) mod tests {
 	/// decides.
 	#[test]
 	fn rotation_leaves_the_previous_epoch_keys_behind() -> Result<(), Box<dyn std::error::Error>> {
-		let epoch = sample_epoch()?;
+		let mut epoch = sample_epoch()?;
 		let salt = sample_salt();
-		let rotated_epoch = epoch.epoch + 1;
-		let previous = DirectionalCiphers::derive::<Provider, _>(&epoch.secret, salt.as_kdf_salt(), rotated_epoch)?;
+		let rotated_epoch = epoch.epoch() + 1;
+		let previous = DirectionalCiphers::derive::<Provider, _>(epoch.secret(), salt.as_kdf_salt()?, rotated_epoch)?;
 		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
-		let mut materials = materials_with(epoch)?;
-		let rotated = materials.rotate(next, &salt, sample_chain_root())?;
-		let (_send, recv) = SessionKeys::for_server(rotated).into_parts();
+		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
+		let (_send, mut recv) = SessionKeys::for_server(rotated).into_parts();
 
 		let mut record = previous_send.encrypt_next(PLAINTEXT)?.to_der()?;
 		let refused = recv.open(&mut record);
@@ -1216,16 +1171,15 @@ pub(crate) mod tests {
 	/// next secret derives.
 	#[test]
 	fn rotation_carries_the_next_epoch() -> Result<(), Box<dyn std::error::Error>> {
-		let epoch = sample_epoch()?;
+		let mut epoch = sample_epoch()?;
 		let salt = sample_salt();
-		let next_epoch = epoch.epoch + 1;
+		let next_epoch = epoch.epoch() + 1;
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
-		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt(), next_epoch)?;
-		let (_peer_send, peer_recv) = SessionKeys::for_server(expected).into_parts();
-		let mut materials = materials_with(epoch)?;
-		let rotated = materials.rotate(next, &salt, sample_chain_root())?;
+		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt()?, next_epoch)?;
+		let (_peer_send, mut peer_recv) = SessionKeys::for_server(expected).into_parts();
+		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
 		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
 
 		let mut record = send.encrypt_next(PLAINTEXT)?.to_der()?;
@@ -1250,16 +1204,15 @@ pub(crate) mod tests {
 	/// octet `00`, and the next epoch in four octets.
 	#[test]
 	fn a_rotated_record_names_the_next_epoch() -> Result<(), Box<dyn std::error::Error>> {
-		let epoch = sample_epoch()?;
+		let mut epoch = sample_epoch()?;
 		let salt = sample_salt();
-		let next_epoch = epoch.epoch + 1;
+		let next_epoch = epoch.epoch() + 1;
 		let expected = [b"tb/session/record/kekid/v1".as_slice(), &[0x00], &next_epoch.to_be_bytes()].concat();
 		let peer = peer_static().server_ephemeral(&stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.secret.next::<Provider>(scalar, &peer, salt.as_kdf_salt())?;
-		let mut materials = materials_with(epoch)?;
+		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
 
-		let rotated = materials.rotate(next, &salt, sample_chain_root())?;
+		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
 		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
 		let record = send.encrypt_next(PLAINTEXT)?;
 		assert_eq!(key_identifier_of(&record), expected);
@@ -1271,7 +1224,7 @@ pub(crate) mod tests {
 		let (mut client, mut server) = rekey_pair()?;
 		run_exchange(&mut client, &mut server).await?;
 
-		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
+		let (client_install, mut server_install) = run_exchange(&mut client, &mut server).await?;
 		assert_eq!(client_install.epoch, 2);
 		assert_eq!(server_install.epoch, 2);
 
@@ -1401,6 +1354,51 @@ pub(crate) mod tests {
 		Ok(())
 	}
 
+	/// The code [`RefusingSettlement`] refuses each settlement with.
+	const SETTLEMENT_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 1;
+
+	/// An authorizer that refuses every grant and every settlement with
+	/// [`SETTLEMENT_REFUSAL_CODE`]. A renewal asks it to settle alone.
+	struct RefusingSettlement;
+
+	impl TransportAuthorizer for RefusingSettlement {
+		fn authorize<'a>(
+			&'a self,
+			_offer: &'a TransportOffer,
+		) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+			Box::pin(async move { Err(AuthorizationRefusal { code: SETTLEMENT_REFUSAL_CODE }) })
+		}
+
+		fn settle<'a>(
+			&'a self,
+			_receipt: &'a SessionReceipt,
+			_response: Option<&'a [u8]>,
+			_client: &'a Certificate,
+		) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
+			Box::pin(async move { Err(AuthorizationRefusal { code: SETTLEMENT_REFUSAL_CODE }) })
+		}
+	}
+
+	/// A verified countersignature rotates the chain under a refused
+	/// settlement, so the server installs the dual-signed receipt the client
+	/// holds, beside the code of the refusal.
+	#[tokio::test]
+	async fn a_refused_settlement_rotates_with_the_dual_signed_receipt_and_its_code(
+	) -> Result<(), Box<dyn std::error::Error>> {
+		let (mut client, mut server) = rekey_pair()?;
+
+		server.authorizer = Some(Arc::new(RefusingSettlement));
+
+		let request = client.start_renewal()?;
+		let response = issued(&mut server, &request).await?;
+		let (ack, client_install) = client.process_response(response).await?;
+
+		let outcome = server.process_ack(ack).await?;
+		let installed = (outcome.install.receipt, outcome.rejection);
+		assert_eq!(installed, (client_install.receipt, Some(SETTLEMENT_REFUSAL_CODE)));
+		Ok(())
+	}
+
 	/// An observer who holds the current epoch secret and the whole renewal
 	/// as the endpoints sent it, and no rekey scalar, derives no key of the
 	/// next epoch.
@@ -1420,7 +1418,7 @@ pub(crate) mod tests {
 		let salt = RandomsSalt::new(&client_random, &server_random);
 
 		let (ack, client_install) = client.process_response(response).await?;
-		let server_install = server.process_ack(ack).await?.install;
+		let mut server_install = server.process_ack(ack).await?.install;
 		let record = client_install.send_cipher.encrypt_next(PLAINTEXT)?.to_der()?;
 
 		// Positive control: the server held a rekey scalar and opens the frame.
@@ -1432,8 +1430,8 @@ pub(crate) mod tests {
 		// draws a scalar of its own for each attempt.
 		let observed = sample_epoch()?;
 		let (first, second) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
-		let against_client = observed.secret.next::<Provider>(first, &wire_client, salt.as_kdf_salt())?;
-		let against_server = observed.secret.next::<Provider>(second, &wire_server, salt.as_kdf_salt())?;
+		let against_client = observed.next_secret::<Provider>(first, &wire_client, salt.as_kdf_salt()?)?;
+		let against_server = observed.next_secret::<Provider>(second, &wire_server, salt.as_kdf_salt()?)?;
 		assert!(server_recv(&against_client, &salt).open(&mut record.clone()).is_err());
 		assert!(server_recv(&against_server, &salt).open(&mut record.clone()).is_err());
 		Ok(())
