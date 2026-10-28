@@ -99,6 +99,9 @@ pub(crate) struct CmsAlgorithmProtection {
 
 /// The content one `SignerInfo` signs: its type, its octets, and the signed
 /// attributes the caller's profile adds.
+///
+/// A signer takes the content by value, so each attribute moves into the
+/// signed set.
 #[derive(Clone, Debug)]
 pub struct SignedContent<'a> {
 	content_type: ObjectIdentifier,

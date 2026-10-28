@@ -207,7 +207,8 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Starts a [`ServletConfigBuilder`].
+	/// Starts a [`ServletConfigBuilder`] over the unit env `()`, which
+	/// [`ServletConfigBuilder::with_config`] replaces.
 	pub fn builder() -> ServletConfigBuilder<P, M, C, (), NoAcceptState> {
 		ServletConfigBuilder::default()
 	}

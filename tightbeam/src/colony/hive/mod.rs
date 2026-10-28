@@ -1086,7 +1086,8 @@ pub struct HiveScalingConfig {
 	pub default_scale: ServletScaleConfig,
 	/// The per-type scaling overrides, keyed by servlet type URN.
 	pub overrides: HashMap<Urn<'static>, ServletScaleConfig>,
-	/// The minimum wait between scaling evaluation cycles.
+	/// The minimum wait between scaling evaluation cycles. It defaults to 5
+	/// seconds.
 	pub cooldown: Duration,
 }
 
@@ -1111,26 +1112,28 @@ impl Default for HiveScalingConfig {
 /// The settings for manage-path admission, drain, and gateway anti-entropy.
 #[derive(Clone)]
 pub struct HiveControlConfig {
-	/// The utilization threshold that trips manage-path backpressure.
+	/// The utilization threshold that trips manage-path backpressure. It
+	/// defaults to 9000 basis points (90%).
 	pub backpressure_threshold: BasisPoints,
 	/// The longest the two waits of a drain last on the hive clock: the wait
 	/// for in-flight commands, then the wait for the servlets to drain. A
 	/// servlet that still drains past it stops by abort. The slate
-	/// announcement follows the two waits.
+	/// announcement follows the two waits. It defaults to 30 seconds.
 	pub drain_timeout: Duration,
 	/// The anti-entropy interval at which the hive re-announces its full
 	/// servlet slate, freshly signed, to every gateway it registered with.
-	/// [`None`] disables the beat.
+	/// It defaults to 5 seconds, and [`None`] disables the beat.
 	pub reregister_interval: Option<Duration>,
 	/// The count of consecutive authentication failures that opens the
-	/// cluster circuit breaker.
+	/// cluster circuit breaker. It defaults to 3.
 	pub circuit_breaker_threshold: u8,
 	/// The time an open circuit refuses a signer's commands before it admits
-	/// them again.
+	/// them again. It defaults to 30 seconds.
 	pub circuit_breaker_cooldown: Duration,
 	/// The freshness window for signed cluster commands. The hive rejects a
 	/// command whose `Frame.metadata.order` is outside this window, or whose
-	/// signature it already saw inside it ([`ReplayGuard`]).
+	/// signature it already saw inside it ([`ReplayGuard`]). It defaults to
+	/// 30 seconds.
 	pub command_freshness_window: Duration,
 	/// The retry policy for the fan-out of scaling updates to gateways.
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,

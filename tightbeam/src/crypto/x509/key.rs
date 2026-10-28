@@ -553,6 +553,7 @@ pub struct KeyIndex<V> {
 	curves: KeyCurves,
 }
 
+/// An empty index that reads each key under [`KeyCurves::HOUSE`].
 #[cfg(feature = "std")]
 impl<V> Default for KeyIndex<V> {
 	fn default() -> Self {

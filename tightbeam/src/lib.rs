@@ -125,6 +125,30 @@ mod wire;
 #[doc = include_str!("../../README.md")]
 mod readme {}
 
+// Each module below compiles every example of one page under `docs/` as a
+// doctest, in the order of the README sections the pages drill down from.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/frame.md")]
+mod docs_frame {}
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/security.md")]
+mod docs_security {}
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/transport.md")]
+mod docs_transport {}
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/handshake.md")]
+mod docs_handshake {}
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/colony.md")]
+mod docs_colony {}
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/instrumentation.md")]
+mod docs_instrumentation {}
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/testing.md")]
+mod docs_testing {}
+
 // `compose!` is in textual scope for every module declared after this one.
 #[cfg(feature = "builder")]
 #[macro_use]

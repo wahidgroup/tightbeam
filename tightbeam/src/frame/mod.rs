@@ -235,6 +235,11 @@ impl TryFrom<MetadataBuilder> for Metadata {
 /// The signature covers the version, the metadata, the message, and the
 /// frame integrity.
 ///
+/// No frame carries a field its version forbids (§5.6):
+///
+/// - [`FrameBuilder`](crate::builder::FrameBuilder) and the DER decoder refuse one.
+/// - Every method that changes a frame in place refuses one too.
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// Frame ::= SEQUENCE {
@@ -434,6 +439,9 @@ impl Frame {
 	}
 
 	/// The signature over the to-be-signed encoding of this frame (V1+).
+	///
+	/// A signature read from the wire is trusted only after [`Frame::verify`]
+	/// or [`Frame::verify_under`] checks it.
 	pub fn nonrepudiation(&self) -> Option<&Signed<SignerInfo>> {
 		self.nonrepudiation.as_ref()
 	}

@@ -341,19 +341,17 @@ macro_rules! tb_process_spec {
 					}
 				}
 
-				/// A typed event label for fault injection.
+				/// An event of this process, which wraps the URN of the
+				/// event.
 				///
-				/// An event wraps a string literal:
-				/// ```ignore
-				/// use my_process::Event;
-				/// fault_model.with_fault(States::Idle, Event("connect"), ...);
-				/// ```
-				#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-				pub struct Event(pub &'static str);
+				/// A fault keyed by an `Event` matches the label that the
+				/// trace records for the URN.
+				#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+				pub struct Event(pub $crate::urn::Urn<'static>);
 
 				impl $crate::testing::fault::ProcessEvent for Event {
 					fn event_label(&self) -> ::std::borrow::Cow<'static, str> {
-						::std::borrow::Cow::Borrowed(self.0)
+						$crate::testing::fault::ProcessEvent::event_label(&self.0)
 					}
 				}
 			}

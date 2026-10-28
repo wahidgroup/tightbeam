@@ -133,8 +133,8 @@ macro_rules! test_job {
 /// implementation of `Job` for `fn run` or of `AsyncJob` for `async fn run`.
 ///
 /// The parameter of `run` is a tuple pattern with its tuple type, or no
-/// parameter at all. The attributes and docs ahead of `name` go onto the
-/// struct.
+/// parameter at all, which gives the trait the input `()`. The attributes and
+/// docs ahead of `name` go onto the struct.
 #[macro_export]
 macro_rules! job {
 	// A sync job with a tuple-destructured parameter implements `Job`. The arm

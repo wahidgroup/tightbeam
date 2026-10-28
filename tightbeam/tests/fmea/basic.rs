@@ -2,9 +2,10 @@
 
 use tightbeam::error::TightBeamError;
 use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
-use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
+use tightbeam::testing::fmea::{FailureMode, FmeaConfig, SeverityScale};
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{FaultModel, ScenarioConfig, SetupEnv, TestHooks};
+use tightbeam::testing::{FaultModel, HookContext, ScenarioConfig, SetupEnv, TestHooks};
+use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
@@ -79,13 +80,36 @@ fn create_test_config(process: Process, scale: SeverityScale) -> FdrConfig {
 /// The configuration that grades [`FmeaTestSpec`], explores [`SafetyProcess`]
 /// with FMEA on the severity `scale`, and verifies the FMEA report.
 fn fmea_scenario_config(scale: SeverityScale) -> Result<ScenarioConfig, Box<dyn std::error::Error>> {
-	let fdr = create_test_config(SafetyProcess::process()?, scale);
 	let hooks = TestHooks::on_pass(|context| {
 		verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
 	});
 
+	fmea_hooked_config(scale, hooks)
+}
+
+/// The configuration that grades [`FmeaTestSpec`], explores [`SafetyProcess`]
+/// with FMEA on the severity `scale`, and runs `hooks`.
+fn fmea_hooked_config(scale: SeverityScale, hooks: TestHooks) -> Result<ScenarioConfig, Box<dyn std::error::Error>> {
+	let fdr = create_test_config(SafetyProcess::process()?, scale);
 	let builder = ScenarioConfig::builder().with_spec(FmeaTestSpec::latest()).with_fdr(fdr);
 	Ok(builder.with_hooks(hooks).build()?)
+}
+
+/// Records one cycle of [`SafetyProcess`]: a sensor read, a validation, and an
+/// actuation.
+fn run_one_cycle(trace: &TraceCollector) -> Result<(), TightBeamError> {
+	trace.event(SENSOR_READ)?;
+	trace.event(VALIDATE)?;
+	trace.event(ACTUATE)?;
+	Ok(())
+}
+
+/// The effects and the severity of the first failure mode in the FMEA report
+/// of `context`.
+fn first_rating(context: &HookContext) -> Option<(Vec<String>, u8)> {
+	let report = context.verdict().fdr()?.fmea_report.as_ref()?;
+	let FailureMode { effects, severity, .. } = report.failure_modes.first()?;
+	Some((effects.clone(), *severity))
 }
 
 fn verify_fmea_report(verdict_opt: Option<&FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
@@ -101,12 +125,7 @@ tb_scenario! {
 	name: test_fmea_mil_std,
 	config: fmea_scenario_config(SeverityScale::MilStd1629),
 	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			trace.event(SENSOR_READ)?;
-			trace.event(VALIDATE)?;
-			trace.event(ACTUATE)?;
-			Ok(())
-		}
+		exec: |SetupEnv { trace, .. }| run_one_cycle(&trace)
 	}
 }
 
@@ -114,11 +133,20 @@ tb_scenario! {
 	name: test_fmea_iso26262,
 	config: fmea_scenario_config(SeverityScale::Iso26262),
 	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			trace.event(SENSOR_READ)?;
-			trace.event(VALIDATE)?;
-			trace.event(ACTUATE)?;
-			Ok(())
-		}
+		exec: |SetupEnv { trace, .. }| run_one_cycle(&trace)
+	}
+}
+
+// The scenario's subject is the process of its recorded trace, and the faults
+// fire in `SafetyProcess`. From `Idle`, every state stays reachable and so
+// does the terminal `SafeMode`, so each fault rates as a minor one.
+tb_scenario! {
+	name: test_fmea_rates_each_fault_in_the_spec_it_fired_in,
+	config: fmea_hooked_config(SeverityScale::MilStd1629, TestHooks::on_pass(|context| {
+				let rating = (vec![String::from("Can reach terminal state(s): SafeMode")], 3);
+				assert_eq!(first_rating(context), Some(rating));
+			})),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| run_one_cycle(&trace)
 	}
 }

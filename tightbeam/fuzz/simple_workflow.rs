@@ -2,9 +2,9 @@
 //!
 //! Run it with these commands:
 //!   cargo install cargo-afl
-//!   cargo afl build --test simple_workflow --features "std,testing-csp"
+//!   cargo afl build --bin fuzz_simple_workflow --features "std,testing-fuzz"
 //!   mkdir -p fuzz_in && echo "seed" > fuzz_in/seed.txt
-//!   cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/deps/simple_workflow-*
+//!   cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/fuzz_simple_workflow
 
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]

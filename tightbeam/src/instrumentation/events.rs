@@ -44,6 +44,21 @@ pub const TIGHTBEAM_NID: &str = "tightbeam";
 // Core lifecycle events
 pub const START: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:core/start");
 pub const END: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:core/end");
+/// Marks where a sink began to drop the events of its trace. A sink keeps it
+/// in place of the first event that it drops, under `instrument`, and the
+/// default bounded sink keeps it in place of the first event past its bound.
+///
+/// - The sequence number and the clock stamp are those of the event it replaces.
+/// - The label is the URN of the event it replaces.
+/// - [`TbEvent::into_overflow_warning`] builds it.
+///
+/// ```
+/// use tightbeam::instrumentation::events::WARN;
+///
+/// assert_eq!(WARN.to_string(), "urn:tightbeam:event:core/warn");
+/// ```
+///
+/// [`TbEvent::into_overflow_warning`]: super::TbEvent::into_overflow_warning
 pub const WARN: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:core/warn");
 pub const ERROR: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:core/error");
 

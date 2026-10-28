@@ -276,7 +276,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	///   [`TransportFailure::EncryptionFailed`] -- a record arrived on a
 	///   session that holds no keys, and the session resets.
 	/// - The open failure of a record that did not open, such as
-	///   [`TransportFailure::TamperDetected`], after the session resets.
+	///   [`TransportFailure::TamperDetected`] or
+	///   [`TransportFailure::RenewalBoundExceeded`], after the session resets.
 	/// - The read and decode failures.
 	///
 	/// A traced session records a refused envelope as
@@ -1374,13 +1375,14 @@ mod tests {
 		matches!(error, TransportError::InvalidMessage)
 	}
 
-	/// Whether `error` is the record limit of the receive key.
+	/// Whether `error` is the refusal of a record past a renewal bound of the
+	/// receive key.
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
-	fn is_rekey_required(error: &TransportError) -> bool {
-		matches!(error, TransportError::OperationFailed(TransportFailure::RekeyRequired))
+	fn is_past_the_renewal_bound(error: &TransportError) -> bool {
+		matches!(error, TransportError::OperationFailed(TransportFailure::RenewalBoundExceeded))
 	}
 
 	/// Whether `error` is the decode failure of a position.
@@ -1427,7 +1429,7 @@ mod tests {
 			past_the_record_limit => (
 				sealed_for_client_at(crate::constants::DEFAULT_REKEY_RECORD_LIMIT),
 				"OpenFailed",
-				is_rekey_required,
+				is_past_the_renewal_bound,
 			),
 			whose_position_does_not_decode => (
 				sealed_for_client_with_an_undecodable_position(),

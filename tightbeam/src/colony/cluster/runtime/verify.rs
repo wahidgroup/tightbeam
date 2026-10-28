@@ -957,6 +957,9 @@ mod tests {
 		fn fingerprints_of_a_refusal(max_events: u32) -> Result<usize, TightBeamError> {
 			let config = TbInstrumentationConfig { enable_payloads: true, max_events, ..Default::default() };
 			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			// A full sink keeps its overflow warning in place of the first
+			// record past its bound, so this record takes that place.
+			trace.emit(CLUSTER_EXPORT_REFUSED, "warning");
 			let session = SessionContext::for_peer(Arc::new(TestCertificate::self_signed(&peer_key())));
 			let audit = ExportAudit { trace: &trace, session: &session, relayed: false };
 			let before = DIGESTS.with(Cell::get);

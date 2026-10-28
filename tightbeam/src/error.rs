@@ -414,10 +414,17 @@ pub enum TightBeamError {
 	#[error("Record sequence space exhausted")]
 	NonceExhausted,
 
-	/// The record limit of one directional key is reached (RFC 9846 § 5.5).
+	/// The send cipher is at the record limit of its key (RFC 9846 § 5.5).
 	#[cfg(feature = "aead")]
 	#[error("Record limit reached: reestablish the session to rekey")]
 	RekeyRequired,
+
+	/// A received record passes a renewal bound of its receive key: its
+	/// sequence number reaches the record limit, or its bytes take the key
+	/// past the renewal volume. An honest sender renews before either bound.
+	#[cfg(feature = "aead")]
+	#[error("Record past a renewal bound of the receive key")]
+	RenewalBoundExceeded,
 
 	/// A received record carries another sequence number than the exact
 	/// next, which signals a replay, a reorder, or a deletion.

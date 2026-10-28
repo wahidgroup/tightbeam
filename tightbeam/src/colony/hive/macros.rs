@@ -8,6 +8,10 @@
 /// Hives coordinate multiple servlets, enabling intra-hive communication,
 /// lifecycle management, auto-scaling, and cluster integration.
 ///
+/// It names a type alias of
+/// [`HiveRuntime`](crate::colony::hive::HiveRuntime) over the protocol, and a
+/// caller registers servlets on it at runtime.
+///
 /// # Syntax
 ///
 /// ```ignore
