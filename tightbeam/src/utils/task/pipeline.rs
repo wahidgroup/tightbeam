@@ -179,8 +179,9 @@ where
 	E: From<TightBeamError>,
 {
 	/// Runs the job `J` on the output of this step, and records its start and
-	/// its outcome under the snake_case form of [`Job::NAME`]: the event
-	/// `urn:tightbeam:event:job/<name>-start`, then `-success` or `-error`.
+	/// its outcome under the snake_case form of [`Job::NAME`], with a hyphen
+	/// for each underscore: the event `urn:tightbeam:event:job/<name>-start`,
+	/// then `-success` or `-error`.
 	///
 	/// A failed step passes its error on, and the job runs on a success alone.
 	///

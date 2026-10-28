@@ -46,6 +46,8 @@ tb_process_spec! {
 }
 
 mod sink {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use std::borrow::Cow;
 	use std::sync::Mutex;
 
 	use tightbeam::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
@@ -114,8 +116,69 @@ mod sink {
 		collector.emit_event(events::MUX_EMIT_DRAINING)?;
 
 		assert!(collector.overflowed(), "bounded sink past cap must latch overflow");
-		assert_eq!(collector.drain_events().len(), 1, "bounded sink must retain only up to cap");
+		assert_eq!(
+			collector.drain_events().len(),
+			2,
+			"bounded sink must retain up to cap and one warning"
+		);
 		Ok(())
+	}
+
+	/// A sink that holds one event, and keeps the overflow warning of the first
+	/// event past it, as [`EventSink`] asks of a sink that drops events.
+	#[derive(Default)]
+	struct OneEventSink {
+		events: Mutex<Vec<TbEvent>>,
+		overflow: AtomicBool,
+	}
+
+	impl EventSink for OneEventSink {
+		fn emit(&self, event: TbEvent) {
+			let Ok(mut events) = self.events.lock() else {
+				return;
+			};
+			if events.is_empty() {
+				events.push(event);
+				return;
+			}
+
+			let first_drop = !self.overflow.swap(true, Ordering::Relaxed);
+			if first_drop {
+				events.push(event.into_overflow_warning());
+			}
+		}
+
+		fn drain(&self) -> Vec<TbEvent> {
+			if let Ok(mut events) = self.events.lock() {
+				events.drain(..).collect()
+			} else {
+				Vec::new()
+			}
+		}
+
+		fn overflowed(&self) -> bool {
+			self.overflow.load(Ordering::Relaxed)
+		}
+	}
+
+	/// A sink of an outside crate keeps the warning of the first event it
+	/// drops, under the sequence number of that event and named by its URN.
+	#[test]
+	fn an_outside_sink_keeps_the_warning_of_the_first_event_it_drops() {
+		let collector = TraceCollector::from(TraceConfig::default().with_sink(OneEventSink::default()));
+		collector.emit(events::MUX_GOAWAY_SENT, "kept");
+		collector.emit(events::MUX_EMIT_DRAINING, "replaced");
+		collector.emit(events::MUX_GOAWAY_RECV, "dropped");
+
+		let drained = collector.drain_events();
+
+		let records: Vec<_> = drained.into_iter().map(|event| (event.seq, event.urn, event.label)).collect();
+		let warning_label = Some(Cow::Borrowed("urn:tightbeam:event:mux/emit-draining"));
+		let expected = [
+			(0, events::MUX_GOAWAY_SENT, Some(Cow::Borrowed("kept"))),
+			(1, events::WARN, warning_label),
+		];
+		assert_eq!(records, expected);
 	}
 }
 

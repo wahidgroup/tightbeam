@@ -531,6 +531,16 @@ pub trait MessageCollector: MessageIO + GateAudit {
 
 	/// The X.509 form of [`Self::collect_message`] over an encrypted session,
 	/// which serves each handshake request that arrives before the message.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::RekeyRequired`] -- the send cipher of the session
+	///   is spent, so the session collects no request it cannot answer.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::RenewalBoundExceeded`] -- a record passed a
+	///   renewal bound of the receive key, and the session resets.
+	/// - The other errors of [`EncryptedMessageIO::collect_step`] and of the server handshake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>

@@ -88,7 +88,7 @@ pub struct PoolConfig {
 	/// The cap on live connections across all destinations,
 	/// [`DEFAULT_MAX_POOL_CONNECTIONS`] by default.
 	pub max_connections: NonZeroUsize,
-	/// The multiplexing offer that pooled dials advertise.
+	/// The multiplexing offer that pooled dials advertise, [`None`] by default.
 	///
 	/// When set, [`ConnectionPool::connect`] reuses a pooled multiplexed
 	/// connection to a destination until its stream caps fill. Two concurrent

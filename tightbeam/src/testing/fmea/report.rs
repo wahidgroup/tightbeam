@@ -19,8 +19,11 @@ pub enum SeverityScale {
 /// FMEA configuration
 #[derive(Debug, Clone)]
 pub struct FmeaConfig {
+	/// The scale of the severity, occurrence, and detection ratings.
 	pub severity_scale: SeverityScale,
+	/// The RPN above which a failure mode is critical, 100 by default.
 	pub rpn_critical_threshold: u32,
+	/// Whether an FDR run that injects a fault puts the report in its verdict.
 	pub auto_generate: bool,
 }
 
@@ -37,12 +40,21 @@ impl Default for FmeaConfig {
 /// Individual failure mode entry
 #[derive(Debug, Clone, PartialEq)]
 pub struct FailureMode {
+	/// The component that fails, which a generated report names by the CSP
+	/// state of the fault, as `Process.State`.
 	pub component: String,
+	/// The failure, which a generated report names by the event label of the
+	/// fault.
 	pub failure: String,
+	/// The effects that the CSP reachability of the fault state finds.
 	pub effects: Vec<String>,
+	/// The severity rating, from the CSP reachability of the fault state.
 	pub severity: u8,
+	/// The occurrence rating, from the injection probability in basis points.
 	pub occurrence: u16,
+	/// The detection rating, from the error-recovery statistics of the run.
 	pub detection: u8,
+	/// The risk priority number, severity × occurrence × detection.
 	pub rpn: u32,
 }
 
@@ -67,9 +79,14 @@ impl FailureMode {
 /// FMEA report
 #[derive(Debug, Clone, PartialEq)]
 pub struct FmeaReport {
+	/// The failure modes, one per injected fault in a generated report.
 	pub failure_modes: Vec<FailureMode>,
+	/// The scale of every rating in the report.
 	pub severity_scale: SeverityScale,
+	/// The aggregate risk priority, the sum of the RPN of every failure mode.
 	pub total_rpn: u32,
+	/// The index in `failure_modes` of each failure mode whose RPN exceeds the
+	/// critical threshold.
 	pub critical_failures: Vec<usize>,
 }
 
@@ -101,18 +118,25 @@ impl FmeaReport {
 impl FdrVerdict {
 	/// FMEA report over the faults this run injected.
 	///
-	/// A run that injected nothing has no failure modes, so the report is
-	/// the empty one at the configured scale.
+	/// Each fault rates at the state it names in the first of `processes` that
+	/// holds that state. A fault whose state no process holds rates as a fault
+	/// in an unknown state. A run that injected nothing has no failure modes,
+	/// so the report is the empty one at the configured scale.
 	///
 	/// # Errors
 	///
 	/// The first failure-mode analysis that fails.
-	pub fn fmea_report(&self, process: &Process, config: Option<FmeaConfig>) -> Result<FmeaReport, TightBeamError> {
+	pub fn fmea_report<'p>(
+		&self,
+		processes: impl IntoIterator<Item = &'p Process>,
+		config: Option<FmeaConfig>,
+	) -> Result<FmeaReport, TightBeamError> {
 		let config = config.unwrap_or_default();
+		let processes: Vec<&Process> = processes.into_iter().collect();
 		let failure_modes: Result<Vec<_>, _> = self
 			.faults_injected
 			.iter()
-			.map(|fault| fault.failure_mode(process, self, &config))
+			.map(|fault| fault.failure_mode(&processes, self, &config))
 			.collect();
 
 		Ok(FmeaReport::new(
@@ -132,27 +156,27 @@ impl InjectedFaultRecord {
 	/// Whatever [`FailureMode::new`] reports.
 	fn failure_mode(
 		&self,
-		process: &Process,
+		processes: &[&Process],
 		verdict: &FdrVerdict,
 		config: &FmeaConfig,
 	) -> Result<FailureMode, TightBeamError> {
 		Ok(FailureMode::new(
 			self.csp_state.clone(),
 			self.event_label.clone(),
-			self.effects(process),
-			self.severity(process, config.severity_scale),
+			self.effects(processes),
+			self.severity_in(processes, config.severity_scale),
 			config.severity_scale.occurrence(self.probability_bps),
 			verdict.detection(config.severity_scale),
 		))
 	}
 
-	/// Effects of this fault, via CSP reachability analysis.
-	fn effects(&self, process: &Process) -> Vec<String> {
+	/// Effects of this fault at its site among `processes`, via CSP
+	/// reachability analysis.
+	fn effects(&self, processes: &[&Process]) -> Vec<String> {
 		let mut effects = Vec::new();
 
 		// Find the state where the fault occurs
-		let fault_state = process.states.iter().find(|s| s.0 == self.csp_state.as_str()).copied();
-		let Some(fault_state) = fault_state else {
+		let Some((process, fault_state)) = self.site_in(processes) else {
 			effects.push(format!("Fault occurs in unknown state: {}", self.csp_state));
 			return effects;
 		};
@@ -173,7 +197,7 @@ impl InjectedFaultRecord {
 			}
 
 			// Get enabled transitions
-			// Check for potential deadlock (no enabled transitions, not terminal)
+			// A non-terminal state with no enabled transition can deadlock.
 			let enabled = process.enabled(current_state);
 			if enabled.is_empty() {
 				potential_deadlocks.push(current_state.0);
@@ -221,7 +245,28 @@ impl InjectedFaultRecord {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::fdr::{DefaultFdrExplorer, FaultModel, FdrConfig};
 	use crate::testing::specs::csp::{Event, Process, State};
+	use crate::urn::Urn;
+
+	const SEND: Urn<'static> = crate::urn!("test", "event:fmea-report/send");
+	const ACK: Urn<'static> = crate::urn!("test", "event:fmea-report/ack");
+
+	// A link that sends and then takes an acknowledgement, the process that
+	// the generated report reads.
+	crate::tb_process_spec! {
+		pub Link,
+		events { observable { SEND, ACK } hidden { } }
+		states {
+			Ready => { SEND => Sent },
+			Sent => { ACK => Done }
+		}
+		terminal { Done }
+	}
+
+	// The fault of the generated report fires in `Ready`, so the call lists
+	// that state alone.
+	crate::tb_gen_process_types!(Link, Ready);
 
 	// Test fixtures and helpers
 	fn create_fault(state: impl AsRef<str>, event: impl AsRef<str>) -> InjectedFaultRecord {
@@ -300,7 +345,7 @@ mod tests {
 			.add_transition(State("Running"), Event("finish"), State("Success"))
 			.build()?;
 
-		let effects = create_fault("Init", "start").effects(&process);
+		let effects = create_fault("TestProcess.Init", "start").effects(&[&process]);
 		assert_effect_contains(&effects, "terminal state", "Terminal state detection");
 		Ok(())
 	}
@@ -313,7 +358,7 @@ mod tests {
 			.add_transition(State("Init"), Event("start"), State("Blocked"))
 			.build()?;
 
-		let effects = create_fault("Init", "start").effects(&process);
+		let effects = create_fault("DeadlockProcess.Init", "start").effects(&[&process]);
 		assert_effect_contains(&effects, "deadlock", "Deadlock detection");
 		Ok(())
 	}
@@ -330,7 +375,7 @@ mod tests {
 			.add_transition(State("B"), Event("to_c"), State("C"))
 			.build()?;
 
-		let effects = create_fault("A", "to_b").effects(&process);
+		let effects = create_fault("RestrictedProcess.A", "to_b").effects(&[&process]);
 		assert_effect_contains(&effects, "Restricts reachable states", "State space restriction");
 
 		Ok(())
@@ -343,7 +388,7 @@ mod tests {
 			.initial_state(State("Known"))
 			.build()?;
 
-		let effects = create_fault("UnknownState", "event").effects(&process);
+		let effects = create_fault("SimpleProcess.UnknownState", "event").effects(&[&process]);
 		assert_eq!(effects.len(), 1);
 		assert!(effects[0].contains("unknown state"));
 		Ok(())
@@ -360,8 +405,30 @@ mod tests {
 			.add_transition(State("S3"), Event("event1"), State("S1"))
 			.build()?;
 
-		let effects = create_fault("S1", "event1").effects(&process);
+		let effects = create_fault("NormalProcess.S1", "event1").effects(&[&process]);
 		assert_effect_contains(&effects, "state transition failure", "Default message");
+		Ok(())
+	}
+
+	#[test]
+	fn a_generated_report_traces_the_effects_from_the_fault_state() -> Result<(), Box<dyn core::error::Error>> {
+		let fault = || TightBeamError::ChannelClosed;
+		let event = link::Event(SEND);
+		let fault_model = FaultModel::default().with_fault(link::States::Ready, event, fault, crate::bps!(10000));
+		let config = FdrConfig {
+			seeds: 1,
+			specs: vec![Link::process()?],
+			fault_model: Some(fault_model),
+			fmea_config: Some(FmeaConfig::default()),
+			..FdrConfig::default()
+		};
+
+		let process = Link::process()?;
+		let verdict = DefaultFdrExplorer::with_defaults(&process, config).explore()?;
+		let modes = verdict.fmea_report.map(|report| report.failure_modes).unwrap_or_default();
+
+		let effects: Vec<Vec<String>> = modes.into_iter().map(|mode| mode.effects).collect();
+		assert_eq!(effects, [["Can reach terminal state(s): Done"]]);
 		Ok(())
 	}
 }

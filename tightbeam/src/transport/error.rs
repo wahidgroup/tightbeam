@@ -51,10 +51,14 @@ pub enum TransportFailure {
 	EncryptorUnavailable,
 	/// Random nonce generation failed.
 	NonceGenerationFailed,
-	/// The session reached the AEAD record limit, because the send cipher
-	/// halted or the peer overran the volume bound. Reestablish the session to
-	/// rekey.
+	/// The send cipher of the session is at its record limit (RFC 9846 § 5.5),
+	/// so every later seal fails. Reestablish the session to rekey.
 	RekeyRequired,
+	/// An inbound record passed a renewal bound of the receive key, by its
+	/// sequence number or by the bytes the key has opened. An honest sender
+	/// renews before either bound, so the record is a fault of the peer or of
+	/// the path, and the read that met it ends the session.
+	RenewalBoundExceeded,
 	/// An inbound envelope broke the AEAD sequence by a replay, reorder, or
 	/// deletion on the connection (CWE-345).
 	TamperDetected,
@@ -231,9 +235,13 @@ impl From<TightBeamError> for TransportError {
 			// An exact-next record sequence makes replay, reorder, and deletion
 			// indistinguishable from tampering, so each surfaces as tampering.
 			TightBeamError::NonceReplayed(_) => TransportError::OperationFailed(TransportFailure::TamperDetected),
-			// The receive side hits this only when the peer overran the
-			// per-key volume bound. The session is unusable either way.
+			// A spent send cipher and a record past a renewal bound of the
+			// receive key keep their own failures, so a routine end of keys
+			// reads apart from a fault of the inbound stream.
 			TightBeamError::RekeyRequired => TransportError::OperationFailed(TransportFailure::RekeyRequired),
+			TightBeamError::RenewalBoundExceeded => {
+				TransportError::OperationFailed(TransportFailure::RenewalBoundExceeded)
+			}
 			#[cfg(feature = "std")]
 			TightBeamError::LockPoisoned => TransportError::OperationFailed(TransportFailure::Internal),
 			_ => TransportError::InvalidMessage,
@@ -604,7 +612,7 @@ impl TransportError {
 	/// error that ends an exchange for another reason.
 	///
 	/// - The refusal of an arrival names its failure: an envelope past its
-	///   ceiling, out of sequence, past the volume bound, or of a mode the
+	///   ceiling, out of sequence, past a renewal bound, or of a mode the
 	///   session refuses.
 	/// - A message that breaks the protocol, ends early, or does not decode is a refusal.
 	/// - A close, a stall past a deadline, an I/O failure, a local fault, and a
@@ -771,6 +779,7 @@ impl TransportFailure {
 			Self::EncryptorUnavailable => "EncryptorUnavailable",
 			Self::NonceGenerationFailed => "NonceGenerationFailed",
 			Self::RekeyRequired => "RekeyRequired",
+			Self::RenewalBoundExceeded => "RenewalBoundExceeded",
 			Self::TamperDetected => "TamperDetected",
 			Self::StreamsExhausted => "StreamsExhausted",
 			Self::BudgetExhausted => "BudgetExhausted",
@@ -795,12 +804,13 @@ impl TransportFailure {
 	}
 
 	/// Whether a read that fails with this failure refuses the envelope that
-	/// arrived: one past its ceiling, out of sequence, past the volume bound
-	/// of the receive key, or a record on a session with no keys.
+	/// arrived: one past its ceiling, out of sequence, past a renewal bound of
+	/// the receive key, or a record on a session with no keys.
 	const fn refuses_arrival(&self) -> bool {
 		match self {
-			Self::SizeExceeded | Self::TamperDetected | Self::RekeyRequired | Self::EncryptionFailed => true,
+			Self::SizeExceeded | Self::TamperDetected | Self::RenewalBoundExceeded | Self::EncryptionFailed => true,
 			Self::EncodingFailed
+			| Self::RekeyRequired
 			| Self::EncryptorUnavailable
 			| Self::NonceGenerationFailed
 			| Self::StreamsExhausted
@@ -980,6 +990,10 @@ mod tests {
 				false
 			),
 			an_answer_past_the_record_limit_ends_the_stream => (
+				TransportError::OperationFailed(TransportFailure::RenewalBoundExceeded),
+				true
+			),
+			a_collect_on_a_spent_send_cipher_ends_the_stream => (
 				TransportError::OperationFailed(TransportFailure::RekeyRequired),
 				true
 			),
@@ -1042,7 +1056,7 @@ mod tests {
 		cases {
 			of_another_epoch => (TightBeamError::RecordEpoch((1, 0).into()), "WrongEpoch"),
 			out_of_sequence => (TightBeamError::NonceReplayed((2, 0).into()), "TamperDetected"),
-			past_the_record_limit => (TightBeamError::RekeyRequired, "OpenFailed"),
+			past_the_record_limit => (TightBeamError::RenewalBoundExceeded, "OpenFailed"),
 			whose_position_does_not_decode => (
 				TightBeamError::SerializationError(der::Error::from(der::ErrorKind::Failed)),
 				"OpenFailed"

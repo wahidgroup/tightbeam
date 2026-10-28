@@ -7,10 +7,28 @@
 
 use crate::testing::fdr::{FdrVerdict, InjectedFaultRecord};
 use crate::testing::fmea::SeverityScale;
-use crate::testing::specs::csp::Process;
+use crate::testing::specs::csp::{Process, State};
 use std::collections::{HashSet, VecDeque};
 
 impl InjectedFaultRecord {
+	/// The site of this fault among `processes`: the first process that holds
+	/// the state this record names, with that state.
+	///
+	/// A record names its state as `Process.State`. A key that starts with the
+	/// name of a process and a dot names the state after the dot. Any other
+	/// key names the state of that full name, so a bare state name reads as a
+	/// state of each process.
+	pub(crate) fn site_in<'p>(&self, processes: &[&'p Process]) -> Option<(&'p Process, State)> {
+		processes.iter().find_map(|process| {
+			let after_process = self.csp_state.strip_prefix(process.name);
+			let qualified = after_process.and_then(|rest| rest.strip_prefix('.'));
+			let state_name = qualified.unwrap_or(self.csp_state.as_str());
+			let state = process.states.iter().find(|state| state.0 == state_name).copied()?;
+
+			Some((*process, state))
+		})
+	}
+
 	/// The severity of this fault, from the CSP criticality analysis.
 	///
 	/// Reachability from the fault state decides the rating. The cases run from
@@ -21,17 +39,13 @@ impl InjectedFaultRecord {
 	/// - A reach of less than 80 percent of the states.
 	/// - Any other reach, which is a small restriction.
 	pub fn severity(&self, process: &Process, scale: SeverityScale) -> u8 {
-		// A production fault record keys its state as "process.state". The
-		// match also accepts a bare state name, for a record built against a
-		// process.
-		let state_name = self
-			.csp_state
-			.strip_prefix(process.name)
-			.and_then(|rest| rest.strip_prefix('.'))
-			.unwrap_or(self.csp_state.as_str());
+		self.severity_in(&[process], scale)
+	}
 
-		let fault_state = process.states.iter().find(|s| s.0 == state_name).copied();
-		let Some(fault_state) = fault_state else {
+	/// The severity of this fault at its site among `processes`, by the rule
+	/// of [`Self::severity`].
+	pub(crate) fn severity_in(&self, processes: &[&Process], scale: SeverityScale) -> u8 {
+		let Some((process, fault_state)) = self.site_in(processes) else {
 			// An unknown state has an uncertain impact, so it rates mid-scale.
 			return scale.mid_value();
 		};

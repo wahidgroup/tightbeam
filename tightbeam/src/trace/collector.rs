@@ -206,9 +206,12 @@ impl TraceConfig {
 	/// let settings = TbInstrumentationConfig { max_events: 1, ..Default::default() };
 	/// let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
 	/// trace.emit(events::GATE_ACCEPT, "kept");
+	/// trace.emit(events::GATE_ACCEPT, "replaced");
 	/// trace.emit(events::GATE_ACCEPT, "dropped");
 	///
-	/// assert_eq!(trace.drain_events().len(), 1);
+	/// // The sink keeps one event, then the overflow warning in place of the next.
+	/// let urns: Vec<_> = trace.drain_events().into_iter().map(|event| event.urn).collect();
+	/// assert_eq!(urns, [events::GATE_ACCEPT, events::WARN]);
 	/// ```
 	#[cfg(feature = "instrument")]
 	pub fn with_instrumentation(config: TbInstrumentationConfig) -> Self {
@@ -585,6 +588,8 @@ impl<'a, V: Into<EventValue>> Drop for EventBuilder<'a, V> {
 }
 
 /// Collects the trace events and assertions of one run.
+///
+/// It builds with `std` alone, so a production build records a trace.
 ///
 /// Every handle [`TraceCollector::share`] makes records into the same state.
 #[derive(Debug)]
@@ -1305,7 +1310,7 @@ impl TraceCollector {
 	) {
 		// A dropped event takes a sequence number too, so gaps in `seq` show
 		// where truncation occurred. The write asks the sink before it builds
-		// the event, so a dropped event costs no allocation.
+		// the event, so an event that the sink refuses costs no allocation.
 		let seq = self.next_seq();
 		let sink = &self.state.sink.0;
 		if !sink.retains() {
@@ -2703,16 +2708,34 @@ mod tests {
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
 			collector.emit(events::END, "third");
+			collector.emit(events::END, "fourth");
 			assert!(collector.overflowed());
-			assert_eq!(collector.drain_events().len(), 2);
+			assert_eq!(collector.drain_events().len(), 3);
 		}
 
-		/// An event that a full sink drops takes its sequence number too, so
-		/// the gap marks where the sink cut the record.
+		/// A sink past its bound keeps one `core/warn` record in place of the
+		/// first event it drops, under the sequence number of that event, and
+		/// drops each later event.
+		#[test]
+		fn the_first_event_past_the_bound_becomes_one_warning() {
+			let collector = collector_with_max_events(1);
+			collector.emit(events::START, "kept");
+			collector.emit(events::END, "replaced");
+			collector.emit(events::END, "dropped");
+
+			let kept = collector.drain_events();
+
+			let records: Vec<_> = kept.into_iter().map(|event| (event.seq, event.urn)).collect();
+			assert_eq!(records, [(0, events::START), (1, events::WARN)]);
+		}
+
+		/// An event that a full sink drops after its warning takes its sequence
+		/// number too, so the gap marks where the sink cut the record.
 		#[test]
 		fn a_dropped_event_still_takes_its_sequence_number() {
 			let collector = collector_with_max_events(1);
 			collector.emit(events::START, "kept");
+			collector.emit(events::END, "replaced");
 			collector.emit(events::END, "dropped");
 
 			let before = collector.drain_events();
@@ -2721,7 +2744,7 @@ mod tests {
 
 			let after = collector.drain_events();
 			let seqs = [before, after].map(|kept| kept.iter().map(|event| event.seq).collect::<Vec<u32>>());
-			assert_eq!(seqs, [vec![0], vec![2]]);
+			assert_eq!(seqs, [vec![0, 1], vec![3]]);
 		}
 
 		/// The trace that drains `collector`.

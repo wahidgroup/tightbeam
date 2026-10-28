@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
 mod tokio_rt {
+	pub use core::task::{Context, Poll, Waker};
 	pub use std::io::Error as IoError;
 	pub use std::io::ErrorKind;
 	pub use std::net::SocketAddr;
 
-	pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	pub use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 	pub use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 	pub use tokio::net::{TcpListener, TcpStream};
 	pub use tokio::time::timeout;
@@ -119,8 +120,22 @@ impl AsyncByteWrite for TokioStream {
 
 #[cfg(feature = "tokio")]
 impl AsyncByteStream for TokioStream {
+	/// Peeks one byte under a no-op waker, so the check returns at once and
+	/// leaves every byte in the stream. End of stream or an error reads dead.
+	/// A byte that waits, or a peek that would wait, reads alive.
+	///
+	/// A read borrows the stream mutably, so it runs apart from the peek and
+	/// registers its own waker.
 	fn is_alive(&self) -> bool {
-		self.stream.peer_addr().is_ok()
+		let mut byte = [0u8; 1];
+		let mut probe = ReadBuf::new(&mut byte);
+		let mut context = Context::from_waker(Waker::noop());
+		let peeked = self.stream.poll_peek(&mut context, &mut probe);
+
+		match peeked {
+			Poll::Ready(Ok(0) | Err(_)) => false,
+			Poll::Ready(Ok(_)) | Poll::Pending => true,
+		}
 	}
 }
 
@@ -2029,15 +2044,22 @@ mod tests {
 	/// A whole frame on the wire: a NULL under the cleartext tag.
 	const WAITING_FRAME: &[u8] = &[0xa0, 0x02, 0x05, 0x00];
 
-	/// A server transport over one end of a loopback connection, beside the
-	/// raw stream of its peer. The server reads its deadlines on `clock`, and
-	/// its handshake begins at the clock's reading.
-	async fn handshaking_server(clock: &Arc<ManualClock>) -> (TcpTransport<TokioStream>, TcpStream) {
+	/// The two ends of one loopback connection: the end that the listener
+	/// accepted, and the end that dialed it.
+	async fn loopback_pair() -> (TcpStream, TcpStream) {
 		let bound = TcpListener::bind("127.0.0.1:0").await;
 		let listener = bound.expect("a loopback port binds");
 		let addr = listener.local_addr().expect("a bound listener has an address");
 		let peer = TcpStream::connect(addr).await.expect("the loopback listener takes the dial");
 		let (stream, _) = listener.accept().await.expect("the dial arrives");
+		(stream, peer)
+	}
+
+	/// A server transport over one end of a loopback connection, beside the
+	/// raw stream of its peer. The server reads its deadlines on `clock`, and
+	/// its handshake begins at the clock's reading.
+	async fn handshaking_server(clock: &Arc<ManualClock>) -> (TcpTransport<TokioStream>, TcpStream) {
+		let (stream, peer) = loopback_pair().await;
 
 		let EncryptedTestServer { config, .. } = encrypted_test_server().expect("the test server provisions");
 		let endpoint = EndpointConfig::try_from(config).expect("a server identity answers the dialer rule");
@@ -2047,6 +2069,48 @@ mod tests {
 		let began = transport.state.begin_handshake(clock.monotonic());
 		assert!(began, "a provisioned server begins its handshake");
 		(transport, peer)
+	}
+
+	/// A stream whose peer sent its FIN reads dead, though the socket still
+	/// names the address of that peer.
+	#[tokio::test]
+	async fn a_stream_whose_peer_closed_is_not_alive() -> TransportResult<()> {
+		let (stream, peer) = loopback_pair().await;
+		let stream = TokioStream::from(stream);
+		drop(peer);
+		stream.stream.readable().await?;
+
+		assert!(!AsyncByteStream::is_alive(&stream));
+		Ok(())
+	}
+
+	/// A stream whose peer holds the connection open and sends nothing reads
+	/// alive.
+	#[tokio::test]
+	async fn a_stream_whose_peer_waits_is_alive() -> TransportResult<()> {
+		let (stream, _peer) = loopback_pair().await;
+		let stream = TokioStream::from(stream);
+
+		assert!(AsyncByteStream::is_alive(&stream));
+		Ok(())
+	}
+
+	/// A stream that holds bytes of its peer reads alive, and the next read
+	/// still takes each of those bytes.
+	#[tokio::test]
+	async fn a_stream_with_bytes_waiting_is_alive_and_keeps_them() -> TransportResult<()> {
+		let (stream, mut peer) = loopback_pair().await;
+		let mut stream = TokioStream::from(stream);
+		peer.write_all(WAITING_FRAME).await?;
+		stream.stream.readable().await?;
+
+		let alive = AsyncByteStream::is_alive(&stream);
+		// The close ends a read that finds fewer bytes than the peer sent.
+		drop(peer);
+		let mut waiting = [0u8; WAITING_FRAME.len()];
+		AsyncByteRead::read_exact(&mut stream, &mut waiting).await?;
+		assert_eq!((alive, waiting.as_slice()), (true, WAITING_FRAME));
+		Ok(())
 	}
 
 	/// A read refuses once the handshake deadline has passed on the connection
@@ -2150,6 +2214,55 @@ mod tests {
 		Ok(())
 	}
 
+	/// What a server whose session holds `keys` collects while `record`, a
+	/// record of the client direction, waits on the wire.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	async fn collected_under(
+		keys: crate::crypto::aead::SessionKeys,
+		record: crate::asn1::AuthEnvelopedData,
+	) -> TransportResult<(Arc<Frame>, TransitStatus)> {
+		use crate::transport::envelopes::WireEnvelope;
+		use crate::transport::handshake::EstablishedSession;
+		use crate::transport::state::{SessionPhase, SessionState};
+
+		let clock = Arc::new(ManualClock::default());
+		let (mut transport, mut peer) = handshaking_server(&clock).await;
+		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)));
+		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
+
+		let envelope = WireEnvelope::Encrypted(record);
+		let wire = envelope.to_der().expect("a record encodes as a wire envelope");
+		peer.write_all(&wire).await.expect("the loopback peer takes the record");
+		transport.collect_message().await
+	}
+
+	/// The DER of a request envelope, which a record of the client direction
+	/// seals.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn request_der() -> Vec<u8> {
+		use crate::transport::envelopes::{RequestPackage, TransportEnvelope};
+
+		let request = TransportEnvelope::Request(RequestPackage::new(TestFrame::prioritized()));
+		request.to_der().expect("a request envelope encodes")
+	}
+
+	/// The failure that the error of `result` names, with its frame or without
+	/// it, or `None` for a result that names none.
+	#[cfg(all(
+		feature = "instrument",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	fn failure_of<T>(result: &TransportResult<T>) -> Option<TransportFailure> {
+		let Err(error) = result else {
+			return None;
+		};
+
+		match error {
+			TransportError::OperationFailed(failure) | TransportError::MessageNotSent(_, failure) => Some(*failure),
+			_ => None,
+		}
+	}
+
 	/// A server whose send cipher is spent can answer no request, so it
 	/// collects none, and the request that waits on the wire never reaches a
 	/// handler.
@@ -2157,24 +2270,36 @@ mod tests {
 	#[tokio::test]
 	async fn a_spent_server_collects_no_request() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::crypto::aead::SessionKeys;
-		use crate::transport::envelopes::{RequestPackage, TransportEnvelope, WireEnvelope};
-		use crate::transport::handshake::EstablishedSession;
-		use crate::transport::state::{SessionPhase, SessionState};
 
-		let clock = Arc::new(ManualClock::default());
-		let (mut transport, mut peer) = handshaking_server(&clock).await;
 		let client = SessionKeys::for_client(TestKey::insecure_directional_keys());
 		let server = SessionKeys::for_server(TestKey::insecure_directional_keys()).with_envelope_ceiling(usize::MAX);
-		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(server, None, None)));
-		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
+		let record = client.send().encrypt_next(request_der())?;
 
-		let request = TransportEnvelope::Request(RequestPackage::new(TestFrame::prioritized()));
-		let record = client.send().encrypt_next(request.to_der()?)?;
-		peer.write_all(&WireEnvelope::Encrypted(record).to_der()?).await?;
-
-		let collected = transport.collect_message().await;
+		let collected = collected_under(server, record).await;
 		let refused = matches!(collected, Err(TransportError::OperationFailed(TransportFailure::RekeyRequired)));
 		assert!(refused, "a spent server collects no request, but it collected {collected:?}");
+		Ok(())
+	}
+
+	/// A record past a renewal bound of the receive key fails a collect with
+	/// another failure than a spent send cipher does, so the error tells a
+	/// fault of the inbound stream from a routine end of keys.
+	#[cfg(all(
+		feature = "instrument",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	#[tokio::test]
+	async fn a_receive_overrun_fails_apart_from_a_spent_cipher() -> Result<(), Box<dyn std::error::Error>> {
+		let client = SessionKeys::for_client(TestKey::insecure_directional_keys());
+		let fresh = SessionKeys::for_server(TestKey::insecure_directional_keys());
+		let spent = SessionKeys::for_server(TestKey::insecure_directional_keys()).with_envelope_ceiling(usize::MAX);
+		let limit = crate::constants::DEFAULT_REKEY_RECORD_LIMIT;
+		let past_the_bound = client.send().seal_at(request_der(), limit)?;
+		let in_sequence = client.send().encrypt_next(request_der())?;
+
+		let overrun = collected_under(fresh, past_the_bound).await;
+		let refused = collected_under(spent, in_sequence).await;
+		assert_ne!(failure_of(&overrun), failure_of(&refused));
 		Ok(())
 	}
 

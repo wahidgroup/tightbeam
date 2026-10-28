@@ -48,21 +48,27 @@ pub trait ProcessState: Copy + core::fmt::Debug {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use std::borrow::Cow;
 ///
 /// use tightbeam::testing::ProcessEvent;
+/// use tightbeam::urn::Urn;
 ///
-/// #[derive(Debug, Clone, Copy)]
-/// struct MyEvent(&'static str);
+/// const SEND: Urn<'static> = tightbeam::urn!("doc", "event:fault/send");
+///
+/// #[derive(Debug, Clone)]
+/// struct MyEvent(Urn<'static>);
 ///
 /// impl ProcessEvent for MyEvent {
-///     fn event_label(&self) -> Cow<'static, str> { Cow::Borrowed(self.0) }
+///     fn event_label(&self) -> Cow<'static, str> { self.0.event_label() }
 /// }
+///
+/// assert_eq!(MyEvent(SEND).event_label(), "urn:doc:event:fault/send");
 /// ```
 pub trait ProcessEvent: Clone + core::fmt::Debug {
-	/// Event label as used in CSP spec; the full URN rendering for
-	/// URN-identified events so fault keys match emitted trace labels.
+	/// The label of the event, as the CSP spec and the trace name it. A URN
+	/// event renders the full URN, so a fault key matches the label that the
+	/// trace records.
 	fn event_label(&self) -> Cow<'static, str>;
 }
 

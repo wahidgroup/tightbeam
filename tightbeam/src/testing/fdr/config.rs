@@ -387,7 +387,10 @@ pub struct FdrConfig {
 	/// The time budget, in milliseconds, of each search that the refinement
 	/// checker runs: the trace, failure, and divergence searches of a process,
 	/// and the search of a spec for the traces of the implementation. A search
-	/// that spends it stops with an incomplete answer.
+	/// that spends it stops with an incomplete answer, and a check it cuts
+	/// short decides [`Decision::Unknown`].
+	///
+	/// [`Decision::Unknown`]: crate::testing::fdr::Decision::Unknown
 	pub timeout_ms: u64,
 
 	/// The specification processes for refinement checking. The explorer

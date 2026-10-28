@@ -7,27 +7,40 @@
 ///
 /// This macro creates a snake_case module containing:
 /// - `States` enum with all process states
-/// - `Event` struct for type-safe event labels
+/// - `Event` struct, which wraps an event URN and keys a fault by the label that the trace records
 /// - ProcessState and ProcessEvent trait implementations
 ///
-/// # Usage
+/// # Examples
 ///
-/// ```ignore
+/// ```
+/// use tightbeam::testing::{FaultModel, ProcessEvent, ProcessState};
+/// use tightbeam::urn::Urn;
+/// use tightbeam::{tb_gen_process_types, tb_process_spec, urn, TightBeamError};
+///
+/// const SEND: Urn<'static> = urn!("doc", "event:gen-states/send");
+/// const ACK: Urn<'static> = urn!("doc", "event:gen-states/ack");
+///
 /// tb_process_spec! {
 ///     pub MyProcess,
-///     events { observable { "send", "ack" } hidden { } }
+///     events { observable { SEND, ACK } hidden { } }
 ///     states {
-///         Ready => { "send" => Sending },
-///         Sending => { "ack" => Ready }
+///         Ready => { SEND => Sending },
+///         Sending => { ACK => Ready }
 ///     }
 /// }
 ///
 /// // Generate types for fault injection
 /// tb_gen_process_types!(MyProcess, Ready, Sending);
 ///
+/// // A state keys as `Process.State`, and an event as the label of its URN.
+/// use my_process::{Event, States};
+/// assert_eq!(States::Ready.full_key(), "MyProcess.Ready");
+/// assert_eq!(Event(SEND).event_label(), SEND.to_string());
+///
 /// // Use in fault injection
-/// use my_process::{States, Event};
-/// fault_model.with_fault(States::Ready, Event("send"), || Error, 1000);
+/// let fault = || TightBeamError::ChannelClosed;
+/// let model = FaultModel::default();
+/// let model = model.with_fault(States::Ready, Event(SEND), fault, tightbeam::bps!(1000));
 /// ```
 #[cfg(feature = "testing-fault")]
 #[macro_export]
@@ -61,19 +74,17 @@ macro_rules! tb_gen_process_types {
 					}
 				}
 
-				/// Event wrapper for type-safe fault injection
+				/// An event of this process, which wraps the URN of the
+				/// event.
 				///
-				/// Create events using string literals:
-				/// ```ignore
-				/// use my_process::Event;
-				/// fault_model.with_fault(States::Idle, Event("connect"), ...);
-				/// ```
-				#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-				pub struct Event(pub &'static str);
+				/// A fault keyed by an `Event` matches the label that the
+				/// trace records for the URN.
+				#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+				pub struct Event(pub $crate::urn::Urn<'static>);
 
 				impl $crate::testing::fault::ProcessEvent for Event {
 					fn event_label(&self) -> ::std::borrow::Cow<'static, str> {
-						::std::borrow::Cow::Borrowed(self.0)
+						$crate::testing::fault::ProcessEvent::event_label(&self.0)
 					}
 				}
 			}
@@ -84,7 +95,10 @@ macro_rules! tb_gen_process_types {
 #[cfg(all(test, feature = "testing-fault"))]
 mod tests {
 	use crate::testing::fault::{ProcessEvent, ProcessState};
+	use crate::testing::fdr::FaultModel;
+	use crate::trace::TraceCollector;
 	use crate::urn::Urn;
+	use crate::TightBeamError;
 
 	const CONNECT: Urn<'static> = crate::urn!("test", "event:gen-states/connect");
 	const SEND: Urn<'static> = crate::urn!("test", "event:gen-states/send");
@@ -138,23 +152,33 @@ mod tests {
 	fn generates_event_wrapper() {
 		use macro_test_process::Event;
 
-		let connect = Event("connect");
-		let send = Event("send");
-		let ack = Event("ack");
-		let disconnect = Event("disconnect");
-		assert_eq!(connect.0, "connect");
-		assert_eq!(send.0, "send");
-		assert_eq!(ack.0, "ack");
-		assert_eq!(disconnect.0, "disconnect");
+		let connect = Event(CONNECT);
+		let send = Event(SEND);
+		let ack = Event(ACK);
+		let disconnect = Event(DISCONNECT);
+		assert_eq!(connect.0, CONNECT);
+		assert_eq!(send.0, SEND);
+		assert_eq!(ack.0, ACK);
+		assert_eq!(disconnect.0, DISCONNECT);
 	}
 
 	#[test]
 	fn implements_process_event_trait() {
 		use macro_test_process::Event;
 
-		assert_eq!(Event("connect").event_label(), "connect");
-		assert_eq!(Event("send").event_label(), "send");
-		assert_eq!(Event("ack").event_label(), "ack");
-		assert_eq!(Event("disconnect").event_label(), "disconnect");
+		assert_eq!(Event(CONNECT).event_label(), "urn:test:event:gen-states/connect");
+		assert_eq!(Event(SEND).event_label(), "urn:test:event:gen-states/send");
+		assert_eq!(Event(ACK).event_label(), "urn:test:event:gen-states/ack");
+		assert_eq!(Event(DISCONNECT).event_label(), "urn:test:event:gen-states/disconnect");
+	}
+
+	#[test]
+	fn a_fault_keyed_by_a_generated_event_fires_at_the_label_the_trace_records() {
+		use macro_test_process::Event;
+
+		let fault = || TightBeamError::ChannelClosed;
+		let model = FaultModel::default().with_event_fault(Event(CONNECT), fault, crate::bps!(10000));
+		let trace = TraceCollector::new().with_fault_model(model);
+		assert!(matches!(trace.event(CONNECT), Err(TightBeamError::ChannelClosed)));
 	}
 }

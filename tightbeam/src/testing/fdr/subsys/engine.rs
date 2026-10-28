@@ -370,14 +370,18 @@ where
 				// that the faults cause.
 				self.explore_specification_with_faults(record)?;
 				#[cfg(feature = "testing-fmea")]
-				self.generate_fmea_if_configured()?;
+				{
+					// Each fault fired in a spec, so it rates in that spec.
+					let config = Arc::clone(&self.config);
+					self.generate_fmea_if_configured(&config.specs)?;
+				}
 				Ok(self.verdict.clone())
 			}
 			// Mode 2: specs with no fault model run the refinement checks.
 			ExplorationMode::Refinement => {
 				self.check_refinement();
 				#[cfg(feature = "testing-fmea")]
-				self.generate_fmea_if_configured()?;
+				self.generate_fmea_if_configured([self.process])?;
 				Ok(self.verdict.clone())
 			}
 			// Mode 3: a run with no spec explores the process over every seed.
@@ -416,7 +420,7 @@ where
 		self.check_determinism();
 
 		#[cfg(feature = "testing-fmea")]
-		self.generate_fmea_if_configured()?;
+		self.generate_fmea_if_configured([self.process])?;
 
 		Ok(self.verdict.clone())
 	}
@@ -464,16 +468,20 @@ where
 	}
 
 	/// Builds the FMEA report when the FMEA configuration sets `auto_generate`
-	/// and the run injected a fault.
+	/// and the run injected a fault. Each fault rates in the first of
+	/// `processes` that holds its state.
 	///
 	/// # Errors
 	///
 	/// - The error of [`FdrVerdict::fmea_report`], which leaves the verdict with no report.
 	#[cfg(feature = "testing-fmea")]
-	fn generate_fmea_if_configured(&mut self) -> Result<(), TightBeamError> {
+	fn generate_fmea_if_configured<'p>(
+		&mut self,
+		processes: impl IntoIterator<Item = &'p Process>,
+	) -> Result<(), TightBeamError> {
 		if let Some(ref fmea_config) = self.config.fmea_config {
 			if fmea_config.auto_generate && !self.verdict.faults_injected.is_empty() {
-				let report = self.verdict.fmea_report(self.process, Some(fmea_config.clone()))?;
+				let report = self.verdict.fmea_report(processes, Some(fmea_config.clone()))?;
 				self.verdict.fmea_report = Some(report);
 			}
 		}

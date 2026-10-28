@@ -178,7 +178,9 @@ macro_rules! __servlet_define {
 ///
 /// # Macro-free path
 ///
-/// 1. Implement [`ServletService`](crate::colony::servlet::ServletService).
+/// 1. Implement [`ServletService`](crate::colony::servlet::ServletService),
+///    or build one from closures with
+///    [`ServletHandlers`](crate::colony::servlet::ServletHandlers).
 /// 2. Pass it to [`ServletRuntime::start`](crate::colony::servlet::ServletRuntime::start).
 #[macro_export]
 macro_rules! servlet {

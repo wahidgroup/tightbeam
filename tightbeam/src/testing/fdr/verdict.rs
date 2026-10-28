@@ -106,12 +106,13 @@ pub struct FdrVerdict {
 	/// [`FdrVerdict::deadlock_witness`] alone.
 	pub deadlock_free: Decision,
 
-	/// Schedulability, which holds when the task set of every configured spec
-	/// meets its deadlines.
+	/// Schedulability, which holds when each configured spec that declares a
+	/// task set meets its deadlines.
 	///
-	/// A spec with no schedulability block has no task set, so it counts as
-	/// schedulable. An analysis error refutes, because every
-	/// `SchedulabilityError` names a defect in the declared task set.
+	/// A spec with no schedulability block has no task set, and a run whose
+	/// specs declare no task set leaves the field [`Decision::NotAsserted`].
+	/// An analysis error refutes, because every `SchedulabilityError` names a
+	/// defect in the declared task set.
 	pub schedulable: Decision,
 
 	/// Whether a structural proof shows that the LTS is deterministic.

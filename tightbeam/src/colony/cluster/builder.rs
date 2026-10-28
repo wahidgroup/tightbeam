@@ -182,20 +182,22 @@ impl ClusterConfig {
 }
 
 impl ClusterConfigBuilder {
-	/// Replace the hive heartbeat configuration.
+	/// Replace the hive heartbeat configuration. It defaults to
+	/// [`HeartbeatConfig::default`].
 	pub fn with_heartbeat_config(mut self, config: HeartbeatConfig) -> Self {
 		self.heartbeat = config;
 		self
 	}
 
 	/// Set route scoring: the reinforcement boost, the weakening penalty, and
-	/// evaporation.
+	/// evaporation. It defaults to [`PheromoneConfig::default`].
 	pub fn with_pheromone_config(mut self, config: PheromoneConfig) -> Self {
 		self.pheromone = config;
 		self
 	}
 
 	/// Set the naming scope that inbound resource URNs must validate against.
+	/// It defaults to [`ColonyNamespace::default`].
 	pub fn with_namespace(mut self, namespace: ColonyNamespace) -> Self {
 		self.namespace = namespace;
 		self
@@ -278,13 +280,15 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Set the outbound connection pool settings for hive and peer dials.
+	/// Set the outbound connection pool settings for hive and peer dials. They
+	/// default to [`PoolConfig::default`].
 	pub fn with_pool_config(mut self, config: PoolConfig) -> Self {
 		self.pool_config = config;
 		self
 	}
 
-	/// Set the freshness window for signed hive control frames.
+	/// Set the freshness window for signed hive control frames. It defaults to
+	/// 30 seconds.
 	pub fn with_control_freshness_window(mut self, window: Duration) -> Self {
 		self.control_freshness_window = window;
 		self
@@ -423,7 +427,8 @@ impl ClusterConfigBuilder {
 	///
 	/// The beat floods the slate rumor on each change of the slate or the flood
 	/// targets, and once per interval. [`ClusterConfig::rumor_refresh`] reads
-	/// the effective interval, clamped to the freshness window.
+	/// the effective interval, clamped to the freshness window. It defaults to
+	/// 30 seconds.
 	pub fn with_rumor_refresh(mut self, rumor_refresh: Duration) -> Self {
 		self.peer.rumor_refresh = rumor_refresh;
 		self

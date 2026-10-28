@@ -351,6 +351,10 @@ pub trait AsyncProtocolStream: MaybeSend + Unpin {
 	fn write_frame(&mut self, buffer: &[u8]) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
 	/// Report whether the underlying transport still appears connected.
+	///
+	/// The check returns at once and leaves every byte in the stream, so a pool
+	/// can ask it of an idle connection. A stream that met end of stream or an
+	/// error reads `false`.
 	fn is_alive(&self) -> bool;
 }
 
@@ -408,6 +412,10 @@ pub trait AsyncByteWrite: MaybeSend + Unpin {
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait AsyncByteStream: AsyncByteRead + AsyncByteWrite {
 	/// Report whether the underlying transport still appears connected.
+	///
+	/// The check returns at once and leaves every byte in the stream, so a pool
+	/// can ask it of an idle connection. A stream that met end of stream or an
+	/// error reads `false`.
 	fn is_alive(&self) -> bool;
 }
 

@@ -1805,7 +1805,10 @@ mod tests {
 			),
 			cleartext_on_an_encrypted_half => (TransportError::MissingEncryption, "invalid-message"),
 			record_on_a_cleartext_half => (crate::transport::TransportFailure::EncryptionFailed.into(), "invalid-message"),
-			record_past_the_volume_bound => (crate::transport::TransportFailure::RekeyRequired.into(), "invalid-message"),
+			record_past_the_volume_bound => (
+				crate::transport::TransportFailure::RenewalBoundExceeded.into(),
+				"invalid-message"
+			),
 			closed_by_the_peer => (TransportError::ConnectionClosed, "connection-closed"),
 			stalled_past_the_deadline => (crate::transport::TransportFailure::DeadlineExceeded.into(), "connection-closed"),
 		}

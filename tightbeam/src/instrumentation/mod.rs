@@ -98,6 +98,49 @@ impl TbEvent {
 	pub fn is_from_event_api(&self) -> bool {
 		self.flags & Self::FROM_EVENT_API != 0
 	}
+
+	/// The overflow warning that a sink keeps in place of this event, the
+	/// first event that the sink drops.
+	///
+	/// The warning is an [`events::WARN`] record with the sequence number and
+	/// the clock stamp of this event, so the record of the sink shows where and
+	/// when the sink began to drop events. Its label is the URN of this event,
+	/// and its other fields are clear.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::instrumentation::{events, TbEvent};
+	///
+	/// let dropped = TbEvent {
+	///     seq: 7,
+	///     urn: events::GATE_REJECT,
+	///     label: Some("PermissionDenied".into()),
+	///     payload_hash: Some([0; 32]),
+	///     duration_ns: None,
+	///     timestamp_ns: Some(1_500),
+	///     flags: TbEvent::FROM_EVENT_API,
+	///     extras: None,
+	/// };
+	///
+	/// let warning = dropped.into_overflow_warning();
+	/// assert_eq!((warning.seq, warning.urn, warning.timestamp_ns), (7, events::WARN, Some(1_500)));
+	/// assert_eq!(warning.label.as_deref(), Some("urn:tightbeam:event:gate/reject"));
+	/// ```
+	pub fn into_overflow_warning(self) -> Self {
+		let label = Cow::Owned(self.urn.to_string());
+
+		Self {
+			seq: self.seq,
+			urn: events::WARN,
+			label: Some(label),
+			payload_hash: None,
+			duration_ns: None,
+			timestamp_ns: self.timestamp_ns,
+			flags: 0,
+			extras: None,
+		}
+	}
 }
 
 /// The instrumentation settings of a trace.
@@ -175,7 +218,8 @@ pub struct TbInstrumentationConfig {
 	///
 	/// [`DIVERGENCE_DETECT`]: events::DIVERGENCE_DETECT
 	pub divergence_heuristics: bool,
-	/// How many events the default bounded sink holds before it drops more.
+	/// How many events the default bounded sink holds. Past them, the sink
+	/// keeps one overflow warning and drops the rest.
 	pub max_events: u32,
 	/// Whether each event keeps the duration that its caller measured.
 	pub record_durations: bool,
@@ -355,6 +399,15 @@ pub mod active {
 	/// so an implementation MUST be amortized O(1) and MUST NOT block on I/O.
 	/// A sink buffers its I/O and defers it.
 	///
+	/// # Overflow
+	///
+	/// A sink that drops events MUST keep one warning of the truncation, so
+	/// the record it drains or forwards shows where the truncation began:
+	///
+	/// - It keeps [`TbEvent::into_overflow_warning`] of the first event it drops, in place of that event.
+	/// - [`Self::retains`] answers `true` until the sink holds it, so the collector builds that event.
+	/// - [`BoundedMemorySink`] keeps the warning as the one record past its bound.
+	///
 	/// # Re-entry
 	///
 	/// - [`Self::emit`] runs after the trace clock releases its lock, so it MAY
@@ -385,20 +438,33 @@ pub mod active {
 		/// [`ConsumedTrace::is_complete`]: crate::trace::ConsumedTrace::is_complete
 		fn overflowed(&self) -> bool;
 
-		/// Whether this sink keeps the next event that it receives.
+		/// Whether this sink keeps the next event that it receives, or the
+		/// overflow warning in its place. The default keeps every event.
 		///
-		/// The collector asks after it takes the event's sequence number and
-		/// before it builds the event, so a dropped event costs no allocation.
-		/// A sink that answers `false` drops that event, so
-		/// [`Self::overflowed`] MUST then read `true`. The default keeps every
-		/// event.
+		/// - The collector asks after it takes the event's sequence number and before it builds the event.
+		/// - An event that the sink refuses costs no allocation.
+		/// - A sink that answers `false` drops that event, so [`Self::overflowed`] MUST then read `true`.
 		///
 		/// # Examples
 		///
 		/// ```
-		/// use tightbeam::instrumentation::{BoundedMemorySink, EventSink};
+		/// use tightbeam::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent};
 		///
 		/// let full = BoundedMemorySink::new(0);
+		/// let first = TbEvent {
+		///     seq: 0,
+		///     urn: events::START,
+		///     label: None,
+		///     payload_hash: None,
+		///     duration_ns: None,
+		///     timestamp_ns: None,
+		///     flags: 0,
+		///     extras: None,
+		/// };
+		///
+		/// // The full sink keeps the warning of its first event, then refuses.
+		/// assert!(full.retains());
+		/// full.emit(first);
 		///
 		/// assert!(!full.retains());
 		/// assert!(full.overflowed());
@@ -453,9 +519,10 @@ pub mod active {
 	/// The default [`EventSink`], a bounded in-memory buffer with a sticky
 	/// overflow latch.
 	///
-	/// - It keeps the oldest events, drops each event past `max_events`, and sets the latch.
-	/// - [`EventSink::retains`] answers from the same bound, so the collector builds no event the sink drops.
-	/// - [`EventSink::drain`] frees capacity but MUST NOT clear the latch.
+	/// - It keeps the oldest `max_events` events and drops each later one.
+	/// - It keeps [`TbEvent::into_overflow_warning`] of the first event it drops, and sets the latch.
+	/// - [`EventSink::retains`] answers from the same state, so the collector builds no event the sink drops.
+	/// - [`EventSink::drain`] frees capacity but MUST NOT clear the latch, so the sink keeps one warning.
 	/// - Dropped events consume collector sequence numbers too, so gaps in [`TbEvent::seq`] mark truncation.
 	#[derive(Debug)]
 	pub struct BoundedMemorySink {
@@ -464,20 +531,33 @@ pub mod active {
 		overflow: AtomicBool,
 	}
 
+	/// What a [`BoundedMemorySink`] keeps of the next event that it receives.
+	enum Slot {
+		/// The event itself, below the bound.
+		Event,
+		/// The overflow warning in place of the first event past the bound.
+		Warning,
+		/// Nothing, once the sink holds its warning.
+		Dropped,
+	}
+
 	impl BoundedMemorySink {
 		pub fn new(max_events: u32) -> Self {
 			Self { max_events, events: Mutex::new(Vec::new()), overflow: AtomicBool::new(false) }
 		}
 
-		/// Whether a sink that holds `held` events drops the next one, which
-		/// sets the latch.
-		fn drops_next(&self, held: usize) -> bool {
-			let full = (held as u32) >= self.max_events;
-			if full {
-				self.overflow.store(true, Ordering::Relaxed);
+		/// What a sink that holds `held` events keeps of the next one. The
+		/// latch sets with the warning, so the sink keeps one warning.
+		fn slot(&self, held: usize) -> Slot {
+			let held = u32::try_from(held).unwrap_or(u32::MAX);
+			if held < self.max_events {
+				return Slot::Event;
+			}
+			if self.overflow.load(Ordering::Relaxed) {
+				return Slot::Dropped;
 			}
 
-			full
+			Slot::Warning
 		}
 
 		/// The lock of the events this sink holds, which a test poisons.
@@ -495,15 +575,18 @@ pub mod active {
 
 	impl EventSink for BoundedMemorySink {
 		// The capacity check and the push share one lock, so concurrent
-		// emitters stay within `max_events`. A poisoned lock still holds a
-		// whole list, as `retains` states.
+		// emitters stay within `max_events` and the one warning. A poisoned
+		// lock still holds a whole list, as `retains` states.
 		fn emit(&self, event: TbEvent) {
 			let mut events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
-			if self.drops_next(events.len()) {
-				return;
+			match self.slot(events.len()) {
+				Slot::Event => events.push(event),
+				Slot::Warning => {
+					self.overflow.store(true, Ordering::Relaxed);
+					events.push(event.into_overflow_warning());
+				}
+				Slot::Dropped => {}
 			}
-
-			events.push(event);
 		}
 
 		// A poisoned lock still holds a whole list, as `retains` states.
@@ -521,7 +604,8 @@ pub mod active {
 		// in one step.
 		fn retains(&self) -> bool {
 			let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
-			!self.drops_next(events.len())
+			let slot = self.slot(events.len());
+			!matches!(slot, Slot::Dropped)
 		}
 	}
 
@@ -906,9 +990,45 @@ mod tests {
 		let sink = BoundedMemorySink::new(1);
 		sink.emit(sample_event(0));
 		sink.emit(sample_event(1));
+		sink.emit(sample_event(2));
 
 		assert!(sink.overflowed());
-		assert_eq!(sink.drain().len(), 1);
+		assert_eq!(sink.drain().len(), 2);
+	}
+
+	/// The warning of an event takes its sequence number and its clock stamp,
+	/// names its URN, and clears every other field.
+	#[test]
+	fn the_warning_of_an_event_takes_its_place_and_names_it() {
+		let dropped = TbEvent {
+			label: Some(Cow::Borrowed("dropped")),
+			payload_hash: Some([7u8; 32]),
+			duration_ns: Some(3),
+			timestamp_ns: Some(1_500),
+			flags: TbEvent::FROM_EVENT_API,
+			extras: Some(vec![1, 2]),
+			..sample_event(7)
+		};
+
+		let warning = dropped.into_overflow_warning();
+
+		let expected = TbEvent {
+			urn: events::WARN,
+			label: Some(Cow::Borrowed("urn:tightbeam:event:core/start")),
+			timestamp_ns: Some(1_500),
+			..sample_event(7)
+		};
+		assert_eq!(warning, expected);
+	}
+
+	/// A full bounded sink that holds no warning yet retains the next event,
+	/// so the collector builds the event that the warning replaces.
+	#[test]
+	fn a_full_bounded_sink_retains_the_event_its_warning_replaces() {
+		let sink = BoundedMemorySink::new(1);
+		sink.emit(sample_event(0));
+
+		assert_eq!([sink.retains(), sink.overflowed()], [true, false]);
 	}
 
 	#[test]
@@ -930,13 +1050,14 @@ mod tests {
 		assert!(sink.overflowed());
 	}
 
-	/// A full bounded sink refuses the next event, and the refusal sets its
-	/// overflow latch.
+	/// A full bounded sink that holds its warning refuses the next event, and
+	/// its overflow latch reads `true`.
 	#[test]
 	fn bounded_sink_refuses_the_next_event_when_full_and_latches() {
 		let sink = BoundedMemorySink::new(1);
 		let first = sink.retains();
 		sink.emit(sample_event(0));
+		sink.emit(sample_event(1));
 		assert_eq!([first, sink.retains(), sink.overflowed()], [true, false, true]);
 	}
 
@@ -953,8 +1074,9 @@ mod tests {
 		assert!(events.is_poisoned());
 	}
 
-	/// A poisoned sink keeps the events it holds, and the event it drops past
-	/// its bound sets the latch, as an unpoisoned sink does.
+	/// A poisoned sink keeps the events it holds, and the warning in place of
+	/// the first event past its bound sets the latch, as an unpoisoned sink
+	/// does.
 	#[test]
 	fn a_poisoned_sink_keeps_its_events_and_latches_a_drop() {
 		let sink = BoundedMemorySink::new(1);
@@ -963,7 +1085,7 @@ mod tests {
 
 		sink.emit(sample_event(1));
 
-		assert_eq!((sink.overflowed(), sink.drain().len()), (true, 1));
+		assert_eq!((sink.overflowed(), sink.drain().len()), (true, 2));
 	}
 
 	/// The trace hash of the artifact of a trace whose one event `record`
@@ -1054,6 +1176,18 @@ mod tests {
 			complete => (artifact_of_one_event, false),
 			overflowed => (artifact_of_an_overflowed_trace, true),
 		}
+	}
+
+	/// The events of an overflowed trace hold the warning of the first event
+	/// that its sink dropped, so the trace hash covers the truncation.
+	#[test]
+	fn the_artifact_of_an_overflowed_trace_covers_its_warning() -> Result<()> {
+		let artifact = artifact_of_an_overflowed_trace()?;
+
+		let urns: Vec<_> = artifact.events().iter().map(|event| event.urn.clone()).collect();
+
+		assert_eq!(urns, [events::START, events::WARN]);
+		Ok(())
 	}
 
 	/// The trace hash is the SHA3-256 of the DER of the events, a SEQUENCE OF

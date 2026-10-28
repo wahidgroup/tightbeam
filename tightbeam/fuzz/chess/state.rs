@@ -800,14 +800,7 @@ impl TryFrom<&ChessGameState> for MatrixDyn {
 	type Error = MatrixError;
 
 	fn try_from(state: &ChessGameState) -> Result<Self, Self::Error> {
-		let mut matrix = MatrixDyn::try_from(8u8)?;
-		for row in 0..8 {
-			for col in 0..8 {
-				matrix.set(row, col, state.board().get(row, col));
-			}
-		}
-
-		Ok(matrix)
+		MatrixDyn::try_from(state.board())
 	}
 }
 

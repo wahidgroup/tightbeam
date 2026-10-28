@@ -749,9 +749,9 @@ impl SendCipher {
 ///
 /// # Renewal bound
 ///
-/// Decryption fails closed with [`TightBeamError::RekeyRequired`] at either
-/// bound of the crate's own renewal policy, which holds a peer that ignores
-/// its send limit to the bounds an honest sender keeps:
+/// Decryption fails closed with [`TightBeamError::RenewalBoundExceeded`] at
+/// either bound of the crate's own renewal policy, which holds a peer that
+/// ignores its send limit to the bounds an honest sender keeps:
 ///
 /// - A sequence number at or past [`DEFAULT_REKEY_RECORD_LIMIT`], which an honest [`SendCipher`] stays below.
 /// - A record that takes the bytes opened under this key past the renewal volume.
@@ -862,7 +862,7 @@ impl RecvCipher {
 	/// - [`TightBeamError::SerializationError`] -- the position the record carries is no `RecordSequence`.
 	/// - [`TightBeamError::RecordEpoch`] -- the record carries another epoch.
 	/// - [`TightBeamError::NonceReplayed`] -- the record carries another sequence number than the next.
-	/// - [`TightBeamError::RekeyRequired`] -- the record meets either renewal bound.
+	/// - [`TightBeamError::RenewalBoundExceeded`] -- the record meets either renewal bound.
 	pub fn open<'a>(&mut self, record: &'a mut [u8]) -> TbResult<&'a [u8]> {
 		// 1. Decode the record with its content left where it arrived, and read the position it claims.
 		let record = AuthEnvelopedData::detach(record, RECORD_CONTENT_TYPE)?;
@@ -874,7 +874,7 @@ impl RecvCipher {
 		// 2. Refuse at the crate's renewal bounds, by record count and by the bytes this key has opened.
 		let counter = carried.sequence;
 		if counter >= DEFAULT_REKEY_RECORD_LIMIT {
-			return Err(TightBeamError::RekeyRequired);
+			return Err(TightBeamError::RenewalBoundExceeded);
 		}
 
 		// This check lets only plausible records reach the key.
@@ -886,7 +886,7 @@ impl RecvCipher {
 		let record_bytes = u64::try_from(record.content_len()).unwrap_or(u64::MAX);
 		let opened_bytes = progress.opened_bytes.saturating_add(record_bytes);
 		if opened_bytes > RENEWAL_VOLUME_BYTES {
-			return Err(TightBeamError::RekeyRequired);
+			return Err(TightBeamError::RenewalBoundExceeded);
 		}
 
 		// 3. Open the content in place. The tag covers the position, so a
@@ -1647,7 +1647,7 @@ mod tests {
 
 		let mut receiver = RecvCipher::with_expected_counter(test_runtime(), DEFAULT_REKEY_RECORD_LIMIT);
 		let refused = receiver.open(&mut over_bound);
-		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
+		assert!(matches!(refused, Err(TightBeamError::RenewalBoundExceeded)));
 	}
 
 	/// A key that has opened the whole renewal volume refuses the next
@@ -1658,7 +1658,7 @@ mod tests {
 
 		let mut receiver = RecvCipher::with_progress(test_runtime(), 0, RENEWAL_VOLUME_BYTES);
 		let refused = receiver.open(&mut record);
-		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
+		assert!(matches!(refused, Err(TightBeamError::RenewalBoundExceeded)));
 	}
 
 	/// The record that brings the opened bytes exactly to the volume is the
@@ -1688,7 +1688,7 @@ mod tests {
 		receiver.open(&mut first)?;
 
 		let refused = receiver.open(&mut second);
-		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
+		assert!(matches!(refused, Err(TightBeamError::RenewalBoundExceeded)));
 		Ok(())
 	}
 

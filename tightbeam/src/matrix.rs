@@ -298,6 +298,48 @@ impl<const N: usize> TryFrom<&[u8]> for Matrix<N> {
 	}
 }
 
+/// A fixed-size matrix converts into the wire type cell for cell, so it goes
+/// into a frame through [`IntoMatrixDyn`].
+///
+/// ```
+/// use tightbeam::matrix::{Matrix, MatrixDyn, MatrixLike};
+///
+/// let mut fixed = Matrix::<2>::default();
+/// fixed.set(1, 0, 4);
+///
+/// let carried = MatrixDyn::try_from(&fixed)?;
+/// assert_eq!(carried.as_bytes(), &[0, 0, 4, 0]);
+/// # Ok::<(), tightbeam::matrix::MatrixError>(())
+/// ```
+impl<const N: usize> TryFrom<&Matrix<N>> for MatrixDyn {
+	type Error = MatrixError;
+
+	/// Copies the `N * N` cells of `matrix` in row-major order.
+	///
+	/// # Errors
+	///
+	/// The copy returns `Ok` for every `Matrix<N>`, because a dimension outside
+	/// `1..=255` fails to compile.
+	fn try_from(matrix: &Matrix<N>) -> Result<Self, Self::Error> {
+		const { assert_wire_dimension::<N>() };
+
+		// The const block above bounds `N` to `1..=255`, so it fits a `u8`.
+		let n = N as u8;
+		let data = matrix.data.as_flattened().to_vec();
+		Ok(Self { n, data })
+	}
+}
+
+impl<const N: usize> TryFrom<Matrix<N>> for MatrixDyn {
+	type Error = MatrixError;
+
+	/// Copies the `N * N` cells of `matrix` in row-major order, as the
+	/// conversion of a `&Matrix<N>` does.
+	fn try_from(matrix: Matrix<N>) -> Result<Self, Self::Error> {
+		Self::try_from(&matrix)
+	}
+}
+
 impl TryFrom<u8> for MatrixDyn {
 	type Error = MatrixError;
 	fn try_from(n: u8) -> Result<Self, Self::Error> {
@@ -540,5 +582,22 @@ mod tests {
 
 		let long = Matrix::<3>::try_from([0u8; 10].as_slice());
 		assert!(matches!(long, Err(MatrixError::LengthMismatch { n: 3, len: 10 })));
+	}
+
+	/// A fixed-size matrix composes into a V3 frame, which carries its cells
+	/// in row-major order.
+	#[test]
+	#[cfg(all(feature = "builder", feature = "testing"))]
+	fn a_fixed_size_matrix_composes_into_a_v3_frame() -> crate::error::Result<()> {
+		let mut matrix = Matrix::<3>::default();
+		matrix.set(0, 1, 2);
+		matrix.set(2, 0, 7);
+		let message = crate::testing::TestMessage::sample(None);
+
+		let frame = compose! { V3: id: "fixed", order: 1, message: message, matrix: matrix }?;
+
+		let carried = frame.metadata().matrix().map(MatrixDyn::as_bytes);
+		assert_eq!(carried, Some(&[0, 2, 0, 0, 0, 0, 7, 0, 0][..]));
+		Ok(())
 	}
 }

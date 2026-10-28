@@ -194,6 +194,9 @@ impl Default for ScaleCooldowns {
 impl ServletScaleConfig {
 	/// The bounds and thresholds a servlet scales on when none are set.
 	///
+	/// It holds 1 to 10 instances, spawns one more above 80% utilization, and
+	/// stops an idle one below 20%.
+	///
 	/// It builds through [`Self::new`] in a const, so a default that fails
 	/// the pair checks fails to compile, and the values have no unchecked
 	/// second home.

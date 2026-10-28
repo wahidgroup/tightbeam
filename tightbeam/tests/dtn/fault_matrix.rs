@@ -39,8 +39,8 @@ impl FaultType {
 /// - Cell [1,0]: Battery percentage (0-100)
 /// - Remaining cells: Reserved for future use
 ///
-/// This provides a clean abstraction for encoding fault flags and telemetry into
-/// the Frame.matrix field while maintaining separation of concerns.
+/// The type encodes the fault flags and the telemetry into the `matrix` field
+/// of a Frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FaultMatrix {
 	matrix: Matrix<3>,
@@ -136,14 +136,8 @@ impl TryFrom<FaultMatrix> for tightbeam::matrix::MatrixDyn {
 
 	fn try_from(fault: FaultMatrix) -> Result<Self, Self::Error> {
 		let matrix_3: Matrix<3> = fault.into();
-		let n = 3u8;
-		let mut data = Vec::with_capacity(9);
-		for r in 0..n {
-			for c in 0..n {
-				data.push(matrix_3.get(r, c));
-			}
-		}
-		tightbeam::matrix::MatrixDyn::from_row_major(n, data).ok_or_else(|| tightbeam::TightBeamError::InvalidBody)
+		let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(matrix_3)?;
+		Ok(matrix_dyn)
 	}
 }
 
