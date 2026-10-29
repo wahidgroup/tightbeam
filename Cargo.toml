@@ -52,25 +52,25 @@ arithmetic_side_effects = "deny"
 tightbeam-derive = { version = "=0.2.0", path = "tightbeam-derive" }
 
 # RustCrypto dependencies
-spki = { version = "=0.7.3", default-features = false }
-der = { version = "=0.7.10", default-features = false, features = [
+spki = { version = "=0.8.1", default-features = false }
+der = { version = "=0.8.3", default-features = false, features = [
 	"alloc",
 	"derive",
 	"oid",
 ] }
 cms = { version = "=0.2.3", default-features = false }
 pkcs12 = { version = "=0.1.0", default-features = false }
-hkdf = { version = "=0.12.4", default-features = false }
-x509-cert = { version = "=0.2.5", default-features = false, features = [
+hkdf = { version = "=0.13.0", default-features = false }
+x509-cert = { version = "=0.3.0", default-features = false, features = [
 	"pem",
 	# The `hazmat` feature opens `Profile::Manual`, so `cert!` writes the key
 	# identifiers of RFC 7093 §2 method 1 in place of the builder's SHA-1 ones.
 	"hazmat",
 ] }
 hex-literal = { version = "=1.1.0", default-features = false }
-elliptic-curve = { version = "=0.13.8", default-features = false }
+elliptic-curve = { version = "=0.14.3", default-features = false }
 subtle = { version = "=2.6.1", default-features = false }
-zeroize = { version = "=1.9.0", features = ["alloc", "zeroize_derive"] }
+zeroize = { version = "=1.9.1", features = ["alloc", "zeroize_derive"] }
 crypto-common = { version = "=0.1.7", default-features = false, features = [
 	"getrandom",
 	"rand_core",
@@ -80,7 +80,7 @@ signature = { version = "=2.2.0", default-features = false, features = [
 	"alloc",
 ] }
 digest = { version = "=0.10.7", default-features = false, features = ["alloc"] }
-aes = { version = "=0.8.4", default-features = false }
+aes = { version = "=0.9.3", default-features = false }
 aes-gcm = { version = "=0.10.3", default-features = false, features = [
 	"aes",
 	"alloc",
@@ -88,8 +88,8 @@ aes-gcm = { version = "=0.10.3", default-features = false, features = [
 aes-kw = { version = "=0.2.1", default-features = false, features = ["alloc"] }
 # Named so the `zeroize` feature of each is reachable: `aes-gcm` 0.10 passes
 # its own `zeroize` feature to neither.
-ghash = { version = "=0.5.1", default-features = false }
-polyval = { version = "=0.6.2", default-features = false }
+ghash = { version = "=0.6.0", default-features = false }
+polyval = { version = "=0.7.3", default-features = false }
 sha3 = { version = "=0.10.9", default-features = false, features = ["oid"] }
 ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"signing",
@@ -97,7 +97,7 @@ ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"der",
 ] }
 kem = { version = "=0.2.0", default-features = false }
-k256 = { version = "=0.13.4", default-features = false, features = [
+k256 = { version = "=0.14.0", default-features = false, features = [
 	"alloc",
 	"signature",
 	"schnorr",
@@ -110,7 +110,7 @@ rayon = { version = "=1.12.0", default-features = false }
 rand_core = { version = "=0.6.4", default-features = false, features = [
 	"getrandom",
 ] }
-tokio = { version = "=1.53.3", default-features = false, features = [
+tokio = { version = "=1.54.1", default-features = false, features = [
 	"rt",
 	"rt-multi-thread",
 	"net",
@@ -119,29 +119,29 @@ tokio = { version = "=1.53.3", default-features = false, features = [
 	"sync",
 	"macros",
 ] }
-time = { version = "=0.3.47", default-features = false, features = [
+time = { version = "=0.3.55", default-features = false, features = [
 	"alloc",
 ] }
 
 # Async utilities
-futures = { version = "=0.3.33", default-features = false, features = ["alloc"] }
+futures = { version = "=0.3.34", default-features = false, features = ["alloc"] }
 
 # Compression dependencies
 zstd-safe = { version = "=8.2.0", default-features = false }
 
 # Dev dependencies
-husky-rs = { version = "=0.3.3" }
-p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
-p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
-p521 = { version = "=0.13.3", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+husky-rs = { version = "=0.4.0" }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+p384 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+p521 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 paste = { version = "=1.0.15" }
-trybuild = { version = "=1.0.118", features = ["diff"] }
+trybuild = { version = "=1.0.122", features = ["diff"] }
 
 # Proc macro dependencies
 proc-macro2 = { version = "=1.0.107" }
 quote = { version = "=1.0.47" }
-syn = { version = "=2.0.119", features = ["full", "derive"] }
+syn = { version = "=3.0.9", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
-afl = { version = "=0.17.1" }
-proptest = { version = "=1.6.0", default-features = false, features = ["std"] }
+afl = { version = "=0.18.2" }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
