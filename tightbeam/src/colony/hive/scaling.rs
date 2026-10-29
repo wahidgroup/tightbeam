@@ -5,8 +5,8 @@
 
 use core::time::Duration;
 
+use crate::basis_points::BasisPoints;
 use crate::urn::Urn;
-use crate::utils::BasisPoints;
 use crate::Errorizable;
 
 /// The default wait after a scale-up, 30 seconds.

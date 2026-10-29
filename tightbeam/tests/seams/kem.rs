@@ -33,11 +33,11 @@ use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::Encode;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::DATA;
 use tightbeam::random::{CryptoRngCore, OsRng};
 use tightbeam::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoRef};
 use tightbeam::testing::{EnvelopeRecipient, TestCertificate};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::ext::pkix::{KeyUsage, KeyUsages};
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;
@@ -380,4 +380,217 @@ fn an_outside_store_anchors_a_pinned_chain() -> Result<(), HandshakeError> {
 	let chain = CmsServerChain::new([server.authority.to_owned(), server.key_agreement.to_owned()])?;
 	ProvisionedTrust::new(CmsServerIdentity::Chain(chain), Arc::new(store))?;
 	Ok(())
+}
+
+/// A KEM of the RustCrypto `kem` traits, which an outside crate brings
+/// through [`KemProvider`] alone, and which [`ProviderKem`] runs as the KEM of
+/// a `KEMRecipientInfo`:
+///
+/// - Its encapsulated key is the shared secret under the mask of the
+///   recipient key, as the stub KEM above masks it.
+/// - Its encapsulation binds no sender key, so its default value runs it.
+/// - Its decapsulation key is a backend outside the crate.
+/// - A [`MaskingProvider`] seals and opens an `AuthEnvelopedData` under it,
+///   with the house algorithms for the rest.
+///
+/// [`KemProvider`]: tightbeam::crypto::profiles::KemProvider
+/// [`ProviderKem`]: tightbeam::crypto::cms::ProviderKem
+#[cfg(feature = "kem")]
+mod provider {
+	use rand_core::{CryptoRng, RngCore};
+
+	use tightbeam::crypto::cms::ProviderKem;
+	use tightbeam::crypto::kem::generic_array::typenum::U32;
+	use tightbeam::crypto::kem::generic_array::GenericArray;
+	use tightbeam::crypto::kem::{Decapsulator, EncappedKey, Encapsulator, Error as KemError, SharedSecret};
+	use tightbeam::crypto::profiles::KemProvider;
+	use tightbeam::der::oid::AssociatedOid;
+
+	use super::*;
+
+	/// The identifier of the masking KEM, under the outside arc.
+	const MASKING_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.4");
+
+	/// The KEM of the outside role.
+	type MaskingKem = ProviderKem<MaskingRole>;
+
+	/// The recipient key parses from the bits of a SubjectPublicKeyInfo,
+	/// whatever their algorithm.
+	impl<'a> TryFrom<SubjectPublicKeyInfoRef<'a>> for StubKey {
+		type Error = tightbeam::spki::Error;
+
+		fn try_from(spki: SubjectPublicKeyInfoRef<'a>) -> Result<Self, Self::Error> {
+			Ok(StubKey(spki.subject_public_key.raw_bytes().to_vec()))
+		}
+	}
+
+	/// The `kemct` of the masking KEM: the shared secret under the mask of
+	/// the recipient key.
+	#[derive(Debug)]
+	struct MaskedSecret(GenericArray<u8, U32>);
+
+	impl AsRef<[u8]> for MaskedSecret {
+		fn as_ref(&self) -> &[u8] {
+			&self.0
+		}
+	}
+
+	impl EncappedKey for MaskedSecret {
+		type EncappedKeySize = U32;
+		type SharedSecretSize = U32;
+		type SenderPublicKey = ();
+		type RecipientPublicKey = StubKey;
+
+		fn from_bytes(bytes: &GenericArray<u8, U32>) -> Result<Self, KemError> {
+			Ok(MaskedSecret(*bytes))
+		}
+	}
+
+	/// The encapsulation of the masking KEM, which draws a fresh secret and
+	/// masks it for the recipient.
+	#[derive(Default)]
+	struct Masking;
+
+	impl AssociatedOid for Masking {
+		const OID: ObjectIdentifier = MASKING_KEM;
+	}
+
+	impl Encapsulator<MaskedSecret> for Masking {
+		fn try_encap<R: CryptoRng + RngCore>(
+			&self,
+			csprng: &mut R,
+			recipient: &StubKey,
+		) -> Result<(MaskedSecret, SharedSecret<MaskedSecret>), KemError> {
+			let mut secret = GenericArray::<u8, U32>::default();
+			csprng.try_fill_bytes(&mut secret).map_err(|_| KemError)?;
+
+			let kemct = GenericArray::from_exact_iter(masked(&secret, &recipient.mask())).ok_or(KemError)?;
+			Ok((MaskedSecret(kemct), SharedSecret::new(secret)))
+		}
+	}
+
+	/// The decapsulation key of a masking recipient, a backend that unmasks a
+	/// `kemct` itself.
+	#[derive(Debug)]
+	struct MaskKey {
+		/// The DER SubjectPublicKeyInfo of the certificate the key answers for.
+		public_key_der: Vec<u8>,
+		/// The recipient key, whose mask the backend holds.
+		key: StubKey,
+	}
+
+	impl KeyBackend for MaskKey {
+		fn algorithm(&self) -> AlgorithmIdentifierOwned {
+			AlgorithmIdentifierOwned { oid: MASKING_KEM, parameters: None }
+		}
+
+		fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+			Ok(self.public_key_der.to_owned())
+		}
+	}
+
+	impl Decapsulator<MaskedSecret> for MaskKey {
+		fn try_decap(&self, encapped_key: &MaskedSecret) -> Result<SharedSecret<MaskedSecret>, KemError> {
+			let secret = masked(encapped_key.as_ref(), &self.key.mask());
+			let secret = GenericArray::from_exact_iter(secret).ok_or(KemError)?;
+			Ok(SharedSecret::new(secret))
+		}
+	}
+
+	/// The role an outside crate defines around the masking KEM, whose
+	/// certificate profile asserts `keyEncipherment` as an ML-KEM profile does.
+	struct MaskingRole;
+
+	impl KemProvider for MaskingRole {
+		type EncappedKey = MaskedSecret;
+		type Kem = Masking;
+		type DecapsulationKey = MaskKey;
+
+		const USAGE: KeyUsages = KeyUsages::KeyEncipherment;
+	}
+
+	/// A provider with the house algorithms, whose KEM is the masking KEM
+	/// through [`ProviderKem`].
+	#[derive(Debug, Default, Clone, Copy)]
+	struct MaskingProvider {
+		profile: StubProfile,
+	}
+
+	impl DigestProvider for MaskingProvider {
+		type Digest = Sha3_256;
+	}
+
+	impl AeadProvider for MaskingProvider {
+		type AeadCipher = Aes256Gcm;
+	}
+
+	impl KeyWrapProvider for MaskingProvider {
+		type KeyWrap = Aes256Wrap;
+	}
+
+	impl SigningProvider for MaskingProvider {
+		type Signature = Secp256k1Signature;
+		type VerifyingKey = Secp256k1VerifyingKey;
+	}
+
+	impl KdfProvider for MaskingProvider {
+		type Kdf = HkdfSha3_256;
+	}
+
+	impl CurveProvider for MaskingProvider {
+		type Curve = Secp256k1;
+	}
+
+	impl CryptoProvider for MaskingProvider {
+		type Profile = StubProfile;
+		type Kem = MaskingKem;
+
+		fn profile(&self) -> &Self::Profile {
+			&self.profile
+		}
+	}
+
+	/// A key-agreement identity under the masking KEM: a certificate that
+	/// asserts `keyEncipherment` alone, beside a masking key of its key.
+	fn masking_identity() -> Result<KeyAgreementIdentity<MaskingKem>, Box<dyn std::error::Error>> {
+		let certificate = certificate_of(KeyUsages::KeyEncipherment);
+		let spki = &certificate.tbs_certificate.subject_public_key_info;
+		let public_key_der = spki.to_der()?;
+		let key = StubKey(spki.subject_public_key.raw_bytes().to_vec());
+
+		let backend = Arc::new(MaskKey { public_key_der, key });
+		Ok(KeyAgreementIdentity::new(certificate, backend)?)
+	}
+
+	/// [`CONTENT`] sealed under [`MaskingProvider`] to the recipient of
+	/// `identity`.
+	fn masking_sealed(
+		identity: &KeyAgreementIdentity<MaskingKem>,
+	) -> Result<AuthEnvelopedData, Box<dyn std::error::Error>> {
+		let recipient = Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL };
+		Ok(AuthEnvelopedData::seal::<MaskingProvider>(recipient, DATA, CONTENT, [], None)?)
+	}
+
+	/// A seal under the masking KEM opens through the decapsulation key of
+	/// the recipient.
+	#[tokio::test]
+	async fn a_kem_of_the_kem_traits_opens_its_seal() -> Result<(), Box<dyn std::error::Error>> {
+		let identity = masking_identity()?;
+		let sealed = masking_sealed(&identity)?;
+		let opener = Opener::Kem { identity: &identity, ukm_label: UKM_LABEL };
+		let arrived = sealed.to_der()?;
+
+		let opened = sealed.open::<MaskingProvider>(arrived, &opener, DATA).await?;
+		assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+		Ok(())
+	}
+
+	/// The `KEMRecipientInfo` of a masking seal names the identifier of the
+	/// masking encapsulation.
+	#[test]
+	fn a_seal_under_the_kem_traits_names_the_kem_of_the_role() -> Result<(), Box<dyn std::error::Error>> {
+		let sealed = masking_sealed(&masking_identity()?)?;
+		assert_eq!(sealed.kem_recipient().kem.oid, MASKING_KEM);
+		Ok(())
+	}
 }

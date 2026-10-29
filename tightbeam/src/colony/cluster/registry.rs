@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use super::error::ClusterError;
+use crate::basis_points::BasisPoints;
+use crate::clock::{Clock, MonotonicInstant};
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::bound_dial::{BoundDial, ExpectedSigner};
 use crate::colony::cluster::servlet_registry::{DialTarget, HiveSlate, ServletRegistry};
 use crate::colony::protocol::RegisterHiveRequest;
 use crate::policy::TransitStatus;
-use crate::utils::time::{Clock, MonotonicInstant};
-use crate::utils::BasisPoints;
 
 /// The shared byte slice of a hive or servlet identifier.
 pub type SharedId = Arc<[u8]>;
@@ -585,6 +585,7 @@ mod tests {
 	use core::str::from_utf8;
 
 	use super::*;
+	use crate::clock::ManualClock;
 	use crate::colony::cluster::servlet_registry::PheromoneConfig;
 	use crate::colony::cluster::{CertificateSpec, ClusterConfig, ClusterTlsConfig};
 	use crate::colony::protocol::ServletInfo;
@@ -594,7 +595,6 @@ mod tests {
 	use crate::der::asn1::OctetString;
 	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey};
-	use crate::utils::time::ManualClock;
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
 	/// A clock that moves only when the test advances it.

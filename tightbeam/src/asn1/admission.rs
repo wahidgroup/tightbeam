@@ -18,6 +18,8 @@
 //! | The opened closing of an anonymous client | CMS | Its attribute set |
 //! | [`decode`](crate::decode) | A | Each message body |
 //! | [`CleartextFrame::decode`] | A ([`DerAdmission::SetOrder`]) | The body of a routed frame |
+//! | [`Frame::decode_message`] | A ([`DerAdmission::SetOrder`]) | The body of a borrowed frame |
+//! | `Frame::decrypt`, `Frame::open_typed` | A ([`DerAdmission::SetOrder`]) | The body of a frame they open in place |
 //! | `CertificateExt::extension` | A | Each extension value |
 //!
 //! A schema with no SET of its own runs no walk. `Frame`, `Metadata`, and
@@ -84,6 +86,7 @@
 //!
 //! [`WireDer`]: crate::asn1::WireDer
 //! [`CleartextFrame::decode`]: crate::router::CleartextFrame::decode
+//! [`Frame::decode_message`]: crate::Frame::decode_message
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
@@ -168,6 +171,18 @@ impl DerAdmission {
 		}
 
 		Ok(())
+	}
+
+	/// Decode `der`, one DER value, as `T` once these rules admit it, so every
+	/// decoder of peer DER runs the walk before the decode sorts a SET.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::admit`].
+	/// - The decode error of `T`, or [`ErrorKind::TrailingData`] -- `der` is no single `T`.
+	pub(crate) fn decode<'a, T: Decode<'a>>(self, der: &'a [u8]) -> DerResult<T> {
+		self.admit(der)?;
+		T::from_der(der)
 	}
 
 	/// Check the elements of the constructed `parent` against these rules,

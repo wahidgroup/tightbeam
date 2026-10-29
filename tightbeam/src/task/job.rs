@@ -41,7 +41,7 @@ pub trait Job {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::utils::task::Job;
+	/// use tightbeam::task::Job;
 	/// use tightbeam::{job, TightBeamError};
 	///
 	/// job! {
@@ -54,7 +54,7 @@ pub trait Job {
 	/// assert_eq!(<AddNumbers as Job>::NAME, "AddNumbers");
 	/// ```
 	///
-	/// [`TracedResult::then_job`]: crate::utils::task::TracedResult::then_job
+	/// [`TracedResult::then_job`]: crate::task::TracedResult::then_job
 	const NAME: &'static str;
 
 	/// Runs the job on `input`.
@@ -76,7 +76,7 @@ pub trait AsyncJob {
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::utils::task::AsyncJob;
+	/// use tightbeam::task::AsyncJob;
 	/// use tightbeam::{job, TightBeamError};
 	///
 	/// job! {
@@ -147,7 +147,7 @@ macro_rules! job {
 		$(#[$meta])*
 		pub struct $job_name;
 
-		impl $crate::utils::task::Job for $job_name {
+		impl $crate::task::Job for $job_name {
 			type Input = $param_ty;
 			type Output = $return_ty;
 
@@ -159,7 +159,7 @@ macro_rules! job {
 		impl $job_name {
 			#[inline]
 			pub fn run(($($param_inner)*): $param_ty) -> $return_ty {
-				<Self as $crate::utils::task::Job>::run(($($param_inner)*))
+				<Self as $crate::task::Job>::run(($($param_inner)*))
 			}
 		}
 	};
@@ -173,7 +173,7 @@ macro_rules! job {
 		$(#[$meta])*
 		pub struct $job_name;
 
-		impl $crate::utils::task::Job for $job_name {
+		impl $crate::task::Job for $job_name {
 			type Input = ();
 			type Output = $return_ty;
 
@@ -185,7 +185,7 @@ macro_rules! job {
 		impl $job_name {
 			#[inline]
 			pub fn run() -> $return_ty {
-				<Self as $crate::utils::task::Job>::run(())
+				<Self as $crate::task::Job>::run(())
 			}
 		}
 	};
@@ -199,7 +199,7 @@ macro_rules! job {
 		$(#[$meta])*
 		pub struct $job_name;
 
-		impl $crate::utils::task::AsyncJob for $job_name {
+		impl $crate::task::AsyncJob for $job_name {
 			type Input = $param_ty;
 			type Output = $return_ty;
 
@@ -211,7 +211,7 @@ macro_rules! job {
 		impl $job_name {
 			#[inline]
 			pub async fn run(($($param_inner)*): $param_ty) -> $return_ty {
-				<Self as $crate::utils::task::AsyncJob>::run(($($param_inner)*)).await
+				<Self as $crate::task::AsyncJob>::run(($($param_inner)*)).await
 			}
 		}
 	};
@@ -225,7 +225,7 @@ macro_rules! job {
 		$(#[$meta])*
 		pub struct $job_name;
 
-		impl $crate::utils::task::AsyncJob for $job_name {
+		impl $crate::task::AsyncJob for $job_name {
 			type Input = ();
 			type Output = $return_ty;
 
@@ -237,7 +237,7 @@ macro_rules! job {
 		impl $job_name {
 			#[inline]
 			pub async fn run() -> $return_ty {
-				<Self as $crate::utils::task::AsyncJob>::run(()).await
+				<Self as $crate::task::AsyncJob>::run(()).await
 			}
 		}
 	};
@@ -344,7 +344,7 @@ mod tests {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata().id(), b"spawn-req");
 
-			let request: HiveManagement = crate::decode(frame.message())?;
+			let request: HiveManagement = frame.decode_message()?;
 			let HiveManagement::Spawn(spawn) = request else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
@@ -361,7 +361,7 @@ mod tests {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata().id(), b"list-req");
 
-			let request: HiveManagement = crate::decode(frame.message())?;
+			let request: HiveManagement = frame.decode_message()?;
 			if !matches!(request, HiveManagement::List(_)) {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			}
@@ -377,7 +377,7 @@ mod tests {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata().id(), b"stop-req");
 
-			let request: HiveManagement = crate::decode(frame.message())?;
+			let request: HiveManagement = frame.decode_message()?;
 			let HiveManagement::Stop(stop) = request else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
@@ -386,7 +386,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "tokio")]
+	#[cfg(all(feature = "tokio", feature = "router"))]
 	test_job! {
 		name: test_async_job,
 		job: AsyncCalculationJob::run((10, 32)),
@@ -394,13 +394,13 @@ mod tests {
 			let frame = frame.await?;
 			assert_eq!(frame.metadata().id(), b"calc-result");
 
-			let result: crate::testing::TestMessage = crate::decode(frame.message())?;
+			let result: crate::testing::TestMessage = frame.decode_message()?;
 			assert_eq!(result.content, "42");
 			Ok(())
 		}
 	}
 
-	#[cfg(feature = "tokio")]
+	#[cfg(all(feature = "tokio", feature = "router"))]
 	test_job! {
 		name: test_async_job_with_no_parameters,
 		job: AsyncPingJob::run(),
@@ -408,7 +408,7 @@ mod tests {
 			let frame = frame.await?;
 			assert_eq!(frame.metadata().id(), b"async-ping");
 
-			let result: crate::testing::TestMessage = crate::decode(frame.message())?;
+			let result: crate::testing::TestMessage = frame.decode_message()?;
 			assert_eq!(result.content, "pong");
 			Ok(())
 		}

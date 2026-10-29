@@ -6,12 +6,17 @@
 //! fingerprints, anchor direct trust, and chain other validators.
 
 #[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::crypto::hash::{Digest, OutputSizeUser, Sha3_256};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
+use crate::crypto::x509::utils::{CertificateExt, Fingerprint, ValidityClock};
 use crate::crypto::x509::Certificate;
 use crate::crypto::x509::{KeyCurves, KeyList, KeyListError};
 use crate::der::Encode;
@@ -113,16 +118,50 @@ pub trait SignatureVerification: CertificateValidation {
 // (trust-on-first-use and key pinning, as in RFC 7469). The certification-path
 // validation of RFC 5280 §6.1 belongs to `CertificateTrustStore`.
 
-/// A validator that checks certificate expiry alone.
+/// A validator that checks certificate expiry alone, at the reading of its
+/// clock.
+///
+/// - [`Default`] reads the crate clock, the system clock where the host has one.
+/// - [`Self::with_clock`] sets the clock it reads.
 ///
 /// A signature check belongs to a [`SignatureVerification`] validator.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ExpiryValidator;
+#[derive(Debug, Clone, Default)]
+pub struct ExpiryValidator {
+	/// The clock that the check reads.
+	clock: ValidityClock,
+}
+
+impl ExpiryValidator {
+	/// Set the clock that the check reads, in place of the crate clock.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::error::CertificateValidationError;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// // The system clock reads a time inside the period of the test
+	/// // certificate, and the clock of the validator a time past its end.
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// ExpiryValidator::default().evaluate(&certificate)?;
+	///
+	/// let validator = ExpiryValidator::default().with_clock(TestCertificate::clock_past_validity());
+	/// let refused = validator.evaluate(&certificate);
+	/// assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+		self.clock = ValidityClock::new(clock);
+		self
+	}
+}
 
 impl CertificateValidation for ExpiryValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// The check covers the validity period of RFC 5280 §6.1.3(a)(2) alone.
-		cert.validate_expiry()
+		self.clock.admits(cert)
 	}
 }
 
@@ -432,9 +471,11 @@ where
 /// to the certification-path validation of [`CertificateTrustStore`].
 ///
 /// - [`CertificateValidation::evaluate`] checks the validity period
-///   (RFC 5280 §6.1.3(a)(2)) and admits a configured trust anchor alone, by
-///   its SHA3-256 fingerprint. With no anchor, as under `Default`, it refuses
-///   every certificate. [`Self::with_trust_chain`] configures the anchors.
+///   (RFC 5280 §6.1.3(a)(2)) at the reading of its clock, and admits a
+///   configured trust anchor alone, by its SHA3-256 fingerprint. With no
+///   anchor, as under `Default`, it refuses every certificate.
+///   [`Self::with_trust_chain`] configures the anchors, and
+///   [`Self::with_clock`] the clock, which is the crate clock under `Default`.
 /// - [`SignatureVerification::verify_with_policy`] checks the validity of one
 ///   certificate, the consistency of its algorithm identifiers
 ///   (RFC 5280 §4.1.1.2), and its signature under an issuer key that the
@@ -450,6 +491,9 @@ where
 pub struct DirectTrustValidator {
 	/// The fingerprint of each trust anchor, which the install decides once.
 	anchors: Vec<Fingerprint<Sha3_256>>,
+	/// The clock that [`CertificateValidation::evaluate`] reads the validity
+	/// period on.
+	clock: ValidityClock,
 }
 
 impl DirectTrustValidator {
@@ -488,13 +532,39 @@ impl DirectTrustValidator {
 		self.anchors = anchors.collect::<Result<Vec<_>, _>>()?;
 		Ok(self)
 	}
+
+	/// Set the clock that [`CertificateValidation::evaluate`] reads the
+	/// validity period on, in place of the crate clock.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::crypto::x509::error::CertificateValidationError;
+	/// use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
+	/// use tightbeam::testing::{TestCertificate, TestKey};
+	///
+	/// // The clock of the validator reads a time past the end of the period
+	/// // of the anchor.
+	/// let anchor = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let validator = DirectTrustValidator::default().with_trust_chain([anchor.clone()])?;
+	/// let validator = validator.with_clock(TestCertificate::clock_past_validity());
+	///
+	/// let refused = validator.evaluate(&anchor);
+	/// assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+		self.clock = ValidityClock::new(clock);
+		self
+	}
 }
 
 impl CertificateValidation for DirectTrustValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): the current time must fall within the
 		// certificate's validity period.
-		cert.validate_expiry()?;
+		self.clock.admits(cert)?;
 
 		// RFC 5280 §4.2: a repeated extension, or an unprocessed critical one,
 		// fails closed.
@@ -599,8 +669,42 @@ mod tests {
 	/// The expiry validator refuses a certificate past its validity period.
 	#[test]
 	fn the_expiry_validator_refuses_an_expired_certificate() {
-		let refused = ExpiryValidator.evaluate(&TestCertificate::expired());
+		let refused = ExpiryValidator::default().evaluate(&TestCertificate::expired());
 		assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+	}
+
+	/// Each validator that checks a validity period reads it on the clock it
+	/// holds. On a clock past the end of the period, each refuses a
+	/// certificate whose period the host clock reads as current.
+	#[cfg(all(host_clock, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	mod clock {
+		use crate::crypto::x509::error::CertificateValidationError;
+		use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator, ExpiryValidator};
+		use crate::crypto::x509::Certificate;
+		use crate::testing::{TestCertificate, TestKey};
+
+		/// The fixed test certificate, current on the host clock.
+		fn current() -> Certificate {
+			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		}
+
+		#[test]
+		fn the_expiry_validator_judges_validity_on_its_own_clock() {
+			let validator = ExpiryValidator::default().with_clock(TestCertificate::clock_past_validity());
+
+			let refused = validator.evaluate(&current());
+			assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+		}
+
+		#[test]
+		fn the_direct_trust_validator_judges_validity_on_its_own_clock() -> Result<(), CertificateValidationError> {
+			let validator = DirectTrustValidator::default().with_trust_chain([current()])?;
+			let validator = validator.with_clock(TestCertificate::clock_past_validity());
+
+			let refused = validator.evaluate(&current());
+			assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+			Ok(())
+		}
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -663,7 +767,7 @@ mod tests {
 			let TestCertificateChain { root, intermediate, leaf, .. } = TestCertificate::insecure_fixed_chain()?;
 			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 			let store = builder.with_certificate(root)?.build();
-			let chain = ChainValidator::default().add(ExpiryValidator).add(store);
+			let chain = ChainValidator::default().add(ExpiryValidator::default()).add(store);
 
 			chain.evaluate_presented(&[intermediate], &leaf)?;
 			Ok(())

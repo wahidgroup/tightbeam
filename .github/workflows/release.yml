@@ -30,6 +30,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # A tag publishes only a commit that master or a release branch already
+      # holds.
+      - name: Require the tagged commit on a release base
+        run: |
+          set -euo pipefail
+          for base in $(git for-each-ref --format='%(refname)' \
+            refs/remotes/origin/master 'refs/remotes/origin/release/*'); do
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$base"; then
+              exit 0
+            fi
+          done
+          echo "${GITHUB_SHA} is on neither master nor a release branch."
+          exit 1
+
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
@@ -39,9 +53,6 @@ jobs:
 
       - name: Setup
         run: make setup
-
-      - name: CI
-        run: make ci
 
       - name: Verify version matches tag
         id: version
@@ -118,16 +129,21 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      # The verify build resolves tightbeam-derive from crates.io. With every
+      # feature on, as docs.rs builds, a stale published derive fails here
+      # before the upload.
       - name: Publish tightbeam-rs
         if: needs.verify.outputs.derive == '0'
-        run: cargo publish --locked --package tightbeam-rs
+        run: cargo publish --locked --package tightbeam-rs --all-features
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      # Cargo 1.94 writes the published package to `target/package/tmp-crate/`,
+      # and older releases to `target/package/`, so the path matches both.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: target/package/*.crate
+          subject-path: target/package/**/*.crate
 
   release:
     name: GitHub Release

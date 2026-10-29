@@ -150,7 +150,7 @@ tb_scenario! {
 				.build()?;
 
 			let response_frame = emit_frame(&mut client, unsigned).await?;
-			let response: RegisterHiveResponse = decode(response_frame.message())?;
+			let response: RegisterHiveResponse = response_frame.decode_message()?;
 			assert!(response.hive_id.is_none(), "a refused registration assigns no hive id");
 			assert_eq!(cluster.hive_count()?, 0, "a refused registration installs no hive");
 
@@ -282,7 +282,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
-			let response: RegisterHiveResponse = decode(response_frame.message())?;
+			let response: RegisterHiveResponse = response_frame.decode_message()?;
 			assert!(response.hive_id.is_none(), "a refused registration assigns no hive id");
 			assert_eq!(cluster.hive_count()?, 0, "a refused registration installs no hive");
 
@@ -359,7 +359,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, refused_reg).await?;
-			let _: RegisterHiveResponse = decode(response_frame.message())?;
+			let _: RegisterHiveResponse = response_frame.decode_message()?;
 
 			// After a clean registration lands, a mismatched add must refuse.
 			let ok_reg = signed_control_frame(
@@ -370,7 +370,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, ok_reg).await?;
-			let _: RegisterHiveResponse = decode(response_frame.message())?;
+			let _: RegisterHiveResponse = response_frame.decode_message()?;
 
 			let bad_add = servlet_address_update(
 				hive_addr,
@@ -380,7 +380,7 @@ tb_scenario! {
 
 			let refused_update = signed_control_frame(&certs, b"misalign-update", bad_add).await?;
 			let response_frame = emit_frame(&mut client, refused_update).await?;
-			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
+			let _: ServletAddressUpdateResponse = response_frame.decode_message()?;
 
 			cluster.stop();
 
@@ -453,11 +453,11 @@ tb_scenario! {
 			let replayed = fresh.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
-			let _: RegisterHiveResponse = decode(response_frame.message())?;
+			let _: RegisterHiveResponse = response_frame.decode_message()?;
 
 			// A byte-identical resend carries an already-seen signature.
 			let response_frame = emit_frame(&mut client, replayed).await?;
-			let _: RegisterHiveResponse = decode(response_frame.message())?;
+			let _: RegisterHiveResponse = response_frame.decode_message()?;
 
 			// The signature is valid but the order lies outside the
 			// freshness window.
@@ -471,7 +471,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, stale).await?;
-			let _: RegisterHiveResponse = decode(response_frame.message())?;
+			let _: RegisterHiveResponse = response_frame.decode_message()?;
 
 			// The same enforcement applies to servlet address updates.
 			let update = servlet_address_update(
@@ -483,10 +483,10 @@ tb_scenario! {
 			let replayed_update = fresh_update.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
-			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
+			let _: ServletAddressUpdateResponse = response_frame.decode_message()?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
-			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
+			let _: ServletAddressUpdateResponse = response_frame.decode_message()?;
 
 			cluster.stop();
 
@@ -532,10 +532,10 @@ tb_scenario! {
 			// The gateway counts the accepted registration as
 			// CLUSTER_HIVE_REGISTERED, so its reply needs no record here.
 			let accepted_frame = emit_frame(&mut client, fresh).await?;
-			decode::<RegisterHiveResponse>(accepted_frame.message())?;
+			accepted_frame.decode_message::<RegisterHiveResponse>()?;
 
 			let response_frame = emit_frame(&mut client, flipped).await?;
-			let response: RegisterHiveResponse = decode(response_frame.message())?;
+			let response: RegisterHiveResponse = response_frame.decode_message()?;
 			assert!(response.hive_id.is_none(), "a refused registration assigns no hive id");
 			assert_eq!(cluster.hive_count()?, 1, "the replay refusal keeps the one registration");
 
@@ -633,7 +633,7 @@ tb_scenario! {
 
 			let mut client = connect_cluster(certs, cluster_addr).await?;
 			let response_frame = emit_frame(&mut client, registration).await?;
-			let response: RegisterHiveResponse = decode(response_frame.message())?;
+			let response: RegisterHiveResponse = response_frame.decode_message()?;
 			assert!(response.hive_id.is_some(), "an accepted registration names the hive");
 
 			// Heartbeats run every 100ms with `max_failures = 1`, so the

@@ -9,10 +9,13 @@ use crate::cms::enveloped_data::{
 	EncryptedContentInfo, EncryptedKey, OriginatorInfo, RecipientIdentifier, RecipientInfos, UserKeyingMaterial,
 };
 use crate::der::asn1::OctetString;
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-use crate::der::asn1::OctetStringRef;
 use crate::der::Sequence;
 use crate::spki::AlgorithmIdentifierOwned;
+
+#[cfg(feature = "aead")]
+use crate::der::asn1::{AnyRef, OctetStringRef};
+#[cfg(feature = "aead")]
+use crate::spki::AlgorithmIdentifierRef;
 
 /// `AuthEnvelopedData` ([RFC 5083 §2.1][rfc5083-2.1]): a content encrypted
 /// under an authenticated cipher for one or more recipients.
@@ -104,6 +107,35 @@ pub struct KemRecipientInfo {
 	pub wrap: AlgorithmIdentifierOwned,
 	/// The wrapped content key.
 	pub encrypted_key: EncryptedKey,
+}
+
+/// [`KemRecipientInfo`] borrowed from the buffer it arrived in, which a
+/// typed decode reads the `wrap` of with no copy of a field.
+///
+/// The `rid` is the element as it arrived, and each other field decodes as
+/// the field of the owned type does.
+#[cfg(feature = "aead")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Sequence)]
+pub(crate) struct KemRecipientInfoRef<'a> {
+	/// The syntax version, which RFC 9629 §3 sets to 0.
+	pub(crate) version: CmsVersion,
+	/// The `RecipientIdentifier` element.
+	pub(crate) rid: AnyRef<'a>,
+	/// The KEM and its parameters.
+	pub(crate) kem: AlgorithmIdentifierRef<'a>,
+	/// The ciphertext the KEM's `Encapsulate` produced.
+	pub(crate) kemct: OctetStringRef<'a>,
+	/// The KDF that derives the key-encryption key from the KEM shared secret.
+	pub(crate) kdf: AlgorithmIdentifierRef<'a>,
+	/// The length in octets of the key-encryption key.
+	pub(crate) kek_length: u16,
+	/// The user keying material the KDF binds, when the sender gives one.
+	#[asn1(context_specific = "0", tag_mode = "EXPLICIT", optional = "true")]
+	pub(crate) ukm: Option<OctetStringRef<'a>>,
+	/// The key-encryption algorithm that wraps the content key.
+	pub(crate) wrap: AlgorithmIdentifierRef<'a>,
+	/// The wrapped content key.
+	pub(crate) encrypted_key: OctetStringRef<'a>,
 }
 
 /// `CMSORIforKEMOtherInfo` ([RFC 9629 §5][rfc9629-5]): the `info` the KDF of

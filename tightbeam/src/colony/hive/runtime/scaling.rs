@@ -7,13 +7,15 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::basis_points::BasisPoints;
+use crate::clock::{Clock, MonotonicInstant};
 use crate::colony::hive::runtime::{
 	ClusterLink, DrainMode, HiveContextImpl, HiveInstances, HiveRuntime, RemoveRefusal,
 };
 use crate::colony::hive::{
 	HiveConfig, ScalingDecision, ScalingMetrics, ServletRegistration, ServletRegistry, ServletScaleConfig, SpawnerFn,
 };
-use crate::colony::protocol::ServletChange;
+use crate::colony::protocol::{IssueClock, ServletChange};
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
 use crate::instrumentation::events::{HIVE_SCALED, HIVE_SCALE_REFUSED};
 use crate::runtime::{rt, TaskGroup};
@@ -22,8 +24,6 @@ use crate::transport::multiplex::MuxCapable;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{MessageEmitter, Protocol};
 use crate::urn::Urn;
-use crate::utils::time::{Clock, MonotonicInstant};
-use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 /// The shared handles that the hive auto-scaling loop runs on.
@@ -58,6 +58,9 @@ pub struct ScalingLoop<P: Protocol, R: ServletRegistry> {
 	config: HiveConfig,
 	/// The owner of the gateway notifications that this loop starts.
 	tasks: TaskGroup,
+	/// The issue times of the hive's control frames, which the link this loop
+	/// builds stamps on its scaling updates.
+	issue_clock: Arc<IssueClock>,
 }
 
 impl<P: Protocol, R: ServletRegistry> ScalingLoop<P, R> {
@@ -78,6 +81,7 @@ impl<P: Protocol, R: ServletRegistry> ScalingLoop<P, R> {
 			hive_addr,
 			config: shares.config.clone(),
 			tasks: shares.tasks.clone(),
+			issue_clock: Arc::clone(shares.issue_clock),
 		}
 	}
 }
@@ -110,6 +114,7 @@ where
 			hive_addr,
 			config,
 			tasks,
+			issue_clock,
 		} = self;
 
 		let config = Arc::new(config);
@@ -120,6 +125,7 @@ where
 				addr,
 				Arc::clone(&config),
 				Arc::clone(&trace),
+				issue_clock,
 			)
 		});
 
@@ -499,13 +505,13 @@ mod tests {
 
 	use super::*;
 	use crate::bps;
+	use crate::clock::ManualClock;
 	use crate::cms::signed_data::SignerIdentifier;
 	use crate::colony::hive::{HashMapRegistry, ServletBox};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::tb_cases;
 	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
 	use crate::transport::TokioListener;
-	use crate::utils::time::ManualClock;
 
 	/// The cooldown every stamp in this module holds for.
 	const COOLDOWN: Duration = Duration::from_secs(30);

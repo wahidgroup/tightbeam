@@ -172,7 +172,7 @@ impl<Env: Send + Sync + 'static> ServletHandlers<Env> {
 		self
 	}
 
-	/// Decode message type `I` after [`crate::Frame::prepare_typed`], then run
+	/// Decode message type `I` through [`crate::Frame::open_typed`], then run
 	/// `handler`.
 	pub fn on_typed_unary<I, F, Fut>(self, handler: F) -> Self
 	where

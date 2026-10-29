@@ -10,10 +10,10 @@
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
+use tightbeam::clock::ManualClock;
 use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::testing::TestCertificate;
-use tightbeam::utils::time::ManualClock;
 use tightbeam::x509::ext::pkix::SubjectKeyIdentifier;
 
 /// A dial address nothing listens on, so a dead direct trail fails fast.
@@ -201,7 +201,7 @@ pub async fn flood_ad_rumor(
 	frame.sign_with_provider(&identity).await?;
 
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
+	let response: GossipResponse = emit_frame(&mut client, frame).await?.decode_message()?;
 	Ok(response.status)
 }
 
@@ -773,7 +773,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(reply.message())?;
+			let echoed: PingResponse = reply.decode_message()?;
 			assert_eq!(echoed.doubled, 8, "the body crossed both hops intact");
 
 			gateway_a.stop();

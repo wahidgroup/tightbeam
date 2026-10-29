@@ -13,6 +13,7 @@
 use core::future::Future;
 use std::sync::Arc;
 
+use crate::marker::MaybeSend;
 use crate::policy::GatePolicy;
 use crate::policy::SessionContext;
 use crate::policy::TransitStatus;
@@ -21,7 +22,6 @@ use crate::transport::messaging::{GateInbound, HandlerAudit};
 use crate::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
 use crate::transport::TransportResult;
 use crate::urn::Urn;
-use crate::utils::marker::MaybeSend;
 use crate::{Frame, TightBeamError};
 
 /// The per-call context that every [`MuxService`] method receives.

@@ -10,6 +10,8 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::basis_points::BasisPoints;
+use crate::clock::{Clock, MonotonicInstant, UnixMillis};
 use crate::colony::cluster::FreshnessWindow;
 use crate::colony::hive::runtime::{InsertRefusal, RemoveRefusal};
 use crate::colony::protocol::{AcceptedRecord, ClusterCommand, ClusterCommandResponse, IssuedAt, ReplyShape};
@@ -20,8 +22,6 @@ use crate::der::Encode;
 use crate::instrumentation::events::{HIVE_COMMAND_ACCEPTED, HIVE_COMMAND_REFUSED};
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
-use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
-use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
 
 /// The states of one signer's circuit in a [`ClusterCircuitBreaker`].
@@ -165,9 +165,9 @@ impl ClusterCircuitBreaker {
 	/// use core::time::Duration;
 	/// use std::sync::Arc;
 	///
+	/// use tightbeam::clock::SystemClock;
 	/// use tightbeam::colony::hive::ClusterCircuitBreaker;
 	/// use tightbeam::policy::SessionContext;
-	/// use tightbeam::utils::time::SystemClock;
 	///
 	/// /// Whether `breaker` admits the verified request of the peer that
 	/// /// `session` proved, which closes the circuit of that peer.
@@ -281,22 +281,51 @@ impl SeenSignatures {
 			.is_some_and(|at| window.admits(*at, now))
 	}
 
-	/// Returns what [`Self::is_live`] returns, for an admission that is about
-	/// to record `signature`.
+	/// Drops the expired records that an admission of `signature` for
+	/// `signer` meets: the record of `signature`, in whichever partition holds
+	/// it, and each expired record of `signer`.
 	///
-	/// It drops a record past the window, so an expired signature returns its
-	/// capacity on the next admission.
-	fn is_live_replay(&mut self, signature: &VerifiedSignature, now: UnixMillis, window: FreshnessWindow) -> bool {
-		if !self.owner.contains_key(signature) {
-			return false;
-		}
-
-		let live = self.is_live(signature, now, window);
-		if !live {
+	/// An expired signature so returns its capacity on the next admission.
+	fn prune(&mut self, signer: &[u8], signature: &VerifiedSignature, now: UnixMillis, window: FreshnessWindow) {
+		let expired = self.owner.contains_key(signature) && !self.is_live(signature, now, window);
+		if expired {
 			self.forget(signature);
 		}
 
-		live
+		self.expire(signer, now, window);
+	}
+
+	/// Returns whether the guard admits a frame of `signer` that states
+	/// `order` and carries `signature`, at `now`.
+	///
+	/// It is the one rule of the guard. It reads live records alone, so a
+	/// verdict and an admission that pruned the expired records answer alike:
+	///
+	/// 1. `order` lies inside the window.
+	/// 2. No live record holds `signature`, in any partition. Either
+	///    `SignerIdentifier` CHOICE arm can name one certificate, so a check of
+	///    one partition would grant one replay per encoding.
+	/// 3. `signer` holds no live record at `order`.
+	/// 4. `signer` holds fewer than [`REPLAY_GUARD_CAPACITY`] live records.
+	fn admits(
+		&self,
+		signer: &[u8],
+		signature: &VerifiedSignature,
+		order: UnixMillis,
+		now: UnixMillis,
+		window: FreshnessWindow,
+	) -> bool {
+		if !window.admits(order, now) {
+			return false;
+		}
+		if self.is_live(signature, now, window) {
+			return false;
+		}
+		if self.holds_order(signer, order, now, window) {
+			return false;
+		}
+
+		self.live_len_for(signer, now, window) < REPLAY_GUARD_CAPACITY
 	}
 
 	/// Drops `signer`'s expired records. The work is bounded by the
@@ -348,20 +377,47 @@ impl SeenSignatures {
 		}
 	}
 
-	fn len_for(&self, signer: impl AsRef<[u8]>) -> usize {
-		let signer = signer.as_ref();
-		self.partitions.get(signer).map_or(0, HashMap::len)
+	/// Returns how many records of `signer` state an order inside the window.
+	///
+	/// The scan reads one partition, which [`REPLAY_GUARD_CAPACITY`] bounds.
+	fn live_len_for(&self, signer: impl AsRef<[u8]>, now: UnixMillis, window: FreshnessWindow) -> usize {
+		let partition = self.partitions.get(signer.as_ref());
+		let orders = partition.into_iter().flat_map(HashMap::values);
+		orders.filter(|at| window.admits(**at, now)).count()
+	}
+
+	/// Returns whether `signer` holds a record whose frame states `order`,
+	/// while that order lies inside the window.
+	///
+	/// The scan reads one partition, which [`REPLAY_GUARD_CAPACITY`] bounds,
+	/// as [`Self::expire`] does.
+	fn holds_order(
+		&self,
+		signer: impl AsRef<[u8]>,
+		order: UnixMillis,
+		now: UnixMillis,
+		window: FreshnessWindow,
+	) -> bool {
+		let partition = self.partitions.get(signer.as_ref());
+		let held = partition.is_some_and(|sigs| sigs.values().any(|at| *at == order));
+
+		held && window.admits(order, now)
 	}
 }
 
 /// A bounded freshness and replay window for signed cluster commands.
 ///
 /// It accepts a command when its `Frame.metadata.order` lies within the
-/// window of the hive clock, in either direction to tolerate skew, and it
-/// holds no live record of the signature.
+/// window of the hive clock, in either direction to tolerate skew, it holds
+/// no live record of the signature, and the signer holds no live record of
+/// another frame at that order. [`ReplayGuard::admits`] is that rule, and
+/// [`ReplayGuard::check_and_insert`] applies it before it records.
 ///
 /// - The guard tracks signatures per signer, so a signer that saturates its partition blocks only itself.
 /// - Each record keeps its frame's order, so it lives exactly as long as its frame is fresh (CWE-294).
+/// - The orders of each signer are one message namespace, so a second frame
+///   of one signer at one order is a duplicate whatever its signature (README
+///   §5.7.1).
 /// - Each insert prunes that signer's entries more than the window from the
 ///   clock, so [`REPLAY_GUARD_CAPACITY`] per trusted signer bounds the memory.
 pub struct ReplayGuard {
@@ -382,12 +438,68 @@ impl ReplayGuard {
 		self.window.admits(order, now)
 	}
 
+	/// Returns whether the guard admits a frame of `signer` that states
+	/// `order` (`Frame.metadata.order`) and carries `signature`, at `now`.
+	///
+	/// It is the one rule of the guard, which
+	/// [`ReplayGuard::check_and_insert`] applies before it records:
+	///
+	/// - `order` lies inside the window, as [`ReplayGuard::is_fresh`] answers.
+	/// - No live record holds `signature`, as [`ReplayGuard::is_replay`] answers.
+	/// - `signer` holds no live record at `order`, as [`ReplayGuard::holds_order`] answers (README §5.7.1).
+	/// - `signer` holds fewer than [`REPLAY_GUARD_CAPACITY`] live records.
+	///
+	/// It is read-only, so a verdict asks it and the admission spends the
+	/// slot. A poisoned lock answers `false`, so a verdict fails closed.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::clock::UnixMillis;
+	/// use tightbeam::colony::hive::ReplayGuard;
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
+	/// use tightbeam::crypto::sign::{PrehashSigner, VerifiedSignature};
+	/// use tightbeam::testing::fixtures::TestKey;
+	///
+	/// let key = TestKey::insecure_fixed_signing();
+	/// let prehash = [7u8; 32];
+	/// let signed: Secp256k1Signature = key.sign_prehash(&prehash)?;
+	/// let signature = VerifiedSignature::verify::<Secp256k1Signature, _>(key.verifying_key(), prehash, signed)?;
+	///
+	/// let guard = ReplayGuard::new(Duration::from_secs(30));
+	/// let order = UnixMillis::new(100_000);
+	///
+	/// // A verdict spends nothing, so the admission records the frame.
+	/// assert!(guard.admits(b"signer", &signature, order, order));
+	/// assert!(guard.check_and_insert(b"signer", &signature, order, order));
+	/// assert!(!guard.admits(b"signer", &signature, order, order));
+	///
+	/// // An order 40 s from the clock lies outside the 30 s window.
+	/// assert!(!guard.admits(b"other", &signature, order, UnixMillis::new(140_000)));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub fn admits(
+		&self,
+		signer: impl AsRef<[u8]>,
+		signature: &VerifiedSignature,
+		order: UnixMillis,
+		now: UnixMillis,
+	) -> bool {
+		let Ok(seen) = self.seen.lock() else {
+			return false;
+		};
+
+		seen.admits(signer.as_ref(), signature, order, now, self.window)
+	}
+
 	/// Returns whether the guard holds a record of `signature` within the
 	/// window.
 	///
-	/// It is read-only. A verdict asks it, and the admission that follows
-	/// spends the slot with [`ReplayGuard::check_and_insert`]. A poisoned lock
-	/// answers `true`, so a verdict fails closed as an admission does.
+	/// It is read-only, as [`ReplayGuard::admits`] is. A poisoned lock answers
+	/// `true`, so a caller fails closed as an admission does.
 	#[must_use]
 	pub fn is_replay(&self, signature: &VerifiedSignature, now: UnixMillis) -> bool {
 		let Ok(seen) = self.seen.lock() else {
@@ -397,25 +509,73 @@ impl ReplayGuard {
 		seen.is_live(signature, now, self.window)
 	}
 
-	/// Records `signature` for `signer`, whose frame states `order`, when it
-	/// is unseen within the window.
+	/// Returns whether the guard holds a live record of a frame of `signer`
+	/// that states `order` (`Frame.metadata.order`).
 	///
-	/// - The record keeps `order` (`Frame.metadata.order`), so it lives exactly
-	///   as long as the frame is fresh, even when `order` leads the clock
-	///   (CWE-294).
-	/// - It returns `true` for a new signature, which it records.
-	/// - It returns `false` for a replay, and fails closed on a full partition or a poisoned lock.
+	/// The orders of each signer are one message namespace, so a second frame
+	/// of `signer` at `order` is a duplicate whatever its signature (README
+	/// §5.7.1). It is read-only, as [`ReplayGuard::is_replay`] is, and a
+	/// poisoned lock answers `true`.
 	///
 	/// # Examples
 	///
 	/// ```
 	/// use core::time::Duration;
 	///
+	/// use tightbeam::clock::UnixMillis;
 	/// use tightbeam::colony::hive::ReplayGuard;
 	/// use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
 	/// use tightbeam::crypto::sign::{PrehashSigner, VerifiedSignature};
 	/// use tightbeam::testing::fixtures::TestKey;
-	/// use tightbeam::utils::time::UnixMillis;
+	///
+	/// let key = TestKey::insecure_fixed_signing();
+	/// let prehash = [7u8; 32];
+	/// let signed: Secp256k1Signature = key.sign_prehash(&prehash)?;
+	/// let signature = VerifiedSignature::verify::<Secp256k1Signature, _>(key.verifying_key(), prehash, signed)?;
+	///
+	/// let guard = ReplayGuard::new(Duration::from_secs(30));
+	/// let order = UnixMillis::new(100_000);
+	/// assert!(guard.check_and_insert(b"signer", &signature, order, order));
+	///
+	/// // Another frame of the signer at that order is a duplicate, and another
+	/// // signer's order is its own.
+	/// assert!(guard.holds_order(b"signer", order, order));
+	/// assert!(!guard.holds_order(b"other", order, order));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	#[must_use]
+	pub fn holds_order(&self, signer: impl AsRef<[u8]>, order: UnixMillis, now: UnixMillis) -> bool {
+		let Ok(seen) = self.seen.lock() else {
+			return true;
+		};
+
+		seen.holds_order(signer, order, now, self.window)
+	}
+
+	/// Records `signature` for `signer`, whose frame states `order`, when
+	/// [`ReplayGuard::admits`] admits the frame.
+	///
+	/// - It drops the expired records it meets, then applies the rule of
+	///   [`ReplayGuard::admits`] and records under the same lock, so of two
+	///   frames that race for one slot, one spends it (CWE-367).
+	/// - The record keeps `order` (`Frame.metadata.order`), so it lives exactly
+	///   as long as the frame is fresh, even when `order` leads the clock
+	///   (CWE-294).
+	/// - It returns `true` for a fresh frame with a new signature at a new order, which it records.
+	/// - It returns `false` for a stale order, a replay, and a second frame of
+	///   `signer` at `order` (README §5.7.1), and fails closed on a full
+	///   partition or a poisoned lock.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::clock::UnixMillis;
+	/// use tightbeam::colony::hive::ReplayGuard;
+	/// use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
+	/// use tightbeam::crypto::sign::{PrehashSigner, VerifiedSignature};
+	/// use tightbeam::testing::fixtures::TestKey;
 	///
 	/// let key = TestKey::insecure_fixed_signing();
 	/// let prehash = [7u8; 32];
@@ -443,15 +603,8 @@ impl ReplayGuard {
 			return false;
 		};
 
-		// Replay detection spans all partitions: either `SignerIdentifier`
-		// CHOICE arm can name one certificate, so a partition-local check would
-		// grant one extra replay per alternate encoding.
-		if seen.is_live_replay(signature, now, self.window) {
-			return false;
-		}
-
-		seen.expire(signer, now, self.window);
-		if seen.len_for(signer) >= REPLAY_GUARD_CAPACITY {
+		seen.prune(signer, signature, now, self.window);
+		if !seen.admits(signer, signature, order, now, self.window) {
 			return false;
 		}
 
@@ -489,7 +642,7 @@ impl ReplayGuard {
 /// | 5 | The signature verifies under that certificate | `PermissionDenied`, **counted** |
 /// | 6 | The verified signer is the handshake-proven peer | `PermissionDenied` |
 /// | 7 | `Frame.metadata.order` is fresh | `PermissionDenied` |
-/// | 8 | The signature is new inside the window | `PermissionDenied` |
+/// | 8 | The signature and the order are new, and the partition has room (README §5.7.1) | `PermissionDenied` |
 ///
 /// On success the breaker admits the command and closes the circuit of its
 /// peer in one step.
@@ -874,14 +1027,16 @@ impl ClusterSecurityGate {
 	/// Judges `frame` with read-only checks.
 	///
 	/// The verdict covers the signer and its binding to the peer, the peer's
-	/// circuit, freshness, and replay. It refuses a captured frame, whose
-	/// signature is already recorded, and changes no record.
+	/// circuit, and the rule of [`ReplayGuard::admits`]: freshness, replay, a
+	/// duplicate order, and a full partition. It refuses a captured frame,
+	/// whose signature is already recorded, and a second frame of the signer
+	/// at a recorded order, and it changes no record.
 	///
 	/// # Left to the admission
 	///
 	/// - The admission records an auth failure.
 	/// - It refuses a body that names no single command.
-	/// - It inserts the signature, which refuses a full partition.
+	/// - It records the signature under the lock that applies the guard's rule again.
 	/// - It closes the circuit of the peer.
 	fn inspect<'a>(
 		&self,
@@ -893,7 +1048,9 @@ impl ClusterSecurityGate {
 			return Err(InspectRefusal::Plain(TransitStatus::Unauthenticated));
 		};
 
-		if frame.integrity().is_none() {
+		// A command declares the protections it requires, such as frame
+		// integrity, so a frame that lacks one carries no command.
+		if frame.validate_for::<ClusterCommand>().is_err() {
 			return Err(InspectRefusal::Plain(TransitStatus::Unauthenticated));
 		}
 
@@ -935,12 +1092,9 @@ impl ClusterSecurityGate {
 			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 		}
 
-		// The gate checks freshness and replay here, so a verdict refuses a
-		// captured frame (CWE-294). `admit` spends the slot itself.
-		if !self.replay_guard.is_fresh(frame.issued_at(), now) {
-			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
-		}
-		if self.replay_guard.is_replay(&signature, now) {
+		// The guard's rule runs here, so a verdict refuses a captured frame
+		// (CWE-294). `admit` spends the slot itself.
+		if !self.replay_guard.admits(&signer_id, &signature, frame.issued_at(), now) {
 			return Err(InspectRefusal::Plain(TransitStatus::PermissionDenied));
 		}
 
@@ -1205,6 +1359,7 @@ impl GatePolicy for PeerListGate {
 mod tests {
 	use super::*;
 	use crate::builder::TypeBuilder;
+	use crate::clock::ManualClock;
 	use crate::cms::signed_data::SignerIdentifier;
 	use crate::colony::protocol::{ClusterStatus, HeartbeatParams};
 	use crate::crypto::hash::Sha3_256;
@@ -1224,7 +1379,6 @@ mod tests {
 	use crate::testing::fixtures::{TestCertificate, TestIdentity, TestKey, TestP256Points};
 	use crate::testing::TestFrame;
 	use crate::testing::TestMessage;
-	use crate::utils::time::ManualClock;
 	use crate::{MessagePriority, Version};
 	use std::sync::LazyLock;
 
@@ -1399,13 +1553,15 @@ mod tests {
 		verifying.expect("the test verifier accepts every canonical value")
 	}
 
-	/// Fills `signer`'s replay partition to capacity with frames issued at
-	/// `now`.
+	/// Fills `signer`'s replay partition to capacity with frames issued one
+	/// millisecond apart after `now`, so no filler states the order `now`.
 	fn fill_replay_partition(gate: &ClusterSecurityGate, signer: impl AsRef<[u8]>, now: UnixMillis) {
 		let signer = signer.as_ref();
 		let guard = gate.replay_guard.as_ref();
+		let issued = |index: usize| now.saturating_add(Duration::from_millis(index as u64 + 1));
+		let spend = |index: usize| guard.check_and_insert(signer, &accepted(index), issued(index), now);
 
-		let filled = (0..REPLAY_GUARD_CAPACITY).all(|index| guard.check_and_insert(signer, &accepted(index), now, now));
+		let filled = (0..REPLAY_GUARD_CAPACITY).all(spend);
 		assert!(filled, "the partition takes every filler up to capacity");
 	}
 
@@ -1549,11 +1705,15 @@ mod tests {
 
 	#[test]
 	fn replay_guard_saturated_signer_does_not_block_others() {
+		// Each seed states an order of its own, one millisecond apart, so the
+		// partition fills to capacity with no duplicate order.
 		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		let seeded = (0..REPLAY_GUARD_CAPACITY).all(|i| spend_at(&guard, b"signer-1", &accepted(i + 10), 1_000));
+		let at = |index: usize| 1_000 + index as u64;
+		let seeded = (0..REPLAY_GUARD_CAPACITY).all(|i| spend_at(&guard, b"signer-1", &accepted(i + 10), at(i)));
 		assert!(seeded);
-		assert!(!spend_at(&guard, b"signer-1", &accepted(REPLAY_GUARD_CAPACITY + 1), 1_000));
-		assert!(spend_at(&guard, b"signer-2", &accepted(1), 1_000));
+		let full = at(REPLAY_GUARD_CAPACITY);
+		assert!(!spend_at(&guard, b"signer-1", &accepted(REPLAY_GUARD_CAPACITY + 10), full));
+		assert!(spend_at(&guard, b"signer-2", &accepted(1), full));
 	}
 
 	#[test]
@@ -1571,6 +1731,37 @@ mod tests {
 		assert!(spend_at(&guard, b"signer-1", &accepted(1), 2_000));
 	}
 
+	/// A second frame of one signer at the order of a live record is a
+	/// duplicate (README §5.7.1), whatever its signature.
+	#[test]
+	fn replay_guard_refuses_a_second_signature_at_one_order() {
+		let guard = ReplayGuard::new(Duration::from_millis(30_000));
+		let first = spend_at(&guard, b"signer-1", &accepted(1), 1_000);
+		let duplicate = spend_at(&guard, b"signer-1", &accepted(2), 1_000);
+		assert_eq!((first, duplicate), (true, false));
+	}
+
+	/// The orders of each signer are a namespace of their own, so two
+	/// signers each spend one order once.
+	#[test]
+	fn replay_guard_admits_one_order_once_per_signer() {
+		let guard = ReplayGuard::new(Duration::from_millis(30_000));
+		let first = spend_at(&guard, b"signer-1", &accepted(1), 1_000);
+		let other = spend_at(&guard, b"signer-2", &accepted(2), 1_000);
+		assert_eq!((first, other), (true, true));
+	}
+
+	/// A released record frees its order, so the signer's retry under a new
+	/// signature passes.
+	#[test]
+	fn replay_guard_forget_frees_the_order() {
+		let guard = ReplayGuard::new(Duration::from_millis(30_000));
+		let first = spend_at(&guard, b"signer-1", &accepted(1), 1_000);
+		guard.forget(&accepted(1));
+		let retried = spend_at(&guard, b"signer-1", &accepted(2), 1_000);
+		assert_eq!((first, retried), (true, true));
+	}
+
 	#[test]
 	fn replay_guard_freshness_window_is_bidirectional() {
 		let guard = ReplayGuard::new(Duration::from_millis(1_000));
@@ -1578,6 +1769,28 @@ mod tests {
 		assert!(guard.is_fresh(UnixMillis::new(10_500), UnixMillis::new(10_000)));
 		assert!(!guard.is_fresh(UnixMillis::new(8_999), UnixMillis::new(10_000)));
 		assert!(!guard.is_fresh(UnixMillis::new(11_001), UnixMillis::new(10_000)));
+	}
+
+	/// A verdict of the guard spends no slot, so the admission after it
+	/// records the frame.
+	#[test]
+	fn a_replay_guard_verdict_leaves_the_slot_to_the_admission() {
+		let guard = ReplayGuard::new(Duration::from_millis(30_000));
+		let at = UnixMillis::new(1_000);
+		let verdict = || guard.admits(b"signer-1", &accepted(1), at, at);
+		let verdicts = [verdict(), verdict()];
+		let spent = guard.check_and_insert(b"signer-1", &accepted(1), at, at);
+		assert_eq!((verdicts, spent), ([true, true], true));
+	}
+
+	/// The guard records a frame only while its order lies inside the window,
+	/// so an admission refuses a stale order as a verdict does.
+	#[test]
+	fn replay_guard_refuses_an_order_outside_its_window() {
+		let guard = ReplayGuard::new(Duration::from_millis(30_000));
+		let stale = UnixMillis::new(1_000);
+		let spent = guard.check_and_insert(b"signer-1", &accepted(1), stale, UnixMillis::new(10_000_000));
+		assert!(!spent);
 	}
 
 	fn work_frame(priority: Option<MessagePriority>) -> Result<Frame, TightBeamError> {
@@ -1912,10 +2125,20 @@ mod tests {
 
 	/// Builds a signed heartbeat whose frame states `order` as its issue time.
 	async fn signed_heartbeat_at(order: UnixMillis, identity: &SigningIdentity) -> Result<Frame, TightBeamError> {
+		signed_heartbeat_named(b"command", order, identity).await
+	}
+
+	/// Builds a signed heartbeat of message id `id`, whose frame states
+	/// `order` as its issue time. Two ids give two signatures at one order.
+	async fn signed_heartbeat_named(
+		id: &[u8],
+		order: UnixMillis,
+		identity: &SigningIdentity,
+	) -> Result<Frame, TightBeamError> {
 		let probe = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 		let mut signed = Version::V2
 			.compose()
-			.with_id(b"command")
+			.with_id(id)
 			.with_order(order.get())
 			.with_message(probe)
 			.with_witness_hasher::<Sha3_256>()
@@ -1966,12 +2189,63 @@ mod tests {
 		Ok(())
 	}
 
+	/// A verdict refuses a signed frame that lacks the frame integrity that a
+	/// cluster command requires.
+	#[tokio::test]
+	async fn a_gate_verdict_refuses_a_frame_without_frame_integrity() -> Result<(), TightBeamError> {
+		let VerifiedGate { gate, sender, clock, .. } = verified_gate().await?;
+		let message = TestMessage::sample(None);
+		let builder = Version::V2.compose().with_id(b"unwitnessed").with_order(clock.unix().get());
+		let mut unwitnessed = builder.with_message(message).build()?;
+		unwitnessed.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
+
+		assert_eq!(gate.evaluate(Some(&unwitnessed), &sender), TransitStatus::Unauthenticated);
+		Ok(())
+	}
+
 	/// A verdict refuses a captured frame, because the guard already recorded
 	/// the signature the frame carries (CWE-294).
 	#[tokio::test]
 	async fn a_gate_verdict_refuses_a_frame_already_admitted() -> Result<(), TightBeamError> {
 		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
 		assert!(gate.admit(signed.to_owned(), &sender).is_ok());
+		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::PermissionDenied);
+		Ok(())
+	}
+
+	/// The gate refuses a second command of one signer at the order of an
+	/// admitted one (README §5.7.1), though the second carries a new signature.
+	#[tokio::test]
+	async fn a_second_command_at_an_admitted_order_is_refused() -> Result<(), TightBeamError> {
+		let VerifiedGate { gate, sender, signed, clock } = verified_gate().await?;
+		let sibling = signed_heartbeat_named(b"sibling", clock.unix(), &TestIdentity::insecure_fixed()).await?;
+
+		let admitted = gate.admit(signed, &sender).is_ok();
+		let duplicate = gate.admit(sibling, &sender).err().map(|refusal| refusal.status());
+		assert_eq!((admitted, duplicate), (true, Some(TransitStatus::PermissionDenied)));
+		Ok(())
+	}
+
+	/// A verdict refuses a second command of one signer at the order of an
+	/// admitted one, as the admission does.
+	#[tokio::test]
+	async fn a_gate_verdict_refuses_a_second_command_at_an_admitted_order() -> Result<(), TightBeamError> {
+		let VerifiedGate { gate, sender, signed, clock } = verified_gate().await?;
+		let sibling = signed_heartbeat_named(b"sibling", clock.unix(), &TestIdentity::insecure_fixed()).await?;
+
+		assert!(gate.admit(signed, &sender).is_ok());
+		assert_eq!(gate.evaluate(Some(&sibling), &sender), TransitStatus::PermissionDenied);
+		Ok(())
+	}
+
+	/// A verdict refuses a command of a signer whose replay partition is
+	/// full, as the admission does.
+	#[tokio::test]
+	async fn a_gate_verdict_refuses_a_command_of_a_full_partition() -> Result<(), TightBeamError> {
+		let VerifiedGate { gate, sender, signed, clock } = verified_gate().await?;
+
+		fill_replay_partition(&gate, signer_id(&signed), clock.unix());
+
 		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::PermissionDenied);
 		Ok(())
 	}
@@ -2094,8 +2368,8 @@ mod tests {
 
 		assert!(gate.circuit_breaker.is_open(breaker_key()));
 
-		// Fill this signer's replay partition, so the admission refuses
-		// after the checks that spend have started.
+		// Fill this signer's replay partition, so the admission refuses the
+		// command at the guard's rule.
 		fill_replay_partition(&gate, signer_id(&signed), clock.unix());
 
 		let refusal = gate.admit(signed, &sender).err().map(|refusal| refusal.status());

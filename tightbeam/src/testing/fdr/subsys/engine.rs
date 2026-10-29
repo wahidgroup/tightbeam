@@ -3,6 +3,8 @@
 //! [`FdrExplorer`] runs exploration and refinement checks through subsystems
 //! that a caller can replace.
 
+use core::ops::Range;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -84,6 +86,24 @@ impl FoundDivergences {
 	/// The divergences kept so far, in the order of the seeds.
 	fn divergences(&self) -> &[Divergence] {
 		self.0.as_deref().unwrap_or_default()
+	}
+}
+
+impl FdrVerdict {
+	/// Adds what the seeds of `seeds` find on `engine` to this verdict, and
+	/// keeps each divergence in `found`.
+	fn add_walk<C>(&mut self, engine: &mut C, seeds: Range<u64>, found: &mut FoundDivergences)
+	where
+		C: ExplorationCore,
+	{
+		for (seed, result) in engine.explore_seeds(seeds) {
+			self.add_seed(*seed, result);
+			found.note(result);
+		}
+
+		self.traces_explored = engine.traces().len();
+		self.states_visited = engine.visited_states().len();
+		self.timing_pruned = engine.timing_pruned();
 	}
 }
 
@@ -379,7 +399,9 @@ where
 			}
 			// Mode 2: specs with no fault model run the refinement checks.
 			ExplorationMode::Refinement => {
-				self.check_refinement();
+				let config = Arc::clone(&self.config);
+				let subject = config.scheduled(self.process).map_err(TightBeamError::from)?;
+				self.check_refinement(&subject);
 				#[cfg(feature = "testing-fmea")]
 				self.generate_fmea_if_configured([self.process])?;
 				Ok(self.verdict.clone())
@@ -392,6 +414,9 @@ where
 	/// Explores the subject over every seed through the engine, and hands
 	/// `record` the states that the seeds visited and the divergences they
 	/// found.
+	///
+	/// Under a scheduler constraint the seeds walk the scheduled subject, on
+	/// an engine that [`ExplorationCore::for_process`] of `E` builds.
 	fn explore_state_space<X, F>(&mut self, record: &mut Option<F>) -> Result<FdrVerdict, X>
 	where
 		F: FnMut(&Process, &HashSet<State>, &[Divergence]) -> Result<(), X>,
@@ -402,19 +427,24 @@ where
 			self.verdict.deadlock_free = Decision::Holds;
 		}
 
+		let config = Arc::clone(&self.config);
+		let subject = config.scheduled(self.process).map_err(TightBeamError::from)?;
 		let mut found = FoundDivergences::kept_when(record.is_some());
-		let seeds = 0..u64::from(self.config.seeds);
-		for (seed, result) in self.explorer.explore_seeds(seeds) {
-			self.verdict.add_seed(*seed, result);
-			found.note(result);
-		}
-
-		self.verdict.traces_explored = self.explorer.traces().len();
-		self.verdict.states_visited = self.explorer.visited_states().len();
-		self.verdict.timing_pruned = self.explorer.timing_pruned();
-
-		if let Some(record) = record.as_mut() {
-			record(self.process, self.explorer.visited_states(), found.divergences())?;
+		let seeds = 0..u64::from(config.seeds);
+		match &subject {
+			Cow::Borrowed(process) => {
+				self.verdict.add_walk(&mut self.explorer, seeds, &mut found);
+				if let Some(record) = record.as_mut() {
+					record(process, self.explorer.visited_states(), found.divergences())?;
+				}
+			}
+			Cow::Owned(process) => {
+				let mut engine = self.explorer.for_process(process);
+				self.verdict.add_walk(&mut engine, seeds, &mut found);
+				if let Some(record) = record.as_mut() {
+					record(process, engine.visited_states(), found.divergences())?;
+				}
+			}
 		}
 
 		self.check_determinism();
@@ -433,14 +463,23 @@ where
 	/// - Each spec runs on an engine of its own, which [`ExplorationCore::for_process`] of `E` builds.
 	/// - `states_visited` counts the distinct states of each spec.
 	/// - The loop covers every spec, because a fault run of `specs[0]` alone would leave the rest untested.
+	/// - Under a scheduler constraint each spec runs scheduled.
+	///
+	/// # Errors
+	///
+	/// - The [`FdrConfigError`](crate::testing::error::FdrConfigError) of a
+	///   scheduler constraint that does not fit a spec.
+	/// - The error of the first call of `record` that failed.
 	#[cfg(feature = "testing-fault")]
 	fn explore_specification_with_faults<X, F>(&mut self, record: &mut Option<F>) -> Result<(), X>
 	where
 		F: FnMut(&Process, &HashSet<State>, &[Divergence]) -> Result<(), X>,
+		X: From<TightBeamError>,
 	{
 		let config = Arc::clone(&self.config);
 		for spec_process in &config.specs {
-			let mut engine = self.explorer.for_process(spec_process);
+			let spec_process = config.scheduled(spec_process).map_err(TightBeamError::from)?;
+			let mut engine = self.explorer.for_process(&spec_process);
 			let mut found = FoundDivergences::kept_when(record.is_some());
 			let seeds = 0..u64::from(config.seeds);
 			for (seed, result) in engine.explore_seeds(seeds) {
@@ -451,7 +490,7 @@ where
 			self.verdict.timing_pruned += engine.timing_pruned();
 			self.verdict.states_visited += engine.visited_states().len();
 			if let Some(record) = record.as_mut() {
-				record(spec_process, engine.visited_states(), found.divergences())?;
+				record(&spec_process, engine.visited_states(), found.divergences())?;
 			}
 		}
 
@@ -496,13 +535,15 @@ where
 		self.verdict.record_determinism(witness);
 	}
 
-	/// Checks `spec ⊑ process` in the models that the subject admits.
+	/// Checks `spec ⊑ subject` in the models that the subject admits.
 	///
-	/// The check always asks traces refinement. It asks failures and
-	/// divergences only of a subject whose observation carries refusals, or the
-	/// checker would grade the subject on refusals it synthesized. Under
-	/// `fail_fast`, each pass stops at its first violation.
-	fn check_refinement(&mut self) {
+	/// - `subject` is the process under verification as the scheduler constraint lets it run.
+	/// - The check always asks traces refinement.
+	/// - It asks failures and divergences only of a subject whose observation
+	///   carries refusals, or the checker would grade the subject on refusals
+	///   it synthesized.
+	/// - Under `fail_fast`, each pass stops at its first violation.
+	fn check_refinement(&mut self, subject: &Process) {
 		// The check reads the spec list through an `Arc` clone and not a copy,
 		// because a clone of `Vec<Process>` duplicates every state set and
 		// transition map that the checker only reads.
@@ -512,19 +553,19 @@ where
 
 		self.verdict.trace_refines = self.check_refinement_for_specs(
 			specs,
-			|r, s| r.check_trace_refinement(s, self.process),
+			|r, s| r.check_trace_refinement(s, subject),
 			|v, w| {
 				v.trace_refinement_witness = Some(w);
 			},
 		);
 
-		if !self.process.observation.carries_refusals() {
+		if !subject.observation.carries_refusals() {
 			return;
 		}
 
 		self.verdict.failures_refines = self.check_refinement_for_specs(
 			specs,
-			|r, s| r.check_failures_refinement(s, self.process),
+			|r, s| r.check_failures_refinement(s, subject),
 			|v, w| {
 				v.failures_refinement_witness = Some(w);
 			},
@@ -532,7 +573,7 @@ where
 
 		self.verdict.divergence_refines = self.check_refinement_for_specs(
 			specs,
-			|r, s| r.check_divergence_refinement(s, self.process),
+			|r, s| r.check_divergence_refinement(s, subject),
 			|v, w| {
 				v.divergence_refinement_witness = Some(w);
 			},

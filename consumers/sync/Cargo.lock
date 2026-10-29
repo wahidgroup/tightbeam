@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-derive"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-rs"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aead",
  "aes",

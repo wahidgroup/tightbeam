@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::utils::BasisPoints;
+use crate::basis_points::BasisPoints;
 
 /// Queue-depth metrics a servlet instance keeps for auto-scaling.
 ///
@@ -332,8 +332,8 @@ impl Default for UtilizationReporter {
 /// # Examples
 ///
 /// ```
+/// use tightbeam::basis_points::BasisPoints;
 /// use tightbeam::colony::servlet::UtilizationGauge;
-/// use tightbeam::utils::BasisPoints;
 ///
 /// /// A gauge that reads one fixed load.
 /// struct Fixed(BasisPoints);

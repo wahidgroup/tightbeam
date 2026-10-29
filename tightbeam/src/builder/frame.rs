@@ -12,14 +12,17 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
+use crate::core::Requirement;
 use crate::der::oid::ObjectIdentifier;
 use crate::error::Result;
-use crate::error::{ReceivedExpectedError, TightBeamError};
+use crate::error::TightBeamError;
 use crate::matrix::{IntoMatrixDyn, MatrixDyn};
 use crate::{DigestInfo, Frame, Message, Metadata, Version};
 
 #[cfg(feature = "aead")]
 use crate::asn1::{AuthEnvelopedData, WireDer};
+#[cfg(host_clock)]
+use crate::clock::UnixMillis;
 #[cfg(feature = "compress")]
 use crate::compress::Compressor;
 #[cfg(feature = "aead")]
@@ -40,8 +43,8 @@ use crate::crypto::sign::{
 };
 #[cfg(any(feature = "digest", feature = "aead"))]
 use crate::der::oid::AssociatedOid;
-#[cfg(host_clock)]
-use crate::utils::time::UnixMillis;
+#[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
+use crate::error::ReceivedExpectedError;
 
 #[cfg(feature = "aead")]
 type EncryptorFn = Box<dyn FnOnce(Vec<u8>) -> Result<AuthEnvelopedData>>;
@@ -292,52 +295,54 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
+	/// Refuse to build a Frame that is no carrier of `T`, before any work.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::Requirement`] -- the version is below the
+	///   `MIN_VERSION` of `T`, the refusal of every typed decode.
+	/// - [`TightBeamError::MissingProtection`] -- `T` sets a requirement that
+	///   this builder holds no call for. The error names the marker and the
+	///   builder call that meets it.
 	fn validate(&self) -> Result<()> {
-		if self.version < T::MIN_VERSION {
-			return Err(TightBeamError::UnsupportedVersion(ReceivedExpectedError::from((
-				self.version,
-				T::MIN_VERSION,
-			))));
-		}
+		self.version.admit_for::<T>()?;
 
-		// Each marker names the builder call that satisfies it, so a refusal
-		// tells the caller what to add.
-		#[cfg(feature = "aead")]
-		if T::MUST_BE_CONFIDENTIAL && self.encryptor.is_none() {
-			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_encryptor" });
-		}
-
-		#[cfg(feature = "signature")]
-		if T::MUST_BE_NON_REPUDIABLE && self.signer.is_none() {
-			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_NON_REPUDIABLE", call: "with_signer" });
-		}
-
-		#[cfg(feature = "compress")]
-		if T::MUST_BE_COMPRESSED && self.compressor.is_none() {
-			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_COMPRESSED", call: "with_compression" });
-		}
-
-		#[cfg(feature = "digest")]
-		if T::MUST_HAVE_MESSAGE_INTEGRITY && self.commitment.is_none() {
-			return Err(TightBeamError::MissingProtection {
-				marker: "MUST_HAVE_MESSAGE_INTEGRITY",
-				call: "with_message_hasher",
-			});
-		}
-
-		#[cfg(feature = "digest")]
-		if T::MUST_HAVE_FRAME_INTEGRITY && self.witness.is_none() {
-			return Err(TightBeamError::MissingProtection {
-				marker: "MUST_HAVE_FRAME_INTEGRITY",
-				call: "with_witness_hasher",
-			});
-		}
-
-		if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
-			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_PRIORITIZED", call: "with_priority" });
+		let mut requirements = Requirement::ALL.into_iter();
+		let unmet = requirements.find(|requirement| requirement.is_set_by::<T>() && !self.meets(*requirement));
+		if let Some(requirement) = unmet {
+			let (marker, call) = (requirement.marker(), requirement.builder_call());
+			return Err(TightBeamError::MissingProtection { marker, call });
 		}
 
 		Ok(())
+	}
+
+	/// Whether this builder meets `requirement` before the build: it holds the
+	/// call that meets it. A build without the feature of that call leaves the
+	/// requirement to step 6 of [`FrameBuilder::build`], which refuses the
+	/// Frame that lacks the protection.
+	fn meets(&self, requirement: Requirement) -> bool {
+		match requirement {
+			#[cfg(feature = "aead")]
+			Requirement::Confidentiality => self.encryptor.is_some(),
+			#[cfg(not(feature = "aead"))]
+			Requirement::Confidentiality => true,
+			#[cfg(feature = "signature")]
+			Requirement::NonRepudiation => self.signer.is_some(),
+			#[cfg(not(feature = "signature"))]
+			Requirement::NonRepudiation => true,
+			#[cfg(feature = "compress")]
+			Requirement::Compression => self.compressor.is_some(),
+			#[cfg(not(feature = "compress"))]
+			Requirement::Compression => true,
+			#[cfg(feature = "digest")]
+			Requirement::MessageIntegrity => self.commitment.is_some(),
+			#[cfg(feature = "digest")]
+			Requirement::FrameIntegrity => self.witness.is_some(),
+			#[cfg(not(feature = "digest"))]
+			Requirement::MessageIntegrity | Requirement::FrameIntegrity => true,
+			Requirement::Priority => self.metadata_builder.has_priority(),
+		}
 	}
 }
 
@@ -508,11 +513,20 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 	///
 	/// - The error a builder method recorded, or [`TightBeamError::Sequence`]
 	///   when two or more methods recorded one.
-	/// - [`TightBeamError::UnsupportedVersion`] -- the version is below the message's `MIN_VERSION`.
+	/// - [`TightBeamError::Requirement`] -- the version is below the message's
+	///   `MIN_VERSION` ([`RequirementError::Version`]), as every typed decode
+	///   refuses it.
 	/// - [`TightBeamError::MissingProtection`] -- a message marker requires a protection the build lacks.
 	/// - [`TightBeamError::InvalidBody`] -- no message is set.
-	/// - [`TightBeamError::BuildError`] -- the metadata fails its validation.
+	/// - [`TightBeamError::BuildError`] -- the metadata has no id or no order.
+	/// - [`TightBeamError::UnsupportedField`] -- a metadata field, the FI
+	///   digest, or the signature is gated above the version (§5.6).
 	/// - The error of the configured signer, when the signature fails.
+	/// - [`TightBeamError::Requirement`] -- the built frame fails a
+	///   requirement of the message type, such as a key wrap outside its
+	///   profile ([`Frame::validate_for`]).
+	///
+	/// [`RequirementError::Version`]: crate::core::RequirementError::Version
 	fn build(mut self) -> Result<Frame> {
 		if let Some(error) = core::mem::take(&mut self.errors).into_error() {
 			return Err(error);
@@ -551,7 +565,7 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 			encryptor,
 		)?;
 
-		Self::build_impl(
+		let frame = Self::build_impl(
 			version,
 			message_bytes,
 			metadata_builder,
@@ -559,7 +573,14 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 			self.witness,
 			#[cfg(feature = "signature")]
 			self.signer,
-		)
+		)?;
+
+		// 6. Hold the frame to the requirements of the message type, as a
+		// receiver holds it. The envelope alone names the key wrap of its
+		// recipients, so this stage compares the wrap with the profile.
+		frame.validate_for::<T>()?;
+
+		Ok(frame)
 	}
 }
 
@@ -575,7 +596,7 @@ impl<T: Message> FrameBuilder<T> {
 	) -> Result<Frame> {
 		// 4. Build the optional witness. FI covers only the version and the
 		// metadata, so the message stays outside it.
-		let metadata = metadata_builder.build()?;
+		let metadata = Metadata::assemble(metadata_builder)?;
 		let integrity = Self::build_frame_integrity(
 			version,
 			&metadata,
@@ -583,6 +604,8 @@ impl<T: Message> FrameBuilder<T> {
 			witness,
 		)?;
 
+		// The assembly refuses a metadata field and a frame field that the
+		// version forbids with one error (§5.6).
 		let tbs = Frame::assemble(version, metadata, message_bytes, integrity)?;
 
 		// 5. Sign the frame when a signer is set.
@@ -717,8 +740,10 @@ impl<T: Message> FrameBuilder<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::core::RequirementError;
 	use crate::test_builder;
 	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage};
+	use crate::Beamable;
 
 	#[cfg(feature = "zstd")]
 	use crate::compress::ZstdCompression;
@@ -1050,12 +1075,37 @@ mod tests {
 		}
 	}
 
+	/// A note whose type requires V2 or later.
+	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
+	#[beam(min_version = "V2")]
+	struct RecentNote {
+		content: String,
+	}
+
+	/// A build below the minimum version of its type refuses with the error
+	/// that every typed decode of a frame of the type returns.
+	#[test]
+	fn a_build_below_the_minimum_version_refuses_as_a_typed_decode_does() -> Result<()> {
+		let message = RecentNote { content: "recent".into() };
+		let refused = compose! { V1: id: "recent", order: 1u64, message: message };
+
+		let below = RequirementError::Version((Version::V1, Version::V2).into());
+		assert!(matches!(refused, Err(TightBeamError::Requirement(error)) if error == below));
+		Ok(())
+	}
+
 	#[cfg(all(feature = "aes-gcm", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	mod seals {
 		use super::*;
 		use crate::asn1::GcmParameters;
-		use crate::crypto::aead::Aes128GcmOid;
-		use crate::crypto::profiles::TightbeamProfile;
+		use crate::crypto::aead::{Aes128GcmOid, Aes256GcmOid};
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::k256::Secp256k1;
+		use crate::crypto::kdf::HkdfSha3_256;
+		use crate::crypto::profiles::{Aes128Wrap, TightbeamProfile};
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::der::asn1::OctetString;
+		use crate::oids::{AES_128_WRAP, AES_256_WRAP};
 		use crate::random::CryptoRngCore;
 		use crate::testing::{SeededStream, TestAttributes};
 
@@ -1138,7 +1188,7 @@ mod tests {
 		/// AEAD, so the builder's run-time comparison is its one guard.
 		#[derive(Clone, Debug, PartialEq, crate::der::Sequence)]
 		struct LaxMessage {
-			content: crate::der::asn1::OctetString,
+			content: OctetString,
 		}
 
 		impl Message for LaxMessage {
@@ -1166,7 +1216,7 @@ mod tests {
 		/// builder, which refuses an encryptor outside it.
 		#[test]
 		fn an_encryptor_outside_the_profile_is_refused() -> Result<()> {
-			let message = LaxMessage { content: crate::der::asn1::OctetString::new(b"lax".as_slice())? };
+			let message = LaxMessage { content: OctetString::new(b"lax".as_slice())? };
 			let built = FrameBuilder::<LaxMessage>::from(Version::V1)
 				.with_message(message)
 				.with_id("lax")
@@ -1176,6 +1226,79 @@ mod tests {
 
 			let expected = ReceivedExpectedError { received: AES_128_GCM, expected: AES_256_GCM };
 			assert!(matches!(built, Err(TightBeamError::UnexpectedAlgorithm(found)) if found == expected));
+			Ok(())
+		}
+
+		/// The house profile under AES-128 key wrap.
+		#[derive(Debug, Default, Clone, Copy)]
+		struct Aes128WrapProfile;
+
+		impl SecurityProfile for Aes128WrapProfile {
+			type Digest = Sha3_256;
+			type AeadOid = Aes256GcmOid;
+			type SignatureAlg = Secp256k1Signature;
+			type Kdf = HkdfSha3_256;
+			type Curve = Secp256k1;
+			type KeyWrapOid = Aes128Wrap;
+		}
+
+		/// A message of the profile that names AES-128 key wrap.
+		#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
+		#[beam(profile(Aes128WrapProfile))]
+		struct WrappedNote {
+			content: OctetString,
+		}
+
+		/// The house encryptor wraps the content key under AES-256 key wrap,
+		/// outside a profile that names AES-128 key wrap, so the builder
+		/// refuses it.
+		#[test]
+		fn an_encryptor_whose_key_wrap_is_outside_the_profile_is_refused() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let message = WrappedNote { content: OctetString::new(b"wrapped".as_slice())? };
+			let built = FrameBuilder::<WrappedNote>::from(Version::V1)
+				.with_message(message)
+				.with_id("wrapped")
+				.with_order(1)
+				.with_encryptor(cipher)
+				.build();
+
+			let outside = RequirementError::Algorithm((AES_256_WRAP, AES_128_WRAP).into());
+			assert!(matches!(built, Err(TightBeamError::Requirement(error)) if error == outside));
+			Ok(())
+		}
+
+		/// A `KEKRecipientInfo` names its wrap in `keyEncryptionAlgorithm`, so
+		/// a receiver refuses a frame sealed under AES-256 key wrap as a
+		/// carrier of a type whose profile names AES-128 key wrap.
+		#[test]
+		fn a_receiver_refuses_a_kek_recipient_whose_wrap_is_outside_the_profile() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let frame = builder().with_encryptor(cipher).build()?;
+
+			let outside = RequirementError::Algorithm((AES_256_WRAP, AES_128_WRAP).into());
+			assert_eq!(frame.validate_for::<WrappedNote>(), Err(outside));
+			Ok(())
+		}
+
+		/// A `KEMRecipientInfo` names its wrap in `wrap`, so a receiver
+		/// refuses a frame sealed to a KEM recipient under AES-256 key wrap as
+		/// a carrier of a type whose profile names AES-128 key wrap.
+		#[cfg(feature = "hpke")]
+		#[test]
+		fn a_receiver_refuses_a_kem_recipient_whose_wrap_is_outside_the_profile() -> Result<()> {
+			use crate::crypto::cms::KemRecipient;
+			use crate::crypto::hpke::HpkeEncryptor;
+			use crate::crypto::key::{KeyBackend, Secp256k1KeyProvider};
+			use crate::crypto::profiles::DefaultCryptoProvider;
+
+			let backend = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
+			let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
+			let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
+			let frame = builder().with_encryptor(encryptor).build()?;
+
+			let outside = RequirementError::Algorithm((AES_256_WRAP, AES_128_WRAP).into());
+			assert_eq!(frame.validate_for::<WrappedNote>(), Err(outside));
 			Ok(())
 		}
 	}

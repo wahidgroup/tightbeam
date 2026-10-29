@@ -13,7 +13,9 @@ use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::runtime::gossip_tasks::PeerLedgers;
 use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
 use crate::colony::cluster::runtime::verify::RequestAudit;
-use crate::colony::cluster::{ClusterConfig, HiveRegistry, HopBudget, ServletRegistry, WireHopBudget};
+use crate::colony::cluster::{ClusterConfig, ClusterError, HiveRegistry, HopBudget, ServletRegistry, WireHopBudget};
+use crate::colony::protocol::{IssueClock, IssuedOrder};
+use crate::colony::urn::ServletTypeKey;
 use crate::crypto::profiles::DigestProvider;
 use crate::macros::server::AcceptedConnection;
 use crate::policy::{SessionContext, TransitStatus};
@@ -27,7 +29,7 @@ use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol};
 use crate::urn::Urn;
-use crate::{Message, TightBeamError};
+use crate::{Message, MessagePriority, TightBeamError, Version};
 
 pub(crate) type ClusterPool<P> = ConnectionPool<P>;
 
@@ -195,13 +197,40 @@ pub(crate) type ColonyDigest<P> = <<P as Protocol>::CryptoProvider as DigestProv
 /// use one digest. It shares the configuration and dereferences to it.
 pub(crate) struct ColonyConfig<P> {
 	config: Arc<ClusterConfig>,
+	/// The issue times of the gateway's signed control frames, which every
+	/// clone shares, so the orders of the gateway increase strictly.
+	issue_clock: Arc<IssueClock>,
+	/// The route key of the gossip ingress, minted once under the namespace
+	/// of the gateway.
+	gossip_ingress: Option<Arc<ServletTypeKey>>,
 	protocol: PhantomData<fn() -> P>,
 }
 
 impl<P> ColonyConfig<P> {
-	/// The shared configuration `config` of a gateway that runs `P`.
-	pub(crate) fn new(config: ClusterConfig) -> Self {
-		Self { config: Arc::new(config), protocol: PhantomData }
+	/// The shared configuration `config` of a gateway that runs `P`, with the
+	/// route key of its gossip ingress minted under its namespace.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`ClusterConfig::gossip_ingress_key`] -- the ingress is
+	///   no bare servlet type of the namespace.
+	pub(crate) fn new(config: ClusterConfig) -> Result<Self, ClusterError> {
+		let gossip_ingress = config.gossip_ingress_key()?.map(Arc::new);
+		let issue_clock = Arc::new(IssueClock::new(Arc::clone(&config.clock)));
+
+		Ok(Self { config: Arc::new(config), issue_clock, gossip_ingress, protocol: PhantomData })
+	}
+
+	/// The issue time of the next signed control frame of this gateway, which
+	/// [`Self::control_frame`] states in `metadata.order` (README §5.7.1).
+	pub(crate) fn issue_order(&self) -> IssuedOrder {
+		self.issue_clock.issue()
+	}
+
+	/// The route key that the gateway delivers admitted rumors under, or
+	/// [`None`] when it delivers none to a local servlet.
+	pub(crate) fn gossip_ingress(&self) -> Option<&ServletTypeKey> {
+		self.gossip_ingress.as_deref()
 	}
 }
 
@@ -209,7 +238,11 @@ impl<P> ColonyConfig<P> {
 // configuration is reference-counted regardless of `P`.
 impl<P> Clone for ColonyConfig<P> {
 	fn clone(&self) -> Self {
-		Self { config: Arc::clone(&self.config), protocol: PhantomData }
+		let issue_clock = Arc::clone(&self.issue_clock);
+		let gossip_ingress = self.gossip_ingress.as_ref().map(Arc::clone);
+		let config = Arc::clone(&self.config);
+
+		Self { config, issue_clock, gossip_ingress, protocol: PhantomData }
 	}
 }
 
@@ -259,6 +292,27 @@ impl<P: ColonyDialProtocol> ColonyConfig<P> {
 	{
 		builder.with_witness_hasher::<ColonyDigest<P>>()
 	}
+
+	/// The builder of a signed control frame of this gateway: `message` at
+	/// V2 under `id`, with network-control priority, the frame witness under
+	/// the colony digest, and `issued` in `metadata.order`.
+	///
+	/// - The replay guard of a receiver refuses a second frame of one signer
+	///   at one order, so the order comes from the issue clock of the gateway
+	///   (README §5.7.1).
+	/// - Priority is a metadata field of V2 or later, so the frame is V2.
+	pub(crate) fn control_frame<T>(&self, id: impl AsRef<[u8]>, issued: IssuedOrder, message: T) -> FrameBuilder<T>
+	where
+		T: Message + CheckDigestOid<ColonyDigest<P>>,
+	{
+		let builder = FrameBuilder::from(Version::V2)
+			.with_id(id)
+			.with_order(issued.instant().get())
+			.with_message(message)
+			.with_priority(MessagePriority::NetworkControl);
+
+		self.witnessed(builder)
+	}
 }
 
 /// The gateway request contexts that the runtime tests hand frames to.
@@ -307,7 +361,8 @@ pub(crate) mod fixtures {
 			trace: &Arc<TraceCollector>,
 			connections: &Arc<TraceCollector>,
 		) -> Self {
-			let config = ColonyConfig::<TokioListener>::new(config);
+			let minted = ColonyConfig::<TokioListener>::new(config);
+			let config = minted.expect("a test configuration mints its gossip ingress key");
 			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, trace);
 			let clock = Arc::clone(&config.clock);
 			let registry = HiveRegistry::new(config.heartbeat.timeout, Arc::clone(&clock));

@@ -10,7 +10,8 @@
 //! - a frame decryptor an outside crate writes, which opens the parts of a
 //!   [`CheckedContent`] itself and refuses a frame whose envelope carries
 //!   `unauthAttrs`,
-//! - a codec an outside crate writes, as a [`Compressor`] and an [`Inflator`], and
+//! - a codec an outside crate writes, as a [`Compressor`] and an [`Inflator`]
+//!   that names its own algorithm and refuses a body under another, and
 //! - the single-shot HPKE API under a suite whose KDF the outside crate defines.
 
 use std::future::Future;
@@ -46,14 +47,19 @@ use tightbeam::crypto::profiles::Kek;
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::der::asn1::{Null, ObjectIdentifier, SetOfVec};
 use tightbeam::der::{Any, Decode, Encode, ErrorKind, Tag as DerTag, TagNumber};
-use tightbeam::error::CompressionResult;
+use tightbeam::error::{CompressionResult, ReceivedExpectedError};
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{AES_128_GCM, AES_128_WRAP, AES_256_WRAP, DATA, ORI_KEM};
 use tightbeam::random::CryptoRngCore;
 use tightbeam::testing::{unhex, SeededStream, TestMessage};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::zeroize::Zeroizing;
 use tightbeam::{compose, Frame, TightBeamError, ZeroizingBytes};
+
+#[cfg(feature = "zstd")]
+use tightbeam::compress::ZstdCompression;
+#[cfg(feature = "zstd")]
+use tightbeam::oids::COMPRESSION_ZSTD;
 
 use super::{
 	AlgorithmIdentifierOwned, DiffieHellman, KeyBackend, OsRng, OutsideAgreementBackend, OutsideKem, OutsideProvider,
@@ -492,9 +498,73 @@ impl Compressor for OutsideCodec {
 }
 
 impl Inflator for OutsideCodec {
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		OUTSIDE_CODEC
+	}
+
 	fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 		Ok(data.iter().rev().copied().collect())
 	}
+}
+
+/// The outside codec under parameters of the test's choice, which the frame
+/// names in its `CompressedData`.
+struct OutsideCodecUnder(Option<Any>);
+
+impl Compressor for OutsideCodecUnder {
+	fn compress(
+		&self,
+		data: &[u8],
+		content_info: Option<EncapsulatedContentInfo>,
+	) -> CompressionResult<(Vec<u8>, CompressedData)> {
+		let (reversed, mut compressed) = OutsideCodec.compress(data, content_info)?;
+		compressed.compression_alg.parameters = self.0.clone();
+		Ok((reversed, compressed))
+	}
+}
+
+/// A cleartext frame under the outside codec, whose `CompressedData` names
+/// `parameters`.
+fn outside_codec_frame(parameters: Option<Any>) -> Result<Frame, TightBeamError> {
+	let message = TestMessage::sample(Some("outside codec"));
+	compose! { V0: id: "outside-codec", order: 1u64, message: message, compactness: OutsideCodecUnder(parameters) }
+}
+
+/// The provided parameter rule of an outside inflator admits the `NULL` of
+/// an algorithm that defines no parameters (RFC 3274 §2).
+#[test]
+fn an_outside_inflator_admits_the_null_parameters_of_its_algorithm() -> Result<(), TightBeamError> {
+	let mut frame = outside_codec_frame(Some(Any::encode_from(&Null)?))?;
+	let _opened = frame.inflate_in_place(&OutsideCodec)?;
+
+	let inflated: TestMessage = tightbeam::decode(frame.message())?;
+	assert_eq!(inflated, TestMessage::sample(Some("outside codec")));
+	Ok(())
+}
+
+/// The provided parameter rule refuses a level, which an algorithm with no
+/// parameters does not define.
+#[test]
+fn an_outside_inflator_refuses_parameters_its_algorithm_lacks() -> Result<(), TightBeamError> {
+	let mut frame = outside_codec_frame(Some(Any::encode_from(&3i32)?))?;
+	let refused = frame.inflate_in_place(&OutsideCodec);
+	assert!(matches!(refused, Err(TightBeamError::InvalidMetadata)));
+	Ok(())
+}
+
+/// An outside inflator refuses a body that names the house zstd algorithm
+/// at its OID, before its own transform runs.
+#[cfg(feature = "zstd")]
+#[test]
+fn an_outside_inflator_refuses_a_body_under_another_algorithm() -> Result<(), TightBeamError> {
+	let message = TestMessage::sample(None);
+	let zstd = ZstdCompression::default();
+	let mut frame = compose! { V0: id: "house-zstd", order: 1u64, message: message, compactness: zstd }?;
+
+	let refused = frame.inflate_in_place(&OutsideCodec);
+	let algorithms = ReceivedExpectedError::from((COMPRESSION_ZSTD, OUTSIDE_CODEC));
+	assert!(matches!(refused, Err(TightBeamError::UnexpectedAlgorithm(found)) if found == algorithms));
+	Ok(())
 }
 
 /// A frame compressed by the outside codec and sealed under the outside

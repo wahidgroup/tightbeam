@@ -589,7 +589,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(reply.message())?;
+			let echoed: PingResponse = reply.decode_message()?;
 			assert_eq!(echoed.doubled, 8, "the exported type splices through B to A's servlet");
 
 			gateway_b.stop();

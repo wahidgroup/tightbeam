@@ -16,11 +16,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use super::{AddressGroup, AdmittedDial, ClusterError, PeerAddress, PeerHint, PeerRecord};
+use crate::clock::UnixMillis;
 use crate::constants::{
 	MAX_PEER_BUCKET, MAX_PEER_TABLE_NEW, MAX_PEER_TABLE_TRIED, MAX_PEER_TRIED_FAILURES, PEER_PROBE_BACKOFF_MAX_MS,
 	PEER_PROBE_BACKOFF_MS, PEER_PROBE_PER_BEAT,
 };
-use crate::utils::time::UnixMillis;
 
 /// What the table knows about one peer address.
 #[derive(Debug, Clone)]

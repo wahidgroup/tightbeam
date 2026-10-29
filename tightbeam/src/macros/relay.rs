@@ -30,6 +30,7 @@ mod tests {
 		value: u64,
 	}
 
+	#[cfg(feature = "router")]
 	#[test]
 	fn relays_frame_over_channel() -> Result<(), TightBeamError> {
 		let (tx, rx) = std::sync::mpsc::channel();
@@ -37,7 +38,7 @@ mod tests {
 		relay!(RelayMessage { value: 7 }, tx)?;
 
 		let frame = rx.recv().map_err(|_| TightBeamError::ChannelClosed)?;
-		let decoded: RelayMessage = crate::decode(frame.message())?;
+		let decoded: RelayMessage = frame.decode_message()?;
 		assert_eq!(decoded, RelayMessage { value: 7 });
 
 		Ok(())

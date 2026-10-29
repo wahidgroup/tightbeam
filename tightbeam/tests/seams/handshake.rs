@@ -13,6 +13,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tightbeam::crypto::profiles::SecurityProfileDesc;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::testing::TestFrame;
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
@@ -22,7 +23,6 @@ use tightbeam::transport::handshake::{
 use tightbeam::transport::state::ServerHandshakeSlot;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{EncryptedMessageIO, MessageCollector, MessageEmitter, TransportResult};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::Frame;
 use tokio::task::JoinHandle;
 

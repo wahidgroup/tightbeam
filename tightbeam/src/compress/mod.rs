@@ -1,7 +1,7 @@
 //! Frame body compression.
 //!
 //! - [`Compressor`] compresses a message body and describes the result as CMS [`CompressedData`].
-//! - [`Inflator`] reverses a compressor and returns the original body.
+//! - [`Inflator`] names the algorithm it reverses, and returns the original body.
 //! - [`ZstdCompression`] implements both with zstd and bounds the output of decompression (CWE-409).
 
 #[cfg(not(feature = "std"))]
@@ -11,7 +11,11 @@ use crate::{cms::signed_data::EncapsulatedContentInfo, error::CompressionResult,
 
 #[cfg(feature = "zstd")]
 use crate::{
-	cms::content_info::CmsVersion, constants::DEFAULT_MAX_DECOMPRESSED_LEN, error::CompressionError, oids::DATA,
+	cms::content_info::CmsVersion,
+	constants::DEFAULT_MAX_DECOMPRESSED_LEN,
+	der::{asn1::ObjectIdentifier, Any},
+	error::CompressionError,
+	oids::{COMPRESSION_ZSTD, DATA},
 	spki::AlgorithmIdentifierOwned,
 };
 
@@ -137,6 +141,21 @@ impl Compressor for ZstdCompression {
 
 #[cfg(feature = "zstd")]
 impl Inflator for ZstdCompression {
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		COMPRESSION_ZSTD
+	}
+
+	/// The parameters of a zstd body are absent, or an INTEGER level inside
+	/// the range zstd accepts, `ZSTD_minCLevel` to `ZSTD_maxCLevel`.
+	fn admits_parameters(&self, parameters: Option<&Any>) -> bool {
+		let Some(parameters) = parameters else {
+			return true;
+		};
+
+		let levels = zstd_safe::min_c_level()..=zstd_safe::max_c_level();
+		parameters.decode_as::<i32>().is_ok_and(|level| levels.contains(&level))
+	}
+
 	fn decompress(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
 		let mut ctx = zstd_safe::DCtx::create();
 		let window_log_max = zstd_safe::DParameter::WindowLogMax(self.window_log_max());
@@ -197,8 +216,8 @@ impl Inflator for ZstdCompression {
 
 #[cfg(feature = "zstd")]
 impl From<&ZstdCompression> for AlgorithmIdentifierOwned {
-	fn from(_: &ZstdCompression) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: crate::oids::COMPRESSION_ZSTD, parameters: None }
+	fn from(compression: &ZstdCompression) -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned { oid: compression.algorithm_oid(), parameters: None }
 	}
 }
 

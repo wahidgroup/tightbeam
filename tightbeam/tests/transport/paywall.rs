@@ -32,10 +32,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::{CanonicalKey, CertificateSpec};
-use tightbeam::decode;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::policy::SessionContext;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
@@ -51,7 +51,6 @@ use tightbeam::transport::handshake::negotiation::{
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;
@@ -247,7 +246,7 @@ async fn start_lottery_server(
 			with_transport_authorizer: [ Arc::clone(&authorizer) ]
 		},
 		handle: move |ticket: Frame| async move {
-			let pick: TestMessage = decode(ticket.message())?;
+			let pick: TestMessage = ticket.decode_message()?;
 			let announced = rig.outcome(&pick.content);
 			Ok(Some(TestFrame::v0(Some(&announced), None)))
 		}
@@ -314,7 +313,7 @@ async fn start_ledger_lottery_server(
 					.peer_key()
 					.map(CanonicalKey::as_der)
 					.ok_or_else(|| expectation_failure("mutual handshake left no client public key"))?;
-				let pick: TestMessage = decode(ticket.message())?;
+				let pick: TestMessage = ticket.decode_message()?;
 				let announced = ledger.announce(account, rig, &pick.content);
 				Ok(Some(TestFrame::v0(Some(&announced), None)))
 			}
@@ -382,7 +381,7 @@ async fn draw(lease: &mut PooledClient<TokioListener>, pick: impl AsRef<str>) ->
 		return Err(expectation_failure("draw produced no announcement"));
 	};
 
-	let announced: TestMessage = decode(announcement.message())?;
+	let announced: TestMessage = announcement.decode_message()?;
 	Ok(announced.content)
 }
 
@@ -712,7 +711,7 @@ tb_scenario! {
 							.ok_or_else(|| expectation_failure("metered session carried no receipt"))?;
 						books.note_receipt(receipt.receipt().transcript_hash.to_der()?);
 
-						let pick: TestMessage = decode(ticket.message())?;
+						let pick: TestMessage = ticket.decode_message()?;
 						let announced = DrawRig::AlwaysWin.outcome(&pick.content);
 						Ok(Some(TestFrame::v0(Some(&announced), None)))
 					}

@@ -36,7 +36,7 @@ type EventsByLabel<'a> = HashMap<&'a str, Vec<&'a TbEvent>>;
 /// the pass selects, with its measure in nanoseconds, in trace order.
 pub(super) struct Samples {
 	/// The sequence number of each sample.
-	seqs: Vec<u32>,
+	seqs: Vec<u64>,
 	/// The measure of each sample, in the order of `seqs`.
 	measures: Vec<u64>,
 }
@@ -110,20 +110,20 @@ impl Samples {
 				.ok_or_else(unmeasured)
 		});
 
-		let measured: Vec<(u32, u64)> = measured.collect::<Result<_, _>>()?;
+		let measured: Vec<(u64, u64)> = measured.collect::<Result<_, _>>()?;
 		let (seqs, measures) = measured.into_iter().unzip();
 
 		Ok(Self { seqs, measures })
 	}
 
 	/// The sequence number of a longest sample, or `None` for an empty set.
-	fn longest_seq(&self) -> Option<u32> {
+	fn longest_seq(&self) -> Option<u64> {
 		let longest = self.seqs.iter().zip(&self.measures).max_by_key(|(_, measure_ns)| **measure_ns);
 		longest.map(|(seq, _)| *seq)
 	}
 
 	/// Each sample as its sequence number and its measure.
-	fn iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+	fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
 		self.seqs.iter().copied().zip(self.measures.iter().copied())
 	}
 }
@@ -386,9 +386,9 @@ impl TimingConstraints {
 /// A deadline window: a start marker and the first end marker after it.
 struct Window {
 	/// The sequence number of the start marker.
-	start_seq: u32,
+	start_seq: u64,
 	/// The sequence number of the end marker.
-	end_seq: u32,
+	end_seq: u64,
 	/// The time from the start marker to the end marker, in nanoseconds.
 	latency_ns: u64,
 }

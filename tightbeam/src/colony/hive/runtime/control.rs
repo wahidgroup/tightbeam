@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::{select, Either};
 use tokio::sync::Notify;
 
+use crate::clock::{Clock, MonotonicInstant};
 use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand, CommandAudit, CommandRefusal};
 use crate::colony::hive::runtime::{DrainMode, HiveContextImpl, HiveInstances, HiveRuntime};
 use crate::colony::hive::{
@@ -30,7 +31,6 @@ use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{AsyncListenerTrait, Protocol, TransportError, TransportFailure};
 use crate::urn::Urn;
-use crate::utils::time::{Clock, MonotonicInstant};
 use crate::{Frame, TightBeamError};
 
 /// The count of cluster commands that the hive holds in flight.
@@ -453,7 +453,7 @@ mod tests {
 	use core::task::Poll;
 
 	use super::*;
-	use crate::utils::time::ManualClock;
+	use crate::clock::ManualClock;
 
 	/// The drain timeout every wait in this module races against.
 	const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);

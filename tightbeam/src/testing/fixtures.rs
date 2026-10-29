@@ -8,11 +8,14 @@ use std::sync::Arc;
 use crate::asn1::{AlgorithmIdentifier, AlgorithmIdentifierOwned, DigestInfo, Frame, ObjectIdentifier, OctetString};
 use crate::der::Sequence;
 use crate::oids::HASH_SHA256;
+use crate::trace::{IntoEventLabel, TraceCollector};
 use crate::Beamable;
-use crate::{decode, Message, Version};
+use crate::{Message, TightBeamError, Version};
 
 #[cfg(host_clock)]
-use crate::utils::time::UnixMillis;
+use crate::clock::UnixMillis;
+#[cfg(all(host_clock, feature = "secp256k1", feature = "signature", feature = "x509"))]
+use crate::clock::{Clock, ManualClock};
 #[cfg(feature = "aead")]
 use aead::*;
 
@@ -191,19 +194,20 @@ use rumor::*;
 #[cfg(feature = "instrument")]
 mod instrumented {
 	pub use crate::instrumentation::TbInstrumentationConfig;
-	pub use crate::trace::{TraceCollector, TraceConfig};
+	pub use crate::trace::TraceConfig;
 	pub use crate::urn::Urn;
 }
 
 #[cfg(feature = "instrument")]
 use instrumented::*;
 
-/// The fixed test validity window, from the epoch through Unix time
-/// 2,000,000,000 (2033-05-18), both as UtcTime.
+/// The fixed test validity window, from the epoch through
+/// [`TestCertificate::END_OF_VALIDITY`], both as UtcTime.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_validity() -> TbResult<Validity> {
 	let not_before = Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(0))?);
-	let not_after = Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(2_000_000_000))?);
+	let not_after = Duration::from_secs(TestCertificate::END_OF_VALIDITY);
+	let not_after = Time::UtcTime(UtcTime::from_unix_duration(not_after)?);
 	let validity = Validity { not_before, not_after };
 	Ok(validity)
 }
@@ -529,10 +533,68 @@ macro_rules! test_builder {
 ///
 /// - A `Frame` or an `Arc<Frame>` compares `metadata.id`.
 /// - A `Result<Frame, E>` compares `metadata.id` of the `Ok` frame, and an `Err` matches no frame.
-/// - Any `T: Message + PartialEq` decodes `T` from `frame.message` and
-///   compares, and a failed decode matches no frame.
+/// - Any `T: Message + PartialEq` decodes `T` through [`Frame::decode_message`],
+///   which holds a frame whose body arrived in cleartext to the requirements
+///   of `T`, and compares. A refused or failed decode matches no frame.
+///
+/// A scenario grades a match through [`Self::record_match`], and its spec
+/// asserts the recorded value with `equals!(true)`.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::testing::{ExpectedMatcher, TestFrame, TestMessage};
+///
+/// let frame = TestFrame::v0(Some("carried"), None);
+///
+/// assert!(TestMessage::sample(Some("carried")).matches(&frame));
+/// assert!(!TestMessage::sample(Some("other")).matches(&frame));
+/// ```
 pub trait ExpectedMatcher {
+	/// Whether `frame` carries this expected value.
 	fn matches(&self, frame: &Frame) -> bool;
+
+	/// Records `label` on `trace`, with the outcome of [`Self::matches`] for
+	/// `frame` as its value.
+	///
+	/// The spec of a scenario asserts the value with `equals!(true)`, so a
+	/// frame that does not carry the expected value fails the assertion layer.
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the fault model of `trace` injects a fault at `label`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::{ExpectedMatcher, TestFrame, TestMessage};
+	/// use tightbeam::trace::{AssertionValue, ConsumedTrace, TraceCollector};
+	///
+	/// const REPLY: tightbeam::urn::Urn<'static> = tightbeam::urn!("doc", "event:reply/expected");
+	///
+	/// let trace = TraceCollector::new();
+	/// let reply = TestFrame::v0(Some("pong"), None);
+	/// TestMessage::sample(Some("pong")).record_match(&trace, REPLY, &reply)?;
+	///
+	/// let mut consumed = ConsumedTrace::new();
+	/// consumed.populate_from_collector(&trace);
+	/// let values: Vec<_> = consumed.assertions().iter().map(|assertion| assertion.value.clone()).collect();
+	/// assert_eq!(values, [Some(AssertionValue::Bool(true))]);
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
+	fn record_match(
+		&self,
+		trace: &TraceCollector,
+		label: impl IntoEventLabel,
+		frame: &Frame,
+	) -> Result<(), TightBeamError>
+	where
+		Self: Sized,
+	{
+		let matched = self.matches(frame);
+		trace.event_with(label, &[], matched)?.emit();
+		Ok(())
+	}
 }
 
 impl ExpectedMatcher for Frame {
@@ -561,11 +623,8 @@ where
 	T: Message + PartialEq,
 {
 	fn matches(&self, frame: &Frame) -> bool {
-		if let Ok(decoded) = decode::<T>(frame.message()) {
-			decoded == *self
-		} else {
-			false
-		}
+		let decoded = frame.decode_message::<T>();
+		decoded.is_ok_and(|decoded| decoded == *self)
 	}
 }
 
@@ -1422,6 +1481,33 @@ impl TestCertificate {
 		"}
 		.expect("Failed to parse expired test certificate")
 	}
+
+	/// The Unix time, in seconds, at which the fixed test validity window
+	/// ends (2033-05-18).
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub const END_OF_VALIDITY: u64 = 2_000_000_000;
+
+	/// A manual clock one second past [`Self::END_OF_VALIDITY`], on which each
+	/// certificate of the fixed test validity window is expired.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::clock::Clock;
+	/// use tightbeam::testing::TestCertificate;
+	///
+	/// let clock = TestCertificate::clock_past_validity();
+	/// assert!(clock.unix().get() > TestCertificate::END_OF_VALIDITY * 1_000);
+	/// ```
+	#[cfg(all(host_clock, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub fn clock_past_validity() -> Arc<ManualClock> {
+		let clock = Arc::new(ManualClock::default());
+		let since_epoch = clock.unix().saturating_since(UnixMillis::new(0));
+		let past = Duration::from_secs(Self::END_OF_VALIDITY.saturating_add(1));
+
+		clock.advance(past.saturating_sub(since_epoch));
+		clock
+	}
 }
 
 /// The signer material of CMS structures.
@@ -1848,8 +1934,18 @@ mod tests {
 	use super::*;
 
 	use crate::builder::MetadataBuilder;
+	use crate::decode;
 	use crate::error::Result as TbResult;
 	use crate::{Metadata, Version};
+
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	use crate::cms::signed_data::EncapsulatedContentInfo;
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	use crate::compress::Compressor;
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	use crate::error::CompressionResult;
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	use crate::CompressedData;
 
 	#[test]
 	#[cfg(feature = "std")]
@@ -1864,6 +1960,70 @@ mod tests {
 		let frame = TestFrame::v0(None, Some("named-id"));
 		assert_eq!(frame.metadata().id(), b"named-id");
 	}
+
+	/// A value matches the cleartext frame that carries it.
+	#[test]
+	fn an_expected_message_matches_the_frame_that_carries_it() -> TbResult<()> {
+		let frame = TestFrame::v0(Some("carried"), None);
+		assert!(TestMessage::sample(Some("carried")).matches(&frame));
+		Ok(())
+	}
+
+	/// A cleartext frame is no carrier of a type that requires
+	/// confidentiality, so a value of that type matches no such frame, though
+	/// the body decodes as that type.
+	#[test]
+	fn an_expected_message_matches_no_frame_that_fails_a_requirement_of_its_type() -> TbResult<()> {
+		let frame = TestFrame::v0(Some("sealed"), None);
+		let expected = ConfidentialNote { content: "sealed".into() };
+
+		let decoded: ConfidentialNote = decode(frame.message())?;
+		assert_eq!(decoded, expected);
+		assert!(!expected.matches(&frame));
+		Ok(())
+	}
+
+	/// A body that still needs an inflate is opaque, so a value matches no
+	/// compressed frame, though the body holds the encoding of that value.
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	#[test]
+	fn an_expected_message_matches_no_frame_whose_body_needs_an_inflate() -> TbResult<()> {
+		let message = TestMessage::sample(Some("stored"));
+		let frame = compose! { V0: id: "stored", order: 1u64, message: message, compactness: Stored }?;
+
+		let decoded: TestMessage = decode(frame.message())?;
+		let expected = TestMessage::sample(Some("stored"));
+		assert_eq!(decoded, expected);
+		assert!(!expected.matches(&frame));
+		Ok(())
+	}
+
+	/// A compressor that keeps the body as it is, so the body of a frame that
+	/// names it still decodes as the message type.
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	struct Stored;
+
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	impl Compressor for Stored {
+		fn compress(
+			&self,
+			data: &[u8],
+			content_info: Option<EncapsulatedContentInfo>,
+		) -> CompressionResult<(Vec<u8>, CompressedData)> {
+			use crate::cms::content_info::CmsVersion;
+			use crate::oids::DATA;
+
+			let compression_alg = AlgorithmIdentifierOwned { oid: STORED, parameters: None };
+			let encap_content_info =
+				content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: DATA, econtent: None });
+			let compressed = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
+			Ok((data.to_vec(), compressed))
+		}
+	}
+
+	/// The algorithm of [`Stored`], under an arc that names no real codec.
+	#[cfg(all(feature = "builder", feature = "compress"))]
+	const STORED: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.4");
 
 	/// A sealed frame opens through [`TestFrame::decrypted`] inside an async
 	/// test, on a thread that a tokio runtime drives.

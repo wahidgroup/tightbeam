@@ -26,6 +26,7 @@ use crate::crypto::x509::{KeyAgreement, KeyPurposes, PeerCertificate};
 use crate::der::asn1::{GeneralizedTime, Null, ObjectIdentifier, OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Decode, Encode, EncodeValue, Tagged};
+use crate::marker::MaybeSendFuture;
 use crate::oids::{
 	AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, ATTR_CONTENT_TYPE, DATA, DHKEM_SECP256K1,
 	HKDF_SHA3_256, SIGNED_DATA,
@@ -33,7 +34,6 @@ use crate::oids::{
 use crate::random::OsRng;
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestKey};
-use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::x509::ext::Extension;

@@ -183,19 +183,20 @@ impl Metadata {
 }
 
 #[cfg(feature = "builder")]
-impl TryFrom<MetadataBuilder> for Metadata {
-	type Error = BuildError;
-
-	/// Assemble the metadata a builder describes.
+impl Metadata {
+	/// Assemble the metadata a builder describes, and leave the version check
+	/// to the frame that carries it.
+	///
+	/// The frame build takes this path, so [`Frame::assemble`] refuses a
+	/// metadata field and a frame field below their versions with one error.
 	///
 	/// # Errors
 	///
 	/// - [`MetadataError::MissingId`] -- the builder has no id.
 	/// - [`MetadataError::MissingOrder`] -- the builder has no order.
-	/// - [`MetadataError::UnsupportedField`] -- a set field is gated above the builder's version.
-	fn try_from(builder: MetadataBuilder) -> Result<Self, Self::Error> {
+	pub(crate) fn assemble(builder: MetadataBuilder) -> Result<Self, BuildError> {
 		let MetadataBuilder {
-			version,
+			version: _,
 			id,
 			order,
 			integrity,
@@ -209,7 +210,8 @@ impl TryFrom<MetadataBuilder> for Metadata {
 
 		let id = id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
 		let order = order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingOrder))?;
-		let metadata = Self {
+
+		Ok(Self {
 			id,
 			order,
 			compactness,
@@ -219,7 +221,24 @@ impl TryFrom<MetadataBuilder> for Metadata {
 			lifetime,
 			previous_frame,
 			matrix,
-		};
+		})
+	}
+}
+
+#[cfg(feature = "builder")]
+impl TryFrom<MetadataBuilder> for Metadata {
+	type Error = BuildError;
+
+	/// Assemble the metadata a builder describes.
+	///
+	/// # Errors
+	///
+	/// - [`MetadataError::MissingId`] -- the builder has no id.
+	/// - [`MetadataError::MissingOrder`] -- the builder has no order.
+	/// - [`MetadataError::UnsupportedField`] -- a set field is gated above the builder's version.
+	fn try_from(builder: MetadataBuilder) -> Result<Self, Self::Error> {
+		let version = builder.version;
+		let metadata = Self::assemble(builder)?;
 
 		if let Some(field) = metadata.forbidden_field(version) {
 			return Err(BuildError::InvalidMetadata(MetadataError::UnsupportedField { field, version }));
@@ -299,7 +318,8 @@ impl fmt::Debug for Frame {
 /// The transform a frame body still needs before a decode.
 ///
 /// Callers read it through [`Frame::body_transform`], and each maps it to its
-/// own policy: the router refuses, and a servlet applies the transform.
+/// own policy: a typed decode and the router refuse, and a servlet applies
+/// the transform.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BodyTransform {
 	/// The body is encrypted. The decrypt also inflates a body that was
@@ -307,6 +327,16 @@ pub enum BodyTransform {
 	Decrypt,
 	/// The body is compressed and in cleartext.
 	Inflate,
+}
+
+/// The transform as the verb that names it: `decrypt` or `inflate`.
+impl fmt::Display for BodyTransform {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Decrypt => f.write_str("decrypt"),
+			Self::Inflate => f.write_str("inflate"),
+		}
+	}
 }
 
 /// The Frame Integrity (FI) digest and the signature that an open in place
@@ -378,7 +408,7 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`crate::TightBeamError::UnsupportedVersion`] -- a part carries a field that `version` forbids.
+	/// - [`crate::TightBeamError::UnsupportedField`] -- a part carries a field that `version` forbids.
 	#[cfg(feature = "builder")]
 	pub(crate) fn assemble(
 		version: Version,
@@ -515,9 +545,8 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`crate::TightBeamError::UnsupportedVersion`] -- the frame's version
-	///   forbids `field`. The error names the frame version and the version
-	///   that introduced the field.
+	/// - [`crate::TightBeamError::UnsupportedField`] -- the frame's version
+	///   forbids `field`. The error names the field and the frame version.
 	#[cfg(feature = "signature")]
 	fn ensure_allows(&self, field: GatedField) -> crate::error::Result<()> {
 		let forbidden = (!self.version.allows(field)).then_some(field);
@@ -526,19 +555,20 @@ impl Frame {
 
 	/// Refuse `forbidden` when it names a field this frame's version forbids.
 	///
+	/// It is the one refusal of the §5.6 rule for a frame in memory, so the
+	/// build and every change in place refuse with one error.
+	///
 	/// # Errors
 	///
-	/// - [`crate::TightBeamError::UnsupportedVersion`] -- `forbidden` names a
-	///   field. The error names the frame version and the version that
-	///   introduced the field.
+	/// - [`crate::TightBeamError::UnsupportedField`] -- `forbidden` names a
+	///   field. The error names the field and the frame version.
 	#[cfg(any(feature = "builder", feature = "signature"))]
 	fn refuse(&self, forbidden: Option<GatedField>) -> crate::error::Result<()> {
 		let Some(field) = forbidden else {
 			return Ok(());
 		};
 
-		let versions = crate::error::ReceivedExpectedError::from((self.version, field.since()));
-		Err(crate::TightBeamError::UnsupportedVersion(versions))
+		Err(crate::TightBeamError::UnsupportedField { field, version: self.version })
 	}
 
 	/// The decoder check that rejects a frame that carries a forbidden field,
@@ -571,7 +601,8 @@ fn first_forbidden<const N: usize>(version: Version, present: [(GatedField, bool
 mod tests {
 	use super::*;
 	use crate::der::{Decode, Encode};
-	use crate::testing::{TestDigest, TestSigner};
+	use crate::testing::{TestDigest, TestMessage, TestSigner};
+	use crate::TightBeamError;
 
 	/// A frame at `version` that carries `field`, built without the
 	/// constructor's check.
@@ -660,8 +691,33 @@ mod tests {
 		let result = Frame::assemble(Version::V0, Metadata::empty(), Vec::new(), integrity);
 		assert!(matches!(
 			result,
-			Err(crate::TightBeamError::UnsupportedVersion(ref versions))
-				if versions.received == Version::V0 && versions.expected == Version::V1
+			Err(crate::TightBeamError::UnsupportedField { field: GatedField::FrameIntegrity, version: Version::V0 })
 		));
+	}
+
+	/// The frame build refuses a metadata field below its version with the
+	/// error that names the field and the frame version.
+	#[cfg(feature = "builder")]
+	#[test]
+	fn a_build_refuses_a_metadata_field_below_its_version_by_name() {
+		let message = crate::testing::TestMessage::sample(None);
+		let result = compose! { V2: id: "grid", order: 1u64, message: message, matrix: MatrixDyn::default() };
+		assert!(matches!(
+			result,
+			Err(crate::TightBeamError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 })
+		));
+	}
+
+	/// The one §5.6 rule refuses a metadata field that the builder sets and a
+	/// frame field that the assembly adds with one error.
+	#[cfg(feature = "builder")]
+	#[test]
+	fn a_metadata_field_and_a_frame_field_below_their_versions_refuse_alike() {
+		let message = TestMessage::sample(None);
+		let metadata_field = compose! { V2: id: "grid", order: 1u64, message: message, matrix: MatrixDyn::default() };
+		let frame_field = Frame::assemble(Version::V0, Metadata::empty(), Vec::new(), Some(TestDigest::info()));
+
+		assert!(matches!(metadata_field, Err(TightBeamError::UnsupportedField { .. })));
+		assert!(matches!(frame_field, Err(TightBeamError::UnsupportedField { .. })));
 	}
 }

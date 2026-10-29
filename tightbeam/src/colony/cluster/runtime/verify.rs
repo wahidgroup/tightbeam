@@ -561,7 +561,7 @@ mod tests {
 	/// `config` as the configuration of a house gateway, whose colony digest
 	/// is SHA3-256.
 	fn house(config: ClusterConfig) -> ColonyConfig<TokioListener> {
-		ColonyConfig::new(config)
+		ColonyConfig::new(config).expect("the test configuration names no gossip ingress")
 	}
 
 	struct GrantAll;

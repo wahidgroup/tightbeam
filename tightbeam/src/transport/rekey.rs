@@ -67,6 +67,7 @@ use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::Encode;
+use crate::marker::{MaybeSend, MaybeSendFuture};
 use crate::random::{generate_nonce, OsRng};
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
@@ -79,7 +80,6 @@ use crate::transport::handshake::{
 	AgreementCertificate, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError, HandshakeOctets,
 	HandshakeProvider, PeerEphemeral, ServerKeys, SessionPeer,
 };
-use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 
 /// Shared epoch state and identities for one session's rekey exchanges.
 ///
@@ -865,7 +865,7 @@ pub(crate) mod tests {
 		pub use crate::testing::TestCmsServer;
 		pub use crate::transport::multiplex::{MuxRekeyContext, MuxRole};
 		pub use crate::transport::state::{EncryptedProtocolState, EncryptionConfig, SessionPhase, SessionState};
-		pub use crate::transport::{TransportError, TransportLimits};
+		pub use crate::transport::{CheckedLimits, TransportError};
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -1578,7 +1578,7 @@ pub(crate) mod tests {
 	#[cfg(feature = "transport-cms")]
 	struct CmsClientProbe {
 		state: SessionState<DefaultCryptoProvider>,
-		limits: TransportLimits,
+		limits: CheckedLimits,
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -1588,7 +1588,7 @@ pub(crate) mod tests {
 	impl EncryptedProtocolState for CmsClientProbe {
 		type CryptoProvider = DefaultCryptoProvider;
 
-		fn limits(&self) -> &TransportLimits {
+		fn limits(&self) -> &CheckedLimits {
 			&self.limits
 		}
 
@@ -1626,7 +1626,7 @@ pub(crate) mod tests {
 		let encryption = EncryptionConfig { client_identity: Some(client), ..EncryptionConfig::unconfigured() };
 
 		let state = SessionState::at(encryption, SessionPhase::Encrypted(Box::new(session)));
-		CmsClientProbe { state, limits: TransportLimits::default() }
+		CmsClientProbe { state, limits: CheckedLimits::default() }
 	}
 
 	/// The client half of the rekey `probe`'s session hands over.

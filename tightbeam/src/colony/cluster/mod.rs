@@ -77,9 +77,11 @@ use core::future::Future;
 use core::num::NonZeroUsize;
 use core::str::FromStr;
 use core::time::Duration;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_HOPS};
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::CryptoProvider;
@@ -93,11 +95,10 @@ use crate::transport::client::{ConnectionBuilder, ConnectionPoolBuilder, PoolCon
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::{Protocol, TightBeamAddress, TransportEncryptionConfig};
 use crate::urn::{Urn, UrnValidationError};
-use crate::utils::time::Clock;
 use crate::TightBeamError;
 
 use super::protocol::ServletAddressUpdate;
-use super::urn::{ColonyNamespace, ColonyResource};
+use super::urn::{ColonyNamespace, ColonyResource, ServletTypeKey};
 
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
@@ -168,7 +169,7 @@ pub struct HeartbeatEvent {
 	pub success: bool,
 	/// The utilization the hive reported, when it answered with a heartbeat
 	/// result.
-	pub utilization: Option<crate::utils::BasisPoints>,
+	pub utilization: Option<crate::basis_points::BasisPoints>,
 }
 
 /// The callback the heartbeat loop calls after each heartbeat result.
@@ -316,7 +317,7 @@ impl ClusterTlsConfig {
 	/// let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
 	/// let tls = ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
 	///
-	/// let mutual = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// let mutual = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default()));
 	/// let tls = tls.with_client_authentication(mutual);
 	/// assert!(tls.peer_authentication().requires_certificate());
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
@@ -594,7 +595,8 @@ pub struct ClusterConfig {
 	/// The freshness window for signed hive control frames.
 	///
 	/// The gateway refuses a stale or replayed registration or update frame
-	/// (CWE-294).
+	/// (CWE-294), and a second frame of one signer at one `order` inside the
+	/// window (README §5.7.1).
 	pub control_freshness_window: Duration,
 	/// The gateway bind address, parsed through the protocol address `FromStr`.
 	/// `None` binds the protocol default. A stable address lets hives register
@@ -619,7 +621,13 @@ pub struct ClusterConfig {
 	pub gossip: GossipConfig,
 	/// The clock every freshness, replay, retention, and lease decision on
 	/// this gateway reads. It defaults to
-	/// [`SystemClock`](crate::utils::time::SystemClock).
+	/// [`SystemClock`](crate::clock::SystemClock).
+	///
+	/// A trust store reads the validity period of a signer on its own clock,
+	/// so the stores of [`ClusterTlsConfig`] are built on this one
+	/// ([`CertificateTrustBuilder::with_clock`]).
+	///
+	/// [`CertificateTrustBuilder::with_clock`]: crate::crypto::x509::store::CertificateTrustBuilder::with_clock
 	pub clock: Arc<dyn Clock>,
 	/// The colony URN from the URI SAN of the gateway certificate. `None` means
 	/// the gateway is in no colony and no flood ([`ClusterConfig::flood`]):
@@ -636,8 +644,8 @@ pub struct ClusterConfig {
 }
 
 /// A parsed address-update delta: the hive's added routes, owned by that
-/// hive, and the locators it removes.
-pub(crate) type ParsedAddressUpdate<'a> = (HiveSlate, Vec<&'a [u8]>);
+/// hive, and the locators it removes, percent-decoded.
+pub(crate) type ParsedAddressUpdate<'a> = (HiveSlate, Vec<Cow<'a, [u8]>>);
 
 impl ClusterConfig {
 	/// The effective advertisement-rumor refresh interval: the configured
@@ -721,10 +729,10 @@ impl ClusterConfig {
 				return Err(ClusterError::InvalidUrn(UrnValidationError::RequiredFieldMissing("instance")));
 			};
 
-			removed.push(locator.as_bytes());
+			removed.push(locator.decoded());
 		}
 
-		let hive_id: Arc<[u8]> = Arc::from(addr.as_bytes());
+		let hive_id: Arc<[u8]> = Arc::from(addr.decoded().as_ref());
 		let added = self.servlet_slate(&update.added, &hive_id)?;
 		Ok((added, removed))
 	}
@@ -771,6 +779,52 @@ impl ClusterConfig {
 	pub(crate) fn bind_colony_membership(&mut self) {
 		self.colony_urn = self.namespace.cert_colony_urn(self.tls.identity().certificate());
 	}
+
+	/// The route key of the gossip ingress ([`GossipConfig::ingress`]) under
+	/// [`Self::namespace`], or [`None`] when the gateway delivers no rumor to
+	/// a local servlet.
+	///
+	/// - The namespace and the gossip section stay writable until a gateway takes the config.
+	/// - [`Cluster::start`] mints the key here once, and its gossip pipeline delivers under it.
+	/// - An implementor of [`Cluster`] outside this crate mints the key here too.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::UnknownServletType`] -- the ingress is no bare
+	///   servlet type of [`Self::namespace`], so no route answers it and the
+	///   gateway would deliver none of its gossip.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # use std::sync::Arc;
+	/// # use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig};
+	/// # use tightbeam::colony::urn::ColonyNamespace;
+	/// # use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// # use tightbeam::crypto::x509::CertificateSpec;
+	/// # use tightbeam::testing::{TestCertificate, TestKey};
+	/// # let key = TestKey::insecure_fixed_signing();
+	/// # let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+	/// # let tls = ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+	/// let acme = ColonyNamespace::new("acme", "prod")?;
+	/// let feed = acme.servlet("feed")?;
+	///
+	/// // The ingress names a servlet type of `acme`, so the key reads the
+	/// // namespace the builder sets, in either call order.
+	/// let builder = ClusterConfig::builder(tls).with_gossip_ingress(feed.clone())?;
+	/// let config = builder.with_namespace(acme.clone()).build();
+	/// assert_eq!(config.gossip_ingress_key()?, acme.servlet_type_key(&feed));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn gossip_ingress_key(&self) -> Result<Option<ServletTypeKey>, ClusterError> {
+		let Some(ingress) = self.gossip.ingress.as_ref() else {
+			return Ok(None);
+		};
+
+		let key = self.namespace.servlet_type_key(ingress);
+		let refused = || ClusterError::UnknownServletType(ingress.canonical_bytes());
+		key.map(Some).ok_or_else(refused)
+	}
 }
 
 impl core::fmt::Debug for ClusterConfig {
@@ -813,8 +867,10 @@ pub trait Cluster: Sized + Send + Sync {
 	///
 	/// - [`TightBeamError::TransportError`] -- an accept plane fails to bind.
 	/// - [`TightBeamError::ClusterError`] -- `bind_addr` or `edge_bind_addr`
-	///   does not parse ([`ClusterError::InvalidAddress`]), or the gateway
-	///   beats from a wildcard bind with no advertise address.
+	///   does not parse ([`ClusterError::InvalidAddress`]), the gossip ingress
+	///   is no bare servlet type of `namespace`
+	///   ([`ClusterConfig::gossip_ingress_key`]), or the gateway beats from a
+	///   wildcard bind with no advertise address.
 	/// - [`TightBeamError`] -- the trace collector refuses an export-posture warning.
 	fn start(
 		trace: Arc<TraceCollector>,
@@ -1097,7 +1153,7 @@ mod tests {
 		}
 		cases {
 			anonymous => (PeerAuthentication::Anonymous, false),
-			mutual => (PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator)), true),
+			mutual => (PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default())), true),
 		}
 	}
 
@@ -1129,6 +1185,31 @@ mod tests {
 
 		let refused = config.servlet_slate(&[mismatched], &hive_addr);
 		assert!(matches!(refused, Err(ClusterError::InvalidAddress(address)) if address == b"127.0.0.1:9002"));
+	}
+
+	/// An update of a hive at an IPv6 literal names the hive and its servlets
+	/// under percent-encoded locators, and the parse gives back the address of
+	/// the hive, of each added servlet, and of each removed one.
+	#[test]
+	fn an_update_of_a_hive_at_an_ipv6_literal_parses_to_its_addresses() -> Result<(), Box<dyn core::error::Error>> {
+		let config = ClusterConfig::new(test_tls_config());
+		let added = ServletInfo {
+			servlet_id: instance_urn("ping", "[::1]:9001"),
+			address: b"[::1]:9001".to_vec(),
+			signer: ServletInfo::fixture_signer(),
+		};
+		let update = ServletAddressUpdate {
+			hive_id: ColonyNamespace::default().hive("[::1]:9000")?,
+			added: vec![added],
+			removed: vec![instance_urn("ping", "[::1]:9002")],
+		};
+
+		let (slate, removed) = config.parse_address_update(&update)?;
+
+		let hive: &[u8] = slate.hive_id().as_ref();
+		let removed: Vec<&[u8]> = removed.iter().map(AsRef::as_ref).collect();
+		assert_eq!((hive, removed), (b"[::1]:9000".as_slice(), vec![b"[::1]:9002".as_slice()]));
+		Ok(())
 	}
 
 	#[test]
@@ -1247,23 +1328,38 @@ mod tests {
 		assert!(response.payload.is_none());
 	}
 
-	/// The builder creates the ingress route key, so it refuses an unroutable
-	/// URN where the operator configures it.
+	/// The builder refuses an unroutable URN where the operator configures it.
 	#[test]
-	fn gossip_ingress_refuses_a_urn_no_route_can_answer() -> Result<(), ClusterError> {
-		let bare = servlet_urn("ping");
-		let instance = bare
-			.servlet_instance("10.0.0.5:9100")
-			.expect("a servlet type URN yields an instance URN");
+	fn gossip_ingress_refuses_a_urn_no_route_can_answer() -> Result<(), UrnValidationError> {
+		let instance = servlet_urn("ping").servlet_instance("10.0.0.5:9100")?;
 
 		let refused = ClusterConfig::builder(test_tls_config()).with_gossip_ingress(instance);
 		assert!(matches!(refused, Err(ClusterError::UnknownServletType(_))));
+		Ok(())
+	}
 
-		let conf = ClusterConfig::builder(test_tls_config())
-			.with_gossip_ingress(bare.clone())?
-			.build();
-		assert_eq!(conf.gossip.ingress, ColonyNamespace::default().servlet_type_key(&bare));
+	/// The ingress key of a configuration is the route key of its ingress
+	/// under its namespace.
+	#[test]
+	fn the_gossip_ingress_key_is_the_route_key_of_the_ingress() -> Result<(), ClusterError> {
+		let bare = servlet_urn("ping");
+		let builder = ClusterConfig::builder(test_tls_config()).with_gossip_ingress(bare.clone())?;
+		let conf = builder.build();
 
+		assert_eq!(conf.gossip_ingress_key()?, ColonyNamespace::default().servlet_type_key(&bare));
+		Ok(())
+	}
+
+	/// A gossip section whose ingress names a servlet type of another
+	/// namespace mints no key, as an ingress set through the builder does.
+	#[test]
+	fn a_gossip_section_of_another_namespace_mints_no_ingress_key() -> Result<(), Box<dyn std::error::Error>> {
+		let ingress = ColonyNamespace::new("acme", "prod")?.servlet("feed")?;
+		let gossip = GossipConfig { ingress: Some(ingress), ..GossipConfig::default() };
+
+		let config = ClusterConfig::builder(test_tls_config()).with_gossip_config(gossip).build();
+		let minted = config.gossip_ingress_key();
+		assert!(matches!(minted, Err(ClusterError::UnknownServletType(_))));
 		Ok(())
 	}
 }

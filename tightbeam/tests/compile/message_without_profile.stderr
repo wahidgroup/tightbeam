@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `Profile`
+  --> tests/compile/message_without_profile.rs:11:1
+   |
+11 | impl Message for HandWrittenMessage {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `Profile` in implementation
+   |
+   = help: implement the missing item: `type Profile = /* Type */;`

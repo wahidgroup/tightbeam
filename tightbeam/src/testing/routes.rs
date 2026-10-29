@@ -1,21 +1,18 @@
 //! Routed stream opens for fuzz harnesses.
 //!
-//! This module compiles when the `testing-fuzz` and `colony` features
-//! are both enabled, and the default `full` feature enables both. The
-//! surface is therefore present in default builds, but it is not a
-//! supported API: fuzz harnesses are the only intended consumer. Every
-//! entry point delegates to a `pub(crate)` inherent item under its
-//! exact inherent name, so call sites grep identically across harness
-//! and production.
+//! The module exists under the `testing-fuzz` and `colony` features. Fuzz
+//! harnesses are its one consumer, and it is no supported API. Each entry
+//! point delegates to the `pub(crate)` inherent item of the same name, so a
+//! search for the name finds the harness call and the production call.
 
 use core::future::Future;
 use core::hash::Hash;
 
+use crate::marker::MaybeSend;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxConnector, RequestSink, StreamBody, StreamRoute};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{PersistentConnection, PooledClient, Protocol, TransportResult};
-use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
 /// Harness-facing stream opens on [`PooledClient`] that carry a fully

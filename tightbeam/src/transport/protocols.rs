@@ -16,9 +16,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::crypto::profiles::CryptoProvider;
+use crate::marker::MaybeSend;
 use crate::transport::error::TransportError;
 use crate::transport::{EndpointConfig, TransportEncryptionConfig, TransportResult};
-use crate::utils::marker::MaybeSend;
 
 #[cfg(feature = "tokio")]
 use crate::transport::error::TransportFailure;

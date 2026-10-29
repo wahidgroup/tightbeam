@@ -94,8 +94,8 @@ struct AdmittedUpdate<'a> {
 	signer: &'a SignerIdentifier,
 	/// The added routes, which the hive owns.
 	added: HiveSlate,
-	/// The locators of the instances the update removes.
-	removed: Vec<&'a [u8]>,
+	/// The locators of the instances the update removes, percent-decoded.
+	removed: Vec<Cow<'a, [u8]>>,
 }
 
 impl<'a> AdmittedUpdate<'a> {
@@ -244,6 +244,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// The signer bind and the route write are one membership step, so
 		// a retirement lands before or after both (CWE-362).
 		let AdmittedUpdate { signer: claimed, added, removed } = admitted;
+		let removed: Vec<&[u8]> = removed.iter().map(AsRef::as_ref).collect();
 		match self.membership().update_addresses(claimed, added, &removed) {
 			Ok(()) => {
 				let evidence = || Some(fingerprint.as_shared().as_ref());

@@ -12,7 +12,7 @@ use crate::asn1::{AuthEnvelopedData, Frame};
 use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::{TransportError, TransportFailure};
-use crate::transport::{ResponsePackage, TransportEnvelope, TransportLimits, TransportResult, WireEnvelope, WireMode};
+use crate::transport::{CheckedLimits, ResponsePackage, TransportEnvelope, TransportResult, WireEnvelope, WireMode};
 use crate::TightBeamError;
 
 use crate::crypto::aead::SendCipher;
@@ -61,13 +61,13 @@ impl Sealing<'_> {
 /// encryption.
 pub struct EnvelopeBuilder<'a> {
 	pub(crate) payload: EnvelopePayload,
-	pub(crate) limits: TransportLimits,
+	pub(crate) limits: CheckedLimits,
 	sealing: Sealing<'a>,
 }
 
 impl<'a> EnvelopeBuilder<'a> {
 	fn new(payload: EnvelopePayload) -> Self {
-		Self { payload, limits: TransportLimits::default(), sealing: Sealing::Cleartext }
+		Self { payload, limits: CheckedLimits::default(), sealing: Sealing::Cleartext }
 	}
 
 	/// Create a builder configured for a request frame.
@@ -130,8 +130,11 @@ impl<'a> EnvelopeBuilder<'a> {
 		self
 	}
 
-	/// Replace every ceiling this envelope is measured against.
-	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
+	/// Replace every ceiling this envelope is measured against with `limits`,
+	/// a set whose ceilings agree ([`TransportLimits::checked`]).
+	///
+	/// [`TransportLimits::checked`]: crate::transport::TransportLimits::checked
+	pub fn with_limits(mut self, limits: CheckedLimits) -> Self {
 		self.limits = limits;
 		self
 	}

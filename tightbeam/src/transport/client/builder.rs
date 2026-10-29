@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::GenericClient;
 use crate::asn1::Frame;
+use crate::clock::Clock;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::transport::error::TransportFailure;
@@ -19,8 +20,9 @@ use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation}
 use crate::transport::EndpointConfig;
 use crate::transport::MessageEmitter;
 use crate::transport::{MessageCollector, Protocol, TransportResult};
-use crate::utils::time::Clock;
 
+#[cfg(host_clock)]
+use crate::clock::SystemClock;
 #[cfg(feature = "std")]
 use crate::crypto::sign::SigningIdentity;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -33,8 +35,6 @@ use crate::transport::handshake::ProvisionedTrust;
 use crate::transport::handshake::ValidatorChain;
 #[cfg(feature = "std")]
 use crate::transport::ConnectionBuilder;
-#[cfg(host_clock)]
-use crate::utils::time::SystemClock;
 
 use crate::transport::policy::{
 	CollectorGateConfig, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy, RetryAction,
@@ -240,7 +240,7 @@ impl<P: Protocol> ClientBuilder<P> {
 	/// let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(store);
 	///
 	/// // The policy narrows which server the store admits.
-	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 	/// let _builder = builder.with_server_policy([expiry]);
 	/// ```
 	///
@@ -278,6 +278,7 @@ impl<P: Protocol> ClientBuilder<P> {
 	///   the client holds no trust store and did not call
 	///   [`Self::allow_cleartext`], so it would accept any peer, or it sets a
 	///   server policy with no trust in a server, with or without cleartext.
+	/// - [`crate::transport::error::TransportError::InvalidLimits`] -- `timeout` is zero.
 	fn endpoint(
 		encryption: EncryptionConfig<P::CryptoProvider>,
 		negotiation: Negotiation,
@@ -286,7 +287,7 @@ impl<P: Protocol> ClientBuilder<P> {
 	) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let encryption = DialableEncryption::new(encryption)?;
 		let endpoint = EndpointConfig::new(encryption, clock).with_negotiation(negotiation);
-		Ok(endpoint.with_operation_timeout(timeout))
+		endpoint.with_operation_timeout(timeout)
 	}
 }
 
@@ -306,6 +307,8 @@ where
 	///   the client holds no trust store and did not call
 	///   [`Self::allow_cleartext`], so it would accept any peer, or it sets a
 	///   server policy with no trust in a server, with or without cleartext.
+	/// - [`crate::transport::error::TransportError::InvalidLimits`] -- the
+	///   timeout of [`ClientPolicies::with_timeout`] is zero.
 	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
 		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
 		let destination = addr.into();
@@ -327,6 +330,8 @@ where
 	///   the client holds no trust store and did not call
 	///   [`Self::allow_cleartext`], or it sets a server policy with no trust in
 	///   a server, with or without cleartext.
+	/// - [`crate::transport::error::TransportError::InvalidLimits`] -- the
+	///   timeout of [`ClientPolicies::with_timeout`] is zero.
 	pub fn adopt(self, stream: P::Stream) -> TransportResult<GenericClient<P>> {
 		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
 
@@ -452,7 +457,7 @@ mod tests {
 	/// The policy that admits every certificate within its validity period.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn expiry_policy() -> [Arc<dyn CertificateValidation>; 1] {
-		[Arc::new(ExpiryValidator)]
+		[Arc::new(ExpiryValidator::default())]
 	}
 
 	/// A server policy narrows which server a trust admits and names no peer

@@ -20,7 +20,15 @@
 //! The peer dial list, the advertise beat, the dial allowlist, the relay
 //! budget, and the rumor refresh live on [`PeerConfig`]. Each matching
 //! builder method sets one, and [`ClusterConfigBuilder::with_peer_config`]
-//! replaces them all.
+//! replaces the section.
+//!
+//! # Sections and their fields
+//!
+//! A method that sets one field of the peer or the gossip section wins over
+//! [`ClusterConfigBuilder::with_peer_config`] and
+//! [`ClusterConfigBuilder::with_gossip_config`] in either call order.
+//! [`ClusterConfigBuilder::build`] applies the section first and each field
+//! method after it, in call order, so no field a method set is lost.
 //!
 //! # Build-time derivation
 //!
@@ -38,11 +46,11 @@ use super::{
 	ClusterConfig, ClusterTlsConfig, HeartbeatCallback, HeartbeatConfig, PeerConfig, PheromoneConfig,
 	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
+use crate::clock::{Clock, SystemClock};
 use crate::colony::cluster::{LoadBalancer, StochasticForager};
 use crate::colony::urn::ColonyNamespace;
 use crate::policy::GatePolicy;
 use crate::transport::client::PoolConfig;
-use crate::utils::time::{Clock, SystemClock};
 
 use crate::colony::cluster::{
 	ClusterError, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
@@ -134,6 +142,12 @@ impl HeartbeatConfigBuilder {
 	}
 }
 
+/// The change one field method makes to a section of the configuration.
+///
+/// [`ClusterConfigBuilder::build`] applies the changes of a section, in call
+/// order, over the section that its whole-section method set.
+type SectionEdit<S> = Box<dyn FnOnce(&mut S) + Send + Sync>;
+
 /// The builder of [`ClusterConfig`].
 ///
 /// Start from TLS material with [`ClusterConfig::builder`], chain the options,
@@ -150,9 +164,15 @@ pub struct ClusterConfigBuilder {
 	control_freshness_window: Duration,
 	bind_addr: Option<String>,
 	edge_bind_addr: Option<String>,
+	/// The peer section that [`Self::with_peer_config`] set.
 	peer: PeerConfig,
+	/// The peer fields that the field methods set, which apply over `peer`.
+	peer_edits: Vec<SectionEdit<PeerConfig>>,
 	peer_store: Arc<dyn PeerStore>,
+	/// The gossip section that [`Self::with_gossip_config`] set.
 	gossip: GossipConfig,
+	/// The gossip fields that the field methods set, which apply over `gossip`.
+	gossip_edits: Vec<SectionEdit<GossipConfig>>,
 	clock: Arc<dyn Clock>,
 	tls: ClusterTlsConfig,
 }
@@ -173,8 +193,10 @@ impl ClusterConfig {
 			bind_addr: None,
 			edge_bind_addr: None,
 			peer: PeerConfig::default(),
+			peer_edits: Vec::new(),
 			peer_store: Arc::new(MemoryPeerStore),
 			gossip: GossipConfig::default(),
+			gossip_edits: Vec::new(),
 			clock: Arc::new(SystemClock),
 			tls,
 		}
@@ -234,9 +256,9 @@ impl ClusterConfigBuilder {
 	/// ([`ClusterTlsConfig::client_authentication`]).
 	///
 	/// [`ClusterTlsConfig::client_authentication`]: super::ClusterTlsConfig::client_authentication
-	pub fn with_exported_types(mut self, exported: impl IntoIterator<Item = Urn<'static>>) -> Self {
-		self.peer.exported_types = Some(Arc::new(StaticExportList::new(exported)));
-		self
+	pub fn with_exported_types(self, exported: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		let list: Arc<dyn ExportAllowlist> = Arc::new(StaticExportList::new(exported));
+		self.edit_peer(move |peer| peer.exported_types = Some(list))
 	}
 
 	/// Install a live export allowlist that discovery and enforcement share.
@@ -245,9 +267,8 @@ impl ClusterConfigBuilder {
 	/// [`Cluster::start`](super::Cluster::start), such as in a fuzz harness
 	/// that mutates exports under load. For a fixed list, use
 	/// [`ClusterConfigBuilder::with_exported_types`].
-	pub fn with_export_allowlist(mut self, exported: Arc<dyn ExportAllowlist>) -> Self {
-		self.peer.exported_types = Some(exported);
-		self
+	pub fn with_export_allowlist(self, exported: Arc<dyn ExportAllowlist>) -> Self {
+		self.edit_peer(move |peer| peer.exported_types = Some(exported))
 	}
 
 	/// Add an export gate for per-identity target rules.
@@ -319,13 +340,42 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Replace the peer-federation configuration wholesale.
+	/// Replace the peer-federation section.
 	///
 	/// It covers the dial list, the advertise beat, the dial allowlist, the
-	/// relay budget, the rumor refresh, and the exported types. To change one
-	/// field, use its own method.
+	/// relay budget, the rumor refresh, and the exported types. A method that
+	/// sets one of these fields wins over the section, whether it comes before
+	/// or after this one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # use std::sync::Arc;
+	/// # use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig, PeerConfig};
+	/// # use tightbeam::crypto::key::Secp256k1KeyProvider;
+	/// # use tightbeam::crypto::x509::CertificateSpec;
+	/// # use tightbeam::testing::{TestCertificate, TestKey};
+	/// # let key = TestKey::insecure_fixed_signing();
+	/// # let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+	/// # let tls = ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+	/// let mut section = PeerConfig::default();
+	/// section.max_hops = 2;
+	///
+	/// let config = ClusterConfig::builder(tls).with_peers(["127.0.0.1:9000"])?.with_peer_config(section).build();
+	///
+	/// // The dial list set before the section survives it.
+	/// assert_eq!((config.peer.peers().len(), config.peer.max_hops), (1, 2));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
 	pub fn with_peer_config(mut self, config: PeerConfig) -> Self {
 		self.peer = config;
+		self
+	}
+
+	/// Record a change to one peer field, which [`Self::build`] applies over
+	/// the peer section.
+	fn edit_peer(mut self, edit: impl FnOnce(&mut PeerConfig) + Send + Sync + 'static) -> Self {
+		self.peer_edits.push(Box::new(edit));
 		self
 	}
 
@@ -340,20 +390,19 @@ impl ClusterConfigBuilder {
 	///
 	/// - [`ClusterError::InvalidPeerAddress`] -- an entry names no socket. A typo
 	///   fails here, so it cannot leave the federation with no anchors.
-	pub fn with_peers<I, S>(mut self, peers: I) -> Result<Self, ClusterError>
+	pub fn with_peers<I, S>(self, peers: I) -> Result<Self, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
 		let spellings: Vec<String> = peers.into_iter().map(Into::into).collect();
-		self.peer.set_anchors(spellings)?;
-		Ok(self)
+		let anchors = PeerConfig::anchors(spellings)?;
+		Ok(self.edit_peer(move |peer| peer.peers = anchors))
 	}
 
 	/// Set the re-advertise beat cadence and enable the advertise beat.
-	pub fn with_advertise_interval(mut self, interval: Duration) -> Self {
-		self.peer.advertise_interval = Some(interval);
-		self
+	pub fn with_advertise_interval(self, interval: Duration) -> Self {
+		self.edit_peer(move |peer| peer.advertise_interval = Some(interval))
 	}
 
 	/// Set the socket this gateway advertises as its own address.
@@ -368,10 +417,9 @@ impl ClusterConfigBuilder {
 	/// - [`ClusterError::InvalidPeerAddress`] -- the address names no socket.
 	///
 	/// [`Cluster::start`]: super::Cluster::start
-	pub fn with_advertise_addr(mut self, addr: impl AsRef<str>) -> Result<Self, ClusterError> {
+	pub fn with_advertise_addr(self, addr: impl AsRef<str>) -> Result<Self, ClusterError> {
 		let address: PeerAddress = addr.as_ref().parse()?;
-		self.peer.advertise_addr = Some(address);
-		Ok(self)
+		Ok(self.edit_peer(move |peer| peer.advertise_addr = Some(address)))
 	}
 
 	/// Restrict claimed peer dial addresses to this allowlist.
@@ -383,7 +431,7 @@ impl ClusterConfigBuilder {
 	/// # Errors
 	///
 	/// - [`ClusterError::InvalidPeerAddress`] -- an entry names no socket.
-	pub fn with_peer_dial_allowlist<I, S>(mut self, allowlist: I) -> Result<Self, ClusterError>
+	pub fn with_peer_dial_allowlist<I, S>(self, allowlist: I) -> Result<Self, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
@@ -395,8 +443,8 @@ impl ClusterConfigBuilder {
 			parsed.insert(address);
 		}
 
-		self.peer.peer_dial_allowlist = Some(Arc::new(parsed));
-		Ok(self)
+		let parsed = Arc::new(parsed);
+		Ok(self.edit_peer(move |peer| peer.peer_dial_allowlist = Some(parsed)))
 	}
 
 	/// Cap the relay budget honored on inbound work and routed stream opens.
@@ -408,9 +456,8 @@ impl ClusterConfigBuilder {
 	/// - `0` disables forwarding.
 	/// - `2` enables relay-trail fallback (one forward at the relay and one more
 	///   to reach the owner). A lower cap installs no relay trails.
-	pub fn with_max_hops(mut self, max_hops: u8) -> Self {
-		self.peer.max_hops = max_hops;
-		self
+	pub fn with_max_hops(self, max_hops: u8) -> Self {
+		self.edit_peer(move |peer| peer.max_hops = max_hops)
 	}
 
 	/// Cap the tried entries one signer may hold in the discovery table.
@@ -418,9 +465,8 @@ impl ClusterConfigBuilder {
 	/// A candidate whose signer already holds `cap` tried entries stays in the
 	/// `new` table, the way a candidate of a full prefix bucket does. A signer
 	/// is one certificate, counted by fingerprint. The default sets no cap.
-	pub fn with_tried_per_signer(mut self, cap: NonZeroUsize) -> Self {
-		self.peer.tried_per_signer = Some(cap);
-		self
+	pub fn with_tried_per_signer(self, cap: NonZeroUsize) -> Self {
+		self.edit_peer(move |peer| peer.tried_per_signer = Some(cap))
 	}
 
 	/// Set the advertisement-rumor refresh interval.
@@ -429,9 +475,8 @@ impl ClusterConfigBuilder {
 	/// targets, and once per interval. [`ClusterConfig::rumor_refresh`] reads
 	/// the effective interval, clamped to the freshness window. It defaults to
 	/// 30 seconds.
-	pub fn with_rumor_refresh(mut self, rumor_refresh: Duration) -> Self {
-		self.peer.rumor_refresh = rumor_refresh;
-		self
+	pub fn with_rumor_refresh(self, rumor_refresh: Duration) -> Self {
+		self.edit_peer(move |peer| peer.rumor_refresh = rumor_refresh)
 	}
 
 	/// Set the persistence driver beneath the peer discovery table.
@@ -444,12 +489,21 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Replace the gossip subsystem configuration.
+	/// Replace the gossip section.
 	///
-	/// The configuration covers freshness, origin TTL, ingress, the journal,
-	/// and admission, and it defaults to [`GossipConfig::default`].
+	/// The section covers freshness, origin TTL, ingress, the journal, and
+	/// admission, and it defaults to [`GossipConfig::default`]. The ingress
+	/// and the admission that their own methods set win over the section,
+	/// whether those methods come before or after this one.
 	pub fn with_gossip_config(mut self, config: GossipConfig) -> Self {
 		self.gossip = config;
+		self
+	}
+
+	/// Record a change to one gossip field, which [`Self::build`] applies
+	/// over the gossip section.
+	fn edit_gossip(mut self, edit: impl FnOnce(&mut GossipConfig) + Send + Sync + 'static) -> Self {
+		self.gossip_edits.push(Box::new(edit));
 		self
 	}
 
@@ -462,9 +516,8 @@ impl ClusterConfigBuilder {
 	/// Set per-signer gossip rate admission.
 	///
 	/// The admission defaults to the token bucket of [`GossipConfig::default`].
-	pub fn with_gossip_admission(mut self, admission: Arc<dyn GossipAdmission>) -> Self {
-		self.gossip.admission = admission;
-		self
+	pub fn with_gossip_admission(self, admission: Arc<dyn GossipAdmission>) -> Self {
+		self.edit_gossip(move |gossip| gossip.admission = admission)
 	}
 
 	/// Deliver admitted rumors to local instances of this servlet type.
@@ -473,32 +526,48 @@ impl ClusterConfigBuilder {
 	/// The ingress sink is outside the export boundary
 	/// ([`GossipConfig::ingress`](super::GossipConfig::ingress)).
 	///
+	/// # Call order
+	///
+	/// [`Cluster::start`] mints the route key of the ingress under the
+	/// namespace the gateway serves ([`ClusterConfig::gossip_ingress_key`]),
+	/// so this method and [`Self::with_namespace`] take effect in either order.
+	///
 	/// # Errors
 	///
-	/// - [`ClusterError::UnknownServletType`] -- the URN is not a bare servlet
-	///   type in this colony's namespace, so no route could answer it and the
-	///   gateway would deliver none of its gossip.
-	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Result<Self, ClusterError> {
-		let Some(type_key) = self.namespace.servlet_type_key(&ingress) else {
+	/// - [`ClusterError::UnknownServletType`] -- the URN is no bare servlet
+	///   type of the namespace it names, such as an instance or a hive. No
+	///   route could answer it, so the gateway would deliver no gossip to it.
+	///
+	/// [`Cluster::start`]: super::Cluster::start
+	pub fn with_gossip_ingress(self, ingress: Urn<'static>) -> Result<Self, ClusterError> {
+		let namespace = ColonyNamespace::of(&ingress);
+		let bare = namespace.is_some_and(|namespace| namespace.is_bare_servlet_type(&ingress));
+		if !bare {
 			return Err(ClusterError::UnknownServletType(ingress.canonical_bytes()));
-		};
+		}
 
-		self.gossip.ingress = Some(type_key);
-		Ok(self)
+		Ok(self.edit_gossip(move |gossip| gossip.ingress = Some(ingress)))
 	}
 
 	/// Build the cluster configuration.
 	///
-	/// It derives colony membership from the certificate and rebuilds the
-	/// peer discovery table from the dial list.
+	/// It applies each field method over its section, derives colony
+	/// membership from the certificate, and rebuilds the peer discovery table
+	/// from the dial list.
 	pub fn build(self) -> ClusterConfig {
-		// The table derives from the dial list here, so the configured peers
+		// 1. Apply each field method over the section it changes, in call
+		// order, so a whole-section method drops no field a method set.
+		let mut peer = self.peer;
+		self.peer_edits.into_iter().for_each(|edit| edit(&mut peer));
+		let mut gossip = self.gossip;
+		self.gossip_edits.into_iter().for_each(|edit| edit(&mut gossip));
+
+		// 2. The table derives from the dial list here, so the configured peers
 		// are always its anchors, which never evict. The anchors are a copy,
 		// because `peers` stays readable beside the table.
-		let mut peer = self.peer;
 		peer.table = Arc::new(PeerTable::new(&peer, self.peer_store));
 
-		// Membership binds to the certificate's URI SAN, and every per-frame
+		// 3. Membership binds to the certificate's URI SAN, and every per-frame
 		// flood check reads the cached value. A certificate with no single
 		// valid colony URN leaves the gateway a non-member, which fails closed.
 		let mut config = ClusterConfig {
@@ -514,7 +583,7 @@ impl ClusterConfigBuilder {
 			bind_addr: self.bind_addr,
 			edge_bind_addr: self.edge_bind_addr,
 			peer,
-			gossip: self.gossip,
+			gossip,
 			clock: self.clock,
 			colony_urn: None,
 			tls: self.tls,
@@ -523,5 +592,54 @@ impl ClusterConfigBuilder {
 		config.bind_colony_membership();
 
 		config
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::x509::CertificateSpec;
+	use crate::testing::{TestCertificate, TestKey};
+	use crate::TightBeamError;
+
+	/// The TLS material of a gateway under the fixed test key.
+	fn tls() -> Result<ClusterTlsConfig, TightBeamError> {
+		let key = TestKey::insecure_fixed_signing();
+		let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+		ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))
+	}
+
+	/// The gossip ingress set before the gossip section survives the section.
+	#[test]
+	fn a_gossip_field_set_before_its_section_survives_it() -> Result<(), Box<dyn std::error::Error>> {
+		let ingress = ColonyNamespace::default().servlet("feed")?;
+		let builder = ClusterConfig::builder(tls()?).with_gossip_ingress(ingress.clone())?;
+		let config = builder.with_gossip_config(GossipConfig::default()).build();
+		assert_eq!(config.gossip.ingress, Some(ingress));
+		Ok(())
+	}
+
+	/// The gossip ingress set before its namespace keys under that namespace.
+	#[test]
+	fn a_gossip_ingress_set_before_its_namespace_keys_under_it() -> Result<(), Box<dyn std::error::Error>> {
+		let acme = ColonyNamespace::new("acme", "prod")?;
+		let ingress = acme.servlet("feed")?;
+		let expected = acme.servlet_type_key(&ingress);
+
+		let builder = ClusterConfig::builder(tls()?).with_gossip_ingress(ingress)?;
+		let config = builder.with_namespace(acme).build();
+		assert_eq!(config.gossip_ingress_key()?, expected);
+		Ok(())
+	}
+
+	/// The dial list and the relay cap set before the peer section survive
+	/// the section.
+	#[test]
+	fn a_peer_field_set_before_its_section_survives_it() -> Result<(), Box<dyn std::error::Error>> {
+		let builder = ClusterConfig::builder(tls()?).with_peers(["127.0.0.1:9000"])?.with_max_hops(2);
+		let config = builder.with_peer_config(PeerConfig::default()).build();
+		assert_eq!((config.peer.peers().len(), config.peer.max_hops), (1, 2));
+		Ok(())
 	}
 }

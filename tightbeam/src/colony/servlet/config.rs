@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::clock::{Clock, SystemClock};
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::HiveContext;
 use crate::colony::servlet::runtime;
@@ -15,7 +16,6 @@ use crate::policy::GatePolicy;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::IntoMuxOffer;
 use crate::transport::{EncryptedProtocol, Protocol};
-use crate::utils::time::{Clock, SystemClock};
 use crate::TightBeamError;
 
 use crate::crypto::key::SigningKeyProvider;

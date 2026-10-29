@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::Errorizable;
 
 #[cfg(feature = "signature")]
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 
 #[cfg(feature = "signature")]
 mod signing {
@@ -90,6 +90,13 @@ use common::*;
 
 #[cfg(any(all(feature = "signature", feature = "ecdh"), feature = "aead"))]
 use crate::crypto::secret::SecretSlice;
+
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use crate::crypto::hpke::DhKemSecp256k1Enc;
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use crate::crypto::kdf::EcdhSecret;
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use kem::{Decapsulator, Error as KemError, SharedSecret};
 
 /// Errors from key provider operations.
 #[derive(Errorizable, Debug)]
@@ -442,6 +449,43 @@ where
 /// feature.
 #[cfg(feature = "signature")]
 pub type Secp256k1KeyProvider = EcdsaKeyProvider<Secp256k1>;
+
+/// `Decap(enc, skR)` of DHKEM(secp256k1, HKDF-SHA256) under the RustCrypto
+/// `kem` traits, with this key as `skR` (RFC 9180 §4.1).
+///
+/// The agreement runs on the point that [`DhKemSecp256k1Enc`] admitted, so the
+/// key never multiplies a point off the curve.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hpke::DhKemSecp256k1;
+/// use tightbeam::crypto::kem::{Decapsulator, Encapsulator};
+/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+/// use tightbeam::crypto::k256::PublicKey;
+/// use tightbeam::random::OsRng;
+/// use tightbeam::SigningKey;
+///
+/// let signing_key = SigningKey::random(&mut OsRng);
+/// let recipient = PublicKey::from(signing_key.verifying_key());
+/// let key = Secp256k1KeyProvider::from(signing_key);
+///
+/// let (encapsulated_key, sent) = DhKemSecp256k1::default().try_encap(&mut OsRng, &recipient)?;
+/// let received = key.try_decap(&encapsulated_key)?;
+/// assert_eq!(received.as_bytes(), sent.as_bytes());
+/// # Ok::<(), tightbeam::crypto::kem::Error>(())
+/// ```
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+impl Decapsulator<DhKemSecp256k1Enc> for Secp256k1KeyProvider {
+	/// # Errors
+	///
+	/// - [`KemError`] -- the KDF refuses a derivation.
+	fn try_decap(&self, encapped_key: &DhKemSecp256k1Enc) -> Result<SharedSecret<DhKemSecp256k1Enc>, KemError> {
+		let agreed = diffie_hellman(self.signing_key.as_nonzero_scalar(), encapped_key.public_key().as_affine());
+		let recipient = PublicKey::from(self.signing_key.verifying_key());
+		encapped_key.decapsulate(EcdhSecret::from(agreed), &recipient)
+	}
+}
 
 /// A pluggable backend for a key-encryption key (KEK), the key a
 /// `KEKRecipientInfo` names (RFC 5652 §6.2.3).

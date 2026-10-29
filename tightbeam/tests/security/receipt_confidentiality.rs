@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tightbeam::asn1::OctetString;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
@@ -36,7 +37,6 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 

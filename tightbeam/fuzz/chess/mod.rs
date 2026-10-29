@@ -168,7 +168,7 @@ tb_scenario! {
 		setup: |env| async move {
 			// The client retries a failed emit up to 3 times, with exponential
 			// backoff delays of 100, 200, and 400 ms.
-			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
+			let restart_policy = RestartExponentialBackoff::new(3, Duration::from_millis(100), None);
 			let client_builder = ClientBuilder::<TokioListener>::builder()
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))

@@ -8,7 +8,6 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::registry::{BeatOutcome, FailureCount};
 use crate::colony::cluster::runtime::bounds::{ColonyConfig, ColonyDialProtocol, GatewayRuntimeCtx};
@@ -18,14 +17,12 @@ use crate::colony::cluster::{ClusterError, HeartbeatEvent, HiveEntry};
 use crate::colony::protocol::{
 	ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult,
 };
-use crate::decode;
 use crate::instrumentation::events::{
 	CLUSTER_HEARTBEAT_FAILED, CLUSTER_HIVE_EVICTED, CLUSTER_PEER_ROUTES_WITHDRAWN, CLUSTER_RELAY_TRAIL_PRUNED,
 };
 use crate::runtime::rt;
 use crate::transport::Protocol;
 use crate::TightBeamError;
-use crate::{MessagePriority, Version};
 
 /// The dial half of a heartbeat: the signing key and the plane to send on.
 ///
@@ -67,22 +64,16 @@ impl<P: ColonyDialProtocol> HiveBeat<P> {
 	pub(crate) async fn send(self, hive: &HiveEntry) -> Result<HeartbeatResult, ClusterError> {
 		let cmd = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
 
-		// Priority is a metadata field of V2 or later. A V1 frame that composes
-		// it fails at build time, so every heartbeat would count as a send
-		// failure. `metadata.order` is the command freshness binding (CWE-294).
-		let builder = FrameBuilder::from(Version::V2)
-			.with_id(b"heartbeat")
-			.with_order(self.config.clock.unix().get())
-			.with_message(cmd)
-			.with_priority(MessagePriority::NetworkControl);
-		let mut signed_frame = self.config.witnessed(builder).build()?;
+		// `metadata.order` is the command freshness binding (CWE-294).
+		let builder = self.config.control_frame(b"heartbeat", self.config.issue_order(), cmd);
+		let mut signed_frame = builder.build()?;
 
 		signed_frame.sign_with_provider(self.config.tls.identity()).await?;
 
 		let mut client = self.plane.hive(hive).connect().await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
-		let cmd_response: ClusterCommandResponse = decode(response.message())?;
+		let cmd_response: ClusterCommandResponse = response.decode_message()?;
 		match cmd_response {
 			ClusterCommandResponse::Heartbeat(result) => Ok(result),
 			ClusterCommandResponse::Manage(_) => Err(ClusterError::MalformedResponse),

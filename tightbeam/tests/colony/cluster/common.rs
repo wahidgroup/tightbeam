@@ -42,6 +42,7 @@ pub use std::collections::HashSet;
 pub use std::sync::{Arc, Mutex};
 
 pub use tightbeam::builder::TypeBuilder;
+pub use tightbeam::clock::{Clock, ManualClock, UnixMillis};
 pub use tightbeam::cms::signed_data::SignerIdentifier;
 pub use tightbeam::colony::cluster::{
 	Admission, AdmittedDial, Cluster, ClusterConfig, ClusterError, ClusterTlsConfig, GossipAdmission, GossipConfig,
@@ -55,7 +56,7 @@ pub use tightbeam::colony::protocol::{
 	ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo,
 };
 pub use tightbeam::colony::servlet::{ServletConfig, ServletConfigBuilder, WithCertificate};
-pub use tightbeam::colony::urn::{ColonyNamespace, ServletTypeKey};
+pub use tightbeam::colony::urn::ColonyNamespace;
 pub use tightbeam::colony::SubmitWork;
 pub use tightbeam::constants::{
 	DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, DEFAULT_GOSSIP_RETENTION_MS, MAX_ADVERTISED_TYPES, MAX_GOSSIP_PAYLOAD_BYTES,
@@ -77,7 +78,6 @@ pub use tightbeam::transport::handshake::PeerAuthentication;
 pub use tightbeam::transport::tcp::r#async::TokioListener;
 pub use tightbeam::transport::{ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig};
 pub use tightbeam::urn::Urn;
-pub use tightbeam::utils::time::{Clock, ManualClock, UnixMillis};
 pub use tightbeam::{
 	absent, at_least, at_most, decode, encode, exactly, tb_assert_spec, tb_process_spec, tb_scenario, Beamable, Frame,
 	TightBeamError, Version,
@@ -628,14 +628,6 @@ pub fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 	colony_ns().servlet(name).expect("test names satisfy the mint grammar")
 }
 
-/// The gossip ingress key for `name`, created as the builder creates it.
-/// [`GossipConfig::ingress`] holds a route key, so a fixture names its ingress
-/// through the same namespace check that production passes.
-pub fn servlet_ingress(name: &(impl AsRef<str> + ?Sized)) -> ServletTypeKey {
-	let urn = servlet_urn(name);
-	colony_ns().servlet_type_key(&urn).expect("test names mint a bare servlet type")
-}
-
 pub fn registration_request(hive_addr: impl AsRef<[u8]>) -> ClusterRequest {
 	registration_request_serving(hive_addr, [])
 }
@@ -884,7 +876,7 @@ pub async fn submit_ping(certs: &ClusterTestCerts, cluster: &ClusterGateway) -> 
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	let servlet_frame = client.submit_work_to(servlet_urn("ping"), &inner).await?;
 
-	decode(servlet_frame.message())
+	servlet_frame.decode_message()
 }
 
 pub async fn register_signed_hive(
@@ -906,7 +898,7 @@ pub async fn register_signed_hive_serving(
 ) -> Result<RegisterHiveResponse, TightBeamError> {
 	let id = id.as_ref();
 	let frame = signed_control_frame_with(key, id, registration_request_serving(addr, servlets)).await?;
-	decode(&emit_frame(client, frame).await?.message())
+	emit_frame(client, frame).await?.decode_message()
 }
 
 pub async fn emit_servlet_update(
@@ -917,7 +909,7 @@ pub async fn emit_servlet_update(
 ) -> Result<ServletAddressUpdateResponse, TightBeamError> {
 	let id = id.as_ref();
 	let frame = signed_control_frame_with(key, id, request).await?;
-	decode(&emit_frame(client, frame).await?.message())
+	emit_frame(client, frame).await?.decode_message()
 }
 
 /// Composes and signs one end-to-end client work frame whose message is the
@@ -937,7 +929,7 @@ pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: impl AsRef<[u8]>) 
 
 /// Decodes the servlet's typed ping echo from its response frame.
 pub fn decode_ping_echo(frame: &Frame) -> Result<PingResponse, TightBeamError> {
-	decode(frame.message())
+	frame.decode_message()
 }
 
 /// Resolves a work submission that a denial scenario expects the gateway to
@@ -1017,7 +1009,7 @@ pub async fn emit_relayed_ping_work(
 		.with_message(work_request)
 		.build()?;
 
-	decode(&emit_frame(client, frame).await?.message())
+	emit_frame(client, frame).await?.decode_message()
 }
 
 /// An instance URN in the `elsewhere` realm, foreign to every test gateway.
@@ -1141,7 +1133,7 @@ pub async fn send_advertisement_frame(
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 
 	let response_frame = emit_frame(&mut client, frame).await?;
-	let response: PeerAdvertisementResponse = decode(response_frame.message())?;
+	let response: PeerAdvertisementResponse = response_frame.decode_message()?;
 
 	Ok(response.status)
 }

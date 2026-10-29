@@ -31,7 +31,16 @@ use tightbeam::flags::{Flags, FlagsError};
 use tightbeam::matrix::{Matrix, MatrixError};
 use tightbeam::oids::{AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256};
 use tightbeam::testing::{TestMessage, TestSigner};
-use tightbeam::urn::Urn;
+use tightbeam::urn::{Urn, UrnValidationError};
+
+/// A NID of the RFC 8141 § 2 production: a letter or a digit at each end,
+/// and up to 30 letters, digits, and hyphens between.
+const NID: &str = "[a-zA-Z0-9][a-zA-Z0-9-]{0,30}[a-zA-Z0-9]";
+
+/// An NSS of the RFC 8141 § 2 production over the `pchar` of RFC 3986 § 3.3:
+/// a `pchar`, then up to 40 more of `pchar` and `/`, each one a character or
+/// a percent-encoded triplet.
+const NSS: &str = "([a-zA-Z0-9._~!$&'()*+,;=:@-]|%[0-9a-fA-F]{2})([a-zA-Z0-9._~!$&'()*+,;=:@/-]|%[0-9a-fA-F]{2}){0,40}";
 
 /// Every wire version, so a field a later version added is exercised under
 /// the version that does not carry it as well as the ones that do.
@@ -154,11 +163,34 @@ proptest! {
 		prop_assert_eq!(flags, Err(FlagsError::LengthMismatch { expected: 9, len }));
 	}
 
-	/// What a URN displays, the parser reads back as the same URN.
+	/// What a URN displays, the parser reads back as the same URN, for any NID
+	/// and NSS of the RFC 8141 § 2 grammar.
 	#[test]
-	fn a_urn_survives_display_and_parse(nid in "[a-zA-Z][a-zA-Z0-9-]{0,30}[a-zA-Z0-9]", nss in ".{1,64}") {
+	fn a_urn_survives_display_and_parse(nid in NID, nss in NSS) {
 		let urn = Urn::from_parts(nid, nss)?;
 		prop_assert_eq!(urn.to_string().parse::<Urn<'static>>()?, urn);
+	}
+
+	/// A URN displays the text it parsed, with the case of its NID and of the
+	/// hex digits of each triplet as written, for any NID and NSS of the RFC
+	/// 8141 § 2 grammar.
+	#[test]
+	fn a_urn_displays_the_text_it_parsed(nid in NID, nss in NSS) {
+		let text = format!("urn:{nid}:{nss}");
+		prop_assert_eq!(text.parse::<Urn<'static>>()?.to_string(), text);
+	}
+
+	/// An NSS that holds a character outside the `pchar` of RFC 3986 § 3.3
+	/// and `/` is refused, wherever the character stands.
+	#[test]
+	fn an_nss_with_a_character_outside_pchar_is_refused(
+		nid in NID,
+		before in NSS,
+		outside in "[ \"#<>?\\[\\\\\\]^`{|}\u{e9}]",
+		after in "[a-z]{0,8}",
+	) {
+		let refused = Urn::from_parts(nid, format!("{before}{outside}{after}"));
+		prop_assert_eq!(refused, Err(UrnValidationError::InvalidNssCharacters));
 	}
 
 	/// Each algorithm carries its own tag, so any set of absent algorithms

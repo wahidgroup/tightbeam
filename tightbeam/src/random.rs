@@ -5,9 +5,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 #[cfg(all(feature = "std", feature = "transport"))]
 use std::sync::OnceLock;
 
-use crate::error::Result;
 #[cfg(all(host_clock, feature = "transport"))]
-use crate::utils::time::{Clock, SystemClock};
+use crate::clock::{Clock, SystemClock};
+use crate::error::Result;
 #[cfg(any(feature = "transport-cms", feature = "hpke"))]
 use rand_core::CryptoRng;
 

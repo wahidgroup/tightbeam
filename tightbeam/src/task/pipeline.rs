@@ -9,11 +9,11 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "testing"))]
 use crate::error::TightBeamError;
 #[cfg(any(test, feature = "testing"))]
+use crate::task::Job;
+#[cfg(any(test, feature = "testing"))]
 use crate::trace::TraceCollector;
 #[cfg(any(test, feature = "testing"))]
 use crate::urn::Urn;
-#[cfg(any(test, feature = "testing"))]
-use crate::utils::task::Job;
 
 /// A chain of jobs, with `Result` as the base pipeline.
 ///
@@ -190,9 +190,9 @@ where
 	/// ```
 	/// use std::sync::Arc;
 	///
+	/// use tightbeam::task::{Pipeline, PipelineBuilder};
 	/// use tightbeam::trace::TraceCollector;
 	/// use tightbeam::urn::Urn;
-	/// use tightbeam::utils::task::{Pipeline, PipelineBuilder};
 	/// use tightbeam::{job, TightBeamError};
 	///
 	/// job! {
@@ -350,7 +350,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use tightbeam::utils::task::{join, Pipeline};
+/// use tightbeam::task::{join, Pipeline};
 ///
 /// let payload = b"telemetry";
 /// let length = || -> Result<usize, &'static str> { Ok(payload.len()) };

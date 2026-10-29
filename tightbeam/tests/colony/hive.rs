@@ -8,8 +8,10 @@ use std::sync::{Arc, Barrier};
 use sha3::Sha3_256;
 use tokio::sync::{AcquireError, Notify, Semaphore, SemaphorePermit};
 
+use tightbeam::basis_points::BasisPoints;
 use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::{CheckDigestOid, TypeBuilder};
+use tightbeam::clock::{Clock, ManualClock, UnixMillis};
 use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox, ServletScaleConfig};
 use tightbeam::colony::protocol::{
@@ -37,11 +39,9 @@ use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, GenericClient, Protocol, TransportError, TransportFailure,
 };
 use tightbeam::urn::Urn;
-use tightbeam::utils::time::{Clock, ManualClock, UnixMillis};
-use tightbeam::utils::BasisPoints;
 use tightbeam::{
-	absent, compose, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, Beamable, Frame, Message,
-	TightBeamError, Version,
+	absent, compose, exactly, hive, servlet, tb_assert_spec, tb_scenario, Beamable, Frame, Message, TightBeamError,
+	Version,
 };
 
 use crate::common::poll::poll_until;
@@ -358,7 +358,7 @@ async fn emit_command(
 	frame: Frame,
 ) -> Result<ClusterCommandResponse, TightBeamError> {
 	let response = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-	decode(response.message())
+	response.decode_message()
 }
 
 /// Requires the response to name the heartbeat alternative. When
@@ -1912,7 +1912,7 @@ tb_scenario! {
 				"the reply signature verifies over the bytes the caller received"
 			);
 
-			let response: HiveTestResponse = decode(reply.message())?;
+			let response: HiveTestResponse = reply.decode_message()?;
 			assert_eq!(response.doubled, 42, "the contract servlet doubles 21");
 
 			hive.stop();

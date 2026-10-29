@@ -21,6 +21,8 @@
 use core::time::Duration;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use tightbeam::basis_points::BasisPoints;
+use tightbeam::clock::ManualClock;
 use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::colony::cluster::Cluster;
 use tightbeam::colony::hive::{Hive, HiveTlsConfig, ServletBox};
@@ -34,8 +36,6 @@ use tightbeam::transport::policy::CoreRetryPolicy;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
 use tightbeam::urn::Urn;
-use tightbeam::utils::time::ManualClock;
-use tightbeam::utils::BasisPoints;
 use tightbeam::{bps, cluster, hive, servlet, TightBeamError};
 
 use super::servlet::{identity_of, seam_cluster_conf, signer_of};

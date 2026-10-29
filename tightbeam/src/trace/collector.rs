@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 #[cfg(feature = "instrument")]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(test, feature = "testing", feature = "testing-fault"))]
 use std::sync::Mutex;
 #[cfg(feature = "testing-fault")]
@@ -18,6 +18,12 @@ use std::sync::{Once, RwLock};
 use crate::trace::AssertionValue;
 use crate::urn::Urn;
 
+#[cfg(all(feature = "instrument", host_clock))]
+use crate::clock::SystemClock;
+#[cfg(all(feature = "logging", not(feature = "instrument")))]
+use crate::clock::UnixMillis;
+#[cfg(feature = "instrument")]
+use crate::clock::{Clock, MonotonicInstant, UnixMillis};
 #[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(any(test, feature = "testing"))]
@@ -29,15 +35,9 @@ use crate::policy::TransitStatus;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::{FaultModel, StrategyDraw};
 #[cfg(feature = "logging")]
-use crate::trace::logging::LogRecord;
+use crate::trace::logging::TraceLogger;
 #[cfg(any(test, feature = "testing"))]
 use crate::trace::{Assertion, AssertionLabel, Presence};
-#[cfg(all(feature = "instrument", host_clock))]
-use crate::utils::time::SystemClock;
-#[cfg(all(feature = "logging", not(feature = "instrument")))]
-use crate::utils::time::UnixMillis;
-#[cfg(feature = "instrument")]
-use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 #[cfg(any(test, feature = "testing"))]
 use crate::Frame;
 
@@ -458,27 +458,18 @@ impl<'a, V: Into<EventValue>> EventBuilder<'a, V> {
 
 		// The log backend reads the label before the label moves out below.
 		#[cfg(feature = "logging")]
-		if let Some(logger_config) = &self.collector.state.logger_config {
+		if let Some(logger) = &self.collector.state.logger_config {
 			let component = self.component.as_deref();
-			if let Some(level) = logger_config.admit(self.log_level, component) {
-				let label_str = match &self.label {
-					Cow::Borrowed(s) => *s,
-					Cow::Owned(s) => s.as_str(),
-				};
+			let message = match &self.label {
+				Cow::Borrowed(s) => *s,
+				Cow::Owned(s) => s.as_str(),
+			};
+			let timestamp = || self.collector.log_timestamp();
 
-				let record = LogRecord {
-					level,
-					timestamp: self.collector.log_timestamp(),
-					component,
-					message: label_str,
-					metadata: None,
-				};
-
-				// The trace is the evidence and the log a convenience, so a
-				// refused log record still leaves the event on the trace. The
-				// log outcome stops here, because `emit` and drop return `()`.
-				let _unlogged = logger_config.backend.emit(&record);
-			}
+			// The trace is the evidence and the log a convenience, so a
+			// refused log record still leaves the event on the trace. The log
+			// outcome stops here, because `emit` and drop return `()`.
+			let _unlogged = logger.log(self.log_level, component, message, timestamp);
 		}
 
 		let label = core::mem::take(&mut self.label);
@@ -824,7 +815,7 @@ struct TraceState {
 	/// The sequence number of the next event. One atomic add gives each event
 	/// its own number.
 	#[cfg(feature = "instrument")]
-	seq: AtomicU32,
+	seq: AtomicU64,
 	#[cfg(feature = "instrument")]
 	clock: TraceClock,
 	#[cfg(feature = "testing-fuzz")]
@@ -838,7 +829,7 @@ struct TraceState {
 	runtime_faults: Arc<OnceLock<Mutex<RuntimeFaults>>>,
 	/// The log backend of the state. A connection trace shares it.
 	#[cfg(feature = "logging")]
-	logger_config: Option<Arc<super::logging::LoggerConfig>>,
+	logger_config: Option<Arc<TraceLogger>>,
 }
 
 impl TraceState {
@@ -853,7 +844,7 @@ impl TraceState {
 			exchanges: Mutex::default(),
 			sink,
 			config,
-			seq: AtomicU32::new(0),
+			seq: AtomicU64::new(0),
 			clock: TraceClock::default(),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
@@ -878,7 +869,7 @@ impl TraceState {
 			#[cfg(feature = "instrument")]
 			config: self.config,
 			#[cfg(feature = "instrument")]
-			seq: AtomicU32::new(0),
+			seq: AtomicU64::new(0),
 			#[cfg(feature = "instrument")]
 			clock: self.clock.split(),
 			#[cfg(feature = "testing-fuzz")]
@@ -902,7 +893,7 @@ impl TraceState {
 			#[cfg(feature = "instrument")]
 			config: TbInstrumentationConfig::default(),
 			#[cfg(feature = "instrument")]
-			seq: AtomicU32::new(0),
+			seq: AtomicU64::new(0),
 			#[cfg(feature = "instrument")]
 			clock: TraceClock::default(),
 			oracle: Some(oracle),
@@ -1034,8 +1025,43 @@ impl TraceCollector {
 			return Err(TraceStateShared { collector: self });
 		};
 
-		state.logger_config = Some(Arc::new(config));
+		state.logger_config = Some(Arc::new(TraceLogger::from(config)));
 		Ok(self)
+	}
+
+	/// Flushes the log backend of this trace, so a backend that buffers its
+	/// records writes them out. On a trace with no log backend, it returns
+	/// `Ok(())`.
+	///
+	/// The last handle of the trace flushes the backend when it drops, and
+	/// drops the outcome. This call returns the outcome to its caller.
+	///
+	/// # Errors
+	///
+	/// - [`LogError`] -- the backend fails to flush, as [`LogBackend::flush`] reports.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig};
+	///
+	/// let logger = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Error));
+	/// let trace = TraceCollector::from(TraceConfig::default().with_logger(logger));
+	/// trace.event(tightbeam::instrumentation::events::ERROR)?.with_log_level(LogLevel::Error).emit();
+	///
+	/// trace.flush_log()?;
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`LogError`]: super::logging::LogError
+	/// [`LogBackend::flush`]: super::logging::LogBackend::flush
+	#[cfg(feature = "logging")]
+	pub fn flush_log(&self) -> Result<(), super::logging::LogError> {
+		let Some(logger) = &self.state.logger_config else {
+			return Ok(());
+		};
+
+		logger.flush()
 	}
 
 	/// Whether this collector records instrumentation events, which a build
@@ -1072,8 +1098,8 @@ impl TraceCollector {
 	/// ```
 	/// use std::sync::Arc;
 	///
+	/// use tightbeam::clock::{Clock, SystemClock};
 	/// use tightbeam::trace::TraceCollector;
-	/// use tightbeam::utils::time::{Clock, SystemClock};
 	///
 	/// const POOL_DIAL: tightbeam::urn::Urn<'static> = tightbeam::urn!("tightbeam", "event:pool/dial");
 	///
@@ -1272,11 +1298,10 @@ impl TraceCollector {
 		let _ = oracle.step_event(&event);
 	}
 
-	/// Takes the sequence number of the next event, which wraps past
-	/// `u32::MAX`. Each event needs a number of its own and no order against
-	/// other memory, so the add is `Relaxed`.
+	/// Takes the sequence number of the next event. Each event needs a number
+	/// of its own and no order against other memory, so the add is `Relaxed`.
 	#[cfg(feature = "instrument")]
-	fn next_seq(&self) -> u32 {
+	fn next_seq(&self) -> u64 {
 		self.state.seq.fetch_add(1, Ordering::Relaxed)
 	}
 
@@ -1758,7 +1783,7 @@ impl TraceCollector {
 	/// that it drains. The read needs no order against other memory, so it is
 	/// `Relaxed`.
 	#[cfg(all(feature = "instrument", any(test, feature = "testing")))]
-	fn sequenced(&self) -> u32 {
+	fn sequenced(&self) -> u64 {
 		self.state.seq.load(Ordering::Relaxed)
 	}
 }
@@ -1778,7 +1803,7 @@ impl From<TraceConfig> for TraceCollector {
 			// the logger config in place.
 			#[cfg(feature = "logging")]
 			if let Some(logger) = config.logger {
-				state.logger_config = Some(Arc::new(logger));
+				state.logger_config = Some(Arc::new(TraceLogger::from(logger)));
 			}
 
 			Self { state: Arc::new(state) }
@@ -2091,7 +2116,7 @@ impl ConsumedTrace {
 			let sequenced = collector.sequenced();
 			let drained = collector.drain_events();
 			let held = drained.iter().filter(|event| event.seq < sequenced).count();
-			let whole = u32::try_from(held) == Ok(sequenced) && !collector.overflowed();
+			let whole = u64::try_from(held) == Ok(sequenced) && !collector.overflowed();
 
 			self.truncated |= !whole;
 			self.instrument_events.extend(drained);
@@ -2743,7 +2768,7 @@ mod tests {
 			collector.emit(events::END, "after the drain");
 
 			let after = collector.drain_events();
-			let seqs = [before, after].map(|kept| kept.iter().map(|event| event.seq).collect::<Vec<u32>>());
+			let seqs = [before, after].map(|kept| kept.iter().map(|event| event.seq).collect::<Vec<u64>>());
 			assert_eq!(seqs, [vec![0, 1], vec![3]]);
 		}
 
@@ -2914,8 +2939,23 @@ mod tests {
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
 
-			let seqs: Vec<u32> = collector.drain_events().iter().map(|e| e.seq).collect();
+			let seqs: Vec<u64> = collector.drain_events().iter().map(|e| e.seq).collect();
 			assert_eq!(seqs, vec![0, 1]);
+		}
+
+		/// The sequence number counts past `u32::MAX`, so the events of a
+		/// long-lived trace stay in strictly increasing order.
+		#[test]
+		fn the_sequence_number_counts_past_u32_max() {
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(UnboundedSink::default()));
+			let counter = &collector.state.seq;
+			counter.store(u64::from(u32::MAX), core::sync::atomic::Ordering::Relaxed);
+			collector.emit(events::START, "the last number of a u32");
+			collector.emit(events::END, "the first number past it");
+
+			let seqs: Vec<u64> = collector.drain_events().iter().map(|event| event.seq).collect();
+
+			assert_eq!(seqs, [u64::from(u32::MAX), u64::from(u32::MAX) + 1]);
 		}
 	}
 
@@ -2925,10 +2965,10 @@ mod tests {
 		use core::time::Duration;
 		use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+		use crate::clock::{Clock, ManualClock};
 		use crate::instrumentation::{events, EventSink, TbEvent};
 		use crate::trace::{TraceCollector, TraceConfig};
 		use crate::urn::Urn;
-		use crate::utils::time::{Clock, ManualClock};
 		use crate::TightBeamError;
 
 		/// A manual clock an hour past its start, so its readings differ from
@@ -3176,10 +3216,10 @@ mod tests {
 		use std::sync::Arc;
 
 		use super::ALPHA;
+		use crate::clock::{Clock, ManualClock};
 		use crate::instrumentation::events;
 		use crate::trace::TraceCollector;
 		use crate::urn::Urn;
-		use crate::utils::time::{Clock, ManualClock};
 		use crate::TightBeamError;
 
 		/// A dual-write takes one sink record of its own, after the record of
@@ -3244,8 +3284,8 @@ mod tests {
 		use std::sync::{Arc, Mutex};
 
 		use super::ALPHA;
+		use crate::clock::{Clock, ManualClock};
 		use crate::trace::{LogBackend, LogError, LogFilter, LogLevel, LogRecord, LoggerConfig, TraceCollector};
-		use crate::utils::time::{Clock, ManualClock};
 
 		/// A backend that keeps the timestamp of each record it receives.
 		struct Stamps(Arc<Mutex<Vec<Option<u64>>>>);

@@ -9,7 +9,7 @@ use core::borrow::Borrow;
 
 use tightbeam::asn1::Frame;
 use tightbeam::compress::{Inflator, ZstdCompression};
-use tightbeam::{decode, TightBeamError};
+use tightbeam::TightBeamError;
 
 use crate::dtn::certs::{FrameSigner, SharedCipher};
 use crate::dtn::messages::{ChainMessage, FrameRequest, FrameResponse, RelayMessage};
@@ -119,7 +119,7 @@ impl Intake {
 	/// The relay message that `frame` carries.
 	async fn message_of(frame: &Frame, cipher: &SharedCipher) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata().confidentiality().is_none() {
-			return decode(frame.message());
+			return frame.decode_message();
 		}
 
 		let zstd = ZstdCompression::default();

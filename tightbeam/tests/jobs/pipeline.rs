@@ -8,7 +8,7 @@
 #![cfg(all(feature = "testing", feature = "std"))]
 
 use tightbeam::der::Sequence;
-use tightbeam::utils::task::Pipeline;
+use tightbeam::task::Pipeline;
 use tightbeam::{compose, job};
 use tightbeam::{Beamable, Frame, TightBeamError};
 
@@ -67,7 +67,7 @@ job! {
 	/// Appends "_transformed" to the content of the frame.
 	name: TransformContent,
 	fn run((frame,): (Frame,)) -> Result<Frame, TightBeamError> {
-		let msg: TestMessage = tightbeam::decode(frame.message())?;
+		let msg: TestMessage = frame.decode_message()?;
 
 		compose! {
 			V0: id: frame.metadata().id(),
@@ -91,7 +91,7 @@ fn test_pipeline_direct_results() -> Result<(), TightBeamError> {
 		.and_then(|f| TransformContent::run((f,)))
 		.run()?;
 
-	let message: TestMessage = tightbeam::decode(frame.message())?;
+	let message: TestMessage = frame.decode_message()?;
 	assert_eq!(message.content, "content_transformed", "the three jobs ran out of order");
 	Ok(())
 }

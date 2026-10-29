@@ -7,9 +7,9 @@
 //! - With `instrument`, a collector records its events ([`TraceCollector::instrumented`]).
 //! - With `instrument`, emission MUST be amortized O(1) and overflow MUST set a flag.
 //!
-//! The evidence hash is SHA3-256 over the spec hash and the trace hash, and
-//! the trace hash is SHA3-256 over the DER of the events. `TbEvent` and
-//! `EvidenceArtifact` encode as DER.
+//! The evidence hash is SHA3-256 over the spec hash, the trace hash, and the
+//! DER of the overflow flag, and the trace hash is SHA3-256 over the DER of
+//! the events. `TbEvent` and `EvidenceArtifact` encode as DER.
 //!
 //! [`TraceCollector::instrumented`]: crate::trace::TraceCollector::instrumented
 
@@ -29,7 +29,7 @@ pub use active::{BoundedMemorySink, EventSink, EvidenceArtifact};
 #[derive(Clone, Debug, PartialEq)]
 pub struct TbEvent {
 	/// The sequence number within the trace.
-	pub seq: u32,
+	pub seq: u64,
 	/// The URN of the event kind.
 	pub urn: Urn<'static>,
 	/// The event label, when the event has one. A static label stays
@@ -353,7 +353,7 @@ pub mod active {
 			// event cannot read past its own. `sequence` would also demand a
 			// second tag.
 			reader.read_nested(header.length, |reader| {
-				let seq_val = u32::decode(reader)?;
+				let seq_val = u64::decode(reader)?;
 				let urn_decoded = Urn::decode(reader)?;
 				let urn: Urn<'static> = urn_decoded.into_owned();
 
@@ -523,7 +523,8 @@ pub mod active {
 	/// - It keeps [`TbEvent::into_overflow_warning`] of the first event it drops, and sets the latch.
 	/// - [`EventSink::retains`] answers from the same state, so the collector builds no event the sink drops.
 	/// - [`EventSink::drain`] frees capacity but MUST NOT clear the latch, so the sink keeps one warning.
-	/// - Dropped events consume collector sequence numbers too, so gaps in [`TbEvent::seq`] mark truncation.
+	/// - Dropped events consume collector sequence numbers too, so a gap in
+	///   [`TbEvent::seq`] marks the events dropped before a later retained one.
 	#[derive(Debug)]
 	pub struct BoundedMemorySink {
 		max_events: u32,
@@ -612,10 +613,10 @@ pub mod active {
 	/// The evidence that a trace gives for a spec, as ASN.1 DER.
 	///
 	/// [`Self::of`] builds one from a consumed trace. The DER decode recomputes
-	/// both hashes from the spec hash and the events it read, and refuses an
-	/// artifact whose hashes differ, so a decoded artifact is one that
-	/// [`Self::of`] could build. `overflow` sits outside the hashes, as the
-	/// evidence format defines it.
+	/// both hashes from the spec hash, the events, and `overflow` it read, and
+	/// refuses an artifact whose hashes differ, so a decoded artifact is one
+	/// that [`Self::of`] could build. The evidence hash covers `overflow`, so
+	/// the evidence hash of a run fixes whether its trace misses events.
 	///
 	/// ```text
 	/// EvidenceArtifact ::= SEQUENCE {
@@ -632,7 +633,8 @@ pub mod active {
 		spec_hash: OctetString,
 		/// The SHA3-256 hash of the DER of `events`.
 		trace_hash: OctetString,
-		/// The SHA3-256 hash of `spec_hash` followed by `trace_hash`.
+		/// The SHA3-256 hash of `spec_hash`, then `trace_hash`, then the DER of
+		/// `overflow`.
 		evidence_hash: OctetString,
 		/// The events the trace hash covers, in the order of the trace.
 		events: Vec<TbEvent>,
@@ -655,11 +657,12 @@ pub mod active {
 			let trace_digest = trace_writer.0.finalize();
 			let trace_hash = OctetString::new(trace_digest.as_slice())?;
 
-			let mut hasher = Sha3_256::new();
-			hasher.update(spec_hash);
-			hasher.update(trace_hash.as_bytes());
+			let mut evidence_writer = DigestWriter(Sha3_256::new());
+			evidence_writer.0.update(spec_hash);
+			evidence_writer.0.update(trace_hash.as_bytes());
+			overflow.encode(&mut evidence_writer)?;
 
-			let evidence_digest = hasher.finalize();
+			let evidence_digest = evidence_writer.0.finalize();
 			let evidence_hash = OctetString::new(evidence_digest.as_slice())?;
 			let spec_hash = OctetString::new(spec_hash)?;
 
@@ -702,21 +705,23 @@ pub mod active {
 			&self.trace_hash
 		}
 
-		/// The SHA3-256 hash of [`Self::spec_hash`] followed by
-		/// [`Self::trace_hash`].
+		/// The SHA3-256 hash of [`Self::spec_hash`], then [`Self::trace_hash`],
+		/// then the DER of [`Self::overflow`], a BOOLEAN.
 		///
 		/// # Examples
 		///
 		/// ```
 		/// use tightbeam::crypto::hash::{Digest, Sha3_256};
+		/// use tightbeam::der::Encode;
 		/// use tightbeam::instrumentation::EvidenceArtifact;
 		/// use tightbeam::trace::ConsumedTrace;
 		///
 		/// let artifact = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::new())?;
-		/// let spec_then_trace = [[0u8; 32].as_slice(), artifact.trace_hash().as_bytes()].concat();
-		/// let expected = Sha3_256::digest(spec_then_trace);
+		/// let overflow = artifact.overflow().to_der()?;
+		/// let covered = [[0u8; 32].as_slice(), artifact.trace_hash().as_bytes(), overflow.as_slice()].concat();
+		/// let expected = Sha3_256::digest(covered);
 		/// assert_eq!(artifact.evidence_hash().as_bytes(), expected.as_slice());
-		/// # Ok::<(), tightbeam::TightBeamError>(())
+		/// # Ok::<(), Box<dyn core::error::Error>>(())
 		/// ```
 		pub fn evidence_hash(&self) -> &OctetString {
 			&self.evidence_hash
@@ -773,7 +778,7 @@ pub mod active {
 		/// - `trace_hash` is the SHA3-256 of the DER of `events`, a SEQUENCE OF
 		///   `TbEvent` (X.690 § 8.10). Its EXPLICIT tags set an absent OPTIONAL
 		///   field apart from an empty one (X.690 § 8.14).
-		/// - `evidence_hash` is the SHA3-256 of `spec_hash` followed by `trace_hash`.
+		/// - `evidence_hash` is the SHA3-256 of `spec_hash`, then `trace_hash`, then the DER of `overflow`.
 		///
 		/// # Errors
 		///
@@ -863,9 +868,11 @@ mod tests {
 	use core::time::Duration;
 	use std::borrow::Cow;
 	use std::panic::{catch_unwind, AssertUnwindSafe};
+	use std::sync::Arc;
 
 	use super::active::{tagged, tb_event_tags};
 	use super::*;
+	use crate::clock::{Clock, ManualClock};
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::der::asn1::{Any, OctetString};
 	use crate::der::{Decode, Encode, ErrorKind, Tag};
@@ -963,7 +970,7 @@ mod tests {
 	}
 
 	/// An event of sequence number `seq` with no optional field.
-	fn sample_event(seq: u32) -> TbEvent {
+	fn sample_event(seq: u64) -> TbEvent {
 		TbEvent {
 			seq,
 			urn: events::START,
@@ -1134,15 +1141,20 @@ mod tests {
 	}
 
 	/// The DER of an `EvidenceArtifact` SEQUENCE of `spec_hash`, the two hashes
-	/// of `artifact`, `events`, and the overflow of `artifact`, whether or not
-	/// the hashes cover them.
-	fn forged_der(artifact: &EvidenceArtifact, spec_hash: &OctetString, events: Vec<TbEvent>) -> Result<Vec<u8>> {
+	/// of `artifact`, `events`, and `overflow`, whether or not the hashes cover
+	/// them.
+	fn forged_der(
+		artifact: &EvidenceArtifact,
+		spec_hash: &OctetString,
+		events: Vec<TbEvent>,
+		overflow: bool,
+	) -> Result<Vec<u8>> {
 		let fields = [
 			spec_hash.to_der()?,
 			artifact.trace_hash().to_der()?,
 			artifact.evidence_hash().to_der()?,
 			events.to_der()?,
-			artifact.overflow().to_der()?,
+			overflow.to_der()?,
 		];
 
 		Ok(Any::new(Tag::Sequence, fields.concat())?.to_der()?)
@@ -1207,7 +1219,7 @@ mod tests {
 	#[test]
 	fn an_artifact_whose_hashes_do_not_cover_its_events_is_refused() -> Result<()> {
 		let artifact = artifact_of_one_event()?;
-		let forged = forged_der(&artifact, artifact.spec_hash(), Vec::new())?;
+		let forged = forged_der(&artifact, artifact.spec_hash(), Vec::new(), artifact.overflow())?;
 
 		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
 
@@ -1221,7 +1233,7 @@ mod tests {
 	fn an_artifact_whose_evidence_hash_does_not_cover_its_spec_hash_is_refused() -> Result<()> {
 		let artifact = artifact_of_one_event()?;
 		let other_spec = OctetString::new([1u8; 32])?;
-		let forged = forged_der(&artifact, &other_spec, artifact.events().to_vec())?;
+		let forged = forged_der(&artifact, &other_spec, artifact.events().to_vec(), artifact.overflow())?;
 
 		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
 
@@ -1235,11 +1247,61 @@ mod tests {
 	fn an_artifact_whose_spec_hash_is_not_32_octets_is_refused() -> Result<()> {
 		let artifact = artifact_of_one_event()?;
 		let short_spec = OctetString::new([0u8; 16])?;
-		let forged = forged_der(&artifact, &short_spec, artifact.events().to_vec())?;
+		let forged = forged_der(&artifact, &short_spec, artifact.events().to_vec(), artifact.overflow())?;
 
 		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
 
 		assert_eq!(refused, Err(ErrorKind::Length { tag: Tag::OctetString }));
+		Ok(())
+	}
+
+	/// The evidence hash covers `overflow`, so the decode refuses the artifact
+	/// of a truncated trace whose `overflow` reads `false`.
+	#[test]
+	fn an_artifact_whose_evidence_hash_does_not_cover_its_overflow_is_refused() -> Result<()> {
+		let artifact = artifact_of_an_overflowed_trace()?;
+		let forged = forged_der(&artifact, artifact.spec_hash(), artifact.events().to_vec(), false)?;
+
+		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
+
+		assert_eq!(refused, Err(ErrorKind::Value { tag: Tag::OctetString }));
+		Ok(())
+	}
+
+	/// The evidence hash of a run on `clock`: three events through the event
+	/// API, so each event carries a stamp of the clock.
+	fn evidence_hash_on(clock: &Arc<ManualClock>) -> Result<OctetString> {
+		let trace = TraceCollector::new().with_clock(Arc::clone(clock) as Arc<dyn Clock>);
+		trace.emit_event(events::START)?;
+		trace.emit_event_with_evidence(events::GATE_REJECT, "PermissionDenied", Some(b"peer key"))?;
+		trace.emit_event(events::END)?;
+
+		let artifact = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(&trace))?;
+		Ok(artifact.evidence_hash().clone())
+	}
+
+	/// Two runs of the same events on a clock that gives each of them the
+	/// same readings give one evidence hash.
+	#[test]
+	fn two_runs_of_one_clock_reading_give_one_evidence_hash() -> Result<()> {
+		let clock = Arc::new(ManualClock::default());
+
+		let (first, second) = (evidence_hash_on(&clock)?, evidence_hash_on(&clock)?);
+
+		assert_eq!(first, second);
+		Ok(())
+	}
+
+	/// The evidence hash of an overflowed trace covers the DER of its
+	/// `overflow`, the BOOLEAN TRUE of X.690 § 11.1.
+	#[test]
+	fn the_evidence_hash_covers_the_der_of_overflow() -> Result<()> {
+		let artifact = artifact_of_an_overflowed_trace()?;
+
+		let der_true: &[u8] = &[0x01, 0x01, 0xFF];
+		let covered = [artifact.spec_hash().as_bytes(), artifact.trace_hash().as_bytes(), der_true].concat();
+
+		assert_eq!(artifact.evidence_hash().as_bytes(), Sha3_256::digest(covered).as_slice());
 		Ok(())
 	}
 }

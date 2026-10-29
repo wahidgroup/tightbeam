@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 
+use crate::basis_points::BasisPoints;
+use crate::clock::Clock;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::hive::{HiveContext, ServletBox, ServletDrainFuture};
 use crate::colony::servlet::serve::ContextService;
@@ -28,8 +30,6 @@ use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::{CollectorGateConfig, PolicyConfig};
 use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
-use crate::utils::time::Clock;
-use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
 use crate::crypto::profiles::CryptoProvider;

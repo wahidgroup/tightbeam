@@ -28,6 +28,8 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::basis_points::BasisPoints;
+use crate::clock::{Clock, SystemClock};
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::protocol::{RegisterHiveResponse, ServletInfo};
 use crate::colony::urn::ColonyNamespace;
@@ -46,8 +48,6 @@ use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::EncryptionConfig;
 use crate::transport::{Protocol, TransportEncryptionConfig};
 use crate::urn::Urn;
-use crate::utils::time::{Clock, SystemClock};
-use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
 
 use crate::crypto::x509::store::CertificateTrust;
@@ -998,14 +998,14 @@ pub type DuplexOpenFuture<'a> =
 /// # use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 /// # use tightbeam::testing::{TestCertificate, TestIdentity, TestKey, TestMessage};
 /// # use tightbeam::urn::Urn;
-/// # use tightbeam::{decode, Frame, TightBeamError, Version};
+/// # use tightbeam::{Frame, TightBeamError, Version};
 /// #
 /// # struct EchoSibling;
 /// #
 /// # impl HiveContext for EchoSibling {
 /// #     fn call<'a>(&'a self, _servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
 /// #         Box::pin(async move {
-/// #             let echoed: TestMessage = decode(frame.message())?;
+/// #             let echoed: TestMessage = frame.decode_message()?;
 /// #             let mut reply = FrameBuilder::from(Version::V1).with_id(b"km-reply").with_message(echoed).build()?;
 /// #             let sibling = TestIdentity::insecure_fixed();
 /// #             reply.sign_with_provider(&sibling).await?;
@@ -1034,7 +1034,7 @@ pub type DuplexOpenFuture<'a> =
 ///
 /// // The reply is the sibling's complete envelope: verify, then decode.
 /// reply.verify(&sibling)?;
-/// let response: TestMessage = decode(reply.message())?;
+/// let response: TestMessage = reply.decode_message()?;
 /// assert_eq!(response.content, "unwrap key 7");
 /// # Ok::<(), TightBeamError>(())
 /// # })
@@ -1131,9 +1131,10 @@ pub struct HiveControlConfig {
 	/// them again. It defaults to 30 seconds.
 	pub circuit_breaker_cooldown: Duration,
 	/// The freshness window for signed cluster commands. The hive rejects a
-	/// command whose `Frame.metadata.order` is outside this window, or whose
-	/// signature it already saw inside it ([`ReplayGuard`]). It defaults to
-	/// 30 seconds.
+	/// command whose `Frame.metadata.order` is outside this window, whose
+	/// signature it already saw inside it, or whose signer already sent another
+	/// command at that order inside it ([`ReplayGuard`]). It defaults to 30
+	/// seconds.
 	pub command_freshness_window: Duration,
 	/// The retry policy for the fan-out of scaling updates to gateways.
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
@@ -1164,7 +1165,7 @@ impl Default for HiveControlConfig {
 			command_freshness_window: Duration::from_millis(crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
 			notify_retry: Arc::new(crate::transport::policy::RestartExponentialBackoff {
 				max_attempts: 3,
-				scale_factor: 500,
+				base_delay: Duration::from_millis(500),
 				jitter: Some(Box::new(crate::transport::policy::DecorrelatedJitter)),
 			}),
 		}

@@ -66,12 +66,12 @@ pub use router::{MuxDrivers, SpawnedMux};
 #[cfg(pooled_mux)]
 pub use service::{CallContext, MuxService};
 
+use crate::marker::MaybeSend;
 use crate::policy::GatePolicy;
 use crate::policy::SessionContext;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::TransportResult;
-use crate::utils::marker::MaybeSend;
 use crate::x509::Certificate;
 use crate::Frame;
 

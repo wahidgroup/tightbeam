@@ -30,6 +30,7 @@ mod tokio_rt {
 #[cfg(feature = "tokio")]
 use tokio_rt::*;
 
+use crate::clock::Clock;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::CryptoProvider;
 use crate::der::Decode;
@@ -46,10 +47,9 @@ use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWri
 use crate::transport::state::{ReadPolicy, SettledExchange};
 use crate::transport::EncryptedMessageIO;
 use crate::transport::{
-	EnvelopeBuilder, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportLimits, TransportResult,
+	CheckedLimits, EnvelopeBuilder, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportResult,
 	WireMode,
 };
-use crate::utils::time::Clock;
 use crate::zeroize::Zeroizing;
 use crate::Frame;
 
@@ -69,11 +69,11 @@ use handshake_imports::*;
 	any(feature = "transport-cms", feature = "transport-hpke")
 ))]
 mod mux_imports {
+	pub use crate::marker::MaybeSend;
 	pub use crate::policy::SessionContext;
 	pub use crate::transport::handshake::negotiation::MuxSettings;
 	pub use crate::transport::handshake::negotiation::TransportOffer;
 	pub use crate::transport::state::EncryptedProtocolState;
-	pub use crate::utils::marker::MaybeSend;
 	pub use crate::x509::Certificate;
 }
 
@@ -618,7 +618,7 @@ where
 {
 	stream: R,
 	mode: SplitRecv,
-	limits: TransportLimits,
+	limits: CheckedLimits,
 	/// The connection clock carried across the split, which the read deadline
 	/// counts from.
 	clock: Arc<dyn Clock>,
@@ -769,7 +769,7 @@ where
 	/// Every ceiling carried across the split, as on the unsplit path. A peer
 	/// that never drains its receive buffer cannot pin the writer task forever
 	/// (CWE-400).
-	limits: TransportLimits,
+	limits: CheckedLimits,
 	/// The connection clock carried across the split. See
 	/// [`EnvelopeSink::clock`].
 	#[cfg(host_clock)]
@@ -1135,6 +1135,7 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
+	use crate::clock::{ManualClock, SystemClock};
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::SigningKey;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
@@ -1146,8 +1147,7 @@ mod tests {
 	use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
-	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
-	use crate::utils::time::{ManualClock, SystemClock};
+	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, TransportLimits};
 
 	#[cfg(feature = "instrument")]
 	use crate::crypto::aead::SessionKeys;
@@ -1158,7 +1158,7 @@ mod tests {
 	#[cfg(feature = "transport-hpke")]
 	use crate::crypto::sign::SigningIdentity;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	use crate::crypto::x509::error::CertificateValidationError::CertificateNotTrusted;
+	use crate::crypto::x509::error::CertificateValidationError::{CertificateNotTrusted, Expired};
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 	#[cfg(feature = "instrument")]
@@ -1206,10 +1206,11 @@ mod tests {
 		use core::time::Duration;
 
 		use super::super::*;
+		use crate::clock::{ManualClock, SystemClock};
 		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 		use crate::crypto::aead::{RecordDirection, RuntimeAead};
 		use crate::testing::{TestFrame, TestKey};
-		use crate::utils::time::{ManualClock, SystemClock};
+		use crate::transport::TransportLimits;
 		use crate::TightBeamError;
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
@@ -1248,7 +1249,7 @@ mod tests {
 		}
 
 		fn writer(mode: SplitSend) -> TransportWriter<NullStream> {
-			writer_under(mode, TransportLimits::default())
+			writer_under(mode, CheckedLimits::default())
 		}
 
 		/// A write half hands out the clock of the connection it split from, so
@@ -1265,7 +1266,7 @@ mod tests {
 			assert_eq!(handed.monotonic(), clock.monotonic());
 		}
 
-		fn writer_under(mode: SplitSend, limits: TransportLimits) -> TransportWriter<NullStream> {
+		fn writer_under(mode: SplitSend, limits: CheckedLimits) -> TransportWriter<NullStream> {
 			TransportWriter {
 				stream: NullStream,
 				mode,
@@ -1280,7 +1281,7 @@ mod tests {
 			TransportReader {
 				stream: NullStream,
 				mode,
-				limits: TransportLimits::default(),
+				limits: CheckedLimits::default(),
 				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
@@ -1291,9 +1292,10 @@ mod tests {
 
 		/// The limits at twice the default encrypted-envelope ceiling, where a
 		/// key admits half the default record volume.
-		fn doubled_ceiling() -> TransportLimits {
+		fn doubled_ceiling() -> CheckedLimits {
 			let encrypted_envelope = 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE;
-			TransportLimits { encrypted_envelope, ..TransportLimits::default() }
+			let limits = TransportLimits { encrypted_envelope, ..TransportLimits::default() };
+			limits.checked().expect("twice the default ceiling agrees with the defaults")
 		}
 
 		/// The send cipher of an encrypted half. A cleartext half has none, so
@@ -1393,8 +1395,9 @@ mod tests {
 			}
 		}
 
-		fn one_second_deadline() -> TransportLimits {
-			TransportLimits { operation_timeout: Duration::from_secs(1), ..TransportLimits::default() }
+		fn one_second_deadline() -> CheckedLimits {
+			let limits = TransportLimits { operation_timeout: Duration::from_secs(1), ..TransportLimits::default() };
+			limits.checked().expect("a one-second deadline agrees with the defaults")
 		}
 
 		/// The operation deadline bounds a cleartext half as it bounds an
@@ -1506,7 +1509,7 @@ mod tests {
 			TransportReader {
 				stream: OneFrameStream(frame.as_ref().to_vec()),
 				mode,
-				limits: TransportLimits::default(),
+				limits: CheckedLimits::default(),
 				clock: Arc::new(SystemClock),
 				#[cfg(feature = "instrument")]
 				trace: None,
@@ -1905,6 +1908,74 @@ mod tests {
 		Ok(())
 	}
 
+	/// A CMS client reads the validity period of the pinned key-agreement
+	/// certificate on the clock of its endpoint, so a clock past the end of
+	/// the period refuses the server before the client sends anything, while
+	/// the host clock reads a time inside that period.
+	#[cfg(feature = "transport-cms")]
+	#[tokio::test]
+	async fn a_cms_client_reads_validity_on_the_clock_of_its_endpoint() -> TransportResult<()> {
+		let (_, client_stream) = bind_and_connect().await?;
+		let server = TestCmsServer::generate("Test Server");
+		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
+			cms_server: Some(server.trust()),
+			client_identity: Some(TestIdentity::insecure_fixed()),
+			..EncryptionConfig::unconfigured()
+		};
+		let encryption = DialableEncryption::new(encryption)?;
+		let endpoint = EndpointConfig::new(encryption, TestCertificate::clock_past_validity());
+
+		let transport = TcpTransport::new(TokioStream::from(client_stream), endpoint);
+		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
+		let dial = transport.perform_client_handshake().await;
+		let refused = matches!(
+			dial,
+			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
+				Expired
+			)))
+		);
+		assert!(refused);
+		Ok(())
+	}
+
+	/// A mutual server reads the validity period of a client certificate on
+	/// the clock of its endpoint, so a clock past the end of the period
+	/// refuses a client that the host clock reads as current.
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn a_mutual_server_reads_validity_on_the_clock_of_its_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+		let (stream, peer) = loopback_pair().await;
+		let EncryptedTestServer { server, config } = encrypted_test_server()?;
+		let anchor = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let anchored: Arc<dyn CertificateValidation> =
+			Arc::new(DirectTrustValidator::default().with_trust_chain([anchor])?);
+		let endpoint = EndpointConfig::try_from(config.with_client_validators([anchored]))?;
+		let endpoint = endpoint.with_clock(TestCertificate::clock_past_validity());
+		let mut accepted = TcpTransport::new(TokioStream::from(stream), endpoint);
+		let served = tokio::spawn(async move { respond_with(&mut accepted, |_| None).await });
+
+		let encryption = EncryptionConfig {
+			trust_store: Some(trust_store_for(&server)),
+			client_identity: Some(TestIdentity::insecure_fixed()),
+			..EncryptionConfig::unconfigured()
+		};
+		let mut client = client_over(peer, encryption);
+		// The verdict on the closing is the server's, so the outcome of the
+		// dial drops here. The close ends a server that admitted the client.
+		let _ = client.ensure_handshake_complete().await;
+		drop(client);
+
+		let served = served.await?;
+		let refused = matches!(
+			served,
+			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
+				Expired
+			)))
+		);
+		assert!(refused);
+		Ok(())
+	}
+
 	/// An HPKE client carries its server policy into the handshake, so a
 	/// policy that refuses the server's certificate refuses the server that
 	/// its store admits.
@@ -2029,7 +2100,8 @@ mod tests {
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_silent_client() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
-		config.limits.handshake_timeout = Duration::from_millis(500);
+		let limits = TransportLimits { handshake_timeout: Duration::from_millis(500), ..*config.limits };
+		config = config.with_limits(limits)?;
 
 		let (listener, server_addr) = bind_encrypted(config).await?;
 		let server_handle = spawn_accept_handle_request(listener);
@@ -2332,7 +2404,8 @@ mod tests {
 	#[tokio::test]
 	async fn handshake_read_rejects_oversize_frame_before_body() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
-		config.limits.handshake_timeout = Duration::from_secs(5);
+		let limits = TransportLimits { handshake_timeout: Duration::from_secs(5), ..*config.limits };
+		config = config.with_limits(limits)?;
 
 		let (listener, server_addr) = bind_encrypted(config).await?;
 		let server_handle = spawn_accept_handle_request(listener);

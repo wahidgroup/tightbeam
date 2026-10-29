@@ -43,11 +43,11 @@ use tightbeam::{
 	exactly,
 	instrumentation::events,
 	job,
+	marker::MaybeSendFuture,
 	spki::AlgorithmIdentifierOwned,
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	utils::marker::MaybeSendFuture,
 	TightBeamError,
 };
 
@@ -142,7 +142,7 @@ fn forged_by(
 	let spliced = SigningIdentity::new(Arc::clone(&victim.certificate), provider)?;
 
 	// The server holds a validator, so it requires client authentication.
-	let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 	let handshake = LiveHandshake::new(HandshakeBackendKind::Hpke, materials.to_owned());
 	let handshake = handshake.with_client_validators([validator]).with_client_identity(spliced);
 	Ok(handshake.audit_server(trace))

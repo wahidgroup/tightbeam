@@ -7,19 +7,19 @@
 
 use std::sync::PoisonError;
 
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::colony::cluster::{PeerRecord, PeerStore};
 use tightbeam::colony::protocol::PeerGossip;
 use tightbeam::constants::{MAX_PEER_TRIED_FAILURES, MAX_PEX_SAMPLE};
 use tightbeam::crypto::key::{KeyBackend, KeyError, SigningKeyProvider};
 use tightbeam::crypto::sign::Error as SignatureError;
 use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::spki::AlgorithmIdentifierOwned;
 use tightbeam::testing::TestFrame;
 use tightbeam::trace::IntoEventLabel;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
-use tightbeam::utils::marker::MaybeSendFuture;
-use tightbeam::utils::time::{Clock, ManualClock};
 use tightbeam::{compose, server};
 
 use super::common::*;
@@ -38,7 +38,7 @@ fn gossip_cluster_conf(
 	conf.tls.hive_trust = Some(split_hive_trust(certs));
 	conf.gossip = GossipConfig {
 		journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
-		ingress: Some(servlet_ingress("rumor")),
+		ingress: Some(servlet_urn("rumor")),
 		..Default::default()
 	};
 
@@ -138,7 +138,7 @@ pub async fn send_gossip_frame(
 	frame: Frame,
 ) -> Result<TransitStatus, TightBeamError> {
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
+	let response: GossipResponse = emit_frame(&mut client, frame).await?.decode_message()?;
 	Ok(response.status)
 }
 
@@ -224,7 +224,7 @@ async fn reconcile_reply(
 	frame: Frame,
 ) -> Result<GossipWant, TightBeamError> {
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let reply: GossipWant = decode(&emit_frame(&mut client, frame).await?.message())?;
+	let reply: GossipWant = emit_frame(&mut client, frame).await?.decode_message()?;
 	Ok(reply)
 }
 
@@ -610,7 +610,7 @@ tb_scenario! {
 			.await?;
 
 			let reply = mux_client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: GossipResponse = decode(reply.message())?;
+			let response: GossipResponse = reply.decode_message()?;
 			assert_eq!(response.status, TransitStatus::PermissionDenied, "admission refuses an oversized rumor");
 
 			cluster.stop();
@@ -857,7 +857,7 @@ tb_scenario! {
 			conf.gossip = GossipConfig {
 				admission: Arc::new(TokenBucketAdmission::new(1, Duration::from_secs(3_600)))
 					as Arc<dyn GossipAdmission>,
-				ingress: Some(servlet_ingress("rumor")),
+				ingress: Some(servlet_urn("rumor")),
 				..Default::default()
 			};
 
@@ -928,7 +928,7 @@ tb_scenario! {
 			conf.gossip = GossipConfig {
 				journal: Arc::new(MemoryGossipJournal::new(Duration::from_millis(1_000))) as Arc<dyn GossipJournal>,
 				seen_ttl: Duration::from_secs(3_600),
-				ingress: Some(servlet_ingress("rumor")),
+				ingress: Some(servlet_urn("rumor")),
 				..Default::default()
 			};
 
@@ -991,7 +991,7 @@ tb_scenario! {
 			conf.gossip = GossipConfig {
 				admission: Arc::new(TokenBucketAdmission::new(2, Duration::from_secs(3_600)))
 					as Arc<dyn GossipAdmission>,
-				ingress: Some(servlet_ingress("rumor")),
+				ingress: Some(servlet_urn("rumor")),
 				..Default::default()
 			};
 			let gateway = start_cluster(&trace, conf).await?;
@@ -1046,7 +1046,7 @@ tb_scenario! {
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
 			conf.gossip = GossipConfig {
 				journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
-				ingress: Some(servlet_ingress("rumor")),
+				ingress: Some(servlet_urn("rumor")),
 				..Default::default()
 			};
 			let gateway = start_cluster(&trace, conf).await?;
@@ -1175,7 +1175,7 @@ tb_scenario! {
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
 			conf.gossip = GossipConfig {
 				journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
-				ingress: Some(servlet_ingress("rumor")),
+				ingress: Some(servlet_urn("rumor")),
 				..Default::default()
 			};
 
@@ -1233,7 +1233,7 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = containment_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
-			conf.gossip.ingress = Some(servlet_ingress("rumor"));
+			conf.gossip.ingress = Some(servlet_urn("rumor"));
 
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
@@ -1718,12 +1718,12 @@ async fn faulted_publish_refusals(fault: KeyFault) -> Result<(TransitStatus, Vec
 	let gateway = start_cluster(&trace, ClusterConfig::builder(tls).build()).await?;
 	let mut client = connect_cluster(&certs, gateway.addr()).await?;
 	let first = hive_publish_gossip(&certs, b"publish-before-fault", rumor_body(vec![1]), 1).await?;
-	let opened: GossipResponse = decode(&emit_frame(&mut client, first).await?.message())?;
+	let opened: GossipResponse = emit_frame(&mut client, first).await?.decode_message()?;
 	assert_eq!(opened.status, TransitStatus::Ok, "the gateway admits the first publish");
 
 	backend.fail_now();
 	let frame = hive_publish_gossip(&certs, b"faulted-publish", rumor_body(vec![1, 2, 3]), 1).await?;
-	let reply: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
+	let reply: GossipResponse = emit_frame(&mut client, frame).await?.decode_message()?;
 	gateway.stop();
 
 	Ok((reply.status, gossip_refusal_labels(&trace)))
@@ -3328,13 +3328,13 @@ async fn beat_until_learned(clock: &ManualClock, store: &RecordingPeerStore, add
 	.await
 }
 
-/// A hint that a peer-exchange reply teaches again carries the reading of the
-/// gateway's clock at the round that taught it.
+/// A hint that a peer-exchange reply teaches again carries the issue time of
+/// the round that taught it, which the gateway stamps from its clock.
 ///
 /// - The prober learns the shared address and drops it, so the reply teaches it again.
 /// - The manual clock moves one beat at a time until the prober's store holds the address.
-/// - The replier records the round's order, which the prober stamps from its clock.
-/// - The persisted stamp of the address equals that reading.
+/// - The replier records the round's order, the issue time the prober stamps from its clock.
+/// - The persisted stamp of the address equals that issue time.
 #[tokio::test]
 async fn cluster_relearned_hint_takes_the_clock_reading() -> Result<(), TightBeamError> {
 	let certs = cluster_certs();

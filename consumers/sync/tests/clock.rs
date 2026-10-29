@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use tightbeam::utils::time::{Clock, SystemClock};
+use tightbeam::clock::{Clock, SystemClock};
 
 /// The call that builds a five-second sleep returns at once, because the park
 /// waits for the first poll.

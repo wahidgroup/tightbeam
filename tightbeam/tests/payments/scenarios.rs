@@ -45,7 +45,6 @@ use tightbeam::{
 			Certificate, CertificateSpec, KeyCurves,
 		},
 	},
-	decode,
 	der::asn1::OctetString,
 	encode,
 	instrumentation::events,
@@ -329,7 +328,7 @@ tb_scenario! {
 			// The gateway returns the servlet's complete response frame. The
 			// typed approval decodes from inside it, which proves that the
 			// response envelope survived the route back to the client.
-			let status: TransactionStatus = decode(servlet_frame.message())?;
+			let status: TransactionStatus = servlet_frame.decode_message()?;
 			assert!(status.status.is_success(), "the client decoded no approval from the servlet frame");
 
 			hive.stop();
@@ -412,7 +411,7 @@ tb_scenario! {
 			let key_request = KeyManagerRequest::GetPublicKey(GetPublicKeyRequest { _placeholder: None });
 			let key_reply = client.emit(key_manager_frame(b"key-manager-public-key", key_request), None).await?;
 			let key_frame = key_reply.ok_or(TightBeamError::MissingResponse)?;
-			let served: GetPublicKeyResponse = decode(key_frame.message())?;
+			let served: GetPublicKeyResponse = key_frame.decode_message()?;
 			let public_key = PublicKey::from_sec1_bytes(served.public_key.as_bytes())?;
 			let sealed = public_key.seal::<HpkeSecp256k1Sha256Aes256Gcm>(KEY_MANAGER_HPKE_INFO, b"", CARD_TOKEN, None)?;
 			let ciphertext = sealed.to_bytes();
@@ -421,7 +420,7 @@ tb_scenario! {
 			let open_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext: OctetString::new(ciphertext)? });
 			let open_reply = client.emit(key_manager_frame(b"key-manager-open", open_request), None).await?;
 			let open_frame = open_reply.ok_or(TightBeamError::MissingResponse)?;
-			let opened: DecryptResponse = decode(open_frame.message())?;
+			let opened: DecryptResponse = open_frame.decode_message()?;
 			assert_eq!(opened.plaintext.as_bytes(), CARD_TOKEN.as_bytes(), "the key manager returned another plaintext");
 
 			let tampered_request = KeyManagerRequest::Decrypt(DecryptRequest { ciphertext: OctetString::new(tampered)? });
@@ -464,7 +463,7 @@ tb_scenario! {
 			let transaction = create_auth_transaction(b"E2E-SPAWNED", MonetaryAmount::new(10000, *b"USD"));
 			let reply = client.emit(authorization_frame(&certs, transaction), None).await?;
 			let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-			let status: TransactionStatus = decode(reply.message())?;
+			let status: TransactionStatus = reply.decode_message()?;
 			assert!(status.status.is_success(), "the client decoded no approval from the servlet frame");
 
 			Ok(())

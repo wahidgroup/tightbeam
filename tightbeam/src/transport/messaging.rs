@@ -14,13 +14,13 @@ use core::future::Future;
 
 use crate::asn1::Frame;
 use crate::error::TightBeamError;
+use crate::marker::MaybeSend;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::policy::{RestartPolicy, RetryAction};
 use crate::transport::TransportResult;
-use crate::utils::marker::MaybeSend;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::state::CollectStep;
@@ -630,14 +630,14 @@ impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
 #[cfg(all(test, feature = "instrument", feature = "testing"))]
 mod tests {
 	use super::*;
+	use crate::clock::{Clock, MonotonicInstant, UnixMillis};
 	use crate::instrumentation::events;
+	use crate::marker::MaybeSendFuture;
 	use crate::policy::{GateChain, GatePolicy};
 	use crate::testing::TestFrame;
 	use crate::trace::{AssertionLabel, AssertionValue, TraceCollector};
 	use crate::transport::policy::RestartLinearBackoff;
 	use crate::urn::Urn;
-	use crate::utils::marker::MaybeSendFuture;
-	use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 	use crate::TightBeamError;
 
 	#[cfg(feature = "testing-fault")]

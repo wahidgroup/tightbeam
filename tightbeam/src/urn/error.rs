@@ -31,8 +31,8 @@ pub enum UrnValidationError {
 	#[error("Invalid NID length: must be 2-32 characters")]
 	InvalidNidLength,
 
-	/// The NID starts with a character other than a letter.
-	#[error("Invalid NID: must start with a letter")]
+	/// The NID starts with a character other than a letter or a digit.
+	#[error("Invalid NID: must start with a letter or a digit")]
 	InvalidNidStart,
 
 	/// The NID holds a character other than a letter, a digit, or a hyphen,
@@ -40,8 +40,25 @@ pub enum UrnValidationError {
 	#[error("Invalid NID characters: must be alphanumeric or hyphens, and end with an alphanumeric")]
 	InvalidNidCharacters,
 
-	/// The string is not of the form `urn:<nid>:<nss>`.
-	#[error("Invalid URN syntax: expected urn:<nid>:<nss>")]
+	/// The NSS breaks the NSS production of RFC 8141 § 2: it starts with a
+	/// `/`, it holds a character outside the `pchar` of RFC 3986 § 3.3 and
+	/// `/`, or two hex digits do not follow one of its `%` characters.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::urn::{Urn, UrnValidationError};
+	///
+	/// let refused = Urn::from_parts("example", "a b");
+	///
+	/// assert_eq!(refused, Err(UrnValidationError::InvalidNssCharacters));
+	/// ```
+	#[error("Invalid NSS characters: must be RFC 3986 pchar or '/', and must not start with '/'")]
+	InvalidNssCharacters,
+
+	/// The string is not a URN of RFC 8141 § 2: `urn:<nid>:<nss>`, then an
+	/// optional `?+` r-component, `?=` q-component, and `#` f-component.
+	#[error("Invalid URN syntax: expected urn:<nid>:<nss>, then optional ?+, ?=, and # components")]
 	InvalidUrnSyntax,
 
 	/// A [`UrnBuilder`] holds both a direct NSS and a spec, so no one mode

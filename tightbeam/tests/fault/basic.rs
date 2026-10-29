@@ -290,8 +290,10 @@ tb_assert_spec! {
 
 fn build_multi_fault_config(process: Process) -> FdrConfig {
 	// Three fault types at three injection points reach three error paths,
-	// after the multiple fault injection campaigns of Hsueh et al. (1997).
-	let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
+	// after the multiple fault injection campaigns of Hsueh et al. (1997). The
+	// random strategy can inject a point at its first visit, so a walk that
+	// visits a point once can take its fault.
+	let fault_model = FaultModel::from(InjectionStrategy::Random)
 		.with_fault(
 			States::Sending,
 			RESPONSE,
@@ -360,8 +362,10 @@ tightbeam::tb_assert_spec! {
 }
 
 fn build_coverage_config(process: Process) -> FdrConfig {
-	// One fault on each of five transitions aims at full branch coverage.
-	let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
+	// One fault on each of five transitions aims at full branch coverage. The
+	// random strategy can inject a point at its first visit, so a walk that
+	// visits a point once can take its fault.
+	let fault_model = FaultModel::from(InjectionStrategy::Random)
 		.with_fault(
 			States::Idle,
 			REQUEST,

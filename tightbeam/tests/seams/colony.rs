@@ -28,8 +28,10 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use tightbeam::builder::TypeBuilder;
+use tightbeam::clock::UnixMillis;
 use tightbeam::colony::cluster::{
-	Cluster, ClusterConfig, ClusterHeartbeat, ClusterTlsConfig, GossipConfig, GossipJournal, MemoryGossipJournal,
+	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, ClusterTlsConfig, GossipConfig, GossipJournal,
+	MemoryGossipJournal,
 };
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig};
 use tightbeam::colony::protocol::{ClusterRequest, GossipRumor};
@@ -52,9 +54,8 @@ use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
 use tightbeam::urn::Urn;
-use tightbeam::utils::time::UnixMillis;
 use tightbeam::x509::Certificate;
-use tightbeam::{absent, at_least, cluster, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, urn};
+use tightbeam::{absent, at_least, cluster, exactly, hive, servlet, tb_assert_spec, tb_scenario, urn};
 use tightbeam::{Frame, TightBeamError, Version};
 
 use super::{outside_identity_of, OutsideProvider};
@@ -491,7 +492,7 @@ tb_scenario! {
 			let work = Version::V0.compose().with_id(b"outside-work").with_message(message).build()?;
 			let echoed = client.submit_work_to(echo_urn(), &work).await?;
 
-			let content: TestMessage = decode(echoed.message())?;
+			let content: TestMessage = echoed.decode_message()?;
 			assert_eq!(content.content, OUTSIDE_CONTENT, "the forwarded work echoes");
 
 			registered.stop();
@@ -524,11 +525,28 @@ tb_scenario! {
 			let call = Version::V0.compose().with_id(b"outside-call").with_message(message).build()?;
 
 			let echoed = hive.context().call(&echo_urn(), call).await?;
-			let content: TestMessage = decode(echoed.message())?;
+			let content: TestMessage = echoed.decode_message()?;
 			assert_eq!(content.content, OUTSIDE_CONTENT, "the hive's context call echoes");
 
 			hive.stop();
 			Ok(())
 		}
 	}
+}
+
+/// A gateway outside the crate mints the route key of its gossip ingress
+/// through the public method that the house gateway calls at start, so it
+/// refuses an ingress outside the namespace its configuration serves.
+#[test]
+fn an_outside_gateway_refuses_a_gossip_ingress_outside_its_namespace() -> Result<(), Box<dyn core::error::Error>> {
+	let colony = OutsideColony::generate();
+	let feed = ColonyNamespace::default().servlet("feed")?;
+	let gossip = GossipConfig { ingress: Some(feed), ..GossipConfig::default() };
+
+	let tls = colony.gateway_tls(&colony.receiver, &colony.advertiser);
+	let acme = ColonyNamespace::new("acme", "prod")?;
+	let builder = ClusterConfig::builder(tls).with_gossip_config(gossip);
+	let config = builder.with_namespace(acme).build();
+	assert!(matches!(config.gossip_ingress_key(), Err(ClusterError::UnknownServletType(_))));
+	Ok(())
 }

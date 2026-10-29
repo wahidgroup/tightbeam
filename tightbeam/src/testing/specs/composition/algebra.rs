@@ -79,8 +79,10 @@ impl ProcessBuilder {
 	/// that `as_event` labels at `from`, with each target mapped through
 	/// `map_target`.
 	///
-	/// A timed edge keeps its guard and its clock resets, and the copy
-	/// declares each clock that the edge names.
+	/// - A timed edge keeps its guard and its clock resets, and the copy
+	///   declares each clock that the edge names.
+	/// - Each copy keeps the components that move on its edge, and the copy
+	///   holds as many components as `process`.
 	fn copy_edges<T>(
 		self,
 		process: &Process,
@@ -91,14 +93,23 @@ impl ProcessBuilder {
 	where
 		T: Fn(&State) -> State,
 	{
+		let movers = |target: State| process.components.moving((state, event, target), 0);
+		let builder = self.components(process.components.count());
+
 		let untimed = process.transitions.targets(state, &event).unwrap_or_default().iter();
-		let builder = untimed.fold(self, |b, target| b.add_transition(from, as_event, map_target(target)));
+		let builder = untimed.fold(builder, |b, target| {
+			let to = map_target(target);
+			let added = b.add_transition(from, as_event, to);
+			added.add_movers((from, as_event, to), movers(*target))
+		});
 
 		#[cfg(feature = "testing-timing")]
 		let builder = process.timed_edges(state, &event).iter().fold(builder, |b, edge| {
 			let declared = edge.clocks().fold(b, |declared, clock| declared.clock(clock));
 			let resets = edge.reset_clocks.iter().cloned();
-			declared.add_timed_transition(from, as_event, map_target(&edge.to), edge.guard.clone(), resets)
+			let to = map_target(&edge.to);
+			let copied = declared.add_timed_transition(from, as_event, to, edge.guard.clone(), resets);
+			copied.add_movers((from, as_event, to), movers(edge.to))
 		});
 
 		builder

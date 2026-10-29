@@ -49,7 +49,7 @@ Four traits attach policies to a transport, one per kind: `RestartConfig::with_r
 
 ### Endpoint configuration
 
-Every transport constructor takes one `EndpointConfig<P>`: the provisioning, the negotiation input, the limits, and the clock.
+Every transport constructor takes one `EndpointConfig<P>`: the provisioning, the negotiation input, the limits, and the clock. Each handshake of the transport reads the validity period of a peer certificate on that clock.
 
 | Type                           | Constructor                                     | Setters                                                                    |
 | ------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------------- |
@@ -94,9 +94,14 @@ Tags 2, 5, and 6 stay reserved, so an archived capture keeps its meaning. `Reque
 | `operation_timeout` | 30 s, `DEFAULT_OPERATION_TIMEOUT`         | A dial, and one read or write                   |
 | `handshake_timeout` | 10 s, `DEFAULT_HANDSHAKE_TIMEOUT`         | The whole handshake exchange                    |
 
-A reader admits `max_envelope()`, the larger of the two envelope ceilings, before the parse, and it checks the ceiling of the arm after it. An envelope past the ceiling of its mode fails with `OperationFailed(SizeExceeded)`. A handshake message past `handshake_wire` fails with `InvalidMessage` before the write.
+A reader admits `max_envelope()`, the larger of the two envelope ceilings, before the parse, and it checks the ceiling of the arm after it. An envelope past the ceiling of its mode fails with `OperationFailed(SizeExceeded)`. A handshake message whose transport envelope passes `handshake_wire` fails with `InvalidMessage` before the write, and a handshaking reader caps the same envelope.
 
-`TransportEncryptionConfig::with_limits` and `EndpointConfig::with_limits` replace the ceilings:
+`TransportEncryptionConfig::with_limits` and `EndpointConfig::with_limits` replace the ceilings once `TransportLimits::checked` admits them. The check returns a `CheckedLimits`, the form that both configurations, every transport, and `EnvelopeBuilder::with_limits` hold, so a set whose ceilings disagree reaches no transport. It fails with `TransportError::InvalidLimits`, and its `LimitsRefusal` names the rule that the set breaks:
+
+| Refusal                  | Set                                                                                    |
+| ------------------------ | -------------------------------------------------------------------------------------- |
+| `ZeroCeiling`            | A ceiling or a deadline is zero, so it refuses everything it bounds                    |
+| `HandshakePastCleartext` | A handshake message of `handshake_wire` octets passes `cleartext_envelope` on the wire |
 
 ```rust
 use core::time::Duration;
@@ -113,9 +118,12 @@ let limits = TransportLimits {
     ..TransportLimits::default()
 };
 let identity = TestIdentity::insecure_fixed();
-let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity).with_limits(limits);
+let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity).with_limits(limits)?;
 # drop(config);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+A client or a pool takes its `with_timeout` value through the same check before it dials.
 
 ### Record limits
 
@@ -301,10 +309,10 @@ assert_eq!(chain.evaluate(None, &SessionContext::default()), TransitStatus::Reso
 | --------------------------- | -------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------- |
 | `NoRestart`                 | `NoRestart`                                              | It answers `NoRetry` at once              | The policy of a new transport                  |
 | `RestartLinearBackoff`      | `new(max_attempts, interval, scale_factor, jitter)`      | `scale_factor * interval * (n + 1)`       | 5 attempts, a 1 s interval, `DecorrelatedJitter` |
-| `RestartExponentialBackoff` | `new(max_attempts, scale_factor, jitter)`                | `scale_factor * 2^n`                      | 5 attempts, 1000 ms, `DecorrelatedJitter`       |
+| `RestartExponentialBackoff` | `new(max_attempts, base_delay, jitter)`                  | `base_delay * 2^n`                        | 5 attempts, a 1 s base delay, `DecorrelatedJitter` |
 
 - Both backoff policies answer `NoRetry` once `attempt` reaches `max_attempts`.
-- `interval` is a `Duration`, and the exponential `scale_factor` counts milliseconds.
+- `interval` and `base_delay` are each a `Duration`, and each policy reads it in whole milliseconds at each delay.
 - A `JitterStrategy` maps each computed delay to the one the policy waits. `DecorrelatedJitter` draws it between a third of the delay and the delay, so peers that fail together retry apart.
 - `CoreRetryPolicy` exposes `max_attempts` and `delay_ms(attempt)`, so a caller that retries its own operation reads the same schedule.
 
@@ -594,11 +602,11 @@ On a multiplexed lease, `emit` handles two failures of `emit_on_stream`. `Stream
 use core::time::Duration;
 use std::sync::Arc;
 
+use tightbeam::clock::SystemClock;
 use tightbeam::constants::DEFAULT_MAX_POOL_CONNECTIONS;
 use tightbeam::transport::client::{ConnectionBuilder, ConnectionPoolBuilder};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::PoolConfig;
-use tightbeam::utils::time::SystemClock;
 
 // A cleartext pool that drops a connection after 30 idle seconds, at the
 // default connection cap.
@@ -621,7 +629,7 @@ let pool = Arc::new(builder.allow_cleartext().build());
 | Provide a durable sink     | An `EventSink` in `TraceConfig::with_sink`. The default is a `BoundedMemorySink` of `max_events` (1024) events              |
 | Map the clock              | `TraceCollector::with_clock(clock)`, which records `TRACE_CLOCK_ORIGIN` once per origin                                      |
 
-The default sink keeps the oldest events up to `max_events`, keeps one `WARN` record in place of the next, and drops each later one, and its `overflowed` latch then reads `true`. The warning takes the sequence number of the event it replaces, and the collector asks `EventSink::retains` after it takes the sequence number of an event, so each later dropped event leaves a gap in the sequence.
+The default sink keeps the oldest events up to `max_events`, keeps one `WARN` record in place of the next, and drops each later one, and its `overflowed` latch then reads `true`. The warning takes the sequence number of the event it replaces, and its label is the URN of that event. The warning and the `overflow` field of the evidence, which the evidence hash covers, show where truncation began. The collector asks `EventSink::retains` after it takes the sequence number of an event, so each dropped event still takes its number, and a gap in `seq` before a later retained event marks the events dropped there.
 
 The access and session verdicts are these events of `tightbeam::instrumentation::events`:
 

@@ -39,7 +39,7 @@ mod guard;
 use guard::{Bounds, Candidate, GuardedTable, PeerEntry, TableState};
 
 use super::{AdmittedDial, ClusterError, PeerConfig, SharedId};
-use crate::utils::time::UnixMillis;
+use crate::clock::UnixMillis;
 
 /// A gateway socket address, parsed once where it enters.
 ///
@@ -240,8 +240,8 @@ pub struct PeerHint {
 /// ```
 /// use core::net::SocketAddr;
 ///
+/// use tightbeam::clock::UnixMillis;
 /// use tightbeam::colony::cluster::{ClusterError, PeerAddress, PeerRecord, PeerStore};
-/// use tightbeam::utils::time::UnixMillis;
 ///
 /// struct SeedStore;
 ///
@@ -406,9 +406,9 @@ impl PeerTable {
 	/// # Examples
 	///
 	/// ```
+	/// use tightbeam::clock::UnixMillis;
 	/// use tightbeam::colony::cluster::{PeerConfig, PeerTable};
 	/// use tightbeam::colony::protocol::PeerGossip;
-	/// use tightbeam::utils::time::UnixMillis;
 	///
 	/// let gossip = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.0.0.1:9000".to_vec() };
 	/// let hint = PeerConfig::default().admit_hint(gossip)?;
@@ -842,8 +842,8 @@ mod tests {
 	/// A table over `store` whose one anchor the operator configured at
 	/// `anchor`.
 	fn anchored(anchor: impl AsRef<str>, store: Arc<dyn PeerStore>) -> PeerTable {
-		let mut peer = PeerConfig::default();
-		peer.set_anchors([anchor.as_ref()]).expect("fixture anchors name sockets");
+		let peers = PeerConfig::anchors([anchor.as_ref()]).expect("fixture anchors name sockets");
+		let peer = PeerConfig { peers, ..PeerConfig::default() };
 		PeerTable::new(&peer, store)
 	}
 

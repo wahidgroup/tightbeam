@@ -1,10 +1,13 @@
-//! An outside crate writes its own [`LogBackend`], and a trace hands each
-//! record that its filter admits to that backend.
+//! An outside crate writes its own [`LogBackend`], and a trace hands that
+//! backend each record that its filter admits and the backend accepts. The
+//! trace flushes the backend on [`TraceCollector::flush_log`] and when its last
+//! handle drops.
 //!
 //! The backend reaches the trace through [`TraceCollector::with_logger`] on a
 //! built collector, and through [`TraceConfig::with_logger`] on the
 //! configuration of a new one.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tightbeam::trace::{
@@ -74,4 +77,83 @@ fn a_trace_config_hands_its_outside_backend_to_the_collector() {
 	let records = records_of(&trace, &kept);
 
 	assert_eq!(records, [(LogLevel::Error, SENT.to_string())]);
+}
+
+/// A backend that accepts the records of `Error` and each more severe level,
+/// keeps the message of each record it receives, and counts its flushes.
+#[derive(Clone, Default)]
+struct Selective {
+	messages: Arc<Mutex<Vec<String>>>,
+	flushes: Arc<AtomicUsize>,
+}
+
+impl Selective {
+	/// The messages of the records this backend received, in order.
+	fn messages(&self) -> Vec<String> {
+		let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+		messages.clone()
+	}
+
+	/// The count of the flushes this backend ran.
+	fn flushes(&self) -> usize {
+		self.flushes.load(Ordering::Relaxed)
+	}
+}
+
+impl LogBackend for Selective {
+	fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
+		let mut messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+		messages.push(record.message.to_string());
+		Ok(())
+	}
+
+	fn accepts(&self, level: LogLevel) -> bool {
+		level <= LogLevel::Error
+	}
+
+	fn flush(&self) -> Result<(), LogError> {
+		self.flushes.fetch_add(1, Ordering::Relaxed);
+		Ok(())
+	}
+}
+
+/// The trace reads `accepts` of an outside backend, so a record that the
+/// filter admits and the backend refuses reaches no backend.
+#[test]
+fn an_outside_backend_receives_each_record_it_accepts() -> Result<(), Box<dyn std::error::Error>> {
+	let backend = Selective::default();
+	let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
+	let trace = TraceCollector::new().with_logger(config)?;
+
+	trace.event(SENT)?.with_log_level(LogLevel::Error).emit();
+	trace.event(SKIPPED)?.with_log_level(LogLevel::Warning).emit();
+
+	assert_eq!(backend.messages(), [SENT.to_string()]);
+	Ok(())
+}
+
+/// `flush_log` flushes an outside backend while the trace is live.
+#[test]
+fn flush_log_flushes_an_outside_backend() -> Result<(), Box<dyn std::error::Error>> {
+	let backend = Selective::default();
+	let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
+	let trace = TraceCollector::new().with_logger(config)?;
+
+	trace.flush_log()?;
+
+	assert_eq!(backend.flushes(), 1);
+	Ok(())
+}
+
+/// The last handle of a trace flushes an outside backend when it drops.
+#[test]
+fn the_last_handle_of_a_trace_flushes_its_outside_backend() -> Result<(), Box<dyn std::error::Error>> {
+	let backend = Selective::default();
+	let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
+	let trace = TraceCollector::new().with_logger(config)?;
+
+	drop(trace);
+
+	assert_eq!(backend.flushes(), 1);
+	Ok(())
 }

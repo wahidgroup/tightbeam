@@ -187,19 +187,21 @@ impl<'a> UrnBuilder<'a> {
 	/// # RFC 8141 Compliance
 	///
 	/// The URN has the format `urn:<NID>:<NSS>`, where:
-	/// - The NID has 2-32 characters of letters, digits, and hyphens, starts
-	///   with a letter, and ends with a letter or digit.
-	/// - The selected mode constructs the NSS.
+	/// - The NID has 2-32 characters of letters, digits, and hyphens, and
+	///   starts and ends with a letter or digit.
+	/// - The selected mode constructs the NSS, a run of the `pchar` of RFC 3986 § 3.3 and `/`.
 	///
 	/// # Errors
 	///
 	/// - [`UrnValidationError::RequiredFieldMissing`] -- the NID is missing,
 	///   the NSS is empty, or the default mode has no components.
 	/// - [`UrnValidationError::InvalidNidLength`] -- the NID is not 2-32 characters long.
-	/// - [`UrnValidationError::InvalidNidStart`] -- the NID starts with a character other than a letter.
+	/// - [`UrnValidationError::InvalidNidStart`] -- the NID starts with a
+	///   character other than a letter or a digit.
 	/// - [`UrnValidationError::InvalidNidCharacters`] -- the NID holds a
 	///   character other than a letter, a digit, or a hyphen, or it ends with a
 	///   hyphen.
+	/// - [`UrnValidationError::InvalidNssCharacters`] -- the NSS breaks the NSS production of RFC 8141 § 2.
 	/// - [`UrnValidationError::ConflictingNssModes`] -- the builder holds both a direct NSS and a spec.
 	/// - Any error of the spec's `validate` or `build_nss`, in the `with_spec()` mode.
 	pub fn build(mut self) -> Result<Urn<'a>, UrnValidationError> {
@@ -440,7 +442,7 @@ mod tests {
 	// The builder names a malformed NID before it checks the NSS.
 	#[test]
 	fn the_builder_names_a_malformed_nid_before_an_empty_nss() {
-		let result = UrnBuilder::default().with_nid("9bad").with_nss("").build();
+		let result = UrnBuilder::default().with_nid("-bad").with_nss("").build();
 		assert!(matches!(result, Err(UrnValidationError::InvalidNidStart)), "got {result:?}");
 	}
 

@@ -61,6 +61,7 @@ use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef};
 use tightbeam::der::oid::AssociatedOid;
 use tightbeam::der::{Any, Decode, Encode, Tag};
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{CURVE_NIST_P256, DATA, SIGNER_ECDSA_WITH_SHA3_256};
 use tightbeam::random::{CryptoRngCore, OsRng};
 use tightbeam::spki::{
@@ -73,7 +74,6 @@ use tightbeam::transport::handshake::{
 	Handshake, HandshakeCurve, HandshakeError, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings,
 	HpkeServerSettings, LearnedTrust, ProvisionedTrust, Server, ServerConfig, ServerFlow, SupportedProfiles,
 };
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::ext::pkix::KeyUsages;
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;

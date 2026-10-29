@@ -283,7 +283,7 @@ The macro emits a unit struct with `Default` and `CompositionSpec`:
 | `timeout_ms`       | `u64`                         | 5000       | `testing-fdr`   | The time budget of each search of the refinement checker               |
 | `specs`            | `Vec<Process>`                | empty      | `testing-fdr`   | The specs that the subject must refine                                  |
 | `fail_fast`        | `bool`                        | `true`     | `testing-fdr`   | Whether each refinement pass returns at its first counterexample        |
-| `scheduler`        | `Option<SchedulerConstraint>` | `None`     | `testing-fault` | The resource-constraint model of the run                                |
+| `scheduler`        | `Option<SchedulerConstraint>` | `None`     | `testing-fault` | The schedulers that run the component processes of the run           |
 | `fault_model`      | `Option<FaultModel>`          | `None`     | `testing-fault` | The faults that exploration injects                                     |
 | `fmea_config`      | `Option<FmeaConfig>`          | `None`     | `testing-fmea`  | The FMEA that a run with injected faults reports                        |
 
@@ -298,6 +298,16 @@ The specs and the fault model select the exploration:
 | Some  | Some        | Each spec runs under the faults of the model |
 
 `SchedulerConstraint::new(model, SchedulerCounts { schedulers, processes })` builds the constraint. Both counts are `NonZeroU32`, the model is `SchedulerModel::Cooperative` or `SchedulerModel::Preemptive`, and the constructor returns an `FdrConfigError` for more schedulers than processes.
+
+A run reads the constraint at each process that a seed walks and at the subject of each refinement check. The `processes` count is the number of component processes that the parallel compositions of that process number, the left operand first. A recorded trace ran under its own schedule, so it runs as it is. The run explores the process that the schedulers let it run, by these rules:
+
+- A component takes an edge when it holds a scheduler, or when a scheduler is free and it takes one.
+- A shared event, an edge of more than one component, needs one of its components to hold or take a scheduler.
+- A component with no edge at its state is blocked, and it yields its scheduler.
+- Under `Cooperative`, a component also yields when it takes a shared event, and it keeps its scheduler across every other event.
+- Under `Preemptive`, every component yields after each event, so a preemptive constraint removes no untimed trace.
+
+A state of the scheduled process is named `State@{c,...}` after the components that hold a scheduler, and a fault point at a state of the process fires at each scheduled state of it. A process that composes other than `processes` components, or that holds a timed transition, makes the run return `TestingError::FdrConfig`.
 
 `DefaultFdrExplorer::with_defaults(&process, config).explore()` runs Layer 3 over one process outside a scenario:
 
@@ -384,21 +394,34 @@ The tools of [README §12.5](../README.md#125-formal-csp-theory) live in `tightb
 
 ### CspmExporter
 
-`CspmExporter::new(&process).export(&mut writer)` writes the process as CSPM to any `std::io::Write`. The output has five parts:
+`CspmExporter::new(&process).export(&mut writer)` writes the process as a CSPM script to any `std::io::Write`. The script has five parts:
 
-1. A comment header with the process name and its description.
-2. `datatype Observable`, `datatype Hidden` when the process has hidden events, and `datatype States`.
-3. `channel obs : Observable` and `channel hid : Hidden`, in every export.
-4. One equation per state. A terminal state is `SKIP`, a state with no enabled action is `STOP`, and any other state is an external choice of `obs.e -> NextProcess` and `hid.e -> NextProcess` terms.
-5. The main process, `Name = InitialProcess \ {| hid |}`.
+1. A comment header with the process name and its description, one comment line per line of the description.
+2. `datatype Events`, with one constructor per event, `channel obs : Events` when the process has observable events, and `channel hid : Events` when it has hidden events.
+3. `datatype States`, with one constructor per state.
+4. One equation per state.
+5. The main process, `Main_Name = P_Initial \ {| hid |}`, or `Main_Name = P_Initial` for a process with no hidden event.
 
-The equations follow three rules:
+The equations follow these rules:
 
-- Each datatype constructor is the full URN rendering of its event, such as `urn:test:event:probe/a`.
-- A terminal state exports as `SKIP`, whatever transitions it has.
-- A nondeterministic transition exports its first target.
+- An accepting state offers `SKIP` in an external choice beside its transitions, so a cyclic process with `terminal { Idle }` can end at `Idle` or go on.
+- An enabled action is the prefix `obs.E_e -> P_Next` or `hid.E_e -> P_Next`.
+- A nondeterministic event leads to the internal choice of its targets, `obs.E_e -> (P_A |~| P_B)`.
+- A state that is not accepting and enables no action is `STOP`.
+- A timed transition is an edge whatever the clocks read, as `Process::step` reads it.
 
-`CspmExporter::export_composition(&expr, &mut writer)` writes a process expression of a composition.
+Each name becomes a CSPM identifier, a letter and then letters, digits, and underscores:
+
+| Kind                    | Prefix  | Name                     | Identifier                             |
+| ----------------------- | ------- | ------------------------ | -------------------------------------- |
+| Event                   | `E_`    | `urn:test:event:probe/a` | `E_urn_3a_test_3a_event_3a_probe_2f_a` |
+| State                   | `S_`    | `Idle`                   | `S_Idle`                               |
+| The equation of a state | `P_`    | `Idle`                   | `P_Idle`                               |
+| The process             | `Main_` | `Every form`             | `Main_Every_20_form`                   |
+
+After the prefix, each ASCII letter and digit stays, and each other character, the underscore among them, becomes `_`, its code point in hexadecimal, and `_`. So each name has its own identifier. The constructors and the equations are sorted by name, so two exports of one process write one script.
+
+`CspmExporter::export_composition(&expr, &mut writer)` evaluates the expression and writes the process it evaluates to, under a comment that names the expression. It returns a `CspmExportError`: `Composition` holds the `CompositionError` of an expression that does not evaluate, and `Io` holds the error of the writer.
 
 ### FdrTraceExt
 
@@ -411,7 +434,7 @@ The equations follow three rules:
 | `assertion_count(label)`             | `usize`                    | The assertions whose label is `label`                                |
 | `project_to_observable()` (`instrument`) | `Vec<String>`          | The labels of the observable instrumentation events                  |
 | `project_to_hidden()` (`instrument`) | `Vec<String>`              | The labels of the hidden instrumentation events                      |
-| `export_cspm(&mut writer)`           | `std::io::Result<()>`      | The observable events as the CSPM sequence `Trace`                   |
+| `export_cspm(&mut writer)`           | `std::io::Result<()>`      | The observable events as the CSPM sequence `Trace`, with the declarations of its events |
 | `to_process()`                       | `Process`                  | A linear process of the assertion events                             |
 | `to_process_with_mode(mode)`         | `Process`                  | A linear process of the events that `mode` selects                   |
 
@@ -449,7 +472,7 @@ The fault model of [README §12.6](../README.md#126-fault-injection) needs `test
 | `FaultModel::from(strategy)`                           | The same with `strategy`                                              |
 | `with_fault(state, event, error_fn, probability)`      | An injection point of FDR exploration at one state and one event      |
 | `with_event_fault(event, error_fn, probability)`       | An injection point at each runtime record of the event, in every state |
-| `with_seed(seed)`                                      | The seed of the random strategy                                       |
+| `with_seed(seed)`                                      | The seed of the random strategy, at runtime and in FDR exploration    |
 
 - `state` is a `ProcessState`, and `event` is a `ProcessEvent`.
 - `error_fn` is a `Fn() -> E + Send + Sync + 'static`, where `E: Into<TightBeamError>`.
@@ -466,7 +489,12 @@ The fault model of [README §12.6](../README.md#126-fault-injection) needs `test
 
 The deterministic rule spreads the injections over the records of each label. At 3000 basis points, it injects on records 4, 7, and 10 of 10.
 
-The strategy and the seed of the model decide runtime injection. FDR exploration draws each injection from the generator of its own exploration seed, so a point injects when that draw, modulo 10000, is below its probability.
+The strategy and the seed of the model decide injection at runtime and in each walk of FDR exploration. Each walk starts the strategy again:
+
+- The deterministic count starts at zero, and a record is a visit of the event at a state with an injection point.
+- The generator starts at the seed of the model XOR the exploration seed of the walk, so a repeated model seed repeats the injections of each walk.
+
+In a walk, an injected fault fails the chosen event, and the walk chooses again from the actions that remain. When the faults leave no action, an accepting state ends the walk there, as the process can terminate, and any other state is a deadlock that counts in `error_recovery_failed`.
 
 ### ProcessState and ProcessEvent
 
@@ -574,6 +602,18 @@ A named scenario expands to one test function:
 
 `ScenarioVerdict` returns each layer: `spec()` the Layer 1 violation, `csp()` the Layer 2 result, `fdr()` the `FdrVerdict`, and `exploration()` the events that the exploration of Layer 3 recorded into a trace of its own. `outcome(expect)` grades every layer together.
 
+### Expected frames
+
+`ExpectedMatcher::matches(&frame)` returns `true` when a `Frame` that a scenario received carries the expected value:
+
+| Expected value             | Matches                                                                                          |
+| -------------------------- | ------------------------------------------------------------------------------------------------ |
+| `Frame`, `Arc<Frame>`      | A frame with the same `metadata.id`                                                              |
+| `Result<Frame, E>`         | A frame with the `metadata.id` of the `Ok` frame. An `Err` matches no frame                      |
+| `T: Message + PartialEq`   | A frame whose body arrived in cleartext, meets the requirements of `T`, and decodes to an equal `T` |
+
+`expected.record_match(&trace, LABEL, &frame)` records `LABEL` with the outcome of `matches` as a `bool` value, and the spec of the scenario asserts it with `(LABEL, exactly!(1), equals!(true))`. A frame without the expected value records `false`, so the assertion layer rejects the run. An outside crate implements `matches` for an expected value of its own, and `record_match` grades it the same way.
+
 ### Panics
 
 A scenario panics, and so fails its test, at each of these:
@@ -677,7 +717,7 @@ The FMEA of [README §12.10.5](../README.md#12105-fmeafmeca-mil-std-1629-iso-262
 
 | `FmeaReport` field  | Type               | Content                                                      |
 | ------------------- | ------------------ | ------------------------------------------------------------ |
-| `failure_modes`     | `Vec<FailureMode>` | One failure mode per injected fault record                   |
+| `failure_modes`     | `Vec<FailureMode>` | One failure mode per injection point that fired              |
 | `severity_scale`    | `SeverityScale`    | The scale of the ratings                                     |
 | `total_rpn`         | `u32`              | The sum of the RPN of every failure mode                     |
 | `critical_failures` | `Vec<usize>`       | The index of each failure mode whose RPN exceeds the threshold |
@@ -702,7 +742,7 @@ The FMEA of [README §12.10.5](../README.md#12105-fmeafmeca-mil-std-1629-iso-262
 | Occurrence | `SeverityScale::occurrence(bps)`          | `bps / 1000 + 1` or `bps / 2500 + 1`, capped at the maximum of the scale |
 | Detection  | `FdrVerdict::detection(scale)`            | `(1 - recovered / attempts) × (max - 1) + 1`, truncated, or the midpoint with no attempt |
 
-`FdrVerdict::fmea_report(processes, config)` builds the report from the faults of the verdict. Each fault rates at the state it names in the first of `processes` that holds that state, and a fault whose state no process holds rates as a fault in an unknown state. A run that injects a fault under `auto_generate` passes the processes that its faults fired in:
+`FdrVerdict::fmea_report(processes, config)` builds the report from the faults of the verdict, with one failure mode per injection point however many seeds it fired in. Each fault rates at the state it names in the first of `processes` that holds that state, and a fault whose state no process holds rates as a fault in an unknown state. A run that injects a fault under `auto_generate` passes the processes that its faults fired in:
 
 - A run that explores each spec under a fault model passes its specs.
 - A run that explores the subject over every seed passes the subject process.

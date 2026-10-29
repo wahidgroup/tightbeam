@@ -95,8 +95,8 @@ Each objective of [README §10.1](../README.md#101-objectives) has one mechanism
 | Objective                              | Mechanism                                                                                                                                                                                  |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Amortized O(1) emission                | One relaxed atomic add takes the sequence number. The sink answers `retains` before the collector builds the event, so an event that the sink refuses allocates nothing. A sink MUST keep `emit` and `retains` amortized O(1) |
-| Increasing sequence numbers            | Each trace state holds one `AtomicU32` counter from 0. A dropped event consumes its number, so the overflow warning or a gap marks it. The counter wraps past `u32::MAX` |
-| Deterministic, hash-stable evidence    | The events encode as DER with EXPLICIT tags, and the hashes cover that DER. The event API stamps `timestamp_ns`, and `trace/clock-origin` carries the Unix time, so two runs give one hash when their clocks read the same values, as a `ManualClock` does |
+| Increasing sequence numbers            | Each trace state holds one `AtomicU64` counter from 0. A dropped event consumes its number, so the overflow warning or a gap before a later retained event marks it |
+| Deterministic, hash-stable evidence    | The events encode as DER with EXPLICIT tags, and the hashes cover that DER. The event API stamps `timestamp_ns`, and `trace/clock-origin` carries the Unix time, so two runs give one hash when their clocks read the same values, as one `ManualClock` does |
 | Feature-gated detail                   | `instrument` compiles the records, and each flag of `TbInstrumentationConfig` turns on one kind of detail                                                                                  |
 | Payload privacy                        | The collector keeps the SHA3-256 hash of a payload, and the raw bytes reach no sink                                                                                                        |
 
@@ -154,7 +154,7 @@ The trace analysis of FDR reads these six URNs as hidden steps.
 
 | Field          | Type                        | Holds                                                                       | Set by                                                         |
 | -------------- | --------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `seq`          | `u32`                       | The number that the counter of the trace gave it                            | Every record                                                   |
+| `seq`          | `u64`                       | The number that the counter of the trace gave it                            | Every record                                                   |
 | `urn`          | `Urn<'static>`              | The event kind                                                              | Every record                                                   |
 | `label`        | `Option<Cow<'static, str>>` | Why the event fired. A static label stays borrowed, and a decoded one is owned | Each method that takes a label, and the `event` builders     |
 | `payload_hash` | `Option<[u8; 32]>`          | The SHA3-256 hash of the payload                                            | A payload, when `enable_payloads` is on                        |
@@ -167,7 +167,7 @@ The trace analysis of FDR reads these six URNs as hidden steps.
 
 ### The trace clock
 
-- A collector adopts `SystemClock` where the host has one, which is a `std` build on any target but `wasm32-unknown-unknown`. `with_clock` adopts another, such as `ManualClock` (`tightbeam::utils::time`).
+- A collector adopts `SystemClock` where the host has one, which is a `std` build on any target but `wasm32-unknown-unknown`. `with_clock` adopts another, such as `ManualClock` (`tightbeam::clock`).
 - Each adoption takes a new origin, and the next event of the event API records `trace/clock-origin` first, once per origin.
 - The origin is in Unix-epoch nanoseconds, at the millisecond precision of the clock.
 - A build with no host clock stamps its events once a clock is adopted.
@@ -284,14 +284,14 @@ assert!(trace.overflowed());
 | `EvidenceArtifact::of(spec_hash: [u8; 32], trace: &ConsumedTrace)` | The artifact of the instrument events of `trace`, with `overflow` set when `trace.is_complete()` reads `false` (`testing`) |
 | `spec_hash()`                                            | The 32 bytes that the caller passed, as `&OctetString`                                                       |
 | `trace_hash()`                                           | The SHA3-256 hash of the DER of `events()`, as `&OctetString`                                                |
-| `evidence_hash()`                                        | The SHA3-256 hash of `spec_hash` followed by `trace_hash`, as `&OctetString`                                 |
+| `evidence_hash()`                                        | The SHA3-256 hash of `spec_hash`, then `trace_hash`, then the DER of `overflow`, as `&OctetString`           |
 | `events()`                                               | The events that the trace hash covers, in the order of the trace                                             |
 | `overflow()`                                             | Whether the trace misses events of its run                                                                   |
 
 - The fields are private, so `of` and the DER decode are the two ways to build an artifact.
 - `of` streams the DER of the events into the digest as it encodes them. It returns `TightBeamError::SerializationError` when that DER passes the length that DER encodes.
 - The artifact derives `Beamable`, so a frame can carry it as its message.
-- `overflow` sits outside both hashes.
+- The evidence hash covers the DER of `overflow`, a BOOLEAN, so the evidence hash of a run fixes whether its trace misses events.
 
 ### DER of an event
 
@@ -346,6 +346,7 @@ The trace keeps recording through each failure of [README §10.7](../README.md#1
 | The sink is full                          | The sink keeps the overflow warning in place of the first event past its bound, drops each later event, and sets its latch. The sequence number of each dropped event stays taken |
 | A panic poisoned a lock of the trace      | Each lock reads through the poison, because each write under it leaves a whole value                        |
 | A log backend refuses a record            | The trace drops the outcome of the log write, and the event stays on the trace                              |
+| A log backend fails to flush              | `flush_log` returns the `LogError`. The flush that the drop of the last handle runs drops it                  |
 | A fault model injects at a label          | `event`, `event_with`, and the event API return the injected error (`testing-fault`)                        |
 | A job event fails to record               | `TracedResult::then_job` passes the error on as the error of the step                                       |
 | The drained record misses an event        | `ConsumedTrace::is_complete` reads `false`, `count_event_urn` returns `EventRecordTruncated`, and `EvidenceArtifact::of` sets `overflow` |
@@ -359,7 +360,7 @@ The trace keeps recording through each failure of [README §10.7](../README.md#1
 On overflow, the trace records the truncation in three places:
 
 - The latch of the sink reads `true`.
-- `is_complete` reads `false`, so `EvidenceArtifact::of` sets `overflow`, which sits outside both hashes.
+- `is_complete` reads `false`, so `EvidenceArtifact::of` sets `overflow`, which the evidence hash covers.
 - The `WARN` record (`event:core/warn`) takes the place and the sequence number of the first event that the sink dropped, inside the events that the trace hash covers.
 
 ## Logging subsystem
@@ -386,8 +387,8 @@ A backend writes the records to its output target. The trait is `Send + Sync`.
 | Method                                              | Default  | Contract                                                         |
 | --------------------------------------------------- | -------- | ---------------------------------------------------------------- |
 | `emit(&self, record: &LogRecord) -> Result<(), LogError>` | Required | Writes one record                                          |
-| `accepts(&self, level: LogLevel) -> bool`           | Required | Whether the backend takes records at `level`, by its own criteria. `MultiplexBackend` reads it for each inner backend |
-| `flush(&self) -> Result<(), LogError>`              | `Ok(())` | Flushes the buffered records of an async backend                 |
+| `accepts(&self, level: LogLevel) -> bool`           | Required | Whether the backend takes records at `level`, by its own criteria. The trace reads it before it hands the backend a record, and `MultiplexBackend` reads it for each inner backend |
+| `flush(&self) -> Result<(), LogError>`              | `Ok(())` | Flushes the buffered records of an async backend. The trace calls it on `TraceCollector::flush_log`, and once more when its last handle drops |
 
 `LogError` has three variants: `IoError`, `BufferFull`, and `BackendUnavailable`.
 
@@ -428,6 +429,7 @@ The fields of `LoggerConfig` are public: `backend: Box<dyn LogBackend>`, `filter
 - `TraceConfig::with_logger` names the logger when the trace is built.
 - `TraceCollector::with_logger` sets it on a trace that no other handle shares, so call it before `share`. A shared trace returns `TraceStateShared`, and `into_collector` hands the handle back.
 - The connection trace shares the logger of its owner.
+- `TraceCollector::flush_log` flushes the backend and returns the `LogError` of the flush. The last handle of the trace to drop, the connection trace included, flushes the backend once more and drops the outcome.
 
 A backend of its own, attached to a trace:
 
@@ -470,22 +472,41 @@ assert_eq!(*messages.lock()?, ["urn:example:event:security/login"]);
 
 ### URNs
 
-`Urn<'a>` (`tightbeam::urn`) holds a NID and an NSS as `Cow<'a, str>`, so a URN borrows its input. Equality and hashing compare both parts byte for byte.
+`Urn<'a>` (`tightbeam::urn`) holds a NID, an NSS, and the optional components of RFC 8141 § 2.3 as `Cow<'a, str>`, so a URN borrows its input. Equality and hashing follow URN-equivalence (RFC 8141 § 3.1):
+
+- The NID compares in any case.
+- The NSS compares octet by octet, with the hex digits of each percent-encoded triplet in one case. A triplet stays encoded.
+- The r-, q-, and f-components take no part.
 
 | Item                              | Behavior                                                                                                            |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `urn!(nid, nss)`                  | A `Urn<'static>` from literals, checked in a `const` block, so a malformed literal fails the build                  |
 | `Urn::from_parts(nid, nss)`       | A `Urn<'static>` from parts known at run time, under the same checks                                                |
-| `FromStr` for `Urn<'static>`      | Splits the text after a lower-case `urn:` at its first `:` into the NID and the NSS. Text of another shape gives `InvalidUrnSyntax` |
-| `nid()`, `nss()`                  | The two parts                                                                                                       |
+| `FromStr` for `Urn<'static>`      | Reads the text after a `urn:` scheme of any case: the NID to the first `:`, the NSS to the first `?` or `#`, then the optional `?+` r-component, `?=` q-component, and `#` f-component. A scheme, a delimiter, or a component of another shape gives `InvalidUrnSyntax` |
+| `nid()`, `nss()`                  | The two parts, as the URN wrote them                                                                                |
+| `r_component()`, `q_component()`, `f_component()` | Each optional component, when the URN carries it                                                    |
 | `verify::<S>()`                   | Checks the URN against the spec `S`, as [URN specs](#urn-specs) states                                              |
-| `Urn::validate_nid(nid)`          | A `const fn`: 2 to 32 ASCII letters, digits, and hyphens, with a letter first and a letter or a digit last          |
-| `Urn::validate_nss(nss)`          | A `const fn`: the NSS holds at least one character                                                                  |
+| `Urn::validate_nid(nid)`          | A `const fn`: 2 to 32 ASCII letters, digits, and hyphens, with a letter or a digit at each end                      |
+| `Urn::validate_nss(nss)`          | A `const fn`: the NSS production of RFC 8141 § 2, a `pchar` of RFC 3986 § 3.3, then a run of `pchar` and `/`. Each `%` starts a triplet of two hex digits |
 | `into_owned()`                    | A `Urn<'static>` that owns its parts                                                                                |
-| `Display`                         | `urn:<nid>:<nss>`                                                                                                   |
+| `NssText::new(text)`              | The text of an NSS, or of one segment of it, under the checks of `Urn::validate_nss`. `as_str()` gives the text and `decoded()` the octets it writes. Two texts compare as an NSS does, with the hex digits of each triplet in one case. A colony locator is an `NssText` |
+| `Display`                         | `urn:<nid>:<nss>`, then each optional component after its delimiter, with the scheme in lower case                 |
 | DER                               | A UTF8String of the full form. The decode parses it, so a decoded URN passes the same checks                        |
 
-The NID rule is the house's own: RFC 8141 § 2 also admits a digit first. `validate_nss` reads the length of the NSS alone, so every character passes it.
+`urn!`, `from_parts`, the builder, and the parser each check the NID and the NSS with these two functions. Three example URNs of RFC 8141 § 3.2 compare as the RFC states:
+
+```rust
+use tightbeam::urn::{Urn, UrnValidationError};
+
+let plain: Urn<'static> = "urn:example:a123,z456".parse()?;
+let shouted: Urn<'static> = "URN:EXAMPLE:a123,z456?=xyz".parse()?;
+let encoded: Urn<'static> = "urn:example:a123%2cz456".parse()?;
+
+assert_eq!(plain, shouted);
+assert_ne!(plain, encoded);
+assert_eq!(shouted.q_component(), Some("xyz"));
+# Ok::<(), UrnValidationError>(())
+```
 
 ### `UrnBuilder`
 
@@ -594,9 +615,10 @@ assert!(matches!(refused, Err(UrnValidationError::InvalidFormat { field: "kind",
 | `NidMismatch`                 | The NID differs from the NID of the spec                                               |
 | `RealmMismatch`               | The realm segment of a colony URN differs from the realm of its namespace              |
 | `InvalidNidLength`            | The NID is shorter than 2 or longer than 32 characters                                 |
-| `InvalidNidStart`             | The first character of the NID is no letter                                            |
+| `InvalidNidStart`             | The first character of the NID is no letter or digit                                   |
 | `InvalidNidCharacters`        | A character of the NID is no letter, digit, or hyphen, or the NID ends with a hyphen   |
-| `InvalidUrnSyntax`            | The text is not of the form `urn:<nid>:<nss>`                                          |
+| `InvalidNssCharacters`        | The NSS starts with a `/`, holds a character outside `pchar` and `/`, or holds a `%` that two hex digits do not follow |
+| `InvalidUrnSyntax`            | The text has no `urn:` scheme or no `:` after the NID, or an optional component breaks its production |
 | `ConflictingNssModes`         | The builder holds both a direct NSS and a spec                                         |
 | `NssMismatch`                 | The spec builds another NSS from the components that it reads                          |
 
@@ -616,7 +638,7 @@ The module `tightbeam::urn::specs` compiles under `cfg(test)`, so the spec build
 
 ### Jobs
 
-`Job` and `AsyncJob` (`tightbeam::utils::task`) are the traits of a stateless unit of work:
+`Job` and `AsyncJob` (`tightbeam::task`) are the traits of a stateless unit of work:
 
 | Item          | `Job`                                     | `AsyncJob`                                                               |
 | ------------- | ----------------------------------------- | ------------------------------------------------------------------------ |
@@ -642,7 +664,7 @@ The module `tightbeam::urn::specs` compiles under `cfg(test)`, so the spec build
 Code that takes any job reads the trait:
 
 ```rust
-use tightbeam::utils::task::Job;
+use tightbeam::task::Job;
 use tightbeam::{job, TightBeamError};
 
 job! {
@@ -665,7 +687,7 @@ assert_eq!(<AddNumbers as Job>::NAME, "AddNumbers");
 
 ### Job pipelines
 
-`Pipeline` (`tightbeam::utils::task`) chains computations on a `Result`. The trait is `Sized`:
+`Pipeline` (`tightbeam::task`) chains computations on a `Result`. The trait is `Sized`:
 
 | Item                         | Contract                                                                          |
 | ---------------------------- | --------------------------------------------------------------------------------- |
@@ -716,9 +738,9 @@ A job that fails records its `error` event, and the step passes its error on:
 ```rust
 use std::sync::Arc;
 
+use tightbeam::task::{Pipeline, PipelineBuilder};
 use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
-use tightbeam::utils::task::{Pipeline, PipelineBuilder};
 use tightbeam::{job, TightBeamError};
 
 job! {
@@ -744,7 +766,8 @@ assert_eq!(trace.recorded(REJECT_EMPTY_ERROR), 1);
 
 ## Sources
 
-- RFC 8141, Uniform Resource Names (URNs), § 2: <https://www.rfc-editor.org/rfc/rfc8141#section-2>
+- RFC 8141, Uniform Resource Names (URNs), § 2 and § 3: <https://www.rfc-editor.org/rfc/rfc8141#section-2>
+- RFC 3986, Uniform Resource Identifier (URI): Generic Syntax, § 2.1 and § 3.3: <https://www.rfc-editor.org/rfc/rfc3986#section-3.3>
 - RFC 5424, The Syslog Protocol, § 6.2.1: <https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1>
-- ITU-T X.690, ASN.1 encoding rules, § 8.4, § 8.10, and § 8.14: <https://www.itu.int/rec/T-REC-X.690>
+- ITU-T X.690, ASN.1 encoding rules, § 8.4, § 8.10, § 8.14, and § 11.1: <https://www.itu.int/rec/T-REC-X.690>
 - FIPS 202, SHA-3 Standard: <https://doi.org/10.6028/NIST.FIPS.202>

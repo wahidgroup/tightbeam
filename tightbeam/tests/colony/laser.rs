@@ -22,6 +22,7 @@ use tightbeam::der::Sequence;
 use tightbeam::{
 	at_least,
 	builder::TypeBuilder,
+	clock::{Clock, ManualClock},
 	cluster,
 	colony::{
 		cluster::{Cluster, ClusterConfig, ClusterTlsConfig},
@@ -32,7 +33,7 @@ use tightbeam::{
 	},
 	compose,
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
-	decode, exactly, hive,
+	exactly, hive,
 	instrumentation::events,
 	policy::TransitStatus,
 	server, servlet, tb_assert_spec, tb_scenario,
@@ -45,7 +46,6 @@ use tightbeam::{
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
 	urn::Urn,
-	utils::time::{Clock, ManualClock},
 	Beamable, Frame, TightBeamError, Version,
 };
 
@@ -315,7 +315,7 @@ tb_scenario! {
 			sink.close_with(b"beam").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let decoded: BeamResponse = decode(reply.message())?;
+			let decoded: BeamResponse = reply.decode_message()?;
 			assert_eq!(decoded.doubled, 8, "the lone server reports the 8-byte body");
 
 			Ok(())
@@ -356,7 +356,7 @@ tb_scenario! {
 			// client surface resolves any other status into `WorkRefused`.
 			let servlet_frame = emit_beam_work(&certs, cluster.addr()).await?;
 
-			let beam_response: BeamResponse = decode(servlet_frame.message())?;
+			let beam_response: BeamResponse = servlet_frame.decode_message()?;
 			assert_eq!(beam_response.doubled, 42, "the laser servlet doubles 21");
 
 			cluster.stop();

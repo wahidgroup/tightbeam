@@ -14,12 +14,12 @@ use super::shared::{BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutc
 use super::sink::RequestSink;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::Encode;
+use crate::marker::MaybeSend;
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
 use crate::urn::Urn;
-use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]

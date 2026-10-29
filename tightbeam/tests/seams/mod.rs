@@ -34,14 +34,19 @@
 //! - [`registry`]: the hive's servlet registry, which hands back each registration it replaces.
 //! - [`restart`]: a restart policy and a jitter strategy, which a transport and a house backoff run.
 //! - [`retry`]: the retry policy of a hive's scaling updates.
+//! - [`router`]: a router policy, which decodes each frame through the requirements of its type.
 //! - [`urn`]: a URN spec with components of its own, which `Urn::verify` reads a URN through.
 //! - [`worker`]: a worker with no house runtime, which a servlet that drains ends through its kill.
 //!
 //! These suites bring one part of the trace or the test harness:
 //!
-//! - [`clock`]: a clock, which a trace stamps its events on.
+//! - [`clock`]: a clock, which a trace stamps its events on and a validator reads validity periods on.
 //! - [`csp`]: a process spec and a composition, which a scenario checks its run against.
-//! - [`logging`]: a log backend, which a trace hands each record that its filter admits.
+//! - [`logging`]: a log backend, which a trace hands each record that its
+//!   filter admits and the backend accepts.
+//! - [`matcher`]: an expected value, which a scenario grades a frame against.
+//! - [`scheduler`]: an exploration engine, which a run with a scheduler
+//!   constraint hands the scheduled subject.
 
 #[cfg(all(feature = "transport-hpke", feature = "tcp"))]
 mod blocking;
@@ -67,12 +72,17 @@ mod kem;
 mod listener;
 #[cfg(feature = "logging")]
 mod logging;
+mod matcher;
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 mod mux;
 mod registry;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
 mod restart;
 mod retry;
+#[cfg(feature = "router")]
+mod router;
+#[cfg(feature = "testing-fault")]
+mod scheduler;
 mod servlet;
 mod spec;
 mod trust;
@@ -118,13 +128,13 @@ use tightbeam::der::asn1::{ObjectIdentifier, OctetString};
 use tightbeam::der::oid::AssociatedOid;
 use tightbeam::der::{Any, Encode};
 use tightbeam::error::ReceivedExpectedError;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{
 	AES_128_GCM, AES_128_WRAP, CURVE_SECP256K1, DATA, SIGNER_ECDSA_WITH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 };
 use tightbeam::random::{CryptoRngCore, OsRng};
 use tightbeam::spki::{AlgorithmIdentifierOwned, Document, EncodePublicKey, SubjectPublicKeyInfoRef};
 use tightbeam::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestMessage};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::ext::pkix::KeyUsages;
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;

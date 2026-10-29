@@ -12,6 +12,9 @@ use super::{
 	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, SlateChange, DEFAULT_ABANDONMENT_LIMIT,
 	DEFAULT_INITIAL_PHEROMONE,
 };
+use crate::basis_points::BasisPoints;
+use crate::basis_points::BasisPointsOutOfRange;
+use crate::clock::{Clock, ManualClock, UnixMillis};
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::cluster::MAX_PHEROMONE;
@@ -21,9 +24,6 @@ use crate::colony::urn::ColonyNamespace;
 use crate::colony::urn::ServletTypeKey;
 use crate::tb_cases;
 use crate::urn::Urn;
-use crate::utils::basis_points::BasisPointsOutOfRange;
-use crate::utils::time::{Clock, ManualClock, UnixMillis};
-use crate::utils::BasisPoints;
 
 /// A clock only the test moves.
 fn manual_clock() -> Arc<ManualClock> {

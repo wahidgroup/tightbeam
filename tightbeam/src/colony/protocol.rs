@@ -8,16 +8,19 @@
 //! - [`ReplyShape`] decides the alternative and the priority of a command's reply.
 
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::asn1::Frame;
+use crate::basis_points::BasisPoints;
 use crate::builder::TypeBuilder;
+use crate::clock::{Clock, UnixMillis};
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::urn::Urn;
-use crate::utils::time::UnixMillis;
-use crate::utils::{decode, encode, BasisPoints};
+use crate::utils::{decode, encode};
 use crate::wire::wire_sequence;
 use crate::{Beamable, Message, MessagePriority, TightBeamError, Version};
 
@@ -166,11 +169,11 @@ impl ClusterWorkResponse {
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with no frame.
-	/// - [`TightBeamError::SerializationError`] -- the reply does not decode as a work response.
+	/// - The errors of [`Frame::decode_message`] -- the reply is no carrier of a work response.
 	/// - Any error that [`Self::served`] reports for the decoded response.
 	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
 		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-		let response: Self = decode(reply.message())?;
+		let response: Self = reply.decode_message()?;
 
 		response.served()
 	}
@@ -1036,14 +1039,15 @@ pub enum ClusterCommandResponse {
 }
 
 impl ClusterCommand {
-	/// The one command `frame` carries, or [`None`] for a body that does not
-	/// decode as one.
+	/// The one command `frame` carries, or [`None`] for a frame that is no
+	/// carrier of one ([`Frame::decode_message`]).
 	///
-	/// A body that is no command is the sender's own fault, so a refusal reads
-	/// its reply shape from this answer through [`ReplyShape::of`].
+	/// A frame that carries no command is the sender's own fault, so a
+	/// refusal reads its reply shape from this answer through
+	/// [`ReplyShape::of`].
 	#[must_use]
 	pub(crate) fn choice_of(frame: &Frame) -> Option<Self> {
-		decode::<Self>(frame.message()).ok()
+		frame.decode_message::<Self>().ok()
 	}
 }
 
@@ -1073,9 +1077,9 @@ impl HeartbeatResult {
 	/// # Examples
 	///
 	/// ```
+	/// use tightbeam::basis_points::BasisPoints;
 	/// use tightbeam::colony::protocol::HeartbeatResult;
 	/// use tightbeam::policy::TransitStatus;
-	/// use tightbeam::utils::BasisPoints;
 	///
 	/// let full = HeartbeatResult {
 	///     status: TransitStatus::ResourceExhausted,
@@ -1102,9 +1106,9 @@ impl ClusterCommandResponse {
 	/// # Examples
 	///
 	/// ```
+	/// use tightbeam::basis_points::BasisPoints;
 	/// use tightbeam::colony::protocol::ClusterCommandResponse;
 	/// use tightbeam::policy::TransitStatus;
-	/// use tightbeam::utils::BasisPoints;
 	///
 	/// let alive = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 2);
 	/// assert!(matches!(alive, ClusterCommandResponse::Heartbeat(result) if result.active_servlets == 2));
@@ -1167,15 +1171,92 @@ impl IssuedAt for Frame {
 	}
 }
 
+/// The issue times one sender stamps on the signed control frames it sends.
+///
+/// Each stamp is the clock's reading, or one millisecond past the stamp
+/// before it while the clock has not passed that stamp. The stamps of one
+/// sender so increase strictly (README §5.7.1), and a receiver, whose replay
+/// guard refuses a second frame of one signer at one order, admits each frame
+/// the sender issues.
+pub(crate) struct IssueClock {
+	clock: Arc<dyn Clock>,
+	/// The least instant the next stamp may take.
+	floor: AtomicU64,
+}
+
+impl IssueClock {
+	/// A sender's stamps on `clock`.
+	pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
+		Self { clock, floor: AtomicU64::new(0) }
+	}
+
+	/// The issue time of the next control frame: the later of the clock's
+	/// reading and the floor that the stamp before it left.
+	pub(crate) fn issue(&self) -> IssuedOrder {
+		let now = self.clock.unix().get();
+		let advance = |floor: u64| Some(now.max(floor).saturating_add(1));
+
+		// The closure returns `Some` for every floor, so the update lands, and
+		// either arm carries the floor it replaced.
+		let (Ok(floor) | Err(floor)) = self.floor.fetch_update(Ordering::AcqRel, Ordering::Acquire, advance);
+
+		IssuedOrder(UnixMillis::new(now.max(floor)))
+	}
+}
+
+/// An issue time that an [`IssueClock`] stamped, which a signed control frame
+/// states in `metadata.order`.
+///
+/// [`IssueClock::issue`] alone makes one, so a control frame that a builder
+/// stamps from it takes the strictly increasing order of its sender (README
+/// §5.7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IssuedOrder(UnixMillis);
+
+impl IssuedOrder {
+	/// The instant of this stamp.
+	pub(crate) const fn instant(self) -> UnixMillis {
+		self.0
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
+	use crate::clock::ManualClock;
 	use crate::colony::urn::ColonyNamespace;
+	use crate::crypto::hash::Sha3_256;
 	use crate::der::{Decode, ErrorKind, Tag, TagNumber};
 	use crate::error::Result;
 	use crate::tb_cases;
+
+	/// An issue clock over a manual clock, beside that clock.
+	fn issue_clock() -> (IssueClock, Arc<ManualClock>) {
+		let clock = Arc::new(ManualClock::default());
+		let erased: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+		(IssueClock::new(erased), clock)
+	}
+
+	/// Two control frames issued at one clock reading take two orders, one
+	/// millisecond apart, so a receiver admits both (README §5.7.1).
+	#[test]
+	fn two_frames_issued_at_one_instant_take_two_orders() {
+		let (issue, clock) = issue_clock();
+		let stamps = (issue.issue().instant(), issue.issue().instant());
+		let next = clock.unix().saturating_add(core::time::Duration::from_millis(1));
+		assert_eq!(stamps, (clock.unix(), next));
+	}
+
+	/// A stamp after the clock passes the floor is the clock's reading.
+	#[test]
+	fn a_stamp_after_the_clock_moves_on_is_its_reading() {
+		let (issue, clock) = issue_clock();
+		let _first = issue.issue();
+		clock.advance(core::time::Duration::from_secs(1));
+		assert_eq!(issue.issue().instant(), clock.unix());
+	}
 
 	fn round_trip(original: ClusterRequest) -> Result<()> {
 		let encoded = crate::encode(&original)?;
@@ -1206,11 +1287,28 @@ mod tests {
 		Frame::v0(b"work-1", vec![0x02, 0x01, 0x2A])
 	}
 
+	/// A V1 frame whose body is `body`, beside the frame integrity digest that
+	/// a carrier of a `ClusterCommand` requires.
+	fn witnessed_frame(body: impl Into<Vec<u8>>) -> Frame {
+		let heartbeat = ClusterCommand::Heartbeat(healthy());
+		let builder = FrameBuilder::from(Version::V1)
+			.with_id(b"command-1")
+			.with_order(1)
+			.with_message(heartbeat);
+		let witnessed = builder
+			.with_witness_hasher::<Sha3_256>()
+			.build()
+			.expect("a witnessed command builds");
+
+		let (metadata, integrity) = (witnessed.metadata().clone(), witnessed.integrity().cloned());
+		Frame::assemble(Version::V1, metadata, body, integrity).expect("a V1 frame carries frame integrity")
+	}
+
 	/// A frame whose body is the DER encoding of `command`.
 	fn command_frame(command: &ClusterCommand) -> Frame {
 		let body = encode(command).expect("a cluster command encodes");
 
-		Frame::v0(b"command-1", body)
+		witnessed_frame(body)
 	}
 
 	/// The parameters of a heartbeat from a healthy cluster.
@@ -1242,7 +1340,7 @@ mod tests {
 	#[test]
 	fn choice_of_refuses_a_body_that_names_two_commands() {
 		let two = [HEARTBEAT_COMMAND.as_slice(), [0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
-		let frame = Frame::v0(b"command-1", two);
+		let frame = witnessed_frame(two);
 
 		let choice = ClusterCommand::choice_of(&frame);
 		assert_eq!(choice, None);
@@ -1250,7 +1348,16 @@ mod tests {
 
 	#[test]
 	fn choice_of_refuses_a_body_that_is_no_command() {
-		let frame = work_frame();
+		let frame = witnessed_frame(work_frame().message());
+		let choice = ClusterCommand::choice_of(&frame);
+		assert_eq!(choice, None);
+	}
+
+	/// `ClusterCommand` requires frame integrity, so a frame without it
+	/// carries no command, whatever its body holds.
+	#[test]
+	fn choice_of_refuses_a_command_frame_without_frame_integrity() {
+		let frame = Frame::v0(b"command-1", HEARTBEAT_COMMAND);
 		let choice = ClusterCommand::choice_of(&frame);
 		assert_eq!(choice, None);
 	}

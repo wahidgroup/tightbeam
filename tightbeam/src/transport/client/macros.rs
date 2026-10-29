@@ -129,7 +129,7 @@ macro_rules! client {
 		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
 	(@process_policy $transport:expr, timeout: $value:expr $(, $($rest:tt)*)?) => {
-		$transport = $transport.with_timeout($value);
+		$transport = $transport.with_timeout($value)?;
 		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
 	(@process_policy $transport:expr,) => {};

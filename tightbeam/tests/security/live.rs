@@ -561,7 +561,7 @@ impl LiveHandshake {
 	) -> Self {
 		let ReceiptHooks { authorizer, approver, observer } = hooks;
 		let offer = TransportOffer::mux(MUX_STREAMS).with_budgets(budgets);
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 
 		let client_offer = offer.to_owned();
 		let client: Configure = Box::new(move |transport| {

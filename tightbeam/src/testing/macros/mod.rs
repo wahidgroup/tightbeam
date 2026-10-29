@@ -165,10 +165,10 @@ where
 #[doc(hidden)]
 pub fn __tb_call_pipeline_exec<F, T>(
 	closure: F,
-	pipeline: crate::utils::task::PipelineBuilder,
+	pipeline: crate::task::PipelineBuilder,
 ) -> Result<(), crate::TightBeamError>
 where
-	F: FnOnce(crate::utils::task::PipelineBuilder) -> Result<T, crate::TightBeamError>,
+	F: FnOnce(crate::task::PipelineBuilder) -> Result<T, crate::TightBeamError>,
 {
 	closure(pipeline).map(|_| ())
 }
@@ -282,7 +282,7 @@ macro_rules! __tb_accept_process {
 /// [`HiveEnv`]: crate::testing::env::HiveEnv
 /// [`TraceCollector`]: crate::trace::TraceCollector
 /// [`FuzzTraceCollector`]: crate::testing::fuzz::FuzzTraceCollector
-/// [`PipelineBuilder`]: crate::utils::task::PipelineBuilder
+/// [`PipelineBuilder`]: crate::task::PipelineBuilder
 /// [`ScenarioConfigBuilder::build`]: crate::testing::ScenarioConfigBuilder::build
 /// [`ScenarioConfig::guided_by`]: crate::testing::ScenarioConfig::guided_by
 /// [`TokioListener`]: crate::transport::tcp::async::TokioListener
@@ -860,7 +860,7 @@ macro_rules! tb_scenario {
 		config: $config:expr,
 		exec: $exec_closure:expr
 	) => {{
-		use $crate::utils::task::PipelineBuilder;
+		use $crate::task::PipelineBuilder;
 
 		let config = $crate::__tb_accept_config!($config);
 		let trace = config.trace();

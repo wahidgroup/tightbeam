@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
+use crate::clock::UnixMillis;
 use crate::colony::cluster::export::ExportScope;
 use crate::colony::cluster::gossip::{LocalClaimGuard, RumorConsumer};
 use crate::colony::cluster::peer::AdmittedPeerAd;
@@ -58,7 +59,6 @@ use crate::runtime::{rt, TaskGroup};
 use crate::trace::TraceCollector;
 use crate::transport::Protocol;
 use crate::urn::Urn;
-use crate::utils::time::UnixMillis;
 use crate::Frame;
 use crate::TightBeamError;
 use crate::{MessagePriority, Version};
@@ -693,7 +693,7 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 
 				// Only a reply that names the origin as outside the target's
 				// trust changes what this gateway offers it next.
-				let response = reply.and_then(|reply| decode::<GossipResponse>(reply.message()).ok());
+				let response = reply.and_then(|reply| reply.decode_message::<GossipResponse>().ok());
 				match response {
 					Some(response) if response.refuses_origin() => FloodHop::OriginRefused(target),
 					_ => FloodHop::Settled,
@@ -795,7 +795,11 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 	///
 	/// - [`LoopFault`] -- the errors of [`Self::expel`], and a trace that refused an event of the round.
 	async fn reconcile_round(&self, peer_addr: P::Address, peer: AdmittedDial) -> Result<Round, LoopFault> {
-		let now = self.config.clock.unix();
+		// The round reads one instant, its issue time, which its order states:
+		// the clock reading, or one millisecond past the last stamp of the
+		// gateway while the clock has not passed it (README §5.7.1).
+		let issued = self.config.issue_order();
+		let now = issued.instant();
 		// A journal fault is local, so the peer stays unscored.
 		let Ok(held_digests) = self.config.gossip.journal.held_digests(now) else {
 			return self.end_round(peer, RoundEnd::Journal);
@@ -820,12 +824,8 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 
 		// The build and the signature are local and come before the peer is
 		// asked anything, so a fault here leaves the peer unscored.
-		let builder = FrameBuilder::from(Version::V2)
-			.with_id(b"gossip-reconcile")
-			.with_order(now.get())
-			.with_message(request)
-			.with_priority(MessagePriority::NetworkControl);
-		let Ok(mut signed_frame) = self.config.witnessed(builder).build() else {
+		let builder = self.config.control_frame(b"gossip-reconcile", issued, request);
+		let Ok(mut signed_frame) = builder.build() else {
 			return self.end_round(peer, RoundEnd::Build);
 		};
 
@@ -837,7 +837,7 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 		// Each fault of the exchange is the peer's, so it fails the round.
 		let asked: Result<GossipWant, ClusterError> = async {
 			let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
-			let reply: GossipWant = decode(response.message())?;
+			let reply: GossipWant = response.decode_message()?;
 
 			// An oversized reply fails the round (CWE-770). The beat scores it
 			// like any failed round, so an abuser keeps its `new` entry with
@@ -1075,7 +1075,7 @@ impl<P: ColonyDialProtocol> FloodBeat<P> {
 			let Some(push_reply) = client.emit(signed, None).await.map_err(ClusterError::from)? else {
 				continue;
 			};
-			let Ok(gossip_reply) = decode::<GossipResponse>(push_reply.message()) else {
+			let Ok(gossip_reply) = push_reply.decode_message::<GossipResponse>() else {
 				continue;
 			};
 
@@ -1170,7 +1170,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	/// - A delivery this task never finishes returns the rumor to the retry set.
 	async fn deliver_local(&self, rumor: Frame, digest_value: GossipDigest) -> Result<(), LoopFault> {
 		let journal = &self.config.gossip.journal;
-		let Some(type_key) = self.config.gossip.ingress.as_ref() else {
+		let Some(type_key) = self.config.gossip_ingress() else {
 			// With no ingress servlet configured, the rumor has no local
 			// consumer, so it leaves the retry set.
 			journal.ack_local(&digest_value)?;
@@ -1208,7 +1208,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 	async fn retry_pending_local(&self) -> Result<(), LoopFault> {
 		let pending = self.config.gossip.journal.pending_local(self.config.clock.unix())?;
 		for (digest, rumor) in pending {
-			let Ok(body) = decode::<GossipRumor>(rumor.message()) else {
+			let Ok(body) = rumor.decode_message::<GossipRumor>() else {
 				continue;
 			};
 
@@ -1407,7 +1407,7 @@ impl<P: ColonyDialProtocol> GossipPipelineCtx<P> {
 			return Ok(None);
 		}
 
-		let Ok(ClusterRequest::AdvertisePeer(advertisement)) = decode::<ClusterRequest>(inner.message()) else {
+		let Ok(ClusterRequest::AdvertisePeer(advertisement)) = inner.decode_message::<ClusterRequest>() else {
 			return Ok(None);
 		};
 		let Ok(admitted) = AdmittedPeerAd::admit(&verified_inner, &advertisement, &self.config) else {
@@ -1772,6 +1772,7 @@ mod tests {
 	use core::num::{NonZeroU32, NonZeroUsize};
 
 	use super::*;
+	use crate::clock::{Clock, ManualClock};
 	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
 	use crate::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
 	use crate::colony::urn::ColonyNamespace;
@@ -1786,7 +1787,6 @@ mod tests {
 	use crate::oids::HASH_SHA3_256;
 	use crate::testing::{unhex, SetupEnv, TestCertificate, TestKey, TestRumor};
 	use crate::transport::TokioListener;
-	use crate::utils::time::ManualClock;
 	use crate::{absent, exactly, tb_assert_spec, tb_cases, tb_scenario};
 
 	/// The window a refusal stands for in these tests.
@@ -1861,7 +1861,7 @@ mod tests {
 	/// names, over the to-be-signed encoding and then the origin signature.
 	#[test]
 	fn a_house_gateway_digests_a_rumor_under_sha3_256() -> Result<(), TransitStatus> {
-		let config = ColonyConfig::<TokioListener>::new(test_config());
+		let config = house_config();
 		let rumor = TestRumor::verified(TestRumor::application(1_000, [1, 2, 3]));
 
 		let admitted = config.admit_rumor(&rumor, 0, UnixMillis::new(1_000))?;
@@ -1873,13 +1873,33 @@ mod tests {
 	/// digest its protocol's provider names.
 	#[test]
 	fn a_house_gateway_witnesses_its_frames_under_sha3_256() -> Result<(), TightBeamError> {
-		let config = ColonyConfig::<TokioListener>::new(test_config());
+		let config = house_config();
 		let message = GossipRumor::application(vec![1, 2, 3]);
 		let builder = FrameBuilder::from(Version::V2).with_id(b"witnessed").with_order(1_000);
 
 		let frame = config.witnessed(builder.with_message(message)).build()?;
 		let witness = frame.integrity().map(|info| info.algorithm.oid);
 		assert_eq!(witness, Some(HASH_SHA3_256));
+		Ok(())
+	}
+
+	/// Two control frames that the gateway builds at one clock reading state
+	/// two orders, one millisecond apart, so the replay guard of a receiver
+	/// admits both (README §5.7.1).
+	#[test]
+	fn two_control_frames_at_one_instant_state_two_orders() -> Result<(), TightBeamError> {
+		let clock = Arc::new(ManualClock::default());
+		let mut config = test_config();
+		config.clock = Arc::<ManualClock>::clone(&clock);
+		let config = ColonyConfig::<TokioListener>::new(config)?;
+
+		let control = |id: &[u8]| config.control_frame(id, config.issue_order(), GossipRumor::application(vec![1]));
+		let first = control(b"first").build()?;
+		let second = control(b"second").build()?;
+		let orders = (first.metadata().order(), second.metadata().order());
+
+		let at = clock.unix().get();
+		assert_eq!(orders, (at, at.saturating_add(1)));
 		Ok(())
 	}
 
@@ -1894,6 +1914,12 @@ mod tests {
 			)
 			.expect("the test certificate must decode"),
 		)
+	}
+
+	/// The configuration of a house gateway under [`test_config`], whose colony
+	/// digest is SHA3-256.
+	fn house_config() -> ColonyConfig<TokioListener> {
+		ColonyConfig::new(test_config()).expect("the test configuration names no gossip ingress")
 	}
 
 	fn config_with_window(window_ms: u64) -> ClusterConfig {
@@ -2077,7 +2103,8 @@ mod tests {
 		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the stranger enrolls").build());
 		let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
 
-		let config = ColonyConfig::new(ClusterConfig::new(tls));
+		let minted = ColonyConfig::new(ClusterConfig::new(tls));
+		let config = minted.expect("the member configuration names no gossip ingress");
 		let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
 		let peer_pool = pools.peer.expect("a peer trust builds a peer pool");
 		let peer_plane = PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
@@ -2148,7 +2175,7 @@ mod tests {
 			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(member_key)));
 			let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
 			let config = ClusterConfig::builder(tls).with_tried_per_signer(NonZeroUsize::MIN).build();
-			let config = ColonyConfig::new(config);
+			let config = ColonyConfig::new(config).expect("the member configuration names no gossip ingress");
 
 			let trace = Arc::new(scenario.share());
 			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
@@ -2218,7 +2245,7 @@ mod tests {
 	// so the journal refuses the echo that a peer floods back as a duplicate.
 	#[tokio::test]
 	async fn a_slate_rumor_carries_the_digest_its_echo_admits_under() -> Result<(), TightBeamError> {
-		let config = ColonyConfig::<TokioListener>::new(test_config());
+		let config = house_config();
 		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
 		let minted = minted_rumor(config.mint_slate_rumor(&advertisement).await);
 
@@ -2237,7 +2264,7 @@ mod tests {
 		let mut config = test_config();
 		config.clock = Arc::<ManualClock>::clone(&clock);
 
-		let config = ColonyConfig::<TokioListener>::new(config);
+		let config = ColonyConfig::<TokioListener>::new(config)?;
 		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
 
 		clock.advance(Duration::from_millis(1));

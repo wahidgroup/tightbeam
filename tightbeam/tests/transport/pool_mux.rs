@@ -17,8 +17,8 @@ use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::utils::time::{Clock, ManualClock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -32,6 +32,7 @@ use tightbeam::crypto::x509::{CertificateSpec, KeyCurves};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::policy::{AcceptAllGate, GatePolicy, SessionContext, TransitStatus};
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
@@ -55,7 +56,6 @@ use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, PooledClient, ResponsePackage,
 	TransportEncryptionConfig, TransportError, TransportFailure,
 };
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 

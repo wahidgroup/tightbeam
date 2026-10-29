@@ -109,7 +109,7 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnsupportedVersion`] -- the frame version predates signatures.
+	/// - [`TightBeamError::UnsupportedField`] -- the frame version predates signatures.
 	/// - [`TightBeamError::KeyError`] -- the provider fails to sign.
 	/// - [`TightBeamError::SignatureError`] -- the provider returns no DER signature.
 	/// - [`TightBeamError::SerializationError`] -- the TBS or a signed attribute fails to encode.
@@ -160,7 +160,7 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnsupportedVersion`] -- the frame version predates signatures.
+	/// - [`TightBeamError::UnsupportedField`] -- the frame version predates signatures.
 	pub fn attach_signer_info(&mut self, signer_info: Signed<SignerInfo>) -> Result<()> {
 		self.ensure_allows(GatedField::Nonrepudiation)?;
 		self.nonrepudiation = Some(signer_info);

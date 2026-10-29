@@ -164,7 +164,7 @@ tb_scenario! {
 		context: uniform_trust_ctx(),
 		exec: |SetupEnv { trace, context: ctx }| async move {
 			let mut conf_third = quiet_flood_conf(&ctx.third, &ctx.peers_of_third, vec![]);
-			conf_third.gossip.ingress = Some(servlet_ingress("rumor"));
+			conf_third.gossip.ingress = Some(servlet_urn("rumor"));
 
 			let third = start_cluster(&trace, conf_third).await?;
 			let ingress_hive = start_rumor_hive(trace.share(), hive_plane_certs(&ctx.third), ctx.main.key.to_owned()).await?;

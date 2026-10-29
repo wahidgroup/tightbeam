@@ -24,7 +24,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
+use tightbeam::basis_points::BasisPoints;
 use tightbeam::builder::TypeBuilder;
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig};
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
@@ -42,9 +44,7 @@ use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, Protocol};
 use tightbeam::urn::Urn;
-use tightbeam::utils::time::{Clock, ManualClock};
-use tightbeam::utils::BasisPoints;
-use tightbeam::{cluster, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
+use tightbeam::{cluster, exactly, hive, servlet, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
 
 use crate::common::poll::poll_until;
 use crate::common::security::{random_signing_key, test_certificate};
@@ -215,7 +215,7 @@ tb_scenario! {
 		client: |ClusterEnv { context: certs, cluster, .. }| async move {
 			let echoed = submit_echo(&certs, cluster.addr()).await?;
 
-			let content: TestMessage = decode(echoed.message())?;
+			let content: TestMessage = echoed.decode_message()?;
 			assert_eq!(content.content, OUTSIDE_CONTENT, "the routed work echoes");
 
 			cluster.stop();

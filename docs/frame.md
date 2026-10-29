@@ -40,18 +40,17 @@ It drills down from [README §4](../README.md#4-protocol-specification) and [REA
 
 Every version carries `id`, `order`, `message`, and `compactness`, so they have no gate.
 
-Four paths refuse a gated field below its version:
+Four paths refuse a gated field below its version. Every path that returns a `TightBeamError` refuses with `TightBeamError::UnsupportedField { field, version }`, which names the field and the frame version:
 
 | Path | Refuses | Error |
 | --- | --- | --- |
-| `MetadataBuilder::build`, which `FrameBuilder::build` runs | A metadata field | `BuildError::InvalidMetadata(MetadataError::UnsupportedField { field, version })`, as `TightBeamError::BuildError` from `FrameBuilder::build` |
-| `FrameBuilder::build` | FI or a signature on a V0 frame | `TightBeamError::UnsupportedVersion`, which names the frame version and the version of the field |
-| `Frame::attach_signer_info`, `Frame::sign_with_provider`, `Frame::encrypt_with_provider` | The field the method adds | `TightBeamError::UnsupportedVersion` |
+| `FrameBuilder::build` and `compose!` | A metadata field, FI, or a signature | `TightBeamError::UnsupportedField { field, version }` |
+| `Frame::attach_signer_info`, `Frame::sign_with_provider`, `Frame::encrypt_with_provider` | The field the method adds | `TightBeamError::UnsupportedField { field, version }` |
+| `MetadataBuilder::build`, on its own | A metadata field | `BuildError::InvalidMetadata(MetadataError::UnsupportedField { field, version })` |
 | The DER decoder of `Frame` | Every gated field, once the fields decode | A `der` value error on the `SEQUENCE` tag |
 
 ```rust
 use tightbeam::asn1::GatedField;
-use tightbeam::builder::error::{BuildError, MetadataError};
 use tightbeam::prelude::MatrixDyn;
 use tightbeam::testing::TestMessage;
 use tightbeam::{compose, TightBeamError, Version};
@@ -66,10 +65,9 @@ let refused = compose! {
         matrix: MatrixDyn::default()
 };
 
-let gate = MetadataError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 };
 assert!(matches!(
     refused,
-    Err(TightBeamError::BuildError(BuildError::InvalidMetadata(error))) if error == gate
+    Err(TightBeamError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 })
 ));
 ```
 
@@ -170,7 +168,7 @@ A method that fails records its error, and `build` returns it before any other s
 
 | Check | Error |
 | --- | --- |
-| The version is below `T::MIN_VERSION` | `UnsupportedVersion` |
+| The version is below `T::MIN_VERSION` | `Requirement(RequirementError::Version)`, the refusal of every typed decode |
 | `MUST_BE_CONFIDENTIAL` with no encryptor | `MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_encryptor" }` |
 | `MUST_BE_NON_REPUDIABLE` with no signer | `MissingProtection { .., call: "with_signer" }` |
 | `MUST_BE_COMPRESSED` with no compressor | `MissingProtection { .., call: "with_compression" }` |
@@ -262,17 +260,26 @@ Every SET of a frame sits inside the envelope or the signature. `WireDer` and `S
 
 - `order` is a `u64` that the frame layer carries as it is.
 - `with_order` sets it. With a host clock, a build with no order takes the current Unix time in seconds.
-- Monotonic order and duplicate refusal belong to the receiver. The colony's signed control frames carry their issue time in `order` as Unix milliseconds, and the colony's replay guards admit each one once inside a freshness window.
+- The application defines its sequences and its namespaces, and refuses a duplicate in each.
+
+The colony's signed control frames carry their issue time in `order` as Unix milliseconds. The frames of one signer to one receiver are one sequence and one namespace:
+
+| Rule | Code |
+| --- | --- |
+| The orders of one sender increase strictly | The hive stamps its registrations and scaling updates, and the gateway its heartbeats, direct advertisements, and reconcile rounds, one millisecond past the stamp before, while the clock has not passed that stamp |
+| A receiver refuses a duplicate `order` | `ReplayGuard::check_and_insert` refuses a second frame of one signer at an order it holds inside the freshness window, whatever its signature, and `ReplayGuard::holds_order` is the read-only check of a verdict |
+| A receiver refuses a replay | `ReplayGuard` refuses a signature it holds inside the window |
 
 ### Compression
 
 [README §5.7.2](../README.md#572-compression-requirements) states the compression rules.
 
-`Compressor` compresses a body into bytes and the `CompressedData` that describes them, and `Inflator` reverses it (`tightbeam::compress`). `ZstdCompression` implements both under the `zstd` feature:
+`Compressor` compresses a body into bytes and the `CompressedData` that describes them, and `Inflator` reverses it (`tightbeam::compress`). An `Inflator` names its algorithm with `algorithm_oid`, and `admits_parameters` decides the parameters of that algorithm. The provided `admits_parameters` admits the parameters omitted or as a `NULL`, the form of an algorithm with none (RFC 3274 §2). `ZstdCompression` implements both traits under the `zstd` feature:
 
 | Property | `ZstdCompression` |
 | --- | --- |
 | Algorithm | `COMPRESSION_ZSTD`, with no parameters |
+| Parameters it admits | None, or an INTEGER level from `ZSTD_minCLevel` to `ZSTD_maxCLevel` |
 | Level | 3, the zstd default |
 | `encapContentInfo` | `id-data` with no `eContent`, and the compressed bytes travel in `Frame.message` |
 | Output cap | `DEFAULT_MAX_DECOMPRESSED_LEN` (16 MiB), or the value of `with_max_output` |
@@ -288,7 +295,16 @@ A decompression fails with one `CompressionError`:
 | `TrailingBytes` | Octets follow the zstd frame |
 | `ZSTD` | The codec refuses the frame, with its numeric code |
 
-`Frame::inflate_in_place(&dyn Inflator)` inflates a compressed cleartext body, clears `compactness`, and returns an `Opened`. A failed inflate restores the frame. `decrypt_in_place` inflates an encrypted body after it decrypts it. The router refuses a compressed body with `RouterError::CompressedFrame`, and a servlet inflates it with the inflator of its context.
+Before any work on the body, the receiver holds the `CompressedData` to the inflator. A refusal leaves the frame as it was:
+
+| Check | Refusal |
+| --- | --- |
+| `compressionAlgorithm` names the `algorithm_oid` of the inflator | `TightBeamError::UnexpectedAlgorithm`, with both OIDs |
+| The version is 0 (RFC 3274 §1.1) | `TightBeamError::InvalidMetadata` |
+| `encapContentInfo` carries no `eContent` | `TightBeamError::InvalidMetadata` |
+| `admits_parameters` of the inflator admits the parameters | `TightBeamError::InvalidMetadata` |
+
+`Frame::inflate_in_place(&dyn Inflator)` runs those checks, inflates a compressed cleartext body, clears `compactness`, and returns an `Opened`. A failed inflate leaves the frame as it was. `decrypt_in_place` runs the checks before it decrypts, and inflates an encrypted body after it decrypts it. The router refuses a compressed body with `RouterError::CompressedFrame`, and a servlet inflates it with the inflator of its context.
 
 ### Message integrity
 
@@ -352,9 +368,9 @@ The frame opens and seals in place through these methods:
 | Method | Effect | Errors |
 | --- | --- | --- |
 | `decrypt_in_place(&decryptor, inflator)` | Opens the body, inflates it when compressed, clears `confidentiality` and `compactness`, returns `Opened` | `MissingEncryptionInfo`, `MissingInflator`, and the errors of the decryptor and the inflator |
-| `decrypt::<T>(decryptor, inflator)` | Runs `decrypt_in_place` on the frame it takes, then decodes `T` | Those of `decrypt_in_place`, and `SerializationError` |
+| `decrypt::<T>(decryptor, inflator)` | Holds the frame, as it arrived, to the requirements of `T` (`validate_for`), runs `decrypt_in_place` on the frame it takes, then decodes `T` | `Requirement`, those of `decrypt_in_place`, and `SerializationError` |
 | `decrypt_bytes(decryptor)` | Takes the frame and returns the plaintext as a `SecretSlice<u8>`, still compressed when the body was | `MissingEncryptionInfo`, and the errors of the decryptor |
-| `encrypt_with_provider::<P>(&provider)` | Seals the body under a key-encryption key an `EncryptingKeyProvider` holds | `UnsupportedVersion`, `CoveredBeforeSeal`, `EnvelopeError` |
+| `encrypt_with_provider::<P>(&provider)` | Seals the body under a key-encryption key an `EncryptingKeyProvider` holds | `UnsupportedField`, `CoveredBeforeSeal`, `EnvelopeError` |
 | `decrypt_with_provider::<P>(&provider)` | Opens a body sealed to a provider, clears `confidentiality`, returns `Opened` | `MissingEncryptionInfo`, `EnvelopeError` |
 
 All five are async. The in-place methods leave the frame unchanged on error. `encrypt_with_provider` refuses a frame that already carries FI or a signature, since both would cover the body before the seal.

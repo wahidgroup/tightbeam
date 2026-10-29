@@ -1357,8 +1357,8 @@ mod tests {
 	use super::super::shared::MuxShared;
 	use super::super::testing::{body_fixture, noop_cx, poll_times, FIXTURE_PEER_CAP};
 	use super::*;
+	use crate::marker::MaybeSend;
 	use crate::transport::multiplex::MuxRole;
-	use crate::utils::marker::MaybeSend;
 
 	#[test]
 	fn test_recv_stream_enforces_granted_limit() {
@@ -1811,6 +1811,21 @@ mod tests {
 			),
 			closed_by_the_peer => (TransportError::ConnectionClosed, "connection-closed"),
 			stalled_past_the_deadline => (crate::transport::TransportFailure::DeadlineExceeded.into(), "connection-closed"),
+		}
+	}
+
+	// A refused renewal drains with the reason its code names: a tightbeam
+	// code below the application floor is a settlement failure, and a code
+	// at or above the floor passes through.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	crate::tb_cases! {
+		fn a_refused_renewal_drains_with_the_reason_of_its_code((code, reason): (u32, GoAwayReason)) {
+			assert_eq!(refusal_reason(code), reason);
+		}
+		cases {
+			the_first_tightbeam_code => (0, GoAwayReason::SettlementFailed),
+			the_last_tightbeam_code => (MUX_APPLICATION_CODE_FLOOR - 1, GoAwayReason::SettlementFailed),
+			the_first_application_code => (MUX_APPLICATION_CODE_FLOOR, GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR)),
 		}
 	}
 }

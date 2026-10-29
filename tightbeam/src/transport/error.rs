@@ -115,6 +115,26 @@ pub enum TransportFailure {
 	Unauthenticated,
 }
 
+/// The rule of [`TransportLimits::checked`] that a set of limits breaks.
+///
+/// [`TransportLimits::checked`]: crate::transport::TransportLimits::checked
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Errorizable)]
+pub enum LimitsRefusal {
+	/// A ceiling is zero, so it refuses every envelope or every operation it
+	/// bounds.
+	#[error("every ceiling must be above zero")]
+	ZeroCeiling,
+	/// A handshake message of [`TransportLimits::handshake_wire`] octets, in
+	/// its cleartext wire form, passes [`TransportLimits::cleartext_envelope`]
+	/// or the largest length DER encodes. A reader then refuses a handshake
+	/// message that the writer admits.
+	///
+	/// [`TransportLimits::handshake_wire`]: crate::transport::TransportLimits::handshake_wire
+	/// [`TransportLimits::cleartext_envelope`]: crate::transport::TransportLimits::cleartext_envelope
+	#[error("a handshake message at handshake_wire must fit cleartext_envelope on the wire")]
+	HandshakePastCleartext,
+}
+
 /// The error every transport operation returns.
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
@@ -189,6 +209,13 @@ pub enum TransportError {
 	#[error("Invalid certificate: {0}")]
 	#[from]
 	InvalidCertificate(CertificateValidationError),
+	/// A set of [`TransportLimits`] breaks a rule of
+	/// [`TransportLimits::checked`], at the configuration that takes it.
+	///
+	/// [`TransportLimits`]: crate::transport::TransportLimits
+	/// [`TransportLimits::checked`]: crate::transport::TransportLimits::checked
+	#[error("Invalid transport limits: {0}")]
+	InvalidLimits(LimitsRefusal),
 	/// The transport did not send the message, and the frame travels with the
 	/// error so a restart policy can retry it.
 	///
@@ -641,6 +668,7 @@ impl TransportError {
 			| TransportError::InvalidState
 			| TransportError::NotServed
 			| TransportError::InvalidCertificate(_)
+			| TransportError::InvalidLimits(_)
 			| TransportError::MessageNotSent(..)
 			| TransportError::HandshakeError(_) => None,
 			#[cfg(feature = "transport-multiplex")]
@@ -676,6 +704,7 @@ impl TransportError {
 			| TransportError::InvalidState
 			| TransportError::NotServed
 			| TransportError::InvalidCertificate(_)
+			| TransportError::InvalidLimits(_)
 			| TransportError::HandshakeError(_)
 			| TransportError::DerError(_) => false,
 			#[cfg(feature = "transport-multiplex")]
@@ -870,6 +899,7 @@ impl TransportError {
 			| TransportError::InvalidAddress
 			| TransportError::InvalidState
 			| TransportError::NotServed
+			| TransportError::InvalidLimits(_)
 			| TransportError::MessageNotSent(..)
 			| TransportError::DerError(_) => None,
 			#[cfg(feature = "transport-multiplex")]

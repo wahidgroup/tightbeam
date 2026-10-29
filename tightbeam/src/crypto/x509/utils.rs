@@ -3,14 +3,19 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::collections::BTreeSet;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::collections::BTreeSet;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use core::fmt::{self, Debug, Formatter};
 use core::hash::{Hash, Hasher};
 use core::time::Duration;
 
 use crate::asn1::admission::DerAdmission;
+use crate::clock::Clock;
 use crate::cms::cert::IssuerAndSerialNumber;
 use crate::cms::enveloped_data::RecipientIdentifier;
 use crate::cms::signed_data::SignerIdentifier;
@@ -29,10 +34,10 @@ use crate::error::ReceivedExpectedError;
 use crate::x509::certificate::{CertificateInner, Profile};
 use crate::x509::serial_number::SerialNumber;
 
+#[cfg(any(host_clock, feature = "time"))]
+use crate::clock::UnixMillis;
 #[cfg(feature = "secp256k1")]
 use crate::spki::SubjectPublicKeyInfoOwned;
-#[cfg(any(host_clock, feature = "time"))]
-use crate::utils::time::UnixMillis;
 
 /// A certificate fingerprint bound to the digest that produced it, as wide
 /// as the output of that digest.
@@ -467,8 +472,7 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		}
 
 		let value = extension.extn_value.as_bytes();
-		DerAdmission::SetOrder.admit(value)?;
-		Ok(Some(T::from_der(value)?))
+		Ok(Some(DerAdmission::SetOrder.decode(value)?))
 	}
 
 	/// Name this certificate as a CMS signer.
@@ -606,6 +610,63 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		}
 
 		Ok(())
+	}
+}
+
+/// The clock that a validity check reads: the clock its owner sets, or the
+/// crate clock ([`UnixMillis::now`]) when the owner sets none.
+///
+/// `C` is the clock as its owner holds it:
+///
+/// - A validator and a trust store are `Send + Sync`, so each holds `dyn Clock + Send + Sync`.
+/// - A handshake holds the clock of its endpoint, `dyn Clock`.
+///
+/// [`UnixMillis::now`]: crate::clock::UnixMillis::now
+pub(crate) struct ValidityClock<C: ?Sized = dyn Clock + Send + Sync>(Option<Arc<C>>);
+
+impl<C: ?Sized> ValidityClock<C> {
+	/// The checks on the crate clock, which an owner that sets no clock reads.
+	pub(crate) const CRATE: Self = Self(None);
+}
+
+impl<C: Clock + ?Sized> ValidityClock<C> {
+	/// The checks on `clock`.
+	pub(crate) fn new(clock: Arc<C>) -> Self {
+		Self(Some(clock))
+	}
+
+	/// Refuse `cert` outside its validity period at the reading of this clock
+	/// (RFC 5280 §6.1.3(a)(2)).
+	///
+	/// # Errors
+	///
+	/// - The errors of [`CertificateExt::validate_expiry_at`], or of
+	///   [`CertificateExt::validate_expiry`] when no clock is set.
+	pub(crate) fn admits(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		let Some(clock) = self.0.as_ref() else {
+			return cert.validate_expiry();
+		};
+
+		let now = Duration::from_millis(clock.unix().get()).as_secs();
+		cert.validate_expiry_at(now)
+	}
+}
+
+impl<C: ?Sized> Clone for ValidityClock<C> {
+	fn clone(&self) -> Self {
+		Self(self.0.as_ref().map(Arc::clone))
+	}
+}
+
+impl<C: ?Sized> Default for ValidityClock<C> {
+	fn default() -> Self {
+		Self::CRATE
+	}
+}
+
+impl<C: Clock + ?Sized> Debug for ValidityClock<C> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.debug_tuple("ValidityClock").field(&self.0).finish()
 	}
 }
 
@@ -752,7 +813,7 @@ mod tests {
 	#[test]
 	fn test_expiry_validator_rejects_expired_cert() {
 		let expired_cert = TestCertificate::expired();
-		let validator = ExpiryValidator;
+		let validator = ExpiryValidator::default();
 
 		// This certificate expired on August 17, 2019, so the validator rejects
 		// it.

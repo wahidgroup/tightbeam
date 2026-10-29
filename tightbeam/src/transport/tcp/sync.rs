@@ -15,6 +15,7 @@ use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStr
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::policy::GatePolicy;
@@ -30,7 +31,6 @@ use crate::transport::{
 	EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO, Protocol,
 	ProtocolStream, TransportEncryptionConfig, TransportResult,
 };
-use crate::utils::time::Clock;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
@@ -444,6 +444,7 @@ mod tests {
 	use std::time::{Duration, Instant};
 
 	use super::*;
+	use crate::clock::{ManualClock, SystemClock};
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::policy::TransitStatus;
 	use crate::runtime::{rt, ParkingExecutor};
@@ -452,7 +453,6 @@ mod tests {
 	use crate::transport::policy::PolicyConfig;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::TransportLimits;
-	use crate::utils::time::{ManualClock, SystemClock};
 
 	/// How long a case waits for a read on another thread before it reports
 	/// the read as blocked.
@@ -467,12 +467,13 @@ mod tests {
 	/// The server of [`validating_server`], which reads its deadlines on
 	/// `clock`.
 	fn validating_server_on(limits: TransportLimits, clock: Arc<dyn Clock>) -> EndpointConfig<DefaultCryptoProvider> {
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 		let peer_authentication = PeerAuthentication::Anonymous.and(validator);
 
 		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
 		let encryption = DialableEncryption::new(encryption).expect("mutual authentication answers for the peer");
-		EndpointConfig::new(encryption, clock).with_limits(limits)
+		let endpoint = EndpointConfig::new(encryption, clock).with_limits(limits);
+		endpoint.expect("the test limits pass the check")
 	}
 
 	/// The accepted end and the peer end of one loopback connection.

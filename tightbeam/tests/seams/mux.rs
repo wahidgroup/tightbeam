@@ -30,13 +30,13 @@ use tokio::time::timeout;
 mod acceptor_seam {
 	pub use core::future::Future;
 
+	pub use tightbeam::marker::MaybeSend;
 	pub use tightbeam::policy::{GatePolicy, SessionContext};
 	pub use tightbeam::transport::handshake::negotiation::TransportOffer;
 	pub use tightbeam::transport::multiplex::{
 		CallContext, GatedHalves, MuxAcceptor, MuxCapable, MuxRekeyContext, MuxService,
 	};
 	pub use tightbeam::transport::policy::CollectorGateConfig;
-	pub use tightbeam::utils::marker::MaybeSend;
 	pub use tightbeam::x509::Certificate;
 
 	pub use crate::transport::support::{establish_mutual_transports, MutualSessionHooks};

@@ -20,7 +20,6 @@
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::WireHopBudget;
 use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
-use crate::decode;
 use crate::policy::{SessionContext, TransitStatus};
 use crate::Frame;
 use crate::TightBeamError;
@@ -111,7 +110,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			return Ok(RequestAdmission::Refused(gate_status));
 		}
 
-		let Ok(request) = decode::<ClusterRequest>(frame.message()) else {
+		let Ok(request) = frame.decode_message::<ClusterRequest>() else {
 			return Ok(RequestAdmission::Refused(TransitStatus::PermissionDenied));
 		};
 

@@ -3,13 +3,13 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use super::ClusterError;
+use crate::basis_points::BasisPoints;
 use crate::colony::cluster::registry::SharedId;
 use crate::colony::cluster::servlet_registry::entry::{DialTarget, LocalRoute, PeerRoute, ServletEntry};
 use crate::colony::cluster::{AdmittedDial, ClusterConfig};
 use crate::colony::protocol::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
 use crate::urn::Urn;
-use crate::utils::BasisPoints;
 
 /// The default decay per evaporation cycle, in basis points (1000 = 10%).
 pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000;

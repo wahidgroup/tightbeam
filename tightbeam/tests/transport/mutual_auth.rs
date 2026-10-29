@@ -33,7 +33,7 @@ use tightbeam::{
 			Certificate, CertificateSpec, KeyCurves,
 		},
 	},
-	decode, exactly,
+	exactly,
 	instrumentation::events,
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
@@ -139,7 +139,7 @@ tb_scenario! {
 
 			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
-			let response: AuthResponse = decode(response_frame.message())?;
+			let response: AuthResponse = response_frame.decode_message()?;
 			assert_eq!(response.server_id, "mutual-auth-server", "the reply must name the servlet");
 			assert!(response.authenticated, "the servlet must accept the client id");
 			Ok(())
