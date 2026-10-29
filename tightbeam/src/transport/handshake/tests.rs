@@ -54,6 +54,7 @@ use crate::der::asn1::GeneralizedTime;
 use crate::der::asn1::{Any as AnyValue, ContextSpecificRef, ObjectIdentifier, PrintableString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode, EncodeValue, TagMode, TagNumber, Tagged};
+use crate::marker::MaybeSendFuture;
 use crate::oids::{AES_256_WRAP, DATA, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -72,7 +73,6 @@ use crate::transport::handshake::{
 	HandshakeMessage, HandshakeSecret, PeerAuthentication, Server, ServerConfig, ServerFlow, ServerHandshake,
 	SupportedProfiles,
 };
-use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::AttributeTypeAndValue;
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::x509::ext::Extension;
@@ -390,6 +390,14 @@ pub fn create_expired_test_certificate() -> TestCertificate {
 
 	expired.certificate.tbs_certificate.validity.not_after = Time::GeneralTime(not_after);
 	expired
+}
+
+/// A test certificate of a fresh key whose validity period is the fixed test
+/// window, so it is expired on [`CertificateFixtures::clock_past_validity`].
+pub fn create_windowed_test_certificate() -> TestCertificate {
+	let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+	let certificate = CertificateFixtures::self_signed(&signing_key);
+	TestCertificate { signing_key, certificate }
 }
 
 /// A certificate of the key of `identity` that differs from its own
@@ -1373,7 +1381,7 @@ pub async fn mutual_run<F: TestFlow>(client_identity: &TestCertificate, key: Arc
 	let client = F::client_presenting(&server_identity, presented);
 
 	let mut server = F::server(&server_identity);
-	server.peer_authentication = mutual_with(ExpiryValidator);
+	server.peer_authentication = mutual_with(ExpiryValidator::default());
 	run(client, server).await
 }
 

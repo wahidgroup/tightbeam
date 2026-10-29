@@ -226,7 +226,7 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 	// Mutual-TLS posture: a configured validator makes the accept plane
 	// capture possession-verified client identities, so grants, deny
 	// gates, and first-party origin stay live under the oracle.
-	tls.client_authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	tls.client_authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default()));
 
 	let pool = PoolConfig {
 		idle_timeout: None,

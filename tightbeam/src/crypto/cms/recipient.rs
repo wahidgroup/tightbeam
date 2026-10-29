@@ -8,6 +8,8 @@
 //! holds one inside a [`KemKeyHolder`], a [`KeyAgreementIdentity`] or a
 //! [`BareKemKey`], which pairs it with the backend of its private key.
 
+#[cfg(all(not(feature = "std"), feature = "kem"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
@@ -31,12 +33,26 @@ use crate::crypto::x509::{KeyAgreement, PeerCertificate};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Decode, Encode};
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::oids::ORI_KEM;
 use crate::random::CryptoRngCore;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned, SubjectPublicKeyInfoRef};
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
 use crate::ZeroizingBytes;
+
+#[cfg(feature = "kem")]
+use core::marker::PhantomData;
+
+#[cfg(feature = "kem")]
+use crate::crypto::profiles::KemProvider;
+#[cfg(feature = "kem")]
+use crate::random::RngWrapper;
+#[cfg(feature = "kem")]
+use crate::zeroize::Zeroizing;
+#[cfg(feature = "kem")]
+use kem::generic_array::GenericArray;
+#[cfg(feature = "kem")]
+use kem::{Decapsulator, EncappedKey, Encapsulator};
 
 /// The length in octets of the random octets that follow the purpose label
 /// in a `ukm`.
@@ -103,6 +119,121 @@ pub trait RecipientKem {
 		recipient: &'a Self::PublicKey,
 		kemct: &'a [u8],
 	) -> MaybeSendFuture<'a, Result<ZeroizingBytes, EnvelopeError>>;
+}
+
+/// The KEM of the [`KemProvider`] role of `P` as the KEM of a
+/// `KEMRecipientInfo` (RFC 9629 §3), so a KEM of the RustCrypto `kem` traits
+/// seals and opens envelopes.
+///
+/// A provider names `ProviderKem<Self>` as its [`CryptoProvider::Kem`], and
+/// its envelopes, its frames, and its handshake then run the KEM of its role:
+///
+/// - The `kem` field names the identifier of [`KemProvider::Kem`].
+/// - A recipient certificate asserts [`KemProvider::USAGE`], the usage of the certificate profile of the KEM.
+/// - The recipient key parses from a SubjectPublicKeyInfo.
+/// - The private key of a recipient is the [`KemProvider::DecapsulationKey`] of `P`, a [`KeyBackend`].
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::cms::{ProviderKem, RecipientKem};
+/// use tightbeam::crypto::k256::PublicKey;
+/// use tightbeam::crypto::key::Secp256k1KeyProvider;
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::random::OsRng;
+/// use tightbeam::SigningKey;
+///
+/// // The house role runs DHKEM(secp256k1, HKDF-SHA256).
+/// type HouseKem = ProviderKem<DefaultCryptoProvider>;
+///
+/// let signing_key = SigningKey::random(&mut OsRng);
+/// let recipient = PublicKey::from(signing_key.verifying_key());
+/// let key = Secp256k1KeyProvider::from(signing_key);
+///
+/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+/// # runtime.block_on(async {
+/// let sent = HouseKem::encapsulate(&recipient, &mut OsRng)?;
+/// let received = HouseKem::decapsulate(&key, &recipient, &sent.kemct).await?;
+/// assert_eq!(received, sent.shared_secret);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// # })?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[cfg(feature = "kem")]
+pub struct ProviderKem<P>(PhantomData<P>);
+
+#[cfg(feature = "kem")]
+impl<P> RecipientKem for ProviderKem<P>
+where
+	P: KemProvider,
+	P::Kem: AssociatedOid,
+	P::DecapsulationKey: KeyBackend + 'static,
+	<P::EncappedKey as EncappedKey>::RecipientPublicKey: Clone
+		+ PartialEq
+		+ Send
+		+ Sync
+		+ 'static
+		+ for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = crate::spki::Error>,
+{
+	const OID: ObjectIdentifier = <P::Kem as AssociatedOid>::OID;
+	const USAGE: KeyUsages = P::USAGE;
+	type PublicKey = <P::EncappedKey as EncappedKey>::RecipientPublicKey;
+	type PrivateKey = P::DecapsulationKey;
+
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::SpkiError`] -- `spki` holds no key of the KEM.
+	fn public_key(spki: SubjectPublicKeyInfoRef<'_>) -> Result<Self::PublicKey, CertificateValidationError> {
+		Ok(Self::PublicKey::try_from(spki)?)
+	}
+
+	/// `Encap(pkR)` by the default value of [`KemProvider::Kem`], with the
+	/// encapsulated key as the `kemct`.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::KemRefused`] -- the KEM refused the encapsulation.
+	fn encapsulate(recipient: &Self::PublicKey, rng: &mut dyn CryptoRngCore) -> Result<Encapsulation, EnvelopeError> {
+		let encapsulated = P::Kem::default().try_encap(&mut RngWrapper(rng), recipient);
+		let (encapsulated_key, shared_secret) = encapsulated.map_err(|_| EnvelopeError::KemRefused)?;
+		let shared_secret = Zeroizing::new(shared_secret.as_bytes().to_vec());
+		let kemct = encapsulated_key.as_ref().to_vec();
+
+		Ok(Encapsulation { shared_secret, kemct })
+	}
+
+	/// `Decap(kemct, skR)` by `key`. The decapsulation runs before the future
+	/// is built, so no copy of the shared secret lives across an await.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::KemRefused`] -- `kemct` is no encapsulated key of the
+	///   KEM, or the KEM refused the decapsulation.
+	fn decapsulate<'a>(
+		key: &'a P::DecapsulationKey,
+		_recipient: &'a Self::PublicKey,
+		kemct: &'a [u8],
+	) -> MaybeSendFuture<'a, Result<ZeroizingBytes, EnvelopeError>> {
+		let decapsulated = Self::decapsulate_now(key, kemct);
+		Box::pin(async move { decapsulated })
+	}
+}
+
+#[cfg(feature = "kem")]
+impl<P: KemProvider> ProviderKem<P> {
+	/// `Decap(kemct, skR)` by `key`, at once.
+	///
+	/// # Errors
+	///
+	/// - [`EnvelopeError::KemRefused`] -- `kemct` is no encapsulated key of the
+	///   KEM, or the KEM refused the decapsulation.
+	fn decapsulate_now(key: &P::DecapsulationKey, kemct: &[u8]) -> Result<ZeroizingBytes, EnvelopeError> {
+		let encoding = GenericArray::from_exact_iter(kemct.iter().copied()).ok_or(EnvelopeError::KemRefused)?;
+		let encapsulated_key = P::EncappedKey::from_bytes(&encoding).map_err(|_| EnvelopeError::KemRefused)?;
+		let shared_secret = key.try_decap(&encapsulated_key).map_err(|_| EnvelopeError::KemRefused)?;
+
+		Ok(Zeroizing::new(shared_secret.as_bytes().to_vec()))
+	}
 }
 
 /// A recipient's public key beside its `rid`: the one form a sender seals to

@@ -18,12 +18,12 @@ use super::link::MuxLink;
 use super::reader::InboundEvent;
 use super::sink::ReplySink;
 use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{GoAwayReason, MuxStreamKind, ResponsePackage};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MuxDispatch, StreamRoute};
 use crate::transport::{TransportError, TransportResult};
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Frame;
 
 #[cfg(feature = "instrument")]

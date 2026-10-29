@@ -99,14 +99,19 @@ impl RestartPolicy for NoRestart {
 /// An exponential backoff restart policy.
 ///
 /// The policy retries after each failure, and the delay doubles with each
-/// attempt: `scale_factor * 2^attempt` milliseconds before the jitter.
+/// attempt: `base_delay * 2^attempt` before the jitter.
 #[cfg(feature = "std")]
 pub struct RestartExponentialBackoff {
 	/// The number of attempts after which the policy answers
 	/// [`RetryAction::NoRetry`].
 	pub max_attempts: usize,
-	/// The base delay in milliseconds, which doubles per attempt.
-	pub scale_factor: u64,
+	/// The delay before the first retry, which doubles per attempt.
+	///
+	/// The field is a [`Duration`], as the interval of
+	/// [`RestartLinearBackoff`] is, so a call site cannot swap it with
+	/// `max_attempts`. The policy reads it in whole milliseconds, and a delay
+	/// past `u64::MAX` milliseconds saturates.
+	pub base_delay: Duration,
 	/// The randomization that the policy applies to each computed delay.
 	/// `None` retries on the exact schedule.
 	pub jitter: Option<Box<dyn JitterStrategy>>,
@@ -114,15 +119,32 @@ pub struct RestartExponentialBackoff {
 
 #[cfg(feature = "std")]
 impl RestartExponentialBackoff {
-	pub fn new(max_attempts: usize, scale_factor: u64, jitter: Option<Box<dyn JitterStrategy>>) -> Self {
-		Self { max_attempts, scale_factor, jitter }
+	/// A policy that retries up to `max_attempts` times, after `base_delay`
+	/// doubled per attempt and then jittered by `jitter`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::transport::policy::{CoreRetryPolicy, RestartExponentialBackoff};
+	///
+	/// let policy = RestartExponentialBackoff::new(4, Duration::from_millis(250), None);
+	/// assert_eq!((policy.delay_ms(0), policy.delay_ms(2)), (250, 1_000));
+	/// ```
+	pub fn new(max_attempts: usize, base_delay: Duration, jitter: Option<Box<dyn JitterStrategy>>) -> Self {
+		Self { max_attempts, base_delay, jitter }
 	}
 }
 
 #[cfg(feature = "std")]
 impl Default for RestartExponentialBackoff {
 	fn default() -> Self {
-		Self { max_attempts: 5, scale_factor: 1000, jitter: Some(Box::new(DecorrelatedJitter)) }
+		Self {
+			max_attempts: 5,
+			base_delay: Duration::from_secs(1),
+			jitter: Some(Box::new(DecorrelatedJitter)),
+		}
 	}
 }
 
@@ -149,6 +171,19 @@ pub struct RestartLinearBackoff {
 
 #[cfg(feature = "std")]
 impl RestartLinearBackoff {
+	/// A policy that retries up to `max_attempts` times, after
+	/// `scale_factor * interval * (attempt + 1)` jittered by `jitter`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::transport::policy::{CoreRetryPolicy, RestartLinearBackoff};
+	///
+	/// let policy = RestartLinearBackoff::new(3, Duration::from_millis(100), 2, None);
+	/// assert_eq!((policy.delay_ms(0), policy.delay_ms(1)), (200, 400));
+	/// ```
 	pub fn new(
 		max_attempts: usize,
 		interval: Duration,
@@ -206,7 +241,8 @@ impl CoreRetryPolicy for RestartExponentialBackoff {
 		// The exponent caps at 63 to prevent overflow, because 2^63 is the
 		// largest power of 2 in a `u64`.
 		let exp = (attempt as u32).min(63);
-		let base_delay = self.scale_factor.saturating_mul(2_u64.saturating_pow(exp));
+		let base_ms = u64::try_from(self.base_delay.as_millis()).unwrap_or(u64::MAX);
+		let base_delay = base_ms.saturating_mul(2_u64.saturating_pow(exp));
 
 		match &self.jitter {
 			Some(jitter_strategy) => jitter_strategy.apply(base_delay),
@@ -274,6 +310,37 @@ mod tests {
 		cases {
 			from_the_random_source => |base| DecorrelatedJitter.apply(base),
 			with_the_source_refused => |base| DecorrelatedJitter::draw(base, None),
+		}
+	}
+
+	/// The default exponential policy waits one second before its first retry.
+	#[test]
+	fn the_default_exponential_policy_waits_one_second_first() {
+		let policy = RestartExponentialBackoff { jitter: None, ..RestartExponentialBackoff::default() };
+		assert_eq!(policy.delay_ms(0), 1_000);
+	}
+
+	/// A policy that a struct literal names reads its base delay in whole
+	/// milliseconds, and doubles it per attempt.
+	#[test]
+	fn a_literal_base_delay_doubles_in_milliseconds() {
+		let base_delay = Duration::from_millis(500);
+		let policy = RestartExponentialBackoff { max_attempts: 3, base_delay, jitter: None };
+		assert_eq!(policy.delay_ms(1), 1_000);
+	}
+
+	// The exponential policy reads the base delay its constructor takes as a
+	// `Duration` in whole milliseconds, and saturates a base past `u64::MAX`
+	// milliseconds.
+	crate::tb_cases! {
+		fn an_exponential_base_delay_keeps_its_milliseconds((base_delay, expected): (Duration, u64)) {
+			let policy = RestartExponentialBackoff::new(4, base_delay, None);
+			assert_eq!(policy.delay_ms(0), expected);
+		}
+		cases {
+			a_quarter_second => (Duration::from_millis(250), 250),
+			under_one_millisecond => (Duration::from_micros(999), 0),
+			past_the_largest_count => (Duration::MAX, u64::MAX),
 		}
 	}
 }

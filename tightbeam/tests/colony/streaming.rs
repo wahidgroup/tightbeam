@@ -20,7 +20,6 @@ use tightbeam::{
 		key::Secp256k1KeyProvider,
 		x509::{utils::CertificateExt, CertificateSpec},
 	},
-	decode,
 	der::Sequence,
 	exactly, hive,
 	instrumentation::events,
@@ -319,7 +318,7 @@ tb_scenario! {
 			sink.close_with(b"beam").await?;
 
 			let reply = response.await?;
-			let label: StreamLabel = decode(reply.message())?;
+			let label: StreamLabel = reply.decode_message()?;
 			assert_eq!(label.label, "9", "the sibling's stream arm reports the 9-byte body");
 
 			hive.stop();
@@ -414,7 +413,7 @@ async fn honest_stream_label(ctx: &Arc<dyn HiveContext>) -> Result<String, Tight
 	sink.close_with(b"beam").await?;
 
 	let reply = response.await?;
-	let label: StreamLabel = decode(reply.message())?;
+	let label: StreamLabel = reply.decode_message()?;
 	Ok(label.label)
 }
 

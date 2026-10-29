@@ -50,9 +50,9 @@ pub use builders::EnvelopeBuilder;
 pub use client::GenericClient;
 pub use client::{ClientBuilder, ClientPolicies};
 pub use envelopes::{Arrived, RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
-pub use error::{Result as TransportResult, TransportError, TransportFailure};
+pub use error::{LimitsRefusal, Result as TransportResult, TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
-pub use limits::TransportLimits;
+pub use limits::{CheckedLimits, TransportLimits};
 pub use messaging::GateAudit;
 pub use messaging::MessageEmitter;
 pub use messaging::{MessageCollector, Transport};
@@ -80,10 +80,12 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::transport::handshake::PeerAuthentication;
 use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
 
+use crate::clock::Clock;
 use crate::transport::state::ServerIdentities;
-use crate::utils::time::Clock;
 use crate::x509::Certificate;
 
+#[cfg(host_clock)]
+use crate::clock::SystemClock;
 #[cfg(feature = "transport-cms")]
 use crate::crypto::cms::KeyAgreementIdentity;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -92,8 +94,6 @@ use crate::crypto::x509::KeyPurposes;
 use crate::trace::TraceCollector;
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::{CmsIdentityPair, HandshakeError};
-#[cfg(host_clock)]
-use crate::utils::time::SystemClock;
 
 /// The configuration of a server endpoint under provider `P`: the identity it
 /// presents, how it authenticates its client, the key purposes its handshakes
@@ -113,7 +113,7 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) key_purposes: KeyPurposes,
 	/// Every ceiling this endpoint enforces.
-	pub(crate) limits: TransportLimits,
+	pub(crate) limits: CheckedLimits,
 	/// The provider the endpoint's handshakes run under.
 	_provider: core::marker::PhantomData<fn() -> P>,
 }
@@ -154,7 +154,7 @@ impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for DialableEncryp
 pub struct EndpointConfig<P: CryptoProvider> {
 	pub(crate) encryption: DialableEncryption<P>,
 	pub(crate) negotiation: Negotiation,
-	pub(crate) limits: TransportLimits,
+	pub(crate) limits: CheckedLimits,
 	pub(crate) clock: Arc<dyn Clock>,
 
 	#[cfg(feature = "instrument")]
@@ -168,7 +168,7 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		Self {
 			encryption: encryption.into(),
 			negotiation: Negotiation::default(),
-			limits: TransportLimits::default(),
+			limits: CheckedLimits::default(),
 			clock,
 			#[cfg(feature = "instrument")]
 			trace: None,
@@ -192,11 +192,30 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
-	/// Replaces every ceiling this endpoint enforces.
-	#[must_use]
-	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
-		self.limits = limits;
-		self
+	/// Replaces every ceiling this endpoint enforces with `limits`, once
+	/// [`TransportLimits::checked`] admits them.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidLimits`] -- the errors of [`TransportLimits::checked`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::transport::{EndpointConfig, TransportLimits};
+	///
+	/// // An endpoint that gives each read and each write 5 seconds.
+	/// let limits = TransportLimits { operation_timeout: Duration::from_secs(5), ..TransportLimits::default() };
+	/// let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext().with_limits(limits)?;
+	/// assert_eq!(endpoint.limits().operation_timeout, Duration::from_secs(5));
+	/// # Ok::<(), tightbeam::transport::TransportError>(())
+	/// ```
+	pub fn with_limits(mut self, limits: TransportLimits) -> TransportResult<Self> {
+		self.limits = limits.checked()?;
+		Ok(self)
 	}
 
 	/// Replaces the clock this endpoint measures deadlines and backoff against.
@@ -209,13 +228,17 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 	/// Replaces the operation timeout of this endpoint when `timeout` is set,
 	/// so a dial and every transport built from this configuration run under
 	/// it.
-	#[must_use]
-	pub(crate) fn with_operation_timeout(mut self, timeout: Option<Duration>) -> Self {
-		if let Some(timeout) = timeout {
-			self.limits.operation_timeout = timeout;
-		}
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidLimits`] -- `timeout` is zero.
+	pub(crate) fn with_operation_timeout(self, timeout: Option<Duration>) -> TransportResult<Self> {
+		let Some(operation_timeout) = timeout else {
+			return Ok(self);
+		};
 
-		self
+		let limits = TransportLimits { operation_timeout, ..*self.limits };
+		self.with_limits(limits)
 	}
 
 	/// Attaches the production instrumentation collector each transport built
@@ -257,13 +280,17 @@ impl<P: CryptoProvider> Clone for EndpointConfig<P> {
 impl<P: CryptoProvider> TryFrom<TransportEncryptionConfig<P>> for EndpointConfig<P> {
 	type Error = TransportError;
 
+	/// The limits of `config` passed [`TransportLimits::checked`] when it took
+	/// them, so the endpoint holds them as they are.
+	///
 	/// # Errors
 	///
 	/// - [`TransportError`] -- an error of the [`DialableEncryption`] conversion.
 	fn try_from(config: TransportEncryptionConfig<P>) -> TransportResult<Self> {
 		let limits = config.limits;
 		let encryption = DialableEncryption::try_from(config)?;
-		Ok(Self::new(encryption, Arc::new(SystemClock)).with_limits(limits))
+
+		Ok(Self { limits, ..Self::new(encryption, Arc::new(SystemClock)) })
 	}
 }
 
@@ -278,7 +305,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 			peer_authentication: PeerAuthentication::Anonymous,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			key_purposes: KeyPurposes::default(),
-			limits: TransportLimits::default(),
+			limits: CheckedLimits::default(),
 			_provider: core::marker::PhantomData,
 		}
 	}
@@ -319,7 +346,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	/// use tightbeam::transport::handshake::PeerAuthentication;
 	/// use tightbeam::transport::TransportEncryptionConfig;
 	///
-	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default()));
 	/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(TestIdentity::insecure_fixed());
 	/// let mutual = config.with_peer_authentication(authentication);
 	/// # drop(mutual);
@@ -330,11 +357,32 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		self
 	}
 
-	/// Replaces every ceiling this endpoint enforces.
-	#[must_use]
-	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
-		self.limits = limits;
-		self
+	/// Replaces every ceiling this endpoint enforces with `limits`, once
+	/// [`TransportLimits::checked`] admits them.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidLimits`] -- the errors of [`TransportLimits::checked`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	///
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::testing::TestIdentity;
+	/// use tightbeam::transport::{TransportEncryptionConfig, TransportLimits};
+	///
+	/// // A server that gives each handshake 5 seconds.
+	/// let limits = TransportLimits { handshake_timeout: Duration::from_secs(5), ..TransportLimits::default() };
+	/// let identity = TestIdentity::insecure_fixed();
+	/// let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity).with_limits(limits)?;
+	/// assert_eq!(config.limits().handshake_timeout, Duration::from_secs(5));
+	/// # Ok::<(), tightbeam::transport::TransportError>(())
+	/// ```
+	pub fn with_limits(mut self, limits: TransportLimits) -> TransportResult<Self> {
+		self.limits = limits.checked()?;
+		Ok(self)
 	}
 
 	/// Returns every ceiling this endpoint enforces.
@@ -397,12 +445,63 @@ mod tests {
 		use crate::testing::fixtures::TestIdentity;
 
 		let identity = TestIdentity::insecure_fixed();
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
 		let mutual = config.with_client_validators([validator]);
 
 		let config = mutual.with_client_validators([]);
 		assert!(config.peer_authentication.requires_certificate());
+	}
+
+	/// An endpoint refuses a set of limits whose handshake ceiling passes its
+	/// cleartext ceiling, before any transport reads the set.
+	#[cfg(host_clock)]
+	#[test]
+	fn an_endpoint_refuses_an_inverted_set_of_limits() {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+
+		let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext();
+		let inverted = TransportLimits { handshake_wire: 1 << 20, ..TransportLimits::default() };
+
+		let refused = endpoint.with_limits(inverted);
+		assert!(matches!(
+			refused,
+			Err(TransportError::InvalidLimits(LimitsRefusal::HandshakePastCleartext))
+		));
+	}
+
+	/// A server configuration refuses a set of limits with a zero ceiling, so
+	/// no listener binds under it.
+	#[cfg(feature = "testing")]
+	#[test]
+	fn a_server_configuration_refuses_a_zero_ceiling() {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::testing::fixtures::TestIdentity;
+
+		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(TestIdentity::insecure_fixed());
+		let zero = TransportLimits { handshake_wire: 0, ..TransportLimits::default() };
+
+		let refused = config.with_limits(zero);
+		assert!(matches!(
+			refused,
+			Err(TransportError::InvalidLimits(LimitsRefusal::ZeroCeiling))
+		));
+	}
+
+	/// A zero operation timeout refuses every operation it bounds, so an
+	/// endpoint refuses it before a dial.
+	#[cfg(host_clock)]
+	#[test]
+	fn an_endpoint_refuses_a_zero_operation_timeout() {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+
+		let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext();
+
+		let refused = endpoint.with_operation_timeout(Some(Duration::ZERO));
+		assert!(matches!(
+			refused,
+			Err(TransportError::InvalidLimits(LimitsRefusal::ZeroCeiling))
+		));
 	}
 
 	/// Both `bind_cleartext` arms of `server!` expand and bind on the tokio
@@ -577,7 +676,7 @@ mod tests {
 		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame)
 			.sealed_by(&encryptor)
-			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() })
+			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() }.checked()?)
 			.finish();
 		assert!(matches!(
 			result,
@@ -598,7 +697,7 @@ mod tests {
 		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
 		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.sealed_by(&encryptor)
-			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() })
+			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() }.checked()?)
 			.finish();
 		assert!(matches!(
 			result,
@@ -609,14 +708,18 @@ mod tests {
 	}
 
 	#[test]
-	fn test_envelope_builder_cleartext_limit_returns_message() {
+	fn test_envelope_builder_cleartext_limit_returns_message() -> Result<(), Box<dyn Error>> {
 		let frame = TestFrame::v0(None, None);
+		// A handshake message of one octet takes three on the wire, so a
+		// cleartext ceiling of four admits the set and refuses the frame.
+		let limits = TransportLimits { handshake_wire: 1, cleartext_envelope: 4, ..TransportLimits::default() };
 		let result = builders::EnvelopeBuilder::request(frame.clone())
-			.with_limits(TransportLimits { cleartext_envelope: 1, ..TransportLimits::default() })
+			.with_limits(limits.checked()?)
 			.finish();
 		assert!(matches!(
 			result,
 			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
 		));
+		Ok(())
 	}
 }

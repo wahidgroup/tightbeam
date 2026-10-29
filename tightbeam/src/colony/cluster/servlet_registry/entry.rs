@@ -3,10 +3,10 @@ use core::str::{from_utf8, FromStr};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::basis_points::BasisPoints;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::MAX_PHEROMONE;
 use crate::colony::cluster::{AdmittedDial, ClusterError, NotASocket, PeerAddress, SharedId};
-use crate::utils::BasisPoints;
 
 /// The endpoint a route dials, parsed once where the route is built.
 ///

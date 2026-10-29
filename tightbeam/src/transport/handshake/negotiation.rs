@@ -33,8 +33,8 @@ use crate::crypto::profiles::{CryptoProvider, ProfileStrength, SecurityProfileDe
 use crate::der::asn1::OctetString;
 use crate::der::Error as DerDecodeError;
 use crate::der::Sequence;
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::transport::handshake::receipt::SessionReceipt;
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
 use crate::Beamable;
 use crate::Errorizable;

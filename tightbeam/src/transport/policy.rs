@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use crate::policy::GatePolicy;
-use crate::transport::error::TransportFailure;
+use crate::transport::error::{Result as TransportResult, TransportFailure};
 use crate::Frame;
 
 mod backoff;
@@ -54,12 +54,20 @@ pub trait TimeoutConfig
 where
 	Self: Sized,
 {
-	/// Set the deadline for a single read or write.
+	/// Set the deadline for a single read or write, once
+	/// [`TransportLimits::checked`] admits the limits that hold it.
 	///
 	/// The blocking transport arms it on its stream, and the async transport
 	/// arms it under `tokio`. An async build without `tokio` has no timer, so
 	/// the application owns the deadline there.
-	fn with_timeout(self, timeout: core::time::Duration) -> Self;
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidLimits`] -- `timeout` is zero.
+	///
+	/// [`TransportLimits::checked`]: crate::transport::TransportLimits::checked
+	/// [`TransportError::InvalidLimits`]: crate::transport::TransportError::InvalidLimits
+	fn with_timeout(self, timeout: core::time::Duration) -> TransportResult<Self>;
 }
 
 /// A transport that honours every policy kind.

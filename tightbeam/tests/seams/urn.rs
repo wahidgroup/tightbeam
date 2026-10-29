@@ -150,3 +150,11 @@ fn a_spec_of_two_optional_fields_verifies_a_urn_of_one() -> Result<(), UrnValida
 	let urn = UrnBuilder::from(TwoOptional).set("zone", "a").set("host", "h1").build()?;
 	urn.verify::<TwoOptional>()
 }
+
+/// The outside spec verifies a URN whose scheme and NID differ from its own
+/// in case alone, because RFC 8141 § 3.1 compares both in any case.
+#[test]
+fn an_outside_spec_verifies_a_urn_of_its_nid_in_another_case() -> Result<(), UrnValidationError> {
+	let urn: Urn<'static> = "URN:OUTSIDE:servlet/ping".parse()?;
+	urn.verify::<KindAndName>()
+}

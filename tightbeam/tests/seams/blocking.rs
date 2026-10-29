@@ -187,7 +187,7 @@ fn loopback_pair() -> (NetTcpStream, NetTcpStream) {
 fn an_outside_blocking_stream_that_times_out_reports_the_deadline() -> Result<(), Box<dyn Error>> {
 	let (stream, _silent) = loopback_pair();
 	let limits = TransportLimits { operation_timeout: READ_DEADLINE, ..TransportLimits::default() };
-	let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext().with_limits(limits);
+	let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext().with_limits(limits)?;
 	let mut transport = TcpTransport::new(OutsideStream(stream), endpoint);
 
 	let read = rt::block_on(transport.read_envelope_bytes());

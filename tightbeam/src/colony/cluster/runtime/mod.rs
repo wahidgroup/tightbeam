@@ -38,6 +38,7 @@ use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
 use self::hop::HivePlane;
 use self::verify::RequestAudit;
+use crate::clock::Clock;
 use crate::colony::cluster::export::ExportScope;
 use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
@@ -56,7 +57,6 @@ use crate::transport::multiplex::{CallContext, MuxCapable, MuxService, ReplySink
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{AsyncListenerTrait, Protocol};
 use crate::urn::Urn;
-use crate::utils::time::Clock;
 use crate::Frame;
 use crate::TightBeamError;
 
@@ -266,7 +266,10 @@ where
 			config
 		};
 
-		let config = ColonyConfig::<P>::new(config);
+		// The gossip section stays writable until here as well, so the start
+		// mints the ingress key once, under the namespace of this gateway, and
+		// refuses an ingress that the namespace does not route.
+		let config = ColonyConfig::<P>::new(config)?;
 
 		// The `colony` feature enables `x509`, so the gateway always serves
 		// TLS.
@@ -749,6 +752,37 @@ mod tests {
 		let started = ClusterGateway::<TokioListener>::start(Arc::new(TraceCollector::new()), config).await;
 
 		assert!(refused_the_address(&started, b"not-a-socket"));
+		Ok(())
+	}
+
+	/// Whether `started` failed on a servlet type that names `octets`.
+	fn refused_the_servlet_type<T>(started: &Result<T, TightBeamError>, octets: &[u8]) -> bool {
+		let Err(TightBeamError::ClusterError(error)) = started else {
+			return false;
+		};
+
+		matches!(error.as_ref(), ClusterError::UnknownServletType(named) if named.as_slice() == octets)
+	}
+
+	// The namespace stays writable after the gossip ingress is set, so the
+	// start refuses an ingress that the namespace it serves cannot route.
+	#[tokio::test]
+	async fn a_gossip_ingress_outside_the_namespace_refuses_the_start() -> Result<(), TightBeamError> {
+		use crate::colony::cluster::CertificateSpec;
+		use crate::colony::urn::ColonyNamespace;
+		use crate::transport::TokioListener;
+
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
+		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)))?;
+		let ingress = ColonyNamespace::default().servlet("feed")?;
+		let acme = ColonyNamespace::new("acme", "prod")?;
+		let builder = ClusterConfig::builder(tls).with_gossip_ingress(ingress)?;
+		let config = builder.with_namespace(acme).build();
+
+		let started = ClusterGateway::<TokioListener>::start(Arc::new(TraceCollector::new()), config).await;
+
+		assert!(refused_the_servlet_type(&started, b"urn:tightbeam::servlet:feed"));
 		Ok(())
 	}
 

@@ -179,7 +179,7 @@ pub async fn bind_encrypted_listener_with_timeout(
 	handshake_timeout: Duration,
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
 	let limits = TransportLimits { handshake_timeout, ..TransportLimits::default() };
-	let config = TransportEncryptionConfig::new(materials.identity()).with_limits(limits);
+	let config = TransportEncryptionConfig::new(materials.identity()).with_limits(limits)?;
 	bind_with_config(config).await
 }
 

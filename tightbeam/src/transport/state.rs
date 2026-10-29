@@ -12,19 +12,20 @@ use alloc::{boxed::Box, sync::Arc};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use crate::clock::{Clock, MonotonicInstant};
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::x509::utils::ValidityClock;
 use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::WireEnvelope;
 use crate::transport::error::{ArrivalCause, ArrivalRefusal, TransportError, TransportFailure};
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::handshake::{EstablishedSession, SessionPeer};
 use crate::transport::handshake::{HandshakeProtocolKind, PeerAuthentication};
-use crate::transport::TransportLimits;
 use crate::transport::TransportResult;
-use crate::utils::time::MonotonicInstant;
+use crate::transport::{CheckedLimits, TransportLimits};
 use crate::x509::Certificate;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -209,9 +210,9 @@ impl SessionPhase {
 	/// # Examples
 	///
 	/// ```
+	/// use tightbeam::clock::{Clock, SystemClock};
 	/// use tightbeam::transport::state::SessionPhase;
 	/// use tightbeam::transport::TransportLimits;
-	/// use tightbeam::utils::time::{Clock, SystemClock};
 	///
 	/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 	/// let limits = TransportLimits::default();
@@ -345,13 +346,15 @@ pub(crate) enum SessionEvent {
 	Fail,
 }
 
-/// A session's phase, the provisioning it starts from, its negotiation input,
-/// the mark of an exchange in flight, and the server orchestrator in flight.
+/// The state of a session, which one constructor sets whole:
 ///
-/// All five are private, and one constructor sets them together, so the phase
-/// an endpoint starts in and returns to on a reset follows from its
-/// provisioning. Every later move consults the transition table, so a session
-/// sits only in a phase the table names.
+/// - Its phase, the provisioning it starts from, and its negotiation input.
+/// - The mark of an exchange in flight, and the server orchestrator in flight.
+/// - The clock its handshakes read.
+///
+/// Every field is private, so the phase an endpoint starts in and returns to
+/// on a reset follows from its provisioning. Every later move consults the
+/// transition table, so a session sits only in a phase the table names.
 pub struct SessionState<P: CryptoProvider> {
 	encryption: DialableEncryption<P>,
 	negotiation: Negotiation,
@@ -364,22 +367,37 @@ pub struct SessionState<P: CryptoProvider> {
 	/// each round advances only after the phase admits the round.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	handshake: HandshakeSlot,
+	/// The clock that each handshake reads the validity period of a peer
+	/// certificate on: the clock of the endpoint, or the crate clock.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	clock: ValidityClock<dyn Clock>,
 }
 
 impl<P: CryptoProvider> SessionState<P> {
 	/// A session for `encryption`, at the phase that provisioning starts in.
+	/// Its handshakes read the crate clock.
 	///
 	/// [`DialableEncryption`] guarantees the endpoint either holds a peer
 	/// authority or names cleartext, so the start is `Provisioned` or a
 	/// chosen `Cleartext`.
 	pub fn new(encryption: DialableEncryption<P>) -> Self {
-		Self::negotiating(encryption, Negotiation::default())
+		Self::negotiating(encryption, Negotiation::default(), ValidityClock::CRATE)
 	}
 
 	/// A session for `encryption` that starts with the negotiation input
-	/// `negotiation`, at the phase that provisioning starts in.
-	pub(crate) fn negotiating(encryption: DialableEncryption<P>, negotiation: Negotiation) -> Self {
+	/// `negotiation`, at the phase that provisioning starts in, whose
+	/// handshakes read `clock`.
+	pub(crate) fn negotiating(
+		encryption: DialableEncryption<P>,
+		negotiation: Negotiation,
+		clock: ValidityClock<dyn Clock>,
+	) -> Self {
 		let phase = SessionPhase::start_for(encryption.encryption());
+
+		// Only a handshake protocol reads the clock, so a build without one
+		// drops it here.
+		#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
+		drop(clock);
 
 		Self {
 			encryption,
@@ -389,6 +407,8 @@ impl<P: CryptoProvider> SessionState<P> {
 			exchange_in_flight: false,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			handshake: HandshakeSlot::empty(),
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			clock,
 		}
 	}
 
@@ -417,10 +437,11 @@ impl<P: CryptoProvider> SessionState<P> {
 
 	/// The endpoint this session runs as. It lends the proof that the
 	/// provisioning passed both checks of [`DialableEncryption::new`], beside
-	/// the negotiation input as the setters below last wrote it.
+	/// the negotiation input as the setters below last wrote it, and the clock
+	/// of its handshakes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn endpoint(&self) -> Endpoint<'_, P> {
-		Endpoint::new(&self.encryption, &self.negotiation)
+		Endpoint::new(&self.encryption, &self.negotiation, &self.clock)
 	}
 
 	/// The phase this session sits in.
@@ -805,6 +826,8 @@ impl<P: CryptoProvider> SessionState<P> {
 			exchange_in_flight: false,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			handshake: HandshakeSlot::empty(),
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			clock: ValidityClock::CRATE,
 		}
 	}
 }
@@ -828,8 +851,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	where
 		P: HandshakeProvider,
 	{
-		let Self { encryption, negotiation, handshake, .. } = self;
-		handshake.occupy(|| Endpoint::new(encryption, negotiation).server_handshake())
+		let Self { encryption, negotiation, handshake, clock, .. } = self;
+		handshake.occupy(|| Endpoint::new(encryption, negotiation, clock).server_handshake())
 	}
 
 	/// Serves `request`, one handshake round at `now`: the phase admits the
@@ -1374,7 +1397,7 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 /// ```compile_fail,E0277
 /// use tightbeam::crypto::profiles::DefaultCryptoProvider;
 /// use tightbeam::transport::state::{EncryptedProtocolState, SessionState};
-/// use tightbeam::transport::TransportLimits;
+/// use tightbeam::transport::CheckedLimits;
 ///
 /// struct Forged;
 ///
@@ -1389,7 +1412,7 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 ///         unimplemented!()
 ///     }
 ///
-///     fn limits(&self) -> &TransportLimits {
+///     fn limits(&self) -> &CheckedLimits {
 ///         unimplemented!()
 ///     }
 /// }
@@ -1451,8 +1474,8 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 		self.session_state().encryption()
 	}
 
-	/// Every ceiling this endpoint enforces.
-	fn limits(&self) -> &TransportLimits;
+	/// Every ceiling this endpoint enforces, as a set whose ceilings agree.
+	fn limits(&self) -> &CheckedLimits;
 
 	/// Returns the allowance for the whole handshake, which bounds
 	/// handshake-phase reads.
@@ -1539,12 +1562,12 @@ impl<E: EncryptedProtocolState> SettledExchange for E {}
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::clock::{Clock, ManualClock};
 	use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::testing::TestFrame;
-	use crate::utils::time::{Clock, ManualClock};
 
 	#[cfg(feature = "testing")]
 	use crate::crypto::x509::CanonicalKey;
@@ -1560,7 +1583,7 @@ mod tests {
 	/// A probe that holds the phase the trait reads back.
 	struct PhaseProbe {
 		state: SessionState<DefaultCryptoProvider>,
-		limits: TransportLimits,
+		limits: CheckedLimits,
 	}
 
 	impl PhaseProbe {
@@ -1574,7 +1597,7 @@ mod tests {
 		}
 
 		fn holding(encryption: EncryptionConfig<DefaultCryptoProvider>, phase: SessionPhase) -> Self {
-			Self { state: SessionState::at(encryption, phase), limits: TransportLimits::default() }
+			Self { state: SessionState::at(encryption, phase), limits: CheckedLimits::default() }
 		}
 	}
 
@@ -1583,7 +1606,7 @@ mod tests {
 	impl EncryptedProtocolState for PhaseProbe {
 		type CryptoProvider = DefaultCryptoProvider;
 
-		fn limits(&self) -> &TransportLimits {
+		fn limits(&self) -> &CheckedLimits {
 			&self.limits
 		}
 
@@ -1604,7 +1627,7 @@ mod tests {
 	}
 
 	fn provisioned_encryption() -> EncryptionConfig<DefaultCryptoProvider> {
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 		let peer_authentication = PeerAuthentication::Anonymous.and(validator);
 		EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() }
 	}
@@ -1806,7 +1829,7 @@ mod tests {
 		let mut state = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
 		state.reset();
 
-		let probe = PhaseProbe { state, limits: TransportLimits::default() };
+		let probe = PhaseProbe { state, limits: CheckedLimits::default() };
 		let builder = EnvelopeBuilder::request(TestFrame::v0(None, None));
 		let refusal = probe.apply_wire_mode(builder);
 		assert!(matches!(
@@ -2091,7 +2114,8 @@ mod tests {
 	#[test]
 	fn installing_a_session_bounds_its_send_cipher_by_the_envelope_ceiling() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.limits.encrypted_envelope = 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE;
+		let limits = TransportLimits { encrypted_envelope: 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE, ..*probe.limits };
+		probe.limits = limits.checked()?;
 		probe.install_established(established_session())?;
 
 		let send_limit = probe.session_state().encryptor()?.rekey_limit();

@@ -260,12 +260,12 @@ use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::{Enumerated, Sequence};
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::wire_der::WireDer;
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
 use crate::Beamable;
 

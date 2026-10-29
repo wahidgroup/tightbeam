@@ -28,6 +28,8 @@ use std::sync::Arc;
 use crate::crypto::x509::policy::CertificateValidation;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::clock::Clock;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::point::AffineCoordinates;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::elliptic_curve::PublicKey;
@@ -40,13 +42,15 @@ use crate::crypto::x509::error::CertificateValidationError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::store::CertificateTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::utils::ValidityClock;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::{AgreementPoint, PeerCertificate, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::ObjectIdentifier;
 #[cfg(any(feature = "transport-cms", mux_rekey))]
 use crate::der::referenced::OwnedToRef;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -61,8 +65,6 @@ use crate::transport::handshake::HandshakeProvider;
 use crate::transport::handshake::SessionPeer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::{ClientConfig, ClientFlow};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::utils::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::Certificate;
 
@@ -85,8 +87,9 @@ pub enum PeerAuthentication {
 	Anonymous,
 	/// Both sides authenticate. The client MUST offer a certificate, and every
 	/// validator in the chain MUST accept it before the session records it.
-	/// The certificate MUST be within its validity period, so a build with no
-	/// clock refuses every client.
+	/// The certificate MUST be within its validity period on the clock of the
+	/// server. A server on the crate clock of a build that has none refuses
+	/// every client.
 	Mutual(ValidatorChain),
 }
 
@@ -153,10 +156,10 @@ mod chain {
 		}
 
 		/// Admit the certificate `offer` holds under this chain, the policy of
-		/// a mutual server: within its validity period, then as every
-		/// validator decides on it beside the issuers the client presents
-		/// above it. This chain passes an offer of no certificate, and
-		/// [`PeerAuthentication::admit`] decides on it.
+		/// a mutual server: within its validity period on `clock`, then as
+		/// every validator decides on it beside the issuers the client
+		/// presents above it. This chain passes an offer of no certificate,
+		/// and [`PeerAuthentication::admit`] decides on it.
 		///
 		/// # Errors
 		///
@@ -164,14 +167,18 @@ mod chain {
 		///   is outside its validity period, or a validator refused it or its
 		///   path.
 		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-		pub(super) fn admit_offer<P: HandshakeProvider>(&self, offer: &Offer<P>) -> Result<(), HandshakeError> {
+		pub(super) fn admit_offer<P: HandshakeProvider>(
+			&self,
+			offer: &Offer<P>,
+			clock: &ValidityClock<dyn Clock>,
+		) -> Result<(), HandshakeError> {
 			let Some((identity, issuers)) = offer.presented() else {
 				return Ok(());
 			};
 			// A validator may accept a certificate and leave its validity
 			// period unread, as a pin does, so the chain reads it first.
 			let certificate = identity.certificate();
-			certificate.validate_expiry()?;
+			clock.admits(certificate)?;
 			for validator in self.0.iter() {
 				validator.evaluate_presented(issuers.as_slice(), certificate)?;
 			}
@@ -242,7 +249,7 @@ impl PeerAuthentication {
 	/// use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	/// use tightbeam::transport::handshake::PeerAuthentication;
 	///
-	/// let validators: Vec<Arc<dyn CertificateValidation>> = vec![Arc::new(ExpiryValidator)];
+	/// let validators: Vec<Arc<dyn CertificateValidation>> = vec![Arc::new(ExpiryValidator::default())];
 	/// let mutual = PeerAuthentication::mutual(validators).ok_or("an empty validator set")?;
 	/// assert!(mutual.requires_certificate());
 	///
@@ -270,7 +277,7 @@ impl PeerAuthentication {
 	/// use tightbeam::crypto::x509::policy::ExpiryValidator;
 	/// use tightbeam::transport::handshake::PeerAuthentication;
 	///
-	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	/// let authentication = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default()));
 	/// assert!(authentication.requires_certificate());
 	/// ```
 	#[must_use]
@@ -295,8 +302,8 @@ impl PeerAuthentication {
 	/// is the same for both protocols:
 	///
 	/// - An [`Offer`] holds a certificate with its client Finished, or neither.
-	/// - Under mutual authentication, the validity check and then every
-	///   validator run before the Finished. Each validator reads the
+	/// - Under mutual authentication, the validity check on `clock` and then
+	///   every validator run before the Finished. Each validator reads the
 	///   certificate beside the issuers the Finished presents, through
 	///   [`CertificateValidation::evaluate_presented`].
 	/// - It verifies the Finished whenever the client offers a certificate,
@@ -315,12 +322,17 @@ impl PeerAuthentication {
 	///
 	/// [`ClientFinished::verify`]: crate::transport::handshake::flow::ClientFinished::verify
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	pub(crate) fn admit<P>(&self, offer: Offer<P>, terms: &Terms<P>) -> Result<AdmittedPeer<P>, HandshakeError>
+	pub(crate) fn admit<P>(
+		&self,
+		offer: Offer<P>,
+		terms: &Terms<P>,
+		clock: &ValidityClock<dyn Clock>,
+	) -> Result<AdmittedPeer<P>, HandshakeError>
 	where
 		P: HandshakeProvider,
 	{
 		if let Self::Mutual(chain) = self {
-			chain.admit_offer(&offer)?;
+			chain.admit_offer(&offer, clock)?;
 		}
 		let Some((identity, finished)) = offer.into_identity() else {
 			return match self {
@@ -544,25 +556,28 @@ mod pair {
 
 	impl<P: HandshakeProvider, V> AdmittedSigning<P, V> {
 		/// Admit `named`, the signing certificate a reply names, under
-		/// `purpose`. Both trusts admit the reply's signer here, in this order:
+		/// `admission`. Both trusts admit the reply's signer here, in this
+		/// order:
 		///
-		/// 1. The validity period, which a validator may leave unread, as a pin does.
-		/// 2. The signing use under `purpose`, which decodes the key that a validator then reads.
+		/// 1. The validity period on the clock of `admission`, which a
+		///    validator may leave unread, as a pin does.
+		/// 2. The signing use under the purpose of `admission`, which decodes
+		///    the key that a validator then reads.
 		/// 3. `validate`, because a validity check alone authenticates nobody (CWE-295).
 		///
 		/// # Errors
 		///
 		/// - [`HandshakeError::CertificateValidationError`] -- the certificate
 		///   is outside its validity period, `validate` refused it, or the
-		///   signing use or `purpose` refused it.
+		///   signing use or the purpose refused it.
 		pub(super) fn admit(
 			named: Certificate,
-			purpose: ObjectIdentifier,
+			admission: ServerAdmission<'_>,
 			validate: impl FnOnce(&Certificate) -> Result<V, CertificateValidationError>,
 		) -> Result<Self, HandshakeError> {
-			named.validate_expiry()?;
+			admission.clock.admits(&named)?;
 
-			let signing = PeerCertificate::parse(named, purpose)?;
+			let signing = PeerCertificate::parse(named, admission.purpose)?;
 			let verdict = validate(signing.certificate())?;
 			Ok(Self { signing, verdict })
 		}
@@ -687,12 +702,12 @@ impl AgreementCertificate for Certificate {
 }
 
 /// What a client lends its server trust at each admission: the key purpose
-/// of the server's role, and the server policy.
+/// of the server's role, the server policy, and the clock of the client.
 ///
 /// [`Self::of`] is its one constructor, so every admission carries the policy
-/// of its client configuration. Each trust runs the policy on the identity
-/// certificate of its flow: the pinned key-agreement certificate of a CMS
-/// server, and the signing certificate of an HPKE server.
+/// and the clock of its client configuration. Each trust runs the policy on
+/// the identity certificate of its flow: the pinned key-agreement certificate
+/// of a CMS server, and the signing certificate of an HPKE server.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 #[derive(Clone, Copy)]
 pub struct ServerAdmission<'a> {
@@ -700,13 +715,21 @@ pub struct ServerAdmission<'a> {
 	purpose: ObjectIdentifier,
 	/// The server policy, or `None` when the client sets none.
 	policy: Option<&'a ValidatorChain>,
+	/// The clock that the validity period of each certificate of the server
+	/// is read on.
+	clock: &'a ValidityClock<dyn Clock>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a> ServerAdmission<'a> {
-	/// The admission of `config`: its server purpose and its server policy.
+	/// The admission of `config`: its server purpose, its server policy, and
+	/// its clock.
 	pub(crate) fn of<F: ClientFlow<P>, P: HandshakeProvider>(config: &'a ClientConfig<F, P>) -> Self {
-		Self { purpose: config.key_purposes().server, policy: config.server_policy() }
+		Self {
+			purpose: config.key_purposes().server,
+			policy: config.server_policy(),
+			clock: config.clock(),
+		}
 	}
 }
 
@@ -755,9 +778,10 @@ impl CmsServerIdentity {
 	/// leaf beside the trust anchor at which the store's path validation ends
 	/// (RFC 5280 §6.1.1(d)).
 	///
-	/// - A bare certificate must be within its validity period, because a
-	///   store's [`evaluate`](CertificateValidation::evaluate) may accept one
-	///   and leave that period unread, and the store then names its anchor.
+	/// - A bare certificate must be within its validity period on `clock`,
+	///   because a store's [`evaluate`](CertificateValidation::evaluate) may
+	///   accept one and leave that period unread, and the store then names
+	///   its anchor.
 	/// - The store path-validates a chain ([RFC 5280 §6.1][rfc5280-6.1]) and
 	///   owns the validity period of each certificate in it. Its leaf
 	///   identifies the server, and [`CertificateTrust::verify_chain`] returns
@@ -769,10 +793,14 @@ impl CmsServerIdentity {
 	///   outside its validity period, or the store refused it or its chain.
 	///
 	/// [rfc5280-6.1]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1
-	fn admit(&self, store: &dyn CertificateTrust) -> Result<(&Arc<Certificate>, Arc<Certificate>), HandshakeError> {
+	fn admit(
+		&self,
+		store: &dyn CertificateTrust,
+		clock: &ValidityClock<dyn Clock>,
+	) -> Result<(&Arc<Certificate>, Arc<Certificate>), HandshakeError> {
 		match self {
 			Self::Certificate(certificate) => {
-				certificate.validate_expiry()?;
+				clock.admits(certificate)?;
 				let anchor = store.trust_anchor(certificate)?;
 				Ok((certificate, anchor))
 			}
@@ -806,9 +834,9 @@ impl ProvisionedTrust {
 	/// Trust in the server whose key-agreement certificate is
 	/// `key_agreement`, as `store` authenticates it.
 	///
-	/// It admits the certificate against the store once, and each handshake
-	/// admits it again, because its validity period and the store's verdict
-	/// change after construction.
+	/// It admits the certificate against the store once, on the crate clock,
+	/// and each handshake admits it again on the clock of its client, because
+	/// its validity period and the store's verdict change after construction.
 	///
 	/// # Errors
 	///
@@ -819,9 +847,10 @@ impl ProvisionedTrust {
 		store: Arc<dyn CertificateTrust>,
 	) -> Result<Self, HandshakeError> {
 		let key_agreement = key_agreement.into();
-		// Each handshake admits the certificate again, so its leaf and anchor
-		// drop here.
-		key_agreement.admit(store.as_ref())?;
+		// The trust precedes every client, so this admission reads the crate
+		// clock. Each handshake admits the certificate again, so its leaf and
+		// anchor drop here.
+		key_agreement.admit(store.as_ref(), &ValidityClock::CRATE)?;
 		Ok(Self { key_agreement, store })
 	}
 }
@@ -916,7 +945,7 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 	///   it.
 	/// - [`HandshakeError::Envelope`] -- the certificate fails to name its recipient.
 	fn admit_provisioned(&self, admission: ServerAdmission<'_>) -> Result<ProvisionedKeyAgreement<P>, HandshakeError> {
-		let (certificate, anchor) = self.key_agreement.admit(self.store.as_ref())?;
+		let (certificate, anchor) = self.key_agreement.admit(self.store.as_ref(), admission.clock)?;
 		let admitted = PeerCertificate::parse(Arc::clone(certificate), admission.purpose)?;
 		ProvisionedKeyAgreement::new(admitted, anchor, admission.policy)
 	}
@@ -941,7 +970,7 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 		let CmsNamedServer { signing, key_agreement } = named;
 		let (leaf, issuers) = signing.into_parts();
 		let anchor = |leaf: &Certificate| self.store.verify_presented(issuers.as_slice(), leaf);
-		let signing = AdmittedSigning::admit(leaf, admission.purpose, anchor)?;
+		let signing = AdmittedSigning::admit(leaf, admission, anchor)?;
 
 		let pair = CmsServerPair::admit(signing, key_agreement)?;
 		AdmittedServer::paired(pair)
@@ -1071,7 +1100,7 @@ impl<P: HandshakeProvider> ServerTrust<P> for LearnedTrust {
 	) -> Result<AdmittedServer<P>, HandshakeError> {
 		let (leaf, issuers) = named.into_parts();
 		let evaluate = |leaf: &Certificate| LearnedVerdict::of(self, leaf, issuers);
-		let signing = AdmittedSigning::admit(leaf, admission.purpose, evaluate)?;
+		let signing = AdmittedSigning::admit(leaf, admission, evaluate)?;
 		AdmittedServer::learned(signing, admission.policy)
 	}
 }
@@ -1127,12 +1156,15 @@ mod tests {
 	/// The house server purpose, which a trust admits a server under.
 	const SERVER: ObjectIdentifier = KeyPurposes::HOUSE.server;
 
-	/// The admission under the house server purpose, with no server policy.
-	const ADMISSION: ServerAdmission<'static> = ServerAdmission { purpose: SERVER, policy: None };
+	/// The admission under the house server purpose on the crate clock, with
+	/// no server policy.
+	const ADMISSION: ServerAdmission<'static> =
+		ServerAdmission { purpose: SERVER, policy: None, clock: &ValidityClock::CRATE };
 
-	/// The admission under the house server purpose and `policy`.
+	/// The admission under the house server purpose and `policy`, on the
+	/// crate clock.
 	fn admission_under(policy: &ValidatorChain) -> ServerAdmission<'_> {
-		ServerAdmission { purpose: SERVER, policy: Some(policy) }
+		ServerAdmission { purpose: SERVER, policy: Some(policy), clock: &ValidityClock::CRATE }
 	}
 
 	/// The validator that pins `certificate` alone, by its fingerprint.
@@ -1187,7 +1219,7 @@ mod tests {
 		put_off_curve_key(&mut named);
 
 		let validate = |_: &Certificate| Err::<(), _>(CertificateValidationError::CertificateDenied);
-		let refused = AdmittedSigning::<DefaultCryptoProvider, ()>::admit(named, SERVER, validate);
+		let refused = AdmittedSigning::<DefaultCryptoProvider, ()>::admit(named, ADMISSION, validate);
 		assert!(matches!(
 			refused,
 			Err(HandshakeError::CertificateValidationError(
@@ -1315,7 +1347,7 @@ mod tests {
 			signing: &Certificate,
 			purpose: ObjectIdentifier,
 		) -> Result<HouseServer, HandshakeError> {
-			let admission = ServerAdmission { purpose, policy: None };
+			let admission = ServerAdmission { purpose, policy: None, clock: &ValidityClock::CRATE };
 			let provisioned = admit_provisioned(trust, admission)?;
 			let (key_agreement, _) = provisioned.into_parts();
 			let named = CmsNamedServer { signing: named(signing), key_agreement };
@@ -2068,7 +2100,7 @@ mod tests {
 			let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
 			let server = TestCertificate::with_key_purposes(create_test_certificate().certificate, [own]);
 			let trust = pinned(&server);
-			let admission = ServerAdmission { purpose: own, policy: None };
+			let admission = ServerAdmission { purpose: own, policy: None, clock: &ValidityClock::CRATE };
 
 			let admitted: Result<HouseServer, _> = trust.admit_named(named(&server), admission);
 			assert!(admitted.is_ok());
@@ -2107,7 +2139,7 @@ mod tests {
 		#[test]
 		fn the_second_validator_of_a_policy_refuses_the_learned_certificate() {
 			let server = create_test_certificate().certificate;
-			let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+			let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 			let policy = policy_of([expiry, pin_of(&create_test_certificate().certificate)]);
 			let admission = admission_under(&policy);
 

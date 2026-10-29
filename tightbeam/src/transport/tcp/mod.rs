@@ -247,8 +247,8 @@ macro_rules! impl_tcp_common {
 			pub(crate) emitter_gate: $crate::policy::GateChain,
 			pub(crate) collector_gate: $crate::policy::GateChain,
 			pub(crate) state: $crate::transport::state::SessionState<P>,
-			pub(crate) limits: $crate::transport::TransportLimits,
-			pub(crate) clock: Arc<dyn $crate::utils::time::Clock>,
+			pub(crate) limits: $crate::transport::CheckedLimits,
+			pub(crate) clock: Arc<dyn $crate::clock::Clock>,
 			/// The instrumentation collector of this connection.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
@@ -278,12 +278,16 @@ macro_rules! impl_tcp_common {
 					trace,
 				} = config;
 
+				// The handshakes of the session read the clock of the endpoint.
+				let validity = $crate::crypto::x509::utils::ValidityClock::new(Arc::clone(&clock));
+				let state = $crate::transport::state::SessionState::negotiating(encryption, negotiation, validity);
+
 				Self {
 					stream,
 					restart_policy: Box::new($crate::transport::policy::NoRestart),
 					emitter_gate: $crate::policy::GateChain::default(),
 					collector_gate: $crate::policy::GateChain::default(),
-					state: $crate::transport::state::SessionState::negotiating(encryption, negotiation),
+					state,
 					limits,
 					clock,
 					#[cfg(feature = "instrument")]
@@ -422,9 +426,10 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
-			fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
-				self.limits.operation_timeout = timeout;
-				self
+			fn with_timeout(mut self, timeout: core::time::Duration) -> $crate::transport::TransportResult<Self> {
+				let limits = $crate::transport::TransportLimits { operation_timeout: timeout, ..*self.limits };
+				self.limits = limits.checked()?;
+				Ok(self)
 			}
 		}
 
@@ -463,7 +468,7 @@ macro_rules! impl_tcp_common {
 				&mut self.state
 			}
 
-			fn limits(&self) -> &$crate::transport::TransportLimits {
+			fn limits(&self) -> &$crate::transport::CheckedLimits {
 				&self.limits
 			}
 

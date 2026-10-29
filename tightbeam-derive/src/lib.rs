@@ -165,11 +165,12 @@ fn get_error_message(attrs: impl AsRef<[Attribute]>) -> Option<String> {
 /// - `confidential`, `nonrepudiable`, `compressed`, `prioritized`,
 ///   `message_integrity`, and `frame_integrity` set the matching `MUST_*`
 ///   constant to `true`.
-/// - `min_version = "V1"` sets the minimum protocol version of the type.
+/// - `min_version = "V1"` sets the minimum protocol version of the type. Beside
+///   `profile = N`, the higher of the two versions holds.
 /// - `profile(MyProfile)` pins the type to a `SecurityProfile`. The builder
-///   refuses a digest, AEAD, or signature algorithm that the profile does not
-///   name. A mismatched algorithm type also fails to compile at the builder
-///   call.
+///   refuses a digest, AEAD, signature, or key wrap that the profile does not
+///   name. A mismatched digest, AEAD, or signature type also fails to compile
+///   at the builder call.
 /// - `profile = N` is a numeric shorthand for a set of requirement flags:
 ///
 ///   | N | Profile  | Effect                                          |
@@ -246,10 +247,11 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 		None => (false, false, None),
 	};
 
-	// A numeric profile's requirements override the matching attributes.
+	// A numeric level and the attributes combine to the stricter requirement:
+	// a flag that either one sets holds, and so does the higher minimum
+	// version.
 	let final_confidential = profile_confidential || confidential;
 	let final_nonrep = profile_nonrep || nonrep;
-	let final_min_version = profile_min_version.or(min_version);
 	let final_message_integrity = message_integrity;
 	let final_frame_integrity = frame_integrity;
 
@@ -267,10 +269,14 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 		feature_checks.push(feature_check(name, "__tb_if_digest", "requiring message integrity", "digest"));
 	}
 
-	let min_version_value = if let Some(version) = final_min_version {
-		quote! { ::tightbeam::Version::#version }
-	} else {
-		quote! { ::tightbeam::Version::V0 }
+	// The emitted constant orders the two versions through `Version::later`,
+	// the method of the type that owns the protocol order.
+	let min_version_value = match (profile_min_version, min_version) {
+		(Some(level), Some(declared)) => quote! {
+			::tightbeam::Version::#level.later(::tightbeam::Version::#declared)
+		},
+		(Some(version), _) | (None, Some(version)) => quote! { ::tightbeam::Version::#version },
+		(None, None) => quote! { ::tightbeam::Version::V0 },
 	};
 
 	// `Message::Profile` is gated behind tightbeam's `crypto` feature, so the

@@ -62,8 +62,8 @@ use crate::cms::signed_data::SignedData;
 use crate::crypto::sign::Signed;
 use crate::der::asn1::OctetString;
 use crate::der::Sequence;
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::transport::handshake::negotiation::MuxBudgets;
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]

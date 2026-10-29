@@ -3,6 +3,7 @@ use crate::builder::TypeBuilder;
 use crate::crypto::hash::Sha3_256;
 use crate::error::Result;
 use crate::testing::{TestKey, TestMessage, TestSigner};
+use crate::version::GatedField;
 use crate::{Frame, TightBeamError, Version};
 
 #[cfg(feature = "secp256k1")]
@@ -36,7 +37,10 @@ fn attaching_a_signature_below_v1_is_refused() -> Result<()> {
 	let original = frame.clone();
 
 	let result = frame.attach_signer_info(TestSigner::info());
-	assert!(matches!(result, Err(TightBeamError::UnsupportedVersion(_))));
+	assert!(matches!(
+		result,
+		Err(TightBeamError::UnsupportedField { field: GatedField::Nonrepudiation, version: Version::V0 })
+	));
 	assert_eq!(frame, original);
 	Ok(())
 }

@@ -7,6 +7,7 @@
 //! - [`extensions`]: the FDR analysis of a consumed trace.
 //! - `recorder` (feature `instrument`): the exploration events of a trace.
 //! - [`refinement`]: trace, failures, and divergence refinement.
+//! - `schedule` (feature `testing-fault`): the process that a scheduler constraint lets a process run.
 //! - `timing` (feature `testing-timing`): the timing checks of exploration.
 
 pub mod cache;
@@ -17,6 +18,8 @@ pub mod extensions;
 #[cfg(feature = "instrument")]
 mod recorder;
 pub mod refinement;
+#[cfg(feature = "testing-fault")]
+mod schedule;
 
 #[cfg(feature = "testing-timing")]
 pub mod timing;

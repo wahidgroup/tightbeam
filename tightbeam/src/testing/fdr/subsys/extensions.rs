@@ -10,8 +10,9 @@ use std::io::Write;
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{Assertion, AssertionLabel};
+use crate::testing::fdr::subsys::export::TraceScript;
 use crate::testing::fdr::verdict::AcceptanceSet;
-use crate::testing::specs::csp::{intern, Action, Event, Observation, Process, State, TransitionRelation};
+use crate::testing::specs::csp::{intern, Action, Components, Event, Observation, Process, State, TransitionRelation};
 use crate::trace::{ConsumedTrace, InternalEvent};
 
 #[cfg(feature = "instrument")]
@@ -282,6 +283,14 @@ pub trait FdrTraceExt {
 
 	/// Writes the observable events of the trace to `writer` as the CSPM
 	/// sequence `Trace`, which is empty in a build without `instrument`.
+	///
+	/// The script declares `datatype Events` and `channel obs`, and each
+	/// member of `Trace` is an event on `obs`, named as
+	/// [`CspmExporter`](super::CspmExporter) names it.
+	///
+	/// # Errors
+	///
+	/// - The error of `writer`.
 	fn export_cspm<W: Write>(&self, writer: &mut W) -> std::io::Result<()>;
 
 	/// Converts the trace to a CSP process of its assertion events, for FDR
@@ -357,22 +366,12 @@ impl FdrTraceExt for ConsumedTrace {
 	}
 
 	fn export_cspm<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-		writeln!(writer, "-- Execution trace")?;
-		writeln!(writer, "Trace = <")?;
-
 		#[cfg(feature = "instrument")]
-		{
-			let observable = self.project_to_observable();
-			for (idx, event) in observable.iter().enumerate() {
-				if idx > 0 {
-					write!(writer, ", ")?;
-				}
-				write!(writer, "{event}")?;
-			}
-		}
+		let observable = self.project_to_observable();
+		#[cfg(not(feature = "instrument"))]
+		let observable: Vec<String> = Vec::new();
 
-		writeln!(writer, ">")?;
-		Ok(())
+		TraceScript::new(&observable).write(writer)
 	}
 
 	/// Converts the trace to a CSP process of the events that `mode` selects,
@@ -448,6 +447,7 @@ impl FdrTraceExt for ConsumedTrace {
 			timed_transitions: None,
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: None,
+			components: Components::default(),
 		}
 	}
 }

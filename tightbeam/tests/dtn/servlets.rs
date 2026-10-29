@@ -16,9 +16,9 @@ use tightbeam::{
 	crypto::sign::ecdsa::Secp256k1SigningKey,
 	prelude::*,
 	servlet,
+	task::Pipeline,
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ConnectionPool},
-	utils::task::Pipeline,
 };
 
 use crate::common::poll::poll_until;

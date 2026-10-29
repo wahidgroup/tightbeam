@@ -1,14 +1,15 @@
 //! The configuration and result types of FDR refinement checking.
 
+use std::borrow::Cow;
+
 #[cfg(feature = "testing-fault")]
 use core::num::NonZeroU32;
 #[cfg(feature = "testing-fault")]
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
+use crate::testing::error::FdrConfigError;
 use crate::testing::specs::csp::Process;
 
-#[cfg(feature = "testing-fault")]
-use crate::testing::error::FdrConfigError;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fault")]
@@ -16,14 +17,29 @@ use crate::testing::fdr::SeededRng;
 #[cfg(feature = "testing-fmea")]
 use crate::testing::fmea::FmeaConfig;
 #[cfg(feature = "testing-fault")]
-use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, utils::BasisPoints};
+use crate::testing::specs::csp::{Event, Observation, State};
+#[cfg(feature = "testing-fault")]
+use crate::{basis_points::BasisPoints, constants::DEFAULT_FAULT_SEED, error::TightBeamError};
 
 /// The scheduling model of the processes in an FDR exploration.
+///
+/// A component process takes an edge when it holds one of the schedulers, or
+/// when a scheduler is free and it takes one. An edge of more than one
+/// component, a shared event, needs one of its components to hold or take a
+/// scheduler. The model decides when a component yields its scheduler:
+///
+/// - A component with no edge at its state is blocked, and it yields under either model.
+/// - Under `Cooperative`, a component also yields when it takes a shared
+///   event, and it keeps its scheduler across every other event.
+/// - Under `Preemptive`, every component yields after each event, so a
+///   preemptive constraint removes no untimed trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerModel {
-	/// Cooperative scheduling, where each process yields.
+	/// Cooperative scheduling, where a process runs until it blocks or takes a
+	/// shared event.
 	Cooperative,
-	/// Preemptive scheduling, where the scheduler slices time.
+	/// Preemptive scheduling, where the scheduler can switch processes after
+	/// each event.
 	Preemptive,
 }
 
@@ -47,6 +63,11 @@ pub struct SchedulerCounts {
 /// With m below n, some traces of the processes become impossible (Pedersen
 /// and Chalmers, SBMF 2024). The fields are private, so [`Self::new`] is the
 /// one construction, and every constraint holds its bound.
+///
+/// - A run reads the constraint as [`FdrConfig::scheduler`] states.
+/// - The n processes are the component processes that the parallel
+///   compositions of the process under verification number.
+/// - The [`SchedulerModel`] decides when each one yields its scheduler.
 ///
 /// # Examples
 ///
@@ -110,6 +131,11 @@ impl SchedulerConstraint {
 ///
 /// - **Deterministic**: counter-based injection, so runs repeat for DO-178C and IEC 61508.
 /// - **Random**: a seeded RNG for statistical coverage, where a repeated seed injects the same faults.
+///
+/// Each walk of FDR exploration starts the strategy again. The count of the
+/// deterministic strategy starts at zero, and the generator of the random
+/// strategy starts at the seed of the model XOR the exploration seed of the
+/// walk.
 #[cfg(feature = "testing-fault")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectionStrategy {
@@ -141,8 +167,7 @@ pub(crate) enum StrategyDraw {
 	/// The deterministic strategy, with the count of the records of each
 	/// label.
 	Counted(HashMap<Cow<'static, str>, u32>),
-	/// The random strategy, with its generator, seeded from the model as FDR
-	/// exploration seeds its own.
+	/// The random strategy, with its generator.
 	Seeded(SeededRng),
 }
 
@@ -154,7 +179,7 @@ impl StrategyDraw {
 	///   runs repeat for DO-178C and IEC 61508: 3000 bps (30%) injects on
 	///   records 4, 7, and 10 of 10.
 	/// - The generator draws one value per record and reads it through
-	///   [`FaultInjection::should_inject`], as FDR exploration does.
+	///   [`FaultInjection::should_inject`].
 	///
 	/// `label` stays the `Cow` the count keys on, so a static label clones as a
 	/// pointer copy, as `TraceCollector::check_runtime_fault_injection` states.
@@ -358,10 +383,76 @@ impl FaultModel {
 		self.injection_strategy.draw(self.seed)
 	}
 
-	/// Sets the seed of the random strategy's generator, so a run repeats.
+	/// The draw state of the model's strategy at the start of the FDR walk of
+	/// `walk_seed`, with the generator of the random strategy at the model's
+	/// seed XOR `walk_seed`.
+	///
+	/// Each walk draws on its own, so the walks run in any order, and a
+	/// repeated model seed repeats the injections of each walk.
+	fn walk_draw(&self, walk_seed: u64) -> StrategyDraw {
+		let seed = self.seed ^ walk_seed;
+		self.injection_strategy.draw(seed)
+	}
+
+	/// Sets the seed of the random strategy's generator, so a run repeats at
+	/// runtime and in each walk of FDR exploration.
 	pub fn with_seed(mut self, seed: u64) -> Self {
 		self.seed = seed;
 		self
+	}
+}
+
+/// The fault model of one walk of FDR exploration, beside the draw state of
+/// its injection strategy.
+///
+/// [`Self::new`] starts the strategy for the walk, so a walk injects the same
+/// faults on each run.
+#[cfg(feature = "testing-fault")]
+pub(crate) struct WalkFaults<'a> {
+	/// The model whose state injection points [`Self::draw`] reads.
+	model: &'a FaultModel,
+	/// The draw state of the model's strategy in this walk.
+	strategy: StrategyDraw,
+}
+
+#[cfg(feature = "testing-fault")]
+impl<'a> WalkFaults<'a> {
+	/// Creates the faults of `model` in the walk of `walk_seed`, with the
+	/// strategy at its start.
+	pub(crate) fn new(model: &'a FaultModel, walk_seed: u64) -> Self {
+		let strategy = model.walk_draw(walk_seed);
+		Self { model, strategy }
+	}
+
+	/// Draws the fault that the model injects at this visit of `event` in
+	/// `state` of `process`, or `None`.
+	///
+	/// - The strategy counts the visits of each event that reach an injection
+	///   point, as it counts the runtime records of an event.
+	/// - A state of a scheduled process keys on the state it runs, so a point at
+	///   a state of the process fires under a scheduler constraint.
+	pub(crate) fn draw(&mut self, process: &Process, state: State, event: &Event) -> Option<InjectedFaultRecord> {
+		// The `Process.State` lookup key costs one allocation. The Cow-keyed
+		// map borrows it, so the lookup reads the fault-injection table in
+		// place.
+		let base = process.components.base_of(state);
+		let state_key = format!("{}.{}", process.name(), base.0);
+		let model = self.model;
+		let injection = model.state_injection(&state_key, event.0)?;
+		let label = Cow::Borrowed(event.0);
+		if !self.strategy.injects(&label, injection) {
+			return None;
+		}
+
+		let probability_bps = injection.probability_bps.get();
+		let error = (injection.error_factory)();
+		let record = InjectedFaultRecord {
+			csp_state: state_key,
+			event_label: event.0.to_string(),
+			error_message: error.to_string(),
+			probability_bps,
+		};
+		Some(record)
 	}
 }
 
@@ -404,6 +495,11 @@ pub struct FdrConfig {
 
 	/// The resource-constraint model of the run, m schedulers that run n
 	/// processes, when the run states one.
+	///
+	/// The walk of each explored process and the subject of each refinement
+	/// check run under it. A recorded trace ran under its own schedule, so it
+	/// stays as it is. A run whose process composes other than n processes, or
+	/// holds a timed transition, returns an [`FdrConfigError`].
 	#[cfg(feature = "testing-fault")]
 	pub scheduler: Option<SchedulerConstraint>,
 
@@ -441,6 +537,33 @@ impl FdrConfig {
 	/// specs, which a configuration that names a spec does.
 	pub(crate) fn refines_against_specs(&self) -> bool {
 		!self.specs.is_empty()
+	}
+
+	/// The process that a walk explores, or a refinement check grades, for
+	/// `process`: the process that the scheduler constraint lets it run, or
+	/// `process` itself with no constraint or for a recorded trace.
+	///
+	/// # Errors
+	///
+	/// - [`FdrConfigError`] -- the constraint does not fit `process`, as
+	///   `SchedulerConstraint::schedule` states.
+	#[cfg(feature = "testing-fault")]
+	pub(crate) fn scheduled<'p>(&self, process: &'p Process) -> Result<Cow<'p, Process>, FdrConfigError> {
+		let recorded = process.observation() == Observation::RecordedTrace;
+		let Some(constraint) = self.scheduler.as_ref().filter(|_| !recorded) else {
+			return Ok(Cow::Borrowed(process));
+		};
+
+		let scheduled = constraint.schedule(process)?;
+		Ok(Cow::Owned(scheduled))
+	}
+
+	/// The process that a walk explores, or a refinement check grades, for
+	/// `process`, which is `process` itself in a build with no scheduler
+	/// constraint.
+	#[cfg(not(feature = "testing-fault"))]
+	pub(crate) fn scheduled<'p>(&self, process: &'p Process) -> Result<Cow<'p, Process>, FdrConfigError> {
+		Ok(Cow::Borrowed(process))
 	}
 
 	/// The exploration that a run of this configuration performs.
@@ -494,7 +617,7 @@ mod tests {
 	use std::collections::HashSet;
 
 	use super::*;
-	use crate::testing::specs::csp::{Observation, State, TransitionRelation};
+	use crate::testing::specs::csp::{Components, Observation, State, TransitionRelation};
 
 	// These unit tests cover `FaultModel`.
 
@@ -692,6 +815,7 @@ mod tests {
 			timed_transitions: None,
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: None,
+			components: Components::default(),
 		}
 	}
 

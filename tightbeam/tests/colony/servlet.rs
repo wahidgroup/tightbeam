@@ -16,7 +16,6 @@ use tightbeam::{
 		sign::ecdsa::Secp256k1Signature,
 		x509::{KeyPurposes, PeerCertificate, Signing},
 	},
-	decode,
 	der::Sequence,
 	exactly,
 	instrumentation::events,
@@ -26,7 +25,7 @@ use tightbeam::{
 		fixtures::TestTrace, ClientEnv, ScenarioConfig, ServletEnv, SetupEnv, TestCertificate, TestIdentity, TestKey,
 	},
 	trace::TraceCollector,
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, TransportError, TransportFailure},
 	urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
 };
@@ -164,7 +163,7 @@ tb_scenario! {
 			}?;
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(response_frame.message())?;
+			let response: CalcResponse = response_frame.decode_message()?;
 
 			assert_eq!(response.doubled, 10, "the doubler doubles 5");
 			assert_eq!(response.squared, 35, "the squarer squares 5 and adds its offset");
@@ -273,7 +272,7 @@ tb_scenario! {
 			}?;
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(response_frame.message())?;
+			let response: CalcResponse = response_frame.decode_message()?;
 			assert_eq!(response.doubled, 14, "the secure servlet doubles 7");
 
 			Ok(())
@@ -309,5 +308,72 @@ async fn a_servlet_declared_with_servlet_reports_the_load_of_its_gauge() -> Resu
 	let reported = ServletBox::utilization(&servlet);
 	servlet.stop();
 	assert_eq!(reported, Some(tightbeam::bps!(2500)));
+	Ok(())
+}
+
+/// A request whose type requires V2 or later. Its DER is the DER of
+/// [`CalcRequest`].
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(min_version = "V2")]
+pub struct RecentCalcRequest {
+	pub value: u32,
+}
+
+servlet! {
+	/// A typed servlet whose input requires V2 or later.
+	RecentCalcServlet<RecentCalcRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |request, _frame, _ctx| async move {
+		let doubled = request.value * 2;
+		Ok(Some(compose! {
+			V0: id: b"recent-calc-response-id",
+				message: CalcResponse { doubled, squared: 0, final_result: 0 }
+		}?))
+	}
+}
+
+/// A V0 frame is below the V2 minimum of the input type, so the typed arm of
+/// `servlet!` refuses it before the handler runs.
+#[tokio::test]
+async fn a_typed_servlet_refuses_a_frame_below_the_minimum_of_its_input() -> Result<(), TightBeamError> {
+	let builder = ServletConfig::<TokioListener, RecentCalcRequest>::builder();
+	let config = builder.allow_cleartext().build();
+	let servlet = RecentCalcServlet::start(Arc::new(TraceCollector::default()), config).await?;
+	let connector = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
+	let mut client = connector.connect(*servlet.addr()).await?;
+
+	let request = compose! {
+		V0: id: b"recent-calc-request-id",
+			message: CalcRequest { value: 7 }
+	}?;
+
+	// The servlet reports the refusal to the client as an internal failure.
+	let outcome = client.emit(request, None).await;
+	servlet.stop();
+	let refused = matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::Internal)));
+	assert!(refused);
+	Ok(())
+}
+
+/// A V2 frame meets the V2 minimum of the input type, so the typed arm of
+/// `servlet!` decodes it and the handler answers. It runs the servlet of the
+/// refusal above, so a fault of the decode or of the handler fails here.
+#[tokio::test]
+async fn a_typed_servlet_answers_a_frame_at_the_minimum_of_its_input() -> Result<(), TightBeamError> {
+	let builder = ServletConfig::<TokioListener, RecentCalcRequest>::builder();
+	let config = builder.allow_cleartext().build();
+	let servlet = RecentCalcServlet::start(Arc::new(TraceCollector::default()), config).await?;
+	let connector = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
+	let mut client = connector.connect(*servlet.addr()).await?;
+
+	let request = compose! {
+		V2: id: b"recent-calc-request-id",
+			message: CalcRequest { value: 7 }
+	}?;
+
+	let answered = client.emit(request, None).await;
+	servlet.stop();
+	let response: CalcResponse = answered?.ok_or(TightBeamError::MissingResponse)?.decode_message()?;
+	assert_eq!(response.doubled, 14);
 	Ok(())
 }

@@ -204,7 +204,7 @@ impl MutualAuthServer {
 		server_key: Secp256k1SigningKey,
 		client_validators: Vec<Arc<dyn CertificateValidation>>,
 	) -> Result<Self> {
-		use tightbeam::{compose, decode};
+		use tightbeam::compose;
 
 		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::der::Sequence)]
 		struct PingMessage {
@@ -232,7 +232,7 @@ impl MutualAuthServer {
 				async move {
 					tx.send(message.to_owned()).await.map_err(|_| TightBeamError::InvalidBody)?;
 
-					let ping: PingMessage = decode(message.message())?;
+					let ping: PingMessage = message.decode_message()?;
 					let pong = PongMessage { echo: ping.data };
 
 					Ok(Some(compose! {

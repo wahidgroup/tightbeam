@@ -123,7 +123,7 @@ pub enum TestingError {
 		/// The event of the record.
 		event: Event,
 		/// The sequence number of the record.
-		seq: u32,
+		seq: u64,
 	},
 	/// A deadline start marker has no end marker after it, so the window it
 	/// opens has no latency.
@@ -135,7 +135,7 @@ pub enum TestingError {
 		/// The end event of the deadline.
 		end: Event,
 		/// The sequence number of the start marker.
-		seq: u32,
+		seq: u64,
 	},
 	/// The analyzer of a percentile WCET bound failed on the samples of its
 	/// event. The cause sits in a box, because a `TightBeamError` can hold a
@@ -235,6 +235,31 @@ pub enum TestingError {
 	SchedulabilityViolation(SchedulabilityViolationDetail),
 	#[error("Invariant violated")]
 	InvariantViolated,
+	/// An FDR configuration that breaks a rule of the run, such as a scheduler
+	/// constraint that does not fit the process under verification.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::testing::error::{FdrConfigError, TestingError};
+	///
+	/// let refused = TestingError::from(FdrConfigError { field: "seeds", reason: "must be positive" });
+	/// assert_eq!(refused.to_string(), "Invalid FDR config field 'seeds': must be positive");
+	/// ```
+	#[error("{0}")]
+	FdrConfig(FdrConfigError),
+}
+
+impl From<FdrConfigError> for TestingError {
+	fn from(error: FdrConfigError) -> Self {
+		TestingError::FdrConfig(error)
+	}
+}
+
+impl From<FdrConfigError> for crate::error::TightBeamError {
+	fn from(error: FdrConfigError) -> Self {
+		crate::error::TightBeamError::TestingError(TestingError::FdrConfig(error))
+	}
 }
 
 #[cfg(feature = "std")]

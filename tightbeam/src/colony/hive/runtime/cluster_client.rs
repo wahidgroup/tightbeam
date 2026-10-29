@@ -11,9 +11,8 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::builder::TypeBuilder;
 use crate::colony::hive::{HiveConfig, ServletRegistry};
 use crate::colony::protocol::{
-	ClusterRequest, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse, ServletChange,
+	ClusterRequest, IssueClock, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdateResponse, ServletChange,
 };
-use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
 use crate::runtime::{rt, TaskGroup};
@@ -57,6 +56,9 @@ pub struct ClusterLink<P: Protocol, R: ServletRegistry> {
 	/// The terms the link sets on each transport it dials: the hive's trace,
 	/// and no mux offer, because each control exchange is one request.
 	terms: ConnectionTerms,
+	/// The issue times of the hive's control frames, which the hive shares
+	/// with every link it builds.
+	issue_clock: Arc<IssueClock>,
 }
 
 impl<P: Protocol, R: ServletRegistry> Clone for ClusterLink<P, R>
@@ -71,6 +73,7 @@ where
 			config: Arc::clone(&self.config),
 			trace: Arc::clone(&self.trace),
 			terms: self.terms.clone(),
+			issue_clock: Arc::clone(&self.issue_clock),
 		}
 	}
 }
@@ -85,19 +88,20 @@ where
 	R: ServletRegistry + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Binds the hive's slate, control address, configuration, and trace to
-	/// its gateway list.
-	pub fn new(
+	/// Binds the hive's slate, control address, configuration, trace, and
+	/// issue clock to its gateway list.
+	pub(crate) fn new(
 		servlets: Arc<R>,
 		cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 		hive_addr: P::Address,
 		config: Arc<HiveConfig>,
 		trace: Arc<TraceCollector>,
+		issue_clock: Arc<IssueClock>,
 	) -> Self {
 		let handle = TraceHandle::new(Arc::clone(&trace));
 		let terms = ConnectionTerms::new(handle, None);
 
-		Self { servlets, cluster_addrs, hive_addr, config, trace, terms }
+		Self { servlets, cluster_addrs, hive_addr, config, trace, terms, issue_clock }
 	}
 
 	/// Takes the read lock of the gateway list, and recovers a poisoned lock.
@@ -155,7 +159,7 @@ where
 		let mut transport = self.dial(gateway).await?;
 		let frame = self.control_frame(b"hive-registration", request).await?;
 		let response_frame = transport.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-		decode::<RegisterHiveResponse>(response_frame.message())
+		response_frame.decode_message::<RegisterHiveResponse>()
 	}
 
 	/// Announces the current slate to `gateway`, and records its answer as
@@ -296,15 +300,16 @@ where
 	/// configured.
 	async fn control_frame(&self, id: impl AsRef<[u8]>, message: impl Message) -> Result<Frame, TightBeamError> {
 		let id = id.as_ref();
-		// `metadata.order` is the control freshness binding (CWE-294).
-		let order = self.config.clock.unix();
+		// `metadata.order` is the control freshness binding (CWE-294), and the
+		// orders of the hive increase strictly (README §5.7.1).
+		let order = self.issue_clock.issue();
 		match self.config.hive_tls.as_ref() {
 			Some(hive_tls) => {
 				// Signatures are a V1 field (§5.6), so a signed frame is V1.
 				let mut signed = Version::V1
 					.compose()
 					.with_id(id)
-					.with_order(order.get())
+					.with_order(order.instant().get())
 					.with_message(message)
 					.build()?;
 				signed.sign_with_provider(hive_tls.identity()).await?;
@@ -314,7 +319,7 @@ where
 				let frame = Version::V0
 					.compose()
 					.with_id(id)
-					.with_order(order.get())
+					.with_order(order.instant().get())
 					.with_message(message)
 					.build()?;
 				Ok(frame)
@@ -358,7 +363,7 @@ where
 			// carry `TransitStatus::Ok`.
 			match transport.emit(frame.clone(), None).await {
 				Ok(Some(response)) => {
-					let decoded = decode::<ServletAddressUpdateResponse>(response.message());
+					let decoded = response.decode_message::<ServletAddressUpdateResponse>();
 					if matches!(decoded, Ok(body) if body.status == TransitStatus::Ok) {
 						return true;
 					}

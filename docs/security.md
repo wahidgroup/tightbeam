@@ -49,7 +49,18 @@ Each cryptographic role is a trait of its own, so a component bounds on the role
 | KDF       | `KdfProvider`     | `Kdf`                       | `kdf`       |                                                   |
 | Curve     | `CurveProvider`   | `Curve`                     | `ecdh`      |                                                   |
 
-`CryptoProvider` composes the six. The KEM of a provider is its associated type `CryptoProvider::Kem`. `KemProvider`, under the `kem` feature, is a separate role for a RustCrypto `kem` encapsulator and decapsulator.
+`CryptoProvider` composes the six. The KEM of a provider is its associated type `CryptoProvider::Kem`, a `RecipientKem`.
+
+`KemProvider`, under the `kem` feature, is the role of a KEM of the RustCrypto `kem` traits, which `tightbeam::crypto::kem` re-exports:
+
+| Associated type    | Bound                                       | Names                                                        |
+| ------------------ | ------------------------------------------- | ------------------------------------------------------------ |
+| `EncappedKey`      | `EncappedKey`                               | The encapsulated key, the recipient key, and the secret size |
+| `Kem`              | `Encapsulator<EncappedKey> + Default`       | The encapsulation, which binds no sender key                 |
+| `DecapsulationKey` | `Decapsulator<EncappedKey>`                 | The private key of a recipient                               |
+
+- `ProviderKem<P>` is a `RecipientKem` that runs the role of `P`, so a provider that names `ProviderKem<Self>` as its `CryptoProvider::Kem` seals and opens every `KEMRecipientInfo` under the role. The `kem` field names the `AssociatedOid` of `Kem`, a recipient certificate asserts `keyEncipherment` (RFC 9629 §3), and `DecapsulationKey` is a `KeyBackend`.
+- `DefaultCryptoProvider` implements the role with DHKEM(secp256k1, HKDF-SHA256): `DhKemSecp256k1Enc`, `DhKemSecp256k1`, and `Secp256k1KeyProvider`. The vectors B.1.1 and B.2.1 of draft-wahby-cfrg-hpke-kem-secp256k1-01 run through the role and through `ProviderKem`.
 
 ### Negotiated form
 
@@ -88,7 +99,7 @@ This section drills down from [README §6.3](../README.md#63-numeric-security-le
 | 2   | Standard | `true`                 | `true`                   | `V1`          |
 
 - `HAS_PROFILE` stays `false`, and `Profile` is `TightbeamProfile`, so the builder compares no OID.
-- The `MIN_VERSION` of the level takes the place of a `min_version` attribute on the same type.
+- `MIN_VERSION` is the higher of `V1` and a `min_version` attribute on the same type.
 - The derive refuses any other `N`, and `profile = N` beside `profile(Type)`, at compile time.
 
 ## Message requirements
@@ -108,21 +119,23 @@ The `Message` trait holds the requirements of a message type as constants, and `
 | `MUST_HAVE_FRAME_INTEGRITY`   | `false`       | `frame_integrity`    | `digest`    | `Frame.integrity`              | `with_witness_hasher`                          |
 | `HAS_PROFILE`                 | `false`       | `profile(Type)`      |             |                                |                                                |
 
-- The associated type `Profile: SecurityProfile`, under the `crypto` feature, is the type that `profile(Type)` names. The derive sets it to `TightbeamProfile` for a type that names none.
+- The associated type `Profile: SecurityProfile`, under the `crypto` feature, is the type that `profile(Type)` names. The derive sets it to `TightbeamProfile` for a type that names none. A hand-written impl names it.
 - The derive fails to compile a type whose attribute needs a feature that the build disables, and the error names the feature.
 
 ### Typed profiles
 
-`profile(Type)` sets `HAS_PROFILE` and `Profile`. The builder checks the three algorithms a Frame carries, at compile time and at run time:
+`profile(Type)` sets `HAS_PROFILE` and `Profile`. The builder checks the algorithms a Frame carries, at compile time and at run time:
 
 | Builder call                                         | Algorithm | Compile-time bound       | Run-time comparison                                   |
 | ---------------------------------------------------- | --------- | ------------------------ | ----------------------------------------------------- |
 | `with_message_hasher::<D>`, `with_witness_hasher::<D>` | Digest    | `T: CheckDigestOid<D>`    | `D::OID` with `Profile::Digest`                       |
 | `with_encryptor::<C, _>`                             | AEAD      | `T: CheckAeadOid<C>`      | `C::OID` with `Profile::AeadOid`                      |
 | `with_signer::<S, _>`                                | Signature | `T: CheckSignatureOid<S>` | `S::ALGORITHM_OID` with `Profile::SignatureAlg`       |
+| `build`                                              | Key wrap  |                          | The wrap of each recipient with `Profile::KeyWrapOid` |
 
 - The derive implements each checker trait for the algorithm of the profile alone, so a mismatched algorithm type fails to compile at the call. For a type with no typed profile, it implements each checker for every algorithm.
 - Any type can implement a checker, so the run-time comparison is the enforcement. When `HAS_PROFILE` is `true` and the OIDs differ, the call records `TightBeamError::UnexpectedAlgorithm` with the received and the expected OID, and leaves the builder as it was.
+- The encryptor names its AEAD alone, and its envelope names the key wrap of each recipient. `build` holds the built Frame to the profile through `Frame::validate_for`, so a wrap outside it fails the build with `TightBeamError::Requirement(RequirementError::Algorithm)`.
 - `compose!` expands to these calls, so it checks the same way.
 
 ### Build refusals
@@ -130,10 +143,11 @@ The `Message` trait holds the requirements of a message type as constants, and `
 `FrameBuilder::build` returns the first refusal in this order:
 
 1. The error a builder call recorded, or `TightBeamError::Sequence` when two or more calls recorded one.
-2. `UnsupportedVersion`, when the version is below `MIN_VERSION`.
+2. `Requirement(RequirementError::Version)`, when the version is below `MIN_VERSION`, the refusal of every typed decode.
 3. `MissingProtection { marker, call }`, when a `MUST_*` constant is `true` and its builder call is absent. `marker` names the constant and `call` names the method. The constants are checked in this order: confidential, nonrepudiable, compressed, message integrity, frame integrity, prioritized.
 4. `InvalidBody`, when no message is set.
 5. `BuildError`, when the metadata fails its validation.
+6. `Requirement`, when the built Frame fails a requirement of the message type in `Frame::validate_for`, such as a key wrap outside the profile.
 
 ```rust
 use tightbeam::der::Sequence;
@@ -167,7 +181,17 @@ This section drills down from [README §7.1.1](../README.md#711-message-security
 | Compile time | The checker bounds of the builder    | The algorithm types of a typed profile, for a derived type                       |
 | Build        | Each builder call                    | The OID of each algorithm, under a typed profile                                 |
 | Build        | `FrameBuilder::build`                | The version and every `MUST_*` constant                                          |
+| Build        | `FrameBuilder::build`, through `Frame::validate_for` | The built Frame, against every requirement, and the key wrap of each recipient under a typed profile |
 | Decode       | The Frame decoder                    | The fields each version admits ([README §5.6](../README.md#56-version-specific-constraints)) |
+| Typed decode | `Frame::validate_for`                | The Frame as it arrived: its version, the field of every `MUST_*` constant, and each algorithm under a typed profile |
+
+Each typed decode calls `Frame::validate_for` before a decrypt or an inflate takes a protection out of the Frame, and a refusal is a `RequirementError`:
+
+- `CleartextFrame::decode` of the router, on the shape that `CleartextFrame::admit`, `CleartextFrame::decrypt`, or `CleartextFrame::inflate` took before the open. The router returns `RouterError::Requirement`.
+- `Frame::decode_message::<T>`, on a borrowed Frame that arrived in cleartext, in every build. It refuses an encrypted or a compressed body with `TightBeamError::OpaqueBody`, and a Frame that fails a requirement with `TightBeamError::Requirement`. Every decode of a colony protocol type, such as a `ClusterRequest` at the gateway or a `ClusterCommand` at the hive, runs it.
+- `Frame::decrypt::<T>`, before its decrypt in place. It returns `TightBeamError::Requirement`.
+- The typed delivery of a servlet, `Frame::open_typed`, before `Frame::prepare_typed`. `Frame::dispatch_typed_unary` and the `handle: |msg, frame, ctx|` arm of `servlet!` decode through it. It returns `TightBeamError::Requirement`.
+- `ExpectedMatcher` of the `testing` feature, when a test matches a typed value against a Frame. It decodes through `Frame::decode_message::<T>`, and a refused Frame matches no value.
 
 ## Crypto providers
 
@@ -395,6 +419,7 @@ Every lookup reads a key by one rule, which [the handshake](handshake.md#key-ide
 
 - `CertificateTrustBuilder::new(policy, curves, revocation)` is the one constructor. It takes a `VerificationPolicy`, the `KeyCurves` the store reads each key under, and a `RevocationChecker`.
 - `with_key_purposes` sets the purposes the store admits its signers under, `KeyPurposes::HOUSE` by default.
+- `with_clock` sets the clock that each validity check of the store reads. The default is the reading of `UnixMillis::now`, the system clock where the host has one.
 - `TrustBuilder::with_certificate` and `TrustBuilder::with_chain` add certificates, and `TrustBuilder::build` seals the store.
 - The builder indexes each certificate by its SHA3-256 fingerprint, by its `subjectKeyIdentifier` value, and by the canonical form of its key. `build` admits the signers among them under the signer purpose, so a certificate the signer role refuses stays a path certificate and resolves no signer.
 
@@ -402,7 +427,7 @@ The builder refuses a certificate in these cases:
 
 | Error                                       | Cause                                                                      |
 | ------------------------------------------- | -------------------------------------------------------------------------- |
-| An error of `validate_expiry`               | The certificate is outside its validity period                             |
+| An error of the validity check              | The certificate is outside its validity period on the clock of the store   |
 | `CertificateValidationError::EncodingError` | The certificate fails to encode, or a key identifier fails to decode       |
 | `CertificateValidationError::DuplicateExtension` | A key identifier extension repeats                                    |
 | `CertificateValidationError::SkidCollision` | Another certificate holds the same `subjectKeyIdentifier`                  |
@@ -484,7 +509,7 @@ Certificate policies (§6.1.3 to §6.1.5) and the fetch of a CRL or an OCSP resp
 
 - The `subjectKeyIdentifier` form matches the extension value of a held certificate, through the index of the store.
 - The `issuerAndSerialNumber` form matches the issuer and the serial number.
-- The built-in store answers while its `RevocationChecker` admits the path of the certificate.
+- The built-in store answers while each certificate of the path is within its validity period and its `RevocationChecker` admits the path.
 
 ### Signing identities
 

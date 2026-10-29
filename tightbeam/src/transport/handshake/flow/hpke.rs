@@ -38,6 +38,7 @@ use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignedDataExt, Signe
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetStringRef;
 use crate::der::{Any, Decode, Encode, Tag};
+use crate::marker::MaybeSendFuture;
 use crate::oids::{DATA, HANDSHAKE_REPLY_CONTENT};
 use crate::random::{generate_nonce, CryptoRngCore, RngWrapper};
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
@@ -54,7 +55,6 @@ use crate::transport::handshake::schedule::{Agreement, CompressedPoint, PeerPoin
 use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{ClientHello, HandshakeCurve, HandshakeMessage, HandshakeProvider, ServerHandshake};
 use crate::transport::wire_der::WireDer;
-use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 
 /// The HPKE handshake protocol.
@@ -833,7 +833,7 @@ mod tests {
 	async fn a_flipped_certificate_demand_fails_the_reply_signature() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let mut config = hpke_server(&identity);
-		config.peer_authentication = mutual_with(ExpiryValidator);
+		config.peer_authentication = mutual_with(ExpiryValidator::default());
 
 		let mut server = Handshake::server(config);
 		let mut client = Handshake::client(anonymous_client(&identity));
@@ -1033,11 +1033,31 @@ mod tests {
 		assert!(matches!(refusal, Err(HandshakeError::DuplicateAttribute)));
 	}
 
+	/// A client reads the validity period of the certificate a reply names on
+	/// its own clock, so a clock past the end of the period refuses a server
+	/// that the host clock reads as current.
+	#[tokio::test]
+	async fn a_client_reads_the_validity_of_the_reply_signer_on_its_own_clock() -> Result<(), Box<dyn Error>> {
+		let identity = create_windowed_test_certificate();
+		let config = anonymous_client(&identity).with_clock(CertificateFixtures::clock_past_validity());
+
+		let mut server = Handshake::server(hpke_server(&identity));
+		let mut client = Handshake::client(config);
+
+		let reply = server.reply(client.start()?).await?;
+		let refused = client.respond(reply).await;
+		assert!(matches!(
+			refused,
+			Err(HandshakeError::CertificateValidationError(CertificateValidationError::Expired))
+		));
+		Ok(())
+	}
+
 	#[tokio::test]
 	async fn an_anonymous_client_refuses_a_server_that_demands_an_identity() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let mut config = hpke_server(&identity);
-		config.peer_authentication = mutual_with(ExpiryValidator);
+		config.peer_authentication = mutual_with(ExpiryValidator::default());
 
 		let mut server = Handshake::server(config);
 		let mut client = Handshake::client(anonymous_client(&identity));
@@ -1057,7 +1077,7 @@ mod tests {
 	async fn a_failed_hpke_closing_leaves_the_client_spent() -> Result<(), Box<dyn Error>> {
 		let identity = create_test_certificate();
 		let mut config = hpke_server(&identity);
-		config.peer_authentication = mutual_with(ExpiryValidator);
+		config.peer_authentication = mutual_with(ExpiryValidator::default());
 		config.transport = Some(budget_offer());
 
 		let mut server = Handshake::server(config);
@@ -1143,7 +1163,7 @@ mod tests {
 	/// type `id-signedData`.
 	#[tokio::test]
 	async fn an_identified_closing_seals_its_client_finished_as_signed_data() -> Result<(), Box<dyn Error>> {
-		let Parties { client, server, .. } = parties::<Hpke>(mutual_with(ExpiryValidator));
+		let Parties { client, server, .. } = parties::<Hpke>(mutual_with(ExpiryValidator::default()));
 		let run = run(client, server).await;
 
 		let closing = run.closing.auth_enveloped()?;
@@ -1168,7 +1188,7 @@ mod tests {
 	/// server records the client's certificate.
 	#[tokio::test]
 	async fn an_identified_closing_opens_and_records_its_certificate() -> Result<(), Box<dyn Error>> {
-		let Parties { client_identity, client, server, .. } = parties::<Hpke>(mutual_with(ExpiryValidator));
+		let Parties { client_identity, client, server, .. } = parties::<Hpke>(mutual_with(ExpiryValidator::default()));
 		let mut run = run(client, server).await;
 
 		let session = run.server.complete()?;
@@ -1194,7 +1214,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_hand_built_identified_closing_is_admitted() -> Result<(), Box<dyn Error>> {
 		let client = create_test_certificate();
-		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator)).await;
+		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator::default())).await;
 		let closing = awaiting.identified(&client).await;
 
 		awaiting.server.finish(closing).await?;
@@ -1269,7 +1289,7 @@ mod tests {
 	/// before its decode sorts a set in it (X.690 §11.6).
 	#[tokio::test]
 	async fn a_client_finished_of_a_descending_set_is_refused() {
-		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator)).await;
+		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator::default())).await;
 		let closing = awaiting.sealed_as(SIGNED_DATA, tlv(Tag::Sequence, &descending_attribute()));
 
 		let refusal = awaiting.server.finish(closing).await;
@@ -1358,7 +1378,7 @@ mod tests {
 	/// certificate.
 	#[tokio::test]
 	async fn a_mutual_server_refuses_an_anonymous_closing() {
-		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator)).await;
+		let mut awaiting = AwaitingClosing::new(mutual_with(ExpiryValidator::default())).await;
 		let closing = awaiting.anonymous(vec![finished_attribute(&awaiting.tag())]);
 
 		let refusal = awaiting.server.finish(closing).await;
@@ -1394,7 +1414,7 @@ mod tests {
 	/// identity refuses the closing of the one it admitted.
 	#[tokio::test]
 	async fn a_demanded_identity_that_sends_its_static_key_as_its_ephemeral_is_refused() {
-		let refusal = finish_with_a_static_ephemeral(mutual_with(ExpiryValidator)).await;
+		let refusal = finish_with_a_static_ephemeral(mutual_with(ExpiryValidator::default())).await;
 		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
 	}
 

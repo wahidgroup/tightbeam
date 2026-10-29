@@ -281,7 +281,7 @@ async fn submit_contract_frame(
 	let reply_signed = servlet_frame.nonrepudiation().is_some();
 	let reply_verifies = frame_signature_verifies(&servlet_frame, &probe_signing_key());
 
-	let ping_response: PingResponse = decode(servlet_frame.message())?;
+	let ping_response: PingResponse = servlet_frame.decode_message()?;
 	let doubled = ping_response.doubled;
 	Ok(FrameContract { sent_signed, sent_linked, reply_id, reply_signed, reply_verifies, doubled })
 }
@@ -478,7 +478,7 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
 			let response_frame = emit_frame(&mut client, frame).await?;
-			let work_response: ClusterWorkResponse = decode(response_frame.message())?;
+			let work_response: ClusterWorkResponse = response_frame.decode_message()?;
 			check_refused_reply(&work_response);
 
 			let echo = submit_ping(&certs, &cluster).await?;
@@ -549,7 +549,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
-			let refusal: ClusterWorkResponse = decode(response_frame.message())?;
+			let refusal: ClusterWorkResponse = response_frame.decode_message()?;
 			assert_eq!(refusal.status, TransitStatus::PermissionDenied, "the edge refuses a registration");
 
 			cluster.stop();

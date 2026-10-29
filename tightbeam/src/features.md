@@ -18,4 +18,4 @@
 | Compress frame payloads                               | `compress`, `zstd`                                                                                                           |
 | Spread verification work across cores                 | `rayon`                                                                                                                      |
 | Read a standards vocabulary                           | `standards`, `standards-rfc`                                                                                                 |
-| Experiment with post-quantum key agreement            | `unstable-pqxdh`, `kem` (the `KemProvider` extension point only: no KEM operation is implemented)                            |
+| Experiment with post-quantum key agreement            | `unstable-pqxdh`, `kem` (the `KemProvider` role of a RustCrypto `kem` KEM, which `ProviderKem` runs in an envelope)          |

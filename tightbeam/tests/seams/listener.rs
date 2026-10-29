@@ -24,6 +24,7 @@ use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStr
 use std::sync::Arc;
 use std::time::Duration;
 
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::testing::TestFrame;
 use tightbeam::transport::client::ClientBuilder;
 use tightbeam::transport::tcp::sync::{TcpListener, TcpTransport};
@@ -32,7 +33,6 @@ use tightbeam::transport::{
 	ConnectionBuilder, EndpointConfig, MessageEmitter, Protocol, TransportEncryptionConfig, TransportError,
 	TransportFailure,
 };
-use tightbeam::utils::time::{Clock, ManualClock};
 
 use super::blocking::{blocking_echo_one, client_trusting};
 use super::{outside_identity, OutsideProvider};

@@ -109,6 +109,8 @@ use crate::crypto::aead::{AeadAlgorithm, CheckedContent, Decryptor, Encryptor};
 use crate::crypto::cms::{
 	ContentEncryption, Encapsulation, EnvelopeError, KemKeyHolder, KemRecipient, Opener, Recipient, RecipientKem,
 };
+#[cfg(all(feature = "kem", feature = "signature"))]
+use crate::crypto::common::OutputSizeUser;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::crypto::key::DiffieHellman;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
@@ -122,11 +124,17 @@ use crate::crypto::x509::EllipticCurvePoint;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::der::oid::AssociatedOid;
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+use crate::marker::MaybeSendFuture;
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::oids::{DATA, DHKEM_SECP256K1};
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 use crate::spki::SubjectPublicKeyInfoRef;
-#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
-use crate::utils::marker::MaybeSendFuture;
+#[cfg(all(feature = "kem", feature = "signature"))]
+use kem::generic_array::GenericArray;
+#[cfg(all(feature = "kem", feature = "signature"))]
+use kem::{EncappedKey, Encapsulator, Error as KemError, SharedSecret};
+#[cfg(all(feature = "kem", feature = "signature"))]
+use rand_core::{CryptoRng, RngCore};
 
 /// The label every HPKE derivation leads with ([RFC 9180 §4][rfc9180-4]).
 ///
@@ -1037,7 +1045,7 @@ where
 /// secp256k1, and its backend runs the Diffie-Hellman agreement.
 #[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
 impl RecipientKem for DhKemSecp256k1 {
-	const OID: ObjectIdentifier = DHKEM_SECP256K1;
+	const OID: ObjectIdentifier = <Self as AssociatedOid>::OID;
 	const USAGE: KeyUsages = KeyUsages::KeyAgreement;
 	type PublicKey = PublicKey<Secp256k1>;
 	type PrivateKey = dyn DiffieHellman<Secp256k1>;
@@ -1076,6 +1084,152 @@ impl RecipientKem for DhKemSecp256k1 {
 		kemct: &'a [u8],
 	) -> MaybeSendFuture<'a, core::result::Result<ZeroizingBytes, EnvelopeError>> {
 		Self::decap_through(key, recipient, kemct)
+	}
+}
+
+/// The identifier of DHKEM(secp256k1, HKDF-SHA256), which a
+/// `KEMRecipientInfo` names in its `kem` field.
+#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh"))]
+impl AssociatedOid for DhKemSecp256k1 {
+	const OID: ObjectIdentifier = DHKEM_SECP256K1;
+}
+
+/// A DHKEM is a type with no state, so its default value runs it.
+impl<C, K, const KEM_ID: u16> Default for DhKem<C, K, KEM_ID> {
+	fn default() -> Self {
+		Self(PhantomData)
+	}
+}
+
+/// The `enc` of DHKEM(secp256k1, HKDF-SHA256) as an encapsulated key of the
+/// RustCrypto `kem` traits: the ephemeral public key of the sender in
+/// uncompressed SEC 1 form, `Nenc` octets ([RFC 9180 §4.1][rfc9180-4.1]).
+///
+/// [`EncappedKey::from_bytes`] admits a point on the curve alone
+/// ([RFC 9180 §7.1.4][rfc9180-7.1.4]), so each decapsulation runs on a
+/// validated key.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hpke::DhKemSecp256k1Enc;
+/// use tightbeam::crypto::kem::generic_array::GenericArray;
+/// use tightbeam::crypto::kem::EncappedKey;
+///
+/// // The octet `0x04` leads an uncompressed point, and these 64 octets
+/// // name none.
+/// let enc = GenericArray::clone_from_slice(&[0x04; 65]);
+/// assert!(DhKemSecp256k1Enc::from_bytes(&enc).is_err());
+/// ```
+///
+/// [rfc9180-4.1]: https://datatracker.ietf.org/doc/html/rfc9180#section-4.1
+/// [rfc9180-7.1.4]: https://datatracker.ietf.org/doc/html/rfc9180#section-7.1.4
+#[cfg(all(feature = "kem", feature = "signature"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DhKemSecp256k1Enc {
+	/// The encoding of the point, `Nenc` octets.
+	enc: GenericArray<u8, UncompressedPointSize<Secp256k1>>,
+	/// The point that the encoding names.
+	key: PublicKey<Secp256k1>,
+}
+
+#[cfg(all(feature = "kem", feature = "signature"))]
+impl DhKemSecp256k1Enc {
+	/// `Decap(enc, skR)` from `dh`, the `DH(skR, pkE)` output that the holder
+	/// of the recipient key `recipient` computes.
+	///
+	/// # Errors
+	///
+	/// - [`KemError`] -- the KDF refuses a derivation.
+	pub(crate) fn decapsulate(
+		&self,
+		dh: EcdhSecret<Secp256k1>,
+		recipient: &PublicKey<Secp256k1>,
+	) -> core::result::Result<SharedSecret<Self>, KemError> {
+		let shared_secret = DhKemSecp256k1::decap(dh, &self.key, recipient).map_err(|_| KemError)?;
+		let shared_secret = GenericArray::from_exact_iter(shared_secret.iter().copied()).ok_or(KemError)?;
+		Ok(SharedSecret::new(shared_secret))
+	}
+
+	/// The ephemeral public key of the sender, which the agreement of the
+	/// recipient key takes.
+	pub(crate) fn public_key(&self) -> &PublicKey<Secp256k1> {
+		&self.key
+	}
+}
+
+/// The `enc` of an ephemeral key of the sender: its uncompressed SEC 1
+/// encoding, `Nenc` octets (RFC 9180 §4.1).
+#[cfg(all(feature = "kem", feature = "signature"))]
+impl TryFrom<PublicKey<Secp256k1>> for DhKemSecp256k1Enc {
+	type Error = KemError;
+
+	/// # Errors
+	///
+	/// - [`KemError`] -- the encoding of `key` is other than `Nenc` octets.
+	fn try_from(key: PublicKey<Secp256k1>) -> core::result::Result<Self, KemError> {
+		let encoded = key.to_encoded_point(false);
+		let enc = GenericArray::from_exact_iter(encoded.as_bytes().iter().copied()).ok_or(KemError)?;
+		Ok(Self { enc, key })
+	}
+}
+
+#[cfg(all(feature = "kem", feature = "signature"))]
+impl AsRef<[u8]> for DhKemSecp256k1Enc {
+	fn as_ref(&self) -> &[u8] {
+		&self.enc
+	}
+}
+
+#[cfg(all(feature = "kem", feature = "signature"))]
+impl EncappedKey for DhKemSecp256k1Enc {
+	type EncappedKeySize = UncompressedPointSize<Secp256k1>;
+	type SharedSecretSize = <Sha256 as OutputSizeUser>::OutputSize;
+	type SenderPublicKey = PublicKey<Secp256k1>;
+	type RecipientPublicKey = PublicKey<Secp256k1>;
+
+	/// # Errors
+	///
+	/// - [`KemError`] -- `bytes` is no uncompressed point on secp256k1.
+	fn from_bytes(bytes: &GenericArray<u8, Self::EncappedKeySize>) -> core::result::Result<Self, KemError> {
+		let key = Secp256k1::encapsulated_key(bytes).map_err(|_| KemError)?;
+		Ok(Self { enc: *bytes, key })
+	}
+}
+
+/// `Encap(pkR)` of DHKEM(secp256k1, HKDF-SHA256) under the RustCrypto `kem`
+/// traits. The encapsulation binds no sender key, so a DHKEM value runs it.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::hpke::DhKemSecp256k1;
+/// use tightbeam::crypto::k256::SecretKey;
+/// use tightbeam::crypto::kem::Encapsulator;
+/// use tightbeam::random::OsRng;
+///
+/// let recipient = SecretKey::random(&mut OsRng).public_key();
+/// let (encapsulated_key, shared_secret) = DhKemSecp256k1::default().try_encap(&mut OsRng, &recipient)?;
+///
+/// // `enc` is an uncompressed secp256k1 point, and `Nsecret` is 32 octets.
+/// assert_eq!(encapsulated_key.as_ref().len(), 65);
+/// assert_eq!(shared_secret.as_bytes().len(), 32);
+/// # Ok::<(), tightbeam::crypto::kem::Error>(())
+/// ```
+#[cfg(all(feature = "kem", feature = "signature"))]
+impl Encapsulator<DhKemSecp256k1Enc> for DhKemSecp256k1 {
+	/// # Errors
+	///
+	/// - [`KemError`] -- the KDF refuses a derivation.
+	fn try_encap<R: CryptoRng + RngCore>(
+		&self,
+		csprng: &mut R,
+		recip_pubkey: &PublicKey<Secp256k1>,
+	) -> core::result::Result<(DhKemSecp256k1Enc, SharedSecret<DhKemSecp256k1Enc>), KemError> {
+		let encapsulated = Self::encap(recip_pubkey, Some(csprng));
+		let (shared_secret, encapsulated_key) = encapsulated.map_err(|_| KemError)?;
+		let shared_secret = GenericArray::from_exact_iter(shared_secret.iter().copied()).ok_or(KemError)?;
+		Ok((DhKemSecp256k1Enc::try_from(encapsulated_key)?, SharedSecret::new(shared_secret)))
 	}
 }
 
@@ -2309,6 +2463,158 @@ mod tests {
 			let (_, backend) = key_with_backend();
 			let (sealed, arrived) = sealed_to(bare_recipient(&backend));
 			assert_eq!(AuthEnvelopedData::from_der(&arrived)?, sealed);
+			Ok(())
+		}
+	}
+
+	/// The published vectors through the RustCrypto `kem` traits, and through
+	/// the provider KEM that runs those traits in a `KEMRecipientInfo`.
+	#[cfg(all(feature = "kem", feature = "signature"))]
+	mod kem_traits {
+		use super::*;
+		use crate::crypto::cms::{ProviderKem, RecipientKem};
+		use crate::crypto::key::Secp256k1KeyProvider;
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::SigningKey;
+		use kem::{Decapsulator, EncappedKey, Encapsulator};
+
+		/// The KEM of the house provider role.
+		type HouseKem = ProviderKem<DefaultCryptoProvider>;
+
+		/// The outcome of a test.
+		type Outcome = core::result::Result<(), Box<dyn std::error::Error>>;
+
+		/// A random source that repeats the octets of one draw, so an
+		/// encapsulation draws the ephemeral secret that a vector names.
+		struct Replay(Vec<u8>);
+
+		impl RngCore for Replay {
+			fn next_u32(&mut self) -> u32 {
+				rand_core::impls::next_u32_via_fill(self)
+			}
+
+			fn next_u64(&mut self) -> u64 {
+				rand_core::impls::next_u64_via_fill(self)
+			}
+
+			fn fill_bytes(&mut self, dest: &mut [u8]) {
+				let draw = dest.iter_mut().zip(self.0.iter().cycle());
+				draw.for_each(|(slot, octet)| *slot = *octet);
+			}
+
+			fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand_core::Error> {
+				self.fill_bytes(dest);
+				Ok(())
+			}
+		}
+
+		impl CryptoRng for Replay {}
+
+		impl Vector {
+			/// A random source that draws the ephemeral secret of this vector.
+			fn replay(&self) -> Replay {
+				Replay(unhex(self.ephemeral_secret))
+			}
+
+			/// The recipient key of this vector, as the house backend holds it.
+			fn recipient_key(&self) -> Secp256k1KeyProvider {
+				Secp256k1KeyProvider::from(SigningKey::from(&self.recipient()))
+			}
+
+			/// The encapsulated key of this vector under the `kem` traits.
+			fn encapped_key(&self) -> core::result::Result<DhKemSecp256k1Enc, KemError> {
+				let enc = unhex(self.ephemeral_public);
+				DhKemSecp256k1Enc::from_bytes(GenericArray::from_slice(&enc))
+			}
+
+			/// What the house recipient key decapsulates from the encapsulated
+			/// key of this vector, through the `kem` traits.
+			fn decapsulated_by_trait(&self) -> core::result::Result<Vec<u8>, KemError> {
+				let shared_secret = self.recipient_key().try_decap(&self.encapped_key()?)?;
+				Ok(shared_secret.as_bytes().to_vec())
+			}
+		}
+
+		/// The `kem` traits, under the ephemeral of the B.2.1 vector, yield the
+		/// encapsulated key and the shared secret that vector publishes.
+		#[test]
+		fn the_kem_traits_encapsulate_to_the_published_vector() -> Outcome {
+			let vector = &AES_256_GCM_VECTOR;
+			let recipient = vector.recipient_public();
+			let encapsulated = DhKemSecp256k1::default().try_encap(&mut vector.replay(), &recipient)?;
+
+			let (encapped_key, shared_secret) = encapsulated;
+			let sent = (*encapped_key.public_key(), shared_secret.as_bytes().to_vec());
+			let (published_secret, published_key) = vector.published_encapsulation();
+			assert_eq!(sent, (published_key, published_secret));
+			Ok(())
+		}
+
+		/// The house recipient key decapsulates the encapsulated key of each
+		/// vector to the shared secret it publishes.
+		#[test]
+		fn the_kem_traits_decapsulate_the_published_vectors() -> Outcome {
+			let with_aes_128 = AES_128_GCM_VECTOR.decapsulated_by_trait()?;
+			let with_aes_256 = AES_256_GCM_VECTOR.decapsulated_by_trait()?;
+			assert_eq!(with_aes_128, unhex(AES_128_GCM_VECTOR.shared_secret));
+			assert_eq!(with_aes_256, unhex(AES_256_GCM_VECTOR.shared_secret));
+			Ok(())
+		}
+
+		/// The provider KEM, under the ephemeral of the B.2.1 vector, carries
+		/// the published encapsulated key as its `kemct` beside the published
+		/// shared secret.
+		#[test]
+		fn the_provider_kem_encapsulates_to_the_published_vector() -> Outcome {
+			let vector = &AES_256_GCM_VECTOR;
+			let sent = HouseKem::encapsulate(&vector.recipient_public(), &mut vector.replay())?;
+
+			let published = (unhex(vector.ephemeral_public), unhex(vector.shared_secret));
+			assert_eq!((sent.kemct, sent.shared_secret.to_vec()), published);
+			Ok(())
+		}
+
+		/// The provider KEM decapsulates the `kemct` of the B.1.1 vector
+		/// through the house recipient key to the shared secret that vector
+		/// publishes.
+		#[tokio::test]
+		async fn the_provider_kem_decapsulates_the_published_vector() -> Outcome {
+			let vector = &AES_128_GCM_VECTOR;
+			let (key, recipient) = (vector.recipient_key(), vector.recipient_public());
+			let kemct = unhex(vector.ephemeral_public);
+
+			let received = HouseKem::decapsulate(&key, &recipient, &kemct).await?;
+			assert_eq!(received.to_vec(), unhex(vector.shared_secret));
+			Ok(())
+		}
+
+		/// The house role runs DHKEM(secp256k1), so its recipient certificate
+		/// asserts the `keyAgreement` that the house KEM asserts (RFC 5480 §3).
+		#[test]
+		fn the_provider_kem_asserts_the_usage_of_the_house_kem() -> Outcome {
+			assert_eq!(HouseKem::USAGE, DhKemSecp256k1::USAGE);
+			Ok(())
+		}
+
+		/// The `enc` of an ephemeral key is its uncompressed SEC 1 encoding,
+		/// `Nenc` octets (RFC 9180 §4.1).
+		#[test]
+		fn an_ephemeral_key_encapsulates_as_its_uncompressed_point() -> Outcome {
+			let vector = &AES_256_GCM_VECTOR;
+			let encapped_key = DhKemSecp256k1Enc::try_from(vector.encapsulated_key())?;
+
+			assert_eq!(encapped_key.as_ref(), unhex(vector.ephemeral_public));
+			Ok(())
+		}
+
+		/// A `kemct` that is no uncompressed point on secp256k1 is refused.
+		#[tokio::test]
+		async fn the_provider_kem_refuses_a_kemct_off_the_curve() -> Outcome {
+			let vector = &AES_128_GCM_VECTOR;
+			let (key, recipient) = (vector.recipient_key(), vector.recipient_public());
+
+			let refused = HouseKem::decapsulate(&key, &recipient, &[0x04; 65]).await;
+			assert!(matches!(refused, Err(EnvelopeError::KemRefused)));
 			Ok(())
 		}
 	}

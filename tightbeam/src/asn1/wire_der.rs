@@ -109,8 +109,7 @@ where
 	/// Admit `der` under the CMS rules of the admission walk, decode it once,
 	/// hold the value to the bytes it arrived as, and keep them.
 	fn try_from(der: &[u8]) -> DerResult<Self> {
-		DerAdmission::Cms.admit(der)?;
-		let value = T::from_der(der)?;
+		let value: T = DerAdmission::Cms.decode(der)?;
 		let contents_at = contents_offset(der)?;
 
 		let received = Self { der: der.to_vec(), contents_at, value };

@@ -157,7 +157,7 @@ impl PeerConfig {
 		Ok(PeerHint { dial, peer_id })
 	}
 
-	/// Records the anchors the operator configured, one per spelling.
+	/// The anchors the operator configured, one per spelling.
 	///
 	/// Configuration is the operator's own choice, so an anchor is admitted
 	/// as written. This is the one place beside [`Self::admit_dial`] that
@@ -167,7 +167,7 @@ impl PeerConfig {
 	/// # Errors
 	///
 	/// - [`ClusterError::InvalidPeerAddress`] -- a spelling names no socket.
-	pub(super) fn set_anchors<I, S>(&mut self, spellings: I) -> Result<(), ClusterError>
+	pub(super) fn anchors<I, S>(spellings: I) -> Result<Vec<AdmittedDial>, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: AsRef<str>,
@@ -178,8 +178,7 @@ impl PeerConfig {
 			anchors.push(AdmittedDial(address));
 		}
 
-		self.peers = anchors;
-		Ok(())
+		Ok(anchors)
 	}
 
 	/// The address this gateway advertises to peers, given the address it

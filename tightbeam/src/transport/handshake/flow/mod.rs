@@ -41,6 +41,7 @@ use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::{Decode, Encode};
 use crate::frame::ArrivedCertificates;
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::oids::{DATA, RECEIPT_ACK, SIGNED_DATA};
 use crate::random::CryptoRngCore;
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
@@ -57,7 +58,6 @@ use crate::transport::handshake::{
 	HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerIdentity,
 };
 use crate::transport::wire_der::WireDer;
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::attr::{Attribute, Attributes};
 
 #[cfg(feature = "transport-cms")]
@@ -874,10 +874,7 @@ impl ClosingContent {
 				let (finished, path) = finished.take_signer_path()?;
 				Ok(Self::Finished(finished, path.map(Box::new)))
 			},
-			DATA => |der| {
-				DerAdmission::Cms.admit(der)?;
-				Ok(Self::Anonymous(Attributes::from_der(der)?))
-			},
+			DATA => |der| Ok(Self::Anonymous(DerAdmission::Cms.decode(der)?)),
 			_ => return Err(HandshakeError::UnexpectedContainer),
 		};
 

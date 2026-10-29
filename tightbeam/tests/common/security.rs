@@ -220,13 +220,13 @@ mod receipt_fixtures {
 	use std::sync::Mutex;
 
 	use tightbeam::asn1::OctetString;
+	use tightbeam::marker::MaybeSendFuture;
 	use tightbeam::transport::handshake::negotiation::{
 		AuthorizationGrant, AuthorizationRefusal, TransportAuthorizer, TransportOffer,
 	};
 	use tightbeam::transport::handshake::receipt::{
 		ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
 	};
-	use tightbeam::utils::marker::MaybeSendFuture;
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
@@ -615,7 +615,7 @@ mod cms_fixtures {
 	) -> Result<CmsSessionPair, TightBeamError> {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 		let pair = cms_handshake_pair(
 			materials,
 			vec![profile],

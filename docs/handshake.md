@@ -94,7 +94,7 @@ Four rules order the steps of both flows:
    1. It opens the closing under `k_close`, in the form its content type names.
    2. It compares the client ephemeral `R` with the key of the offered certificate.
    3. It verifies the [key-confirmation tag](#key-confirmation).
-   4. It admits the client: the validity period, the validators, and then the client Finished.
+   4. It admits the client: the validity period on the clock of the server, the validators, and then the client Finished.
    5. It settles the receipt countersignature.
 
    Because of this order:
@@ -213,8 +213,8 @@ The decider reads these rules:
 
 And the client admits each certificate this way:
 
-- **The pinned certificate.** `ProvisionedTrust::new` takes the key-agreement certificate, bare or as a root-to-leaf `CmsServerChain`, beside the store. It admits the certificate once at configuration, and again before each opening, because the store's verdict and the validity period change.
-- **The carried certificate.** At each reply, the client builds the path the server Finished presents from the certificate its `sid` names. The store validates that path to one of its trust anchors, and the client admits the certificate for signing within its validity period.
+- **The pinned certificate.** `ProvisionedTrust::new` takes the key-agreement certificate, bare or as a root-to-leaf `CmsServerChain`, beside the store. It admits the certificate once at configuration on the reading of `UnixMillis::now`, and again before each opening on the clock of the client, because the store's verdict and the validity period change.
+- **The carried certificate.** At each reply, the client builds the path the server Finished presents from the certificate its `sid` names. The store validates that path to one of its trust anchors, and the client admits the certificate for signing within its validity period on the clock of the client.
 - **Rotation.** The server can rotate its signing certificate under the same subject and anchor, and its clients keep their configuration.
 - **A missing identity.** A CMS transport server that holds a signing identity alone refuses the handshake with `MissingKeyAgreementIdentity` before it reads the opening.
 
@@ -271,8 +271,19 @@ The policy evaluates the identity certificate of the flow once the store admits 
 - Each evaluation method of the policy takes one identity type, so the policy reads the identity certificate of its flow alone.
 - The trust store admits a certificate by its contents alone, whatever role the handshake reads it in.
 - A check of a server's identity belongs in the client's server policy. A check of a client's identity belongs in the validators of the server's mutual `PeerAuthentication`.
-- The built-in store runs path validation and revocation on each certificate that `evaluate`, `evaluate_presented`, `trust_anchor`, `verify_chain`, or `verify_presented` admits. Each of its lookups runs its `RevocationChecker` over the path of the certificate it answers with, so a check of every certificate, such as a denylist, belongs in that checker.
+- The built-in store runs path validation and revocation on each certificate that `evaluate`, `evaluate_presented`, `trust_anchor`, `verify_chain`, or `verify_presented` admits. Each of its lookups holds the path of the certificate it answers with to its validity period and runs its `RevocationChecker` over that path, so a check of every certificate, such as a denylist, belongs in that checker.
 - An empty list sets no policy.
+
+### The clock of a validity check
+
+Each validity check of a handshake reads the clock of its side:
+
+| Side | Setter | A transport sets |
+| --- | --- | --- |
+| Client | `ClientConfig::with_clock` | The clock of its `EndpointConfig` |
+| Server | `ServerConfig::with_clock` | The clock of its `EndpointConfig` |
+
+A configuration that sets no clock reads `UnixMillis::now`, the system clock where the host has one. A trust store and each validator read the clock that their own `with_clock` sets: `CertificateTrustBuilder`, `ExpiryValidator`, and `DirectTrustValidator`.
 
 ### Key identity
 
@@ -778,9 +789,9 @@ stateDiagram-v2
 A transport holds one `SessionState`, which pairs the endpoint's provisioning and its negotiation input with one `SessionPhase`:
 
 ```rust
+# use tightbeam::clock::MonotonicInstant;
 # use tightbeam::transport::handshake::EstablishedSession;
 # use tightbeam::transport::state;
-# use tightbeam::utils::time::MonotonicInstant;
 #
 pub enum SessionPhase {
     Cleartext,

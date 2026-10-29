@@ -13,27 +13,27 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::asn1::Frame;
+use crate::clock::Clock;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::der::{Decode, Encode};
 use crate::encode;
+use crate::marker::MaybeSend;
 use crate::policy::TransitStatus;
 use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::TransportResult;
-use crate::utils::marker::MaybeSend;
-use crate::utils::time::Clock;
 use crate::zeroize::Zeroizing;
 
+#[cfg(host_clock)]
+use crate::clock::SystemClock;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke", feature = "instrument"))]
 use crate::transport::error::ArrivalRefusal;
-#[cfg(host_clock)]
-use crate::utils::time::SystemClock;
 // Doc links name this import, so the docs build carries it.
 #[cfg(doc)]
 use crate::transport::error::TransportFailure;
@@ -595,8 +595,9 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidMessage`] -- `message` passes the handshake
-	///   wire ceiling, and no byte of it is written.
+	/// - [`TransportError::InvalidMessage`] -- the transport envelope of
+	///   `message` passes the handshake wire ceiling, and no byte of it is
+	///   written.
 	/// - The encode failure, and the errors of [`write_envelope_bytes`](MessageIO::write_envelope_bytes).
 	///
 	/// # Examples
@@ -617,9 +618,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	where
 		Self: Sized + EncryptedProtocolState,
 	{
-		self.limits().admit_handshake_wire(message.der().len())?;
+		let envelope = TransportEnvelope::from(message);
+		self.limits().admit_handshake_wire(&envelope)?;
 
-		let wire_envelope = WireEnvelope::Cleartext(message.into());
+		let wire_envelope = WireEnvelope::Cleartext(envelope);
 		let wire_bytes = wire_envelope.to_der()?;
 		self.write_envelope_bytes(&wire_bytes).await
 	}
@@ -849,19 +851,19 @@ impl TransportRefusal {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::clock::ManualClock;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::testing::TestFrame;
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::transport::handshake::EstablishedSession;
 	use crate::transport::state::{EncryptionConfig, SessionPhase, SessionState};
-	use crate::utils::time::ManualClock;
 	use crate::Version;
 
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::transport::error::TransportFailure;
 	use crate::transport::handshake::PeerAuthentication;
-	use crate::transport::TransportLimits;
+	use crate::transport::{CheckedLimits, TransportLimits};
 
 	#[cfg(all(
 		feature = "instrument",
@@ -877,10 +879,11 @@ mod tests {
 		pub use core::sync::atomic::{AtomicUsize, Ordering};
 
 		pub use crate::crypto::profiles::SecurityProfileDesc;
+		pub use crate::marker::MaybeSendFuture;
+		pub(super) use crate::transport::framing::{FrameAssembler, Step};
 		pub use crate::transport::handshake::tests::create_test_signed_data;
 		pub use crate::transport::handshake::{HandshakeError, ServerHandshakeProtocol};
 		pub use crate::transport::state::HandshakeSlot;
-		pub use crate::utils::marker::MaybeSendFuture;
 	}
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -926,7 +929,7 @@ mod tests {
 	/// the session phase that the case under test sets.
 	struct StreamProbe {
 		state: SessionState<DefaultCryptoProvider>,
-		limits: TransportLimits,
+		limits: CheckedLimits,
 		clock: ManualClock,
 		inbound: Option<Vec<u8>>,
 		/// Every buffer the probe wrote, in order.
@@ -939,13 +942,13 @@ mod tests {
 		/// Returns a provisioned endpoint placed directly in `phase`, whose
 		/// stream is closed.
 		fn at(phase: SessionPhase) -> Self {
-			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 			let peer_authentication = PeerAuthentication::Anonymous.and(validator);
 			let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
 
 			Self {
 				state: SessionState::at(encryption, phase),
-				limits: TransportLimits::default(),
+				limits: CheckedLimits::default(),
 				clock: ManualClock::default(),
 				inbound: None,
 				sent: Vec::new(),
@@ -1066,7 +1069,7 @@ mod tests {
 	impl EncryptedProtocolState for StreamProbe {
 		type CryptoProvider = DefaultCryptoProvider;
 
-		fn limits(&self) -> &TransportLimits {
+		fn limits(&self) -> &CheckedLimits {
 			&self.limits
 		}
 
@@ -1193,7 +1196,14 @@ mod tests {
 	#[tokio::test]
 	async fn a_cleartext_answer_past_its_ceiling_is_refused() -> crate::error::Result<()> {
 		let mut probe = StreamProbe::at(SessionPhase::Cleartext);
-		probe.limits.cleartext_envelope = UNDECODABLE_CLEARTEXT.len();
+		// A handshake message of two octets takes four on the wire, so the
+		// set admits a cleartext ceiling of four.
+		let limits = TransportLimits {
+			cleartext_envelope: UNDECODABLE_CLEARTEXT.len(),
+			handshake_wire: 2,
+			..*probe.limits
+		};
+		probe.limits = limits.checked()?;
 
 		let response = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, None));
 		let answer = WireEnvelope::Cleartext(response).to_der()?;
@@ -1531,13 +1541,75 @@ mod tests {
 	/// the endpoint writes a byte of it.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test]
-	async fn a_handshake_reply_past_the_wire_ceiling_is_refused_before_the_write() {
+	async fn a_handshake_reply_past_the_wire_ceiling_is_refused_before_the_write() -> TransportResult<()> {
 		let (mut probe, _rounds) = counting_slot(SessionPhase::Provisioned);
-		probe.limits.handshake_wire = 16;
+		probe.limits = TransportLimits { handshake_wire: 16, ..*probe.limits }.checked()?;
 
 		let refused = probe.drive_server_handshake(handshake_round()).await;
 		let oversize = matches!(refused, Err(TransportError::InvalidMessage));
 		assert_eq!((oversize, probe.sent.len()), (true, 0));
+		Ok(())
+	}
+
+	/// The octets of the transport envelope that `message` travels in, the
+	/// width the reader of a handshaking session caps.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn envelope_len(message: &HandshakeMessage) -> usize {
+		let envelope = TransportEnvelope::from(message.clone());
+		let len = envelope.encoded_len().expect("a handshake envelope encodes");
+		usize::try_from(len).expect("a test envelope fits a usize")
+	}
+
+	/// The frame that a reader under `cap` takes off `wire`, through the one
+	/// framing sequence of both planes.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn framed(wire: &[u8], cap: usize) -> TransportResult<Vec<u8>> {
+		let mut assembler = FrameAssembler::new(cap);
+		let mut unread = wire;
+		loop {
+			let wanted = assembler.wanted();
+			let (read, rest) = unread.split_at_checked(wanted.len()).ok_or(TransportError::ConnectionClosed)?;
+			wanted.copy_from_slice(read);
+			unread = rest;
+
+			if let Step::Done(frame) = assembler.advance()? {
+				return Ok(frame);
+			}
+		}
+	}
+
+	/// A handshake message at the handshake wire ceiling passes the cap of a
+	/// handshaking reader under the same ceiling, so the frame the writer sends
+	/// is one the peer takes.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_handshake_message_at_the_wire_ceiling_passes_the_cap_of_the_peer() -> TransportResult<()> {
+		let message = handshake_round();
+		let mut probe = StreamProbe::at(SessionPhase::Provisioned);
+		probe.limits = TransportLimits { handshake_wire: envelope_len(&message), ..*probe.limits }.checked()?;
+		probe.write_handshake(message).await?;
+
+		let wire = probe.sent.concat();
+		let policy = handshaking_phase().read_policy(&probe.limits, probe.clock.monotonic());
+		let frame = framed(&wire, policy.cap())?;
+		assert_eq!(frame, wire);
+		Ok(())
+	}
+
+	/// A handshake message whose transport envelope passes the handshake wire
+	/// ceiling by one octet is refused before the write, though its container
+	/// alone fits. The writer measures the envelope that the reader caps.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[tokio::test]
+	async fn a_handshake_envelope_past_the_wire_ceiling_is_refused_before_the_write() -> TransportResult<()> {
+		let message = handshake_round();
+		let mut probe = StreamProbe::at(SessionPhase::Provisioned);
+		probe.limits = TransportLimits { handshake_wire: envelope_len(&message) - 1, ..*probe.limits }.checked()?;
+
+		let refused = probe.write_handshake(message).await;
+		let oversize = matches!(refused, Err(TransportError::InvalidMessage));
+		assert_eq!((oversize, probe.sent.len()), (true, 0));
+		Ok(())
 	}
 
 	/// An exchange takes a response as its answer, so a request that arrives

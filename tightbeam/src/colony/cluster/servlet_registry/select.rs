@@ -158,8 +158,8 @@ impl ServletRegistry {
 	/// ```
 	/// use std::sync::Arc;
 	///
+	/// use tightbeam::clock::SystemClock;
 	/// use tightbeam::colony::cluster::{PheromoneConfig, ServletRegistry};
-	/// use tightbeam::utils::time::SystemClock;
 	///
 	/// let registry = ServletRegistry::new(PheromoneConfig::default(), Arc::new(SystemClock));
 	/// let weakened = registry.weaken_peer(b"peer-fingerprint")?;
@@ -196,8 +196,8 @@ impl ServletRegistry {
 	/// ```
 	/// use std::sync::Arc;
 	///
+	/// use tightbeam::clock::SystemClock;
 	/// use tightbeam::colony::cluster::{PeerAddress, PheromoneConfig, ServletRegistry};
-	/// use tightbeam::utils::time::SystemClock;
 	///
 	/// let registry = ServletRegistry::new(PheromoneConfig::default(), Arc::new(SystemClock));
 	/// let gateway = PeerAddress::from("127.0.0.1:9000".parse::<std::net::SocketAddr>()?);
@@ -313,8 +313,8 @@ impl ServletRegistry {
 /// ```
 /// use std::sync::Arc;
 ///
+/// use tightbeam::clock::SystemClock;
 /// use tightbeam::colony::cluster::{PheromoneConfig, ServletRegistry, Weakened};
-/// use tightbeam::utils::time::SystemClock;
 ///
 /// let registry = ServletRegistry::new(PheromoneConfig::default(), Arc::new(SystemClock));
 /// let weakened: Weakened = registry.weaken_peer(b"peer-fingerprint")?;

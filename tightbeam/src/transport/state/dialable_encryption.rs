@@ -18,6 +18,10 @@ use crate::transport::TransportResult;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::Arc;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::clock::Clock;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::crypto::x509::utils::ValidityClock;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::error::TransportError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::negotiation::RunnableProfile;
@@ -167,8 +171,8 @@ impl Negotiation {
 	}
 }
 
-/// The endpoint a session runs as: the proof of its provisioning and its
-/// negotiation input, lent together.
+/// The endpoint a session runs as: the proof of its provisioning, its
+/// negotiation input, and its clock, lent together.
 ///
 /// Each flow builds both of its configurations from this view, and each mux
 /// role takes what it renews under from it.
@@ -178,13 +182,20 @@ pub(crate) struct Endpoint<'a, P: CryptoProvider> {
 	proof: &'a DialableEncryption<P>,
 	/// The negotiation input the session holds beside it.
 	negotiation: &'a Negotiation,
+	/// The clock that each handshake of the session reads the validity
+	/// period of a peer certificate on.
+	clock: &'a ValidityClock<dyn Clock>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a, P: CryptoProvider> Endpoint<'a, P> {
-	/// The endpoint of `proof` beside `negotiation`.
-	pub(super) fn new(proof: &'a DialableEncryption<P>, negotiation: &'a Negotiation) -> Self {
-		Self { proof, negotiation }
+	/// The endpoint of `proof` beside `negotiation`, on `clock`.
+	pub(super) fn new(
+		proof: &'a DialableEncryption<P>,
+		negotiation: &'a Negotiation,
+		clock: &'a ValidityClock<dyn Clock>,
+	) -> Self {
+		Self { proof, negotiation, clock }
 	}
 
 	/// The client handshake this endpoint dials with, of the flow that its
@@ -218,8 +229,8 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	/// Each implementation of [`FlowProvisioning`] builds `flow` from this
 	/// provisioning, whose client identity passed the key-purpose check that
 	/// [`ClientConfig::admitted`] requires. The key purposes, transport offer,
-	/// receipt approver, and server policy enter that constructor as required
-	/// parts, so each flow passes them alike.
+	/// receipt approver, server policy, and clock enter that constructor as
+	/// required parts, so each flow passes them alike.
 	fn client_config_with<F>(&self, flow: F::Settings) -> ClientConfig<F, P>
 	where
 		F: ClientFlow<P>,
@@ -229,8 +240,16 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 		let transport_offer = self.negotiation.mux_offer.as_deref().cloned();
 		let receipt_approver = self.negotiation.receipt_approver.as_ref().map(Arc::clone);
 		let server_policy = encryption.server_policy.clone();
+		let clock = self.clock.clone();
 
-		ClientConfig::admitted(flow, encryption.key_purposes, transport_offer, receipt_approver, server_policy)
+		ClientConfig::admitted(
+			flow,
+			encryption.key_purposes,
+			transport_offer,
+			receipt_approver,
+			server_policy,
+			clock,
+		)
 	}
 
 	/// The configuration of a server handshake of flow `F` around `flow` and
@@ -246,8 +265,9 @@ impl<'a, P: CryptoProvider> Endpoint<'a, P> {
 	{
 		let encryption = &self.proof.0;
 		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
+		let clock = self.clock.clone();
 
-		let mut config = ServerConfig::admitted(flow, identity, profiles, encryption.key_purposes);
+		let mut config = ServerConfig::admitted(flow, identity, profiles, encryption.key_purposes, clock);
 		config.peer_authentication = encryption.peer_authentication.clone();
 		config.transport = self.negotiation.mux_offer.as_deref().cloned();
 		config.transport_authorizer = self.negotiation.transport_authorizer.as_ref().map(Arc::clone);

@@ -1,4 +1,4 @@
-use tightbeam::utils::BasisPoints;
+use tightbeam::basis_points::BasisPoints;
 
 // Basis points run 0 to 10000. The range check runs in a `const` block, so an
 // out-of-range literal fails here rather than panicking at run time.

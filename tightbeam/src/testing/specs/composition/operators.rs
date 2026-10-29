@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use crate::testing::specs::composition::{CompositionError, CompositionOperator};
-use crate::testing::specs::csp::{intern, Event, Process, State};
+use crate::testing::specs::csp::{intern, Components, Event, Process, State};
 
 impl CompositionOperator {
 	/// Composes `p` and `q` under this operator.
@@ -315,6 +315,11 @@ impl Process {
 			.filter(|event| !p.observable.contains(event) && !p.hidden.contains(event))
 			.fold(builder, |b, event| b.add_hidden(event));
 
+		// The components of `Q` follow those of `P`, so an edge of `Q` moves
+		// its own components, raised by the count of `P`.
+		let offset = p.components.count();
+		let builder = builder.components(offset.saturating_add(q.components.count()));
+
 		// Collect the transitions in a vector first to keep the closures flat.
 		let mut all_transitions = Vec::new();
 		for (p_state, q_state) in p.states.iter().flat_map(|p_s| q.states.iter().map(move |q_s| (p_s, q_s))) {
@@ -325,12 +330,17 @@ impl Process {
 			// A synchronized event moves both components together.
 			for p_action in p_actions.iter().filter(|a| sync_alphabet.contains(&a.event)) {
 				if q_actions.iter().any(|a| a.event == p_action.event) {
-					let p_targets = p.step(*p_state, &p_action.event);
-					let q_targets = q.step(*q_state, &p_action.event);
+					let event = p_action.event;
+					let p_targets = p.step(*p_state, &event);
+					let q_targets = q.step(*q_state, &event);
 					for (p_target, q_target) in
 						p_targets.iter().flat_map(|p_t| q_targets.iter().map(move |q_t| (p_t, q_t)))
 					{
-						all_transitions.push((product_state, p_action.event, State::product(*p_target, *q_target)));
+						let p_movers = p.components.moving((*p_state, event, *p_target), 0);
+						let q_movers = q.components.moving((*q_state, event, *q_target), offset);
+						let movers = Components::together(&p_movers, &q_movers);
+						let target = State::product(*p_target, *q_target);
+						all_transitions.push((product_state, event, target, movers));
 					}
 				}
 			}
@@ -338,20 +348,26 @@ impl Process {
 			// P moves alone on an event outside the sync set.
 			for p_action in p_actions.iter().filter(|a| !sync_alphabet.contains(&a.event)) {
 				for p_target in p.step(*p_state, &p_action.event) {
-					all_transitions.push((product_state, p_action.event, State::product(p_target, *q_state)));
+					let movers = p.components.moving((*p_state, p_action.event, p_target), 0);
+					let target = State::product(p_target, *q_state);
+					all_transitions.push((product_state, p_action.event, target, movers));
 				}
 			}
 
 			// Q moves alone on an event outside the sync set.
 			for q_action in q_actions.iter().filter(|a| !sync_alphabet.contains(&a.event)) {
 				for q_target in q.step(*q_state, &q_action.event) {
-					all_transitions.push((product_state, q_action.event, State::product(*p_state, q_target)));
+					let movers = q.components.moving((*q_state, q_action.event, q_target), offset);
+					let target = State::product(*p_state, q_target);
+					all_transitions.push((product_state, q_action.event, target, movers));
 				}
 			}
 		}
 
-		let builder = all_transitions.into_iter().fold(builder, |b, (state, event, target)| {
-			b.add_state(state).add_state(target).add_transition(state, event, target)
+		let builder = all_transitions.into_iter().fold(builder, |b, (state, event, target, movers)| {
+			let edge = (state, event, target);
+			let placed = b.add_state(state).add_state(target);
+			placed.add_transition(state, event, target).add_movers(edge, movers)
 		});
 
 		let builder = p

@@ -100,7 +100,7 @@ async fn the_hpke_flow_agrees_on_the_outside_algorithms() -> Result<(), Box<dyn 
 async fn an_outside_server_admits_an_outside_client_over_hpke() {
 	let client_identity = outside_identity();
 	let expected = client_identity.certificate().to_owned();
-	let mutual = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator));
+	let mutual = PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default()));
 	let (mut client, mut server) = outside_pair(outside_identity(), Some(client_identity), mutual);
 	run_legs(&mut client, &mut server).await;
 

@@ -372,7 +372,7 @@ fn sync_server_holds_a_connection_past_its_cap() -> TransportResult<()> {
 
 	let waiting = NetTcpStream::connect(addr)?;
 	let queued = TcpTransport::new(waiting, EndpointConfig::<DefaultCryptoProvider>::cleartext());
-	let mut queued = queued.with_timeout(CAP_WAIT);
+	let mut queued = queued.with_timeout(CAP_WAIT)?;
 	let frame = TestFrame::v0(Some("sync-past-cap"), None);
 	let starved = rt::block_on(queued.emit(frame, None));
 	let after_starved = TestFrame::v0(Some("sync-after-starved"), None);

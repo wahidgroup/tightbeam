@@ -32,6 +32,7 @@ use crate::crypto::x509::utils::Skid;
 use crate::crypto::x509::KeyCurves;
 use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
+use crate::marker::MaybeSendFuture;
 use crate::oids::{AES_128_GCM, SESSION_RECEIPT};
 use crate::testing::TestIdentity;
 use crate::transport::handshake::error::HandshakeError;
@@ -41,7 +42,6 @@ use crate::transport::handshake::tests::*;
 use crate::transport::handshake::{
 	Handshake, HandshakeAttribute, HandshakeMessage, HandshakePhase, PeerAuthentication,
 };
-use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::Certificate;
 use crate::TightBeamError;
@@ -73,7 +73,7 @@ fn foreign_profile() -> SecurityProfileDesc {
 }
 
 async fn the_phase_follows_the_steps<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (mut client, mut server) = pair::<F>(mutual_with(ExpiryValidator));
+	let (mut client, mut server) = pair::<F>(mutual_with(ExpiryValidator::default()));
 	assert_eq!(client.phase(), HandshakePhase::Idle);
 	assert_eq!(server.phase(), HandshakePhase::Idle);
 
@@ -187,7 +187,7 @@ async fn a_step_after_completion_is_refused<F: TestFlow>() -> Result<(), Box<dyn
 /// Completion moves the handshake secret out, so a second completion has
 /// nothing to derive from and each accessor answers `None`.
 async fn completion_takes_what_the_handshake_agreed<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
 	let mut run = run(client, server).await;
 	assert!(run.client.selected_profile().is_some());
 	assert!(run.client.peer_certificate().is_some());
@@ -260,7 +260,8 @@ async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> Result<()
 /// Both sides of a mutually authenticated handshake derive one key schedule:
 /// a frame the client seals opens on the server.
 async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Established { client_session, server_session, .. } = established::<F>(mutual_with(ExpiryValidator)).await;
+	let Established { client_session, server_session, .. } =
+		established::<F>(mutual_with(ExpiryValidator::default())).await;
 
 	let mut record = sealed_record(&client_session)?;
 	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
@@ -344,7 +345,7 @@ fn sealed_length<F: TestFlow>(run: &Run<F>) -> usize {
 /// The client Finished adds about 440 bytes to the 285-byte test
 /// certificate, so an identified closing pads to the 1024-byte floor.
 async fn an_identified_closing_pads_to_the_floor<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
 	let run = run(client, server).await;
 	assert_eq!(sealed_length(&run), 1024);
 	Ok(())
@@ -353,7 +354,7 @@ async fn an_identified_closing_pads_to_the_floor<F: TestFlow>() -> Result<(), Bo
 /// A receipt countersignature adds about 620 bytes more, so a budget-bearing
 /// identified closing pads past the floor to 1536 bytes.
 async fn a_budget_bearing_identified_closing_pads_past_the_floor<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
 	client.transport_offer = Some(budget_offer());
 	client.receipt_approver = Some(Arc::new(PayingApprover));
 	server.transport = Some(budget_offer());
@@ -369,7 +370,7 @@ async fn a_budget_bearing_identified_closing_pads_past_the_floor<F: TestFlow>() 
 /// recorder derives opens it. The session is budget-bearing, so the client
 /// Finished carries the countersignature inside that seal.
 async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let mutual = mutual_with(ExpiryValidator);
+	let mutual = mutual_with(ExpiryValidator::default());
 	let Parties { server_identity, client_identity, mut client, mut server } = parties::<F>(mutual);
 	client.transport_offer = Some(budget_offer());
 	client.receipt_approver = Some(Arc::new(PayingApprover));
@@ -393,7 +394,7 @@ async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>()
 /// the handshake secret with the step and leaves nothing to complete or to
 /// replay with.
 async fn a_refused_settlement_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
 	client.transport_offer = Some(budget_offer());
 	client.receipt_approver = Some(Arc::new(PayingApprover));
 	server.transport = Some(budget_offer());
@@ -476,7 +477,7 @@ fn with_unsigned_attribute(reply: HandshakeMessage, attribute: Attribute) -> Han
 /// A budget-bearing client of flow `F` whose approver is `approver`, and the
 /// server it opened to, with that server's reply.
 async fn budget_bearing_reply<F: TestFlow>(approver: &Arc<CountingApprover>) -> (TestClient<F>, HandshakeMessage) {
-	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator));
+	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
 	client.transport_offer = Some(budget_offer());
 	client.receipt_approver = Some(approver.to_owned());
 	server.transport = Some(budget_offer());
@@ -581,6 +582,26 @@ async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestF
 	let pinned = [client_identity.certificate.to_owned()];
 	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
 	let mut server_config = F::server(&server_identity);
+	server_config.peer_authentication = mutual_with(pin);
+
+	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
+	let mut server = Handshake::server(server_config);
+
+	let reply = server.reply(client.start()?).await?;
+	let closing = client.respond(reply).await?;
+	let refusal = server.finish(closing).await;
+	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
+	Ok(())
+}
+
+/// A mutual server reads the validity period of a client certificate on its
+/// own clock, so a clock past the end of the period refuses a client that the
+/// host clock reads as current.
+async fn a_mutual_server_reads_the_validity_period_on_its_own_clock<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+	let server_identity = create_test_server();
+	let client_identity = create_windowed_test_certificate();
+	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates([client_identity.certificate.to_owned()])?;
+	let mut server_config = F::server(&server_identity).with_clock(CertificateFixtures::clock_past_validity());
 	server_config.peer_authentication = mutual_with(pin);
 
 	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
@@ -867,6 +888,7 @@ over_each_flow! {
 	a_mutual_server_records_the_accepted_peer,
 	a_mutual_server_refuses_a_refused_certificate,
 	a_mutual_server_refuses_an_expired_certificate_its_pin_accepts,
+	a_mutual_server_reads_the_validity_period_on_its_own_clock,
 	a_mutual_server_reads_the_validity_period_before_its_validators,
 	both_sides_fix_the_offered_profile_the_server_runs,
 	a_server_refuses_an_offer_that_names_no_profile_it_runs,

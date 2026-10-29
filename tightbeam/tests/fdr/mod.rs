@@ -14,6 +14,8 @@
 mod diners;
 mod refinement;
 mod scenario;
+#[cfg(feature = "testing-fault")]
+mod scheduler;
 mod tennis;
 mod trace_analysis;
 

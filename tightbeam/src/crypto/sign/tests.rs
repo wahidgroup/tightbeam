@@ -26,6 +26,7 @@ use crate::der::asn1::{BitString, OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, AnyRef, Decode, Encode, ErrorKind, Header, Reader, SliceReader, Tag, TagNumber};
 use crate::error::ReceivedExpectedError;
+use crate::marker::MaybeSendFuture;
 use crate::oids::{
 	ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST, DATA, HASH_SHA3_256, HASH_SHA3_512,
 	RECEIPT_ROLE, SESSION_RECEIPT_CONTENT, SIGNER_ECDSA_WITH_SHA256,
@@ -33,7 +34,6 @@ use crate::oids::{
 use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use crate::testing::fixtures::{TestAttributes, TestCertificate, TestIdentity, TestKey};
-use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::Attribute;
 use crate::x509::ext::pkix::{KeyUsage, KeyUsages, SubjectKeyIdentifier};
 use crate::x509::name::RdnSequence;

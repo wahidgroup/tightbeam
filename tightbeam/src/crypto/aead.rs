@@ -27,8 +27,8 @@ use std::sync::Arc;
 use crate::asn1::{AuthEnvelopedData, ObjectIdentifier, WireDer};
 use crate::der::oid::AssociatedOid;
 use crate::error::Result as TbResult;
+use crate::marker::MaybeSendFuture;
 use crate::random::CryptoRngCore;
-use crate::utils::marker::MaybeSendFuture;
 use crate::TightBeamError;
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -360,8 +360,8 @@ impl<'a> CheckedContent<'a> {
 	/// use tightbeam::crypto::cms::Opener;
 	/// use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
 	/// use tightbeam::der::asn1::ObjectIdentifier;
+	/// use tightbeam::marker::MaybeSendFuture;
 	/// use tightbeam::oids::AES_256_GCM;
-	/// use tightbeam::utils::marker::MaybeSendFuture;
 	/// use tightbeam::TightBeamError;
 	///
 	/// /// A frame decryptor that opens each frame under a KEK it holds.

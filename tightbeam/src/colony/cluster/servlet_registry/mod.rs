@@ -17,9 +17,9 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use crate::clock::{Clock, MonotonicInstant, UnixMillis};
 use crate::colony::cluster::PeerAddress;
 use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
-use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 
 use entry::Owner;
 pub(crate) use entry::RoutePlane;

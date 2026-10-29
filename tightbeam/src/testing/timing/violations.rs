@@ -14,7 +14,7 @@ pub struct TimingViolation {
 	/// or the percentile of a percentile bound.
 	pub observed_ns: u64,
 	/// The sequence number of a longest sample of the event.
-	pub seq: u32,
+	pub seq: u64,
 }
 
 /// A deadline miss, where the latency from the start event to the end event
@@ -30,9 +30,9 @@ pub struct DeadlineMiss {
 	/// The latency of the window, in nanoseconds.
 	pub observed_ns: u64,
 	/// The sequence number of the start marker.
-	pub start_seq: u32,
+	pub start_seq: u64,
 	/// The sequence number of the end marker.
-	pub end_seq: u32,
+	pub end_seq: u64,
 }
 
 /// A jitter violation, where the timing variation of an event exceeds its
@@ -46,7 +46,7 @@ pub struct JitterViolation {
 	/// The jitter of the samples, in nanoseconds.
 	pub observed_jitter_ns: u64,
 	/// The sequence numbers of the samples that the jitter measures.
-	pub seqs: Vec<u32>,
+	pub seqs: Vec<u64>,
 }
 
 /// A slack violation, where the slack of a window falls below the minimum
@@ -66,9 +66,9 @@ pub struct TimingSlackViolation {
 	/// The latency of the window, in nanoseconds.
 	pub observed_latency_ns: u64,
 	/// The sequence number of the start marker.
-	pub start_seq: u32,
+	pub start_seq: u64,
 	/// The sequence number of the end marker.
-	pub end_seq: u32,
+	pub end_seq: u64,
 }
 
 /// A path WCET violation, where the total duration of a path exceeds its WCET.
@@ -81,5 +81,5 @@ pub struct PathWcetViolation {
 	/// The total duration of the runs of the path, in nanoseconds.
 	pub observed_path_duration_ns: u64,
 	/// The sequence numbers of the trace events whose label lies on the path.
-	pub seqs: Vec<u32>,
+	pub seqs: Vec<u64>,
 }

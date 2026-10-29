@@ -1,17 +1,11 @@
-//! The utility modules, and the DER encode, decode, and digest functions.
+//! The DER encode, decode, and digest functions, and the `hex!` macro of
+//! `hex-literal`.
 
 use crate::asn1::admission::DerAdmission;
 use crate::error::TightBeamError;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-
-pub mod basis_points;
-pub mod marker;
-pub mod task;
-pub mod time;
-
-pub use basis_points::{BasisPoints, BasisPointsOutOfRange};
 
 #[cfg(feature = "hex")]
 pub use ::hex_literal::hex;
@@ -73,9 +67,7 @@ pub fn encode<T: der::Encode>(value: &T) -> Result<Vec<u8>, TightBeamError> {
 ///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
 #[inline]
 pub fn decode<'a, T: der::Decode<'a>>(content: &'a (impl AsRef<[u8]> + ?Sized)) -> Result<T, TightBeamError> {
-	let content = content.as_ref();
-	DerAdmission::SetOrder.admit(content)?;
-	Ok(der::Decode::from_der(content)?)
+	Ok(DerAdmission::SetOrder.decode(content.as_ref())?)
 }
 
 /// Compute the `DigestInfo` of `data` under the digest algorithm `D`.

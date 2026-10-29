@@ -18,6 +18,8 @@ use core::future::Future;
 
 use crate::constants::DEFAULT_ACCEPT_RETRY_DELAY;
 
+#[cfg(feature = "tokio")]
+use crate::clock::Clock;
 #[cfg(feature = "colony")]
 use crate::trace::TraceHandle;
 #[cfg(feature = "colony")]
@@ -28,8 +30,6 @@ use crate::transport::multiplex::MuxCapable;
 use crate::transport::protocols::AsyncListenerTrait;
 #[cfg(feature = "colony")]
 use crate::transport::state::EncryptedProtocolState;
-#[cfg(feature = "tokio")]
-use crate::utils::time::Clock;
 
 /// A plane that accepts connections under a fixed cap and owns what it admits.
 ///
@@ -60,9 +60,9 @@ impl AcceptPlane {
 	/// ```
 	/// use std::sync::Arc;
 	///
+	/// use tightbeam::clock::SystemClock;
 	/// use tightbeam::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 	/// use tightbeam::transport::accept::AcceptPlane;
-	/// use tightbeam::utils::time::SystemClock;
 	///
 	/// let _plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::new(SystemClock));
 	/// ```
@@ -389,7 +389,7 @@ mod tests {
 	use core::time::Duration;
 
 	use super::*;
-	use crate::utils::time::ManualClock;
+	use crate::clock::ManualClock;
 
 	#[cfg(all(pooled_mux, feature = "tcp"))]
 	use crate::crypto::profiles::DefaultCryptoProvider;

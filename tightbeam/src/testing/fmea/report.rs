@@ -79,7 +79,8 @@ impl FailureMode {
 /// FMEA report
 #[derive(Debug, Clone, PartialEq)]
 pub struct FmeaReport {
-	/// The failure modes, one per injected fault in a generated report.
+	/// The failure modes, one per injection point that fired in a generated
+	/// report.
 	pub failure_modes: Vec<FailureMode>,
 	/// The scale of every rating in the report.
 	pub severity_scale: SeverityScale,
@@ -118,10 +119,11 @@ impl FmeaReport {
 impl FdrVerdict {
 	/// FMEA report over the faults this run injected.
 	///
-	/// Each fault rates at the state it names in the first of `processes` that
-	/// holds that state. A fault whose state no process holds rates as a fault
-	/// in an unknown state. A run that injected nothing has no failure modes,
-	/// so the report is the empty one at the configured scale.
+	/// - Each injection point that fired is one failure mode, however many seeds it fired in.
+	/// - The fault of a point rates at its state in the first of `processes` that holds that state.
+	/// - A fault whose state no process holds rates as a fault in an unknown state.
+	/// - A run that injected nothing has no failure modes, so the report is the
+	///   empty one at the configured scale.
 	///
 	/// # Errors
 	///
@@ -134,8 +136,7 @@ impl FdrVerdict {
 		let config = config.unwrap_or_default();
 		let processes: Vec<&Process> = processes.into_iter().collect();
 		let failure_modes: Result<Vec<_>, _> = self
-			.faults_injected
-			.iter()
+			.fault_points()
 			.map(|fault| fault.failure_mode(&processes, self, &config))
 			.collect();
 
@@ -145,9 +146,25 @@ impl FdrVerdict {
 			config.rpn_critical_threshold,
 		))
 	}
+
+	/// The first record of each injection point among the faults this run
+	/// injected, in the order of injection.
+	///
+	/// The records of one point name its state, its event, and its
+	/// probability, and the verdict rates the detection of the whole run, so
+	/// each record of the point gives the one failure mode of the point.
+	fn fault_points(&self) -> impl Iterator<Item = &InjectedFaultRecord> {
+		let mut seen = HashSet::new();
+		self.faults_injected.iter().filter(move |fault| seen.insert(fault.point()))
+	}
 }
 
 impl InjectedFaultRecord {
+	/// The injection point of this fault, as its state and its event.
+	fn point(&self) -> (&str, &str) {
+		(&self.csp_state, &self.event_label)
+	}
+
 	/// Failure-mode entry for this fault: severity, occurrence, detection,
 	/// and the effects reachability analysis found.
 	///
@@ -410,13 +427,14 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn a_generated_report_traces_the_effects_from_the_fault_state() -> Result<(), Box<dyn core::error::Error>> {
+	/// The failure modes of the report that a run of `seeds` seeds generates,
+	/// where every send in `Ready` fails.
+	fn generated_modes(seeds: u32) -> Result<Vec<FailureMode>, Box<dyn core::error::Error>> {
 		let fault = || TightBeamError::ChannelClosed;
 		let event = link::Event(SEND);
 		let fault_model = FaultModel::default().with_fault(link::States::Ready, event, fault, crate::bps!(10000));
 		let config = FdrConfig {
-			seeds: 1,
+			seeds,
 			specs: vec![Link::process()?],
 			fault_model: Some(fault_model),
 			fmea_config: Some(FmeaConfig::default()),
@@ -427,8 +445,22 @@ mod tests {
 		let verdict = DefaultFdrExplorer::with_defaults(&process, config).explore()?;
 		let modes = verdict.fmea_report.map(|report| report.failure_modes).unwrap_or_default();
 
+		Ok(modes)
+	}
+
+	#[test]
+	fn a_generated_report_traces_the_effects_from_the_fault_state() -> Result<(), Box<dyn core::error::Error>> {
+		let modes = generated_modes(1)?;
+
 		let effects: Vec<Vec<String>> = modes.into_iter().map(|mode| mode.effects).collect();
 		assert_eq!(effects, [["Can reach terminal state(s): Done"]]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_fault_point_that_injects_on_every_seed_is_one_failure_mode() -> Result<(), Box<dyn core::error::Error>> {
+		let modes = generated_modes(4)?;
+		assert_eq!(modes.len(), 1);
 		Ok(())
 	}
 }

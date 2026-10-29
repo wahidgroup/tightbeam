@@ -14,17 +14,14 @@
 
 use std::sync::Arc;
 
-use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 use crate::colony::cluster::runtime::bounds::{ClusterPool, ColonyConfig, ColonyDialProtocol};
 use crate::colony::cluster::ClusterError;
 use crate::colony::protocol::{ClusterRequest, PeerAdvertisement, PeerAdvertisementResponse};
-use crate::decode;
 use crate::policy::TransitStatus;
 use crate::transport::{PooledClient, Protocol};
 use crate::urn::Urn;
 use crate::Frame;
-use crate::{MessagePriority, Version};
 
 /// One signed peer advertisement of this gateway's slate.
 ///
@@ -64,12 +61,8 @@ impl<P: ColonyDialProtocol> ColonyConfig<P> {
 			advertised_types: types,
 		});
 
-		let builder = FrameBuilder::from(Version::V2)
-			.with_id(b"peer-advertise")
-			.with_order(self.clock.unix().get())
-			.with_message(request)
-			.with_priority(MessagePriority::NetworkControl);
-		let mut signed_frame = self.witnessed(builder).build()?;
+		let builder = self.control_frame(b"peer-advertise", self.issue_order(), request);
+		let mut signed_frame = builder.build()?;
 
 		signed_frame.sign_with_provider(self.tls.identity()).await?;
 		Ok(SignedAdvertisement(signed_frame))
@@ -123,7 +116,7 @@ impl<P: ColonyDialProtocol> Advertiser<P> {
 		}
 
 		let response = replied?.ok_or(ClusterError::NoResponse)?;
-		let decoded: PeerAdvertisementResponse = decode(response.message())?;
+		let decoded: PeerAdvertisementResponse = response.decode_message()?;
 		Ok(decoded.status)
 	}
 

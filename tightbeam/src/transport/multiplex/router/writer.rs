@@ -28,6 +28,8 @@ use super::flow::renewal_floor;
 #[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 use super::shared::RekeyPhase;
 #[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+use crate::clock::{Clock, MonotonicInstant};
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
 use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::SendCipher;
@@ -35,8 +37,6 @@ use crate::crypto::aead::SendCipher;
 use crate::instrumentation::events;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::rekey::ClientRekeyExchange;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-use crate::utils::time::{Clock, MonotonicInstant};
 
 /// One unit of writer work, resolved by [`MuxWriterDriver::poll_step`].
 enum WriterStep {
@@ -448,6 +448,8 @@ mod tests {
 	use super::super::testing::{client_shared, noop_cx};
 	use super::super::transport::MuxTransport;
 	use super::*;
+	use crate::clock::ManualClock;
+	use crate::marker::MaybeSendFuture;
 	use crate::transport::envelopes::{
 		MuxPingPackage, MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage,
 	};
@@ -456,8 +458,6 @@ mod tests {
 	use crate::transport::rekey::tests::{rekey_pair, run_exchange};
 	use crate::transport::rekey::{EpochInstall, RekeyDriver};
 	use crate::transport::{EnvelopeSource, TransportError};
-	use crate::utils::marker::MaybeSendFuture;
-	use crate::utils::time::ManualClock;
 
 	/// A sink that accepts every envelope and every send cipher, and reports
 	/// unlimited records.

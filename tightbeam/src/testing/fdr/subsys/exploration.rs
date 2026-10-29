@@ -17,7 +17,7 @@ use crate::testing::fdr::verdict::Trace;
 use crate::testing::specs::csp::{Action, DivergentStates, Event, Process, State};
 
 #[cfg(feature = "testing-fault")]
-use crate::testing::fdr::config::{FaultInjection, FaultModel, InjectedFaultRecord};
+use crate::testing::fdr::config::{InjectedFaultRecord, WalkFaults};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::TimingConstraints;
 
@@ -125,6 +125,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 		let mut failures = Vec::new();
 		#[cfg(feature = "testing-fault")]
 		let mut injected_faults: Vec<InjectedFaultRecord> = Vec::new();
+		#[cfg(feature = "testing-fault")]
+		let mut walk_faults = config.fault_model.as_ref().map(|model| WalkFaults::new(model, seed));
 
 		while let Some(state) = queue.pop_front() {
 			visited.insert(state.process_state());
@@ -199,35 +201,39 @@ impl<'a> DefaultExplorationEngine<'a> {
 			}
 
 			// An injected fault fails the chosen event, and the walk selects
-			// again from the enabled actions that remain. A state with no
-			// usable action is a fault-induced deadlock (recovery failure).
+			// again from the enabled actions that remain. When the faults leave
+			// no usable action, an accepting state ends the walk there, as it
+			// can terminate, and any other state is a fault-induced deadlock
+			// (recovery failure).
 			#[cfg(feature = "testing-fault")]
 			let action = {
 				let mut candidates: Vec<&Action> = actions.iter().collect();
 				loop {
 					let candidate =
 						Self::select_action_helper_from(&mut rng, process, state.process_state(), &candidates);
-					let fault = config.fault_model.as_ref().and_then(|fault_model| {
-						Self::check_fault_injection(
-							fault_model,
-							process,
-							state.process_state(),
-							&candidate.event,
-							&mut rng,
-						)
-					});
+					let faults = walk_faults.as_mut();
+					let fault = faults.and_then(|faults| faults.draw(process, state.process_state(), &candidate.event));
 
 					let Some(fault_record) = fault else {
-						break candidate;
+						break Some(candidate);
 					};
 
 					injected_faults.push(fault_record);
 					candidates.retain(|a| a.event != candidate.event);
 
-					if candidates.is_empty() {
+					let stuck = candidates.is_empty();
+					if stuck && accepting {
+						break None;
+					}
+					if stuck {
 						return SeedResult::Deadlock(state.trace().to_vec(), state.process_state(), injected_faults);
 					}
 				}
+			};
+			#[cfg(feature = "testing-fault")]
+			let action = match action {
+				Some(action) => action,
+				None => continue,
 			};
 			#[cfg(not(feature = "testing-fault"))]
 			let action = Self::select_action_helper(&mut rng, process, state.process_state(), &actions);
@@ -355,40 +361,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 		} else {
 			actions[0]
 		}
-	}
-
-	/// The fault record when the fault model holds an injection for this
-	/// `(state, event)` pair and the RNG draw fires it.
-	#[cfg(feature = "testing-fault")]
-	fn check_fault_injection(
-		fault_model: &FaultModel,
-		process: &Process,
-		state: State,
-		event: &Event,
-		rng: &mut SeededRng,
-	) -> Option<InjectedFaultRecord> {
-		// The `Process.State` lookup key costs one allocation. The Cow-keyed
-		// map borrows it, so the lookup reads the fault-injection table in
-		// place.
-		let state_key_str = format!("{}.{}", process.name, state.0);
-
-		fault_model
-			.state_injection(&state_key_str, event.0)
-			.and_then(|injection: &FaultInjection| {
-				let rng_value = rng.get_next();
-				if injection.should_inject(rng_value) {
-					let error = (injection.error_factory)();
-					// Only a path that injects a fault clones the key.
-					Some(InjectedFaultRecord {
-						csp_state: state_key_str.clone(),
-						event_label: event.0.to_string(),
-						error_message: error.to_string(),
-						probability_bps: injection.probability_bps.get(),
-					})
-				} else {
-					None
-				}
-			})
 	}
 
 	/// Executes a transition and queues the next states.
@@ -652,5 +624,112 @@ mod tests {
 		let result = result_of(&process, FdrConfig::default());
 		assert!(matches!(result, SeedResult::Success(..)), "the result was {result:?}");
 		Ok(())
+	}
+
+	// These tests cover the faults that a walk injects.
+	#[cfg(feature = "testing-fault")]
+	mod faults {
+		use super::{result_of, FdrConfig, ProcessBuildError, SeedResult};
+		use crate::basis_points::BasisPoints;
+		use crate::testing::fault::{ProcessEvent, ProcessState};
+		use crate::testing::fdr::verdict::Trace;
+		use crate::testing::fdr::{FaultModel, InjectionStrategy};
+		use crate::testing::specs::csp::{Event, Process};
+		use crate::urn::Urn;
+		use crate::TightBeamError;
+
+		const PING: Urn<'static> = crate::urn!("test", "event:exploration-faults/ping");
+		const PONG: Urn<'static> = crate::urn!("test", "event:exploration-faults/pong");
+
+		// A beacon that pings and takes a pong, over and over, so a walk
+		// visits `Idle` once per round.
+		crate::tb_process_spec! {
+			pub Beacon,
+			events { observable { PING, PONG } hidden { } }
+			states {
+				Idle => { PING => Busy },
+				Busy => { PONG => Idle }
+			}
+		}
+
+		// The beacon, which can also stop while it is idle.
+		crate::tb_process_spec! {
+			pub DockedBeacon,
+			events { observable { PING, PONG } hidden { } }
+			states {
+				Idle => { PING => Busy },
+				Busy => { PONG => Idle }
+			}
+			terminal { Idle }
+		}
+
+		crate::tb_gen_process_types!(Beacon, Idle);
+		crate::tb_gen_process_types!(DockedBeacon, Idle);
+
+		/// The result of seed 0 of `process` under `model`, with a fault on
+		/// `event` in `state` at `probability`.
+		fn walk_of<S, E>(process: &Process, point: (S, E), model: FaultModel, probability: BasisPoints) -> SeedResult
+		where
+			S: ProcessState,
+			E: ProcessEvent,
+		{
+			let closed = || TightBeamError::ChannelClosed;
+			let (state, event) = point;
+			let model = model.with_fault(state, event, closed, probability);
+			let config = FdrConfig { fault_model: Some(model), ..FdrConfig::default() };
+
+			result_of(process, config)
+		}
+
+		/// The result of seed 0 of `Beacon` under `model`, with a fault on
+		/// `PING` in `Idle` at `probability`.
+		fn walk_under(model: FaultModel, probability: BasisPoints) -> Result<SeedResult, ProcessBuildError> {
+			let process = Beacon::process()?;
+			let point = (beacon::States::Idle, beacon::Event(PING));
+			Ok(walk_of(&process, point, model, probability))
+		}
+
+		/// The trace of a walk that a fault ended in a deadlock, or `None`.
+		fn deadlock_trace(result: SeedResult) -> Option<Trace> {
+			match result {
+				SeedResult::Deadlock(trace, _state, _faults) => Some(trace),
+				_ => None,
+			}
+		}
+
+		#[test]
+		fn the_deterministic_strategy_injects_at_the_counted_visits_of_a_walk() -> Result<(), ProcessBuildError> {
+			let model = FaultModel::from(InjectionStrategy::Deterministic);
+
+			let trace = deadlock_trace(walk_under(model, crate::bps!(3000))?);
+
+			let rounds = [Event::from(PING), Event::from(PONG)].repeat(3);
+			assert_eq!(trace, Some(rounds));
+			Ok(())
+		}
+
+		#[test]
+		fn the_seed_of_the_model_decides_the_random_injections_of_a_walk() -> Result<(), ProcessBuildError> {
+			let first = FaultModel::from(InjectionStrategy::Random).with_seed(1);
+			let second = FaultModel::from(InjectionStrategy::Random).with_seed(2);
+
+			let first = deadlock_trace(walk_under(first, crate::bps!(5000))?);
+			let second = deadlock_trace(walk_under(second, crate::bps!(5000))?);
+
+			let round = [Event::from(PING), Event::from(PONG)];
+			assert_eq!([first, second], [Some(round.repeat(4)), Some(round.repeat(0))]);
+			Ok(())
+		}
+
+		#[test]
+		fn a_fault_on_every_action_of_an_accepting_state_ends_the_walk_there() -> Result<(), ProcessBuildError> {
+			let process = DockedBeacon::process()?;
+
+			let point = (docked_beacon::States::Idle, docked_beacon::Event(PING));
+
+			let result = walk_of(&process, point, FaultModel::default(), crate::bps!(10000));
+			assert!(matches!(result, SeedResult::Success(..)));
+			Ok(())
+		}
 	}
 }

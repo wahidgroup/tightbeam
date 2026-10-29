@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Notify, Semaphore};
 
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveRuntime};
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::colony::urn::ColonyNamespace;
@@ -18,7 +19,6 @@ use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, TransportError, TransportFailure};
 use tightbeam::urn::Urn;
-use tightbeam::utils::time::{Clock, ManualClock};
 use tightbeam::Beamable;
 use tightbeam::{compose, exactly, servlet, tb_assert_spec, tb_scenario, worker, Frame, TightBeamError};
 

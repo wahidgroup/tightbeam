@@ -17,7 +17,7 @@
 /// ```
 ///
 /// ```compile_fail
-/// const REJECTED: tightbeam::urn::Urn<'static> = tightbeam::urn!("9bad", "resource");
+/// const REJECTED: tightbeam::urn::Urn<'static> = tightbeam::urn!("-bad", "resource");
 /// ```
 ///
 /// [`Urn`]: crate::urn::Urn
@@ -31,12 +31,16 @@ macro_rules! urn {
 
 			if $crate::urn::Urn::validate_nid(nid).is_err() {
 				::core::panic!(
-					"malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter and ending with an alphanumeric"
+					"malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting and ending with an alphanumeric"
 				);
 			}
 
-			if $crate::urn::Urn::validate_nss(nss).is_err() {
-				::core::panic!("malformed URN literal: the NSS must not be empty");
+			match $crate::urn::Urn::validate_nss(nss) {
+				Ok(()) => {}
+				Err($crate::urn::UrnValidationError::InvalidNssCharacters) => ::core::panic!(
+					"malformed URN literal: the NSS must be RFC 3986 pchar or '/', and must not start with '/'"
+				),
+				Err(_) => ::core::panic!("malformed URN literal: the NSS must not be empty"),
 			}
 
 			$crate::urn::Urn::new_unchecked(nid, nss)

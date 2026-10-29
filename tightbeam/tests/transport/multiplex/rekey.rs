@@ -10,6 +10,7 @@ use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
@@ -20,7 +21,6 @@ use tightbeam::transport::handshake::negotiation::{
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt, StoredReceipt};
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxHandle, MuxRole};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 use tokio::time::timeout;

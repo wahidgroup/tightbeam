@@ -45,13 +45,13 @@ use tightbeam::crypto::sign::{
 	SigningIdentity, Verifier,
 };
 use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{CURVE_NIST_P521, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::random::OsRng;
 use tightbeam::spki::{
 	AlgorithmIdentifierOwned, Document, EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef,
 };
 use tightbeam::testing::unhex;
-use tightbeam::utils::marker::MaybeSendFuture;
 
 use super::{
 	carried_point, certificate_of, cms_pair, first_record_opened, hpke_pair, identity_of, outside_cms_server,

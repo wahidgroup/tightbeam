@@ -237,6 +237,36 @@ pub enum TightBeamError {
 	#[error("Unsupported protocol version: {0}")]
 	UnsupportedVersion(ReceivedExpectedError<Version, Version>),
 
+	/// A frame carries a field that its version forbids (README §5.6).
+	///
+	/// `field` names the field, and `version` names the frame version, which
+	/// is below [`GatedField::since`](crate::asn1::GatedField::since) of the
+	/// field. The frame build and every change to a frame in place refuse
+	/// with it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # #[cfg(feature = "builder")]
+	/// # {
+	/// use tightbeam::asn1::GatedField;
+	/// use tightbeam::prelude::MatrixDyn;
+	/// use tightbeam::testing::TestMessage;
+	/// use tightbeam::{compose, TightBeamError, Version};
+	///
+	/// let refused = compose! {
+	///     V2: id: "grid", order: 1u64, message: TestMessage::sample(None), matrix: MatrixDyn::default()
+	/// };
+	///
+	/// assert!(matches!(
+	///     refused,
+	///     Err(TightBeamError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 })
+	/// ));
+	/// # }
+	/// ```
+	#[error("Field {field} is not supported in protocol version {version:?}")]
+	UnsupportedField { field: crate::asn1::GatedField, version: Version },
+
 	/// A testing operation failed.
 	#[cfg(feature = "testing")]
 	#[error("Testing error: {0}")]
@@ -368,6 +398,26 @@ pub enum TightBeamError {
 	#[error("{marker} requires {call} before build")]
 	MissingProtection { marker: &'static str, call: &'static str },
 
+	/// A Frame fails a requirement of the message type it carries.
+	#[error("Requirement error: {0}")]
+	#[source]
+	Requirement(crate::core::RequirementError),
+
+	/// A typed decode reads a Frame body that still needs the named transform:
+	/// a decrypt for an encrypted body, or an inflate for a compressed one.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::asn1::BodyTransform;
+	/// use tightbeam::TightBeamError;
+	///
+	/// let refused = TightBeamError::OpaqueBody(BodyTransform::Decrypt);
+	/// assert_eq!(refused.to_string(), "Frame body needs a decrypt before a decode");
+	/// ```
+	#[error("Frame body needs a {0} before a decode")]
+	OpaqueBody(crate::frame::BodyTransform),
+
 	/// The response is missing.
 	#[error("Missing response")]
 	MissingResponse,
@@ -498,6 +548,7 @@ crate::impl_from!(crate::crypto::kdf::KdfError => TightBeamError::KeyDerivationE
 crate::impl_from!(crate::crypto::key::KeyError => TightBeamError::KeyError);
 #[cfg(feature = "std")]
 crate::impl_from!(std::io::Error => TightBeamError::IoError);
+crate::impl_from!(crate::core::RequirementError => TightBeamError::Requirement);
 #[cfg(feature = "router")]
 crate::impl_from!(crate::router::RouterError => TightBeamError::RouterError);
 #[cfg(feature = "builder")]

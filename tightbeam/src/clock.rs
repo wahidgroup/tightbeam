@@ -15,7 +15,7 @@
 
 use core::time::Duration;
 
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 
 /// A point in time, as unix milliseconds.
 ///

@@ -260,8 +260,9 @@ pub enum GoAwayReason {
 	/// The session budget is spent down to the drain headroom. The epoch's
 	/// negotiated data volume is exhausted, and the sender drains.
 	BudgetExhausted,
-	/// The settlement of the session agreement failed, or a revocation ended
-	/// the agreement after activation.
+	/// The settlement or the approval of a renewed session receipt was refused
+	/// with a tightbeam code, one below [`MUX_APPLICATION_CODE_FLOOR`]. A code
+	/// at or above the floor drains as [`Self::Application`] instead.
 	SettlementFailed,
 	/// An application-defined code at or above
 	/// [`MUX_APPLICATION_CODE_FLOOR`], or a TB code newer than this build.
@@ -1066,6 +1067,20 @@ impl WireEnvelope {
 	/// - [`der::Error`] -- `wire` is no wire envelope, or carries bytes past it.
 	pub fn arrive(wire: &mut [u8]) -> DerResult<Arrived<'_>> {
 		Self::admit(wire)?.arrive()
+	}
+
+	/// The octets on the wire of a cleartext envelope whose transport envelope
+	/// is `envelope_len` octets: the `[0]` header, then the envelope.
+	///
+	/// # Errors
+	///
+	/// - [`der::Error`] -- `envelope_len` passes the largest length DER encodes.
+	pub(crate) fn cleartext_len(envelope_len: usize) -> DerResult<usize> {
+		let envelope_len = Length::try_from(envelope_len)?;
+		let header = Header::new(CLEARTEXT_TAG, envelope_len)?;
+		let wire_len = (header.encoded_len()? + envelope_len)?;
+
+		usize::try_from(wire_len)
 	}
 
 	/// Returns the frame of a cleartext request, which a refused exchange

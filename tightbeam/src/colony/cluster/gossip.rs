@@ -33,9 +33,9 @@ use std::sync::{Arc, Mutex};
 use super::runtime::LoopFault;
 use super::{ClusterError, ClusterTlsConfig, FreshnessWindow};
 use crate::asn1::Frame;
+use crate::clock::UnixMillis;
 use crate::colony::protocol::IssuedAt;
 use crate::colony::protocol::{GossipRumor, GossipRumorKind};
-use crate::colony::urn::ServletTypeKey;
 use crate::constants::{
 	DEFAULT_GOSSIP_RATE_BURST, DEFAULT_GOSSIP_RATE_REFILL_MS, DEFAULT_GOSSIP_RETENTION_MS, DEFAULT_GOSSIP_SEEN_TTL_MS,
 	DEFAULT_GOSSIP_TTL, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_RATE_SIGNERS,
@@ -43,10 +43,9 @@ use crate::constants::{
 };
 use crate::crypto::hash::{Digest, OutputSizeUser};
 use crate::crypto::sign::VerifiedSignature;
-use crate::decode;
 use crate::policy::TransitStatus;
 use crate::transport::handshake::primitives::transcript::DigestOutput;
-use crate::utils::time::UnixMillis;
+use crate::urn::Urn;
 use crate::TightBeamError;
 
 /// The content digest of a gossip rumor, under the digest of the colony's
@@ -371,7 +370,7 @@ impl AdmittedGossip {
 	///
 	/// Each of these refuses the rumor:
 	///
-	/// - The rumor body does not decode.
+	/// - The frame is no carrier of a [`GossipRumor`] ([`Frame::decode_message`]).
 	/// - The payload exceeds [`MAX_GOSSIP_PAYLOAD_BYTES`].
 	/// - `ttl` exceeds [`MAX_GOSSIP_TTL`], which caps the hop radius here at the trust boundary (CWE-770).
 	/// - The issue time lies outside the `seen` window of `now`, on either side.
@@ -382,11 +381,11 @@ impl AdmittedGossip {
 	/// ```
 	/// use core::time::Duration;
 	///
+	/// use tightbeam::clock::UnixMillis;
 	/// use tightbeam::colony::cluster::{AdmittedGossip, FreshnessWindow};
 	/// use tightbeam::crypto::hash::Sha3_256;
 	/// use tightbeam::policy::TransitStatus;
 	/// use tightbeam::testing::fixtures::TestRumor;
-	/// use tightbeam::utils::time::UnixMillis;
 	///
 	/// let rumor = TestRumor::verified(TestRumor::application(1_000, [1, 2, 3]));
 	/// let seen = FreshnessWindow::new(Duration::from_secs(30));
@@ -405,7 +404,7 @@ impl AdmittedGossip {
 		now: UnixMillis,
 	) -> Result<Self, TransitStatus> {
 		let frame = rumor.frame();
-		let body: GossipRumor = decode(frame.message()).map_err(|_| TransitStatus::PermissionDenied)?;
+		let body: GossipRumor = frame.decode_message().map_err(|_| TransitStatus::PermissionDenied)?;
 
 		let within_payload = body.payload.len() <= MAX_GOSSIP_PAYLOAD_BYTES;
 		let within_ttl = ttl <= u64::from(MAX_GOSSIP_TTL);
@@ -1058,16 +1057,20 @@ pub struct GossipConfig {
 	pub seen_ttl: Duration,
 	/// The hop radius of an origin publish, clamped to [`MAX_GOSSIP_TTL`].
 	pub ttl: u8,
-	/// The route key that this gateway delivers admitted rumors to.
+	/// The servlet type that this gateway delivers admitted rumors to.
 	///
-	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a configured
-	///   ingress always names a servlet type this colony can route.
+	/// - [`Cluster::start`] mints its route key once, through
+	///   [`ClusterConfig::gossip_ingress_key`], under the namespace the gateway
+	///   serves. It refuses a URN that is no bare servlet type of that
+	///   namespace, so the ingress of a running gateway names a servlet type it
+	///   can route.
 	/// - Local delivery is a policy of the receiving gateway, not part of the rumor.
 	/// - The servlet receives the origin-signed rumor frame. Its message decodes
 	///   as a [`GossipRumor`], and its signature names the publishing gateway.
 	/// - `None` only journals and refloods, and marks the record delivered, out of the pending retry set.
 	///
-	/// [`ColonyNamespace::servlet_type_key`]: crate::colony::urn::ColonyNamespace::servlet_type_key
+	/// [`ClusterConfig::gossip_ingress_key`]: crate::colony::cluster::ClusterConfig::gossip_ingress_key
+	/// [`Cluster::start`]: crate::colony::cluster::Cluster::start
 	///
 	/// # Export boundary
 	///
@@ -1077,7 +1080,7 @@ pub struct GossipConfig {
 	///
 	/// Every trusted colony delivers through this type, so an operator who
 	/// restricts exports should treat it as a channel for the whole flood.
-	pub ingress: Option<ServletTypeKey>,
+	pub ingress: Option<Urn<'static>>,
 	/// The deduplication and retention store, which owns its retention window.
 	pub journal: Arc<dyn GossipJournal>,
 	/// The per-signer rate admission that runs before record or reflood.
@@ -1299,6 +1302,7 @@ mod tests {
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
+	use crate::decode;
 	use crate::encode;
 	use crate::tb_cases;
 	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage, TestRumor};

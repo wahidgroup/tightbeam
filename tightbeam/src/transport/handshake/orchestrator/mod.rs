@@ -26,13 +26,15 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::mem;
 
+use crate::clock::Clock;
 use crate::crypto::aead::{DirectionalCiphers, RuntimeAead, SessionKeys};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::utils::{CertificateExt, ValidityClock};
 use crate::crypto::x509::KeyPurposes;
+use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::random::OsRng;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
@@ -53,7 +55,6 @@ use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, ServerHandshakeProtocol,
 	ServerIdentity,
 };
-use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::x509::Certificate;
 
 mod sealed {
@@ -148,6 +149,9 @@ pub struct ClientConfig<F: ClientFlow<P>, P: HandshakeProvider> {
 	/// The server policy, which [`Self::with_server_policy`] sets, or `None`
 	/// for a client that sets none.
 	server_policy: Option<ValidatorChain>,
+	/// The clock that the client reads the validity period of each server
+	/// certificate on, which [`Self::with_clock`] sets.
+	clock: ValidityClock<dyn Clock>,
 }
 
 impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
@@ -168,25 +172,29 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 
 	/// The configuration of a client whose client identity was admitted for
 	/// the client purpose where the transport's provisioning was answered,
-	/// once. The transport offer, the receipt approver, and the server policy
-	/// are required parameters, so the builder of each flow passes them alike.
+	/// once. The transport offer, the receipt approver, the server policy,
+	/// and the clock of the endpoint are required parameters, so the builder
+	/// of each flow passes them alike.
 	pub(crate) fn admitted(
 		flow: F::Settings,
 		key_purposes: KeyPurposes,
 		transport_offer: Option<TransportOffer>,
 		receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 		server_policy: Option<ValidatorChain>,
+		clock: ValidityClock<dyn Clock>,
 	) -> Self {
 		Self {
 			transport_offer,
 			receipt_approver,
 			server_policy,
+			clock,
 			..Self::offering_nothing(flow, key_purposes)
 		}
 	}
 
 	/// A configuration that offers nothing, sets no server policy, applies
-	/// the default strength floor, and admits each role under `key_purposes`.
+	/// the default strength floor, reads the crate clock, and admits each
+	/// role under `key_purposes`.
 	fn offering_nothing(flow: F::Settings, key_purposes: KeyPurposes) -> Self {
 		Self {
 			flow,
@@ -196,6 +204,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 			key_purposes,
 			receipt_approver: None,
 			server_policy: None,
+			clock: ValidityClock::CRATE,
 		}
 	}
 
@@ -234,7 +243,7 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 	/// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
 	///
 	/// // The policy reads the signing certificate the reply names.
-	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 	/// let _config = config.with_server_policy([expiry]);
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
@@ -247,6 +256,42 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> ClientConfig<F, P> {
 	/// of its flow.
 	pub(crate) fn server_policy(&self) -> Option<&ValidatorChain> {
 		self.server_policy.as_ref()
+	}
+
+	/// Sets the clock that the client reads the validity period of each
+	/// server certificate on, in place of the crate clock. A transport sets
+	/// the clock of its [`EndpointConfig`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::clock::{Clock, SystemClock};
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::crypto::x509::policy::DirectTrustValidator;
+	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::transport::handshake::{ClientConfig, Hpke, HpkeClientSettings, LearnedTrust};
+	///
+	/// let settings = HpkeClientSettings::new(LearnedTrust::new(DirectTrustValidator::default()));
+	/// let config = ClientConfig::<Hpke, DefaultCryptoProvider>::new(settings, KeyPurposes::HOUSE)?;
+	///
+	/// let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+	/// let _config = config.with_clock(clock);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`EndpointConfig`]: crate::transport::EndpointConfig
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = ValidityClock::new(clock);
+		self
+	}
+
+	/// The clock that the client reads the validity period of each server
+	/// certificate on.
+	pub(crate) fn clock(&self) -> &ValidityClock<dyn Clock> {
+		&self.clock
 	}
 }
 
@@ -358,6 +403,9 @@ pub struct ServerConfig<F: ServerFlow<P>, P: HandshakeProvider> {
 	/// The observer that records the outcome of every budget-bearing session
 	/// whose receipt exchange concluded, activated or refused.
 	pub session_observer: Option<Arc<dyn SessionObserver>>,
+	/// The clock that the server reads the validity period of a client
+	/// certificate on, which [`Self::with_clock`] sets.
+	clock: ValidityClock<dyn Clock>,
 }
 
 impl<F: ServerFlow<P>, P: HandshakeProvider> ServerConfig<F, P> {
@@ -376,16 +424,18 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> ServerConfig<F, P> {
 		key_purposes: KeyPurposes,
 	) -> Result<Self, HandshakeError> {
 		identity.require_purpose(key_purposes.server)?;
-		Ok(Self::admitted(flow, identity, profiles, key_purposes))
+		Ok(Self::admitted(flow, identity, profiles, key_purposes, ValidityClock::CRATE))
 	}
 
 	/// A configuration whose identity was admitted for the server purpose of
-	/// `key_purposes` where the transport's provisioning was answered, once.
+	/// `key_purposes` where the transport's provisioning was answered, once,
+	/// on `clock`.
 	pub(crate) fn admitted(
 		flow: F::Settings,
 		identity: F::Identity,
 		profiles: SupportedProfiles,
 		key_purposes: KeyPurposes,
+		clock: ValidityClock<dyn Clock>,
 	) -> Self {
 		Self {
 			flow,
@@ -397,6 +447,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> ServerConfig<F, P> {
 			transport: None,
 			transport_authorizer: None,
 			session_observer: None,
+			clock,
 		}
 	}
 
@@ -408,6 +459,41 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> ServerConfig<F, P> {
 	/// The key purpose of each role.
 	pub fn key_purposes(&self) -> &KeyPurposes {
 		&self.key_purposes
+	}
+
+	/// Sets the clock that the server reads the validity period of a client
+	/// certificate on, in place of the crate clock. A transport sets the
+	/// clock of its [`EndpointConfig`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::clock::{Clock, SystemClock};
+	/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	/// use tightbeam::crypto::x509::KeyPurposes;
+	/// use tightbeam::testing::fixtures::TestIdentity;
+	/// use tightbeam::transport::handshake::negotiation::RunnableProfile;
+	/// use tightbeam::transport::handshake::{Hpke, HpkeServerSettings, ServerConfig, SupportedProfiles};
+	///
+	/// let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
+	/// let profiles = SupportedProfiles::from(native);
+	/// let identity = TestIdentity::insecure_fixed();
+	/// let settings = HpkeServerSettings::new();
+	/// let purposes = KeyPurposes::HOUSE;
+	/// let config = ServerConfig::<Hpke, DefaultCryptoProvider>::new(settings, identity, profiles, purposes)?;
+	///
+	/// let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+	/// let _config = config.with_clock(clock);
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	///
+	/// [`EndpointConfig`]: crate::transport::EndpointConfig
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = ValidityClock::new(clock);
+		self
 	}
 }
 
@@ -1054,7 +1140,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		// 5. Admit the offered identity. Every validator runs when the server
 		//    demands a certificate, and an offered certificate's proof is
 		//    verified in either mode.
-		let peer = config.peer_authentication.admit(offer, &terms)?;
+		let peer = config.peer_authentication.admit(offer, &terms, &config.clock)?;
 
 		// 6. Open and verify the receipt countersignature, and settle.
 		let authorizer = config.transport_authorizer.as_deref();

@@ -13,11 +13,11 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use crate::clock::{Clock, UnixMillis};
 use crate::colony::hive::ReplayGuard;
 use crate::colony::protocol::IssuedAt;
 use crate::crypto::sign::VerifiedSignature;
 use crate::policy::TransitStatus;
-use crate::utils::time::{Clock, UnixMillis};
 use crate::Frame;
 
 /// A span of time on each side of a clock reading, inside which a stated
@@ -32,8 +32,8 @@ use crate::Frame;
 /// ```
 /// use core::time::Duration;
 ///
+/// use tightbeam::clock::UnixMillis;
 /// use tightbeam::colony::cluster::FreshnessWindow;
-/// use tightbeam::utils::time::UnixMillis;
 ///
 /// let window = FreshnessWindow::new(Duration::from_secs(30));
 /// let now = UnixMillis::new(100_000);
@@ -55,8 +55,8 @@ impl FreshnessWindow {
 	/// ```
 	/// use core::time::Duration;
 	///
+	/// use tightbeam::clock::UnixMillis;
 	/// use tightbeam::colony::cluster::FreshnessWindow;
-	/// use tightbeam::utils::time::UnixMillis;
 	///
 	/// let window = FreshnessWindow::new(Duration::ZERO);
 	/// let now = UnixMillis::new(5_000);
@@ -79,8 +79,8 @@ impl FreshnessWindow {
 	/// ```
 	/// use core::time::Duration;
 	///
+	/// use tightbeam::clock::UnixMillis;
 	/// use tightbeam::colony::cluster::FreshnessWindow;
-	/// use tightbeam::utils::time::UnixMillis;
 	///
 	/// let window = FreshnessWindow::new(Duration::from_millis(1_000));
 	///
@@ -132,23 +132,23 @@ impl GatewayReplayGuard {
 	///
 	/// The checks apply in order:
 	///
-	/// 1. Reject when `metadata.order` falls outside the freshness window.
-	/// 2. Require a signer identifier on the frame.
-	/// 3. Insert the verified signature in the ledger under its `metadata.order`, and refuse a duplicate.
+	/// 1. Require a signer identifier on the frame.
+	/// 2. Insert the verified signature in the ledger under its
+	///    `metadata.order`, by the rule of [`ReplayGuard::admits`].
 	///
-	/// The ledger keys on the canonical form, so a capture with `s` flipped to
-	/// `n - s` finds the slot its original spent.
+	/// The ledger refuses an order outside the freshness window, a full
+	/// partition, and a duplicate of either kind:
+	///
+	/// - A signature it holds. It keys on the canonical form, so a capture
+	///   with `s` flipped to `n - s` finds the slot its original spent.
+	/// - A second frame of the signer at an order it holds, whatever its signature (README §5.7.1).
 	pub(crate) fn admits(&self, frame: &Frame, signature: &VerifiedSignature) -> TransitStatus {
-		let now = self.clock.unix();
-		let order = frame.issued_at();
-		if !self.ledger.is_fresh(order, now) {
-			return TransitStatus::PermissionDenied;
-		}
-
 		let Some(signer_id) = frame.signer_id() else {
 			return TransitStatus::PermissionDenied;
 		};
-		if !self.ledger.check_and_insert(&signer_id, signature, order, now) {
+
+		let now = self.clock.unix();
+		if !self.ledger.check_and_insert(&signer_id, signature, frame.issued_at(), now) {
 			return TransitStatus::PermissionDenied;
 		}
 
@@ -174,9 +174,9 @@ impl Clone for GatewayReplayGuard {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::clock::ManualClock;
 	use crate::tb_cases;
 	use crate::testing::fixtures::{TestIdentity, TestRumor};
-	use crate::utils::time::ManualClock;
 
 	/// The window every case judges against.
 	const WINDOW: FreshnessWindow = FreshnessWindow::new(Duration::from_millis(30_000));
@@ -211,7 +211,14 @@ mod tests {
 	/// A signed frame that states `order`, beside the signature that verified
 	/// over it.
 	fn signed_at(order: UnixMillis) -> (Frame, VerifiedSignature) {
-		let frame = TestRumor::application(order.get(), [1]);
+		signed_carrying(order, [1])
+	}
+
+	/// A signed frame that states `order` and carries `payload`, beside the
+	/// signature that verified over it. Two payloads give two signatures at
+	/// one order.
+	fn signed_carrying(order: UnixMillis, payload: impl Into<Vec<u8>>) -> (Frame, VerifiedSignature) {
+		let frame = TestRumor::application(order.get(), payload);
 		let identity = TestIdentity::insecure_fixed();
 		let signature = frame.verify_under(identity.signing_certificate(), identity.policy());
 
@@ -233,5 +240,31 @@ mod tests {
 
 		assert_eq!(first, TransitStatus::Ok);
 		assert_eq!(replayed, TransitStatus::PermissionDenied);
+	}
+
+	/// A control frame whose order lies past the window is stale, so the
+	/// ledger refuses it (CWE-294).
+	#[test]
+	fn a_control_frame_past_the_window_is_refused() {
+		let clock = Arc::new(ManualClock::default());
+		let guard = GatewayReplayGuard::new(Duration::from_millis(60_000), Arc::clone(&clock) as Arc<dyn Clock>);
+		let (frame, signature) = signed_at(clock.unix());
+
+		clock.advance(Duration::from_millis(60_001));
+		assert_eq!(guard.admits(&frame, &signature), TransitStatus::PermissionDenied);
+	}
+
+	/// A second control frame of one signer at the order of an admitted one
+	/// is a duplicate (README §5.7.1), though its signature is new.
+	#[test]
+	fn a_second_control_frame_at_an_admitted_order_is_refused() {
+		let clock = Arc::new(ManualClock::default());
+		let guard = GatewayReplayGuard::new(Duration::from_millis(60_000), Arc::clone(&clock) as Arc<dyn Clock>);
+		let (first, first_signature) = signed_carrying(clock.unix(), [1]);
+		let (second, second_signature) = signed_carrying(clock.unix(), [2]);
+
+		let admitted = guard.admits(&first, &first_signature);
+		let duplicate = guard.admits(&second, &second_signature);
+		assert_eq!((admitted, duplicate), (TransitStatus::Ok, TransitStatus::PermissionDenied));
 	}
 }

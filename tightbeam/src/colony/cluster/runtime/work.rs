@@ -76,7 +76,7 @@ impl RoutePlane {
 	}
 
 	/// Delivers one forward on `hop`, a hop of this plane, and returns the
-	/// bytes that answered it.
+	/// frame that answered it.
 	///
 	/// - A local servlet receives the client's frame on the hive trust plane:
 	///   the frame `frame_cache` holds, or the decode of `payload`.
@@ -89,7 +89,7 @@ impl RoutePlane {
 		payload: Vec<u8>,
 		budget: HopBudget,
 		frame_cache: &mut Option<Frame>,
-	) -> Result<Vec<u8>, ClusterError> {
+	) -> Result<Frame, ClusterError> {
 		match self {
 			Self::Hive { .. } => {
 				let frame = match frame_cache.take() {
@@ -106,15 +106,26 @@ impl RoutePlane {
 		}
 	}
 
-	/// Classifies one forward this plane answered with `response_payload`.
-	fn classify(&self, response_payload: Vec<u8>) -> ForwardOutcome {
-		match self {
-			Self::Hive { .. } => ForwardOutcome::Local(response_payload),
-			Self::Peer { .. } => match decode::<ClusterWorkResponse>(&response_payload) {
+	/// Classifies one forward this plane answered with `reply`.
+	///
+	/// - A local servlet's reply returns encoded whole, so the client verifies
+	///   the servlet's envelope end to end.
+	/// - A peer gateway's reply is its work response, which the reply carries
+	///   ([`Frame::decode_message`]), or a garbled answer.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::Frame`] -- a local servlet's reply frame does not encode.
+	fn classify(&self, reply: Frame) -> Result<ForwardOutcome, ClusterError> {
+		let outcome = match self {
+			Self::Hive { .. } => ForwardOutcome::Local(encode(&reply)?),
+			Self::Peer { .. } => match reply.decode_message::<ClusterWorkResponse>() {
 				Ok(peer_response) => ForwardOutcome::Peer(peer_response),
 				Err(_) => ForwardOutcome::PeerGarbled,
 			},
-		}
+		};
+
+		Ok(outcome)
 	}
 
 	/// The route a splice on this plane stamps on its open: local on the hive
@@ -237,11 +248,12 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		payload: impl Into<Vec<u8>>,
 		budget: HopBudget,
 		frame_cache: &mut Option<Frame>,
-	) -> Result<Vec<u8>, ClusterError> {
+	) -> Result<ForwardOutcome, ClusterError> {
 		let payload: Vec<u8> = payload.into();
 		let hop = choice.hop(&self.hive_plane, &self.peer_plane);
 
-		choice.plane.deliver(hop, servlet_type, payload, budget, frame_cache).await
+		let reply = choice.plane.deliver(hop, servlet_type, payload, budget, frame_cache).await?;
+		choice.plane.classify(reply)
 	}
 
 	/// Settles an answered forward: it reinforces or weakens the trail, records
@@ -345,9 +357,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 			// The outcome feeds the pheromone scores, which steer selection
 			// toward instances that answer and away from those that fail.
 			match forward_result {
-				Ok(response_payload) => {
-					let outcome = choice.plane.classify(response_payload);
-
+				Ok(outcome) => {
 					// A live peer that cannot serve the type takes the same
 					// bounded failover as a fault before the write, so the
 					// trail weakens and the next-best one gets the retry.
@@ -492,11 +502,11 @@ mod tests {
 	use crate::colony::urn::ColonyNamespace;
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
 
+	use crate::clock::ManualClock;
 	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PheromoneConfig};
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::{TestCertificate, TestKey};
-	use crate::utils::time::ManualClock;
 
 	/// A registry on a clock only the test moves.
 	fn registry() -> ServletRegistry {
@@ -547,8 +557,10 @@ mod tests {
 		)
 	}
 
-	fn encoded_work_response(response: &ClusterWorkResponse) -> Vec<u8> {
-		encode(response).expect("test responses satisfy the codec")
+	/// The reply frame of a gateway that answers with `response`.
+	fn work_reply(response: &ClusterWorkResponse) -> Frame {
+		let body = encode(response).expect("test responses satisfy the codec");
+		Frame::v0(b"work-forward", body)
 	}
 
 	/// The plane of a local route, bound to the fixture servlet's signer.
@@ -566,44 +578,57 @@ mod tests {
 		relay_entry(b"origin", b"relay", "192.0.2.3:9001").plane()
 	}
 
+	/// A local servlet's reply returns encoded whole, so the client verifies
+	/// the servlet's envelope.
 	#[test]
-	fn forward_outcome_local_reply_never_fails_over() {
-		let outcome = local_plane().classify(b"pong".to_vec());
+	fn forward_outcome_local_reply_never_fails_over() -> Result<(), ClusterError> {
+		let reply = Frame::v0(b"pong", b"pong".to_vec());
+		let encoded = encode(&reply)?;
+
+		let outcome = local_plane().classify(reply)?;
 		assert!(!outcome.proves_undelivered());
-		assert!(matches!(outcome, ForwardOutcome::Local(payload) if payload == b"pong"));
+		assert!(matches!(outcome, ForwardOutcome::Local(payload) if payload == encoded));
+		Ok(())
 	}
 
 	#[test]
-	fn forward_outcome_peer_unavailable_reply_fails_over() {
-		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(peer_plane().classify(bytes).proves_undelivered());
+	fn forward_outcome_peer_unavailable_reply_fails_over() -> Result<(), ClusterError> {
+		let reply = work_reply(&ClusterWorkResponse::err(TransitStatus::Unavailable));
+		assert!(peer_plane().classify(reply)?.proves_undelivered());
+		Ok(())
 	}
 
 	#[test]
-	fn forward_outcome_relay_unavailable_reply_fails_over() {
-		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(relay_plane().classify(bytes).proves_undelivered());
+	fn forward_outcome_relay_unavailable_reply_fails_over() -> Result<(), ClusterError> {
+		let reply = work_reply(&ClusterWorkResponse::err(TransitStatus::Unavailable));
+		assert!(relay_plane().classify(reply)?.proves_undelivered());
+		Ok(())
 	}
 
 	#[test]
-	fn forward_outcome_peer_ok_reply_settles() {
-		let bytes = encoded_work_response(&ClusterWorkResponse::ok(b"pong".to_vec()));
-		assert!(!peer_plane().classify(bytes).proves_undelivered());
+	fn forward_outcome_peer_ok_reply_settles() -> Result<(), ClusterError> {
+		let reply = work_reply(&ClusterWorkResponse::ok(b"pong".to_vec()));
+		assert!(!peer_plane().classify(reply)?.proves_undelivered());
+		Ok(())
 	}
 
 	#[test]
-	fn forward_outcome_peer_refusal_relays_unchanged() {
-		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::PermissionDenied));
-		assert!(!peer_plane().classify(bytes).proves_undelivered());
+	fn forward_outcome_peer_refusal_relays_unchanged() -> Result<(), ClusterError> {
+		let reply = work_reply(&ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+		assert!(!peer_plane().classify(reply)?.proves_undelivered());
+		Ok(())
 	}
 
 	// A garbled reply follows a frame the peer read, so it proves nothing, and
 	// the frame stays with its first route.
 	#[test]
-	fn forward_outcome_garbled_peer_reply_never_fails_over() {
-		let outcome = peer_plane().classify(b"not-a-response".to_vec());
+	fn forward_outcome_garbled_peer_reply_never_fails_over() -> Result<(), ClusterError> {
+		let reply = Frame::v0(b"work-forward", b"not-a-response".to_vec());
+
+		let outcome = peer_plane().classify(reply)?;
 		assert!(matches!(outcome, ForwardOutcome::PeerGarbled));
 		assert!(!outcome.proves_undelivered());
+		Ok(())
 	}
 
 	fn test_config() -> ClusterConfig {

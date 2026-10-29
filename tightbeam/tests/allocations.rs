@@ -15,25 +15,27 @@ use std::error::Error;
 use std::sync::Arc;
 
 use tightbeam::asn1::{AuthEnvelopedData, WireDer};
+use tightbeam::clock::UnixMillis;
 use tightbeam::colony::cluster::{AdmittedGossip, GossipDigest, WantList};
 use tightbeam::colony::protocol::GossipRumor;
 use tightbeam::colony::servlet::ServletContext;
 use tightbeam::compress::ZstdCompression;
 use tightbeam::core::Inflator;
-use tightbeam::crypto::cms::Recipient;
+use tightbeam::crypto::cms::{KemRecipient, Recipient};
 use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::hpke::HpkeEncryptor;
+use tightbeam::crypto::key::{KeyBackend, Secp256k1KeyProvider};
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::{DefaultCryptoProvider, Kek};
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::utils::CertificateExt;
 use tightbeam::crypto::x509::{CanonicalKey, KeyCurves, KeyIndex};
-use tightbeam::decode;
 use tightbeam::der::asn1::{BitString, ObjectIdentifier};
 use tightbeam::der::oid::db::rfc8410::ID_ED_25519;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::instrumentation::{events, TbInstrumentationConfig};
 use tightbeam::macros::server::SingleFlightAnswer;
-use tightbeam::oids::{CURVE_NIST_P256, CURVE_NIST_P521, DATA};
+use tightbeam::oids::{COMPRESSION_ZSTD, CURVE_NIST_P256, CURVE_NIST_P521, DATA};
 use tightbeam::policy::TransitStatus;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::testing::fdr::{DefaultFdrExplorer, FdrConfig};
@@ -44,7 +46,6 @@ use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
 use tightbeam::transport::EndpointConfig;
 use tightbeam::urn::{UrnSpecBuilder, UrnValidationError};
-use tightbeam::utils::time::UnixMillis;
 use tightbeam::{compose, Frame, TightBeamError};
 
 thread_local! {
@@ -267,7 +268,7 @@ fn admissions_of_the_fixed_rumor() -> (usize, usize) {
 	let before = ALLOCATIONS.with(Cell::get);
 	let admitted = AdmittedGossip::admit::<Sha3_256>(&rumor, 0, Duration::from_secs(30), now);
 	let between = ALLOCATIONS.with(Cell::get);
-	let body = decode::<GossipRumor>(frame.message());
+	let body = frame.decode_message::<GossipRumor>();
 	let tbs = frame.to_tbs();
 	let after = ALLOCATIONS.with(Cell::get);
 
@@ -313,10 +314,15 @@ fn a_want_list_against_held_entries_allocates_the_held_set_alone() {
 }
 
 /// An inflator that hands a body back as it arrived, so each inflate makes
-/// the one allocation of the buffer it returns.
+/// the one allocation of the buffer it returns. It names zstd, the algorithm
+/// of the frames it inflates.
 struct CopyInflator;
 
 impl Inflator for CopyInflator {
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		COMPRESSION_ZSTD
+	}
+
 	fn decompress(&self, data: &[u8]) -> tightbeam::error::Result<Vec<u8>> {
 		Ok(data.to_vec())
 	}
@@ -363,6 +369,37 @@ fn inflations_with_the_detail_off() -> Result<(usize, usize), TightBeamError> {
 fn a_typed_delivery_with_the_detail_off_allocates_what_its_inflate_allocates() -> Result<(), TightBeamError> {
 	let (inflate, delivery) = inflations_with_the_detail_off()?;
 	assert_eq!(delivery, inflate);
+	Ok(())
+}
+
+/// A frame of a sample message, sealed to a bare recipient of the house KEM.
+fn kem_sealed_frame() -> Result<Frame, Box<dyn Error>> {
+	let backend = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
+	let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
+	let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
+	let message = TestMessage::sample(None);
+
+	Ok(compose! { V1: id: "kem-shape", order: 1u64, message: message, encryptor: encryptor }?)
+}
+
+/// The allocation count of the requirement check of a frame sealed to one
+/// KEM recipient.
+fn allocations_of_a_kem_shape() -> Result<usize, Box<dyn Error>> {
+	let frame = kem_sealed_frame()?;
+
+	let before = ALLOCATIONS.with(Cell::get);
+	let admitted = frame.validate_for::<TestMessage>();
+	let after = ALLOCATIONS.with(Cell::get);
+
+	admitted?;
+	Ok(after - before)
+}
+
+/// The requirement check reads the wrap of a KEM recipient in place, so it
+/// allocates the list of wraps alone and copies no field of the recipient.
+#[test]
+fn the_requirement_check_of_a_kem_recipient_allocates_its_wrap_list_alone() -> Result<(), Box<dyn Error>> {
+	assert_eq!(allocations_of_a_kem_shape()?, 1);
 	Ok(())
 }
 

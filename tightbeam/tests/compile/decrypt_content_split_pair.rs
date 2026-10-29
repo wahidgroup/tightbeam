@@ -1,6 +1,6 @@
 use tightbeam::crypto::aead::DecryptContent;
 use tightbeam::crypto::cms::AuthEnvelopedData;
-use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::TightBeamError;
 
 /// The decryption of `envelope` beside `arrived`, two values that no decode

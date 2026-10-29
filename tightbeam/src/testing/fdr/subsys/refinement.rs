@@ -9,11 +9,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::clock::{Clock, MonotonicInstant, SystemClock};
 use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{CacheKey, MemoizationCache, RefinementChecker, RefinementOutcome};
 use crate::testing::fdr::verdict::{Failure, Trace};
 use crate::testing::specs::csp::{Action, Event, Process, State};
-use crate::utils::time::{Clock, MonotonicInstant, SystemClock};
 
 /// The result of a search for a single trace in a specification.
 ///

@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```
-//! use tightbeam::utils::BasisPoints;
+//! use tightbeam::basis_points::BasisPoints;
 //!
 //! // Compile-time validated constants
 //! const ALWAYS: BasisPoints = tightbeam::bps!(10000);  // 100%
@@ -29,22 +29,22 @@ use crate::der::{Decode, Encode, Reader, Tag, Writer};
 /// ## Examples
 ///
 /// ```
-/// const HALF: tightbeam::utils::BasisPoints = tightbeam::bps!(5000);
+/// const HALF: tightbeam::basis_points::BasisPoints = tightbeam::bps!(5000);
 /// ```
 ///
 /// ```compile_fail
-/// const TOO_HIGH: tightbeam::utils::BasisPoints = tightbeam::bps!(10001);
+/// const TOO_HIGH: tightbeam::basis_points::BasisPoints = tightbeam::bps!(10001);
 /// ```
 #[macro_export]
 macro_rules! bps {
 	($value:expr $(,)?) => {
 		const {
 			let value: u16 = $value;
-			if value > $crate::utils::BasisPoints::MAX.get() {
+			if value > $crate::basis_points::BasisPoints::MAX.get() {
 				::core::panic!("BasisPoints must be 0-10000");
 			}
 
-			$crate::utils::BasisPoints::new::<{ $value }>()
+			$crate::basis_points::BasisPoints::new::<{ $value }>()
 		}
 	};
 }
@@ -117,7 +117,7 @@ impl BasisPoints {
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::BasisPoints;
+	/// use tightbeam::basis_points::BasisPoints;
 	///
 	/// let bps = tightbeam::bps!(7500);
 	/// assert_eq!(bps.as_percentage(), 75.0);
@@ -131,7 +131,7 @@ impl BasisPoints {
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::BasisPoints;
+	/// use tightbeam::basis_points::BasisPoints;
 	///
 	/// let bps = tightbeam::bps!(2500);
 	/// assert_eq!(bps.as_fraction(), 0.25);
@@ -149,7 +149,7 @@ impl BasisPoints {
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::{BasisPoints, BasisPointsOutOfRange};
+	/// use tightbeam::basis_points::{BasisPoints, BasisPointsOutOfRange};
 	///
 	/// # fn main() -> Result<(), BasisPointsOutOfRange> {
 	/// let bps = BasisPoints::from_percentage(75.5)?;
@@ -174,7 +174,7 @@ impl BasisPoints {
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::{BasisPoints, BasisPointsOutOfRange};
+	/// use tightbeam::basis_points::{BasisPoints, BasisPointsOutOfRange};
 	///
 	/// # fn main() -> Result<(), BasisPointsOutOfRange> {
 	/// let bps = BasisPoints::from_fraction(0.75)?;
@@ -198,7 +198,7 @@ impl BasisPoints {
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::BasisPoints;
+	/// use tightbeam::basis_points::BasisPoints;
 	///
 	/// let clamped = BasisPoints::new_saturating(15000);
 	/// assert_eq!(clamped.get(), 10000);
@@ -219,7 +219,7 @@ impl BasisPoints {
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::BasisPoints;
+	/// use tightbeam::basis_points::BasisPoints;
 	///
 	/// assert_eq!(BasisPoints::saturating_from(7_500u32).get(), 7_500);
 	/// assert_eq!(BasisPoints::saturating_from(65_537u64), BasisPoints::MAX);

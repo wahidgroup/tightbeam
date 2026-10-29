@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "std")]
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+use crate::clock::{Clock, MonotonicInstant};
 use crate::constants::DEFAULT_MAX_POOL_CONNECTIONS;
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::SigningIdentity;
@@ -30,9 +31,10 @@ use crate::transport::MessageCollector;
 use crate::transport::MessageEmitter;
 use crate::transport::{EndpointConfig, TransportResult};
 use crate::urn::Urn;
-use crate::utils::time::{Clock, MonotonicInstant};
 use crate::Frame;
 
+#[cfg(host_clock)]
+use crate::clock::SystemClock;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -45,8 +47,6 @@ use crate::transport::handshake::receipt::ReceiptApprover;
 use crate::transport::handshake::ProvisionedTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::ValidatorChain;
-#[cfg(host_clock)]
-use crate::utils::time::SystemClock;
 
 /// Gates each item it wraps behind the `pooled_mux` alias of `build.rs`.
 /// Multiplexed pooling needs the mux engine, the service module's connector,
@@ -67,7 +67,7 @@ pooled_mux! {
 
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::runtime::rt;
-	use crate::utils::marker::MaybeSend;
+	use crate::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
 	use crate::transport::multiplex::{
 		MuxCapable, MuxConnector, MuxDrivers, MuxHandle, MuxTransport, RequestSink, SpawnedMux, StreamBody,
@@ -294,7 +294,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	/// let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
 	///
 	/// // Every pooled dial runs the policy on the server the store admits.
-	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+	/// let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
 	/// let _builder = builder.with_server_policy([expiry]);
 	/// ```
 	///
@@ -551,10 +551,11 @@ impl<P: Protocol> ConnectionPool<P> {
 	/// - [`TransportError::HandshakeError`] -- the client identity names a key
 	///   purpose other than the client's, or its extended key usage fails to
 	///   decode.
+	/// - [`TransportError::InvalidLimits`] -- the pool's timeout is zero.
 	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let endpoint = self.tls.endpoint(&self.clock)?;
 		let endpoint = endpoint.with_negotiation(self.negotiation.clone());
-		let endpoint = endpoint.with_operation_timeout(self.timeout);
+		let endpoint = endpoint.with_operation_timeout(self.timeout)?;
 
 		#[cfg(feature = "instrument")]
 		let endpoint = match self.trace.as_ref() {
@@ -1818,12 +1819,12 @@ mod tests {
 	#[cfg(all(pooled_mux, feature = "transport-cms", feature = "testing"))]
 	mod draining {
 		use super::*;
+		use crate::clock::ManualClock;
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::testing::TestCmsServer;
 		use crate::transport::multiplex::MuxAcceptor;
 		use crate::transport::tcp::TightBeamSocketAddr;
 		use crate::transport::{EncryptedProtocol, TokioListener, TransportEncryptionConfig};
-		use crate::utils::time::ManualClock;
 
 		/// The idle timeout of the pool, which the test clock passes at once.
 		const IDLE: Duration = Duration::from_secs(1);

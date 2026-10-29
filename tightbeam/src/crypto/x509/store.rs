@@ -29,12 +29,13 @@ mod std_imports {
 	pub use std::collections::{HashMap, HashSet};
 	pub use std::sync::Arc;
 
+	pub use crate::clock::Clock;
 	pub use crate::crypto::hash::{Digest, OutputSizeUser, Sha3_256};
 	pub use crate::crypto::x509::ext::pkix::{AuthorityKeyIdentifier, BasicConstraints, KeyUsage, KeyUsages};
 	pub(super) use crate::crypto::x509::key::{KeyCurves, KeyIndex};
 	pub use crate::crypto::x509::name::Name;
-	pub(super) use crate::crypto::x509::utils::SubjectKeyIdentifierRef;
 	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
+	pub(super) use crate::crypto::x509::utils::{SubjectKeyIdentifierRef, ValidityClock};
 	pub use crate::crypto::x509::KeyPurposes;
 	pub use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 	pub use crate::der::oid::AssociatedOid;
@@ -512,7 +513,8 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	///
 	/// A store admits each certificate for signing once, at enrolment, so a
 	/// certificate that only certifies others resolves no signer. The built-in
-	/// store resolves a signer while its [`RevocationChecker`] admits it.
+	/// store resolves a signer while each certificate of its path is within
+	/// its validity period and its [`RevocationChecker`] admits it.
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>>;
 
 	/// Find a certificate admitted for signing by the `sid` of `signer_info`,
@@ -576,7 +578,9 @@ pub trait TrustBuilder: Sized {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`validate_expiry`](crate::crypto::x509::utils::CertificateExt::validate_expiry).
+	/// - The errors of the expiry check, as
+	///   [`validate_expiry_at`](crate::crypto::x509::utils::CertificateExt::validate_expiry_at)
+	///   names them.
 	/// - [`CertificateValidationError::EncodingError`] -- `cert` fails to
 	///   DER-encode, or a key identifier extension fails to decode.
 	/// - [`CertificateValidationError::DuplicateExtension`] -- a key identifier extension repeats.
@@ -981,12 +985,15 @@ pub struct CertificateTrustStore {
 	/// [`CertificateTrust`] contract.
 	key_index: KeyIndex<Sha3Fingerprint>,
 	/// The certification path of each held certificate, anchor first, which the
-	/// revocation check of a lookup reads.
+	/// validity and revocation checks of a lookup read.
 	paths: HashMap<Sha3Fingerprint, Box<[Arc<Certificate>]>>,
 	/// The verification policy that checks signatures.
 	policy: Arc<dyn VerificationPolicy>,
 	/// The revocation checker that path validation and each lookup consult.
 	revocation: Arc<dyn RevocationChecker>,
+	/// The clock that path validation and each lookup read the validity
+	/// period of a certificate on.
+	clock: ValidityClock,
 }
 
 #[cfg(feature = "std")]
@@ -1058,7 +1065,7 @@ impl CertificateTrustStore {
 	fn validate_path(&self, path: &[&Certificate]) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): each certificate is within its validity
 		// period.
-		path.iter().try_for_each(|cert| cert.validate_expiry())?;
+		path.iter().try_for_each(|cert| self.clock.admits(cert))?;
 
 		// RFC 5280 §6.1.4(g): name constraints stay out of scope, so a
 		// certificate that states one fails closed, whatever its criticality.
@@ -1130,15 +1137,21 @@ impl CertificateTrustStore {
 		pairs.try_for_each(|(issuer, cert)| self.revocation.check(issuer.borrow(), cert.borrow()))
 	}
 
-	/// Whether this store holds a certificate under `fingerprint` that its
-	/// revocation checker admits, beside each issuer above it that the store
-	/// holds, as path validation checks them.
+	/// Whether this store holds a certificate under `fingerprint` whose path
+	/// passes two checks of path validation. The path is the certificate and
+	/// each issuer above it that the store holds.
 	///
-	/// Each lookup consults the checker, so a lookup finds no certificate the
-	/// checker revokes, even one it revokes after the build.
+	/// - Each certificate is within its validity period on the clock of the store (RFC 5280 §6.1.3(a)(2)).
+	/// - The revocation checker admits each certificate (RFC 5280 §6.1.3(a)(3)).
+	///
+	/// Each lookup runs both, so a lookup finds no certificate whose period
+	/// ends or that the checker revokes after the build (CWE-324).
 	fn admits(&self, fingerprint: &Sha3Fingerprint) -> bool {
 		let path = self.paths.get(fingerprint);
-		path.is_some_and(|path| self.check_revocation(path).is_ok())
+		path.is_some_and(|path| {
+			let in_validity = path.iter().try_for_each(|cert| self.clock.admits(cert));
+			in_validity.is_ok() && self.check_revocation(path).is_ok()
+		})
 	}
 
 	/// Returns the certificate this store holds under `fingerprint`, while
@@ -1255,8 +1268,9 @@ impl CertificateTrustStore {
 
 #[cfg(feature = "std")]
 impl CertificateTrust for CertificateTrustStore {
-	/// The store trusts a certificate it holds while its revocation checker
-	/// admits it and each issuer above it.
+	/// The store trusts a certificate it holds while it and each issuer above
+	/// it are within their validity periods and its revocation checker admits
+	/// them.
 	fn is_trusted(&self, cert: &Certificate) -> bool {
 		let fingerprint = Sha3Fingerprint::from_certificate(cert);
 		fingerprint.is_ok_and(|fingerprint| self.admits(&fingerprint))
@@ -1290,8 +1304,9 @@ impl CertificateTrust for CertificateTrustStore {
 		self.held(&anchor)
 	}
 
-	/// The store resolves a signer while its revocation checker admits the
-	/// signer and each issuer above it.
+	/// The store resolves a signer while the signer and each issuer above it
+	/// are within their validity periods and its revocation checker admits
+	/// them.
 	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
 		let (fingerprint, signer) = match sid {
 			SignerIdentifier::IssuerAndSerialNumber(_) => {
@@ -1306,16 +1321,16 @@ impl CertificateTrust for CertificateTrustStore {
 		self.admits(fingerprint).then_some(signer)
 	}
 
-	/// The store finds a certificate while its revocation checker admits the
-	/// certificate and each issuer above it.
+	/// The store finds a certificate while it and each issuer above it are
+	/// within their validity periods and its revocation checker admits them.
 	fn find_by_public_key(&self, spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
 		let fingerprint = self.key_index.find(spki)?;
 		self.admitted(fingerprint)
 	}
 
 	/// The store finds `key` in its key index as it stands, with no decode,
-	/// while its revocation checker admits the certificate and each issuer
-	/// above it.
+	/// while the certificate and each issuer above it are within their
+	/// validity periods and its revocation checker admits them.
 	///
 	/// A key that a handshake admits is a valid point or a key of another
 	/// algorithm, whose canonical form is one under every [`KeyCurves`], so
@@ -1351,6 +1366,7 @@ pub struct CertificateTrustBuilder {
 	key_index: KeyIndex<Sha3Fingerprint>,
 	policy: Arc<dyn VerificationPolicy>,
 	revocation: Arc<dyn RevocationChecker>,
+	clock: ValidityClock,
 }
 
 /// Returns `bytes` as lowercase hexadecimal, the form in which a collision
@@ -1415,6 +1431,7 @@ impl CertificateTrustBuilder {
 			key_index: KeyIndex::new(curves),
 			policy: Arc::new(policy),
 			revocation: Arc::new(revocation),
+			clock: ValidityClock::default(),
 		}
 	}
 
@@ -1424,6 +1441,48 @@ impl CertificateTrustBuilder {
 	/// The default is [`KeyPurposes::HOUSE`].
 	pub fn with_key_purposes(mut self, purposes: KeyPurposes) -> Self {
 		self.purposes = purposes;
+		self
+	}
+
+	/// Set the clock that every validity check of the store reads, in place of
+	/// the crate clock `UnixMillis::now`:
+	///
+	/// - The check of each certificate that this builder adds after this call.
+	/// - The check of each path, at path validation and at each lookup.
+	///
+	/// A gateway on `ClusterConfig::clock` builds its stores on that clock, so
+	/// one admission reads one time.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use core::time::Duration;
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::clock::{Clock, ManualClock, UnixMillis};
+	/// use tightbeam::crypto::policy::Secp256k1Policy;
+	/// use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	/// use tightbeam::crypto::x509::KeyCurves;
+	/// use tightbeam::testing::fixtures::{TestCertificate, TestKey};
+	///
+	/// // The test certificate is valid through Unix time 2,000,000,000.
+	/// let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	/// let clock = Arc::new(ManualClock::default());
+	///
+	/// let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+	/// let builder = builder.with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+	/// let store = builder.with_certificate(certificate.clone())?.build();
+	/// assert!(store.is_trusted(&certificate));
+	///
+	/// // Once the clock of the store passes the end of the period, the store
+	/// // refuses the certificate.
+	/// let since_epoch = clock.unix().saturating_since(UnixMillis::new(0));
+	/// clock.advance(Duration::from_secs(2_000_000_001).saturating_sub(since_epoch));
+	/// assert!(!store.is_trusted(&certificate));
+	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// ```
+	pub fn with_clock(mut self, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+		self.clock = ValidityClock::new(clock);
 		self
 	}
 
@@ -1487,7 +1546,7 @@ impl TrustBuilder for CertificateTrustBuilder {
 			return Err(CertificateValidationError::EmptyChain);
 		}
 
-		chain.iter().try_for_each(CertificateExt::validate_expiry)?;
+		chain.iter().try_for_each(|cert| self.clock.admits(cert))?;
 
 		// The builder checks name chaining only, and signatures verify at run
 		// time.
@@ -1506,7 +1565,7 @@ impl TrustBuilder for CertificateTrustBuilder {
 	}
 
 	fn with_certificate(mut self, cert: Certificate) -> Result<Self, CertificateValidationError> {
-		cert.validate_expiry()?;
+		self.clock.admits(&cert)?;
 		self.add_certificate(cert)?;
 		Ok(self)
 	}
@@ -1537,6 +1596,7 @@ impl TrustBuilder for CertificateTrustBuilder {
 			key_index: self.key_index,
 			policy: self.policy,
 			revocation: self.revocation,
+			clock: self.clock,
 		}
 	}
 }
@@ -1555,14 +1615,16 @@ impl Debug for CertificateTrustBuilder {
 #[cfg(test)]
 mod tests {
 	use core::sync::atomic::{AtomicUsize, Ordering};
+	use core::time::Duration;
 
 	use super::*;
+	use crate::clock::{ManualClock, UnixMillis};
 	use crate::crypto::k256::sha2::{Sha256, Sha384};
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, SigningKey};
 	use crate::crypto::sign::{CanonicalSigner, CmsSigner, SignatureEncoding, SignedContent, SigningIdentity};
 	use crate::crypto::x509::error::CertificateValidationError::PublicKeyCollision;
-	use crate::der::asn1::{BitString, ObjectIdentifier, OctetString};
+	use crate::der::asn1::{BitString, GeneralizedTime, ObjectIdentifier, OctetString};
 	use crate::der::oid::AssociatedOid;
 	use crate::der::Decode;
 	use crate::oids::CURVE_NIST_P256;
@@ -1570,6 +1632,7 @@ mod tests {
 	use crate::testing::{TestFrame, TestKey};
 	use crate::x509::ext::pkix::name::GeneralName;
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
+	use crate::x509::time::Time;
 	use std::str::FromStr;
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2448,6 +2511,95 @@ mod tests {
 
 		let member = store.trusts_public_key(&chain.root);
 		assert!(member);
+		Ok(())
+	}
+
+	/// The end of the validity period of an [`expiring`] certificate, in Unix
+	/// seconds: ahead of the system clock, and before the end of the test
+	/// validity window at 2,000,000,000.
+	const END_OF_PERIOD: u64 = 1_999_999_000;
+
+	/// `certificate` with a validity period that ends at [`END_OF_PERIOD`],
+	/// signed again by `issuer_key`.
+	fn expiring(mut certificate: Certificate, issuer_key: &Secp256k1SigningKey) -> Certificate {
+		let not_after = GeneralizedTime::from_unix_duration(Duration::from_secs(END_OF_PERIOD));
+		let not_after = not_after.expect("the end of the period is a time");
+
+		certificate.tbs_certificate.validity.not_after = Time::GeneralTime(not_after);
+		TestCertificate::signed_by(certificate, issuer_key)
+	}
+
+	/// A store on a manual clock that holds `certificates`, as it stands once
+	/// the clock passes [`END_OF_PERIOD`].
+	fn store_past_expiry(
+		certificates: impl IntoIterator<Item = Certificate>,
+	) -> Result<CertificateTrustStore, CertificateValidationError> {
+		let clock = Arc::new(ManualClock::default());
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let builder = builder.with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+		let builder = certificates.into_iter().try_fold(builder, TrustBuilder::with_certificate)?;
+		let store = builder.build();
+
+		let since_epoch = clock.unix().saturating_since(UnixMillis::new(0));
+		clock.advance(Duration::from_secs(END_OF_PERIOD + 1).saturating_sub(since_epoch));
+		Ok(store)
+	}
+
+	/// A store reads the validity period of a certificate on the clock it was
+	/// built on, so a certificate whose period ends on that clock is refused
+	/// while the host clock reads a time inside the period.
+	#[test]
+	fn a_store_judges_validity_on_its_own_clock() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let certificate = expiring(TestCertificate::self_signed(&key), &key);
+		let store = store_past_expiry([certificate.clone()])?;
+
+		let trusted = store.is_trusted(&certificate);
+		assert!(!trusted);
+		Ok(())
+	}
+
+	/// A store resolves no signer whose certificate is past its validity
+	/// period, so an expired certificate verifies no frame (RFC 5280
+	/// §6.1.3(a)(2), CWE-324).
+	#[tokio::test]
+	async fn an_expired_signer_verifies_no_frame() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let certificate = expiring(TestCertificate::self_signed(&key), &key);
+		let identity = TestIdentity::presenting(certificate.clone(), &key);
+		let store = store_past_expiry([certificate])?;
+		let mut frame = TestFrame::with_integrity();
+		frame.sign_with_provider(&identity).await?;
+
+		let verification = store.verify_frame(&frame);
+		assert!(matches!(verification, TrustVerification::UnknownSigner));
+		Ok(())
+	}
+
+	/// A store holds no key of a certificate past its validity period, so an
+	/// expired certificate counts as enrolled for no plane.
+	#[test]
+	fn an_expired_certificate_is_no_member_by_its_key() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let certificate = expiring(TestCertificate::self_signed(&key), &key);
+		let store = store_past_expiry([certificate.clone()])?;
+
+		let member = store.trusts_public_key(&certificate);
+		assert!(!member);
+		Ok(())
+	}
+
+	/// A lookup holds the path of the certificate it finds to its validity
+	/// period, so the leaf under an expired intermediate is no member by its
+	/// key.
+	#[test]
+	fn a_certificate_under_an_expired_issuer_is_no_member() -> TestResult {
+		let chain = TestCertificate::insecure_fixed_chain()?;
+		let intermediate = expiring(chain.intermediate, &chain.root_key);
+		let store = store_past_expiry([chain.root, intermediate, chain.leaf.clone()])?;
+
+		let member = store.trusts_public_key(&chain.leaf);
+		assert!(!member);
 		Ok(())
 	}
 

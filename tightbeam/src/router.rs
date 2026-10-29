@@ -1,11 +1,13 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-use crate::asn1::admission::DerAdmission;
-use crate::der::Decode;
+use crate::core::{FrameShape, Inflator, RequirementError};
 use crate::frame::BodyTransform;
 use crate::Errorizable;
 use crate::{Frame, Message};
+
+#[cfg(feature = "aead")]
+use crate::crypto::aead::Decryptor;
 
 /// Single `Arc` spelling for both std and no_std builds so [`crate::routes!`]
 /// can emit one `dispatch` body via `$crate::router::Arc`.
@@ -26,49 +28,173 @@ pub enum RouterError {
 	ConfidentialFrame,
 	#[error("Frame body is compressed; inflate before routing")]
 	CompressedFrame,
+	/// The frame, as it arrived, fails a requirement of the dispatched type.
+	#[error("Frame fails a requirement of the dispatched type: {0}")]
+	#[source]
+	Requirement(RequirementError),
 }
 
 crate::impl_from!(crate::der::Error => RouterError::DecodeFailed);
+crate::impl_from!(RequirementError => RouterError::Requirement);
 
-/// A frame whose body a router may decode.
+impl RouterError {
+	/// The refusal of a body that still needs `transform` before a decode.
+	fn opaque(transform: BodyTransform) -> Self {
+		match transform {
+			BodyTransform::Decrypt => Self::ConfidentialFrame,
+			BodyTransform::Inflate => Self::CompressedFrame,
+		}
+	}
+}
+
+/// A frame whose body a router may decode, beside the shape that the frame
+/// arrived in.
 ///
-/// [`CleartextFrame::admit`] is the one constructor. An encrypted or
-/// compressed body is opaque bytes, so a decode against the dispatched type
-/// either fails confusingly or succeeds against a structurally similar type
-/// and misdelivers in silence.
-pub struct CleartextFrame(Arc<Frame>);
+/// An encrypted or compressed body is opaque bytes, so a decode against the
+/// dispatched type either fails confusingly or succeeds against a
+/// structurally similar type and misdelivers in silence. Each constructor
+/// leaves a cleartext body:
+///
+/// - [`CleartextFrame::admit`] takes a frame that arrived in cleartext.
+/// - [`CleartextFrame::decrypt`] decrypts the body of a frame that arrived encrypted.
+/// - [`CleartextFrame::inflate`] inflates the body of a frame that arrived compressed.
+pub struct CleartextFrame {
+	frame: Arc<Frame>,
+	arrived: FrameShape,
+}
 
 impl CleartextFrame {
-	/// Admit `frame` for routing.
-	///
-	/// Decrypt or inflate upstream through
-	/// [`Frame::prepare_typed`](crate::Frame::prepare_typed), then admit.
+	/// Admit `frame`, which arrived in cleartext, for routing.
 	///
 	/// # Errors
 	///
-	/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is set.
-	/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set.
+	/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is
+	///   set, so the frame enters through [`Self::decrypt`].
+	/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set, so
+	///   the frame enters through [`Self::inflate`].
 	pub fn admit(frame: Arc<Frame>) -> Result<Self> {
-		match frame.body_transform() {
-			Some(BodyTransform::Decrypt) => Err(RouterError::ConfidentialFrame),
-			Some(BodyTransform::Inflate) => Err(RouterError::CompressedFrame),
-			None => Ok(Self(frame)),
+		let arrived = frame.cleartext_shape().map_err(RouterError::opaque)?;
+		Ok(Self { frame, arrived })
+	}
+
+	/// Decrypt the body of `frame`, which arrived encrypted, and inflate it
+	/// after when it is also compressed, for routing.
+	///
+	/// The open takes the FI digest and the signature out of the frame, and
+	/// the routed frame drops both. The shape of the frame as it arrived keeps
+	/// each protection for [`Self::decode`].
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Frame::decrypt_in_place`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::der::Sequence;
+	/// use tightbeam::router::CleartextFrame;
+	/// use tightbeam::testing::TestKey;
+	/// use tightbeam::{compose, Beamable};
+	///
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// #[beam(confidential)]
+	/// struct Secret {
+	///     code: u64,
+	/// }
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// # runtime.block_on(async {
+	/// let (_, cipher) = TestKey::insecure_fixed_cipher();
+	/// let frame = compose! { V1: id: "secret", order: 1u64, message: Secret { code: 7 }, confidentiality: cipher }?;
+	///
+	/// // The frame arrived encrypted, so the type that requires it decodes.
+	/// let (_, key) = TestKey::insecure_fixed_cipher();
+	/// let opened = CleartextFrame::decrypt(frame, &key, None).await?;
+	/// assert_eq!(opened.decode::<Secret>()?, Secret { code: 7 });
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// ```
+	#[cfg(feature = "aead")]
+	pub async fn decrypt(
+		mut frame: Frame,
+		decryptor: &(impl Decryptor + ?Sized),
+		inflator: Option<&(dyn Inflator + Sync)>,
+	) -> crate::error::Result<Self> {
+		let arrived = FrameShape::from(&frame);
+		// The shape keeps what the digest and the signature protected, so the
+		// two drop with the open.
+		let _opened = frame.decrypt_in_place(decryptor, inflator).await?;
+
+		Ok(Self { frame: Arc::new(frame), arrived })
+	}
+
+	/// Inflate the body of `frame`, which arrived compressed in cleartext,
+	/// for routing.
+	///
+	/// The inflate takes the FI digest and the signature out of the frame,
+	/// and the routed frame drops both. The shape of the frame as it arrived
+	/// keeps each protection for [`Self::decode`].
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is
+	///   set, so the frame enters through [`Self::decrypt`].
+	/// - The errors of [`Frame::inflate_in_place`].
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # #[cfg(feature = "zstd")]
+	/// # {
+	/// use tightbeam::compress::ZstdCompression;
+	/// use tightbeam::der::Sequence;
+	/// use tightbeam::router::CleartextFrame;
+	/// use tightbeam::{compose, Beamable};
+	///
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// #[beam(compressed)]
+	/// struct Bulk {
+	///     count: u64,
+	/// }
+	///
+	/// let packed = ZstdCompression::default();
+	/// let frame = compose! { V0: id: "bulk", order: 1u64, message: Bulk { count: 7 }, compactness: packed }?;
+	///
+	/// // The frame arrived compressed, so the type that requires it decodes.
+	/// let inflated = CleartextFrame::inflate(frame, &ZstdCompression::default())?;
+	/// assert_eq!(inflated.decode::<Bulk>()?, Bulk { count: 7 });
+	/// # }
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// ```
+	pub fn inflate(mut frame: Frame, inflator: &dyn Inflator) -> crate::error::Result<Self> {
+		if frame.body_transform() == Some(BodyTransform::Decrypt) {
+			return Err(RouterError::ConfidentialFrame.into());
 		}
+
+		let arrived = FrameShape::from(&frame);
+		// The shape keeps what the digest and the signature protected, so the
+		// two drop with the inflate.
+		let _opened = frame.inflate_in_place(inflator)?;
+
+		Ok(Self { frame: Arc::new(frame), arrived })
 	}
 
 	/// The admitted frame, for the decode and for metadata reads.
 	#[must_use]
 	pub fn frame(&self) -> &Frame {
-		&self.0
+		&self.frame
 	}
 
 	/// The admitted frame as the shared handle a handler keeps.
 	#[must_use]
 	pub fn into_shared(self) -> Arc<Frame> {
-		self.0
+		self.frame
 	}
 
-	/// Decode the body of the admitted frame as `T`.
+	/// Decode the body of the admitted frame as `T`, after the shape that the
+	/// frame arrived in meets the requirements of `T`
+	/// ([`Frame::validate_for`]).
 	///
 	/// The body arrived from a peer, so every universal SET in it MUST hold its
 	/// elements in DER order (X.690 § 11.6), which the decode checks before it
@@ -76,6 +202,7 @@ impl CleartextFrame {
 	///
 	/// # Errors
 	///
+	/// - [`RouterError::Requirement`] -- the frame, as it arrived, fails a requirement of `T`.
 	/// - [`RouterError::DecodeFailed`] -- the body is no DER encoding of `T`,
 	///   or a SET in it holds its elements out of DER order.
 	///
@@ -106,17 +233,14 @@ impl CleartextFrame {
 	/// # Sources
 	///
 	/// - ITU-T X.690 (02/2021) § 11.6, set-of components: <https://www.itu.int/rec/T-REC-X.690-202102-I/en>
-	pub fn decode<'a, T: Decode<'a>>(&'a self) -> Result<T> {
-		let body = self.0.message();
-		DerAdmission::SetOrder.admit(body)?;
-
-		Ok(T::from_der(body)?)
+	pub fn decode<T: Message>(&self) -> Result<T> {
+		self.arrived.decode::<T, RouterError>(self.frame.message())
 	}
 }
 
 pub trait RouterPolicy: Send + Sync {
-	/// Route `frame` to the handler registered for message type `T`, and
-	/// deliver the body decoded as `T`.
+	/// Route `frame`, which arrived in cleartext, to the handler registered
+	/// for message type `T`, and deliver the body decoded as `T`.
 	///
 	/// Dispatch decodes the cleartext body exactly once and hands the typed
 	/// value to the handler, so a mismatched turbofish fails loudly at the
@@ -126,7 +250,8 @@ pub trait RouterPolicy: Send + Sync {
 	/// # Errors
 	///
 	/// - The errors of [`CleartextFrame::admit`], for a body still opaque.
-	/// - [`RouterError::DecodeFailed`] -- the body did not decode as `T`.
+	/// - The errors of [`CleartextFrame::decode`], for a frame that fails a
+	///   requirement of `T` or a body that is no `T`.
 	/// - [`RouterError::UnknownRoute`] -- no handler is registered for `T`.
 	fn dispatch<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()> {
 		self.dispatch_cleartext::<T>(CleartextFrame::admit(frame)?)
@@ -140,7 +265,8 @@ pub trait RouterPolicy: Send + Sync {
 	///
 	/// # Errors
 	///
-	/// - [`RouterError::DecodeFailed`] -- the body did not decode as `T`.
+	/// - The errors of [`CleartextFrame::decode`], for a frame that fails a
+	///   requirement of `T` or a body that is no `T`.
 	/// - [`RouterError::UnknownRoute`] -- no handler is registered for `T`.
 	fn dispatch_cleartext<T: Message + Send + 'static>(&self, frame: CleartextFrame) -> Result<()>;
 }
@@ -184,11 +310,11 @@ mod tests {
 	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
+	use crate::core::{Requirement, RequirementError};
 	use crate::der::asn1::SetOfVec;
 	use crate::der::{Decode, Encode, ErrorKind, Sequence};
-	use crate::router::{RouterError, RouterPolicy};
-	use crate::Beamable;
-	use crate::Frame;
+	use crate::router::{CleartextFrame, RouterError, RouterPolicy};
+	use crate::{Beamable, Frame, TightBeamError, Version};
 
 	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 	pub struct HealthCheck {
@@ -337,6 +463,133 @@ mod tests {
 		let refused = router.dispatch::<Tally>(Arc::new(descending_tally()?));
 		assert!(matches!(refused, Err(RouterError::DecodeFailed(error)) if error.kind() == ErrorKind::SetOrdering));
 		Ok(())
+	}
+
+	/// A payment whose type requires confidentiality. Its DER is the DER of
+	/// [`Payment`].
+	#[cfg(feature = "aead")]
+	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	#[beam(confidential)]
+	pub struct SealedPayment {
+		pub from: String,
+		pub amount: u64,
+	}
+
+	/// A health check whose type requires V2 or later. Its DER is the DER of
+	/// [`HealthCheck`].
+	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	#[beam(min_version = "V2")]
+	pub struct RecentHealthCheck {
+		pub uptime: u64,
+	}
+
+	#[cfg(feature = "aead")]
+	routes! {
+		SealedRouter {
+			sealed_tx: mpsc::Sender<SealedPayment>,
+		}:
+			SealedPayment |router, _frame, msg| {
+				// The test reads the refusal alone, so a failed send is moot.
+				let _ = router.sealed_tx.send(msg);
+			}
+	}
+
+	routes! {
+		RecentRouter {
+			recent_tx: mpsc::Sender<RecentHealthCheck>,
+		}:
+			RecentHealthCheck |router, _frame, msg| {
+				// The test reads the refusal alone, so a failed send is moot.
+				let _ = router.recent_tx.send(msg);
+			}
+	}
+
+	/// A cleartext frame carries no `confidentiality`, so the router refuses it
+	/// as a carrier of a type that requires confidentiality.
+	#[cfg(feature = "aead")]
+	#[test]
+	fn a_cleartext_frame_of_a_confidential_type_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+		let (sealed_tx, _sealed_rx) = mpsc::channel();
+		let router = SealedRouter { sealed_tx };
+
+		let refused = router.dispatch::<SealedPayment>(Arc::new(compose_payment(0)?));
+		let unprotected = RequirementError::Unprotected(Requirement::Confidentiality);
+		assert!(matches!(refused, Err(RouterError::Requirement(error)) if error == unprotected));
+		Ok(())
+	}
+
+	/// A V0 frame is below the V2 minimum of its type, so the router
+	/// refuses it.
+	#[test]
+	fn a_frame_below_the_minimum_version_of_its_type_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+		let (recent_tx, _recent_rx) = mpsc::channel();
+		let router = RecentRouter { recent_tx };
+
+		let refused = router.dispatch::<RecentHealthCheck>(Arc::new(compose_health(0)?));
+		let below = RequirementError::Version((Version::V0, Version::V2).into());
+		assert!(matches!(refused, Err(RouterError::Requirement(error)) if error == below));
+		Ok(())
+	}
+
+	/// A frame that arrived encrypted keeps that shape across its decrypt, so a
+	/// type that requires confidentiality routes.
+	#[cfg(feature = "aead")]
+	#[tokio::test]
+	async fn a_decrypted_frame_of_a_confidential_type_routes() -> Result<(), Box<dyn std::error::Error>> {
+		let (sealed_tx, sealed_rx) = mpsc::channel();
+		let router = SealedRouter { sealed_tx };
+
+		let (_, key) = crate::testing::TestKey::insecure_fixed_cipher();
+		let opened = CleartextFrame::decrypt(confidential_payment(3)?, &key, None).await?;
+		router.dispatch_cleartext::<SealedPayment>(opened)?;
+
+		let delivered = sealed_rx.recv_timeout(Duration::from_millis(200))?;
+		assert_eq!(delivered, SealedPayment { from: "alice".into(), amount: 3 });
+		Ok(())
+	}
+
+	/// A decrypt in place outside the router takes the confidentiality out of
+	/// the frame, so the router refuses the frame it then admits.
+	#[cfg(feature = "aead")]
+	#[tokio::test]
+	async fn a_frame_decrypted_before_admission_loses_its_confidentiality() -> Result<(), Box<dyn std::error::Error>> {
+		let (sealed_tx, _sealed_rx) = mpsc::channel();
+		let router = SealedRouter { sealed_tx };
+
+		let (_, key) = crate::testing::TestKey::insecure_fixed_cipher();
+		let mut frame = confidential_payment(3)?;
+		let _opened = frame.decrypt_in_place(&key, None).await?;
+
+		let refused = router.dispatch::<SealedPayment>(Arc::new(frame));
+		let unprotected = RequirementError::Unprotected(Requirement::Confidentiality);
+		assert!(matches!(refused, Err(RouterError::Requirement(error)) if error == unprotected));
+		Ok(())
+	}
+
+	/// An encrypted body needs a decrypt before an inflate, so the inflate
+	/// refuses it.
+	#[cfg(feature = "aead")]
+	#[test]
+	fn an_inflate_refuses_an_encrypted_body() -> Result<(), Box<dyn std::error::Error>> {
+		let inflated = CleartextFrame::inflate(confidential_payment(3)?, &Unused);
+		let refused = matches!(inflated, Err(TightBeamError::RouterError(RouterError::ConfidentialFrame)));
+		assert!(refused);
+		Ok(())
+	}
+
+	/// An inflator that the refused inflate never reaches.
+	#[cfg(feature = "aead")]
+	struct Unused;
+
+	#[cfg(feature = "aead")]
+	impl crate::core::Inflator for Unused {
+		fn algorithm_oid(&self) -> crate::der::asn1::ObjectIdentifier {
+			crate::oids::COMPRESSION_ZSTD
+		}
+
+		fn decompress(&self, _data: &[u8]) -> crate::error::Result<Vec<u8>> {
+			Err(crate::TightBeamError::MissingInflator)
+		}
 	}
 
 	#[test]

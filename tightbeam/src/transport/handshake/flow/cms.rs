@@ -51,6 +51,7 @@ use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{BitString, OctetString};
 use crate::der::{Choice, Decode, DecodeValue, Encode, Error as DerError, Sequence};
+use crate::marker::MaybeSendFuture;
 use crate::oids::HANDSHAKE_OPENING_CONTENT;
 use crate::random::{CryptoRngCore, RngWrapper};
 use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoOwned};
@@ -69,7 +70,6 @@ use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::schedule::{Agreement, BaseSecret, FinishedRole, PeerPoint, Salt};
 use crate::transport::handshake::{CmsIdentityPair, HandshakeCurve, HandshakeMessage, HandshakeProvider};
 use crate::transport::wire_der::WireDer;
-use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::{Zeroize, Zeroizing};
 
@@ -2101,7 +2101,7 @@ mod tests {
 	/// an on-path party can change neither alone.
 	#[tokio::test]
 	async fn an_altered_sealed_finished_settles_nothing() -> Result<(), Box<dyn Error>> {
-		let Parties { mut client, mut server, .. } = parties::<Cms>(mutual_with(ExpiryValidator));
+		let Parties { mut client, mut server, .. } = parties::<Cms>(mutual_with(ExpiryValidator::default()));
 		let observer = Arc::new(CountingObserver::default());
 		client.transport_offer = Some(budget_offer());
 		client.receipt_approver = Some(Arc::new(PayingApprover));
@@ -2131,7 +2131,7 @@ mod tests {
 	/// altered closing.
 	#[tokio::test]
 	async fn an_honest_budget_bearing_closing_reports_one_outcome() -> Result<(), Box<dyn Error>> {
-		let Parties { mut client, mut server, .. } = parties::<Cms>(mutual_with(ExpiryValidator));
+		let Parties { mut client, mut server, .. } = parties::<Cms>(mutual_with(ExpiryValidator::default()));
 		let observer = Arc::new(CountingObserver::default());
 		client.transport_offer = Some(budget_offer());
 		client.receipt_approver = Some(Arc::new(PayingApprover));
@@ -2169,7 +2169,7 @@ mod tests {
 	/// handshake, so the forger gets no second closing.
 	#[tokio::test]
 	async fn a_finished_sealed_without_the_handshake_secret_is_refused() -> Result<(), Box<dyn Error>> {
-		let (mut client, mut server) = pair::<Cms>(mutual_with(ExpiryValidator));
+		let (mut client, mut server) = pair::<Cms>(mutual_with(ExpiryValidator::default()));
 		let server_finished = server.reply(client.start()?).await?.signed()?;
 		let transcript_hash = signed_transcript(server_finished.value());
 
@@ -2193,7 +2193,7 @@ mod tests {
 	async fn a_reflected_server_finished_is_refused() {
 		let server_identity = create_test_server();
 		let ephemeral = SecretKey::<Secp256k1>::random(&mut OsRng);
-		let mutual = mutual_with(ExpiryValidator);
+		let mutual = mutual_with(ExpiryValidator::default());
 
 		// The reflected Finished embeds the server certificate, which the
 		// validator accepts. The tag confirms the secret the server derives,
@@ -2381,7 +2381,7 @@ mod tests {
 		let identity = create_test_server();
 		let observer = Arc::new(CountingObserver::default());
 		let mut config = Cms::server(&identity);
-		config.peer_authentication = mutual_with(ExpiryValidator);
+		config.peer_authentication = mutual_with(ExpiryValidator::default());
 		config.transport = Some(budget_offer());
 		config.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
 		config.session_observer = Some(observer.to_owned());
@@ -2621,7 +2621,7 @@ mod tests {
 		let client_identity = issued_client(&server_identity);
 		let mut client = Cms::client(&server_identity, &client_identity);
 		let mut server = Cms::server(&server_identity);
-		server.peer_authentication = mutual_with(ExpiryValidator);
+		server.peer_authentication = mutual_with(ExpiryValidator::default());
 
 		let observer = Arc::new(ArtifactObserver::default());
 		client.transport_offer = Some(budget_offer());

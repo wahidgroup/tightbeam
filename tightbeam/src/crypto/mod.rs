@@ -54,3 +54,5 @@ pub use subtle;
 pub use hkdf;
 #[cfg(feature = "secp256k1")]
 pub use k256;
+#[cfg(feature = "kem")]
+pub use kem;

@@ -24,7 +24,7 @@ use crate::crypto::x509::Certificate;
 use crate::trace::TraceCollector;
 use crate::transport::TransportResult;
 use crate::transport::{PooledClient, Protocol};
-use crate::{encode, Frame};
+use crate::Frame;
 
 /// The plane this gateway dials its own hives and their servlets on.
 ///
@@ -223,34 +223,31 @@ impl<P: ColonyDialProtocol> PeerPlane<P> {
 
 impl<P: ColonyDialProtocol> Hop<'_, P> {
 	/// Delivers a client's end-to-end frame and returns the peer's
-	/// complete reply frame, encoded.
+	/// complete reply frame.
 	///
 	/// - `frame` is the client's frame from [`ClusterWorkRequest::payload`],
 	///   re-emitted as-is. DER is canonical, so the emitted bytes match what
 	///   the client signed and the servlet can verify the envelope end to end.
-	/// - The reply frame returns encoded whole so the client can verify the servlet's envelope the same way.
 	/// - An origin-signed gossip rumor reaches an ingress servlet through this path too, for the same reason.
 	///
 	/// [`ClusterWorkRequest::payload`]: crate::colony::protocol::ClusterWorkRequest::payload
-	pub(crate) async fn deliver_frame(self, frame: Frame) -> Result<Vec<u8>, ClusterError> {
-		let response = self.emit(frame).await?;
-		Ok(encode(&response)?)
+	pub(crate) async fn deliver_frame(self, frame: Frame) -> Result<Frame, ClusterError> {
+		self.emit(frame).await
 	}
 
 	/// Delivers hop-local bytes under a fresh transport wrapper and
-	/// returns the reply body.
+	/// returns the reply frame.
 	///
 	/// This path carries the one hop-local message, a re-encoded
 	/// [`ClusterRequest::Work`] envelope toward a peer gateway. Every other
 	/// path carries an end-to-end frame.
 	///
 	/// [`ClusterRequest::Work`]: crate::colony::protocol::ClusterRequest::Work
-	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Vec<u8>, ClusterError> {
+	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Frame, ClusterError> {
 		let message: Vec<u8> = message.into();
 		let frame = Frame::v0(b"work-forward", message);
 
-		let response = self.emit(frame).await?;
-		Ok(response.into_message())
+		self.emit(frame).await
 	}
 
 	/// Opens a pooled connection to the target, with its handshake complete,
@@ -385,7 +382,7 @@ mod tests {
 			let plane = HivePlane::new(Arc::clone(&pools.hive), trace);
 
 			Self {
-				config: ColonyConfig::new(config),
+				config: ColonyConfig::new(config).expect("the test configuration names no gossip ingress"),
 				pool: pools.hive,
 				plane,
 				member_certificate: member.0.clone(),

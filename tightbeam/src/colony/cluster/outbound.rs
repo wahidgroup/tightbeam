@@ -6,12 +6,12 @@
 
 use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::colony::cluster::ClusterTlsConfig;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::trace::TraceCollector;
 use crate::transport::client::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::Protocol;
-use crate::utils::time::Clock;
 
 type ClusterPool<P> = ConnectionPool<P>;
 

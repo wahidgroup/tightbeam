@@ -8,6 +8,7 @@ use super::{
 	AdmittedDial, ClusterConfig, DialTarget, Party, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, RouteKind,
 	ServletEntry, SharedId,
 };
+use crate::clock::UnixMillis;
 use crate::colony::protocol::IssuedAt;
 use crate::colony::protocol::{ClusterWorkRequest, PeerAdvertisement};
 use crate::colony::urn::ColonyNamespace;
@@ -20,7 +21,6 @@ use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
 use crate::transport::multiplex::StreamRoute;
 use crate::urn::Urn;
-use crate::utils::time::UnixMillis;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
 

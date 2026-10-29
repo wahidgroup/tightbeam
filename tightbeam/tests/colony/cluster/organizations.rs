@@ -16,7 +16,7 @@
 use super::common::*;
 use super::federation::{drive_until_advertised, federation_conf, flood_ad_rumor, type_route_count};
 use super::gossip::relay_application_rumor;
-use tightbeam::utils::time::{Clock, ManualClock};
+use tightbeam::clock::{Clock, ManualClock};
 
 #[cfg(feature = "testing-fdr")]
 use tightbeam::testing::fdr::FdrConfig;

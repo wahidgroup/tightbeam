@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::der::{Decode, Encode};
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::policy::{SessionContext, TransitStatus};
 use tightbeam::testing::macros::BuiltAssertSpec;
 use tightbeam::testing::{HookContext, ScenarioConfig, Violations};
@@ -34,7 +35,6 @@ use tightbeam::transport::{
 	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError,
 	TransportFailure,
 };
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::{Frame, TightBeamError};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;

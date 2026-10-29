@@ -21,6 +21,7 @@ use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::{OctetString, SetOfVec};
 use tightbeam::der::{AnyRef, Decode, Encode, Reader, SliceReader, Tag, TagNumber, Tagged};
 use tightbeam::exactly;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::RECEIPT_ANSWER;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -37,7 +38,6 @@ use tightbeam::transport::handshake::receipt::{
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
 use tightbeam::transport::{EncryptedMessageIO, MessageIO, TransportError};
-use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;

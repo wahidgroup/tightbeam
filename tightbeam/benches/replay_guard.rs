@@ -17,11 +17,11 @@ mod measure;
 use core::time::Duration;
 use std::hint::black_box;
 
+use tightbeam::clock::UnixMillis;
 use tightbeam::colony::hive::gates::{ReplayGuard, REPLAY_GUARD_CAPACITY};
 use tightbeam::crypto::sign::ecdsa::k256::Scalar;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Signature};
 use tightbeam::crypto::sign::{Error, PrehashVerifier, VerifiedSignature};
-use tightbeam::utils::time::UnixMillis;
 
 use measure::median_ns;
 

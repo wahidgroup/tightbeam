@@ -146,7 +146,7 @@ macro_rules! __servlet_define {
 				$crate::colony::hive::ServletBox::signer(&self.runtime)
 			}
 
-			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
+			fn utilization(&self) -> Option<$crate::basis_points::BasisPoints> {
 				$crate::colony::hive::ServletBox::utilization(&self.runtime)
 			}
 
@@ -164,7 +164,9 @@ macro_rules! __servlet_define {
 ///
 /// # Unary
 ///
-/// - `handle: |msg, frame, ctx|`: typed delivery, the default. The arm
+/// - `handle: |msg, frame, ctx|`: typed delivery, the default. The arm decodes
+///   through [`Frame::open_typed`](crate::Frame::open_typed), which holds the
+///   frame, as it arrived, to the requirements of the input type, and then
 ///   normalizes an encrypted or compressed body in place before the decode.
 /// - `handle: raw |frame, ctx|`: the caller owns the frame lifecycle.
 ///
@@ -211,9 +213,7 @@ macro_rules! servlet {
 			protocol: $protocol,
 			handle: raw |$frame, $ctx| async move {
 				let mut $frame = $frame;
-				$frame.prepare_typed($ctx).await?;
-
-				let $msg: $input = $crate::decode($frame.message())?;
+				let $msg: $input = $frame.open_typed($ctx).await?;
 				$handler_body
 			}
 			$(, stream: |$sbody, $sctx| async move $stream_body)?

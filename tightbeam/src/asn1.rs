@@ -17,6 +17,8 @@ pub use wire_der::WireDer;
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 pub(crate) use syntax::GcmParametersRef;
+#[cfg(feature = "aead")]
+pub(crate) use syntax::KemRecipientInfoRef;
 
 /// The protocol version of a frame, which selects the metadata structure and
 /// the features the frame can use.

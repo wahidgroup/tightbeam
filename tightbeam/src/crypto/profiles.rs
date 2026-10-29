@@ -54,6 +54,8 @@ use crate::crypto::sign::ecdsa::Secp256k1Signature;
 use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{CanonicalForm, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding};
+#[cfg(all(feature = "kem", feature = "x509"))]
+use crate::crypto::x509::ext::pkix::KeyUsages;
 #[cfg(any(
 	feature = "digest",
 	feature = "aead",
@@ -668,18 +670,32 @@ pub trait CurveProvider {
 	type Curve: Curve + CurveArithmetic + AssociatedOid;
 }
 
-/// The provider role for Key Encapsulation Mechanism (KEM) operations.
+/// The provider role for a Key Encapsulation Mechanism (KEM) of the RustCrypto
+/// `kem` traits, such as a post-quantum KEM:
 ///
-/// The role supports post-quantum and hybrid key agreement through the
-/// RustCrypto `kem` traits. An application can supply a KEM implementation
-/// for a hybrid classical and post-quantum protocol such as PQXDH.
+/// - [`ProviderKem`](crate::crypto::cms::ProviderKem) runs it in a `KEMRecipientInfo` (RFC 9629 §3).
+/// - A provider that names `ProviderKem<Self>` as its [`CryptoProvider::Kem`]
+///   seals and opens every envelope under it.
+/// - [`DefaultCryptoProvider`] names DHKEM(secp256k1, HKDF-SHA256) (RFC 9180 §4.1).
 #[cfg(feature = "kem")]
 pub trait KemProvider {
-	/// The encapsulated key that [`Self::Kem`] sends to its recipient.
+	/// The encapsulated key that [`Self::Kem`] sends to its recipient, which
+	/// names the public key of the recipient and the size of the shared
+	/// secret.
 	type EncappedKey: EncappedKey;
-	/// The KEM, which encapsulates a shared secret into a
-	/// [`Self::EncappedKey`] and decapsulates it.
-	type Kem: Encapsulator<Self::EncappedKey> + Decapsulator<Self::EncappedKey> + Send + Sync;
+	/// The KEM, which encapsulates a fresh shared secret into a
+	/// [`Self::EncappedKey`] to the public key of a recipient.
+	type Kem: Encapsulator<Self::EncappedKey> + Default + Send + Sync;
+	/// The private key of a recipient, which decapsulates a
+	/// [`Self::EncappedKey`] to the shared secret.
+	type DecapsulationKey: Decapsulator<Self::EncappedKey> + Send + Sync;
+
+	/// The `keyUsage` bit that the certificate profile of [`Self::Kem`]
+	/// asserts on a recipient certificate: `keyAgreement` for a DHKEM over an
+	/// `id-ecPublicKey` key (RFC 5480 §3), and `keyEncipherment` for ML-KEM
+	/// (RFC 9935 §5, RFC 9629 §3).
+	#[cfg(feature = "x509")]
+	const USAGE: KeyUsages;
 }
 
 /// Binds concrete implementations to the metadata in a [`SecurityProfile`].
@@ -833,6 +849,19 @@ impl KdfProvider for DefaultCryptoProvider {
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
+}
+
+/// The house KEM role: DHKEM(secp256k1, HKDF-SHA256) under the RustCrypto
+/// `kem` traits, whose recipient key is a [`Secp256k1KeyProvider`].
+///
+/// [`Secp256k1KeyProvider`]: crate::crypto::key::Secp256k1KeyProvider
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+impl KemProvider for DefaultCryptoProvider {
+	type EncappedKey = crate::crypto::hpke::DhKemSecp256k1Enc;
+	type Kem = crate::crypto::hpke::DhKemSecp256k1;
+	type DecapsulationKey = crate::crypto::key::Secp256k1KeyProvider;
+
+	const USAGE: KeyUsages = KeyUsages::KeyAgreement;
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]

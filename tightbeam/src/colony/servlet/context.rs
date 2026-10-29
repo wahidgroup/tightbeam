@@ -281,11 +281,104 @@ impl Frame {
 		Ok(())
 	}
 
-	/// Prepare, decode, and invoke a typed unary handler.
+	/// Open this frame's body for the typed delivery of `ctx`, and decode it
+	/// as `I`.
 	///
-	/// It runs [`Frame::prepare_typed`] first, so an encrypted or compressed
-	/// body without the transform that matches it fails closed before the
-	/// decode.
+	/// The typed arm of [`servlet!`](crate::servlet) and
+	/// [`Frame::dispatch_typed_unary`] decode through it, in this order:
+	///
+	/// 1. The frame, as it arrived, meets the requirements of `I` ([`Frame::validate_for`]).
+	/// 2. [`Frame::prepare_typed`] opens the body, so a body with no matching transform fails closed.
+	/// 3. The cleartext decodes as `I`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::Requirement`] -- the frame, as it arrived, fails a requirement of `I`.
+	/// - The errors of [`Frame::prepare_typed`].
+	/// - [`TightBeamError::SerializationError`] -- the cleartext is no DER
+	///   encoding of `I`, or a SET in it holds its elements out of DER order.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::ServletContext;
+	/// use tightbeam::core::RequirementError;
+	/// use tightbeam::der::Sequence;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::{compose, Beamable, TightBeamError};
+	///
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// struct Ping {
+	///     sequence: u64,
+	/// }
+	///
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// #[beam(min_version = "V2")]
+	/// struct RecentPing {
+	///     sequence: u64,
+	/// }
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// # runtime.block_on(async {
+	/// let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::default()), Arc::new(()), [], None);
+	/// let mut frame = compose! { V1: id: "ping", order: 1u64, message: Ping { sequence: 7 } }?;
+	/// assert_eq!(frame.open_typed::<Ping, _>(&ctx).await?, Ping { sequence: 7 });
+	///
+	/// // The same body is no carrier of a type whose minimum is V2.
+	/// let refused = frame.open_typed::<RecentPing, _>(&ctx).await;
+	/// assert!(matches!(refused, Err(TightBeamError::Requirement(RequirementError::Version(_)))));
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// ```
+	pub async fn open_typed<I, Env>(&mut self, ctx: &ServletContext<Env>) -> Result<I, TightBeamError>
+	where
+		I: Message,
+	{
+		let open = async |frame: &mut Self| frame.prepare_typed(ctx).await;
+		self.open_message::<I>(open).await
+	}
+
+	/// Open and decode this frame's body as `I` ([`Frame::open_typed`]), then
+	/// invoke a typed unary handler with the message, the frame, and `ctx`.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Frame::open_typed`], before the handler runs.
+	/// - The error that `handler` returns.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use std::sync::Arc;
+	///
+	/// use tightbeam::colony::servlet::ServletContext;
+	/// use tightbeam::der::Sequence;
+	/// use tightbeam::trace::TraceCollector;
+	/// use tightbeam::{compose, Beamable, Frame};
+	///
+	/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	/// struct Ping {
+	///     sequence: u64,
+	/// }
+	///
+	/// # let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+	/// # runtime.block_on(async {
+	/// let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::default()), Arc::new(()), [], None);
+	/// let frame = compose! { V1: id: "ping", order: 1u64, message: Ping { sequence: 7 } }?;
+	///
+	/// // The handler answers no frame, so the delivery returns none.
+	/// let handler = |ping: Ping, _: Frame, _: &ServletContext| async move {
+	///     assert_eq!(ping, Ping { sequence: 7 });
+	///     Ok(None)
+	/// };
+	/// assert!(frame.dispatch_typed_unary(&ctx, handler).await?.is_none());
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// # })?;
+	/// # Ok::<(), Box<dyn std::error::Error>>(())
+	/// ```
 	pub async fn dispatch_typed_unary<I, Env, F, Fut>(
 		mut self,
 		ctx: &ServletContext<Env>,
@@ -296,9 +389,7 @@ impl Frame {
 		F: FnOnce(I, Frame, &ServletContext<Env>) -> Fut,
 		Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
 	{
-		self.prepare_typed(ctx).await?;
-
-		let message: I = crate::decode(self.message())?;
+		let message = self.open_typed::<I, Env>(ctx).await?;
 		handler(message, self, ctx).await
 	}
 }

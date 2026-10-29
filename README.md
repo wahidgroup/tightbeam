@@ -568,10 +568,11 @@ The following rules cover ordering, compression, integrity, chaining, and Nonrep
 
 #### 5.7.2 Compression Requirements
 
-- When `compactness` is present, `message` MUST hold `CompressedData` per [RFC 3274][rfc3274].
+- When `compactness` is present, `message` MUST hold the compressed bytes, and `compactness` MUST hold the `CompressedData` per [RFC 3274][rfc3274] that describes them, with no `eContent`.
 - If the compressed bytes do not match a recognized content type, `encapContentInfo` MUST use the `id-data` content type OID.
 - Compression algorithm identifiers MUST be valid OIDs. zlib uses `id-alg-zlibCompress`. zstd uses Wahid Group PEN `1.3.6.1.4.1.64586.2.1` until an S/MIME registry OID exists.
 - When `compressionAlgorithm.parameters` carries a level, that level MUST stay inside the algorithm-specific valid range.
+- Receivers MUST refuse a `CompressedData` whose version is not 0, that carries an `eContent`, or whose algorithm or parameters their inflator does not reverse, before they inflate the body.
 
 #### 5.7.3 Integrity Semantics: Order of Operations
 
@@ -1033,7 +1034,7 @@ Numeric security levels are a shorthand for common message requirements ([§6.4]
 
 Implementation: [docs/security.md](docs/security.md#numeric-security-levels)
 
-- Level 1 or level 2 requires confidentiality and nonrepudiation, and sets the minimum Frame version to V1.
+- Level 1 or level 2 requires confidentiality and nonrepudiation, and sets the minimum Frame version to V1. A `min_version` above V1 on the same message type holds.
 - Numeric levels set requirements, and a typed security profile constrains algorithms ([§6.4](#64-message-level-security-requirements)). A level 1 ("FIPS") message accepts any digest, AEAD, or signature algorithm.
 
 ### 6.4 Message-Level Security Requirements
@@ -1146,7 +1147,7 @@ let frame = Version::V1.compose::<SecureMessage>()
 #### Implementation Enforcement
 
 - **Compile time**: A derived message accepts only the algorithm types its profile names, so a mismatch is a compile error.
-- **Run time**: Composition compares each algorithm OID with the profile, so the profile holds for every message type, derived or written by hand. Frame validation checks that the Frame shape matches the message requirements.
+- **Run time**: Composition compares each algorithm OID with the profile, so the profile holds for every message type, derived or written by hand. Frame validation checks that the Frame shape matches the message requirements, at the build and at each typed decode.
 - **Profile binding**: A message type names its profile with the `#[beam(profile(...))]` attribute below.
 
 #### Derive Macro Usage
@@ -1262,7 +1263,7 @@ Implementation: [docs/security.md](docs/security.md#enforcement)
 
 #### Runtime Validation
 
-- Frame encode and decode paths MUST validate the Frame shape against the message type requirements.
+- Frame encode and typed decode paths MUST validate the Frame shape against the message type requirements, and a decode validates the Frame as it arrived.
 - Requirement violations MUST surface as errors.
 
 ### 7.2 Transport Layer
@@ -1296,7 +1297,7 @@ Every trust store keeps three rules, which the handshake and the colony rely on:
 The built-in store runs its revocation checker at each admission, so a check of every certificate, such as a denylist, belongs in that checker:
 
 - Path validation, with revocation as one of its checks, runs on each certificate that the store admits.
-- Each lookup runs the checker over the path of the certificate it answers with, so a revoked certificate fails every frame verification and every key lookup.
+- Each lookup holds the path of the certificate it answers with to its validity period and runs the checker over that path, so an expired or a revoked certificate fails every frame verification and every key lookup.
 
 The built-in store, public-key pinning, the hive's peer list gate, and the key index each read a key by one rule, under the curve decoders each holds:
 
@@ -1717,7 +1718,7 @@ use tightbeam::transport::policy::{RestartLinearBackoff, RestartExponentialBacko
 let restart = RestartLinearBackoff::new(3, Duration::from_millis(1000), 1, None);
 
 // Exponential backoff: 1s, 2s, 4s, 8s delays
-let restart = RestartExponentialBackoff::new(4, 1000, None);
+let restart = RestartExponentialBackoff::new(4, Duration::from_millis(1000), None);
 ```
 
 `policy!` **macro:**
@@ -2803,7 +2804,7 @@ Deployments with audit obligations (for example ISO 27001 A.8.15, NIST 800-53 AU
 
 1. Build with instrumentation, and attach a trace to every transport that terminates connections.
 2. Record payload hashes in the trace if peer identity (SPKI SHA3-256) must appear on gate verdicts.
-3. Provide a durable event sink. The default sink is a bounded in-memory buffer. Once full, it keeps the oldest events and drops each new one. Dropped events still take sequence numbers, so sequence-number gaps in exported evidence reveal where truncation occurred.
+3. Provide a durable event sink. The default sink is a bounded in-memory buffer. Once full, it keeps the oldest events and drops each new one, and the exported evidence records the truncation ([§10.5](#105-configuration)).
 
 Event timestamps count nanoseconds on the trace's clock since its origin:
 
@@ -3416,7 +3417,7 @@ let (result1, result2) = tokio::join!(
 Servlets with workers can be tested using `environment Servlet`. This scenario tests the servlet of [Defining a Servlet](#defining-a-servlet):
 
 ```rust,no_run,test_harness
-use tightbeam::{compose, decode, exactly, tb_assert_spec, tb_scenario, TightBeamError};
+use tightbeam::{compose, exactly, tb_assert_spec, tb_scenario, TightBeamError};
 use tightbeam::instrumentation::events;
 use tightbeam::testing::{fixtures::TestTrace, ScenarioConfig};
 # use std::sync::Arc;
@@ -3538,7 +3539,7 @@ tb_scenario! {
 
 			let response_frame = client.emit(request, None).await?
 				.ok_or(TightBeamError::MissingResponse)?;
-			let response: ResponseMessage = decode(response_frame.message())?;
+			let response: ResponseMessage = response_frame.decode_message()?;
 
 			assert_eq!(response.result, "pong", "the worker answers its configured response");
 			assert!(response.is_winner, "42 is the lotto number");
@@ -3685,10 +3686,11 @@ let hive_conf = HiveConfig {
 
 Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
 
-Signed commands are also checked for freshness. Each signed command frame states its issue time in the `order` field of its Metadata, in Unix milliseconds. The hive rejects two kinds of command:
+Signed commands are also checked for freshness. Each signed command frame states its issue time in the `order` field of its Metadata, in Unix milliseconds, and the issue times of one signer increase strictly ([§5.7.1](#571-message-ordering)). The hive rejects three kinds of command:
 
 - A command whose issue time falls outside the command freshness window of the hive's clock.
 - A command whose signature it already saw inside that window (replay protection).
+- A command whose signer already sent another command with the same issue time inside that window (a duplicate `order`).
 
 ##### Resilience Features
 
@@ -3780,7 +3782,9 @@ Standalone hive behavior (control plane gates, circuit breaker, backpressure, dr
 ```rust,no_run,test_harness
 use tightbeam::instrumentation::events;
 # use std::sync::Arc;
+# use tightbeam::basis_points::BasisPoints;
 # use tightbeam::builder::TypeBuilder;
+# use tightbeam::clock::UnixMillis;
 # use tightbeam::colony::hive::{Hive, HiveConfig, HiveRuntime, HiveTlsConfig};
 # use tightbeam::colony::protocol::{ClusterCommand, ClusterCommandResponse, HiveManagement, HiveManagementOutcome, StopServletParams};
 # use tightbeam::colony::urn::ColonyNamespace;
@@ -3795,9 +3799,7 @@ use tightbeam::instrumentation::events;
 # use tightbeam::trace::TraceCollector;
 # use tightbeam::transport::handshake::PeerAuthentication;
 # use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, TokioListener};
-# use tightbeam::utils::time::UnixMillis;
-# use tightbeam::utils::BasisPoints;
-# use tightbeam::{decode, exactly, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
+# use tightbeam::{exactly, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
 # type TestHive = HiveRuntime<TokioListener>;
 # struct TrustedSigner {
 # 	certificate: Certificate,
@@ -3838,7 +3840,7 @@ use tightbeam::instrumentation::events;
 # }
 # async fn emit_command(client: &mut GenericClient<TokioListener>, frame: Frame) -> Result<ClusterCommandResponse, TightBeamError> {
 # 	let response = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-# 	decode(response.message())
+# 	response.decode_message()
 # }
 # fn manage_stop_shape_status(response: ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
 # 	match response {
@@ -4341,14 +4343,14 @@ The work plane is request-reply. The client's frame reaches the servlet unchange
 ```rust,no_run
 use tightbeam::builder::TypeBuilder;
 use tightbeam::colony::SubmitWork;
+# use tightbeam::clock::UnixMillis;
 # use tightbeam::crypto::profiles::DefaultCryptoProvider;
 # use tightbeam::crypto::sign::SigningIdentity;
 # use tightbeam::crypto::x509::{Certificate, KeyPurposes, PeerCertificate, Signing};
 # use tightbeam::der::Sequence;
 # use tightbeam::transport::{GenericClient, TokioListener};
 # use tightbeam::urn::Urn;
-# use tightbeam::utils::time::UnixMillis;
-# use tightbeam::{decode, Beamable, Version};
+# use tightbeam::{Beamable, Version};
 # #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 # pub struct CalcRequest {
 # 	pub value: u32,
@@ -4382,7 +4384,7 @@ let response = client.submit_work_to(calculator_urn, &work).await?;
 // certificate admitted for signing under the house frame signer purpose.
 let servlet = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(servlet_certificate, KeyPurposes::HOUSE.signer)?;
 response.verify(&servlet)?;
-let result: CalcResponse = decode(response.message())?;
+let result: CalcResponse = response.decode_message()?;
 # Ok(())
 # }
 ```
@@ -4417,7 +4419,7 @@ The colony URN comes from the gateway certificate. Read it with `ClusterConfig::
 Clusters can be tested using `environment Cluster`:
 
 ```rust,no_run,test_harness
-use tightbeam::{cluster, compose, decode, exactly, hive, servlet, tb_assert_spec, tb_scenario, TightBeamError};
+use tightbeam::{cluster, compose, exactly, hive, servlet, tb_assert_spec, tb_scenario, TightBeamError};
 
 use tightbeam::instrumentation::events;
 # use std::sync::Arc;
@@ -4562,7 +4564,7 @@ tb_scenario! {
 			// envelope and resolves the reply to the servlet's response
 			// frame. A refusal surfaces as an error that carries its status.
 			let response = client.submit_work_to(servlet_urn("ping"), &work).await?;
-			let echoed: PingResponse = decode(response.message())?;
+			let echoed: PingResponse = response.decode_message()?;
 
 			assert_eq!(echoed.doubled, 42, "the ping servlet doubles the request");
 
@@ -4768,7 +4770,7 @@ Every emitted event goes to exactly one sink. When no sink is configured, the tr
 
 The `core/warn` event takes the place and the sequence number of the first event past the bound, and its label is the URN of that event. It sits in the events that the trace hash covers ([§10.6](#106-evidence-artifact-format)), so the evidence shows where truncation began. A configured sink that drops events MUST keep the same warning in place of the first event it drops.
 
-Sequence gaps in exported evidence reveal truncation (see [§8.8.1](#881-audit-trail-deployment-requirements)).
+The `overflow` field of the evidence records the truncation, and the evidence hash covers it ([§10.6](#106-evidence-artifact-format)).
 
 ### 10.6 Evidence Artifact Format
 
@@ -4782,9 +4784,9 @@ Wire shape:
 EvidenceArtifact ::= SEQUENCE {
 	specHash      OCTET STRING,           -- SHA3-256(spec definition)
 	traceHash     OCTET STRING,           -- SHA3-256 over the DER of events
-	evidenceHash  OCTET STRING,           -- SHA3-256(specHash || traceHash)
+	evidenceHash  OCTET STRING,           -- SHA3-256(specHash || traceHash || DER(overflow))
 	events        SEQUENCE OF TbEvent,
-	overflow      BOOLEAN                 -- true if the collector dropped events
+	overflow      BOOLEAN                 -- true if the trace misses events of its run
 }
 
 TbEvent ::= SEQUENCE {
@@ -4811,7 +4813,7 @@ Artifact integrity:
 
 - `traceHash` MUST be SHA3-256 over the DER of the `events` field, a SEQUENCE OF TbEvent, so an absent OPTIONAL field and an empty one hash apart.
 - `overflow` MUST be true for a trace that misses events of its run.
-- `evidenceHash` MUST be SHA3-256(`specHash` || `traceHash`) where `||` is raw byte concatenation.
+- `evidenceHash` MUST be SHA3-256(`specHash` || `traceHash` || DER(`overflow`)), where `||` is raw byte concatenation.
 
 Privacy:
 
@@ -4864,7 +4866,7 @@ let filter = LogFilter::new(LogLevel::Warning)
 
 #### Integration
 
-A trace logs an event at the level the event names, or else at the default level of its logger, when the filter admits that level:
+A trace logs an event at the level the event names, or else at the default level of its logger, when the filter admits that level and the backend accepts it:
 
 ```rust
 use tightbeam::instrumentation::events;
@@ -4901,7 +4903,7 @@ Implementation: [docs/instrumentation.md](docs/instrumentation.md#utilities)
 
 The URN subsystem provides:
 
-- The URN of [RFC 8141][rfc8141], `urn:<nid>:<nss>`.
+- The URN of [RFC 8141][rfc8141], `urn:<nid>:<nss>`, with its optional r-, q-, and f-components and its URN-equivalence.
 - `UrnBuilder`, which constructs and validates a URN from either a raw NID and NSS or structured components.
 - Namespace-specific validation, which an application defines for its own namespace and which reports a `UrnValidationError`.
 - A built-in spec for application and test instrumentation labels, of the form `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
@@ -4934,7 +4936,7 @@ fn build_customer_urn() -> Result<(), UrnValidationError> {
 
 #### 11.1.2 Jobs
 
-**Module**: `tightbeam::utils::task`
+**Module**: `tightbeam::task`
 
 The `job!` macro wraps a unit of work as a named type with one `run` function, sync or async.
 
@@ -4984,19 +4986,19 @@ A call passes one input value, often a tuple, such as `AddNumbers::run((1, 2))`.
 
 #### 11.1.3 Job Pipelines
 
-**Module**: `tightbeam::utils::task`
+**Module**: `tightbeam::task`
 
 Every `Result` is a pipeline. Jobs that return `Result` chain with familiar `and_then`, `map`, and `or_else`. Closures that return `Result` are pipelines too. `run` ends a pipeline and returns its result.
 
 ```rust
 use tightbeam::job;
-use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
+use tightbeam::task::{Pipeline, PipelineBuilder, join};
 ```
 
 **Basic usage:**
 
 ```rust
-# use tightbeam::utils::task::Pipeline;
+# use tightbeam::task::Pipeline;
 # use tightbeam::{job, TightBeamError};
 # pub struct Request;
 # impl Request { fn with_timestamp(self, _at: u64) -> Self { self } }
@@ -5016,7 +5018,7 @@ let frame = CreateHandshakeRequest::run((client_id, nonce))
 **Mixed composition** (start from any `Result`):
 
 ```rust
-# use tightbeam::utils::task::Pipeline;
+# use tightbeam::task::Pipeline;
 # use tightbeam::{job, TightBeamError};
 # pub struct Config;
 # fn parse_config_file(_path: &str) -> Result<Config, TightBeamError> { Ok(Config) }
@@ -5040,7 +5042,7 @@ config
 A join runs the first pipeline and then the second, and pairs their outputs. The first error ends the run.
 
 ```rust
-# use tightbeam::utils::task::{join, Pipeline};
+# use tightbeam::task::{join, Pipeline};
 # use tightbeam::{job, TightBeamError};
 # job! { name: EncryptPayload, fn run((_payload,): (&'static [u8],)) -> Result<Vec<u8>, TightBeamError> { Ok(Vec::new()) } }
 # job! { name: SignPayload, fn run((_payload,): (&'static [u8],)) -> Result<Vec<u8>, TightBeamError> { Ok(Vec::new()) } }
@@ -5058,7 +5060,7 @@ SendRequest::run((encrypted, signed))?;
 **Error recovery** with `or_else`:
 
 ```rust
-# use tightbeam::utils::task::Pipeline;
+# use tightbeam::task::Pipeline;
 # use tightbeam::{job, TightBeamError};
 # pub struct Request;
 # pub struct Response;
@@ -5085,8 +5087,8 @@ A job name is the type name that `job!` declares, in lowercase words joined by h
 
 ```rust
 # use std::sync::Arc;
+# use tightbeam::task::{Pipeline, PipelineBuilder};
 # use tightbeam::trace::TraceCollector;
-# use tightbeam::utils::task::{Pipeline, PipelineBuilder};
 # use tightbeam::{job, TightBeamError};
 # pub struct Request;
 # impl Request { fn validate(self) -> Self { self } }
@@ -5112,9 +5114,9 @@ PipelineBuilder::new(trace)
 Assert the full job URNs, as an exact string match (see [§10.2](#102-event-kind-taxonomy)):
 
 ```rust,test_harness
+# use tightbeam::task::Pipeline;
 # use tightbeam::testing::ScenarioConfig;
 # use tightbeam::urn::Urn;
-# use tightbeam::utils::task::Pipeline;
 # use tightbeam::{exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, urn, TightBeamError};
 # pub struct Request;
 # impl Request { fn with_metadata(self) -> Self { self } }
@@ -5185,7 +5187,7 @@ tb_scenario! {
 **Complete example:**
 
 ```rust
-use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
+use tightbeam::task::{Pipeline, PipelineBuilder, join};
 # use std::sync::Arc;
 # use tightbeam::trace::TraceCollector;
 # use tightbeam::{job, TightBeamError};
@@ -5529,7 +5531,7 @@ A scenario drives production code with the scenario trace and asserts what produ
 # use tightbeam::colony::protocol::RegisterHiveResponse;
 # use tightbeam::instrumentation::events;
 # use tightbeam::policy::TransitStatus;
-# use tightbeam::{decode, exactly, tb_assert_spec, Frame};
+# use tightbeam::{exactly, tb_assert_spec, Frame};
 tb_assert_spec! {
 	pub ClusterUnsignedRegistrationSpec,
 	V(1,0,0): {
@@ -5542,7 +5544,7 @@ tb_assert_spec! {
 
 // client body
 # fn client_body(cluster: &impl Cluster, response_frame: &Frame) -> Result<(), Box<dyn core::error::Error>> {
-let response: RegisterHiveResponse = decode(response_frame.message())?;
+let response: RegisterHiveResponse = response_frame.decode_message()?;
 assert!(response.hive_id.is_none(), "a refused registration assigns no hive id");
 assert_eq!(cluster.hive_count()?, 0, "a refused registration installs no hive");
 # Ok(())
@@ -6182,7 +6184,9 @@ Based on research by Pedersen & Chalmers,[^pedersen2024] refinement in cooperati
 - It runs them under a cooperative or a preemptive model.
 - It refuses more schedulers than processes.
 
-**tightbeam addresses this through multi-seed exploration**: Each seed represents a different scheduling strategy, exploring alternative interleaving of concurrent events. Each seed works like a test under another number of schedulers, so the exploration checks behavior across resource constraints:
+Each walk and each refinement check run the subject under that constraint. Implementation: [docs/testing.md](docs/testing.md#fdrconfig).
+
+**tightbeam addresses this through multi-seed exploration**: Each seed represents a different scheduling strategy, exploring alternative interleaving of concurrent events:
 
 ```rust
 # use tightbeam::testing::fdr::FdrConfig;
@@ -6234,9 +6238,9 @@ Generated CSPM includes:
 - Observable and hidden alphabet declarations
 - State space enumeration
 - Labeled transition system as CSP processes
-- Main process with τ-hiding: `Name = InitialProcess \ {| hid |}`
+- Main process with τ-hiding: `Main_Name = P_Initial \ {| hid |}`
 
-The output is the starting point of an FDR4 model. The event names and the hidden channel need edits before FDR4 loads the file, and a terminal state exports as `SKIP`.
+The output is a complete CSPM script. Implementation: [docs/testing.md](docs/testing.md#csp-export-and-trace-analysis).
 
 #### 12.5.6 Trace Analysis Extensions
 
@@ -6348,7 +6352,7 @@ InjectionStrategy::Random
 - Statistical coverage analysis
 - Same seed produces same fault sequence
 
-The strategy decides runtime injection at trace events. FDR exploration draws each injection from the generator of its own exploration seed (§12.4.4).
+The strategy decides injection at runtime trace events and in each walk of FDR exploration (§12.4.4).
 
 #### 12.6.3 Type-Safe State and Event Identifiers
 
@@ -6628,7 +6632,7 @@ tb_scenario! {
 
 			// Decode the response and record its content as a value assertion
 			if let Some(resp_frame) = response {
-				let decoded: TestMessage = tightbeam::decode(resp_frame.message())?;
+				let decoded: TestMessage = resp_frame.decode_message()?;
 				trace.event_with(MESSAGE_CONTENT, &[], decoded.content)?;
 			}
 
@@ -7074,7 +7078,7 @@ Implementation: [docs/testing.md](docs/testing.md#fmea-reports)
 
 - `FmeaConfig` with configurable severity scales (`MilStd1629`, `Iso26262`) and RPN thresholds (default: 100)
 - An FMEA report, generated through `fmea_config` from each FDR verdict that injected a fault, which holds:
-  - each failure mode with its severity, occurrence, and detection ratings
+  - one failure mode per injection point that fired, with its severity, occurrence, and detection ratings
   - the aggregate risk priority
   - the failure modes whose RPN exceeds the threshold
 - `FaultModel::with_fault()` allows precise failure mode specification with error factories and injection probabilities
@@ -7309,7 +7313,7 @@ use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::testing::ScenarioConfig;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::urn::Urn;
-use tightbeam::{compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn, TightBeamError};
+use tightbeam::{compose, exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn, TightBeamError};
 # use tightbeam::der::Sequence;
 # use tightbeam::policy::{ReceptorPolicy, TransitStatus};
 # use tightbeam::Beamable;
@@ -7464,7 +7468,7 @@ tb_scenario! {
 			}?;
 
 			let response = client.emit(ping_message, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response_message: ResponseMessage = decode(response.message())?;
+			let response_message: ResponseMessage = response.decode_message()?;
 
 			trace.event_with(RESPONSE_RESULT, &[], response_message.result)?;
 			trace.event_with(IS_WINNER, &[], response_message.is_winner)?;
@@ -7593,8 +7597,8 @@ The official tightbeam extensions live in [tightbeam-ext](https://github.com/wah
 [crate-link]: https://crates.io/crates/tightbeam-rs
 [docs-image]: https://img.shields.io/docsrs/tightbeam-rs
 [docs-link]: https://docs.rs/tightbeam-rs
-[build-image]: https://img.shields.io/github/actions/workflow/status/wahidgroup/tightbeam/ci.yaml?branch=master
-[build-link]: https://github.com/wahidgroup/tightbeam/actions/workflows/ci.yaml
+[build-image]: https://img.shields.io/github/actions/workflow/status/wahidgroup/tightbeam/ci.yml?branch=master
+[build-link]: https://github.com/wahidgroup/tightbeam/actions/workflows/ci.yml
 [license-image]: https://img.shields.io/badge/license-MIT%2FApache--2.0-blue
 [rustc-image]: https://img.shields.io/badge/rustc-1.88.0%2B-orange?logo=rust
 [chat-image]: https://img.shields.io/badge/chat-Discussions-blue?logo=github

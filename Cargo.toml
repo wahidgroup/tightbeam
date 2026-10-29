@@ -49,7 +49,7 @@ indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 
 [workspace.dependencies]
-tightbeam-derive = { version = "=0.1.7", path = "tightbeam-derive" }
+tightbeam-derive = { version = "=0.2.0", path = "tightbeam-derive" }
 
 # RustCrypto dependencies
 spki = { version = "=0.7.3", default-features = false }

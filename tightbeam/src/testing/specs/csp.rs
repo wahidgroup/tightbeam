@@ -16,7 +16,7 @@
 //!   <https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf>
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[cfg(feature = "testing-timing")]
@@ -257,6 +257,96 @@ pub struct Process {
 	/// into a [`TaskSet`].
 	#[cfg(feature = "testing-schedulability")]
 	pub(crate) schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
+
+	/// The component processes of this process, and the components that move
+	/// on each edge.
+	pub(crate) components: Components,
+}
+
+/// The component processes of a process, and the components that move on
+/// each of its edges, which a scheduler constraint reads.
+///
+/// - A process that no parallel operator built is one component, number 0.
+/// - A parallel composition numbers the components of its left operand
+///   first, then those of its right operand.
+/// - An edge of one component moves that component, and a synchronized edge
+///   moves the components of both operands.
+/// - Sequential composition and both choices run one operand at a time, so
+///   their operands share component numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Components {
+	/// The number of component processes, at least one.
+	count: u32,
+	/// The movers of each edge that holds them, by its source, its event, and
+	/// its target. Each alternative is a set of components that move
+	/// together, and an edge with no entry moves component 0.
+	movers: HashMap<(State, Event, State), Vec<BTreeSet<u32>>>,
+	/// The state that each state of a scheduled process runs, in the process
+	/// before scheduling.
+	#[cfg(feature = "testing-fault")]
+	bases: HashMap<State, State>,
+}
+
+impl Default for Components {
+	fn default() -> Self {
+		Self {
+			count: 1,
+			movers: HashMap::new(),
+			#[cfg(feature = "testing-fault")]
+			bases: HashMap::new(),
+		}
+	}
+}
+
+impl Components {
+	/// The number of component processes.
+	pub(crate) fn count(&self) -> u32 {
+		self.count
+	}
+
+	/// The alternatives of `edge`, each a set of components that move
+	/// together, with each component number raised by `offset`.
+	pub(crate) fn moving(&self, edge: (State, Event, State), offset: u32) -> Vec<BTreeSet<u32>> {
+		let first = BTreeSet::from([0]);
+		let stored = self.movers.get(&edge).map(Vec::as_slice);
+		let alternatives = stored.unwrap_or(core::slice::from_ref(&first));
+		let raise = |component: &u32| component.saturating_add(offset);
+
+		alternatives.iter().map(|movers| movers.iter().map(raise).collect()).collect()
+	}
+
+	/// The alternatives of an edge that two operands take together: each
+	/// alternative of `left` joined with each alternative of `right`.
+	pub(crate) fn together(left: &[BTreeSet<u32>], right: &[BTreeSet<u32>]) -> Vec<BTreeSet<u32>> {
+		let pairs = left.iter().flat_map(|mine| right.iter().map(move |theirs| mine | theirs));
+		pairs.collect()
+	}
+
+	/// Adds `movers` as an alternative of `edge`, once.
+	pub(crate) fn add(&mut self, edge: (State, Event, State), movers: BTreeSet<u32>) {
+		let alternatives = self.movers.entry(edge).or_default();
+		if !alternatives.contains(&movers) {
+			alternatives.push(movers);
+		}
+	}
+
+	/// Raises the number of components to `count`, when it is more.
+	pub(crate) fn widen_to(&mut self, count: u32) {
+		self.count = self.count.max(count);
+	}
+
+	/// Records that the scheduled state `scheduled` runs `base`.
+	#[cfg(feature = "testing-fault")]
+	pub(crate) fn schedule_as(&mut self, scheduled: State, base: State) {
+		self.bases.insert(scheduled, base);
+	}
+
+	/// The state before scheduling that `state` runs, or `state` itself in a
+	/// process that no scheduler constraint built.
+	#[cfg(feature = "testing-fault")]
+	pub(crate) fn base_of(&self, state: State) -> State {
+		self.bases.get(&state).copied().unwrap_or(state)
+	}
 }
 
 /// The parts of a process that a search of its traces, failures, and
@@ -1640,6 +1730,7 @@ pub struct ProcessBuilder {
 	clocks: HashSet<String>,
 	#[cfg(feature = "testing-schedulability")]
 	schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
+	components: Components,
 }
 
 impl ProcessBuilder {
@@ -1663,6 +1754,7 @@ impl ProcessBuilder {
 			clocks: HashSet::new(),
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: None,
+			components: Components::default(),
 		}
 	}
 
@@ -1711,6 +1803,25 @@ impl ProcessBuilder {
 		self.states.insert(from);
 		self.states.insert(to);
 		self.transitions.add(from, event.into(), to);
+		self
+	}
+
+	/// Adds each of `alternatives` as a set of components that move together
+	/// on `edge`, by its source, its event, and its target.
+	pub(crate) fn add_movers<A>(mut self, edge: (State, Event, State), alternatives: A) -> Self
+	where
+		A: IntoIterator<Item = BTreeSet<u32>>,
+	{
+		for movers in alternatives {
+			self.components.add(edge, movers);
+		}
+
+		self
+	}
+
+	/// Raises the number of component processes to `count`, when it is more.
+	pub(crate) fn components(mut self, count: u32) -> Self {
+		self.components.widen_to(count);
 		self
 	}
 
@@ -1863,6 +1974,7 @@ impl ProcessBuilder {
 			timed_transitions: self.timed_transitions,
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: self.schedulability_periods,
+			components: self.components,
 		})
 	}
 

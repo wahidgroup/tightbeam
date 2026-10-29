@@ -7,10 +7,12 @@ use crate::Message;
 
 /// A Frame or Metadata field that only later protocol versions carry.
 ///
-/// This enum is mapping for the version-to-field mapping in §5.6 of the
-/// specification. An encoder MUST NOT emit a gated field below its
-/// [`GatedField::since`] version, and a decoder MUST reject a frame
-/// that carries one.
+/// This enum is the version-to-field mapping of §5.6 of the specification.
+/// An encoder MUST NOT emit a gated field below its [`GatedField::since`]
+/// version, and a decoder MUST reject a frame that carries one. A frame in
+/// memory refuses such a field with [`UnsupportedField`].
+///
+/// [`UnsupportedField`]: crate::TightBeamError::UnsupportedField
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatedField {
 	/// Message Integrity (MI) in `Metadata.integrity`.
@@ -25,7 +27,7 @@ pub enum GatedField {
 	Priority,
 	/// Time-to-live in `Metadata.lifetime`.
 	Lifetime,
-	/// The prior-frame digest in `Metadata.previous_frame`.
+	/// The prior-frame digest in `Metadata.previousFrame`.
 	PreviousFrame,
 	/// The routing matrix in `Metadata.matrix`.
 	Matrix,
@@ -55,7 +57,7 @@ impl core::fmt::Display for GatedField {
 			GatedField::Nonrepudiation => "Frame.nonrepudiation",
 			GatedField::Priority => "Metadata.priority",
 			GatedField::Lifetime => "Metadata.lifetime",
-			GatedField::PreviousFrame => "Metadata.previous_frame",
+			GatedField::PreviousFrame => "Metadata.previousFrame",
 			GatedField::Matrix => "Metadata.matrix",
 		};
 
@@ -69,6 +71,29 @@ impl Version {
 		self as u8 >= field.since() as u8
 	}
 
+	/// The later of this version and `other`, in protocol order.
+	///
+	/// The method is `const`, so the `Beamable` derive combines two minimum
+	/// versions of a message type in its `MIN_VERSION` constant through it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam::Version;
+	///
+	/// const LATER: Version = Version::V1.later(Version::V2);
+	/// assert_eq!(LATER, Version::V2);
+	/// assert_eq!(Version::V3.later(Version::V0), Version::V3);
+	/// ```
+	#[must_use]
+	pub const fn later(self, other: Self) -> Self {
+		if other as u8 > self as u8 {
+			other
+		} else {
+			self
+		}
+	}
+
 	/// Start a [`FrameBuilder`] for message type `T` at this version.
 	///
 	/// This is the method form of the `compose!` macro, for contexts
@@ -76,5 +101,23 @@ impl Version {
 	#[cfg(feature = "builder")]
 	pub fn compose<T: Message>(self) -> FrameBuilder<T> {
 		FrameBuilder::from(self)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::asn1::Version;
+
+	// The later of two versions is the one later in protocol order, in either
+	// argument order.
+	crate::tb_cases! {
+		fn the_later_of_two_versions_is_later_in_protocol_order((first, second, later): (Version, Version, Version)) {
+			assert_eq!(first.later(second), later);
+		}
+		cases {
+			the_receiver_is_later => (Version::V2, Version::V1, Version::V2),
+			the_argument_is_later => (Version::V0, Version::V3, Version::V3),
+			both_are_one_version => (Version::V1, Version::V1, Version::V1),
+		}
 	}
 }

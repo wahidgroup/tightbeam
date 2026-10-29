@@ -20,7 +20,7 @@ use crate::colony::hive::{
 	HashMapRegistry, Hive, HiveConfig, HiveContext, HiveError, ServletBox, ServletRegistration, ServletRegistry,
 	SpawnerFn, SpawnerTable,
 };
-use crate::colony::protocol::RegisterHiveResponse;
+use crate::colony::protocol::{IssueClock, RegisterHiveResponse};
 use crate::colony::urn::ColonyResource;
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::instrumentation::events::HIVE_ESTABLISHED;
@@ -129,6 +129,9 @@ pub struct HiveRuntime<P: Protocol, R: ServletRegistry = HashMapRegistry> {
 	in_flight: InFlight,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_context: Arc<HiveContextImpl<P>>,
+	/// The issue times of this hive's control frames, which every link to
+	/// the gateways shares, so the orders of the hive increase strictly.
+	issue_clock: Arc<IssueClock>,
 }
 
 /// The shared handles of a [`HiveRuntime`], which the control plane and the
@@ -148,6 +151,7 @@ pub(super) struct RuntimeShares<'a, P: Protocol, R: ServletRegistry> {
 	pub(super) in_flight: &'a InFlight,
 	pub(super) cluster_addrs: &'a Arc<RwLock<Vec<P::Address>>>,
 	pub(super) hive_context: &'a Arc<HiveContextImpl<P>>,
+	pub(super) issue_clock: &'a Arc<IssueClock>,
 }
 
 impl<P: Protocol, R: ServletRegistry + Default> HiveRuntime<P, R> {
@@ -207,6 +211,7 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 		let trace = Arc::new(TraceCollector::default());
 		let servlet_pool = Self::servlet_pool(&config, &trace);
 		let hive_context = Arc::new(HiveContextImpl::new(servlet_pool).with_trace(Arc::clone(&trace)));
+		let issue_clock = Arc::new(IssueClock::new(Arc::clone(&config.clock)));
 
 		Ok(Self {
 			servlets: Arc::new(registry),
@@ -221,6 +226,7 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 			in_flight: InFlight::default(),
 			cluster_addrs: Arc::new(RwLock::new(Vec::new())),
 			hive_context,
+			issue_clock,
 		})
 	}
 
@@ -240,6 +246,7 @@ impl<P: Protocol, R: ServletRegistry> HiveRuntime<P, R> {
 			in_flight: &self.in_flight,
 			cluster_addrs: &self.cluster_addrs,
 			hive_context: &self.hive_context,
+			issue_clock: &self.issue_clock,
 		}
 	}
 
@@ -325,6 +332,7 @@ where
 			addr,
 			Arc::new(self.config.clone()),
 			Arc::clone(&self.trace),
+			Arc::clone(&self.issue_clock),
 		))
 	}
 

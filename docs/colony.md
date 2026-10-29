@@ -173,7 +173,7 @@ These methods exist in every state:
 2. Pass the config and the handlers to `ServletRuntime::start`. The handlers' `Env` must equal the config's `Env`, so a handler that names another env fails to compile.
 3. A call site bounded on `Servlet<I, Env>` passes a `RuntimeServletConf { config, service }`.
 
-`Frame::prepare_typed` decrypts or inflates a body in place, and `Frame::dispatch_typed_unary` runs it before the decode. A body with no matching transform fails closed with `RouterError::ConfidentialFrame` or `RouterError::CompressedFrame`.
+`Frame::prepare_typed` decrypts or inflates a body in place. `Frame::dispatch_typed_unary` and the typed arm of `servlet!` first hold the Frame, as it arrived, to the requirements of the message type through `Frame::validate_for`, and then run `Frame::prepare_typed` before the decode. A body with no matching transform fails closed with `RouterError::ConfidentialFrame` or `RouterError::CompressedFrame`.
 
 This servlet echoes each `TestMessage` it receives:
 
@@ -283,7 +283,7 @@ A pool connection multiplexes only when the servlet also advertises through `Ser
 | `circuit_breaker_threshold` | `u8` | 3 | The consecutive authentication failures of one signer that open its circuit |
 | `circuit_breaker_cooldown` | `Duration` | 30 s | The time an open circuit refuses the signer |
 | `command_freshness_window` | `Duration` | 30 s | The window around the hive clock that a command's issue time must fall inside |
-| `notify_retry` | `Arc<dyn CoreRetryPolicy>` | Exponential backoff: 3 attempts, scale factor 500, decorrelated jitter | The retry of the scaling updates the hive fans out to gateways |
+| `notify_retry` | `Arc<dyn CoreRetryPolicy>` | Exponential backoff: 3 attempts, a 500 ms base delay, decorrelated jitter | The retry of the scaling updates the hive fans out to gateways |
 
 ### Scaling
 
@@ -334,9 +334,11 @@ The hive builds its control-plane gates from `HiveConfig`:
 | Gate | Rule |
 | --- | --- |
 | `ClusterSecurityGate` | Verifies each command against the trust store, under the `GateLimits` that `control` names |
-| `ReplayGuard` | Records each signature per signer, for as long as its frame is fresh (CWE-294) |
+| `ReplayGuard` | Records each signature per signer, for as long as its frame is fresh (CWE-294), and refuses a second frame of one signer at a recorded `order` (README §5.7.1) |
 | `ClusterCircuitBreaker` | Keeps one circuit per signer, keyed on the handshake-proven peer. Only the failures of a known signer count (CWE-645) |
 | `BackpressureGate` | Refuses manage commands at or over `backpressure_threshold` |
+
+The hive reads a command through `Frame::decode_message`, so a frame that fails a requirement of `ClusterCommand`, such as its frame integrity, carries no command. The gateway reads each colony protocol type through the same call ([security.md](security.md#enforcement)).
 
 ### Hive scenarios
 
@@ -373,9 +375,10 @@ The gateway digests under `<P as Protocol>::CryptoProvider`.
 | `stop(self)` | Aborts the accept and background tasks |
 | `join(self)` | Waits for the accept loops to end |
 
-`start` fails with `TightBeamError::TransportError` when a plane fails to bind. It fails with `TightBeamError::ClusterError` in two cases:
+`start` fails with `TightBeamError::TransportError` when a plane fails to bind. It fails with `TightBeamError::ClusterError` in three cases:
 
 - `bind_addr` or `edge_bind_addr` does not parse (`ClusterError::InvalidAddress`).
+- The gossip ingress is no bare servlet type of `namespace`, as `ClusterConfig::gossip_ingress_key` decides (`ClusterError::UnknownServletType`).
 - A federating gateway binds a wildcard address with no advertise address (`ClusterError::AdvertiseAddressRequired`).
 
 The registry reads fail with `ClusterError::LockPoisoned`. A poisoned lock also ends the background loop that reads it, which traces `CLUSTER_LOOP_POISONED`.
@@ -392,6 +395,15 @@ The registry reads fail with `ClusterError::LockPoisoned`. A poisoned lock also 
 | `client_authentication`, `with_client_authentication` | How the accept planes authenticate their clients | `PeerAuthentication::Anonymous` |
 | `hive_trust`, `with_hive_trust` | Validates each hive and servlet dial, verifies hive control frames, and marks a first-party caller | `None` |
 | `peer_trust`, `with_peer_trust` | Verifies peer advertisements and relayed gossip. It wins over `hive_trust`, so a key in both stays a peer | `None` |
+
+### Resource URNs
+
+`ColonyNamespace` mints and validates every resource URN of a deployment, in the grammar `urn:{nid}:{realm}:{resource-type}:{resource-id}`.
+
+- `validate` refuses a URN that carries an r-, q-, or f-component with `UrnValidationError::ForbiddenFieldPresent`, because the grammar defines none.
+- The NID compares in any case. The realm compares octet by octet, with the hex digits of each percent-encoded triplet in any case (RFC 8141 §3.1).
+- Each registry and route key is `Urn::canonical_bytes`: `urn:`, the NID in lower case, `:`, and the NSS with the hex digits of each triplet in upper case. Two URN-equivalent names key one resource.
+- A hive address and a servlet instance locator are NSS text, with each byte outside the NSS production percent-encoded. `ColonyResource` carries each as an `NssText`, and `NssText::decoded` gives the address.
 
 ### `ClusterConfig`
 
@@ -425,9 +437,9 @@ The registry reads fail with `ClusterError::LockPoisoned`. A poisoned lock also 
 Four methods check their input:
 
 - `with_peers`, `with_advertise_addr`, and `with_peer_dial_allowlist` fail with `ClusterError::InvalidPeerAddress` on an entry that names no socket.
-- `with_gossip_ingress` fails with `ClusterError::UnknownServletType` on a URN that is no bare servlet type of the namespace.
+- `with_gossip_ingress` fails with `ClusterError::UnknownServletType` on a URN that is no bare servlet type of the namespace it names. `GossipConfig::ingress` holds the URN. `ClusterConfig::gossip_ingress_key` mints its route key under `namespace`, and `start` mints it there once and refuses an ingress outside the gateway's `namespace`, so `with_namespace` and `with_gossip_ingress` take effect in either call order.
 
-`with_peer_config` replaces the whole peer plane, and `with_gossip_config` replaces the whole gossip section. Each one comes before the methods that set one field of its section, because it drops what they set before it.
+`with_peer_config` replaces the peer section, and `with_gossip_config` replaces the gossip section. A method that sets one field of a section wins over the section in either call order: `build` applies the section first and each field method after it, in call order.
 
 ### Peer federation
 
@@ -522,7 +534,7 @@ The dial list, the advertised address, the dial allowlist, the discovery table, 
 
 ### Manual clock
 
-`ManualClock` (`tightbeam::utils::time`, feature `testing`) moves only when `advance(span)` moves it, and an advance wakes each sleep it ends. Each part that reads time takes the clock through its own setter:
+`ManualClock` (`tightbeam::clock`, feature `testing`) moves only when `advance(span)` moves it, and an advance wakes each sleep it ends. Each part that reads time takes the clock through its own setter:
 
 | Part | Setter |
 | --- | --- |
@@ -540,6 +552,7 @@ One manual clock drives a gateway, a hive, a servlet, and a trace:
 use core::time::Duration;
 use std::sync::Arc;
 
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig};
 use tightbeam::colony::hive::HiveConfig;
 use tightbeam::colony::servlet::ServletConfig;
@@ -548,7 +561,6 @@ use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::testing::{TestCertificate, TestKey, TestMessage};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::TokioListener;
-use tightbeam::utils::time::{Clock, ManualClock};
 
 let clock = Arc::new(ManualClock::default());
 let shared: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
@@ -571,6 +583,7 @@ clock.advance(Duration::from_secs(5));
 ## Sources
 
 - RFC 5280, "Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile," §4.2.1.6 and §4.2.1.12. [rfc-editor.org/rfc/rfc5280](https://www.rfc-editor.org/rfc/rfc5280)
+- RFC 8141, "Uniform Resource Names (URNs)," §2 and §3.1. [rfc-editor.org/rfc/rfc8141](https://www.rfc-editor.org/rfc/rfc8141)
 - CWE-294, "Authentication Bypass by Capture-replay." [cwe.mitre.org/data/definitions/294.html](https://cwe.mitre.org/data/definitions/294.html)
 - CWE-645, "Overly Restrictive Account Lockout Mechanism." [cwe.mitre.org/data/definitions/645.html](https://cwe.mitre.org/data/definitions/645.html)
 - CWE-835, "Loop with Unreachable Exit Condition ('Infinite Loop')." [cwe.mitre.org/data/definitions/835.html](https://cwe.mitre.org/data/definitions/835.html)

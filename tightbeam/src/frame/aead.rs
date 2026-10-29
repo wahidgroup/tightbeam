@@ -57,18 +57,24 @@ impl Frame {
 	/// Decrypt, decompress when needed, and decode the message body into a
 	/// typed message `T`.
 	///
-	/// It combines [`Frame::decrypt_in_place`] and [`crate::decode`]. A
-	/// compressed body requires an `inflator`. The [`Opened`] drops with the
-	/// frame, so a caller that names the signer after the open calls
-	/// [`Frame::decrypt_in_place`].
+	/// The steps run in this order:
+	///
+	/// 1. The frame, as it arrived, meets the requirements of `T` ([`Frame::validate_for`]).
+	/// 2. [`Frame::decrypt_in_place`] opens the body, and an `inflator` inflates a compressed one.
+	/// 3. The cleartext decodes as `T`.
+	///
+	/// The [`Opened`] drops with the frame, so a caller that names the signer
+	/// after the open calls [`Frame::decrypt_in_place`].
 	///
 	/// # Errors
 	///
+	/// - [`TightBeamError::Requirement`] -- the frame, as it arrived, fails a requirement of `T`.
 	/// - [`TightBeamError::MissingEncryptionInfo`] -- the metadata holds no
 	///   encryption info, as V0 metadata does.
 	/// - [`TightBeamError::MissingInflator`] -- the body is compressed and `inflator` is `None`.
 	/// - The errors of [`DecryptContent::decrypt_content`] and [`Inflator::decompress`].
-	/// - [`TightBeamError::SerializationError`] -- the cleartext fails to decode as `T`.
+	/// - [`TightBeamError::SerializationError`] -- the cleartext fails to decode as
+	///   `T`, or a SET in it holds its elements out of DER order.
 	pub async fn decrypt<T>(
 		mut self,
 		decryptor: &(impl Decryptor + ?Sized),
@@ -78,9 +84,9 @@ impl Frame {
 		T: Message,
 	{
 		// The typed message is the one product, so the digest and the
-		// signature the open takes out drop with the frame.
-		let _opened = self.decrypt_in_place(decryptor, inflator).await?;
-		crate::decode::<T>(&self.message)
+		// signature that the open takes out drop with the frame.
+		let open = async |frame: &mut Self| frame.decrypt_in_place(decryptor, inflator).await.map(drop);
+		self.open_message::<T>(open).await
 	}
 
 	/// Decrypt the message body in place, so an encrypted frame becomes its
@@ -98,6 +104,8 @@ impl Frame {
 	///
 	/// - [`TightBeamError::MissingEncryptionInfo`] -- the frame is not encrypted.
 	/// - [`TightBeamError::MissingInflator`] -- the body is compressed and `inflator` is `None`.
+	/// - The errors of [`Frame::inflate_in_place`] for the `CompressedData`,
+	///   when it names an algorithm or a form that `inflator` refuses.
 	/// - The errors of [`DecryptContent::decrypt_content`] and [`Inflator::decompress`].
 	pub async fn decrypt_in_place(
 		&mut self,
@@ -108,11 +116,15 @@ impl Frame {
 			return Err(TightBeamError::MissingEncryptionInfo);
 		};
 
-		// A compressed body needs an inflator, so its absence refuses before
-		// any work.
+		// A compressed body needs an inflator that reverses the algorithm its
+		// `CompressedData` names, so a missing or a refusing inflator refuses
+		// before any work.
 		let inflator = match (self.metadata.compactness.is_some(), inflator) {
 			(false, _) => None,
-			(true, Some(inflator)) => Some(inflator),
+			(true, Some(inflator)) => {
+				self.metadata.admit_compactness(inflator)?;
+				Some(inflator)
+			}
 			(true, None) => return Err(TightBeamError::MissingInflator),
 		};
 
@@ -123,7 +135,7 @@ impl Frame {
 			Some(inflator) => {
 				let mut compressed = Zeroizing::new(self.message.clone());
 				decryptor.decrypt_content(sealed, &mut compressed).await?;
-				self.message = inflator.decompress(&compressed)?;
+				self.message = self.metadata.inflate(inflator, &compressed)?;
 			}
 			// The body opens in the buffer it arrived in, and a refused open
 			// leaves that buffer unchanged (`Decryptor::open`).
@@ -149,7 +161,7 @@ impl Frame {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::UnsupportedVersion`] -- the frame version predates confidentiality.
+	/// - [`TightBeamError::UnsupportedField`] -- the frame version predates confidentiality.
 	/// - [`TightBeamError::CoveredBeforeSeal`] -- the frame carries an FI digest or a signature.
 	/// - [`TightBeamError::EnvelopeError`] -- the provider or the envelope refuses to seal.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -277,6 +289,11 @@ mod tests {
 		use crate::oids::{COMPRESSION_ZSTD, DATA};
 		use crate::spki::AlgorithmIdentifier;
 		use crate::x509::attr::Attribute;
+
+		#[cfg(feature = "zstd")]
+		use crate::compress::ZstdCompression;
+		#[cfg(feature = "zstd")]
+		use crate::oids::COMPRESSION_ZLIB;
 
 		fn encrypted_frame() -> Result<Frame> {
 			let message = TestMessage::sample(Some("in-place"));
@@ -500,6 +517,10 @@ mod tests {
 		struct RefusingInflator;
 
 		impl crate::core::Inflator for RefusingInflator {
+			fn algorithm_oid(&self) -> ObjectIdentifier {
+				COMPRESSION_ZSTD
+			}
+
 			fn decompress(&self, _data: &[u8]) -> Result<Vec<u8>> {
 				Err(TightBeamError::MissingInflator)
 			}
@@ -514,6 +535,25 @@ mod tests {
 			let original = frame.clone();
 			let result = frame.decrypt_in_place(&cipher, Some(&RefusingInflator)).await;
 			assert!(result.is_err());
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		/// A sealed body that names another compression algorithm than the
+		/// inflator's is refused before the decrypt, so the frame keeps its
+		/// ciphertext.
+		#[cfg(feature = "zstd")]
+		#[tokio::test]
+		async fn a_body_under_another_compression_algorithm_is_refused_before_the_decrypt() -> Result<()> {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let mut frame = encrypted_frame()?;
+			let compression_alg = AlgorithmIdentifier { oid: COMPRESSION_ZLIB, parameters: None };
+			frame.metadata.compactness = Some(CompressedData { compression_alg, ..zstd_compactness() });
+			let original = frame.clone();
+
+			let refused = frame.decrypt_in_place(&cipher, Some(&ZstdCompression::default())).await;
+			let algorithms = ReceivedExpectedError::from((COMPRESSION_ZLIB, COMPRESSION_ZSTD));
+			assert!(matches!(refused, Err(TightBeamError::UnexpectedAlgorithm(found)) if found == algorithms));
 			assert_eq!(frame, original);
 			Ok(())
 		}
@@ -533,6 +573,8 @@ mod tests {
 		use crate::der::Length;
 		use crate::oids::AES_256_WRAP;
 		use crate::spki::AlgorithmIdentifierOwned;
+		use crate::version::GatedField;
+		use crate::Version;
 
 		/// The key identifier of [`provider`].
 		const KEY_IDENTIFIER: &[u8] = b"tb/test/frame/kek/v1";
@@ -719,7 +761,10 @@ mod tests {
 			let original = frame.clone();
 
 			let result = frame.encrypt_with_provider::<DefaultCryptoProvider>(&provider()?).await;
-			assert!(matches!(result, Err(TightBeamError::UnsupportedVersion(_))));
+			assert!(matches!(
+				result,
+				Err(TightBeamError::UnsupportedField { field: GatedField::Confidentiality, version: Version::V0 })
+			));
 			assert_eq!(frame, original);
 			Ok(())
 		}

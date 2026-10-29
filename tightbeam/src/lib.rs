@@ -81,7 +81,7 @@
 //!    │      V0: id: "msg-001", order: 1, message: MyMessage { .. }    │
 //!    │  }?;                                                           │
 //!    │                                                                │
-//!    │  let decode: MyMessage = tightbeam::decode(frame.message())?;  │
+//!    │  let decode: MyMessage = frame.decode_message()?;              │
 //!    └────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -158,15 +158,19 @@ pub(crate) mod frame;
 pub(crate) mod version;
 
 pub mod asn1;
+pub mod basis_points;
+pub mod clock;
 pub mod constants;
 pub mod core;
 pub mod error;
 pub mod flags;
 pub mod helpers;
 pub mod macros;
+pub mod marker;
 pub mod matrix;
 pub mod oids;
 pub mod prelude;
+pub mod task;
 pub mod urn;
 pub mod utils;
 

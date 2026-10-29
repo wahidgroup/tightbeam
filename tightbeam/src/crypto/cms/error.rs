@@ -97,6 +97,12 @@ pub enum EnvelopeError {
 	#[error("The KEM ciphertext is no uncompressed point on the curve")]
 	KemPoint,
 
+	/// The KEM of a provider refused an encapsulation, a `kemct`, or a
+	/// decapsulation.
+	#[cfg(feature = "kem")]
+	#[error("The KEM refused the encapsulation or the decapsulation")]
+	KemRefused,
+
 	/// The wrapped content key fails the integrity check of AES key wrap
 	/// (RFC 3394 §2.2.3), or it unwraps to no key of the cipher.
 	#[error("The wrapped content key fails to unwrap")]
@@ -180,6 +186,8 @@ impl EnvelopeError {
 			Self::Ukm => "ukm",
 			Self::KeyIdentifier => "key-identifier",
 			Self::KemPoint => "kem-point",
+			#[cfg(feature = "kem")]
+			Self::KemRefused => "kem-refused",
 			Self::KeyUnwrap => "key-unwrap",
 			Self::Authentication => "authentication",
 			Self::Encryption => "encryption",
