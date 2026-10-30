@@ -119,6 +119,15 @@ pub const TIGHTBEAM_RECORD_KEY_ID_DOMAIN: &[u8] = b"tb/session/record/kekid/v1";
 ///   <https://datatracker.ietf.org/doc/html/rfc9846#section-7.2>
 pub const TIGHTBEAM_EPOCH_KDF_INFO: &[u8] = b"tb/session/kdf/epoch/v1";
 
+/// The label that leads the fixed info of the combiner of a hybrid key
+/// exchange, ahead of the identifier of its pairing and its shares.
+///
+/// # Sources
+///
+/// - NIST SP 800-56C Rev. 2 § 4.1, the one-step key derivation and its `FixedInfo`:
+///   <https://csrc.nist.gov/pubs/sp/800/56/c/r2/final>
+pub const TIGHTBEAM_HYBRID_EXCHANGE_LABEL: &[u8] = b"tb/exchange/hybrid/v1";
+
 /// The purpose label that leads the `ukm` of the CMS opening's
 /// `KEMRecipientInfo`, ahead of the 32 random octets the seal draws for
 /// itself.

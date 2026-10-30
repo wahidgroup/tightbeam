@@ -130,6 +130,21 @@ pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3
 ///   <https://datatracker.ietf.org/doc/html/draft-wahby-cfrg-hpke-kem-secp256k1-01>
 pub const DHKEM_SECP256K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.3");
 
+/// The hybrid key exchange of ML-KEM-768 and ECDH over secp256k1, as the
+/// key exchange a security profile negotiates and as the `kem` of its
+/// `KemCiphertext` reply. Its parameters are absent.
+///
+/// No registry assigns an OID to a hybrid over secp256k1. Wahid Group, LLC
+/// therefore assigns this OID under its IANA PEN 64586, in the algorithms arc
+/// `.2`, and `docs/handshake.md` specifies its shares and its combiner.
+///
+/// # Sources
+///
+/// - FIPS 203, Module-Lattice-Based Key-Encapsulation Mechanism Standard:
+///   <https://csrc.nist.gov/pubs/fips/203/final>
+/// - NIST SP 800-227 §4.6, multi-algorithm KEMs: <https://csrc.nist.gov/pubs/sp/800/227/final>
+pub const KEM_SECP256K1_ML_KEM_768: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.2.4");
+
 /// The key purpose of a tightbeam frame and colony signer, as a
 /// `KeyPurposeId` of `extendedKeyUsage`.
 ///
@@ -324,6 +339,18 @@ pub const BINARY_FIELD_CURVES: [ObjectIdentifier; 18] = [
 /// - OID repository entry: <https://oid-base.com/get/1.3.101.110>
 pub const CURVE_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
 
+/// ML-KEM-768 (`id-alg-ml-kem-768`), the post-quantum KEM that NIST
+/// standardized from Kyber-768.
+///
+/// # Sources
+///
+/// - FIPS 203, Module-Lattice-Based Key-Encapsulation Mechanism Standard:
+///   <https://csrc.nist.gov/pubs/fips/203/final>
+/// - NIST Computer Security Objects Register, algorithm registration:
+///   <https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration>
+/// - RFC 9935, ML-KEM algorithm identifiers: <https://datatracker.ietf.org/doc/html/rfc9935>
+pub const KEM_ML_KEM_768: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.4.2");
+
 /// ML-KEM-1024 (`id-alg-ml-kem-1024`), the post-quantum KEM that NIST
 /// standardized from Kyber-1024.
 ///
@@ -503,6 +530,7 @@ mod tests {
 			(HKDF_SHA3_256, "1.2.840.113549.1.9.16.3.33"),
 			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
 			(DHKEM_SECP256K1, "1.3.6.1.4.1.64586.2.3"),
+			(KEM_SECP256K1_ML_KEM_768, "1.3.6.1.4.1.64586.2.4"),
 			(KEY_PURPOSE_SIGNER, "1.3.6.1.4.1.64586.3.1"),
 			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
 			(HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
@@ -522,6 +550,7 @@ mod tests {
 			(CURVE_NIST_P521, "1.3.132.0.35"),
 			(CURVE_X962_C_TWO, "1.2.840.10045.3.0"),
 			(CURVE_X25519, "1.3.101.110"),
+			(KEM_ML_KEM_768, "2.16.840.1.101.3.4.4.2"),
 			(KEM_ML_KEM_1024, "2.16.840.1.101.3.4.4.3"),
 			(HANDSHAKE_PROTOCOL_VERSION, "1.3.6.1.4.1.64586.1.1"),
 			(HANDSHAKE_ALGORITHM_PROFILE, "1.3.6.1.4.1.64586.1.2"),

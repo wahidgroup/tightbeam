@@ -1397,6 +1397,7 @@ mod tests {
 		let closing = awaiting.anonymous(vec![finished_attribute(&awaiting.tag())]);
 		let mut sealed = closing.auth_enveloped()?.into_value();
 		let alert = attribute_of(HANDSHAKE_ABORT_ALERT, &4u8);
+
 		sealed.unauth_attrs = Some(Attributes::try_from(vec![alert])?);
 
 		let refusal = awaiting.server.finish(HandshakeMessage::try_from(sealed)?).await;
@@ -1479,28 +1480,48 @@ mod tests {
 		));
 	}
 
-	/// A handshake under a provider whose digest is SHA3-512 seals the whole
-	/// 64-byte digest as its transcript hash, and its closing confirms and
-	/// opens under that hash.
-	#[tokio::test]
-	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash() -> Result<(), Box<dyn Error>> {
+	/// The server of an HPKE handshake under the provider `P`, once the three
+	/// legs run with a client that presents its identity.
+	async fn server_after_handshake<P: HandshakeProvider>() -> Result<Handshake<Server, Hpke, P>, Box<dyn Error>> {
 		let server_identity = create_test_certificate();
 		let identity = Some(client_identity(&create_test_certificate()));
 		let settings = hpke_client_settings(&server_identity.certificate, identity);
-		let profiles = SupportedProfiles::from(RunnableProfile::<Aes256Sha3_512Provider>::native().descriptor());
+		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
 		let signing = signing_identity(&server_identity);
 		let server_config = ServerConfig::new(HpkeServerSettings::new(), signing, profiles, KeyPurposes::HOUSE)?;
 		let client_config = ClientConfig::new(settings, KeyPurposes::HOUSE)?;
-		let mut client = Handshake::<Client, Hpke, Aes256Sha3_512Provider>::client(client_config);
-		let mut server = Handshake::<Server, Hpke, Aes256Sha3_512Provider>::server(server_config);
+		let mut client = Handshake::<Client, Hpke, P>::client(client_config);
+		let mut server = Handshake::<Server, Hpke, P>::server(server_config);
 
 		let opening = client.start()?;
 		let reply = server.reply(opening).await?;
 		let closing = client.respond(reply).await?;
 		server.finish(closing).await?;
+		Ok(server)
+	}
 
+	/// A handshake under a provider whose digest is SHA3-512 seals the whole
+	/// 64-byte digest as its transcript hash, and its closing confirms and
+	/// opens under that hash.
+	#[tokio::test]
+	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash() -> Result<(), Box<dyn Error>> {
+		let server = server_after_handshake::<Aes256Sha3_512Provider>().await?;
 		let transcript_hash = server.transcript_hash().ok_or("the reply sealed the transcript")?;
 		assert_eq!(transcript_hash.as_bytes().len(), 64);
+		Ok(())
+	}
+
+	/// A handshake under the house provider of the hybrid key exchange runs to
+	/// its closing under the identifier of the hybrid.
+	#[cfg(feature = "preview-pqc")]
+	#[tokio::test]
+	async fn the_preview_provider_runs_the_hpke_flow() -> Result<(), Box<dyn Error>> {
+		use crate::crypto::profiles::PreviewPqcProvider;
+		use crate::oids::KEM_SECP256K1_ML_KEM_768;
+
+		let server = server_after_handshake::<PreviewPqcProvider>().await?;
+		let selected = server.selected_profile().ok_or("the reply selected a profile")?;
+		assert_eq!(selected.key_exchange, Some(KEM_SECP256K1_ML_KEM_768));
 		Ok(())
 	}
 

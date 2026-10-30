@@ -14,6 +14,8 @@
 //! | [`ReplyAttribute`] | The attribute that carries the server's share in the CMS Finished |
 //! | [`ReplyKind`] | The kind of a reply, which picks its attribute |
 //! | [`Ecdhe`] | The house exchange: ECDH over a [`HandshakeCurve`] |
+//! | [`MlKem`] | ML-KEM-768 and ML-KEM-1024, under the `preview-pqc` feature |
+//! | [`Hybrid`] | A KEM paired with a classical exchange, under the `preview-pqc`, `sha3`, and `kdf` features |
 //!
 //! # Sources
 //!
@@ -23,6 +25,16 @@
 //! - RFC 9629 (August 2024), §3, the `kem` and `kemct` of a KEM recipient.
 //! - SEC 1 v2.0 (May 2009), §2.3.3 and §3.3.1, the point forms and the x-coordinate an ECDH keeps.
 //! - NIST SP 800-227 (September 2025), §4.6, a multi-algorithm KEM is a KEM.
+
+#[cfg(all(feature = "preview-pqc", feature = "sha3", feature = "kdf"))]
+mod hybrid;
+#[cfg(feature = "preview-pqc")]
+mod lattice;
+
+#[cfg(all(feature = "preview-pqc", feature = "sha3", feature = "kdf"))]
+pub use hybrid::{Hybrid, HybridPair, HybridPending, HybridShare, Secp256k1MlKem768};
+#[cfg(feature = "preview-pqc")]
+pub use lattice::{MlKem, MlKem1024, MlKem768, MlKemOffer, MlKemParameterSet, MlKemReply};
 
 use core::marker::PhantomData;
 
@@ -103,8 +115,10 @@ impl<C> HandshakeCurve for C where
 /// - `static_key` MUST read every certificate key whose secret can produce a
 ///   share of this exchange. X25519 reads `id-X25519` and `id-Ed25519`,
 ///   because one scalar serves both keys (RFC 7748 §4.1). A hybrid reads the
-///   keys of its classical part. An exchange whose shares cannot collapse into
-///   a static key names `StaticKey = Infallible`.
+///   keys of its classical part. An exchange names `StaticKey = Infallible`
+///   when no certificate key of a sender can produce its share, as ML-KEM
+///   does: its offer is a client's share, and a client's certificate holds a
+///   signing key.
 /// - `REPLY` is [`ReplyKind::Dh`] when the reply is the responder's public
 ///   key, and [`ReplyKind::Kem`] when it is a ciphertext.
 /// - `Pending` wipes its secret where it drops (CWE-226).
@@ -137,6 +151,7 @@ pub trait KeyExchange: AssociatedOid + Sized + Send + Sync + 'static {
 	/// # Errors
 	///
 	/// - [`KeyExchangeError::Refused`] -- the exchange refuses the offer.
+	/// - [`KeyExchangeError::Encoding`] -- a value the secret binds fails to encode.
 	fn respond(
 		offer: &Self::Offer,
 		rng: &mut dyn CryptoRngCore,
@@ -149,6 +164,7 @@ pub trait KeyExchange: AssociatedOid + Sized + Send + Sync + 'static {
 	/// # Errors
 	///
 	/// - [`KeyExchangeError::Refused`] -- the exchange refuses the reply.
+	/// - [`KeyExchangeError::Encoding`] -- a value the secret binds fails to encode.
 	fn complete(pending: &Self::Pending, reply: &Self::Reply) -> Result<SecretSlice<u8>, KeyExchangeError>;
 
 	/// Reads `spki`, the key of a certificate, in the form that a share of this
@@ -208,6 +224,19 @@ pub trait KeyShare<X: KeyExchange>: Sized + Send + Sync + 'static {
 		let public_key = BitString::from_bytes(&self.to_octets()).map_err(|_| KeyExchangeError::Encoding)?;
 		Ok(OriginatorPublicKey { algorithm, public_key })
 	}
+}
+
+/// A share whose OCTET STRING form has one width, so a [`Hybrid`] splits a
+/// share of two parts at the width of the first.
+///
+/// An implementation keeps both rules:
+///
+/// - [`KeyShare::to_octets`] returns `WIDTH` octets.
+/// - [`KeyShare::from_octets`] refuses octets of any other width with [`KeyExchangeError::Width`].
+#[cfg(feature = "preview-pqc")]
+pub trait FixedWidthShare {
+	/// The width of the share in its OCTET STRING form, in bytes.
+	const WIDTH: usize;
 }
 
 /// The kind of an exchange's reply, which fixes its [`ReplyAttribute`].
@@ -447,6 +476,12 @@ impl<C: HandshakeCurve> KeyShare<Ecdhe<C>> for EcdheShare<C> {
 	}
 }
 
+/// The compressed form, which the OCTET STRING carriers hold.
+#[cfg(feature = "preview-pqc")]
+impl<C: HandshakeCurve> FixedWidthShare for EcdheShare<C> {
+	const WIDTH: usize = CompressedPointSize::<C>::USIZE;
+}
+
 impl<C: HandshakeCurve> KeyExchange for Ecdhe<C> {
 	type Offer = EcdheShare<C>;
 	type Reply = EcdheShare<C>;
@@ -529,8 +564,14 @@ mod tests {
 	use crate::random::OsRng;
 
 	/// The point of a fresh secp256k1 scalar.
-	fn fresh_point() -> PublicKey<Secp256k1> {
+	pub(super) fn fresh_point() -> PublicKey<Secp256k1> {
 		SecretKey::<Secp256k1>::random(&mut OsRng).public_key()
+	}
+
+	/// The octets of `secret`, to compare with a vector or another secret.
+	#[cfg(feature = "preview-pqc")]
+	pub(super) fn octets_of(secret: &SecretSlice<u8>) -> Vec<u8> {
+		secret.with(|octets| octets.to_vec())
 	}
 
 	#[test]

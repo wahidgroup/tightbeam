@@ -22,11 +22,11 @@ use tightbeam::der::oid::AssociatedOid;
 use tightbeam::oids::CURVE_X25519;
 use tightbeam::random::CryptoRngCore;
 use tightbeam::spki::{AlgorithmIdentifierRef, SubjectPublicKeyInfoRef};
-use tightbeam::testing::unhex;
+use tightbeam::testing::{unhex, PublishedDraw};
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::zeroize::ZeroizeOnDrop;
 
-use super::{cms_opens, hello_carrying, hpke_opens, hpke_pair, p384_identity, OnP384, PublishedDraw, CONTENT};
+use super::{cms_opens, hello_carrying, hpke_opens, hpke_pair, p384_identity, OnP384, CONTENT};
 
 /// `id-Ed25519` (RFC 8410 §3).
 const ID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");

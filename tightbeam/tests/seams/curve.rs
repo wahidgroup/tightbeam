@@ -22,7 +22,7 @@
 //!
 //! - [`p384`] and [`p521`], the same parts on P-384 and on P-521,
 //! - [`signer`], a provider that signs on P-384 and agrees on secp256k1, and
-//! - [`exchange`], outside key exchanges: ECDH, X25519, and ML-KEM-768.
+//! - [`exchange`], outside key exchanges: ECDH, X25519, ML-KEM-768, and a hybrid of ML-KEM-768 with ECDH.
 
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
@@ -34,8 +34,6 @@ use p256::elliptic_curve::group::Curve as _;
 use p256::elliptic_curve::point::AffineCoordinates;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{NistP256, PublicKey};
-use rand_core::impls::{next_u32_via_fill, next_u64_via_fill};
-use rand_core::{CryptoRng, Error as RandError, RngCore};
 use tightbeam::cms::content_info::ContentInfo;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes256Gcm, Aes256GcmOid};
 use tightbeam::crypto::cms::{Encapsulation, EnvelopeError, KeyAgreementIdentity, RecipientKem};
@@ -71,7 +69,7 @@ use tightbeam::random::{CryptoRngCore, OsRng};
 use tightbeam::spki::{
 	AlgorithmIdentifierOwned, Document, EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef,
 };
-use tightbeam::testing::{unhex, TestCertificate, TestCmsServer, TestKey};
+use tightbeam::testing::{unhex, PublishedDraw, TestCertificate, TestCmsServer, TestKey};
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
 	Client, ClientConfig, ClientFlow, ClientHello, Cms, CmsClientSettings, CmsIdentityPair, CmsServerSettings,
@@ -482,33 +480,6 @@ impl<C: HandshakeCurve> DiffieHellman<C> for AgreementBackend<C> {
 		Box::pin(async move { Ok(agreed) })
 	}
 }
-
-/// A random source that draws the octets a published vector names, in order,
-/// so an operation that draws from it draws the scalars or seeds of the
-/// vector.
-struct PublishedDraw(Vec<u8>);
-
-impl RngCore for PublishedDraw {
-	fn next_u32(&mut self) -> u32 {
-		next_u32_via_fill(self)
-	}
-
-	fn next_u64(&mut self) -> u64 {
-		next_u64_via_fill(self)
-	}
-
-	fn fill_bytes(&mut self, dest: &mut [u8]) {
-		let drawn: Vec<u8> = self.0.drain(..dest.len()).collect();
-		dest.copy_from_slice(&drawn);
-	}
-
-	fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
-		self.fill_bytes(dest);
-		Ok(())
-	}
-}
-
-impl CryptoRng for PublishedDraw {}
 
 /// The certificate of the point `point` on the curve `curve`, cut from the
 /// self-signed house certificate of a fresh secp256k1 key, whose key

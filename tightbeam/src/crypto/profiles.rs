@@ -42,14 +42,22 @@ use crate::crypto::common::BlockSizeUser;
 use crate::crypto::common::KeySizeUser;
 #[cfg(feature = "ecdh")]
 use crate::crypto::exchange::{Ecdhe, KeyExchange};
+#[cfg(all(feature = "preview-pqc", feature = "ecdh", feature = "sha3", feature = "kdf"))]
+use crate::crypto::exchange::{Hybrid, Secp256k1MlKem768};
 #[cfg(all(feature = "digest", feature = "sha3"))]
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "digest")]
 use crate::crypto::hash::{CoreProxy, Digest, HashCore};
+#[cfg(all(feature = "hpke", feature = "signature"))]
+use crate::crypto::hpke::DhKemSecp256k1;
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use crate::crypto::hpke::DhKemSecp256k1Enc;
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
 #[cfg(feature = "aead")]
 use crate::crypto::key::KeyError;
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use crate::crypto::key::Secp256k1KeyProvider;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::Secp256k1Signature;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -879,6 +887,62 @@ impl SecurityProfile for TightbeamProfile {
 	type KeyWrapOid = Aes256Wrap;
 }
 
+/// Implements every role of a house provider that holds its profile in a
+/// `profile` field: SHA3-256, AES-256-GCM, AES-256 key wrap, ECDSA over
+/// secp256k1, HKDF-SHA3-256, the key exchange `$exchange`, and
+/// DHKEM(secp256k1, HKDF-SHA256) as its KEM, under the profile `$profile`.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+macro_rules! impl_house_provider {
+	($provider:ty, $profile:ty, $exchange:ty) => {
+		impl DigestProvider for $provider {
+			type Digest = Sha3_256;
+		}
+
+		impl AeadProvider for $provider {
+			type AeadCipher = Aes256Gcm;
+		}
+
+		impl KeyWrapProvider for $provider {
+			type KeyWrap = Aes256Wrap;
+		}
+
+		impl SigningProvider for $provider {
+			type Signature = Secp256k1Signature;
+			type VerifyingKey = Secp256k1VerifyingKey;
+		}
+
+		impl KdfProvider for $provider {
+			type Kdf = HkdfSha3_256;
+		}
+
+		impl KeyExchangeProvider for $provider {
+			type KeyExchange = $exchange;
+		}
+
+		/// The house KEM role: DHKEM(secp256k1, HKDF-SHA256) under the
+		/// RustCrypto `kem` traits, whose recipient key is a
+		/// [`Secp256k1KeyProvider`].
+		#[cfg(all(feature = "kem", feature = "hpke"))]
+		impl KemProvider for $provider {
+			type EncappedKey = DhKemSecp256k1Enc;
+			type Kem = DhKemSecp256k1;
+			type DecapsulationKey = Secp256k1KeyProvider;
+
+			const USAGE: KeyUsages = KeyUsages::KeyAgreement;
+		}
+
+		impl CryptoProvider for $provider {
+			type Profile = $profile;
+			#[cfg(feature = "hpke")]
+			type Kem = DhKemSecp256k1;
+
+			fn profile(&self) -> &Self::Profile {
+				&self.profile
+			}
+		}
+	};
+}
+
 /// The house provider, which runs [`TightbeamProfile`] and keeps the
 /// [`DefaultStrengthFloor`].
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -888,59 +952,52 @@ pub struct DefaultCryptoProvider {
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl DigestProvider for DefaultCryptoProvider {
+impl_house_provider!(DefaultCryptoProvider, TightbeamProfile, Ecdhe<k256::Secp256k1>);
+
+/// The profile [`PreviewPqcProvider`] runs: the algorithms of
+/// [`TightbeamProfile`], with the hybrid of ML-KEM-768 and ECDH over
+/// secp256k1 as its key exchange.
+#[cfg(all(feature = "preview-pqc", feature = "ecdh", feature = "sha3", feature = "kdf"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PreviewPqcProfile;
+
+#[cfg(all(feature = "preview-pqc", feature = "ecdh", feature = "sha3", feature = "kdf"))]
+impl SecurityProfile for PreviewPqcProfile {
+	#[cfg(feature = "digest")]
 	type Digest = Sha3_256;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl AeadProvider for DefaultCryptoProvider {
-	type AeadCipher = Aes256Gcm;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl KeyWrapProvider for DefaultCryptoProvider {
-	type KeyWrap = Aes256Wrap;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl SigningProvider for DefaultCryptoProvider {
-	type Signature = Secp256k1Signature;
-	type VerifyingKey = Secp256k1VerifyingKey;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl KdfProvider for DefaultCryptoProvider {
+	#[cfg(feature = "aead")]
+	type AeadOid = Aes256GcmOid;
+	#[cfg(feature = "signature")]
+	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
+	type KeyExchange = Hybrid<Secp256k1MlKem768>;
+	#[cfg(feature = "aead")]
+	type KeyWrapOid = Aes256Wrap;
 }
 
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl KeyExchangeProvider for DefaultCryptoProvider {
-	type KeyExchange = Ecdhe<k256::Secp256k1>;
+/// The house provider with a post-quantum key exchange: it runs
+/// [`PreviewPqcProfile`] and keeps the [`DefaultStrengthFloor`]. Its envelope
+/// KEM is the KEM of [`DefaultCryptoProvider`].
+#[cfg(all(
+	feature = "preview-pqc",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PreviewPqcProvider {
+	profile: PreviewPqcProfile,
 }
 
-/// The house KEM role: DHKEM(secp256k1, HKDF-SHA256) under the RustCrypto
-/// `kem` traits, whose recipient key is a [`Secp256k1KeyProvider`].
-///
-/// [`Secp256k1KeyProvider`]: crate::crypto::key::Secp256k1KeyProvider
-#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
-impl KemProvider for DefaultCryptoProvider {
-	type EncappedKey = crate::crypto::hpke::DhKemSecp256k1Enc;
-	type Kem = crate::crypto::hpke::DhKemSecp256k1;
-	type DecapsulationKey = crate::crypto::key::Secp256k1KeyProvider;
-
-	const USAGE: KeyUsages = KeyUsages::KeyAgreement;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl CryptoProvider for DefaultCryptoProvider {
-	type Profile = TightbeamProfile;
-	#[cfg(all(feature = "hpke", feature = "signature"))]
-	type Kem = crate::crypto::hpke::DhKemSecp256k1;
-
-	fn profile(&self) -> &Self::Profile {
-		&self.profile
-	}
-}
+#[cfg(all(
+	feature = "preview-pqc",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+impl_house_provider!(PreviewPqcProvider, PreviewPqcProfile, Hybrid<Secp256k1MlKem768>);
 
 #[cfg(test)]
 mod tests {
@@ -948,8 +1005,8 @@ mod tests {
 	use crate::constants::{
 		TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
 		TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_FRAME_UKM_LABEL,
-		TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
-		TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
+		TIGHTBEAM_HYBRID_EXCHANGE_LABEL, TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN,
+		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 	};
 
 	/// Guard the domain constants against accidental change.
@@ -969,6 +1026,7 @@ mod tests {
 		assert_eq!(TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1");
 		assert_eq!(TIGHTBEAM_SERVER_FINISHED_KEY_INFO, b"tb/handshake/finished/server/mac/v1");
+		assert_eq!(TIGHTBEAM_HYBRID_EXCHANGE_LABEL, b"tb/exchange/hybrid/v1");
 	}
 
 	/// Each optional field carries its own tag, so every OID decodes into its
@@ -1046,6 +1104,62 @@ mod tests {
 		let fixture = SecurityProfileDesc::from(&Aes256Sha3_512Profile).to_der()?;
 		assert_eq!((house, fixture), (unhex(TIGHTBEAM_DESCRIPTOR), unhex(SHA3_512_DESCRIPTOR)));
 		Ok(())
+	}
+
+	/// The DER of the descriptor of [`PreviewPqcProfile`]: the house
+	/// descriptor, with the hybrid of ML-KEM-768 and ECDH over secp256k1 as
+	/// its key exchange.
+	#[cfg(all(
+		feature = "preview-pqc",
+		feature = "testing",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	const PREVIEW_PQC_DESCRIPTOR: &str = "3051a00b0609608648016503040208a10b060960864801650304\
+		012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40c060a2b0601040183\
+		f84a0204a50b060960864801650304012d";
+
+	/// The preview profile negotiates the hybrid under its own identifier,
+	/// encodes as its known DER, and its 192-bit exchange meets the default
+	/// floor.
+	#[cfg(all(
+		feature = "preview-pqc",
+		feature = "testing",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	#[test]
+	fn the_preview_profile_negotiates_the_hybrid() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::der::Encode;
+		use crate::oids::KEM_SECP256K1_ML_KEM_768;
+		use crate::testing::unhex;
+		use crate::transport::handshake::negotiation::RunnableProfile;
+
+		let descriptor = SecurityProfileDesc::from(&PreviewPqcProfile);
+		let strength = RunnableProfile::<PreviewPqcProvider>::native().strength();
+
+		let negotiated = (descriptor.key_exchange, strength.key_exchange);
+		let expected = (Some(KEM_SECP256K1_ML_KEM_768), SecurityStrength::BITS_192);
+		assert_eq!(negotiated, expected);
+		assert!(PreviewPqcProvider::strength_floor().meets_floor(&strength));
+		assert_eq!(descriptor.to_der()?, unhex(PREVIEW_PQC_DESCRIPTOR));
+		Ok(())
+	}
+
+	/// A server that supports the preview profile alone finds no profile in an
+	/// offer of the house profile alone, since the two name other exchanges.
+	#[cfg(all(
+		feature = "preview-pqc",
+		feature = "testing",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	#[test]
+	fn a_house_offer_finds_no_profile_on_a_preview_server() {
+		use crate::transport::handshake::negotiation::{NegotiationError, SecurityOffer};
+
+		let offer = SecurityOffer::new(Vec::from([SecurityProfileDesc::from(&TightbeamProfile)]));
+		let supported = [SecurityProfileDesc::from(&PreviewPqcProfile)];
+
+		let selected = offer.select_profile(supported);
+		assert!(matches!(selected, Err(NegotiationError::NoMutualProfile)));
 	}
 
 	/// Each ECC order rates as its row of NIST SP 800-57 Part 1 Rev. 5 Table 2:

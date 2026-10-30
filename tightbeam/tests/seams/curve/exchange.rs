@@ -2,8 +2,9 @@
 //! brings, each a [`KeyExchange`] with shares of its own:
 //!
 //! - [`OutsideDh`], ECDH over P-256 or P-384 under the outside arc, whose draw a test can fix,
-//! - [`X25519`](x25519::X25519), the exchange of RFC 7748, through `x25519-dalek`, and
-//! - [`MlKem768`](ml_kem::MlKem768), the KEM of FIPS 203, through `ml-kem`.
+//! - [`X25519`](x25519::X25519), the exchange of RFC 7748, through `x25519-dalek`,
+//! - [`MlKem768`](ml_kem::MlKem768), the KEM of FIPS 203, through `ml-kem`, and
+//! - a hybrid of the outside ML-KEM-768 with [`OutsideDh`], under a pairing of its own, in [`hybrid`].
 //!
 //! [`OnP384`] runs each of them. It signs under ECDSA over P-384, and a CMS
 //! server under it agrees through a key on P-256, so no signing key is a key
@@ -39,11 +40,14 @@ use tightbeam::testing::unhex;
 use tightbeam::transport::handshake::{HandshakeError, HandshakeProvider};
 use tightbeam::zeroize::Zeroizing;
 
-use super::p384::{p384_cms_server, p384_identity, p384_identity_of, OnP384};
-use super::{
-	cms_pair, first_record_opened, hello_carrying, hpke_pair, AgreementBackend, P256Kem, PublishedDraw, CONTENT,
-};
+#[cfg(feature = "preview-pqc")]
+use tightbeam::crypto::exchange::FixedWidthShare;
 
+use super::p384::{p384_cms_server, p384_identity, p384_identity_of, OnP384};
+use super::{cms_pair, first_record_opened, hello_carrying, hpke_pair, AgreementBackend, P256Kem, CONTENT};
+
+#[cfg(feature = "preview-pqc")]
+mod hybrid;
 mod ml_kem;
 mod x25519;
 
@@ -149,6 +153,12 @@ impl<C: DhCurve> DhShare<C> {
 		let shared = diffie_hellman(scalar, self.0.as_affine());
 		SecretSlice::from(shared.raw_secret_bytes().to_vec())
 	}
+}
+
+/// The compressed form, which the OCTET STRING carriers hold.
+#[cfg(feature = "preview-pqc")]
+impl<C: DhCurve> FixedWidthShare for DhShare<C> {
+	const WIDTH: usize = CompressedPointSize::<C>::USIZE;
 }
 
 impl<C: DhCurve, D: Draw> KeyShare<OutsideDh<C, D>> for DhShare<C> {

@@ -58,7 +58,7 @@ pub use teardown::Teardown;
 pub use vectors::unhex;
 
 #[cfg(feature = "random")]
-pub use vectors::SeededStream;
+pub use vectors::{PublishedDraw, SeededStream};
 
 #[cfg(all(feature = "hpke", feature = "signature"))]
 pub use envelope::EnvelopeRecipient;

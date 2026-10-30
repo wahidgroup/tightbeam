@@ -98,7 +98,6 @@ Four rules order the steps of both flows:
    5. It settles the receipt countersignature.
 
    Because of this order:
-
    - Only a client that derived the same secret reaches a validator.
    - A budget-bearing session activates only after the countersignature verifies.
    - A refused settlement drops the handshake secret, so a replay of that closing has nothing to complete.
@@ -112,12 +111,12 @@ Four rules order the steps of both flows:
 
 Both flows negotiate the security profile and the transport capabilities in their opening messages. [README §8.5.5](../README.md#855-security-profile-negotiation) states the rules, and these types carry them:
 
-| Message                       | Type              | Fields                                                                                                                                              |
-| ----------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The client's profile offer    | `SecurityOffer`   | `profiles`, a `Vec<SecurityProfileDesc>` in the client's order                                                                                     |
-| The server's selection        | `SecurityAccept`  | `profile`, the one `SecurityProfileDesc` the server selects in its own order                                                                       |
+| Message                       | Type              | Fields                                                                                                                                                       |
+| ----------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| The client's profile offer    | `SecurityOffer`   | `profiles`, a `Vec<SecurityProfileDesc>` in the client's order                                                                                               |
+| The server's selection        | `SecurityAccept`  | `profile`, the one `SecurityProfileDesc` the server selects in its own order                                                                                 |
 | The client's transport offer  | `TransportOffer`  | `mux`, `max_peer_initiated_streams`, `chunk_payload_size`, `credit_unit`, `initial_stream_credit`, `requested_budgets`, and the opaque `authorization` token |
-| The server's transport answer | `TransportAccept` | `mux`, `max_peer_initiated_streams`, `chunk_payload_size`, `credit_unit`, `initial_stream_credit`, and `granted_budgets`                           |
+| The server's transport answer | `TransportAccept` | `mux`, `max_peer_initiated_streams`, `chunk_payload_size`, `credit_unit`, `initial_stream_credit`, and `granted_budgets`                                     |
 
 Each failure of [README §8.5.6](../README.md#856-negotiation-and-failure-modes) surfaces as one `HandshakeError`:
 
@@ -224,11 +223,11 @@ An HPKE server holds one signing identity, and its secret derives from the two e
 
 Every path ends at a trust anchor of the store, and two certificates name one anchor when the path validation of each ends there (RFC 5280 § 6.1.1 (d)):
 
-| The anchor of      | Returned by                          |
-| ------------------ | ------------------------------------ |
-| A certificate      | `CertificateTrust::trust_anchor`     |
-| A pinned chain     | `CertificateTrust::verify_chain`     |
-| A presented path   | `CertificateTrust::verify_presented` |
+| The anchor of    | Returned by                          |
+| ---------------- | ------------------------------------ |
+| A certificate    | `CertificateTrust::trust_anchor`     |
+| A pinned chain   | `CertificateTrust::verify_chain`     |
+| A presented path | `CertificateTrust::verify_presented` |
 
 A signing certificate under an intermediate therefore pairs with a key-agreement certificate that the root issued, and a chain that starts at a held intermediate names the root above it.
 
@@ -278,8 +277,8 @@ The policy evaluates the identity certificate of the flow once the store admits 
 
 Each validity check of a handshake reads the clock of its side:
 
-| Side | Setter | A transport sets |
-| --- | --- | --- |
+| Side   | Setter                     | A transport sets                  |
+| ------ | -------------------------- | --------------------------------- |
 | Client | `ClientConfig::with_clock` | The clock of its `EndpointConfig` |
 | Server | `ServerConfig::with_clock` | The clock of its `EndpointConfig` |
 
@@ -382,13 +381,13 @@ confirm = HMAC-H(mac_c, transcript_hash)
 server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 ```
 
-| Input  | What it is                                                                                                 |
-| ------ | ---------------------------------------------------------------------------------------------------------- |
-| `ee`   | The secret of the key exchange of the client's ephemeral `R` and the server's ephemeral `E`                |
-| `base` | The 32-byte base secret that the CMS client seals to the key-agreement certificate, in the CMS flow alone  |
-| `S`    | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS                         |
-| `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile            |
-| `H`    | The negotiated digest, SHA3-256 in the default profile. `Hash.length` is its output length                 |
+| Input  | What it is                                                                                                |
+| ------ | --------------------------------------------------------------------------------------------------------- |
+| `ee`   | The secret of the key exchange of the client's ephemeral `R` and the server's ephemeral `E`               |
+| `base` | The 32-byte base secret that the CMS client seals to the key-agreement certificate, in the CMS flow alone |
+| `S`    | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS                        |
+| `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile           |
+| `H`    | The negotiated digest, SHA3-256 in the default profile. `Hash.length` is its output length                |
 
 Each input follows a standard:
 
@@ -416,7 +415,7 @@ The provider's `KeyExchange` runs the ephemeral exchange of a handshake and of e
 An implementation of `KeyExchange` keeps these rules:
 
 - `REPLY` is `ReplyKind::Dh` when the reply is the responder's public key, and `ReplyKind::Kem` when it is a ciphertext, a hybrid's among them.
-- `static_key` MUST read every certificate key whose secret can produce a share of the exchange. `Ecdhe<C>` reads a key of its curve under `id-ecPublicKey`, `id-ecDH`, or `id-ecMQV` (RFC 5480 § 2.1.1, § 2.1.2). X25519 reads `id-X25519` and `id-Ed25519` keys, because one scalar serves both (RFC 7748 § 4.1). An exchange whose shares cannot collapse into a static key, such as ML-KEM, names `StaticKey = Infallible`.
+- `static_key` MUST read every certificate key whose secret can produce a share of the exchange. `Ecdhe<C>` reads a key of its curve under `id-ecPublicKey`, `id-ecDH`, or `id-ecMQV` (RFC 5480 § 2.1.1, § 2.1.2). X25519 reads `id-X25519` and `id-Ed25519` keys, because one scalar serves both (RFC 7748 § 4.1). An exchange names `StaticKey = Infallible` when no certificate key of a sender can produce its share, as ML-KEM does: its offer is a client's share, and a client's certificate holds a signing key.
 - `respond` and `complete` refuse a share only with a `KeyExchangeError`, and the refusal aborts the handshake. X25519 refuses an all-zero secret (RFC 8446 § 7.4.2).
 - `Pending` wipes its secret where it drops (CWE-226).
 - The secret of one exchange has one width, so the key schedule concatenates it unambiguously.
@@ -433,6 +432,42 @@ Each carrier holds a share in its own syntax:
 | The CMS Finished, KEM reply    | `KemCiphertext ::= SEQUENCE { kem AlgorithmIdentifier, kemct OCTET STRING }` (RFC 9629 § 3) under `HANDSHAKE_SERVER_KEM_CIPHERTEXT`, `1.3.6.1.4.1.64586.1.28`                                  |
 
 The two reply attributes follow CMS, which splits key agreement from KEM recipients. A hybrid is a KEM (NIST SP 800-227 § 4.6) and writes `KemCiphertext`. A Finished that carries no reply attribute fails `MissingAttribute`, one that carries both fails `DuplicateAttribute`, and a reply in the carrier of the other kind fails `KeyExchange(Algorithm)`.
+
+### Post-quantum exchanges
+
+The `preview-pqc` feature adds two house exchanges and a provider that runs them. Their API may change while they stay in preview.
+
+| Item                    | What it is                                                                                                                                   |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MlKem768`, `MlKem1024` | ML-KEM (FIPS 203) through `ml-kem`, under `id-alg-ml-kem-768` and `id-alg-ml-kem-1024` (RFC 9935). They rate 192 and 256 bits (FIPS 203 § 8) |
+| `Hybrid<P>`             | A post-quantum part and a classical part that the `HybridPair` `P` names. Its OID is the OID of `P`                                          |
+| `Secp256k1MlKem768`     | The house pairing: `MlKem768` with `Ecdhe<Secp256k1>`, under `KEM_SECP256K1_ML_KEM_768`, `1.3.6.1.4.1.64586.2.4`. It rates 192 bits          |
+| `PreviewPqcProvider`    | The roles of `DefaultCryptoProvider`, with `Hybrid<Secp256k1MlKem768>` as its exchange                                                       |
+
+An ML-KEM exchange keeps these rules:
+
+- The offer is the encapsulation key: 1184 octets for ML-KEM-768 and 1568 for ML-KEM-1024. Its parse runs the modulus check of FIPS 203 § 7.2 and refuses a key that fails it (`Malformed`).
+- The reply is the ciphertext: 1088 octets for ML-KEM-768 and 1568 for ML-KEM-1024. It travels as a `KemCiphertext`.
+- A ciphertext that fails the re-encryption check of FIPS 203 § 6.3 yields the implicit rejection key, so the key confirmation refuses the handshake.
+- A client's certificate holds a signing key, which produces no offer, so the exchange names `StaticKey = Infallible`.
+
+A hybrid keeps these rules:
+
+- Each share is the share of the post-quantum part, then the share of the classical part, each at the width its `FixedWidthShare` states. The house shares are 1217 octets in the offer and 1121 in the reply.
+- A share collapses into a static key of its classical part, and `static_key` reads the keys of that part.
+- `REPLY` is `ReplyKind::Kem`, so the reply travels as a `KemCiphertext` under the OID of the pairing.
+- The combiner binds both shares of each part, so a hybrid rates at its stronger part (NIST SP 800-227 § 4.6.3).
+
+The combiner is the one-step key derivation of NIST SP 800-56C Rev. 2 § 4.1 over SHA3-256:
+
+```text
+ee = SHA3-256(00000001 || ss_pq || ss_classical || "tb/exchange/hybrid/v1" || DER(pairing OID) || offer || reply)
+```
+
+- The post-quantum secret is `Z`, and the classical secret is the auxiliary `T` of § 2.
+- The fixed info binds the label, the pairing, and both shares.
+
+Each share has the width its `FixedWidthShare` states, each secret has one width by the contract of `KeyExchange`, and the DER of the OID delimits itself, so the input parses one way.
 
 ### Ephemeral keys
 

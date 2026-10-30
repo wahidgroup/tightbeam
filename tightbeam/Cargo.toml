@@ -45,6 +45,7 @@ signature = { workspace = true, optional = true }
 digest = { workspace = true, optional = true }
 hkdf = { workspace = true, optional = true }
 kem = { workspace = true, optional = true }
+ml-kem = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 aes-kw = { workspace = true, optional = true }
@@ -155,8 +156,7 @@ transport = [
 compress = []
 transport-policy = ["transport", "policy"]
 transport-multiplex = ["transport", "std", "futures", "futures/std"]
-# UNSTABLE: PQXDH prekey/kdf-chain/hybrid-KEM primitives.
-unstable-pqxdh = []
+preview-pqc = ["kem", "dep:ml-kem"]
 tcp = ["transport", "std"]
 async-transport = ["transport", "std"]
 colony = [
@@ -281,6 +281,7 @@ std = [
 	"x509-cert/std",
 	"subtle?/std",
 	"kem?/std",
+	"ml-kem?/std",
 	"crypto-common?/std",
 	"zeroize?/std",
 	"digest?/std",

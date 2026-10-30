@@ -97,6 +97,7 @@ ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"der",
 ] }
 kem = { version = "=0.2.0", default-features = false }
+ml-kem = { version = "=0.2.3", default-features = false, features = ["zeroize"] }
 k256 = { version = "=0.13.4", default-features = false, features = [
 	"alloc",
 	"signature",
@@ -131,7 +132,6 @@ zstd-safe = { version = "=8.2.0", default-features = false }
 
 # Dev dependencies
 husky-rs = { version = "=0.3.3" }
-ml-kem = { version = "=0.2.1", default-features = false, features = ["zeroize"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 p521 = { version = "=0.13.3", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }

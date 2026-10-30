@@ -1,5 +1,7 @@
 //! Helpers that read published test vectors and fix the random draws of a
-//! known answer.
+//! known answer, and the published vectors that more than one suite runs.
+
+pub mod ml_kem;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -52,3 +54,36 @@ impl RngCore for SeededStream {
 
 #[cfg(feature = "random")]
 impl rand_core::CryptoRng for SeededStream {}
+
+/// A random source that draws the octets a published vector names, in order,
+/// so an operation that draws from it draws the scalars or seeds of the
+/// vector. A draw past the last octet panics.
+#[cfg(feature = "random")]
+pub struct PublishedDraw(
+	/// The octets left to draw.
+	pub Vec<u8>,
+);
+
+#[cfg(feature = "random")]
+impl RngCore for PublishedDraw {
+	fn next_u32(&mut self) -> u32 {
+		rand_core::impls::next_u32_via_fill(self)
+	}
+
+	fn next_u64(&mut self) -> u64 {
+		rand_core::impls::next_u64_via_fill(self)
+	}
+
+	fn fill_bytes(&mut self, dest: &mut [u8]) {
+		let drawn: Vec<u8> = self.0.drain(..dest.len()).collect();
+		dest.copy_from_slice(&drawn);
+	}
+
+	fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand_core::Error> {
+		self.fill_bytes(dest);
+		Ok(())
+	}
+}
+
+#[cfg(feature = "random")]
+impl rand_core::CryptoRng for PublishedDraw {}

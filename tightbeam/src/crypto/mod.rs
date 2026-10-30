@@ -58,3 +58,5 @@ pub use hkdf;
 pub use k256;
 #[cfg(feature = "kem")]
 pub use kem;
+#[cfg(feature = "preview-pqc")]
+pub use ml_kem;
