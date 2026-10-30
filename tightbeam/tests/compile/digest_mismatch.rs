@@ -19,7 +19,7 @@ impl SecurityProfile for Sha3_256Profile {
 	#[cfg(feature = "kdf")]
 	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type Curve = tightbeam::crypto::k256::Secp256k1;
+	type KeyExchange = tightbeam::crypto::exchange::Ecdhe<tightbeam::crypto::k256::Secp256k1>;
 }
 
 // Create a message with a profile that expects SHA3-256

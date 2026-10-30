@@ -29,10 +29,6 @@ use crate::crypto::x509::policy::CertificateValidation;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::clock::Clock;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::point::AffineCoordinates;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::PublicKey;
 #[cfg(feature = "transport-hpke")]
 use crate::crypto::sign::PresentedIssuers;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -44,27 +40,25 @@ use crate::crypto::x509::store::CertificateTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::utils::ValidityClock;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::{AgreementPoint, PeerCertificate, Signing};
+use crate::crypto::x509::{PeerCertificate, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::ObjectIdentifier;
-#[cfg(any(feature = "transport-cms", mux_rekey))]
-use crate::der::referenced::OwnedToRef;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::marker::{MaybeSend, MaybeSync};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ephemeral::{Distinct, PeerStatics};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::flow::Offer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::schedule::{PeerEphemeral, Terms};
-#[cfg(any(feature = "transport-cms", mux_rekey))]
-use crate::transport::handshake::HandshakeCurve;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::HandshakeProvider;
+use crate::transport::handshake::schedule::Terms;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::SessionPeer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::{ClientConfig, ClientFlow};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::{Exchange, HandshakeProvider, ServerShare};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::Certificate;
 
@@ -449,6 +443,8 @@ mod pair {
 	pub struct AdmittedServer<P: HandshakeProvider> {
 		/// The case of this server.
 		admitted: Admitted<P>,
+		/// The static keys this server's ephemeral must differ from.
+		statics: PeerStatics<Exchange<P>>,
 		/// The record of this server the session keeps as its peer.
 		peer: SessionPeer,
 	}
@@ -489,8 +485,9 @@ mod pair {
 			// its life ends here.
 			let AdmittedSigning { signing, verdict } = signing;
 			let _admitted: LearnedVerdict = verdict;
+			let statics = PeerStatics::of(signing.certificate(), None);
 			let peer = SessionPeer::admitted(&signing)?;
-			Ok(Self { admitted: Admitted::Signing(signing), peer })
+			Ok(Self { admitted: Admitted::Signing(signing), statics, peer })
 		}
 
 		/// The CMS server of `pair`.
@@ -502,8 +499,9 @@ mod pair {
 		/// - [`HandshakeError::DerError`] -- the DER encoder refuses the key of the signing certificate.
 		#[cfg(feature = "transport-cms")]
 		pub(super) fn paired(pair: CmsServerPair<P>) -> Result<Self, HandshakeError> {
+			let statics = PeerStatics::of(pair.signing.certificate(), Some(&pair.key_agreement));
 			let peer = pair.peer()?;
-			Ok(Self { admitted: Admitted::Cms(pair), peer })
+			Ok(Self { admitted: Admitted::Cms(pair), statics, peer })
 		}
 
 		/// The certificate whose key signs the reply.
@@ -516,21 +514,17 @@ mod pair {
 			}
 		}
 
-		/// Every static key of this server, which its ephemeral must differ
-		/// from.
-		fn keys(&self) -> ServerKeys<'_, P> {
-			match &self.admitted {
-				#[cfg(feature = "transport-hpke")]
-				Admitted::Signing(signing) => ServerKeys { signing, key_agreement: None },
-				#[cfg(feature = "transport-cms")]
-				Admitted::Cms(pair) => ServerKeys { signing: &pair.signing, key_agreement: pair.point.as_ref() },
-			}
-		}
-	}
-
-	impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for AdmittedServer<P> {
-		fn distinct_from(&self, point: &PublicKey<P::Curve>) -> bool {
-			self.keys().distinct_from(point)
+		/// Admits `share` as the share of this server, distinct from each of
+		/// its static keys.
+		///
+		/// # Errors
+		///
+		/// - The errors of [`PeerStatics::server_ephemeral`].
+		pub(crate) fn server_ephemeral(
+			&self,
+			share: ServerShare<P>,
+		) -> Result<Distinct<ServerShare<P>>, HandshakeError> {
+			self.statics.server_ephemeral(share)
 		}
 	}
 
@@ -599,13 +593,10 @@ mod pair {
 	pub struct CmsServerPair<P: HandshakeProvider> {
 		/// The certificate whose key signs the reply.
 		signing: PeerCertificate<Signing<P>>,
-		/// The key-agreement certificate, shared with the trust that pins it,
-		/// which the session keeps for a rekey.
-		#[cfg(mux_rekey)]
+		/// The key-agreement certificate, shared with the trust that pins it.
+		/// The admitted server reads its key once, and the session keeps it for
+		/// a rekey.
 		key_agreement: Arc<Certificate>,
-		/// The key of the key-agreement certificate as a point of the
-		/// handshake curve, or `None` for a key of another curve.
-		point: Option<PublicKey<P::Curve>>,
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -623,21 +614,16 @@ mod pair {
 		/// - [`HandshakeError::AnchorMismatch`] -- the two certificates name two trust anchors.
 		pub(super) fn admit(
 			signing: AdmittedSigning<P, Arc<Certificate>>,
-			key_agreement: PinnedKeyAgreement<P>,
+			key_agreement: PinnedKeyAgreement,
 		) -> Result<Self, HandshakeError> {
 			let AdmittedSigning { signing, verdict: signing_anchor } = signing;
-			let PinnedKeyAgreement { certificate, anchor, point } = key_agreement;
+			let PinnedKeyAgreement { certificate, anchor } = key_agreement;
 			signing.certificate().pairs_with(&certificate)?;
 			if *signing_anchor != *anchor {
 				return Err(HandshakeError::AnchorMismatch);
 			}
 
-			Ok(Self {
-				signing,
-				#[cfg(mux_rekey)]
-				key_agreement: certificate,
-				point,
-			})
+			Ok(Self { signing, key_agreement: certificate })
 		}
 
 		/// The certificates of this pair as the session records them: the
@@ -649,55 +635,6 @@ mod pair {
 			let peer = peer.with_key_agreement(Arc::clone(&self.key_agreement));
 			Ok(peer)
 		}
-	}
-}
-
-/// The static keys a server ephemeral must differ from: the key of the
-/// server's signing certificate, and for a CMS server the key of its
-/// key-agreement certificate as a point of the handshake curve.
-///
-/// The handshake reads them from the [`AdmittedServer`], and a rekey from the
-/// session, so both compare a server ephemeral alike.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) struct ServerKeys<'a, P: HandshakeProvider> {
-	/// The certificate whose key signs the reply.
-	pub(crate) signing: &'a PeerCertificate<Signing<P>>,
-	/// The key of a CMS server's key-agreement certificate, or `None` for an
-	/// HPKE server and for a key of another curve.
-	pub(crate) key_agreement: Option<&'a PublicKey<P::Curve>>,
-}
-
-/// A server ephemeral collapses into a server key when it shares the
-/// x-coordinate of either certificate key, so the check reads both against
-/// the ephemeral's x-coordinate, read once.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for ServerKeys<'_, P> {
-	fn distinct_from(&self, point: &PublicKey<P::Curve>) -> bool {
-		let x = point.as_affine().x();
-		let signing = !self.signing.shares_x(&x);
-		let agreement = self
-			.key_agreement
-			.is_none_or(|key| !AgreementPoint::<P::Curve>::shares_x(key, &x));
-		signing && agreement
-	}
-}
-
-/// A certificate read as a key of the handshake curve, the form an agreement
-/// compares it in.
-#[cfg(any(feature = "transport-cms", mux_rekey))]
-pub(crate) trait AgreementCertificate {
-	/// The key of this certificate as a point of the curve `C`, or `None` for
-	/// a key of another curve.
-	fn agreement_point<C: HandshakeCurve>(&self) -> Option<PublicKey<C>>;
-}
-
-#[cfg(any(feature = "transport-cms", mux_rekey))]
-impl AgreementCertificate for Certificate {
-	fn agreement_point<C: HandshakeCurve>(&self) -> Option<PublicKey<C>> {
-		// A key of another curve is no point of the handshake curve and
-		// collapses no agreement on it, so its parse refusal drops here.
-		let spki = self.tbs_certificate.subject_public_key_info.owned_to_ref();
-		PublicKey::<C>::try_from(spki).ok()
 	}
 }
 
@@ -862,7 +799,7 @@ impl ProvisionedTrust {
 #[cfg(feature = "transport-cms")]
 pub struct ProvisionedKeyAgreement<P: HandshakeProvider> {
 	/// The certificate as the client holds it from the opening to the reply.
-	pinned: PinnedKeyAgreement<P>,
+	pinned: PinnedKeyAgreement,
 	/// The key the opening seals to, beside its `rid`.
 	recipient: KemRecipient<P::Kem>,
 }
@@ -871,15 +808,12 @@ pub struct ProvisionedKeyAgreement<P: HandshakeProvider> {
 /// the opening to the reply, where the pair with the signing certificate
 /// reads it.
 #[cfg(feature = "transport-cms")]
-pub struct PinnedKeyAgreement<P: HandshakeProvider> {
+pub struct PinnedKeyAgreement {
 	/// The certificate, shared with the trust that pins it.
 	certificate: Arc<Certificate>,
 	/// The trust anchor at which the store's path validation of the
 	/// certificate ended.
 	anchor: Arc<Certificate>,
-	/// The key, parsed once as a point of the handshake curve, or `None` for a
-	/// key of another curve.
-	point: Option<PublicKey<P::Curve>>,
 }
 
 #[cfg(feature = "transport-cms")]
@@ -902,15 +836,14 @@ impl<P: HandshakeProvider> ProvisionedKeyAgreement<P> {
 		}
 
 		let certificate = Arc::clone(admitted.certificate());
-		let point = certificate.agreement_point::<P::Curve>();
 		let recipient = KemRecipient::from_certificate(admitted)?;
-		let pinned = PinnedKeyAgreement { certificate, anchor, point };
+		let pinned = PinnedKeyAgreement { certificate, anchor };
 		Ok(Self { pinned, recipient })
 	}
 
 	/// The certificate the client holds to the reply, and the key the opening
 	/// seals to, beside its `rid`.
-	pub(crate) fn into_parts(self) -> (PinnedKeyAgreement<P>, KemRecipient<P::Kem>) {
+	pub(crate) fn into_parts(self) -> (PinnedKeyAgreement, KemRecipient<P::Kem>) {
 		(self.pinned, self.recipient)
 	}
 }
@@ -919,19 +852,19 @@ impl<P: HandshakeProvider> ProvisionedKeyAgreement<P> {
 /// certificate its Finished carries, beside the key-agreement certificate the
 /// opening sealed to.
 #[cfg(feature = "transport-cms")]
-pub struct CmsNamedServer<P: HandshakeProvider> {
+pub struct CmsNamedServer {
 	/// The certificate the Finished's `sid` names and the issuers above it
 	/// that the Finished presents, parsed from the bytes the transcript
 	/// bound.
 	pub(crate) signing: PresentedPath,
 	/// The key-agreement certificate, admitted before the opening.
-	pub(crate) key_agreement: PinnedKeyAgreement<P>,
+	pub(crate) key_agreement: PinnedKeyAgreement,
 }
 
 #[cfg(feature = "transport-cms")]
 impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 	type Provisioned = ProvisionedKeyAgreement<P>;
-	type Named = CmsNamedServer<P>;
+	type Named = CmsNamedServer;
 
 	/// Admit the pinned key-agreement certificate before the opening: against
 	/// the store, then for key agreement under the server's purpose, then
@@ -964,7 +897,7 @@ impl<P: HandshakeProvider> ServerTrust<P> for ProvisionedTrust {
 	/// - The errors of [`CmsServerPair::admit`].
 	fn admit_named(
 		&self,
-		named: CmsNamedServer<P>,
+		named: CmsNamedServer,
 		admission: ServerAdmission<'_>,
 	) -> Result<AdmittedServer<P>, HandshakeError> {
 		let CmsNamedServer { signing, key_agreement } = named;
@@ -1232,10 +1165,11 @@ mod tests {
 	mod provisioned {
 		use super::*;
 		use crate::cms::signed_data::SignerIdentifier;
+		use crate::crypto::exchange::{EcdheShare, KeyShare};
 		use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 		use crate::crypto::sign::ecdsa::k256::Secp256k1;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::crypto::sign::elliptic_curve::sec1::CompressedPoint as Sec1CompressedPoint;
+		use crate::crypto::sign::elliptic_curve::PublicKey;
 		use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
 		use crate::crypto::x509::error::CertificateValidationError::{
 			CertificateNotPinned, CertificateRevoked, Expired,
@@ -1250,7 +1184,6 @@ mod tests {
 		use crate::random::OsRng;
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 		use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestCmsServer};
-		use crate::transport::handshake::schedule::CompressedPoint;
 		use crate::transport::handshake::tests::{negated, LaterRevocation};
 		use crate::transport::handshake::CmsServerChain;
 		use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
@@ -1373,16 +1306,20 @@ mod tests {
 			certificate
 		}
 
-		/// The compressed SEC 1 point of the key of `key`.
-		fn point_of(key: &Secp256k1SigningKey) -> Sec1CompressedPoint<Secp256k1> {
-			let point = PublicKey::from(key.verifying_key()).compressed_point();
-			point.expect("a secp256k1 point compresses")
+		/// The compressed SEC 1 point of the key of `key`, as the house
+		/// exchange encodes a share.
+		fn point_of(key: &Secp256k1SigningKey) -> Vec<u8> {
+			share_of(key).to_octets()
 		}
 
-		/// The compressed SEC 1 point of the negation of the key of `key`.
-		fn negated_point_of(key: &Secp256k1SigningKey) -> Sec1CompressedPoint<Secp256k1> {
-			let negation = negated(&PublicKey::from(key.verifying_key()));
-			negation.compressed_point().expect("a secp256k1 point compresses")
+		/// The house share of the key of `key`.
+		fn share_of(key: &Secp256k1SigningKey) -> EcdheShare<Secp256k1> {
+			EcdheShare::from(PublicKey::from(key.verifying_key()))
+		}
+
+		/// The house share of the negation of the key of `key`.
+		fn negated_share_of(key: &Secp256k1SigningKey) -> EcdheShare<Secp256k1> {
+			EcdheShare::from(negated(&PublicKey::from(key.verifying_key())))
 		}
 
 		/// The chain of `leaf` under `root`, ordered root to leaf.
@@ -1911,7 +1848,7 @@ mod tests {
 		#[test]
 		fn a_server_ephemeral_equal_to_the_signing_key_is_refused() {
 			let server = fresh_server();
-			let refused = admitted(&server).server_ephemeral(&point_of(&server.signing_key));
+			let refused = admitted(&server).server_ephemeral(share_of(&server.signing_key));
 			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		}
 
@@ -1920,7 +1857,7 @@ mod tests {
 		#[test]
 		fn a_server_ephemeral_equal_to_the_key_agreement_key_is_refused() {
 			let server = fresh_server();
-			let refused = admitted(&server).server_ephemeral(&point_of(&server.key_agreement_key));
+			let refused = admitted(&server).server_ephemeral(share_of(&server.key_agreement_key));
 			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		}
 
@@ -1929,9 +1866,9 @@ mod tests {
 		#[test]
 		fn a_server_ephemeral_of_the_negated_key_agreement_key_is_refused() {
 			let server = fresh_server();
-			let negation = negated_point_of(&server.key_agreement_key);
+			let negation = negated_share_of(&server.key_agreement_key);
 
-			let refused = admitted(&server).server_ephemeral(&negation);
+			let refused = admitted(&server).server_ephemeral(negation);
 			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		}
 
@@ -1941,7 +1878,7 @@ mod tests {
 		fn a_server_ephemeral_of_neither_key_is_admitted() {
 			let server = fresh_server();
 			let ephemeral = Secp256k1SigningKey::random(&mut OsRng);
-			let admitted = admitted(&server).server_ephemeral(&point_of(&ephemeral));
+			let admitted = admitted(&server).server_ephemeral(share_of(&ephemeral));
 			assert!(admitted.is_ok());
 		}
 

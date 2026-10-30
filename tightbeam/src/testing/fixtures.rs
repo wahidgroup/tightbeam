@@ -70,10 +70,11 @@ use x509_certs::*;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod sha3_512_profile {
 	pub use crate::crypto::aead::Aes256GcmOid;
+	pub use crate::crypto::exchange::Ecdhe;
 	pub use crate::crypto::hash::Sha3_512;
 	pub use crate::crypto::kdf::HkdfSha3_256;
 	pub use crate::crypto::profiles::{
-		AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
+		AeadProvider, Aes256Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
 		SecurityProfile, SigningProvider,
 	};
 	pub use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
@@ -1876,7 +1877,7 @@ impl SecurityProfile for Aes256Sha3_512Profile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = k256::Secp256k1;
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 	type KeyWrapOid = Aes256Wrap;
 }
 
@@ -1915,8 +1916,8 @@ impl KdfProvider for Aes256Sha3_512Provider {
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl CurveProvider for Aes256Sha3_512Provider {
-	type Curve = k256::Secp256k1;
+impl KeyExchangeProvider for Aes256Sha3_512Provider {
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]

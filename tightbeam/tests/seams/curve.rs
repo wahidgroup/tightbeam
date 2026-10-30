@@ -18,7 +18,11 @@
 //! - an in-band renewal of a multiplexed session over TCP, and
 //! - a handshake and one exchange over the blocking TCP transport.
 //!
-//! [`p384`] and [`p521`] bring the same parts on P-384 and on P-521.
+//! Its child modules bring more:
+//!
+//! - [`p384`] and [`p521`], the same parts on P-384 and on P-521,
+//! - [`signer`], a provider that signs on P-384 and agrees on secp256k1, and
+//! - [`exchange`], outside key exchanges: ECDH, X25519, ML-KEM-768, and a hybrid of ML-KEM-768 with ECDH.
 
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
@@ -29,14 +33,13 @@ use p256::elliptic_curve;
 use p256::elliptic_curve::group::Curve as _;
 use p256::elliptic_curve::point::AffineCoordinates;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{AffinePoint, NistP256, PublicKey};
-use rand_core::impls::{next_u32_via_fill, next_u64_via_fill};
-use rand_core::{CryptoRng, Error as RandError, RngCore};
+use p256::{NistP256, PublicKey};
 use tightbeam::cms::content_info::ContentInfo;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes256Gcm, Aes256GcmOid};
 use tightbeam::crypto::cms::{Encapsulation, EnvelopeError, KeyAgreementIdentity, RecipientKem};
 use tightbeam::crypto::common::typenum::Unsigned;
 use tightbeam::crypto::common::{BlockSizeUser, OutputSizeUser};
+use tightbeam::crypto::exchange::{Ecdhe, HandshakeCurve, KeyExchangeError};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::crypto::hkdf::{InvalidLength, SimpleHkdf};
 use tightbeam::crypto::hpke::{
@@ -46,8 +49,8 @@ use tightbeam::crypto::k256::ecdsa::SigningKey as Secp256k1SigningKey;
 use tightbeam::crypto::kdf::{HkdfSha3_256, KdfError};
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
-	SecurityProfile, SigningProvider,
+	AeadProvider, Aes256Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
+	SecurityProfile, SecurityProfileDesc, SigningProvider,
 };
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::crypto::sign::{
@@ -59,7 +62,6 @@ use tightbeam::crypto::x509::policy::DirectTrustValidator;
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef};
-use tightbeam::der::oid::AssociatedOid;
 use tightbeam::der::{Any, Decode, Encode, Tag};
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{CURVE_NIST_P256, DATA, SIGNER_ECDSA_WITH_SHA3_256};
@@ -67,12 +69,12 @@ use tightbeam::random::{CryptoRngCore, OsRng};
 use tightbeam::spki::{
 	AlgorithmIdentifierOwned, Document, EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef,
 };
-use tightbeam::testing::{unhex, TestCertificate, TestCmsServer, TestKey};
+use tightbeam::testing::{unhex, PublishedDraw, TestCertificate, TestCmsServer, TestKey};
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
 	Client, ClientConfig, ClientFlow, ClientHello, Cms, CmsClientSettings, CmsIdentityPair, CmsServerSettings,
-	Handshake, HandshakeCurve, HandshakeError, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings,
-	HpkeServerSettings, LearnedTrust, ProvisionedTrust, Server, ServerConfig, ServerFlow, SupportedProfiles,
+	Handshake, HandshakeError, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings, HpkeServerSettings,
+	LearnedTrust, ProvisionedTrust, Server, ServerConfig, ServerFlow, SupportedProfiles,
 };
 use tightbeam::x509::ext::pkix::KeyUsages;
 use tightbeam::x509::Certificate;
@@ -81,8 +83,10 @@ use tightbeam::ZeroizingBytes;
 
 use super::{run_legs, CONTENT};
 
+mod exchange;
 mod p384;
 mod p521;
+mod signer;
 
 /// `id-ecPublicKey` (RFC 5480 §2.1.1), the algorithm of the key each outside
 /// key-agreement backend holds.
@@ -258,21 +262,6 @@ impl Verifier<P256Signature> for P256VerifyingKey {
 	}
 }
 
-/// The key of a point on P-256, as a handshake reads it from a certificate.
-impl From<PublicKey> for P256VerifyingKey {
-	fn from(key: PublicKey) -> Self {
-		Self(VerifyingKey::from(key))
-	}
-}
-
-/// The point of the key, lent by reference, which a handshake compares an
-/// agreement ephemeral with.
-impl AsRef<AffinePoint> for P256VerifyingKey {
-	fn as_ref(&self) -> &AffinePoint {
-		self.0.as_affine()
-	}
-}
-
 impl EncodePublicKey for P256VerifyingKey {
 	fn to_public_key_der(&self) -> tightbeam::spki::Result<Document> {
 		self.0.to_public_key_der()
@@ -364,7 +353,7 @@ impl SecurityProfile for P256Profile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = P256Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = NistP256;
+	type KeyExchange = Ecdhe<NistP256>;
 	type KeyWrapOid = Aes256Wrap;
 }
 
@@ -396,8 +385,8 @@ impl KdfProvider for P256Provider {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for P256Provider {
-	type Curve = NistP256;
+impl KeyExchangeProvider for P256Provider {
+	type KeyExchange = Ecdhe<NistP256>;
 }
 
 impl CryptoProvider for P256Provider {
@@ -492,31 +481,6 @@ impl<C: HandshakeCurve> DiffieHellman<C> for AgreementBackend<C> {
 	}
 }
 
-/// A random source that draws the scalar a published vector names, so an
-/// encapsulation that draws from it draws that scalar.
-struct PublishedDraw(Vec<u8>);
-
-impl RngCore for PublishedDraw {
-	fn next_u32(&mut self) -> u32 {
-		next_u32_via_fill(self)
-	}
-
-	fn next_u64(&mut self) -> u64 {
-		next_u64_via_fill(self)
-	}
-
-	fn fill_bytes(&mut self, dest: &mut [u8]) {
-		dest.copy_from_slice(&self.0[..dest.len()]);
-	}
-
-	fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
-		self.fill_bytes(dest);
-		Ok(())
-	}
-}
-
-impl CryptoRng for PublishedDraw {}
-
 /// The certificate of the point `point` on the curve `curve`, cut from the
 /// self-signed house certificate of a fresh secp256k1 key, whose key
 /// identifier sets it apart from every other certificate of a test. A trust
@@ -584,14 +548,17 @@ fn carried_ephemeral(opening: HandshakeMessage) -> Result<Vec<u8>, Box<dyn std::
 }
 
 /// The ephemeral `R` that the hello of an HPKE client under `P` carries,
-/// beside the compressed form of the point it decodes to on the curve of `P`.
-fn carried_point<P: HandshakeProvider>(
-	server: SigningIdentity,
-) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+/// beside the compressed form of the point it decodes to on `C`, the curve of
+/// the exchange of `P`.
+fn carried_point<P, C>(server: SigningIdentity) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>>
+where
+	P: HandshakeProvider<KeyExchange = Ecdhe<C>>,
+	C: HandshakeCurve,
+{
 	let (mut client, _server) = hpke_pair::<P>(server);
 	let ephemeral = carried_ephemeral(client.start()?)?;
 
-	let point = elliptic_curve::PublicKey::<P::Curve>::from_sec1_bytes(&ephemeral)?;
+	let point = elliptic_curve::PublicKey::<C>::from_sec1_bytes(&ephemeral)?;
 	let compressed = point.to_encoded_point(true).as_bytes().to_vec();
 	Ok((ephemeral, compressed))
 }
@@ -634,26 +601,28 @@ fn reissued(house: &TestCmsServer, certificate: &Certificate, curve: ObjectIdent
 }
 
 /// A CMS server under `P` named `name`, whose signing backend `signer` holds
-/// the point `signing_point` and whose key-agreement backend is an
-/// [`AgreementBackend`] of a fresh scalar. Its two certificates name one
-/// subject under one house authority.
-fn outside_cms_server<P>(
+/// the point `signing_point` on the curve `signing_curve`, and whose
+/// key-agreement backend is `backend`, on `C`, the curve of the KEM of `P`.
+/// Its two certificates name one subject under one house authority.
+fn outside_cms_server<P, C>(
 	name: &str,
 	signer: Arc<dyn SigningKeyProvider>,
+	signing_curve: ObjectIdentifier,
 	signing_point: &[u8],
+	backend: AgreementBackend<C>,
 ) -> OutsideCmsServer<P::Kem>
 where
-	P: HandshakeProvider<VerifyingKey: PartialEq, Kem: RecipientKem<PrivateKey = dyn DiffieHellman<P::Curve>>>,
+	P: HandshakeProvider<VerifyingKey: PartialEq, Kem: RecipientKem<PrivateKey = dyn DiffieHellman<C>>>,
+	C: HandshakeCurve,
 {
 	let house = TestCmsServer::generate(name);
-	let backend = AgreementBackend::<P::Curve>::random();
-	let curve = <P::Curve as AssociatedOid>::OID;
+	let curve = C::OID;
 
 	let agreement_point = backend.public_key().to_encoded_point(false);
-	let signing = reissued(&house, &house.signing, curve, signing_point);
+	let signing = reissued(&house, &house.signing, signing_curve, signing_point);
 	let key_agreement = reissued(&house, &house.key_agreement, curve, agreement_point.as_bytes());
 	let signing = identity_of::<P>(signing, signer);
-	let backend: Arc<dyn DiffieHellman<P::Curve>> = Arc::new(backend);
+	let backend: Arc<dyn DiffieHellman<C>> = Arc::new(backend);
 	OutsideCmsServer::of(&house, signing, key_agreement, backend)
 }
 
@@ -661,7 +630,9 @@ where
 fn p256_cms_server() -> OutsideCmsServer<P256Kem> {
 	let key = SigningKey::random(&mut OsRng);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
-	outside_cms_server::<P256Provider>("p256 server", Arc::new(P256KeyProvider { key }), point.as_bytes())
+	let signer = Arc::new(P256KeyProvider { key });
+	let backend = AgreementBackend::random();
+	outside_cms_server::<P256Provider, _>("p256 server", signer, CURVE_NIST_P256, point.as_bytes(), backend)
 }
 
 /// A client of `server` that pins its key-agreement certificate and presents
@@ -684,6 +655,28 @@ fn cms_pair<P: HandshakeProvider>(
 	(Handshake::client(client), Handshake::server(server_config))
 }
 
+/// The certificate the server of `pair` admitted as its client once the
+/// three legs run, beside the first record the client seals, as the server
+/// opens it under its session keys.
+async fn admitted_and_opened<P, F>(
+	pair: (Handshake<Client, F, P>, Handshake<Server, F, P>),
+) -> Result<(Option<Certificate>, Vec<u8>), Box<dyn std::error::Error>>
+where
+	P: HandshakeProvider,
+	F: ClientFlow<P> + ServerFlow<P>,
+{
+	let (mut client, mut server) = pair;
+	run_legs(&mut client, &mut server).await;
+	let admitted = server.peer_certificate().cloned();
+
+	let client_session = client.complete()?;
+	let server_session = server.complete()?;
+
+	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
+	Ok((admitted, opened.to_vec()))
+}
+
 /// The first record the client of `pair` seals once the three legs run, as
 /// the server of `pair` opens it under its session keys.
 async fn first_record_opened<P, F>(
@@ -693,15 +686,8 @@ where
 	P: HandshakeProvider,
 	F: ClientFlow<P> + ServerFlow<P>,
 {
-	let (mut client, mut server) = pair;
-	run_legs(&mut client, &mut server).await;
-
-	let client_session = client.complete()?;
-	let server_session = server.complete()?;
-
-	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
-	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
-	Ok(opened.to_vec())
+	let (_admitted, opened) = admitted_and_opened(pair).await?;
+	Ok(opened)
 }
 
 /// The outside KEM encapsulates to the recipient key of RFC 9180 A.3.1 as
@@ -754,7 +740,7 @@ async fn a_p256_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::
 /// compressed form, so `R` has the width of that form on P-256.
 #[test]
 fn a_p256_hello_carries_a_compressed_p256_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (carried, compressed) = carried_point::<P256Provider>(p256_identity())?;
+	let (carried, compressed) = carried_point::<P256Provider, _>(p256_identity())?;
 	assert_eq!(carried, compressed);
 	Ok(())
 }
@@ -769,7 +755,7 @@ async fn a_p256_server_refuses_a_secp256k1_point() -> Result<(), Box<dyn std::er
 	let hello = hello_carrying(client.start()?, &TestKey::SEC2_SECP256K1_G_COMPRESSED)?;
 
 	let refused = server.reply(hello).await;
-	assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+	assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 	Ok(())
 }
 
@@ -981,4 +967,16 @@ mod certificate {
 		assert_eq!((algorithm, verified), (SIGNER_ECDSA_WITH_SHA3_256, true));
 		Ok(())
 	}
+}
+
+/// The DER of the descriptor of [`P256Profile`].
+const P256_DESCRIPTOR: &str = "304fa00b0609608648016503040208a10b060960864801650304012ea20b060960864801650304030aa3\
+	0d060b2a864886f70d0109100321a40a06082a8648ce3d030107a50b060960864801650304012d";
+
+/// The descriptor of [`P256Profile`] encodes as [`P256_DESCRIPTOR`].
+#[test]
+fn the_p256_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+	let der = SecurityProfileDesc::from(&P256Profile).to_der()?;
+	assert_eq!(der, unhex(P256_DESCRIPTOR));
+	Ok(())
 }

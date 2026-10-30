@@ -19,13 +19,14 @@ use tightbeam::crypto::aead::Aes256Gcm;
 use tightbeam::crypto::cms::{
 	AuthEnvelopedData, Encapsulation, EnvelopeError, KeyAgreementIdentity, Opener, Recipient, RecipientKem,
 };
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::crypto::k256::ecdsa::SigningKey;
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::key::{KeyBackend, KeyError};
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
+	AeadProvider, Aes256Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
 	SigningProvider, TightbeamProfile,
 };
 use tightbeam::crypto::secret::ToInsecure;
@@ -65,7 +66,7 @@ use super::trust::PinningTrust;
 use flow::*;
 
 /// The identifier of the stub KEM, under the outside arc.
-const STUB_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.3");
+const STUB_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.7");
 
 /// The recipient key of the stub KEM: the bits of a certificate's
 /// `subjectPublicKey`, whatever their algorithm.
@@ -192,8 +193,8 @@ impl KdfProvider for StubProvider {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for StubProvider {
-	type Curve = Secp256k1;
+impl KeyExchangeProvider for StubProvider {
+	type KeyExchange = Ecdhe<Secp256k1>;
 }
 
 impl CryptoProvider for StubProvider {
@@ -409,7 +410,7 @@ mod provider {
 	use super::*;
 
 	/// The identifier of the masking KEM, under the outside arc.
-	const MASKING_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.4");
+	const MASKING_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.8");
 
 	/// The KEM of the outside role.
 	type MaskingKem = ProviderKem<MaskingRole>;
@@ -537,8 +538,8 @@ mod provider {
 		type Kdf = HkdfSha3_256;
 	}
 
-	impl CurveProvider for MaskingProvider {
-		type Curve = Secp256k1;
+	impl KeyExchangeProvider for MaskingProvider {
+		type KeyExchange = Ecdhe<Secp256k1>;
 	}
 
 	impl CryptoProvider for MaskingProvider {

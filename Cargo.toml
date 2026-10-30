@@ -97,6 +97,7 @@ ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"der",
 ] }
 kem = { version = "=0.2.0", default-features = false }
+ml-kem = { version = "=0.2.3", default-features = false, features = ["zeroize"] }
 k256 = { version = "=0.13.4", default-features = false, features = [
 	"alloc",
 	"signature",
@@ -136,6 +137,7 @@ p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa", "ec
 p521 = { version = "=0.13.3", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 paste = { version = "=1.0.15" }
 trybuild = { version = "=1.0.118", features = ["diff"] }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 
 # Proc macro dependencies
 proc-macro2 = { version = "=1.0.107" }

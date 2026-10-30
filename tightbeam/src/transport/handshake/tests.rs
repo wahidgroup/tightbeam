@@ -29,7 +29,7 @@ use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecordDirection, RecvCiph
 use crate::crypto::cms::{AuthEnvelopedData, Opener};
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::{Digest, Sha3_256};
-use crate::crypto::kdf::{EcdhSecret, KdfFunction, KdfSalt};
+use crate::crypto::kdf::{KdfFunction, KdfSalt};
 use crate::crypto::key::{KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::policy::VerificationPolicy;
@@ -85,12 +85,12 @@ use crate::x509::{name::RdnSequence, TbsCertificate, Version};
 use crate::TightBeamError;
 use crate::ZeroizingBytes;
 
-#[cfg(feature = "transport-hpke")]
-use crate::transport::handshake::schedule::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation, PeerEphemeral, PeerPoint, Sealer, SecretSeal,
-};
+use crate::crypto::exchange::{Ecdhe, EcdheShare, KeyShare};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ephemeral::{Distinct, ExchangeSecret, PeerStatics};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::schedule::{BaseSecret, KeyConfirmation, Sealer, SecretSeal};
 
 #[cfg(feature = "transport-hpke")]
 mod hpke {
@@ -478,7 +478,8 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 #[cfg(feature = "transport-hpke")]
 pub fn create_test_server_ephemeral() -> Sec1CompressedPoint<Secp256k1> {
 	let public_key = SecretKey::random(&mut OsRng).public_key();
-	public_key.compressed_point().expect("a secp256k1 point compresses")
+	let octets = EcdheShare::from(public_key).to_octets();
+	Sec1CompressedPoint::<Secp256k1>::clone_from_slice(&octets)
 }
 
 /// A compressed encoding at the width of secp256k1 whose x-coordinate lies
@@ -524,61 +525,42 @@ pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> 
 	haystack.as_ref().windows(needle.len()).any(|window| window == needle)
 }
 
-/// An agreement that yields a chosen secret in place of an ECDH output, so a
-/// fixture or an observer runs the production derivation over the value it
-/// picked.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-struct FixedAgreement<'a>(&'a EcdhSecret<Secp256k1>);
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
-	fn shared_secret(&self, _peer: &PublicKey<Secp256k1>) -> EcdhSecret<Secp256k1> {
-		self.0.duplicate()
-	}
-}
-
-/// `point` as an admitted peer ephemeral, for a fixture that holds no static
+/// `point` as an admitted server share, for a fixture that holds no static
 /// key to tell it from.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn admitted(point: &PublicKey<Secp256k1>) -> PeerPoint<Secp256k1> {
-	let sec1 = point.to_encoded_point(true);
-	let parsed = PeerPoint::parse(sec1.as_bytes());
-	parsed.expect("a public key encodes a point")
+fn admitted(point: &PublicKey<Secp256k1>) -> Distinct<EcdheShare<Secp256k1>> {
+	let parsed = PeerStatics::<Ecdhe<Secp256k1>>::none().server_ephemeral(EcdheShare::from(*point));
+	parsed.expect("a fixture holds no static key to compare")
+}
+
+/// The secret of the house exchange of `scalar` with `point`, through the
+/// production completion.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn exchange_of(scalar: &SecretKey, point: &PublicKey<Secp256k1>) -> ExchangeSecret {
+	let completed = admitted(point).complete::<Ecdhe<Secp256k1>>(scalar);
+	let completed = completed.expect("the house exchange completes on a point of its curve");
+	completed.as_ref().with(|secret| ExchangeSecret::fixture(secret.to_vec()))
 }
 
 /// The handshake secret of `shared`, followed by `base` when the flow
 /// carries one, under `salt`, through the production derivation.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub fn derive_handshake_secret(
-	shared: &EcdhSecret<Secp256k1>,
+	shared: &ExchangeSecret,
 	base: Option<&BaseSecret>,
 	salt: KdfSalt<'_>,
 ) -> Result<HandshakeSecret, HandshakeError> {
-	// The fixed agreement ignores its peer, so any point serves.
-	let peer = admitted(&SecretKey::random(&mut OsRng).public_key());
-	let agreement = agreement_of(&peer, base);
-	agreement.settle(&FixedAgreement(shared), salt)
-}
-
-/// The agreement of `peer`, hybrid with `base` as the CMS flow derives, or
-/// ephemeral alone as the HPKE flow derives.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn agreement_of<'a>(
-	peer: &'a PeerPoint<Secp256k1>,
-	base: Option<&'a BaseSecret>,
-) -> Agreement<'a, DefaultCryptoProvider> {
 	match base {
-		Some(base) => Agreement::hybrid(peer, base),
-		None => Agreement::ephemeral(peer),
+		Some(base) => HandshakeSecret::hybrid::<DefaultCryptoProvider>(shared, base, salt),
+		None => HandshakeSecret::ephemeral::<DefaultCryptoProvider>(shared, salt),
 	}
 }
 
-/// An ephemeral-ephemeral secret on secp256k1 of 32 `fill` bytes, in place
-/// of an ECDH output.
+/// An exchange secret of 32 `fill` bytes, in place of the secret of an
+/// exchange on secp256k1.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub fn fixture_agreement(fill: u8) -> EcdhSecret<Secp256k1> {
-	let octets = SecretSlice::from(vec![fill; 32]);
-	EcdhSecret::try_from(octets).expect("32 bytes make a secp256k1 shared secret")
+pub fn fixture_agreement(fill: u8) -> ExchangeSecret {
+	ExchangeSecret::fixture(vec![fill; 32])
 }
 
 /// The salt of the fixture derivations, 32 octets of `0x99`.
@@ -661,10 +643,9 @@ impl Confirming {
 	/// the server ephemeral, under `base` when the flow carries one.
 	pub fn secret(&self, base: Option<&BaseSecret>, ephemeral: &SecretKey) -> HandshakeSecret {
 		let salt = KdfSalt::try_from(self.salt.as_slice()).expect("the handshake salt meets the floor");
-		let server_ephemeral = admitted(&self.server_ephemeral);
-		let agreement = agreement_of(&server_ephemeral, base);
+		let shared = exchange_of(ephemeral, &self.server_ephemeral);
 
-		let settled = agreement.settle(ephemeral, salt);
+		let settled = derive_handshake_secret(&shared, base, salt);
 		settled.expect("the agreement derives a handshake secret")
 	}
 }
@@ -763,7 +744,7 @@ pub type SealAttempts = Vec<Result<SecretSlice<u8>, HandshakeError>>;
 pub struct StaticKeyObserver {
 	base: Option<BaseSecret>,
 	salt: Vec<u8>,
-	candidates: Vec<EcdhSecret<Secp256k1>>,
+	candidates: Vec<ExchangeSecret>,
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -782,8 +763,8 @@ impl StaticKeyObserver {
 		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(server_ephemeral)?;
 		let candidates = vec![
 			fixture_agreement(0x00),
-			static_key.shared_secret(&client_ephemeral),
-			static_key.shared_secret(&server_ephemeral),
+			exchange_of(static_key, &client_ephemeral),
+			exchange_of(static_key, &server_ephemeral),
 			x_coordinate(&client_ephemeral)?,
 			x_coordinate(&server_ephemeral)?,
 		];
@@ -878,11 +859,12 @@ impl StaticKeyObserver {
 	}
 }
 
-/// The x-coordinate of `point` in the place of an ECDH output.
-fn x_coordinate(point: &PublicKey<Secp256k1>) -> Result<EcdhSecret<Secp256k1>, Box<dyn Error>> {
+/// The x-coordinate of `point` in the place of the secret of an exchange.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn x_coordinate(point: &PublicKey<Secp256k1>) -> Result<ExchangeSecret, Box<dyn Error>> {
 	let encoded = point.to_encoded_point(false);
 	let x = encoded.x().ok_or("an affine point has an x-coordinate")?;
-	Ok(EcdhSecret::try_from(SecretSlice::from(x.to_vec()))?)
+	Ok(ExchangeSecret::fixture(x.to_vec()))
 }
 
 /// Generate a random secp256k1 signing key for tests.

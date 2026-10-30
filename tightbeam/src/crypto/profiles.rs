@@ -40,14 +40,24 @@ use crate::crypto::common::BlockSizeUser;
 	feature = "digest"
 ))]
 use crate::crypto::common::KeySizeUser;
+#[cfg(feature = "ecdh")]
+use crate::crypto::exchange::{Ecdhe, KeyExchange};
+#[cfg(all(feature = "preview-pqc", feature = "ecdh", feature = "sha3", feature = "kdf"))]
+use crate::crypto::exchange::{Hybrid, Secp256k1MlKem768};
 #[cfg(all(feature = "digest", feature = "sha3"))]
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "digest")]
 use crate::crypto::hash::{CoreProxy, Digest, HashCore};
+#[cfg(all(feature = "hpke", feature = "signature"))]
+use crate::crypto::hpke::DhKemSecp256k1;
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use crate::crypto::hpke::DhKemSecp256k1Enc;
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
 #[cfg(feature = "aead")]
 use crate::crypto::key::KeyError;
+#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
+use crate::crypto::key::Secp256k1KeyProvider;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::Secp256k1Signature;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -69,8 +79,6 @@ use crate::oids::{AES_128_WRAP, AES_192_WRAP, AES_256_WRAP};
 #[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::Beamable;
-#[cfg(feature = "ecdh")]
-use elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "kem")]
 use kem::{Decapsulator, EncappedKey, Encapsulator};
 /// A one-shot closure that verifies a signature over the given bytes against
@@ -152,8 +160,9 @@ pub struct SecurityProfileDesc {
 	pub signature: Option<ObjectIdentifier>,
 	/// The OID of the key derivation function that the profile negotiates.
 	pub kdf: Option<ObjectIdentifier>,
-	/// The OID of the elliptic curve for key agreement.
-	pub curve: Option<ObjectIdentifier>,
+	/// The OID of the key exchange that the profile negotiates. The house
+	/// exchange names the OID of its curve.
+	pub key_exchange: Option<ObjectIdentifier>,
 	/// The OID of the key-wrap algorithm that the profile negotiates.
 	pub key_wrap: Option<ObjectIdentifier>,
 }
@@ -163,7 +172,7 @@ wire_sequence!(SecurityProfileDesc {
 	aead: ctx(TagNumber::N1),
 	signature: ctx(TagNumber::N2),
 	kdf: ctx(TagNumber::N3),
-	curve: ctx(TagNumber::N4),
+	key_exchange: ctx(TagNumber::N4),
 	key_wrap: ctx(TagNumber::N5),
 });
 
@@ -187,9 +196,9 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 			#[cfg(not(feature = "kdf"))]
 			kdf: None,
 			#[cfg(feature = "ecdh")]
-			curve: Some(<P::Curve as AssociatedOid>::OID),
+			key_exchange: Some(<P::KeyExchange as AssociatedOid>::OID),
 			#[cfg(not(feature = "ecdh"))]
-			curve: None,
+			key_exchange: None,
 			#[cfg(feature = "aead")]
 			key_wrap: Some(<P::KeyWrapOid as AssociatedOid>::OID),
 			#[cfg(not(feature = "aead"))]
@@ -212,9 +221,69 @@ pub struct ProfileStrength {
 	pub aead_key_bytes: usize,
 	/// The output length in bytes of the provider's digest.
 	pub digest_bytes: usize,
-	/// The field width in bytes of the provider's key-agreement curve, which
-	/// bounds the strength of every session key.
-	pub curve_field_bytes: usize,
+	/// The security strength of the provider's key exchange, which bounds the
+	/// strength of every session key.
+	pub key_exchange: SecurityStrength,
+}
+
+/// A security strength in bits, as the "Security Strength" column of NIST
+/// SP 800-57 Part 1 Rev. 5, Table 2, states it.
+///
+/// The bits stay private, and one constant names each row of the table, so a
+/// key exchange rates itself by a row. Each kind of exchange reads its row
+/// from its own standard:
+///
+/// - An elliptic-curve group rates by the size of the order of its base
+///   point, as Table 2 states ([`Self::of_ecc_order`]).
+/// - X25519 rates [`Self::BITS_128`], at its "~128-bit security level" (RFC 7748 §1).
+/// - ML-KEM-512, -768, and -1024 rate 128, 192, and 256 bits, by their categories (FIPS 203 §8).
+/// - A hybrid rates at its stronger part only when its combiner binds each
+///   part's ciphertext and encapsulation key, and at its weaker part
+///   otherwise (NIST SP 800-227 §4.6.3).
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::profiles::SecurityStrength;
+///
+/// // secp256k1 and P-256 have a 256-bit order, which Table 2 rates at 128.
+/// assert_eq!(SecurityStrength::of_ecc_order(256), SecurityStrength::BITS_128);
+/// assert!(SecurityStrength::BITS_112 < SecurityStrength::BITS_128);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SecurityStrength(u16);
+
+impl SecurityStrength {
+	/// The row of 80 bits or fewer, below the 112 bits NIST SP 800-57 Part 1
+	/// Rev. 5 requires to apply protection.
+	pub const BITS_80: Self = Self(80);
+	/// The row of 112 bits.
+	pub const BITS_112: Self = Self(112);
+	/// The row of 128 bits.
+	pub const BITS_128: Self = Self(128);
+	/// The row of 192 bits.
+	pub const BITS_192: Self = Self(192);
+	/// The row of 256 bits.
+	pub const BITS_256: Self = Self(256);
+
+	/// The bits of this strength.
+	pub const fn bits(self) -> u16 {
+		self.0
+	}
+
+	/// The row of an elliptic-curve key whose base point has an order of
+	/// `order_bits` bits, as the ECC column of Table 2 states it: 224 to 255
+	/// bits rate 112, 256 to 383 rate 128, 384 to 511 rate 192, and 512 or more
+	/// rate 256.
+	pub const fn of_ecc_order(order_bits: usize) -> Self {
+		match order_bits {
+			512.. => Self::BITS_256,
+			384.. => Self::BITS_192,
+			256.. => Self::BITS_128,
+			224.. => Self::BITS_112,
+			_ => Self::BITS_80,
+		}
+	}
 }
 
 /// The minimum-strength filter that a handshake endpoint applies to profiles.
@@ -233,7 +302,7 @@ pub trait ProfileStrengthPolicy {
 ///
 /// - The AEAD key size is at least 256 bits.
 /// - The digest output is at least 256 bits.
-/// - The field of the key-agreement curve is at least 256 bits, so P-192 and P-224 fall below the floor.
+/// - The key exchange rates 128 bits or more, so ECDH over P-192 or P-224 falls below the floor.
 ///
 /// # Examples
 ///
@@ -248,16 +317,19 @@ pub trait ProfileStrengthPolicy {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultStrengthFloor;
 
-/// The minimum length in bytes of the AEAD key, the digest output, and the
-/// curve field, 256 bits each.
+/// The minimum length in bytes of the AEAD key and the digest output, 256
+/// bits each.
 const DEFAULT_FLOOR_BYTES: usize = 32;
+
+/// The minimum strength of the key exchange.
+const DEFAULT_FLOOR_STRENGTH: SecurityStrength = SecurityStrength::BITS_128;
 
 impl ProfileStrengthPolicy for DefaultStrengthFloor {
 	fn meets_floor(&self, strength: &ProfileStrength) -> bool {
 		let aead_ok = strength.aead_key_bytes >= DEFAULT_FLOOR_BYTES;
 		let digest_ok = strength.digest_bytes >= DEFAULT_FLOOR_BYTES;
-		let curve_ok = strength.curve_field_bytes >= DEFAULT_FLOOR_BYTES;
-		aead_ok && digest_ok && curve_ok
+		let exchange_ok = strength.key_exchange >= DEFAULT_FLOOR_STRENGTH;
+		aead_ok && digest_ok && exchange_ok
 	}
 }
 
@@ -294,14 +366,15 @@ impl ProfileStrengthPolicy for NoStrengthFloor {
 /// # Rationale
 ///
 /// - Peers negotiate over a compact [`SecurityProfileDesc`] of the hash,
-///   AEAD, signature, key-wrap, KDF, and curve OIDs.
+///   AEAD, signature, key-wrap, KDF, and key-exchange OIDs.
 /// - The trait separates the identifiers a peer sees from the algorithm
 ///   types of [`CryptoProvider`] that run them at compile time.
 /// - A dynamic dispatch or a plugin loader can use the trait with no change to the wire format.
-/// - Peers must negotiate the KDF and the curve to interoperate. Two different
-///   KDFs derive different keys from the same inputs, and the curve fixes the
-///   group the ECDH runs in. Ed25519 signatures, for example, pair with X25519
-///   for ECDH.
+/// - Peers must negotiate the KDF and the key exchange to interoperate. Two
+///   different KDFs derive different keys from the same inputs, and the key
+///   exchange fixes the shares both sides send. The signature role is
+///   independent of the exchange, so Ed25519 signatures pair with X25519 or
+///   with ML-KEM.
 pub trait SecurityProfile {
 	/// The negotiated digest algorithm. A [`CryptoProvider`] for this profile
 	/// MUST use this type as its digest.
@@ -319,10 +392,10 @@ pub trait SecurityProfile {
 	/// profile MUST use this type as its KDF.
 	#[cfg(feature = "kdf")]
 	type Kdf: AssociatedOid;
-	/// The negotiated elliptic curve for key agreement. A [`CryptoProvider`]
-	/// for this profile MUST use this type as its curve.
+	/// The negotiated key exchange. A [`CryptoProvider`] for this profile MUST
+	/// use this type as its key exchange.
 	#[cfg(feature = "ecdh")]
-	type Curve: AssociatedOid;
+	type KeyExchange: AssociatedOid;
 	/// The negotiated key-wrap algorithm identifier. A [`CryptoProvider`] for
 	/// this profile MUST use a key wrap that names this identifier.
 	#[cfg(feature = "aead")]
@@ -658,16 +731,17 @@ pub trait KdfProvider {
 	type Kdf: KdfFunction + AssociatedOid;
 }
 
-/// The provider role for elliptic curve operations.
+/// The provider role for the ephemeral key exchange of a handshake and of
+/// each rekey.
 ///
-/// The role isolates curve-specific operations such as ECDH and key
-/// generation. The curve type names the algorithm identifier a peer
-/// negotiates for it.
+/// The role isolates the exchange, so a signer on one curve pairs with an
+/// exchange on another, or with an exchange on no curve, such as ML-KEM. The
+/// exchange type names the algorithm identifier a peer negotiates for it.
 #[cfg(feature = "ecdh")]
-pub trait CurveProvider {
-	/// The elliptic curve for key agreement, which names the algorithm
-	/// identifier the profile negotiates.
-	type Curve: Curve + CurveArithmetic + AssociatedOid;
+pub trait KeyExchangeProvider {
+	/// The key exchange, which names the algorithm identifier the profile
+	/// negotiates, such as [`Ecdhe`] over a curve.
+	type KeyExchange: KeyExchange;
 }
 
 /// The provider role for a Key Encapsulation Mechanism (KEM) of the RustCrypto
@@ -733,7 +807,7 @@ pub trait CryptoProvider:
 	+ KeyWrapProvider<KeyWrap: KeyWrapAlgorithm<KekSize: IsGreaterOrEqual<AeadKeySize<Self>, Output = B1>>>
 	+ SigningProvider
 	+ KdfProvider
-	+ CurveProvider
+	+ KeyExchangeProvider
 {
 	/// The profile this provider runs. Each algorithm it names is the type its
 	/// role above uses.
@@ -742,7 +816,7 @@ pub trait CryptoProvider:
 			AeadOid = <Self::AeadCipher as AeadAlgorithm>::Oid,
 			SignatureAlg = Self::Signature,
 			Kdf = Self::Kdf,
-			Curve = Self::Curve,
+			KeyExchange = Self::KeyExchange,
 			KeyWrapOid = <Self::KeyWrap as KeyWrapAlgorithm>::Oid,
 		> + Default;
 
@@ -757,9 +831,10 @@ pub trait CryptoProvider:
 	/// The strength floor every handshake of this provider holds its profile
 	/// to, on each endpoint that runs the provider.
 	///
-	/// - The default is [`DefaultStrengthFloor`]: an AEAD key, a digest
-	///   output, and a curve field of 256 bits or more.
-	/// - A provider whose AEAD key, digest output, or curve field is shorter
+	/// - The default is [`DefaultStrengthFloor`]: an AEAD key and a digest
+	///   output of 256 bits or more, and a key exchange of 128-bit strength or
+	///   more.
+	/// - A provider whose AEAD key, digest output, or key exchange is weaker
 	///   runs a handshake only under a floor that admits its profile, such as
 	///   [`NoStrengthFloor`], so it names that floor here (CWE-757).
 	///
@@ -807,9 +882,65 @@ impl SecurityProfile for TightbeamProfile {
 	#[cfg(feature = "kdf")]
 	type Kdf = HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type Curve = k256::Secp256k1;
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 	#[cfg(feature = "aead")]
 	type KeyWrapOid = Aes256Wrap;
+}
+
+/// Implements every role of a house provider that holds its profile in a
+/// `profile` field: SHA3-256, AES-256-GCM, AES-256 key wrap, ECDSA over
+/// secp256k1, HKDF-SHA3-256, the key exchange `$exchange`, and
+/// DHKEM(secp256k1, HKDF-SHA256) as its KEM, under the profile `$profile`.
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+macro_rules! impl_house_provider {
+	($provider:ty, $profile:ty, $exchange:ty) => {
+		impl DigestProvider for $provider {
+			type Digest = Sha3_256;
+		}
+
+		impl AeadProvider for $provider {
+			type AeadCipher = Aes256Gcm;
+		}
+
+		impl KeyWrapProvider for $provider {
+			type KeyWrap = Aes256Wrap;
+		}
+
+		impl SigningProvider for $provider {
+			type Signature = Secp256k1Signature;
+			type VerifyingKey = Secp256k1VerifyingKey;
+		}
+
+		impl KdfProvider for $provider {
+			type Kdf = HkdfSha3_256;
+		}
+
+		impl KeyExchangeProvider for $provider {
+			type KeyExchange = $exchange;
+		}
+
+		/// The house KEM role: DHKEM(secp256k1, HKDF-SHA256) under the
+		/// RustCrypto `kem` traits, whose recipient key is a
+		/// [`Secp256k1KeyProvider`].
+		#[cfg(all(feature = "kem", feature = "hpke"))]
+		impl KemProvider for $provider {
+			type EncappedKey = DhKemSecp256k1Enc;
+			type Kem = DhKemSecp256k1;
+			type DecapsulationKey = Secp256k1KeyProvider;
+
+			const USAGE: KeyUsages = KeyUsages::KeyAgreement;
+		}
+
+		impl CryptoProvider for $provider {
+			type Profile = $profile;
+			#[cfg(feature = "hpke")]
+			type Kem = DhKemSecp256k1;
+
+			fn profile(&self) -> &Self::Profile {
+				&self.profile
+			}
+		}
+	};
 }
 
 /// The house provider, which runs [`TightbeamProfile`] and keeps the
@@ -821,59 +952,52 @@ pub struct DefaultCryptoProvider {
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl DigestProvider for DefaultCryptoProvider {
+impl_house_provider!(DefaultCryptoProvider, TightbeamProfile, Ecdhe<k256::Secp256k1>);
+
+/// The profile [`PreviewPqcProvider`] runs: the algorithms of
+/// [`TightbeamProfile`], with the hybrid of ML-KEM-768 and ECDH over
+/// secp256k1 as its key exchange.
+#[cfg(all(feature = "preview-pqc", feature = "ecdh", feature = "sha3", feature = "kdf"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PreviewPqcProfile;
+
+#[cfg(all(feature = "preview-pqc", feature = "ecdh", feature = "sha3", feature = "kdf"))]
+impl SecurityProfile for PreviewPqcProfile {
+	#[cfg(feature = "digest")]
 	type Digest = Sha3_256;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl AeadProvider for DefaultCryptoProvider {
-	type AeadCipher = Aes256Gcm;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl KeyWrapProvider for DefaultCryptoProvider {
-	type KeyWrap = Aes256Wrap;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl SigningProvider for DefaultCryptoProvider {
-	type Signature = Secp256k1Signature;
-	type VerifyingKey = Secp256k1VerifyingKey;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl KdfProvider for DefaultCryptoProvider {
+	#[cfg(feature = "aead")]
+	type AeadOid = Aes256GcmOid;
+	#[cfg(feature = "signature")]
+	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
+	type KeyExchange = Hybrid<Secp256k1MlKem768>;
+	#[cfg(feature = "aead")]
+	type KeyWrapOid = Aes256Wrap;
 }
 
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl CurveProvider for DefaultCryptoProvider {
-	type Curve = k256::Secp256k1;
+/// The house provider with a post-quantum key exchange: it runs
+/// [`PreviewPqcProfile`] and keeps the [`DefaultStrengthFloor`]. Its envelope
+/// KEM is the KEM of [`DefaultCryptoProvider`].
+#[cfg(all(
+	feature = "preview-pqc",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PreviewPqcProvider {
+	profile: PreviewPqcProfile,
 }
 
-/// The house KEM role: DHKEM(secp256k1, HKDF-SHA256) under the RustCrypto
-/// `kem` traits, whose recipient key is a [`Secp256k1KeyProvider`].
-///
-/// [`Secp256k1KeyProvider`]: crate::crypto::key::Secp256k1KeyProvider
-#[cfg(all(feature = "kem", feature = "hpke", feature = "signature"))]
-impl KemProvider for DefaultCryptoProvider {
-	type EncappedKey = crate::crypto::hpke::DhKemSecp256k1Enc;
-	type Kem = crate::crypto::hpke::DhKemSecp256k1;
-	type DecapsulationKey = crate::crypto::key::Secp256k1KeyProvider;
-
-	const USAGE: KeyUsages = KeyUsages::KeyAgreement;
-}
-
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-impl CryptoProvider for DefaultCryptoProvider {
-	type Profile = TightbeamProfile;
-	#[cfg(all(feature = "hpke", feature = "signature"))]
-	type Kem = crate::crypto::hpke::DhKemSecp256k1;
-
-	fn profile(&self) -> &Self::Profile {
-		&self.profile
-	}
-}
+#[cfg(all(
+	feature = "preview-pqc",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+impl_house_provider!(PreviewPqcProvider, PreviewPqcProfile, Hybrid<Secp256k1MlKem768>);
 
 #[cfg(test)]
 mod tests {
@@ -881,8 +1005,8 @@ mod tests {
 	use crate::constants::{
 		TIGHTBEAM_ACK_KEY_ID_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_CLIENT_FINISHED_KEY_INFO,
 		TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_FRAME_UKM_LABEL,
-		TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN,
-		TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
+		TIGHTBEAM_HYBRID_EXCHANGE_LABEL, TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN,
+		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 	};
 
 	/// Guard the domain constants against accidental change.
@@ -902,6 +1026,7 @@ mod tests {
 		assert_eq!(TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1");
 		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1");
 		assert_eq!(TIGHTBEAM_SERVER_FINISHED_KEY_INFO, b"tb/handshake/finished/server/mac/v1");
+		assert_eq!(TIGHTBEAM_HYBRID_EXCHANGE_LABEL, b"tb/exchange/hybrid/v1");
 	}
 
 	/// Each optional field carries its own tag, so every OID decodes into its
@@ -915,7 +1040,7 @@ mod tests {
 			aead: Some(crate::oids::AES_256_GCM),
 			signature: None,
 			kdf: None,
-			curve: None,
+			key_exchange: None,
 			key_wrap: Some(AES_256_WRAP),
 		};
 
@@ -935,7 +1060,7 @@ mod tests {
 			type AeadOid = crate::crypto::aead::Aes128GcmOid;
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
 			type Kdf = crate::crypto::kdf::HkdfSha3_256;
-			type Curve = k256::Secp256k1;
+			type KeyExchange = Ecdhe<k256::Secp256k1>;
 			type KeyWrapOid = Aes256Wrap;
 		}
 
@@ -943,13 +1068,117 @@ mod tests {
 		assert_eq!(desc.aead, Some(crate::crypto::aead::Aes128GcmOid::OID));
 	}
 
-	// The KDF and curve types carry the identifiers that peers negotiate, so
-	// the default descriptor names `HKDF_SHA3_256` and `CURVE_SECP256K1`.
+	// The KDF and key-exchange types carry the identifiers that peers
+	// negotiate, so the default descriptor names `HKDF_SHA3_256` and
+	// `CURVE_SECP256K1`.
 	#[cfg(all(feature = "kdf", feature = "ecdh"))]
 	#[test]
-	fn the_default_profile_negotiates_its_kdf_and_curve_identifiers() {
+	fn the_default_profile_negotiates_its_kdf_and_key_exchange_identifiers() {
 		let desc = SecurityProfileDesc::from(&TightbeamProfile);
 		assert_eq!(desc.kdf, Some(crate::oids::HKDF_SHA3_256));
-		assert_eq!(desc.curve, Some(crate::oids::CURVE_SECP256K1));
+		assert_eq!(desc.key_exchange, Some(crate::oids::CURVE_SECP256K1));
+	}
+
+	/// The DER of the descriptor of [`TightbeamProfile`].
+	#[cfg(all(feature = "testing", any(feature = "transport-cms", feature = "transport-hpke")))]
+	const TIGHTBEAM_DESCRIPTOR: &str = "304ca00b0609608648016503040208a10b0609608648016503\
+		04012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40706052b8104000a\
+		a50b060960864801650304012d";
+
+	/// The DER of the descriptor of the SHA3-512 profile of the test fixtures.
+	#[cfg(all(feature = "testing", any(feature = "transport-cms", feature = "transport-hpke")))]
+	const SHA3_512_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b0609608648016503\
+		04012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40706052b8104000a\
+		a50b060960864801650304012d";
+
+	/// The house descriptors encode as their known DER, so a peer of another
+	/// release reads the same profile from them.
+	#[cfg(all(feature = "testing", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[test]
+	fn the_house_descriptors_encode_as_their_known_der() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::der::Encode;
+		use crate::testing::fixtures::Aes256Sha3_512Profile;
+		use crate::testing::unhex;
+
+		let house = SecurityProfileDesc::from(&TightbeamProfile).to_der()?;
+		let fixture = SecurityProfileDesc::from(&Aes256Sha3_512Profile).to_der()?;
+		assert_eq!((house, fixture), (unhex(TIGHTBEAM_DESCRIPTOR), unhex(SHA3_512_DESCRIPTOR)));
+		Ok(())
+	}
+
+	/// The DER of the descriptor of [`PreviewPqcProfile`]: the house
+	/// descriptor, with the hybrid of ML-KEM-768 and ECDH over secp256k1 as
+	/// its key exchange.
+	#[cfg(all(
+		feature = "preview-pqc",
+		feature = "testing",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	const PREVIEW_PQC_DESCRIPTOR: &str = "3051a00b0609608648016503040208a10b060960864801650304\
+		012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40c060a2b0601040183\
+		f84a0204a50b060960864801650304012d";
+
+	/// The preview profile negotiates the hybrid under its own identifier,
+	/// encodes as its known DER, and its 192-bit exchange meets the default
+	/// floor.
+	#[cfg(all(
+		feature = "preview-pqc",
+		feature = "testing",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	#[test]
+	fn the_preview_profile_negotiates_the_hybrid() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::der::Encode;
+		use crate::oids::KEM_SECP256K1_ML_KEM_768;
+		use crate::testing::unhex;
+		use crate::transport::handshake::negotiation::RunnableProfile;
+
+		let descriptor = SecurityProfileDesc::from(&PreviewPqcProfile);
+		let strength = RunnableProfile::<PreviewPqcProvider>::native().strength();
+
+		let negotiated = (descriptor.key_exchange, strength.key_exchange);
+		let expected = (Some(KEM_SECP256K1_ML_KEM_768), SecurityStrength::BITS_192);
+		assert_eq!(negotiated, expected);
+		assert!(PreviewPqcProvider::strength_floor().meets_floor(&strength));
+		assert_eq!(descriptor.to_der()?, unhex(PREVIEW_PQC_DESCRIPTOR));
+		Ok(())
+	}
+
+	/// A server that supports the preview profile alone finds no profile in an
+	/// offer of the house profile alone, since the two name other exchanges.
+	#[cfg(all(
+		feature = "preview-pqc",
+		feature = "testing",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	#[test]
+	fn a_house_offer_finds_no_profile_on_a_preview_server() {
+		use crate::transport::handshake::negotiation::{NegotiationError, SecurityOffer};
+
+		let offer = SecurityOffer::new(Vec::from([SecurityProfileDesc::from(&TightbeamProfile)]));
+		let supported = [SecurityProfileDesc::from(&PreviewPqcProfile)];
+
+		let selected = offer.select_profile(supported);
+		assert!(matches!(selected, Err(NegotiationError::NoMutualProfile)));
+	}
+
+	/// Each ECC order rates as its row of NIST SP 800-57 Part 1 Rev. 5 Table 2:
+	/// the first order of each row, and the last order of the row below it.
+	#[test]
+	fn each_ecc_order_rates_as_its_row_of_table_2() {
+		let rows = [
+			(160, SecurityStrength::BITS_80),
+			(223, SecurityStrength::BITS_80),
+			(224, SecurityStrength::BITS_112),
+			(255, SecurityStrength::BITS_112),
+			(256, SecurityStrength::BITS_128),
+			(383, SecurityStrength::BITS_128),
+			(384, SecurityStrength::BITS_192),
+			(511, SecurityStrength::BITS_192),
+			(512, SecurityStrength::BITS_256),
+		];
+
+		let rated = rows.map(|(order_bits, _)| (order_bits, SecurityStrength::of_ecc_order(order_bits)));
+		assert_eq!(rated, rows);
 	}
 }

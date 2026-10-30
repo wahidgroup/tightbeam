@@ -51,16 +51,6 @@ use crate::der::referenced::OwnedToRef;
 #[cfg(feature = "signature")]
 use crate::spki::SubjectPublicKeyInfoRef;
 
-#[cfg(all(feature = "signature", feature = "ecdh"))]
-mod agreement {
-	pub use crate::crypto::profiles::CurveProvider;
-	pub use crate::crypto::sign::elliptic_curve::point::AffineCoordinates;
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, CurveArithmetic, FieldBytes, PublicKey};
-}
-
-#[cfg(all(feature = "signature", feature = "ecdh"))]
-use agreement::*;
-
 #[cfg(all(feature = "hpke", feature = "signature"))]
 use crate::crypto::cms::RecipientKem;
 #[cfg(feature = "signature")]
@@ -280,61 +270,14 @@ impl Default for KeyPurposes {
 	}
 }
 
-#[cfg(all(feature = "signature", feature = "ecdh"))]
-impl<P> PeerCertificate<Signing<P>>
-where
-	P: SigningProvider + CurveProvider,
-	P::VerifyingKey: for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = crate::spki::Error>,
-	P::VerifyingKey: AsRef<AffinePoint<P::Curve>>,
-{
-	/// Whether an ECDH agreement with `point` differs from one with this
-	/// certificate's key, as a point on the curve of `P`.
-	///
-	/// A peer's agreement ephemeral MUST be distinct from its static key, so
-	/// the agreement keeps the forward secrecy of two ephemerals.
-	pub fn distinct(&self, point: &PublicKey<P::Curve>) -> bool {
-		!self.shares_x(&point.as_affine().x())
-	}
-
-	/// Whether an agreement with this certificate's key equals one with a
-	/// point whose x-coordinate is `x`, so a check of one point against
-	/// more than one key reads its x-coordinate once.
-	pub(crate) fn shares_x(&self, x: &FieldBytes<P::Curve>) -> bool {
-		AgreementPoint::<P::Curve>::shares_x(&self.key, x)
-	}
-}
-
-/// The rule of an ECDH agreement over a point: the agreement keeps the
-/// x-coordinate of the product alone (SEC 1 v2.0 §3.3.1), so a point and its
-/// negation agree alike.
-#[cfg(all(feature = "signature", feature = "ecdh"))]
-pub(crate) trait AgreementPoint<C: CurveArithmetic> {
-	/// Whether an agreement with this point equals one with a point whose
-	/// x-coordinate is `x`.
-	fn shares_x(&self, x: &FieldBytes<C>) -> bool;
-}
-
-/// A key is a point by reference. The comparison reads the key's
-/// x-coordinate as a field element on the stack.
-#[cfg(all(feature = "signature", feature = "ecdh"))]
-impl<C, T> AgreementPoint<C> for T
-where
-	C: CurveArithmetic,
-	T: AsRef<AffinePoint<C>> + ?Sized,
-{
-	fn shares_x(&self, x: &FieldBytes<C>) -> bool {
-		self.as_ref().x() == *x
-	}
-}
-
 /// The SEC 1 point of an `id-ecPublicKey` SubjectPublicKeyInfo, whose first
 /// octet names its form (RFC 5480 §2.2, SEC 1 v2.0 §2.3.3).
 #[cfg(feature = "signature")]
 pub(crate) trait EllipticCurvePoint {
 	/// The x-coordinate of an `id-ecPublicKey` key, read from its compressed
 	/// or uncompressed point, or `None` for a key of another algorithm. It is
-	/// the coordinate `AgreementPoint::shares_x` reads from a parsed point,
-	/// read here where no curve type is named.
+	/// the coordinate an ECDH agreement keeps (SEC 1 v2.0 §3.3.1), read here
+	/// where no curve type is named.
 	///
 	/// # Errors
 	///
@@ -372,8 +315,8 @@ impl EllipticCurvePoint for SubjectPublicKeyInfoRef<'_> {
 #[cfg(feature = "transport-cms")]
 pub(crate) trait SubjectKey {
 	/// Whether this key and `other` are one key: for two elliptic-curve keys,
-	/// one curve and one x-coordinate in either SEC 1 encoding, as
-	/// [`AgreementPoint`] reads a point, and for any other key, one
+	/// one curve and one x-coordinate in either SEC 1 encoding, as an ECDH
+	/// agreement reads a point, and for any other key, one
 	/// SubjectPublicKeyInfo.
 	fn same_key(&self, other: &Self) -> bool;
 }
@@ -397,6 +340,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+	use crate::crypto::sign::elliptic_curve::PublicKey;
 	use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
 	use crate::der::asn1::{BitString, ObjectIdentifier};
 	use crate::der::oid::db::rfc5280::{ANY_EXTENDED_KEY_USAGE, ID_KP_EMAIL_PROTECTION, ID_KP_TIME_STAMPING};
@@ -766,30 +710,6 @@ mod tests {
 
 		let refused = spki.owned_to_ref().require_point_form();
 		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
-	#[test]
-	fn a_point_is_distinct_from_another_key() -> Result<(), CertificateValidationError> {
-		let signing = PeerCertificate::<HouseSigning>::parse(both_uses(), SERVER)?;
-		let other = SecretKey::random(&mut OsRng).public_key();
-		assert!(signing.distinct(&other));
-		Ok(())
-	}
-
-	#[test]
-	fn the_certificate_key_is_not_distinct_from_itself() -> Result<(), CertificateValidationError> {
-		let signing = PeerCertificate::<HouseSigning>::parse(both_uses(), SERVER)?;
-		assert!(!signing.distinct(&fixed_point()));
-		Ok(())
-	}
-
-	/// ECDH keeps the x-coordinate alone, so the negation of the key collapses
-	/// an agreement as the key does.
-	#[test]
-	fn the_negation_of_the_certificate_key_is_not_distinct() -> Result<(), CertificateValidationError> {
-		let signing = PeerCertificate::<HouseSigning>::parse(both_uses(), SERVER)?;
-		assert!(!signing.distinct(&negated_fixed_point()));
-		Ok(())
 	}
 
 	/// One point in its compressed and its uncompressed SEC 1 encoding is one

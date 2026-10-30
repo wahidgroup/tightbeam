@@ -26,8 +26,8 @@ use crate::constants::{
 	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_CHUNK_SIZE,
 	MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CAP, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE,
 };
-use crate::crypto::common::typenum::Unsigned;
 use crate::crypto::common::KeySizeUser;
+use crate::crypto::exchange::KeyExchange;
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::{CryptoProvider, ProfileStrength, SecurityProfileDesc};
 use crate::der::asn1::OctetString;
@@ -38,7 +38,6 @@ use crate::transport::handshake::receipt::SessionReceipt;
 use crate::x509::Certificate;
 use crate::Beamable;
 use crate::Errorizable;
-use elliptic_curve::FieldBytesSize;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::ProfileStrengthPolicy;
@@ -1141,13 +1140,13 @@ impl<P: CryptoProvider> RunnableProfile<P> {
 	}
 
 	/// The strength a [`ProfileStrengthPolicy`] judges, read from the
-	/// provider's cipher, digest, and curve types.
+	/// provider's cipher, digest, and key exchange.
 	pub fn strength(&self) -> ProfileStrength {
 		ProfileStrength {
 			descriptor: self.descriptor,
 			aead_key_bytes: <P::AeadCipher as KeySizeUser>::key_size(),
 			digest_bytes: <P::Digest as Digest>::output_size(),
-			curve_field_bytes: FieldBytesSize::<P::Curve>::USIZE,
+			key_exchange: <P::KeyExchange as KeyExchange>::strength(),
 		}
 	}
 }
@@ -1444,7 +1443,7 @@ mod tests {
 
 	use super::*;
 	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
-	use crate::crypto::profiles::{DefaultCryptoProvider, DefaultStrengthFloor};
+	use crate::crypto::profiles::{DefaultCryptoProvider, DefaultStrengthFloor, SecurityStrength};
 	use crate::oids::{
 		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
@@ -1463,7 +1462,7 @@ mod tests {
 			aead: Some(AES_256_GCM),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			kdf: Some(HKDF_SHA3_256),
-			curve: Some(CURVE_SECP256K1),
+			key_exchange: Some(CURVE_SECP256K1),
 			key_wrap,
 		}
 	}
@@ -2130,7 +2129,7 @@ mod tests {
 			aead: Some(AES_128_GCM),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			kdf: Some(HASH_SHA256),
-			curve: Some(CURVE_SECP256K1),
+			key_exchange: Some(CURVE_SECP256K1),
 			key_wrap: Some(AES_128_WRAP),
 		};
 		let aes256_gcm = SecurityProfileDesc {
@@ -2138,7 +2137,7 @@ mod tests {
 			aead: Some(AES_256_GCM),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			kdf: Some(HASH_SHA256),
-			curve: Some(CURVE_SECP256K1),
+			key_exchange: Some(CURVE_SECP256K1),
 			key_wrap: Some(AES_256_WRAP),
 		};
 
@@ -2201,12 +2200,13 @@ mod tests {
 		assert!(!DefaultStrengthFloor.meets_floor(&weak));
 	}
 
-	/// A 24-byte field is the field of P-192, whose agreement holds 80 bits
-	/// of strength (NIST SP 800-57 Part 1 Rev. 5 Table 2).
+	/// An exchange that rates 112 bits, such as ECDH on a curve whose order is
+	/// 224 to 255 bits, falls below the floor (NIST SP 800-57 Part 1 Rev. 5
+	/// Table 2, CWE-757).
 	#[test]
-	fn the_default_floor_refuses_a_192_bit_curve_field() {
+	fn the_default_floor_refuses_a_112_bit_key_exchange() {
 		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
-		let weak = ProfileStrength { curve_field_bytes: 24, ..strength };
+		let weak = ProfileStrength { key_exchange: SecurityStrength::BITS_112, ..strength };
 		assert!(DefaultStrengthFloor.meets_floor(&strength));
 		assert!(!DefaultStrengthFloor.meets_floor(&weak));
 	}

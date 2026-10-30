@@ -30,8 +30,6 @@ use crate::transport::handshake::HandshakeMessage;
 mod multiplex {
 	pub use crate::cms::signed_data::SignerInfo;
 	pub use crate::constants::DEFAULT_HOP_BUDGET;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, CurveArithmetic, FieldBytesSize, PublicKey};
 	pub use crate::crypto::sign::Signed;
 	pub use crate::der::asn1::OctetString;
 	pub use crate::der::Enumerated;
@@ -674,39 +672,34 @@ pub struct MuxRekeyRequestPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyRequestPackage {
-	/// Builds a request that carries `client_random` and `client_ephemeral` in
-	/// the compressed SEC 1 form, at the width of that form on the curve `C`
-	/// (SEC 1 v2.0 §2.3.3).
+	/// Builds a request that carries `client_random` and `client_share`, the
+	/// octets of the client's rekey share of the negotiated key exchange: a
+	/// compressed SEC 1 point for the house exchange.
 	///
 	/// # Errors
 	///
-	/// - [`der::Error`] -- `client_random` is longer than the DER length cap.
+	/// - [`der::Error`] -- `client_random` or `client_share` is longer than the DER length cap.
 	///
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::crypto::k256::{PublicKey, SecretKey};
+	/// use tightbeam::crypto::exchange::{Ecdhe, KeyExchange, KeyShare};
+	/// use tightbeam::crypto::k256::Secp256k1;
 	/// use tightbeam::random::OsRng;
 	/// use tightbeam::transport::envelopes::MuxRekeyRequestPackage;
 	///
-	/// let ephemeral = SecretKey::random(&mut OsRng).public_key();
-	/// let request = MuxRekeyRequestPackage::new([0x01; 32], &ephemeral)?;
+	/// let (_pending, share) = Ecdhe::<Secp256k1>::offer(&mut OsRng);
+	/// let request = MuxRekeyRequestPackage::new([0x01; 32], share.to_octets())?;
 	///
-	/// // The request carries the point in its compressed form.
+	/// // The request carries the octets of the share, a compressed point.
 	/// let carried = request.client_ephemeral();
-	/// assert_eq!(PublicKey::from_sec1_bytes(carried)?, ephemeral);
+	/// assert_eq!(carried, share.to_octets().as_slice());
 	/// assert!(matches!(carried.first(), Some(0x02 | 0x03)));
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
-	pub fn new<C>(client_random: impl Into<Vec<u8>>, client_ephemeral: &PublicKey<C>) -> DerResult<Self>
-	where
-		C: CurveArithmetic,
-		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-		FieldBytesSize<C>: ModulusSize,
-	{
+	pub fn new(client_random: impl Into<Vec<u8>>, client_share: impl AsRef<[u8]>) -> DerResult<Self> {
 		let client_random = OctetString::new(client_random)?;
-		let compressed = client_ephemeral.to_encoded_point(true);
-		let client_ephemeral = OctetString::new(compressed.as_bytes())?;
+		let client_ephemeral = OctetString::new(client_share.as_ref())?;
 		Ok(Self { client_random, client_ephemeral })
 	}
 
@@ -715,7 +708,8 @@ impl MuxRekeyRequestPackage {
 		self.client_random.as_bytes()
 	}
 
-	/// The client's rekey ephemeral public key, a compressed SEC 1 point.
+	/// The octets of the client's rekey share: a compressed SEC 1 point for
+	/// the house exchange.
 	pub fn client_ephemeral(&self) -> &[u8] {
 		self.client_ephemeral.as_bytes()
 	}
@@ -740,43 +734,40 @@ pub struct MuxRekeyResponsePackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyResponsePackage {
-	/// Builds a response that carries `server_random`, `server_ephemeral` in
-	/// the compressed SEC 1 form, at the width of that form on the curve `C`
-	/// (SEC 1 v2.0 §2.3.3), and the optional `epoch_receipt`.
+	/// Builds a response that carries `server_random`, `server_share`, the
+	/// octets of the server's rekey share of the negotiated key exchange (a
+	/// compressed SEC 1 point for the house exchange), and the optional
+	/// `epoch_receipt`.
 	///
 	/// # Errors
 	///
-	/// - [`der::Error`] -- `server_random` is longer than the DER length cap.
+	/// - [`der::Error`] -- `server_random` or `server_share` is longer than the DER length cap.
 	///
 	/// # Examples
 	///
 	/// ```
-	/// use tightbeam::crypto::k256::{PublicKey, SecretKey};
+	/// use tightbeam::crypto::exchange::{Ecdhe, KeyExchange, KeyShare};
+	/// use tightbeam::crypto::k256::Secp256k1;
 	/// use tightbeam::random::OsRng;
 	/// use tightbeam::transport::envelopes::MuxRekeyResponsePackage;
 	///
-	/// let ephemeral = SecretKey::random(&mut OsRng).public_key();
-	/// let response = MuxRekeyResponsePackage::new([2; 32], &ephemeral, None)?;
+	/// let (_pending, offer) = Ecdhe::<Secp256k1>::offer(&mut OsRng);
+	/// let (share, _secret) = Ecdhe::<Secp256k1>::respond(&offer, &mut OsRng)?;
+	/// let response = MuxRekeyResponsePackage::new([2; 32], share.to_octets(), None)?;
 	///
-	/// // The response carries the point in its compressed form.
+	/// // The response carries the octets of the share, a compressed point.
 	/// let carried = response.server_ephemeral();
-	/// assert_eq!(PublicKey::from_sec1_bytes(carried)?, ephemeral);
+	/// assert_eq!(carried, share.to_octets().as_slice());
 	/// assert!(matches!(carried.first(), Some(0x02 | 0x03)));
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
-	pub fn new<C>(
+	pub fn new(
 		server_random: impl Into<Vec<u8>>,
-		server_ephemeral: &PublicKey<C>,
+		server_share: impl AsRef<[u8]>,
 		epoch_receipt: Option<Signed<SignedData>>,
-	) -> DerResult<Self>
-	where
-		C: CurveArithmetic,
-		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-		FieldBytesSize<C>: ModulusSize,
-	{
+	) -> DerResult<Self> {
 		let server_random = OctetString::new(server_random)?;
-		let compressed = server_ephemeral.to_encoded_point(true);
-		let server_ephemeral = OctetString::new(compressed.as_bytes())?;
+		let server_ephemeral = OctetString::new(server_share.as_ref())?;
 		let epoch_receipt = epoch_receipt.map(Box::new);
 		Ok(Self { server_random, server_ephemeral, epoch_receipt })
 	}
@@ -786,7 +777,8 @@ impl MuxRekeyResponsePackage {
 		self.server_random.as_bytes()
 	}
 
-	/// The server's rekey ephemeral public key, a compressed SEC 1 point.
+	/// The octets of the server's rekey share: a compressed SEC 1 point for
+	/// the house exchange.
 	pub fn server_ephemeral(&self) -> &[u8] {
 		self.server_ephemeral.as_bytes()
 	}
@@ -1267,7 +1259,9 @@ mod tests {
 	use std::error::Error;
 
 	#[cfg(feature = "transport-multiplex")]
-	use crate::crypto::k256::Secp256k1;
+	use crate::crypto::exchange::{EcdheShare, KeyShare};
+	#[cfg(feature = "transport-multiplex")]
+	use crate::crypto::k256::PublicKey;
 	#[cfg(feature = "transport-multiplex")]
 	use crate::testing::{unhex, TestKey};
 
@@ -1580,11 +1574,12 @@ mod tests {
 	}
 
 	/// The generator of secp256k1 (SEC 2 v2.0 §2.4.1), read from its
-	/// uncompressed form, as a point a rekey leg carries.
+	/// uncompressed form, as the octets of the house share a rekey leg carries.
 	#[cfg(feature = "transport-multiplex")]
-	fn secp256k1_generator() -> PublicKey<Secp256k1> {
+	fn secp256k1_generator() -> Vec<u8> {
 		let point = PublicKey::from_sec1_bytes(&TestKey::SEC2_SECP256K1_G_UNCOMPRESSED);
-		point.expect("the generator of SEC 2 is a point of secp256k1")
+		let point = point.expect("the generator of SEC 2 is a point of secp256k1");
+		EcdheShare::from(point).to_octets()
 	}
 
 	/// The DER of a rekey request of 32 `0x01` octets of randomness and the
@@ -1607,7 +1602,7 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_secp256k1_rekey_request_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
-		let request = MuxRekeyRequestPackage::new([0x01u8; 32], &secp256k1_generator())?;
+		let request = MuxRekeyRequestPackage::new([0x01u8; 32], secp256k1_generator())?;
 		assert_eq!(request.to_der()?, unhex(SECP256K1_REKEY_REQUEST));
 		Ok(())
 	}
@@ -1617,7 +1612,7 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn a_secp256k1_rekey_response_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
-		let response = MuxRekeyResponsePackage::new([0x02u8; 32], &secp256k1_generator(), None)?;
+		let response = MuxRekeyResponsePackage::new([0x02u8; 32], secp256k1_generator(), None)?;
 		assert_eq!(response.to_der()?, unhex(SECP256K1_REKEY_RESPONSE));
 		Ok(())
 	}
@@ -1632,9 +1627,9 @@ mod tests {
 			Ok(())
 		}
 		cases {
-			zero_randomness => MuxRekeyRequestPackage::new([0u8; 32], &secp256k1_generator())?,
-			full_randomness => MuxRekeyRequestPackage::new([0xFF; 32], &secp256k1_generator())?,
-			no_randomness => MuxRekeyRequestPackage::new(Vec::new(), &secp256k1_generator())?,
+			zero_randomness => MuxRekeyRequestPackage::new([0u8; 32], secp256k1_generator())?,
+			full_randomness => MuxRekeyRequestPackage::new([0xFF; 32], secp256k1_generator())?,
+			no_randomness => MuxRekeyRequestPackage::new(Vec::new(), secp256k1_generator())?,
 		}
 	}
 
@@ -1649,9 +1644,9 @@ mod tests {
 		}
 		cases {
 			with_a_receipt => {
-				MuxRekeyResponsePackage::new([7u8; 32], &secp256k1_generator(), Some(sample_signed_data()?))?
+				MuxRekeyResponsePackage::new([7u8; 32], secp256k1_generator(), Some(sample_signed_data()?))?
 			},
-			with_no_receipt => MuxRekeyResponsePackage::new([9u8; 32], &secp256k1_generator(), None)?,
+			with_no_receipt => MuxRekeyResponsePackage::new([9u8; 32], secp256k1_generator(), None)?,
 		}
 	}
 
@@ -1781,10 +1776,10 @@ mod tests {
 			cancel => TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
 			go_away => TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
 			ping => TransportEnvelope::from(MuxPingPackage::new(false, 7)),
-			rekey_request => TransportEnvelope::from(MuxRekeyRequestPackage::new([1u8; 32], &secp256k1_generator())?),
+			rekey_request => TransportEnvelope::from(MuxRekeyRequestPackage::new([1u8; 32], secp256k1_generator())?),
 			rekey_response => TransportEnvelope::from(MuxRekeyResponsePackage::new(
 				[2u8; 32],
-				&secp256k1_generator(),
+				secp256k1_generator(),
 				Some(sample_signed_data()?),
 			)?),
 			rekey_ack => TransportEnvelope::from(MuxRekeyAckPackage::new(Some(sample_signer_info()?))),

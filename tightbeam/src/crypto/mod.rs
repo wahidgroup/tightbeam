@@ -36,6 +36,8 @@ pub mod aead;
 pub mod cms;
 #[cfg(feature = "digest")]
 pub mod commitment;
+#[cfg(feature = "ecdh")]
+pub mod exchange;
 #[cfg(any(feature = "digest", feature = "sha3"))]
 pub mod hash;
 #[cfg(feature = "hpke")]
@@ -56,3 +58,5 @@ pub use hkdf;
 pub use k256;
 #[cfg(feature = "kem")]
 pub use kem;
+#[cfg(feature = "preview-pqc")]
+pub use ml_kem;

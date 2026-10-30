@@ -19,6 +19,8 @@ use crate::cms::enveloped_data::OriginatorPublicKey;
 use crate::cms::signed_data::SignedData;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::cms::AttributesExt;
+#[cfg(feature = "transport-cms")]
+use crate::crypto::exchange::KemCiphertext;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::Signed;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -33,8 +35,8 @@ use crate::oids::HANDSHAKE_ABORT_ALERT;
 use crate::oids::{HANDSHAKE_KEY_CONFIRMATION, RECEIPT_ACK, SESSION_RECEIPT};
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
-	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_TRANSPORT_ACCEPT,
-	HANDSHAKE_TRANSPORT_OFFER,
+	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_SERVER_KEM_CIPHERTEXT,
+	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER,
 };
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
@@ -244,6 +246,13 @@ impl AttributePayload for OctetString {
 #[cfg(feature = "transport-cms")]
 impl AttributePayload for OriginatorPublicKey {
 	const OID: ObjectIdentifier = HANDSHAKE_SERVER_EPHEMERAL;
+}
+
+/// The server's share of a KEM exchange on its Finished, the ciphertext the
+/// server encapsulated for the client.
+#[cfg(feature = "transport-cms")]
+impl AttributePayload for KemCiphertext {
+	const OID: ObjectIdentifier = HANDSHAKE_SERVER_KEM_CIPHERTEXT;
 }
 
 /// The key-confirmation tag a closing carries, and the server Finished the

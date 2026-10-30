@@ -13,11 +13,12 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::Sha3_512;
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
+	AeadProvider, Aes128Wrap, CryptoProvider, DefaultCryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider,
 	KeyWrapProvider, SigningProvider,
 };
 use tightbeam::crypto::sign::SigningIdentity;
@@ -69,8 +70,8 @@ impl KdfProvider for FlooredOutsideProvider {
 	type Kdf = OutsideKdf;
 }
 
-impl CurveProvider for FlooredOutsideProvider {
-	type Curve = Secp256k1;
+impl KeyExchangeProvider for FlooredOutsideProvider {
+	type KeyExchange = Ecdhe<Secp256k1>;
 }
 
 impl CryptoProvider for FlooredOutsideProvider {

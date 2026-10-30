@@ -16,11 +16,12 @@ use tightbeam::{
 	crypto::{
 		aead::{Aes128Gcm, Aes128GcmOid},
 		cms::{AuthEnvelopedData, EnvelopeError, Opener},
+		exchange::Ecdhe,
 		hash::Sha3_256,
 		kdf::{Hkdf, HkdfSha3_256},
 		profiles::{
-			AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-			KdfProvider, Kek, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
+			AeadProvider, Aes128Wrap, CryptoProvider, DefaultCryptoProvider, DigestProvider, KdfProvider, Kek,
+			KeyExchangeProvider, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
 			SecurityProfileDesc, SigningProvider,
 		},
 		secret::SecretSlice,
@@ -68,7 +69,7 @@ impl SecurityProfile for Aes128Profile {
 	type AeadOid = Aes128GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = k256::Secp256k1;
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 
 	type KeyWrapOid = Aes128Wrap;
 }
@@ -98,8 +99,8 @@ impl KdfProvider for Aes128CryptoProvider {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for Aes128CryptoProvider {
-	type Curve = k256::Secp256k1;
+impl KeyExchangeProvider for Aes128CryptoProvider {
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 }
 
 impl KeyWrapProvider for Aes128CryptoProvider {

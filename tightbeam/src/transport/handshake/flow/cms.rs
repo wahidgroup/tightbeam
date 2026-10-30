@@ -45,21 +45,22 @@ use crate::cms::enveloped_data::OriginatorPublicKey;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::constants::TIGHTBEAM_OPENING_UKM_LABEL;
 use crate::crypto::cms::{AuthEnvelopedData, Opener, Recipient};
+use crate::crypto::exchange::{KemCiphertext, KeyExchange, KeyShare, ReplyAttribute};
+use crate::crypto::kdf::KdfSalt;
 use crate::crypto::secret::SecretSlice;
-use crate::crypto::sign::elliptic_curve::SecretKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
-use crate::der::asn1::{BitString, OctetString};
-use crate::der::{Choice, Decode, DecodeValue, Encode, Error as DerError, Sequence};
+use crate::der::asn1::OctetString;
+use crate::der::{Choice, Decode, DecodeValue, Encode, Sequence};
 use crate::marker::MaybeSendFuture;
 use crate::oids::HANDSHAKE_OPENING_CONTENT;
-use crate::random::{CryptoRngCore, RngWrapper};
-use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoOwned};
+use crate::random::CryptoRngCore;
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
+use crate::transport::handshake::ephemeral::{Distinct, ExchangeSecret, OpenedShare};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
 	sealed, ClientAgreement, ClientLegs, FinishedDraft, HandshakeFlow, Opened, OpeningIntake, OpeningParts,
-	ReplyBinding, ReplyIntake, ReplyParts, ReplyVerified, ServerAgreement, ServerLegs,
+	ReceivedShare, ReplyBinding, ReplyIntake, ReplyParts, ReplyVerified, ServerAgreement, ServerLegs,
 };
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
 use crate::transport::handshake::peer::{
@@ -67,8 +68,10 @@ use crate::transport::handshake::peer::{
 };
 use crate::transport::handshake::primitives::transcript::{ServerFinishedLegs, Transcript};
 use crate::transport::handshake::primitives::TranscriptHash;
-use crate::transport::handshake::schedule::{Agreement, BaseSecret, FinishedRole, PeerPoint, Salt};
-use crate::transport::handshake::{CmsIdentityPair, HandshakeCurve, HandshakeMessage, HandshakeProvider};
+use crate::transport::handshake::schedule::{BaseSecret, FinishedRole, Salt};
+use crate::transport::handshake::{
+	ClientShare, CmsIdentityPair, Exchange, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerShare,
+};
 use crate::transport::wire_der::WireDer;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::{Zeroize, Zeroizing};
@@ -97,20 +100,20 @@ pub struct CmsClientSettings {
 }
 
 /// What a CMS client keeps from its opening to read the reply against.
-pub struct CmsOpening<P: HandshakeProvider> {
+pub struct CmsOpening {
 	/// The transcript, open over the opening as it was sent.
 	transcript: Transcript,
 	/// The key-agreement certificate the opening sealed to.
-	server: PinnedKeyAgreement<P>,
+	server: PinnedKeyAgreement,
 }
 
 /// The secrets a CMS client holds from its opening to the agreement.
-pub struct CmsPending<C: HandshakeCurve> {
+pub struct CmsPending<P: HandshakeProvider> {
 	/// The base secret the opening carried to the server.
 	base: BaseSecret,
-	/// The agreement ephemeral `R`, kept for the agreement with the server
-	/// ephemeral.
-	ephemeral: SecretKey<C>,
+	/// The pending half of the exchange of `R`, kept for its completion with
+	/// the server's share.
+	ephemeral: <Exchange<P> as KeyExchange>::Pending,
 }
 
 /// The content of a CMS opening, under the content type
@@ -130,48 +133,60 @@ pub(crate) struct OpeningContent {
 	pub(crate) agreement_key: OriginatorPublicKey,
 }
 
-/// Carriage of a public key as a CMS `OriginatorPublicKey`
-/// ([RFC 5652 §6.2.2][rfc5652-6.2.2]).
+/// The server's share as the server Finished carries it: an unsigned
+/// attribute under the OID of its carrier, whose value the transcript binds.
 ///
-/// The opening carries the client's agreement ephemeral from its SPKI, and the
-/// server Finished carries the server ephemeral from the public key itself, so
-/// the mapping has one home.
-///
-/// [rfc5652-6.2.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.2
-trait OriginatorKey {
-	/// What fails on the way from this key to its originator form.
-	type Error;
-
-	/// This key as an originator: its algorithm identifier and its public key
-	/// bits.
-	fn originator_key(self) -> Result<OriginatorPublicKey, Self::Error>;
-}
-
-impl OriginatorKey for SubjectPublicKeyInfoOwned {
-	type Error = DerError;
-
+/// A DH reply travels as an `OriginatorPublicKey` (RFC 5652 §6.2.2), and a KEM
+/// reply as a [`KemCiphertext`] (RFC 9629 §3), so each field means what its
+/// standard says.
+impl ReplyAttribute {
+	/// Reads the one reply attribute that `finished` carries, beside the bytes
+	/// of its value as they arrived.
+	///
 	/// # Errors
 	///
-	/// - [`DerError`] -- the key bits fail to re-encode as a BIT STRING.
-	fn originator_key(self) -> Result<OriginatorPublicKey, DerError> {
-		let public_key = BitString::from_bytes(self.subject_public_key.raw_bytes())?;
-		Ok(OriginatorPublicKey { algorithm: self.algorithm, public_key })
+	/// - [`HandshakeError::MissingAttribute`] -- `finished` carries no reply attribute.
+	/// - [`HandshakeError::DuplicateAttribute`] -- a carrier repeats, or `finished` carries both carriers.
+	/// - [`HandshakeError::DerError`] -- a carrier fails to decode.
+	fn extract(finished: &SignedData) -> Result<(Self, Vec<u8>), HandshakeError> {
+		let key = ReceivedAttribute::<OriginatorPublicKey>::extract(finished)?;
+		let ciphertext = ReceivedAttribute::<KemCiphertext>::extract(finished)?;
+		match (key, ciphertext) {
+			(Some(key), None) => {
+				let (key, bytes) = key.into_parts();
+				Ok((Self::OriginatorKey(key), bytes))
+			}
+			(None, Some(ciphertext)) => {
+				let (ciphertext, bytes) = ciphertext.into_parts();
+				Ok((Self::KemCiphertext(ciphertext), bytes))
+			}
+			(None, None) => Err(HandshakeError::MissingAttribute),
+			(Some(_), Some(_)) => Err(HandshakeError::DuplicateAttribute),
+		}
 	}
-}
 
-impl<K> OriginatorKey for &K
-where
-	K: EncodePublicKey,
-{
-	type Error = SpkiError;
-
+	/// The bytes of the attribute value, as the transcript binds them.
+	///
 	/// # Errors
 	///
-	/// - [`SpkiError`] -- the key fails to encode as an SPKI, or its bits fail to re-encode as a BIT STRING.
-	fn originator_key(self) -> Result<OriginatorPublicKey, SpkiError> {
-		let spki_der = self.to_public_key_der()?;
-		let spki = SubjectPublicKeyInfoOwned::from_der(spki_der.as_bytes())?;
-		Ok(spki.originator_key()?)
+	/// - [`HandshakeError::DerError`] -- the value fails to encode.
+	fn transcript_bytes(&self) -> Result<Vec<u8>, HandshakeError> {
+		match self {
+			Self::OriginatorKey(key) => HandshakeAttribute::transcript_bytes(key),
+			Self::KemCiphertext(ciphertext) => HandshakeAttribute::transcript_bytes(ciphertext),
+		}
+	}
+
+	/// The attribute under the OID of its carrier.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- the value fails to encode.
+	fn attribute(&self) -> Result<HandshakeAttribute, HandshakeError> {
+		match self {
+			Self::OriginatorKey(key) => HandshakeAttribute::encode(key),
+			Self::KemCiphertext(ciphertext) => HandshakeAttribute::encode(ciphertext),
+		}
 	}
 }
 
@@ -235,8 +250,8 @@ impl<T> ReceivedAttribute<T> {
 impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 	type Settings = CmsClientSettings;
 	type Trust = ProvisionedTrust;
-	type Opening = CmsOpening<P>;
-	type Pending = Box<CmsPending<P::Curve>>;
+	type Opening = CmsOpening;
+	type Pending = Box<CmsPending<P>>;
 
 	fn identity(settings: &Self::Settings) -> Option<&SigningIdentity> {
 		Some(&settings.identity)
@@ -256,15 +271,16 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		//    secret, fresh for this handshake (CWE-321).
 		let base = BaseSecret::random(Some(&mut *rng))?;
 
-		// 2. Draw the agreement ephemeral `R`, kept for the agreement with the
-		//    server ephemeral. The KEM draws the key it seals under itself.
-		let ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(&mut *rng));
-		let ephemeral_spki = SubjectPublicKeyInfoOwned::from_key(ephemeral.public_key())?;
+		// 2. Draw the offer `R` of the exchange, and keep its pending half for
+		//    the completion with the server's share. The KEM draws the key it
+		//    seals under itself.
+		let (ephemeral, offer) = Exchange::<P>::offer(&mut *rng);
+		let agreement_key = offer.to_originator_key()?;
 
 		// 3. Encode the content. The DER buffer holds the base secret, so it
 		//    wipes when dropped, along with the transient OCTET STRING copy.
 		let base_secret = OctetString::new(base.as_bytes())?;
-		let content = OpeningContent { base_secret, agreement_key: ephemeral_spki.originator_key()? };
+		let content = OpeningContent { base_secret, agreement_key };
 		let mut content_der = Zeroizing::new(content.to_der()?);
 		content.base_secret.into_bytes().zeroize();
 
@@ -312,15 +328,13 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		let finished = reply.value();
 		finished.refuse_alert()?;
 
-		// 2. Read the accepts, the server ephemeral, and the receipt, each
-		//    with the bytes it arrived as. The ephemeral is mandatory.
+		// 2. Read the accepts, the server's share, and the receipt, each with
+		//    the bytes it arrived as. The share is mandatory.
 		let received_accept = ReceivedAttribute::<SecurityAccept>::extract(finished)?;
 		let (security_accept, security_accept_bytes) = received_accept.map(ReceivedAttribute::into_parts).unzip();
 		let received_transport = ReceivedAttribute::<TransportAccept>::extract(finished)?;
 		let (transport_accept, transport_accept_bytes) = received_transport.map(ReceivedAttribute::into_parts).unzip();
-		let received_ephemeral = ReceivedAttribute::<OriginatorPublicKey>::extract(finished)?;
-		let received_ephemeral = received_ephemeral.ok_or(HandshakeError::MissingAttribute)?;
-		let (server_ephemeral, server_ephemeral_bytes) = received_ephemeral.into_parts();
+		let (server_ephemeral, server_ephemeral_bytes) = ReplyAttribute::extract(finished)?;
 		let received_artifact = ReceivedAttribute::<Signed<SignedData>>::extract(finished)?;
 		let receipt = received_artifact.map(|received| received.into_parts().0);
 
@@ -342,13 +356,12 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 		transcript.append_server_finished(legs)?;
 		let transcript_hash = transcript.seal::<P::Digest>()?;
 
-		// 5. Return the facts of the reply.
-		let server_ephemeral = server_ephemeral.public_key.raw_bytes().to_vec();
+		// 5. Return the facts of the reply, with the share in its carrier until the signature verifies.
 		Ok(ReplyIntake {
 			server: CmsNamedServer { signing, key_agreement: server },
 			security_accept,
 			transport_accept,
-			server_ephemeral,
+			server_ephemeral: ReceivedShare::Attribute(server_ephemeral),
 			receipt,
 			client_cert_required: false,
 			transcript_hash,
@@ -367,16 +380,17 @@ impl<P: HandshakeProvider> ClientLegs<P> for Cms {
 	}
 }
 
-/// The CMS client agrees hybrid: the ECDH output, then the base secret its
-/// opening carried. The secrets are read in place, so each is wiped where the
-/// box drops.
-impl<P: HandshakeProvider> ClientAgreement<P> for Box<CmsPending<P::Curve>> {
-	fn agreement<'a>(&'a self, peer: &'a PeerPoint<P::Curve>) -> Agreement<'a, P> {
-		Agreement::hybrid(peer, &self.base)
-	}
-
-	fn ephemeral(&self) -> &SecretKey<P::Curve> {
-		&self.ephemeral
+/// The CMS client derives the hybrid secret: the secret of the exchange, then
+/// the base secret its opening carried. The secrets are read in place, so
+/// each is wiped where the box drops.
+impl<P: HandshakeProvider> ClientAgreement<P> for Box<CmsPending<P>> {
+	fn agree(
+		self,
+		server_ephemeral: &Distinct<ServerShare<P>>,
+		salt: KdfSalt<'_>,
+	) -> Result<HandshakeSecret, HandshakeError> {
+		let shared = server_ephemeral.complete::<Exchange<P>>(&self.ephemeral)?;
+		HandshakeSecret::hybrid::<P>(shared.as_ref(), &self.base, salt)
 	}
 }
 
@@ -397,12 +411,11 @@ pub struct CmsSealed {
 }
 
 /// What a CMS server holds from the static open to its Finished.
-pub struct CmsOpened<C: HandshakeCurve> {
+pub struct CmsOpened<P: HandshakeProvider> {
 	/// The base secret the opening carried.
 	base: BaseSecret,
-	/// The client's agreement ephemeral `R`, parsed once at the open as a
-	/// point of the curve.
-	client_ephemeral: PeerPoint<C>,
+	/// The client's share `R`, parsed once at the open.
+	client_ephemeral: OpenedShare<ClientShare<P>>,
 	/// The transcript, open over the opening.
 	transcript: Transcript,
 }
@@ -413,7 +426,8 @@ pub struct CmsReplyDraft {
 	finished: FinishedDraft,
 	security_accept: SecurityAccept,
 	transport_accept: Option<TransportAccept>,
-	server_ephemeral: OriginatorPublicKey,
+	/// The server's share, in the carrier of its kind of reply.
+	server_ephemeral: ReplyAttribute,
 	/// The certificates the Finished carries: the signing certificate its
 	/// `SignerInfo` names, and the issuers above it that the server presents.
 	certificates: CertificateSet,
@@ -423,7 +437,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 	type Settings = CmsServerSettings;
 	type Identity = CmsIdentityPair<P::Kem>;
 	type Sealed = CmsSealed;
-	type Opened = Box<CmsOpened<P::Curve>>;
+	type Opened = Box<CmsOpened<P>>;
 	type Draft = CmsReplyDraft;
 
 	fn read_opening(
@@ -470,11 +484,10 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 			//    wiping wrapper without a copy (CWE-226).
 			let base = BaseSecret::try_from(SecretSlice::from(base_secret.into_bytes()))?;
 
-			// 3. Parse `R`. A malformed, off-curve, or identity point is
-			//    refused here, ahead of the agreement. The comparison with the
-			//    client's static key waits for the identity, which opens at the
-			//    closing.
-			let client_ephemeral = PeerPoint::parse(agreement_key.public_key.raw_bytes())?;
+			// 3. Parse `R`. A share that fails its parse is refused here, ahead
+			//    of the agreement. The comparison with the client's static key
+			//    waits for the identity, which opens at the closing.
+			let client_ephemeral = OpenedShare::from_originator_key::<Exchange<P>>(&agreement_key)?;
 
 			// The base secret crosses the signature and receipt awaits in the
 			// orchestrator. It is boxed, so that move copies a pointer.
@@ -490,11 +503,10 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 	) -> Result<ReplyBinding<Self, P>, HandshakeError> {
 		let ReplyParts { identity, profile, transport_accept, server_ephemeral, .. } = parts;
 
-		// 1. Carry the server ephemeral as the originator key the Finished
-		//    sends, through the SPKI encoding of the provider's verifying key.
+		// 1. Carry the server's share in the reply attribute of its kind of
+		//    exchange, which the Finished sends.
 		let security_accept = SecurityAccept::new(profile.descriptor());
-		let ephemeral_key = P::VerifyingKey::from(server_ephemeral);
-		let server_ephemeral = (&ephemeral_key).originator_key()?;
+		let server_ephemeral = ReplyAttribute::of::<Exchange<P>>(server_ephemeral)?;
 
 		// 2. Append both selections, the ephemeral, and the `certificates`
 		//    field the Finished carries, as the DER its identity encoded once.
@@ -504,7 +516,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 		let legs = ServerFinishedLegs {
 			security_accept: Some(HandshakeAttribute::transcript_bytes(&security_accept)?),
 			transport_accept: transport_accept.map(HandshakeAttribute::transcript_bytes).transpose()?,
-			server_ephemeral: HandshakeAttribute::transcript_bytes(&server_ephemeral)?,
+			server_ephemeral: server_ephemeral.transcript_bytes()?,
 			certificates: presented.field(),
 		};
 		opened.transcript.append_server_finished(legs)?;
@@ -540,7 +552,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 			attributes.push(HandshakeAttribute::encode(artifact)?);
 		}
 
-		attributes.push(HandshakeAttribute::encode(&server_ephemeral)?);
+		attributes.push(server_ephemeral.attribute()?);
 
 		let encoded: Result<Vec<Attribute>, HandshakeError> = attributes.into_iter().map(Attribute::try_from).collect();
 		let unsigned_attrs = Attributes::try_from(encoded?)?;
@@ -549,17 +561,23 @@ impl<P: HandshakeProvider> ServerLegs<P> for Cms {
 	}
 }
 
-/// The CMS server agrees hybrid with `R`: the ECDH output, then the base
-/// secret the opening carried. The base secret and the transcript drop with
-/// the value, and the secrets are read in place, so each is wiped where its
-/// box drops.
-impl<P: HandshakeProvider> ServerAgreement<P> for Box<CmsOpened<P::Curve>> {
-	fn client_ephemeral(&self) -> &PeerPoint<P::Curve> {
-		&self.client_ephemeral
+/// The CMS server derives the hybrid secret with `R`: the secret of the
+/// exchange, then the base secret the opening carried. The base secret is read
+/// in place, and it drops with the transcript, so it is wiped where its box
+/// drops.
+impl<P: HandshakeProvider> ServerAgreement<P> for Box<CmsOpened<P>> {
+	fn respond(&self, rng: &mut dyn CryptoRngCore) -> Result<(ServerShare<P>, ExchangeSecret), HandshakeError> {
+		self.client_ephemeral.respond::<Exchange<P>>(rng)
 	}
 
-	fn agreement(&self) -> Agreement<'_, P> {
-		Agreement::hybrid(&self.client_ephemeral, &self.base)
+	fn settle(
+		self,
+		shared: ExchangeSecret,
+		salt: KdfSalt<'_>,
+	) -> Result<(HandshakeSecret, OpenedShare<ClientShare<P>>), HandshakeError> {
+		let secret = HandshakeSecret::hybrid::<P>(&shared, &self.base, salt)?;
+		let CmsOpened { client_ephemeral, .. } = *self;
+		Ok((secret, client_ephemeral))
 	}
 }
 
@@ -569,12 +587,15 @@ mod tests {
 	use std::str::FromStr;
 	use std::sync::Arc;
 
+	use p256::NistP256;
+
 	use super::*;
 	use crate::asn1::admission::fixtures::tlv;
 	use crate::cms::content_info::{CmsVersion, ContentInfo};
 	use crate::cms::signed_data::SignerInfo;
 	use crate::constants::{TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 	use crate::crypto::cms::{EnvelopeError, GcmParameters, KemRecipient, KemRecipientInfo};
+	use crate::crypto::exchange::{Ecdhe, EcdheShare, KeyExchangeError};
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::hpke::DhKemSecp256k1;
 	use crate::crypto::kdf::KdfSalt;
@@ -583,23 +604,28 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Signature};
 	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
-	use crate::crypto::sign::elliptic_curve::PublicKey;
+	use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 	use crate::crypto::sign::{CmsSigner, SignedContent, SignedDataExt, SignerError};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::crypto::x509::utils::CertificateExt;
 	use crate::crypto::x509::KeyAgreement;
 	use crate::crypto::x509::KeyPurposes;
-	use crate::der::asn1::ObjectIdentifier;
+	use crate::der::asn1::{BitString, ObjectIdentifier};
 	use crate::der::Any;
 	use crate::der::{Choice, DecodeValue, EncodeValue, ErrorKind, Tag, TagNumber, Tagged};
 	use crate::oids::{AES_128_GCM, AUTH_ENVELOPED_DATA, HANDSHAKE_ABORT_ALERT, HANDSHAKE_SERVER_EPHEMERAL};
 	use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST};
-	use crate::oids::{DATA, SESSION_RECEIPT, SIGNED_DATA};
+	use crate::oids::{CURVE_SECP256K1, DATA, SESSION_RECEIPT, SIGNED_DATA};
 	use crate::random::OsRng;
-	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestAttributes, TestIdentity};
+	use crate::spki::AlgorithmIdentifierOwned;
+	use crate::testing::{
+		unhex, Aes256Sha3_512Provider, EnvelopeRecipient, SeededStream, TestAttributes, TestIdentity,
+	};
 	use crate::transport::envelopes::TransportEnvelope;
+	use crate::transport::handshake::ephemeral::PeerStatics;
 	use crate::transport::handshake::negotiation::{RunnableProfile, SecurityOffer};
+	use crate::transport::handshake::peer::{ServerAdmission, ServerTrust};
 	use crate::transport::handshake::schedule::{KeyConfirmation, Sealer, SecretSeal, TrafficSecret};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{
@@ -613,13 +639,16 @@ mod tests {
 	/// The base secret a hand-built opening carries.
 	const TEST_BASE_SECRET: [u8; 32] = [2u8; 32];
 
+	/// The originator key of `key`, as the house exchange encodes a share.
+	fn originator_of(key: PublicKey<Secp256k1>) -> OriginatorPublicKey {
+		let share = EcdheShare::from(key);
+		let encoded = share.to_originator_key();
+		encoded.expect("a point encodes as an originator key")
+	}
+
 	/// The originator key of a fresh secp256k1 ephemeral, as a server sends it.
 	fn fresh_server_ephemeral() -> OriginatorPublicKey {
-		let public_key = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
-		let spki_der = public_key.to_public_key_der().expect("a public key encodes as an SPKI");
-
-		let spki = SubjectPublicKeyInfoOwned::from_der(spki_der.as_bytes()).expect("the SPKI decodes");
-		spki.originator_key().expect("an SPKI names an originator key")
+		originator_of(SecretKey::<Secp256k1>::random(&mut OsRng).public_key())
 	}
 
 	/// `ephemeral` with its point bytes replaced by `point`.
@@ -659,14 +688,37 @@ mod tests {
 		opening: &WireDer<AuthEnvelopedData>,
 		ephemeral: &OriginatorPublicKey,
 	) -> SignedData {
+		let reply = ReplyAttribute::OriginatorKey(ephemeral.to_owned());
+		server_finished_carrying(server, opening, &[reply])
+	}
+
+	/// A server Finished as [`server_finished_over`] builds it, whose reply
+	/// attributes are `replies`, each bound into the transcript in order.
+	fn server_finished_carrying(
+		server: &TestCertificate,
+		opening: &WireDer<AuthEnvelopedData>,
+		replies: &[ReplyAttribute],
+	) -> SignedData {
 		let accept = SecurityAccept::new(create_default_test_profile());
 		let accept_bytes = HandshakeAttribute::transcript_bytes(&accept).expect("an accept has transcript bytes");
-		let ephemeral_bytes = HandshakeAttribute::transcript_bytes(ephemeral).expect("a key has transcript bytes");
+		let transcript_bytes = |reply: &ReplyAttribute| reply.transcript_bytes().expect("a reply has transcript bytes");
+		let reply_bytes: Vec<u8> = replies.iter().flat_map(transcript_bytes).collect();
 		let certificates = certificates_field([server.certificate.to_owned()]);
-		let transcript = [opening.der(), &accept_bytes, &ephemeral_bytes, &certificates].concat();
-		let attrs = unsigned_attrs(vec![attribute(&accept), attribute(ephemeral)]);
+		let transcript = [opening.der(), &accept_bytes, &reply_bytes, &certificates].concat();
 
-		signed_server_finished(server, &transcript, attrs)
+		let encoded = |reply: &ReplyAttribute| reply.attribute().expect("a reply encodes as an attribute");
+		let reply_attributes = replies.iter().map(encoded);
+		let attributes = [attribute(&accept)].into_iter().chain(reply_attributes).collect();
+		signed_server_finished(server, &transcript, unsigned_attrs(attributes))
+	}
+
+	/// The compressed point of a fresh secp256k1 scalar as a KEM ciphertext
+	/// under the OID of the curve, the carrier of another kind of reply.
+	fn kem_carried_point() -> ReplyAttribute {
+		let point = SecretKey::<Secp256k1>::random(&mut OsRng).public_key().to_encoded_point(true);
+		let kem = AlgorithmIdentifierOwned { oid: CURVE_SECP256K1, parameters: None };
+		let kemct = OctetString::new(point.as_bytes()).expect("a point is an OCTET STRING");
+		ReplyAttribute::KemCiphertext(KemCiphertext { kem, kemct })
 	}
 
 	/// A server Finished signed by `server` over `transcript` that carries
@@ -877,8 +929,7 @@ mod tests {
 		base: &[u8],
 		auth_attrs: impl IntoIterator<Item = HandshakeAttribute>,
 	) -> AuthEnvelopedData {
-		let spki = SubjectPublicKeyInfoOwned::from_key(ephemeral.public_key()).expect("a public key has an SPKI");
-		let agreement_key = spki.originator_key().expect("an SPKI names an originator key");
+		let agreement_key = originator_of(ephemeral.public_key());
 		build_test_opening_of(server, base, agreement_key, auth_attrs)
 	}
 
@@ -1325,6 +1376,31 @@ mod tests {
 		assert!(matches!(result, Err(HandshakeError::MissingAttribute)));
 	}
 
+	/// A server Finished that carries its share as a KEM ciphertext, the
+	/// carrier of another kind of reply, is refused at the parse of the share.
+	#[tokio::test]
+	async fn a_server_share_in_the_kem_carrier_is_refused() {
+		let server = create_test_server();
+		let (mut client, sent) = client_after_opening(&server, None);
+		let finished = server_finished_carrying(&server.signing, &sent, &[kem_carried_point()]);
+
+		let result = client.respond(reply(finished)).await;
+		assert!(matches!(result, Err(HandshakeError::KeyExchange(KeyExchangeError::Algorithm))));
+	}
+
+	/// A server Finished that carries both reply carriers carries two replies,
+	/// so it is refused before the transcript seals.
+	#[tokio::test]
+	async fn a_server_finished_with_both_reply_carriers_is_refused() {
+		let server = create_test_server();
+		let (mut client, sent) = client_after_opening(&server, None);
+		let key = ReplyAttribute::OriginatorKey(fresh_server_ephemeral());
+		let finished = server_finished_carrying(&server.signing, &sent, &[key, kem_carried_point()]);
+
+		let result = client.respond(reply(finished)).await;
+		assert!(matches!(result, Err(HandshakeError::DuplicateAttribute)));
+	}
+
 	/// A server Finished that carries an abort alert is refused before any
 	/// attribute is read.
 	#[tokio::test]
@@ -1383,7 +1459,7 @@ mod tests {
 		let finished = server_finished_over(&server.signing, &sent, &identity);
 
 		let result = client.respond(reply(finished)).await;
-		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(result, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 	}
 
 	/// A validly signed server ephemeral whose x-coordinate lies off the
@@ -1396,7 +1472,7 @@ mod tests {
 		let finished = server_finished_over(&server.signing, &sent, &off_curve);
 
 		let result = client.respond(reply(finished)).await;
-		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(result, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 	}
 
 	/// A validly signed server ephemeral that is the server's own static key
@@ -1405,7 +1481,7 @@ mod tests {
 	async fn a_server_ephemeral_equal_to_the_static_key_is_refused() -> Result<(), Box<dyn Error>> {
 		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let static_key = server.signing.signing_key.verifying_key().originator_key()?;
+		let static_key = originator_of(PublicKey::from(server.signing.signing_key.verifying_key()));
 		let finished = server_finished_over(&server.signing, &sent, &static_key);
 
 		let result = client.respond(reply(finished)).await;
@@ -1420,7 +1496,7 @@ mod tests {
 	async fn a_server_ephemeral_equal_to_the_key_agreement_key_is_refused() -> Result<(), Box<dyn Error>> {
 		let server = create_test_server();
 		let (mut client, sent) = client_after_opening(&server, None);
-		let static_key = server.key_agreement.signing_key.verifying_key().originator_key()?;
+		let static_key = originator_of(PublicKey::from(server.key_agreement.signing_key.verifying_key()));
 		let finished = server_finished_over(&server.signing, &sent, &static_key);
 
 		let result = client.respond(reply(finished)).await;
@@ -1485,7 +1561,21 @@ mod tests {
 		let sealed = build_test_opening_of(&server_certificate, &TEST_BASE_SECRET, agreement_key, []);
 
 		let refusal = server.reply(opening(sealed)).await;
-		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
+	}
+
+	/// An agreement key on another curve names another algorithm, so the
+	/// server refuses the opening before it answers.
+	#[tokio::test]
+	async fn an_agreement_key_of_another_curve_is_refused() -> Result<(), Box<dyn Error>> {
+		let (mut server, server_certificate) = anonymous_server();
+		let point = p256::SecretKey::random(&mut OsRng).public_key();
+		let agreement_key = EcdheShare::<NistP256>::from(point).to_originator_key()?;
+		let sealed = build_test_opening_of(&server_certificate, &TEST_BASE_SECRET, agreement_key, []);
+
+		let refusal = server.reply(opening(sealed)).await;
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(KeyExchangeError::Algorithm))));
+		Ok(())
 	}
 
 	/// A base secret of another length is refused where the opened content is
@@ -2436,11 +2526,12 @@ mod tests {
 	#[test]
 	fn the_cms_handshake_secret_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
 		let ephemeral = SecretKey::<Secp256k1>::from_slice(&[0x03u8; 32])?;
-		let pending = Box::new(CmsPending { base: test_base_secret(), ephemeral });
-		let server_ephemeral = PeerPoint::<Secp256k1>::parse(KNOWN_SERVER_EPHEMERAL)?;
+		let pending = Box::new(CmsPending::<DefaultCryptoProvider> { base: test_base_secret(), ephemeral });
+		let server_share = EcdheShare::from(PublicKey::<Secp256k1>::from_sec1_bytes(&KNOWN_SERVER_EPHEMERAL)?);
+		let server_ephemeral = PeerStatics::<Ecdhe<Secp256k1>>::none().server_ephemeral(server_share)?;
 		let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 
-		let agree = <Box<CmsPending<Secp256k1>> as ClientAgreement<DefaultCryptoProvider>>::agree;
+		let agree = <Box<CmsPending<DefaultCryptoProvider>> as ClientAgreement<DefaultCryptoProvider>>::agree;
 		let secret = agree(pending, &server_ephemeral, salt)?;
 		let expected = [
 			0x1d, 0xdf, 0x26, 0xec, 0xa0, 0x1c, 0x5d, 0xb2, 0x3d, 0x34, 0x0c, 0x3c, 0x62, 0x94, 0xb0, 0xe2, 0x4c, 0x9c,
@@ -2450,28 +2541,121 @@ mod tests {
 		Ok(())
 	}
 
-	/// A handshake under a provider whose digest is SHA3-512 seals the whole
-	/// 64-byte digest as its transcript hash, and its closing confirms and
-	/// opens under that hash.
+	/// The DER of the `OriginatorPublicKey` of the point of
+	/// [`KNOWN_SERVER_EPHEMERAL`]: `id-ecPublicKey` on secp256k1 and the
+	/// uncompressed point (RFC 5480 §2.2).
+	const KNOWN_ORIGINATOR_KEY: &str = "3056301006072a8648ce3d020106052b8104000a03420004\
+		62c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7\
+		6d83f6a6ff2df8664ec7b804ab1362cc95403e4374d1819e0840bd8a8817800d";
+
+	/// The DER of the server-ephemeral attribute that carries
+	/// [`KNOWN_ORIGINATOR_KEY`].
+	const KNOWN_SERVER_EPHEMERAL_ATTRIBUTE: &str = "3066060a2b0601040183f84a01173158\
+		3056301006072a8648ce3d020106052b8104000a03420004\
+		62c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7\
+		6d83f6a6ff2df8664ec7b804ab1362cc95403e4374d1819e0840bd8a8817800d";
+
+	/// The opening carries its agreement ephemeral `R` as
+	/// [`KNOWN_ORIGINATOR_KEY`] when the seeded draw makes `R` the point of
+	/// [`KNOWN_SERVER_EPHEMERAL`]: the base secret takes the draw of `0x04`
+	/// bytes, and `R` the scalar of `0x05` bytes.
 	#[tokio::test]
-	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash() -> Result<(), Box<dyn Error>> {
+	async fn the_opening_carries_its_agreement_key_as_its_known_der() -> Result<(), Box<dyn Error>> {
+		let server = create_test_server();
+		let config = Cms::client(&server, &create_test_certificate());
+		let provisioned = config.flow().trust.admit_provisioned(ServerAdmission::of(&config))?;
+		let parts = OpeningParts { security_offer: None, transport_offer: None };
+		let open = <Cms as ClientLegs<DefaultCryptoProvider>>::open;
+		let opened = open(config.flow(), provisioned, parts, &mut SeededStream(3))?;
+
+		let identity = server.key_agreement_identity();
+		let opener = Opener::Kem { identity: &identity, ukm_label: TIGHTBEAM_OPENING_UKM_LABEL };
+		let (arrived, sealed) = opened.message.auth_enveloped()?.into_parts();
+		let opening = sealed.open::<DefaultCryptoProvider>(arrived, &opener, HANDSHAKE_OPENING_CONTENT);
+		let content = opening.await?;
+		let content = OpeningContent::from_der(&content.to_insecure())?;
+		let der = content.agreement_key.to_der()?;
+		assert_eq!(der, unhex(KNOWN_ORIGINATOR_KEY));
+		Ok(())
+	}
+
+	/// The server Finished carries the server ephemeral of
+	/// [`KNOWN_SERVER_EPHEMERAL`] as [`KNOWN_SERVER_EPHEMERAL_ATTRIBUTE`].
+	#[tokio::test]
+	async fn the_server_finished_carries_its_ephemeral_as_its_known_der() -> Result<(), Box<dyn Error>> {
+		let server = create_test_server();
+		let identity = signing_identity(&server.signing);
+		let known = EcdheShare::from(PublicKey::<Secp256k1>::from_sec1_bytes(&KNOWN_SERVER_EPHEMERAL)?);
+		let client_ephemeral = OpenedShare::fixture(known);
+		let opened = CmsOpened { base: test_base_secret(), client_ephemeral, transcript: Transcript::new() };
+		let mut opened = Box::new(opened);
+		let server_ephemeral = &known;
+		let profile = RunnableProfile::<DefaultCryptoProvider>::native();
+		let parts = ReplyParts {
+			identity: &identity,
+			profile,
+			transport_accept: None,
+			server_ephemeral,
+			client_cert_required: false,
+		};
+
+		let bind = <Cms as ServerLegs<DefaultCryptoProvider>>::bind_reply;
+		let bound = bind(&mut opened, &CmsServerSettings, parts, &mut OsRng)?;
+		let signature = identity.sign_prehash(&bound.prehash).await?;
+		let encode = <Cms as ServerLegs<DefaultCryptoProvider>>::encode_reply;
+		let finished = encode(bound.draft, signature, None)?;
+
+		let carried = finished.find_unsigned_attr(HANDSHAKE_SERVER_EPHEMERAL)?;
+		let carried = carried.ok_or("the server Finished carries its ephemeral")?;
+		assert_eq!(carried.to_der()?, unhex(KNOWN_SERVER_EPHEMERAL_ATTRIBUTE));
+		Ok(())
+	}
+
+	/// The server of a CMS handshake under the provider `P`, once the three
+	/// legs run with a client that presents its identity.
+	async fn server_after_handshake<P>() -> Result<Handshake<Server, Cms, P>, Box<dyn Error>>
+	where
+		P: HandshakeProvider<Kem = DhKemSecp256k1>,
+	{
 		let server_identity = create_test_server();
 		let identity = client_identity(&create_test_certificate());
 		let settings = CmsClientSettings { trust: server_identity.trust(), identity };
-		let profiles = SupportedProfiles::from(RunnableProfile::<Aes256Sha3_512Provider>::native().descriptor());
+		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
 		let pair = server_identity.pair();
 		let server_config = ServerConfig::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE)?;
 		let client_config = ClientConfig::new(settings, KeyPurposes::HOUSE)?;
-		let mut client = Handshake::<Client, Cms, Aes256Sha3_512Provider>::client(client_config);
-		let mut server = Handshake::<Server, Cms, Aes256Sha3_512Provider>::server(server_config);
+		let mut client = Handshake::<Client, Cms, P>::client(client_config);
+		let mut server = Handshake::<Server, Cms, P>::server(server_config);
 
 		let opening = client.start()?;
 		let reply = server.reply(opening).await?;
 		let closing = client.respond(reply).await?;
 		server.finish(closing).await?;
+		Ok(server)
+	}
 
+	/// A handshake under a provider whose digest is SHA3-512 seals the whole
+	/// 64-byte digest as its transcript hash, and its closing confirms and
+	/// opens under that hash.
+	#[tokio::test]
+	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash() -> Result<(), Box<dyn Error>> {
+		let server = server_after_handshake::<Aes256Sha3_512Provider>().await?;
 		let transcript_hash = server.transcript_hash().ok_or("the reply sealed the transcript")?;
 		assert_eq!(transcript_hash.as_bytes().len(), 64);
+		Ok(())
+	}
+
+	/// A handshake under the house provider of the hybrid key exchange runs to
+	/// its closing under the identifier of the hybrid.
+	#[cfg(feature = "preview-pqc")]
+	#[tokio::test]
+	async fn the_preview_provider_runs_the_cms_flow() -> Result<(), Box<dyn Error>> {
+		use crate::crypto::profiles::PreviewPqcProvider;
+		use crate::oids::KEM_SECP256K1_ML_KEM_768;
+
+		let server = server_after_handshake::<PreviewPqcProvider>().await?;
+		let selected = server.selected_profile().ok_or("the reply selected a profile")?;
+		assert_eq!(selected.key_exchange, Some(KEM_SECP256K1_ML_KEM_768));
 		Ok(())
 	}
 

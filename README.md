@@ -679,10 +679,10 @@ Any change to those fields invalidates the signature. The resulting binding is t
 
 The `SignerInfo` signs those bytes as CMS content of type `id-data` ([RFC 5652][rfc5652] §5.4). Every field has one value:
 
-| Field             | Value                                                                                                                                                                  |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`         | 3 when `sid` is a `subjectKeyIdentifier`, 1 when it is an `issuerAndSerialNumber` (RFC 5652 §5.3)                                                                      |
-| `sid`             | The subjectKeyIdentifier extension of the signer certificate, or its issuer and serial number when it carries none                                                     |
+| Field             | Value                                                                                                                            |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `version`         | 3 when `sid` is a `subjectKeyIdentifier`, 1 when it is an `issuerAndSerialNumber` (RFC 5652 §5.3)                                |
+| `sid`             | The subjectKeyIdentifier extension of the signer certificate, or its issuer and serial number when it carries none               |
 | `digestAlgorithm` | The digest the signature algorithm names ([RFC 5753][rfc5753] §2.1.1), so the signature type fixes both                          |
 | `signedAttrs`     | Exactly three: content type `id-data`, the message digest of the bytes above, and `CMSAlgorithmProtection` ([RFC 6211][rfc6211]) |
 | `signature`       | The DER `ECDSA-Sig-Value` ([RFC 3279][rfc3279] §2.2.3) over the digest of the DER signed attributes, with `s` in the low half    |
@@ -976,7 +976,7 @@ A profile names six algorithms, each by its OID:
 - the AEAD cipher
 - the signature
 - the KDF
-- the key-agreement curve
+- the key exchange
 - the key wrap
 
 The AEAD OID names the cipher, and the cipher fixes the key length.
@@ -990,7 +990,7 @@ tightbeam splits cryptographic work into roles, so a component depends only on t
 - **Key wrap**: The wrap of a content key. Examples include AES key wrap ([RFC 3394][rfc3394]).
 - **Signature**: Signature generation and verification. Examples include ECDSA ([FIPS 186-5][fips186-5]) and Ed25519 ([RFC 8032][rfc8032]).
 - **KDF**: Key derivation. Examples include HKDF ([RFC 5869][rfc5869]).
-- **Curve**: Elliptic-curve operations. Examples include secp256k1, P-384 ([RFC 5480][rfc5480]), and X25519 ([RFC 7748][rfc7748]).
+- **Key exchange**: The ephemeral exchange of a handshake and of each rekey. Examples include ECDH over secp256k1 or P-384 ([RFC 5480][rfc5480]), X25519 ([RFC 7748][rfc7748]), and ML-KEM ([FIPS 203][fips203]). The signature role is independent of it.
 
 A crypto provider binds one implementation to each role ([§6.5](#65-crypto-provider-system)).
 
@@ -1004,6 +1004,7 @@ Implementation: [docs/security.md](docs/security.md#profile-types)
 
 ```rust
 # use tightbeam::crypto::aead::Aes256GcmOid;
+# use tightbeam::crypto::exchange::Ecdhe;
 # use tightbeam::crypto::hash::Sha3_256;
 # use tightbeam::crypto::k256;
 # use tightbeam::crypto::kdf::HkdfSha3_256;
@@ -1017,7 +1018,7 @@ impl SecurityProfile for MyAppProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = k256::Secp256k1;
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 	type KeyWrapOid = Aes256Wrap;
 }
 ```
@@ -1027,6 +1028,8 @@ impl SecurityProfile for MyAppProfile {
 The built-in default profile is the reference profile. It names the algorithms of the reference provider, which [§6.5](#65-crypto-provider-system) lists.
 
 > Note: Applications MAY define additional profiles for other contexts. Examples include a high-assurance profile, a legacy-interop profile, or a post-quantum profile. Bind each profile to the message types that require it ([§6.4](#64-message-level-security-requirements)).
+
+The `preview-pqc` feature names one post-quantum profile, `PreviewPqcProfile`, whose key exchange is the hybrid of ML-KEM-768 ([FIPS 203][fips203]) and ECDH over secp256k1. Implementation: [docs/handshake.md](docs/handshake.md#post-quantum-exchanges).
 
 ### 6.3 Numeric Security Levels
 
@@ -1185,7 +1188,7 @@ struct HighSecurityTransfer { account: String, amount: u64 }
 
 ### 6.5 Crypto Provider System
 
-A crypto provider binds one implementation to each cryptographic role of a security profile: digest, AEAD, key wrap, signature, KDF, key-agreement curve, and KEM. Each role MUST run the algorithm its profile names. The binding is checked when the code compiles, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM never runs. The key-encryption key MUST be at least as long as the AEAD key ([RFC 3565][rfc3565] §2.3.2).
+A crypto provider binds one implementation to each cryptographic role of a security profile: digest, AEAD, key wrap, signature, KDF, key exchange, and KEM. Each role MUST run the algorithm its profile names. The binding is checked when the code compiles, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM never runs. The key-encryption key MUST be at least as long as the AEAD key ([RFC 3565][rfc3565] §2.3.2).
 
 Implementation: [docs/security.md](docs/security.md#crypto-providers)
 
@@ -1197,11 +1200,11 @@ The reference provider uses:
 - AEAD: AES-256-GCM
 - Signature: ECDSA over secp256k1
 - KDF: HKDF-SHA3-256
-- Key-agreement curve: secp256k1
+- Key exchange: ECDH over secp256k1
 - Key wrap: AES-256 key wrap
 - KEM: DHKEM(secp256k1, HKDF-SHA256)
 
-Each endpoint holds a negotiated profile to a strength floor and refuses a profile below it (CWE-757). The default floor requires AEAD keys, digest outputs, and curve fields of 256 bits or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1), so P-192 and P-224 fall below it. A provider built on a shorter algorithm, such as AES-128-GCM, names a floor that admits it.
+Each endpoint holds a negotiated profile to a strength floor and refuses a profile below it (CWE-757). The default floor requires AEAD keys and digest outputs of 256 bits or more, and a key exchange of 128-bit security strength or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1), so ECDH over P-192 or P-224 falls below it. A provider built on a shorter algorithm, such as AES-128-GCM, names a floor that admits it.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1532,12 +1535,12 @@ When the endpoints multiplex ([§8.6](#86-multiplexing)), `TransportEnvelope` al
 
 An encrypted `WireEnvelope` carries one record, the DER `TransportEnvelope` sealed as an `AuthEnvelopedData` ([RFC 5083][rfc5083]):
 
-| Field                 | Value                                                                                                                                                           |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `recipientInfos`      | One `KEKRecipientInfo` ([RFC 5652][rfc5652] §6.2.3), version 4, under the session key of the record's direction and epoch |
-| `kekid.keyIdentifier` | `tb/session/record/kekid/v1`, then the direction octet (`0x00` client to server, `0x01` server to client), then the epoch as four big-endian octets             |
-| Content key and nonce | Fresh for each record, the content key wrapped under the session key                                                                                            |
-| `authAttrs`           | The content type `id-data`, and a `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27`                              |
+| Field                 | Value                                                                                                                                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recipientInfos`      | One `KEKRecipientInfo` ([RFC 5652][rfc5652] §6.2.3), version 4, under the session key of the record's direction and epoch                           |
+| `kekid.keyIdentifier` | `tb/session/record/kekid/v1`, then the direction octet (`0x00` client to server, `0x01` server to client), then the epoch as four big-endian octets |
+| Content key and nonce | Fresh for each record, the content key wrapped under the session key                                                                                |
+| `authAttrs`           | The content type `id-data`, and a `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }` under `1.3.6.1.4.1.64586.1.27`                  |
 
 Before it unwraps the content key, a receiver refuses:
 
@@ -1821,7 +1824,7 @@ Two handshake protocols establish mutual authentication and a session key:
 Security goals for both:
 
 - **Mutual authentication**: Each party proves identity with certificates
-- **Perfect forward secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) protects past sessions if long-term keys leak later
+- **Perfect forward secrecy**: An ephemeral key exchange, such as ECDH ([NIST SP 800-56A][nist-800-56a]), protects past sessions if long-term keys leak later
 - **Replay protection**: Nonces block replayed handshake messages
 - **Downgrade prevention**: The transcript hash covers handshake messages, including profile negotiation ([RFC 9846 §4.2.3][rfc9846-4.2.3])
 - **Confidentiality**: HKDF-derived session keys protect later messages
@@ -1896,7 +1899,7 @@ The transcript hash binds the handshake messages, so it blocks reordering, profi
 
 Each flow derives the handshake secret `hs` from its own input:
 
-- The CMS flow derives `hs` from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the ephemeral-ephemeral ECDH output, followed by the client's base secret.
+- The CMS flow derives `hs` from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the secret of the ephemeral key exchange, followed by the client's base secret.
 - The HPKE flow derives `hs` from `ee` alone, as the ECDHE secret of TLS 1.3 does ([RFC 9846 §7.1][rfc9846-7.1]).
 
 **Key confirmation:**
@@ -1914,6 +1917,7 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 
 - The client sends `confirm` in its closing, in both flows.
 - The server of either flow sends `server`, the server Finished, in its reply, over the transcript hash and the octets of the reply's one signature. The client verifies it before it builds its closing.
+
 #### 8.5.3 Implementation: CMS-Based Handshake Protocol
 
 CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
@@ -2101,18 +2105,18 @@ A reply whose server Finished is absent or fails is refused before the client bu
 
 **Wire format comparison:**
 
-| Feature             | CMS-based                                                                                                                      | HPKE-based                                                                                                                               |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Opening             | `AuthEnvelopedData` with a `KEMRecipientInfo` ([RFC 9629][rfc9629])                      | `ContentInfo` of type `id-data`                                                                                                          |
-| Server identity     | The key-agreement certificate pinned before the opening, and the signing certificate from the server Finished's `certificates` | Learned from the reply's `certificates`                                                                                                  |
-| Handshake secret    | Ephemeral ECDH and the base secret the opening seals                                                                           | Ephemeral ECDH alone                                                                                                                     |
-| Server confirmation | The server Finished's signature over the transcript, and the server Finished MAC                                               | The reply's signature over the transcript, and the server Finished MAC                                                                   |
-| Closing             | `AuthEnvelopedData` with a `KEKRecipientInfo`                                                                                  | The same closing                                                                                                                         |
-| Standards           | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629] | RFC 5652, [RFC 5083][rfc5083], the [RFC 9846][rfc9846] shape |
+| Feature             | CMS-based                                                                                                                      | HPKE-based                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Opening             | `AuthEnvelopedData` with a `KEMRecipientInfo` ([RFC 9629][rfc9629])                                                            | `ContentInfo` of type `id-data`                                        |
+| Server identity     | The key-agreement certificate pinned before the opening, and the signing certificate from the server Finished's `certificates` | Learned from the reply's `certificates`                                |
+| Handshake secret    | The ephemeral key exchange and the base secret the opening seals                                                               | The ephemeral key exchange alone                                       |
+| Server confirmation | The server Finished's signature over the transcript, and the server Finished MAC                                               | The reply's signature over the transcript, and the server Finished MAC |
+| Closing             | `AuthEnvelopedData` with a `KEKRecipientInfo`                                                                                  | The same closing                                                       |
+| Standards           | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629]                                                                             | RFC 5652, [RFC 5083][rfc5083], the [RFC 9846][rfc9846] shape           |
 
 **Security equivalence:**
 
-Both protocols target the same properties: mutual authentication, forward secrecy via ephemeral ECDH, replay protection via nonces, transcript integrity via signatures, and confidentiality via AEAD.
+Both protocols target the same properties: mutual authentication, forward secrecy via an ephemeral key exchange, replay protection via nonces, transcript integrity via signatures, and confidentiality via AEAD.
 
 #### 8.5.5 Security Profile Negotiation
 
@@ -2220,7 +2224,7 @@ A failed handshake ends in one of these failures:
 | **Stream Cap Inflation**   | Cap clamp and local refusal                 | Caps clamped to 1024. An open past the local cap fails locally, and no stream opens                                                                                                                                                                                           |
 | **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to 1 KiB to 64 KiB, stream credit to 4096 chunks. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770)                                                                                    |
 | **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                                                                                    |
-| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on a cancel budget, 1024 by default. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                                     |
+| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on a cancel budget, 1024 by default. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                                                                                   |
 | **Certificate Forgery**    | X.509 chain validation                      | Verify against a configured root of trust (application responsibility)                                                                                                                                                                                                        |
 | **Nonce Reuse**            | Fresh content key per record                | Each record draws a fresh content key and nonce, and wraps the content key under the session key (RFC 5084 §3.2)                                                                                                                                                              |
 
@@ -2286,19 +2290,19 @@ Each endpoint MUST enforce the cap it advertised and respect the cap its peer ad
 
 **Envelope types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-10):
 
-| Variant         | Role                                                                                                                                                  |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Open`          | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `kind`, `payload`, and on a routed open `target` and `hops_remaining`)   |
-| `Data`          | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                                                               |
-| `End`           | Responder trailer: `status` plus the final payload chunk inline                                                                                       |
-| `Credit`        | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA, [RFC 9000 §4.1][rfc9000-4.1]) |
-| `Cancel`        | Abort a single in-flight stream without tearing down the connection                                                                                   |
-| `GoAway`        | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected                                                     |
-| `Ping`          | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                                                                       |
-| `RekeyRequest`  | Client opens an epoch renewal: nonce, ephemeral key ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request)   |
-| `RekeyResponse` | Server answers: nonce and ephemeral key, plus the server-signed epoch receipt that pins both ephemerals                                               |
-| `RekeyAck`      | Client accepts: its countersignature. Marks the client-to-server key switch                                                                           |
-| `RekeyDone`     | Server confirms settlement. Marks the server-to-client key switch                                                                                     |
+| Variant         | Role                                                                                                                                                |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Open`          | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `kind`, `payload`, and on a routed open `target` and `hops_remaining`) |
+| `Data`          | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                                                             |
+| `End`           | Responder trailer: `status` plus the final payload chunk inline                                                                                     |
+| `Credit`        | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA, [RFC 9000 §4.1][rfc9000-4.1])                                             |
+| `Cancel`        | Abort a single in-flight stream without tearing down the connection                                                                                 |
+| `GoAway`        | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected                                                   |
+| `Ping`          | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                                                                     |
+| `RekeyRequest`  | Client opens an epoch renewal: nonce, ephemeral key ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request)                                               |
+| `RekeyResponse` | Server answers: nonce and ephemeral key, plus the server-signed epoch receipt that pins both ephemerals                                             |
+| `RekeyAck`      | Client accepts: its countersignature. Marks the client-to-server key switch                                                                         |
+| `RekeyDone`     | Server confirms settlement. Marks the server-to-client key switch                                                                                   |
 
 **Stream grammar** (unified: a unary request is a degenerate stream, [RFC 9113 §8.1][rfc9113-8.1]):
 
@@ -2350,14 +2354,14 @@ either:     Cancel(code)       Credit(limit)
 
 **GoAway reasons:**
 
-| Reason              | Code    | Meaning                                                                       |
-| ------------------- | ------- | ----------------------------------------------------------------------------- |
-| `Shutdown`          | 0       | Orderly shutdown initiated by the sender                                      |
-| `ProtocolError`     | 1       | Peer violated multiplexing rules                                              |
-| `EnhanceYourCalm`   | 2       | Peer exceeded the cancel budget (RFC 9113 §7 / CVE-2023-44487 hardening)      |
-| `BudgetExhausted`   | 3       | Sender's outbound session budget reached the drain reserve                    |
-| `SettlementFailed`  | 4       | A renewed receipt's settlement or approval failed with a tightbeam code       |
-| `Application(code)` | 0x1000+ | Application-defined                                                           |
+| Reason              | Code    | Meaning                                                                  |
+| ------------------- | ------- | ------------------------------------------------------------------------ |
+| `Shutdown`          | 0       | Orderly shutdown initiated by the sender                                 |
+| `ProtocolError`     | 1       | Peer violated multiplexing rules                                         |
+| `EnhanceYourCalm`   | 2       | Peer exceeded the cancel budget (RFC 9113 §7 / CVE-2023-44487 hardening) |
+| `BudgetExhausted`   | 3       | Sender's outbound session budget reached the drain reserve               |
+| `SettlementFailed`  | 4       | A renewed receipt's settlement or approval failed with a tightbeam code  |
+| `Application(code)` | 0x1000+ | Application-defined                                                      |
 
 **Request/response flow:**
 
@@ -4053,12 +4057,12 @@ A gateway with an advertise beat that binds a wildcard address (`0.0.0.0` or `[:
 
 **Claimed dial addresses.** One policy decides which addresses a peer may ask this gateway to dial. The rules apply in this order:
 
-| Setting                              | Rule                                                                                                           |
-| ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| Every plane                          | The unspecified address (`0.0.0.0`, `[::]`) is refused, because a connect to it lands on loopback.             |
-| Every plane                          | A multicast, broadcast, reserved (`240.0.0.0/4`), or `0.0.0.0/8` address is refused.                           |
-| `with_peer_dial_allowlist`, when set | The list decides alone.                                                                                        |
-| No allowlist                         | Every other address is admitted, including private and loopback addresses.                                     |
+| Setting                              | Rule                                                                                               |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| Every plane                          | The unspecified address (`0.0.0.0`, `[::]`) is refused, because a connect to it lands on loopback. |
+| Every plane                          | A multicast, broadcast, reserved (`240.0.0.0/4`), or `0.0.0.0/8` address is refused.               |
+| `with_peer_dial_allowlist`, when set | The list decides alone.                                                                            |
+| No allowlist                         | Every other address is admitted, including private and loopback addresses.                         |
 
 Without an allowlist, a verified peer can point this gateway at any unicast address, including services on its own host (CWE-918). A gateway reachable from an internal network SHOULD set `with_peer_dial_allowlist`.
 
@@ -7661,6 +7665,7 @@ The official tightbeam extensions live in [tightbeam-ext](https://github.com/wah
 [fips186-5]: https://csrc.nist.gov/pubs/fips/186-5/final
 [fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
 [fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
+[fips203]: https://csrc.nist.gov/pubs/fips/203/final
 [nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
 [nist-800-56c]: https://csrc.nist.gov/publications/detail/sp/800-56c/rev-2/final
 [nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final

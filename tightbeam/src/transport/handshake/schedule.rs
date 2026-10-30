@@ -2,9 +2,9 @@
 //!
 //! Both flows and both roles derive through these owners:
 //!
-//! - [`Agreement`] derives the [`HandshakeSecret`], the one secret a session
-//!   derives from. Its input is the [`EcdhSecret`] of [`HandshakeAgreement`],
-//!   followed in the CMS flow by a `BaseSecret`.
+//! - [`HandshakeSecret`] is the one secret a session derives from. Its input
+//!   is the [`ExchangeSecret`] of the key exchange, followed in the CMS flow by
+//!   a `BaseSecret`.
 //! - [`Terms`] holds what negotiation fixed: the profile, the multiplexing
 //!   terms, the transcript hash, and the protocol's salt.
 //! - [`Agreed`] derives everything a session takes from the handshake secret.
@@ -13,7 +13,7 @@
 //!
 //! The schedule reads these inputs:
 //!
-//! - `ee` is the ephemeral-ephemeral ECDH output.
+//! - `ee` is the shared secret of the ephemeral key exchange.
 //! - `base` is the random secret the CMS client seals to the server's key-agreement certificate.
 //! - `S` is the protocol's salt.
 //! - `H` is the negotiated digest, whose output is `Hash.length` bytes wide.
@@ -73,27 +73,15 @@ use crate::crypto::common::typenum::Unsigned;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::hash::Digest;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::kdf::{EcdhSecret, KdfError, KdfFunction, KdfSalt, ZeroizingHkdf, ZeroizingHmac};
+use crate::crypto::kdf::{KdfError, KdfFunction, KdfSalt, ZeroizingHkdf, ZeroizingHmac};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::profiles::{CryptoProvider, KeyWrapAlgorithm};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::secret::SecretSlice;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-#[cfg(any(feature = "transport-hpke", mux_rekey, test))]
-use crate::crypto::sign::elliptic_curve::sec1;
-#[cfg(any(feature = "transport-hpke", test))]
-use crate::crypto::sign::elliptic_curve::sec1::{CompressedPointSize, ToEncodedPoint};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::sec1::{EncodedPoint, FromEncodedPoint};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::{CurveArithmetic, Error as EllipticCurveError, PublicKey, SecretKey};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::SignedDataSigners;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::subtle::ConstantTimeEq;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::{PeerCertificate, Sec1Point, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 #[cfg(mux_rekey)]
@@ -104,6 +92,10 @@ use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Res
 use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
 #[cfg(feature = "transport-cms")]
 use crate::random::{generate_nonce, CryptoRngCore};
+#[cfg(mux_rekey)]
+use crate::transport::handshake::ephemeral::DistinctSecret;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ephemeral::ExchangeSecret;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -126,7 +118,7 @@ use crate::transport::handshake::primitives::TranscriptHash;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, HandshakeProvider, SessionPeer};
+use crate::transport::handshake::{Arc, EstablishedSession, HandshakeProvider, SessionPeer};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::attr::Attributes;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -191,9 +183,9 @@ impl TryFrom<SecretSlice<u8>> for BaseSecret {
 	}
 }
 
-/// The secret both endpoints agree on: the ephemeral-ephemeral ECDH output,
-/// followed in the CMS flow by the client's base secret, extracted under the
-/// protocol salt.
+/// The secret both endpoints agree on: the shared secret of the ephemeral key
+/// exchange, followed in the CMS flow by the client's base secret, extracted
+/// under the protocol salt.
 ///
 /// Every session key derives from it. `hybrid` derives the CMS secret, and
 /// `ephemeral` the HPKE one.
@@ -205,8 +197,8 @@ pub struct HandshakeSecret(ZeroizingBytes);
 const HANDSHAKE_SECRET_SIZE: usize = 32;
 
 /// The size in octets of the stack buffer of the hybrid secret `ee || base`:
-/// the 66 octets of the P-521 field, the widest named prime curve, and the 32
-/// of the base secret.
+/// the 66 octets of the P-521 field, the widest curve the suites run, and
+/// the 32 of the base secret. A wider secret goes on the heap.
 #[cfg(feature = "transport-cms")]
 const HYBRID_INLINE_SIZE: usize = 66 + BASE_SECRET_SIZE;
 
@@ -215,7 +207,7 @@ impl HandshakeSecret {
 	/// Derives the CMS handshake secret from the hybrid shared secret
 	/// `Z′ = ee || base`, extracted under `salt` (NIST SP 800-56C Rev. 2 § 2).
 	///
-	/// - `ee` is the ephemeral-ephemeral ECDH output, the shared secret `Z`, as wide as the curve's field.
+	/// - `ee` is the shared secret `Z` of the ephemeral key exchange, at the one width its exchange gives it.
 	/// - `base` is the auxiliary secret `T` that follows it, 32 bytes.
 	///
 	/// Each part has a fixed width for one provider, so the concatenation is
@@ -226,7 +218,7 @@ impl HandshakeSecret {
 	/// - [`HandshakeError::IntegerOutOfRange`] -- the width of `ee || base` passes `usize`.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
 	#[cfg(feature = "transport-cms")]
-	fn hybrid<P>(ee: &EcdhSecret<P::Curve>, base: &BaseSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	pub(crate) fn hybrid<P>(ee: &ExchangeSecret, base: &BaseSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
@@ -262,7 +254,8 @@ impl HandshakeSecret {
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
-	fn ephemeral<P>(ee: &EcdhSecret<P::Curve>, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	#[cfg(any(test, feature = "transport-hpke"))]
+	pub(crate) fn ephemeral<P>(ee: &ExchangeSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
@@ -922,56 +915,30 @@ impl TrafficSecret for EpochSecret {
 
 #[cfg(mux_rekey)]
 impl EpochSecret {
-	/// The next link of the rekey KDF chain: this link and a fresh agreement
-	/// between `local` and `peer`, extracted under `salt` and the epoch label.
+	/// The next link of the rekey KDF chain: this link and `shared`, the secret
+	/// of a fresh exchange, extracted under `salt` and the epoch label.
 	///
 	/// ```text
 	/// epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt, "tb/session/kdf/epoch/v1")
 	/// ```
 	///
-	/// `Ndh` is the width of `ee`, the field width of the curve of `P`.
-	///
-	/// The agreement runs here, so every later link takes a rekey scalar. Even
-	/// a holder of this link who records the whole renewal needs that scalar
-	/// to derive the next one.
-	///
-	/// - `local` is a single-use scalar, moved in. Its drop wipes it before the
-	///   derivation runs, so it is gone before any later await of the caller.
-	/// - `peer` is a [`PeerPoint`], so it is a point of the curve other than
-	///   the identity. Each rekey caller admits it through [`PeerEphemeral`].
+	/// - `Ndh` is the width of `ee`, the one width the exchange of `P` gives it.
+	/// - `shared` is a [`DistinctSecret`], so it comes from an exchange on a
+	///   share that each side checked against the static keys of its peer. Even
+	///   a holder of this link who records the whole renewal needs the private
+	///   half of a rekey share to derive the next.
+	/// - `shared` drops here, so it is wiped before any later await of the caller.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- an input is too long for its `u32` length prefix.
-	pub(crate) fn next<P>(
-		&self,
-		local: Box<EphemeralSecret<P::Curve>>,
-		peer: &PeerPoint<P::Curve>,
-		salt: KdfSalt<'_>,
-	) -> Result<Self, HandshakeError>
-	where
-		P: HandshakeProvider,
-	{
-		let shared = local.shared_secret(peer.as_public_key());
-
-		// The scalar served its one agreement, so its drop wipes it here.
-		drop(local);
-
-		self.chained::<P>(&shared, salt)
-	}
-
-	/// The chain step over the agreement output `shared`: the framed pair of
-	/// this link and `shared`, extracted under `salt` and the epoch label.
-	///
-	/// [`Self::next`] is its one caller outside the tests. The step holds the
-	/// formula alone, so a known-answer test pins it with no scalar.
-	fn chained<P>(&self, shared: &EcdhSecret<P::Curve>, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	pub(crate) fn next<P>(&self, shared: DistinctSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
 		let label = KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO);
-		let secret = shared.with(|shared| {
+		let secret = shared.as_ref().with(|shared| {
 			let inputs: [&[u8]; 2] = [&self.0, shared];
 			multi_input_kdf::<P>(&inputs, salt, label, EPOCH_SECRET_SIZE)
 		})?;
@@ -1054,8 +1021,8 @@ impl EpochMaterials {
 
 #[cfg(mux_rekey)]
 impl EpochMaterials {
-	/// The next link of the chain: this epoch's secret and a fresh agreement
-	/// between `local` and `peer`, under `salt`, as [`EpochSecret::next`]
+	/// The next link of the chain: this epoch's secret and `shared`, the
+	/// secret of a fresh exchange, under `salt`, as [`EpochSecret::next`]
 	/// derives it.
 	///
 	/// # Errors
@@ -1063,14 +1030,13 @@ impl EpochMaterials {
 	/// - The errors of [`EpochSecret::next`].
 	pub(crate) fn next_secret<P>(
 		&self,
-		local: Box<EphemeralSecret<P::Curve>>,
-		peer: &PeerPoint<P::Curve>,
+		shared: DistinctSecret,
 		salt: KdfSalt<'_>,
 	) -> Result<EpochSecret, HandshakeError>
 	where
-		P: HandshakeProvider,
+		P: CryptoProvider,
 	{
-		self.secret.next::<P>(local, peer, salt)
+		self.secret.next::<P>(shared, salt)
 	}
 
 	/// Installs `next` as the current link, with `next_hash` as its chain
@@ -1113,24 +1079,26 @@ impl EpochMaterials {
 	}
 
 	/// The pin an epoch receipt commits to:
-	/// `H(hash || request_der || server_random || server_ephemeral)`.
+	/// `H(hash || request_der || server_random || server_share)`.
 	///
 	/// The pin is computable before the receipt exists, so the receipt's
-	/// `transcript_hash` commits to the exchange without circularity. It
-	/// covers both rekey ephemerals: the client's inside `request_der`, and
-	/// the server's as its last leg.
+	/// `transcript_hash` commits to the exchange without circularity. It covers
+	/// both rekey shares:
+	///
+	/// - the client's share, inside `request_der`, and
+	/// - the server's share, as the last leg, so the concatenation frames it at any width.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::TranscriptDigestLength`] -- the output of `D` is not 32 to 64 bytes.
-	pub(crate) fn exchange_pin<D: Digest + AssociatedOid, C: HandshakeCurve>(
+	pub(crate) fn exchange_pin<D: Digest + AssociatedOid>(
 		&self,
 		request_der: impl AsRef<[u8]>,
 		server_random: &[u8; 32],
-		server_ephemeral: &sec1::CompressedPoint<C>,
+		server_share: impl AsRef<[u8]>,
 	) -> Result<TranscriptHash, HandshakeError> {
 		let hash = self.transcript_hash.as_bytes();
-		let legs: [&[u8]; 4] = [hash, request_der.as_ref(), server_random, server_ephemeral.as_slice()];
+		let legs: [&[u8]; 4] = [hash, request_der.as_ref(), server_random, server_share.as_ref()];
 		Transcript::digest::<D>(legs.concat())
 	}
 
@@ -1168,246 +1136,6 @@ const EPOCH_SECRET_SIZE: usize = 32;
 /// from.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 const HANDSHAKE_EPOCH: u32 = 0;
-
-/// The compressed SEC 1 encoding of an ephemeral public key, at the width of
-/// that form on the key's curve (SEC 1 v2.0 §2.3.3).
-///
-/// The HPKE hello, the HPKE reply, and both rekey legs carry an ephemeral in
-/// this form. The rekey pin hashes it as a leg of the type's width, so the
-/// curve fixes the width of every point the pin covers.
-#[cfg(any(feature = "transport-hpke", test))]
-pub(crate) trait CompressedPoint {
-	/// The curve of the point.
-	type Curve: HandshakeCurve;
-
-	/// The compressed SEC 1 octets of this point.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::OctetStringLengthError`] -- the encoding differs
-	///   from the compressed width of the curve.
-	fn compressed_point(&self) -> Result<sec1::CompressedPoint<Self::Curve>, HandshakeError>;
-}
-
-#[cfg(any(feature = "transport-hpke", test))]
-impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
-	type Curve = C;
-
-	fn compressed_point(&self) -> Result<sec1::CompressedPoint<C>, HandshakeError> {
-		let encoded = self.to_encoded_point(true);
-		let octets = encoded.as_bytes();
-		let point = sec1::CompressedPoint::<C>::from_exact_iter(octets.iter().copied());
-		let width = (octets.len(), CompressedPointSize::<C>::USIZE);
-		point.ok_or_else(|| HandshakeError::OctetStringLengthError(width.into()))
-	}
-}
-
-/// A peer's ephemeral as a point of the curve other than the identity, the
-/// one input [`Agreement`] takes.
-///
-/// [`Self::parse`] admits any such point, and [`PeerEphemeral`] admits one
-/// whose x-coordinate differs from a static key known before the agreement.
-/// A server learns its client's static key only after the agreement, so the
-/// server's `Offer` refuses a collapsed client ephemeral instead.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C: HandshakeCurve> PeerPoint<C> {
-	/// Parses `sec1` as a peer ephemeral: the one parse of every ephemeral an
-	/// agreement takes, which [`PeerEphemeral`] runs before its comparison.
-	/// [`Sec1Point::read`] reads the form from the first octet
-	/// (SEC 1 v2.0 §2.3.3) before the curve decodes a point:
-	///
-	/// - The compressed and the uncompressed forms, the two that RFC 5480 §2.2 names, parse.
-	/// - The parse refuses the compact form `0x05` and the identity `0x00`.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	pub(crate) fn parse(sec1: impl AsRef<[u8]>) -> Result<Self, HandshakeError> {
-		let octets = sec1.as_ref();
-		let named_form = Sec1Point::read(octets).is_some();
-		if !named_form {
-			return Err(EllipticCurveError.into());
-		}
-
-		let encoded = EncodedPoint::<C>::from_bytes(octets).map_err(|_| EllipticCurveError)?;
-		let decoded = PublicKey::<C>::from_encoded_point(&encoded);
-
-		let point = Option::from(decoded).ok_or(EllipticCurveError)?;
-		Ok(Self(point))
-	}
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C: CurveArithmetic> PeerPoint<C> {
-	/// The admitted point, for the scalar multiplication that reads it.
-	pub(crate) fn as_public_key(&self) -> &PublicKey<C> {
-		&self.0
-	}
-}
-
-/// The static keys that a peer's ephemeral must differ from, when the peer
-/// holds any.
-///
-/// The parse refuses a malformed, off-curve, or identity point, so every
-/// scalar multiplication runs on a valid one. The trait also refuses a point
-/// that collapses an ECDH agreement into one with a static key of the peer:
-/// the key itself, or its negation, because ECDH keeps the x-coordinate alone.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) trait PeerEphemeral<C>
-where
-	C: HandshakeCurve,
-{
-	/// Whether an agreement with `point` differs from one with every static
-	/// key of this peer.
-	fn distinct_from(&self, point: &PublicKey<C>) -> bool;
-
-	/// Parses `sec1` as an ephemeral of this peer, or `None` when the point
-	/// collapses into a static key of the peer.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
-		let point = PeerPoint::parse(sec1)?;
-		let distinct = self.distinct_from(point.as_public_key());
-		Ok(distinct.then_some(point))
-	}
-
-	/// Parses `sec1` as the ephemeral of this server.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the point collapses into a static key of the server.
-	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
-		let distinct = self.distinct_ephemeral(sec1)?;
-		distinct.ok_or(HandshakeError::ServerEphemeralIsStatic)
-	}
-
-	/// Parses `sec1` as the ephemeral of this client at a rekey, where the
-	/// client's static key is known before the agreement.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point collapses into the client's static key.
-	#[cfg(mux_rekey)]
-	fn client_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
-		let distinct = self.distinct_ephemeral(sec1)?;
-		distinct.ok_or(HandshakeError::ClientEphemeralIsStatic)
-	}
-}
-
-/// A peer that signs with one certificate holds the one static key of that
-/// certificate.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for PeerCertificate<Signing<P>> {
-	fn distinct_from(&self, point: &PublicKey<P::Curve>) -> bool {
-		self.distinct(point)
-	}
-}
-
-/// ECDH key agreement of a handshake and of a rekey.
-///
-/// The ephemeral-ephemeral step of a handshake runs it with the client's
-/// [`SecretKey`], or with the [`EphemeralSecret`] the server drew for that
-/// handshake. A rekey runs it with the [`EphemeralSecret`] of one renewal.
-///
-/// Every peer arrives as a [`PublicKey`], a valid point of the curve, so each
-/// scalar multiplication runs on a valid point.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) trait HandshakeAgreement<C>
-where
-	C: HandshakeCurve,
-{
-	/// ECDH with `peer`, as the shared secret the key schedule takes, at the
-	/// field width of `C` that [`EcdhSecret`] holds.
-	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret<C>;
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C> HandshakeAgreement<C> for EphemeralSecret<C>
-where
-	C: HandshakeCurve,
-{
-	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret<C> {
-		EcdhSecret::from(self.diffie_hellman(peer))
-	}
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C> HandshakeAgreement<C> for SecretKey<C>
-where
-	C: HandshakeCurve,
-{
-	fn shared_secret(&self, peer: &PublicKey<C>) -> EcdhSecret<C> {
-		EcdhSecret::agree(self, peer)
-	}
-}
-
-/// The peer point, beside the base secret that follows its agreement output
-/// in the CMS flow, borrowed for one settlement.
-///
-/// [`Self::hybrid`] builds one for the CMS flow and [`Self::ephemeral`] for the
-/// HPKE flow. [`Self::settle`] is the one derivation of the
-/// [`HandshakeSecret`].
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub struct Agreement<'a, P: HandshakeProvider> {
-	peer: &'a PeerPoint<P::Curve>,
-	/// The base secret of the CMS flow, or `None` for the HPKE flow, whose
-	/// secret derives from the agreement output alone.
-	#[cfg(feature = "transport-cms")]
-	base: Option<&'a BaseSecret>,
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<'a, P: HandshakeProvider> Agreement<'a, P> {
-	/// Pairs the ephemeral `peer` with the `base` that follows its agreement,
-	/// as the CMS flow derives the secret.
-	#[cfg(feature = "transport-cms")]
-	pub(crate) fn hybrid(peer: &'a PeerPoint<P::Curve>, base: &'a BaseSecret) -> Self {
-		Self { peer, base: Some(base) }
-	}
-
-	/// The ephemeral `peer` alone, as the HPKE flow derives the secret.
-	#[cfg(feature = "transport-hpke")]
-	pub(crate) fn ephemeral(peer: &'a PeerPoint<P::Curve>) -> Self {
-		Self {
-			peer,
-			#[cfg(feature = "transport-cms")]
-			base: None,
-		}
-	}
-
-	/// Runs the agreement of `local` with the peer point, and derives the
-	/// handshake secret of that output under `salt`: the hybrid secret with
-	/// the base secret of the CMS flow, or the ephemeral secret of the HPKE
-	/// flow.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
-	pub(crate) fn settle(
-		self,
-		local: &impl HandshakeAgreement<P::Curve>,
-		salt: KdfSalt<'_>,
-	) -> Result<HandshakeSecret, HandshakeError> {
-		let shared = local.shared_secret(self.peer.as_public_key());
-		#[cfg(feature = "transport-cms")]
-		if let Some(base) = self.base {
-			return HandshakeSecret::hybrid::<P>(&shared, base, salt);
-		}
-
-		HandshakeSecret::ephemeral::<P>(&shared, salt)
-	}
-}
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl DirectionalCiphers<RuntimeAead> {
@@ -1717,33 +1445,36 @@ mod tests {
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::crypto::x509::KeyPurposes;
+	use crate::crypto::sign::elliptic_curve::CurveArithmetic;
 	use crate::der::asn1::{OctetString, SetOfVec};
 	use crate::der::{Decode, Encode, ErrorKind};
 	use crate::oids::DATA;
-	use crate::random::OsRng;
 	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestCertificate, TestKey};
 	use crate::transport::handshake::tests::{
-		create_test_certificate, create_test_signed_data, fixture_agreement, fixture_transcript, negated, FIXTURE_SALT,
+		create_test_signed_data, fixture_agreement, fixture_transcript, FIXTURE_SALT,
 	};
 
 	#[cfg(mux_rekey)]
 	use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+	#[cfg(mux_rekey)]
+	use crate::crypto::exchange::{Ecdhe, EcdheShare, HandshakeCurve};
 	#[cfg(mux_rekey)]
 	use crate::crypto::hpke::DhKemSecp256k1;
 	#[cfg(mux_rekey)]
 	use crate::crypto::kdf::HkdfSha3_256;
 	#[cfg(mux_rekey)]
 	use crate::crypto::profiles::{
-		AeadProvider, Aes256Wrap, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider, SecurityProfile,
-		SigningProvider,
+		AeadProvider, Aes256Wrap, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider, SecurityProfile,
+		SecurityStrength, SigningProvider,
 	};
 	#[cfg(mux_rekey)]
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 	#[cfg(mux_rekey)]
-	use crate::crypto::sign::elliptic_curve::{Curve, NonZeroScalar, Scalar};
+	use crate::crypto::sign::elliptic_curve::{NonZeroScalar, Scalar, SecretKey};
 	#[cfg(mux_rekey)]
 	use crate::testing::unhex;
+	#[cfg(mux_rekey)]
+	use crate::transport::handshake::ephemeral::PeerStatics;
 	#[cfg(mux_rekey)]
 	use core::marker::PhantomData;
 	#[cfg(mux_rekey)]
@@ -1783,100 +1514,6 @@ mod tests {
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let result = derive_directional(&secret, &salt);
 		assert!(result.is_ok());
-	}
-
-	/// The static key of a fresh test certificate.
-	fn static_key() -> PublicKey<Secp256k1> {
-		let client = create_test_certificate();
-		PublicKey::from(client.signing_key.verifying_key())
-	}
-
-	/// A fresh test certificate, admitted for signing, beside its static key.
-	fn static_peer() -> (PeerCertificate<Signing<DefaultCryptoProvider>>, PublicKey<Secp256k1>) {
-		let client = create_test_certificate();
-		let key = PublicKey::from(client.signing_key.verifying_key());
-		let peer = PeerCertificate::parse(client.certificate, KeyPurposes::HOUSE.client);
-		let peer = peer.expect("a test certificate is admitted for signing");
-		(peer, key)
-	}
-
-	/// The parse reads the point alone, so any point of the curve parses as a
-	/// peer point.
-	#[test]
-	fn any_point_of_the_curve_parses_as_a_peer_point() -> Result<(), HandshakeError> {
-		let key = static_key();
-		let point = key.to_encoded_point(true);
-
-		let parsed = PeerPoint::<Secp256k1>::parse(point.as_bytes())?;
-		assert_eq!(parsed.as_public_key(), &key);
-		Ok(())
-	}
-
-	/// The uncompressed form is one of the two forms RFC 5480 §2.2 names, so
-	/// a point in it parses as a peer point, as the CMS flow carries one.
-	#[test]
-	fn a_point_in_the_uncompressed_form_parses_as_a_peer_point() -> Result<(), HandshakeError> {
-		let key = static_key();
-		let point = key.to_encoded_point(false);
-
-		let parsed = PeerPoint::<Secp256k1>::parse(point.as_bytes())?;
-		assert_eq!(parsed.as_public_key(), &key);
-		Ok(())
-	}
-
-	/// RFC 5480 §2.2 names no compact form, so the parse refuses the compact
-	/// form `0x05` of a point the curve decodes from it.
-	#[test]
-	fn a_point_in_the_compact_form_is_refused_at_the_parse() {
-		let compressed = static_key().to_encoded_point(true);
-		let mut compact = compressed.as_bytes().to_vec();
-		compact[0] = 0x05;
-
-		let refused = PeerPoint::<Secp256k1>::parse(&compact);
-		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
-	}
-
-	#[cfg(mux_rekey)]
-	#[test]
-	fn a_client_ephemeral_equal_to_the_client_static_key_is_refused() {
-		let (peer, static_key) = static_peer();
-		let point = static_key.to_encoded_point(true);
-
-		let refused = peer.client_ephemeral(point.as_bytes());
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	#[cfg(mux_rekey)]
-	#[test]
-	fn a_client_ephemeral_other_than_the_static_key_is_admitted() -> Result<(), HandshakeError> {
-		let (peer, _static_key) = static_peer();
-		let other_key = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
-		let point = other_key.to_encoded_point(true);
-
-		let admitted = peer.client_ephemeral(point.as_bytes())?;
-		assert_eq!(admitted.as_public_key(), &other_key);
-		Ok(())
-	}
-
-	/// ECDH keeps the x-coordinate alone, so the negation of a static key
-	/// agrees to the secret the key itself agrees to.
-	#[cfg(mux_rekey)]
-	#[test]
-	fn the_negation_of_the_client_static_key_is_refused_as_its_ephemeral() {
-		let (peer, static_key) = static_peer();
-		let point = negated(&static_key).to_encoded_point(true);
-
-		let refused = peer.client_ephemeral(point.as_bytes());
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	#[test]
-	fn the_negation_of_the_server_static_key_is_refused_as_its_ephemeral() {
-		let (peer, static_key) = static_peer();
-		let point = negated(&static_key).to_encoded_point(true);
-
-		let refused = peer.server_ephemeral(point.as_bytes());
-		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 	}
 
 	/// The handshake secret changes with the ephemeral-ephemeral output, so a
@@ -1923,10 +1560,10 @@ mod tests {
 	#[test]
 	fn the_epoch_chain_step_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
-		let shared = fixture_agreement(0x11);
+		let shared = DistinctSecret::fixture(vec![0x11u8; 32]);
 		let salt = [0x99u8; 64];
 
-		let next = epoch.chained::<DefaultCryptoProvider>(&shared, KdfSalt::try_from(salt.as_slice())?)?;
+		let next = epoch.next::<DefaultCryptoProvider>(shared, KdfSalt::try_from(salt.as_slice())?)?;
 		let expected = [
 			0xad, 0x8e, 0x99, 0x9c, 0x3c, 0x48, 0x89, 0xe6, 0x28, 0x89, 0xc7, 0x98, 0xf7, 0x91, 0x97, 0x07, 0xdc, 0x45,
 			0x57, 0x59, 0x77, 0xa1, 0x65, 0x31, 0x42, 0x6a, 0xbb, 0x9c, 0x21, 0x01, 0xb4, 0x34,
@@ -1939,10 +1576,8 @@ mod tests {
 	/// `0x02`, at the width of a compressed secp256k1 point. The pin hashes the
 	/// leg as it is, so the octets name no point.
 	#[cfg(mux_rekey)]
-	fn pin_ephemeral_leg() -> sec1::CompressedPoint<Secp256k1> {
-		let mut leg = sec1::CompressedPoint::<Secp256k1>::default();
-		leg.fill(0x02);
-		leg
+	fn pin_ephemeral_leg() -> [u8; 33] {
+		[0x02u8; 33]
 	}
 
 	/// The rekey pin is SHA3-256 over the chain hash, the request, the server
@@ -1958,7 +1593,7 @@ mod tests {
 		let materials = EpochMaterials { secret, epoch: 0, transcript_hash };
 
 		let leg = pin_ephemeral_leg();
-		let pin = materials.exchange_pin::<Sha3_256, Secp256k1>(b"request der", &[0x21u8; 32], &leg)?;
+		let pin = materials.exchange_pin::<Sha3_256>(b"request der", &[0x21u8; 32], leg)?;
 		let expected = [
 			0x63, 0x36, 0x6b, 0x7a, 0x2d, 0xa7, 0xb4, 0x7b, 0xe9, 0xc3, 0x4c, 0xca, 0x39, 0x08, 0x11, 0x9f, 0x61, 0xc2,
 			0x58, 0x9d, 0xc7, 0x45, 0x84, 0x8b, 0x2a, 0xd8, 0x55, 0xc7, 0xa7, 0xdc, 0x83, 0xde,
@@ -1985,7 +1620,7 @@ mod tests {
 	#[test]
 	fn a_sha3_512_exchange_pin_matches_its_known_answer() -> Result<(), HandshakeError> {
 		let leg = pin_ephemeral_leg();
-		let pin = wide_materials().exchange_pin::<Sha3_512, Secp256k1>(b"request der", &[0x21u8; 32], &leg)?;
+		let pin = wide_materials().exchange_pin::<Sha3_512>(b"request der", &[0x21u8; 32], leg)?;
 		let expected = [
 			0x70, 0x3d, 0x40, 0x9e, 0x9c, 0xc2, 0x66, 0x79, 0xb2, 0x32, 0x39, 0xff, 0xc5, 0xc6, 0x7d, 0x1b, 0x48, 0x5f,
 			0x63, 0x58, 0x0f, 0x54, 0x29, 0xc3, 0xe8, 0x40, 0xaa, 0x55, 0xd7, 0x51, 0xc1, 0x06, 0x84, 0x77, 0x32, 0x90,
@@ -2016,7 +1651,7 @@ mod tests {
 	}
 
 	/// The HPKE handshake secret is HKDF-SHA3-256 under the salt and the
-	/// session label over the ECDH output `0x11` × 32 alone.
+	/// session label over the exchange secret `0x11` × 32 alone.
 	///
 	/// The expected bytes come from an independent HKDF (Python's `hmac` and
 	/// `hashlib`), so a base secret mixed into the HPKE input fails here.
@@ -2133,7 +1768,7 @@ mod tests {
 	}
 
 	/// The CMS reply carries the server Finished of the HPKE reply, keyed by
-	/// the hybrid secret the CMS flow derives: the ECDH output `0x11` × 32,
+	/// the hybrid secret the CMS flow derives: the exchange secret `0x11` × 32,
 	/// then the base secret `0x42` × 32, under the transcript hash `0x07` × 32
 	/// as the salt.
 	///
@@ -2844,21 +2479,6 @@ mod tests {
 		Ok(())
 	}
 
-	/// The ephemeral holder converts the curve's own output, and the static
-	/// holder multiplies in [`EcdhSecret::agree`], which HPKE also runs. Both
-	/// reach one secret for one pair of keys.
-	#[test]
-	fn every_agreement_path_reaches_one_secret() {
-		let ephemeral = EphemeralSecret::<Secp256k1>::random(&mut OsRng);
-		let fixed = SecretKey::<Secp256k1>::random(&mut OsRng);
-		let ephemeral_public = ephemeral.public_key();
-		let fixed_public = fixed.public_key();
-
-		let from_ephemeral = ephemeral.shared_secret(&fixed_public).with(|x_coordinate| *x_coordinate);
-		let from_static = fixed.shared_secret(&ephemeral_public).with(|x_coordinate| *x_coordinate);
-		assert_eq!(from_ephemeral, from_static);
-	}
-
 	/// The house profile on the curve `C`: the house digest, AEAD, signature,
 	/// KDF, and key wrap.
 	#[cfg(mux_rekey)]
@@ -2866,12 +2486,12 @@ mod tests {
 	struct HouseProfileOn<C>(PhantomData<C>);
 
 	#[cfg(mux_rekey)]
-	impl<C: AssociatedOid> SecurityProfile for HouseProfileOn<C> {
+	impl<C: HandshakeCurve> SecurityProfile for HouseProfileOn<C> {
 		type Digest = Sha3_256;
 		type AeadOid = Aes256GcmOid;
 		type SignatureAlg = Secp256k1Signature;
 		type Kdf = HkdfSha3_256;
-		type Curve = C;
+		type KeyExchange = Ecdhe<C>;
 		type KeyWrapOid = Aes256Wrap;
 	}
 
@@ -2910,12 +2530,12 @@ mod tests {
 	}
 
 	#[cfg(mux_rekey)]
-	impl<C: Curve + CurveArithmetic + AssociatedOid> CurveProvider for HouseOn<C> {
-		type Curve = C;
+	impl<C: HandshakeCurve> KeyExchangeProvider for HouseOn<C> {
+		type KeyExchange = Ecdhe<C>;
 	}
 
 	#[cfg(mux_rekey)]
-	impl<C: Curve + CurveArithmetic + AssociatedOid + Default + Copy> CryptoProvider for HouseOn<C> {
+	impl<C: HandshakeCurve + Default + Copy> CryptoProvider for HouseOn<C> {
 		type Profile = HouseProfileOn<C>;
 		type Kem = DhKemSecp256k1;
 
@@ -3013,16 +2633,18 @@ mod tests {
 			C: HandshakeCurve + Default + Copy,
 		{
 			let local = small_scalar::<C>(2);
-			let peer = small_scalar::<C>(3).public_key();
-			let agreement = local.shared_secret(&peer);
+			let peer = EcdheShare::from(small_scalar::<C>(3).public_key());
+			let peer = PeerStatics::<Ecdhe<C>>::none().server_ephemeral(peer)?;
+			let agreement = peer.complete::<Ecdhe<C>>(&local)?;
 			let salt = KdfSalt::try_from(FIXTURE_SALT)?;
 
-			let hpke = HandshakeSecret::ephemeral::<HouseOn<C>>(&agreement, salt)?;
-			let cms = HandshakeSecret::hybrid::<HouseOn<C>>(&agreement, &base_secret(0x42), salt)?;
+			let published = agreement.as_ref().with(<[u8]>::to_vec);
+			let hpke = HandshakeSecret::ephemeral::<HouseOn<C>>(agreement.as_ref(), salt)?;
+			let cms = HandshakeSecret::hybrid::<HouseOn<C>>(agreement.as_ref(), &base_secret(0x42), salt)?;
 			let epoch = EpochSecret(ZeroizingBytes::new(vec![0x42u8; 32]));
-			let rekey = epoch.chained::<HouseOn<C>>(&agreement, KdfSalt::try_from([0x99u8; 64].as_slice())?)?;
+			let rekey = epoch.next::<HouseOn<C>>(agreement, KdfSalt::try_from([0x99u8; 64].as_slice())?)?;
 			Ok(Self {
-				agreement: agreement.with(|x_coordinate| x_coordinate.to_vec()),
+				agreement: published,
 				hpke: hpke.as_bytes().to_vec(),
 				cms: cms.as_bytes().to_vec(),
 				rekey: rekey.0.to_vec(),
@@ -3082,12 +2704,12 @@ mod tests {
 		Ok(())
 	}
 
-	/// A profile on P-521 reports the 66-byte field of its curve in
-	/// [`RunnableProfile::strength`], which the strength floor reads.
+	/// A profile on P-521 reports the strength its 521-bit order rates, 256
+	/// bits, in [`RunnableProfile::strength`], which the strength floor reads.
 	#[cfg(mux_rekey)]
 	#[test]
-	fn a_p521_profile_reports_the_field_width_of_its_curve() {
+	fn a_p521_profile_reports_the_strength_of_its_exchange() {
 		let strength = RunnableProfile::<HouseOn<NistP521>>::native().strength();
-		assert_eq!(strength.curve_field_bytes, 66);
+		assert_eq!(strength.key_exchange, SecurityStrength::BITS_256);
 	}
 }
