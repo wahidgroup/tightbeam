@@ -363,10 +363,10 @@ Each validator reads the offered certificate beside the issuers its client Finis
 
 Every traffic key of both flows derives from one `HandshakeSecret`:
 
-| Flow | Constructor                                                  | Input                                           |
-| ---- | ------------------------------------------------------------ | ----------------------------------------------- |
-| CMS  | `HandshakeSecret::hybrid`, through `Agreement::hybrid`       | `Z′ = ee \|\| base`, NIST SP 800-56C Rev. 2 § 2 |
-| HPKE | `HandshakeSecret::ephemeral`, through `Agreement::ephemeral` | `Z = ee`                                        |
+| Flow | Constructor                                                            | Input                                           |
+| ---- | ---------------------------------------------------------------------- | ----------------------------------------------- |
+| CMS  | `HandshakeSecret::hybrid`, through `Agreement::hybrid`                 | `Z′ = ee \|\| base`, NIST SP 800-56C Rev. 2 § 2 |
+| HPKE | `HandshakeSecret::ephemeral`, through `Agreement::settle` with no base | `Z = ee`                                        |
 
 ```text
 hs      = HKDF(ee || base, salt = S, info = "tb/session/kdf/v1")    CMS
@@ -412,24 +412,25 @@ A handshake draws three ephemerals:
 | The client drops its private half | In `respond`, at the agreement                                    | In `respond`, at the agreement            |
 | The server drops its private half | In `reply`, at the agreement, before it encodes the reply         | In `reply`, at the agreement              |
 
-`PeerPoint::parse` parses every received ephemeral before any scalar multiplication, and the agreement takes a `PeerPoint` alone:
+One parse reads every received ephemeral before any scalar multiplication:
 
 - It refuses a malformed, off-curve, or identity point, and a point in a form that RFC 5480 § 2.2 refuses, the compact form `0x05` among them.
 - The HPKE hello and the HPKE reply carry their ephemeral in the compressed SEC 1 form, at the width the curve of the provider gives that form (SEC 1 v2.0 § 2.3.3). Each reader refuses a point of another width (`OctetStringLengthError`).
 
 An ephemeral with the x-coordinate of its sender's static key would collapse the agreement into the static one, so each side refuses it:
 
-| Comparison                                                                                      | Home            | When                                                    |
-| ----------------------------------------------------------------------------------------------- | --------------- | ------------------------------------------------------- |
-| The client compares `E` with the key of each server certificate, the key-agreement one included | `PeerEphemeral` | At the reply, before the agreement                      |
-| The server compares `R` with the key of the offered certificate                                 | `Offer::new`    | At the closing, once the identity opens, before the tag |
-| A rekey server compares `Ce` with the client's static key                                       | `PeerEphemeral` | At the request                                          |
-| A rekey client compares `Se` with every static key of the server                                | `ServerKeys`    | At the response                                         |
+| Comparison                                                                                                    | Home                                                  | When                                                    |
+| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
+| The client compares `E` with each server key that is a point of the handshake curve, the signing key included | `PeerStatics::server_ephemeral`                       | At the reply, before the agreement                      |
+| The server compares `R` with the key of the offered certificate                                               | `PeerStatics::admit_client`, which `Offer::new` calls | At the closing, once the identity opens, before the tag |
+| A rekey server compares `Ce` with the client's static key                                                     | `PeerStatics::client_ephemeral`                       | At the request                                          |
+| A rekey client compares `Se` with every static key of the server                                              | `PeerStatics::server_ephemeral`                       | At the response                                         |
 
 - The comparison reads the x-coordinate, because ECDH keeps that coordinate alone. A key and its negation agree to one secret.
-- A server reads the client's static key only once the identity opens. An anonymous client holds none.
+- `PeerStatics` reads each static key once, when the peer is admitted. The client, and each rekey side, agrees only with the `DistinctPoint` it returns.
+- A server reads the client's static key only once the identity opens, so it agrees at the reply with the `OpenedPoint` it parsed. The pending server holds that one value, and the closing admits it. An anonymous client holds no static key.
 - The CMS `kemct` derives the key-encryption key alone, so the server compares `R` alone.
-- The client compares `E` with a key-agreement key only when that key is a point of the handshake curve.
+- A static key outside the group of the handshake curve collapses no agreement on it, so no comparison reads it. A signer on P-384 beside an agreement on secp256k1 leaves the client the key-agreement key alone to compare.
 
 ### Forward secrecy
 
@@ -465,7 +466,7 @@ A holder of one epoch secret lacks `ee`, so it derives nothing of the next epoch
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | The next epoch needs a rekey scalar                                | `EpochSecret::next` runs the agreement itself                                                                                            |
 | Both ephemerals are authenticated                                  | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns |
-| A peer ephemeral is a curve point, and never the peer's static key | `PeerEphemeral` yields a `PeerPoint`, the one point type `EpochSecret::next` takes                                                       |
+| A peer ephemeral is a curve point, and never the peer's static key | `PeerStatics` yields a `DistinctPoint`, the one point type `EpochSecret::next` takes                                                     |
 | `Ce` and `Se` travel compressed, at the width of the curve         | Each side reads a leg at the compressed width of the curve and parses it before the pin, and the server pins `Se` as it sends it         |
 | The server drops its rekey scalar before it awaits                 | It agrees and drops its scalar before it awaits its authorizer, and holds the derived secret until the acknowledgement                   |
 | The client spends its rekey scalar before each await of a step     | `EpochSecret::next` takes the boxed scalar by value before the client awaits its approver                                                |

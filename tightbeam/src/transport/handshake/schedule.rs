@@ -85,15 +85,11 @@ use crate::crypto::sign::elliptic_curve::sec1;
 #[cfg(any(feature = "transport-hpke", test))]
 use crate::crypto::sign::elliptic_curve::sec1::{CompressedPointSize, ToEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::sec1::{EncodedPoint, FromEncodedPoint};
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::sign::elliptic_curve::{CurveArithmetic, Error as EllipticCurveError, PublicKey, SecretKey};
+use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::sign::SignedDataSigners;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::subtle::ConstantTimeEq;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::crypto::x509::{PeerCertificate, Sec1Point, Signing};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 #[cfg(mux_rekey)]
@@ -104,6 +100,8 @@ use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Res
 use crate::oids::HANDSHAKE_TRANSCRIPT_HASH;
 #[cfg(feature = "transport-cms")]
 use crate::random::{generate_nonce, CryptoRngCore};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ephemeral::{DistinctPoint, OpenedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -937,8 +935,8 @@ impl EpochSecret {
 	///
 	/// - `local` is a single-use scalar, moved in. Its drop wipes it before the
 	///   derivation runs, so it is gone before any later await of the caller.
-	/// - `peer` is a [`PeerPoint`], so it is a point of the curve other than
-	///   the identity. Each rekey caller admits it through [`PeerEphemeral`].
+	/// - `peer` is a [`DistinctPoint`], so it is a point of the curve other
+	///   than the identity, distinct from every static key of the peer.
 	///
 	/// # Errors
 	///
@@ -947,7 +945,7 @@ impl EpochSecret {
 	pub(crate) fn next<P>(
 		&self,
 		local: Box<EphemeralSecret<P::Curve>>,
-		peer: &PeerPoint<P::Curve>,
+		peer: &DistinctPoint<P::Curve>,
 		salt: KdfSalt<'_>,
 	) -> Result<Self, HandshakeError>
 	where
@@ -1064,7 +1062,7 @@ impl EpochMaterials {
 	pub(crate) fn next_secret<P>(
 		&self,
 		local: Box<EphemeralSecret<P::Curve>>,
-		peer: &PeerPoint<P::Curve>,
+		peer: &DistinctPoint<P::Curve>,
 		salt: KdfSalt<'_>,
 	) -> Result<EpochSecret, HandshakeError>
 	where
@@ -1202,118 +1200,6 @@ impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 	}
 }
 
-/// A peer's ephemeral as a point of the curve other than the identity, the
-/// one input [`Agreement`] takes.
-///
-/// [`Self::parse`] admits any such point, and [`PeerEphemeral`] admits one
-/// whose x-coordinate differs from a static key known before the agreement.
-/// A server learns its client's static key only after the agreement, so the
-/// server's `Offer` refuses a collapsed client ephemeral instead.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub struct PeerPoint<C: CurveArithmetic>(PublicKey<C>);
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C: HandshakeCurve> PeerPoint<C> {
-	/// Parses `sec1` as a peer ephemeral: the one parse of every ephemeral an
-	/// agreement takes, which [`PeerEphemeral`] runs before its comparison.
-	/// [`Sec1Point::read`] reads the form from the first octet
-	/// (SEC 1 v2.0 §2.3.3) before the curve decodes a point:
-	///
-	/// - The compressed and the uncompressed forms, the two that RFC 5480 §2.2 names, parse.
-	/// - The parse refuses the compact form `0x05` and the identity `0x00`.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	pub(crate) fn parse(sec1: impl AsRef<[u8]>) -> Result<Self, HandshakeError> {
-		let octets = sec1.as_ref();
-		let named_form = Sec1Point::read(octets).is_some();
-		if !named_form {
-			return Err(EllipticCurveError.into());
-		}
-
-		let encoded = EncodedPoint::<C>::from_bytes(octets).map_err(|_| EllipticCurveError)?;
-		let decoded = PublicKey::<C>::from_encoded_point(&encoded);
-
-		let point = Option::from(decoded).ok_or(EllipticCurveError)?;
-		Ok(Self(point))
-	}
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C: CurveArithmetic> PeerPoint<C> {
-	/// The admitted point, for the scalar multiplication that reads it.
-	pub(crate) fn as_public_key(&self) -> &PublicKey<C> {
-		&self.0
-	}
-}
-
-/// The static keys that a peer's ephemeral must differ from, when the peer
-/// holds any.
-///
-/// The parse refuses a malformed, off-curve, or identity point, so every
-/// scalar multiplication runs on a valid one. The trait also refuses a point
-/// that collapses an ECDH agreement into one with a static key of the peer:
-/// the key itself, or its negation, because ECDH keeps the x-coordinate alone.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) trait PeerEphemeral<C>
-where
-	C: HandshakeCurve,
-{
-	/// Whether an agreement with `point` differs from one with every static
-	/// key of this peer.
-	fn distinct_from(&self, point: &PublicKey<C>) -> bool;
-
-	/// Parses `sec1` as an ephemeral of this peer, or `None` when the point
-	/// collapses into a static key of the peer.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	fn distinct_ephemeral(&self, sec1: &[u8]) -> Result<Option<PeerPoint<C>>, HandshakeError> {
-		let point = PeerPoint::parse(sec1)?;
-		let distinct = self.distinct_from(point.as_public_key());
-		Ok(distinct.then_some(point))
-	}
-
-	/// Parses `sec1` as the ephemeral of this server.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the point collapses into a static key of the server.
-	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
-		let distinct = self.distinct_ephemeral(sec1)?;
-		distinct.ok_or(HandshakeError::ServerEphemeralIsStatic)
-	}
-
-	/// Parses `sec1` as the ephemeral of this client at a rekey, where the
-	/// client's static key is known before the agreement.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidPublicKey`] -- `sec1` is no point on the
-	///   curve in a form RFC 5480 §2.2 names.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the point collapses into the client's static key.
-	#[cfg(mux_rekey)]
-	fn client_ephemeral(&self, sec1: &[u8]) -> Result<PeerPoint<C>, HandshakeError> {
-		let distinct = self.distinct_ephemeral(sec1)?;
-		distinct.ok_or(HandshakeError::ClientEphemeralIsStatic)
-	}
-}
-
-/// A peer that signs with one certificate holds the one static key of that
-/// certificate.
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<P: HandshakeProvider> PeerEphemeral<P::Curve> for PeerCertificate<Signing<P>> {
-	fn distinct_from(&self, point: &PublicKey<P::Curve>) -> bool {
-		self.distinct(point)
-	}
-}
-
 /// ECDH key agreement of a handshake and of a rekey.
 ///
 /// The ephemeral-ephemeral step of a handshake runs it with the client's
@@ -1352,15 +1238,17 @@ where
 	}
 }
 
-/// The peer point, beside the base secret that follows its agreement output
-/// in the CMS flow, borrowed for one settlement.
+/// The peer's ephemeral, beside the base secret that follows its agreement
+/// output in the CMS flow, borrowed for one settlement.
 ///
-/// [`Self::hybrid`] builds one for the CMS flow and [`Self::ephemeral`] for the
-/// HPKE flow. [`Self::settle`] is the one derivation of the
-/// [`HandshakeSecret`].
+/// Each role has one constructor, which takes the proof point of that role:
+/// [`Self::client`] a [`DistinctPoint`], and [`Self::server`] an
+/// [`OpenedPoint`]. [`Self::hybrid`] adds the base secret of the CMS flow, and
+/// [`Self::settle`] is the one derivation of the [`HandshakeSecret`].
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub struct Agreement<'a, P: HandshakeProvider> {
-	peer: &'a PeerPoint<P::Curve>,
+	/// The point of the peer's ephemeral, lent by its proof point.
+	peer: &'a PublicKey<P::Curve>,
 	/// The base secret of the CMS flow, or `None` for the HPKE flow, whose
 	/// secret derives from the agreement output alone.
 	#[cfg(feature = "transport-cms")]
@@ -1369,16 +1257,30 @@ pub struct Agreement<'a, P: HandshakeProvider> {
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<'a, P: HandshakeProvider> Agreement<'a, P> {
-	/// Pairs the ephemeral `peer` with the `base` that follows its agreement,
-	/// as the CMS flow derives the secret.
-	#[cfg(feature = "transport-cms")]
-	pub(crate) fn hybrid(peer: &'a PeerPoint<P::Curve>, base: &'a BaseSecret) -> Self {
-		Self { peer, base: Some(base) }
+	/// The client's agreement with the server ephemeral `peer`, which a check
+	/// against every static key of the server proved distinct.
+	pub(crate) fn client(peer: &'a DistinctPoint<P::Curve>) -> Self {
+		Self::of(peer.as_public_key())
 	}
 
-	/// The ephemeral `peer` alone, as the HPKE flow derives the secret.
-	#[cfg(feature = "transport-hpke")]
-	pub(crate) fn ephemeral(peer: &'a PeerPoint<P::Curve>) -> Self {
+	/// The server's agreement with the client ephemeral `peer`. The server
+	/// answers before the client's identity opens, so the closing admits the
+	/// same point through [`PeerStatics::admit_client`].
+	///
+	/// [`PeerStatics::admit_client`]: super::ephemeral::PeerStatics::admit_client
+	pub(crate) fn server(peer: &'a OpenedPoint<P::Curve>) -> Self {
+		Self::of(peer.as_public_key())
+	}
+
+	/// This agreement with the `base` that follows its output, as the CMS
+	/// flow derives the secret.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) fn hybrid(self, base: &'a BaseSecret) -> Self {
+		Self { base: Some(base), ..self }
+	}
+
+	/// The agreement with `peer` alone, as the HPKE flow derives the secret.
+	fn of(peer: &'a PublicKey<P::Curve>) -> Self {
 		Self {
 			peer,
 			#[cfg(feature = "transport-cms")]
@@ -1399,7 +1301,7 @@ impl<'a, P: HandshakeProvider> Agreement<'a, P> {
 		local: &impl HandshakeAgreement<P::Curve>,
 		salt: KdfSalt<'_>,
 	) -> Result<HandshakeSecret, HandshakeError> {
-		let shared = local.shared_secret(self.peer.as_public_key());
+		let shared = local.shared_secret(self.peer);
 		#[cfg(feature = "transport-cms")]
 		if let Some(base) = self.base {
 			return HandshakeSecret::hybrid::<P>(&shared, base, salt);
@@ -1717,14 +1619,14 @@ mod tests {
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::crypto::x509::KeyPurposes;
+	use crate::crypto::sign::elliptic_curve::CurveArithmetic;
 	use crate::der::asn1::{OctetString, SetOfVec};
 	use crate::der::{Decode, Encode, ErrorKind};
 	use crate::oids::DATA;
 	use crate::random::OsRng;
 	use crate::testing::{Aes256Sha3_512Provider, EnvelopeRecipient, TestCertificate, TestKey};
 	use crate::transport::handshake::tests::{
-		create_test_certificate, create_test_signed_data, fixture_agreement, fixture_transcript, negated, FIXTURE_SALT,
+		create_test_signed_data, fixture_agreement, fixture_transcript, FIXTURE_SALT,
 	};
 
 	#[cfg(mux_rekey)]
@@ -1783,100 +1685,6 @@ mod tests {
 		let secret = handshake_secret(0x11, 0x42, &salt);
 		let result = derive_directional(&secret, &salt);
 		assert!(result.is_ok());
-	}
-
-	/// The static key of a fresh test certificate.
-	fn static_key() -> PublicKey<Secp256k1> {
-		let client = create_test_certificate();
-		PublicKey::from(client.signing_key.verifying_key())
-	}
-
-	/// A fresh test certificate, admitted for signing, beside its static key.
-	fn static_peer() -> (PeerCertificate<Signing<DefaultCryptoProvider>>, PublicKey<Secp256k1>) {
-		let client = create_test_certificate();
-		let key = PublicKey::from(client.signing_key.verifying_key());
-		let peer = PeerCertificate::parse(client.certificate, KeyPurposes::HOUSE.client);
-		let peer = peer.expect("a test certificate is admitted for signing");
-		(peer, key)
-	}
-
-	/// The parse reads the point alone, so any point of the curve parses as a
-	/// peer point.
-	#[test]
-	fn any_point_of_the_curve_parses_as_a_peer_point() -> Result<(), HandshakeError> {
-		let key = static_key();
-		let point = key.to_encoded_point(true);
-
-		let parsed = PeerPoint::<Secp256k1>::parse(point.as_bytes())?;
-		assert_eq!(parsed.as_public_key(), &key);
-		Ok(())
-	}
-
-	/// The uncompressed form is one of the two forms RFC 5480 §2.2 names, so
-	/// a point in it parses as a peer point, as the CMS flow carries one.
-	#[test]
-	fn a_point_in_the_uncompressed_form_parses_as_a_peer_point() -> Result<(), HandshakeError> {
-		let key = static_key();
-		let point = key.to_encoded_point(false);
-
-		let parsed = PeerPoint::<Secp256k1>::parse(point.as_bytes())?;
-		assert_eq!(parsed.as_public_key(), &key);
-		Ok(())
-	}
-
-	/// RFC 5480 §2.2 names no compact form, so the parse refuses the compact
-	/// form `0x05` of a point the curve decodes from it.
-	#[test]
-	fn a_point_in_the_compact_form_is_refused_at_the_parse() {
-		let compressed = static_key().to_encoded_point(true);
-		let mut compact = compressed.as_bytes().to_vec();
-		compact[0] = 0x05;
-
-		let refused = PeerPoint::<Secp256k1>::parse(&compact);
-		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
-	}
-
-	#[cfg(mux_rekey)]
-	#[test]
-	fn a_client_ephemeral_equal_to_the_client_static_key_is_refused() {
-		let (peer, static_key) = static_peer();
-		let point = static_key.to_encoded_point(true);
-
-		let refused = peer.client_ephemeral(point.as_bytes());
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	#[cfg(mux_rekey)]
-	#[test]
-	fn a_client_ephemeral_other_than_the_static_key_is_admitted() -> Result<(), HandshakeError> {
-		let (peer, _static_key) = static_peer();
-		let other_key = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
-		let point = other_key.to_encoded_point(true);
-
-		let admitted = peer.client_ephemeral(point.as_bytes())?;
-		assert_eq!(admitted.as_public_key(), &other_key);
-		Ok(())
-	}
-
-	/// ECDH keeps the x-coordinate alone, so the negation of a static key
-	/// agrees to the secret the key itself agrees to.
-	#[cfg(mux_rekey)]
-	#[test]
-	fn the_negation_of_the_client_static_key_is_refused_as_its_ephemeral() {
-		let (peer, static_key) = static_peer();
-		let point = negated(&static_key).to_encoded_point(true);
-
-		let refused = peer.client_ephemeral(point.as_bytes());
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	#[test]
-	fn the_negation_of_the_server_static_key_is_refused_as_its_ephemeral() {
-		let (peer, static_key) = static_peer();
-		let point = negated(&static_key).to_encoded_point(true);
-
-		let refused = peer.server_ephemeral(point.as_bytes());
-		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 	}
 
 	/// The handshake secret changes with the ephemeral-ephemeral output, so a

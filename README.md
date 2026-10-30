@@ -990,7 +990,7 @@ tightbeam splits cryptographic work into roles, so a component depends only on t
 - **Key wrap**: The wrap of a content key. Examples include AES key wrap ([RFC 3394][rfc3394]).
 - **Signature**: Signature generation and verification. Examples include ECDSA ([FIPS 186-5][fips186-5]) and Ed25519 ([RFC 8032][rfc8032]).
 - **KDF**: Key derivation. Examples include HKDF ([RFC 5869][rfc5869]).
-- **Curve**: Elliptic-curve operations. Examples include secp256k1, P-384 ([RFC 5480][rfc5480]), and X25519 ([RFC 7748][rfc7748]).
+- **Curve**: Elliptic-curve agreement. Examples include secp256k1 and P-384 ([RFC 5480][rfc5480]). The signature role is independent of it.
 
 A crypto provider binds one implementation to each role ([§6.5](#65-crypto-provider-system)).
 

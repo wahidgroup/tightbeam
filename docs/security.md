@@ -257,7 +257,7 @@ The digest, the cipher, the signature, and the verifying key are also `Send + Sy
 
 The layers above the envelope take the provider as a type parameter:
 
-- **Handshake.** `HandshakeProvider` is the one bound of the handshake layer. It is a `CryptoProvider` whose curve is a `HandshakeCurve`, whose cipher is `KeyInit + ContentEncryption`, whose signature parses from its bytes, and whose verifying key parses from an SPKI and from a point of the curve. Every provider that meets the bounds is a handshake provider, and it runs both flows with no HPKE suite.
+- **Handshake.** `HandshakeProvider` is the one bound of the handshake layer. It is a `CryptoProvider` whose curve is a `HandshakeCurve`, whose cipher is `KeyInit + ContentEncryption`, whose signature parses from its bytes, and whose verifying key parses from an SPKI. The verifying key names no curve, so a provider may sign on one curve and agree on another. Every provider that meets the bounds is a handshake provider, and it runs both flows with no HPKE suite.
 - **Transport.** `TokioListener<P>` and `TcpListener<L, P>` take `DefaultCryptoProvider` as the default of `P`. A call names `P` when no other type in the call names it, such as `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)`, `TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(listener)`, or `TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity)`.
 - **Signatures.** `SigningIdentity::with_provider::<P>` signs under the signature of `P`, and `ProviderPolicy::<P>` verifies it.
 

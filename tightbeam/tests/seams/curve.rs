@@ -18,7 +18,8 @@
 //! - an in-band renewal of a multiplexed session over TCP, and
 //! - a handshake and one exchange over the blocking TCP transport.
 //!
-//! [`p384`] and [`p521`] bring the same parts on P-384 and on P-521.
+//! [`p384`] and [`p521`] bring the same parts on P-384 and on P-521, and
+//! [`signer`] brings a provider that signs on P-384 and agrees on secp256k1.
 
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
@@ -29,7 +30,7 @@ use p256::elliptic_curve;
 use p256::elliptic_curve::group::Curve as _;
 use p256::elliptic_curve::point::AffineCoordinates;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{AffinePoint, NistP256, PublicKey};
+use p256::{NistP256, PublicKey};
 use rand_core::impls::{next_u32_via_fill, next_u64_via_fill};
 use rand_core::{CryptoRng, Error as RandError, RngCore};
 use tightbeam::cms::content_info::ContentInfo;
@@ -83,6 +84,7 @@ use super::{run_legs, CONTENT};
 
 mod p384;
 mod p521;
+mod signer;
 
 /// `id-ecPublicKey` (RFC 5480 §2.1.1), the algorithm of the key each outside
 /// key-agreement backend holds.
@@ -255,21 +257,6 @@ impl Verifier<P256Signature> for P256VerifyingKey {
 	fn verify(&self, message: &[u8], signature: &P256Signature) -> Result<(), SignatureError> {
 		let prehash = Sha3_256::digest(message);
 		self.0.verify_prehash(&prehash, &signature.0)
-	}
-}
-
-/// The key of a point on P-256, as a handshake reads it from a certificate.
-impl From<PublicKey> for P256VerifyingKey {
-	fn from(key: PublicKey) -> Self {
-		Self(VerifyingKey::from(key))
-	}
-}
-
-/// The point of the key, lent by reference, which a handshake compares an
-/// agreement ephemeral with.
-impl AsRef<AffinePoint> for P256VerifyingKey {
-	fn as_ref(&self) -> &AffinePoint {
-		self.0.as_affine()
 	}
 }
 
@@ -634,12 +621,14 @@ fn reissued(house: &TestCmsServer, certificate: &Certificate, curve: ObjectIdent
 }
 
 /// A CMS server under `P` named `name`, whose signing backend `signer` holds
-/// the point `signing_point` and whose key-agreement backend is an
-/// [`AgreementBackend`] of a fresh scalar. Its two certificates name one
-/// subject under one house authority.
+/// the point `signing_point` on the curve `signing_curve`, and whose
+/// key-agreement backend is an [`AgreementBackend`] of a fresh scalar on the
+/// curve of `P`. Its two certificates name one subject under one house
+/// authority.
 fn outside_cms_server<P>(
 	name: &str,
 	signer: Arc<dyn SigningKeyProvider>,
+	signing_curve: ObjectIdentifier,
 	signing_point: &[u8],
 ) -> OutsideCmsServer<P::Kem>
 where
@@ -650,7 +639,7 @@ where
 	let curve = <P::Curve as AssociatedOid>::OID;
 
 	let agreement_point = backend.public_key().to_encoded_point(false);
-	let signing = reissued(&house, &house.signing, curve, signing_point);
+	let signing = reissued(&house, &house.signing, signing_curve, signing_point);
 	let key_agreement = reissued(&house, &house.key_agreement, curve, agreement_point.as_bytes());
 	let signing = identity_of::<P>(signing, signer);
 	let backend: Arc<dyn DiffieHellman<P::Curve>> = Arc::new(backend);
@@ -661,7 +650,8 @@ where
 fn p256_cms_server() -> OutsideCmsServer<P256Kem> {
 	let key = SigningKey::random(&mut OsRng);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
-	outside_cms_server::<P256Provider>("p256 server", Arc::new(P256KeyProvider { key }), point.as_bytes())
+	let signer = Arc::new(P256KeyProvider { key });
+	outside_cms_server::<P256Provider>("p256 server", signer, CURVE_NIST_P256, point.as_bytes())
 }
 
 /// A client of `server` that pins its key-agreement certificate and presents
@@ -684,6 +674,28 @@ fn cms_pair<P: HandshakeProvider>(
 	(Handshake::client(client), Handshake::server(server_config))
 }
 
+/// The certificate the server of `pair` admitted as its client once the
+/// three legs run, beside the first record the client seals, as the server
+/// opens it under its session keys.
+async fn admitted_and_opened<P, F>(
+	pair: (Handshake<Client, F, P>, Handshake<Server, F, P>),
+) -> Result<(Option<Certificate>, Vec<u8>), Box<dyn std::error::Error>>
+where
+	P: HandshakeProvider,
+	F: ClientFlow<P> + ServerFlow<P>,
+{
+	let (mut client, mut server) = pair;
+	run_legs(&mut client, &mut server).await;
+	let admitted = server.peer_certificate().cloned();
+
+	let client_session = client.complete()?;
+	let server_session = server.complete()?;
+
+	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
+	Ok((admitted, opened.to_vec()))
+}
+
 /// The first record the client of `pair` seals once the three legs run, as
 /// the server of `pair` opens it under its session keys.
 async fn first_record_opened<P, F>(
@@ -693,15 +705,8 @@ where
 	P: HandshakeProvider,
 	F: ClientFlow<P> + ServerFlow<P>,
 {
-	let (mut client, mut server) = pair;
-	run_legs(&mut client, &mut server).await;
-
-	let client_session = client.complete()?;
-	let server_session = server.complete()?;
-
-	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
-	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
-	Ok(opened.to_vec())
+	let (_admitted, opened) = admitted_and_opened(pair).await?;
+	Ok(opened)
 }
 
 /// The outside KEM encapsulates to the recipient key of RFC 9180 A.3.1 as

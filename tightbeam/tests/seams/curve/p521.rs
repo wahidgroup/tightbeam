@@ -29,7 +29,7 @@ use std::sync::Arc;
 use p521::ecdsa::signature::hazmat::RandomizedPrehashSigner;
 use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p521::elliptic_curve::sec1::ToEncodedPoint;
-use p521::{AffinePoint, NistP521, PublicKey};
+use p521::{NistP521, PublicKey};
 use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::DhKemSuite;
@@ -151,21 +151,6 @@ impl Verifier<P521Signature> for P521VerifyingKey {
 	fn verify(&self, message: &[u8], signature: &P521Signature) -> Result<(), SignatureError> {
 		let prehash = Sha3_512::digest(message);
 		self.verify_prehash(&prehash, signature)
-	}
-}
-
-/// The key of a point on P-521, as a handshake reads it from a certificate.
-impl From<PublicKey> for P521VerifyingKey {
-	fn from(key: PublicKey) -> Self {
-		Self(key)
-	}
-}
-
-/// The point of the key, lent by reference, which a handshake compares an
-/// agreement ephemeral with.
-impl AsRef<AffinePoint> for P521VerifyingKey {
-	fn as_ref(&self) -> &AffinePoint {
-		self.0.as_affine()
 	}
 }
 
@@ -298,7 +283,7 @@ fn p521_identity() -> SigningIdentity {
 fn p521_cms_server() -> OutsideCmsServer<P521Kem> {
 	let signer = P521KeyProvider { key: SigningKey::random(&mut OsRng) };
 	let point = signer.public_key().to_encoded_point(false);
-	outside_cms_server::<P521Provider>("p521 server", Arc::new(signer), point.as_bytes())
+	outside_cms_server::<P521Provider>("p521 server", Arc::new(signer), CURVE_NIST_P521, point.as_bytes())
 }
 
 /// The outside KEM encapsulates to the recipient key of RFC 9180 A.6.1 as

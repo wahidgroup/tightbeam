@@ -50,7 +50,7 @@ use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::receipt::{
 	CountersignedReceipt, IssuedReceipt, PendingReceipt, ReceiptApprover, SessionObserver, Settlement, StoredReceipt,
 };
-use crate::transport::handshake::schedule::{Agreed, PeerEphemeral, SecretSeal, Terms};
+use crate::transport::handshake::schedule::{Agreed, SecretSeal, Terms};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EstablishedSession, HandshakeMessage, HandshakeProvider, ServerHandshakeProtocol,
 	ServerIdentity,

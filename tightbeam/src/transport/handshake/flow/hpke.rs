@@ -42,6 +42,7 @@ use crate::marker::MaybeSendFuture;
 use crate::oids::{DATA, HANDSHAKE_REPLY_CONTENT};
 use crate::random::{generate_nonce, CryptoRngCore, RngWrapper};
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
+use crate::transport::handshake::ephemeral::{DistinctPoint, OpenedPoint};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
 	sealed, ClientAgreement, ClientLegs, HandshakeFlow, Opened, OpeningIntake, OpeningParts, ReplyBinding, ReplyIntake,
@@ -51,7 +52,7 @@ use crate::transport::handshake::negotiation::SecurityAccept;
 use crate::transport::handshake::peer::LearnedTrust;
 use crate::transport::handshake::primitives::transcript::Transcript;
 use crate::transport::handshake::primitives::TranscriptHash;
-use crate::transport::handshake::schedule::{Agreement, CompressedPoint, PeerPoint, Salt};
+use crate::transport::handshake::schedule::{Agreement, CompressedPoint, Salt};
 use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{ClientHello, HandshakeCurve, HandshakeMessage, HandshakeProvider, ServerHandshake};
 use crate::transport::wire_der::WireDer;
@@ -204,8 +205,8 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 /// The HPKE client agrees over the ephemerals alone. The agreement reads the
 /// ephemeral in place, so `SecretKey` wipes it where the box drops.
 impl<P: HandshakeProvider> ClientAgreement<P> for Box<SecretKey<P::Curve>> {
-	fn agreement<'a>(&'a self, peer: &'a PeerPoint<P::Curve>) -> Agreement<'a, P> {
-		Agreement::ephemeral(peer)
+	fn agreement<'a>(&'a self, peer: &'a DistinctPoint<P::Curve>) -> Agreement<'a, P> {
+		Agreement::client(peer)
 	}
 
 	fn ephemeral(&self) -> &SecretKey<P::Curve> {
@@ -236,7 +237,7 @@ pub struct HpkeHello<C: HandshakeCurve> {
 	client_random: [u8; 32],
 	/// The client's agreement ephemeral `R`, parsed once as a point of the
 	/// curve.
-	client_ephemeral: PeerPoint<C>,
+	client_ephemeral: OpenedPoint<C>,
 }
 
 /// A reply that awaits its signature and its receipt.
@@ -281,7 +282,7 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		//    negotiation. The static-key check waits for the closing identity.
 		let client_random = client_random.to_32_byte_array()?;
 		let client_point = client_ephemeral.to_compressed_point::<P::Curve>()?;
-		let client_ephemeral = PeerPoint::parse(client_point)?;
+		let client_ephemeral = OpenedPoint::parse(client_point)?;
 		let sealed = HpkeHello { transcript, client_random, client_ephemeral };
 		Ok(OpeningIntake { security_offer, transport_offer, sealed })
 	}
@@ -357,12 +358,12 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 /// ephemeral serves this one agreement, and the transcript of the hello drops
 /// with the value.
 impl<P: HandshakeProvider> ServerAgreement<P> for HpkeHello<P::Curve> {
-	fn client_ephemeral(&self) -> &PeerPoint<P::Curve> {
-		&self.client_ephemeral
+	fn into_client_ephemeral(self) -> OpenedPoint<P::Curve> {
+		self.client_ephemeral
 	}
 
 	fn agreement(&self) -> Agreement<'_, P> {
-		Agreement::ephemeral(&self.client_ephemeral)
+		Agreement::server(&self.client_ephemeral)
 	}
 }
 

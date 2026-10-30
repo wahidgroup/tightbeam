@@ -27,13 +27,14 @@ use std::sync::Arc;
 
 use p384::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
 use p384::elliptic_curve::sec1::ToEncodedPoint;
-use p384::{AffinePoint, NistP384, PublicKey};
+use p384::{NistP384, PublicKey};
 use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+use tightbeam::crypto::cms::RecipientKem;
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::DhKemSuite;
 use tightbeam::crypto::k256::sha2::Sha384;
 use tightbeam::crypto::kdf::HkdfSha3_256;
-use tightbeam::crypto::key::{KeyBackend, KeyError, SigningKeyProvider};
+use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
 	AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
 	SecurityProfile, SigningProvider,
@@ -50,6 +51,7 @@ use tightbeam::spki::{
 	AlgorithmIdentifierOwned, Document, EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef,
 };
 use tightbeam::testing::unhex;
+use tightbeam::transport::handshake::HandshakeProvider;
 
 use super::{
 	carried_point, certificate_of, cms_pair, first_record_opened, hpke_pair, identity_of, outside_cms_server,
@@ -88,7 +90,7 @@ const KNOWN_ANSWER: KemVector = KemVector {
 /// An ECDSA signature over P-384 under SHA3-512, in DER. SHA3-512 meets the
 /// 192-bit strength of the curve (FIPS 186-5 §6.4.1).
 #[derive(Clone, Debug)]
-struct P384Signature(DerSignature);
+pub(super) struct P384Signature(DerSignature);
 
 impl TryFrom<&[u8]> for P384Signature {
 	type Error = SignatureError;
@@ -125,7 +127,7 @@ impl CanonicalForm for P384Signature {
 
 /// The P-384 key that verifies a [`P384Signature`].
 #[derive(Clone, Debug, PartialEq)]
-struct P384VerifyingKey(VerifyingKey);
+pub(super) struct P384VerifyingKey(VerifyingKey);
 
 impl PrehashVerifier<P384Signature> for P384VerifyingKey {
 	fn verify_prehash(&self, prehash: &[u8], signature: &P384Signature) -> Result<(), SignatureError> {
@@ -147,21 +149,6 @@ impl Verifier<P384Signature> for P384VerifyingKey {
 	fn verify(&self, message: &[u8], signature: &P384Signature) -> Result<(), SignatureError> {
 		let prehash = Sha3_512::digest(message);
 		self.0.verify_prehash(&prehash, &signature.0)
-	}
-}
-
-/// The key of a point on P-384, as a handshake reads it from a certificate.
-impl From<PublicKey> for P384VerifyingKey {
-	fn from(key: PublicKey) -> Self {
-		Self(VerifyingKey::from(key))
-	}
-}
-
-/// The point of the key, lent by reference, which a handshake compares an
-/// agreement ephemeral with.
-impl AsRef<AffinePoint> for P384VerifyingKey {
-	fn as_ref(&self) -> &AffinePoint {
-		self.0.as_affine()
 	}
 }
 
@@ -267,18 +254,22 @@ impl SigningKeyProvider for P384KeyProvider {
 }
 
 /// An identity under [`P384Provider`], of a fresh key.
-fn p384_identity() -> SigningIdentity {
+pub(super) fn p384_identity() -> SigningIdentity {
 	let key = SigningKey::random(&mut OsRng);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
 	let certificate = certificate_of(CURVE_NIST_P384, point.as_bytes());
 	identity_of::<P384Provider>(certificate, Arc::new(P384KeyProvider { key }))
 }
 
-/// A CMS server of fresh P-384 keys.
-fn p384_cms_server() -> OutsideCmsServer<P384Kem> {
+/// A CMS server under `P` named `name`, which signs under a fresh P-384 key.
+pub(super) fn p384_cms_server<P>(name: &str) -> OutsideCmsServer<P::Kem>
+where
+	P: HandshakeProvider<VerifyingKey: PartialEq, Kem: RecipientKem<PrivateKey = dyn DiffieHellman<P::Curve>>>,
+{
 	let key = SigningKey::random(&mut OsRng);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
-	outside_cms_server::<P384Provider>("p384 server", Arc::new(P384KeyProvider { key }), point.as_bytes())
+	let signer = Arc::new(P384KeyProvider { key });
+	outside_cms_server::<P>(name, signer, CURVE_NIST_P384, point.as_bytes())
 }
 
 /// The outside KEM encapsulates to the recipient key of the known answer as
@@ -342,7 +333,8 @@ fn a_p384_hello_carries_a_compressed_p384_point() -> Result<(), Box<dyn std::err
 /// under the server's session keys.
 #[tokio::test]
 async fn a_p384_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let opened = first_record_opened(cms_pair::<P384Provider>(p384_cms_server(), p384_identity())).await?;
+	let server = p384_cms_server::<P384Provider>("p384 server");
+	let opened = first_record_opened(cms_pair::<P384Provider>(server, p384_identity())).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }

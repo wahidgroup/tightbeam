@@ -62,7 +62,6 @@ use futures::lock::Mutex as FuturesMutex;
 use crate::cms::signed_data::SignedData;
 use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
@@ -77,8 +76,8 @@ use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, StoredReceipt,
 };
 use crate::transport::handshake::{
-	AgreementCertificate, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError, HandshakeOctets,
-	HandshakeProvider, PeerEphemeral, ServerKeys, SessionPeer,
+	DistinctPoint, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError, HandshakeOctets, HandshakeProvider,
+	PeerStatics, SessionPeer,
 };
 
 /// Shared epoch state and identities for one session's rekey exchanges.
@@ -103,8 +102,8 @@ where
 }
 
 /// The peer a session recorded, once its certificate is admitted for signing
-/// under the key purpose of its role, with the key of a CMS server's
-/// key-agreement certificate as a point of the handshake curve.
+/// under the key purpose of its role, beside the static keys its rekey
+/// ephemeral must differ from.
 ///
 /// A rekey's materials take it whole, so each key a rekey reads names the one
 /// peer.
@@ -114,8 +113,8 @@ where
 {
 	/// The certificate, admitted for signing under the purpose of its role.
 	signing: PeerCertificate<Signing<P>>,
-	/// The key of a CMS server's key-agreement certificate.
-	key_agreement: Option<PublicKey<P::Curve>>,
+	/// The static keys of the peer, read once from its certificates.
+	statics: PeerStatics<P::Curve>,
 }
 
 impl<P> RekeyPeer<P>
@@ -130,14 +129,28 @@ where
 	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or `purpose` refuses `peer`.
 	pub(crate) fn admit(peer: &SessionPeer, purpose: ObjectIdentifier) -> Result<Self, HandshakeError> {
 		let signing = PeerCertificate::parse(Arc::clone(peer.certificate()), purpose)?;
-		let key_agreement = peer.key_agreement();
-		let key_agreement = key_agreement.and_then(|certificate| certificate.agreement_point::<P::Curve>());
-		Ok(Self { signing, key_agreement })
+		let statics = PeerStatics::of(peer.certificate(), peer.key_agreement());
+		Ok(Self { signing, statics })
 	}
 
-	/// The static keys of this peer as the server of its session.
-	fn server_keys(&self) -> ServerKeys<'_, P> {
-		ServerKeys { signing: &self.signing, key_agreement: self.key_agreement.as_ref() }
+	/// Parses `sec1` as the rekey ephemeral of this peer as the server of its
+	/// session.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`PeerStatics::server_ephemeral`].
+	fn server_ephemeral(&self, sec1: impl AsRef<[u8]>) -> Result<DistinctPoint<P::Curve>, HandshakeError> {
+		self.statics.server_ephemeral(sec1)
+	}
+
+	/// Parses `sec1` as the rekey ephemeral of this peer as the client of its
+	/// session.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`PeerStatics::client_ephemeral`].
+	fn client_ephemeral(&self, sec1: impl AsRef<[u8]>) -> Result<DistinctPoint<P::Curve>, HandshakeError> {
+		self.statics.client_ephemeral(sec1)
 	}
 }
 
@@ -283,8 +296,7 @@ where
 		// The parse refuses a leg that is a static key of the server or its
 		// negation. The signed receipt pins the leg, so the checks below
 		// authenticate the point before the agreement runs.
-		let keys = self.materials.peer.server_keys();
-		let server_ephemeral = keys.server_ephemeral(&server_point)?;
+		let server_ephemeral = self.materials.peer.server_ephemeral(&server_point)?;
 
 		let receipt = artifact.receipt()?;
 		let server_role = ReceiptRole::Server;
@@ -416,7 +428,7 @@ where
 		let request_der = request.to_der()?;
 		let client_random = request.client_random.to_32_byte_array()?;
 		let client_point = request.client_ephemeral.to_compressed_point::<P::Curve>()?;
-		let client_ephemeral = self.materials.peer.signing.client_ephemeral(&client_point)?;
+		let client_ephemeral = self.materials.peer.client_ephemeral(&client_point)?;
 		let server_random = generate_nonce::<32>(None)?;
 
 		// The agreement takes the scalar by value and runs before the first
@@ -926,12 +938,11 @@ pub(crate) mod tests {
 		point_of(&stray_key())
 	}
 
-	/// A peer certificate with a fresh key, distinct from every point of a
+	/// The statics of a peer with a fresh key, distinct from every point of a
 	/// test, for the parse that admits a peer point to an agreement.
-	fn peer_static() -> PeerCertificate<Signing<Provider>> {
+	fn peer_static() -> PeerStatics<Secp256k1> {
 		let certificate = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
-		let peer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.server);
-		peer.expect("a fresh certificate is admitted for signing")
+		PeerStatics::of(&certificate, None)
 	}
 
 	/// [`SAMPLE_CHAIN_ROOT`] as the chain hash an epoch holds.
@@ -1126,8 +1137,8 @@ pub(crate) mod tests {
 		let mut first = sample_epoch_from(SAMPLE_BASE)?;
 		let mut second = sample_epoch_from(SAMPLE_BASE + 1)?;
 		let (client_scalar, server_scalar) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
-		let client_point = peer_static().server_ephemeral(&point_of(&client_scalar.public_key()))?;
-		let server_point = peer_static().server_ephemeral(&point_of(&server_scalar.public_key()))?;
+		let client_point = peer_static().server_ephemeral(point_of(&client_scalar.public_key()))?;
+		let server_point = peer_static().server_ephemeral(point_of(&server_scalar.public_key()))?;
 		let salt = sample_salt();
 		let kdf_salt = salt.as_kdf_salt()?;
 		let first_next = first.next_secret::<Provider>(client_scalar, &server_point, kdf_salt)?;
@@ -1154,7 +1165,7 @@ pub(crate) mod tests {
 		let rotated_epoch = epoch.epoch() + 1;
 		let previous = DirectionalCiphers::derive::<Provider, _>(epoch.secret(), salt.as_kdf_salt()?, rotated_epoch)?;
 		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
-		let peer = peer_static().server_ephemeral(&stray_point())?;
+		let peer = peer_static().server_ephemeral(stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
 		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
 		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
@@ -1174,7 +1185,7 @@ pub(crate) mod tests {
 		let mut epoch = sample_epoch()?;
 		let salt = sample_salt();
 		let next_epoch = epoch.epoch() + 1;
-		let peer = peer_static().server_ephemeral(&stray_point())?;
+		let peer = peer_static().server_ephemeral(stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
 		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
 		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt()?, next_epoch)?;
@@ -1208,7 +1219,7 @@ pub(crate) mod tests {
 		let salt = sample_salt();
 		let next_epoch = epoch.epoch() + 1;
 		let expected = [b"tb/session/record/kekid/v1".as_slice(), &[0x00], &next_epoch.to_be_bytes()].concat();
-		let peer = peer_static().server_ephemeral(&stray_point())?;
+		let peer = peer_static().server_ephemeral(stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
 		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
 

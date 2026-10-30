@@ -85,11 +85,13 @@ use crate::x509::{name::RdnSequence, TbsCertificate, Version};
 use crate::TightBeamError;
 use crate::ZeroizingBytes;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::ephemeral::{DistinctPoint, PeerStatics};
 #[cfg(feature = "transport-hpke")]
 use crate::transport::handshake::schedule::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::{
-	Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation, PeerEphemeral, PeerPoint, Sealer, SecretSeal,
+	Agreement, BaseSecret, HandshakeAgreement, KeyConfirmation, Sealer, SecretSeal,
 };
 
 #[cfg(feature = "transport-hpke")]
@@ -537,12 +539,12 @@ impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
 	}
 }
 
-/// `point` as an admitted peer ephemeral, for a fixture that holds no static
+/// `point` as an admitted server ephemeral, for a fixture that holds no static
 /// key to tell it from.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-fn admitted(point: &PublicKey<Secp256k1>) -> PeerPoint<Secp256k1> {
+fn admitted(point: &PublicKey<Secp256k1>) -> DistinctPoint<Secp256k1> {
 	let sec1 = point.to_encoded_point(true);
-	let parsed = PeerPoint::parse(sec1.as_bytes());
+	let parsed = PeerStatics::none().server_ephemeral(sec1.as_bytes());
 	parsed.expect("a public key encodes a point")
 }
 
@@ -564,12 +566,13 @@ pub fn derive_handshake_secret(
 /// ephemeral alone as the HPKE flow derives.
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 fn agreement_of<'a>(
-	peer: &'a PeerPoint<Secp256k1>,
+	peer: &'a DistinctPoint<Secp256k1>,
 	base: Option<&'a BaseSecret>,
 ) -> Agreement<'a, DefaultCryptoProvider> {
+	let agreement = Agreement::client(peer);
 	match base {
-		Some(base) => Agreement::hybrid(peer, base),
-		None => Agreement::ephemeral(peer),
+		Some(base) => agreement.hybrid(base),
+		None => agreement,
 	}
 }
 

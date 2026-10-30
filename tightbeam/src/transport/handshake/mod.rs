@@ -195,6 +195,8 @@ mod schedule;
 mod session_peer;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+mod ephemeral;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod flow;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod orchestrator;
@@ -221,8 +223,8 @@ pub(crate) use session_peer::SessionPeer;
 
 #[cfg(mux_rekey)]
 pub(crate) use self::{
-	peer::{AgreementCertificate, ServerKeys},
-	schedule::{EpochSecret, PeerEphemeral},
+	ephemeral::{DistinctPoint, PeerStatics},
+	schedule::EpochSecret,
 	wire::HandshakeOctets,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -279,7 +281,6 @@ mod transport {
 	pub use crate::crypto::aead::KeyInit;
 	pub use crate::crypto::cms::RecipientKem;
 	pub use crate::crypto::hpke::DhKemCurve;
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey};
 	pub use crate::crypto::sign::Verifier;
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef};
@@ -324,9 +325,7 @@ impl<C> HandshakeCurve for C where C: DhKemCurve + AssociatedOid + Send + Sync +
 ///
 /// - the curve is a [`HandshakeCurve`],
 /// - a signature parses from its encoded bytes,
-/// - the verifying key parses from an SPKI, converts from a point on that
-///   curve, lends its point by reference, verifies a signature, and encodes as
-///   an SPKI,
+/// - the verifying key parses from an SPKI, verifies a signature, and encodes as an SPKI, free of the curve,
 /// - the KEM and the backend of its private key outlive the handshake, and
 /// - the AEAD cipher keys from derived bytes and seals an envelope.
 ///
@@ -350,8 +349,6 @@ pub trait HandshakeProvider:
 		Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
 		VerifyingKey: Verifier<Self::Signature>
 		                  + for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>
-		                  + From<PublicKey<Self::Curve>>
-		                  + AsRef<AffinePoint<Self::Curve>>
 		                  + EncodePublicKey
 		                  + 'static,
 		Digest: 'static,
@@ -370,8 +367,6 @@ impl<P> HandshakeProvider for P where
 			Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
 			VerifyingKey: Verifier<P::Signature>
 			                  + for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>
-			                  + From<PublicKey<P::Curve>>
-			                  + AsRef<AffinePoint<P::Curve>>
 			                  + EncodePublicKey
 			                  + 'static,
 			Digest: 'static,

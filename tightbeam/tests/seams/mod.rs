@@ -108,7 +108,7 @@ use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
 use tightbeam::crypto::k256::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
 use tightbeam::crypto::k256::elliptic_curve::point::AffineCoordinates;
-use tightbeam::crypto::k256::{AffinePoint, NonZeroScalar, PublicKey, Secp256k1};
+use tightbeam::crypto::k256::{NonZeroScalar, PublicKey, Secp256k1};
 use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction, KdfSalt};
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::ProviderPolicy;
@@ -237,22 +237,6 @@ impl Verifier<OutsideSignature> for OutsideVerifyingKey {
 	fn verify(&self, message: &[u8], signature: &OutsideSignature) -> Result<(), SignatureError> {
 		let prehash = Sha3_512::digest(message);
 		self.0.verify_prehash(&prehash, &signature.0)
-	}
-}
-
-/// The key of a point on secp256k1, as a handshake reads it from a
-/// certificate.
-impl From<PublicKey> for OutsideVerifyingKey {
-	fn from(key: PublicKey) -> Self {
-		Self(VerifyingKey::from(key))
-	}
-}
-
-/// The point of the key, lent by reference, which a handshake compares an
-/// agreement ephemeral with.
-impl AsRef<AffinePoint> for OutsideVerifyingKey {
-	fn as_ref(&self) -> &AffinePoint {
-		self.0.as_affine()
 	}
 }
 

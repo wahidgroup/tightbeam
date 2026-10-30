@@ -27,15 +27,15 @@ mod octets {
 		/// The view of a point of the curve `C` in the compressed SEC 1 form,
 		/// at the width of that form on `C` (SEC 1 v2.0 §2.3.3), as the HPKE
 		/// hello, the HPKE reply, and each rekey leg carry it. This view reads
-		/// the width alone, and [`PeerPoint::parse`] reads the form and decodes
-		/// the point.
+		/// the width alone, and the one parse of a peer ephemeral, in the
+		/// [`ephemeral`] module, reads the form and decodes the point.
 		///
 		/// # Errors
 		///
 		/// - [`HandshakeError::OctetStringLengthError`] -- the length differs
 		///   from the compressed width of `C`.
 		///
-		/// [`PeerPoint::parse`]: super::super::schedule::PeerPoint::parse
+		/// [`ephemeral`]: super::super::ephemeral
 		fn to_compressed_point<C: HandshakeCurve>(&self) -> Result<CompressedPoint<C>, HandshakeError>;
 
 		/// The fixed 32-byte view of an HPKE wire nonce or other public value.

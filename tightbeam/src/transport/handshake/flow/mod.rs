@@ -45,6 +45,7 @@ use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::oids::{DATA, RECEIPT_ACK, SIGNED_DATA};
 use crate::random::CryptoRngCore;
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
+use crate::transport::handshake::ephemeral::{DistinctPoint, OpenedPoint, PeerStatics};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	RunnableProfile, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
@@ -52,7 +53,7 @@ use crate::transport::handshake::negotiation::{
 use crate::transport::handshake::peer::ServerTrust;
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::schedule::{
-	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, PeerPoint, Salt, Sealer, SecretSeal, Terms,
+	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, Salt, Sealer, SecretSeal, Terms,
 };
 use crate::transport::handshake::{
 	HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerIdentity,
@@ -199,7 +200,7 @@ pub trait ClientAgreement<P: HandshakeProvider>: Sized {
 	/// The agreement this value makes with the server ephemeral `peer`: the
 	/// hybrid agreement with the base secret in the CMS flow, or the
 	/// ephemeral agreement in the HPKE flow.
-	fn agreement<'a>(&'a self, peer: &'a PeerPoint<P::Curve>) -> Agreement<'a, P>;
+	fn agreement<'a>(&'a self, peer: &'a DistinctPoint<P::Curve>) -> Agreement<'a, P>;
 
 	/// The private half of the client's agreement ephemeral `R`.
 	fn ephemeral(&self) -> &SecretKey<P::Curve>;
@@ -212,7 +213,7 @@ pub trait ClientAgreement<P: HandshakeProvider>: Sized {
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	fn agree(
 		self,
-		server_ephemeral: &PeerPoint<P::Curve>,
+		server_ephemeral: &DistinctPoint<P::Curve>,
 		salt: KdfSalt<'_>,
 	) -> Result<HandshakeSecret, HandshakeError> {
 		self.agreement(server_ephemeral).settle(self.ephemeral(), salt)
@@ -226,8 +227,9 @@ pub trait ClientAgreement<P: HandshakeProvider>: Sized {
 /// [`ServerPending::settle`] is the one settlement of the server's handshake
 /// secret.
 pub trait ServerAgreement<P: HandshakeProvider> {
-	/// The client's agreement ephemeral `R`.
-	fn client_ephemeral(&self) -> &PeerPoint<P::Curve>;
+	/// The client's agreement ephemeral `R`, moved out for the pending server,
+	/// which holds it to the closing. The rest of this value drops here.
+	fn into_client_ephemeral(self) -> OpenedPoint<P::Curve>;
 
 	/// The agreement this value makes with `R`: the hybrid agreement with the
 	/// base secret in the CMS flow, or the ephemeral agreement in the HPKE
@@ -358,8 +360,8 @@ pub struct ReplyBinding<F: ServerLegs<P>, P: HandshakeProvider> {
 pub struct ServerPending<C: CurveArithmetic> {
 	/// The handshake secret, derived when the reply was built.
 	secret: HandshakeSecret,
-	/// The client's agreement ephemeral `R`.
-	client_ephemeral: PublicKey<C>,
+	/// The client's agreement ephemeral `R`, the value the agreement read.
+	client_ephemeral: OpenedPoint<C>,
 }
 
 impl<C: HandshakeCurve> ServerPending<C> {
@@ -378,7 +380,7 @@ impl<C: HandshakeCurve> ServerPending<C> {
 		let agreement = opened.agreement();
 
 		let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt()?)?;
-		let client_ephemeral = *opened.client_ephemeral().as_public_key();
+		let client_ephemeral = opened.into_client_ephemeral();
 		Ok(Self { secret, client_ephemeral })
 	}
 
@@ -635,8 +637,9 @@ impl<P: HandshakeProvider> Offer<P> {
 	/// The offer of `identity` under `issuers`, proven by `finished`.
 	///
 	/// A server learns its client's static key only after the agreement, so
-	/// the comparison lives here: `ephemeral` MUST be distinct from the key
-	/// of `identity`, or the agreement collapses into the static one.
+	/// the admission of `ephemeral`, the point the server agreed with, lives
+	/// here: it MUST be distinct from the key of `identity`, or the agreement
+	/// collapses into the static one.
 	///
 	/// # Errors
 	///
@@ -645,11 +648,10 @@ impl<P: HandshakeProvider> Offer<P> {
 		identity: PeerCertificate<Signing<P>>,
 		issuers: PresentedIssuers,
 		finished: ClientFinished,
-		ephemeral: &PublicKey<P::Curve>,
+		ephemeral: OpenedPoint<P::Curve>,
 	) -> Result<Self, HandshakeError> {
-		if !identity.distinct(ephemeral) {
-			return Err(HandshakeError::ClientEphemeralIsStatic);
-		}
+		let statics = PeerStatics::of(identity.certificate(), None);
+		statics.admit_client(ephemeral)?;
 
 		Ok(Self(Some(Offered { identity, issuers, finished })))
 	}
@@ -814,7 +816,7 @@ impl Closing {
 		let (confirmation, receipt_ack) = content.confirmation()?;
 
 		// 3. Build the offer, which compares `R` with the key of the certificate the Finished names.
-		let offer = content.into_offer(&client_ephemeral, purpose)?;
+		let offer = content.into_offer(client_ephemeral, purpose)?;
 		Ok(ClosingOpened { secret, confirmation, receipt_ack, offer })
 	}
 }
@@ -915,10 +917,11 @@ impl ClosingContent {
 	/// - [`HandshakeError::MissingClientCertificate`] -- the Finished has no certificate its signer names.
 	/// - [`HandshakeError::CertificateValidationError`] -- the signing use or
 	///   `purpose` refuses the certificate.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- `client_ephemeral` equals the certificate key.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- `client_ephemeral`
+	///   collapses into the key of the certificate.
 	fn into_offer<P: HandshakeProvider>(
 		self,
-		client_ephemeral: &PublicKey<P::Curve>,
+		client_ephemeral: OpenedPoint<P::Curve>,
 		purpose: ObjectIdentifier,
 	) -> Result<Offer<P>, HandshakeError> {
 		let Self::Finished(finished, path) = self else {
@@ -987,6 +990,7 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
+	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 	use crate::crypto::sign::PresentedPath;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::random::OsRng;
@@ -1027,7 +1031,9 @@ mod tests {
 		let leaf = Certificate::clone(identity.certificate());
 		let path = PresentedPath::walk(leaf, Vec::new()).expect("a certificate alone is a path");
 		let (_, issuers) = path.into_parts();
-		Offer::new(identity, issuers, finished(), ephemeral)
+		let opened = OpenedPoint::parse(ephemeral.to_encoded_point(true));
+		let opened = opened.expect("a public key encodes a point");
+		Offer::new(identity, issuers, finished(), opened)
 	}
 
 	/// An offer whose ephemeral differs from the key of its identity holds
