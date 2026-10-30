@@ -976,7 +976,7 @@ A profile names six algorithms, each by its OID:
 - the AEAD cipher
 - the signature
 - the KDF
-- the key-agreement curve
+- the key exchange
 - the key wrap
 
 The AEAD OID names the cipher, and the cipher fixes the key length.
@@ -990,7 +990,7 @@ tightbeam splits cryptographic work into roles, so a component depends only on t
 - **Key wrap**: The wrap of a content key. Examples include AES key wrap ([RFC 3394][rfc3394]).
 - **Signature**: Signature generation and verification. Examples include ECDSA ([FIPS 186-5][fips186-5]) and Ed25519 ([RFC 8032][rfc8032]).
 - **KDF**: Key derivation. Examples include HKDF ([RFC 5869][rfc5869]).
-- **Curve**: Elliptic-curve agreement. Examples include secp256k1 and P-384 ([RFC 5480][rfc5480]). The signature role is independent of it.
+- **Key exchange**: The ephemeral exchange of a handshake and of each rekey. Examples include ECDH over secp256k1 or P-384 ([RFC 5480][rfc5480]), X25519 ([RFC 7748][rfc7748]), and ML-KEM ([FIPS 203][fips203]). The signature role is independent of it.
 
 A crypto provider binds one implementation to each role ([§6.5](#65-crypto-provider-system)).
 
@@ -1004,6 +1004,7 @@ Implementation: [docs/security.md](docs/security.md#profile-types)
 
 ```rust
 # use tightbeam::crypto::aead::Aes256GcmOid;
+# use tightbeam::crypto::exchange::Ecdhe;
 # use tightbeam::crypto::hash::Sha3_256;
 # use tightbeam::crypto::k256;
 # use tightbeam::crypto::kdf::HkdfSha3_256;
@@ -1017,7 +1018,7 @@ impl SecurityProfile for MyAppProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = k256::Secp256k1;
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 	type KeyWrapOid = Aes256Wrap;
 }
 ```
@@ -1185,7 +1186,7 @@ struct HighSecurityTransfer { account: String, amount: u64 }
 
 ### 6.5 Crypto Provider System
 
-A crypto provider binds one implementation to each cryptographic role of a security profile: digest, AEAD, key wrap, signature, KDF, key-agreement curve, and KEM. Each role MUST run the algorithm its profile names. The binding is checked when the code compiles, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM never runs. The key-encryption key MUST be at least as long as the AEAD key ([RFC 3565][rfc3565] §2.3.2).
+A crypto provider binds one implementation to each cryptographic role of a security profile: digest, AEAD, key wrap, signature, KDF, key exchange, and KEM. Each role MUST run the algorithm its profile names. The binding is checked when the code compiles, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM never runs. The key-encryption key MUST be at least as long as the AEAD key ([RFC 3565][rfc3565] §2.3.2).
 
 Implementation: [docs/security.md](docs/security.md#crypto-providers)
 
@@ -1197,11 +1198,11 @@ The reference provider uses:
 - AEAD: AES-256-GCM
 - Signature: ECDSA over secp256k1
 - KDF: HKDF-SHA3-256
-- Key-agreement curve: secp256k1
+- Key exchange: ECDH over secp256k1
 - Key wrap: AES-256 key wrap
 - KEM: DHKEM(secp256k1, HKDF-SHA256)
 
-Each endpoint holds a negotiated profile to a strength floor and refuses a profile below it (CWE-757). The default floor requires AEAD keys, digest outputs, and curve fields of 256 bits or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1), so P-192 and P-224 fall below it. A provider built on a shorter algorithm, such as AES-128-GCM, names a floor that admits it.
+Each endpoint holds a negotiated profile to a strength floor and refuses a profile below it (CWE-757). The default floor requires AEAD keys and digest outputs of 256 bits or more, and a key exchange of 128-bit security strength or more ([NIST SP 800-57 Part 1 Rev. 5][nist-800-57] §5.6.1), so ECDH over P-192 or P-224 falls below it. A provider built on a shorter algorithm, such as AES-128-GCM, names a floor that admits it.
 
 ### 6.6 Cryptographic Requirements
 
@@ -1821,7 +1822,7 @@ Two handshake protocols establish mutual authentication and a session key:
 Security goals for both:
 
 - **Mutual authentication**: Each party proves identity with certificates
-- **Perfect forward secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) protects past sessions if long-term keys leak later
+- **Perfect forward secrecy**: An ephemeral key exchange, such as ECDH ([NIST SP 800-56A][nist-800-56a]), protects past sessions if long-term keys leak later
 - **Replay protection**: Nonces block replayed handshake messages
 - **Downgrade prevention**: The transcript hash covers handshake messages, including profile negotiation ([RFC 9846 §4.2.3][rfc9846-4.2.3])
 - **Confidentiality**: HKDF-derived session keys protect later messages
@@ -1896,7 +1897,7 @@ The transcript hash binds the handshake messages, so it blocks reordering, profi
 
 Each flow derives the handshake secret `hs` from its own input:
 
-- The CMS flow derives `hs` from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the ephemeral-ephemeral ECDH output, followed by the client's base secret.
+- The CMS flow derives `hs` from `ee || base`, the hybrid shared secret `Z′ = Z || T` of [NIST SP 800-56C Rev. 2][nist-800-56c] §2: the secret of the ephemeral key exchange, followed by the client's base secret.
 - The HPKE flow derives `hs` from `ee` alone, as the ECDHE secret of TLS 1.3 does ([RFC 9846 §7.1][rfc9846-7.1]).
 
 **Key confirmation:**
@@ -2105,14 +2106,14 @@ A reply whose server Finished is absent or fails is refused before the client bu
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | Opening             | `AuthEnvelopedData` with a `KEMRecipientInfo` ([RFC 9629][rfc9629])                      | `ContentInfo` of type `id-data`                                                                                                          |
 | Server identity     | The key-agreement certificate pinned before the opening, and the signing certificate from the server Finished's `certificates` | Learned from the reply's `certificates`                                                                                                  |
-| Handshake secret    | Ephemeral ECDH and the base secret the opening seals                                                                           | Ephemeral ECDH alone                                                                                                                     |
+| Handshake secret    | The ephemeral key exchange and the base secret the opening seals                                                               | The ephemeral key exchange alone                                                                                                         |
 | Server confirmation | The server Finished's signature over the transcript, and the server Finished MAC                                               | The reply's signature over the transcript, and the server Finished MAC                                                                   |
 | Closing             | `AuthEnvelopedData` with a `KEKRecipientInfo`                                                                                  | The same closing                                                                                                                         |
 | Standards           | RFC 5652, [RFC 5083][rfc5083], [RFC 9629][rfc9629] | RFC 5652, [RFC 5083][rfc5083], the [RFC 9846][rfc9846] shape |
 
 **Security equivalence:**
 
-Both protocols target the same properties: mutual authentication, forward secrecy via ephemeral ECDH, replay protection via nonces, transcript integrity via signatures, and confidentiality via AEAD.
+Both protocols target the same properties: mutual authentication, forward secrecy via an ephemeral key exchange, replay protection via nonces, transcript integrity via signatures, and confidentiality via AEAD.
 
 #### 8.5.5 Security Profile Negotiation
 
@@ -7661,6 +7662,7 @@ The official tightbeam extensions live in [tightbeam-ext](https://github.com/wah
 [fips186-5]: https://csrc.nist.gov/pubs/fips/186-5/final
 [fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
 [fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
+[fips203]: https://csrc.nist.gov/pubs/fips/203/final
 [nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
 [nist-800-56c]: https://csrc.nist.gov/publications/detail/sp/800-56c/rev-2/final
 [nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final

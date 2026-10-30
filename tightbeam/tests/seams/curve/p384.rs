@@ -23,6 +23,8 @@
 //! [`DiffieHellman`]: tightbeam::crypto::key::DiffieHellman
 //! [`HpkeKdf`]: tightbeam::crypto::hpke::HpkeKdf
 
+use core::fmt::{Debug, Formatter};
+use core::marker::PhantomData;
 use std::sync::Arc;
 
 use p384::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
@@ -30,20 +32,22 @@ use p384::elliptic_curve::sec1::ToEncodedPoint;
 use p384::{NistP384, PublicKey};
 use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 use tightbeam::crypto::cms::RecipientKem;
+use tightbeam::crypto::exchange::{Ecdhe, HandshakeCurve, KeyExchange};
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::DhKemSuite;
 use tightbeam::crypto::k256::sha2::Sha384;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
-	SecurityProfile, SigningProvider,
+	AeadProvider, Aes256Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
+	SecurityProfile, SecurityProfileDesc, SigningProvider,
 };
 use tightbeam::crypto::sign::{
 	CanonicalForm, Error as SignatureError, PrehashSigner, PrehashVerifier, SignatureAlgorithmIdentifier,
 	SignatureEncoding, SigningIdentity, Verifier,
 };
 use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::der::Encode;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{CURVE_NIST_P384, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::random::OsRng;
@@ -55,7 +59,8 @@ use tightbeam::transport::handshake::HandshakeProvider;
 
 use super::{
 	carried_point, certificate_of, cms_pair, first_record_opened, hpke_pair, identity_of, outside_cms_server,
-	KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, CONTENT, RFC_9180_PLAINTEXT,
+	AgreementBackend, KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, P256Kem, CONTENT,
+	RFC_9180_PLAINTEXT,
 };
 
 /// DHKEM(P-384, HKDF-SHA384) in the HPKE KEM registry (RFC 9180 §7.1).
@@ -174,59 +179,106 @@ type P384Kem = OutsideKem<NistP384, HkdfSha384, KEM_DHKEM_P384_HKDF_SHA384>;
 /// DHKEM(P-384, HKDF-SHA384), HKDF-SHA384, and AES-256-GCM.
 type P384Suite = DhKemSuite<NistP384, HkdfSha384, Aes256Gcm, KEM_DHKEM_P384_HKDF_SHA384>;
 
-/// The profile of [`P384Provider`].
-#[derive(Debug, Default, Clone, Copy)]
-struct P384Profile;
+/// The profile of [`OnP384`]: the P-384 signature beside the exchange `X`.
+pub(super) struct OnP384Profile<X>(PhantomData<fn() -> X>);
 
-impl SecurityProfile for P384Profile {
+impl<X> Default for OnP384Profile<X> {
+	fn default() -> Self {
+		Self(PhantomData)
+	}
+}
+
+impl<X> Clone for OnP384Profile<X> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<X> Copy for OnP384Profile<X> {}
+
+impl<X> Debug for OnP384Profile<X> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+		f.write_str("OnP384Profile")
+	}
+}
+
+impl<X: KeyExchange> SecurityProfile for OnP384Profile<X> {
 	type Digest = Sha3_512;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = P384Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = NistP384;
+	type KeyExchange = X;
 	type KeyWrapOid = Aes256Wrap;
 }
 
-/// A provider an outside crate defines on P-384: its own signature and KEM,
-/// beside the house digest, AEAD, key wrap, and KDF.
-#[derive(Debug, Default, Clone, Copy)]
-struct P384Provider {
-	profile: P384Profile,
+/// A provider an outside crate defines around a P-384 signer: its own
+/// signature, the exchange `X`, and the KEM `K`, beside the house digest,
+/// AEAD, key wrap, and KDF.
+pub(super) struct OnP384<X, K = P256Kem> {
+	profile: OnP384Profile<X>,
+	kem: PhantomData<fn() -> K>,
 }
 
-impl DigestProvider for P384Provider {
+impl<X, K> Default for OnP384<X, K> {
+	fn default() -> Self {
+		Self { profile: OnP384Profile::default(), kem: PhantomData }
+	}
+}
+
+impl<X, K> Clone for OnP384<X, K> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<X, K> Copy for OnP384<X, K> {}
+
+impl<X, K> Debug for OnP384<X, K> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+		f.write_str("OnP384")
+	}
+}
+
+impl<X, K> DigestProvider for OnP384<X, K> {
 	type Digest = Sha3_512;
 }
 
-impl AeadProvider for P384Provider {
+impl<X, K> AeadProvider for OnP384<X, K> {
 	type AeadCipher = Aes256Gcm;
 }
 
-impl KeyWrapProvider for P384Provider {
+impl<X, K> KeyWrapProvider for OnP384<X, K> {
 	type KeyWrap = Aes256Wrap;
 }
 
-impl SigningProvider for P384Provider {
+impl<X, K> SigningProvider for OnP384<X, K> {
 	type Signature = P384Signature;
 	type VerifyingKey = P384VerifyingKey;
 }
 
-impl KdfProvider for P384Provider {
+impl<X, K> KdfProvider for OnP384<X, K> {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for P384Provider {
-	type Curve = NistP384;
+impl<X: KeyExchange, K> KeyExchangeProvider for OnP384<X, K> {
+	type KeyExchange = X;
 }
 
-impl CryptoProvider for P384Provider {
-	type Profile = P384Profile;
-	type Kem = P384Kem;
+impl<X: KeyExchange, K: RecipientKem> CryptoProvider for OnP384<X, K> {
+	type Profile = OnP384Profile<X>;
+	type Kem = K;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile
 	}
 }
+
+/// The profile of [`P384Provider`].
+type P384Profile = OnP384Profile<Ecdhe<NistP384>>;
+
+/// A provider an outside crate defines on P-384: its own signature and KEM,
+/// beside the house digest, AEAD, key wrap, and KDF.
+type P384Provider = OnP384<Ecdhe<NistP384>, P384Kem>;
 
 /// The signing backend of a P-384 identity: it signs under
 /// `ecdsa-with-SHA3-512`.
@@ -255,21 +307,27 @@ impl SigningKeyProvider for P384KeyProvider {
 
 /// An identity under [`P384Provider`], of a fresh key.
 pub(super) fn p384_identity() -> SigningIdentity {
-	let key = SigningKey::random(&mut OsRng);
+	p384_identity_of(SigningKey::random(&mut OsRng))
+}
+
+/// An identity under [`P384Provider`] of `key`.
+pub(super) fn p384_identity_of(key: SigningKey) -> SigningIdentity {
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
 	let certificate = certificate_of(CURVE_NIST_P384, point.as_bytes());
 	identity_of::<P384Provider>(certificate, Arc::new(P384KeyProvider { key }))
 }
 
-/// A CMS server under `P` named `name`, which signs under a fresh P-384 key.
-pub(super) fn p384_cms_server<P>(name: &str) -> OutsideCmsServer<P::Kem>
+/// A CMS server under `P` named `name`, which signs under a fresh P-384 key
+/// and agrees through `backend`, on `C`, the curve of the KEM of `P`.
+pub(super) fn p384_cms_server<P, C>(name: &str, backend: AgreementBackend<C>) -> OutsideCmsServer<P::Kem>
 where
-	P: HandshakeProvider<VerifyingKey: PartialEq, Kem: RecipientKem<PrivateKey = dyn DiffieHellman<P::Curve>>>,
+	P: HandshakeProvider<VerifyingKey: PartialEq, Kem: RecipientKem<PrivateKey = dyn DiffieHellman<C>>>,
+	C: HandshakeCurve,
 {
 	let key = SigningKey::random(&mut OsRng);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
 	let signer = Arc::new(P384KeyProvider { key });
-	outside_cms_server::<P>(name, signer, CURVE_NIST_P384, point.as_bytes())
+	outside_cms_server::<P, C>(name, signer, CURVE_NIST_P384, point.as_bytes(), backend)
 }
 
 /// The outside KEM encapsulates to the recipient key of the known answer as
@@ -323,7 +381,7 @@ async fn a_p384_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::
 /// compressed form, 49 octets.
 #[test]
 fn a_p384_hello_carries_a_compressed_p384_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (carried, compressed) = carried_point::<P384Provider>(p384_identity())?;
+	let (carried, compressed) = carried_point::<P384Provider, _>(p384_identity())?;
 	assert_eq!(carried, compressed);
 	Ok(())
 }
@@ -333,7 +391,7 @@ fn a_p384_hello_carries_a_compressed_p384_point() -> Result<(), Box<dyn std::err
 /// under the server's session keys.
 #[tokio::test]
 async fn a_p384_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let server = p384_cms_server::<P384Provider>("p384 server");
+	let server = p384_cms_server::<P384Provider, _>("p384 server", AgreementBackend::random());
 	let opened = first_record_opened(cms_pair::<P384Provider>(server, p384_identity())).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
@@ -346,5 +404,17 @@ async fn a_p384_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::E
 async fn a_p384_session_renews_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
 	let renewed = super::renewal::renews_its_epoch::<P384Provider>(p384_identity).await?;
 	assert!(renewed);
+	Ok(())
+}
+
+/// The DER of the descriptor of [`P384Profile`].
+const P384_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b060960864801650304012ea20b060960864801650304030ca3\
+	0d060b2a864886f70d0109100321a40706052b81040022a50b060960864801650304012d";
+
+/// The descriptor of [`P384Profile`] encodes as [`P384_DESCRIPTOR`].
+#[test]
+fn the_p384_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+	let der = SecurityProfileDesc::from(&P384Profile::default()).to_der()?;
+	assert_eq!(der, unhex(P384_DESCRIPTOR));
 	Ok(())
 }

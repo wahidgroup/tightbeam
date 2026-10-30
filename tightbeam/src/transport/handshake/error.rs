@@ -35,14 +35,20 @@ pub enum HandshakeError {
 	#[from]
 	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
 
-	/// The server sent its static key, or its negation, as its ephemeral. The
+	/// The exchange refuses a key share for its width, its encoding, or its
+	/// algorithm, or refuses it as it runs.
+	#[error("Key share refused: {0}")]
+	#[from]
+	KeyExchange(crate::crypto::exchange::KeyExchangeError),
+
+	/// The server sent a share that collapses into its static key. The
 	/// agreement would collapse into the static one, which the server's key
 	/// recovers, so the client refuses it.
 	#[error("Server ephemeral equals the server static key")]
 	ServerEphemeralIsStatic,
 
-	/// The client sent its static key, or its negation, as an ephemeral of the
-	/// handshake or of a rekey. The agreement would collapse into the static
+	/// The client sent a share that collapses into its static key, in the
+	/// handshake or in a rekey. The agreement would collapse into the static
 	/// one, which the client's key recovers, so the server refuses it.
 	#[error("Client ephemeral equals the client static key")]
 	ClientEphemeralIsStatic,
@@ -308,6 +314,7 @@ impl HandshakeError {
 			Self::Other(_) => HandshakeAudit::Failed,
 			Self::NegotiationError(_)
 			| Self::InvalidPublicKey(_)
+			| Self::KeyExchange(_)
 			| Self::DerError(_)
 			| Self::SpkiError(_)
 			| Self::KeyError(_)

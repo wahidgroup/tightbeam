@@ -29,7 +29,6 @@ use core::mem;
 use crate::clock::Clock;
 use crate::crypto::aead::{DirectionalCiphers, RuntimeAead, SessionKeys};
 use crate::crypto::profiles::SecurityProfileDesc;
-use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
 use crate::crypto::sign::SigningIdentity;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::{CertificateExt, ValidityClock};
@@ -39,7 +38,8 @@ use crate::random::OsRng;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
 	ClientAgreement, ClientFlow, Closing, ClosingDraft, ClosingParts, ConfirmedClosing, HandshakeFlow, Opened,
-	OpeningIntake, OpeningParts, ReplyBinding, ReplyIntake, ReplyParts, ServerConfirmed, ServerFlow, ServerPending,
+	OpeningIntake, OpeningParts, ReplyBinding, ReplyIntake, ReplyParts, ServerAgreement, ServerConfirmed, ServerFlow,
+	ServerPending,
 };
 use crate::transport::handshake::negotiation::{
 	AuthorizedTransport, MuxSettings, ProfilePolicy, SecurityOffer, SupportedProfiles, TransportAuthorizer,
@@ -502,7 +502,7 @@ pub struct SentReply<F: ServerFlow<P>, P: HandshakeProvider> {
 	/// What the reply negotiated.
 	terms: Terms<P>,
 	/// The handshake secret and the client ephemeral the closing opens with.
-	pending: ServerPending<P::Curve>,
+	pending: ServerPending<P>,
 	/// The receipt of a budget-bearing session, which the closing settles.
 	issued: Option<IssuedReceipt>,
 	/// The flow the reply ran.
@@ -760,8 +760,6 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	/// - [`HandshakeError::MissingServerCertificate`] -- the provisioned chain is empty.
 	/// - [`HandshakeError::CertificateValidationError`] -- the trust or the
 	///   server policy refused the provisioned server.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the provisioned server
-	///   certificate key is not a point on the curve.
 	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
 	/// - [`HandshakeError::Envelope`] -- the CMS opening fails to seal to the
 	///   provisioned server's certificate.
@@ -820,10 +818,10 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 	///   nothing, or a profile outside the offer.
 	/// - [`HandshakeError::NegotiationError`] -- the selected profile is below
 	///   the strength floor or unrunnable, or the transport accept is invalid.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the named server certificate
-	///   key or the signed server ephemeral is not a point on the curve.
-	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the signed server
-	///   ephemeral is the server's static key.
+	/// - [`HandshakeError::KeyExchange`] -- the server's share has another
+	///   width, form, or algorithm, or the exchange refuses it.
+	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the signed server share
+	///   collapses into a static key of the server.
 	/// - [`HandshakeError::ReceiptMissing`] -- a budget-bearing accept has no signed receipt.
 	/// - [`HandshakeError::ReceiptMismatch`] -- the receipt disagrees with the negotiated session.
 	/// - [`HandshakeError::MutualAuthRequired`] -- the server or a receipt
@@ -875,9 +873,11 @@ impl<F: ClientFlow<P>, P: HandshakeProvider> Handshake<Client, F, P> {
 		let mux = MuxSettings::for_client(config.transport_offer.as_ref(), transport_accept.as_ref())?;
 		let terms = Terms::new(profile, mux, transcript_hash, salt);
 
-		// 7. Parse the server ephemeral that the reply signature authenticated,
-		//    beside every static key of the server it must differ from.
-		let server_ephemeral = server.server_ephemeral(&server_ephemeral)?;
+		// 7. Parse the server's share, which the reply signature authenticated,
+		//    and check it against every static key of the server it must
+		//    differ from.
+		let server_ephemeral = server_ephemeral.parse::<P>()?;
+		let server_ephemeral = server.server_ephemeral(server_ephemeral)?;
 
 		// 8. Refuse a server that demands an identity this client does not
 		//    hold. The refusal runs before the approver is asked and before
@@ -986,7 +986,8 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	/// - [`HandshakeError::Envelope`] -- the CMS opening fails to open: its
 	///   recipient, its `ukm`, its key, or its tag is refused, or the key
 	///   provider failed the agreement.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the client's ephemeral is not a point on the curve.
+	/// - [`HandshakeError::KeyExchange`] -- the client's share fails its parse,
+	///   or the exchange refuses to answer it.
 	/// - [`HandshakeError::InvalidKeySize`] -- the opened base secret is not 32 bytes.
 	/// - [`HandshakeError::DerError`] -- the opened content fails to decode.
 	/// - [`HandshakeError::NegotiationError`] -- profile or transport negotiation failed.
@@ -1027,15 +1028,15 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 			None => (None, None, None),
 		};
 
-		// 6. Draw the per-handshake ephemeral. It is boxed before the first
-		//    await that it crosses, so every later move copies a pointer and
-		//    the scalar is wiped where the box drops.
-		let ephemeral = Box::new(EphemeralSecret::<P::Curve>::random(&mut OsRng));
+		// 6. Answer the client's share with the server's. The exchange spends
+		//    its private half at once, and its secret waits on the heap across
+		//    the awaits below, wiped where it drops.
+		let (server_ephemeral, shared) = opened.respond(&mut OsRng)?;
 
 		// 7. Bind the reply legs into the transcript and seal it, which fixes what the reply negotiated.
 		let client_cert_required = config.peer_authentication.requires_certificate();
 		let transport_accept = transport_accept.as_ref();
-		let server_ephemeral = ephemeral.public_key();
+		let server_ephemeral = &server_ephemeral;
 		let parts = ReplyParts { identity, profile, transport_accept, server_ephemeral, client_cert_required };
 		let bound = F::bind_reply(&mut opened, settings, parts, &mut OsRng)?;
 		let ReplyBinding { transcript_hash, salt, prehash, draft } = bound;
@@ -1053,7 +1054,7 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 		// 10. Derive the handshake secret, which the reply's server Finished
 		//     and the closing derive from, and fix what the server carries to
 		//     the closing.
-		let pending = ServerPending::settle(opened, ephemeral, &terms)?;
+		let pending = ServerPending::settle(opened, shared, &terms)?;
 
 		// 11. Encode the reply, and attach its server Finished.
 		let artifact = issued.as_ref().map(IssuedReceipt::artifact);
@@ -1097,7 +1098,6 @@ impl<F: ServerFlow<P>, P: HandshakeProvider> Handshake<Server, F, P> {
 	///   outside its validity period, a validator refused it, the signing use
 	///   or the client's key purpose refused it, or its key reads as no point
 	///   of its curve.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the offered certificate key is not a point on the curve.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the client Finished
 	///   fails to verify, or the countersignature fails to verify.
 	/// - [`HandshakeError::SealedClosing`] -- the closing fails to open: its

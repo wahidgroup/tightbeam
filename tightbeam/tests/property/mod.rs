@@ -201,10 +201,10 @@ proptest! {
 		aead in any_algorithm(),
 		signature in any_algorithm(),
 		kdf in any_algorithm(),
-		curve in any_algorithm(),
+		key_exchange in any_algorithm(),
 		key_wrap in any_algorithm(),
 	) {
-		let descriptor = SecurityProfileDesc { digest, aead, signature, kdf, curve, key_wrap };
+		let descriptor = SecurityProfileDesc { digest, aead, signature, kdf, key_exchange, key_wrap };
 		prop_assert_eq!(SecurityProfileDesc::from_der(&descriptor.to_der()?)?, descriptor);
 	}
 

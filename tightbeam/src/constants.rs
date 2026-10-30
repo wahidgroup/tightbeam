@@ -12,8 +12,9 @@
 /// KDF info string for the handshake secret (HKDF), which both protocols
 /// extract under the protocol salt:
 ///
-/// - The CMS flow extracts it from the ephemeral-ephemeral ECDH output followed by the client's base secret.
-/// - The HPKE flow extracts it from that output alone.
+/// - The CMS flow extracts it from the secret of the ephemeral key exchange
+///   followed by the client's base secret.
+/// - The HPKE flow extracts it from that secret alone.
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 
 /// KDF info string for the key that seals the receipt acknowledgement (HKDF).

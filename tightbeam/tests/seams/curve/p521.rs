@@ -31,20 +31,22 @@ use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p521::elliptic_curve::sec1::ToEncodedPoint;
 use p521::{NistP521, PublicKey};
 use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::DhKemSuite;
 use tightbeam::crypto::k256::sha2::Sha512;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::key::{KeyBackend, KeyError, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
-	SecurityProfile, SigningProvider,
+	AeadProvider, Aes256Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
+	SecurityProfile, SecurityProfileDesc, SigningProvider,
 };
 use tightbeam::crypto::sign::{
 	CanonicalForm, Error as SignatureError, PrehashVerifier, SignatureAlgorithmIdentifier, SignatureEncoding,
 	SigningIdentity, Verifier,
 };
 use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::der::Encode;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{CURVE_NIST_P521, SIGNER_ECDSA_WITH_SHA3_512};
 use tightbeam::random::OsRng;
@@ -55,7 +57,7 @@ use tightbeam::testing::unhex;
 
 use super::{
 	carried_point, certificate_of, cms_pair, first_record_opened, hpke_pair, identity_of, outside_cms_server,
-	KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, CONTENT, RFC_9180_PLAINTEXT,
+	AgreementBackend, KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, CONTENT, RFC_9180_PLAINTEXT,
 };
 
 /// DHKEM(P-521, HKDF-SHA512) in the HPKE KEM registry (RFC 9180 §7.1).
@@ -186,7 +188,7 @@ impl SecurityProfile for P521Profile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = P521Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = NistP521;
+	type KeyExchange = Ecdhe<NistP521>;
 	type KeyWrapOid = Aes256Wrap;
 }
 
@@ -218,8 +220,8 @@ impl KdfProvider for P521Provider {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for P521Provider {
-	type Curve = NistP521;
+impl KeyExchangeProvider for P521Provider {
+	type KeyExchange = Ecdhe<NistP521>;
 }
 
 impl CryptoProvider for P521Provider {
@@ -283,7 +285,8 @@ fn p521_identity() -> SigningIdentity {
 fn p521_cms_server() -> OutsideCmsServer<P521Kem> {
 	let signer = P521KeyProvider { key: SigningKey::random(&mut OsRng) };
 	let point = signer.public_key().to_encoded_point(false);
-	outside_cms_server::<P521Provider>("p521 server", Arc::new(signer), CURVE_NIST_P521, point.as_bytes())
+	let backend = AgreementBackend::random();
+	outside_cms_server::<P521Provider, _>("p521 server", Arc::new(signer), CURVE_NIST_P521, point.as_bytes(), backend)
 }
 
 /// The outside KEM encapsulates to the recipient key of RFC 9180 A.6.1 as
@@ -338,7 +341,7 @@ async fn a_p521_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::
 /// compressed form, 67 octets.
 #[test]
 fn a_p521_hello_carries_a_compressed_p521_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (carried, compressed) = carried_point::<P521Provider>(p521_identity())?;
+	let (carried, compressed) = carried_point::<P521Provider, _>(p521_identity())?;
 	assert_eq!(carried, compressed);
 	Ok(())
 }
@@ -360,5 +363,17 @@ async fn a_p521_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::E
 async fn a_p521_session_renews_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
 	let renewed = super::renewal::renews_its_epoch::<P521Provider>(p521_identity).await?;
 	assert!(renewed);
+	Ok(())
+}
+
+/// The DER of the descriptor of [`P521Profile`].
+const P521_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b060960864801650304012ea20b060960864801650304030ca3\
+	0d060b2a864886f70d0109100321a40706052b81040023a50b060960864801650304012d";
+
+/// The descriptor of [`P521Profile`] encodes as [`P521_DESCRIPTOR`].
+#[test]
+fn the_p521_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+	let der = SecurityProfileDesc::from(&P521Profile).to_der()?;
+	assert_eq!(der, unhex(P521_DESCRIPTOR));
 	Ok(())
 }

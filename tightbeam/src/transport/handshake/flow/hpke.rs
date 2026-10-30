@@ -33,28 +33,32 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use crate::asn1::OctetString;
 use crate::cms::content_info::ContentInfo;
 use crate::cms::signed_data::{CertificateSet, SignedData};
-use crate::crypto::sign::elliptic_curve::SecretKey;
+use crate::crypto::exchange::{KeyExchange, KeyShare};
+use crate::crypto::kdf::KdfSalt;
 use crate::crypto::sign::{CmsSigner, Signed, SignedContent, SignedDataExt, SignerInfoDraft, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::OctetStringRef;
 use crate::der::{Any, Decode, Encode, Tag};
 use crate::marker::MaybeSendFuture;
 use crate::oids::{DATA, HANDSHAKE_REPLY_CONTENT};
-use crate::random::{generate_nonce, CryptoRngCore, RngWrapper};
+use crate::random::{generate_nonce, CryptoRngCore};
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
-use crate::transport::handshake::ephemeral::{DistinctPoint, OpenedPoint};
+use crate::transport::handshake::ephemeral::{Distinct, ExchangeSecret, OpenedShare};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::flow::{
-	sealed, ClientAgreement, ClientLegs, HandshakeFlow, Opened, OpeningIntake, OpeningParts, ReplyBinding, ReplyIntake,
-	ReplyParts, ReplyVerified, ServerAgreement, ServerLegs,
+	sealed, ClientAgreement, ClientLegs, HandshakeFlow, Opened, OpeningIntake, OpeningParts, ReceivedShare,
+	ReplyBinding, ReplyIntake, ReplyParts, ReplyVerified, ServerAgreement, ServerLegs,
 };
 use crate::transport::handshake::negotiation::SecurityAccept;
 use crate::transport::handshake::peer::LearnedTrust;
 use crate::transport::handshake::primitives::transcript::Transcript;
 use crate::transport::handshake::primitives::TranscriptHash;
-use crate::transport::handshake::schedule::{Agreement, CompressedPoint, Salt};
+use crate::transport::handshake::schedule::Salt;
 use crate::transport::handshake::wire::HandshakeOctets;
-use crate::transport::handshake::{ClientHello, HandshakeCurve, HandshakeMessage, HandshakeProvider, ServerHandshake};
+use crate::transport::handshake::{
+	ClientHello, ClientShare, Exchange, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerHandshake,
+	ServerShare,
+};
 use crate::transport::wire_der::WireDer;
 use crate::x509::attr::{Attribute, Attributes};
 
@@ -93,13 +97,17 @@ pub struct HpkeOpening {
 	client_random: [u8; 32],
 }
 
+/// What an HPKE client holds from its hello to the agreement: the pending
+/// half of its exchange, which the agreement reads in place.
+pub struct HpkePending<P: HandshakeProvider>(<Exchange<P> as KeyExchange>::Pending);
+
 impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 	type Settings = HpkeClientSettings;
 	type Trust = LearnedTrust;
 	type Opening = HpkeOpening;
-	/// The agreement ephemeral `R`. It is boxed, so a move to the agreement
-	/// copies a pointer, and `SecretKey` wipes the scalar where the box drops.
-	type Pending = Box<SecretKey<P::Curve>>;
+	/// The pending half of the exchange. It is boxed, so a move to the
+	/// agreement copies a pointer, and it wipes in place where the box drops.
+	type Pending = Box<HpkePending<P>>;
 
 	fn identity(settings: &Self::Settings) -> Option<&SigningIdentity> {
 		settings.identity.as_ref()
@@ -115,17 +123,16 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		parts: OpeningParts<'_>,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<Opened<Self, P>, HandshakeError> {
-		// 1. Draw the client random and the agreement ephemeral `R`, whose
-		//    agreement with the server ephemeral derives the handshake secret
+		// 1. Draw the client random and the offer `R` of the exchange, whose
+		//    completion with the server's share derives the handshake secret
 		//    alone.
 		let client_random = generate_nonce::<32>(Some(&mut *rng))?;
-		let ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(rng));
-		let client_ephemeral = ephemeral.public_key().compressed_point()?;
+		let (pending, client_ephemeral) = Exchange::<P>::offer(rng);
 
 		// 2. Carry the hello as the OCTET STRING of a `ContentInfo` of type `id-data`, and encode it once.
 		let hello = ClientHello {
 			client_random: OctetString::new(client_random)?,
-			client_ephemeral: OctetString::new(client_ephemeral.as_slice())?,
+			client_ephemeral: OctetString::new(client_ephemeral.to_octets())?,
 			security_offer: parts.security_offer.cloned(),
 			transport_offer: parts.transport_offer.cloned(),
 		};
@@ -137,7 +144,7 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		transcript.append(message.der())?;
 
 		let opening = HpkeOpening { transcript, client_random };
-		Ok(Opened { message, opening, pending: Box::new(ephemeral) })
+		Ok(Opened { message, opening, pending: Box::new(HpkePending(pending)) })
 	}
 
 	fn read_reply(
@@ -169,16 +176,16 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 		let reply = reply.into_value();
 
 		// 4. Return the facts of the reply, with the session receipt its signer
-		//    attached, and its ephemeral at the compressed width of the curve.
+		//    attached, and its share in its OCTET STRING until the signature
+		//    verifies.
 		let receipt = reply.find_unsigned_attr(<Signed<SignedData> as AttributePayload>::OID)?;
 		let receipt = receipt.map(|attribute| attribute.decode::<Signed<SignedData>>()).transpose()?;
 		let server_random = handshake.server_random.to_32_byte_array()?;
-		let server_point = handshake.server_ephemeral.to_compressed_point::<P::Curve>()?;
 		Ok(ReplyIntake {
 			server,
 			security_accept: handshake.security_accept.map(WireDer::into_value),
 			transport_accept: handshake.transport_accept.map(WireDer::into_value),
-			server_ephemeral: server_point.to_vec(),
+			server_ephemeral: ReceivedShare::Octets(handshake.server_ephemeral),
 			receipt,
 			client_cert_required: handshake.client_cert_required,
 			transcript_hash,
@@ -202,15 +209,17 @@ impl<P: HandshakeProvider> ClientLegs<P> for Hpke {
 	}
 }
 
-/// The HPKE client agrees over the ephemerals alone. The agreement reads the
-/// ephemeral in place, so `SecretKey` wipes it where the box drops.
-impl<P: HandshakeProvider> ClientAgreement<P> for Box<SecretKey<P::Curve>> {
-	fn agreement<'a>(&'a self, peer: &'a DistinctPoint<P::Curve>) -> Agreement<'a, P> {
-		Agreement::client(peer)
-	}
-
-	fn ephemeral(&self) -> &SecretKey<P::Curve> {
-		self
+/// The HPKE client derives the ephemeral secret from the exchange alone. The
+/// completion reads the pending half in place, so it wipes where the box
+/// drops.
+impl<P: HandshakeProvider> ClientAgreement<P> for Box<HpkePending<P>> {
+	fn agree(
+		self,
+		server_ephemeral: &Distinct<ServerShare<P>>,
+		salt: KdfSalt<'_>,
+	) -> Result<HandshakeSecret, HandshakeError> {
+		let shared = server_ephemeral.complete::<Exchange<P>>(&self.0)?;
+		HandshakeSecret::ephemeral::<P>(shared.as_ref(), salt)
 	}
 }
 
@@ -230,14 +239,13 @@ impl HpkeServerSettings {
 
 /// What an HPKE server keeps of the hello to bind the reply over and to
 /// agree with.
-pub struct HpkeHello<C: HandshakeCurve> {
+pub struct HpkeHello<P: HandshakeProvider> {
 	/// The transcript, open over the hello as it arrived.
 	transcript: Transcript,
 	/// The client random the hello carried.
 	client_random: [u8; 32],
-	/// The client's agreement ephemeral `R`, parsed once as a point of the
-	/// curve.
-	client_ephemeral: OpenedPoint<C>,
+	/// The client's share `R`, parsed once from the hello.
+	client_ephemeral: OpenedShare<ClientShare<P>>,
 }
 
 /// A reply that awaits its signature and its receipt.
@@ -254,8 +262,8 @@ pub struct HpkeReplyDraft {
 impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 	type Settings = HpkeServerSettings;
 	type Identity = SigningIdentity;
-	type Sealed = HpkeHello<P::Curve>;
-	type Opened = HpkeHello<P::Curve>;
+	type Sealed = HpkeHello<P>;
+	type Opened = HpkeHello<P>;
 	type Draft = HpkeReplyDraft;
 
 	fn read_opening(
@@ -277,12 +285,11 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 		let ClientHello { client_random, client_ephemeral, security_offer, transport_offer } =
 			ClientHello::from_der(octets.as_bytes())?;
 
-		// 3. Parse `R` at the compressed width, so a point of another width or
-		//    form, malformed, off-curve, or the identity fails before any
-		//    negotiation. The static-key check waits for the closing identity.
+		// 3. Parse `R` as a share of the exchange, so a share of another width
+		//    or form, or no share at all, fails before any negotiation. The
+		//    static-key check waits for the closing identity.
 		let client_random = client_random.to_32_byte_array()?;
-		let client_point = client_ephemeral.to_compressed_point::<P::Curve>()?;
-		let client_ephemeral = OpenedPoint::parse(client_point)?;
+		let client_ephemeral = OpenedShare::from_octets::<Exchange<P>>(client_ephemeral.as_bytes())?;
 		let sealed = HpkeHello { transcript, client_random, client_ephemeral };
 		Ok(OpeningIntake { security_offer, transport_offer, sealed })
 	}
@@ -305,10 +312,9 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 
 		// 1. Encode the reply content once, so the transcript binds the bytes the reply signs.
 		let server_random = generate_nonce::<32>(Some(rng))?;
-		let server_point = server_ephemeral.compressed_point()?;
 		let handshake = ServerHandshake {
 			server_random: OctetString::new(server_random)?,
-			server_ephemeral: OctetString::new(server_point.as_slice())?,
+			server_ephemeral: OctetString::new(server_ephemeral.to_octets())?,
 			security_accept: Some(WireDer::new(SecurityAccept::new(profile.descriptor()))?),
 			client_cert_required,
 			transport_accept: transport_accept.copied().map(WireDer::new).transpose()?,
@@ -354,16 +360,21 @@ impl<P: HandshakeProvider> ServerLegs<P> for Hpke {
 	}
 }
 
-/// The HPKE server agrees with `R` over the ephemerals alone. The server
-/// ephemeral serves this one agreement, and the transcript of the hello drops
-/// with the value.
-impl<P: HandshakeProvider> ServerAgreement<P> for HpkeHello<P::Curve> {
-	fn into_client_ephemeral(self) -> OpenedPoint<P::Curve> {
-		self.client_ephemeral
+/// The HPKE server derives the ephemeral secret from the exchange with `R`
+/// alone. The server's share serves this one exchange, and the transcript of
+/// the hello drops with the value.
+impl<P: HandshakeProvider> ServerAgreement<P> for HpkeHello<P> {
+	fn respond(&self, rng: &mut dyn CryptoRngCore) -> Result<(ServerShare<P>, ExchangeSecret), HandshakeError> {
+		self.client_ephemeral.respond::<Exchange<P>>(rng)
 	}
 
-	fn agreement(&self) -> Agreement<'_, P> {
-		Agreement::server(&self.client_ephemeral)
+	fn settle(
+		self,
+		shared: ExchangeSecret,
+		salt: KdfSalt<'_>,
+	) -> Result<(HandshakeSecret, OpenedShare<ClientShare<P>>), HandshakeError> {
+		let secret = HandshakeSecret::ephemeral::<P>(&shared, salt)?;
+		Ok((secret, self.client_ephemeral))
 	}
 }
 
@@ -377,6 +388,7 @@ mod tests {
 	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::crypto::cms::AuthEnvelopedData;
 	use crate::crypto::common::typenum::Unsigned;
+	use crate::crypto::exchange::{EcdheShare, KeyExchangeError};
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::crypto::kdf::KdfSalt;
 	use crate::crypto::key::SigningKeyProvider;
@@ -384,7 +396,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::elliptic_curve::sec1::{CompressedPointSize, ToEncodedPoint};
-	use crate::crypto::sign::elliptic_curve::PublicKey;
+	use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
 	use crate::crypto::x509::KeyPurposes;
@@ -394,7 +406,7 @@ mod tests {
 		AUTH_ENVELOPED_DATA, HANDSHAKE_ABORT_ALERT, HANDSHAKE_TRANSCRIPT_HASH, HASH_SHA3_384, RECEIPT_ACK, SIGNED_DATA,
 	};
 	use crate::random::OsRng;
-	use crate::testing::{Aes256Sha3_512Provider, TestIdentity};
+	use crate::testing::{unhex, Aes256Sha3_512Provider, SeededStream, TestIdentity};
 	use crate::transport::envelopes::TransportEnvelope;
 	use crate::transport::handshake::flow::{ClosingDraft, ClosingParts};
 	use crate::transport::handshake::negotiation::{RunnableProfile, SecurityOffer, TransportOffer};
@@ -431,7 +443,7 @@ mod tests {
 	/// A hello that carries [`CLIENT_RANDOM`] and the public half of
 	/// `ephemeral`, as a client that keeps `ephemeral` builds it.
 	fn hello_of(ephemeral: &SecretKey<Secp256k1>) -> ClientHello {
-		let client_ephemeral = ephemeral.public_key().compressed_point().expect("a point compresses");
+		let client_ephemeral = EcdheShare::from(ephemeral.public_key()).to_octets();
 		hello_carrying(client_ephemeral)
 	}
 
@@ -815,6 +827,21 @@ mod tests {
 		Ok(())
 	}
 
+	/// A server share that is rewritten into octets that encode no share,
+	/// after the server signed its reply, fails the signature. The client
+	/// checks the signature before it parses the share, so no unauthenticated
+	/// octet reaches the parse.
+	#[tokio::test]
+	async fn a_tampered_malformed_share_fails_the_signature_before_its_parse() -> Result<(), Box<dyn Error>> {
+		let (mut client, reply) = replied(&create_test_certificate()).await;
+		let malformed = OctetString::new(off_curve_point().as_slice())?;
+		let tampered = with_content(&reply, |handshake| handshake.server_ephemeral = malformed);
+
+		let refusal = client.respond(tampered).await;
+		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
+		Ok(())
+	}
+
 	/// A reply whose accept was stripped after the server signed it fails its
 	/// signature. The client verifies the signature before it reads the
 	/// selection, so the refusal names the signature and not the selection.
@@ -916,7 +943,7 @@ mod tests {
 		let handshake = reply_content(Some(create_default_test_profile()), off_curve_point());
 
 		let refusal = client.respond(signed_reply(&server, &opening, &handshake)).await;
-		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 	}
 
 	/// The reply signs under a content type of its own, so the same content
@@ -944,7 +971,8 @@ mod tests {
 		let handshake = reply_content(Some(create_default_test_profile()), key.to_encoded_point(false));
 
 		let refusal = client.respond(signed_reply(&server, &opening, &handshake)).await;
-		assert!(matches!(refusal, Err(HandshakeError::OctetStringLengthError(_))));
+		let width = KeyExchangeError::Width { expected: 33, actual: 65 };
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(error)) if error == width));
 	}
 
 	/// The client refuses a validly signed server ephemeral that is the
@@ -954,8 +982,9 @@ mod tests {
 	async fn a_server_ephemeral_equal_to_the_static_key_is_refused() -> Result<(), Box<dyn Error>> {
 		let server = create_test_certificate();
 		let (mut client, opening) = client_after_hello(&server, None);
-		let static_key = PublicKey::<Secp256k1>::from(*server.signing_key.verifying_key()).compressed_point()?;
-		let handshake = reply_content(Some(create_default_test_profile()), static_key);
+		let static_key = PublicKey::<Secp256k1>::from(*server.signing_key.verifying_key());
+		let static_share = EcdheShare::from(static_key).to_octets();
+		let handshake = reply_content(Some(create_default_test_profile()), static_share);
 
 		let refusal = client.respond(signed_reply(&server, &opening, &handshake)).await;
 		assert!(matches!(refusal, Err(HandshakeError::ServerEphemeralIsStatic)));
@@ -1105,7 +1134,7 @@ mod tests {
 		let mut server = Handshake::server(hpke_server(&create_test_certificate()));
 
 		let refusal = server.reply(hello_opening(&hello_carrying(off_curve_point()))).await;
-		assert!(matches!(refusal, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 	}
 
 	/// The server refuses, at the width, a hello whose agreement ephemeral is a
@@ -1117,7 +1146,8 @@ mod tests {
 		let key = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
 
 		let refusal = server.reply(hello_opening(&hello_carrying(key.to_encoded_point(false)))).await;
-		assert!(matches!(refusal, Err(HandshakeError::OctetStringLengthError(_))));
+		let width = KeyExchangeError::Width { expected: 33, actual: 65 };
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(error)) if error == width));
 	}
 
 	/// The server refuses a hello in a `ContentInfo` of another content type,
@@ -1546,5 +1576,69 @@ mod tests {
 		];
 
 		write_interop_samples(&samples, &[("hpke-closing", &emitted.closing_opening)], &[])
+	}
+
+	/// The point of the secp256k1 scalar of 32 `0x05` bytes, the agreement
+	/// ephemeral that `SeededStream(3)` draws after a random of `0x04` bytes.
+	fn seeded_point() -> PublicKey<Secp256k1> {
+		let scalar = SecretKey::<Secp256k1>::from_slice(&[0x05; 32]);
+		scalar.expect("32 bytes of 0x05 are a scalar").public_key()
+	}
+
+	/// The DER of the `ClientHello` a client sends under `SeededStream(3)`.
+	const KNOWN_HELLO: &str = "304504200404040404040404040404040404040404040404040404040404040404040404\
+		04210362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7";
+
+	/// The DER of the `ServerHandshake` a server binds under `SeededStream(9)`,
+	/// with [`seeded_point`] as its ephemeral.
+	const KNOWN_SERVER_HANDSHAKE: &str = "30819804200a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\
+		04210362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7\
+		304e304ca00b0609608648016503040208a10b060960864801650304012ea20b060960864801650304030a\
+		a30d060b2a864886f70d0109100321a40706052b8104000aa50b060960864801650304012d010100";
+
+	/// The hello carries its agreement ephemeral `R` as the compressed point
+	/// the seeded draw makes, and encodes as [`KNOWN_HELLO`].
+	#[test]
+	fn the_hello_carries_its_share_as_its_known_octets() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let config = anonymous_client(&server);
+		let parts = OpeningParts { security_offer: None, transport_offer: None };
+		let open = <Hpke as ClientLegs<DefaultCryptoProvider>>::open;
+		let opened = open(config.flow(), (), parts, &mut SeededStream(3))?;
+
+		let hello = opened.message.data()?;
+		let octets = hello.value().content.decode_as::<OctetStringRef<'_>>()?;
+		let decoded = ClientHello::from_der(octets.as_bytes())?;
+		let expected = seeded_point().to_encoded_point(true);
+		assert_eq!(decoded.client_ephemeral.as_bytes(), expected.as_bytes());
+		assert_eq!(octets.as_bytes(), unhex(KNOWN_HELLO));
+		Ok(())
+	}
+
+	/// The reply carries the server ephemeral as the compressed point, and its
+	/// content encodes as [`KNOWN_SERVER_HANDSHAKE`].
+	#[test]
+	fn the_reply_carries_its_share_as_its_known_octets() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let identity = signing_identity(&server);
+		let server_share = EcdheShare::from(seeded_point());
+		let client_ephemeral = OpenedShare::fixture(EcdheShare::from(seeded_point()));
+		let mut opened = HpkeHello { transcript: Transcript::new(), client_random: CLIENT_RANDOM, client_ephemeral };
+		let profile = RunnableProfile::<DefaultCryptoProvider>::native();
+		let parts = ReplyParts {
+			identity: &identity,
+			profile,
+			transport_accept: None,
+			server_ephemeral: &server_share,
+			client_cert_required: false,
+		};
+
+		let bind = <Hpke as ServerLegs<DefaultCryptoProvider>>::bind_reply;
+		let bound = bind(&mut opened, &HpkeServerSettings, parts, &mut SeededStream(9))?;
+		let handshake = ServerHandshake::from_der(&bound.draft.content)?;
+		let expected = seeded_point().to_encoded_point(true);
+		assert_eq!(handshake.server_ephemeral.as_bytes(), expected.as_bytes());
+		assert_eq!(bound.draft.content, unhex(KNOWN_SERVER_HANDSHAKE));
+		Ok(())
 	}
 }

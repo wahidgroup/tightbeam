@@ -13,6 +13,7 @@
 ))]
 
 use tightbeam::crypto::aead::Aes128GcmOid;
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::profiles::{Aes128Wrap, SecurityProfile, SecurityProfileDesc};
@@ -37,7 +38,7 @@ impl SecurityProfile for Aes128Sha3_256Profile {
 	type AeadOid = Aes128GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = k256::Secp256k1;
+	type KeyExchange = Ecdhe<k256::Secp256k1>;
 	type KeyWrapOid = Aes128Wrap;
 }
 

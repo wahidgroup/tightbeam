@@ -32,7 +32,7 @@ impl SecurityProfile for OtherSignatureProfile {
 	#[cfg(feature = "kdf")]
 	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type Curve = tightbeam::crypto::k256::Secp256k1;
+	type KeyExchange = tightbeam::crypto::exchange::Ecdhe<tightbeam::crypto::k256::Secp256k1>;
 	type KeyWrapOid = tightbeam::crypto::profiles::Aes256Wrap;
 }
 

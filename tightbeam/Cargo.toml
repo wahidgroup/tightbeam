@@ -87,11 +87,13 @@ tightbeam-rs = { path = ".", features = [
 	"testing-timing",
 ] }
 husky-rs = { workspace = true }
+ml-kem = { workspace = true }
 p256 = { workspace = true }
 p384 = { workspace = true }
 p521 = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
+x25519-dalek = { workspace = true }
 
 # `make loom` builds the library tests under `--cfg tightbeam_loom`, where the
 # atomics of the multiplexer's hand-built protocols come from `loom`.

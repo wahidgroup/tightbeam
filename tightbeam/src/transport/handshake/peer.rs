@@ -46,7 +46,7 @@ use crate::der::asn1::ObjectIdentifier;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::ephemeral::{DistinctPoint, PeerStatics};
+use crate::transport::handshake::ephemeral::{Distinct, PeerStatics};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -54,11 +54,11 @@ use crate::transport::handshake::flow::Offer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::schedule::Terms;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::HandshakeProvider;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::SessionPeer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::{ClientConfig, ClientFlow};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::{Exchange, HandshakeProvider, ServerShare};
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::x509::Certificate;
 
@@ -444,7 +444,7 @@ mod pair {
 		/// The case of this server.
 		admitted: Admitted<P>,
 		/// The static keys this server's ephemeral must differ from.
-		statics: PeerStatics<P::Curve>,
+		statics: PeerStatics<Exchange<P>>,
 		/// The record of this server the session keeps as its peer.
 		peer: SessionPeer,
 	}
@@ -514,7 +514,7 @@ mod pair {
 			}
 		}
 
-		/// Parses `sec1` as the ephemeral of this server, distinct from each of
+		/// Admits `share` as the share of this server, distinct from each of
 		/// its static keys.
 		///
 		/// # Errors
@@ -522,9 +522,9 @@ mod pair {
 		/// - The errors of [`PeerStatics::server_ephemeral`].
 		pub(crate) fn server_ephemeral(
 			&self,
-			sec1: impl AsRef<[u8]>,
-		) -> Result<DistinctPoint<P::Curve>, HandshakeError> {
-			self.statics.server_ephemeral(sec1)
+			share: ServerShare<P>,
+		) -> Result<Distinct<ServerShare<P>>, HandshakeError> {
+			self.statics.server_ephemeral(share)
 		}
 	}
 
@@ -1165,10 +1165,10 @@ mod tests {
 	mod provisioned {
 		use super::*;
 		use crate::cms::signed_data::SignerIdentifier;
+		use crate::crypto::exchange::{EcdheShare, KeyShare};
 		use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 		use crate::crypto::sign::ecdsa::k256::Secp256k1;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::crypto::sign::elliptic_curve::sec1::CompressedPoint as Sec1CompressedPoint;
 		use crate::crypto::sign::elliptic_curve::PublicKey;
 		use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
 		use crate::crypto::x509::error::CertificateValidationError::{
@@ -1184,7 +1184,6 @@ mod tests {
 		use crate::random::OsRng;
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 		use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestCmsServer};
-		use crate::transport::handshake::schedule::CompressedPoint;
 		use crate::transport::handshake::tests::{negated, LaterRevocation};
 		use crate::transport::handshake::CmsServerChain;
 		use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
@@ -1307,16 +1306,20 @@ mod tests {
 			certificate
 		}
 
-		/// The compressed SEC 1 point of the key of `key`.
-		fn point_of(key: &Secp256k1SigningKey) -> Sec1CompressedPoint<Secp256k1> {
-			let point = PublicKey::from(key.verifying_key()).compressed_point();
-			point.expect("a secp256k1 point compresses")
+		/// The compressed SEC 1 point of the key of `key`, as the house
+		/// exchange encodes a share.
+		fn point_of(key: &Secp256k1SigningKey) -> Vec<u8> {
+			share_of(key).to_octets()
 		}
 
-		/// The compressed SEC 1 point of the negation of the key of `key`.
-		fn negated_point_of(key: &Secp256k1SigningKey) -> Sec1CompressedPoint<Secp256k1> {
-			let negation = negated(&PublicKey::from(key.verifying_key()));
-			negation.compressed_point().expect("a secp256k1 point compresses")
+		/// The house share of the key of `key`.
+		fn share_of(key: &Secp256k1SigningKey) -> EcdheShare<Secp256k1> {
+			EcdheShare::from(PublicKey::from(key.verifying_key()))
+		}
+
+		/// The house share of the negation of the key of `key`.
+		fn negated_share_of(key: &Secp256k1SigningKey) -> EcdheShare<Secp256k1> {
+			EcdheShare::from(negated(&PublicKey::from(key.verifying_key())))
 		}
 
 		/// The chain of `leaf` under `root`, ordered root to leaf.
@@ -1845,7 +1848,7 @@ mod tests {
 		#[test]
 		fn a_server_ephemeral_equal_to_the_signing_key_is_refused() {
 			let server = fresh_server();
-			let refused = admitted(&server).server_ephemeral(&point_of(&server.signing_key));
+			let refused = admitted(&server).server_ephemeral(share_of(&server.signing_key));
 			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		}
 
@@ -1854,7 +1857,7 @@ mod tests {
 		#[test]
 		fn a_server_ephemeral_equal_to_the_key_agreement_key_is_refused() {
 			let server = fresh_server();
-			let refused = admitted(&server).server_ephemeral(&point_of(&server.key_agreement_key));
+			let refused = admitted(&server).server_ephemeral(share_of(&server.key_agreement_key));
 			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		}
 
@@ -1863,9 +1866,9 @@ mod tests {
 		#[test]
 		fn a_server_ephemeral_of_the_negated_key_agreement_key_is_refused() {
 			let server = fresh_server();
-			let negation = negated_point_of(&server.key_agreement_key);
+			let negation = negated_share_of(&server.key_agreement_key);
 
-			let refused = admitted(&server).server_ephemeral(&negation);
+			let refused = admitted(&server).server_ephemeral(negation);
 			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		}
 
@@ -1875,7 +1878,7 @@ mod tests {
 		fn a_server_ephemeral_of_neither_key_is_admitted() {
 			let server = fresh_server();
 			let ephemeral = Secp256k1SigningKey::random(&mut OsRng);
-			let admitted = admitted(&server).server_ephemeral(&point_of(&ephemeral));
+			let admitted = admitted(&server).server_ephemeral(share_of(&ephemeral));
 			assert!(admitted.is_ok());
 		}
 

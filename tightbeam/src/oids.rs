@@ -441,6 +441,15 @@ pub const HANDSHAKE_REPLY_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwr
 /// value is `RecordSequence ::= SEQUENCE { epoch INTEGER, sequence INTEGER }`.
 pub const RECORD_SEQUENCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.27");
 
+/// The OID of the server's share of a KEM exchange, carried as a CMS attribute
+/// on the server Finished, inside the transcript the Finished signs. The value
+/// is a [`KemCiphertext`](crate::crypto::exchange::KemCiphertext): the `kem`
+/// and `kemct` fields of a KEM recipient ([RFC 9629 §3][rfc9629-3]). A DH
+/// exchange carries its share under [`HANDSHAKE_SERVER_EPHEMERAL`] instead.
+///
+/// [rfc9629-3]: https://datatracker.ietf.org/doc/html/rfc9629#section-3
+pub const HANDSHAKE_SERVER_KEM_CIPHERTEXT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.1.28");
+
 /// The PKCS #9 content-type signed attribute ([RFC 5652 §11.1][rfc5652-11.1]).
 ///
 /// [rfc5652-11.1]: https://datatracker.ietf.org/doc/html/rfc5652#section-11.1
@@ -535,6 +544,7 @@ mod tests {
 			(HANDSHAKE_OPENING_CONTENT, "1.3.6.1.4.1.64586.1.25"),
 			(HANDSHAKE_REPLY_CONTENT, "1.3.6.1.4.1.64586.1.26"),
 			(RECORD_SEQUENCE, "1.3.6.1.4.1.64586.1.27"),
+			(HANDSHAKE_SERVER_KEM_CIPHERTEXT, "1.3.6.1.4.1.64586.1.28"),
 			(ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
 			(ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
 			(ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),

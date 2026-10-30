@@ -54,14 +54,14 @@
 //! Both protocols derive every traffic key from one [`HandshakeSecret`], whose
 //! inputs are:
 //!
-//! - the ECDH output of the client's ephemeral and the server's ephemeral, and
+//! - the shared secret of the ephemeral key exchange between the client's share and the server's, and
 //! - in the CMS flow, the base secret the client seals to the server's key-agreement certificate.
 //!
 //! The server signs its ephemeral inside the transcript, and both ephemeral
 //! private keys drop at the step that consumes them. A recording plus a later
 //! copy of the server's static keys recovers the CMS base secret alone, which
-//! the key-agreement key opens, and no HPKE secret. These need the ECDH
-//! output, which needs a private key that neither side retains:
+//! the key-agreement key opens, and no HPKE secret. These need the exchange's
+//! secret, which needs a private key that neither side retains:
 //!
 //! - the traffic keys and the rekey epochs,
 //! - the sealed receipt acknowledgement, and
@@ -87,7 +87,7 @@
 //! │  ┌─────────────────────▼───────┐    ┌──────────▼────────┐              │
 //! │  │   Handshake Orchestrator    │    │   CryptoProvider  │              │
 //! │  │  ┌────────────────────────┐ │    │  ┌─────────────┐  │              │
-//! │  │  │ Handshake<R, F, P>     │ │    │  │  Curve      │  │              │
+//! │  │  │ Handshake<R, F, P>     │ │    │  │ KeyExchange │  │              │
 //! │  │  │   R: Client | Server   │ │    │  │  Digest     │  │              │
 //! │  │  │   F: Hpke | Cms        │ │    │  │  KDF        │  │              │
 //! │  │  └────────────────────────┘ │    │  │  AEAD       │  │              │
@@ -120,7 +120,7 @@
 //! - The AEAD cipher, such as AES-256-GCM.
 //! - The signature algorithm, such as ECDSA-with-SHA3-256.
 //! - The KDF, such as HKDF-SHA3-256.
-//! - The key-agreement curve, such as secp256k1.
+//! - The key exchange, such as ECDH over secp256k1.
 //! - The key-wrap algorithm, such as AES-256 key wrap.
 //!
 //! One policy, [`negotiation::ProfilePolicy`], makes both decisions in both
@@ -223,7 +223,7 @@ pub(crate) use session_peer::SessionPeer;
 
 #[cfg(mux_rekey)]
 pub(crate) use self::{
-	ephemeral::{DistinctPoint, PeerStatics},
+	ephemeral::{Distinct, PeerStatics},
 	schedule::EpochSecret,
 	wire::HandshakeOctets,
 };
@@ -247,8 +247,6 @@ pub use peer::LearnedTrust;
 pub use peer::ProvisionedTrust;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub(crate) use peer::ValidatorChain;
-#[cfg(all(test, mux_rekey))]
-pub(crate) use schedule::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub use schedule::HandshakeSecret;
 
@@ -280,50 +278,20 @@ use crate::crypto::profiles::CryptoProvider;
 mod transport {
 	pub use crate::crypto::aead::KeyInit;
 	pub use crate::crypto::cms::RecipientKem;
-	pub use crate::crypto::hpke::DhKemCurve;
+	pub use crate::crypto::exchange::KeyExchange;
+	pub use crate::crypto::profiles::KeyExchangeProvider;
 	pub use crate::crypto::sign::Verifier;
-	pub use crate::der::oid::AssociatedOid;
 	pub use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef};
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use transport::*;
 
-/// A curve both handshake protocols run on: a [`DhKemCurve`] that names its
-/// OID. Every curve that meets the bounds is a handshake curve, such as
-/// secp256k1, P-256, P-384, or P-521.
-///
-/// - A shared secret is the x-coordinate of an agreement, as wide as the field (SEC 1 v2.0 §3.3.1).
-/// - A point of the HPKE flow or of a rekey travels in its compressed SEC 1 form (SEC 1 v2.0 §2.3.3).
-/// - The field sets the strength of every session key, so
-///   [`DefaultStrengthFloor`] refuses a field under 256 bits.
-///
-/// # Examples
-///
-/// ```
-/// use tightbeam::transport::handshake::HandshakeCurve;
-///
-/// fn runs_a_handshake<C: HandshakeCurve>() {}
-///
-/// runs_a_handshake::<tightbeam::crypto::k256::Secp256k1>();
-/// runs_a_handshake::<p256::NistP256>();
-/// runs_a_handshake::<p384::NistP384>();
-/// runs_a_handshake::<p521::NistP521>();
-/// ```
-///
-/// [`DefaultStrengthFloor`]: crate::crypto::profiles::DefaultStrengthFloor
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub trait HandshakeCurve: DhKemCurve + AssociatedOid + Send + Sync + 'static {}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-impl<C> HandshakeCurve for C where C: DhKemCurve + AssociatedOid + Send + Sync + 'static {}
-
 /// A [`CryptoProvider`] the handshake layer runs on.
 ///
 /// It is the one bound the layer states about a provider. The bounds sit on
 /// the supertrait, so `P: HandshakeProvider` gives a caller every one of them:
 ///
-/// - the curve is a [`HandshakeCurve`],
 /// - a signature parses from its encoded bytes,
 /// - the verifying key parses from an SPKI, verifies a signature, and encodes as an SPKI, free of the curve,
 /// - the KEM and the backend of its private key outlive the handshake, and
@@ -345,7 +313,6 @@ impl<C> HandshakeCurve for C where C: DhKemCurve + AssociatedOid + Send + Sync +
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 pub trait HandshakeProvider:
 	CryptoProvider<
-		Curve: HandshakeCurve,
 		Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
 		VerifyingKey: Verifier<Self::Signature>
 		                  + for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>
@@ -363,7 +330,6 @@ pub trait HandshakeProvider:
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl<P> HandshakeProvider for P where
 	P: CryptoProvider<
-			Curve: HandshakeCurve,
 			Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
 			VerifyingKey: Verifier<P::Signature>
 			                  + for<'a> TryFrom<SubjectPublicKeyInfoRef<'a>, Error = SpkiError>
@@ -377,6 +343,18 @@ impl<P> HandshakeProvider for P where
 		+ 'static
 {
 }
+
+/// The key exchange of the provider `P`.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) type Exchange<P> = <P as KeyExchangeProvider>::KeyExchange;
+
+/// The share that the client of a handshake under `P` offers.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) type ClientShare<P> = <Exchange<P> as KeyExchange>::Offer;
+
+/// The share that the server of a handshake under `P` replies with.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+pub(crate) type ServerShare<P> = <Exchange<P> as KeyExchange>::Reply;
 
 /// The certificate a CMS client pins for its server: the server's
 /// key-agreement certificate, a leaf or a chain that ends at the leaf.
@@ -913,9 +891,9 @@ pub enum HandshakeProtocolKind {
 pub struct ClientHello {
 	/// A 32-byte anti-replay nonce that the key derivation mixes in.
 	pub client_random: OctetString,
-	/// The client's agreement ephemeral `R`, as a compressed SEC 1 point on the
-	/// negotiated curve. Its ECDH with the server ephemeral derives the
-	/// handshake secret alone (see
+	/// The client's agreement ephemeral `R`: its share of the negotiated key
+	/// exchange, a compressed SEC 1 point for the house exchange. The exchange
+	/// with the server's share derives the handshake secret alone (see
 	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
 	pub client_ephemeral: OctetString,
 	/// The security profiles the client offers for negotiation.
@@ -937,9 +915,10 @@ pub struct ClientHello {
 pub struct ServerHandshake {
 	/// A 32-byte anti-replay nonce that the key derivation mixes in.
 	pub server_random: OctetString,
-	/// The server's per-handshake ephemeral public key, as a compressed SEC 1
-	/// point on the negotiated curve. The signed transcript binds it, and its
-	/// ECDH with the client ephemeral derives the handshake secret (see
+	/// The server's per-handshake share of the negotiated key exchange, a
+	/// compressed SEC 1 point for the house exchange. The signed transcript
+	/// binds it, and the exchange with the client's share derives the
+	/// handshake secret (see
 	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
 	pub server_ephemeral: OctetString,
 	/// The profile the server selected, which travels with the bytes the

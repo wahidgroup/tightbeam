@@ -435,9 +435,9 @@ impl<C: Curve> EcdhSecret<C> {
 	/// Returns a secret that holds a copy of `bytes`.
 	///
 	/// The bytes land in the wiping buffer directly, so no plain array of the
-	/// shared secret exists on the way (CWE-226). Every conversion from a curve
-	/// [`SharedSecret`] copies here, and the output of a provider copies in
-	/// [`Self::sized`].
+	/// shared secret exists on the way (CWE-226). Every HPKE conversion from a
+	/// curve [`SharedSecret`] copies here, and the output of a provider copies
+	/// in [`Self::sized`].
 	#[cfg(any(test, feature = "ecdh", feature = "hpke"))]
 	fn copy_of(bytes: &FieldBytes<C>) -> Self {
 		let mut sized = Zeroizing::new(FieldBytes::<C>::default());
@@ -462,20 +462,11 @@ impl<C: Curve> EcdhSecret<C> {
 		Ok(Self(Secret::from(sized)))
 	}
 
-	/// Returns a second owner of this secret, for a holder that derives from
-	/// it more than once.
-	#[cfg(test)]
-	pub(crate) fn duplicate(&self) -> Self {
-		self.with(Self::copy_of)
-	}
-
 	/// Runs ECDH between `secret` and the peer's point `peer`.
 	///
-	/// HPKE and the handshake agreement of a held key both multiply here. Two
-	/// other holders of a scalar multiply on their own: an `EphemeralSecret`,
-	/// which keeps its scalar private, and a `SigningKeyProvider`, whose key
-	/// may live outside the process. Each of them converts its output into
-	/// this type.
+	/// HPKE multiplies here. A `SigningKeyProvider`, whose key may live outside
+	/// the process, multiplies on its own and converts its output into this
+	/// type.
 	///
 	/// # Examples
 	///

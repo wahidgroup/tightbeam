@@ -31,8 +31,6 @@ use crate::asn1::admission::DerAdmission;
 use crate::cms::signed_data::{CertificateSet, SignedData};
 use crate::crypto::cms::AuthEnvelopedData;
 use crate::crypto::kdf::KdfSalt;
-use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
-use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::sign::{
 	CmsSigner, PresentedIssuers, PresentedPath, Signed, SignedContent, SignedDataExt, SignerInfoDraft, SigningIdentity,
 };
@@ -45,7 +43,7 @@ use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::oids::{DATA, RECEIPT_ACK, SIGNED_DATA};
 use crate::random::CryptoRngCore;
 use crate::transport::handshake::attributes::{AttributePayload, HandshakeAttribute, HandshakeAttributes};
-use crate::transport::handshake::ephemeral::{DistinctPoint, OpenedPoint, PeerStatics};
+use crate::transport::handshake::ephemeral::{Distinct, ExchangeSecret, OpenedShare, PeerStatics};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	RunnableProfile, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
@@ -53,13 +51,18 @@ use crate::transport::handshake::negotiation::{
 use crate::transport::handshake::peer::ServerTrust;
 use crate::transport::handshake::primitives::TranscriptHash;
 use crate::transport::handshake::schedule::{
-	Agreement, ConfirmedSecret, FinishedRole, KeyConfirmation, Salt, Sealer, SecretSeal, Terms,
+	ConfirmedSecret, FinishedRole, KeyConfirmation, Salt, Sealer, SecretSeal, Terms,
 };
 use crate::transport::handshake::{
-	HandshakeCurve, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerIdentity,
+	ClientShare, Exchange, HandshakeMessage, HandshakeProvider, HandshakeSecret, ServerIdentity, ServerShare,
 };
 use crate::transport::wire_der::WireDer;
 use crate::x509::attr::{Attribute, Attributes};
+
+#[cfg(feature = "transport-hpke")]
+use crate::crypto::exchange::KeyShare;
+#[cfg(feature = "transport-cms")]
+use crate::crypto::exchange::ReplyAttribute;
 
 #[cfg(feature = "transport-cms")]
 mod cms;
@@ -101,6 +104,34 @@ pub struct Opened<F: ClientLegs<P>, P: HandshakeProvider> {
 	pub pending: F::Pending,
 }
 
+/// The server's share as its reply carried it. The client parses it once the
+/// reply's signature verifies, so no unauthenticated octet reaches a parse.
+pub enum ReceivedShare {
+	/// The OCTET STRING of the HPKE reply.
+	#[cfg(feature = "transport-hpke")]
+	Octets(OctetString),
+	/// The reply attribute of the CMS Finished.
+	#[cfg(feature = "transport-cms")]
+	Attribute(ReplyAttribute),
+}
+
+impl ReceivedShare {
+	/// Parses the share of the exchange of `P` from its carrier.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KeyExchange`] -- the carrier holds no share of the exchange.
+	pub(crate) fn parse<P: HandshakeProvider>(&self) -> Result<ServerShare<P>, HandshakeError> {
+		let share = match self {
+			#[cfg(feature = "transport-hpke")]
+			Self::Octets(octets) => <ServerShare<P> as KeyShare<Exchange<P>>>::from_octets(octets.as_bytes()),
+			#[cfg(feature = "transport-cms")]
+			Self::Attribute(attribute) => attribute.reply::<Exchange<P>>(),
+		};
+		Ok(share?)
+	}
+}
+
 /// The facts of a decoded reply, bound into the sealed transcript.
 pub struct ReplyIntake<F: ClientLegs<P>, P: HandshakeProvider> {
 	/// What the reply names as the server, for the trust to admit.
@@ -109,9 +140,10 @@ pub struct ReplyIntake<F: ClientLegs<P>, P: HandshakeProvider> {
 	pub security_accept: Option<SecurityAccept>,
 	/// The transport capabilities the server accepted.
 	pub transport_accept: Option<TransportAccept>,
-	/// The server ephemeral as SEC1 bytes. The orchestrator parses it beside
-	/// the static key it must differ from.
-	pub server_ephemeral: Vec<u8>,
+	/// The server's share in its carrier. The orchestrator parses it once the
+	/// reply's signature verifies, and checks it against the static keys of the
+	/// server it admits.
+	pub server_ephemeral: ReceivedShare,
 	/// The server-signed session receipt, when the session carries budgets.
 	pub receipt: Option<Signed<SignedData>>,
 	/// Whether the server demands a client identity. The HPKE reply carries
@@ -191,50 +223,55 @@ impl ServerConfirmed {
 	}
 }
 
-/// What a client flow holds from its opening to the agreement: the private
-/// half of its agreement ephemeral `R`, and the one decision of the flow,
-/// which agreement it makes with the server ephemeral.
-///
-/// [`Self::agree`] is the one settlement of the client's handshake secret.
+/// What a client flow holds from its opening to the agreement: the pending
+/// half of its exchange. It also holds the one decision of the flow, which
+/// handshake secret it derives from the exchange. That secret is the hybrid
+/// secret with the base secret in the CMS flow, or the ephemeral secret in the
+/// HPKE flow.
 pub trait ClientAgreement<P: HandshakeProvider>: Sized {
-	/// The agreement this value makes with the server ephemeral `peer`: the
-	/// hybrid agreement with the base secret in the CMS flow, or the
-	/// ephemeral agreement in the HPKE flow.
-	fn agreement<'a>(&'a self, peer: &'a DistinctPoint<P::Curve>) -> Agreement<'a, P>;
-
-	/// The private half of the client's agreement ephemeral `R`.
-	fn ephemeral(&self) -> &SecretKey<P::Curve>;
-
-	/// Settle the agreement with `server_ephemeral` under `salt`. The value
-	/// drops here, so each secret it holds is wiped with the call.
+	/// Completes the exchange with `server_ephemeral` and derives the handshake
+	/// secret under `salt`. The value drops here, so each secret it holds is
+	/// wiped in place with the call.
 	///
 	/// # Errors
 	///
+	/// - [`HandshakeError::KeyExchange`] -- the exchange refuses the server's share.
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	fn agree(
 		self,
-		server_ephemeral: &DistinctPoint<P::Curve>,
+		server_ephemeral: &Distinct<ServerShare<P>>,
 		salt: KdfSalt<'_>,
-	) -> Result<HandshakeSecret, HandshakeError> {
-		self.agreement(server_ephemeral).settle(self.ephemeral(), salt)
-	}
+	) -> Result<HandshakeSecret, HandshakeError>;
 }
 
 /// What a server flow holds from its open of the opening to the reply: the
-/// client's agreement ephemeral `R`, and the one decision of the flow, which
-/// agreement it makes with `R`.
+/// client's share `R`, and the one decision of the flow, which handshake
+/// secret it derives from the exchange.
 ///
 /// [`ServerPending::settle`] is the one settlement of the server's handshake
 /// secret.
 pub trait ServerAgreement<P: HandshakeProvider> {
-	/// The client's agreement ephemeral `R`, moved out for the pending server,
-	/// which holds it to the closing. The rest of this value drops here.
-	fn into_client_ephemeral(self) -> OpenedPoint<P::Curve>;
+	/// Answers `R` with the server's share, drawn from `rng`, beside the
+	/// secret of the exchange.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KeyExchange`] -- the exchange refuses `R`.
+	fn respond(&self, rng: &mut dyn CryptoRngCore) -> Result<(ServerShare<P>, ExchangeSecret), HandshakeError>;
 
-	/// The agreement this value makes with `R`: the hybrid agreement with the
-	/// base secret in the CMS flow, or the ephemeral agreement in the HPKE
-	/// flow.
-	fn agreement(&self) -> Agreement<'_, P>;
+	/// Derives the handshake secret of `shared` under `salt`: the hybrid secret
+	/// with the base secret in the CMS flow, or the ephemeral secret in the
+	/// HPKE flow. It moves `R` out for the pending server, which holds it to
+	/// the closing, and the rest of this value drops here.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
+	fn settle(
+		self,
+		shared: ExchangeSecret,
+		salt: KdfSalt<'_>,
+	) -> Result<(HandshakeSecret, OpenedShare<ClientShare<P>>), HandshakeError>;
 }
 
 /// The client side of one protocol. It is sealed, so the flow markers of this
@@ -333,8 +370,8 @@ pub struct ReplyParts<'a, P: HandshakeProvider> {
 	pub profile: RunnableProfile<P>,
 	/// The transport capabilities the server accepted.
 	pub transport_accept: Option<&'a TransportAccept>,
-	/// The public half of the server ephemeral, which the reply signs.
-	pub server_ephemeral: PublicKey<P::Curve>,
+	/// The server's share of the exchange, which the reply signs.
+	pub server_ephemeral: &'a ServerShare<P>,
 	/// Whether the server demands a client identity.
 	pub client_cert_required: bool,
 }
@@ -357,30 +394,28 @@ pub struct ReplyBinding<F: ServerLegs<P>, P: HandshakeProvider> {
 /// agreement ephemeral `R` stays for the offer, which compares it with the key
 /// of the certificate the closing presents. [`Self::settle`] is its one
 /// constructor, for both flows.
-pub struct ServerPending<C: CurveArithmetic> {
+pub struct ServerPending<P: HandshakeProvider> {
 	/// The handshake secret, derived when the reply was built.
 	secret: HandshakeSecret,
 	/// The client's agreement ephemeral `R`, the value the agreement read.
-	client_ephemeral: OpenedPoint<C>,
+	client_ephemeral: OpenedShare<ClientShare<P>>,
 }
 
-impl<C: HandshakeCurve> ServerPending<C> {
-	/// Settle the agreement `opened` makes with the server `ephemeral` under
-	/// the salt of `terms`, and keep `R` for the offer. `opened` and the
-	/// ephemeral drop here, so each secret they hold is wiped with the call.
+impl<P: HandshakeProvider> ServerPending<P> {
+	/// Settle the agreement `opened` makes from `shared`, the secret of its
+	/// exchange, under the salt of `terms`, and keep `R` for the offer.
+	/// `opened` and `shared` drop here, so each secret they hold is wiped with
+	/// the call.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
-	pub(crate) fn settle<P: HandshakeProvider<Curve = C>>(
+	pub(crate) fn settle(
 		opened: impl ServerAgreement<P>,
-		ephemeral: Box<EphemeralSecret<C>>,
+		shared: ExchangeSecret,
 		terms: &Terms<P>,
 	) -> Result<Self, HandshakeError> {
-		let agreement = opened.agreement();
-
-		let secret = agreement.settle(ephemeral.as_ref(), terms.kdf_salt()?)?;
-		let client_ephemeral = opened.into_client_ephemeral();
+		let (secret, client_ephemeral) = opened.settle(shared, terms.kdf_salt()?)?;
 		Ok(Self { secret, client_ephemeral })
 	}
 
@@ -394,7 +429,7 @@ impl<C: HandshakeCurve> ServerPending<C> {
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the server's `MacKey`.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- `reply` does not have exactly one signer.
 	/// - [`HandshakeError::DerError`] -- the attribute or the reply fails to encode.
-	pub(crate) fn finish_reply<P: HandshakeProvider<Curve = C>>(
+	pub(crate) fn finish_reply(
 		&self,
 		reply: Signed<SignedData>,
 		terms: &Terms<P>,
@@ -443,7 +478,7 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::UnexpectedContainer`] -- the opening travels in another container.
 	/// - [`HandshakeError::AbortReceived`] -- the CMS opening carries an abort alert.
 	/// - [`HandshakeError::DuplicateAttribute`] -- an offer or the abort alert repeats.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the HPKE client ephemeral is not a point on the curve.
+	/// - [`HandshakeError::KeyExchange`] -- the HPKE client share is no share of the exchange.
 	/// - [`HandshakeError`] -- the opening fails to decode.
 	fn read_opening(
 		settings: &Self::Settings,
@@ -457,7 +492,7 @@ pub trait ServerLegs<P: HandshakeProvider>: HandshakeFlow {
 	/// - [`HandshakeError::Envelope`] -- the CMS opening fails to open: its
 	///   recipient, its `ukm`, its key, or its tag is refused.
 	/// - [`HandshakeError::InvalidKeySize`] -- the opened base secret is not 32 bytes.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the client's agreement key is not a point on the curve.
+	/// - [`HandshakeError::KeyExchange`] -- the client's agreement key is no share of the exchange.
 	/// - [`HandshakeError::DerError`] -- the opened content fails to decode.
 	fn open_opening<'a>(
 		sealed: Self::Sealed,
@@ -637,7 +672,7 @@ impl<P: HandshakeProvider> Offer<P> {
 	/// The offer of `identity` under `issuers`, proven by `finished`.
 	///
 	/// A server learns its client's static key only after the agreement, so
-	/// the admission of `ephemeral`, the point the server agreed with, lives
+	/// the admission of `ephemeral`, the share the server agreed with, lives
 	/// here: it MUST be distinct from the key of `identity`, or the agreement
 	/// collapses into the static one.
 	///
@@ -648,9 +683,9 @@ impl<P: HandshakeProvider> Offer<P> {
 		identity: PeerCertificate<Signing<P>>,
 		issuers: PresentedIssuers,
 		finished: ClientFinished,
-		ephemeral: OpenedPoint<P::Curve>,
+		ephemeral: OpenedShare<ClientShare<P>>,
 	) -> Result<Self, HandshakeError> {
-		let statics = PeerStatics::of(identity.certificate(), None);
+		let statics = PeerStatics::<Exchange<P>>::of(identity.certificate(), None);
 		statics.admit_client(ephemeral)?;
 
 		Ok(Self(Some(Offered { identity, issuers, finished })))
@@ -802,7 +837,7 @@ impl Closing {
 	/// - The errors of [`ClosingContent::into_offer`].
 	pub(crate) async fn open<P: HandshakeProvider>(
 		self,
-		pending: ServerPending<P::Curve>,
+		pending: ServerPending<P>,
 		terms: &Terms<P>,
 		purpose: ObjectIdentifier,
 	) -> Result<ClosingOpened<P>, HandshakeError> {
@@ -921,7 +956,7 @@ impl ClosingContent {
 	///   collapses into the key of the certificate.
 	fn into_offer<P: HandshakeProvider>(
 		self,
-		client_ephemeral: OpenedPoint<P::Curve>,
+		client_ephemeral: OpenedShare<ClientShare<P>>,
 		purpose: ObjectIdentifier,
 	) -> Result<Offer<P>, HandshakeError> {
 		let Self::Finished(finished, path) = self else {
@@ -987,10 +1022,11 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::crypto::exchange::EcdheShare;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
-	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+	use crate::crypto::sign::elliptic_curve::PublicKey;
 	use crate::crypto::sign::PresentedPath;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::random::OsRng;
@@ -1031,8 +1067,7 @@ mod tests {
 		let leaf = Certificate::clone(identity.certificate());
 		let path = PresentedPath::walk(leaf, Vec::new()).expect("a certificate alone is a path");
 		let (_, issuers) = path.into_parts();
-		let opened = OpenedPoint::parse(ephemeral.to_encoded_point(true));
-		let opened = opened.expect("a public key encodes a point");
+		let opened = OpenedShare::fixture(EcdheShare::from(*ephemeral));
 		Offer::new(identity, issuers, finished(), opened)
 	}
 

@@ -432,7 +432,7 @@ async fn an_outside_decryptor_opens_a_frame_from_its_parts() -> Result<(), Tight
 
 /// The attribute that [`UnauthenticatedAttributeCipher`] attaches, under an
 /// arc of the outside crate.
-const OUTSIDE_UNAUTHENTICATED_ATTRIBUTE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.4");
+const OUTSIDE_UNAUTHENTICATED_ATTRIBUTE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.14");
 
 /// A frame cipher an outside crate writes that seals as
 /// [`OutsideFrameCipher`] seals, then attaches one `unauthAttrs` attribute,
@@ -476,7 +476,7 @@ async fn an_outside_parts_decryptor_refuses_an_envelope_that_carries_unauthentic
 }
 
 /// The compression algorithm of the outside codec, under an arc of its own.
-const OUTSIDE_CODEC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.3");
+const OUTSIDE_CODEC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.9");
 
 /// A codec an outside crate writes under its own algorithm identifier. It
 /// reverses the body, a transform its inflator alone undoes, so a frame

@@ -12,19 +12,16 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid};
-use tightbeam::crypto::hash::Sha3_512;
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hpke::{HkdfSha256, KEM_DHKEM_SECP256K1_HKDF_SHA256};
 use tightbeam::crypto::k256::Secp256k1;
-use tightbeam::crypto::kdf::HkdfSha3_256;
-use tightbeam::crypto::profiles::{
-	AeadProvider, Aes256Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
-	SecurityProfile, SigningProvider,
-};
+use tightbeam::crypto::profiles::SecurityProfileDesc;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::DirectTrustValidator;
 use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::der::Encode;
+use tightbeam::testing::unhex;
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
 	Client, ClientConfig, Cms, CmsClientSettings, CmsServerSettings, Handshake, Hpke, HpkeClientSettings,
@@ -32,8 +29,8 @@ use tightbeam::transport::handshake::{
 	SupportedProfiles,
 };
 
-use super::p384::{p384_cms_server, p384_identity, P384Signature, P384VerifyingKey};
-use super::{admitted_and_opened, OutsideCmsServer, OutsideKem, OutsideKemOid, CONTENT};
+use super::p384::{p384_cms_server, p384_identity, OnP384, OnP384Profile};
+use super::{admitted_and_opened, AgreementBackend, OutsideCmsServer, OutsideKem, OutsideKemOid, CONTENT};
 
 /// The secp256k1 KEM of the outside arc.
 impl OutsideKemOid for Secp256k1 {
@@ -47,61 +44,11 @@ type MixedKem = OutsideKem<Secp256k1, HkdfSha256, KEM_DHKEM_SECP256K1_HKDF_SHA25
 
 /// The profile of [`MixedProvider`]: the P-384 signature beside the
 /// secp256k1 agreement.
-#[derive(Debug, Default, Clone, Copy)]
-struct MixedProfile;
-
-impl SecurityProfile for MixedProfile {
-	type Digest = Sha3_512;
-	type AeadOid = Aes256GcmOid;
-	type SignatureAlg = P384Signature;
-	type Kdf = HkdfSha3_256;
-	type Curve = Secp256k1;
-	type KeyWrapOid = Aes256Wrap;
-}
+type MixedProfile = OnP384Profile<Ecdhe<Secp256k1>>;
 
 /// A provider an outside crate defines with its signer on P-384 and its
-/// agreement on secp256k1, beside the house digest, AEAD, key wrap, and KDF.
-///
-/// It takes the P-384 signature and verifying key of [`p384`](super::p384),
-/// and brings [`MixedKem`].
-#[derive(Debug, Default, Clone, Copy)]
-struct MixedProvider {
-	profile: MixedProfile,
-}
-
-impl DigestProvider for MixedProvider {
-	type Digest = Sha3_512;
-}
-
-impl AeadProvider for MixedProvider {
-	type AeadCipher = Aes256Gcm;
-}
-
-impl KeyWrapProvider for MixedProvider {
-	type KeyWrap = Aes256Wrap;
-}
-
-impl SigningProvider for MixedProvider {
-	type Signature = P384Signature;
-	type VerifyingKey = P384VerifyingKey;
-}
-
-impl KdfProvider for MixedProvider {
-	type Kdf = HkdfSha3_256;
-}
-
-impl CurveProvider for MixedProvider {
-	type Curve = Secp256k1;
-}
-
-impl CryptoProvider for MixedProvider {
-	type Profile = MixedProfile;
-	type Kem = MixedKem;
-
-	fn profile(&self) -> &Self::Profile {
-		&self.profile
-	}
-}
+/// agreement on secp256k1, which brings [`MixedKem`].
+type MixedProvider = OnP384<Ecdhe<Secp256k1>, MixedKem>;
 
 /// The authentication of a server that admits `client` alone.
 fn admitting(client: &SigningIdentity) -> PeerAuthentication {
@@ -179,7 +126,7 @@ async fn a_p384_signer_runs_the_cms_flow_over_secp256k1() -> Result<(), Box<dyn 
 	let client = p384_identity();
 	let expected = client.certificate().to_owned();
 
-	let server = p384_cms_server::<MixedProvider>("mixed server");
+	let server = p384_cms_server::<MixedProvider, _>("mixed server", AgreementBackend::random());
 	let outcome = admitted_and_opened(mutual_cms_pair(server, client)).await?;
 	assert_eq!(outcome, (Some(expected), CONTENT.to_vec()));
 	Ok(())
@@ -192,5 +139,17 @@ async fn a_p384_signer_runs_the_cms_flow_over_secp256k1() -> Result<(), Box<dyn 
 async fn a_p384_signer_renews_its_epoch_over_secp256k1() -> Result<(), Box<dyn Error>> {
 	let renewed = super::renewal::renews_its_epoch::<MixedProvider>(p384_identity).await?;
 	assert!(renewed);
+	Ok(())
+}
+
+/// The DER of the descriptor of [`MixedProfile`].
+const MIXED_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b060960864801650304012ea20b060960864801650304030ca3\
+	0d060b2a864886f70d0109100321a40706052b8104000aa50b060960864801650304012d";
+
+/// The descriptor of [`MixedProfile`] encodes as [`MIXED_DESCRIPTOR`].
+#[test]
+fn the_mixed_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+	let der = SecurityProfileDesc::from(&MixedProfile::default()).to_der()?;
+	assert_eq!(der, unhex(MIXED_DESCRIPTOR));
 	Ok(())
 }

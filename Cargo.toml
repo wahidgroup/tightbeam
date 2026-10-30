@@ -131,11 +131,13 @@ zstd-safe = { version = "=8.2.0", default-features = false }
 
 # Dev dependencies
 husky-rs = { version = "=0.3.3" }
+ml-kem = { version = "=0.2.1", default-features = false, features = ["zeroize"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 p521 = { version = "=0.13.3", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 paste = { version = "=1.0.15" }
 trybuild = { version = "=1.0.118", features = ["diff"] }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 
 # Proc macro dependencies
 proc-macro2 = { version = "=1.0.107" }

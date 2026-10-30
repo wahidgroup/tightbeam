@@ -1,9 +1,10 @@
 use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, KeyWrapProvider,
+	AeadProvider, Aes128Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
 	SecurityProfile, SigningProvider,
 };
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
@@ -17,7 +18,7 @@ impl SecurityProfile for ShortKekProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = Secp256k1;
+	type KeyExchange = Ecdhe<Secp256k1>;
 	type KeyWrapOid = Aes128Wrap;
 }
 
@@ -49,8 +50,8 @@ impl KdfProvider for ShortKekProvider {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for ShortKekProvider {
-	type Curve = Secp256k1;
+impl KeyExchangeProvider for ShortKekProvider {
+	type KeyExchange = Ecdhe<Secp256k1>;
 }
 
 impl CryptoProvider for ShortKekProvider {

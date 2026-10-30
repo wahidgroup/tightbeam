@@ -22,20 +22,20 @@
 //!
 //! # Fresh agreement
 //!
-//! `C` and `S` are ephemeral public keys, drawn for one renewal. The next
-//! epoch secret takes the previous one and the agreement between them:
+//! `C` and `S` are the two shares of one renewal's key exchange. The next
+//! epoch secret takes the previous one and the secret of that exchange:
 //!
 //! ```text
 //! epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt = client_random || server_random)
 //! ```
 //!
-//! `Ndh` is the width of `ee`, the field width of the session's curve.
+//! `Ndh` is the width of `ee`, which the exchange fixes.
 //!
-//! So a holder of one epoch secret who records the renewal still needs a rekey
-//! scalar to derive the next epoch. Each side refuses a peer ephemeral that is
-//! off the curve, or that equals a static key of the peer or its negation: the
-//! client's one key, or either key of a CMS server, as the handshake refuses
-//! it.
+//! So a holder of one epoch secret who records the renewal still needs the
+//! private half of a rekey share to derive the next epoch. Each side refuses a
+//! peer share that fails its parse, or that collapses into a static key of the
+//! peer, as the handshake refuses it. The static keys are the client's one
+//! key, or either key of a CMS server.
 //!
 //! # Bindings
 //!
@@ -61,7 +61,7 @@ use futures::lock::Mutex as FuturesMutex;
 
 use crate::cms::signed_data::SignedData;
 use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
-use crate::crypto::sign::elliptic_curve::ecdh::EphemeralSecret;
+use crate::crypto::exchange::{KeyExchange, KeyShare};
 use crate::crypto::sign::{Signed, SigningIdentity};
 use crate::crypto::x509::{PeerCertificate, Signing};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
@@ -76,8 +76,8 @@ use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, StoredReceipt,
 };
 use crate::transport::handshake::{
-	DistinctPoint, EpochMaterials, EpochSecret, HandshakeCurve, HandshakeError, HandshakeOctets, HandshakeProvider,
-	PeerStatics, SessionPeer,
+	ClientShare, Distinct, EpochMaterials, EpochSecret, Exchange, HandshakeError, HandshakeOctets, HandshakeProvider,
+	PeerStatics, ServerShare, SessionPeer,
 };
 
 /// Shared epoch state and identities for one session's rekey exchanges.
@@ -89,7 +89,7 @@ use crate::transport::handshake::{
 /// - the local signing identity, and
 /// - the [`RekeyPeer`] the session recorded, whose signing key verifies the peer's receipt signatures.
 ///
-/// The provider's cipher type names the AEAD, and its curve names the
+/// The provider's cipher type names the AEAD, and its key exchange runs the
 /// agreement.
 pub(crate) struct RekeyMaterials<P>
 where
@@ -114,7 +114,7 @@ where
 	/// The certificate, admitted for signing under the purpose of its role.
 	signing: PeerCertificate<Signing<P>>,
 	/// The static keys of the peer, read once from its certificates.
-	statics: PeerStatics<P::Curve>,
+	statics: PeerStatics<Exchange<P>>,
 }
 
 impl<P> RekeyPeer<P>
@@ -133,24 +133,28 @@ where
 		Ok(Self { signing, statics })
 	}
 
-	/// Parses `sec1` as the rekey ephemeral of this peer as the server of its
-	/// session.
+	/// Parses `octets` as the rekey share of this peer as the server of its
+	/// session, and checks it against the peer's static keys.
 	///
 	/// # Errors
 	///
+	/// - [`HandshakeError::KeyExchange`] -- `octets` is no share of the exchange.
 	/// - The errors of [`PeerStatics::server_ephemeral`].
-	fn server_ephemeral(&self, sec1: impl AsRef<[u8]>) -> Result<DistinctPoint<P::Curve>, HandshakeError> {
-		self.statics.server_ephemeral(sec1)
+	fn server_ephemeral(&self, octets: impl AsRef<[u8]>) -> Result<Distinct<ServerShare<P>>, HandshakeError> {
+		let share = <ServerShare<P> as KeyShare<Exchange<P>>>::from_octets(octets.as_ref())?;
+		self.statics.server_ephemeral(share)
 	}
 
-	/// Parses `sec1` as the rekey ephemeral of this peer as the client of its
-	/// session.
+	/// Parses `octets` as the rekey share of this peer as the client of its
+	/// session, and checks it against the peer's static key.
 	///
 	/// # Errors
 	///
+	/// - [`HandshakeError::KeyExchange`] -- `octets` is no share of the exchange.
 	/// - The errors of [`PeerStatics::client_ephemeral`].
-	fn client_ephemeral(&self, sec1: impl AsRef<[u8]>) -> Result<DistinctPoint<P::Curve>, HandshakeError> {
-		self.statics.client_ephemeral(sec1)
+	fn client_ephemeral(&self, octets: impl AsRef<[u8]>) -> Result<Distinct<ClientShare<P>>, HandshakeError> {
+		let share = <ClientShare<P> as KeyShare<Exchange<P>>>::from_octets(octets.as_ref())?;
+		self.statics.client_ephemeral(share)
 	}
 }
 
@@ -195,15 +199,15 @@ where
 
 /// The client randomness, the request DER, and the client's rekey ephemeral,
 /// held between the request and the server's response.
-struct PendingRenewal<C>
+struct PendingRenewal<P>
 where
-	C: HandshakeCurve,
+	P: HandshakeProvider,
 {
 	client_random: [u8; 32],
 	request_der: Vec<u8>,
-	/// The scalar of this renewal. It is boxed, so a move copies a pointer,
-	/// and the scalar zeroizes where the box drops.
-	ephemeral: Box<EphemeralSecret<C>>,
+	/// The pending half of the exchange of this renewal. It is boxed, so a
+	/// move copies a pointer, and it wipes in place where the box drops.
+	ephemeral: Box<<Exchange<P> as KeyExchange>::Pending>,
 }
 
 /// The client half of the rekey exchange.
@@ -216,7 +220,7 @@ where
 {
 	materials: RekeyMaterials<P>,
 	approver: Option<Arc<dyn ReceiptApprover>>,
-	pending: Option<PendingRenewal<P::Curve>>,
+	pending: Option<PendingRenewal<P>>,
 }
 
 impl<P> ClientRekey<P>
@@ -254,10 +258,10 @@ where
 		}
 
 		let client_random = generate_nonce::<32>(None)?;
-		let ephemeral = Box::new(EphemeralSecret::<P::Curve>::random(&mut OsRng));
-		let client_point = ephemeral.public_key();
+		let (pending, client_share) = Exchange::<P>::offer(&mut OsRng);
+		let ephemeral = Box::new(pending);
 
-		let request = MuxRekeyRequestPackage::new(client_random, &client_point)?;
+		let request = MuxRekeyRequestPackage::new(client_random, client_share.to_octets())?;
 		let request_der = request.to_der()?;
 		self.pending = Some(PendingRenewal { client_random, request_der, ephemeral });
 		Ok(request)
@@ -269,16 +273,14 @@ where
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- no renewal is in flight.
-	/// - [`HandshakeError::OctetStringLengthError`] -- the server random is not
-	///   32 bytes, or the server ephemeral is not the width of a compressed
-	///   point.
+	/// - [`HandshakeError::OctetStringLengthError`] -- the server random is not 32 bytes.
 	/// - [`HandshakeError::ReceiptMissing`] -- the response has no epoch receipt.
 	/// - [`HandshakeError::ReceiptMismatch`] -- the exchange pin or the credit match fails.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the server `SignerInfo` is invalid.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the server ephemeral is no
-	///   point on the curve in the compressed form.
-	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the server ephemeral is
-	///   a static key of the server or its negation.
+	/// - [`HandshakeError::KeyExchange`] -- the server's share has another
+	///   width or form, or the exchange refuses it.
+	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the server's share
+	///   collapses into a static key of the server.
 	/// - [`HandshakeError::ApprovalRefused`] -- the approver refuses the renewal.
 	pub(crate) async fn process_response(
 		&mut self,
@@ -287,16 +289,10 @@ where
 		let pending = self.pending.take().ok_or(HandshakeError::InvalidState)?;
 		let PendingRenewal { client_random, request_der, ephemeral } = pending;
 		let response_der = response.to_der()?;
-		let MuxRekeyResponsePackage { server_random, server_ephemeral, epoch_receipt } = response;
+		let MuxRekeyResponsePackage { server_random, server_ephemeral: server_octets, epoch_receipt } = response;
 		let server_random = server_random.to_32_byte_array()?;
-		let server_point = server_ephemeral.to_compressed_point::<P::Curve>()?;
 		let epoch_receipt = epoch_receipt.ok_or(HandshakeError::ReceiptMissing)?;
 		let artifact = *epoch_receipt;
-
-		// The parse refuses a leg that is a static key of the server or its
-		// negation. The signed receipt pins the leg, so the checks below
-		// authenticate the point before the agreement runs.
-		let server_ephemeral = self.materials.peer.server_ephemeral(&server_point)?;
 
 		let receipt = artifact.receipt()?;
 		let server_role = ReceiptRole::Server;
@@ -304,17 +300,24 @@ where
 		receipt.verify_signer::<P>(server_signer, server_role, &self.materials.peer.signing)?;
 
 		let epoch = &self.materials.epoch;
-		let challenge_hash = epoch.exchange_pin::<P::Digest, P::Curve>(&request_der, &server_random, &server_point)?;
+		let challenge_hash = epoch.exchange_pin::<P::Digest>(&request_der, &server_random, server_octets.as_bytes())?;
 		let reference_budgets = self.materials.reference.budgets;
 		let reference_unit = self.materials.reference.credit_unit;
 
 		receipt.verify_terms(&challenge_hash, reference_budgets, reference_unit)?;
 
-		// The agreement takes the scalar by value and runs before the client
-		// awaits the approver, so the scalar is gone before the first await of
-		// this step.
+		// The signed receipt pins the leg, so the share parses only after the
+		// checks above authenticate it, as the handshake parses its reply. The
+		// parse refuses a leg that collapses into a static key of the server.
+		let server_ephemeral = self.materials.peer.server_ephemeral(server_octets.as_bytes())?;
+
+		// The exchange completes before the client awaits the approver, and its
+		// pending half drops right after, so it is wiped before the first await
+		// of this step.
 		let salt = RandomsSalt::new(&client_random, &server_random);
-		let next_secret = epoch.next_secret::<P>(ephemeral, &server_ephemeral, salt.as_kdf_salt()?)?;
+		let shared = server_ephemeral.complete::<Exchange<P>>(&ephemeral)?;
+		drop(ephemeral);
+		let next_secret = epoch.next_secret::<P>(shared, salt.as_kdf_salt()?)?;
 
 		let answer = receipt.approve(self.approver.as_deref()).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
@@ -344,8 +347,8 @@ where
 /// The receipt, the artifact, the randoms, the exchange DERs, and the next
 /// epoch secret, held between the response and the client's acknowledgement.
 ///
-/// The server runs the agreement on the request and drops its scalar there,
-/// so the derived secret waits here.
+/// The server answers the exchange on the request, which spends its private
+/// half there, so the derived secret waits here.
 struct PendingSettlement {
 	receipt: SessionReceipt,
 	artifact: Signed<SignedData>,
@@ -409,13 +412,11 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::OctetStringLengthError`] -- the client random is not
-	///   32 bytes, or the client ephemeral is not the width of a compressed
-	///   point.
-	/// - [`HandshakeError::InvalidPublicKey`] -- the client ephemeral is no
-	///   point on the curve in the compressed form.
-	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client ephemeral is
-	///   the client's static key or its negation.
+	/// - [`HandshakeError::OctetStringLengthError`] -- the client random is not 32 bytes.
+	/// - [`HandshakeError::KeyExchange`] -- the client's share has another
+	///   width or form, or the exchange refuses to answer it.
+	/// - [`HandshakeError::ClientEphemeralIsStatic`] -- the client's share
+	///   collapses into the client's static key.
 	/// - [`HandshakeError::SettlementRejected`] -- the authorizer refuses the renewal.
 	pub(crate) async fn process_request(
 		&mut self,
@@ -427,23 +428,21 @@ where
 
 		let request_der = request.to_der()?;
 		let client_random = request.client_random.to_32_byte_array()?;
-		let client_point = request.client_ephemeral.to_compressed_point::<P::Curve>()?;
-		let client_ephemeral = self.materials.peer.client_ephemeral(&client_point)?;
+		let client_ephemeral = self.materials.peer.client_ephemeral(request.client_ephemeral.as_bytes())?;
 		let server_random = generate_nonce::<32>(None)?;
 
-		// The agreement takes the scalar by value and runs before the first
-		// await, so the server holds the derived secret alone across an await
-		// or between two legs.
+		// The exchange spends its private half inside `respond` and runs before
+		// the first await, so the server holds the derived secret alone across
+		// an await or between two legs.
 		let epoch = &self.materials.epoch;
 		let salt = RandomsSalt::new(&client_random, &server_random);
-		let ephemeral = Box::new(EphemeralSecret::<P::Curve>::random(&mut OsRng));
-		let mut response = MuxRekeyResponsePackage::new(server_random, &ephemeral.public_key(), None)?;
-		let next_secret = epoch.next_secret::<P>(ephemeral, &client_ephemeral, salt.as_kdf_salt()?)?;
+		let (server_share, shared) = client_ephemeral.respond::<Exchange<P>>(&mut OsRng)?;
+		let mut response = MuxRekeyResponsePackage::new(server_random, server_share.to_octets(), None)?;
+		let next_secret = epoch.next_secret::<P>(shared, salt.as_kdf_salt()?)?;
 
-		// The pin covers the leg as the response carries it, read back with
-		// the reader the client runs.
-		let server_point = response.server_ephemeral.to_compressed_point::<P::Curve>()?;
-		let challenge_hash = epoch.exchange_pin::<P::Digest, P::Curve>(&request_der, &server_random, &server_point)?;
+		// The pin covers the leg as the response carries it.
+		let server_octets = response.server_ephemeral.as_bytes();
+		let challenge_hash = epoch.exchange_pin::<P::Digest>(&request_der, &server_random, server_octets)?;
 
 		let challenge = match self.authorizer.as_deref() {
 			Some(authorizer) => {
@@ -850,13 +849,14 @@ pub(crate) mod tests {
 	use crate::cms::enveloped_data::RecipientInfo;
 	use crate::crypto::aead::DirectionalCiphers;
 	use crate::crypto::cms::EnvelopeError;
+	use crate::crypto::exchange::{Ecdhe, EcdheShare, KeyExchangeError};
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::kdf::KdfSalt;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::sign::elliptic_curve::sec1::{CompressedPoint as Sec1CompressedPoint, ToEncodedPoint};
-	use crate::crypto::sign::elliptic_curve::PublicKey;
+	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+	use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 	use crate::crypto::x509::KeyPurposes;
 	use crate::der::Encode;
 	use crate::oids::HASH_SHA3_256;
@@ -868,7 +868,7 @@ pub(crate) mod tests {
 	};
 	use crate::transport::handshake::primitives::TranscriptHash;
 	use crate::transport::handshake::tests::{fixture_handshake_secret, fixture_transcript, off_curve_point};
-	use crate::transport::handshake::{CompressedPoint, EstablishedSession};
+	use crate::transport::handshake::{Distinct, EstablishedSession};
 	use crate::x509::Certificate;
 	use crate::TightBeamError;
 
@@ -917,14 +917,18 @@ pub(crate) mod tests {
 		Ok(Identity { signing, public_key: PublicKey::from(verifying_key) })
 	}
 
+	/// The house exchange of the tests.
+	type House = Ecdhe<Secp256k1>;
+
 	/// A rekey scalar drawn for one test.
-	fn fresh_ephemeral() -> EphemeralSecret<Secp256k1> {
-		EphemeralSecret::random(&mut OsRng)
+	fn fresh_ephemeral() -> SecretKey<Secp256k1> {
+		SecretKey::random(&mut OsRng)
 	}
 
-	/// The compressed SEC 1 bytes of `key`, as a rekey leg carries a point.
-	fn point_of(key: &PublicKey<Secp256k1>) -> Sec1CompressedPoint<Secp256k1> {
-		key.compressed_point().expect("a secp256k1 point compresses")
+	/// The compressed SEC 1 bytes of `key`, as a rekey leg carries a share of
+	/// the house exchange.
+	fn point_of(key: &PublicKey<Secp256k1>) -> Vec<u8> {
+		EcdheShare::from(*key).to_octets()
 	}
 
 	/// A valid point that belongs to no party of the test.
@@ -934,15 +938,32 @@ pub(crate) mod tests {
 
 	/// The compressed SEC 1 bytes of a valid point that belongs to no party of
 	/// the test.
-	fn stray_point() -> Sec1CompressedPoint<Secp256k1> {
+	fn stray_point() -> Vec<u8> {
 		point_of(&stray_key())
 	}
 
 	/// The statics of a peer with a fresh key, distinct from every point of a
 	/// test, for the parse that admits a peer point to an agreement.
-	fn peer_static() -> PeerStatics<Secp256k1> {
+	fn peer_static() -> PeerStatics<House> {
 		let certificate = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
 		PeerStatics::of(&certificate, None)
+	}
+
+	/// `octets` as a rekey share that [`peer_static`] admits.
+	fn distinct(octets: impl AsRef<[u8]>) -> Result<Distinct<EcdheShare<Secp256k1>>, HandshakeError> {
+		let share = <EcdheShare<Secp256k1> as KeyShare<House>>::from_octets(octets.as_ref())?;
+		peer_static().server_ephemeral(share)
+	}
+
+	/// The next link of `epoch` from the exchange of `scalar` with `peer`.
+	fn next_of(
+		epoch: &EpochMaterials,
+		scalar: &SecretKey<Secp256k1>,
+		peer: &Distinct<EcdheShare<Secp256k1>>,
+		salt: KdfSalt<'_>,
+	) -> Result<EpochSecret, HandshakeError> {
+		let shared = peer.complete::<House>(scalar)?;
+		epoch.next_secret::<Provider>(shared, salt)
 	}
 
 	/// [`SAMPLE_CHAIN_ROOT`] as the chain hash an epoch holds.
@@ -1137,12 +1158,12 @@ pub(crate) mod tests {
 		let mut first = sample_epoch_from(SAMPLE_BASE)?;
 		let mut second = sample_epoch_from(SAMPLE_BASE + 1)?;
 		let (client_scalar, server_scalar) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
-		let client_point = peer_static().server_ephemeral(point_of(&client_scalar.public_key()))?;
-		let server_point = peer_static().server_ephemeral(point_of(&server_scalar.public_key()))?;
+		let client_point = distinct(point_of(&client_scalar.public_key()))?;
+		let server_point = distinct(point_of(&server_scalar.public_key()))?;
 		let salt = sample_salt();
 		let kdf_salt = salt.as_kdf_salt()?;
-		let first_next = first.next_secret::<Provider>(client_scalar, &server_point, kdf_salt)?;
-		let second_next = second.next_secret::<Provider>(server_scalar, &client_point, kdf_salt)?;
+		let first_next = next_of(&first, &client_scalar, &server_point, kdf_salt)?;
+		let second_next = next_of(&second, &server_scalar, &client_point, kdf_salt)?;
 
 		let first_rotated = first.install::<Provider>(first_next, kdf_salt, sample_chain_root())?;
 		let second_rotated = second.install::<Provider>(second_next, kdf_salt, sample_chain_root())?;
@@ -1165,9 +1186,9 @@ pub(crate) mod tests {
 		let rotated_epoch = epoch.epoch() + 1;
 		let previous = DirectionalCiphers::derive::<Provider, _>(epoch.secret(), salt.as_kdf_salt()?, rotated_epoch)?;
 		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
-		let peer = peer_static().server_ephemeral(stray_point())?;
+		let peer = distinct(stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let next = next_of(&epoch, &scalar, &peer, salt.as_kdf_salt()?)?;
 		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
 		let (_send, mut recv) = SessionKeys::for_server(rotated).into_parts();
 
@@ -1185,9 +1206,9 @@ pub(crate) mod tests {
 		let mut epoch = sample_epoch()?;
 		let salt = sample_salt();
 		let next_epoch = epoch.epoch() + 1;
-		let peer = peer_static().server_ephemeral(stray_point())?;
+		let peer = distinct(stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let next = next_of(&epoch, &scalar, &peer, salt.as_kdf_salt()?)?;
 		let expected = DirectionalCiphers::derive::<Provider, _>(&next, salt.as_kdf_salt()?, next_epoch)?;
 		let (_peer_send, mut peer_recv) = SessionKeys::for_server(expected).into_parts();
 		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
@@ -1219,9 +1240,9 @@ pub(crate) mod tests {
 		let salt = sample_salt();
 		let next_epoch = epoch.epoch() + 1;
 		let expected = [b"tb/session/record/kekid/v1".as_slice(), &[0x00], &next_epoch.to_be_bytes()].concat();
-		let peer = peer_static().server_ephemeral(stray_point())?;
+		let peer = distinct(stray_point())?;
 		let scalar = Box::new(fresh_ephemeral());
-		let next = epoch.next_secret::<Provider>(scalar, &peer, salt.as_kdf_salt()?)?;
+		let next = next_of(&epoch, &scalar, &peer, salt.as_kdf_salt()?)?;
 
 		let rotated = epoch.install::<Provider>(next, salt.as_kdf_salt()?, sample_chain_root())?;
 		let (send, _recv) = SessionKeys::for_client(rotated).into_parts();
@@ -1279,7 +1300,7 @@ pub(crate) mod tests {
 	#[tokio::test]
 	async fn unsolicited_legs_fail_closed() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
-		let request = MuxRekeyRequestPackage::new([1u8; 32], &stray_key())?;
+		let request = MuxRekeyRequestPackage::new([1u8; 32], stray_point())?;
 		let response = issued(&mut server, &request).await?;
 
 		let unsolicited = client.process_response(response).await;
@@ -1297,7 +1318,7 @@ pub(crate) mod tests {
 		let (mut client, _) = rekey_pair()?;
 		client.start_renewal()?;
 
-		let bare = MuxRekeyResponsePackage::new([9u8; 32], &stray_key(), None)?;
+		let bare = MuxRekeyResponsePackage::new([9u8; 32], stray_point(), None)?;
 		let missing_receipt = client.process_response(bare).await;
 		assert!(matches!(missing_receipt, Err(HandshakeError::ReceiptMissing)));
 		Ok(())
@@ -1422,8 +1443,8 @@ pub(crate) mod tests {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
 		let response = issued(&mut server, &request).await?;
-		let wire_client = peer_static().server_ephemeral(request.client_ephemeral())?;
-		let wire_server = peer_static().server_ephemeral(response.server_ephemeral())?;
+		let wire_client = distinct(request.client_ephemeral())?;
+		let wire_server = distinct(response.server_ephemeral())?;
 		let client_random = request.client_random.to_32_byte_array()?;
 		let server_random = response.server_random.to_32_byte_array()?;
 		let salt = RandomsSalt::new(&client_random, &server_random);
@@ -1441,8 +1462,8 @@ pub(crate) mod tests {
 		// draws a scalar of its own for each attempt.
 		let observed = sample_epoch()?;
 		let (first, second) = (Box::new(fresh_ephemeral()), Box::new(fresh_ephemeral()));
-		let against_client = observed.next_secret::<Provider>(first, &wire_client, salt.as_kdf_salt()?)?;
-		let against_server = observed.next_secret::<Provider>(second, &wire_server, salt.as_kdf_salt()?)?;
+		let against_client = next_of(&observed, &first, &wire_client, salt.as_kdf_salt()?)?;
+		let against_server = next_of(&observed, &second, &wire_server, salt.as_kdf_salt()?)?;
 		assert!(server_recv(&against_client, &salt).open(&mut record.clone()).is_err());
 		assert!(server_recv(&against_server, &salt).open(&mut record.clone()).is_err());
 		Ok(())
@@ -1462,10 +1483,10 @@ pub(crate) mod tests {
 		Ok(())
 	}
 
-	/// A server ephemeral in the compact form has the width of the compressed
-	/// form, and the client refuses it at the parse, before the pin hashes it.
+	/// A malformed server ephemeral swapped in transit fails the pin, because
+	/// the client parses the share only after the receipt authenticates it.
 	#[tokio::test]
-	async fn a_compact_server_ephemeral_is_refused_before_the_pin() -> Result<(), HandshakeError> {
+	async fn a_malformed_server_ephemeral_fails_the_pin_before_its_parse() -> Result<(), HandshakeError> {
 		let (mut client, mut server) = rekey_pair()?;
 		let request = client.start_renewal()?;
 		let mut response = issued(&mut server, &request).await?;
@@ -1474,7 +1495,28 @@ pub(crate) mod tests {
 		response.server_ephemeral = OctetString::new(compact.as_slice())?;
 
 		let refused = client.process_response(response).await;
-		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(refused, Err(HandshakeError::ReceiptMismatch)));
+		Ok(())
+	}
+
+	/// A server ephemeral in the compact form has the width of the compressed
+	/// form, and the client refuses it at the parse, even under a receipt the
+	/// server signed over it.
+	#[tokio::test]
+	async fn a_signed_compact_server_ephemeral_is_refused() -> Result<(), HandshakeError> {
+		let Parties { mut client, server_identity, .. } = rekey_parties()?;
+		let request = client.start_renewal()?;
+		let mut compact = stray_point();
+		compact[0] = 0x05;
+		let epoch = sample_epoch()?;
+		let pin = epoch.exchange_pin::<Sha3_256>(request.to_der()?, &SAMPLE_SERVER_RANDOM, &compact)?;
+		let signer = &server_identity.signing;
+		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
+		let (_receipt, artifact) = issuing.await?;
+
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, compact, Some(artifact))?;
+		let refused = client.process_response(response).await;
+		assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 		Ok(())
 	}
 
@@ -1502,7 +1544,7 @@ pub(crate) mod tests {
 		request.client_ephemeral = OctetString::new(off_curve_point().as_slice())?;
 
 		let refused = server.process_request(&request).await;
-		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 		assert!(!server.exchange_in_flight());
 		Ok(())
 	}
@@ -1516,7 +1558,8 @@ pub(crate) mod tests {
 		request.client_ephemeral = OctetString::new([0x02u8; 32])?;
 
 		let refused = server.process_request(&request).await;
-		assert!(matches!(refused, Err(HandshakeError::OctetStringLengthError(_))));
+		let width = KeyExchangeError::Width { expected: 33, actual: 32 };
+		assert!(matches!(refused, Err(HandshakeError::KeyExchange(error)) if error == width));
 		Ok(())
 	}
 
@@ -1531,7 +1574,8 @@ pub(crate) mod tests {
 		request.client_ephemeral = OctetString::new(uncompressed.as_bytes())?;
 
 		let refused = server.process_request(&request).await;
-		assert!(matches!(refused, Err(HandshakeError::OctetStringLengthError(_))));
+		let width = KeyExchangeError::Width { expected: 33, actual: 65 };
+		assert!(matches!(refused, Err(HandshakeError::KeyExchange(error)) if error == width));
 		Ok(())
 	}
 
@@ -1547,7 +1591,7 @@ pub(crate) mod tests {
 		request.client_ephemeral = OctetString::new(compact.as_slice())?;
 
 		let refused = server.process_request(&request).await;
-		assert!(matches!(refused, Err(HandshakeError::InvalidPublicKey(_))));
+		assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
 		Ok(())
 	}
 
@@ -1572,13 +1616,13 @@ pub(crate) mod tests {
 		let request = client.start_renewal()?;
 		let static_point = point_of(&server_identity.public_key);
 		let epoch = sample_epoch()?;
-		let pin = epoch.exchange_pin::<Sha3_256, Secp256k1>(request.to_der()?, &SAMPLE_SERVER_RANDOM, &static_point)?;
+		let pin = epoch.exchange_pin::<Sha3_256>(request.to_der()?, &SAMPLE_SERVER_RANDOM, &static_point)?;
 		let signer = &server_identity.signing;
 		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
 		let (_receipt, artifact) = issuing.await?;
 
 		let static_key = &server_identity.public_key;
-		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, static_key, Some(artifact))?;
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, point_of(static_key), Some(artifact))?;
 		let refused = client.process_response(response).await;
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		Ok(())
@@ -1664,12 +1708,12 @@ pub(crate) mod tests {
 		let key = PublicKey::from(server.key_agreement_key.verifying_key());
 		let point = point_of(&key);
 		let request_der = request.to_der()?;
-		let pin = sample_epoch()?.exchange_pin::<Sha3_256, Secp256k1>(request_der, &SAMPLE_SERVER_RANDOM, &point)?;
+		let pin = sample_epoch()?.exchange_pin::<Sha3_256>(request_der, &SAMPLE_SERVER_RANDOM, &point)?;
 		let signer = server.signing_identity();
 		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, &signer);
 		let (_receipt, artifact) = issuing.await?;
 
-		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &key, Some(artifact))?;
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, point, Some(artifact))?;
 		let refused = exchange.process_response(response).await;
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		Ok(())
@@ -1765,12 +1809,12 @@ pub(crate) mod tests {
 		let point = point_of(&key_agreement_public);
 		let epoch = sample_epoch()?;
 		let request_der = request.to_der()?;
-		let pin = epoch.exchange_pin::<Sha3_256, Secp256k1>(request_der, &SAMPLE_SERVER_RANDOM, &point)?;
+		let pin = epoch.exchange_pin::<Sha3_256>(request_der, &SAMPLE_SERVER_RANDOM, &point)?;
 		let signer = &server_identity.signing;
 		let issuing = SessionReceipt::issue(pin, SAMPLE_BUDGETS, SAMPLE_CREDIT_UNIT, None, signer);
 		let (_receipt, artifact) = issuing.await?;
 
-		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, &key_agreement_public, Some(artifact))?;
+		let response = MuxRekeyResponsePackage::new(SAMPLE_SERVER_RANDOM, point, Some(artifact))?;
 		let refused = client.process_response(response).await;
 		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
 		Ok(())

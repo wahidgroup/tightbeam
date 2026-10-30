@@ -1099,6 +1099,7 @@ mod tests {
 		use super::*;
 		use crate::asn1::GcmParameters;
 		use crate::crypto::aead::{Aes128GcmOid, Aes256GcmOid};
+		use crate::crypto::exchange::Ecdhe;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::k256::Secp256k1;
 		use crate::crypto::kdf::HkdfSha3_256;
@@ -1238,7 +1239,7 @@ mod tests {
 			type AeadOid = Aes256GcmOid;
 			type SignatureAlg = Secp256k1Signature;
 			type Kdf = HkdfSha3_256;
-			type Curve = Secp256k1;
+			type KeyExchange = Ecdhe<Secp256k1>;
 			type KeyWrapOid = Aes128Wrap;
 		}
 

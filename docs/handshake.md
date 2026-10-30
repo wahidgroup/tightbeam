@@ -32,7 +32,7 @@ TightBeam has two handshake flows. Both send three messages, encode every messag
 | Shape               | The TLS 1.3 handshake (RFC 9846) in CMS containers                   | The client seals its first message to the server's key-agreement certificate                                                  |
 | First message       | The hello: a `ContentInfo` of type `id-data` with the `ClientHello`  | The opening: an `AuthEnvelopedData` with the base secret and the client ephemeral                                             |
 | Server certificates | One signing certificate, sent in the reply with the issuers above it | A signing certificate, sent in the server Finished with the issuers above it, and a key-agreement certificate the client pins |
-| Handshake secret    | `ee`, the ECDH output of the two ephemerals                          | `ee \|\| base`, which adds the base secret of the opening                                                                     |
+| Handshake secret    | `ee`, the secret of the key exchange of the two ephemerals           | `ee \|\| base`, which adds the base secret of the opening                                                                     |
 
 ## Message flow
 
@@ -43,7 +43,7 @@ sequenceDiagram
     participant C as Client
     participant S as Server
     C->>S: Hello: the ClientHello with the client random, the ephemeral R, and the offers
-    Note over S: negotiates a profile, draws E, derives hs from the ECDH of E and R
+    Note over S: negotiates a profile, answers R with E, derives hs from the key exchange of R and E
     S->>C: Reply: SignedData over the ServerHandshake with E. The signing certificate and the issuers above it in certificates. The server Finished and any receipt as unsigned attributes
     Note over C: admits the certificate, verifies the signature, derives hs, verifies the server Finished
     C->>S: Closing: AuthEnvelopedData under k_close with the client Finished, or the anonymous tag set
@@ -70,7 +70,7 @@ sequenceDiagram
     Note over S: decapsulates through its key-agreement backend, opens the base secret and R
     S->>C: Server Finished: SignedData under the signing certificate, which certificates carries with the issuers above it, binding E. The server Finished MAC and any receipt as unsigned attributes
     Note over C: validates the path of the signing certificate, pairs it with the pinned one, verifies the signature
-    Note over C,S: both derive hs from the ECDH of E and R, and the base secret
+    Note over C,S: both derive hs from the key exchange of R and E, and the base secret
     Note over C: verifies the server Finished MAC, then reads the receipt
     C->>S: Closing: AuthEnvelopedData under k_close with the client Finished, its certificate, and the receipt countersignature
     Note over S: opens the closing, verifies the tag, verifies the Finished, settles the receipt
@@ -363,10 +363,10 @@ Each validator reads the offered certificate beside the issuers its client Finis
 
 Every traffic key of both flows derives from one `HandshakeSecret`:
 
-| Flow | Constructor                                                            | Input                                           |
-| ---- | ---------------------------------------------------------------------- | ----------------------------------------------- |
-| CMS  | `HandshakeSecret::hybrid`, through `Agreement::hybrid`                 | `Z′ = ee \|\| base`, NIST SP 800-56C Rev. 2 § 2 |
-| HPKE | `HandshakeSecret::ephemeral`, through `Agreement::settle` with no base | `Z = ee`                                        |
+| Flow | Constructor                                                                                  | Input                                           |
+| ---- | -------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| CMS  | `HandshakeSecret::hybrid`, through `ClientAgreement::agree` and `ServerAgreement::settle`    | `Z′ = ee \|\| base`, NIST SP 800-56C Rev. 2 § 2 |
+| HPKE | `HandshakeSecret::ephemeral`, through `ClientAgreement::agree` and `ServerAgreement::settle` | `Z = ee`                                        |
 
 ```text
 hs      = HKDF(ee || base, salt = S, info = "tb/session/kdf/v1")    CMS
@@ -384,7 +384,7 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 
 | Input  | What it is                                                                                                 |
 | ------ | ---------------------------------------------------------------------------------------------------------- |
-| `ee`   | The ECDH output of the client's ephemeral and the server's ephemeral, as wide as the field of the curve    |
+| `ee`   | The secret of the key exchange of the client's ephemeral `R` and the server's ephemeral `E`                |
 | `base` | The 32-byte base secret that the CMS client seals to the key-agreement certificate, in the CMS flow alone  |
 | `S`    | The salt: `client_random \|\| server_random` for HPKE, the transcript hash for CMS                         |
 | `HKDF` | The profile's KDF, extract then expand under its own hash: HKDF-SHA3-256 in the default profile            |
@@ -393,9 +393,46 @@ server  = HMAC-H(mac_s, transcript_hash || SignerInfo.signature)
 Each input follows a standard:
 
 - **CMS.** `ee || base` is the hybrid secret `Z′ = Z || T` of NIST SP 800-56C Rev. 2 § 2: the shared secret, then an auxiliary secret whose format both ends fix in advance. Both widths are fixed, so the plain concatenation is unambiguous:
-  - The curve fixes the width of `ee`: 32 bytes on secp256k1 and P-256, 48 on P-384, and 66 on P-521.
+  - The key exchange fixes the width of `ee`. ECDH gives the x-coordinate: 32 bytes on secp256k1 and P-256, 48 on P-384, and 66 on P-521. X25519 and ML-KEM give 32 bytes.
   - `base` is 32 bytes.
 - **HPKE.** The flow takes `ee` alone, as TLS 1.3 takes its ECDHE secret (RFC 9846 § 7.1).
+
+### Key exchange
+
+The provider's `KeyExchange` runs the ephemeral exchange of a handshake and of each rekey. RFC 9180 § 4.1 builds a KEM from a DH group, so the exchange runs in the shape of a KEM, in the order in which TLS 1.3 runs its `key_share` (RFC 8446 § 4.2.8):
+
+1. The initiator draws its share `R` with `offer`, and keeps the pending state.
+2. The responder answers `R` with `respond`, which returns its own share `E` and the secret `ee`.
+3. The initiator derives the same `ee` with `complete`, from its pending state and `E`.
+
+| Item               | What it owns                                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KeyExchange`      | The three operations, `static_key`, which reads a certificate key in the form that a share is compared with, `strength`, and `REPLY`, the kind of its reply   |
+| `KeyShare`         | One share in the OCTET STRING carriers and in the CMS opening, and `collapses_into`, its collapse rule                                                        |
+| `ReplyAttribute`   | The carrier of a reply in the CMS Finished. `ReplyAttribute::of` writes the carrier `REPLY` names, and `ReplyAttribute::reply` reads it and refuses the other |
+| `Ecdhe<C>`         | The house exchange: ECDH over a `HandshakeCurve`, whose OID is the OID of the curve and whose secret is the x-coordinate                                      |
+| `KeyExchangeError` | `Width`, `Malformed`, `Algorithm`, `Refused`, and `Encoding`. A handshake and a rekey raise it as `HandshakeError::KeyExchange`                               |
+
+An implementation of `KeyExchange` keeps these rules:
+
+- `REPLY` is `ReplyKind::Dh` when the reply is the responder's public key, and `ReplyKind::Kem` when it is a ciphertext, a hybrid's among them.
+- `static_key` MUST read every certificate key whose secret can produce a share of the exchange. `Ecdhe<C>` reads a key of its curve under `id-ecPublicKey`, `id-ecDH`, or `id-ecMQV` (RFC 5480 § 2.1.1, § 2.1.2). X25519 reads `id-X25519` and `id-Ed25519` keys, because one scalar serves both (RFC 7748 § 4.1). An exchange whose shares cannot collapse into a static key, such as ML-KEM, names `StaticKey = Infallible`.
+- `respond` and `complete` refuse a share only with a `KeyExchangeError`, and the refusal aborts the handshake. X25519 refuses an all-zero secret (RFC 8446 § 7.4.2).
+- `Pending` wipes its secret where it drops (CWE-226).
+- The secret of one exchange has one width, so the key schedule concatenates it unambiguously.
+- `strength` rates the exchange as its own standard does, and the strength floor reads it ([docs/security.md](security.md#strength-floor)).
+
+Each carrier holds a share in its own syntax:
+
+| Carrier                        | Syntax                                                                                                                                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The HPKE hello and reply       | An OCTET STRING with no identifier, because the negotiated profile names the exchange                                                                                                          |
+| The rekey request and response | An OCTET STRING, as in the HPKE flow                                                                                                                                                           |
+| The CMS opening                | The `agreementKey`, an `OriginatorPublicKey` under the OID of the exchange, or for `Ecdhe<C>` an `id-ecPublicKey` key on `C`. A parse refuses an identifier of another algorithm (`Algorithm`) |
+| The CMS Finished, DH reply     | An `OriginatorPublicKey` (RFC 5652 § 6.2.2) in the share's opening form, under `HANDSHAKE_SERVER_EPHEMERAL`, `1.3.6.1.4.1.64586.1.23`                                                          |
+| The CMS Finished, KEM reply    | `KemCiphertext ::= SEQUENCE { kem AlgorithmIdentifier, kemct OCTET STRING }` (RFC 9629 § 3) under `HANDSHAKE_SERVER_KEM_CIPHERTEXT`, `1.3.6.1.4.1.64586.1.28`                                  |
+
+The two reply attributes follow CMS, which splits key agreement from KEM recipients. A hybrid is a KEM (NIST SP 800-227 § 4.6) and writes `KemCiphertext`. A Finished that carries no reply attribute fails `MissingAttribute`, one that carries both fails `DuplicateAttribute`, and a reply in the carrier of the other kind fails `KeyExchange(Algorithm)`.
 
 ### Ephemeral keys
 
@@ -410,27 +447,28 @@ A handshake draws three ephemerals:
 | The client sends `R`              | In clear, as a field of the hello, as TLS 1.3 sends its key share | Sealed, as a field of the opening content |
 | The client draws its private half | In `start`                                                        | In `start`                                |
 | The client drops its private half | In `respond`, at the agreement                                    | In `respond`, at the agreement            |
-| The server drops its private half | In `reply`, at the agreement, before it encodes the reply         | In `reply`, at the agreement              |
+| The server drops its private half | In `reply`, inside `respond`, before it encodes the reply         | In `reply`, inside `respond`              |
 
-One parse reads every received ephemeral before any scalar multiplication:
+One parse of the exchange reads every received share before the exchange runs on it, and the client parses the server's share only once the reply's signature verifies. For `Ecdhe<C>`:
 
-- It refuses a malformed, off-curve, or identity point, and a point in a form that RFC 5480 § 2.2 refuses, the compact form `0x05` among them.
-- The HPKE hello and the HPKE reply carry their ephemeral in the compressed SEC 1 form, at the width the curve of the provider gives that form (SEC 1 v2.0 § 2.3.3). Each reader refuses a point of another width (`OctetStringLengthError`).
+- The parse refuses a malformed, off-curve, or identity point, and a point in a form that RFC 5480 § 2.2 refuses, the compact form `0x05` among them (`KeyExchange(Malformed)`).
+- The HPKE hello, the HPKE reply, and both rekey legs carry a point in the compressed SEC 1 form, at the width the curve gives that form (SEC 1 v2.0 § 2.3.3). Each reader refuses a point of another width (`KeyExchange(Width)`).
+- The CMS opening and the CMS Finished carry a point as an `id-ecPublicKey` key on the curve, and admit both SEC 1 forms.
 
-An ephemeral with the x-coordinate of its sender's static key would collapse the agreement into the static one, so each side refuses it:
+A share that collapses into a static key of its sender would collapse the agreement into the static one, so each side refuses it:
 
-| Comparison                                                                                                    | Home                                                  | When                                                    |
-| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
-| The client compares `E` with each server key that is a point of the handshake curve, the signing key included | `PeerStatics::server_ephemeral`                       | At the reply, before the agreement                      |
-| The server compares `R` with the key of the offered certificate                                               | `PeerStatics::admit_client`, which `Offer::new` calls | At the closing, once the identity opens, before the tag |
-| A rekey server compares `Ce` with the client's static key                                                     | `PeerStatics::client_ephemeral`                       | At the request                                          |
-| A rekey client compares `Se` with every static key of the server                                              | `PeerStatics::server_ephemeral`                       | At the response                                         |
+| Comparison                                                                                     | Home                                                  | When                                                    |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
+| The client compares `E` with each server key that `static_key` reads, the signing key included | `PeerStatics::server_ephemeral`                       | At the reply, before the agreement                      |
+| The server compares `R` with the key of the offered certificate                                | `PeerStatics::admit_client`, which `Offer::new` calls | At the closing, once the identity opens, before the tag |
+| A rekey server compares `Ce` with the client's static key                                      | `PeerStatics::client_ephemeral`                       | At the request                                          |
+| A rekey client compares `Se` with every static key of the server                               | `PeerStatics::server_ephemeral`                       | At the response                                         |
 
-- The comparison reads the x-coordinate, because ECDH keeps that coordinate alone. A key and its negation agree to one secret.
-- `PeerStatics` reads each static key once, when the peer is admitted. The client, and each rekey side, agrees only with the `DistinctPoint` it returns.
-- A server reads the client's static key only once the identity opens, so it agrees at the reply with the `OpenedPoint` it parsed. The pending server holds that one value, and the closing admits it. An anonymous client holds no static key.
+- `KeyShare::collapses_into` decides each comparison. ECDH keeps the x-coordinate alone, so for `Ecdhe<C>` a key and its negation agree to one secret.
+- `PeerStatics` reads each static key once, when the peer is admitted. The client, and each rekey side, agrees only with the `Distinct` share it returns.
+- A server reads the client's static key only once the identity opens, so it answers at the reply with the `OpenedShare` it parsed. The pending server holds that one value, and the closing admits it. An anonymous client holds no static key.
 - The CMS `kemct` derives the key-encryption key alone, so the server compares `R` alone.
-- A static key outside the group of the handshake curve collapses no agreement on it, so no comparison reads it. A signer on P-384 beside an agreement on secp256k1 leaves the client the key-agreement key alone to compare.
+- A certificate key that `static_key` reads as `None` collapses no agreement, so no comparison reads it. A signer on P-384 beside an exchange on secp256k1 leaves the client the key-agreement key alone to compare.
 
 ### Forward secrecy
 
@@ -448,7 +486,7 @@ The traffic keys, the receipt acknowledgement, the closing, and every rekey epoc
 
 ### Rekey
 
-Each renewal runs a fresh agreement. The client sends an ephemeral `Ce` on the request, and the server sends `Se` on the response:
+Each renewal runs a fresh key exchange. The client offers a share `Ce` on the request, and the server answers with `Se` on the response:
 
 ```text
 epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt = client_random || server_random, info = "tb/session/kdf/epoch/v1")
@@ -456,20 +494,20 @@ epoch_next = HKDF(u32be(32) || epoch || u32be(Ndh) || ee, salt = client_random |
 
 The formula names three terms:
 
-- `ee` is the ECDH output of the two rekey ephemerals.
-- `Ndh` is the width of `ee`, the field width of the curve (RFC 9180 § 4.1).
+- `ee` is the secret of the exchange of the two rekey shares.
+- `Ndh` is the width of `ee`, which the exchange fixes (RFC 9180 § 4.1).
 - `u32be(n)` is the 4-byte big-endian length of the input after it.
 
 A holder of one epoch secret lacks `ee`, so it derives nothing of the next epoch.
 
-| Rule                                                               | Enforced by                                                                                                                              |
-| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| The next epoch needs a rekey scalar                                | `EpochSecret::next` runs the agreement itself                                                                                            |
-| Both ephemerals are authenticated                                  | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns |
-| A peer ephemeral is a curve point, and never the peer's static key | `PeerStatics` yields a `DistinctPoint`, the one point type `EpochSecret::next` takes                                                     |
-| `Ce` and `Se` travel compressed, at the width of the curve         | Each side reads a leg at the compressed width of the curve and parses it before the pin, and the server pins `Se` as it sends it         |
-| The server drops its rekey scalar before it awaits                 | It agrees and drops its scalar before it awaits its authorizer, and holds the derived secret until the acknowledgement                   |
-| The client spends its rekey scalar before each await of a step     | `EpochSecret::next` takes the boxed scalar by value before the client awaits its approver                                                |
+| Rule                                                              | Enforced by                                                                                                                              |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| The next epoch needs the secret of a rekey exchange               | `EpochSecret::next` takes a `DistinctSecret`, which only a `Distinct` share's `complete` or `respond` returns                            |
+| Both ephemerals are authenticated                                 | The server signs a receipt over `H(hash \|\| request \|\| server_random \|\| Se)`, the request carries `Ce`, and the client countersigns |
+| A peer share never collapses into the peer's static key           | `PeerStatics` yields a `Distinct` share, the one share type that completes or answers a rekey exchange                                   |
+| `Ce` and `Se` travel as the octets of their shares                | Each side parses a leg with `KeyShare::from_octets`, the client after it verifies the receipt, and the server pins `Se` as it sends it   |
+| The server drops its rekey secret state before it awaits          | It answers the exchange before it awaits its authorizer, and holds the derived secret until the acknowledgement                          |
+| The client drops its pending exchange before each await of a step | It completes the exchange and drops the pending state before it awaits its approver                                                      |
 
 ### Traffic secrets
 
@@ -657,12 +695,12 @@ Each signature signs under a domain of its own. Neither Finished label is a pref
 
 Both transcripts bind both ephemerals:
 
-| Ephemeral        | Bound by                                                                        | Tampering fails at                                                                                   |
-| ---------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Server `E`, HPKE | A field of the `ServerHandshake`, which the reply signs                         | The reply signature. An off-curve point fails `InvalidPublicKey` at its parse                        |
-| Server `E`, CMS  | A transcript leg after the accepts and before the `certificates` field          | The server signature. A removed one fails `MissingAttribute`                                         |
-| Client `R`, HPKE | A field of the `ClientHello`, whose DER is the first leg                        | The client's check of the reply signature. An off-curve point fails `InvalidPublicKey` at the server |
-| Client `R`, CMS  | A field of the opening content, under the tag. The opening DER is the first leg | The opening's tag (`HandshakeError::Envelope`). An off-curve point fails `InvalidPublicKey`          |
+| Ephemeral        | Bound by                                                                        | Tampering fails at                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Server `E`, HPKE | A field of the `ServerHandshake`, which the reply signs                         | The reply signature. A share that fails its parse fails `KeyExchange` there                               |
+| Server `E`, CMS  | A transcript leg after the accepts and before the `certificates` field          | The server signature. A removed one fails `MissingAttribute`                                              |
+| Client `R`, HPKE | A field of the `ClientHello`, whose DER is the first leg                        | The client's check of the reply signature. A share that fails its parse fails `KeyExchange` at the server |
+| Client `R`, CMS  | A field of the opening content, under the tag. The opening DER is the first leg | The opening's tag (`HandshakeError::Envelope`). A share that fails its parse fails `KeyExchange`          |
 
 ## Signatures
 

@@ -19,8 +19,6 @@ pub(crate) use key::KeyIdentity;
 #[cfg(feature = "std")]
 pub use key::KeyIndex;
 pub(crate) use key::KeyList;
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-pub(crate) use key::Sec1Point;
 #[cfg(all(feature = "hpke", feature = "signature", feature = "ecdh"))]
 pub(crate) use peer::EllipticCurvePoint;
 #[cfg(all(feature = "hpke", feature = "signature"))]

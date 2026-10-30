@@ -23,8 +23,8 @@
 //! - [`floor`] holds its strength floor at the TCP transport, and refuses a mixed pair.
 //! - [`blocking`] runs a handshake and one exchange over the blocking TCP transport.
 //! - [`curve`] brings providers on P-256, P-384, and P-521, which run both
-//!   handshakes and a renewal. Its P-256 key signs a certificate that `cert!`
-//!   issues under a P-256 signature type.
+//!   handshakes and a renewal, and three outside key exchanges. Its P-256 key
+//!   signs a certificate that `cert!` issues under a P-256 signature type.
 //!
 //! These suites bring one part of the transport or the colony:
 //!
@@ -104,6 +104,7 @@ use tightbeam::crypto::cms::{
 	Recipient, RecipientKem,
 };
 use tightbeam::crypto::common::typenum::U32;
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::{Digest, Sha3_512};
 use tightbeam::crypto::hpke::{DhKem, HkdfSha256};
 use tightbeam::crypto::k256::ecdsa::{DerSignature, Signature, SigningKey, VerifyingKey};
@@ -113,9 +114,9 @@ use tightbeam::crypto::kdf::{Hkdf, KdfError, KdfFunction, KdfSalt};
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::{
-	AeadProvider, Aes128Wrap, Aes256Wrap, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider,
-	KdfProvider, Kek, KeyWrapAlgorithm, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
-	SigningProvider,
+	AeadProvider, Aes128Wrap, Aes256Wrap, CryptoProvider, DefaultCryptoProvider, DigestProvider, KdfProvider, Kek,
+	KeyExchangeProvider, KeyWrapAlgorithm, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
+	SecurityProfileDesc, SigningProvider,
 };
 use tightbeam::crypto::secret::{SecretSlice, ToInsecure};
 use tightbeam::crypto::sign::{
@@ -308,7 +309,7 @@ impl SecurityProfile for OutsideProfile {
 	type AeadOid = Aes128GcmOid;
 	type SignatureAlg = OutsideSignature;
 	type Kdf = OutsideKdf;
-	type Curve = Secp256k1;
+	type KeyExchange = Ecdhe<Secp256k1>;
 	type KeyWrapOid = Aes128Wrap;
 }
 
@@ -473,8 +474,8 @@ impl KdfProvider for OutsideProvider {
 	type Kdf = OutsideKdf;
 }
 
-impl CurveProvider for OutsideProvider {
-	type Curve = Secp256k1;
+impl KeyExchangeProvider for OutsideProvider {
+	type KeyExchange = Ecdhe<Secp256k1>;
 }
 
 impl CryptoProvider for OutsideProvider {
@@ -804,5 +805,17 @@ async fn the_house_provider_refuses_an_outside_seal() -> Result<(), Box<dyn std:
 
 	let refused = sealed.open::<DefaultCryptoProvider>(arrived, &opener, DATA).await;
 	assert!(matches!(refused, Err(EnvelopeError::ContentEncryptionAlgorithm)));
+	Ok(())
+}
+
+/// The DER of the descriptor of [`OutsideProfile`].
+const OUTSIDE_DESCRIPTOR: &str = "304ba00b060960864801650304020aa10b0609608648016503040106a20b060960864801650304030ca3\
+	0c060a2b06010401868d1f0302a40706052b8104000aa50b0609608648016503040105";
+
+/// The descriptor of [`OutsideProfile`] encodes as [`OUTSIDE_DESCRIPTOR`].
+#[test]
+fn the_outside_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+	let der = SecurityProfileDesc::from(&OutsideProfile).to_der()?;
+	assert_eq!(der, unhex(OUTSIDE_DESCRIPTOR));
 	Ok(())
 }

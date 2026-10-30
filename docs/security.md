@@ -31,7 +31,7 @@ This section drills down from [README §6.1](../README.md#61-securityprofile-tra
 | `AeadOid`       | `AssociatedOid`                | `aead`      | The AEAD cipher             |
 | `SignatureAlg`  | `SignatureAlgorithmIdentifier` | `signature` | The signature algorithm     |
 | `Kdf`           | `AssociatedOid`                | `kdf`       | The key derivation function |
-| `Curve`         | `AssociatedOid`                | `ecdh`      | The key-agreement curve     |
+| `KeyExchange`   | `AssociatedOid`                | `ecdh`      | The key exchange            |
 | `KeyWrapOid`    | `AssociatedOid`                | `aead`      | The key wrap                |
 
 The trait holds identifiers alone. A [crypto provider](#crypto-providers) runs the algorithms.
@@ -40,14 +40,14 @@ The trait holds identifiers alone. A [crypto provider](#crypto-providers) runs t
 
 Each cryptographic role is a trait of its own, so a component bounds on the roles it uses, such as `SigningProvider + DigestProvider`:
 
-| Role      | Trait             | Associated types            | Feature     | Provided methods                                  |
-| --------- | ----------------- | --------------------------- | ----------- | ------------------------------------------------- |
-| Digest    | `DigestProvider`  | `Digest`                    | `digest`    | `to_digest_algorithm_identifier`, `as_digestor`   |
-| AEAD      | `AeadProvider`    | `AeadCipher`                | `aead`      | `to_aead_algorithm_identifier`                    |
-| Key wrap  | `KeyWrapProvider` | `KeyWrap`                   | `aead`      |                                                   |
-| Signature | `SigningProvider` | `Signature`, `VerifyingKey` | `signature` | `to_signature_algorithm_identifier`               |
-| KDF       | `KdfProvider`     | `Kdf`                       | `kdf`       |                                                   |
-| Curve     | `CurveProvider`   | `Curve`                     | `ecdh`      |                                                   |
+| Role         | Trait                 | Associated types            | Feature     | Provided methods                                |
+| ------------ | --------------------- | --------------------------- | ----------- | ----------------------------------------------- |
+| Digest       | `DigestProvider`      | `Digest`                    | `digest`    | `to_digest_algorithm_identifier`, `as_digestor` |
+| AEAD         | `AeadProvider`        | `AeadCipher`                | `aead`      | `to_aead_algorithm_identifier`                  |
+| Key wrap     | `KeyWrapProvider`     | `KeyWrap`                   | `aead`      |                                                 |
+| Signature    | `SigningProvider`     | `Signature`, `VerifyingKey` | `signature` | `to_signature_algorithm_identifier`             |
+| KDF          | `KdfProvider`         | `Kdf`                       | `kdf`       |                                                 |
+| Key exchange | `KeyExchangeProvider` | `KeyExchange`               | `ecdh`      |                                                 |
 
 `CryptoProvider` composes the six. The KEM of a provider is its associated type `CryptoProvider::Kem`, a `RecipientKem`.
 
@@ -67,7 +67,7 @@ Each cryptographic role is a trait of its own, so a component bounds on the role
 Peers negotiate a `SecurityProfileDesc`: the six OIDs of a profile, which `From<&P>` builds from any `SecurityProfile`.
 
 - Each field is an `Option<ObjectIdentifier>`. `None` marks an algorithm whose feature the build of the sender disables.
-- The fields `digest`, `aead`, `signature`, `kdf`, `curve`, and `key_wrap` carry the context tags `[0]` to `[5]`, so each OID decodes into its own field when an earlier one is absent.
+- The fields `digest`, `aead`, `signature`, `kdf`, `key_exchange`, and `key_wrap` carry the context tags `[0]` to `[5]`, so each OID decodes into its own field when an earlier one is absent.
 
 ## Profile types
 
@@ -75,14 +75,14 @@ This section drills down from [README §6.2](../README.md#62-security-profile-ty
 
 `TightbeamProfile` is the profile of the reference provider, a unit struct with `Debug`, `Default`, `Clone`, and `Copy`. Its types are the ones a custom profile names to run the house algorithms:
 
-| Associated type | Type                 | Path                         |
-| --------------- | -------------------- | ---------------------------- |
-| `Digest`        | `Sha3_256`           | `tightbeam::crypto::hash`    |
-| `AeadOid`       | `Aes256GcmOid`       | `tightbeam::crypto::aead`    |
-| `SignatureAlg`  | `Secp256k1Signature` | `tightbeam::crypto::sign::ecdsa` |
-| `Kdf`           | `HkdfSha3_256`       | `tightbeam::crypto::kdf`     |
-| `Curve`         | `Secp256k1`          | `tightbeam::crypto::k256`    |
-| `KeyWrapOid`    | `Aes256Wrap`         | `tightbeam::crypto::profiles` |
+| Associated type | Type                 | Path                                                        |
+| --------------- | -------------------- | ----------------------------------------------------------- |
+| `Digest`        | `Sha3_256`           | `tightbeam::crypto::hash`                                   |
+| `AeadOid`       | `Aes256GcmOid`       | `tightbeam::crypto::aead`                                   |
+| `SignatureAlg`  | `Secp256k1Signature` | `tightbeam::crypto::sign::ecdsa`                            |
+| `Kdf`           | `HkdfSha3_256`       | `tightbeam::crypto::kdf`                                    |
+| `KeyExchange`   | `Ecdhe<Secp256k1>`   | `tightbeam::crypto::exchange` and `tightbeam::crypto::k256` |
+| `KeyWrapOid`    | `Aes256Wrap`         | `tightbeam::crypto::profiles`                               |
 
 - The crate also names `Aes128GcmOid`, `Aes128Wrap`, and `Aes192Wrap`, for a profile on a shorter key.
 - A profile that a message type names needs `SecurityProfile` alone. A profile that a provider runs also needs `Default`.
@@ -219,7 +219,7 @@ This section drills down from [README §6.5](../README.md#65-crypto-provider-sys
 | `AeadOid`      | `<Self::AeadCipher as AeadAlgorithm>::Oid` |
 | `SignatureAlg` | `Self::Signature`                          |
 | `Kdf`          | `Self::Kdf`                                |
-| `Curve`        | `Self::Curve`                              |
+| `KeyExchange`  | `Self::KeyExchange`                        |
 | `KeyWrapOid`   | `<Self::KeyWrap as KeyWrapAlgorithm>::Oid` |
 
 `AeadKeySize<P>` is the key size of the AEAD cipher of `P`, as a `typenum` number. The compile-fail tests `tests/compile/provider_profile_mismatch.rs` and `tests/compile/provider_kek_size_mismatch.rs` hold both bounds.
@@ -228,16 +228,16 @@ This section drills down from [README §6.5](../README.md#65-crypto-provider-sys
 
 An implementor brings its own algorithm as a type that implements the trait of its role:
 
-| Role          | Associated type                  | The type implements                                                                    | House type              |
-| ------------- | -------------------------------- | -------------------------------------------------------------------------------------- | ----------------------- |
-| Digest        | `DigestProvider::Digest`         | `Digest`, `AssociatedOid`, `BlockSizeUser`, and `CoreProxy` over a `HashCore`          | `Sha3_256`              |
-| AEAD          | `AeadProvider::AeadCipher`       | `AeadAlgorithm`, and `ContentEncryption` to seal an envelope                           | `Aes256Gcm`             |
-| Key wrap      | `KeyWrapProvider::KeyWrap`       | `KeyWrapAlgorithm`                                                                     | `Aes256Wrap`            |
-| Signature     | `SigningProvider::Signature`     | `SignatureEncoding`, `SignatureAlgorithmIdentifier`, and `CanonicalForm`               | `Secp256k1Signature`    |
-| Verifying key | `SigningProvider::VerifyingKey`  | `PrehashVerifier` of the signature                                                     | `Secp256k1VerifyingKey` |
-| KDF           | `KdfProvider::Kdf`               | `KdfFunction` and `AssociatedOid`                                                      | `HkdfSha3_256`          |
-| Curve         | `CurveProvider::Curve`           | `Curve`, `CurveArithmetic`, and `AssociatedOid`, and `HandshakeCurve` for a handshake  | `Secp256k1`             |
-| KEM           | `CryptoProvider::Kem`            | `RecipientKem`                                                                         | `DhKemSecp256k1`        |
+| Role          | Associated type                    | The type implements                                                           | House type              |
+| ------------- | ---------------------------------- | ----------------------------------------------------------------------------- | ----------------------- |
+| Digest        | `DigestProvider::Digest`           | `Digest`, `AssociatedOid`, `BlockSizeUser`, and `CoreProxy` over a `HashCore` | `Sha3_256`              |
+| AEAD          | `AeadProvider::AeadCipher`         | `AeadAlgorithm`, and `ContentEncryption` to seal an envelope                  | `Aes256Gcm`             |
+| Key wrap      | `KeyWrapProvider::KeyWrap`         | `KeyWrapAlgorithm`                                                            | `Aes256Wrap`            |
+| Signature     | `SigningProvider::Signature`       | `SignatureEncoding`, `SignatureAlgorithmIdentifier`, and `CanonicalForm`      | `Secp256k1Signature`    |
+| Verifying key | `SigningProvider::VerifyingKey`    | `PrehashVerifier` of the signature                                            | `Secp256k1VerifyingKey` |
+| KDF           | `KdfProvider::Kdf`                 | `KdfFunction` and `AssociatedOid`                                             | `HkdfSha3_256`          |
+| Key exchange  | `KeyExchangeProvider::KeyExchange` | `KeyExchange`, whose `Offer` and `Reply` are each a `KeyShare` of it          | `Ecdhe<Secp256k1>`      |
+| KEM           | `CryptoProvider::Kem`              | `RecipientKem`                                                                | `DhKemSecp256k1`        |
 
 The digest, the cipher, the signature, and the verifying key are also `Send + Sync`, and the digest is also `Clone + Default`. Each role type keeps the contract of its trait:
 
@@ -246,7 +246,7 @@ The digest, the cipher, the signature, and the verifying key are also `Send + Sy
 - **Key wrap.** `KeyWrapAlgorithm` names `Oid` and `KekSize`, and runs `wrap`, `unwrap`, and `unwrap_into` under a `Kek` of that size (RFC 3394).
 - **Signature.** The signature parses its own encoding alone and names its canonical form: for ECDSA, the DER `ECDSA-Sig-Value` with a low `s`.
 - **KDF.** `KdfFunction::derive_dynamic_key` takes a key size at run time, and wipes the pseudorandom key, each chained output block, and each buffered input when it ends (NIST SP 800-56C Rev. 2 §5.1).
-- **Curve.** Every curve that is a `DhKemCurve` with an OID is a `HandshakeCurve`, such as secp256k1, P-256, P-384, and P-521. Its shared secret is the x-coordinate, as wide as the field (SEC 1 v2.0 §3.3.1).
+- **Key exchange.** `KeyExchange` runs the ephemeral exchange of a handshake and of each rekey in the shape of a KEM: `offer`, `respond`, and `complete` (RFC 9180 §4.1). It reads the static keys a share must differ from, and rates its own strength. `Ecdhe<C>` runs ECDH over any `HandshakeCurve`, such as secp256k1, P-256, P-384, and P-521, and its secret is the x-coordinate, as wide as the field (SEC 1 v2.0 §3.3.1). [The handshake](handshake.md#key-exchange) states the contract of an exchange and the carriers of its shares.
 - **KEM.** `RecipientKem` names its `OID`, the `keyUsage` bit `USAGE` of its certificate, its `PublicKey`, and its `PrivateKey`, a `KeyBackend`. It runs `encapsulate` and `decapsulate` (RFC 9180 §4). A DHKEM names `DiffieHellman` as its private key.
 
 ### The reference provider
@@ -257,7 +257,7 @@ The digest, the cipher, the signature, and the verifying key are also `Send + Sy
 
 The layers above the envelope take the provider as a type parameter:
 
-- **Handshake.** `HandshakeProvider` is the one bound of the handshake layer. It is a `CryptoProvider` whose curve is a `HandshakeCurve`, whose cipher is `KeyInit + ContentEncryption`, whose signature parses from its bytes, and whose verifying key parses from an SPKI. The verifying key names no curve, so a provider may sign on one curve and agree on another. Every provider that meets the bounds is a handshake provider, and it runs both flows with no HPKE suite.
+- **Handshake.** `HandshakeProvider` is the one bound of the handshake layer. It is a `CryptoProvider` whose cipher is `KeyInit + ContentEncryption`, whose signature parses from its bytes, and whose verifying key parses from an SPKI. The key exchange is a role of its own, so a provider may sign under one algorithm and exchange keys under another. Every provider that meets the bounds is a handshake provider, and it runs both flows with no HPKE suite.
 - **Transport.** `TokioListener<P>` and `TcpListener<L, P>` take `DefaultCryptoProvider` as the default of `P`. A call names `P` when no other type in the call names it, such as `TokioListener::<DefaultCryptoProvider>::bind_cleartext(addr)`, `TcpListener::<_, DefaultCryptoProvider>::from_listener_cleartext(listener)`, or `TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity)`.
 - **Signatures.** `SigningIdentity::with_provider::<P>` signs under the signature of `P`, and `ProviderPolicy::<P>` verifies it.
 
@@ -268,8 +268,9 @@ Each handshake endpoint holds its profile to the floor of its provider. [The han
 | Item                             | Kind                  | Rule                                                                                                        |
 | -------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `ProfileStrengthPolicy`          | Trait                 | `meets_floor(&ProfileStrength) -> bool`                                                                     |
-| `ProfileStrength`                | Struct                | `descriptor`, `aead_key_bytes`, `digest_bytes`, and `curve_field_bytes`, read from the types of the provider |
-| `DefaultStrengthFloor`           | Policy                | Each of the three sizes is 32 bytes or more                                                                 |
+| `ProfileStrength`                | Struct                | `descriptor`, `aead_key_bytes`, `digest_bytes`, and `key_exchange`, read from the types of the provider     |
+| `SecurityStrength`               | Struct                | A strength in bits, one constant for each row of NIST SP 800-57 Part 1 Rev. 5 Table 2                       |
+| `DefaultStrengthFloor`           | Policy                | The AEAD key and the digest output are 32 bytes or more, and the key exchange rates 128 bits or more        |
 | `NoStrengthFloor`                | Policy                | Admits every profile                                                                                        |
 | `CryptoProvider::strength_floor` | Provided function     | `DefaultStrengthFloor`, unless the provider names another policy                                            |
 | `RunnableProfile::<P>::strength` | Method                | The strength of a profile that `P` runs                                                                     |
@@ -283,12 +284,13 @@ A provider on AES-128-GCM pairs it with AES-128 key wrap, whose KEK is as long a
 
 ```rust
 use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid};
+use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::hpke::DhKemSecp256k1;
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::kdf::HkdfSha3_256;
-use tightbeam::crypto::profiles::{AeadProvider, Aes128Wrap, CryptoProvider, CurveProvider, DefaultStrengthFloor};
-use tightbeam::crypto::profiles::{DigestProvider, KdfProvider, KeyWrapProvider, NoStrengthFloor};
+use tightbeam::crypto::profiles::{AeadProvider, Aes128Wrap, CryptoProvider, DefaultStrengthFloor};
+use tightbeam::crypto::profiles::{DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider, NoStrengthFloor};
 use tightbeam::crypto::profiles::{ProfileStrengthPolicy, SecurityProfile, SigningProvider};
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 use tightbeam::transport::handshake::negotiation::RunnableProfile;
@@ -302,7 +304,7 @@ impl SecurityProfile for Aes128Profile {
 	type AeadOid = Aes128GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type Kdf = HkdfSha3_256;
-	type Curve = Secp256k1;
+	type KeyExchange = Ecdhe<Secp256k1>;
 	type KeyWrapOid = Aes128Wrap;
 }
 
@@ -332,8 +334,8 @@ impl KdfProvider for Aes128Provider {
 	type Kdf = HkdfSha3_256;
 }
 
-impl CurveProvider for Aes128Provider {
-	type Curve = Secp256k1;
+impl KeyExchangeProvider for Aes128Provider {
+	type KeyExchange = Ecdhe<Secp256k1>;
 }
 
 impl CryptoProvider for Aes128Provider {

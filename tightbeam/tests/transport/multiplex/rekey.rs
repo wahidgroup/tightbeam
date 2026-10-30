@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tightbeam::at_least;
+use tightbeam::crypto::exchange::{EcdheShare, KeyShare};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::OctetString;
@@ -142,10 +143,11 @@ async fn await_matching_receipt(handle: &MuxHandle, expected: &StoredReceipt) ->
 }
 
 /// A hand-built rekey request that carries `seed` as its randomness and a
-/// fresh ephemeral point.
+/// fresh share of the house exchange.
 fn rekey_request_envelope(seed: u8) -> Result<TransportEnvelope, TightBeamError> {
 	let ephemeral = k256::SecretKey::random(&mut rand_core::OsRng).public_key();
-	let package = MuxRekeyRequestPackage::new(vec![seed; 32], &ephemeral)?;
+	let share = EcdheShare::from(ephemeral);
+	let package = MuxRekeyRequestPackage::new(vec![seed; 32], share.to_octets())?;
 	Ok(MuxEnvelope::RekeyRequest(package).into())
 }
 
