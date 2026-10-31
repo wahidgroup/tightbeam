@@ -4,16 +4,16 @@
 //! the deadlock of the process with no butler. Each process reaches every state
 //! it defines.
 
-#![cfg(feature = "testing-fdr")]
-
-use core::error::Error;
 use std::collections::HashSet;
 
-use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::macros::BuiltAssertSpec;
+use tightbeam::tb_cases;
+use tightbeam::testing::fdr::{Decision, DefaultFdrExplorer, FdrConfig};
 use tightbeam::testing::specs::csp::{Process, ProcessBuildError, State};
-use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
+use tightbeam::trace::{ConsumedTrace, TraceCollector};
 use tightbeam::urn::Urn;
+use tightbeam::TightBeamError;
+
+use crate::common::result::TestResult;
 
 pub(crate) const EATS: Urn<'static> = tightbeam::urn!("test", "event:diners/eats");
 pub(crate) const GETS_UP: Urn<'static> = tightbeam::urn!("test", "event:diners/gets-up");
@@ -24,23 +24,61 @@ pub(crate) const PUTS_DOWN_RIGHT: Urn<'static> = tightbeam::urn!("test", "event:
 pub(crate) const SITS: Urn<'static> = tightbeam::urn!("test", "event:diners/sits");
 pub(crate) const THINKS: Urn<'static> = tightbeam::urn!("test", "event:diners/thinks");
 
-fn build_fdr_config(
-	specs: impl IntoIterator<Item = Process>,
-	seeds: u32,
-	max_depth: usize,
-	max_internal_run: usize,
-	timeout_ms: u64,
-) -> FdrConfig {
-	let specs: Vec<Process> = specs.into_iter().collect();
-	FdrConfig {
-		seeds,
-		max_depth,
-		max_internal_run,
-		timeout_ms,
-		specs,
-		fail_fast: true,
-		..Default::default()
+/// The bound of an exploration, which covers two cycles and the start of a
+/// third. A walk keeps each target of the event it takes, so its work doubles
+/// at each nondeterministic edge, and the default bound of 128 spends the state
+/// budget of a walk and leaves the deadlock check undecided.
+const WALK_DEPTH: usize = 18;
+
+/// The builder of a philosophers process.
+type ProcessBuilder = fn() -> Result<Process, ProcessBuildError>;
+
+/// One philosopher thinks, sits, eats, and gets up.
+const ONE_CYCLE: &[Urn<'static>] = &[
+	THINKS,
+	SITS,
+	PICKS_LEFT,
+	PICKS_RIGHT,
+	EATS,
+	PUTS_DOWN_LEFT,
+	PUTS_DOWN_RIGHT,
+	GETS_UP,
+];
+
+/// One philosopher runs a cycle, and then the other runs a cycle.
+const TWO_CYCLES: &[Urn<'static>] = &[
+	THINKS,
+	SITS,
+	PICKS_LEFT,
+	PICKS_RIGHT,
+	EATS,
+	PUTS_DOWN_LEFT,
+	PUTS_DOWN_RIGHT,
+	GETS_UP,
+	THINKS,
+	SITS,
+	PICKS_LEFT,
+	PICKS_RIGHT,
+	EATS,
+	PUTS_DOWN_LEFT,
+	PUTS_DOWN_RIGHT,
+	GETS_UP,
+];
+
+/// Each philosopher sits and picks up its left fork.
+const BOTH_LEFT: &[Urn<'static>] = &[THINKS, SITS, PICKS_LEFT, THINKS, SITS, PICKS_LEFT];
+
+/// The process of a run that records each event of `run` in order, as a
+/// scenario hands its trace to refinement.
+fn recorded(run: &[Urn<'static>]) -> Result<Process, TightBeamError> {
+	let collector = TraceCollector::new();
+	for event in run {
+		collector.event(event)?;
 	}
+
+	let mut trace = ConsumedTrace::new();
+	trace.populate_from_collector(&collector);
+	Ok(trace.to_process())
 }
 
 /// The states of `process` that no path from its initial state reaches.
@@ -58,19 +96,6 @@ fn unreachable_states(process: &Process) -> HashSet<State> {
 	}
 
 	process.states().difference(&reached).copied().collect()
-}
-
-/// The configuration that grades `spec`, refines the run against `process`
-/// under the FDR bounds of `fdr`, and expects `expect`.
-fn philosophers_config(
-	spec: &'static BuiltAssertSpec,
-	process: Result<Process, ProcessBuildError>,
-	fdr: impl FnOnce(Process) -> FdrConfig,
-	expect: Expect,
-) -> Result<ScenarioConfig, Box<dyn Error>> {
-	let fdr = fdr(process?);
-	let builder = ScenarioConfig::builder().with_spec(spec).with_fdr(fdr);
-	Ok(builder.with_expect(expect).build()?)
 }
 
 // The dining philosophers process, simplified to two philosophers.
@@ -146,7 +171,7 @@ tightbeam::tb_process_spec! {
 
 		// The deadlock: each philosopher holds a left fork, and neither can
 		// pick up a right fork.
-		Deadlock => {}, // A terminal state with an empty set of transitions.
+		Deadlock => {},
 		P1Sitting_P2HasBoth => { EATS => P1Sitting_P2Eating },
 		P1Sitting_P2Eating => { PUTS_DOWN_LEFT => P1Sitting_P2HasRight },
 		P1Sitting_P2HasRight => { PUTS_DOWN_RIGHT => P1Sitting_P2Finished },
@@ -160,7 +185,7 @@ tightbeam::tb_process_spec! {
 		P1Finished_P2HasRight => { PUTS_DOWN_RIGHT => P1Finished_P2Finished },
 		P1Finished_P2Finished => { GETS_UP => P1Finished_P2Idle, GETS_UP => P1Idle_P2Finished },
 	}
-	terminal { BothIdle, Deadlock, P1Finished_P2Finished }
+	terminal { BothIdle, P1Finished_P2Finished }
 	annotations { description: "Dining philosophers (2 philosophers, deadlock-prone) - models fork sharing constraint" }
 }
 
@@ -239,182 +264,79 @@ tightbeam::tb_process_spec! {
 	annotations { description: "Deadlock-free dining philosophers (butler ensures mutual exclusion - only one can sit at a time)" }
 }
 
-// Test 1: a valid trace refines the process.
+// Test 1: refinement decides whether a process can perform a run.
 
-// In the valid trace, one philosopher completes a full cycle.
-tightbeam::tb_assert_spec! {
-	pub ValidPhilosopherSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(THINKS, tightbeam::exactly!(1)),
-			(SITS, tightbeam::exactly!(1)),
-			(PICKS_LEFT, tightbeam::exactly!(1)),
-			(PICKS_RIGHT, tightbeam::exactly!(1)),
-			(EATS, tightbeam::exactly!(1)),
-			(PUTS_DOWN_LEFT, tightbeam::exactly!(1)),
-			(PUTS_DOWN_RIGHT, tightbeam::exactly!(1)),
-			(GETS_UP, tightbeam::exactly!(1))
-		]
-	},
-}
+// Trace refinement accepts a run that a philosophers process can perform. The
+// butler seats one philosopher at a time, so it refutes the run where both
+// philosophers hold their left fork.
+tb_cases! {
+	fn refinement_decides_whether_a_philosophers_process_can_perform_a_run(
+		(process, run, decided): (ProcessBuilder, &'static [Urn<'static>], Decision)
+	) -> TestResult {
+		let spec = process()?;
+		let subject = recorded(run)?;
+		let config = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
 
-tightbeam::tb_scenario! {
-	name: test_philosophers_valid_trace_refinement,
-	config: philosophers_config(
-		ValidPhilosopherSpec::latest(),
-		DiningPhilosophers::process(),
-		|process| build_fdr_config([process], 4, 16, 8, 500),
-		Expect::Pass,
-	),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			// One philosopher completes a full cycle.
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			trace.event(PICKS_RIGHT)?;
-			trace.event(EATS)?;
-			trace.event(PUTS_DOWN_LEFT)?;
-			trace.event(PUTS_DOWN_RIGHT)?;
-			trace.event(GETS_UP)?;
-			Ok(())
-		}
+		let verdict = explorer.explore()?;
+		assert_eq!(verdict.trace_refines, decided);
+		Ok(())
+	}
+	cases {
+		/// The process with no butler runs one cycle.
+		one_cycle_with_no_butler => (DiningPhilosophers::process, ONE_CYCLE, Decision::Holds),
+		/// The process with no butler reaches its deadlock.
+		the_deadlock_with_no_butler => (DiningPhilosophers::process, BOTH_LEFT, Decision::Holds),
+		/// The process with a butler runs one cycle and then the other.
+		two_cycles_in_turn_with_a_butler => (DeadlockFreePhilosophers::process, TWO_CYCLES, Decision::Holds),
+		/// The butler keeps the second philosopher from its seat, so the
+		/// process with a butler refuses the second `SITS`.
+		the_deadlock_with_a_butler => (DeadlockFreePhilosophers::process, BOTH_LEFT, Decision::Refuted),
 	}
 }
 
-// Test 2: a deadlock trace refines the process that allows it.
+// Test 2: exploration decides whether a process deadlocks.
 
-// In the deadlock trace, both philosophers pick up their left fork. The trace
-// refines DiningPhilosophers, whose spec allows the deadlock.
-tightbeam::tb_assert_spec! {
-	pub DeadlockPhilosopherSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(THINKS, tightbeam::exactly!(2)),
-			(SITS, tightbeam::exactly!(2)),
-			(PICKS_LEFT, tightbeam::exactly!(2))
-		]
-	},
-}
+// Exploration finds the deadlock of the process with no butler at the state
+// where each philosopher holds its left fork.
+tb_cases! {
+	fn exploration_decides_whether_a_philosophers_process_deadlocks(
+		(process, decided): (ProcessBuilder, (Decision, Option<State>))
+	) -> TestResult {
+		let subject = process()?;
+		let config = FdrConfig { max_depth: WALK_DEPTH, ..FdrConfig::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
 
-tightbeam::tb_scenario! {
-	name: test_philosophers_deadlock_trace_refinement,
-	config: philosophers_config(
-		DeadlockPhilosopherSpec::latest(),
-		DiningPhilosophers::process(),
-		|process| build_fdr_config([process], 1, 10, 8, 2000),
-		Expect::Pass,
-	),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			// P1 picks up its left fork, and then P2 picks up its left fork.
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			Ok(())
-		}
+		let verdict = explorer.explore()?;
+		let stuck = verdict.deadlock_witness.map(|(_, _, state)| state);
+		assert_eq!((verdict.deadlock_free, stuck), decided);
+		Ok(())
+	}
+	cases {
+		/// Each philosopher can hold its left fork, so the process deadlocks.
+		with_no_butler => (DiningPhilosophers::process, (Decision::Refuted, Some(State("Deadlock")))),
+		/// The butler seats one philosopher at a time, so the process is free
+		/// of deadlock.
+		with_a_butler => (DeadlockFreePhilosophers::process, (Decision::Holds, None)),
 	}
 }
 
-// Test 3: a deadlock-free trace refines the butler process.
+// Test 3: each process reaches every state that it defines.
 
-// In the deadlock-free trace, the philosophers complete their cycles in turn.
-tightbeam::tb_assert_spec! {
-	pub DeadlockFreePhilosopherSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(THINKS, tightbeam::exactly!(2)),
-			(SITS, tightbeam::exactly!(2)),
-			(PICKS_LEFT, tightbeam::exactly!(2)),
-			(PICKS_RIGHT, tightbeam::exactly!(2)),
-			(EATS, tightbeam::exactly!(2)),
-			(PUTS_DOWN_LEFT, tightbeam::exactly!(2)),
-			(PUTS_DOWN_RIGHT, tightbeam::exactly!(2)),
-			(GETS_UP, tightbeam::exactly!(2))
-		]
-	},
-}
-
-tightbeam::tb_scenario! {
-	name: test_philosophers_deadlock_free_refinement,
-	config: philosophers_config(
-		DeadlockFreePhilosopherSpec::latest(),
-		DeadlockFreePhilosophers::process(),
-		|process| build_fdr_config([process], 4, 18, 8, 500),
-		Expect::Pass,
-	),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			// P1 completes its cycle, then P2, because the butler lets one
-			// philosopher sit at a time.
-			// The cycle of P1.
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			trace.event(PICKS_RIGHT)?;
-			trace.event(EATS)?;
-			trace.event(PUTS_DOWN_LEFT)?;
-			trace.event(PUTS_DOWN_RIGHT)?;
-			trace.event(GETS_UP)?;
-			// The cycle of P2.
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			trace.event(PICKS_RIGHT)?;
-			trace.event(EATS)?;
-			trace.event(PUTS_DOWN_LEFT)?;
-			trace.event(PUTS_DOWN_RIGHT)?;
-			trace.event(GETS_UP)?;
-			Ok(())
-		}
+// A philosophers process reaches each state that it defines from its initial
+// state.
+tb_cases! {
+	fn a_philosophers_process_reaches_every_state_it_defines(
+		process: ProcessBuilder
+	) -> TestResult {
+		let unreachable = unreachable_states(&process()?);
+		assert_eq!(unreachable, HashSet::new());
+		Ok(())
 	}
-}
-
-// Test 4: a deadlock trace violates the deadlock-free spec.
-
-// The deadlock trace, in which both philosophers pick up their left fork,
-// fails refinement against DeadlockFreePhilosophers.
-tightbeam::tb_scenario! {
-	name: test_philosophers_deadlock_violates_deadlock_free,
-	config: philosophers_config(
-		DeadlockPhilosopherSpec::latest(),
-		DeadlockFreePhilosophers::process(),
-		|process| build_fdr_config([process], 4, 16, 8, 500),
-		Expect::Violation(Layer::Refinement),
-	),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| {
-			// P1 picks up its left fork, and then P2 picks up its left fork.
-			// The butler seats one philosopher at a time, so the trace fails.
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			trace.event(THINKS)?;
-			trace.event(SITS)?;
-			trace.event(PICKS_LEFT)?;
-			Ok(())
-		}
+	cases {
+		/// The process with no butler reaches every state it defines.
+		with_no_butler => DiningPhilosophers::process,
+		/// The process with a butler reaches every state it defines.
+		with_a_butler => DeadlockFreePhilosophers::process,
 	}
-}
-
-// Test 5: each process reaches every state that it defines.
-
-#[test]
-fn the_dining_philosophers_reach_every_state_they_define() -> Result<(), Box<dyn Error>> {
-	let unreachable = unreachable_states(&DiningPhilosophers::process()?);
-	assert_eq!(unreachable, HashSet::new());
-	Ok(())
-}
-
-#[test]
-fn the_philosophers_with_a_butler_reach_every_state_they_define() -> Result<(), Box<dyn Error>> {
-	let unreachable = unreachable_states(&DeadlockFreePhilosophers::process()?);
-	assert_eq!(unreachable, HashSet::new());
-	Ok(())
 }

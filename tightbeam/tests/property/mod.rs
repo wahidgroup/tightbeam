@@ -5,13 +5,6 @@
 //! tests fix the field combination they happen to name, so they cover the
 //! shapes someone thought of. These generate the shape.
 
-#![cfg(all(
-	feature = "testing-property",
-	feature = "std",
-	feature = "sha3",
-	feature = "signature"
-))]
-
 #[cfg(feature = "colony")]
 mod colony;
 #[cfg(all(feature = "tokio", feature = "transport-multiplex"))]
@@ -93,9 +86,8 @@ fn built(
 
 	let mut frame = builder.build().expect("parts the version carries build");
 	if signed {
-		frame
-			.attach_signer_info(TestSigner::info())
-			.expect("a version that carries a signature accepts one");
+		let attached = frame.attach_signer_info(TestSigner::info());
+		attached.expect("a version that carries a signature accepts one");
 	}
 
 	frame
@@ -136,8 +128,8 @@ proptest! {
 		content in ".{0,256}",
 	) {
 		let frame = built(version, &id, order, &content, witnessed, signed);
-		let encoded = frame.to_der().expect("a built frame encodes");
-		let decoded = Frame::from_der(&encoded).expect("what the encoder wrote, the decoder reads");
+		let encoded = frame.to_der()?;
+		let decoded = Frame::from_der(&encoded)?;
 		prop_assert_eq!(frame, decoded);
 	}
 
@@ -147,8 +139,7 @@ proptest! {
 	fn a_matrix_and_a_flag_set_read_back_nine_bytes(bytes in prop::collection::vec(any::<u8>(), 9)) {
 		let matrix = Matrix::<3>::try_from(bytes.as_slice()).map(row_major);
 		let flags = Flags::<9>::try_from(bytes.as_slice()).map(Vec::<u8>::from);
-		prop_assert_eq!(matrix, Ok(bytes.clone()));
-		prop_assert_eq!(flags, Ok(bytes));
+		prop_assert_eq!((matrix, flags), (Ok(bytes.clone()), Ok(bytes)));
 	}
 
 	/// A matrix and a flag set both refuse every length but nine.
@@ -159,8 +150,9 @@ proptest! {
 		let len = bytes.len();
 		let matrix = Matrix::<3>::try_from(bytes.as_slice()).map(row_major);
 		let flags = Flags::<9>::try_from(bytes.as_slice()).map(Vec::<u8>::from);
-		prop_assert_eq!(matrix, Err(MatrixError::LengthMismatch { n: 3, len }));
-		prop_assert_eq!(flags, Err(FlagsError::LengthMismatch { expected: 9, len }));
+		let matrix_refusal = Err(MatrixError::LengthMismatch { n: 3, len });
+		let flags_refusal = Err(FlagsError::LengthMismatch { expected: 9, len });
+		prop_assert_eq!((matrix, flags), (matrix_refusal, flags_refusal));
 	}
 
 	/// What a URN displays, the parser reads back as the same URN, for any NID
@@ -219,7 +211,8 @@ proptest! {
 	) {
 		let (commitment, opening) = Opening::prove::<Sha3_256, _>(&TestMessage::sample(Some(&body)), &salt)?;
 		let (other, _) = Opening::prove::<Sha3_256, _>(&TestMessage::sample(Some(&other_body)), &other_salt)?;
-		prop_assert!(opening.verify::<Sha3_256>(&commitment)?);
-		prop_assert_eq!(opening.verify::<Sha3_256>(&other)?, (body, salt) == (other_body, other_salt));
+		let same = (body, salt) == (other_body, other_salt);
+		let verified = (opening.verify::<Sha3_256>(&commitment)?, opening.verify::<Sha3_256>(&other)?);
+		prop_assert_eq!(verified, (true, same));
 	}
 }

@@ -96,14 +96,16 @@ pub struct FdrVerdict {
 	///
 	/// A seed refutes it at a visited state from which a run of hidden events
 	/// reaches a cycle of hidden events, or at a run of more than
-	/// `max_internal_run` hidden events.
+	/// `max_internal_run` hidden events. A walk that stops at its budget of
+	/// states leaves an unrefuted freedom [`Decision::Unknown`].
 	pub divergence_free: Decision,
 
 	/// Deadlock freedom, the absence of an unexpected STOP state.
 	///
 	/// A run under fault injection leaves it unasserted, because that run
 	/// measures what the faults cause. Such a run records a deadlock in
-	/// [`FdrVerdict::deadlock_witness`] alone.
+	/// [`FdrVerdict::deadlock_witness`] alone. A walk that stops at its budget
+	/// of states leaves an unrefuted freedom [`Decision::Unknown`].
 	pub deadlock_free: Decision,
 
 	/// Schedulability, which holds when each configured spec that declares a
@@ -217,6 +219,17 @@ pub struct FdrVerdict {
 }
 
 impl FdrVerdict {
+	/// Leaves open each freedom that holds, for a run with a walk that stopped
+	/// at its budget of states. A refuted freedom keeps its witness.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn leave_freedom_open(&mut self) {
+		for freedom in [&mut self.deadlock_free, &mut self.divergence_free] {
+			if *freedom == Decision::Holds {
+				*freedom = Decision::Unknown;
+			}
+		}
+	}
+
 	/// Every assertion this verdict carries.
 	///
 	/// The pattern names every field, so a new field breaks the build until

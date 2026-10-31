@@ -1,20 +1,7 @@
-//! Timing verification integration tests
+//! The integration tests of timing verification.
 //!
-//! These tests validate timing verification in integration scenarios:
-//! - Timing constraints in CSP processes
-//! - Timing verification with FDR trace refinement
-//! - Combined timing + CSP + FDR scenarios
-//!
-//! Test Plan:
-//! 1. Simple real-time process with WCET constraints
-//! 2. Process with deadline constraints (start/end pairs)
-//! 3. Process with jitter constraints
-//! 4. Process with path-based WCET constraints
-//! 5. Process with slack constraints
-//! 6. Combined constraints (WCET + deadline + jitter)
-//! 7. Timing violations detected during FDR exploration
-//! 8. Timing verification with actual instrumentation events
+//! - `wcet` holds the durations that a scenario records to the WCET bounds of a CSP process.
+//! - `deadline` holds the branches of an FDR exploration to the deadline of a CSP process.
 
-#![cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
-
+mod deadline;
 mod wcet;

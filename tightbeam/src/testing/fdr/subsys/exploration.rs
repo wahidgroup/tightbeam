@@ -21,6 +21,13 @@ use crate::testing::fdr::config::{InjectedFaultRecord, WalkFaults};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::TimingConstraints;
 
+/// The most states that one walk takes from its queue.
+///
+/// A walk keeps each target of a nondeterministic event, so a cycle through
+/// such events doubles the branches of the walk up to the depth bound. The
+/// budget bounds the work and the memory of a walk at any depth.
+const MAX_WALK_STATES: usize = 1 << 14;
+
 /// The default exploration engine, which walks one process once per seed and
 /// keeps the result of each seed.
 pub struct DefaultExplorationEngine<'a> {
@@ -34,6 +41,8 @@ pub struct DefaultExplorationEngine<'a> {
 	visited_states: HashSet<State>,
 	/// The count of branches pruned for timing violations across all seeds.
 	timing_pruned: usize,
+	/// Whether a walk stopped at [`MAX_WALK_STATES`].
+	cut_short: bool,
 	/// The divergent states of the process, which the first walk computes and
 	/// each later walk reads.
 	divergent: OnceLock<DivergentStates>,
@@ -47,6 +56,8 @@ struct SeedWalk {
 	visited: HashSet<State>,
 	/// The count of the branches that the walk pruned for timing violations.
 	timing_pruned: usize,
+	/// Whether the walk stopped at [`MAX_WALK_STATES`].
+	cut_short: bool,
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
@@ -59,6 +70,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 			seed_results: Vec::new(),
 			visited_states: HashSet::new(),
 			timing_pruned: 0,
+			cut_short: false,
 			divergent: OnceLock::new(),
 		}
 	}
@@ -83,6 +95,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 	fn absorb(&mut self, walk: SeedWalk) -> SeedResult {
 		self.visited_states.extend(walk.visited);
 		self.timing_pruned += walk.timing_pruned;
+		self.cut_short |= walk.cut_short;
 
 		walk.result
 	}
@@ -91,9 +104,10 @@ impl<'a> DefaultExplorationEngine<'a> {
 	fn walk(&self, seed: u64) -> SeedWalk {
 		let mut visited = HashSet::new();
 		let mut timing_pruned = 0usize;
-		let result = self.walk_into(seed, &mut visited, &mut timing_pruned);
+		let mut cut_short = false;
+		let result = self.walk_into(seed, &mut visited, &mut timing_pruned, &mut cut_short);
 
-		SeedWalk { result, visited, timing_pruned }
+		SeedWalk { result, visited, timing_pruned, cut_short }
 	}
 
 	/// The walk of `seed` under its own RNG schedule.
@@ -101,7 +115,14 @@ impl<'a> DefaultExplorationEngine<'a> {
 	/// `visited` receives each state the seed visits. `timing_pruned` counts
 	/// the branches dropped for deadline or path WCET violations, so the
 	/// verdict reports the model-level timing violations exploration pruned.
-	fn walk_into(&self, seed: u64, visited: &mut HashSet<State>, timing_pruned: &mut usize) -> SeedResult {
+	/// `cut_short` turns true when the walk stops at [`MAX_WALK_STATES`].
+	fn walk_into(
+		&self,
+		seed: u64,
+		visited: &mut HashSet<State>,
+		timing_pruned: &mut usize,
+		cut_short: &mut bool,
+	) -> SeedResult {
 		let process = self.process;
 		let config = &self.config;
 		let mut rng = SeededRng::new(seed);
@@ -128,7 +149,14 @@ impl<'a> DefaultExplorationEngine<'a> {
 		#[cfg(feature = "testing-fault")]
 		let mut walk_faults = config.fault_model.as_ref().map(|model| WalkFaults::new(model, seed));
 
+		let mut taken = 0usize;
 		while let Some(state) = queue.pop_front() {
+			taken += 1;
+			if taken > MAX_WALK_STATES {
+				*cut_short = true;
+				break;
+			}
+
 			visited.insert(state.process_state());
 
 			// A state from which a run of hidden events reaches a cycle of
@@ -310,6 +338,10 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 
 	fn timing_pruned(&self) -> usize {
 		self.timing_pruned
+	}
+
+	fn cut_short(&self) -> bool {
+		self.cut_short
 	}
 
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {

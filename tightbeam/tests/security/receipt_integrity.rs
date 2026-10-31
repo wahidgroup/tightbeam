@@ -25,21 +25,12 @@
 //! - CWE-347: Improper Verification of Cryptographic Signature
 //!   <https://cwe.mitre.org/data/definitions/347.html>
 
-#![cfg(all(
-	feature = "transport-hpke",
-	feature = "transport-policy",
-	feature = "transport-multiplex",
-	feature = "tcp",
-	feature = "tokio",
-	feature = "testing"
-))]
+#![cfg(feature = "transport-multiplex")]
 
 use tightbeam::constants::MAX_MUX_SESSION_BUDGET;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportOffer};
-use tightbeam::TightBeamError;
 
-use crate::common::security::expectation_failure;
-use crate::transport::support::{establish_mutual_transports, MutualSessionHooks};
+use crate::common::transport::{establish_mutual_transports, MutualSessionHooks, MutualTransports};
 
 /// The client request that overshoots the enforcement ceiling in both
 /// directions, so a faithful receipt must reflect the clamp.
@@ -48,37 +39,40 @@ const OVER_MAX: MuxBudgets = MuxBudgets {
 	server_to_client: MAX_MUX_SESSION_BUDGET + 5000,
 };
 
-/// A budget request above the enforcement ceiling must yield a receipt whose
-/// budgets equal the values that the transport enforces. The signed artifact
-/// is the single source of truth.
-#[tokio::test]
-async fn receipt_budgets_bound_to_enforcement() -> Result<(), TightBeamError> {
+/// The budgets that enforcement clamps [`OVER_MAX`] to: the ceiling in each
+/// direction.
+const CLAMPED: MuxBudgets = MuxBudgets {
+	client_to_server: MAX_MUX_SESSION_BUDGET,
+	server_to_client: MAX_MUX_SESSION_BUDGET,
+};
+
+/// A session whose client and server both request [`OVER_MAX`].
+async fn over_ceiling_session() -> MutualTransports {
 	let client_offer = TransportOffer::mux(4).with_budgets(OVER_MAX);
 	let server_offer = TransportOffer::mux(4).with_budgets(OVER_MAX);
 	let hooks = MutualSessionHooks::default();
-	let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 
-	let stored = session
-		.client
-		.session_receipt()
-		.ok_or_else(|| expectation_failure("client must retain the receipt"))?;
-	let settings = session
-		.client
-		.negotiated_mux()
-		.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
-	let budgets = stored.receipt().budgets;
+	let session = establish_mutual_transports(client_offer, server_offer, hooks).await;
+	session.expect("a session over the ceiling establishes")
+}
 
-	assert!(
-		budgets.client_to_server <= MAX_MUX_SESSION_BUDGET && budgets.server_to_client <= MAX_MUX_SESSION_BUDGET,
-		"the receipt binds a budget above the ceiling"
-	);
+/// A budget request above the enforcement ceiling yields a receipt that binds
+/// the ceiling in each direction.
+#[tokio::test]
+async fn a_receipt_binds_the_clamped_budgets() {
+	let session = over_ceiling_session().await;
+	let budgets = session.client.session_receipt().map(|stored| stored.receipt().budgets);
+	assert_eq!(budgets, Some(CLAMPED));
+}
 
-	// The client's send budget is the client-to-server direction. Its receive
-	// budget is the server-to-client direction.
-	assert_eq!(
-		(Some(budgets.client_to_server), Some(budgets.server_to_client)),
-		(settings.send_budget(), settings.recv_budget()),
-		"the receipt and the enforced budgets differ"
-	);
-	Ok(())
+/// The transport of a session over the ceiling negotiates the clamped budgets
+/// that its receipt binds. The client's send budget is the client-to-server
+/// direction, and its receive budget is the server-to-client direction.
+#[tokio::test]
+async fn the_transport_negotiates_the_budgets_its_receipt_binds() {
+	let session = over_ceiling_session().await;
+
+	let settings = session.client.negotiated_mux();
+	let negotiated = settings.map(|settings| (settings.send_budget(), settings.recv_budget()));
+	assert_eq!(negotiated, Some((Some(MAX_MUX_SESSION_BUDGET), Some(MAX_MUX_SESSION_BUDGET))));
 }

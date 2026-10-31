@@ -31,6 +31,10 @@ pub(crate) const DUPLEX_SERVLET_HANDLED: Urn<'static> = tightbeam::urn!("test", 
 /// its handler.
 pub(crate) const FIRST_INSTANCE_RECEIVED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/first-instance-received");
+/// The second instance of a two-instance type records it when a frame reaches
+/// its handler.
+pub(crate) const SECOND_INSTANCE_RECEIVED: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/second-instance-received");
 /// The draining sibling records it when a frame reaches its handler.
 pub(crate) const SIBLING_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:cluster/sibling-received");
 /// The probe servlet records whether the frame it received carries the id of

@@ -6,7 +6,6 @@
 //! production audit event of a refused attack reaches the spec of the
 //! scenario.
 
-use core::time::Duration;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -29,11 +28,13 @@ use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthoriz
 #[cfg(feature = "transport-multiplex")]
 use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 
-use crate::common::security::flip_sealed_content;
-use crate::security::common::{
-	bind_on_loopback, expectation_failure, Direction, HandshakeBackendKind, ServerMaterials,
-};
-use crate::transport::support::serve_one_handshake_message;
+use crate::common::poll::joined;
+use crate::common::security::{expectation_failure, ServerMaterials};
+use crate::common::transport::{bind_on_loopback, serve_one_handshake_message};
+use crate::security::common::{flip_sealed_content, Direction, HandshakeBackendKind};
+
+#[cfg(feature = "transport-multiplex")]
+use crate::common::security::{PayingApprover, RecordingObserver, SettleSpyAuthorizer};
 
 /// The transport that each endpoint of a live handshake runs.
 pub type LiveTransport = TcpTransport<TokioStream>;
@@ -42,16 +43,16 @@ pub type LiveTransport = TcpTransport<TokioStream>;
 /// message, such as its multiplexing offer or its receipt hooks.
 type Configure = Box<dyn FnOnce(LiveTransport) -> LiveTransport + Send>;
 
-/// A rewrite of the handshake message that one frame carries.
+/// The attacker's change to the handshake message that one frame carries.
 pub type MessageRewrite = Box<dyn FnOnce(HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> + Send>;
-
-/// How long a server of a live handshake may take to end its handshake once
-/// the client ended its own.
-const LIVE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The stream cap that each endpoint of a budget-bearing handshake offers.
 #[cfg(feature = "transport-multiplex")]
 const MUX_STREAMS: u32 = 4;
+
+/// The budgets that a receipt scenario requests in each direction.
+#[cfg(feature = "transport-multiplex")]
+pub const SMALL_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
 /// The opening of either backend, the first frame that the client sends.
 pub const OPENING_FRAME: FrameSlot = FrameSlot { direction: Direction::ClientToServer, ordinal: 1 };
@@ -92,7 +93,7 @@ pub enum FrameEdit {
 	Drop,
 	/// Send the frame twice.
 	Duplicate,
-	/// Send the frame with its handshake message rewritten.
+	/// Send the frame with the attacker's change to its handshake message.
 	Rewrite(MessageRewrite),
 	/// Send the frame with its last octet flipped. The last octet of a record
 	/// lies in its tag, so the edit forges a record that no key opens.
@@ -114,8 +115,8 @@ impl FrameEdit {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- a rewrite fails to read the handshake message
-	///   of `frame`, refuses it, or fails to encode its result.
+	/// - [`TightBeamError`] -- the attacker's change fails to read the handshake
+	///   message of `frame`, refuses it, or fails to encode its result.
 	/// - An expectation failure -- `frame` holds no octet to flip.
 	fn apply(self, frame: Vec<u8>) -> Result<Vec<Vec<u8>>, TightBeamError> {
 		match self {
@@ -398,6 +399,7 @@ impl EndpointSetup {
 pub struct LiveHandshake {
 	kind: HandshakeBackendKind,
 	materials: ServerMaterials,
+	trusted: Option<ServerMaterials>,
 	client_validators: Vec<Arc<dyn CertificateValidation>>,
 	client_identity: Option<SigningIdentity>,
 	server_policy: Vec<Arc<dyn CertificateValidation>>,
@@ -414,6 +416,7 @@ impl LiveHandshake {
 		Self {
 			kind,
 			materials,
+			trusted: None,
 			client_validators: Vec::new(),
 			client_identity: None,
 			server_policy: Vec::new(),
@@ -421,6 +424,13 @@ impl LiveHandshake {
 			client: EndpointSetup::default(),
 			step: None,
 		}
+	}
+
+	/// The client trusts the server of `materials`, in place of the server it
+	/// reaches.
+	pub fn trusting(mut self, materials: ServerMaterials) -> Self {
+		self.trusted = Some(materials);
+		self
 	}
 
 	/// The server demands a client certificate, which each validator of
@@ -474,12 +484,19 @@ impl LiveHandshake {
 	/// # Errors
 	///
 	/// - [`TightBeamError`] -- a socket fails to bind or to connect, the client
-	///   builder refuses its trust, the server task panics or ends no
-	///   handshake within its deadline, or the relay fails.
+	///   builder refuses its trust, the server fails to accept, or the relay
+	///   fails.
+	///
+	/// # Panics
+	///
+	/// - The server task panics, or ends no handshake within [`HANG_GUARD`].
+	///
+	/// [`HANG_GUARD`]: crate::common::poll::HANG_GUARD
 	pub async fn run(self) -> Result<LiveOutcome, TightBeamError> {
 		let Self {
 			kind,
 			materials,
+			trusted,
 			client_validators,
 			client_identity,
 			server_policy,
@@ -489,7 +506,7 @@ impl LiveHandshake {
 		} = self;
 
 		// 1. Bind the server, and the relay in front of it.
-		let config = kind.server_config(&materials)?.with_client_validators(client_validators);
+		let config = kind.server_config(&materials).with_client_validators(client_validators);
 		let (listener, server_addr) = bind_on_loopback(config).await?;
 		let relay = FrameRelay::spawn(server_addr, step).await?;
 
@@ -503,7 +520,8 @@ impl LiveHandshake {
 		});
 
 		// 3. Run the client handshake through the relay.
-		let builder = kind.client_builder(&materials, client_identity)?;
+		let trusted = trusted.as_ref().unwrap_or(&materials);
+		let builder = kind.client_builder(trusted, client_identity);
 		let builder = builder.with_server_policy(server_policy);
 		let stream = TcpStream::connect(relay.addr()).await?;
 		let adopted = builder.adopt(TokioStream::from(stream))?;
@@ -512,11 +530,10 @@ impl LiveHandshake {
 		let client = verdict.map(|()| transport).map_err(TightBeamError::from);
 
 		// 4. Join the server, and surface a fault of the relay ahead of the verdicts it caused.
-		let joined = tokio::time::timeout(LIVE_DEADLINE, server_task).await;
+		let served = joined(server_task).await;
 		relay.check()?;
 
-		let joined = joined.map_err(|_| expectation_failure("the server ended no handshake within the deadline"))?;
-		let (transport, verdict) = joined.map_err(|_| expectation_failure("the server task panicked"))??;
+		let (transport, verdict) = served?;
 		let server = verdict.map(|()| transport);
 
 		Ok(LiveOutcome { client, server, relay })
@@ -541,6 +558,40 @@ pub struct ReceiptHooks {
 	pub approver: Option<Arc<dyn ReceiptApprover>>,
 	/// The observer that the server reports each receipt outcome to.
 	pub observer: Option<Arc<dyn SessionObserver>>,
+}
+
+/// The hooks of a paying client and a spying server, beside the handles a
+/// scenario reads its verdicts from.
+#[cfg(feature = "transport-multiplex")]
+pub struct PayingHooks {
+	/// The authorizer, which records each call to `settle`.
+	pub authorizer: Arc<SettleSpyAuthorizer>,
+	/// The observer, which records each receipt outcome.
+	pub observer: Arc<RecordingObserver>,
+	/// The hooks that install the two beside a paying approver.
+	pub hooks: ReceiptHooks,
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl ReceiptHooks {
+	/// The hooks of a client that answers `challenge` with `response` and a
+	/// server whose authorizer settles that answer alone and records every
+	/// settlement, beside an observer that records every outcome.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- `challenge` or `response` is no OCTET STRING.
+	pub fn paying(challenge: impl AsRef<[u8]>, response: impl AsRef<[u8]>) -> Result<PayingHooks, TightBeamError> {
+		let authorizer = Arc::new(SettleSpyAuthorizer::expecting(challenge, &response)?);
+		let observer = Arc::new(RecordingObserver::default());
+		let hooks = Self {
+			authorizer: Some(Arc::clone(&authorizer) as Arc<dyn TransportAuthorizer>),
+			approver: Some(Arc::new(PayingApprover::answering(response)?)),
+			observer: Some(Arc::clone(&observer) as Arc<dyn SessionObserver>),
+		};
+
+		Ok(PayingHooks { authorizer, observer, hooks })
+	}
 }
 
 #[cfg(feature = "transport-multiplex")]

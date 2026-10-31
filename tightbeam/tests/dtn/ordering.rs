@@ -4,6 +4,10 @@
 //! missing frames arrive, it releases in order each held frame that the chain
 //! takes at its turn. [`RequestGate`] admits the frame requests of each peer in
 //! their order.
+//!
+//! Both types are test code, so the tests of this file are self-checks of the
+//! harness. They reach tightbeam only through the frame builder, the frame
+//! getters, and the transit status conversions.
 
 use core::borrow::Borrow;
 use std::collections::btree_map::Entry;
@@ -12,7 +16,6 @@ use std::sync::Mutex;
 
 use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::policy::TransitStatus;
-use tightbeam::testing::error::TestingError;
 use tightbeam::transport::TransportError;
 use tightbeam::TightBeamError;
 
@@ -343,6 +346,11 @@ impl<T: Borrow<Frame>> OutOfOrderBuffer<T> {
 	}
 }
 
+/// The orders of `frames`, in order.
+pub fn orders_of(frames: &[impl Borrow<Frame>]) -> Vec<u64> {
+	frames.iter().map(|frame| frame.borrow().metadata().order()).collect()
+}
+
 /// The order and replay gate of the frame requests that a node answers.
 ///
 /// Each node numbers its frame requests from 1. The gate admits a peer's
@@ -375,201 +383,67 @@ impl RequestGate {
 	}
 }
 
-#[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::dtn::storage::DtnPayload;
-	use tightbeam::compose;
 	use tightbeam::crypto::hash::Sha3_256;
+	use tightbeam::tb_cases;
 	use tightbeam::utils::digest;
 
-	#[test]
-	fn in_order_frames() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(10);
-		let frame1 = compose! {
-			V0: id: "frame-1",
-				order: 1,
-				message: DtnPayload::new(b"first", "test", "test", 0)?
-		}?;
-		let frame2 = compose! {
-			V0: id: "frame-2",
-				order: 2,
-				message: DtnPayload::new(b"second", "test", "test", 0)?
-		}?;
-
-		// Each frame in order releases at once.
-		let result1 = buffer.insert(frame1)?;
-		let Admission::Released(result1) = result1 else {
-			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
-		};
-		assert_eq!(result1.len(), 1);
-
-		let result2 = buffer.insert(frame2)?;
-		let Admission::Released(result2) = result2 else {
-			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
-		};
-		assert_eq!(result2.len(), 1);
-
-		assert_eq!(buffer.next_expected(), 3);
-		assert_eq!(buffer.buffered_count(), 0);
-
-		Ok(())
-	}
-
-	#[test]
-	fn out_of_order_reordering() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(10);
-
-		let frame1 = compose! {
-			V0: id: "frame-1",
-				order: 1,
-				message: DtnPayload::new(b"first", "test", "test", 0)?
-		}?;
-
-		let frame3 = compose! {
-			V0: id: "frame-3",
-				order: 3,
-				message: DtnPayload::new(b"third", "test", "test", 0)?
-		}?;
-
-		let frame2 = compose! {
-			V0: id: "frame-2",
-			order: 2,
-			message: DtnPayload::new(b"second", "test", "test", 0)?
-		}?;
-
-		// Frame 1 is next, so it releases at once.
-		let result1 = buffer.insert(frame1)?;
-		let Admission::Released(result1) = result1 else {
-			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
-		};
-		assert_eq!(result1.len(), 1);
-		assert_eq!(buffer.next_expected(), 2);
-
-		// Frame 3 arrives ahead of frame 2, so the buffer holds it.
-		let result3 = buffer.insert(frame3)?;
-		assert!(matches!(result3, Admission::Held));
-		assert_eq!(buffer.buffered_count(), 1);
-		assert_eq!(buffer.next_expected(), 2);
-
-		// Frame 2 fills the gap, so frames 2 and 3 release together.
-		let result2 = buffer.insert(frame2)?;
-		let Admission::Released(frames) = result2 else {
-			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
-		};
-		assert_eq!(frames.len(), 2);
-		assert_eq!(frames[0].metadata().order(), 2);
-		assert_eq!(frames[1].metadata().order(), 3);
-		assert_eq!(buffer.next_expected(), 4);
-		assert_eq!(buffer.buffered_count(), 0);
-
-		Ok(())
-	}
-
-	#[test]
-	fn buffer_full() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(2);
-		let payload = |content: &[u8]| DtnPayload::new(content, "test", "test", 0);
-
-		let frame1 = compose! {
-			V0: id: "frame-1",
-				order: 1,
-				message: payload(b"first")?
-		}?;
-		buffer.insert(frame1)?;
-
-		// Frames 3 and 4 wait for frame 2 and fill the buffer of two.
-		let frame3 = compose! {
-			V0: id: "frame-3",
-			order: 3,
-			message: payload(b"third")?
-		}?;
-		buffer.insert(frame3)?;
-
-		let frame4 = compose! {
-			V0: id: "frame-4",
-				order: 4,
-				message: payload(b"fourth")?
-		}?;
-		buffer.insert(frame4)?;
-
-		// Frame 5 finds the buffer full, so its insert fails.
-		let frame5 = compose! {
-			V0: id: "frame-5",
-				order: 5,
-				message: payload(b"fifth")?
-		}?;
-
-		let result = buffer.insert(frame5);
-		assert!(result.is_err());
-
-		Ok(())
-	}
-
-	#[test]
-	fn duplicate_frame_rejection() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(10);
-		let payload = |content: &[u8]| DtnPayload::new(content, "test", "test", 0);
-		let frame1 = compose! {
-			V0: id: "frame-1",
-			order: 1,
-			message: payload(b"first")?
-		}?;
-
-		buffer.insert(frame1)?;
-
-		// A second frame of order 1 repeats a released order, so it fails.
-		let frame1_dup = compose! {
-			V0: id: "frame-1-dup",
-			order: 1,
-			message: payload(b"duplicate")?
-		}?;
-
-		let result = buffer.insert(frame1_dup);
-		assert!(result.is_err());
-
-		Ok(())
-	}
-
-	/// A frame at `order` under `id` that carries a test payload and leaves
-	/// `previous_frame` empty.
-	fn frame_named(id: impl AsRef<str>, order: u64) -> Frame {
-		let id = id.as_ref();
-		let payload = DtnPayload::new(id, "test", "test", 0).expect("a short payload fits");
-		let frame = compose! {
-			V0: id: id,
-				order: order,
-				message: payload
-		};
-
-		frame.expect("a V0 frame with an order composes")
-	}
+	use super::*;
+	use crate::common::dedup::HarnessFrame;
+	use crate::common::result::TestResult;
+	use crate::dtn::transit_status_of;
 
 	/// A frame at `order` that carries a test payload and leaves
 	/// `previous_frame` empty.
 	fn frame_at(order: u64) -> Frame {
-		let payload = DtnPayload::new(b"payload", "test", "test", 0).expect("a short payload fits");
-		let frame = compose! {
-			V0: id: format!("frame-{order}"),
-				order: order,
-				message: payload
-		};
-
-		frame.expect("a V0 frame with an order composes")
+		HarnessFrame::at(format!("frame-{order}"), order, "payload")
 	}
 
-	/// A frame at `order` that carries a test payload after the frame that
-	/// `previous` names.
-	fn frame_after(order: u64, previous: DigestInfo) -> Frame {
-		let payload = DtnPayload::new(b"payload", "test", "test", 0).expect("a short payload fits");
-		let frame = compose! {
-			V2: id: format!("frame-{order}"),
-				order: order,
-				previous_frame: previous,
-				message: payload
-		};
+	/// Inserts each of `arrivals` into `buffer` in turn, and returns the orders
+	/// that the buffer releases, in order.
+	fn released_orders(buffer: &mut OutOfOrderBuffer<Frame>, arrivals: &[u64]) -> Vec<u64> {
+		let mut released = Vec::new();
+		for &order in arrivals {
+			let admission = buffer.insert(frame_at(order)).expect("the buffer takes each arrival");
+			if let Admission::Released(frames) = admission {
+				released.extend(orders_of(&frames));
+			}
+		}
 
-		frame.expect("a V2 frame with a previous frame composes")
+		released
+	}
+
+	// The buffer releases the frames of each arrival order in the order of the
+	// chain, and holds none once the holes fill.
+	tb_cases! {
+		fn the_buffer_releases_each_arrival_order_in_turn((arrivals, released, next): (&[u64], &[u64], u64)) {
+			let mut buffer = OutOfOrderBuffer::new(10);
+
+			let released_in_turn = released_orders(&mut buffer, arrivals);
+			let settled = (released_in_turn, buffer.next_expected(), buffer.buffered_count());
+			assert_eq!(settled, (released.to_vec(), next, 0));
+		}
+		cases {
+			/// Each frame in order releases at once.
+			in_order => (&[1, 2], &[1, 2], 3),
+			/// A frame fills the hole before a held frame, so both release.
+			one_hole => (&[1, 3, 2], &[1, 2, 3], 4),
+			/// Each frame fills the hole before a held frame in turn.
+			two_holes => (&[1, 3, 2, 5, 4], &[1, 2, 3, 4, 5], 6),
+		}
+	}
+
+	/// A frame ahead of its turn waits in the buffer, which still expects the
+	/// frame before it.
+	#[test]
+	fn a_frame_ahead_of_its_turn_waits_in_the_buffer() -> TestResult {
+		let mut buffer = OutOfOrderBuffer::new(10);
+		buffer.insert(frame_at(1))?;
+
+		let admission = buffer.insert(frame_at(3))?;
+		assert!(matches!(admission, Admission::Held));
+		assert_eq!((buffer.buffered_count(), buffer.next_expected()), (1, 2));
+		Ok(())
 	}
 
 	/// The ids of the frames that `admission` releases, in order.
@@ -581,12 +455,10 @@ mod tests {
 		frames.iter().map(|frame| frame.metadata().id()).collect()
 	}
 
-	/// The orders of `frames`, in order.
-	fn orders_of(frames: &[Frame]) -> Vec<u64> {
-		frames.iter().map(|frame| frame.metadata().order()).collect()
-	}
-
-	/// A chain that takes each frame, and fails at the frame of `order`.
+	/// A chain that takes each frame, and fails at the frame of `order`. The
+	/// chain of a node fails only on a fault of its store, which the table
+	/// `a_failed_turn_keeps_the_frames_that_the_chain_took` of
+	/// `dtn/chain_processor.rs` plants, so the buffer test runs a closure.
 	fn fails_at(order: u64) -> impl FnMut(&Frame) -> Result<bool, TightBeamError> {
 		move |frame| {
 			if frame.metadata().order() == order {
@@ -597,62 +469,57 @@ mod tests {
 		}
 	}
 
-	/// The transit status that `error` refuses a frame with, if it carries one.
-	fn transit_status(error: TightBeamError) -> Option<TransitStatus> {
-		let TightBeamError::TransportError(error) = error else {
-			return None;
-		};
-
-		error.transit_status()
-	}
-
-	/// A frame that repeats a released order is refused as a frame that the
-	/// chain holds already.
-	#[test]
-	fn a_repeated_order_is_refused_as_already_held() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(10);
-		buffer.insert(frame_at(1))?;
-
-		let refusal = buffer.insert(frame_at(1)).map_err(TightBeamError::from);
-		assert_eq!(refusal.err().and_then(transit_status), Some(TransitStatus::AlreadyExists));
+	/// A chain that lets each passed frame leave the buffer.
+	fn let_pass(_: &Frame) -> Result<(), TightBeamError> {
 		Ok(())
 	}
 
-	/// A frame ahead of its turn that finds the buffer full is refused for lack
-	/// of capacity.
-	#[test]
-	fn a_frame_past_a_full_buffer_is_refused_as_exhausted() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(1);
-		buffer.insert(frame_at(2))?;
+	// A frame that the buffer refuses by its order carries the transit status
+	// of its refusal.
+	tb_cases! {
+		fn a_refused_order_carries_its_transit_status(
+			(capacity, first, arriving, status): (usize, u64, u64, TransitStatus)
+		) -> TestResult {
+			let mut buffer = OutOfOrderBuffer::new(capacity);
+			buffer.insert(frame_at(first))?;
 
-		let refusal = buffer.insert(frame_at(3)).map_err(TightBeamError::from);
-		assert_eq!(refusal.err().and_then(transit_status), Some(TransitStatus::ResourceExhausted));
-		Ok(())
+			let refusal = buffer.insert(frame_at(arriving)).map_err(TightBeamError::from);
+			assert_eq!(refusal.err().and_then(transit_status_of), Some(status));
+			Ok(())
+		}
+		cases {
+			/// A frame that repeats a released order is refused as a frame that
+			/// the chain holds already.
+			repeated_order => (10, 1, 1, TransitStatus::AlreadyExists),
+			/// A frame ahead of its turn that finds the buffer full is refused
+			/// for lack of capacity.
+			full_buffer => (1, 2, 3, TransitStatus::ResourceExhausted),
+		}
 	}
 
 	/// A frame that takes the last slot stalls the buffer, and the stall names
 	/// the frame before the lowest held frame, the last frame of the hole.
 	#[test]
-	fn a_frame_in_the_last_slot_names_the_end_of_the_hole() -> Result<(), TightBeamError> {
+	fn a_frame_in_the_last_slot_names_the_end_of_the_hole() -> TestResult {
 		let hole_end = digest::<Sha3_256>(b"the last frame of the hole")?;
 		let held_end = digest::<Sha3_256>(b"the frame before the arriving frame")?;
 		let mut buffer = OutOfOrderBuffer::new(2);
-		buffer.insert(frame_after(3, hole_end.to_owned()))?;
+		buffer.insert(HarnessFrame::linked("frame-3", 3, "payload", hole_end.to_owned()))?;
 
-		let admission = buffer.insert(frame_after(4, held_end))?;
+		let admission = buffer.insert(HarnessFrame::linked("frame-4", 4, "payload", held_end))?;
 		assert!(matches!(admission, Admission::Stalled(digest) if digest == hole_end));
 		Ok(())
 	}
 
 	/// A frame past a full buffer names the last frame of the hole.
 	#[test]
-	fn a_frame_past_a_full_buffer_names_the_end_of_the_hole() -> Result<(), TightBeamError> {
+	fn a_frame_past_a_full_buffer_names_the_end_of_the_hole() -> TestResult {
 		let hole_end = digest::<Sha3_256>(b"the last frame of the hole")?;
 		let held_end = digest::<Sha3_256>(b"the frame before the arriving frame")?;
 		let mut buffer = OutOfOrderBuffer::new(1);
-		buffer.insert(frame_after(3, hole_end.to_owned()))?;
+		buffer.insert(HarnessFrame::linked("frame-3", 3, "payload", hole_end.to_owned()))?;
 
-		let refusal = buffer.insert(frame_after(4, held_end)).err();
+		let refusal = buffer.insert(HarnessFrame::linked("frame-4", 4, "payload", held_end)).err();
 		assert_eq!(refusal.as_ref().and_then(OrderingError::hole_end), Some(&hole_end));
 		Ok(())
 	}
@@ -660,22 +527,22 @@ mod tests {
 	/// A frame request that repeats the order of a request that the gate
 	/// admitted is refused as one that the gate holds already.
 	#[test]
-	fn a_replayed_request_is_refused_as_already_admitted() -> Result<(), TightBeamError> {
+	fn a_replayed_request_is_refused_as_already_admitted() -> TestResult {
 		let gate = RequestGate::default();
 		gate.admit(DtnRole::MarsRelay, 1)?;
 
 		let refusal = gate.admit(DtnRole::MarsRelay, 1);
-		assert_eq!(refusal.err().and_then(transit_status), Some(TransitStatus::AlreadyExists));
+		assert_eq!(refusal.err().and_then(transit_status_of), Some(TransitStatus::AlreadyExists));
 		Ok(())
 	}
 
 	/// A later frame at a held order leaves the held frame in its slot.
 	#[test]
-	fn a_later_frame_leaves_the_held_frame_in_its_slot() -> Result<(), TightBeamError> {
+	fn a_later_frame_leaves_the_held_frame_in_its_slot() -> TestResult {
 		let mut buffer = OutOfOrderBuffer::new(10);
-		buffer.insert(frame_named("first", 2))?;
+		buffer.insert(HarnessFrame::at("first", 2, "payload"))?;
 
-		let refusal = buffer.insert(frame_named("later", 2));
+		let refusal = buffer.insert(HarnessFrame::at("later", 2, "payload"));
 		let released = buffer.insert(frame_at(1))?;
 		assert!(matches!(refusal, Err(OrderingError::Held { order: 2 })));
 		assert_eq!(released_ids(&released), [b"frame-1".as_slice(), b"first"]);
@@ -684,7 +551,7 @@ mod tests {
 
 	/// A frame at a held order finds a held slot.
 	#[test]
-	fn a_frame_at_a_held_order_finds_a_held_slot() -> Result<(), TightBeamError> {
+	fn a_frame_at_a_held_order_finds_a_held_slot() -> TestResult {
 		let mut buffer = OutOfOrderBuffer::new(10);
 		buffer.insert(frame_at(2))?;
 
@@ -695,7 +562,7 @@ mod tests {
 
 	/// A chain that fails at a turn gets back the frames that it took before.
 	#[test]
-	fn a_failed_turn_returns_the_frames_that_the_chain_took() -> Result<(), TightBeamError> {
+	fn a_failed_turn_returns_the_frames_that_the_chain_took() -> TestResult {
 		let mut buffer = OutOfOrderBuffer::new(10);
 		buffer.insert(frame_at(2))?;
 		buffer.insert(frame_at(3))?;
@@ -706,32 +573,45 @@ mod tests {
 		Ok(())
 	}
 
-	/// A move past the last order leaves the buffer at that order.
-	#[test]
-	fn a_move_past_the_last_order_leaves_the_buffer_there() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::<Frame>::new(10);
-		buffer.move_past(u64::MAX, |_| Ok::<(), TightBeamError>(()))?;
-		assert_eq!(buffer.next_expected(), u64::MAX);
+	/// Moves `buffer` past the last order.
+	fn move_past_the_last(buffer: &mut OutOfOrderBuffer<Frame>) -> Result<(), TightBeamError> {
+		buffer.move_past(u64::MAX, let_pass)
+	}
+
+	/// Releases the frame at the last order from `buffer`.
+	fn release_the_last(buffer: &mut OutOfOrderBuffer<Frame>) -> Result<(), TightBeamError> {
+		buffer.move_past(u64::MAX - 1, let_pass)?;
+		buffer.insert(frame_at(u64::MAX))?;
 		Ok(())
 	}
 
-	/// A release of the last order leaves the buffer at that order.
-	#[test]
-	fn a_release_of_the_last_order_leaves_the_buffer_there() -> Result<(), TightBeamError> {
-		let mut buffer = OutOfOrderBuffer::new(10);
-		buffer.move_past(u64::MAX - 1, |_| Ok::<(), TightBeamError>(()))?;
-		buffer.insert(frame_at(u64::MAX))?;
-		assert_eq!(buffer.next_expected(), u64::MAX);
-		Ok(())
+	// A turn that reaches the last order stops there, whichever way the buffer
+	// moves to it.
+	tb_cases! {
+		fn a_turn_stops_at_the_last_order(
+			advance: fn(&mut OutOfOrderBuffer<Frame>) -> Result<(), TightBeamError>
+		) -> TestResult {
+			let mut buffer = OutOfOrderBuffer::new(10);
+
+			advance(&mut buffer)?;
+			assert_eq!(buffer.next_expected(), u64::MAX);
+			Ok(())
+		}
+		cases {
+			/// A move past the last order leaves the buffer at that order.
+			move_past => move_past_the_last,
+			/// A release of the last order leaves the buffer at that order.
+			release => release_the_last,
+		}
 	}
 
 	/// A held frame at an order that the buffer moves past leaves the buffer,
 	/// because the chain holds the frame of the node there.
 	#[test]
-	fn a_held_frame_that_the_buffer_moves_past_leaves_it() -> Result<(), TightBeamError> {
+	fn a_held_frame_that_the_buffer_moves_past_leaves_it() -> TestResult {
 		let mut buffer = OutOfOrderBuffer::new(10);
 		buffer.insert(frame_at(3))?;
-		buffer.move_past(3, |_| Ok::<(), TightBeamError>(()))?;
+		buffer.move_past(3, let_pass)?;
 		assert_eq!(buffer.buffered_count(), 0);
 		Ok(())
 	}

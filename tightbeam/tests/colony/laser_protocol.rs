@@ -1,11 +1,11 @@
-//! In-memory "laser" protocol: a free-space optical link stand-in built
-//! from byte-level duplex pipes with its own address space.
+//! The in-memory "laser" protocol stands in for a free-space optical link. It
+//! carries bytes over duplex pipes in an address space of its own.
 //!
-//! Implements only the byte traits ([`AsyncByteRead`] / [`AsyncByteWrite`] /
-//! [`AsyncByteStream`]) plus the listener traits, exactly what an external
-//! transport crate would write: DER framing, handshakes, multiplexing, and
-//! the colony stack all arrive through library code. Proof that nothing in
-//! the stack is coupled to TCP.
+//! It implements the byte traits ([`AsyncByteRead`], [`AsyncByteWrite`], and
+//! [`AsyncByteStream`]) and the listener traits, as an outside transport crate
+//! writes them. DER framing, handshakes, multiplexing, and the colony stack
+//! all arrive through library code, so the colony suite proves that the stack
+//! runs over a transport other than TCP.
 
 use core::fmt;
 use core::str::FromStr;
@@ -24,18 +24,19 @@ use tightbeam::transport::{
 	PersistentConnection, Protocol, SplittableStream, TightBeamAddress, TransportEncryptionConfig, TransportError,
 };
 
-/// Buffered capacity of one laser link direction.
+/// The buffered capacity of each direction of a laser link.
 const BEAM_CAPACITY: usize = 64 * 1024;
 
-/// Address in the laser airspace: `laser://N`.
+/// An address in the laser airspace, written `laser://N`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LaserAddr(
-	/// Airspace slot; [`LaserAddr::ANY`] asks bind for a fresh one.
+	/// The slot in the airspace, where [`LaserAddr::ANY`] asks for a fresh one.
 	pub u64,
 );
 
 impl LaserAddr {
-	/// Bind-to-any address: the airspace assigns a fresh slot.
+	/// The address that binds to any slot, for which the airspace assigns a
+	/// fresh one.
 	pub const ANY: LaserAddr = LaserAddr(0);
 }
 
@@ -65,7 +66,7 @@ impl From<LaserAddr> for Vec<u8> {
 
 impl TightBeamAddress for LaserAddr {}
 
-/// One end of a laser link: a byte pipe, no framing of its own.
+/// One end of a laser link: a byte pipe with no framing of its own.
 pub struct LaserStream(DuplexStream);
 
 impl AsyncByteRead for LaserStream {
@@ -86,12 +87,13 @@ impl AsyncByteWrite for LaserStream {
 
 impl AsyncByteStream for LaserStream {
 	fn is_alive(&self) -> bool {
-		// Liveness surfaces as read/write errors on a torn-down pipe.
+		// A pipe that tore down fails its next read or write, which reports the
+		// loss of the link.
 		true
 	}
 }
 
-/// Read half of a split laser link, for the concurrent mux drivers.
+/// The read half of a split laser link, for the concurrent mux drivers.
 pub struct LaserReadHalf(ReadHalf<DuplexStream>);
 
 impl AsyncByteRead for LaserReadHalf {
@@ -102,7 +104,7 @@ impl AsyncByteRead for LaserReadHalf {
 	}
 }
 
-/// Write half of a split laser link.
+/// The write half of a split laser link.
 pub struct LaserWriteHalf(WriteHalf<DuplexStream>);
 
 impl AsyncByteWrite for LaserWriteHalf {
@@ -125,28 +127,32 @@ impl SplittableStream for LaserStream {
 
 /// The laser transport is the shared transport machinery over a
 /// [`LaserStream`]: handshakes, multiplexing, and message collection all
-/// come from the library, none from this fixture.
+/// come from the library.
 pub type LaserTransport<P = DefaultCryptoProvider> = TcpTransport<LaserStream, P>;
 
-/// Airspace registry: addresses to incoming-beam channels.
+/// The registry of the airspace, which maps each address to the channel of
+/// its incoming beams.
 type Airspace = Mutex<HashMap<u64, mpsc::UnboundedSender<DuplexStream>>>;
 
+/// The registry of every bound laser address in the process.
 fn airspace() -> &'static Airspace {
 	static AIRSPACE: OnceLock<Airspace> = OnceLock::new();
 	AIRSPACE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The next slot of the airspace, counted from 1 across the process.
 fn next_addr() -> u64 {
 	static NEXT: AtomicU64 = AtomicU64::new(1);
 	NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The error that a poisoned lock of the airspace reads as.
 fn poisoned() -> TransportError {
 	TransportError::InvalidState
 }
 
-/// Listener half of a laser endpoint. Every accepted beam is built from one
-/// endpoint configuration, encrypted or cleartext.
+/// The listener half of a laser endpoint. It builds each beam it accepts from
+/// one endpoint configuration, encrypted or cleartext.
 pub struct LaserListener<P: CryptoProvider = DefaultCryptoProvider> {
 	incoming: AsyncMutex<mpsc::UnboundedReceiver<DuplexStream>>,
 	config: EndpointConfig<P>,
@@ -165,8 +171,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> LaserListener<P> {
 		Ok((rx, LaserAddr(id)))
 	}
 
-	/// Accept one beam as a transport built from this listener's
-	/// configuration.
+	/// Accepts one beam as a transport built from the configuration of this
+	/// listener.
 	pub async fn accept(&self) -> Result<(LaserTransport<P>, LaserAddr), TransportError> {
 		let stream = self
 			.incoming

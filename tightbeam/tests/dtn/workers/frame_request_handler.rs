@@ -21,6 +21,7 @@ use crate::dtn::{
 /// The request to the frame request handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequestHandlerRequest {
+	/// The frame request that the node answers.
 	pub request: FrameRequest,
 	/// The node that answers the request.
 	pub node: DtnRole,
@@ -48,7 +49,9 @@ pub enum FrameRequestAction {
 /// The response of the frame request handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequestHandlerResponse {
+	/// The action that the servlet executes for the request.
 	pub action: FrameRequestAction,
+	/// The frames of the gap that the node holds, in chain order.
 	pub missing_frames: Vec<Frame>,
 }
 

@@ -9,53 +9,61 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tightbeam::{
+	asn1::GcmParameters,
 	cms::content_info::ContentInfo,
 	cms::enveloped_data::RecipientInfo,
 	cms::signed_data::SignedData,
 	constants::{TIGHTBEAM_CLOSING_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO},
 	crypto::{
-		aead::{Aes128Gcm, Aes128GcmOid},
+		aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid},
 		cms::{AuthEnvelopedData, EnvelopeError, Opener},
-		exchange::Ecdhe,
+		exchange::{Ecdhe, KeyExchange, KeyExchangeError, KeyShare, ReplyKind},
 		hash::Sha3_256,
 		kdf::{Hkdf, HkdfSha3_256},
 		profiles::{
-			AeadProvider, Aes128Wrap, CryptoProvider, DefaultCryptoProvider, DigestProvider, KdfProvider, Kek,
-			KeyExchangeProvider, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
-			SecurityProfileDesc, SigningProvider,
+			AeadProvider, Aes128Wrap, Aes256Wrap, CryptoProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
+			Kek, KeyExchangeProvider, KeyWrapProvider, NoStrengthFloor, ProfileStrengthPolicy, SecurityProfile,
+			SecurityProfileDesc, SecurityStrength, SigningProvider,
 		},
 		secret::SecretSlice,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
 		sign::SigningIdentity,
+		x509::error::CertificateValidationError,
+		x509::policy::CertificateValidation,
+		x509::Certificate,
 	},
-	der::{asn1::OctetString, asn1::OctetStringRef, Any, Decode, Encode},
-	prelude::TightBeamSocketAddr,
-	testing::error::TestingError,
+	der::{
+		asn1::ObjectIdentifier, asn1::OctetString, asn1::OctetStringRef, oid::AssociatedOid, Any, Decode, Encode, Tag,
+	},
+	random::CryptoRngCore,
+	spki::SubjectPublicKeyInfoRef,
+	testing::{error::TestingError, SeededStream},
+	trace::TraceCollector,
 	transport::handshake::{
 		negotiation::{ProfilePolicy, SecurityOffer},
-		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeMessage, HandshakeProtocolKind,
-		HandshakeProvider, Hpke, Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
+		Client, ClientFlow, ClientHandshakeProtocol, ClientHello, Handshake, HandshakeError, HandshakeMessage,
+		HandshakeProtocolKind, HandshakeProvider, Hpke, Server, ServerFlow, ServerHandshake, ServerHandshakeProtocol,
 	},
 	transport::tcp::r#async::TokioListener,
 	transport::wire_der::WireDer,
-	transport::{ClientBuilder, ConnectionBuilder, EncryptedProtocol, TransportEncryptionConfig},
+	transport::{Arrived, ClientBuilder, ConnectionBuilder, TransportEncryptionConfig, WireEnvelope},
+	urn::Urn,
 	TightBeamError,
 };
 
-use crate::common::security::pinning_trust_store;
-use crate::security::live::{AttackStep, FrameSlot, LiveHandshake};
-
-// The shared fixtures live in the crate-wide `common` module, so each threat
-// suite depends only on that module.
-pub use crate::common::security::{
-	default_security_profile, expectation_failure, hpke_client_config, hpke_server_config, pinning_validator,
-	rewritten_reply, signed_handshake, weak_security_profile, ServerMaterials,
+use crate::common::security::{
+	combined_trust, default_security_profile, expectation_failure, hpke_client_config, pinning_validator,
+	weak_security_profile, ClientMaterials, ServerMaterials,
 };
+use crate::common::transport::bind_on_loopback;
+use crate::security::live::{AttackStep, FrameEdit, FrameSlot, LiveHandshake, REPLY_FRAME};
 
 #[cfg(feature = "transport-cms")]
-use crate::common::security::{cms_client_config, cms_server_config, ClientMaterials};
+use crate::common::transport::TestCmsServerExt;
 #[cfg(feature = "transport-cms")]
 use tightbeam::crypto::hpke::DhKemSecp256k1;
+#[cfg(feature = "transport-cms")]
+use tightbeam::oids::{AES_128_GCM, AES_256_GCM};
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::Cms;
 
@@ -120,6 +128,133 @@ impl CryptoProvider for Aes128CryptoProvider {
 	}
 }
 
+/// The exchange that [`KnownExchange`] runs through.
+type HouseExchange = Ecdhe<k256::Secp256k1>;
+
+/// ECDH over secp256k1 whose two scalars are fixed, so a test holds the secret
+/// of each handshake under it. The OS source of a handshake fills every draw
+/// of [`HouseExchange`], so this exchange draws from a seeded stream.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KnownExchange;
+
+impl AssociatedOid for KnownExchange {
+	const OID: ObjectIdentifier = HouseExchange::OID;
+}
+
+/// One share of [`KnownExchange`].
+pub struct KnownShare(<HouseExchange as KeyExchange>::Offer);
+
+impl KeyShare<KnownExchange> for KnownShare {
+	fn from_octets(octets: &[u8]) -> Result<Self, KeyExchangeError> {
+		KeyShare::<HouseExchange>::from_octets(octets).map(Self)
+	}
+
+	fn to_octets(&self) -> Vec<u8> {
+		KeyShare::<HouseExchange>::to_octets(&self.0)
+	}
+
+	fn collapses_into(&self, key: &<HouseExchange as KeyExchange>::StaticKey) -> bool {
+		KeyShare::<HouseExchange>::collapses_into(&self.0, key)
+	}
+}
+
+impl KeyExchange for KnownExchange {
+	type Offer = KnownShare;
+	type Reply = KnownShare;
+	type Pending = <HouseExchange as KeyExchange>::Pending;
+	type StaticKey = <HouseExchange as KeyExchange>::StaticKey;
+
+	const REPLY: ReplyKind = <HouseExchange as KeyExchange>::REPLY;
+
+	fn strength() -> SecurityStrength {
+		HouseExchange::strength()
+	}
+
+	fn offer(_rng: &mut dyn CryptoRngCore) -> (Self::Pending, KnownShare) {
+		let (pending, offer) = HouseExchange::offer(&mut SeededStream(1));
+		(pending, KnownShare(offer))
+	}
+
+	fn respond(
+		offer: &KnownShare,
+		_rng: &mut dyn CryptoRngCore,
+	) -> Result<(KnownShare, SecretSlice<u8>), KeyExchangeError> {
+		let (reply, shared) = HouseExchange::respond(&offer.0, &mut SeededStream(2))?;
+		Ok((KnownShare(reply), shared))
+	}
+
+	fn complete(pending: &Self::Pending, reply: &KnownShare) -> Result<SecretSlice<u8>, KeyExchangeError> {
+		HouseExchange::complete(pending, &reply.0)
+	}
+
+	fn static_key(spki: SubjectPublicKeyInfoRef<'_>) -> Option<Self::StaticKey> {
+		HouseExchange::static_key(spki)
+	}
+}
+
+impl KnownExchange {
+	/// The secret of the exchange of every handshake under [`KnownExchange`].
+	pub fn secret() -> Result<Vec<u8>, TightBeamError> {
+		let (_, offer) = Self::offer(&mut SeededStream(1));
+		let (_, shared) = Self::respond(&offer, &mut SeededStream(2)).map_err(|_| expectation_failure("no share"))?;
+		Ok(shared.with(|secret| secret.to_vec()))
+	}
+}
+
+/// The default profile, over [`KnownExchange`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KnownExchangeProfile;
+
+impl SecurityProfile for KnownExchangeProfile {
+	type Digest = Sha3_256;
+	type AeadOid = Aes256GcmOid;
+	type SignatureAlg = Secp256k1Signature;
+	type Kdf = HkdfSha3_256;
+	type KeyExchange = KnownExchange;
+
+	type KeyWrapOid = Aes256Wrap;
+}
+
+/// The default provider, over [`KnownExchange`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KnownExchangeProvider {
+	profile: KnownExchangeProfile,
+}
+
+impl DigestProvider for KnownExchangeProvider {
+	type Digest = Sha3_256;
+}
+
+impl AeadProvider for KnownExchangeProvider {
+	type AeadCipher = Aes256Gcm;
+}
+
+impl SigningProvider for KnownExchangeProvider {
+	type Signature = Secp256k1Signature;
+	type VerifyingKey = Secp256k1VerifyingKey;
+}
+
+impl KdfProvider for KnownExchangeProvider {
+	type Kdf = HkdfSha3_256;
+}
+
+impl KeyExchangeProvider for KnownExchangeProvider {
+	type KeyExchange = KnownExchange;
+}
+
+impl KeyWrapProvider for KnownExchangeProvider {
+	type KeyWrap = Aes256Wrap;
+}
+
+impl CryptoProvider for KnownExchangeProvider {
+	type Profile = KnownExchangeProfile;
+	type Kem = tightbeam::crypto::hpke::DhKemSecp256k1;
+
+	fn profile(&self) -> &Self::Profile {
+		&self.profile
+	}
+}
+
 /// The direction a handshake message travels in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -157,11 +292,6 @@ impl CapturedHandshake {
 		self.messages.iter().rev().find(|m| m.direction == Direction::ClientToServer)
 	}
 
-	/// Every client-to-server message.
-	pub fn client_messages(&self) -> impl Iterator<Item = &CapturedMessage> {
-		self.messages.iter().filter(|m| m.direction == Direction::ClientToServer)
-	}
-
 	/// The reply, the one server-to-client message, which the server
 	/// signs over the transcript of its client's opening.
 	pub fn server_reply(&self) -> Option<&CapturedMessage> {
@@ -169,7 +299,6 @@ impl CapturedHandshake {
 	}
 
 	/// The message captured at `step`.
-	#[allow(dead_code)]
 	pub fn message_at(&self, step: usize) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.step == step)
 	}
@@ -243,20 +372,12 @@ pub trait HandshakeFlow: Send {
 ///
 /// Every [`HandshakeFlow`] implements this trait from its step table, so a
 /// backend states its sequence once and gets its capture from it.
-#[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
-	/// The backend kind of this session.
-	fn kind(&self) -> HandshakeBackendKind;
-
 	/// Runs a complete handshake, and captures every message that it exchanges.
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
 }
 
 impl<F: HandshakeFlow> HandshakeProtocol for F {
-	fn kind(&self) -> HandshakeBackendKind {
-		HandshakeFlow::backend(self)
-	}
-
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake> {
 		Box::pin(async move {
 			let steps = self.steps();
@@ -289,16 +410,6 @@ pub enum HandshakeBackendKind {
 }
 
 impl HandshakeBackendKind {
-	/// The human-readable backend label, for logs and trace events.
-	#[allow(dead_code)]
-	pub fn label(self) -> &'static str {
-		match self {
-			Self::Hpke => "hpke",
-			#[cfg(feature = "transport-cms")]
-			Self::Cms => "cms",
-		}
-	}
-
 	/// The ordered steps of this backend's flow.
 	fn steps(self) -> &'static [FlowStep] {
 		match self {
@@ -325,24 +436,12 @@ impl HandshakeBackendKind {
 
 	/// The encryption configuration of a server of this backend over
 	/// `materials`, under the default transport limits.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError`] -- the CMS pair refuses its key-agreement identity.
-	pub fn server_config(
-		self,
-		materials: &ServerMaterials,
-	) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
-		let config = match self {
+	pub fn server_config(self, materials: &ServerMaterials) -> TransportEncryptionConfig<DefaultCryptoProvider> {
+		match self {
 			Self::Hpke => TransportEncryptionConfig::new(materials.identity()),
 			#[cfg(feature = "transport-cms")]
-			Self::Cms => {
-				let config = TransportEncryptionConfig::new(materials.cms.signing_identity());
-				config.with_key_agreement(materials.cms.key_agreement_identity())?
-			}
-		};
-
-		Ok(config)
+			Self::Cms => materials.cms.encryption_config(),
+		}
 	}
 
 	/// Binds a listener on a free local port that serves this backend under
@@ -350,13 +449,12 @@ impl HandshakeBackendKind {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the CMS pair refuses its key-agreement identity, or the socket fails to bind.
+	/// - [`TightBeamError`] -- the socket fails to bind.
 	pub async fn bind_listener(
 		self,
 		materials: &ServerMaterials,
 	) -> Result<(TokioListener, SocketAddr), TightBeamError> {
-		let config = self.server_config(materials)?;
-		bind_on_loopback(config).await
+		bind_on_loopback(self.server_config(materials)).await
 	}
 
 	/// A client builder of this backend that trusts the server of
@@ -366,19 +464,15 @@ impl HandshakeBackendKind {
 	/// - A CMS client seals its opening to the key-agreement certificate of
 	///   the server and signs its Finished, so it presents `identity`, or a
 	///   fresh identity in its place.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError`] -- the trust store refuses the server certificate.
 	pub fn client_builder(
 		self,
 		materials: &ServerMaterials,
 		identity: Option<SigningIdentity>,
-	) -> Result<ClientBuilder<TokioListener>, TightBeamError> {
+	) -> ClientBuilder<TokioListener> {
 		let builder = ClientBuilder::<TokioListener>::builder().with_handshake_protocol(self.protocol());
 		let (builder, identity) = match self {
 			Self::Hpke => {
-				let store = pinning_trust_store(&materials.certificate)?;
+				let store = combined_trust(&[&materials.certificate]);
 				(builder.with_trust_store(store), identity)
 			}
 			#[cfg(feature = "transport-cms")]
@@ -388,12 +482,10 @@ impl HandshakeBackendKind {
 			}
 		};
 
-		let builder = match identity {
+		match identity {
 			Some(identity) => builder.with_client_identity(identity),
 			None => builder,
-		};
-
-		Ok(builder)
+		}
 	}
 
 	/// The frame that carries the message at step `index` of this backend's
@@ -423,6 +515,26 @@ impl HandshakeBackendKind {
 		Ok(AttackStep::replace(slot, message))
 	}
 
+	/// The attack step that tampers the reply of a live session in transit,
+	/// as [`Self::tamper_server_message`] does. The reply stays the reply of
+	/// the client that reads it, so only the check of the tamper can refuse
+	/// it.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the flow of this backend holds no reply.
+	pub fn tamper_reply(self) -> Result<AttackStep, TightBeamError> {
+		let mut steps = self.steps().iter();
+		let reply = steps.find(|step| step.direction == Direction::ServerToClient);
+		let reply = reply.ok_or_else(|| expectation_failure("the flow holds no reply"))?;
+		let tamper = move |message: HandshakeMessage| {
+			let tampered = self.tamper_server_message(message.der())?;
+			reply.container.message(&tampered)
+		};
+
+		Ok(AttackStep::new(REPLY_FRAME, FrameEdit::Rewrite(Box::new(tamper))))
+	}
+
 	/// Flips one byte of the signed content in this backend's server message.
 	///
 	/// It models a MITM attacker that changes the message in transit. It edits
@@ -445,16 +557,38 @@ impl HandshakeBackendKind {
 			#[cfg(feature = "transport-cms")]
 			Self::Cms => {
 				let mut signed_data = SignedData::from_der(payload)?;
-				let content = signed_data
+				let carried = signed_data
 					.encap_content_info
 					.econtent
 					.as_ref()
 					.ok_or_else(|| expectation_failure("ServerFinished carries no content"))?;
 
-				let transcript_hash: OctetString = content.decode_as()?;
-				let tampered_hash = OctetString::new(flip_first_byte(transcript_hash.as_bytes())?)?;
-				signed_data.encap_content_info.econtent = Some(Any::encode_from(&tampered_hash)?);
+				let content: OctetString = carried.decode_as()?;
+				let tampered = OctetString::new(flip_first_byte(content.as_bytes())?)?;
+				signed_data.encap_content_info.econtent = Some(Any::encode_from(&tampered)?);
 				Ok(signed_data.to_der()?)
+			}
+		}
+	}
+
+	/// The reply of this backend as a MITM that decodes it and encodes it
+	/// unchanged sends it on. It is the control of the tampers above: a
+	/// handshake that completes through it shows that the re-encoding of a
+	/// decoded reply alone refuses nothing.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the reply fails to decode or to encode.
+	pub fn re_encoded_reply(self, reply: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
+		match self {
+			Self::Hpke => {
+				let handshake = signed_handshake(reply.to_owned());
+				Ok(rewritten_reply(reply, &handshake))
+			}
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => {
+				let der = SignedData::from_der(reply.der())?.to_der()?;
+				Container::Signed.message(&der)
 			}
 		}
 	}
@@ -472,22 +606,16 @@ fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	Ok(flipped)
 }
 
-/// Binds a listener under `config` on a free loopback port, beside its
-/// address.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- the socket fails to bind.
-pub async fn bind_on_loopback(
-	config: TransportEncryptionConfig<DefaultCryptoProvider>,
-) -> Result<(TokioListener, SocketAddr), TightBeamError> {
-	let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
-	let (listener, bound) = TokioListener::bind_with(addr, config).await?;
-	Ok((listener, *bound))
-}
+/// A validator that refuses every certificate with `CertificateDenied`, for a
+/// scenario whose endpoint policy refuses the genuine peer.
+#[derive(Debug, Clone, Copy)]
+pub struct RejectAllValidator;
 
-use tightbeam::trace::TraceCollector;
-use tightbeam::urn::Urn;
+impl CertificateValidation for RejectAllValidator {
+	fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
+		Err(CertificateValidationError::CertificateDenied)
+	}
+}
 
 /// A harness that spawns handshake sessions across every enabled backend.
 ///
@@ -502,7 +630,7 @@ pub struct SecurityThreatHarness {
 
 impl Default for SecurityThreatHarness {
 	fn default() -> Self {
-		Self { materials: ServerMaterials::generate(), trace: None }
+		Self { materials: ServerMaterials::fixed(), trace: None }
 	}
 }
 
@@ -515,16 +643,10 @@ impl SecurityThreatHarness {
 	/// Observable CSP event: the harness selects the CMS backend for the
 	/// session.
 	pub const HARNESS_SPAWN_CMS: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms");
-	/// Observable CSP event: the harness enters the weak-cipher spawn path.
-	pub const HARNESS_SPAWN_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-weak");
-	/// Observable CSP event: the harness selects the weak HPKE backend.
-	pub const HARNESS_SPAWN_HPKE_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-hpke-weak");
-	/// Observable CSP event: the harness selects the weak CMS backend.
-	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
 	/// A harness that records its spawn events into `trace`.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
-		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
+		Self { materials: ServerMaterials::fixed(), trace: Some(trace) }
 	}
 
 	/// The server materials of the harness, for test verification.
@@ -537,6 +659,7 @@ impl SecurityThreatHarness {
 		if let Some(ref trace) = self.trace {
 			trace.event(event)?;
 		}
+
 		Ok(())
 	}
 
@@ -554,7 +677,7 @@ impl SecurityThreatHarness {
 	}
 
 	/// Spawns a protocol session of `kind` with separate client and server
-	/// profiles, which a cross-session downgrade test needs.
+	/// profiles.
 	///
 	/// - The client offers `client_profiles`.
 	/// - The server accepts `server_profiles`.
@@ -590,6 +713,16 @@ impl SecurityThreatHarness {
 		}
 	}
 
+	/// Spawns an HPKE session under [`KnownExchange`], whose secret a test
+	/// holds.
+	pub fn spawn_known_exchange(&self) -> Box<dyn HandshakeProtocol> {
+		let profiles = [default_security_profile()];
+		let session =
+			Session::<Hpke, KnownExchangeProvider>::with_profiles(&self.materials, profiles.to_owned(), profiles);
+
+		Box::new(session)
+	}
+
 	/// Starts a live handshake of `kind` over the server materials of this
 	/// harness, for the attack of a threat scenario. It records the spawn
 	/// events that [`Self::spawn`] records for `kind`.
@@ -613,40 +746,6 @@ impl SecurityThreatHarness {
 			HandshakeBackendKind::Cms => Self::HARNESS_SPAWN_CMS,
 		}
 	}
-
-	/// Spawns a session of `kind` on the weak AES-128-GCM cipher, for a
-	/// downgrade test.
-	///
-	/// - [`Aes128CryptoProvider`] runs AES-128 in the cipher and names it in the profile descriptor OIDs.
-	/// - The session is weak by design. Its provider names [`NoStrengthFloor`]
-	///   as its floor, so the downgrade harness can capture an AES-128 session.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError`] -- the trace collector refuses a spawn event, as
-	///   an injected fault of a `testing-fault` run does.
-	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Result<Box<dyn HandshakeProtocol>, TightBeamError> {
-		self.emit(Self::HARNESS_SPAWN_WEAK)?;
-		match kind {
-			HandshakeBackendKind::Hpke => {
-				self.emit(Self::HARNESS_SPAWN_HPKE_WEAK)?;
-				Ok(Box::new(Session::<Hpke, Aes128CryptoProvider>::with_profiles(
-					&self.materials,
-					vec![weak_security_profile()],
-					vec![weak_security_profile()],
-				)))
-			}
-			#[cfg(feature = "transport-cms")]
-			HandshakeBackendKind::Cms => {
-				self.emit(Self::HARNESS_SPAWN_CMS_WEAK)?;
-				Ok(Box::new(Session::<Cms, Aes128CryptoProvider>::with_profiles(
-					&self.materials,
-					vec![weak_security_profile()],
-					vec![weak_security_profile()],
-				)))
-			}
-		}
-	}
 }
 
 /// The error for an injection step at `index` that the handshake flow lacks.
@@ -654,24 +753,37 @@ fn invalid_step_error(index: usize) -> TightBeamError {
 	TightBeamError::TestingError(TestingError::UnknownFlowStep(index))
 }
 
-/// `payload` with `extra` appended, as a MITM attacker that adds data
-/// to a message sends it.
-#[allow(dead_code)]
-pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>) -> Vec<u8> {
-	let payload = payload.as_ref();
-	let extra = extra.as_ref();
+/// The `AuthEnvelopedData` of `frame`, a record that the relay kept as it
+/// travelled sealed on an established session.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- `frame` is no wire envelope, or its record fails to decode.
+/// - An expectation failure -- `frame` travels in the clear.
+pub fn sealed_record(mut frame: Vec<u8>) -> Result<AuthEnvelopedData, TightBeamError> {
+	let Arrived::Encrypted(record) = WireEnvelope::arrive(&mut frame)? else {
+		return Err(expectation_failure("a record of an established session travels sealed"));
+	};
 
-	let mut tampered = payload.to_vec();
-	tampered.extend_from_slice(extra);
-	tampered
+	Ok(AuthEnvelopedData::from_der(record)?)
 }
 
-/// The first `keep_bytes` bytes of `payload`, as a MITM attacker that
-/// truncates a message sends it.
-#[allow(dead_code)]
-pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> Vec<u8> {
-	let payload = payload.as_ref();
-	payload.iter().take(keep_bytes).copied().collect()
+/// The wrapped content key and the GCM nonce of `envelope`, the two values
+/// that each seal draws afresh.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the parameters of the content cipher are no `GCMParameters`.
+/// - An expectation failure -- the envelope names no single `KEKRecipientInfo`, or no parameters.
+pub fn fresh_values(envelope: &AuthEnvelopedData) -> Result<(Vec<u8>, Vec<u8>), TightBeamError> {
+	let [RecipientInfo::Kekri(recipient)] = envelope.recipient_infos.0.as_slice() else {
+		return Err(expectation_failure("the envelope carries one KEKRecipientInfo"));
+	};
+
+	let parameters = envelope.auth_encrypted_content_info.content_enc_alg.parameters.as_ref();
+	let parameters = parameters.ok_or_else(|| expectation_failure("the content cipher carries its parameters"))?;
+	let nonce = parameters.decode_as::<GcmParameters>()?.aes_nonce.into_bytes();
+	Ok((recipient.encrypted_key.as_bytes().to_vec(), nonce))
 }
 
 /// The `ClientHello` that a captured HPKE hello carries, decoded from its DER.
@@ -687,6 +799,11 @@ fn captured_handshake(reply: &[u8]) -> Result<ServerHandshake, TightBeamError> {
 	let econtent = signed.encap_content_info.econtent;
 	let econtent = econtent.ok_or_else(|| expectation_failure("the reply carries no content"))?;
 	Ok(ServerHandshake::from_der(econtent.value())?)
+}
+
+/// The `client_random` of a captured HPKE hello.
+pub fn captured_client_random(hello: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	Ok(captured_hello(hello)?.client_random.into_bytes())
 }
 
 /// The two ephemerals a captured HPKE handshake carries in the clear: the
@@ -746,7 +863,7 @@ impl StaticKeyObserver {
 	) -> Result<Self, TightBeamError> {
 		let hello = captured_hello(hello)?;
 		let handshake = captured_handshake(reply)?;
-		let salt = [hello.client_random.as_bytes(), handshake.server_random.as_bytes()].concat();
+		let salt = closing_salt(&hello, &handshake);
 		let client_ephemeral = hello.client_ephemeral.as_bytes();
 		let server_ephemeral = handshake.server_ephemeral.as_bytes();
 
@@ -760,6 +877,13 @@ impl StaticKeyObserver {
 
 		let keks = candidates.iter().map(|ee| closing_key(ee, &salt)).collect::<Result<_, _>>()?;
 		Ok(Self { closing: closing.to_vec(), keks })
+	}
+
+	/// The observer of the captured `hello`, `reply`, and `closing` who holds
+	/// `ee`, the secret of the exchange, as its one candidate.
+	pub fn holding(hello: &[u8], reply: &[u8], closing: &[u8], ee: &[u8]) -> Result<Self, TightBeamError> {
+		let salt = closing_salt(&captured_hello(hello)?, &captured_handshake(reply)?);
+		Ok(Self { closing: closing.to_vec(), keks: vec![closing_key(ee, &salt)?] })
 	}
 
 	/// Opens the closing under each candidate closing key, with the key
@@ -778,6 +902,12 @@ impl StaticKeyObserver {
 
 		Ok(attempts)
 	}
+}
+
+/// The salt of the key schedule of a captured handshake: the client random
+/// and the server random.
+fn closing_salt(hello: &ClientHello, handshake: &ServerHandshake) -> Vec<u8> {
+	[hello.client_random.as_bytes(), handshake.server_random.as_bytes()].concat()
 }
 
 /// The ECDH output of `static_key` with the SEC 1 point `peer`.
@@ -885,7 +1015,7 @@ impl<P: HandshakeProvider> SessionFlow<P> for Hpke {
 		profiles: Vec<SecurityProfileDesc>,
 		policy: ProfilePolicy<P>,
 	) -> Handshake<Server, Self, P> {
-		let mut config = hpke_server_config(materials, profiles);
+		let mut config = materials.hpke_server_config(profiles);
 		config.policy = policy;
 		Handshake::server(config)
 	}
@@ -905,7 +1035,7 @@ impl<P: HandshakeProvider<Kem = DhKemSecp256k1>> SessionFlow<P> for Cms {
 		let client_materials = ClientMaterials::generate();
 		let identity = client_materials.identity();
 
-		let mut config = cms_client_config(materials, identity);
+		let mut config = materials.cms_client_config(identity);
 		config.security_offer = Some(offer);
 		config.profiles = policy;
 		Handshake::client(config)
@@ -916,7 +1046,7 @@ impl<P: HandshakeProvider<Kem = DhKemSecp256k1>> SessionFlow<P> for Cms {
 		profiles: Vec<SecurityProfileDesc>,
 		policy: ProfilePolicy<P>,
 	) -> Handshake<Server, Self, P> {
-		let mut config = cms_server_config(materials, profiles);
+		let mut config = materials.cms_server_config(profiles);
 		config.policy = policy;
 		Handshake::server(config)
 	}
@@ -984,3 +1114,209 @@ impl<F: SessionFlow<P>, P: HandshakeProvider> HandshakeFlow for Session<F, P> {
 		})
 	}
 }
+
+/// A downgrade of one handshake of flow `F`: a victim that offers the strong
+/// profile ahead of the weak one, a server of the victim on the strong profile,
+/// and a client and a server of the MITM on the weak profile alone. The two
+/// sides share their server materials, so a reply of the weak server names the
+/// server that the victim trusts.
+pub struct DowngradeAttack<F>
+where
+	F: SessionFlow<DefaultCryptoProvider> + SessionFlow<Aes128CryptoProvider>,
+{
+	victim: Session<F, DefaultCryptoProvider>,
+	weak: Session<F, Aes128CryptoProvider>,
+}
+
+impl<F> DowngradeAttack<F>
+where
+	F: SessionFlow<DefaultCryptoProvider> + SessionFlow<Aes128CryptoProvider>,
+{
+	/// The attack on one handshake with the server of `materials`.
+	pub fn new(materials: &ServerMaterials) -> Self {
+		let strong = strong_security_profile();
+		let weak = weak_security_profile();
+		Self {
+			victim: Session::with_profiles(materials, [strong.to_owned(), weak.to_owned()], [strong]),
+			weak: Session::with_profiles(materials, [weak.to_owned()], [weak]),
+		}
+	}
+
+	/// The opening of the victim.
+	pub fn victim_opening(&mut self) -> Result<HandshakeMessage, HandshakeError> {
+		self.victim.client.start()
+	}
+
+	/// An opening that the MITM seals itself, which offers the weak profile
+	/// alone.
+	pub fn mitm_opening(&mut self) -> Result<HandshakeMessage, HandshakeError> {
+		self.weak.client.start()
+	}
+
+	/// The answer of the server of the victim to `opening`.
+	pub async fn strong_reply(&mut self, opening: HandshakeMessage) -> Result<HandshakeMessage, HandshakeError> {
+		self.victim.server.reply(opening).await
+	}
+
+	/// The answer of the server on the weak profile to `opening`.
+	pub async fn weak_reply(&mut self, opening: HandshakeMessage) -> Result<HandshakeMessage, HandshakeError> {
+		self.weak.server.reply(opening).await
+	}
+
+	/// The verdict of the victim on `reply`: its closing, or its refusal.
+	pub async fn victim_reads(&mut self, reply: HandshakeMessage) -> Result<HandshakeMessage, HandshakeError> {
+		self.victim.client.respond(reply).await
+	}
+}
+
+/// `opening` with the weak entry of its sealed offer forged in place, by a MITM
+/// that holds no key of the seal.
+///
+/// The seal runs AES-256-GCM, so AES-128-GCM appears in the offer alone. A
+/// server selects the strong entry, so the tag of the seal is the check that
+/// meets the forged entry. The two OIDs have one length, so the DER stays well
+/// formed.
+#[cfg(feature = "transport-cms")]
+pub fn forge_sealed_offer(opening: &HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
+	let mut der = opening.der().to_vec();
+	let weak = AES_128_GCM.as_bytes();
+	let at = der.windows(weak.len()).position(|window| window == weak);
+	let at = at.ok_or_else(|| expectation_failure("the opening names no AES-128-GCM"))?;
+
+	// The forged bytes travel as they are, so the seal meets the forged entry
+	// and no re-encoding.
+	der[at..at + weak.len()].copy_from_slice(AES_256_GCM.as_bytes());
+	Container::AuthEnveloped.message(&der)
+}
+
+/// The sealed closing with the middle byte of its encrypted content flipped.
+/// A flipped content byte is the one change on the wire that a MITM can make
+/// to what the closing seals: the client Finished or the anonymous
+/// attributes, and the acknowledgement inside either.
+pub fn flip_sealed_content(sealed_closing: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
+	let mut tampered = sealed_closing.to_owned();
+	let content = tampered.auth_encrypted_content_info.encrypted_content.as_ref();
+	let content = content.ok_or_else(|| expectation_failure("a sealed closing carries content"))?;
+	let mut forged = content.as_bytes().to_vec();
+	let middle = forged.len() / 2;
+
+	forged[middle] ^= 0xFF;
+	tampered.auth_encrypted_content_info.encrypted_content = Some(OctetString::new(forged)?);
+	Ok(tampered)
+}
+
+/// The strong profile (AES-256-GCM) of a downgrade test: the profile of the
+/// default provider.
+pub fn strong_security_profile() -> SecurityProfileDesc {
+	default_security_profile()
+}
+
+/// Whether `needle` appears as a contiguous window inside `haystack`.
+#[cfg(feature = "transport-multiplex")]
+pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
+	let haystack = haystack.as_ref();
+	let needle = needle.as_ref();
+	haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The `ServerHandshake` that `reply` signs as its content.
+pub fn signed_handshake(reply: HandshakeMessage) -> ServerHandshake {
+	let signed = reply.signed().expect("an HPKE reply is a SignedData").into_value();
+	let econtent = signed.encap_content_info.econtent.expect("the reply carries its content");
+	ServerHandshake::from_der(econtent.value()).expect("the reply signs a ServerHandshake")
+}
+
+/// `reply` with `handshake` in place of the content it signs, as a MITM forges
+/// it. The signature and every attribute stay as the server made them.
+pub fn rewritten_reply(reply: HandshakeMessage, handshake: &ServerHandshake) -> HandshakeMessage {
+	let mut signed = reply.signed().expect("an HPKE reply is a SignedData").into_value();
+	let der = handshake.to_der().expect("a ServerHandshake encodes");
+	let content = Any::new(Tag::OctetString, der).expect("the content fits an OCTET STRING");
+	signed.encap_content_info.econtent = Some(content);
+
+	HandshakeMessage::try_from(signed).expect("the rewritten reply encodes")
+}
+
+/// A client and server pair of either backend that a receipt scenario drives
+/// by hand.
+#[cfg(feature = "transport-multiplex")]
+mod budget_fixtures {
+	use std::sync::Arc;
+
+	use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportOffer};
+	use tightbeam::transport::handshake::{
+		ClientConfig, ClientFlow, ClientHandshakeProtocol, Handshake, PeerAuthentication, ServerConfig, ServerFlow,
+		ServerHandshakeProtocol,
+	};
+
+	#[cfg(feature = "transport-cms")]
+	use tightbeam::transport::handshake::Cms;
+
+	use super::{default_security_profile, HandshakeBackendKind, ServerMaterials};
+	use crate::common::security::{hpke_client_config_presenting, pinning_validator, ClientMaterials};
+	use crate::security::live::ReceiptHooks;
+
+	/// A mutually authenticated client and server with a budget-bearing
+	/// transport offer, ready to drive by hand through the protocol traits.
+	pub struct BudgetPair {
+		/// The client, before its opening.
+		pub client: Box<dyn ClientHandshakeProtocol>,
+		/// The server, before the opening arrives.
+		pub server: Box<dyn ServerHandshakeProtocol>,
+	}
+
+	impl ServerMaterials {
+		/// Builds a [`BudgetPair`] of `kind`. The client presents the fixed
+		/// identity, pins the server of these materials, and requests the
+		/// `request` budgets. The server demands a client certificate within
+		/// its validity period.
+		pub fn budget_pair(&self, kind: HandshakeBackendKind, request: MuxBudgets, hooks: ReceiptHooks) -> BudgetPair {
+			let offer = TransportOffer::mux(4).with_budgets(request);
+			match kind {
+				HandshakeBackendKind::Hpke => {
+					let identity = ClientMaterials::fixed().identity();
+					let client = hpke_client_config_presenting(pinning_validator(&self.certificate), identity);
+					let server = self.hpke_server_config(vec![default_security_profile()]);
+					Self::budget_pair_of(client, server, offer, hooks)
+				}
+				#[cfg(feature = "transport-cms")]
+				HandshakeBackendKind::Cms => {
+					let profile = default_security_profile();
+					let pair = self.cms_pair(vec![profile], vec![profile], PeerAuthentication::Anonymous);
+					Self::budget_pair_of::<Cms>(pair.client, pair.server, offer, hooks)
+				}
+			}
+		}
+
+		/// The pair of `client` and `server` once both offer `offer` and hold
+		/// the `hooks`, and the server demands a client certificate.
+		fn budget_pair_of<F>(
+			mut client: ClientConfig<F, DefaultCryptoProvider>,
+			mut server: ServerConfig<F, DefaultCryptoProvider>,
+			offer: TransportOffer,
+			hooks: ReceiptHooks,
+		) -> BudgetPair
+		where
+			F: ClientFlow<DefaultCryptoProvider> + ServerFlow<DefaultCryptoProvider> + 'static,
+		{
+			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
+			client.transport_offer = Some(offer.to_owned());
+			client.receipt_approver = hooks.approver;
+
+			server.transport = Some(offer);
+			server.transport_authorizer = hooks.authorizer;
+			server.session_observer = hooks.observer;
+			server.peer_authentication = PeerAuthentication::Anonymous.and(validator);
+
+			BudgetPair {
+				client: Box::new(Handshake::client(client)),
+				server: Box::new(Handshake::server(server)),
+			}
+		}
+	}
+}
+
+#[cfg(feature = "transport-multiplex")]
+pub use budget_fixtures::*;

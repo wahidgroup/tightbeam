@@ -1337,25 +1337,13 @@ impl TestFlow for Hpke {
 		reply.with_content(|handshake| handshake.security_accept = None)
 	}
 
-	/// The opening is a hello of [`CLIENT_RANDOM`], and the salt of the
-	/// handshake is that random followed by the server random.
+	/// The opening is that of [`AwaitingClosing::offering`], with no offer.
 	async fn awaiting_closing(peer_authentication: PeerAuthentication, ephemeral: SecretKey) -> AwaitingClosing<Self> {
 		let identity = create_test_server();
 		let mut config = Self::server(&identity);
 		config.peer_authentication = peer_authentication;
 
-		let mut server = Handshake::server(config);
-		let reply = server.reply(hello_opening(&hello_of(&ephemeral))).await;
-		let reply = reply.expect("the server admits the hello");
-		let handshake = reply.signed_handshake();
-		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(handshake.server_ephemeral.as_bytes());
-		let confirming = Confirming {
-			server_ephemeral: server_ephemeral.expect("the reply carries a point on the curve"),
-			salt: [CLIENT_RANDOM.as_slice(), handshake.server_random.as_bytes()].concat(),
-			transcript_hash: server.transcript_hash().expect("the reply sealed the transcript"),
-		};
-
-		AwaitingClosing { server, reply, confirming, ephemeral, base: None }
+		AwaitingClosing::offering(config, ephemeral, None).await
 	}
 
 	async fn agreed_under<P: HandshakeProvider<Kem = DhKemSecp256k1>>() -> AgreedTerms {
@@ -1738,6 +1726,33 @@ pub fn reply_content(profile: Option<SecurityProfileDesc>, server_ephemeral: imp
 
 #[cfg(feature = "transport-hpke")]
 impl AwaitingClosing<Hpke> {
+	/// A server under `config` that has answered a hand-built hello of the
+	/// agreement ephemeral `ephemeral` that carries `transport_offer`.
+	///
+	/// The hello carries [`CLIENT_RANDOM`], and the salt of the handshake is
+	/// that random followed by the server random.
+	pub async fn offering(
+		config: TestServerConfig<Hpke>,
+		ephemeral: SecretKey,
+		transport_offer: Option<TransportOffer>,
+	) -> Self {
+		let mut hello = hello_of(&ephemeral);
+		hello.transport_offer = transport_offer;
+
+		let mut server = Handshake::server(config);
+		let reply = server.reply(hello_opening(&hello)).await;
+		let reply = reply.expect("the server admits the hello");
+		let handshake = reply.signed_handshake();
+		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(handshake.server_ephemeral.as_bytes());
+		let confirming = Confirming {
+			server_ephemeral: server_ephemeral.expect("the reply carries a point on the curve"),
+			salt: [CLIENT_RANDOM.as_slice(), handshake.server_random.as_bytes()].concat(),
+			transcript_hash: server.transcript_hash().expect("the reply sealed the transcript"),
+		};
+
+		Self { server, reply, confirming, ephemeral, base: None }
+	}
+
 	/// The closing that carries `content` of `content_type`, sealed as the
 	/// client that built the hello seals it.
 	pub fn sealed_as(&self, content_type: ObjectIdentifier, content: Vec<u8>) -> HandshakeMessage {

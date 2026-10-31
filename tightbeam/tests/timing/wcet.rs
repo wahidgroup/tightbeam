@@ -1,7 +1,5 @@
 //! The integration tests of WCET constraints.
 
-#![cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
-
 use core::error::Error;
 use std::time::Duration;
 
@@ -81,8 +79,7 @@ fn wcet_config(
 // 1. The process declares its timing constraints.
 // 2. The trace records the instrumentation events.
 // 3. Timing verification runs and passes a duration within the constraint.
-// FDR exploration or a hook calls the timing verification, and this test
-// calls it from its pass hook to check the timing infrastructure.
+// This test calls the timing verification from its pass hook.
 tb_scenario! {
 	name: test_wcet_constraint_passing,
 	config: wcet_config(|context, process| {

@@ -2,29 +2,38 @@
 //! scheduler constraint hands that engine the scheduled subject through
 //! [`ExplorationCore::for_process`].
 
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use core::num::NonZeroU32;
-
-use tightbeam::testing::fdr::{
-	DefaultCache, DefaultExplorationEngine, DefaultRefinementChecker, ExplorationCore, FdrConfig, FdrExplorer,
-	SchedulerConstraint, SchedulerCounts, SchedulerModel, SeedResult, Trace,
-};
+use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig, SeedResult, Trace};
 use tightbeam::testing::specs::composition::CompositionOperator;
-use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+use tightbeam::testing::specs::csp::{Process, State};
+
+use crate::common::csp::{cooperative, explorer_of, once};
+use crate::common::result::TestResult;
+
+/// The seeds of the exploration.
+const SEEDS: u32 = 4;
+
+/// The initial states that a [`NotingEngine`] and each engine it builds note.
+#[derive(Clone, Default)]
+struct Notes {
+	/// The initial state of each process that `for_process` received.
+	handed: Arc<Mutex<Vec<State>>>,
+	/// The initial state of the process that each seed walked.
+	walked: Arc<Mutex<Vec<State>>>,
+}
 
 /// An exploration engine that notes the initial state of each process that
-/// [`ExplorationCore::for_process`] hands it, and walks with the house engine.
+/// [`ExplorationCore::for_process`] hands it, and of the process that each
+/// seed walks, and walks with the house engine.
 struct NotingEngine<'a> {
 	/// The process under exploration.
 	process: &'a Process,
 	/// The configuration of the exploration.
 	config: Arc<FdrConfig>,
-	/// The initial state of each process that `for_process` received.
-	handed: Arc<Mutex<Vec<State>>>,
+	/// The states that this engine notes.
+	notes: Notes,
 	/// The result of each seed.
 	results: Vec<(u64, SeedResult)>,
 	/// The engine that walks each seed.
@@ -32,10 +41,10 @@ struct NotingEngine<'a> {
 }
 
 impl<'a> NotingEngine<'a> {
-	/// An engine of `process` under `config` that notes into `handed`.
-	fn new(process: &'a Process, config: Arc<FdrConfig>, handed: Arc<Mutex<Vec<State>>>) -> Self {
+	/// An engine of `process` under `config` that notes into `notes`.
+	fn new(process: &'a Process, config: Arc<FdrConfig>, notes: Notes) -> Self {
 		let walker = DefaultExplorationEngine::new(process, Arc::clone(&config));
-		Self { process, config, handed, results: Vec::new(), walker }
+		Self { process, config, notes, results: Vec::new(), walker }
 	}
 }
 
@@ -43,11 +52,11 @@ impl ExplorationCore for NotingEngine<'_> {
 	type ForProcess<'p> = NotingEngine<'p>;
 
 	fn for_process<'p>(&self, process: &'p Process) -> NotingEngine<'p> {
-		let mut handed = self.handed.lock().expect("no test panics while it holds the lock");
+		let mut handed = self.notes.handed.lock().expect("no test panics while it holds the lock");
 		handed.push(process.initial());
 		drop(handed);
 
-		NotingEngine::new(process, Arc::clone(&self.config), Arc::clone(&self.handed))
+		NotingEngine::new(process, Arc::clone(&self.config), self.notes.clone())
 	}
 
 	fn process(&self) -> &Process {
@@ -59,6 +68,10 @@ impl ExplorationCore for NotingEngine<'_> {
 	}
 
 	fn explore_seed(&mut self, seed: u64) -> SeedResult {
+		let mut walked = self.notes.walked.lock().expect("no test panics while it holds the lock");
+		walked.push(self.process.initial());
+		drop(walked);
+
 		self.walker.explore_seed(seed)
 	}
 
@@ -79,34 +92,27 @@ impl ExplorationCore for NotingEngine<'_> {
 	}
 }
 
-/// A process named `name` that takes `event` from `start` to the accepting
-/// `end`.
-fn once(name: &'static str, (start, end): (&'static str, &'static str), event: &'static str) -> Process {
-	let built: Result<Process, ProcessBuildError> = Process::builder(name)
-		.initial_state(State(start))
-		.add_observable(Event(event))
-		.add_transition(State(start), Event(event), State(end))
-		.add_terminal(State(end))
-		.build();
-
-	built.expect("a process of one event builds")
+/// The states that an engine noted into `noted`, in the order it noted them.
+fn noted_states(noted: &Mutex<Vec<State>>) -> Vec<State> {
+	let noted = noted.lock().expect("no engine panics while it holds the lock");
+	noted.to_vec()
 }
 
+/// An FDR run with a scheduler constraint hands an outside engine the
+/// scheduled subject, the interleaving of two processes, through
+/// [`ExplorationCore::for_process`], and each seed of the run walks that
+/// engine.
 #[test]
-fn an_outside_engine_walks_the_scheduled_subject() -> Result<(), Box<dyn core::error::Error>> {
+fn an_outside_engine_walks_the_scheduled_subject() -> TestResult {
 	let (a, b) = (once("A", ("A0", "A1"), "a"), once("B", ("B0", "B1"), "b"));
 	let subject = CompositionOperator::Interleaved.compose(&a, &b)?;
-	let counts = SchedulerCounts { schedulers: NonZeroU32::MIN, processes: NonZeroU32::try_from(2)? };
-	let scheduler = SchedulerConstraint::new(SchedulerModel::Cooperative, counts)?;
-	let config = Arc::new(FdrConfig { scheduler: Some(scheduler), ..FdrConfig::default() });
-	let handed = Arc::new(Mutex::new(Vec::new()));
-	let engine = NotingEngine::new(&subject, Arc::clone(&config), Arc::clone(&handed));
-	let cache = Rc::new(RefCell::new(DefaultCache::new()));
-	let checker = DefaultRefinementChecker::new(&subject, Arc::clone(&config), cache);
+	let notes = Notes::default();
+	let noting = |process, config| NotingEngine::new(process, config, notes.clone());
+	let config = cooperative(FdrConfig { seeds: SEEDS, ..FdrConfig::default() });
+	let mut explorer = explorer_of(&subject, config, noting);
+	explorer.explore()?;
 
-	FdrExplorer::new_with_arc(&subject, config, engine, checker).explore()?;
-
-	let handed = handed.lock().map(|handed| handed.clone()).unwrap_or_default();
-	assert_eq!(handed, [State("(A0,B0)@{}")]);
+	assert_eq!(noted_states(&notes.handed), [State("(A0,B0)@{}")]);
+	assert_eq!(noted_states(&notes.walked), [State("(A0,B0)@{}"); SEEDS as usize]);
 	Ok(())
 }

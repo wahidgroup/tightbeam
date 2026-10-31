@@ -5,7 +5,6 @@
 //! operations.
 
 pub mod command_ack_handler;
-pub mod command_execution;
 pub mod frame_request_handler;
 pub mod frame_response_handler;
 pub mod messages;
@@ -14,7 +13,6 @@ pub mod rover_command_handler;
 pub mod telemetry_builder;
 
 pub use command_ack_handler::CommandAckHandlerWorker;
-pub use command_execution::CommandExecutionWorker;
 pub use frame_request_handler::{FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig};
 pub use frame_response_handler::FrameResponseHandlerWorker;
 pub use mission_control_telemetry_handler::{

@@ -10,32 +10,23 @@
 //! An outside [`ServletBox`] that keeps the default drain stops at the drain
 //! of its hive.
 
-#![cfg(all(
-	feature = "std",
-	feature = "tokio",
-	feature = "testing",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "colony"
-))]
+#![cfg(feature = "colony")]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::sync::Arc;
 
 use tightbeam::basis_points::BasisPoints;
 use tightbeam::builder::TypeBuilder;
-use tightbeam::clock::{Clock, ManualClock};
+use tightbeam::clock::Clock;
 use tightbeam::cms::signed_data::SignerIdentifier;
-use tightbeam::colony::cluster::{ClusterConfig, ClusterTlsConfig};
+use tightbeam::colony::cluster::ClusterConfig;
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
 use tightbeam::colony::servlet::{ServletConfig, UtilizationGauge};
 use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::SubmitWork;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
-use tightbeam::crypto::x509::utils::CertificateExt;
-use tightbeam::crypto::x509::{Certificate, CertificateSpec};
+use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::{ClusterEnv, SetupEnv, TestMessage};
@@ -46,9 +37,12 @@ use tightbeam::transport::{ClientBuilder, ConnectionBuilder, Protocol};
 use tightbeam::urn::Urn;
 use tightbeam::{cluster, exactly, hive, servlet, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
 
-use crate::common::poll::poll_until;
+use super::StopProbe;
+use crate::common::clock::ParkingClock;
+use crate::common::hive::servlet_urn;
+use crate::common::result::TestResult;
 use crate::common::security::{random_signing_key, test_certificate};
-use crate::common::x509::GatewayCerts;
+use crate::common::x509::{signer_of, GatewayCerts};
 
 const OUTSIDE_SERVLET_RAN: Urn<'static> = tightbeam::urn!("test", "event:seams/outside-servlet-ran");
 
@@ -97,11 +91,6 @@ impl ServletBox for OutsideServlet {
 	}
 }
 
-/// The signer that names `certificate` (RFC 5652 §5.3).
-pub(super) fn signer_of(certificate: &Certificate) -> SignerIdentifier {
-	certificate.signer_identifier().expect("a fixture certificate names its key")
-}
-
 /// The type URN the outside servlet registers under.
 fn echo_urn() -> Urn<'static> {
 	ColonyNamespace::default()
@@ -110,17 +99,15 @@ fn echo_urn() -> Urn<'static> {
 }
 
 /// The certificate and key of `certs`, as a specification and a provider.
-pub(super) fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256k1KeyProvider>) {
+fn identity_of(certs: &GatewayCerts) -> (CertificateSpec, Arc<Secp256k1KeyProvider>) {
 	let spec = CertificateSpec::Built(Box::new(certs.cert.to_owned()));
 	let provider = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
 	(spec, provider)
 }
 
 /// A gateway under `certs`, whose hive trust holds the same identity.
-pub(super) fn seam_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
-	let (spec, provider) = identity_of(certs);
-	let tls = ClusterTlsConfig::new(spec, provider).expect("the seam certificate decodes");
-	ClusterConfig::new(tls.with_hive_trust(Some(Arc::clone(&certs.trust))))
+fn seam_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
+	ClusterConfig::new(certs.cluster_tls())
 }
 
 /// Starts an established hive under `certs` that registers one
@@ -263,12 +250,6 @@ tb_scenario! {
 /// The scaling cadence of the gauged hive, on its manual clock.
 const SCALING_PERIOD: Duration = Duration::from_secs(5);
 
-/// The polls of the wait for the hive to scale up.
-const SCALE_POLLS: u32 = 100;
-
-/// The interval between two polls.
-const SCALE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 /// A gauge that an outside crate writes: it reads full load, so the hive
 /// scales up the servlet that holds it.
 struct FullLoad;
@@ -279,84 +260,59 @@ impl UtilizationGauge for FullLoad {
 	}
 }
 
-/// The type URN the gauged servlet registers under.
-fn gauged_urn() -> Urn<'static> {
-	let urn = ColonyNamespace::default().servlet("gauged-echo");
-	urn.expect("test names satisfy the mint grammar")
-}
-
 /// Starts a hive on `clock` with no control plane, whose one `servlet!`
 /// servlet holds the outside [`FullLoad`] gauge behind the erased handle.
-async fn start_gauged_hive(clock: &Arc<ManualClock>) -> Result<SeamHive, TightBeamError> {
+async fn start_gauged_hive(clock: Arc<dyn Clock>) -> SeamHive {
 	let gauge: Arc<dyn UtilizationGauge> = Arc::new(FullLoad);
 	let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_utilization(gauge);
 	let servlet_conf = builder.allow_cleartext().build();
-	let servlet = SeamEchoServlet::start(Arc::new(TraceCollector::new()), servlet_conf).await?;
+	let servlet = SeamEchoServlet::start(Arc::new(TraceCollector::new()), servlet_conf).await;
+	let servlet = servlet.expect("the gauged servlet starts");
 
-	let mut conf = HiveConfig { clock: Arc::clone(clock) as Arc<dyn Clock>, ..Default::default() };
+	let mut conf = HiveConfig { clock, ..Default::default() };
 	conf.scaling.cooldown = SCALING_PERIOD;
 
-	let mut hive = SeamHive::new(Some(conf))?;
-	hive.register(gauged_urn(), servlet, |t| SeamEchoServlet::start(t, ServletConfig::cleartext()))?;
-	hive.establish(Arc::new(TraceCollector::new())).await?;
-	Ok(hive)
+	let mut hive = SeamHive::new(Some(conf)).expect("the hive configuration holds");
+	let spawner = |t| SeamEchoServlet::start(t, ServletConfig::cleartext());
+	let registered = hive.register(servlet_urn("gauged-echo"), servlet, spawner);
+	registered.expect("the hive registers its servlet");
+
+	let established = hive.establish(Arc::new(TraceCollector::new())).await;
+	established.expect("the hive establishes");
+
+	hive
 }
 
 /// A hive scales up the `servlet!` servlet whose outside gauge reads full
-/// load. Each poll moves the hive clock one scaling period.
+/// load, at the first scaling evaluation that its clock passes.
 #[tokio::test]
-async fn a_hive_scales_up_a_servlet_on_its_outside_gauge() -> Result<(), TightBeamError> {
-	let clock = Arc::new(ManualClock::default());
-	let hive = start_gauged_hive(&clock).await?;
-	let scaled_up = poll_until(SCALE_POLLS, SCALE_POLL_INTERVAL, || {
-		clock.advance(SCALING_PERIOD);
-		hive.servlet_addresses().len() > 1
-	})
-	.await;
+async fn a_hive_scales_up_a_servlet_on_its_outside_gauge() {
+	let clock = Arc::new(ParkingClock::default());
+	let hive = start_gauged_hive(Arc::clone(&clock) as Arc<dyn Clock>).await;
+
+	clock.parked(SCALING_PERIOD).await;
+	clock.advance(SCALING_PERIOD);
+	clock.parked(SCALING_PERIOD).await;
+
+	let addresses = hive.servlet_addresses();
 
 	hive.stop();
 
-	assert!(scaled_up);
-	Ok(())
-}
-
-/// A [`ServletBox`] an outside crate writes with no house runtime under it.
-/// It keeps the default drain, and it marks its stop.
-struct StopMarking {
-	stopped: Arc<AtomicBool>,
-}
-
-impl ServletBox for StopMarking {
-	fn addr_bytes(&self) -> Arc<[u8]> {
-		Arc::from(b"127.0.0.1:7080".as_slice())
-	}
-
-	fn stop_boxed(self: Box<Self>) {
-		self.stopped.store(true, Ordering::SeqCst);
-	}
-
-	fn signer(&self) -> Option<&SignerIdentifier> {
-		None
-	}
-}
-
-/// The type URN the stop-marking servlet registers under.
-fn marking_urn() -> Urn<'static> {
-	let urn = ColonyNamespace::default().servlet("stop-marking");
-	urn.expect("test names satisfy the mint grammar")
+	assert_eq!(addresses.len(), 2);
 }
 
 /// A hive's drain stops an outside servlet that keeps the default drain, so
 /// a servlet with no drain of its own still ends at the drain of its hive.
 #[tokio::test]
-async fn a_hive_drain_stops_an_outside_servlet_that_keeps_the_default_drain() -> Result<(), TightBeamError> {
-	let stopped = Arc::new(AtomicBool::new(false));
-	let servlet = StopMarking { stopped: Arc::clone(&stopped) };
-	let spawner = |_| async { Ok(StopMarking { stopped: Arc::default() }) };
-	let mut hive = SeamHive::new(None)?;
-	hive.register(marking_urn(), servlet, spawner)?;
-	hive.establish(Arc::new(TraceCollector::new())).await?;
+async fn a_hive_drain_stops_an_outside_servlet_that_keeps_the_default_drain() -> TestResult {
+	let (servlet, stopped) = StopProbe::new();
 
+	// The hive scales nothing, so it calls no spawner, and the flag of the
+	// probe that the spawner would start drops with it.
+	let spawner = |_| async { Ok(StopProbe::new().0) };
+	let mut hive = SeamHive::new(None)?;
+	hive.register(servlet_urn("stop-marking"), servlet, spawner)?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
 	hive.drain().await?;
 
 	assert!(stopped.load(Ordering::SeqCst));

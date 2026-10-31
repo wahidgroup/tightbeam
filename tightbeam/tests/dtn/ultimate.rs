@@ -12,28 +12,14 @@
 //!
 //! # Features
 //!
-//! - Rover telemetry modelled on NASA instruments (APXS, ChemCam, Mastcam)
-//! - A simulated mission clock with the Mars-Earth delays of the timeline below
-//! - Cryptographic chain validation over `previous_frame` hash chains
-//! - A matrix bit field for the rover fault flags
-//! - Fault recovery: low power, then recharge, then resume
-//! - Cascading gap recovery
+//! - Rover telemetry carries a reading of the APXS, a NASA instrument.
+//! - A simulated mission clock advances by the delays of each round and by the one recharge of the rover.
+//! - Each node validates the cryptographic chain over `previous_frame` hash chains.
+//! - A matrix bit field carries the rover fault flags, which Mission Control reads from each telemetry frame.
+//! - Fault recovery runs low power, then recharge, then resume.
 //!
-//! # Timeline
-//!
-//! Each leg restarts its clock at T+0.
-//!
-//! | Leg | Step | Mission time |
-//! | --- | --- | --- |
-//! | Command | Mission Control sends the command | T+0 |
-//! | Command | Earth Relay forwards | T+1.5s |
-//! | Command | Mars Relay forwards | T+12.5min |
-//! | Command | Rover receives, executes, and sends a stateful ACK | T+13min |
-//! | Command | Mission Control receives the ACK | T+25min |
-//! | Telemetry | Rover sends telemetry | T+0 |
-//! | Telemetry | Mars Relay forwards | T+1.5s |
-//! | Telemetry | Earth Relay forwards | T+12.5min |
-//! | Telemetry | Mission Control receives it and sends the next command | T+13min |
+//! `a_gap_step_names_the_event_of_its_node` is a self-check of the harness,
+//! because the steps and their events are test code.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -47,11 +33,10 @@ use tightbeam::{
 	instrumentation::TbInstrumentationConfig,
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
-	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, specs::csp::Process, ScenarioConfig},
+	testing::{fdr::FdrConfig, ScenarioConfig},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig},
 	transport::{tcp::r#async::TokioListener, GenericClient},
 	urn::Urn,
-	wcet,
 };
 
 use crate::common::poll::poll_until;
@@ -243,6 +228,11 @@ impl Drop for DtnScenarioConfig {
 /// The number of command and response round trips the test runs.
 const COMMAND_ROUND_TRIPS: usize = 6;
 
+/// The mission time at the end of the run: the two delays of each round, and
+/// the one recharge of the low-power fault.
+const MISSION_ELAPSED_MS: u64 =
+	COMMAND_ROUND_TRIPS as u64 * (delays::ROVER_TO_RELAY_MS + delays::RELAY_TO_EARTH_MS) + delays::ROVER_RECHARGE_MS;
+
 // Telemetry flows from the rover through the Mars relay and the Earth relay to
 // Mission Control.
 tb_process_spec! {
@@ -283,17 +273,6 @@ tb_process_spec! {
 		}
 	}
 	terminal { TelemetryIdle }
-	timing {
-		wcet: {
-			ROVER_SEND_TELEMETRY => wcet!(Duration::from_millis(100)),
-			MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER => wcet!(Duration::from_millis(50)),
-			MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH => wcet!(Duration::from_millis(50)),
-			EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS => wcet!(Duration::from_millis(50)),
-			EARTH_RELAY_FORWARD_TELEMETRY_TO_MC => wcet!(Duration::from_millis(50)),
-			MISSION_CONTROL_RECEIVE_TELEMETRY => wcet!(Duration::from_millis(50)),
-			MISSION_CONTROL_ANALYZE_TELEMETRY => wcet!(Duration::from_millis(200))
-		}
-	}
 }
 
 // Commands flow from Mission Control through the Earth relay and the Mars relay
@@ -375,19 +354,6 @@ tb_process_spec! {
 		}
 	}
 	terminal { CommandIdle }
-	timing {
-		wcet: {
-			MISSION_CONTROL_SEND_COMMAND => wcet!(Duration::from_millis(50)),
-			EARTH_RELAY_RECEIVE_FROM_MC => wcet!(Duration::from_millis(50)),
-			EARTH_RELAY_FORWARD_TO_MARS => wcet!(Duration::from_millis(50)),
-			MARS_RELAY_RECEIVE_FROM_EARTH => wcet!(Duration::from_millis(50)),
-			MARS_RELAY_FORWARD_TO_ROVER => wcet!(Duration::from_millis(50)),
-			ROVER_RECEIVE_COMMAND => wcet!(Duration::from_millis(50)),
-			ROVER_EXECUTE_COMMAND => wcet!(Duration::from_millis(500)),
-			ROVER_COMMAND_COMPLETE => wcet!(Duration::from_millis(100)),
-			ROVER_SEND_ACK => wcet!(Duration::from_millis(50))
-		}
-	}
 }
 
 // This process models the mission lifecycle and its low-power fault recovery.
@@ -467,6 +433,13 @@ tb_assert_spec! {
 			// The mission starts and completes once.
 			(MISSION_START, exactly!(1)),
 			(MISSION_COMPLETE, exactly!(1)),
+
+			// The default battery reaches low power once in the six rounds, and
+			// one telemetry frame carries the raised flag to Mission Control.
+			(FAULT_LOW_POWER_DETECTED, exactly!(1)),
+			(COMMS_HALTED, exactly!(1)),
+			(FAULT_CLEARED, exactly!(1)),
+			(MISSION_CONTROL_RECEIVE_LOW_POWER_FLAG, exactly!(1)),
 
 			// Each Mission Control event fires once per round trip.
 			(MISSION_CONTROL_SEND_COMMAND, exactly!(6)),
@@ -642,6 +615,10 @@ async fn run_mission_loop(
 		}
 	}
 
+	if mission_time_ms() != MISSION_ELAPSED_MS {
+		return Err(expectation_failure("the mission clock misses a delay of the run"));
+	}
+
 	Ok(())
 }
 
@@ -652,36 +629,29 @@ async fn await_completed_rounds(state: &RwLock<MissionState>, rounds: usize) -> 
 	poll_until(100, Duration::from_millis(100), reached).await
 }
 
-/// Builds the FDR configuration of the DTN test.
+/// Builds the FDR configuration of the DTN test, under which the framework
+/// explores the state space of `DtnComposedSystem`.
 ///
-/// The framework's FDR runs in two modes:
-///
-/// 1. CSP spec exploration: the framework explores the state space of `DtnComposedSystem`.
-/// 2. Trace refinement: the framework checks the runtime trace against the spec in `specs`.
-fn build_dtn_fdr_config_refinement(process: Process) -> FdrConfig {
+/// The CSP layer grades every event of the run against the same process, so
+/// the configuration names no refinement spec.
+fn build_dtn_fdr_config() -> FdrConfig {
 	FdrConfig {
-		seeds: 2, // Each seed explores another interleaving of the CSP model.
-		max_depth: 10,
+		seeds: 2,      // Each seed explores another interleaving of the CSP model.
+		max_depth: 10, // The model is cyclic, and a walk keeps every branch in memory.
 		max_internal_run: 5,
 		timeout_ms: 15000,
-		specs: vec![process], // It turns on trace refinement.
-		fail_fast: true,
-		scheduler: None,
-		fault_model: None,
-		#[cfg(feature = "testing-fmea")]
-		fmea_config: None,
+		..FdrConfig::default()
 	}
 }
 
 /// The configuration of the DTN scenario over `trace`. It grades the event
-/// counts, checks the run and the claims of [`DtnComposedSystem`], and refines
-/// the run against it.
+/// counts, checks the run and the claims of [`DtnComposedSystem`], and explores
+/// its state space.
 fn dtn_config(trace: TraceCollector) -> Result<ScenarioConfig, Box<dyn core::error::Error>> {
-	let fdr = build_dtn_fdr_config_refinement(DtnComposedSystem::process()?);
 	let builder = ScenarioConfig::builder()
 		.with_spec(DtnEventCountSpec::latest())
 		.with_csp(DtnComposedSystem);
-	Ok(builder.with_fdr(fdr).with_trace(trace).build()?)
+	Ok(builder.with_fdr(build_dtn_fdr_config()).with_trace(trace).build()?)
 }
 
 tb_scenario! {
@@ -804,7 +774,6 @@ tb_scenario! {
 				// Mission Control sends the first command to the Earth relay
 				// over a client of its own.
 				let mut earth_relay_client = DtnRole::MissionControl.connect(DtnRole::EarthRelay, earth_relay_addr).await?;
-
 				earth_relay_client.emit(command_frame, None).await?;
 			}
 
@@ -850,19 +819,16 @@ tb_scenario! {
 	}
 }
 
-#[cfg(test)]
 mod tests {
 	use tightbeam::tb_cases;
 
 	use super::*;
 
-	// A gap-recovery step records the event of the node that it runs on.
+	// A gap-recovery step names the event of the node that it runs on.
 	tb_cases! {
-		fn a_gap_step_records_the_event_of_its_node((role, event): (DtnRole, Urn<'static>)) -> Result<(), TightBeamError> {
-			let trace = TraceCollector::new();
-			trace.event(GapRecoveryStep::GapDetected.event_on(role))?;
-			assert_eq!(trace.recorded(event), 1);
-			Ok(())
+		fn a_gap_step_names_the_event_of_its_node((role, event): (DtnRole, Urn<'static>)) {
+			let named = GapRecoveryStep::GapDetected.event_on(role);
+			assert_eq!(named, event);
 		}
 		cases {
 			mission_control => (DtnRole::MissionControl, MISSION_CONTROL_GAP_DETECTED),

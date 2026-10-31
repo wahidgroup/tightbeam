@@ -5,7 +5,7 @@
 //! [`WorkerBox`] of its own with no [`Worker`] under it, and the context finds
 //! each by its type.
 
-#![cfg(all(feature = "std", feature = "tokio", feature = "colony"))]
+#![cfg(feature = "colony")]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,8 @@ use tightbeam::colony::worker::{Worker, WorkerKillFuture, WorkerRelayFuture, Wor
 use tightbeam::testing::TestMessage;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::TightBeamError;
+
+use crate::common::result::TestResult;
 
 /// A worker an outside crate writes with no house runtime: it answers the
 /// length of the content of each message, and it marks its kill.
@@ -78,9 +79,14 @@ impl ServletService for Idle {
 	type Env = ();
 }
 
+/// A context that holds `worker` alone, as a servlet hands it its workers.
+fn context_holding(worker: Box<dyn WorkerBox>) -> ServletContext {
+	ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), [worker], None)
+}
+
 /// A servlet that drains ends its outside worker through the worker's kill.
 #[tokio::test]
-async fn a_servlet_drain_kills_an_outside_worker() -> Result<(), TightBeamError> {
+async fn a_servlet_drain_kills_an_outside_worker() -> TestResult {
 	let killed = Arc::new(AtomicBool::new(false));
 	let worker = OutsideWorker::new(Arc::clone(&killed));
 	let builder = ServletConfig::<TokioListener, TestMessage>::builder().with_worker(worker);
@@ -96,23 +102,17 @@ async fn a_servlet_drain_kills_an_outside_worker() -> Result<(), TightBeamError>
 /// A worker that an outside crate hands to a context finds itself by its
 /// type.
 #[test]
-fn a_worker_handed_to_a_context_resolves_by_its_type() -> Result<(), TightBeamError> {
-	let workers: [Box<dyn WorkerBox>; 1] = [Box::new(OutsideWorker::new(Arc::default()))];
-
-	let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), workers, None);
-
-	assert!(ctx.worker::<OutsideWorker>().is_some());
-	Ok(())
+fn a_worker_handed_to_a_context_resolves_by_its_type() {
+	let ctx = context_holding(Box::new(OutsideWorker::new(Arc::default())));
+	let found = ctx.worker::<OutsideWorker>();
+	assert!(found.is_some());
 }
 
 /// An outside box that an outside crate hands to a context finds itself by its
 /// type, so the context keys a box with no [`Worker`] under it.
 #[test]
-fn an_outside_worker_box_handed_to_a_context_resolves_by_its_type() -> Result<(), TightBeamError> {
-	let workers: [Box<dyn WorkerBox>; 1] = [Box::new(OutsideBox)];
-
-	let ctx: ServletContext = ServletContext::new(Arc::new(TraceCollector::new()), Arc::new(()), workers, None);
-
-	assert!(ctx.worker::<OutsideBox>().is_some());
-	Ok(())
+fn an_outside_worker_box_handed_to_a_context_resolves_by_its_type() {
+	let ctx = context_holding(Box::new(OutsideBox));
+	let found = ctx.worker::<OutsideBox>();
+	assert!(found.is_some());
 }

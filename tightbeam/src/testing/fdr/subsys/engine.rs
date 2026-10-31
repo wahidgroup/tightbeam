@@ -104,6 +104,9 @@ impl FdrVerdict {
 		self.traces_explored = engine.traces().len();
 		self.states_visited = engine.visited_states().len();
 		self.timing_pruned = engine.timing_pruned();
+		if engine.cut_short() {
+			self.leave_freedom_open();
+		}
 	}
 }
 
@@ -489,6 +492,10 @@ where
 
 			self.verdict.timing_pruned += engine.timing_pruned();
 			self.verdict.states_visited += engine.visited_states().len();
+			if engine.cut_short() {
+				self.verdict.leave_freedom_open();
+			}
+
 			if let Some(record) = record.as_mut() {
 				record(&spec_process, engine.visited_states(), found.divergences())?;
 			}
@@ -871,6 +878,18 @@ mod tests {
 		.build()
 	}
 
+	/// A subject whose every step takes `a` to both of its states, so a walk
+	/// doubles its branches at each step.
+	fn doubling_cycle() -> Process {
+		TestProcess {
+			observable: &["a"],
+			transitions: &[("S0", "a", "S0"), ("S0", "a", "S1"), ("S1", "a", "S0"), ("S1", "a", "S1")],
+			terminal: &["S0"],
+			..TestProcess::of("DoublingCycle", "S0")
+		}
+		.build()
+	}
+
 	/// A subject whose `start` resets `clk` on its way to the accepting `S1`,
 	/// where the hidden `t` spins under `guard`.
 	#[cfg(feature = "testing-timing")]
@@ -929,6 +948,24 @@ mod tests {
 			a_guard_on_a_clock_at_zero => (guarded_from_the_start, Decision::Holds),
 			/// `b` leads from the accepting `Idle` to `D`.
 			a_deadlock_behind_an_accepting_state => (stuck_after_b, Decision::Refuted),
+		}
+	}
+
+	// A walk of a cycle that doubles its branches stops at its budget of
+	// states under a deep bound, so the run leaves each freedom open.
+	crate::tb_cases! {
+		fn a_walk_decides_freedom_within_its_budget((max_depth, decided): (usize, Decision)) {
+			let config = FdrConfig { max_depth, ..FdrConfig::default() };
+
+			let verdict = doubling_cycle().verdict_under(config);
+			assert_eq!((verdict.deadlock_free, verdict.divergence_free), (decided, decided));
+		}
+
+		cases {
+			/// Six steps stay within the budget of each walk.
+			a_shallow_bound => (6, Decision::Holds),
+			/// The default bound spends the budget of each walk.
+			the_default_bound => (128, Decision::Unknown),
 		}
 	}
 

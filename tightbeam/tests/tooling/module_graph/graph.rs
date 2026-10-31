@@ -240,6 +240,18 @@ impl<'t> ModuleGraph<'t> {
 		let components = Adjacency(adjacency).cycles(&nodes);
 		Cycles { graph: self, components }
 	}
+
+	/// `Ok` when the production edges are acyclic, and otherwise a
+	/// [`GraphError::Cycles`] that names the nodes of each cycle and reports
+	/// the edges that close it.
+	pub(super) fn acyclic(&self) -> Result<(), GraphError> {
+		let cycles = self.production_cycles();
+		if cycles.is_empty() {
+			return Ok(());
+		}
+
+		Err(GraphError::Cycles { names: cycles.names(), report: cycles.to_string() })
+	}
 }
 
 /// The production cycles of a graph, which print with their closing edges.
@@ -251,6 +263,12 @@ pub(super) struct Cycles<'g, 't> {
 impl Cycles<'_, '_> {
 	pub(super) fn is_empty(&self) -> bool {
 		self.components.is_empty()
+	}
+
+	/// The names of the nodes of each cycle, in the order of the nodes.
+	fn names(&self) -> Vec<Vec<String>> {
+		let names = |component: &BTreeSet<&Node>| component.iter().map(|node| node.to_string()).collect();
+		self.components.iter().map(names).collect()
 	}
 }
 

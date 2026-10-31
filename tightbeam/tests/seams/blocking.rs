@@ -9,23 +9,16 @@
 //! - The house provider runs the same exchange here, beside them.
 //! - [`OutsideStream`] brings a blocking stream of its own, whose expired
 //!   timeout the transport reports as `DeadlineExceeded`.
-
-#![cfg(all(feature = "transport-hpke", feature = "tcp"))]
+//! - [`ExpiredStream`] raises each kind of error that an expired timeout raises.
 
 use std::error::Error;
-use std::io::{Error as IoError, Read, Write};
+use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use tightbeam::crypto::k256::ecdsa::SigningKey;
-use tightbeam::crypto::policy::ProviderPolicy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-use tightbeam::crypto::x509::KeyCurves;
-use tightbeam::random::OsRng;
 use tightbeam::runtime::rt;
 use tightbeam::testing::{TestFrame, TestIdentity};
 use tightbeam::transport::client::ClientBuilder;
@@ -39,7 +32,9 @@ use tightbeam::transport::{
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 
-use super::{outside_identity, OutsideProvider};
+use super::{outside_identity, OutsideProvider, SERVER_SEED};
+use crate::common::result::TestResult;
+use crate::common::security::trust_under;
 
 /// A blocking listener under `P` on a loopback port, whose transports
 /// present `identity`, and the address it binds.
@@ -79,10 +74,7 @@ pub(super) fn client_trusting<P: HandshakeProvider>(
 	addr: SocketAddr,
 	server: &Certificate,
 ) -> TcpTransport<NetTcpStream, P> {
-	let builder = CertificateTrustBuilder::new(ProviderPolicy::<P>::default(), KeyCurves::HOUSE, NoRevocation);
-	let anchored = builder.with_certificate(server.to_owned());
-	let store = anchored.expect("the server certificate anchors");
-	let store: Arc<dyn CertificateTrust> = Arc::new(store.build());
+	let store = trust_under::<P>([server]);
 
 	let stream = NetTcpStream::connect(addr).expect("the client reaches the listener");
 	let client = ClientBuilder::<TcpListener<NetTcpListener, P>>::builder().with_trust_store(store);
@@ -121,8 +113,8 @@ pub(super) async fn blocking_exchange<P: HandshakeProvider>(
 /// A blocking client and server under [`OutsideProvider`] complete its
 /// handshake. The client holds the server certificate and gets its frame back.
 #[tokio::test]
-async fn an_outside_provider_runs_the_blocking_transport() -> Result<(), Box<dyn Error>> {
-	let exchange = blocking_exchange::<OutsideProvider>(outside_identity(), "outside-blocking").await?;
+async fn an_outside_provider_runs_the_blocking_transport() -> TestResult {
+	let exchange = blocking_exchange::<OutsideProvider>(outside_identity(SERVER_SEED), "outside-blocking").await?;
 	assert_eq!(exchange.received, exchange.sent);
 	Ok(())
 }
@@ -130,8 +122,8 @@ async fn an_outside_provider_runs_the_blocking_transport() -> Result<(), Box<dyn
 /// A blocking client and server under the house provider complete its
 /// handshake and echo a frame, as the outside providers do.
 #[tokio::test]
-async fn the_house_provider_runs_the_blocking_transport() -> Result<(), Box<dyn Error>> {
-	let server = TestIdentity::of(&SigningKey::random(&mut OsRng));
+async fn the_house_provider_runs_the_blocking_transport() -> TestResult {
+	let server = TestIdentity::insecure_fixed();
 	let exchange = blocking_exchange::<DefaultCryptoProvider>(server, "house-blocking").await?;
 	assert_eq!(exchange.received, exchange.sent);
 	Ok(())
@@ -170,6 +162,42 @@ impl ProtocolStream for OutsideStream {
 	}
 }
 
+/// A blocking stream an outside crate writes whose every read raises `kind`,
+/// the error that an expired timeout raises on one platform.
+struct ExpiredStream(ErrorKind);
+
+impl ProtocolStream for ExpiredStream {
+	type Error = IoError;
+
+	fn write_all(&mut self, _buf: &[u8]) -> Result<(), IoError> {
+		Ok(())
+	}
+
+	fn write_some(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+		Ok(buf.len())
+	}
+
+	fn read_exact(&mut self, _buf: &mut [u8]) -> Result<(), IoError> {
+		Err(self.0.into())
+	}
+
+	fn read_some(&mut self, _buf: &mut [u8]) -> Result<usize, IoError> {
+		Err(self.0.into())
+	}
+
+	fn set_timeout(&mut self, _timeout: Option<Duration>) -> Result<(), IoError> {
+		Ok(())
+	}
+}
+
+/// The endpoint of a cleartext blocking transport, whose reads end at
+/// [`READ_DEADLINE`].
+fn deadline_endpoint() -> EndpointConfig<DefaultCryptoProvider> {
+	let limits = TransportLimits { operation_timeout: READ_DEADLINE, ..TransportLimits::default() };
+	let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext().with_limits(limits);
+	endpoint.expect("the read deadline meets the limits of an endpoint")
+}
+
 /// The two ends of one loopback connection: the end a transport reads, and
 /// the end of a peer that stays silent.
 fn loopback_pair() -> (NetTcpStream, NetTcpStream) {
@@ -181,19 +209,37 @@ fn loopback_pair() -> (NetTcpStream, NetTcpStream) {
 }
 
 /// The blocking transport over an outside stream reports a read that a silent
-/// peer runs past its deadline as `DeadlineExceeded`, whichever of
-/// `WouldBlock` and `TimedOut` the timeout of the stream raises.
+/// peer runs past its deadline as `DeadlineExceeded`.
+///
+/// The blocking transport bounds the read by the timeout of its OS socket, the
+/// one clock it reads, so the test waits the real deadline.
 #[test]
-fn an_outside_blocking_stream_that_times_out_reports_the_deadline() -> Result<(), Box<dyn Error>> {
+fn an_outside_blocking_stream_that_times_out_reports_the_deadline() {
 	let (stream, _silent) = loopback_pair();
-	let limits = TransportLimits { operation_timeout: READ_DEADLINE, ..TransportLimits::default() };
-	let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext().with_limits(limits)?;
-	let mut transport = TcpTransport::new(OutsideStream(stream), endpoint);
+	let mut transport = TcpTransport::new(OutsideStream(stream), deadline_endpoint());
 
 	let read = rt::block_on(transport.read_envelope_bytes());
 	assert!(matches!(
 		read,
 		Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
 	));
-	Ok(())
+}
+
+// The blocking transport names each error of an expired timeout
+// `DeadlineExceeded`, so the platform of the stream decides no refusal.
+tightbeam::tb_cases! {
+	fn an_outside_stream_read_that_expires_reports_the_deadline(kind: ErrorKind) {
+		let mut transport = TcpTransport::new(ExpiredStream(kind), deadline_endpoint());
+		let read = rt::block_on(transport.read_envelope_bytes());
+		assert!(matches!(
+			read,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
+	}
+	cases {
+		/// The read raises `WouldBlock`, the expiry of a socket on Unix.
+		with_would_block => ErrorKind::WouldBlock,
+		/// The read raises `TimedOut`, the expiry of a socket on Windows.
+		with_timed_out => ErrorKind::TimedOut,
+	}
 }

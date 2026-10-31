@@ -3,16 +3,8 @@
 //! end.
 //!
 //! A laser tightbeam arrives at the cluster gateway, which relays it to a
-//! servlet through the hive, with every link encrypted and multiplexed.
-
-#![cfg(all(
-	feature = "std",
-	feature = "tokio",
-	feature = "testing",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature"
-))]
+//! servlet that a hive registered. Every link is encrypted, and the pool of
+//! the gateway reaches the servlet over a multiplexed connection.
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
@@ -49,8 +41,9 @@ use tightbeam::{
 	Beamable, Frame, TightBeamError, Version,
 };
 
+use crate::colony::laser_protocol::{LaserAddr, LaserListener};
 use crate::common::hive::scenario_hive_config;
-use crate::common::laser::{LaserAddr, LaserListener};
+use crate::common::result::TestResult;
 use crate::common::security::expectation_failure;
 use crate::common::x509::{signing_identity, GatewayCerts};
 
@@ -329,14 +322,17 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_WORK_ROUTED, exactly!(1))
+			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
+			(events::POOL_DIAL, at_least!(1)),
+			(events::POOL_MUX_DECLINED, exactly!(0))
 		]
 	}
 }
 
-// A laser tightbeam runs from the client through the cluster gateway and the
-// hive control plane to a hive servlet, and every link runs the in-memory
-// laser protocol, encrypted and multiplexed.
+// A laser tightbeam runs from the client through the cluster gateway to a
+// servlet that the hive registered. Every link runs the in-memory laser
+// protocol under encryption, and each dial of the gateway's pool negotiates
+// the multiplexed plane, which the spec reads as a dial that no peer declined.
 tb_scenario! {
 	name: cluster_routes_work_over_laser_protocol,
 	spec: LaserRoutingSpec,
@@ -429,17 +425,14 @@ tb_scenario! {
 	}
 }
 
-/// An outside protocol over the TCP transport keeps the lease contract of
-/// the house pool: a connection whose emit was dropped before its answer is
-/// not leased again, though its stream is still open.
-#[tokio::test]
-async fn a_laser_lease_whose_emit_was_dropped_is_not_leased_again() -> Result<(), Box<dyn std::error::Error>> {
-	use tightbeam::testing::TestFrame;
-	use tightbeam::transport::{MessageCollector, PersistentConnection, Protocol};
+/// Starts a laser server that reads the request of its one connection and
+/// never answers, so an emit to it stays in flight while the stream stays
+/// open, and returns its address.
+async fn start_silent_laser_server() -> LaserAddr {
+	use tightbeam::transport::{MessageCollector, Protocol};
 
-	// The server reads the request and never answers, so the emit stays in
-	// flight while the stream stays open.
-	let (listener, addr) = <LaserListener as Protocol>::bind_cleartext(LaserAddr::ANY).await?;
+	let bound = <LaserListener as Protocol>::bind_cleartext(LaserAddr::ANY).await;
+	let (listener, addr) = bound.expect("the laser airspace has a free slot");
 	tokio::spawn(async move {
 		let Ok((mut transport, _)) = listener.accept().await else {
 			return;
@@ -449,12 +442,33 @@ async fn a_laser_lease_whose_emit_was_dropped_is_not_leased_again() -> Result<()
 		core::future::pending::<()>().await;
 	});
 
-	let pool = Arc::new(ConnectionPool::<LaserListener>::builder().allow_cleartext().build());
+	addr
+}
+
+/// An outside protocol over the TCP transport keeps the lease contract of
+/// the house pool: a connection that loses its emit before the answer reads
+/// as not leasable while its stream stays open, so the next lease of the
+/// address dials a connection of its own.
+///
+/// The laser stream is an in-memory duplex, so the timeout that drops the
+/// emit elapses on the paused clock of the test.
+#[tokio::test(start_paused = true)]
+async fn a_laser_lease_whose_emit_was_dropped_is_not_leased_again() -> TestResult {
+	use tightbeam::testing::TestFrame;
+	use tightbeam::transport::PersistentConnection;
+
+	let addr = start_silent_laser_server().await;
+	let trace = TraceCollector::new();
+	let builder = ConnectionPool::<LaserListener>::builder().allow_cleartext();
+	let pool = Arc::new(builder.with_trace(trace.share()).build());
 	let mut lease = pool.connect(addr).await?;
 	let emit = lease.emit(TestFrame::v0(Some("request"), None), None);
 	let abandoned = tokio::time::timeout(Duration::from_millis(100), emit).await;
-
 	let leasable = <LaserListener as PersistentConnection>::is_connected(lease.conn()?.transport());
-	assert_eq!((abandoned.is_err(), leasable), (true, false));
+	drop(lease);
+
+	let _next = pool.connect(addr).await?;
+	let dials = trace.recorded(events::POOL_DIAL);
+	assert_eq!((abandoned.is_err(), leasable, dials), (true, false, 2));
 	Ok(())
 }

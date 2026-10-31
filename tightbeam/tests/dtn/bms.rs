@@ -1,28 +1,28 @@
-//! Battery Management System (BMS)
+//! The battery management system (BMS) of the Mars rover.
+//!
+//! The battery is a simulation of this suite, so the tests of this file are
+//! self-checks of the harness, and no tightbeam code runs in them.
 
-/// Battery Management System for Mars Rover
-///
-/// Manages battery state including:
-/// - Current charge level (0-100%)
-/// - Drain rate during operations
-/// - Re-energize rate during faults
-/// - Fault detection for low power
+/// The battery of the Mars rover, which each operational round drains and
+/// each skipped round re-energizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatteryManagementSystem {
-	/// Current battery energy percentage (0-100)
+	/// The charge level, from 0 to 100 percent.
 	energy_percent: u8,
-	/// Drain rate per operational round (percentage points)
+	/// The percentage points that one operational round drains.
 	drain_rate: u8,
-	/// Re-energize rate per skipped round (percentage points)
+	/// The percentage points that one skipped round re-energizes.
 	reenergize_rate: u8,
-	/// Low power fault threshold (percentage)
+	/// The charge level below which the battery reads low power.
 	fault_threshold: u8,
-	/// Full threshold for clearing faults (percentage)
+	/// The charge level from which the battery reads full, which clears a
+	/// low-power fault.
 	full_threshold: u8,
 }
 
 impl BatteryManagementSystem {
-	/// Create a BMS with custom parameters
+	/// A battery of these parameters, with its charge level capped at 100
+	/// percent.
 	pub fn with_config(
 		energy_percent: u8,
 		drain_rate: u8,
@@ -39,43 +39,41 @@ impl BatteryManagementSystem {
 		}
 	}
 
-	/// Get current battery percentage
+	/// The charge level, in percent.
 	pub fn to_energy_percent(self) -> u8 {
 		self.energy_percent
 	}
 
-	/// Drain battery by one operational round
-	///
-	/// Returns the new charge level after draining
+	/// Drains the battery by one operational round, and returns the new
+	/// charge level.
 	pub fn drain(&mut self) -> u8 {
 		self.energy_percent = self.energy_percent.saturating_sub(self.drain_rate);
 		self.energy_percent
 	}
 
-	/// Re-energize battery by one cycle
-	///
-	/// Returns the new charge level after re-energizing
+	/// Re-energizes the battery by one cycle, up to 100 percent, and returns
+	/// the new charge level.
 	pub fn reenergize(&mut self) -> u8 {
 		self.energy_percent = self.energy_percent.saturating_add(self.reenergize_rate).min(100);
 		self.energy_percent
 	}
 
-	/// Check if battery is in low power fault state
+	/// Whether the charge level is below the low-power threshold.
 	pub fn is_low_power(&self) -> bool {
 		self.energy_percent < self.fault_threshold
 	}
 
-	/// Check if battery is fully energized
+	/// Whether the charge level is at the full threshold or above it.
 	pub fn is_full(&self) -> bool {
 		self.energy_percent >= self.full_threshold
 	}
 
-	/// Reset battery to full charge
+	/// Refills the battery to 100 percent.
 	pub fn reset(&mut self) {
 		self.energy_percent = 100;
 	}
 
-	/// Set energy level to a specific percentage
+	/// Sets the charge level to `energy_level`, capped at 100 percent.
 	pub fn set_energy_level(&mut self, energy_level: u8) {
 		self.energy_percent = energy_level.min(100);
 	}
@@ -93,70 +91,64 @@ impl Default for BatteryManagementSystem {
 	}
 }
 
-#[cfg(test)]
 mod tests {
+	use tightbeam::tb_cases;
+
 	use super::*;
 
-	#[test]
-	fn test_bms_default() {
-		let bms = BatteryManagementSystem::default();
-		assert_eq!(bms.to_energy_percent(), 100);
-		assert!(!bms.is_low_power());
-		assert!(bms.is_full());
+	// A drain or a recharge moves the charge of the default battery by its rate
+	// of 25 points, within 0 and 100.
+	tb_cases! {
+		fn a_step_moves_the_charge_by_its_rate((step, start, after): (fn(&mut BatteryManagementSystem) -> u8, u8, u8)) {
+			let mut bms = BatteryManagementSystem::default();
+			bms.set_energy_level(start);
+
+			let charge = step(&mut bms);
+			assert_eq!(charge, after);
+		}
+		cases {
+			drain_from_full => (BatteryManagementSystem::drain, 100, 75),
+			drain_from_the_threshold => (BatteryManagementSystem::drain, 25, 0),
+			drain_at_empty => (BatteryManagementSystem::drain, 0, 0),
+			recharge_from_empty => (BatteryManagementSystem::reenergize, 0, 25),
+			recharge_to_full => (BatteryManagementSystem::reenergize, 75, 100),
+			recharge_at_full => (BatteryManagementSystem::reenergize, 100, 100),
+		}
 	}
 
-	#[test]
-	fn test_bms_drain() {
-		let mut bms = BatteryManagementSystem::default();
+	// The default battery reads low power below its threshold of 25 points, and
+	// full at 100 points.
+	tb_cases! {
+		fn a_charge_reads_low_and_full_by_the_thresholds((level, low, full): (u8, bool, bool)) {
+			let mut bms = BatteryManagementSystem::default();
+			bms.set_energy_level(level);
 
-		assert_eq!(bms.drain(), 75); // 100 - 25
-		assert_eq!(bms.drain(), 50); // 75 - 25
-		assert_eq!(bms.drain(), 25); // 50 - 25
-		assert_eq!(bms.drain(), 0); // 25 - 25
-		assert_eq!(bms.drain(), 0); // Can't go below 0
-
-		assert!(bms.is_low_power());
-		assert!(!bms.is_full());
+			let reads = (bms.is_low_power(), bms.is_full());
+			assert_eq!(reads, (low, full));
+		}
+		cases {
+			full => (100, false, true),
+			at_the_threshold => (25, false, false),
+			below_the_threshold => (24, true, false),
+			empty => (0, true, false),
+		}
 	}
 
+	/// A battery of a custom configuration reads its charge by its own
+	/// thresholds, where the default thresholds read it low and not full.
 	#[test]
-	fn test_bms_recharge() {
-		let mut bms = BatteryManagementSystem::default();
-		bms.set_energy_level(0);
+	fn a_custom_config_reads_its_own_thresholds() {
+		let bms = BatteryManagementSystem::with_config(20, 10, 15, 10, 20);
 
-		assert_eq!(bms.reenergize(), 25); // 0 + 25
-		assert_eq!(bms.reenergize(), 50); // 25 + 25
-		assert_eq!(bms.reenergize(), 75); // 50 + 25
-		assert_eq!(bms.reenergize(), 100); // 75 + 25
-		assert_eq!(bms.reenergize(), 100); // Can't go above 100
-
-		assert!(!bms.is_low_power());
-		assert!(bms.is_full());
+		let reads = (bms.to_energy_percent(), bms.is_low_power(), bms.is_full());
+		assert_eq!(reads, (20, false, true));
 	}
 
+	/// A reset refills the battery to a full charge.
 	#[test]
-	fn test_bms_fault_threshold() {
-		let mut bms = BatteryManagementSystem::default();
-		bms.set_energy_level(25);
-		assert!(!bms.is_low_power()); // Exactly at threshold is OK
-
-		bms.set_energy_level(24);
-		assert!(bms.is_low_power()); // Below threshold triggers fault
-	}
-
-	#[test]
-	fn test_bms_custom_config() {
-		let bms = BatteryManagementSystem::with_config(50, 10, 15, 20, 90);
-		assert_eq!(bms.to_energy_percent(), 50);
-		assert!(!bms.is_low_power()); // 50 >= 20
-		assert!(!bms.is_full()); // 50 < 90
-	}
-
-	#[test]
-	fn test_bms_reset() {
+	fn a_reset_refills_the_battery() {
 		let mut bms = BatteryManagementSystem::default();
 		bms.set_energy_level(25);
-		assert_eq!(bms.to_energy_percent(), 25);
 
 		bms.reset();
 		assert_eq!(bms.to_energy_percent(), 100);

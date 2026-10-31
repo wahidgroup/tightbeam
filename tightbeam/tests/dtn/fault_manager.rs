@@ -12,26 +12,15 @@ use crate::dtn::{
 	faults::RoverFaultHandler,
 };
 
-/// Result of battery state update
+/// The outcome of a battery update.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BatteryUpdate {
-	/// Battery state updated, no fault changes
+	/// The charge moves, and the fault state stays as it is.
 	Updated,
-	/// Low power fault detected
+	/// The low-power fault starts at this charge.
 	LowPowerDetected(u8),
-	/// Fault cleared (battery recharged)
+	/// The recharge clears the fault at this charge.
 	FaultCleared(u8),
-}
-
-/// Action to take based on fault state
-/// NOTE: Available for explicit fault action handling in complex scenarios
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FaultAction {
-	/// Continue normal operations
-	Continue,
-	/// Halt communications and recharge
-	HaltComms,
 }
 
 /// Manages rover fault detection and handling
@@ -42,7 +31,8 @@ pub struct FaultManager {
 }
 
 impl FaultManager {
-	/// Create a new FaultManager from references
+	/// A fault manager over copies of `bms`, `fault_matrix`, and
+	/// `fault_handler`, each at its default when its lock is poisoned.
 	pub fn from_refs(
 		bms: &RwLock<BatteryManagementSystem>,
 		fault_matrix: &RwLock<FaultMatrix>,
@@ -88,20 +78,6 @@ impl FaultManager {
 		} else {
 			drop(fault_matrix_guard);
 			Ok(BatteryUpdate::Updated)
-		}
-	}
-
-	/// Check for faults and return action to take
-	/// NOTE: Available for scenarios requiring explicit fault action decisions
-	#[allow(dead_code)]
-	pub fn check_and_handle_faults(&self) -> Result<FaultAction, TightBeamError> {
-		let fault_matrix = *self.fault_matrix.read()?;
-		let fault_handler = *self.fault_handler.read()?;
-
-		if fault_handler.should_halt_comms(&fault_matrix) {
-			Ok(FaultAction::HaltComms)
-		} else {
-			Ok(FaultAction::Continue)
 		}
 	}
 

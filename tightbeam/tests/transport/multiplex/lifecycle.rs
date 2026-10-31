@@ -1,7 +1,9 @@
-//! The mux lifecycle scenarios of GoAway, rekey headroom, the cancel budget,
-//! and teardown.
+//! The mux lifecycle tests of GoAway, rekey headroom, the cancel budget, and
+//! teardown.
 
-use core::error::Error;
+use core::future::{poll_fn, Future};
+use core::pin::pin;
+use core::task::Poll;
 use std::sync::Arc;
 
 use tightbeam::asn1::Version;
@@ -13,13 +15,17 @@ use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind};
+use tightbeam::transport::envelopes::{
+	GoAwayPackage, GoAwayReason, MuxDataPackage, MuxEnvelope, MuxOpenPackage, MuxStreamKind,
+};
 use tightbeam::transport::multiplex::MuxAcceptor;
-use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
-use tightbeam::TightBeamError;
+use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError};
+use tightbeam::Frame;
 
+use crate::common::poll::joined;
+use crate::common::result::TestResult;
 use crate::common::security::expectation_failure;
-use crate::transport::support::{await_ok, join_task, mux_frame, mux_offer};
+use crate::transport::fixtures::{await_ok, join_task, mux_frame, mux_offer};
 
 use super::common::*;
 
@@ -102,13 +108,15 @@ tb_scenario! {
 	}
 }
 
-async fn run_shutdown_with_case(reason: GoAwayReason, trace: TraceCollector) -> Result<bool, TightBeamError> {
-	let mut link = establish_client_mux_server_raw(4, trace).await?;
+/// Shuts the muxed client of a raw link on `trace` down with `reason`, and
+/// returns the envelope that the raw server reads next.
+async fn run_shutdown_with_case(reason: GoAwayReason, trace: TraceCollector) -> TransportEnvelope {
+	let link = establish_client_mux_server_raw(4, trace).await;
+	let mut link = link.expect("the raw link establishes");
+	link.client.handle.shutdown_with(reason).await.expect("the shutdown drains");
 
-	link.client.handle.shutdown_with(reason).await?;
-
-	let envelope = link.server_reader.read_envelope().await?;
-	Ok(is_goaway(&envelope, reason, Some(0)))
+	let envelope = link.server_reader.read_envelope().await;
+	envelope.expect("the raw server reads the GoAway")
 }
 
 tb_assert_spec! {
@@ -124,12 +132,12 @@ tb_assert_spec! {
 // `shutdown_with` advertises its reason in the GoAway it sends, at watermark
 // 0, whatever the reason.
 tb_cases! {
-	fn mux_shutdown_with_advertises_reason(reason: GoAwayReason) -> Result<(), Box<dyn Error>> {
+	async fn shutdown_with_advertises_its_reason_at_watermark_zero(reason: GoAwayReason) -> TestResult {
 		grade_case(MuxShutdownReasonSpec::latest(), |trace| async move {
-			let advertised = run_shutdown_with_case(reason, trace).await?;
-			assert!(advertised, "shutdown_with must advertise its reason at watermark 0");
-			Ok(())
+			let advertised = run_shutdown_with_case(reason, trace).await;
+			assert_eq!(advertised, TransportEnvelope::from(GoAwayPackage::new(0, reason)));
 		})
+		.await
 	}
 	cases {
 		enhance_your_calm => GoAwayReason::EnhanceYourCalm,
@@ -138,29 +146,42 @@ tb_cases! {
 }
 
 /// A shutdown with no stream in flight ends on the poll that sends its
-/// GoAway, so the future that `kick_shutdown` returns yields the output of
-/// that poll.
+/// GoAway.
 #[tokio::test]
-async fn a_shutdown_that_ends_on_its_first_poll_yields_its_output() -> Result<(), TightBeamError> {
+async fn a_shutdown_with_no_stream_in_flight_ends_on_its_first_poll() -> TestResult {
 	let link = establish_client_mux_server_raw(4, TraceCollector::new()).await?;
-	let shutdown = kick_shutdown(&link.client.handle).await;
-	shutdown.await?;
+	let mut shutdown = pin!(link.client.handle.shutdown());
+
+	let first = poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+	assert!(matches!(first, Poll::Ready(Ok(()))));
 	Ok(())
 }
 
-async fn run_peer_reason_case(reason: GoAwayReason, trace: TraceCollector) -> Result<bool, TightBeamError> {
-	let mut link = establish_client_mux_server_raw(4, trace).await?;
+/// What a muxed client showed after the raw server answered its in-flight
+/// emit with a GoAway at watermark 0.
+struct PeerGoAway {
+	/// The outcome of the in-flight emit.
+	emit: Result<Option<Frame>, TransportError>,
+	/// The reason that the handle of the client surfaces.
+	surfaced: Option<GoAwayReason>,
+}
+
+/// Answers an in-flight emit of the muxed client of a raw link on `trace`
+/// with a GoAway of `reason` at watermark 0, and returns what the client
+/// showed.
+async fn run_peer_reason_case(reason: GoAwayReason, trace: TraceCollector) -> PeerGoAway {
+	let link = establish_client_mux_server_raw(4, trace).await;
+	let mut link = link.expect("the raw link establishes");
 
 	let emit_task = spawn_emit(&link.client.handle, mux_frame("mux-peer-reason"));
-	let _stream_id = read_muxed_request_id(&mut link.server_reader).await?;
+	let request = read_muxed_request_id(&mut link.server_reader).await;
+	request.expect("the raw server reads the request");
 
-	write_goaway(&mut link.server_writer, 0, reason).await?;
+	let goaway = write_goaway(&mut link.server_writer, 0, reason).await;
+	goaway.expect("the raw server writes the GoAway");
 
-	let outcome = join_task(emit_task, "drained emit task must not panic").await?;
-	let drained = is_draining(&outcome);
-	let surfaced = link.client.handle.goaway_reason() == Some(reason);
-
-	Ok(drained && surfaced)
+	let emit = joined(emit_task).await;
+	PeerGoAway { emit, surfaced: link.client.handle.goaway_reason() }
 }
 
 tb_assert_spec! {
@@ -176,12 +197,13 @@ tb_assert_spec! {
 // The reason of a peer GoAway surfaces on the handle and drains the emit,
 // whatever the reason.
 tb_cases! {
-	fn mux_peer_goaway_reason_surfaces_on_handle(reason: GoAwayReason) -> Result<(), Box<dyn Error>> {
+	async fn a_peer_goaway_reason_surfaces_on_the_handle(reason: GoAwayReason) -> TestResult {
 		grade_case(MuxPeerReasonSpec::latest(), |trace| async move {
-			let surfaced = run_peer_reason_case(reason, trace).await?;
-			assert!(surfaced, "the peer GoAway reason must surface on the handle and drain the emit");
-			Ok(())
+			let peer_goaway = run_peer_reason_case(reason, trace).await;
+			assert!(matches!(peer_goaway.emit, Err(TransportError::Draining)));
+			assert_eq!(peer_goaway.surfaced, Some(reason));
 		})
+		.await
 	}
 	cases {
 		enhance_your_calm => GoAwayReason::EnhanceYourCalm,
@@ -189,51 +211,48 @@ tb_cases! {
 	}
 }
 
-/// Writes `count` requests from the raw client, one per stream, and reports
-/// whether each draws its own response, beside the ID of the last stream.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- the write or read failure of the raw client.
-async fn responses_before_drain(
-	reader: &mut SplitReader,
-	writer: &mut SplitWriter,
-	count: u32,
-) -> Result<(bool, u32), TightBeamError> {
-	let mut last_stream_id = 0u32;
-	let mut responses_ok = true;
-	for index in 0..count {
-		let stream_id = client_stream_id(index);
-		last_stream_id = stream_id;
-		write_muxed_request(writer, stream_id, mux_frame("mux-rekey")).await?;
+/// Writes one request from the raw client on each of `streams`, and returns
+/// the streams whose own `End` answers it, in order.
+async fn responses_before_drain(reader: &mut SplitReader, writer: &mut SplitWriter, streams: &[u32]) -> Vec<u32> {
+	let mut answered = Vec::new();
+	for &stream_id in streams {
+		let request = write_muxed_request(writer, stream_id, mux_frame("mux-rekey")).await;
+		request.expect("the raw client writes its request");
 
-		let response = reader.read_envelope().await?;
-		responses_ok &= is_muxed_response(&response, stream_id);
+		let response = reader.read_envelope().await.expect("the raw client reads the next envelope");
+		if is_muxed_response(&response, stream_id) {
+			answered.push(stream_id);
+		}
 	}
 
-	Ok((responses_ok, last_stream_id))
+	answered
 }
 
-async fn run_rekey_case(case: RekeyCase, trace: TraceCollector) -> Result<bool, TightBeamError> {
-	let mut link = establish_server_mux_client_raw(
-		case.server_local_cap,
-		case.server_peer_cap,
-		MuxEndpointConfig { rekey_limit: Some(case.rekey_limit), ..MuxEndpointConfig::default() },
-		trace,
-	)
-	.await?;
+/// What a server under the rekey limit of a [`RekeyCase`] showed as it
+/// drained.
+struct RekeyDrain {
+	/// The streams whose request drew its own `End` before the drain.
+	answered: Vec<u32>,
+	/// The envelope that followed the last answer.
+	goaway: TransportEnvelope,
+	/// The outcome of an emit of the server after its GoAway.
+	late: Result<Option<Frame>, TransportError>,
+}
+
+/// Drives the server of `case` on `trace` up to its drain, and returns what
+/// it showed.
+async fn run_rekey_case(case: &RekeyCase, trace: TraceCollector) -> RekeyDrain {
+	let config = MuxEndpointConfig { rekey_limit: Some(case.rekey_limit), ..MuxEndpointConfig::default() };
+	let link = establish_server_mux_client_raw(case.server_local_cap, case.server_peer_cap, config, trace).await;
+	let mut link = link.expect("the raw link establishes");
 	let _server_serve = spawn_immediate_echo(link.responder);
 
-	let responses = case.responses_before_goaway();
-	let (responses_ok, last_stream_id) =
-		responses_before_drain(&mut link.client_reader, &mut link.client_writer, responses).await?;
+	let answered = responses_before_drain(&mut link.client_reader, &mut link.client_writer, case.answered).await;
 
-	let goaway = link.client_reader.read_envelope().await?;
-	let goaway_ok = is_goaway(&goaway, GoAwayReason::Shutdown, Some(last_stream_id));
+	let goaway = link.client_reader.read_envelope().await;
+	let goaway = goaway.expect("the raw client reads the GoAway");
 	let late = link.server.handle.emit_on_stream(&mux_frame("mux-rekey-late")).await;
-	let draining_ok = is_draining(&late);
-
-	Ok(responses_ok && goaway_ok && draining_ok)
+	RekeyDrain { answered, goaway, late }
 }
 
 tb_assert_spec! {
@@ -247,21 +266,27 @@ tb_assert_spec! {
 	}
 }
 
-// Each case sets the drain headroom `2 * (local_cap + peer_cap) + 1`
-// against the record limit.
+// Each case sets the drain headroom `2 * (local_cap + peer_cap) + 1` against
+// the record limit, so the server answers the requests that the rest of the
+// limit carries, sends GoAway(Shutdown) at the last of them, and then refuses
+// its own emit as draining.
 tb_cases! {
-	fn mux_rekey_headroom(case: RekeyCase) -> Result<(), Box<dyn Error>> {
+	async fn the_server_drains_at_its_rekey_headroom(case: RekeyCase) -> TestResult {
 		grade_case(MuxRekeyHeadroomSpec::latest(), |trace| async move {
-			let holds = run_rekey_case(case, trace).await?;
-			assert!(holds, "the server must answer N responses, then GoAway(Shutdown) at the watermark, then refuse");
-			Ok(())
+			let goaway = GoAwayPackage::new(case.watermark(), GoAwayReason::Shutdown);
+
+			let drain = run_rekey_case(&case, trace).await;
+			assert_eq!(drain.answered, case.answered);
+			assert_eq!(drain.goaway, TransportEnvelope::from(goaway));
+			assert!(matches!(drain.late, Err(TransportError::Draining)));
 		})
+		.await
 	}
 	cases {
-		caps_2_1_limit_8 => RekeyCase { server_local_cap: 2, server_peer_cap: 1, rekey_limit: 8 },
-		caps_2_1_limit_9 => RekeyCase { server_local_cap: 2, server_peer_cap: 1, rekey_limit: 9 },
-		caps_4_2_limit_14 => RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 14 },
-		caps_4_2_limit_15 => RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 15 },
+		caps_2_1_limit_8 => RekeyCase { server_local_cap: 2, server_peer_cap: 1, rekey_limit: 8, answered: &[1] },
+		caps_2_1_limit_9 => RekeyCase { server_local_cap: 2, server_peer_cap: 1, rekey_limit: 9, answered: &[1, 3] },
+		caps_4_2_limit_14 => RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 14, answered: &[1] },
+		caps_4_2_limit_15 => RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 15, answered: &[1, 3] },
 	}
 }
 
@@ -474,17 +499,14 @@ fn version_incompatible_frame_der() -> Vec<u8> {
 /// The call panics when a fixture record does not encode.
 fn offender(offence: Offence) -> TransportEnvelope {
 	let chunk = mux_frame("mux-violation").to_der().expect("the fixture frame encodes");
-	match offence {
+	let unary_open = |payload| MuxOpenPackage::new(1, true, MuxStreamKind::Unary, payload);
+	let record = match offence {
 		Offence::DataWithoutOpen => MuxDataPackage::new(1, true, chunk).map(Into::into),
-		Offence::OpenWithoutFrame => {
-			MuxOpenPackage::new(1, true, MuxStreamKind::Unary, vec![0xDE, 0xAD]).map(Into::into)
-		}
-		Offence::OpenWithoutMessage => MuxOpenPackage::new(1, true, MuxStreamKind::Unary, Vec::new()).map(Into::into),
-		Offence::OpenOfForbiddenFields => {
-			MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der()).map(Into::into)
-		}
-	}
-	.expect("the fixture record encodes")
+		Offence::OpenWithoutFrame => unary_open(vec![0xDE, 0xAD]).map(Into::into),
+		Offence::OpenWithoutMessage => unary_open(Vec::new()).map(Into::into),
+		Offence::OpenOfForbiddenFields => unary_open(version_incompatible_frame_der()).map(Into::into),
+	};
+	record.expect("the fixture record encodes")
 }
 
 /// The breaks of the stream grammar that the server must answer with a
@@ -500,18 +522,18 @@ enum Offence {
 	OpenOfForbiddenFields,
 }
 
-async fn violation_answered_with_goaway(
-	offender: TransportEnvelope,
-	trace: TraceCollector,
-) -> Result<bool, TightBeamError> {
-	let mut link = establish_server_mux_client_raw(4, 4, MuxEndpointConfig::default(), trace).await?;
+/// Writes `offender` from the raw client of a muxed server on `trace`, and
+/// returns the envelope that the raw client reads back.
+async fn violation_answered_with_goaway(offender: TransportEnvelope, trace: TraceCollector) -> TransportEnvelope {
+	let link = establish_server_mux_client_raw(4, 4, MuxEndpointConfig::default(), trace).await;
+	let mut link = link.expect("the raw link establishes");
 	let _server_serve = spawn_immediate_echo(link.responder);
 
-	link.client_writer.write_envelope(offender).await?;
+	let written = link.client_writer.write_envelope(offender).await;
+	written.expect("the raw client writes the offender");
 
-	let goaway = link.client_reader.read_envelope().await?;
-	let rejected = is_goaway(&goaway, GoAwayReason::ProtocolError, None);
-	Ok(rejected)
+	let answer = link.client_reader.read_envelope().await;
+	answer.expect("the raw client reads the answer of the server")
 }
 
 tb_assert_spec! {
@@ -528,12 +550,15 @@ tb_assert_spec! {
 // Each break of the stream grammar draws a `ProtocolError` GoAway from the
 // server that reads it.
 tb_cases! {
-	fn mux_stream_grammar_violation_rejected(offence: Offence) -> Result<(), Box<dyn Error>> {
+	async fn a_stream_grammar_violation_draws_a_protocol_error_goaway(offence: Offence) -> TestResult {
 		grade_case(MuxGrammarViolationSpec::latest(), |trace| async move {
-			let rejected = violation_answered_with_goaway(offender(offence), trace).await?;
-			assert!(rejected, "the grammar violation must draw a ProtocolError GoAway");
-			Ok(())
+			let answer = violation_answered_with_goaway(offender(offence), trace).await;
+			assert!(matches!(
+				answer,
+				TransportEnvelope::Mux(MuxEnvelope::GoAway(package)) if package.reason() == GoAwayReason::ProtocolError
+			));
 		})
+		.await
 	}
 	cases {
 		data_without_open => Offence::DataWithoutOpen,

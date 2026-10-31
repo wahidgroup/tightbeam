@@ -1,22 +1,34 @@
 //! # Cipher downgrade threat
 //!
 //! ## Weakness
-//! A negotiated handshake may complete with a weaker cipher than both parties
-//! support if the signed transcript does not detect message substitution
+//! A negotiated handshake may complete with a weaker cipher than the client
+//! prefers if the signed transcript does not detect message substitution
 //! across cipher strengths.
 //!
+//! The strength floor of the victim is the second line: it refuses AES-128-GCM
+//! with `BelowStrengthFloor` whatever the transcript says, so each test reads
+//! the first line by its variant, `SignatureVerificationFailed`.
+//!
 //! ## Attack
-//! 1. The victim offers AES-256-GCM, the strong cipher: the `SecurityOffer` of
-//!    its opening carries the AEAD OID (`...3.4.1.46`).
-//! 2. A MITM replaces the opening with one that offers AES-128-GCM, the weak cipher (OID `...3.4.1.6`).
+//! 1. The victim offers AES-256-GCM, the strong cipher, ahead of AES-128-GCM: the
+//!    `SecurityOffer` of its opening carries the AEAD OID (`...3.4.1.46`).
+//! 2. A MITM changes the opening so that it offers AES-128-GCM alone, the weak cipher (OID `...3.4.1.6`).
 //! 3. A server that runs the weak cipher answers it with a reply that selects AES-128-GCM.
-//! 4. The MITM hands that reply to the victim. The harness takes it from a weak handshake of the MITM's own.
+//! 4. The MITM hands that reply to the victim.
+//!
+//! An HPKE hello travels in the clear, so the MITM forges the offer and keeps
+//! the client random and `R`. A CMS opening carries its offer as an
+//! authenticated attribute of its seal, so the MITM forges the attribute in
+//! place, or sends an opening that it seals itself.
 //!
 //! ## Expected control
 //! The transcript MUST bind the opening with its offer. The server signed a
 //! transcript of the weak opening, and the victim checks the reply against a
 //! transcript of its strong opening, so the reply's signature MUST fail
 //! (`SignatureVerificationFailed`) before the victim reads the selection.
+//!
+//! A CMS server MUST refuse an offer forged in place, because the seal of the
+//! opening authenticates it.
 //!
 //! ## References
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
@@ -25,153 +37,100 @@
 //! - CAPEC-620: Drop Encryption Level <https://capec.mitre.org/data/definitions/620.html>
 //! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
-use std::sync::Arc;
-
-use tightbeam::{
-	exactly,
-	instrumentation::events,
-	job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConfig, SetupEnv},
-	trace::TraceCollector,
-	urn::Urn,
-	TightBeamError,
-};
-
-use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
-
-pub(crate) const DOWNGRADE_CAPTURE_STRONG: Urn<'static> =
-	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-strong");
-pub(crate) const DOWNGRADE_CAPTURE_WEAK: Urn<'static> =
-	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-weak");
-
-tb_assert_spec! {
-	pub DowngradeAttackSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(DOWNGRADE_CAPTURE_STRONG, exactly!(1)),
-			(DOWNGRADE_CAPTURE_WEAK, exactly!(1)),
-			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature"))
-		]
-	}
-}
-
-tb_process_spec! {
-	pub DowngradeAttackProcess,
-	events {
-		observable {
-
-			DOWNGRADE_CAPTURE_STRONG,
-			DOWNGRADE_CAPTURE_WEAK,
-			events::SESSION_CERT_REJECTED,
-			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
-			SecurityThreatHarness::HARNESS_SPAWN_HPKE,
-			SecurityThreatHarness::HARNESS_SPAWN_CMS,
-			SecurityThreatHarness::HARNESS_SPAWN_WEAK,
-			SecurityThreatHarness::HARNESS_SPAWN_HPKE_WEAK,
-			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK
-		}
-		hidden { }
-	}
-	states {
-		Idle => {
-			SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningStrong,
-			SecurityThreatHarness::HARNESS_SPAWN_WEAK => SpawningWeak
-		},
-		SpawningStrong => {
-			SecurityThreatHarness::HARNESS_SPAWN_HPKE => StrongReady,
-			SecurityThreatHarness::HARNESS_SPAWN_CMS => StrongReady
-		},
-		StrongReady => { DOWNGRADE_CAPTURE_STRONG => StrongCaptured },
-		StrongCaptured => { SecurityThreatHarness::HARNESS_SPAWN_WEAK => SpawningWeak },
-		SpawningWeak => {
-			SecurityThreatHarness::HARNESS_SPAWN_HPKE_WEAK => WeakReady,
-			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK => WeakReady
-		},
-		WeakReady => { DOWNGRADE_CAPTURE_WEAK => WeakCaptured },
-		WeakCaptured => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
-		SpawningAttack => {
-			SecurityThreatHarness::HARNESS_SPAWN_HPKE => AttackReady,
-			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
-		},
-		AttackReady => { events::SESSION_CERT_REJECTED => Idle }
-	}
-	terminal { Idle }
-	annotations { description: "Downgrade attack: AES-256 vs AES-128 cross-session substitution" }
-}
-
-tb_scenario! {
-	name: downgrade_attack_hpke,
-	config: ScenarioConfig::builder()
-		.with_spec(DowngradeAttackSpec::latest())
-		.with_csp(DowngradeAttackProcess)
-		.build(),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			DowngradeAttackScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
-		}
-	}
-}
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::der::Decode;
+use tightbeam::transport::handshake::negotiation::SecurityOffer;
+use tightbeam::transport::handshake::{ClientHello, HandshakeError, HandshakeMessage, Hpke};
+use tightbeam::TightBeamError;
 
 #[cfg(feature = "transport-cms")]
-tb_scenario! {
-	name: downgrade_attack_cms,
-	config: ScenarioConfig::builder()
-		.with_spec(DowngradeAttackSpec::latest())
-		.with_csp(DowngradeAttackProcess)
-		.build(),
-	environment Bare {
-		exec: |SetupEnv { trace, .. }| async move {
-			DowngradeAttackScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
-		}
-	}
+use tightbeam::crypto::cms::EnvelopeError;
+#[cfg(feature = "transport-cms")]
+use tightbeam::transport::handshake::Cms;
+
+use crate::common::result::TestResult;
+use crate::common::security::{carried_hello, hello_opening, weak_security_profile, ServerMaterials};
+use crate::security::common::{Aes128CryptoProvider, DowngradeAttack, SessionFlow};
+
+#[cfg(feature = "transport-cms")]
+use crate::security::common::forge_sealed_offer;
+
+/// `opening` with a forged offer of the weak profile alone. The hello keeps its
+/// `client_random` and its client ephemeral.
+fn weakened_hello(opening: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
+	let mut hello = ClientHello::from_der(&carried_hello(opening))?;
+	hello.security_offer = Some(SecurityOffer::new(vec![weak_security_profile()]));
+	Ok(hello_opening(&hello))
 }
 
-job! {
-	name: DowngradeAttackScenario,
-	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
-		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
+/// The victim of flow `F` accepts the reply of its server to its opening, so a
+/// refusal of a downgrade comes from what the MITM changed.
+async fn the_victim_accepts_its_own_exchange<F>() -> TestResult
+where
+	F: SessionFlow<DefaultCryptoProvider> + SessionFlow<Aes128CryptoProvider>,
+{
+	let mut attack = DowngradeAttack::<F>::new(&ServerMaterials::fixed());
+	let opening = attack.victim_opening()?;
+	let reply = attack.strong_reply(opening).await?;
 
-		// Step 1: Capture the strong handshake (AES-256-GCM) under
-		// DefaultCryptoProvider.
-		let mut strong_session = harness.spawn(kind)?;
-		let strong_handshake = strong_session.capture_full().await?;
+	attack.victim_reads(reply).await?;
+	Ok(())
+}
 
-		trace.event(DOWNGRADE_CAPTURE_STRONG)?;
+/// An HPKE victim accepts the reply to its own opening.
+#[tokio::test]
+async fn an_hpke_victim_accepts_the_reply_to_its_own_opening() -> TestResult {
+	the_victim_accepts_its_own_exchange::<Hpke>().await
+}
 
-		// Step 2: Capture the weak handshake (AES-128-GCM) under
-		// Aes128CryptoProvider, which runs AES-128 at the cipher level.
-		let mut weak_session = harness.spawn_weak(kind)?;
-		let weak_handshake = weak_session.capture_full().await?;
+/// A CMS victim accepts the reply to its own opening.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_cms_victim_accepts_the_reply_to_its_own_opening() -> TestResult {
+	the_victim_accepts_its_own_exchange::<Cms>().await
+}
 
-		trace.event(DOWNGRADE_CAPTURE_WEAK)?;
+/// A MITM forges the offer of an HPKE hello to name the weak profile, and the
+/// weak server signs the forged hello, so the signature fails against the hello
+/// that the victim sent.
+#[tokio::test]
+async fn a_forged_hpke_offer_fails_the_reply_signature() -> TestResult {
+	let mut attack = DowngradeAttack::<Hpke>::new(&ServerMaterials::fixed());
+	let opening = attack.victim_opening()?;
+	let reply = attack.weak_reply(weakened_hello(opening)?).await?;
 
-		// Step 3: Verify that the two openings differ in their wire bytes.
-		// Their cipher OIDs differ, so their `SecurityOffer` values differ.
-		let strong_hello = strong_handshake
-			.client_messages()
-			.next()
-			.ok_or_else(|| expectation_failure("no strong client messages"))?;
+	let verdict = attack.victim_reads(reply).await;
+	assert!(matches!(verdict, Err(HandshakeError::SignatureVerificationFailed)));
+	Ok(())
+}
 
-		let weak_hello = weak_handshake
-			.client_messages()
-			.next()
-			.ok_or_else(|| expectation_failure("no weak client messages"))?;
+/// A MITM replaces a CMS opening with a weak opening that it seals itself, and
+/// the weak server signs that opening, so the signature fails against the
+/// opening that the victim sent.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_cms_opening_of_the_mitm_fails_the_reply_signature() -> TestResult {
+	let mut attack = DowngradeAttack::<Cms>::new(&ServerMaterials::fixed());
+	attack.victim_opening()?;
 
-		assert_ne!(strong_hello.payload, weak_hello.payload, "the AES-256 and AES-128 openings must differ");
+	let substitute = attack.mitm_opening()?;
+	let reply = attack.weak_reply(substitute).await?;
 
-		// Step 4: Attempt the downgrade substitution, and hand the reply to
-		// the weak opening to a live strong client, whose verdict the
-		// scenario trace files.
-		let weak_reply = weak_handshake.server_reply();
-		let weak_reply = weak_reply.ok_or_else(|| expectation_failure("no weak reply"))?;
+	let verdict = attack.victim_reads(reply).await;
+	assert!(matches!(verdict, Err(HandshakeError::SignatureVerificationFailed)));
+	Ok(())
+}
 
-		let substitution = kind.replacement(weak_reply.step, &weak_reply.payload)?;
-		let attack = harness.live(kind)?.audit_client(&trace).with_step(substitution);
+/// A MITM forges the sealed offer of a CMS opening in place, and the seal
+/// authenticates the offer, so the server refuses the opening.
+#[cfg(feature = "transport-cms")]
+#[tokio::test]
+async fn a_cms_offer_forged_in_place_fails_the_seal_of_its_opening() -> TestResult {
+	let mut attack = DowngradeAttack::<Cms>::new(&ServerMaterials::fixed());
+	let opening = attack.victim_opening()?;
+	let forged = forge_sealed_offer(&opening)?;
 
-		// A strong client that accepts the reply to a weak opening is a
-		// downgrade, so the expected control of the module doc MUST reject it.
-		let outcome = attack.run().await?;
-		outcome.refused_by_client("downgrade substitution was accepted")
-	}
+	let refused = attack.strong_reply(forged).await;
+	assert!(matches!(refused, Err(HandshakeError::Envelope(EnvelopeError::Authentication))));
+	Ok(())
 }

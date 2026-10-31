@@ -1,4 +1,4 @@
-//! Transport layer integration tests
+//! The integration tests of the transport layer.
 
 mod cms_socket;
 mod cms_toolkit;
@@ -14,4 +14,12 @@ mod pool_mux;
 mod receipt;
 mod split;
 
-pub(crate) mod support;
+#[cfg(all(
+	feature = "transport-hpke",
+	feature = "tcp",
+	feature = "tokio",
+	feature = "testing"
+))]
+mod fixtures;
+#[cfg(feature = "hex")]
+mod static_pair;

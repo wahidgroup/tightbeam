@@ -47,10 +47,13 @@ use tightbeam::testing::config::ScenarioConfig;
 use tightbeam::testing::{SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioWriteHalf, TransportReader};
-use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportWriter};
+use tightbeam::transport::{
+	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
+};
 use tightbeam::TightBeamError;
 
-use crate::security::common::{Direction, HandshakeBackendKind, ServerMaterials};
+use crate::common::security::ServerMaterials;
+use crate::security::common::{Direction, HandshakeBackendKind};
 use crate::security::live::{AttackStep, FrameEdit, FrameSlot, LiveHandshake};
 
 /// HPKE sends exactly two client handshake frames, the hello and the closing,
@@ -105,7 +108,7 @@ job! {
 		// The relay deletes the first envelope, so sequence 1 arrives where the
 		// server expects 0.
 		let tampered = reader.read_envelope().await;
-		assert!(tampered.is_err(), "server accepted traffic after a deleted encrypted envelope");
+		assert!(matches!(tampered, Err(TransportError::OperationFailed(TransportFailure::TamperDetected))));
 
 		Ok(())
 	}
@@ -161,7 +164,7 @@ job! {
 
 		// The replay presents sequence 0 again where the server expects 1.
 		let replayed = reader.read_envelope().await;
-		assert!(replayed.is_err(), "server accepted a replayed encrypted envelope");
+		assert!(matches!(replayed, Err(TransportError::OperationFailed(TransportFailure::TamperDetected))));
 
 		Ok(())
 	}
@@ -226,7 +229,7 @@ async fn tampered_link(
 	edit: FrameEdit,
 ) -> Result<(TransportReader<TokioReadHalf>, TransportWriter<TokioWriteHalf>), TightBeamError> {
 	let step = AttackStep::new(FIRST_ENCRYPTED_FRAME, edit);
-	let link = LiveHandshake::new(HandshakeBackendKind::Hpke, ServerMaterials::generate());
+	let link = LiveHandshake::new(HandshakeBackendKind::Hpke, ServerMaterials::fixed());
 	let outcome = link.audit_server(trace).with_step(step).run().await?;
 
 	let (client, server) = outcome.established()?;

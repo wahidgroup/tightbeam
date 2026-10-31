@@ -14,6 +14,6 @@
 //!
 //! ## Test Structure
 //!
-//! - `comprehensive.rs`: Complete fault injection workflow with tb_scenario! and FDR
+//! - `basic.rs`: Each fault injection workflow, with tb_scenario! and FDR
 
 mod basic;

@@ -2,11 +2,9 @@
 
 #![cfg(all(
 	feature = "transport-hpke",
-	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",
 	feature = "tokio",
-	feature = "x509",
 	feature = "testing",
 	feature = "instrument"
 ))]
@@ -17,15 +15,15 @@ use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tightbeam::clock::{Clock, ManualClock};
-use tightbeam::crypto::sign::SigningIdentity;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use tightbeam::at_least;
+use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::policy::Secp256k1Policy;
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
 use tightbeam::crypto::x509::{CertificateSpec, KeyCurves};
@@ -53,19 +51,19 @@ use tightbeam::transport::multiplex::{
 use tightbeam::transport::policy::CollectorGateConfig;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
-	ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, PooledClient, ResponsePackage,
-	TransportEncryptionConfig, TransportError, TransportFailure,
+	ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, GenericClient, PoolConfig, PooledClient,
+	ResponsePackage, TransportEncryptionConfig, TransportError, TransportFailure,
 };
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 
+use crate::common::poll::joined;
+use crate::common::result::TestResult;
 use crate::common::security::{
-	pinning_trust_store, random_signing_key, test_certificate, PayingApprover, ServerMaterials,
+	combined_trust, pinning_trust_store, random_signing_key, test_certificate, PayingApprover, ServerMaterials,
 };
-use crate::transport::support::{
-	await_ok, await_receipt_rotation, await_transport, await_within_deadline, bind_encrypted_listener,
-	bind_mutual_listener, mux_frame, mux_offer, HandlerSignal,
-};
+use crate::common::transport::{await_receipt_rotation, await_transport, bind_mutual_listener};
+use crate::transport::fixtures::{await_ok, bind_encrypted_listener, mux_frame, mux_offer, HandlerSignal};
 
 type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
 
@@ -82,6 +80,8 @@ const FOUR_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(4) {
 	None => panic!("a pool cap takes one connection or more"),
 };
 
+/// Binds an encrypted listener that presents `materials` on a free loopback
+/// port, beside its address.
 async fn bind_pool_listener(
 	materials: &ServerMaterials,
 ) -> Result<(TokioListener, TightBeamSocketAddr), TightBeamError> {
@@ -89,6 +89,8 @@ async fn bind_pool_listener(
 	Ok((listener, TightBeamSocketAddr(addr)))
 }
 
+/// Starts a `server!` that presents `materials`, answers `offer` to a client
+/// that offers multiplexing, and echoes each frame, beside its address.
 async fn start_echo_server(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
@@ -129,6 +131,8 @@ where
 	Ok((acceptor, addr))
 }
 
+/// Serves every accepted connection with `service` behind `gate`, as
+/// [`start_service_server`] does.
 async fn start_gated_service_server<S, G>(
 	materials: &ServerMaterials,
 	trace: TraceCollector,
@@ -212,6 +216,9 @@ struct IdlePrune {
 	clock: Arc<dyn Clock>,
 }
 
+/// A pool that pins the server of `materials`, offers `offer`, holds at most
+/// `max_connections`, prunes idle connections as `idle` says, and records on
+/// `trace`.
 fn mux_pool_with_idle_timeout(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
@@ -219,7 +226,7 @@ fn mux_pool_with_idle_timeout(
 	idle: Option<IdlePrune>,
 	trace: &TraceCollector,
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
-	let trust_store = pinning_trust_store(&materials.certificate)?;
+	let trust_store = combined_trust(&[&materials.certificate]);
 	let mut config = PoolConfig { max_connections, mux_offer: offer.map(Arc::new), ..PoolConfig::default() };
 	let mut builder = ConnectionPool::<TokioListener>::builder();
 	if let Some(IdlePrune { timeout, clock }) = idle {
@@ -227,16 +234,12 @@ fn mux_pool_with_idle_timeout(
 		builder = builder.with_clock(clock);
 	}
 
-	let pool = Arc::new(
-		builder
-			.with_config(config)
-			.with_trust_store(trust_store)
-			.with_trace(trace.share())
-			.build(),
-	);
+	let builder = builder.with_config(config).with_trust_store(trust_store);
+	let pool = Arc::new(builder.with_trace(trace.share()).build());
 	Ok(pool)
 }
 
+/// A pool as [`mux_pool_with_idle_timeout`] builds it, with no idle pruning.
 fn mux_pool(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
@@ -273,7 +276,7 @@ tb_scenario! {
 	name: pooled_mux_shares_one_connection_across_leases,
 	spec: MuxLeaseShareSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_echo_server(&env.context, Some(mux_offer(8))).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -309,7 +312,7 @@ tb_scenario! {
 	name: pooled_open_stream_reaches_streaming_server,
 	spec: PooledStreamSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), LengthService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -346,7 +349,7 @@ tb_scenario! {
 	name: pooled_open_duplex_echoes_through_serve_wrapper,
 	spec: PooledDuplexSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), DuplexEchoService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -384,7 +387,7 @@ tb_scenario! {
 	name: pooled_mixed_kinds_share_one_connection,
 	spec: PooledMixedKindsSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), MixedService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -444,7 +447,7 @@ tb_scenario! {
 	name: unserved_kind_answers_unimplemented,
 	spec: UnservedKindSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_service_server(&env.context, env.trace.share(), LengthService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -495,7 +498,7 @@ tb_scenario! {
 	name: pooled_mux_lease_exposes_peer_certificate,
 	spec: MuxPeerCertificateSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_echo_server(&env.context, Some(mux_offer(8))).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -510,17 +513,15 @@ tb_scenario! {
 
 /// A mux lease refuses `conn()`, the accessor of an exclusive lease.
 #[tokio::test]
-async fn mux_lease_conn_reports_invalid_state() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
-	let (_server, addr) = start_echo_server(&materials, Some(mux_offer(8))).await?;
-	let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &TraceCollector::default())?;
+async fn a_mux_lease_refuses_the_exclusive_accessor() -> TestResult {
+	let materials = ServerMaterials::fixed();
+	let (_server, addr) = start_echo_server(&materials, Some(TransportOffer::mux(8))).await?;
+	let trace = TraceCollector::default();
+	let pool = mux_pool(&materials, Some(TransportOffer::mux(8)), NonZeroUsize::MIN, &trace)?;
 
 	let mut lease = pool.connect(addr).await?;
 	let conn = lease.conn();
-	assert!(
-		matches!(conn, Err(TransportError::InvalidState)),
-		"a mux lease must refuse conn() with InvalidState"
-	);
+	assert!(matches!(conn, Err(TransportError::InvalidState)));
 	Ok(())
 }
 
@@ -533,7 +534,7 @@ struct GatedContext {
 impl GatedContext {
 	fn generate() -> Self {
 		Self {
-			materials: ServerMaterials::generate(),
+			materials: ServerMaterials::fixed(),
 			started: HandlerSignal::default(),
 			release: Notify::new(),
 		}
@@ -944,7 +945,7 @@ tb_scenario! {
 	name: pooled_mux_declined_falls_back_to_exclusive_lease,
 	spec: MuxDeclinedFallbackSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_echo_server(&env.context, None).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -976,7 +977,7 @@ tb_scenario! {
 	name: pooled_mux_declined_reuses_idle_exclusive_lease,
 	spec: MuxDeclinedIdleReuseSpec,
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |env| async move { start_echo_server(&env.context, None).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), NonZeroUsize::MIN, &trace)?;
@@ -999,7 +1000,7 @@ struct ManualContext {
 
 impl ManualContext {
 	fn generate() -> Self {
-		Self { materials: ServerMaterials::generate(), connection_tasks: Mutex::new(Vec::new()) }
+		Self { materials: ServerMaterials::fixed(), connection_tasks: Mutex::new(Vec::new()) }
 	}
 
 	fn register_tasks(&self, spawned: impl IntoIterator<Item = JoinHandle<Result<(), TransportError>>>) {
@@ -1153,7 +1154,7 @@ tb_scenario! {
 /// connection, and returns once its reader reads the close of the client.
 async fn serve_until_the_client_closes(listener: TokioListener) -> Result<(), TransportError> {
 	let (transport, _) = listener.accept().await?;
-	let mut transport = transport.with_mux_offer(Some(mux_offer(4)));
+	let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(4)));
 	let negotiated = transport.negotiate_mux().await?;
 	let settings = negotiated.ok_or(TransportError::InvalidState)?;
 
@@ -1170,54 +1171,57 @@ async fn serve_until_the_client_closes(listener: TokioListener) -> Result<(), Tr
 /// A dropped pool ends the driver tasks of each multiplexed connection it
 /// held, so the peer reads the close (CWE-772).
 #[tokio::test]
-async fn dropping_a_pool_ends_its_multiplexed_connections() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
+async fn dropping_a_pool_ends_its_multiplexed_connections() -> TestResult {
+	let materials = ServerMaterials::fixed();
 	let (listener, addr) = bind_pool_listener(&materials).await?;
 	let served = tokio::spawn(serve_until_the_client_closes(listener));
-	let pool = mux_pool(&materials, Some(mux_offer(4)), NonZeroUsize::MIN, &TraceCollector::new())?;
+	let trace = TraceCollector::new();
+	let pool = mux_pool(&materials, Some(TransportOffer::mux(4)), NonZeroUsize::MIN, &trace)?;
 
 	drop(pool.connect(addr).await?);
 	drop(pool);
 
-	let ended = await_within_deadline(served, "the peer of the dropped pool must read its close").await?;
-	assert!(ended.is_ok_and(|served| served.is_ok()));
+	let ended = joined(served).await;
+	assert!(matches!(ended, Ok(())));
 	Ok(())
 }
 
 /// A server that offers multiplexing serves a single-flight client through its
 /// single-flight loop.
 #[tokio::test]
-async fn single_flight_client_round_trips_on_mux_server() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
-	let (_server, addr) = start_echo_server(&materials, Some(mux_offer(8))).await?;
-	let mut client = single_flight_client(&materials, addr).await?;
+async fn single_flight_client_round_trips_on_mux_server() -> TestResult {
+	let materials = ServerMaterials::fixed();
+	let (_server, addr) = start_echo_server(&materials, Some(TransportOffer::mux(8))).await?;
+	let mut client = single_flight_client(&materials, addr).await;
 
 	let frame = mux_frame("single-flight");
 	let reply = client.emit(frame.to_owned(), None).await?;
-	assert_eq!(reply, Some(frame), "a mux-offering server must serve a single-flight client");
+	assert_eq!(reply, Some(frame));
 	Ok(())
 }
 
 /// A single-flight client against the pinned server of `materials`.
-async fn single_flight_client(
-	materials: &ServerMaterials,
-	addr: TightBeamSocketAddr,
-) -> Result<tightbeam::transport::client::GenericClient<TokioListener>, TightBeamError> {
-	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let client = ClientBuilder::<TokioListener>::builder()
-		.with_trust_store(trust_store)
-		.build()
-		.connect(addr)
-		.await?;
-	Ok(client)
+async fn single_flight_client(materials: &ServerMaterials, addr: TightBeamSocketAddr) -> GenericClient<TokioListener> {
+	let trust_store = combined_trust(&[&materials.certificate]);
+	let client = ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store).build();
+	let connected = client.connect(addr).await;
+	connected.expect("a single-flight client provisions its connection")
 }
 
+/// How long the second connection is sampled for its starvation.
+///
+/// No public event marks a dial that waits in the listener backlog, because
+/// `CONNECTION_ACCEPTED` records only once the service of a connection runs,
+/// so a bounded probe samples the wait. A slow machine can pass it falsely,
+/// and no machine can fail it falsely.
+const STARVATION_PROBE: Duration = Duration::from_millis(500);
+
 /// With `max_connections: [ 1 ]` the accept loop holds one permit per live
-/// connection: a second connection queues in the listener backlog until
-/// the first connection's task ends.
+/// connection: a second connection queues in the listener backlog until the
+/// first connection's task ends.
 #[tokio::test]
-async fn accept_cap_queues_second_connection() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
+async fn a_second_connection_waits_for_the_permit_of_the_first() -> TestResult {
+	let materials = ServerMaterials::fixed();
 	let (listener, addr) = bind_pool_listener(&materials).await?;
 	let _server = server! {
 		protocol TokioListener: listener,
@@ -1225,25 +1229,20 @@ async fn accept_cap_queues_second_connection() -> Result<(), TightBeamError> {
 		handle: move |frame: Frame| async move { Ok(Some(frame)) }
 	};
 
-	let mut held = single_flight_client(&materials, addr).await?;
-	let echoed = held.emit(mux_frame("held"), None).await?;
-	assert!(echoed.is_some(), "first connection should echo while holding the only permit");
+	let mut held = single_flight_client(&materials, addr).await;
+	held.emit(mux_frame("held"), None).await?;
 
-	let mut queued = single_flight_client(&materials, addr).await?;
-	let starved = tokio::time::timeout(Duration::from_millis(500), queued.emit(mux_frame("queued"), None)).await;
-	assert!(starved.is_err(), "second connection must starve until the permit frees");
+	let mut queued = single_flight_client(&materials, addr).await;
+	let starved = tokio::time::timeout(STARVATION_PROBE, queued.emit(mux_frame("queued"), None)).await;
+	assert!(starved.is_err());
 
 	drop(queued);
 	drop(held);
 
-	let mut fresh = single_flight_client(&materials, addr).await?;
-	let fresh_emit = fresh.emit(mux_frame("after-release"), None);
-	let bounded = await_within_deadline(fresh_emit, "the fresh emit must resolve once the permit frees");
-	let released = bounded.await?;
-	assert!(
-		matches!(released, Ok(Some(_))),
-		"a new connection should be served once the held permit releases"
-	);
+	let frame = mux_frame("after-release");
+	let mut fresh = single_flight_client(&materials, addr).await;
+	let released = fresh.emit(Frame::clone(&frame), None).await?;
+	assert_eq!(released, Some(frame));
 	Ok(())
 }
 
@@ -1254,7 +1253,7 @@ struct GateContext {
 
 impl GateContext {
 	fn generate() -> Self {
-		Self { materials: ServerMaterials::generate(), handler_invoked: AtomicBool::new(false) }
+		Self { materials: ServerMaterials::fixed(), handler_invoked: AtomicBool::new(false) }
 	}
 }
 
@@ -1304,7 +1303,7 @@ tb_scenario! {
 	name: mux_serve_gate_rejects_without_handler,
 	config: detailed_config(MuxGateSpec::latest()),
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |SetupEnv { context: materials, trace }| async move {
 			let (listener, addr) = bind_pool_listener(&materials).await?;
 			let handle = server! {
@@ -1351,7 +1350,7 @@ tb_scenario! {
 	name: mux_serve_gate_rejects_streaming_without_handler,
 	config: detailed_config(MuxStreamGateSpec::latest()),
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |SetupEnv { context: materials, trace }| async move {
 			start_gated_service_server(&materials, trace.share(), LengthService, ForbidAllGate).await
 		},
@@ -1391,7 +1390,7 @@ tb_scenario! {
 	name: mux_serve_gate_rejects_duplex_without_handler,
 	config: detailed_config(MuxDuplexGateSpec::latest()),
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |SetupEnv { context: materials, trace }| async move {
 			start_gated_service_server(&materials, trace.share(), DuplexEchoService, ForbidAllGate).await
 		},
@@ -1431,7 +1430,7 @@ tb_scenario! {
 	name: mux_serve_gate_list_composes_first_refusal,
 	config: detailed_config(MuxGateListSpec::latest()),
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |SetupEnv { context: materials, trace }| async move {
 			let (listener, addr) = bind_pool_listener(&materials).await?;
 			let handle = server! {
@@ -1479,7 +1478,7 @@ tb_scenario! {
 	name: mux_serve_unknown_gate_answers_internal,
 	config: detailed_config(MuxUnknownGateSpec::latest()),
 	environment ServiceClient {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		server: |SetupEnv { context: materials, trace }| async move {
 			let (listener, addr) = bind_pool_listener(&materials).await?;
 			let handle = server! {
@@ -1649,7 +1648,7 @@ impl MeteredContext {
 		let signing_key = random_signing_key();
 		let client_certificate = Arc::new(test_certificate(&signing_key));
 		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		Self { materials: ServerMaterials::generate(), client_certificate, client_provider }
+		Self { materials: ServerMaterials::fixed(), client_certificate, client_provider }
 	}
 }
 

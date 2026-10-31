@@ -10,6 +10,8 @@ use std::borrow::Cow;
 use tightbeam::urn::builders::spec::Pattern;
 use tightbeam::urn::{Urn, UrnBuilder, UrnComponents, UrnSpec, UrnValidationError};
 
+use crate::common::result::TestResult;
+
 /// The spec of `urn:outside:<kind>/<name>`, for a kind of `servlet` or
 /// `worker`.
 struct KindAndName;
@@ -107,16 +109,17 @@ impl KindAndName {
 
 /// The outside spec verifies the URN its own grammar builds.
 #[test]
-fn an_outside_spec_verifies_the_urn_it_builds() -> Result<(), UrnValidationError> {
+fn an_outside_spec_verifies_the_urn_it_builds() -> TestResult {
 	let builder = UrnBuilder::from(KindAndName).set("kind", "servlet");
 	let urn = builder.set("name", "ping").build()?;
-	urn.verify::<KindAndName>()
+	urn.verify::<KindAndName>()?;
+	Ok(())
 }
 
 /// The outside spec reads no name from an NSS without a `/`, so `verify`
 /// refuses it with the error the spec names.
 #[test]
-fn an_outside_spec_refuses_a_urn_its_grammar_reads_no_name_from() -> Result<(), UrnValidationError> {
+fn an_outside_spec_refuses_a_urn_its_grammar_reads_no_name_from() -> TestResult {
 	let urn = Urn::from_parts("outside", "servlet")?;
 	let refused = urn.verify::<KindAndName>();
 	assert_eq!(refused, Err(UrnValidationError::RequiredFieldMissing("name")));
@@ -134,27 +137,37 @@ tightbeam::urn_spec! {
 	}
 }
 
-/// A URN that names both optional fields verifies under the spec that built
-/// it.
-#[test]
-fn a_spec_of_two_optional_fields_verifies_a_urn_of_both() -> Result<(), UrnValidationError> {
-	let builder = UrnBuilder::from(TwoOptional).set("region", "eu").set("zone", "a");
-	let urn = builder.set("host", "h1").build()?;
-	urn.verify::<TwoOptional>()
+/// The URN that [`TwoOptional`] builds of the host `h1` beside `fields`.
+fn two_optional_of(fields: &[(&'static str, &'static str)]) -> Urn<'static> {
+	let set = |builder: UrnBuilder<'static>, &(key, value): &(&'static str, &'static str)| builder.set(key, value);
+	let builder = fields.iter().fold(UrnBuilder::from(TwoOptional), set);
+	let built = builder.set("host", "h1").build();
+	built.expect("the spec builds a URN of the fields it names")
 }
 
-/// A URN that names one optional field verifies under the spec that built
-/// it, whichever field the parse gives its value to.
-#[test]
-fn a_spec_of_two_optional_fields_verifies_a_urn_of_one() -> Result<(), UrnValidationError> {
-	let urn = UrnBuilder::from(TwoOptional).set("zone", "a").set("host", "h1").build()?;
-	urn.verify::<TwoOptional>()
+// A URN of the optional fields of a spec verifies under the spec that built
+// it.
+tightbeam::tb_cases! {
+	fn a_spec_of_two_optional_fields_verifies_the_urn_it_builds(fields: &[(&'static str, &'static str)]) -> TestResult {
+		let urn = two_optional_of(fields);
+
+		urn.verify::<TwoOptional>()?;
+		Ok(())
+	}
+	cases {
+		/// The URN names both optional fields.
+		of_both => &[("region", "eu"), ("zone", "a")],
+		/// The URN names one optional field, whichever field the parse gives
+		/// its value to.
+		of_one => &[("zone", "a")],
+	}
 }
 
 /// The outside spec verifies a URN whose scheme and NID differ from its own
 /// in case alone, because RFC 8141 § 3.1 compares both in any case.
 #[test]
-fn an_outside_spec_verifies_a_urn_of_its_nid_in_another_case() -> Result<(), UrnValidationError> {
+fn an_outside_spec_verifies_a_urn_of_its_nid_in_another_case() -> TestResult {
 	let urn: Urn<'static> = "URN:OUTSIDE:servlet/ping".parse()?;
-	urn.verify::<KindAndName>()
+	urn.verify::<KindAndName>()?;
+	Ok(())
 }

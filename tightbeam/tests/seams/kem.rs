@@ -3,8 +3,7 @@
 //!
 //! - The KEM names its own recipient key type, and its own decapsulation
 //!   trait, [`StubDecapsulator`], as its `PrivateKey`.
-//! - Its certificate profile asserts `keyEncipherment`, as an ML-KEM
-//!   certificate does (RFC 9935 §5).
+//! - Its certificate profile asserts `keyEncipherment`, as an ML-KEM certificate does (RFC 9935 §5).
 //! - A backend outside the crate implements that trait.
 //! - A [`KeyAgreementIdentity`] pairs the backend with a key-agreement certificate.
 //! - A [`StubProvider`] seals and opens an `AuthEnvelopedData` under the KEM,
@@ -17,11 +16,10 @@ use std::sync::Arc;
 
 use tightbeam::crypto::aead::Aes256Gcm;
 use tightbeam::crypto::cms::{
-	AuthEnvelopedData, Encapsulation, EnvelopeError, KeyAgreementIdentity, Opener, Recipient, RecipientKem,
+	AuthEnvelopedData, Encapsulation, EnvelopeError, KeyAgreementIdentity, Recipient, RecipientKem,
 };
 use tightbeam::crypto::exchange::Ecdhe;
 use tightbeam::crypto::hash::{Digest, Sha3_256};
-use tightbeam::crypto::k256::ecdsa::SigningKey;
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::key::{KeyBackend, KeyError};
@@ -29,39 +27,39 @@ use tightbeam::crypto::profiles::{
 	AeadProvider, Aes256Wrap, CryptoProvider, DigestProvider, KdfProvider, KeyExchangeProvider, KeyWrapProvider,
 	SigningProvider, TightbeamProfile,
 };
-use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::Encode;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::DATA;
-use tightbeam::random::{CryptoRngCore, OsRng};
+use tightbeam::random::CryptoRngCore;
 use tightbeam::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoRef};
-use tightbeam::testing::{EnvelopeRecipient, TestCertificate};
+use tightbeam::testing::{EnvelopeRecipient, TestCertificate, TestKey};
 use tightbeam::x509::ext::pkix::{KeyUsage, KeyUsages};
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;
 use tightbeam::ZeroizingBytes;
 
-use super::{CONTENT, UKM_LABEL};
+use super::{opened_kem_seal, CONTENT, UKM_LABEL};
+use crate::common::result::TestResult;
 
 #[cfg(feature = "transport-cms")]
 mod flow {
-	pub use tightbeam::crypto::x509::KeyPurposes;
 	pub use tightbeam::der::asn1::BitString;
 	pub use tightbeam::oids::KEM_ML_KEM_1024;
 	pub use tightbeam::spki::SubjectPublicKeyInfoOwned;
 	pub use tightbeam::testing::{TestCmsServer, TestIdentity};
-	pub use tightbeam::transport::handshake::negotiation::RunnableProfile;
 	pub use tightbeam::transport::handshake::{
-		Client, ClientConfig, Cms, CmsClientSettings, CmsIdentityPair, CmsServerChain, CmsServerIdentity,
-		CmsServerSettings, Handshake, HandshakeError, ProvisionedTrust, Server, ServerConfig, SupportedProfiles,
+		Client, Cms, CmsIdentityPair, CmsServerChain, CmsServerIdentity, CmsServerSettings, Handshake, HandshakeError,
+		ProvisionedTrust, Server,
 	};
 }
 
 #[cfg(feature = "transport-cms")]
 use super::trust::PinningTrust;
+#[cfg(feature = "transport-cms")]
+use super::{cms_client, native_server, replied, run_legs};
 #[cfg(feature = "transport-cms")]
 use flow::*;
 
@@ -206,17 +204,24 @@ impl CryptoProvider for StubProvider {
 	}
 }
 
-/// A certificate of a fresh key whose `keyUsage` is `usage` alone.
+/// A certificate of [`TestKey::insecure_fixed_signing`] whose `keyUsage` is
+/// `usage` alone.
 fn certificate_of(usage: KeyUsages) -> Certificate {
-	let certificate = TestCertificate::self_signed(&SigningKey::random(&mut OsRng));
+	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 	TestCertificate::with_key_usage(certificate, KeyUsage(usage.into()))
+}
+
+/// The DER SubjectPublicKeyInfo of `certificate`, beside the stub recipient
+/// key of its bits.
+fn stub_key_of(certificate: &Certificate) -> (Vec<u8>, StubKey) {
+	let spki = &certificate.tbs_certificate.subject_public_key_info;
+	let public_key_der = spki.to_der().expect("the certificate's SPKI encodes");
+	(public_key_der, StubKey(spki.subject_public_key.raw_bytes().to_vec()))
 }
 
 /// A stub backend of the key of `certificate`.
 fn backend_of(certificate: &Certificate) -> Arc<dyn StubDecapsulator> {
-	let spki = &certificate.tbs_certificate.subject_public_key_info;
-	let public_key_der = spki.to_der().expect("the certificate's SPKI encodes");
-	let key = StubKey(spki.subject_public_key.raw_bytes().to_vec());
+	let (public_key_der, key) = stub_key_of(certificate);
 	Arc::new(StubBackend { public_key_der, key })
 }
 
@@ -239,14 +244,12 @@ fn stub_sealed(identity: &KeyAgreementIdentity<StubKem>) -> AuthEnvelopedData {
 /// A seal to a key-agreement identity of the stub KEM opens through its
 /// backend, whose private-key operation is the KEM's own trait.
 #[tokio::test]
-async fn a_kem_with_its_own_private_key_operation_opens_its_seal() -> Result<(), Box<dyn std::error::Error>> {
+async fn a_kem_with_its_own_private_key_operation_opens_its_seal() -> TestResult {
 	let identity = stub_identity();
 	let sealed = stub_sealed(&identity);
-	let opener = Opener::Kem { identity: &identity, ukm_label: UKM_LABEL };
-	let arrived = sealed.to_der()?;
 
-	let opened = sealed.open::<StubProvider>(arrived, &opener, DATA).await?;
-	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	let opened = opened_kem_seal::<StubProvider>(&identity, sealed).await?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 
@@ -288,30 +291,51 @@ fn with_stub_key(certificate: Certificate) -> Certificate {
 	TestCertificate::with_key_usage(certificate, KeyUsage(KeyUsages::KeyEncipherment.into()))
 }
 
-/// The stub CMS server, whose key-agreement certificate holds a key of the
-/// stub KEM, a client of it that pins that certificate against the outside
-/// store `store` makes of the server and that certificate, and the server's
-/// handshake, both under [`StubProvider`].
+/// The pin of a client that names `key_agreement` alone.
 #[cfg(feature = "transport-cms")]
-fn stub_parties(store: impl FnOnce(&TestCmsServer, Certificate) -> PinningTrust) -> StubParties {
+fn pin_of_the_leaf(_server: &TestCmsServer, key_agreement: &Certificate) -> CmsServerIdentity {
+	CmsServerIdentity::Certificate(Arc::new(key_agreement.to_owned()))
+}
+
+/// The pin of a client that names the chain from the authority of `server` to
+/// `key_agreement`.
+#[cfg(feature = "transport-cms")]
+fn pin_of_the_chain(server: &TestCmsServer, key_agreement: &Certificate) -> CmsServerIdentity {
+	let chain = CmsServerChain::new([server.authority.to_owned(), key_agreement.to_owned()]);
+	CmsServerIdentity::Chain(chain.expect("the chain holds a leaf"))
+}
+
+/// The outside store that pins both certificates of `server` under its
+/// authority, as the trust anchor of each.
+#[cfg(feature = "transport-cms")]
+fn under_authority(server: &TestCmsServer, key_agreement: Certificate) -> PinningTrust {
+	PinningTrust::under(server.authority.to_owned(), vec![server.signing.to_owned(), key_agreement])
+}
+
+/// The stub CMS server, whose key-agreement certificate holds a key of the
+/// stub KEM, a client of it that pins that certificate as `pin` names it
+/// against the outside store `store` makes of the server and that certificate,
+/// and the server's handshake, both under [`StubProvider`].
+#[cfg(feature = "transport-cms")]
+fn stub_parties(
+	pin: fn(&TestCmsServer, &Certificate) -> CmsServerIdentity,
+	store: impl FnOnce(&TestCmsServer, Certificate) -> PinningTrust,
+) -> StubParties {
 	let server = TestCmsServer::generate("stub server");
 	let key_agreement = with_stub_key(server.key_agreement.to_owned());
 	let identity = KeyAgreementIdentity::<StubKem>::new(key_agreement.to_owned(), backend_of(&key_agreement));
 	let pair = CmsIdentityPair::new(server.signing_identity(), identity.expect("the stub backend holds its key"));
 
-	let pinned = CmsServerIdentity::Certificate(Arc::new(key_agreement.to_owned()));
+	let pinned = pin(&server, &key_agreement);
 	let store = store(&server, key_agreement);
 	let trust = ProvisionedTrust::new(pinned, Arc::new(store)).expect("the store admits the pinned certificate");
 
-	let client_identity = TestIdentity::of(&SigningKey::random(&mut OsRng));
-	let settings = CmsClientSettings { trust, identity: client_identity };
-	let client = ClientConfig::<Cms, StubProvider>::new(settings, KeyPurposes::HOUSE);
-	let profiles = SupportedProfiles::from(RunnableProfile::<StubProvider>::native().descriptor());
+	let client = cms_client::<StubProvider>(trust, TestIdentity::insecure_fixed());
 	let pair = pair.expect("the stub server's certificates name one subject with two keys");
-	let server_config = ServerConfig::<Cms, StubProvider>::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE);
+	let server_config = native_server::<Cms, StubProvider>(CmsServerSettings, pair);
 
-	let client = Handshake::client(client.expect("the client configuration holds"));
-	let handshake = Handshake::server(server_config.expect("the server configuration holds"));
+	let client = Handshake::client(client);
+	let handshake = Handshake::server(server_config);
 	StubParties { client, handshake, server }
 }
 
@@ -335,14 +359,9 @@ struct StubParties {
 /// - The client compares the server ephemeral with the signing key alone.
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
-async fn a_kem_of_its_own_key_type_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let under_authority = |server: &TestCmsServer, key_agreement: Certificate| {
-		PinningTrust::under(server.authority.to_owned(), vec![server.signing.to_owned(), key_agreement])
-	};
-
-	let StubParties { mut client, mut handshake, server } = stub_parties(under_authority);
-	let opening = client.start()?;
-	let reply = handshake.reply(opening).await?;
+async fn a_kem_of_its_own_key_type_runs_the_cms_flow() -> TestResult {
+	let StubParties { mut client, mut handshake, server } = stub_parties(pin_of_the_leaf, under_authority);
+	let reply = replied(&mut client, &mut handshake).await;
 	let closing = client.respond(reply).await?;
 
 	handshake.finish(closing).await?;
@@ -356,31 +375,28 @@ async fn a_kem_of_its_own_key_type_runs_the_cms_flow() -> Result<(), Box<dyn std
 /// reply.
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
-async fn an_outside_store_of_two_anchors_refuses_the_pair() -> Result<(), Box<dyn std::error::Error>> {
+async fn an_outside_store_of_two_anchors_refuses_the_pair() {
 	let each_its_own_anchor = |server: &TestCmsServer, key_agreement: Certificate| {
 		PinningTrust::of(vec![server.signing.to_owned(), key_agreement])
 	};
 
-	let StubParties { mut client, mut handshake, .. } = stub_parties(each_its_own_anchor);
-	let opening = client.start()?;
-	let reply = handshake.reply(opening).await?;
+	let StubParties { mut client, mut handshake, .. } = stub_parties(pin_of_the_leaf, each_its_own_anchor);
+	let reply = replied(&mut client, &mut handshake).await;
 
 	let refused = client.respond(reply).await;
 	assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
-	Ok(())
 }
 
 /// An outside store anchors a pinned chain at the authority it names for the
-/// chain's leaf, so a client pins the chain through it.
+/// chain's leaf, so a client pins the chain through it, pairs the chain with
+/// the signing certificate under one anchor, and runs the whole flow.
 #[cfg(feature = "transport-cms")]
-#[test]
-fn an_outside_store_anchors_a_pinned_chain() -> Result<(), HandshakeError> {
-	let server = TestCmsServer::generate("stub server");
-	let store = PinningTrust::under(server.authority.to_owned(), vec![server.key_agreement.to_owned()]);
+#[tokio::test]
+async fn an_outside_store_anchors_a_pinned_chain() {
+	let StubParties { mut client, mut handshake, server } = stub_parties(pin_of_the_chain, under_authority);
 
-	let chain = CmsServerChain::new([server.authority.to_owned(), server.key_agreement.to_owned()])?;
-	ProvisionedTrust::new(CmsServerIdentity::Chain(chain), Arc::new(store))?;
-	Ok(())
+	run_legs(&mut client, &mut handshake).await;
+	assert_eq!(client.peer_certificate(), Some(&server.signing));
 }
 
 /// A KEM of the RustCrypto `kem` traits, which an outside crate brings
@@ -553,45 +569,40 @@ mod provider {
 
 	/// A key-agreement identity under the masking KEM: a certificate that
 	/// asserts `keyEncipherment` alone, beside a masking key of its key.
-	fn masking_identity() -> Result<KeyAgreementIdentity<MaskingKem>, Box<dyn std::error::Error>> {
+	fn masking_identity() -> KeyAgreementIdentity<MaskingKem> {
 		let certificate = certificate_of(KeyUsages::KeyEncipherment);
-		let spki = &certificate.tbs_certificate.subject_public_key_info;
-		let public_key_der = spki.to_der()?;
-		let key = StubKey(spki.subject_public_key.raw_bytes().to_vec());
+		let (public_key_der, key) = stub_key_of(&certificate);
 
 		let backend = Arc::new(MaskKey { public_key_der, key });
-		Ok(KeyAgreementIdentity::new(certificate, backend)?)
+		let identity = KeyAgreementIdentity::new(certificate, backend);
+		identity.expect("the masking key answers for the certificate's key")
 	}
 
 	/// [`CONTENT`] sealed under [`MaskingProvider`] to the recipient of
 	/// `identity`.
-	fn masking_sealed(
-		identity: &KeyAgreementIdentity<MaskingKem>,
-	) -> Result<AuthEnvelopedData, Box<dyn std::error::Error>> {
+	fn masking_sealed(identity: &KeyAgreementIdentity<MaskingKem>) -> AuthEnvelopedData {
 		let recipient = Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL };
-		Ok(AuthEnvelopedData::seal::<MaskingProvider>(recipient, DATA, CONTENT, [], None)?)
+		let sealed = AuthEnvelopedData::seal::<MaskingProvider>(recipient, DATA, CONTENT, [], None);
+		sealed.expect("the content seals under the masking KEM")
 	}
 
 	/// A seal under the masking KEM opens through the decapsulation key of
 	/// the recipient.
 	#[tokio::test]
-	async fn a_kem_of_the_kem_traits_opens_its_seal() -> Result<(), Box<dyn std::error::Error>> {
-		let identity = masking_identity()?;
-		let sealed = masking_sealed(&identity)?;
-		let opener = Opener::Kem { identity: &identity, ukm_label: UKM_LABEL };
-		let arrived = sealed.to_der()?;
+	async fn a_kem_of_the_kem_traits_opens_its_seal() -> TestResult {
+		let identity = masking_identity();
+		let sealed = masking_sealed(&identity);
 
-		let opened = sealed.open::<MaskingProvider>(arrived, &opener, DATA).await?;
-		assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+		let opened = opened_kem_seal::<MaskingProvider>(&identity, sealed).await?;
+		assert_eq!(opened, CONTENT);
 		Ok(())
 	}
 
 	/// The `KEMRecipientInfo` of a masking seal names the identifier of the
 	/// masking encapsulation.
 	#[test]
-	fn a_seal_under_the_kem_traits_names_the_kem_of_the_role() -> Result<(), Box<dyn std::error::Error>> {
-		let sealed = masking_sealed(&masking_identity()?)?;
+	fn a_seal_under_the_kem_traits_names_the_kem_of_the_role() {
+		let sealed = masking_sealed(&masking_identity());
 		assert_eq!(sealed.kem_recipient().kem.oid, MASKING_KEM);
-		Ok(())
 	}
 }

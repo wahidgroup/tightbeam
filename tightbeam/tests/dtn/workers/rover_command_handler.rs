@@ -1,7 +1,5 @@
-//! Rover command handler worker - handles all Command message processing
-//!
-//! Business logic: Receives EarthCommand, validates, executes, updates mission state.
-//! Returns data needed for servlet to build ACK frame.
+//! The rover command handler worker, which runs an [`EarthCommand`] on the
+//! Rover and records the progress of the mission.
 
 use std::sync::{Arc, RwLock};
 
@@ -16,17 +14,21 @@ use crate::dtn::{
 	servlets::MissionState,
 };
 
-/// Rover command handler request (the full command message)
+/// The request to the rover command handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct RoverCommandHandlerRequest {
+	/// The command that the Rover runs.
 	pub command: EarthCommand,
+	/// The number of commands at which the Rover marks the mission complete.
 	pub max_rounds: u64,
 }
 
-/// Rover command handler response (data for ACK building)
+/// The response of the rover command handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct RoverCommandHandlerResponse {
+	/// The order of the command frame, which the handler answers as 0.
 	pub command_order: u64,
+	/// Whether the Rover ran the command, which is always `true`.
 	pub execution_success: bool,
 }
 
@@ -39,7 +41,8 @@ worker! {
 		trace.event(ROVER_RECEIVE_COMMAND)?;
 		trace.event(ROVER_EXECUTE_COMMAND)?;
 
-		// Execute command based on type (parameters are in request.command.parameters if needed)
+		// The type of the command picks its execute event, so the handler reads
+		// the type alone.
 		let rover_command = RoverCommand::try_from(request.command.command_type)?;
 
 		match rover_command {
@@ -59,7 +62,6 @@ worker! {
 
 		trace.event(ROVER_COMMAND_COMPLETE)?;
 
-		// Update mission state
 		{
 			let mut state = config.mission_state.write()?;
 			state.completed_rounds += 1;
@@ -69,9 +71,9 @@ worker! {
 			}
 		}
 
-		// Return response data (servlet will build ACK frame)
 		Ok(RoverCommandHandlerResponse {
-			command_order: 0, // Servlet has this from frame metadata
+			// The servlet holds the order from the frame metadata.
+			command_order: 0,
 			execution_success: true,
 		})
 	}

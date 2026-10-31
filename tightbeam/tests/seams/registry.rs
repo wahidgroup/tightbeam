@@ -4,24 +4,26 @@
 //! registry answers the type of an instance through the provided
 //! [`ServletRegistry::servlet_type`].
 
-#![cfg(all(feature = "std", feature = "colony", feature = "tcp"))]
+#![cfg(all(feature = "colony", feature = "tcp"))]
 
 use core::future::{ready, Ready};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tightbeam::cms::signed_data::SignerIdentifier;
 use tightbeam::colony::hive::{
-	Hive, HiveConfig, HiveError, HiveRuntime, RefusedRegistration, ReplacedServlet, ServletBox, ServletRegistration,
+	Hive, HiveConfig, HiveError, HiveRuntime, RefusedRegistration, ReplacedServlet, ServletRegistration,
 	ServletRegistry, SpawnerFn,
 };
-use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
+
+use super::StopProbe;
+use crate::common::hive::servlet_urn;
+use crate::common::result::TestResult;
 
 /// The instance key under which a hive registers a [`StopProbe`].
 const INSTANCE_KEY: &[u8] = b"urn:tightbeam::servlet:outside/127.0.0.1:7100";
@@ -120,33 +122,6 @@ impl ServletRegistry for OutsideRegistry {
 	}
 }
 
-/// A [`ServletBox`] whose stop the test reads, because a hive stops a servlet
-/// through [`ServletBox::stop_boxed`] alone.
-struct StopProbe {
-	stopped: Arc<AtomicBool>,
-}
-
-impl ServletBox for StopProbe {
-	fn addr_bytes(&self) -> Arc<[u8]> {
-		Arc::from(b"127.0.0.1:7100".as_slice())
-	}
-
-	fn stop_boxed(self: Box<Self>) {
-		self.stopped.store(true, Ordering::SeqCst);
-	}
-
-	fn signer(&self) -> Option<&SignerIdentifier> {
-		None
-	}
-}
-
-/// A [`StopProbe`] and the flag it sets when it stops.
-fn probe() -> (StopProbe, Arc<AtomicBool>) {
-	let stopped = Arc::new(AtomicBool::new(false));
-	let probe = StopProbe { stopped: Arc::clone(&stopped) };
-	(probe, stopped)
-}
-
 /// The spawner of a [`StopProbe`], which a test never calls.
 fn no_spawn(_trace: Arc<TraceCollector>) -> Ready<Result<StopProbe, TightBeamError>> {
 	ready(Err(TightBeamError::NotEstablished))
@@ -154,22 +129,39 @@ fn no_spawn(_trace: Arc<TraceCollector>) -> Ready<Result<StopProbe, TightBeamErr
 
 /// The type URN that a [`StopProbe`] registers under.
 fn outside_type() -> Urn<'static> {
-	let servlet_type = ColonyNamespace::default().servlet("outside");
-	servlet_type.expect("test names satisfy the mint grammar")
+	servlet_urn("outside")
 }
 
 /// A provisional hive that stores its servlets in `registry`, which shares its
 /// map with the caller's clone.
-fn outside_hive(registry: &OutsideRegistry) -> Result<OutsideHive, TightBeamError> {
-	OutsideHive::with_registry(HiveConfig::default(), registry.clone())
+fn outside_hive(registry: &OutsideRegistry) -> OutsideHive {
+	let hive = OutsideHive::with_registry(HiveConfig::default(), registry.clone());
+	hive.expect("a registry that holds no registration takes a hive")
+}
+
+/// A provisional hive on an outside registry of no bound, beside a clone of
+/// that registry.
+fn unbounded_hive() -> (OutsideRegistry, OutsideHive) {
+	let registry = OutsideRegistry::holding(usize::MAX);
+	let hive = outside_hive(&registry);
+	(registry, hive)
+}
+
+/// An [`unbounded_hive`] that holds one registered [`StopProbe`], beside the
+/// flag that the probe sets when it stops.
+fn hive_holding_a_probe() -> (OutsideRegistry, OutsideHive, Arc<AtomicBool>) {
+	let (registry, mut hive) = unbounded_hive();
+	let (servlet, stopped) = StopProbe::new();
+	let registered = hive.register(outside_type(), servlet, no_spawn);
+	registered.expect("a registry of no bound takes the probe");
+	(registry, hive, stopped)
 }
 
 /// A hive stores each servlet it registers in the outside registry it runs on.
 #[test]
-fn a_hive_registers_its_servlet_in_an_outside_registry() -> Result<(), TightBeamError> {
-	let registry = OutsideRegistry::holding(usize::MAX);
-	let mut hive = outside_hive(&registry)?;
-	let (servlet, _stopped) = probe();
+fn a_hive_registers_its_servlet_in_an_outside_registry() -> TestResult {
+	let (registry, mut hive) = unbounded_hive();
+	let (servlet, _stopped) = StopProbe::new();
 
 	hive.register(outside_type(), servlet, no_spawn)?;
 
@@ -180,25 +172,19 @@ fn a_hive_registers_its_servlet_in_an_outside_registry() -> Result<(), TightBeam
 /// An outside registry on the provided `servlet_type` answers the type of each
 /// instance through the default walk of its registrations.
 #[test]
-fn an_outside_registry_answers_the_type_of_an_instance_through_the_provided_walk() -> Result<(), TightBeamError> {
-	let registry = OutsideRegistry::holding(usize::MAX);
-	let mut hive = outside_hive(&registry)?;
-	let (servlet, _stopped) = probe();
-
-	hive.register(outside_type(), servlet, no_spawn)?;
-
-	assert_eq!(registry.servlet_type(INSTANCE_KEY), Some(outside_type()));
-	Ok(())
+fn an_outside_registry_answers_the_type_of_an_instance_through_the_provided_walk() {
+	let (registry, _hive, _stopped) = hive_holding_a_probe();
+	let servlet_type = registry.servlet_type(INSTANCE_KEY);
+	assert_eq!(servlet_type, Some(outside_type()));
 }
 
 /// A registration under an instance the outside registry holds replaces it,
 /// and the hive stops the replaced servlet while the replacing one runs.
 #[test]
-fn a_hive_stops_the_servlet_that_an_outside_registry_replaces() -> Result<(), TightBeamError> {
-	let registry = OutsideRegistry::holding(usize::MAX);
-	let mut hive = outside_hive(&registry)?;
-	let (replaced, replaced_stopped) = probe();
-	let (replacing, replacing_stopped) = probe();
+fn a_hive_stops_the_servlet_that_an_outside_registry_replaces() -> TestResult {
+	let (_registry, mut hive) = unbounded_hive();
+	let (replaced, replaced_stopped) = StopProbe::new();
+	let (replacing, replacing_stopped) = StopProbe::new();
 
 	hive.register(outside_type(), replaced, no_spawn)?;
 	hive.register(outside_type(), replacing, no_spawn)?;
@@ -212,12 +198,9 @@ fn a_hive_stops_the_servlet_that_an_outside_registry_replaces() -> Result<(), Ti
 /// A running hive drains the outside registry as it stops, and stops each
 /// servlet that the registry held.
 #[tokio::test]
-async fn a_running_hive_stops_each_servlet_its_outside_registry_holds() -> Result<(), TightBeamError> {
-	let registry = OutsideRegistry::holding(usize::MAX);
-	let mut hive = outside_hive(&registry)?;
-	let (servlet, stopped) = probe();
+async fn a_running_hive_stops_each_servlet_its_outside_registry_holds() -> TestResult {
+	let (registry, mut hive, stopped) = hive_holding_a_probe();
 
-	hive.register(outside_type(), servlet, no_spawn)?;
 	hive.establish(Arc::new(TraceCollector::new())).await?;
 	hive.stop();
 
@@ -228,30 +211,32 @@ async fn a_running_hive_stops_each_servlet_its_outside_registry_holds() -> Resul
 /// An outside registry that refuses a registration fails the hive's register
 /// with the registry's own error, and the hive stops the refused servlet.
 #[test]
-fn a_hive_stops_the_servlet_that_an_outside_registry_refuses() -> Result<(), TightBeamError> {
+fn a_hive_stops_the_servlet_that_an_outside_registry_refuses() {
 	let registry = OutsideRegistry::holding(0);
-	let mut hive = outside_hive(&registry)?;
-	let (servlet, stopped) = probe();
+	let mut hive = outside_hive(&registry);
+	let (servlet, stopped) = StopProbe::new();
 
 	let registered = hive.register(outside_type(), servlet, no_spawn);
-	let refused = matches!(registered, Err(TightBeamError::WorkRefused(TransitStatus::ResourceExhausted)));
-	assert_eq!((refused, stopped.load(Ordering::SeqCst)), (true, true));
-	Ok(())
+	assert!(matches!(
+		registered,
+		Err(TightBeamError::WorkRefused(TransitStatus::ResourceExhausted))
+	));
+	assert!(stopped.load(Ordering::SeqCst));
 }
 
 /// A hive refuses an occupied outside registry and stops its servlet.
 #[test]
-fn a_hive_refuses_an_outside_registry_that_holds_a_registration() -> Result<(), TightBeamError> {
+fn a_hive_refuses_an_outside_registry_that_holds_a_registration() -> TestResult {
 	let registry = OutsideRegistry::holding(usize::MAX);
-	let (servlet, stopped) = probe();
+	let (servlet, stopped) = StopProbe::new();
 	let spawner: SpawnerFn = Arc::new(|_| Box::pin(async { Err(TightBeamError::NotEstablished) }));
 	let registration = ServletRegistration { servlet: Box::new(servlet), spawner, servlet_type: outside_type() };
-	let _replaced = registry
-		.insert(INSTANCE_KEY, registration)
-		.map_err(|refused| refused.stop_servlet())?;
+	let inserted = registry.insert(INSTANCE_KEY, registration);
+	// An empty registry replaces no servlet, so the insert answers `None`.
+	let _replaced = inserted.map_err(|refused| refused.stop_servlet())?;
 
-	let refused = outside_hive(&registry).err();
-	let occupied = matches!(refused, Some(TightBeamError::HiveError(HiveError::OccupiedRegistry)));
-	assert_eq!((occupied, stopped.load(Ordering::SeqCst)), (true, true));
+	let refused = OutsideHive::with_registry(HiveConfig::default(), registry.clone()).err();
+	assert!(matches!(refused, Some(TightBeamError::HiveError(HiveError::OccupiedRegistry))));
+	assert!(stopped.load(Ordering::SeqCst));
 	Ok(())
 }

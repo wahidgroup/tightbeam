@@ -42,8 +42,10 @@ use tightbeam::{
 	TightBeamError,
 };
 
+use crate::common::result::TestResult;
+use crate::common::security::expectation_failure;
 use crate::security::common::{
-	closing_key, expectation_failure, CapturedHandshake, HandshakeBackendKind, SecurityThreatHarness,
+	closing_key, fresh_values, CapturedHandshake, HandshakeBackendKind, KnownExchange, SecurityThreatHarness,
 	StaticKeyObserver, STATIC_KEY_CANDIDATES,
 };
 
@@ -134,9 +136,9 @@ job! {
 		let (hello, reply) = (message_of(&captured, 0)?, message_of(&captured, 1)?);
 		let observer = StaticKeyObserver::new(hello, reply, closing, static_key)?;
 		let attempts = observer.closing_attempts().await?;
+
 		let unwrap_refused = attempts.iter().all(|attempt| matches!(attempt, Err(EnvelopeError::KeyUnwrap)));
 		let refused = attempts.len() == STATIC_KEY_CANDIDATES && unwrap_refused;
-
 		assert!(refused, "a closing key that the server's static key yields opened the closing");
 
 		// Step 4: Two handshakes seal two closings, each under a fresh content
@@ -147,18 +149,37 @@ job! {
 		trace.event(CONF_CAPTURE_HANDSHAKE)?;
 
 		let closing2 = message_of(&captured2, 2)?;
-		assert_ne!(closing, closing2, "two handshakes sealed byte-equal closings");
+		let (wrapped_key, nonce) = fresh_values(&AuthEnvelopedData::from_der(closing)?)?;
+		let (wrapped_key2, nonce2) = fresh_values(&AuthEnvelopedData::from_der(closing2)?)?;
+		assert_ne!(wrapped_key, wrapped_key2);
+		assert_ne!(nonce, nonce2);
 
 		Ok(())
 	}
 }
 
+/// An observer that holds the secret of the exchange opens the closing through
+/// the schedule of the observer in `confidentiality`, so the refusals there
+/// come from the key that the observer lacks.
+#[tokio::test]
+async fn an_observer_that_holds_the_exchange_secret_opens_the_closing() -> TestResult {
+	let harness = SecurityThreatHarness::default();
+	let captured = harness.spawn_known_exchange().capture_full().await?;
+	let (hello, reply) = (message_of(&captured, 0)?, message_of(&captured, 1)?);
+	let closing = message_of(&captured, 2)?;
+	let observer = StaticKeyObserver::holding(hello, reply, closing, &KnownExchange::secret()?)?;
+
+	let attempts = observer.closing_attempts().await?;
+	assert!(matches!(attempts.as_slice(), [Ok(_)]));
+	Ok(())
+}
+
 /// The observer's closing key over `ee` = `0x11` × 32 and the salt `0x99` ×
 /// 32 matches an independent HKDF-SHA3-256 (Python's `hmac` and `hashlib`).
-/// Its intermediate handshake secret is the crate's known answer of the
-/// ephemeral handshake secret, so the observer runs the flow's own schedule.
+/// The test holds the helper of the observer to that vector, and the crate test
+/// `the_seal_key_matches_its_known_answer` holds the schedule to its own.
 #[test]
-fn the_observer_closing_key_matches_its_known_answer() -> Result<(), TightBeamError> {
+fn the_observer_closing_key_matches_its_known_answer() -> TestResult {
 	let closing = closing_key(&[0x11u8; 32], &[0x99u8; 32])?;
 	let expected = [
 		0x5d, 0xb3, 0x7d, 0x19, 0x92, 0xd1, 0x26, 0xa1, 0x41, 0x3e, 0x0a, 0xeb, 0xc5, 0x88, 0xd3, 0x19, 0xcc, 0xc8,

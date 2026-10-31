@@ -1,4 +1,4 @@
-//! Integration test of mutual authentication.
+//! The integration test of mutual authentication.
 //!
 //! The test runs end-to-end mutual authentication with X.509 certificates.
 
@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
+use crate::transport::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::{
 	colony::servlet::ServletConfig,
@@ -30,11 +30,12 @@ use tightbeam::{
 		x509::{
 			policy::CertificateValidation,
 			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
-			Certificate, CertificateSpec, KeyCurves,
+			CanonicalKey, Certificate, CertificateSpec, KeyCurves,
 		},
 	},
 	exactly,
 	instrumentation::events,
+	policy::{GatePolicy, SessionContext, TransitStatus},
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
 	trace::TraceCollector,
@@ -63,7 +64,6 @@ struct AuthRequest {
 #[derive(Clone, Debug, PartialEq, Beamable, Sequence)]
 struct AuthResponse {
 	server_id: String,
-	authenticated: bool,
 }
 
 // This servlet runs mutual authentication with X.509 certificates.
@@ -71,11 +71,8 @@ struct AuthResponse {
 servlet! {
 	pub MutualAuthServlet<AuthRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |request, frame, _ctx| async move {
-		let response = AuthResponse {
-			server_id: "mutual-auth-server".to_string(),
-			authenticated: request.client_id == "test-client-mutual-001",
-		};
+	handle: |_request, frame, _ctx| async move {
+		let response = AuthResponse { server_id: "mutual-auth-server".to_string() };
 
 		let response_frame = compose! {
 			V0: id: frame.metadata().id(),
@@ -88,7 +85,35 @@ servlet! {
 
 // The positive scenario authenticates both ends and exchanges one request.
 
-// The servlet admits the pinned client and completes the handshake. The
+/// A gate that admits a frame when the handshake of its session proved the
+/// key of [`CLIENT_CERT`]. A servlet handler holds no session, so this gate
+/// reads the identity that the server authenticated.
+struct StaticClientGate {
+	/// The key of the static client.
+	client: CanonicalKey,
+}
+
+impl StaticClientGate {
+	/// A gate over the key that [`CLIENT_CERT`] carries.
+	fn over_the_certificate() -> Result<Self, TightBeamError> {
+		let certificate = Certificate::try_from(CLIENT_CERT)?;
+		let client = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
+		Ok(Self { client })
+	}
+}
+
+impl GatePolicy for StaticClientGate {
+	fn evaluate(&self, _message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
+		if session.peer_key() == Some(&self.client) {
+			return TransitStatus::Ok;
+		}
+
+		TransitStatus::PermissionDenied
+	}
+}
+
+// The servlet admits the pinned client and completes the handshake, and its
+// gate admits the one frame only for the key that the handshake proved. The
 // servlet alone records into the scenario trace, so each event is its own.
 tb_assert_spec! {
 	MutualAuthSpec,
@@ -96,7 +121,9 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
-			(events::SESSION_CERT_REJECTED, exactly!(0))
+			(events::SESSION_CERT_REJECTED, exactly!(0)),
+			(events::GATE_ACCEPT, exactly!(1)),
+			(events::GATE_REJECT, exactly!(0))
 		]
 	}
 }
@@ -112,6 +139,7 @@ tb_scenario! {
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
+				.with_collector_gate(StaticClientGate::over_the_certificate()?)
 				.build();
 
 			MutualAuthServlet::start(Arc::clone(&trace), servlet_conf).await
@@ -141,7 +169,6 @@ tb_scenario! {
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
 			let response: AuthResponse = response_frame.decode_message()?;
 			assert_eq!(response.server_id, "mutual-auth-server", "the reply must name the servlet");
-			assert!(response.authenticated, "the servlet must accept the client id");
 			Ok(())
 		}
 	}

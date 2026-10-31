@@ -1,4 +1,4 @@
-//! What `ScenarioConfigBuilder::build` refuses
+//! The refusals of `ScenarioConfigBuilder::build`.
 //!
 //! A scenario is only worth running when some layer can reject it. These
 //! tests hold the two halves of that rule against specs the macro built,
@@ -6,7 +6,7 @@
 
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, ScenarioConfigError};
 use tightbeam::urn::Urn;
-use tightbeam::{exactly, tb_assert_spec, tb_process_spec};
+use tightbeam::{exactly, tb_assert_spec, tb_cases, tb_process_spec};
 
 const STEP: Urn<'static> = tightbeam::urn!("test", "event:config/step");
 
@@ -20,11 +20,46 @@ tb_assert_spec! {
 	}
 }
 
-#[test]
-fn a_spec_that_grades_nothing_is_not_an_effective_verifier() {
-	let refused = ScenarioConfig::builder().with_spec(InertSpec::latest()).build();
+/// The config that a build accepts, or its refusal.
+type Built = Result<ScenarioConfig, ScenarioConfigError>;
 
-	assert_eq!(refused.err(), Some(ScenarioConfigError::NoEffectiveVerifier));
+// A config builds when each layer it relies on can reject a run: some layer
+// for a scenario that expects to pass, and the expected layer for a scenario
+// that expects a violation.
+tb_cases! {
+	fn a_config_builds_when_the_layers_it_relies_on_can_reject(
+		(build, refusal): (fn() -> Built, Option<ScenarioConfigError>)
+	) {
+		let built = build();
+		assert_eq!(built.err(), refusal);
+	}
+	cases {
+		/// A spec that grades nothing is no effective verifier.
+		for_a_spec_that_grades_nothing => (
+			|| ScenarioConfig::builder().with_spec(InertSpec::latest()).build(),
+			Some(ScenarioConfigError::NoEffectiveVerifier),
+		),
+		/// A trace that never records a required event refutes it, so a spec
+		/// that names one makes the assertion layer a verifier.
+		#[cfg(feature = "instrument")]
+		for_a_spec_that_only_orders_events => (
+			|| ScenarioConfig::builder().with_spec(required_events::EventOrderSpec::latest()).build(),
+			None,
+		),
+		/// The CSP layer makes the config able to reject, and the assertion
+		/// layer that the scenario expects to reject grades nothing.
+		#[cfg(feature = "testing-csp")]
+		for_an_inert_spec_under_an_expected_assertion_violation => (
+			|| {
+				ScenarioConfig::builder()
+					.with_spec(InertSpec::latest())
+					.with_csp(with_another_layer::OneStep)
+					.with_expect(Expect::Violation(Layer::Assertion))
+					.build()
+			},
+			Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Assertion)),
+		),
+	}
 }
 
 #[cfg(feature = "instrument")]
@@ -38,15 +73,6 @@ mod required_events {
 			assertions: [],
 			events: [ STEP ]
 		}
-	}
-
-	// A required event is refuted by a trace that never records it, so naming
-	// one is enough on its own to make the assertion layer a verifier.
-	#[test]
-	fn a_spec_that_only_orders_events_can_reject() {
-		let accepted = ScenarioConfig::builder().with_spec(EventOrderSpec::latest()).build();
-
-		assert!(accepted.is_ok(), "a required event is a rejection this spec can produce");
 	}
 }
 
@@ -64,22 +90,6 @@ mod with_another_layer {
 			S0 => { STEP => S1 }
 		}
 		terminal { S1 }
-	}
-
-	// The CSP layer makes the configuration able to reject, so the effective
-	// verifier check passes.
-	#[test]
-	fn an_inert_spec_cannot_satisfy_an_expected_assertion_violation() {
-		let refused = ScenarioConfig::builder()
-			.with_spec(InertSpec::latest())
-			.with_csp(OneStep)
-			.with_expect(Expect::Violation(Layer::Assertion))
-			.build();
-
-		assert_eq!(
-			refused.err(),
-			Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Assertion))
-		);
 	}
 }
 

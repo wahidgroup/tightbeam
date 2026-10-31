@@ -45,16 +45,13 @@ use tightbeam::oids::RECEIPT_ACK;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
-use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::HandshakeMessage;
 use tightbeam::x509::attr::{Attribute, Attributes};
 use tightbeam::TightBeamError;
 
 use crate::common::security::{ClientMaterials, GrantingAuthorizer, ServerMaterials};
 use crate::security::common::HandshakeBackendKind;
-use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME};
-
-const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME, SMALL_BUDGETS};
 
 /// The sealed client Finished with a `RECEIPT_ACK` unauthenticated
 /// attribute that carries a forged value beside the seal.
@@ -96,7 +93,7 @@ tb_scenario! {
 	spec: AttributeInjectionSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let identity = ClientMaterials::generate().identity();
 			let hooks = ReceiptHooks {
 				authorizer: Some(Arc::new(GrantingAuthorizer::challenge_free())),
@@ -106,7 +103,7 @@ tb_scenario! {
 			// The MITM injects the forged acknowledgement on the wire.
 			let injection = AttackStep::new(CLOSING_FRAME, FrameEdit::Rewrite(Box::new(injected)));
 			let kind = HandshakeBackendKind::Cms;
-			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
+			let handshake = LiveHandshake::budget_bearing(kind, materials, identity, SMALL_BUDGETS, hooks);
 			let outcome = handshake.audit_server(&trace).with_step(injection).run().await?;
 			outcome.refused_by_server("server accepted a closing that carries an unauthenticated attribute")?;
 

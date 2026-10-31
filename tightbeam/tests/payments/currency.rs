@@ -2,6 +2,10 @@
 //!
 //! A monetary amount holds quanta, the smallest units of its currency, and
 //! the exponent lookup gives the decimal places of each currency.
+//!
+//! The tests of this module are self-checks of the harness that run no
+//! tightbeam code. The scenarios build amounts with these types, and the
+//! verdict of a scenario reads none of their conversions.
 
 use tightbeam::der::asn1::OctetStringRef;
 use tightbeam::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Sequence, Tag, Writer};
@@ -171,9 +175,8 @@ impl MonetaryAmount {
 
 // Unit tests
 
-#[cfg(test)]
 mod tests {
-	use tightbeam::der::Decode;
+	use tightbeam::der::{Decode, ErrorKind};
 	use tightbeam::tb_cases;
 
 	use super::*;
@@ -194,70 +197,51 @@ mod tests {
 		}
 	}
 
-	/// A currency code holds three octets, so a code of four fails to decode.
+	/// A currency code holds three octets, so a code of four fails to decode
+	/// with the length error of its OCTET STRING.
 	#[test]
 	fn a_currency_code_of_four_octets_is_refused() {
 		let four_octets = [0x30, 0x09, 0x02, 0x01, 0x01, 0x04, 0x04, b'U', b'S', b'D', b'X'];
-
-		let decoded = MonetaryAmount::from_der(&four_octets);
-
-		assert!(decoded.is_err());
+		let decoded = MonetaryAmount::from_der(&four_octets).map_err(|error| error.kind());
+		assert_eq!(decoded, Err(ErrorKind::Length { tag: Tag::OctetString }));
 	}
 
-	#[test]
-	fn exponent_usd_is_2() {
-		assert_eq!(currency_exponent(b"USD"), 2);
+	// A currency has the minor-unit exponent of ISO 4217, and a code outside
+	// the table has the default exponent of two.
+	tb_cases! {
+		fn a_currency_has_its_iso_4217_exponent((code, exponent): (&[u8; 3], u8)) {
+			assert_eq!(currency_exponent(code), exponent);
+		}
+		cases {
+			dollars => (b"USD", 2),
+			yen => (b"JPY", 0),
+			bahraini_dinars => (b"BHD", 3),
+			chilean_units_of_account => (b"CLF", 4),
+			an_unknown_code_at_the_default => (b"XXX", 2),
+		}
 	}
 
-	#[test]
-	fn exponent_jpy_is_0() {
-		assert_eq!(currency_exponent(b"JPY"), 0);
+	// An amount displays its major units, then the decimals of its minor unit,
+	// then its currency code.
+	tb_cases! {
+		fn an_amount_displays_with_the_decimals_of_its_currency((amount, text): (MonetaryAmount, &str)) {
+			assert_eq!(amount.to_display(), text);
+		}
+		cases {
+			dollars => (MonetaryAmount::new(1099, *b"USD"), "10.99 USD"),
+			yen => (MonetaryAmount::new(1099, *b"JPY"), "1099 JPY"),
+			bahraini_dinars => (MonetaryAmount::new(10999, *b"BHD"), "10.999 BHD"),
+		}
 	}
 
-	#[test]
-	fn exponent_bhd_is_3() {
-		assert_eq!(currency_exponent(b"BHD"), 3);
-	}
-
-	#[test]
-	fn exponent_clf_is_4() {
-		assert_eq!(currency_exponent(b"CLF"), 4);
-	}
-
-	#[test]
-	fn exponent_unknown_defaults_to_2() {
-		assert_eq!(currency_exponent(b"XXX"), 2);
-	}
-
-	#[test]
-	fn display_usd_cents() {
-		let amount = MonetaryAmount::new(1099, *b"USD");
-		assert_eq!(amount.to_display(), "10.99 USD");
-	}
-
-	#[test]
-	fn display_jpy_no_decimals() {
-		let amount = MonetaryAmount::new(1099, *b"JPY");
-		assert_eq!(amount.to_display(), "1099 JPY");
-	}
-
-	#[test]
-	fn display_bhd_three_decimals() {
-		let amount = MonetaryAmount::new(10999, *b"BHD");
-		assert_eq!(amount.to_display(), "10.999 BHD");
-	}
-
-	#[test]
-	fn major_minor_units_usd() {
-		let amount = MonetaryAmount::new(1099, *b"USD");
-		assert_eq!(amount.major_units(), 10);
-		assert_eq!(amount.minor_units(), 99);
-	}
-
-	#[test]
-	fn major_minor_units_jpy() {
-		let amount = MonetaryAmount::new(1099, *b"JPY");
-		assert_eq!(amount.major_units(), 1099);
-		assert_eq!(amount.minor_units(), 0);
+	// An amount splits into its major units and the minor units that remain.
+	tb_cases! {
+		fn an_amount_splits_into_major_and_minor_units((amount, parts): (MonetaryAmount, (u64, u64))) {
+			assert_eq!((amount.major_units(), amount.minor_units()), parts);
+		}
+		cases {
+			dollars => (MonetaryAmount::new(1099, *b"USD"), (10, 99)),
+			yen => (MonetaryAmount::new(1099, *b"JPY"), (1099, 0)),
+		}
 	}
 }

@@ -1,3 +1,3 @@
-//! Instrumentation integration tests
+//! The integration tests of instrumentation.
 
 mod tests;

@@ -1,10 +1,8 @@
-//! Mux scenarios for chunking, credit, budgets, flow violations, and
+//! The integration tests of mux chunking, credit, budgets, flow violations, and
 //! authorizers.
 
 use core::time::Duration;
 use std::sync::Arc;
-
-use tokio::time::timeout;
 
 use tightbeam::der::Decode;
 use tightbeam::exactly;
@@ -15,9 +13,9 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{
-	GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage, MuxStreamKind,
+	GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage, MuxPingPackage, MuxStreamKind,
 };
-use tightbeam::transport::handshake::negotiation::{MuxBudgets, NegotiationError};
+use tightbeam::transport::handshake::negotiation::{MuxBudgets, MuxSettings, NegotiationError, TransportOffer};
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::{
 	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure,
@@ -25,11 +23,15 @@ use tightbeam::transport::{
 use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
-use crate::common::security::{expectation_failure, ServerMaterials};
-use crate::transport::support::{
-	await_ok, await_transport, await_within_deadline, bind_encrypted_listener, bind_encrypted_listener_with_timeout,
-	connect_pinned_client, establish_mutual_transports, join_task, mux_frame, mux_offer, serve_one_handshake_message,
-	MutualSessionHooks,
+use crate::common::poll::joined;
+use crate::common::result::TestResult;
+use crate::common::security::ServerMaterials;
+use crate::common::transport::{
+	await_transport, establish_mutual_transports, serve_one_handshake_message, MutualSessionHooks,
+};
+use crate::transport::fixtures::{
+	await_within_deadline, bind_encrypted_listener, bind_encrypted_listener_with_timeout, connect_pinned_client,
+	join_task, mux_frame, mux_offer,
 };
 
 use super::common::*;
@@ -39,7 +41,7 @@ pub(crate) const DRAIN_COMPLETES_CLEAN: Urn<'static> = tightbeam::urn!("test", "
 
 /// Two concurrent chunked frames each echo on their own stream.
 #[tokio::test]
-async fn mux_chunked_large_frames_roundtrip_and_interleave() -> Result<(), TightBeamError> {
+async fn two_concurrent_chunked_frames_each_echo_on_their_stream() -> TestResult {
 	let config = MuxEndpointConfig::default();
 	let pair = establish_echo_pair(chunked_offer(4), chunked_offer(4), config, TraceCollector::new()).await?;
 	let first = large_mux_frame("mux-chunked-first");
@@ -49,57 +51,103 @@ async fn mux_chunked_large_frames_roundtrip_and_interleave() -> Result<(), Tight
 		pair.client.handle.emit_on_stream(&second),
 	);
 
-	assert!(is_echo(first_echo?, &first), "the first chunked frame must echo");
-	assert!(is_echo(second_echo?, &second), "the second chunked frame must echo");
+	assert_eq!((first_echo?, second_echo?), (Some(first), Some(second)));
 	Ok(())
 }
 
 /// Reads the next envelope as the first chunk of a chunked open on
-/// `stream_id`, and returns its payload.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- an expectation failure when the envelope is another record, or the read failure.
-async fn read_partial_open(reader: &mut SplitReader, stream_id: u32) -> Result<Vec<u8>, TightBeamError> {
-	let open = reader.read_envelope().await?;
-	match open {
-		TransportEnvelope::Mux(MuxEnvelope::Open(package)) if !package.last() && package.stream_id() == stream_id => {
-			Ok(package.payload().to_vec())
-		}
-		_ => Err(expectation_failure(
-			"the open chunk must spend the initial credit of its stream",
-		)),
+/// `stream_id`, which spends the initial credit of its stream, and returns
+/// its payload.
+async fn read_partial_open(reader: &mut SplitReader, stream_id: u32) -> Vec<u8> {
+	let open = reader.read_envelope().await.expect("the raw server reads the open chunk");
+	let TransportEnvelope::Mux(MuxEnvelope::Open(package)) = open else {
+		panic!("the first record of a transfer is its open chunk");
+	};
+
+	assert_eq!((package.stream_id(), package.last()), (stream_id, false));
+	package.payload().to_vec()
+}
+
+/// The opaque value of the ping probe that a parked sender answers.
+const PARKED_PROBE: u64 = 7;
+
+/// A large frame in flight on a raw link whose server grants one chunk of
+/// initial credit per stream, after the raw server read its open chunk.
+struct ParkedTransfer {
+	/// The link of the transfer.
+	link: ClientMuxServerRaw,
+	/// The frame in flight.
+	frame: Frame,
+	/// The emit of the frame.
+	emit: EmitTask,
+	/// The payload of the open chunk, which spent the initial credit.
+	open_payload: Vec<u8>,
+}
+
+impl ParkedTransfer {
+	/// Starts the transfer of a large frame, and reads its open chunk on the
+	/// raw server.
+	async fn start() -> Self {
+		let server_offer = chunked_offer(4).with_initial_stream_credit(1);
+		let link = establish_client_mux_server_raw_with(chunked_offer(4), server_offer, TraceCollector::new()).await;
+		let mut link = link.expect("the raw link establishes");
+
+		let frame = large_mux_frame("mux-credit-stall");
+		let emit = spawn_emit(&link.client.handle, frame.to_owned());
+		let open_payload = read_partial_open(&mut link.server_reader, client_stream_id(0)).await;
+		ParkedTransfer { link, frame, emit, open_payload }
+	}
+
+	/// Grants the stream of the transfer 64 more chunks of credit, and returns
+	/// the payload that the raw server reads up to the last chunk.
+	async fn resume(&mut self) -> Vec<u8> {
+		let grant = MuxCreditPackage::new(client_stream_id(0), 64);
+		let granted = self.link.server_writer.write_envelope(grant.into()).await;
+		granted.expect("the raw server writes its grant");
+
+		let open_payload = self.open_payload.to_owned();
+		let payload = read_remaining_chunks(&mut self.link.server_reader, client_stream_id(0), open_payload).await;
+		payload.expect("the raw server reads the remaining chunks")
 	}
 }
 
-/// A sender parks at the initial credit of its stream, and the transfer
-/// resumes on the grant.
+/// A sender parks at the initial credit of its stream, so the client answers
+/// a ping probe of the raw server before any further chunk. A sender that did
+/// not park would already have queued its data ahead of the ack.
 #[tokio::test]
-async fn mux_stream_credit_stall_and_resume() -> Result<(), TightBeamError> {
-	let server_offer = chunked_offer(4).with_initial_stream_credit(1);
-	let mut link = establish_client_mux_server_raw_with(chunked_offer(4), server_offer, TraceCollector::new()).await?;
+async fn a_sender_parks_at_the_initial_credit_of_its_stream() -> TestResult {
+	let mut parked = ParkedTransfer::start().await;
+	let probe = MuxPingPackage::new(false, PARKED_PROBE);
 
-	let frame = large_mux_frame("mux-credit-stall");
-	let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
-	let payload = read_partial_open(&mut link.server_reader, client_stream_id(0)).await?;
+	parked.link.server_writer.write_envelope(probe.into()).await?;
 
-	let stalled = timeout(Duration::from_millis(200), link.server_reader.read_envelope())
-		.await
-		.is_err();
-	assert!(stalled, "the sender must stall at the initial credit of its stream");
+	let next = parked.link.server_reader.read_envelope().await?;
+	assert_eq!(next, TransportEnvelope::from(MuxPingPackage::new(true, PARKED_PROBE)));
+	Ok(())
+}
 
-	let grant = MuxCreditPackage::new(client_stream_id(0), 64);
-	link.server_writer.write_envelope(grant.into()).await?;
+/// A parked transfer resumes on the grant, so the raw server reads the whole
+/// frame.
+#[tokio::test]
+async fn a_parked_transfer_resumes_on_the_grant() -> TestResult {
+	let mut parked = ParkedTransfer::start().await;
+	let payload = parked.resume().await;
+	assert_eq!(Frame::from_der(&payload)?, parked.frame);
+	Ok(())
+}
 
-	let payload = read_remaining_chunks(&mut link.server_reader, client_stream_id(0), payload).await?;
-	let received = Frame::from_der(&payload)?;
-	assert_eq!(received, frame, "the transfer must resume on the grant");
+/// A stream that parked and resumed still resolves its emit to the answer of
+/// the raw server.
+#[tokio::test]
+async fn a_resumed_stream_still_echoes() -> TestResult {
+	let mut parked = ParkedTransfer::start().await;
+	parked.resume().await;
 
 	let ack = mux_frame("mux-stall-ack");
-	write_muxed_echo(&mut link.server_writer, client_stream_id(0), &Arc::new(ack.to_owned())).await?;
+	write_muxed_echo(&mut parked.link.server_writer, client_stream_id(0), &Arc::new(ack.to_owned())).await?;
 
-	let resolved = await_ok(emit_task, "stalled emit task must not panic").await?;
-	assert!(is_echo(resolved, &ack), "the stalled stream must still echo");
+	let resolved = joined(parked.emit).await?;
+	assert_eq!(resolved, Some(ack));
 	Ok(())
 }
 
@@ -325,27 +373,25 @@ tb_scenario! {
 	}
 }
 
+/// The send and receive budgets of `settings`, when the session negotiated
+/// multiplexing.
+fn budgets_of(settings: Option<MuxSettings>) -> Option<(Option<u64>, Option<u64>)> {
+	settings.map(|settings| (settings.send_budget(), settings.recv_budget()))
+}
+
 /// An authorizer that halves the requested budgets binds the same reduced
 /// grant on both sides.
 #[tokio::test]
-async fn mux_authorizer_reduced_grant_both_sides() -> Result<(), TightBeamError> {
+async fn both_sides_bind_the_grant_a_halving_authorizer_makes() -> TestResult {
 	let request = MuxBudgets { client_to_server: 10, server_to_client: 10 };
 	let hooks = MutualSessionHooks { authorizer: Some(Arc::new(HalvingAuthorizer)), ..MutualSessionHooks::default() };
-	let session = establish_mutual_transports(mux_offer(4).with_budgets(request), mux_offer(4), hooks).await?;
+	let halved = Some((Some(5), Some(5)));
 
-	let client_settings = session
-		.client
-		.negotiated_mux()
-		.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
-	let server_settings = session
-		.server
-		.negotiated_mux()
-		.ok_or_else(|| expectation_failure("server must negotiate multiplexing"))?;
-
-	let client_grant = (client_settings.send_budget(), client_settings.recv_budget());
-	let server_grant = (server_settings.send_budget(), server_settings.recv_budget());
-	assert_eq!(client_grant, (Some(5), Some(5)), "the client must take the halved grant");
-	assert_eq!(server_grant, (Some(5), Some(5)), "the server must bind the halved grant");
+	let client_offer = TransportOffer::mux(4).with_budgets(request);
+	let session = establish_mutual_transports(client_offer, TransportOffer::mux(4), hooks).await?;
+	let client_grant = budgets_of(session.client.negotiated_mux());
+	let server_grant = budgets_of(session.server.negotiated_mux());
+	assert_eq!((client_grant, server_grant), (halved, halved));
 	Ok(())
 }
 
@@ -366,7 +412,7 @@ tb_scenario! {
 	spec: MuxAuthorizerRefusalSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let (listener, addr) = bind_encrypted_listener(&materials).await?;
 			let server_trace = trace.share();
 
@@ -419,7 +465,7 @@ tb_scenario! {
 	spec: MuxAuthorizerDeadlineSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let (listener, addr) =
 				bind_encrypted_listener_with_timeout(&materials, Duration::from_millis(200)).await?;
 			let server_trace = trace.share();

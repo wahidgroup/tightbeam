@@ -1,28 +1,18 @@
 //! Payment Processing Gateway Integration Tests
 //!
-//! Real-world scenario demonstrating TightBeam's full feature set:
+//! Real-world scenarios that run these TightBeam features in a payment flow:
 //! - Integrity verification (Sha3_256 hashing)
-//! - Non-repudiation (SignerInfo signatures)
-//! - Idempotence (Frame-based deduplication)
-//! - Queue-less backpressure (AdaptiveGate)
+//! - Non-repudiation (SignerInfo signatures that a collector gate verifies)
 //! - DAG transaction chains (previous_frame linking)
-//! - Priority routing (MessagePriority)
-//! - TLS mutual authentication
-//! - Bio-inspired ACO/ABC cluster routing
+//! - TLS mutual authentication on the control plane of a hive
+//!
+//! Idempotence sits in the dedup book of the harness, over the ID and the
+//! order of a frame.
 //!
 //! Message types follow ISO 20022 pacs.008 structure.
 //! Monetary amounts use ISO 4217 currency quanta.
 
-#![cfg(all(
-	feature = "std",
-	feature = "tokio",
-	feature = "testing",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "colony",
-	feature = "transport-policy"
-))]
+#![cfg(feature = "testing")]
 
 pub mod cluster;
 pub mod currency;

@@ -1,29 +1,33 @@
-//! Scenarios for the streaming consumer API, which carries each chunk on the
-//! stream records that every stream kind shares.
+//! The integration tests of the streaming consumer API, which carries each
+//! chunk on the stream records that every stream kind shares.
 
+use core::future::pending;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
-use tokio::time::timeout;
+use tokio::sync::{mpsc, Notify};
 
 use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
+use tightbeam::tb_cases;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::multiplex::{MuxResponder, MuxRole, RequestSink, StreamBody};
-use tightbeam::transport::{TransportError, TransportFailure};
+use tightbeam::transport::multiplex::{
+	BufferedGrantor, CreditGrantor, MuxResponder, MuxRole, RequestSink, StreamBody, StreamId,
+};
+use tightbeam::transport::{ResponsePackage, TransportError, TransportFailure};
 use tightbeam::Frame;
 use tightbeam::TightBeamError;
 
 use super::common::*;
-use crate::transport::support::{await_ok, await_within_deadline, HandlerSignal};
+use crate::common::poll::{joined, within_hang_guard};
+use crate::common::result::TestResult;
+use crate::transport::fixtures::HandlerSignal;
 
 /// Returns a client endpoint, a server responder, and the server endpoint
 /// whose drivers keep the connection running, over freshly established
@@ -32,50 +36,102 @@ async fn streaming_endpoints(
 	trace: &TraceCollector,
 	server_offer: TransportOffer,
 ) -> Result<(MuxEndpoint, MuxResponder, MuxEndpoint), TightBeamError> {
-	let (client, server) = establish_transports(Some(chunked_offer(4)), Some(server_offer)).await?;
-	let (client_end, _) = spawn_mux_endpoint(client.with_trace(trace.share()), MuxRole::Client)?;
-	let (server_end, responder) = spawn_mux_endpoint(server.with_trace(trace.share()), MuxRole::Server)?;
-
-	Ok((client_end, responder, server_end))
+	let MuxLink { client, server, responder } = MuxLink::encrypted(server_offer, trace).await;
+	Ok((client, responder, server))
 }
 
-/// A streamed request pushes its chunks to a streaming handler and awaits the
-/// unary response.
-#[tokio::test]
-async fn mux_open_stream_pushes_chunks_and_awaits_response() -> Result<(), TightBeamError> {
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+/// What a streamed request of a large frame showed on its way through a
+/// streaming echo handler.
+struct StreamedEcho {
+	/// The frame that the request carried.
+	sent: Frame,
+	/// The response that the request resolved to.
+	echoed: Option<Frame>,
+	/// The count of chunks that the handler read.
+	chunks: usize,
+}
+
+/// Opens a stream on a fresh link of `link`, pushes a large frame on it in
+/// two parts to a streaming echo handler, and returns what it showed.
+async fn streamed_echo(link: Link) -> StreamedEcho {
+	let mux = link.endpoints().await;
 	let chunks_seen = Arc::new(AtomicUsize::new(0));
-	let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
+	let _serve = tokio::spawn(mux.responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
 
-	let frame = large_mux_frame("mux-open-stream-echo");
-	let payload = frame.to_der()?;
-	let (sink, response) = client_end.handle.open_stream()?;
-	push_split(sink, &payload).await?;
+	let sent = large_mux_frame("mux-streamed-echo");
+	let payload = sent.to_der().expect("a test frame encodes");
+	let (sink, response) = mux.client.handle.open_stream().expect("a fresh link opens a stream");
+	push_split(sink, &payload).await.expect("the push reaches the handler");
 
-	let echoed = response.await?;
-	let chunked = saw_multiple_chunks(&chunks_seen);
-	assert!(is_echo(echoed, &frame), "the streamed request must echo");
-	assert!(chunked, "the streaming handler must see more than one chunk");
-	Ok(())
+	let echoed = response.await.expect("the streamed request draws its response");
+	StreamedEcho { sent, echoed, chunks: chunks_seen.load(Ordering::SeqCst) }
 }
 
-/// A duplex stream receives its reply as a streamed body.
-#[tokio::test]
-async fn mux_open_duplex_receives_streamed_reply() -> Result<(), TightBeamError> {
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+// A streamed request on each link pushes its chunks to a streaming handler,
+// and its unary response echoes the frame it carried.
+tb_cases! {
+	async fn a_streamed_request_echoes(link: Link) {
+		let streamed = streamed_echo(link).await;
+		assert_eq!(streamed.echoed, Some(streamed.sent));
+	}
+	cases {
+		cleartext => Link::Cleartext,
+		encrypted => Link::Encrypted,
+	}
+}
+
+// A streamed request of a large frame on each link reaches its handler in
+// more than one chunk.
+tb_cases! {
+	async fn a_streamed_request_arrives_in_more_than_one_chunk(link: Link) {
+		let streamed = streamed_echo(link).await;
+		assert!(streamed.chunks > 1);
+	}
+	cases {
+		cleartext => Link::Cleartext,
+		encrypted => Link::Encrypted,
+	}
+}
+
+/// The client endpoint of a fresh encrypted link whose server serves
+/// [`duplex_echo_handler`], beside the server endpoint, whose drivers keep the
+/// link up.
+async fn duplex_echo_endpoints() -> (MuxEndpoint, MuxEndpoint) {
+	let mux = Link::Encrypted.endpoints().await;
 	let handler_chunks = Arc::new(AtomicUsize::new(0));
-	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
+	tokio::spawn(mux.responder.serve_duplex(duplex_echo_handler(handler_chunks)));
+	(mux.client, mux.server)
+}
+
+/// The frame that a duplex stream carries to an echo handler, beside the
+/// reply body drained to its end.
+async fn duplex_echo() -> (Frame, DrainedBody) {
+	let (client, _server) = duplex_echo_endpoints().await;
 
 	let frame = large_mux_frame("mux-open-duplex-echo");
-	let payload = frame.to_der()?;
-	let (sink, mut reply) = client_end.handle.open_duplex()?;
-	push_split(sink, &payload).await?;
+	let payload = frame.to_der().expect("a test frame encodes");
+	let (sink, mut reply) = client.handle.open_duplex().expect("a fresh link opens a duplex stream");
+	push_split(sink, &payload).await.expect("the push reaches the handler");
+	(frame, drain_body(&mut reply).await)
+}
 
-	let drained = drain_body(&mut reply).await;
+/// A duplex stream receives its reply as a streamed body, which reassembles
+/// to the request.
+#[tokio::test]
+async fn a_duplex_reply_reassembles_to_its_request() -> TestResult {
+	let (frame, drained) = duplex_echo().await;
+
 	let echoed = Frame::from_der(&drained.bytes)?;
-	assert_eq!(echoed, frame, "the duplex reply must reassemble to the request");
-	assert!(drained.chunks > 1, "the duplex reply must arrive in more than one chunk");
+	assert_eq!(echoed, frame);
 	Ok(())
+}
+
+/// The streamed reply of a large frame on a duplex stream arrives in more
+/// than one chunk.
+#[tokio::test]
+async fn a_duplex_reply_arrives_in_more_than_one_chunk() {
+	let (_frame, drained) = duplex_echo().await;
+	assert!(drained.chunks > 1);
 }
 
 /// Whether the responder refuses a unary-kind emit with `Unimplemented`.
@@ -146,8 +202,8 @@ tb_scenario! {
 	}
 }
 
-/// A guard that raises its signal on drop, so it observes the handler unwind
-/// whether the abort lands or the handler returns after its body severs.
+/// A guard that raises its signal on drop, so it observes the abort of the
+/// handler that holds it.
 struct RaiseOnDrop(Arc<HandlerSignal>);
 
 impl Drop for RaiseOnDrop {
@@ -156,61 +212,117 @@ impl Drop for RaiseOnDrop {
 	}
 }
 
-/// Returns a handler that signals entry, consumes the body until it ends, and
-/// flags its unwind through the drop guard.
-fn hanging_streaming_handler(
+/// Returns a handler that signals entry, hands its body to `bodies`, and parks
+/// for good, so an abort alone unwinds it. The drop guard flags the unwind.
+fn parked_streaming_handler(
 	started: Arc<HandlerSignal>,
 	unwound: Arc<HandlerSignal>,
+	bodies: mpsc::UnboundedSender<StreamBody>,
 ) -> impl Fn(StreamBody) -> HandlerFuture {
-	move |mut body| {
+	move |body| {
 		let started = Arc::clone(&started);
 		let unwound = Arc::clone(&unwound);
+		let bodies = bodies.clone();
 		Box::pin(async move {
 			let _guard = RaiseOnDrop(unwound);
+			bodies.send(body).expect("the stream holds the receiver of the bodies");
 			started.raise();
 
-			let drained = drain_body(&mut body).await;
-			echo_reassembled(&drained.bytes)
+			pending::<ResponsePackage>().await
 		})
 	}
 }
 
-/// A drop of the sink mid-stream cancels the stream: the response resolves
-/// `Cancelled` locally, and the server discards the in-flight body and unwinds
-/// its handler.
-#[tokio::test]
-async fn mux_streaming_cancel_discards_inflight_body() -> Result<(), TightBeamError> {
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
+/// A stream whose sink the client dropped mid-stream, after its handler
+/// started on the first two chunks.
+struct CancelledStream {
+	/// The outcome that the response of the stream resolved to.
+	outcome: Result<Option<Frame>, TransportError>,
+	/// The body that the handler handed over as it parked.
+	body: StreamBody,
+	/// The signal that the handler raises as it unwinds.
+	unwound: Arc<HandlerSignal>,
+	/// The client endpoint, which stays up while the cancel travels.
+	_client: MuxEndpoint,
+	/// The server endpoint, whose drivers carry the cancel to the handler.
+	_server: MuxEndpoint,
+}
+
+/// Opens a stream on `trace` to a handler that parks for good, pushes two
+/// chunks on it, drops the sink once the handler starts, and returns what the
+/// stream showed.
+async fn cancelled_mid_stream(trace: &TraceCollector) -> CancelledStream {
+	let mux = MuxLink::encrypted(chunked_offer(4), trace).await;
 	let started = Arc::new(HandlerSignal::default());
 	let unwound = Arc::new(HandlerSignal::default());
-	let handler = hanging_streaming_handler(Arc::clone(&started), Arc::clone(&unwound));
-	let _serve = tokio::spawn(responder.serve_streaming(handler));
+	let (bodies, mut handed_over) = mpsc::unbounded_channel();
+	let handler = parked_streaming_handler(Arc::clone(&started), Arc::clone(&unwound), bodies);
+	let _serve = tokio::spawn(mux.responder.serve_streaming(handler));
 
-	let (mut sink, response) = client_end.handle.open_stream()?;
+	let (mut sink, response) = mux.client.handle.open_stream().expect("a fresh link opens a stream");
 	// Pushes go out eagerly: the first one carries the open and starts the
 	// handler.
-	sink.push(b"first-chunk").await?;
-	sink.push(b"second-chunk").await?;
-	started.wait("handler must start before the cancel").await?;
+	sink.push(b"first-chunk").await.expect("the first chunk goes out");
+	sink.push(b"second-chunk").await.expect("the second chunk goes out");
+	started.raised().await;
 
 	drop(sink);
 
 	let outcome = response.await;
-	let cancelled = matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::Cancelled)));
-	assert!(cancelled, "dropping the sink must resolve the response as cancelled");
-	assert!(unwound.raised().await, "a peer cancel must unwind the streaming handler");
-	Ok(())
+	let body = handed_over
+		.try_recv()
+		.expect("the handler hands over its body before its start");
+	CancelledStream { outcome, body, unwound, _client: mux.client, _server: mux.server }
+}
+
+/// A drop of the sink mid-stream cancels the stream, so the response resolves
+/// `Cancelled` locally.
+#[tokio::test]
+async fn a_dropped_sink_resolves_its_response_cancelled() {
+	let cancelled = cancelled_mid_stream(&TraceCollector::new()).await;
+	assert!(matches!(
+		cancelled.outcome,
+		Err(TransportError::OperationFailed(TransportFailure::Cancelled))
+	));
+}
+
+tb_assert_spec! {
+	pub MuxPeerCancelSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::MUX_STREAM_CANCELLED, exactly!(1))
+		]
+	}
+}
+
+/// A drop of the sink mid-stream reaches the server as a peer cancel, whose
+/// abort alone unwinds the parked streaming handler.
+#[tokio::test]
+async fn a_peer_cancel_unwinds_the_streaming_handler() -> TestResult {
+	grade_case(MuxPeerCancelSpec::latest(), |trace| async move {
+		let cancelled = cancelled_mid_stream(&trace).await;
+		cancelled.unwound.raised().await;
+	})
+	.await
+}
+
+/// A peer cancel discards the in-flight body, so a reader of that body reads a
+/// failure after the chunks that arrived, with no clean end.
+#[tokio::test]
+async fn a_peer_cancel_fails_the_body_in_flight() {
+	let mut cancelled = cancelled_mid_stream(&TraceCollector::new()).await;
+	let drained = within_hang_guard(drain_body(&mut cancelled.body), "the peer cancel ends the body").await;
+	assert!(matches!(drained.failure, Some(TransportError::ConnectionClosed)));
 }
 
 /// A drop of the duplex sink before close cancels the stream: the reply body
 /// fails with `Cancelled` instead of a wait on a trailer that never arrives.
 #[tokio::test]
-async fn mux_duplex_sink_drop_fails_reply_body() -> Result<(), TightBeamError> {
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
-	let handler_chunks = Arc::new(AtomicUsize::new(0));
-	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
+async fn a_dropped_duplex_sink_fails_its_reply_body_cancelled() -> TestResult {
+	let (client, _server) = duplex_echo_endpoints().await;
 
-	let (mut sink, mut reply) = client_end.handle.open_duplex()?;
+	let (mut sink, mut reply) = client.handle.open_duplex()?;
 	sink.push(b"first-chunk").await?;
 	sink.push(b"second-chunk").await?;
 
@@ -219,11 +331,10 @@ async fn mux_duplex_sink_drop_fails_reply_body() -> Result<(), TightBeamError> {
 	// Echoed chunks may already sit ahead of the cancel event, so drain to the
 	// terminal outcome.
 	let drained = drain_body(&mut reply).await;
-	let cancelled = matches!(
+	assert!(matches!(
 		drained.failure,
 		Some(TransportError::OperationFailed(TransportFailure::Cancelled))
-	);
-	assert!(cancelled, "dropping the duplex sink must fail the reply body as cancelled");
+	));
 	Ok(())
 }
 
@@ -247,41 +358,82 @@ fn gated_streaming_echo(started: Arc<HandlerSignal>, release: Arc<Notify>) -> im
 	}
 }
 
+/// A [`BufferedGrantor`] that records the `(received, limit)` of each drain
+/// report. The reader consults the grantor of a streaming body on a drain
+/// report alone, so the record stays empty while the consumer parks.
+#[derive(Default)]
+struct RecordingGrantor {
+	/// The policy that answers each report.
+	policy: BufferedGrantor,
+	/// The reports, in arrival order.
+	reports: Mutex<Vec<(u64, u64)>>,
+}
+
+impl RecordingGrantor {
+	/// The reports so far.
+	fn reports(&self) -> Vec<(u64, u64)> {
+		self.reports.lock().expect("a report holds the lock without a panic").to_vec()
+	}
+}
+
+impl CreditGrantor for RecordingGrantor {
+	fn replenish(&self, stream_id: StreamId, received: u64, limit: u64) -> Option<u64> {
+		self.reports
+			.lock()
+			.expect("a report holds the lock without a panic")
+			.push((received, limit));
+		self.policy.replenish(stream_id, received, limit)
+	}
+}
+
+/// A link whose server grants one chunk of initial credit per stream and takes
+/// its replenishment from `grantor`.
+async fn one_credit_link(grantor: Arc<RecordingGrantor>) -> MuxLink {
+	let server_offer = chunked_offer(4).with_initial_stream_credit(1);
+	let transports = establish_transports(Some(chunked_offer(4)), Some(server_offer)).await;
+	let (client, server) = transports.expect("the pinned client completes its handshake");
+	let config = MuxEndpointConfig { grantor: Some(grantor), ..MuxEndpointConfig::default() };
+
+	let client = spawn_mux_endpoint(client, MuxRole::Client);
+	let (client, _client_responder) = client.expect("the handshake negotiates multiplexing");
+	let server = spawn_mux_endpoint_with(server, MuxRole::Server, config);
+	let (server, responder) = server.expect("the handshake negotiates multiplexing");
+	MuxLink { client, server, responder }
+}
+
 /// End-to-end backpressure: with one chunk of initial credit and a parked
 /// consumer, the client's push stalls. Grants follow only from the consumer's
 /// drain, so the handler's release resumes the transfer.
+///
+/// - The ack of a ping fences the stall, because the reader acts on every record ahead of the probe.
+/// - The first drain report shows the initial credit of one chunk as the limit of the push.
 #[tokio::test]
-async fn mux_streaming_slow_consumer_stalls_then_resumes() -> Result<(), TightBeamError> {
-	let server_offer = chunked_offer(4).with_initial_stream_credit(1);
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), server_offer).await?;
+async fn a_slow_consumer_stalls_the_push_until_it_drains() -> TestResult {
+	let grantor = Arc::new(RecordingGrantor::default());
+	let mux = one_credit_link(Arc::clone(&grantor)).await;
 	let started = Arc::new(HandlerSignal::default());
 	let release = Arc::new(Notify::new());
 	let handler = gated_streaming_echo(Arc::clone(&started), Arc::clone(&release));
-	let _serve = tokio::spawn(responder.serve_streaming(handler));
+	let _serve = tokio::spawn(mux.responder.serve_streaming(handler));
 
 	let frame = large_mux_frame("mux-streaming-backpressure");
 	let payload = frame.to_der()?;
-	let handle = client_end.handle.clone();
-	let mut transfer = tokio::spawn(async move {
-		let (mut sink, response) = handle.open_stream()?;
+	let (mut sink, response) = mux.client.handle.open_stream()?;
+	let transfer = tokio::spawn(async move {
 		sink.push(&payload).await?;
-		sink.close().await?;
-		response.await
+		sink.close().await
 	});
 
-	started.wait("handler must start on the open chunk").await?;
+	started.raised().await;
 
-	// A slow enough machine can keep a healthy transfer in flight past the
-	// window, so this sample is only a probe. The resume assertion bounds the
-	// exposure, because the transfer must complete once the handler drains.
-	let stalled = timeout(Duration::from_millis(200), &mut transfer).await.is_err();
-	assert!(stalled, "the push must stall while the consumer holds its body");
+	mux.client.handle.ping().await?;
+	assert_eq!((transfer.is_finished(), grantor.reports()), (false, Vec::new()));
 
 	release.notify_one();
 
-	let echoed = await_ok(transfer, "stalled transfer must not panic").await?;
-	let finished = is_echo(echoed, &frame);
-	assert!(finished, "the stalled transfer must finish once the consumer drains");
+	joined(transfer).await?;
+	let echoed = response.await?;
+	assert_eq!((grantor.reports().first().copied(), echoed), (Some((1, 1)), Some(frame)));
 	Ok(())
 }
 
@@ -289,68 +441,69 @@ async fn mux_streaming_slow_consumer_stalls_then_resumes() -> Result<(), TightBe
 /// out.
 const PINGS: [&[u8]; 3] = [b"ping-one", b"ping-two", b"ping-three"];
 
-/// Push each of [`PINGS`] and await its echoed reply before the next push,
-/// then close with a final ping and read the reply to its end.
+/// The ping that closes the conversation in [`exchange_pings`].
+const FINAL_PING: &[u8] = b"ping-final";
+
+/// Pushes each of [`PINGS`] and awaits its echoed reply before the next push,
+/// then closes with [`FINAL_PING`] and reads the reply to its end.
 ///
-/// The result is whether each reply matched its push, and whether the reply
-/// body ended clean on its `Ok` trailer.
-///
-/// # Errors
-///
-/// - [`TransportError`] -- the push, close, or read failure of the exchange.
-async fn exchange_pings(mut sink: RequestSink, mut reply: StreamBody) -> Result<(bool, bool), TransportError> {
-	let mut matched = true;
+/// The result is each reply chunk in the order it arrived, beside the chunk
+/// that ends the reply body.
+async fn exchange_pings(mut sink: RequestSink, mut reply: StreamBody) -> (Vec<Option<Vec<u8>>>, Option<Vec<u8>>) {
+	let mut pongs = Vec::new();
 	for ping in PINGS {
-		sink.push(ping).await?;
-		let pong = reply.chunk().await?;
-		matched &= pong.as_deref() == Some(ping);
+		sink.push(ping).await.expect("a ping goes out");
+		pongs.push(reply.chunk().await.expect("the reply body reads its next chunk"));
 	}
 
-	sink.close_with(b"ping-final").await?;
+	sink.close_with(FINAL_PING).await.expect("the final ping goes out");
+	pongs.push(reply.chunk().await.expect("the reply body reads its next chunk"));
 
-	let pong = reply.chunk().await?;
-	matched &= pong.as_deref() == Some(&b"ping-final"[..]);
-
-	let terminal = reply.chunk().await?;
-	Ok((matched, terminal.is_none()))
+	let terminal = reply.chunk().await.expect("the reply body reads its end");
+	(pongs, terminal)
 }
 
 /// Eager pushes make duplex conversational: an exchange that awaits each
 /// echoed reply between pushes must progress chunk for chunk, not park on a
-/// held-back record, and `close_with` flags the final chunk itself.
+/// held-back record, and `close_with` flags the final chunk itself, so the
+/// reply ends on its `Ok` trailer after the last pong.
 #[tokio::test]
-async fn mux_duplex_ping_pong_awaits_reply_between_pushes() -> Result<(), TightBeamError> {
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
-	let handler_chunks = Arc::new(AtomicUsize::new(0));
-	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
+async fn a_duplex_exchange_awaits_each_reply_between_pushes() -> TestResult {
+	let (client, _server) = duplex_echo_endpoints().await;
+	let (sink, reply) = client.handle.open_duplex()?;
 
-	let (sink, reply) = client_end.handle.open_duplex()?;
 	let exchange = exchange_pings(sink, reply);
-	let progressed = await_within_deadline(exchange, "a chunk-for-chunk exchange must progress with eager pushes");
-
-	let (matched, ended_clean) = progressed.await??;
-	assert!(matched, "each duplex reply must match its push");
-	assert!(ended_clean, "the duplex reply must end on its Ok trailer");
+	let transcript = within_hang_guard(exchange, "the duplex exchange ends within the hang guard").await;
+	assert_eq!(
+		transcript,
+		(
+			vec![
+				Some(b"ping-one".to_vec()),
+				Some(b"ping-two".to_vec()),
+				Some(b"ping-three".to_vec()),
+				Some(b"ping-final".to_vec()),
+			],
+			None,
+		)
+	);
 	Ok(())
 }
 
 /// The collection sugar runs end to end: `close_with` carries the final
 /// request chunk, and `into_frame` reassembles the chunked reply.
 #[tokio::test]
-async fn mux_duplex_reply_collects_into_frame() -> Result<(), TightBeamError> {
-	let (client_end, responder, _server_end) = streaming_endpoints(&TraceCollector::new(), chunked_offer(4)).await?;
-	let handler_chunks = Arc::new(AtomicUsize::new(0));
-	let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(handler_chunks)));
+async fn a_duplex_reply_collects_into_its_frame() -> TestResult {
+	let (client, _server) = duplex_echo_endpoints().await;
 
 	let frame = large_mux_frame("mux-duplex-into-frame");
 	let payload = frame.to_der()?;
 	let middle = payload.len() / 2;
 
-	let (mut sink, reply) = client_end.handle.open_duplex()?;
+	let (mut sink, reply) = client.handle.open_duplex()?;
 	sink.push(&payload[..middle]).await?;
 	sink.close_with(&payload[middle..]).await?;
 
 	let echoed = reply.into_frame().await?;
-	assert_eq!(echoed, frame, "into_frame must reassemble the chunked reply");
+	assert_eq!(echoed, frame);
 	Ok(())
 }

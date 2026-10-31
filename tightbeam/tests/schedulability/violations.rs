@@ -5,7 +5,7 @@ use core::time::Duration;
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::{Process, ProcessBuildError};
-use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
+use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv, TBSpec};
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
@@ -24,8 +24,9 @@ tb_assert_spec! {
 	}
 }
 
-// The task set of this process is not schedulable under RMA, and FDR
-// exploration must catch the miss.
+// The task set of this process misses a deadline under RMA, and its
+// utilization sits under the bound of EDF, so Layer 3 must run the analysis of
+// RMA to catch the miss.
 tb_process_spec! {
 	pub RmaNotSchedulableProcess,
 	events {
@@ -39,7 +40,7 @@ tb_process_spec! {
 	terminal { S2 }
 	timing {
 		wcet: {
-			TASK1 => wcet!(Duration::from_millis(8)),
+			TASK1 => wcet!(Duration::from_millis(6)),
 			TASK2 => wcet!(Duration::from_millis(5))
 		}
 	}
@@ -47,14 +48,17 @@ tb_process_spec! {
 		scheduler: RateMonotonic,
 		periods: {
 			TASK1 => Duration::from_millis(10),
-			TASK2 => Duration::from_millis(20)
+			TASK2 => Duration::from_millis(15)
 		}
 	}
 }
 
-/// The configuration that grades [`SchedulabilityViolationSpec`], and expects
-/// Layer 3 to refuse the task set of `process`.
-fn violation_config(process: Result<Process, ProcessBuildError>) -> Result<ScenarioConfig, Box<dyn Error>> {
+/// The configuration that grades [`SchedulabilityViolationSpec`], analyses the
+/// task set of `process`, and expects `expect`.
+fn schedule_config(
+	process: Result<Process, ProcessBuildError>,
+	expect: Expect,
+) -> Result<ScenarioConfig, Box<dyn Error>> {
 	let fdr = FdrConfig {
 		seeds: 1,
 		max_depth: 10,
@@ -67,15 +71,63 @@ fn violation_config(process: Result<Process, ProcessBuildError>) -> Result<Scena
 
 	let builder = ScenarioConfig::builder().with_spec(SchedulabilityViolationSpec::latest());
 	let builder = builder.with_fdr(fdr);
-	Ok(builder.with_expect(Expect::Violation(Layer::Refinement)).build()?)
+	Ok(builder.with_expect(expect).build()?)
 }
 
-// The RMA task set runs at utilization 1.05 against a bound of about 0.828,
-// so `Process::schedulability_violated` reports a miss and Layer 3 rejects the
-// run. The expectation is what grades that rejection.
+/// The configuration of [`schedule_config`] that expects Layer 3 to refuse the
+/// task set of `process`.
+fn violation_config(process: Result<Process, ProcessBuildError>) -> Result<ScenarioConfig, Box<dyn Error>> {
+	schedule_config(process, Expect::Violation(Layer::Refinement))
+}
+
+// The RMA task set runs at utilization 0.933 against a bound of about 0.828,
+// so response-time analysis decides it: TASK2 responds at 17 ms, past its
+// deadline of 15 ms. `Process::schedulability_violated` reports the miss and
+// Layer 3 rejects the run. The expectation is what grades that rejection.
 tb_scenario! {
 	name: test_rma_schedulability_violation_detected,
 	config: violation_config(RmaNotSchedulableProcess::process()),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(TASK1)?;
+			trace.event(TASK2)?;
+			Ok(())
+		}
+	}
+}
+
+// The task set of the RMA process above, under EDF.
+tb_process_spec! {
+	pub EdfSchedulableProcess,
+	events {
+		observable { TASK1, TASK2 }
+		hidden { }
+	}
+	states {
+		S0 => { TASK1 => S1 },
+		S1 => { TASK2 => S2 }
+	}
+	terminal { S2 }
+	timing {
+		wcet: {
+			TASK1 => wcet!(Duration::from_millis(6)),
+			TASK2 => wcet!(Duration::from_millis(5))
+		}
+	}
+	schedulability {
+		scheduler: EarliestDeadlineFirst,
+		periods: {
+			TASK1 => Duration::from_millis(10),
+			TASK2 => Duration::from_millis(15)
+		}
+	}
+}
+
+// The utilization of 0.933 sits under the bound of EDF, 1.0, so Layer 3
+// accepts under EDF the task set that it refuses under RMA.
+tb_scenario! {
+	name: edf_admits_the_task_set_that_rma_refuses,
+	config: schedule_config(EdfSchedulableProcess::process(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			trace.event(TASK1)?;
@@ -180,12 +232,9 @@ tb_assert_spec! {
 	}
 }
 
-// The block is the only thing this spec names, so a spec that can reject is
-// the observable form of the block reaching the built spec.
+/// The block is the only thing this spec names, so a spec that can reject is
+/// the observable form of the block reaching the built spec.
 #[test]
 fn a_schedulability_block_reaches_the_built_spec() {
-	assert!(
-		tightbeam::testing::TBSpec::can_reject(ScheduleOnlySpec::latest()),
-		"the schedulability block did not reach the spec"
-	);
+	assert!(TBSpec::can_reject(ScheduleOnlySpec::latest()));
 }

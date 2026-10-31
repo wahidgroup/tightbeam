@@ -1,4 +1,4 @@
-//! # Nonce reuse / replay threat
+//! # Reply replay to a fresh client
 //!
 //! ## Weakness
 //! A handshake whose transcript omits the fresh random of its opening lets a
@@ -20,7 +20,6 @@
 //! ## References
 //! - CWE-323: Reusing a Nonce, Key Pair in Encryption <https://cwe.mitre.org/data/definitions/323.html>
 //! - CWE-294: Authentication Bypass by Capture-replay <https://cwe.mitre.org/data/definitions/294.html>
-//! - NIST SP 800-38D §8: IV/nonce uniqueness requirements for GCM
 
 use std::sync::Arc;
 
@@ -34,7 +33,9 @@ use tightbeam::{
 	TightBeamError,
 };
 
-use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
+use crate::common::result::TestResult;
+use crate::common::security::expectation_failure;
+use crate::security::common::{captured_client_random, HandshakeBackendKind, SecurityThreatHarness};
 
 pub(crate) const NONCE_CAPTURE_VALID: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-capture-valid");
 pub(crate) const NONCE_REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-replay-attempt");
@@ -137,4 +138,20 @@ job! {
 		let outcome = replay.run().await?;
 		outcome.refused_by_client("the fresh client accepted a replayed reply")
 	}
+}
+
+/// Two HPKE handshakes draw two client randoms, so each opening carries a
+/// nonce of its own.
+#[tokio::test]
+async fn each_hpke_opening_draws_its_own_client_random() -> TestResult {
+	let harness = SecurityThreatHarness::default();
+	let first = harness.spawn(HandshakeBackendKind::Hpke)?.capture_full().await?;
+	let second = harness.spawn(HandshakeBackendKind::Hpke)?.capture_full().await?;
+
+	let (first, second) = (first.messages.first(), second.messages.first());
+	let (first, second) = first.zip(second).ok_or_else(|| expectation_failure("no opening captured"))?;
+	let first = captured_client_random(&first.payload)?;
+	let second = captured_client_random(&second.payload)?;
+	assert_ne!(first, second);
+	Ok(())
 }

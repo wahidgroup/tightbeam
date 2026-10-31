@@ -206,6 +206,12 @@ pub trait ExplorationCore {
 		0
 	}
 
+	/// Whether a walk stopped at its budget of states, so the seeds searched
+	/// less than the bounds of the configuration allow.
+	fn cut_short(&self) -> bool {
+		false
+	}
+
 	/// The refusal set that a failure of `process` records at `state`, or
 	/// `None` at an unstable state.
 	///

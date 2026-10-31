@@ -16,10 +16,9 @@
 //! - the refusal, end to end, of a server share equal to the server's
 //!   key-agreement key, and of a client share equal to the client's signing
 //!   key, and
-//! - the published vectors of X25519 and of ML-KEM-768, through the operations of each exchange.
+//! - the published vectors of X25519 and of ML-KEM-768, as self-checks of each fixture.
 
 use core::marker::PhantomData;
-use std::error::Error;
 
 use p256::elliptic_curve::ecdh::diffie_hellman;
 use p256::elliptic_curve::point::AffineCoordinates;
@@ -37,14 +36,18 @@ use tightbeam::der::oid::AssociatedOid;
 use tightbeam::random::CryptoRngCore;
 use tightbeam::spki::SubjectPublicKeyInfoRef;
 use tightbeam::testing::unhex;
-use tightbeam::transport::handshake::{HandshakeError, HandshakeProvider};
+use tightbeam::transport::handshake::{HandshakeError, HandshakeMessage, HandshakeProvider};
 use tightbeam::zeroize::Zeroizing;
 
 #[cfg(feature = "preview-pqc")]
 use tightbeam::crypto::exchange::FixedWidthShare;
 
 use super::p384::{p384_cms_server, p384_identity, p384_identity_of, OnP384};
-use super::{cms_pair, first_record_opened, hello_carrying, hpke_pair, AgreementBackend, P256Kem, CONTENT};
+use super::{
+	cms_pair, first_record_opened, hello_carrying, hpke_pair, replied, AgreementBackend, P256Kem, CLIENT_SEED, CONTENT,
+	SERVER_SEED,
+};
+use crate::common::result::TestResult;
 
 #[cfg(feature = "preview-pqc")]
 mod hybrid;
@@ -231,40 +234,56 @@ type DhProvider = OnP384<OutsideDh<NistP256, Fresh>>;
 
 /// The first record an anonymous HPKE client under `P` seals once the three
 /// legs run, as the server opens it.
-async fn hpke_opens<P: HandshakeProvider>() -> Result<Vec<u8>, Box<dyn Error>> {
-	let opened = first_record_opened(hpke_pair::<P>(p384_identity())).await?;
-	Ok(opened)
+async fn hpke_opens<P: HandshakeProvider>() -> Result<Vec<u8>, Box<dyn core::error::Error>> {
+	let pair = hpke_pair::<P>(p384_identity(SERVER_SEED));
+	first_record_opened(pair).await
 }
 
 /// The first record a CMS client under `P` seals once the three legs run, as
-/// a server that agrees through a fresh P-256 key opens it.
-async fn cms_opens<P>() -> Result<Vec<u8>, Box<dyn Error>>
+/// a server that agrees through a fixed P-256 key opens it.
+async fn cms_opens<P>() -> Result<Vec<u8>, Box<dyn core::error::Error>>
 where
 	P: HandshakeProvider<VerifyingKey: PartialEq, Kem = P256Kem>,
 {
-	let server = p384_cms_server::<P, NistP256>("outside exchange server", AgreementBackend::random());
-	let opened = first_record_opened(cms_pair::<P>(server, p384_identity())).await?;
-	Ok(opened)
+	let server = p384_cms_server::<P, NistP256>("outside exchange server", AgreementBackend::fixed());
+	let pair = cms_pair::<P>(server, p384_identity(CLIENT_SEED));
+	first_record_opened(pair).await
+}
+
+/// The answer of a CMS client under `P` to the reply of a server whose
+/// key-agreement key holds the known scalar of P-256, the scalar that a
+/// [`KnownReply`] exchange answers with.
+async fn answer_to_a_collapsing_server<P>() -> Result<HandshakeMessage, HandshakeError>
+where
+	P: HandshakeProvider<VerifyingKey: PartialEq, Kem = P256Kem>,
+{
+	let backend = AgreementBackend::of(NistP256::known());
+	let server = p384_cms_server::<P, NistP256>("collapsing server", backend);
+	let (mut client, mut server) = cms_pair::<P>(server, p384_identity(CLIENT_SEED));
+	let reply = replied(&mut client, &mut server).await;
+	client.respond(reply).await
 }
 
 /// The HPKE flow runs under the outside ECDH over P-256.
 #[tokio::test]
-async fn an_outside_dh_exchange_runs_the_hpke_flow() -> Result<(), Box<dyn Error>> {
-	assert_eq!(hpke_opens::<DhProvider>().await?, CONTENT);
+async fn an_outside_dh_exchange_runs_the_hpke_flow() -> TestResult {
+	let opened = hpke_opens::<DhProvider>().await?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 
 /// The CMS flow runs under the outside ECDH over P-256.
 #[tokio::test]
-async fn an_outside_dh_exchange_runs_the_cms_flow() -> Result<(), Box<dyn Error>> {
-	assert_eq!(cms_opens::<DhProvider>().await?, CONTENT);
+async fn an_outside_dh_exchange_runs_the_cms_flow() -> TestResult {
+	let opened = cms_opens::<DhProvider>().await?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 
 /// A session under the outside ECDH over P-256 renews its epoch in band.
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 #[tokio::test]
-async fn an_outside_dh_exchange_renews_its_epoch() -> Result<(), Box<dyn Error>> {
+async fn an_outside_dh_exchange_renews_its_epoch() -> TestResult {
 	let renewed = super::renewal::renews_its_epoch::<DhProvider>(p384_identity).await?;
 	assert!(renewed);
 	Ok(())
@@ -274,28 +293,23 @@ async fn an_outside_dh_exchange_renews_its_epoch() -> Result<(), Box<dyn Error>>
 /// sends that key as its share. Its signing key is on P-384, so the client
 /// compares the share with the key-agreement key alone, and refuses it.
 #[tokio::test]
-async fn a_server_share_equal_to_its_key_agreement_key_is_refused() -> Result<(), Box<dyn Error>> {
+async fn a_server_share_equal_to_its_key_agreement_key_is_refused() {
 	type Collapsing = OnP384<OutsideDh<NistP256, KnownReply>>;
-	let backend = AgreementBackend::of(NistP256::known());
-	let server = p384_cms_server::<Collapsing, _>("collapsing server", backend);
-	let (mut client, mut server) = cms_pair::<Collapsing>(server, p384_identity());
 
-	let reply = server.reply(client.start()?).await?;
-	let refused = client.respond(reply).await;
+	let refused = answer_to_a_collapsing_server::<Collapsing>().await;
 	assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
-	Ok(())
 }
 
 /// A client whose exchange offers the scalar of its signing key sends that
 /// key as its share, so the server refuses the closing that names it.
 #[tokio::test]
-async fn a_client_share_equal_to_its_signing_key_is_refused() -> Result<(), Box<dyn Error>> {
+async fn a_client_share_equal_to_its_signing_key_is_refused() -> TestResult {
 	type Collapsing = OnP384<OutsideDh<NistP384, KnownOffer>>;
 	let identity = p384_identity_of(SigningKey::from(NistP384::known()));
-	let server = p384_cms_server::<Collapsing, NistP256>("server", AgreementBackend::random());
+	let server = p384_cms_server::<Collapsing, NistP256>("server", AgreementBackend::fixed());
 	let (mut client, mut server) = cms_pair::<Collapsing>(server, identity);
 
-	let reply = server.reply(client.start()?).await?;
+	let reply = replied(&mut client, &mut server).await;
 	let closing = client.respond(reply).await?;
 	let refused = server.finish(closing).await;
 	assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));

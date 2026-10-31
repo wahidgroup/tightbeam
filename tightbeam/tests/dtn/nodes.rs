@@ -9,31 +9,36 @@ use core::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::colony::servlet::{ServletConfig, ServletConfigBuilder, WithCertificate};
+use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::key::SigningKeySpec;
-use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1SigningKey};
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-use tightbeam::crypto::x509::{Certificate, CertificateSpec, KeyCurves};
-use tightbeam::der::Enumerated;
+use tightbeam::crypto::x509::store::CertificateTrust;
+use tightbeam::crypto::x509::{Certificate, CertificateSpec, KeyPurposes, PeerCertificate};
+use tightbeam::der::{Encode, Enumerated};
 use tightbeam::prelude::TightBeamSocketAddr;
+use tightbeam::testing::TestCertificate;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig};
+use tightbeam::utils::digest;
 use tightbeam::TightBeamError;
 
+use crate::common::security::combined_trust;
 use crate::dtn::certs::{
-	earth_relay_pinning, earth_relay_signer, mars_relay_pinning, mars_relay_signer, mission_control_pinning,
-	mission_control_signer, rover_pinning, rover_signer, FrameSigner, SharedCipher, EARTH_RELAY_CERT, EARTH_RELAY_KEY,
-	MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, ROVER_CERT, ROVER_KEY,
+	earth_relay_pinning, generate_shared_cipher, mars_relay_pinning, mission_control_pinning, rover_pinning,
+	FrameSigner, SharedCipher, EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY,
+	MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, ROVER_CERT, ROVER_KEY,
 };
-use crate::dtn::chain_processor::ChainProcessor;
+use crate::dtn::chain_processor::{ChainProcessor, ProcessResult};
 use crate::dtn::fault_manager::FaultManager;
 use crate::dtn::frame_builder::FrameBuilderHelper;
-use crate::dtn::messages::{MessageChainState, RelayMessage};
+use crate::dtn::intake::ChainFrame;
+use crate::dtn::messages::{EarthCommand, FrameRequest, MessageChainState, RelayMessage};
 use crate::dtn::ordering::OutOfOrderBuffer;
 use crate::dtn::servlets::{
 	EarthRelaySatelliteServlet, EarthRelaySatelliteServletConfig, LateAddr, MarsRelaySatelliteServlet,
@@ -42,9 +47,9 @@ use crate::dtn::servlets::{
 };
 use crate::dtn::storage::{FrameStore, StorageRoot};
 use crate::dtn::workers::{
-	CommandAckHandlerWorker, CommandExecutionWorker, FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig,
-	FrameResponseHandlerWorker, MissionControlTelemetryHandlerWorker, MissionControlTelemetryHandlerWorkerConfig,
-	RoverCommandHandlerWorker, RoverCommandHandlerWorkerConfig, TelemetryBuilderWorker, TelemetryBuilderWorkerConfig,
+	CommandAckHandlerWorker, FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig, FrameResponseHandlerWorker,
+	MissionControlTelemetryHandlerWorker, MissionControlTelemetryHandlerWorkerConfig, RoverCommandHandlerWorker,
+	RoverCommandHandlerWorkerConfig, TelemetryBuilderWorker, TelemetryBuilderWorkerConfig,
 };
 
 /// The servlet configuration builder of a node that presents its certificate,
@@ -107,14 +112,13 @@ impl DtnRole {
 		Secp256k1SigningKey::from_slice(bytes).expect("each DTN key is a valid secp256k1 scalar")
 	}
 
-	/// The certificate that verifies the frames this node signs.
+	/// The certificate that verifies the frames this node signs: the fixture
+	/// certificate that `TestIdentity::certified` pairs with the key of the
+	/// node, admitted for signing under the house provider.
 	pub fn signer(self) -> FrameSigner {
-		match self {
-			Self::MissionControl => mission_control_signer(),
-			Self::EarthRelay => earth_relay_signer(),
-			Self::MarsRelay => mars_relay_signer(),
-			Self::Rover => rover_signer(),
-		}
+		let certificate = TestCertificate::self_signed(&self.signing_key());
+		let signer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.signer);
+		signer.expect("a fixture certificate asserts digitalSignature")
 	}
 
 	/// The name of the node's directory under a storage root.
@@ -141,8 +145,7 @@ impl DtnRole {
 	/// A trust store that admits the certificate of this node alone.
 	pub fn trust_store(self) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 		let certificate = Certificate::try_from(self.certificate())?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		Ok(Arc::new(builder.with_certificate(certificate)?.build()))
+		Ok(combined_trust(&[&certificate]))
 	}
 
 	/// The TLS identity of the node as a client.
@@ -253,6 +256,99 @@ impl NodeChain {
 		let frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&processor)));
 		Self { processor, frame_builder }
 	}
+
+	/// Builds the next ACK of the Rover, which extends this chain.
+	pub fn rover_ack(&self) -> Frame {
+		let key = DtnRole::Rover.signing_key();
+		let (order, previous) = self.processor.prepare_outgoing().expect("the chain reads");
+		let builder = &self.frame_builder;
+
+		let ack = builder.build_relay_ack_frame(0, order, previous, &key, &generate_shared_cipher());
+		ack.expect("an ACK frame builds")
+	}
+
+	/// Extends this chain by `acks` ACKs of the Rover.
+	pub fn advance(&self, acks: usize) {
+		for _ in 0..acks {
+			self.rover_ack();
+		}
+	}
+
+	/// Builds the next standby command of Mission Control, which extends this
+	/// chain.
+	pub fn command(&self) -> Frame {
+		self.command_signed_by(&DtnRole::MissionControl.signing_key())
+	}
+
+	/// Builds the next standby command, which `key` signs and which extends
+	/// this chain.
+	pub fn command_signed_by(&self, key: &Secp256k1SigningKey) -> Frame {
+		let (order, previous) = self.processor.prepare_outgoing().expect("the chain reads");
+		let standby = EarthCommand::standby();
+		let builder = &self.frame_builder;
+
+		let command = builder.build_relay_command_frame(standby, order, previous, key, &generate_shared_cipher());
+		command.expect("a command frame builds")
+	}
+
+	/// Builds the ACK of the Rover at `order` on this chain, over a predecessor
+	/// that no node holds.
+	pub fn fork_ack(&self, order: u64) -> Frame {
+		let key = DtnRole::Rover.signing_key();
+		let unknown = digest::<Sha3_256>(b"a frame of another branch").expect("SHA3-256 digests");
+		let builder = &self.frame_builder;
+
+		let ack = builder.build_relay_ack_frame(0, order, Some(unknown), &key, &generate_shared_cipher());
+		ack.expect("an ACK of another branch builds")
+	}
+
+	/// Builds a standby command of Mission Control at order 2 on this chain,
+	/// over a predecessor that no node holds.
+	pub fn stray_command(&self) -> Frame {
+		let key = DtnRole::MissionControl.signing_key();
+		let unknown = digest::<Sha3_256>(b"a frame that no node holds").expect("SHA3-256 digests");
+		let standby = EarthCommand::standby();
+		let builder = &self.frame_builder;
+
+		let command = builder.build_relay_command_frame(standby, 2, Some(unknown), &key, &generate_shared_cipher());
+		command.expect("a stray command builds")
+	}
+
+	/// Builds a frame request that `signer` signs, for the frames between the
+	/// two hashes of [`FrameRequest::sample`].
+	pub fn frame_request(&self, signer: DtnRole) -> Frame {
+		let key = signer.signing_key();
+		let builder = &self.frame_builder;
+
+		let request = builder.build_frame_request_frame(FrameRequest::sample(), &key, &generate_shared_cipher());
+		request.expect("a frame request builds")
+	}
+
+	/// The digest of the frame at the head of this chain.
+	pub fn head(&self) -> DigestInfo {
+		let (_, head) = self.processor.prepare_outgoing().expect("the chain reads");
+		head.expect("the chain holds a frame")
+	}
+
+	/// Whether the store of this chain holds `frame`.
+	pub fn stores(&self, frame: &Frame) -> bool {
+		let encoded = frame.to_der().expect("a frame encodes");
+		let hash = digest::<Sha3_256>(encoded).expect("SHA3-256 digests");
+
+		let held = self.processor.stores(hash.digest.as_bytes());
+		held.expect("the store of the chain reads")
+	}
+
+	/// Takes `frame` into this chain as it arrives from the peer `signer` on
+	/// `side`.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`ChainProcessor::process_incoming`].
+	pub fn take(&self, frame: &Frame, signer: DtnRole, side: PathSide) -> Result<ProcessResult, TightBeamError> {
+		let entry = ChainFrame::arriving(frame, signer, side);
+		self.processor.process_incoming(entry)
+	}
 }
 
 /// The parts that every node of one DTN path shares.
@@ -301,6 +397,7 @@ impl DtnPath {
 			can_cascade: false, // Mission Control is an origin of the path.
 			gate: Arc::default(),
 		});
+
 		let frame_responses = FrameResponseHandlerWorker::new(());
 		let servlet_config = role
 			.servlet_config(config)?
@@ -417,7 +514,6 @@ impl DtnPath {
 		let servlet_config = role
 			.servlet_config(config)?
 			.with_worker(commands)
-			.with_worker(CommandExecutionWorker::new(()))
 			.with_worker(telemetry)
 			.with_worker(frame_requests)
 			.with_worker(frame_responses)

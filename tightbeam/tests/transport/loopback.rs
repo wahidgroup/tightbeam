@@ -9,7 +9,11 @@
 //! - The derived directional `SessionKeys` are complementary.
 //! - CMS traffic keys are fresh per handshake, never shared (CWE-321).
 
-#![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
+#![cfg(all(
+	feature = "tokio",
+	feature = "testing",
+	any(feature = "transport-hpke", feature = "transport-cms")
+))]
 
 use tightbeam::{
 	crypto::{
@@ -17,245 +21,213 @@ use tightbeam::{
 		profiles::{DefaultCryptoProvider, SecurityProfileDesc},
 	},
 	der::Encode,
-	transport::handshake::{
-		ClientHandshakeProtocol, EstablishedSession, Handshake, HandshakeMessage, ServerHandshakeProtocol,
-	},
-	TightBeamError,
+	tb_cases,
+	transport::handshake::{ClientHandshakeProtocol, EstablishedSession, Handshake, ServerHandshakeProtocol},
 };
 
-#[cfg(feature = "transport-hpke")]
-use tightbeam::transport::handshake::negotiation::SecurityOffer;
 #[cfg(feature = "transport-cms")]
-use tightbeam::transport::handshake::{Client, Cms, PeerAuthentication, Server};
-
-use crate::common::security::{default_security_profile, expectation_failure, ServerMaterials};
-
+use tightbeam::crypto::cms::EnvelopeError;
 #[cfg(feature = "transport-cms")]
-use crate::common::security::cms_handshake_pair;
-#[cfg(feature = "transport-hpke")]
-use crate::common::security::{hpke_client_config, hpke_server_config, pinning_validator};
+use tightbeam::transport::handshake::PeerAuthentication;
+#[cfg(feature = "transport-cms")]
+use tightbeam::TightBeamError;
 
-#[cfg(feature = "transport-hpke")]
-fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
-	SecurityOffer::new(vec![profile])
+use crate::common::security::{default_security_profile, ServerMaterials};
+
+/// The probe that the client seals to the server.
+const CLIENT_PROBE: &[u8] = b"client->server probe";
+
+/// The probe that the server seals to the client.
+const SERVER_PROBE: &[u8] = b"server->client probe";
+
+/// The handshake flow of a loopback pair, over the fixture server and the
+/// default profile.
+#[derive(Clone, Copy)]
+enum Backend {
+	/// The hello, then the signed reply, then the closing.
+	#[cfg(feature = "transport-hpke")]
+	Hpke,
+	/// The opening, then ServerFinished, then the closing with the
+	/// ClientFinished.
+	#[cfg(feature = "transport-cms")]
+	Cms,
 }
 
-/// Probes both directions and returns whether the plaintexts match the probes.
-///
-/// Each direction has its own key and record sequence, and each record has
-/// its own content key.
-fn bidirectional_roundtrip_ok(
-	client_keys: &mut SessionKeys,
-	server_keys: &mut SessionKeys,
-) -> Result<bool, TightBeamError> {
-	let c2s_probe = b"client->server probe";
-	let mut c2s_record = client_keys.send().encrypt_next(c2s_probe)?.to_der()?;
-	let c2s_plaintext = server_keys.recv_mut().open(&mut c2s_record)?;
-	let c2s_ok = c2s_plaintext == c2s_probe;
-
-	let s2c_probe = b"server->client probe";
-	let mut s2c_record = server_keys.send().encrypt_next(s2c_probe)?.to_der()?;
-	let s2c_plaintext = client_keys.recv_mut().open(&mut s2c_record)?;
-	let s2c_ok = s2c_plaintext == s2c_probe;
-
-	Ok(c2s_ok && s2c_ok)
+impl Backend {
+	/// What a pair of this flow shows as it completes.
+	async fn completion(self) -> Completion {
+		let materials = ServerMaterials::fixed();
+		let profile = default_security_profile();
+		match self {
+			#[cfg(feature = "transport-hpke")]
+			Backend::Hpke => {
+				let (client, server) = materials.hpke_pair::<DefaultCryptoProvider>([profile], [profile]);
+				Completion::of(client, server).await
+			}
+			#[cfg(feature = "transport-cms")]
+			Backend::Cms => {
+				let pair = materials.cms_pair([profile], [profile], PeerAuthentication::Anonymous);
+				Completion::of(Handshake::client(pair.client), Handshake::server(pair.server)).await
+			}
+		}
+	}
 }
 
 /// What a pair of handshake machines showed as it completed.
 struct Completion {
-	/// Whether both machines were mid-flight before `complete()`.
-	pending_before_completion: bool,
-	/// Whether the session keys of each peer open the records of the other.
-	keys_interoperate: bool,
+	/// Whether the client and the server read as complete before
+	/// `complete()`.
+	complete_before: (bool, bool),
+	/// The probe of the client as the server opened it, then the probe of the
+	/// server as the client opened it.
+	opened: (Vec<u8>, Vec<u8>),
 	/// The profile that the client and the server selected.
 	profiles: (Option<SecurityProfileDesc>, Option<SecurityProfileDesc>),
 }
 
-/// Completes both peers, and returns the [`Completion`] that they showed.
-async fn complete_pair<C, S>(client: Box<C>, server: Box<S>) -> Result<Completion, TightBeamError>
+impl Completion {
+	/// Drives `client` and `server` to their last message and completes both,
+	/// and returns what they showed.
+	async fn of<C, S>(mut client: C, mut server: S) -> Self
+	where
+		C: ClientHandshakeProtocol + 'static,
+		S: ServerHandshakeProtocol + 'static,
+	{
+		drive_pair(&mut client, &mut server).await;
+
+		// `complete()` consumes each orchestrator and makes its final
+		// transition, so the pair reads both machines first.
+		let complete_before = (client.is_complete(), server.is_complete());
+		let profiles = (client.selected_profile(), server.selected_profile());
+
+		let (client_session, server_session) = complete_both(client, server).await;
+		let opened = exchange_probes(&mut client_session.into_keys(), &mut server_session.into_keys());
+		Completion { complete_before, opened, profiles }
+	}
+}
+
+/// Drives `client` and `server` through the three legs of their flow, and
+/// checks that the closing draws no reply.
+async fn drive_pair<C, S>(client: &mut C, server: &mut S)
 where
 	C: ClientHandshakeProtocol,
 	S: ServerHandshakeProtocol,
 {
-	// `complete()` consumes each orchestrator and makes its final transition,
-	// so the test reads both machines first. The pair is mid-flight here, and
-	// the caller checks the transition that `complete()` makes.
-	let pending_before_completion = !ClientHandshakeProtocol::is_complete(client.as_ref())
-		&& !ServerHandshakeProtocol::is_complete(server.as_ref());
+	let opening = client.start().await.expect("the client opens its handshake");
+	let reply = server.handle_request(opening).await.expect("the server reads the opening");
+	let reply = reply.expect("the server answers the opening");
 
-	let client_profile = ClientHandshakeProtocol::selected_profile(client.as_ref());
-	let server_profile = ServerHandshakeProtocol::selected_profile(server.as_ref());
+	let closing = client.handle_response(reply).await.expect("the client reads the reply");
+	let closing = closing.expect("the client answers the reply");
 
-	let client_session = ClientHandshakeProtocol::complete(client).await?;
-	let server_session = ServerHandshakeProtocol::complete(server).await?;
-	let mut client_keys = client_session.into_keys();
-	let mut server_keys = server_session.into_keys();
-	let keys_interoperate = bidirectional_roundtrip_ok(&mut client_keys, &mut server_keys)?;
-
-	Ok(Completion {
-		pending_before_completion,
-		keys_interoperate,
-		profiles: (client_profile, server_profile),
-	})
+	let last = server.handle_request(closing).await.expect("the server reads the closing");
+	assert!(last.is_none());
 }
 
-/// Returns the handshake reply, or an expectation failure with `msg` when the
-/// step drew none.
-fn require_reply(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<HandshakeMessage, TightBeamError> {
-	let message = reply.ok_or_else(|| expectation_failure(msg))?;
-	Ok(message)
+/// Completes `client` and `server`, and returns the session of each.
+async fn complete_both<C, S>(client: C, server: S) -> (EstablishedSession, EstablishedSession)
+where
+	C: ClientHandshakeProtocol + 'static,
+	S: ServerHandshakeProtocol + 'static,
+{
+	let client_session = ClientHandshakeProtocol::complete(Box::new(client)).await;
+	let server_session = ServerHandshakeProtocol::complete(Box::new(server)).await;
+	let client_session = client_session.expect("a driven client completes");
+	(client_session, server_session.expect("a driven server completes"))
 }
 
-/// Passes when a protocol step draws no reply, and returns an expectation
-/// failure with `msg` otherwise.
-fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<(), TightBeamError> {
-	if reply.is_some() {
-		return Err(expectation_failure(msg));
-	}
-
-	Ok(())
-}
-
-/// Runs the HPKE loopback through the orchestrator trait surface.
-#[cfg(feature = "transport-hpke")]
-#[tokio::test]
-async fn hpke_loopback() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
-	let profile = default_security_profile();
-	let offer = security_offer(profile);
-	let validator = pinning_validator(&materials.certificate);
-
-	let mut config = hpke_client_config::<DefaultCryptoProvider>(validator);
-	config.security_offer = Some(offer);
-
-	let mut client = Handshake::client(config);
-	let server_config = hpke_server_config::<DefaultCryptoProvider>(&materials, [profile]);
-	let mut server = Handshake::server(server_config);
-
-	// The flow is the hello, then the signed reply, then the closing, which
-	// draws no reply.
-	let client_hello = ClientHandshakeProtocol::start(&mut client).await?;
-	let server_reply = server.handle_request(client_hello).await?;
-	let server_handshake = require_reply(server_reply, "HPKE server must answer the hello")?;
-
-	let client_reply = client.handle_response(server_handshake).await?;
-	let closing = require_reply(client_reply, "HPKE client must answer the reply")?;
-
-	let no_reply = server.handle_request(closing).await?;
-	require_terminal(no_reply, "HPKE server must not reply to the closing")?;
-
-	let completion = complete_pair(Box::new(client), Box::new(server)).await?;
-	assert!(
-		completion.pending_before_completion,
-		"both HPKE machines must be mid-flight before complete()"
-	);
-	assert!(
-		completion.keys_interoperate,
-		"the HPKE session keys must open each other's records"
-	);
-	assert_eq!(
-		completion.profiles,
-		(Some(profile), Some(profile)),
-		"both HPKE machines must select the offered profile"
-	);
-	Ok(())
-}
-
-/// Builds a CMS client and server pair that shares the fixture server identity.
-#[cfg(feature = "transport-cms")]
-#[allow(clippy::type_complexity)]
-fn build_cms_pair(
-	materials: &ServerMaterials,
-) -> Result<
-	(
-		Handshake<Client, Cms, DefaultCryptoProvider>,
-		Handshake<Server, Cms, DefaultCryptoProvider>,
-	),
-	TightBeamError,
-> {
-	let profile = default_security_profile();
-	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::Anonymous)?;
-	Ok((Handshake::client(pair.client), Handshake::server(pair.server)))
-}
-
-/// Drives a CMS pair through its three legs. The flow is the opening, then
-/// ServerFinished, then the closing with the ClientFinished, which draws no
-/// reply.
-#[cfg(feature = "transport-cms")]
-async fn drive_cms_pair(
-	client: &mut Handshake<Client, Cms, DefaultCryptoProvider>,
-	server: &mut Handshake<Server, Cms, DefaultCryptoProvider>,
-) -> Result<(), TightBeamError> {
-	let opening = ClientHandshakeProtocol::start(client).await?;
-	let server_reply = server.handle_request(opening).await?;
-	let server_finished = require_reply(server_reply, "CMS server must answer the opening with ServerFinished")?;
-
-	let client_reply = client.handle_response(server_finished).await?;
-	let client_finished = require_reply(client_reply, "CMS client must answer ServerFinished with ClientFinished")?;
-
-	let no_reply = server.handle_request(client_finished).await?;
-	require_terminal(no_reply, "CMS server must not reply to ClientFinished")
-}
-
-/// Runs the CMS loopback through the orchestrator trait surface.
+/// Seals each probe on the send key of one peer and opens it on the receive
+/// key of the other, and returns the two opened plaintexts.
 ///
-/// Both sides derive a working AEAD from the handshake secret, and the client
-/// learns the negotiated profile from the server-Finished `SecurityAccept`
-/// attribute and can `complete()`.
+/// Each direction has its own key and record sequence, and each record has
+/// its own content key.
+fn exchange_probes(client_keys: &mut SessionKeys, server_keys: &mut SessionKeys) -> (Vec<u8>, Vec<u8>) {
+	let mut c2s_record = sealed(client_keys, CLIENT_PROBE);
+	let c2s_opened = server_keys.recv_mut().open(&mut c2s_record);
+	let c2s_opened = c2s_opened.expect("the server opens the record of the client");
+
+	let mut s2c_record = sealed(server_keys, SERVER_PROBE);
+	let s2c_opened = client_keys.recv_mut().open(&mut s2c_record);
+	let s2c_opened = s2c_opened.expect("the client opens the record of the server");
+	(c2s_opened.to_vec(), s2c_opened.to_vec())
+}
+
+/// The DER of the next record that `keys` seals around `probe`.
+fn sealed(keys: &SessionKeys, probe: &[u8]) -> Vec<u8> {
+	let record = keys.send().encrypt_next(probe).expect("a fresh send key seals");
+	record.to_der().expect("a record encodes")
+}
+
+// A loopback pair of each flow is mid-flight before `complete()`, so neither
+// machine reads as complete.
+tb_cases! {
+	async fn a_handshake_pair_is_pending_before_completion(backend: Backend) {
+		let completion = backend.completion().await;
+		assert_eq!(completion.complete_before, (false, false));
+	}
+	cases {
+		#[cfg(feature = "transport-hpke")]
+		hpke => Backend::Hpke,
+		#[cfg(feature = "transport-cms")]
+		cms => Backend::Cms,
+	}
+}
+
+// The session keys that each flow derives are complementary, so each peer
+// opens the record of the other.
+tb_cases! {
+	async fn the_session_keys_of_each_peer_open_the_records_of_the_other(backend: Backend) {
+		let completion = backend.completion().await;
+		assert_eq!(completion.opened, (CLIENT_PROBE.to_vec(), SERVER_PROBE.to_vec()));
+	}
+	cases {
+		#[cfg(feature = "transport-hpke")]
+		hpke => Backend::Hpke,
+		#[cfg(feature = "transport-cms")]
+		cms => Backend::Cms,
+	}
+}
+
+// Both peers of each flow select the one profile the client offers and the
+// server runs. The CMS client learns it from the `SecurityAccept` attribute
+// of ServerFinished.
+tb_cases! {
+	async fn both_peers_select_the_offered_profile(backend: Backend) {
+		let profile = default_security_profile();
+		let completion = backend.completion().await;
+		assert_eq!(completion.profiles, (Some(profile), Some(profile)));
+	}
+	cases {
+		#[cfg(feature = "transport-hpke")]
+		hpke => Backend::Hpke,
+		#[cfg(feature = "transport-cms")]
+		cms => Backend::Cms,
+	}
+}
+
+/// The client and the server sessions of one CMS handshake against the
+/// fixture server of `materials`.
 #[cfg(feature = "transport-cms")]
-#[tokio::test]
-async fn cms_loopback() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
+async fn established_cms_pair(materials: &ServerMaterials) -> (EstablishedSession, EstablishedSession) {
 	let profile = default_security_profile();
-	let (mut client, mut server) = build_cms_pair(&materials)?;
-	drive_cms_pair(&mut client, &mut server).await?;
+	let pair = materials.cms_pair([profile], [profile], PeerAuthentication::Anonymous);
+	let (mut client, mut server) = (Handshake::client(pair.client), Handshake::server(pair.server));
 
-	let completion = complete_pair(Box::new(client), Box::new(server)).await?;
-	assert!(
-		completion.pending_before_completion,
-		"both CMS machines must be mid-flight before complete()"
-	);
-	assert!(
-		completion.keys_interoperate,
-		"the CMS session keys must open each other's records"
-	);
-	assert_eq!(
-		completion.profiles,
-		(Some(profile), Some(profile)),
-		"both CMS machines must select the offered profile"
-	);
-	Ok(())
+	drive_pair(&mut client, &mut server).await;
+	complete_both(client, server).await
 }
 
-/// Completes one CMS handshake against the fixture server, and returns both
-/// sessions.
-#[cfg(feature = "transport-cms")]
-async fn established_cms_pair(
-	materials: &ServerMaterials,
-) -> Result<(EstablishedSession, EstablishedSession), TightBeamError> {
-	let (mut client, mut server) = build_cms_pair(materials)?;
-	drive_cms_pair(&mut client, &mut server).await?;
-
-	let client_session = ClientHandshakeProtocol::complete(Box::new(client)).await?;
-	let server_session = ServerHandshakeProtocol::complete(Box::new(server)).await?;
-	Ok((client_session, server_session))
-}
-
-/// CMS traffic keys must be fresh per handshake (CWE-321): a record of one
-/// session does not open on another session against the same server.
+/// CMS traffic keys are fresh per handshake (CWE-321), so a record of one
+/// session fails to unwrap under the key of another session against the same
+/// server.
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
-async fn cms_unique_traffic_keys() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
-	let (client_a, _server_a) = established_cms_pair(&materials).await?;
-	let (_client_b, server_b) = established_cms_pair(&materials).await?;
+async fn a_cms_record_of_one_session_opens_under_no_other() {
+	let materials = ServerMaterials::fixed();
+	let (client_a, _server_a) = established_cms_pair(&materials).await;
+	let (_client_b, server_b) = established_cms_pair(&materials).await;
+	let mut record_a = sealed(client_a.keys(), CLIENT_PROBE);
 
-	let probe = b"same probe under two sessions";
-	let record_a = client_a.keys().send().encrypt_next(probe)?;
-
-	let mut arrived_a = record_a.to_der()?;
-	let isolated = server_b.into_keys().recv_mut().open(&mut arrived_a).is_err();
-	assert!(isolated, "a CMS record of one session must not open under another (CWE-321)");
-
-	Ok(())
+	let opened = server_b.into_keys().recv_mut().open(&mut record_a);
+	assert!(matches!(opened, Err(TightBeamError::EnvelopeError(EnvelopeError::KeyUnwrap))));
 }

@@ -2,10 +2,12 @@
 
 use core::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tightbeam::at_least;
+use tightbeam::crypto::aead::{RecvCipher, SendCipher};
 use tightbeam::crypto::exchange::{EcdheShare, KeyShare};
+use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::OctetString;
@@ -13,24 +15,29 @@ use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::tb_assert_spec;
+use tightbeam::tb_cases;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxEnvelope, MuxRekeyRequestPackage, MUX_APPLICATION_CODE_FLOOR};
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt, StoredReceipt};
-use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxHandle, MuxRole};
-use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
+use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxHandle, MuxRekeyContext, MuxRole, MuxTransport};
+use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
+use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportResult};
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 use tokio::time::timeout;
 
+use crate::common::result::TestResult;
 use crate::common::security::{expectation_failure, ClientMaterials, ServerMaterials};
-use crate::transport::support::{
-	await_receipt_rotation, await_transport, establish_mutual_transports, establish_mutual_transports_of, mux_frame,
-	mux_offer, MutualSessionHooks, MutualTransports,
+use crate::common::transport::{
+	await_receipt_rotation, await_transport, establish_mutual_transports, establish_mutual_transports_of,
+	MutualSessionHooks, MutualTransports,
 };
+use crate::transport::fixtures::{mux_frame, mux_offer};
 
 use super::common::*;
 
@@ -412,6 +419,167 @@ tb_scenario! {
 	}
 }
 
+/// The legs of the renewals that the halves of one client carry, in wire
+/// order.
+#[derive(Clone, Default)]
+struct RekeyTape(Arc<Mutex<Vec<MuxEnvelope>>>);
+
+impl RekeyTape {
+	/// Keeps `envelope` when it is a leg of a renewal.
+	fn keep(&self, envelope: &TransportEnvelope) {
+		let TransportEnvelope::Mux(mux) = envelope else {
+			return;
+		};
+
+		let is_leg = matches!(
+			mux,
+			MuxEnvelope::RekeyRequest(_) | MuxEnvelope::RekeyResponse(_) | MuxEnvelope::RekeyAck(_)
+		);
+		if is_leg {
+			self.0.lock().expect("a tape keeps a leg without a panic").push(mux.clone());
+		}
+	}
+
+	/// The two renewals that this tape holds, oldest first.
+	fn two_renewals(&self) -> [CarriedRenewal; 2] {
+		let legs = self.0.lock().expect("a tape keeps a leg without a panic");
+		let renewals: Vec<CarriedRenewal> = legs.chunks_exact(3).map(CarriedRenewal::of_legs).collect();
+		renewals.try_into().expect("the tape holds two renewals")
+	}
+}
+
+/// One renewal as a client's halves carried it: the DER of each leg, beside
+/// the two values of the response that an epoch receipt pins.
+#[derive(Debug)]
+struct CarriedRenewal {
+	/// The DER of the request.
+	request_der: Vec<u8>,
+	/// The DER of the response.
+	response_der: Vec<u8>,
+	/// The DER of the ack.
+	ack_der: Vec<u8>,
+	/// The server randomness of the response.
+	server_random: Vec<u8>,
+	/// The octets of the server's rekey share.
+	server_share: Vec<u8>,
+}
+
+impl CarriedRenewal {
+	/// The renewal of `legs`, which hold a request, a response, and an ack.
+	fn of_legs(legs: &[MuxEnvelope]) -> Self {
+		let [MuxEnvelope::RekeyRequest(request), MuxEnvelope::RekeyResponse(response), MuxEnvelope::RekeyAck(ack)] =
+			legs
+		else {
+			panic!("a renewal carries its request, its response, and its ack in that order");
+		};
+
+		Self {
+			request_der: request.to_der().expect("a request encodes"),
+			response_der: response.to_der().expect("a response encodes"),
+			ack_der: ack.to_der().expect("an ack encodes"),
+			server_random: response.server_random().to_vec(),
+			server_share: response.server_ephemeral().to_vec(),
+		}
+	}
+
+	/// The hash that the epoch receipt of this renewal pins over the chain
+	/// hash `chain`.
+	fn pin_over(&self, chain: &[u8]) -> Vec<u8> {
+		chain_digest([chain, &self.request_der, &self.server_random, &self.server_share])
+	}
+
+	/// The chain hash that follows `chain` over this renewal.
+	fn chain_after(&self, chain: &[u8]) -> Vec<u8> {
+		chain_digest([chain, &self.request_der, &self.response_der, &self.ack_der])
+	}
+}
+
+/// The digest of `legs` in order, under the digest of the house provider.
+fn chain_digest(legs: [&[u8]; 4]) -> Vec<u8> {
+	Sha3_256::digest(legs.concat()).to_vec()
+}
+
+/// The transcript hash that `stored` pins.
+fn pinned_hash(stored: &StoredReceipt) -> Vec<u8> {
+	stored.receipt().transcript_hash.digest.as_bytes().to_vec()
+}
+
+/// A read half that keeps each leg of a renewal it reads on its tape.
+struct TappedReader {
+	/// The half that reads the link.
+	inner: SplitReader,
+	/// The tape of the client.
+	tape: RekeyTape,
+}
+
+impl EnvelopeSource for TappedReader {
+	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+		let envelope = self.inner.read_envelope().await?;
+		self.tape.keep(&envelope);
+		Ok(envelope)
+	}
+
+	fn remaining_records(&self) -> u64 {
+		EnvelopeSource::remaining_records(&self.inner)
+	}
+
+	fn install_recv_cipher(&mut self, cipher: RecvCipher) -> TransportResult<()> {
+		EnvelopeSource::install_recv_cipher(&mut self.inner, cipher)
+	}
+
+	fn trace(&self) -> Option<TraceCollector> {
+		EnvelopeSource::trace(&self.inner)
+	}
+}
+
+/// A write half that keeps each leg of a renewal it writes on its tape.
+struct TappedWriter {
+	/// The half that writes the link.
+	inner: SplitWriter,
+	/// The tape of the client.
+	tape: RekeyTape,
+}
+
+impl EnvelopeSink for TappedWriter {
+	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+		self.tape.keep(&envelope);
+		self.inner.write_envelope(envelope).await
+	}
+
+	fn remaining_records(&self) -> u64 {
+		EnvelopeSink::remaining_records(&self.inner)
+	}
+
+	fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
+		EnvelopeSink::install_send_cipher(&mut self.inner, cipher)
+	}
+
+	fn trace(&self) -> Option<TraceCollector> {
+		EnvelopeSink::trace(&self.inner)
+	}
+}
+
+/// Spawns the client endpoint of `client` with its rekey materials over tapped
+/// halves, and returns it beside its tape.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- an expectation failure when the session holds no
+///   multiplexing or no rekey materials, or the rekey harvest or split failure.
+fn spawn_tapped_client(mut client: TcpTransport<TokioStream>) -> Result<(MuxEndpoint, RekeyTape), TightBeamError> {
+	let settings = client.negotiated_mux();
+	let settings = settings.ok_or_else(|| expectation_failure("handshake must negotiate multiplexing"))?;
+	let rekey = MuxConnector::take_rekey(&mut client)?;
+	let rekey = rekey.ok_or_else(|| expectation_failure("a receipt-bearing session must yield rekey materials"))?;
+	let (reader, writer) = client.into_split()?;
+
+	let tape = RekeyTape::default();
+	let reader = TappedReader { inner: reader, tape: tape.clone() };
+	let writer = TappedWriter { inner: writer, tape: tape.clone() };
+	let (endpoint, _responder) = spawn_mux_tasks(MuxTransport::with_rekey(reader, writer, rekey, settings), None);
+	Ok((endpoint, tape))
+}
+
 tb_assert_spec! {
 	pub MuxRekeyEpochChainSpec,
 	V(1,0,0): {
@@ -426,6 +594,9 @@ tb_assert_spec! {
 	}
 }
 
+// Each epoch receipt pins its exchange over a chain hash that starts at the
+// handshake receipt and advances over each full exchange. The client's halves
+// keep the legs of both renewals, so both pins are recomputed from the wire.
 tb_scenario! {
 	name: mux_rekey_consecutive_epochs_chain_receipts,
 	spec: MuxRekeyEpochChainSpec,
@@ -438,13 +609,16 @@ tb_scenario! {
 				PeerCertificate::parse(session.server_certificate.to_owned(), KeyPurposes::HOUSE.server)?;
 			let client_certificate: PeerCertificate<Signing<DefaultCryptoProvider>> =
 				PeerCertificate::parse(session.client_certificate.to_owned(), KeyPurposes::HOUSE.client)?;
-			let pair = spawn_echo_pair_with(session.client, session.server, rekey_config(), rekey_config(), trace.share())?;
+			let (client, tape) = spawn_tapped_client(session.client.with_trace(trace.share()))?;
+			let server_transport = session.server.with_trace(trace.share());
+			let (_server_end, responder) = spawn_mux_endpoint_with(server_transport, MuxRole::Server, rekey_config())?;
+			let _serve = spawn_immediate_echo(responder);
 
-			let first_batch = emit_series(&pair.client.handle, "rekey-chain-a", 5).await?;
-			let first = await_rotation(&pair.client.handle, initial.as_ref()).await;
+			let first_batch = emit_series(&client.handle, "rekey-chain-a", 5).await?;
+			let first = await_rotation(&client.handle, initial.as_ref()).await;
 			let first = first.ok_or_else(|| expectation_failure("first renewal must rotate the receipt"))?;
-			let second_batch = emit_series(&pair.client.handle, "rekey-chain-b", 5).await?;
-			let second = await_rotation(&pair.client.handle, Some(&*first)).await;
+			let second_batch = emit_series(&client.handle, "rekey-chain-b", 5).await?;
+			let second = await_rotation(&client.handle, Some(&*first)).await;
 			let second = second.ok_or_else(|| expectation_failure("second renewal must rotate the receipt"))?;
 			assert!(first_batch && second_batch, "every emit must echo across both renewals");
 
@@ -456,6 +630,15 @@ tb_scenario! {
 
 			let renewed = await_transport(|| trace.recorded(events::MUX_REKEY_RENEWED) >= 4).await;
 			assert!(renewed, "both endpoints must record both renewals");
+
+			let root = initial.as_ref().map(pinned_hash);
+			let root = root.ok_or_else(|| expectation_failure("the handshake must settle a receipt"))?;
+			let [first_renewal, second_renewal] = tape.two_renewals();
+			let chain = first_renewal.chain_after(&root);
+			assert_eq!(
+				(pinned_hash(&first), pinned_hash(&second)),
+				(first_renewal.pin_over(&root), second_renewal.pin_over(&chain))
+			);
 
 			Ok(())
 		}
@@ -783,33 +966,42 @@ tb_scenario! {
 
 /// A mutual session whose server certificate names the house server purpose
 /// alone and whose client certificate names the house client purpose alone.
-async fn establish_purposed_session() -> Result<MutualTransports, TightBeamError> {
-	let materials = ServerMaterials::generate().with_key_purpose(KeyPurposes::HOUSE.server);
-	let client_materials = ClientMaterials::generate().with_key_purpose(KeyPurposes::HOUSE.client);
+async fn establish_purposed_session() -> MutualTransports {
+	let materials = ServerMaterials::fixed().with_key_purpose(KeyPurposes::HOUSE.server);
+	let client = ClientMaterials::fixed().with_key_purpose(KeyPurposes::HOUSE.client);
 
 	let client_offer = chunked_offer(1).with_budgets(AMPLE_BUDGETS);
 	let server_offer = chunked_offer(1).with_budgets(AMPLE_BUDGETS);
 	let hooks = MutualSessionHooks::default();
 	let key_purposes = KeyPurposes::HOUSE;
-	establish_mutual_transports_of(client_offer, server_offer, hooks, &materials, &client_materials, key_purposes).await
+
+	let session = establish_mutual_transports_of(client_offer, server_offer, hooks, &materials, &client, key_purposes);
+	session.await.expect("a session of the house purposes establishes")
 }
 
-/// The client reads its server's certificate under the server purpose, so a
-/// certificate of that purpose alone yields the client's rekey materials.
-#[tokio::test]
-async fn a_client_detaches_its_rekey_materials_under_the_server_purpose() -> Result<(), TightBeamError> {
-	let MutualTransports { mut client, .. } = establish_purposed_session().await?;
-	let rekey = MuxConnector::take_rekey(&mut client)?;
-	assert!(rekey.is_some());
-	Ok(())
+/// The rekey materials that the endpoint of `role` detaches from a session of
+/// [`establish_purposed_session`].
+async fn detached_rekey(role: MuxRole) -> TransportResult<Option<MuxRekeyContext>> {
+	let MutualTransports { mut client, mut server, .. } = establish_purposed_session().await;
+	match role {
+		MuxRole::Client => MuxConnector::take_rekey(&mut client),
+		MuxRole::Server => MuxAcceptor::take_rekey(&mut server),
+	}
 }
 
-/// The server reads its client's certificate under the client purpose, so a
-/// certificate of that purpose alone yields the server's rekey materials.
-#[tokio::test]
-async fn a_server_detaches_its_rekey_materials_under_the_client_purpose() -> Result<(), TightBeamError> {
-	let MutualTransports { mut server, .. } = establish_purposed_session().await?;
-	let rekey = MuxAcceptor::take_rekey(&mut server)?;
-	assert!(rekey.is_some());
-	Ok(())
+// Each endpoint reads the certificate of its peer under the purpose of the
+// peer's role, so a certificate of that purpose alone yields the endpoint's
+// rekey materials.
+tb_cases! {
+	async fn an_endpoint_detaches_its_rekey_materials_under_its_peer_purpose(role: MuxRole) -> TestResult {
+		let rekey = detached_rekey(role).await?;
+		assert!(rekey.is_some());
+		Ok(())
+	}
+	cases {
+		/// The client reads its server's certificate under the server purpose.
+		client => MuxRole::Client,
+		/// The server reads its client's certificate under the client purpose.
+		server => MuxRole::Server,
+	}
 }

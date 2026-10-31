@@ -1,57 +1,54 @@
 //! The test helpers that the integration suites share.
 //!
-//! They cover certificate creation, server fixtures, and validation helpers.
+//! Each module holds the helpers of one concern, and the comment above its
+//! declaration names that concern. A helper that one suite alone calls lives
+//! in that suite, beside the type it extends.
 
-// The queue and the payment harnesses share it, under their own gates.
-#[cfg(any(
-	all(feature = "full", feature = "tokio", feature = "transport-policy"),
-	all(
-		feature = "std",
-		feature = "tokio",
-		feature = "testing",
-		feature = "x509",
-		feature = "secp256k1",
-		feature = "signature",
-		feature = "colony",
-		feature = "transport-policy"
-	)
-))]
+// The result type of each fallible test. A test target of its own reaches it
+// through a `#[path]` module of this one file.
+pub mod result;
+
+// The dedup book and the chain state, which the queue and the payment
+// harnesses share under their own gates, and the test frames of the DTN and
+// payment suites.
+#[cfg(feature = "testing")]
 pub mod dedup;
 
+// The colony fixtures of the colony, payment, and seam suites.
 #[cfg(feature = "colony")]
 pub mod hive;
 
-// Every suite that waits on another task uses it: colony and DTN through
-// `tokio`, and the multiplex transport suites, which can build without it.
-#[cfg(any(feature = "tokio", feature = "transport-multiplex"))]
+// The bounded waits of each suite that waits on another task.
+#[cfg(feature = "tokio")]
 pub mod poll;
 
-#[cfg(all(feature = "x509", feature = "hex"))]
-pub mod static_pair;
+// The manual clock that records each sleep a task starts on it.
+#[cfg(all(feature = "testing", feature = "tokio"))]
+pub mod clock;
 
-#[cfg(all(
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "sha3",
-	feature = "transport",
-	feature = "tokio"
-))]
+// The trace constructor and readers of the instrumented suites.
+#[cfg(feature = "instrument")]
+pub mod trace;
+
+// The CSP processes, the scheduler, and the explorer of the FDR and seam
+// suites.
+#[cfg(feature = "testing-fdr")]
+pub mod csp;
+
+// The gateway identities of the colony transport and federation suites.
+#[cfg(feature = "testing")]
 pub mod x509;
 
-#[cfg(all(
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "sha3",
-	feature = "transport"
-))]
+// The key materials, trust stores, handshake configs, and authorizers of the
+// transport, security, colony, and seam suites.
+#[cfg(feature = "testing")]
 pub mod security;
 
+// The transport fixtures of the transport, security, colony, and seam suites.
 #[cfg(all(
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "tokio"
+	feature = "transport-hpke",
+	feature = "tcp",
+	feature = "tokio",
+	feature = "testing"
 ))]
-pub mod laser;
+pub mod transport;

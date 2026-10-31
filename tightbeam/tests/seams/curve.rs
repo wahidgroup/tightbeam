@@ -34,7 +34,6 @@ use p256::elliptic_curve::group::Curve as _;
 use p256::elliptic_curve::point::AffineCoordinates;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{NistP256, PublicKey};
-use tightbeam::cms::content_info::ContentInfo;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes256Gcm, Aes256GcmOid};
 use tightbeam::crypto::cms::{Encapsulation, EnvelopeError, KeyAgreementIdentity, RecipientKem};
 use tightbeam::crypto::common::typenum::Unsigned;
@@ -45,7 +44,6 @@ use tightbeam::crypto::hkdf::{InvalidLength, SimpleHkdf};
 use tightbeam::crypto::hpke::{
 	DhKem, DhKemSuite, HkdfSha256, HpkeKdf, HpkeMessage, HpkePublicKeyOps, HpkeSecretKeyOps, HpkeSuite,
 };
-use tightbeam::crypto::k256::ecdsa::SigningKey as Secp256k1SigningKey;
 use tightbeam::crypto::kdf::{HkdfSha3_256, KdfError};
 use tightbeam::crypto::key::{DiffieHellman, KeyBackend, KeyError, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
@@ -58,30 +56,30 @@ use tightbeam::crypto::sign::{
 	SignatureEncoding, SigningIdentity, Verifier,
 };
 use tightbeam::crypto::x509::error::CertificateValidationError;
-use tightbeam::crypto::x509::policy::DirectTrustValidator;
 use tightbeam::crypto::x509::store::CertificateTrust;
-use tightbeam::crypto::x509::KeyPurposes;
-use tightbeam::der::asn1::{ObjectIdentifier, OctetString, OctetStringRef};
-use tightbeam::der::{Any, Decode, Encode, Tag};
+use tightbeam::der::asn1::{ObjectIdentifier, OctetString};
+use tightbeam::der::{Any, Decode, Encode};
 use tightbeam::marker::MaybeSendFuture;
-use tightbeam::oids::{CURVE_NIST_P256, DATA, SIGNER_ECDSA_WITH_SHA3_256};
-use tightbeam::random::{CryptoRngCore, OsRng};
+use tightbeam::oids::{CURVE_NIST_P256, SIGNER_ECDSA_WITH_SHA3_256};
+use tightbeam::random::CryptoRngCore;
 use tightbeam::spki::{
 	AlgorithmIdentifierOwned, Document, EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef,
 };
-use tightbeam::testing::{unhex, PublishedDraw, TestCertificate, TestCmsServer, TestKey};
-use tightbeam::transport::handshake::negotiation::RunnableProfile;
+use tightbeam::testing::{unhex, PublishedDraw, SeededStream, TestCertificate, TestCmsServer, TestKey};
 use tightbeam::transport::handshake::{
-	Client, ClientConfig, ClientFlow, ClientHello, Cms, CmsClientSettings, CmsIdentityPair, CmsServerSettings,
-	Handshake, HandshakeError, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings, HpkeServerSettings,
-	LearnedTrust, ProvisionedTrust, Server, ServerConfig, ServerFlow, SupportedProfiles,
+	Client, ClientHello, Cms, CmsIdentityPair, CmsServerSettings, Handshake, HandshakeError, HandshakeMessage,
+	HandshakeProvider, Hpke, HpkeServerSettings, ProvisionedTrust, Server,
 };
-use tightbeam::x509::ext::pkix::KeyUsages;
+use tightbeam::x509::ext::pkix::{KeyUsages, SubjectKeyIdentifier};
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;
 use tightbeam::ZeroizingBytes;
 
-use super::{run_legs, CONTENT};
+use super::{
+	admitted_and_opened, cms_client, first_record_opened, native_server, replied, CLIENT_SEED, CONTENT, SERVER_SEED,
+};
+use crate::common::result::TestResult;
+use crate::common::security::{carried_hello, hello_opening, hpke_client_config, pinning_validator};
 
 mod exchange;
 mod p384;
@@ -445,9 +443,10 @@ impl<C: HandshakeCurve> AgreementBackend<C> {
 		Self { scalar }
 	}
 
-	/// The backend of a fresh scalar.
-	fn random() -> Self {
-		Self::of(elliptic_curve::NonZeroScalar::random(&mut OsRng))
+	/// The backend of the scalar that `SeededStream(0x40)` draws, the same in
+	/// every run and apart from each identity key of a test.
+	fn fixed() -> Self {
+		Self::of(elliptic_curve::NonZeroScalar::random(&mut SeededStream(0x40)))
 	}
 
 	/// The public half of the scalar.
@@ -482,12 +481,15 @@ impl<C: HandshakeCurve> DiffieHellman<C> for AgreementBackend<C> {
 }
 
 /// The certificate of the point `point` on the curve `curve`, cut from the
-/// self-signed house certificate of a fresh secp256k1 key, whose key
-/// identifier sets it apart from every other certificate of a test. A trust
-/// that pins it compares it whole.
+/// self-signed house certificate of [`TestKey::insecure_fixed_signing`]. Its
+/// key identifier is the SHA3-256 digest of `point`, which sets it apart from
+/// every other certificate of a test. A trust that pins it compares it whole.
 fn certificate_of(curve: ObjectIdentifier, point: &[u8]) -> Certificate {
-	let template = TestCertificate::self_signed(&Secp256k1SigningKey::random(&mut OsRng));
-	TestCertificate::with_curve_point(template, curve, point)
+	let template = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	let moved = TestCertificate::with_curve_point(template, curve, point);
+	let digest = OctetString::new(Sha3_256::digest(point).as_slice());
+	let identifier = SubjectKeyIdentifier(digest.expect("a digest fits an OCTET STRING"));
+	TestCertificate::with_key_identifier(moved, identifier)
 }
 
 /// The identity under the provider `P` of `certificate` and `key`, the
@@ -500,9 +502,15 @@ where
 	identity.expect("the outside key matches its certificate and its algorithm")
 }
 
-/// An identity under [`P256Provider`], of a fresh key.
-fn p256_identity() -> SigningIdentity {
-	let key = SigningKey::random(&mut OsRng);
+/// The P-256 key whose scalar is thirty-two `seed` octets.
+fn p256_key(seed: u8) -> SigningKey {
+	let key = SigningKey::from_slice(&[seed; 32]);
+	key.expect("thirty-two octets below 0xff name a scalar of P-256")
+}
+
+/// An identity under [`P256Provider`], of the key of [`p256_key`] of `seed`.
+fn p256_identity(seed: u8) -> SigningIdentity {
+	let key = p256_key(seed);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
 	let certificate = certificate_of(CURVE_NIST_P256, point.as_bytes());
 	identity_of::<P256Provider>(certificate, Arc::new(P256KeyProvider { key }))
@@ -513,50 +521,35 @@ fn p256_identity() -> SigningIdentity {
 fn hpke_pair<P: HandshakeProvider>(
 	server: SigningIdentity,
 ) -> (Handshake<Client, Hpke, P>, Handshake<Server, Hpke, P>) {
-	let pinned = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
-	let pinned = pinned.expect("an outside certificate encodes");
-	let settings = HpkeClientSettings::new(LearnedTrust::new(pinned));
-	let client = ClientConfig::<Hpke, P>::new(settings, KeyPurposes::HOUSE);
-	let client = client.expect("an outside client serves the client role");
-
-	let native = RunnableProfile::<P>::native().descriptor();
-	let profiles = SupportedProfiles::from(native);
-	let purposes = KeyPurposes::HOUSE;
-	let server_config = ServerConfig::<Hpke, P>::new(HpkeServerSettings::new(), server, profiles, purposes);
-	let server_config = server_config.expect("an outside server identity serves the server role");
+	let client = hpke_client_config::<P>(pinning_validator(server.certificate()));
+	let server_config = native_server::<Hpke, P>(HpkeServerSettings::new(), server);
 	(Handshake::client(client), Handshake::server(server_config))
+}
+
+/// The `ClientHello` that `opening` carries.
+fn hello_of(opening: HandshakeMessage) -> ClientHello {
+	let hello = ClientHello::from_der(&carried_hello(opening));
+	hello.expect("the opening carries a ClientHello")
 }
 
 /// The hello of `opening`, which carries `point` as its agreement ephemeral
 /// `R` in place of the one the client drew.
-fn hello_carrying(opening: HandshakeMessage, point: &[u8]) -> Result<HandshakeMessage, Box<dyn std::error::Error>> {
-	let content_info = opening.data()?.into_value();
-	let octets = content_info.content.decode_as::<OctetStringRef<'_>>()?;
-	let hello = ClientHello::from_der(octets.as_bytes())?;
-
-	let hello = ClientHello { client_ephemeral: OctetString::new(point)?, ..hello };
-	let content = Any::new(Tag::OctetString, hello.to_der()?)?;
-	Ok(HandshakeMessage::try_from(ContentInfo { content_type: DATA, content })?)
-}
-
-/// The ephemeral the hello of `opening` carries.
-fn carried_ephemeral(opening: HandshakeMessage) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	let content_info = opening.data()?.into_value();
-	let octets = content_info.content.decode_as::<OctetStringRef<'_>>()?;
-	let hello = ClientHello::from_der(octets.as_bytes())?;
-	Ok(hello.client_ephemeral.as_bytes().to_vec())
+fn hello_carrying(opening: HandshakeMessage, point: &[u8]) -> HandshakeMessage {
+	let client_ephemeral = OctetString::new(point).expect("a point fits an OCTET STRING");
+	let hello = ClientHello { client_ephemeral, ..hello_of(opening) };
+	hello_opening(&hello)
 }
 
 /// The ephemeral `R` that the hello of an HPKE client under `P` carries,
 /// beside the compressed form of the point it decodes to on `C`, the curve of
 /// the exchange of `P`.
-fn carried_point<P, C>(server: SigningIdentity) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>>
+fn carried_point<P, C>(server: SigningIdentity) -> Result<(Vec<u8>, Vec<u8>), Box<dyn core::error::Error>>
 where
 	P: HandshakeProvider<KeyExchange = Ecdhe<C>>,
 	C: HandshakeCurve,
 {
 	let (mut client, _server) = hpke_pair::<P>(server);
-	let ephemeral = carried_ephemeral(client.start()?)?;
+	let ephemeral = hello_of(client.start()?).client_ephemeral.as_bytes().to_vec();
 
 	let point = elliptic_curve::PublicKey::<C>::from_sec1_bytes(&ephemeral)?;
 	let compressed = point.to_encoded_point(true).as_bytes().to_vec();
@@ -626,12 +619,12 @@ where
 	OutsideCmsServer::of(&house, signing, key_agreement, backend)
 }
 
-/// A CMS server of fresh P-256 keys.
+/// A CMS server of the P-256 key of [`p256_key`] of [`SERVER_SEED`].
 fn p256_cms_server() -> OutsideCmsServer<P256Kem> {
-	let key = SigningKey::random(&mut OsRng);
+	let key = p256_key(SERVER_SEED);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
 	let signer = Arc::new(P256KeyProvider { key });
-	let backend = AgreementBackend::random();
+	let backend = AgreementBackend::fixed();
 	outside_cms_server::<P256Provider, _>("p256 server", signer, CURVE_NIST_P256, point.as_bytes(), backend)
 }
 
@@ -643,58 +636,16 @@ fn cms_pair<P: HandshakeProvider>(
 ) -> (Handshake<Client, Cms, P>, Handshake<Server, Cms, P>) {
 	let trust = ProvisionedTrust::new(Arc::new(server.key_agreement), server.store);
 	let trust = trust.expect("the store admits the outside key-agreement certificate");
-	let settings = CmsClientSettings { trust, identity };
-	let client = ClientConfig::<Cms, P>::new(settings, KeyPurposes::HOUSE);
-	let client = client.expect("an outside client serves the client role");
-
-	let native = RunnableProfile::<P>::native().descriptor();
-	let profiles = SupportedProfiles::from(native);
-	let purposes = KeyPurposes::HOUSE;
-	let server_config = ServerConfig::<Cms, P>::new(CmsServerSettings, server.pair, profiles, purposes);
-	let server_config = server_config.expect("an outside server pair serves the server role");
+	let client = cms_client::<P>(trust, identity);
+	let server_config = native_server::<Cms, P>(CmsServerSettings, server.pair);
 	(Handshake::client(client), Handshake::server(server_config))
-}
-
-/// The certificate the server of `pair` admitted as its client once the
-/// three legs run, beside the first record the client seals, as the server
-/// opens it under its session keys.
-async fn admitted_and_opened<P, F>(
-	pair: (Handshake<Client, F, P>, Handshake<Server, F, P>),
-) -> Result<(Option<Certificate>, Vec<u8>), Box<dyn std::error::Error>>
-where
-	P: HandshakeProvider,
-	F: ClientFlow<P> + ServerFlow<P>,
-{
-	let (mut client, mut server) = pair;
-	run_legs(&mut client, &mut server).await;
-	let admitted = server.peer_certificate().cloned();
-
-	let client_session = client.complete()?;
-	let server_session = server.complete()?;
-
-	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
-	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
-	Ok((admitted, opened.to_vec()))
-}
-
-/// The first record the client of `pair` seals once the three legs run, as
-/// the server of `pair` opens it under its session keys.
-async fn first_record_opened<P, F>(
-	pair: (Handshake<Client, F, P>, Handshake<Server, F, P>),
-) -> Result<Vec<u8>, Box<dyn std::error::Error>>
-where
-	P: HandshakeProvider,
-	F: ClientFlow<P> + ServerFlow<P>,
-{
-	let (_admitted, opened) = admitted_and_opened(pair).await?;
-	Ok(opened)
 }
 
 /// The outside KEM encapsulates to the recipient key of RFC 9180 A.3.1 as
 /// the vector does: `enc` is `pkEm` of the scalar it draws, and the shared
 /// secret is the published one.
 #[test]
-fn the_p256_kem_encapsulates_as_rfc_9180_a_3_1() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p256_kem_encapsulates_as_rfc_9180_a_3_1() -> TestResult {
 	let encapsulated = RFC_9180_A_3_1.encapsulated_by::<NistP256, P256Kem>()?;
 	assert_eq!(encapsulated, RFC_9180_A_3_1.encapsulation());
 	Ok(())
@@ -703,7 +654,7 @@ fn the_p256_kem_encapsulates_as_rfc_9180_a_3_1() -> Result<(), Box<dyn std::erro
 /// The outside KEM decapsulates `enc` of RFC 9180 A.3.1 through the backend
 /// of the recipient scalar to the published shared secret.
 #[tokio::test]
-async fn the_p256_kem_decapsulates_rfc_9180_a_3_1() -> Result<(), Box<dyn std::error::Error>> {
+async fn the_p256_kem_decapsulates_rfc_9180_a_3_1() -> TestResult {
 	let shared = RFC_9180_A_3_1.decapsulated_by::<NistP256, P256Kem>().await?;
 	assert_eq!(shared, unhex(RFC_9180_A_3_1.shared_secret));
 	Ok(())
@@ -712,7 +663,7 @@ async fn the_p256_kem_decapsulates_rfc_9180_a_3_1() -> Result<(), Box<dyn std::e
 /// The HPKE suite of P-256 seals the plaintext of RFC 9180 A.3.1.1 at
 /// sequence number zero to `enc` and the published ciphertext.
 #[test]
-fn the_p256_hpke_suite_seals_as_rfc_9180_a_3_1_1() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p256_hpke_suite_seals_as_rfc_9180_a_3_1_1() -> TestResult {
 	let sealed = RFC_9180_A_3_1.sealed_by::<P256Suite>()?;
 	assert_eq!(sealed, RFC_9180_A_3_1.message());
 	Ok(())
@@ -721,7 +672,7 @@ fn the_p256_hpke_suite_seals_as_rfc_9180_a_3_1_1() -> Result<(), Box<dyn std::er
 /// The HPKE suite of P-256 opens `enc` and the ciphertext of RFC 9180
 /// A.3.1.1 at sequence number zero under the recipient scalar.
 #[test]
-fn the_p256_hpke_suite_opens_rfc_9180_a_3_1_1() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p256_hpke_suite_opens_rfc_9180_a_3_1_1() -> TestResult {
 	let opened = RFC_9180_A_3_1.opened_by::<P256Suite>()?;
 	assert_eq!(opened, unhex(RFC_9180_PLAINTEXT));
 	Ok(())
@@ -730,8 +681,9 @@ fn the_p256_hpke_suite_opens_rfc_9180_a_3_1_1() -> Result<(), Box<dyn std::error
 /// The HPKE flow runs under the P-256 provider, and the client's first
 /// record opens under the server's session keys.
 #[tokio::test]
-async fn a_p256_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let opened = first_record_opened(hpke_pair::<P256Provider>(p256_identity())).await?;
+async fn a_p256_provider_runs_the_hpke_flow() -> TestResult {
+	let pair = hpke_pair::<P256Provider>(p256_identity(SERVER_SEED));
+	let opened = first_record_opened(pair).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -739,8 +691,8 @@ async fn a_p256_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::
 /// The hello of a P-256 client carries `R` as a point of P-256 in the
 /// compressed form, so `R` has the width of that form on P-256.
 #[test]
-fn a_p256_hello_carries_a_compressed_p256_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (carried, compressed) = carried_point::<P256Provider, _>(p256_identity())?;
+fn a_p256_hello_carries_a_compressed_p256_point() -> TestResult {
+	let (carried, compressed) = carried_point::<P256Provider, _>(p256_identity(SERVER_SEED))?;
 	assert_eq!(carried, compressed);
 	Ok(())
 }
@@ -750,9 +702,9 @@ fn a_p256_hello_carries_a_compressed_p256_point() -> Result<(), Box<dyn std::err
 /// x-coordinate of P-256, so a P-256 server refuses the hello that carries
 /// it as `R`.
 #[tokio::test]
-async fn a_p256_server_refuses_a_secp256k1_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (mut client, mut server) = hpke_pair::<P256Provider>(p256_identity());
-	let hello = hello_carrying(client.start()?, &TestKey::SEC2_SECP256K1_G_COMPRESSED)?;
+async fn a_p256_server_refuses_a_secp256k1_point() -> TestResult {
+	let (mut client, mut server) = hpke_pair::<P256Provider>(p256_identity(SERVER_SEED));
+	let hello = hello_carrying(client.start()?, &TestKey::SEC2_SECP256K1_G_COMPRESSED);
 
 	let refused = server.reply(hello).await;
 	assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
@@ -763,8 +715,9 @@ async fn a_p256_server_refuses_a_secp256k1_point() -> Result<(), Box<dyn std::er
 /// on P-256 behind the outside KEM, and the client's first record opens
 /// under the server's session keys.
 #[tokio::test]
-async fn a_p256_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let opened = first_record_opened(cms_pair::<P256Provider>(p256_cms_server(), p256_identity())).await?;
+async fn a_p256_provider_runs_the_cms_flow() -> TestResult {
+	let pair = cms_pair::<P256Provider>(p256_cms_server(), p256_identity(CLIENT_SEED));
+	let opened = first_record_opened(pair).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -774,14 +727,9 @@ async fn a_p256_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::E
 /// at the fifth single-chunk emit.
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 mod renewal {
-	use core::time::Duration;
 	use std::sync::Arc;
 
-	use tightbeam::crypto::policy::Secp256k1Policy;
 	use tightbeam::crypto::sign::SigningIdentity;
-	use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
-	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use tightbeam::crypto::x509::KeyCurves;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::prelude::TightBeamSocketAddr;
 	use tightbeam::testing::TestFrame;
@@ -797,8 +745,11 @@ mod renewal {
 	use tokio::net::TcpStream;
 	use tokio::task::JoinHandle;
 
-	use super::{p256_identity, P256Provider};
-	use crate::common::poll::poll_until;
+	use super::{p256_identity, P256Provider, CLIENT_SEED, SERVER_SEED};
+	use crate::common::poll::joined;
+	use crate::common::result::TestResult;
+	use crate::common::security::{combined_trust, pinning_validator};
+	use crate::common::transport::await_receipt_rotation;
 
 	/// The budgets under which the fifth single-chunk emit of a client tips
 	/// its budget into the drain reserve, with one chunk of 1 KiB a stream.
@@ -806,10 +757,6 @@ mod renewal {
 
 	/// The emits of the client, past the one that brings the renewal.
 	const EMITS: usize = 8;
-
-	/// The reads of a receipt, one every 5 ms for 2 s, before the wait for a
-	/// renewal fails.
-	const RENEWAL_POLLS: u32 = 400;
 
 	/// The dispatch of the server: it echoes each unary frame.
 	struct EchoDispatch;
@@ -835,21 +782,20 @@ mod renewal {
 		offer.with_budgets(RENEWAL_BUDGETS)
 	}
 
-	/// A client and a server under the provider `P` that pin each other, each
-	/// with an identity of `identity`, and each assembled as a multiplexed
-	/// plane with its rekey context, while the server serves [`EchoDispatch`].
-	async fn renewing_session<P: HandshakeProvider>(
-		identity: fn() -> SigningIdentity,
-	) -> Result<RenewingSession, Box<dyn std::error::Error>> {
-		let server_identity = identity();
-		let client_identity = identity();
+	/// A client and a server under the provider `P` that pin each other, the
+	/// server with the identity of `identity` of [`SERVER_SEED`] and the client
+	/// with the one of [`CLIENT_SEED`], each assembled as a multiplexed plane
+	/// with its rekey context, while the server serves [`EchoDispatch`].
+	async fn renewing_session<P: HandshakeProvider>(identity: fn(u8) -> SigningIdentity) -> RenewingSession {
+		let server_identity = identity(SERVER_SEED);
+		let client_identity = identity(CLIENT_SEED);
 		let server_certificate = server_identity.certificate().to_owned();
-		let pinned = DirectTrustValidator::default().with_trust_chain([client_identity.certificate().to_owned()])?;
-		let validators: [Arc<dyn CertificateValidation>; 1] = [Arc::new(pinned)];
+		let validators = [pinning_validator(client_identity.certificate())];
 
 		let config = TransportEncryptionConfig::<P>::new(server_identity).with_client_validators(validators);
-		let bind = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
-		let (listener, addr) = TokioListener::<P>::bind_with(bind, config).await?;
+		let bind = "127.0.0.1:0".parse::<TightBeamSocketAddr>().expect("a loopback address parses");
+		let bound = TokioListener::<P>::bind_with(bind, config).await;
+		let (listener, addr) = bound.expect("a loopback listener binds");
 		let accepting = tokio::spawn(async move {
 			let (transport, _) = listener.accept().await?;
 			let mut transport = transport.with_mux_offer(Some(renewing_offer()));
@@ -857,20 +803,22 @@ mod renewal {
 			transport.into_mux(MuxRole::Server)
 		});
 
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store = store.with_certificate(server_certificate)?;
-		let builder = ClientBuilder::<TokioListener<P>>::builder().with_trust_store(Arc::new(store.build()));
+		let store = combined_trust(&[&server_certificate]);
+		let builder = ClientBuilder::<TokioListener<P>>::builder().with_trust_store(store);
 		let builder = builder.with_client_identity(client_identity);
-		let stream = TcpStream::connect(*addr).await?;
-		let client = builder.adopt(TokioStream::from(stream))?.into_transport();
-		let mut client = client.with_mux_offer(Some(renewing_offer()));
-		MuxConnector::complete_client_handshake(&mut client).await?;
+		let stream = TcpStream::connect(*addr).await.expect("the client reaches the listener");
+		let adopted = builder.adopt(TokioStream::from(stream));
+		let adopted = adopted.expect("the client names a trust store");
+		let mut client = adopted.into_transport().with_mux_offer(Some(renewing_offer()));
+		let handshake = MuxConnector::complete_client_handshake(&mut client).await;
+		handshake.expect("the client completes its handshake");
 
-		let SpawnedMux { handle, drivers: client_drivers, .. } = client.into_mux(MuxRole::Client)?.spawn();
-		let server = accepting.await??;
+		let client_mux = client.into_mux(MuxRole::Client).expect("the client assembles its plane");
+		let SpawnedMux { handle, drivers: client_drivers, .. } = client_mux.spawn();
+		let server = joined(accepting).await.expect("the server assembles its plane");
 		let SpawnedMux { responder, drivers: server_drivers, .. } = server.spawn();
 		let serving = tokio::spawn(responder.serve_with(EchoDispatch));
-		Ok(RenewingSession { handle, _drivers: [client_drivers, server_drivers], _serving: serving })
+		RenewingSession { handle, _drivers: [client_drivers, server_drivers], _serving: serving }
 	}
 
 	/// Emits [`EMITS`] frames on `handle`, each on a stream of its own.
@@ -886,23 +834,25 @@ mod renewal {
 
 	/// Whether a session under the provider `P`, with identities of
 	/// `identity`, renews its epoch in band: the client holds an epoch receipt
-	/// other than the receipt of its handshake within [`RENEWAL_POLLS`] reads.
+	/// other than the receipt of its handshake once [`EMITS`] frames cross it.
+	///
+	/// The multiplexer has no event for a receipt rotation, so the wait polls
+	/// the receipt of the client.
 	pub(super) async fn renews_its_epoch<P: HandshakeProvider>(
-		identity: fn() -> SigningIdentity,
-	) -> Result<bool, Box<dyn std::error::Error>> {
-		let session = renewing_session::<P>(identity).await?;
+		identity: fn(u8) -> SigningIdentity,
+	) -> TransportResult<bool> {
+		let session = renewing_session::<P>(identity).await;
 		let handshake_receipt = session.handle.session_receipt();
 		emit_series(&session.handle).await?;
 
-		let interval = Duration::from_millis(5);
-		let rotated = || session.handle.session_receipt() != handshake_receipt;
-		Ok(poll_until(RENEWAL_POLLS, interval, rotated).await)
+		let rotated = await_receipt_rotation(|| session.handle.session_receipt(), handshake_receipt.as_deref()).await;
+		Ok(rotated.is_some())
 	}
 
 	/// A session under the P-256 provider renews its epoch in band, so the
 	/// client holds an epoch receipt other than the receipt of its handshake.
 	#[tokio::test]
-	async fn a_p256_session_renews_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
+	async fn a_p256_session_renews_its_epoch() -> TestResult {
 		let renewed = renews_its_epoch::<P256Provider>(p256_identity).await?;
 		assert!(renewed);
 		Ok(())
@@ -913,15 +863,16 @@ mod renewal {
 /// exchange over the blocking TCP transport.
 #[cfg(feature = "tcp")]
 mod blocking {
-	use super::{p256_identity, P256Provider};
+	use super::{p256_identity, P256Provider, SERVER_SEED};
+	use crate::common::result::TestResult;
 	use crate::seams::blocking::blocking_exchange;
 
 	/// A blocking client and server under the P-256 provider complete their
 	/// handshake, so the client holds the certificate of the server, and a
 	/// frame the client emits comes back to it.
 	#[tokio::test]
-	async fn a_p256_provider_runs_the_blocking_transport() -> Result<(), Box<dyn std::error::Error>> {
-		let exchange = blocking_exchange::<P256Provider>(p256_identity(), "p256-blocking").await?;
+	async fn a_p256_provider_runs_the_blocking_transport() -> TestResult {
+		let exchange = blocking_exchange::<P256Provider>(p256_identity(SERVER_SEED), "p256-blocking").await?;
 		assert_eq!(exchange.received, exchange.sent);
 		Ok(())
 	}
@@ -933,20 +884,22 @@ mod certificate {
 	use core::time::Duration;
 
 	use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
-	use p256::ecdsa::{DerSignature, Signature, SigningKey};
+	use p256::ecdsa::{DerSignature, Signature};
 	use tightbeam::crypto::hash::{Digest, Sha3_256};
 	use tightbeam::crypto::sign::Sha3Signer;
 	use tightbeam::der::Encode;
 	use tightbeam::oids::SIGNER_ECDSA_WITH_SHA3_256;
-	use tightbeam::random::OsRng;
 	use tightbeam::spki::SubjectPublicKeyInfoOwned;
+
+	use super::{p256_key, SERVER_SEED};
+	use crate::common::result::TestResult;
 
 	/// `cert!` signs a root certificate under the P-256 signature type of its
 	/// `signature:` key, so the P-256 key verifies it under
 	/// `ecdsa-with-SHA3-256`.
 	#[test]
-	fn cert_issues_a_p256_certificate_under_a_p256_signature_type() -> Result<(), Box<dyn std::error::Error>> {
-		let key = SigningKey::random(&mut OsRng);
+	fn cert_issues_a_p256_certificate_under_a_p256_signature_type() -> TestResult {
+		let key = p256_key(SERVER_SEED);
 		let signer = Sha3Signer::from(&key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(*key.verifying_key())?;
 
@@ -962,9 +915,8 @@ mod certificate {
 
 		let prehash = Sha3_256::digest(certificate.tbs_certificate.to_der()?);
 		let signature = Signature::from_der(certificate.signature.raw_bytes())?;
-		let verified = key.verifying_key().verify_prehash(&prehash, &signature).is_ok();
-		let algorithm = certificate.signature_algorithm.oid;
-		assert_eq!((algorithm, verified), (SIGNER_ECDSA_WITH_SHA3_256, true));
+		key.verifying_key().verify_prehash(&prehash, &signature)?;
+		assert_eq!(certificate.signature_algorithm.oid, SIGNER_ECDSA_WITH_SHA3_256);
 		Ok(())
 	}
 }
@@ -975,7 +927,7 @@ const P256_DESCRIPTOR: &str = "304fa00b0609608648016503040208a10b060960864801650
 
 /// The descriptor of [`P256Profile`] encodes as [`P256_DESCRIPTOR`].
 #[test]
-fn the_p256_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p256_descriptor_encodes_as_its_known_der() -> TestResult {
 	let der = SecurityProfileDesc::from(&P256Profile).to_der()?;
 	assert_eq!(der, unhex(P256_DESCRIPTOR));
 	Ok(())

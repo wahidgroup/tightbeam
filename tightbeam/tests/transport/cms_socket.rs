@@ -36,7 +36,6 @@ use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;
 
 use crate::common::security::{random_signing_key, test_certificate, ServerMaterials};
-use crate::transport::support::bind_cms_mutual_listener;
 
 /// The mutual-auth CMS fixture, which holds the server materials and the
 /// client identity that the server pins.
@@ -51,7 +50,7 @@ impl CmsWireContext {
 		let signing_key = random_signing_key();
 		let client_certificate = Arc::new(test_certificate(&signing_key));
 		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		Self { materials: ServerMaterials::generate(), client_certificate, client_provider }
+		Self { materials: ServerMaterials::fixed(), client_certificate, client_provider }
 	}
 }
 
@@ -61,7 +60,7 @@ async fn start_cms_echo_server(
 	ctx: &Arc<CmsWireContext>,
 	trace: &TraceCollector,
 ) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
-	let (listener, addr) = bind_cms_mutual_listener(&ctx.materials, &ctx.client_certificate).await?;
+	let (listener, addr) = ctx.materials.bind_cms_mutual_listener(&ctx.client_certificate).await?;
 	let addr = TightBeamSocketAddr(addr);
 	let trace = trace.share();
 	let handle = server! {
@@ -111,7 +110,6 @@ tb_scenario! {
 			let mut client = builder.connect(addr).await?;
 			let frame = TestFrame::v0(Some("cms-wire"), None);
 			let reply = client.emit(frame.to_owned(), None).await?;
-
 			assert_eq!(reply, Some(frame), "the CMS session must echo the frame");
 			Ok(())
 		}

@@ -8,6 +8,9 @@
 //! - It updates the chain state.
 //! - It passes a duplicate of a chain frame.
 //! - It detects a gap, and answers a frame request with the frames of a gap.
+//!
+//! `a_chain_at_the_last_order_prepares_no_frame` is a self-check of this
+//! fixture, because it builds no frame.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,7 +26,7 @@ use crate::dtn::ordering::{Admission, OutOfOrderBuffer, Slot, Stopped};
 use crate::dtn::storage::FrameStore;
 
 /// The result of [`ChainProcessor::process_incoming`] for one frame.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ProcessResult {
 	/// The buffer released these frames and the chain validated them, so the
 	/// application acts on them in chain order.
@@ -332,67 +335,53 @@ impl ChainProcessor {
 	}
 }
 
-#[cfg(test)]
 mod tests {
-	use tightbeam::asn1::MessagePriority;
-	use tightbeam::der::Encode;
 	use tightbeam::policy::TransitStatus;
+	use tightbeam::tb_cases;
 	use tightbeam::utils::digest;
 
 	use super::*;
-	use crate::dtn::certs::{generate_shared_cipher, SharedCipher};
-	use crate::dtn::intake::SignedFrame;
-	use crate::dtn::messages::{EarthCommand, RoverCommand};
+	use crate::common::result::TestResult;
 	use crate::dtn::nodes::{DtnRole, NodeChain, PathSide, ORDER_BUFFER_FRAMES};
+	use crate::dtn::ordering::orders_of;
 	use crate::dtn::storage::{FrameKey, StorageRoot};
+	use crate::dtn::transit_status_of;
 
-	/// Builds the next ACK of the Rover, chained on `rover`.
-	fn rover_ack(rover: &NodeChain, cipher: &SharedCipher) -> Frame {
-		let key = DtnRole::Rover.signing_key();
-		let (order, previous) = rover.processor.prepare_outgoing().expect("the Rover chain reads");
-		let ack = rover.frame_builder.build_relay_ack_frame(0, order, previous, &key, cipher);
-		ack.expect("an ACK frame builds")
+	/// A frame of [`Branches`], which a table row names before the frames
+	/// exist.
+	#[derive(Clone, Copy)]
+	enum Pick {
+		/// The first ACK of the Rover chain.
+		First,
+		/// The second ACK of the Rover chain.
+		Second,
+		/// The ACK at order 2 of another branch.
+		Fork,
+		/// The ACK at order 3 of another branch.
+		ThirdFork,
 	}
 
-	/// The digest of the frame at the head of `chain`.
-	fn head_of(chain: &NodeChain) -> DigestInfo {
-		let (_, head) = chain.processor.prepare_outgoing().expect("the chain reads");
-		head.expect("the chain holds a frame")
+	/// How the first ACK of the Rover chain reaches the node.
+	#[derive(Clone, Copy)]
+	enum Delivery {
+		/// The node takes the ACK as it arrives from the Rover.
+		Taken,
+		/// The node sends the ACK as a frame of its own.
+		Sent,
 	}
 
-	/// Builds the ACK of the Rover at `order` on `branch`, over a predecessor
-	/// that no node holds.
-	fn fork_ack(branch: &NodeChain, order: u64, cipher: &SharedCipher) -> Frame {
-		let key = DtnRole::Rover.signing_key();
-		let unknown = digest::<Sha3_256>(b"a frame of another branch").expect("SHA3-256 digests");
-		let builder = &branch.frame_builder;
-		let ack = builder.build_relay_ack_frame(0, order, Some(unknown), &key, cipher);
-		ack.expect("an ACK of another branch builds")
-	}
-
-	/// Builds a standby command of Mission Control at order 2 on `branch`,
-	/// over a predecessor that no node holds.
-	fn stray_command(branch: &NodeChain, cipher: &SharedCipher) -> Frame {
-		let key = DtnRole::MissionControl.signing_key();
-		let unknown = digest::<Sha3_256>(b"a frame that no node holds").expect("SHA3-256 digests");
-		let command = EarthCommand::new(RoverCommand::Standby, MessagePriority::Standard, 0);
-		let command = command.expect("a standby command has no parameter");
-		let builder = &branch.frame_builder;
-		let frame = builder.build_relay_command_frame(command, 2, Some(unknown), &key, cipher);
-		frame.expect("a stray command builds")
-	}
-
-	/// Opens `frame`, which `role` signs, as it arrives from `side`.
-	async fn arrival(frame: &Frame, role: DtnRole, side: PathSide, cipher: &SharedCipher) -> ChainFrame {
-		let signed = SignedFrame::from_peer(frame.to_owned(), role, side);
-		let signed = signed.expect("the signer of the role verifies the frame");
-		let entry = ChainFrame::open(signed, cipher).await;
-		entry.expect("the frame opens as a frame of the chain")
-	}
-
-	/// The orders of `frames`, in order.
-	fn orders_of(frames: &[ChainFrame]) -> Vec<u64> {
-		frames.iter().map(ChainFrame::order).collect()
+	impl Delivery {
+		/// Delivers `frame` to `node` this way.
+		///
+		/// # Errors
+		///
+		/// - The errors of [`ChainProcessor::process_incoming`] and [`ChainProcessor::finalize_outgoing`].
+		fn deliver(self, node: &NodeChain, frame: &Frame) -> Result<(), TightBeamError> {
+			match self {
+				Self::Taken => node.take(frame, DtnRole::Rover, PathSide::Mars).map(drop),
+				Self::Sent => node.processor.finalize_outgoing(frame),
+			}
+		}
 	}
 
 	/// A node with an empty chain, the first two ACKs of a Rover chain, and
@@ -408,8 +397,6 @@ mod tests {
 		fork: Frame,
 		/// The ACK at order 3 of another branch, which forks the chain.
 		third_fork: Frame,
-		/// The cipher of the ACKs.
-		cipher: SharedCipher,
 		/// The storage root of the chains, which lives as long as the node.
 		root: StorageRoot,
 	}
@@ -419,23 +406,47 @@ mod tests {
 		/// ACKs.
 		fn new() -> Self {
 			let root = StorageRoot::create().expect("the storage root opens");
-			let cipher = generate_shared_cipher();
 			let rover = NodeChain::open(&root, "rover").expect("the Rover chain opens");
 			let branch = NodeChain::open(&root, "branch").expect("the branch chain opens");
 			let node = NodeChain::open(&root, "node").expect("the node chain opens");
-			let first = rover_ack(&rover, &cipher);
-			let second = rover_ack(&rover, &cipher);
-			let fork = fork_ack(&branch, 2, &cipher);
-			let third_fork = fork_ack(&branch, 3, &cipher);
+			let first = rover.rover_ack();
+			let second = rover.rover_ack();
+			let fork = branch.fork_ack(2);
+			let third_fork = branch.fork_ack(3);
 
-			Self { node, first, second, fork, third_fork, cipher, root }
+			Self { node, first, second, fork, third_fork, root }
+		}
+
+		/// The branches after the node took each of `picks` in turn.
+		fn having_taken(picks: &[Pick]) -> Self {
+			let branches = Self::new();
+			for &pick in picks {
+				let taken = branches.take(branches.pick(pick));
+				taken.expect("the node takes each frame of the arrange");
+			}
+
+			branches
+		}
+
+		/// The frame that `pick` names.
+		fn pick(&self, pick: Pick) -> &Frame {
+			match pick {
+				Pick::First => &self.first,
+				Pick::Second => &self.second,
+				Pick::Fork => &self.fork,
+				Pick::ThirdFork => &self.third_fork,
+			}
+		}
+
+		/// `frame` as it arrives at the node from the Rover.
+		fn arrival(&self, frame: &Frame) -> ChainFrame {
+			ChainFrame::arriving(frame, DtnRole::Rover, PathSide::Mars)
 		}
 
 		/// Takes `frame` into the chain of the node, as the frame arrives from
 		/// the Rover.
-		async fn take(&self, frame: &Frame) -> Result<ProcessResult, TightBeamError> {
-			let entry = arrival(frame, DtnRole::Rover, PathSide::Mars, &self.cipher).await;
-			self.node.processor.process_incoming(entry)
+		fn take(&self, frame: &Frame) -> Result<ProcessResult, TightBeamError> {
+			self.node.take(frame, DtnRole::Rover, PathSide::Mars)
 		}
 
 		/// Puts a directory at the file of `frame`, so its removal fails.
@@ -455,285 +466,229 @@ mod tests {
 		refused: Frame,
 		/// The digest of the lost ACK, the last frame of the hole.
 		lost: DigestInfo,
-		/// The digest of the ACK that finds the buffer full.
-		refused_digest: DigestInfo,
+		/// The storage root of the chains, which lives as long as the node.
+		_root: StorageRoot,
 	}
 
 	impl FullBuffer {
-		/// Opens a Rover chain and a node under `root`, and fills the order
-		/// buffer of the node with the ACKs after the first.
-		async fn new(root: &StorageRoot, cipher: &SharedCipher) -> Self {
-			let rover = NodeChain::open(root, "rover").expect("the Rover chain opens");
-			let node = NodeChain::open(root, "node").expect("the node chain opens");
+		/// Opens a Rover chain and a node under a storage root of their own,
+		/// and fills the order buffer of the node with the ACKs after the
+		/// first.
+		fn new() -> Self {
+			let root = StorageRoot::create().expect("the storage root opens");
+			let rover = NodeChain::open(&root, "rover").expect("the Rover chain opens");
+			let node = NodeChain::open(&root, "node").expect("the node chain opens");
 
-			rover_ack(&rover, cipher);
+			rover.advance(1);
 
-			let lost = head_of(&rover);
+			let lost = rover.head();
 			for _ in 0..ORDER_BUFFER_FRAMES {
-				let entry = arrival(&rover_ack(&rover, cipher), DtnRole::Rover, PathSide::Mars, cipher).await;
-				let held = node.processor.process_incoming(entry);
+				let held = node.take(&rover.rover_ack(), DtnRole::Rover, PathSide::Mars);
 				held.expect("the buffer holds an ACK after the lost one");
 			}
 
-			let refused = rover_ack(&rover, cipher);
-			let refused_digest = head_of(&rover);
+			let refused = rover.rover_ack();
+			Self { node, refused, lost, _root: root }
+		}
 
-			Self { node, refused, lost, refused_digest }
+		/// Takes the ACK that finds the buffer full, as it arrives from the
+		/// Rover.
+		fn take_refused(&self) -> Result<ProcessResult, TightBeamError> {
+			self.node.take(&self.refused, DtnRole::Rover, PathSide::Mars)
 		}
 	}
 
 	/// A frame that finds the buffer full asks for the hole before the held
 	/// frames, so a failed recovery asks again at the next arrival.
-	#[tokio::test]
-	async fn a_frame_that_finds_the_buffer_full_asks_for_the_hole() -> Result<(), TightBeamError> {
-		let root = StorageRoot::create()?;
-		let cipher = generate_shared_cipher();
-		let full = FullBuffer::new(&root, &cipher).await;
-		let refused = arrival(&full.refused, DtnRole::Rover, PathSide::Mars, &cipher).await;
+	#[test]
+	fn a_frame_that_finds_the_buffer_full_asks_for_the_hole() -> TestResult {
+		let full = FullBuffer::new();
 
-		let taken = full.node.processor.process_incoming(refused)?;
-		let hole_end = full.lost.digest.as_bytes();
-		assert!(matches!(taken, ProcessResult::ChainGap { missing_hash, .. } if missing_hash == hole_end));
+		let taken = full.take_refused()?;
+		let current_head = MessageChainState::EMPTY_HEAD.to_vec();
+		let missing_hash = full.lost.digest.as_bytes().to_vec();
+		assert_eq!(taken, ProcessResult::ChainGap { current_head, missing_hash });
 		Ok(())
 	}
 
 	/// A frame that finds the buffer full stays out of the store, which
 	/// answers the frame requests of other nodes.
-	#[tokio::test]
-	async fn a_frame_that_finds_the_buffer_full_stays_out_of_the_store() -> Result<(), TightBeamError> {
-		let root = StorageRoot::create()?;
-		let cipher = generate_shared_cipher();
-		let full = FullBuffer::new(&root, &cipher).await;
-		let refused = arrival(&full.refused, DtnRole::Rover, PathSide::Mars, &cipher).await;
-
-		full.node.processor.process_incoming(refused)?;
-
-		assert!(!full.node.processor.stores(full.refused_digest.digest.as_bytes())?);
+	#[test]
+	fn a_frame_that_finds_the_buffer_full_stays_out_of_the_store() -> TestResult {
+		let full = FullBuffer::new();
+		full.take_refused()?;
+		assert!(!full.node.stores(&full.refused));
 		Ok(())
 	}
 
 	/// A walk that never meets the head of the requester answers no frame,
 	/// so a request gets no more than the hole that it names.
 	#[test]
-	fn a_walk_that_misses_the_head_of_the_requester_answers_nothing() -> Result<(), TightBeamError> {
+	fn a_walk_that_misses_the_head_of_the_requester_answers_nothing() -> TestResult {
 		let root = StorageRoot::create()?;
-		let cipher = generate_shared_cipher();
 		let holder = NodeChain::open(&root, "holder")?;
-
-		rover_ack(&holder, &cipher);
-		rover_ack(&holder, &cipher);
+		holder.advance(2);
 
 		let unknown = digest::<Sha3_256>(b"a head that the walk never meets")?;
-		let answer = holder
-			.processor
-			.request_missing_frames(unknown.digest.as_bytes(), head_of(&holder).digest.as_bytes())?;
+		let requester_head = unknown.digest.as_bytes();
+		let head = holder.head();
+		let processor = &holder.processor;
 
+		let answer = processor.request_missing_frames(requester_head, head.digest.as_bytes())?;
 		assert!(answer.is_empty());
 		Ok(())
 	}
 
-	/// A frame that repeats a frame of the chain passes as a duplicate.
-	#[tokio::test]
-	async fn a_repeat_of_a_frame_of_the_chain_passes_as_a_duplicate() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.first).await?;
-
-		let repeat = branches.take(&branches.first).await?;
-		assert!(matches!(repeat, ProcessResult::Duplicate));
-		Ok(())
+	// A repeat of a frame at a taken slot gets the answer of its first copy.
+	tb_cases! {
+		fn a_repeat_answers_as_its_first_copy((pick, answer): (Pick, ProcessResult)) -> TestResult {
+			let branches = Branches::having_taken(&[pick]);
+			let repeat = branches.take(branches.pick(pick))?;
+			assert_eq!(repeat, answer);
+			Ok(())
+		}
+		cases {
+			/// A repeat of a released frame passes as a duplicate.
+			released => (Pick::First, ProcessResult::Duplicate),
+			/// A repeat of a held frame waits as its first copy does.
+			held => (Pick::Second, ProcessResult::Buffered),
+		}
 	}
 
-	/// Another frame at an order that the chain holds is no duplicate, so the
-	/// buffer refuses it as a repeated order.
-	#[tokio::test]
-	async fn another_frame_at_an_order_of_the_chain_is_refused_as_repeated() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.first).await?;
-		branches.take(&branches.second).await?;
-
-		let refusal = branches.take(&branches.fork).await;
-		let repeated = Some(TransitStatus::AlreadyExists);
-		assert!(matches!(refusal, Err(TightBeamError::TransportError(error)) if error.transit_status() == repeated));
-		Ok(())
+	// Another frame at an order that the node took is no duplicate, so the
+	// buffer refuses it as a frame that exists, and the frame at the order
+	// keeps its slot.
+	tb_cases! {
+		fn another_frame_at_a_taken_order_is_refused_as_existing(taken: &[Pick]) -> TestResult {
+			let branches = Branches::having_taken(taken);
+			let refusal = branches.take(&branches.fork);
+			assert_eq!(refusal.err().and_then(transit_status_of), Some(TransitStatus::AlreadyExists));
+			Ok(())
+		}
+		cases {
+			/// The chain holds a frame at the order.
+			released_order => &[Pick::First, Pick::Second],
+			/// The buffer holds a frame at the order.
+			held_order => &[Pick::Second],
+		}
 	}
 
-	/// A frame that forks the chain at its turn leaves the turn open, so the
-	/// frame of the chain at that order extends the chain.
-	#[tokio::test]
-	async fn the_frame_of_the_chain_takes_the_turn_that_a_fork_missed() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.first).await?;
-		branches.take(&branches.fork).await?;
-
-		let taken = branches.take(&branches.second).await?;
-
-		assert!(matches!(taken, ProcessResult::Processed(frames) if frames.len() == 1));
-		Ok(())
+	// A frame that forks the chain at its turn leaves the turn open, so the
+	// frame of the chain at that order extends the chain.
+	tb_cases! {
+		fn the_frame_of_the_chain_takes_the_turn_that_a_fork_missed(arrivals: [Pick; 2]) -> TestResult {
+			let branches = Branches::having_taken(&arrivals);
+			let taken = branches.take(&branches.second)?;
+			assert_eq!(taken, ProcessResult::Processed(vec![branches.arrival(&branches.second)]));
+			Ok(())
+		}
+		cases {
+			/// The fork arrives at its turn, after the first ACK.
+			fork_at_its_turn => [Pick::First, Pick::Fork],
+			/// The fork waits in the buffer, and leaves it at its turn.
+			held_fork => [Pick::Fork, Pick::First],
+		}
 	}
 
-	/// A held frame that forks the chain at its turn leaves the buffer, so the
-	/// frame of the chain at that order extends the chain.
-	#[tokio::test]
-	async fn a_held_fork_leaves_its_turn_to_the_frame_of_the_chain() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.fork).await?;
-		branches.take(&branches.first).await?;
-
-		let taken = branches.take(&branches.second).await?;
-		assert!(matches!(taken, ProcessResult::Processed(frames) if frames.len() == 1));
-		Ok(())
-	}
-
-	/// A held frame that the chain refuses at its turn leaves the store, which
-	/// answers the frame requests of other nodes.
-	#[tokio::test]
-	async fn a_held_fork_leaves_the_store_at_its_turn() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		let fork_digest = digest::<Sha3_256>(branches.fork.to_der()?)?;
-
-		branches.take(&branches.fork).await?;
-		branches.take(&branches.first).await?;
-
-		assert!(!branches.node.processor.stores(fork_digest.digest.as_bytes())?);
-		Ok(())
-	}
-
-	/// A repeat of a held frame gets the answer of its first copy.
-	#[tokio::test]
-	async fn a_repeat_of_a_held_frame_answers_as_its_first_copy() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.second).await?;
-
-		let repeat = branches.take(&branches.second).await?;
-		assert!(matches!(repeat, ProcessResult::Buffered));
-		Ok(())
-	}
-
-	/// Another frame at the order of a held frame is refused, and the held
-	/// frame keeps its slot.
-	#[tokio::test]
-	async fn another_frame_at_a_held_order_is_refused() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.second).await?;
-
-		let refusal = branches.take(&branches.fork).await;
-		let held = Some(TransitStatus::AlreadyExists);
-		assert!(matches!(refusal, Err(TightBeamError::TransportError(error)) if error.transit_status() == held));
-		Ok(())
+	// A held fork leaves the store once the chain takes its turn, which the
+	// first ACK opens as it arrives or as the node sends it.
+	tb_cases! {
+		fn a_fork_leaves_the_store_once_the_chain_takes_its_turn(first: Delivery) -> TestResult {
+			let branches = Branches::having_taken(&[Pick::Fork]);
+			first.deliver(&branches.node, &branches.first)?;
+			assert!(!branches.node.stores(&branches.fork));
+			Ok(())
+		}
+		cases {
+			taken => Delivery::Taken,
+			sent => Delivery::Sent,
+		}
 	}
 
 	/// A held frame that a frame of the node passes leaves the store.
-	#[tokio::test]
-	async fn a_held_frame_that_an_outgoing_frame_passes_leaves_the_store() -> Result<(), TightBeamError> {
+	#[test]
+	fn a_held_frame_that_an_outgoing_frame_passes_leaves_the_store() -> TestResult {
 		let root = StorageRoot::create()?;
-		let cipher = generate_shared_cipher();
 		let node = NodeChain::open(&root, "node")?;
 		let branch = NodeChain::open(&root, "branch")?;
 		let origin = NodeChain::open(&root, "origin")?;
-		let held = stray_command(&branch, &cipher);
-		let held_digest = digest::<Sha3_256>(held.to_der()?)?;
-		let entry = arrival(&held, DtnRole::MissionControl, PathSide::Earth, &cipher).await;
-		node.processor.process_incoming(entry)?;
-		rover_ack(&origin, &cipher);
-		let passing = rover_ack(&origin, &cipher);
+		let held = branch.stray_command();
+
+		node.take(&held, DtnRole::MissionControl, PathSide::Earth)?;
+		origin.advance(1);
+
+		let passing = origin.rover_ack();
 
 		node.processor.finalize_outgoing(&passing)?;
 
-		assert!(!node.processor.stores(held_digest.digest.as_bytes())?);
+		assert!(!node.stores(&held));
 		Ok(())
 	}
 
 	/// A held frame at the turn that a frame of the node opens takes it at
 	/// once, and the chain releases it for the node to route.
-	#[tokio::test]
-	async fn a_frame_at_the_turn_that_an_outgoing_frame_opens_is_released() -> Result<(), TightBeamError> {
+	#[test]
+	fn a_frame_at_the_turn_that_an_outgoing_frame_opens_is_released() -> TestResult {
 		let branches = Branches::new();
-		branches.take(&branches.second).await?;
+		branches.take(&branches.second)?;
 		branches.node.processor.finalize_outgoing(&branches.first)?;
 
 		let released = branches.node.processor.take_released()?;
-		assert!(matches!(released.as_slice(), [frame] if frame.order() == 2));
+		assert_eq!(released, [branches.arrival(&branches.second)]);
 		Ok(())
 	}
 
-	/// A held fork at the turn that a frame of the node opens leaves the
-	/// buffer and the store at once.
-	#[tokio::test]
-	async fn a_fork_at_the_turn_that_an_outgoing_frame_opens_leaves_the_store() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		let fork_digest = digest::<Sha3_256>(branches.fork.to_der()?)?;
+	// A failed turn keeps the frames that the chain took for the next take,
+	// and the failure names the fault of the store.
+	tb_cases! {
+		fn a_failed_turn_keeps_the_frames_that_the_chain_took((first, kept): (Delivery, Vec<u64>)) -> TestResult {
+			let branches = Branches::having_taken(&[Pick::Second, Pick::ThirdFork]);
+			branches.block_removal_of(&branches.third_fork);
 
-		branches.take(&branches.fork).await?;
-		branches.node.processor.finalize_outgoing(&branches.first)?;
-
-		assert!(!branches.node.processor.stores(fork_digest.digest.as_bytes())?);
-		Ok(())
+			let failed = first.deliver(&branches.node, &branches.first);
+			let released = branches.node.processor.take_released()?;
+			assert!(matches!(failed, Err(TightBeamError::IoError(_))));
+			assert_eq!(orders_of(&released), kept);
+			Ok(())
+		}
+		cases {
+			/// An arrival opens the turn, so the chain took the first ACK too.
+			taken => (Delivery::Taken, vec![1, 2]),
+			/// A send opens the turn, so the node routes the first ACK itself.
+			sent => (Delivery::Sent, vec![2]),
+		}
 	}
 
-	/// A failed turn keeps the frames that the chain took for the next take.
-	#[tokio::test]
-	async fn a_failed_turn_keeps_the_frames_that_the_chain_took() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.second).await?;
-		branches.take(&branches.third_fork).await?;
-		branches.block_removal_of(&branches.third_fork);
-
-		let failed = branches.take(&branches.first).await;
-
-		let kept = branches.node.processor.take_released()?;
-		assert!(failed.is_err());
-		assert_eq!(orders_of(&kept), [1, 2]);
-		Ok(())
-	}
-
-	/// A failed turn that a send opens keeps the frames that the chain took.
-	#[tokio::test]
-	async fn a_failed_turn_that_a_send_opens_keeps_the_frames_that_the_chain_took() -> Result<(), TightBeamError> {
-		let branches = Branches::new();
-		branches.take(&branches.second).await?;
-		branches.take(&branches.third_fork).await?;
-		branches.block_removal_of(&branches.third_fork);
-
-		let failed = branches.node.processor.finalize_outgoing(&branches.first);
-
-		let kept = branches.node.processor.take_released()?;
-		assert!(failed.is_err());
-		assert_eq!(orders_of(&kept), [2]);
-		Ok(())
-	}
-
-	/// A refused frame of an answer keeps the frames before it.
-	#[tokio::test]
-	async fn a_refused_frame_of_an_answer_keeps_the_frames_before_it() -> Result<(), TightBeamError> {
+	/// A refused frame of an answer keeps the frames before it, and the
+	/// refusal names the order that the chain holds.
+	#[test]
+	fn a_refused_frame_of_an_answer_keeps_the_frames_before_it() -> TestResult {
 		let branches = Branches::new();
 		let other = NodeChain::open(&branches.root, "other")?;
-		let other_first = rover_ack(&other, &branches.cipher);
-		branches.take(&branches.second).await?;
+		let other_first = other.rover_ack();
+		branches.take(&branches.second)?;
 
-		let first = arrival(&branches.first, DtnRole::Rover, PathSide::Mars, &branches.cipher).await;
-		let refused = arrival(&other_first, DtnRole::Rover, PathSide::Mars, &branches.cipher).await;
+		let first = branches.arrival(&branches.first);
+		let refused = branches.arrival(&other_first);
 
 		let failed = branches.node.processor.fill(vec![first, refused]);
 		let kept = branches.node.processor.take_released()?;
-		assert!(failed.is_err());
+		assert_eq!(failed.err().and_then(transit_status_of), Some(TransitStatus::AlreadyExists));
 		assert_eq!(orders_of(&kept), [1, 2]);
 		Ok(())
 	}
 
 	/// A chain at the last order refuses to prepare a next frame.
 	#[test]
-	fn a_chain_at_the_last_order_prepares_no_frame() -> Result<(), TightBeamError> {
+	fn a_chain_at_the_last_order_prepares_no_frame() -> TestResult {
 		let root = StorageRoot::create()?;
-		let store = FrameStore::new(root.node("node"))?;
+		let store = Arc::new(RwLock::new(root.store("node")));
 		let mut chain = MessageChainState::new("node");
 		chain.sequence = u64::MAX;
 
-		let buffer = OutOfOrderBuffer::new(ORDER_BUFFER_FRAMES);
-		let processor = ChainProcessor::new(
-			Arc::new(RwLock::new(store)),
-			Arc::new(RwLock::new(chain)),
-			Arc::new(RwLock::new(buffer)),
-		);
+		let chain = Arc::new(RwLock::new(chain));
+		let buffer = Arc::new(RwLock::new(OutOfOrderBuffer::new(ORDER_BUFFER_FRAMES)));
+		let processor = ChainProcessor::new(store, chain, buffer);
 
 		let prepared = processor.prepare_outgoing();
 		assert!(matches!(prepared, Err(TightBeamError::InvalidOrder)));

@@ -1,11 +1,12 @@
-//! Teardown runs when the scenario body panics
+//! Teardown runs when the scenario body panics.
 //!
 //! A test fails by panicking, so the statement after the client closure is
 //! the one a failing run skips. These tests drive an internal `tb_scenario!`
 //! arm down that path and check the scenario still released what it started.
 
-#![cfg(all(feature = "testing", feature = "tokio"))]
+#![cfg(feature = "tokio")]
 
+use core::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,12 +50,33 @@ async fn count_until_aborted(ticks: Arc<AtomicU64>) {
 
 /// Whether `ticks` stands still once the runtime has retired whatever was
 /// advancing it.
+///
+/// The sleeps stay because no public event marks the abort of a spawned task.
+/// Each caller runs on a paused clock, so each sleep advances it at once.
 async fn stands_still(ticks: &AtomicU64) -> bool {
 	sleep(Duration::from_millis(50)).await;
 	let settled = ticks.load(Ordering::SeqCst);
 	sleep(Duration::from_millis(50)).await;
 
 	ticks.load(Ordering::SeqCst) == settled
+}
+
+/// The accepted config of a scenario under [`ServerUpSpec`].
+fn server_up() -> ScenarioConfig {
+	let built = ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build();
+	built.expect("a spec that requires an event is an effective verifier")
+}
+
+/// Whether `scenario` panics as it runs to its end.
+async fn panics(scenario: impl Future) -> bool {
+	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
+	outcome.is_err()
+}
+
+/// Whether `scenario` panics as it runs.
+fn panics_sync<T>(scenario: impl FnOnce() -> T) -> bool {
+	let outcome = catch_unwind(AssertUnwindSafe(scenario));
+	outcome.is_err()
 }
 
 /// A value an arm hands to its closure. Its drop is the observable form of
@@ -67,13 +89,15 @@ impl Drop for Released {
 	}
 }
 
+/// The bare async arm drops its context when the exec closure panics, and the
+/// panic reaches the caller.
 #[tokio::test]
 async fn a_panicking_bare_async_body_still_releases_the_context() {
 	let released = Arc::new(AtomicBool::new(false));
 	let guard = Released(Arc::clone(&released));
 	let scenario = async move {
 		tb_scenario!(@run_bare_async
-			config: ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build(),
+			config: Ok::<_, TightBeamError>(server_up()),
 			context: [ guard ],
 			exec: |SetupEnv { trace, .. }| async move {
 				trace.event(SERVER_UP)?;
@@ -82,18 +106,18 @@ async fn a_panicking_bare_async_body_still_releases_the_context() {
 		)
 	};
 
-	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-	assert!(outcome.is_err(), "the exec closure's panic must reach the caller");
-	assert!(released.load(Ordering::SeqCst), "the scenario context outlived the scenario");
+	let panicked = panics(scenario).await;
+	assert_eq!((panicked, released.load(Ordering::SeqCst)), (true, true));
 }
 
+/// The bare sync arm drops its context when the exec closure panics, and the
+/// panic reaches the caller.
 #[test]
 fn a_panicking_bare_sync_body_still_releases_the_context() {
 	let released = Arc::new(AtomicBool::new(false));
 	let guard = Released(Arc::clone(&released));
 	let scenario = move || {
-		let scenario_config = ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build();
-		let config = tightbeam::__tb_accept_config!(scenario_config);
+		let config = server_up();
 		let trace = config.trace();
 
 		tb_scenario!(@run_bare_sync
@@ -107,15 +131,15 @@ fn a_panicking_bare_sync_body_still_releases_the_context() {
 		)
 	};
 
-	let outcome = catch_unwind(AssertUnwindSafe(scenario));
-	assert!(outcome.is_err(), "the exec closure's panic must reach the caller");
-	assert!(released.load(Ordering::SeqCst), "the scenario context outlived the scenario");
+	let panicked = panics_sync(scenario);
+	assert_eq!((panicked, released.load(Ordering::SeqCst)), (true, true));
 }
 
+/// The pipeline arm drops its share of the trace when the exec closure panics,
+/// and the panic reaches the caller.
 #[test]
 fn a_panicking_pipeline_body_still_releases_the_trace() {
-	let scenario_config = ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build();
-	let config = tightbeam::__tb_accept_config!(scenario_config);
+	let config = server_up();
 	let held = config.trace();
 	let scenario = move || {
 		tb_scenario!(@run_pipeline
@@ -126,18 +150,18 @@ fn a_panicking_pipeline_body_still_releases_the_trace() {
 		)
 	};
 
-	let outcome = catch_unwind(AssertUnwindSafe(scenario));
-	assert!(outcome.is_err(), "the exec closure's panic must reach the caller");
-	assert_eq!(Arc::strong_count(&held), 1, "the pipeline's trace share outlived the scenario");
+	let panicked = panics_sync(scenario);
+	assert_eq!((panicked, Arc::strong_count(&held)), (true, 1));
 }
 
+/// The hive arm drops the hive that its start closure built when the client
+/// closure panics, and the panic reaches the caller.
 #[tokio::test]
 async fn a_panicking_client_closure_still_releases_the_hive() {
 	let released = Arc::new(AtomicBool::new(false));
 	let recorded = Arc::clone(&released);
 	let scenario = async move {
-		let scenario_config = ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build();
-		let config = tightbeam::__tb_accept_config!(scenario_config);
+		let config = server_up();
 		let trace = config.trace();
 
 		tb_scenario!(@run_hive
@@ -155,18 +179,19 @@ async fn a_panicking_client_closure_still_releases_the_hive() {
 		)
 	};
 
-	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-	assert!(outcome.is_err(), "the client closure's panic must reach the caller");
-	assert!(released.load(Ordering::SeqCst), "the hive outlived the scenario");
+	let panicked = panics(scenario).await;
+	assert_eq!((panicked, released.load(Ordering::SeqCst)), (true, true));
 }
 
+/// The service arm aborts its server task when the client closure panics, and
+/// the panic reaches the caller.
 #[tokio::test(start_paused = true)]
 async fn a_panicking_client_closure_still_aborts_the_server_task() {
 	let ticks = Arc::new(AtomicU64::new(0));
 	let counted = Arc::clone(&ticks);
 	let scenario = async move {
 		tb_scenario!(@run_service_client
-			config: ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build(),
+			config: Ok::<_, TightBeamError>(server_up()),
 			context: [ counted ],
 			server: |SetupEnv { trace, context }| async move {
 				let handle = tokio::spawn(count_until_aborted(Arc::clone(&context)));
@@ -180,9 +205,9 @@ async fn a_panicking_client_closure_still_aborts_the_server_task() {
 		)
 	};
 
-	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-	assert!(outcome.is_err(), "the client closure's panic must reach the caller");
-	assert!(stands_still(&ticks).await, "the server task outlived the scenario");
+	let panicked = panics(scenario).await;
+	let aborted = stands_still(&ticks).await;
+	assert_eq!((panicked, aborted), (true, true));
 }
 
 /// The message the spinning worker consumes.
@@ -213,7 +238,7 @@ async fn a_panicking_stimulus_closure_still_aborts_the_worker() {
 	let counted = Arc::clone(&ticks);
 	let scenario = async move {
 		tb_scenario!(@run_worker
-			config: ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build(),
+			config: Ok::<_, TightBeamError>(server_up()),
 			context: [ counted ],
 			setup: |SetupEnv { context, .. }: SetupEnv<Arc<AtomicU64>>| {
 				SpinningWorker::new(SpinningWorkerConfig { ticks: Arc::clone(&*context) })
@@ -227,14 +252,16 @@ async fn a_panicking_stimulus_closure_still_aborts_the_worker() {
 		)
 	};
 
-	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-	assert!(outcome.is_err(), "the stimulus closure's panic must reach the caller");
-	assert_ne!(ticks.load(Ordering::SeqCst), 0, "the worker's handler never ran");
-	assert!(stands_still(&ticks).await, "the worker's handler outlived the scenario");
+	let panicked = panics(scenario).await;
+	let ran = ticks.load(Ordering::SeqCst) > 0;
+	let aborted = stands_still(&ticks).await;
+	assert_eq!((panicked, ran, aborted), (true, true, true));
 }
 
-/// Stands in for a started servlet. `@run_servlet` reads `addr` and stops the
-/// instance, and asks nothing else of it, so no listener is needed here.
+/// Stands in for a started servlet, because a real servlet shows its stop as
+/// a closed listener alone, which a test reads only through a poll.
+/// `@run_servlet` reads `addr` and stops the instance, so the stop call is
+/// the teardown under test.
 struct StubServlet {
 	stopped: Arc<AtomicBool>,
 }
@@ -249,14 +276,15 @@ impl StubServlet {
 	}
 }
 
+/// The servlet arm stops its servlet when the client closure panics, and the
+/// panic reaches the caller.
 #[tokio::test]
 async fn a_panicking_client_closure_still_stops_the_servlet() {
 	let stopped = Arc::new(AtomicBool::new(false));
 	let recorded = Arc::clone(&stopped);
 
 	let scenario = async move {
-		let scenario_config = ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build();
-		let config = tightbeam::__tb_accept_config!(scenario_config);
+		let config = server_up();
 		let trace = config.trace();
 
 		tb_scenario!(@run_servlet
@@ -279,13 +307,13 @@ async fn a_panicking_client_closure_still_stops_the_servlet() {
 		)
 	};
 
-	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-	assert!(outcome.is_err(), "the client closure's panic must reach the caller");
-	assert!(stopped.load(Ordering::SeqCst), "the servlet outlived the scenario");
+	let panicked = panics(scenario).await;
+	assert_eq!((panicked, stopped.load(Ordering::SeqCst)), (true, true));
 }
 
-/// Stands in for a cluster gateway. `@run_cluster` reads `addr` and hands the
-/// instance to the client closure.
+/// Stands in for a cluster gateway, because `@run_cluster` reads its `addr`
+/// alone and hands it to the stand-in hives, whose registration answers at
+/// once. The arm hands the instance to the client closure.
 #[cfg(feature = "colony")]
 struct StubCluster;
 
@@ -296,7 +324,10 @@ impl StubCluster {
 	}
 }
 
-/// Stands in for a registered hive. The arm registers it, then owns the stop.
+/// Stands in for a registered hive, because a real hive shows its stop as a
+/// closed listener alone, which a test reads only through a poll. The arm
+/// registers it, then owns the stop, so the stop call is the teardown under
+/// test.
 #[cfg(feature = "colony")]
 struct StubHive {
 	stopped: Arc<AtomicBool>,
@@ -313,14 +344,15 @@ impl StubHive {
 	}
 }
 
+/// The cluster arm stops each hive that it registered when the client closure
+/// panics, and the panic reaches the caller.
 #[cfg(feature = "colony")]
 #[tokio::test]
 async fn a_panicking_client_closure_still_stops_the_registered_hives() {
 	let stopped = Arc::new(AtomicBool::new(false));
 	let recorded = Arc::clone(&stopped);
 	let scenario = async move {
-		let scenario_config = ScenarioConfig::builder().with_spec(ServerUpSpec::latest()).build();
-		let config = tightbeam::__tb_accept_config!(scenario_config);
+		let config = server_up();
 		let trace = config.trace();
 
 		tb_scenario!(@run_cluster
@@ -343,7 +375,6 @@ async fn a_panicking_client_closure_still_stops_the_registered_hives() {
 		)
 	};
 
-	let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-	assert!(outcome.is_err(), "the client closure's panic must reach the caller");
-	assert!(stopped.load(Ordering::SeqCst), "the registered hive outlived the scenario");
+	let panicked = panics(scenario).await;
+	assert_eq!((panicked, stopped.load(Ordering::SeqCst)), (true, true));
 }

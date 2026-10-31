@@ -13,15 +13,7 @@
 //! - [`streaming`]: routed stream and duplex opens
 //! - [`organizations`]: multi-org trust layouts
 
-#![cfg(all(
-	feature = "std",
-	feature = "tokio",
-	feature = "testing",
-	feature = "testing-csp",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature"
-))]
+#![cfg(feature = "testing-csp")]
 
 mod common;
 mod events;

@@ -447,9 +447,10 @@ tb_assert_spec! {
 	}
 }
 
+// The body records the order of the process, so the refinement admits it.
 #[cfg(feature = "testing-fdr")]
 tb_scenario! {
-	name: cluster_multi_org_control_plane_refines_model,
+	name: cluster_multi_org_model_admits_learn_before_forward,
 	config: multi_org_model_config(ClusterMultiOrgModelSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

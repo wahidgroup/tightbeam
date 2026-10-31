@@ -9,9 +9,11 @@ use core::borrow::Borrow;
 
 use tightbeam::asn1::Frame;
 use tightbeam::compress::{Inflator, ZstdCompression};
+use tightbeam::runtime::rt;
 use tightbeam::TightBeamError;
 
-use crate::dtn::certs::{FrameSigner, SharedCipher};
+use crate::dtn::certs::{generate_shared_cipher, FrameSigner, SharedCipher};
+use crate::dtn::fault_matrix::FaultMatrix;
 use crate::dtn::messages::{ChainMessage, FrameRequest, FrameResponse, RelayMessage};
 use crate::dtn::nodes::{DtnRole, PathSide};
 
@@ -96,11 +98,16 @@ impl Intake {
 	///
 	/// # Errors
 	///
+	/// - [`TightBeamError::MissingSignature`] -- Mission Control does not sign the command of the frame.
 	/// - [`TightBeamError`] -- the frame fails to decrypt, to inflate, or to decode as a [`RelayMessage`].
 	pub async fn open(signed: SignedFrame, cipher: &SharedCipher) -> Result<Self, TightBeamError> {
-		let SignedFrame { frame, side, .. } = signed;
+		let SignedFrame { frame, side, role } = signed;
 		let message = Self::message_of(&frame, cipher).await?;
 		let intake = match message {
+			// Mission Control alone issues a command.
+			RelayMessage::Command(_) if role != DtnRole::MissionControl => {
+				return Err(TightBeamError::MissingSignature);
+			}
 			RelayMessage::Command(command) => Self::chain(frame, ChainMessage::Command(command), side),
 			RelayMessage::Telemetry(telemetry) => Self::chain(frame, ChainMessage::Telemetry(telemetry), side),
 			RelayMessage::CommandAck(ack) => Self::chain(frame, ChainMessage::CommandAck(ack), side),
@@ -138,7 +145,7 @@ impl Intake {
 ///
 /// [`Intake::open`] makes each one from a [`SignedFrame`], so its side comes
 /// from the signer check.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ChainFrame {
 	/// The sealed frame, as it arrived.
 	frame: Frame,
@@ -163,6 +170,16 @@ impl ChainFrame {
 		}
 	}
 
+	/// `frame` as a node takes it from the peer `signer` on `side`, opened
+	/// under the shared cipher of the path. It expects the signer of the peer
+	/// to verify the frame and the frame to open as a frame of the chain.
+	pub fn arriving(frame: &Frame, signer: DtnRole, side: PathSide) -> Self {
+		let signed = SignedFrame::from_peer(frame.to_owned(), signer, side);
+		let signed = signed.expect("the signer of the peer verifies the frame");
+		let entry = rt::block_on(Self::open(signed, &generate_shared_cipher()));
+		entry.expect("the frame opens as a frame of the chain")
+	}
+
 	/// The sealed frame, as it arrived.
 	pub fn frame(&self) -> &Frame {
 		&self.frame
@@ -183,6 +200,15 @@ impl ChainFrame {
 		self.side
 	}
 
+	/// The fault flags in the matrix of the frame.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the flags fail to read from the matrix.
+	pub fn fault_matrix(&self) -> Result<FaultMatrix, TightBeamError> {
+		FaultMatrix::try_from(&self.frame.metadata().matrix().cloned())
+	}
+
 	/// The sealed frame, which a relay sends on.
 	pub fn into_frame(self) -> Frame {
 		self.frame
@@ -201,45 +227,53 @@ impl Borrow<Frame> for ChainFrame {
 	}
 }
 
-#[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::dtn::certs::generate_shared_cipher;
+	use crate::common::result::TestResult;
 	use crate::dtn::nodes::NodeChain;
 	use crate::dtn::storage::StorageRoot;
 
-	/// A frame request that the Mars Relay signs, for the frames between two
-	/// fixed test hashes.
-	fn frame_request(cipher: &SharedCipher) -> Frame {
+	/// A frame request that the Mars Relay signs.
+	fn frame_request() -> Frame {
 		let root = StorageRoot::create().expect("the storage root opens");
 		let chain = NodeChain::open(&root, "requester").expect("a node chain opens");
-		let request = FrameRequest::new([1; 32], [2; 32]).expect("two hashes fit an OCTET STRING");
-		let key = DtnRole::MarsRelay.signing_key();
-		let frame = chain.frame_builder.build_frame_request_frame(request, &key, cipher);
-		frame.expect("a frame request builds")
+		chain.frame_request(DtnRole::MarsRelay)
 	}
 
 	/// A frame request fails to open as a frame of the chain.
-	#[tokio::test]
-	async fn a_frame_request_opens_as_no_frame_of_the_chain() -> Result<(), TightBeamError> {
+	#[test]
+	fn a_frame_request_opens_as_no_frame_of_the_chain() -> TestResult {
 		let cipher = generate_shared_cipher();
-		let request = SignedFrame::from_peer(frame_request(&cipher), DtnRole::MarsRelay, PathSide::Mars)?;
+		let request = SignedFrame::from_peer(frame_request(), DtnRole::MarsRelay, PathSide::Mars)?;
 
-		let opened = ChainFrame::open(request, &cipher).await;
+		let opened = rt::block_on(ChainFrame::open(request, &cipher));
 		assert!(matches!(opened, Err(TightBeamError::InvalidBody)));
 		Ok(())
 	}
 
+	/// A command that the Mars Relay signs fails to open, because Mission
+	/// Control alone issues a command.
+	#[test]
+	fn a_command_that_a_relay_signs_opens_as_missing_its_signature() -> TestResult {
+		let root = StorageRoot::create()?;
+		let chain = NodeChain::open(&root, "relay")?;
+		let command = chain.command_signed_by(&DtnRole::MarsRelay.signing_key());
+		let signed = SignedFrame::from_peer(command, DtnRole::MarsRelay, PathSide::Earth)?;
+
+		let opened = rt::block_on(ChainFrame::open(signed, &generate_shared_cipher()));
+		assert!(matches!(opened, Err(TightBeamError::MissingSignature)));
+		Ok(())
+	}
+
 	/// A frame takes the side of the peer whose signer verifies it.
-	#[tokio::test]
-	async fn a_frame_takes_the_side_of_the_peer_whose_signer_verifies_it() -> Result<(), TightBeamError> {
-		let cipher = generate_shared_cipher();
+	#[test]
+	fn a_frame_takes_the_side_of_the_peer_whose_signer_verifies_it() -> TestResult {
 		let mission_control = DtnRole::MissionControl.signer();
 		let mars_relay = DtnRole::MarsRelay.signer();
 		let earth = (PathSide::Earth, DtnRole::MissionControl, &mission_control);
 		let mars = (PathSide::Mars, DtnRole::MarsRelay, &mars_relay);
 
-		let signed = SignedFrame::check(frame_request(&cipher), [earth, mars])?;
+		let signed = SignedFrame::check(frame_request(), [earth, mars])?;
 		assert_eq!(signed.side(), PathSide::Mars);
 		Ok(())
 	}

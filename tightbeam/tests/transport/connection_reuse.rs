@@ -34,7 +34,7 @@ use tightbeam::{
 };
 
 #[cfg(feature = "x509")]
-use crate::common::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
+use crate::transport::static_pair::{client_pinning, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY};
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{

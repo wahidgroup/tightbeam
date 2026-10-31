@@ -1,4 +1,4 @@
-//! Mux scenarios for the ping and ack control plane.
+//! The integration tests of the mux ping and ack control plane.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -10,12 +10,12 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::fixtures::TestTrace;
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::envelopes::{MuxEnvelope, MuxPingPackage};
+use tightbeam::transport::envelopes::MuxPingPackage;
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError};
-use tightbeam::{Frame, TightBeamError};
+use tightbeam::Frame;
 
-use crate::common::security::expectation_failure;
-use crate::transport::support::{await_ok, bind_encrypted_listener, mux_frame, mux_offer};
+use crate::common::result::TestResult;
+use crate::transport::fixtures::{await_ok, bind_encrypted_listener, mux_frame, mux_offer};
 
 use super::common::*;
 
@@ -80,38 +80,52 @@ tb_scenario! {
 	}
 }
 
-/// Read the next envelope, and require it to be the ack of the probe that
+/// The opaque value of the probe that the raw server writes.
+const PROBE: u64 = 42;
+
+/// Reads the next envelope, and requires it to be the ack of the probe that
 /// carries `opaque`.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- the read fails.
-/// - An expectation failure -- the envelope is another record.
-async fn expect_ping_ack(link: &mut ClientMuxServerRaw, opaque: u64) -> Result<(), TightBeamError> {
-	let ack = link.server_reader.read_envelope().await?;
-	match ack {
-		TransportEnvelope::Mux(MuxEnvelope::Ping(package)) if package.ack() && package.opaque() == opaque => Ok(()),
-		_ => Err(expectation_failure(
-			"the client reader must answer the probe with a matching ack",
-		)),
-	}
+async fn expect_ping_ack(link: &mut ClientMuxServerRaw, opaque: u64) {
+	let ack = link.server_reader.read_envelope().await;
+	let ack = ack.expect("the raw server reads the next envelope");
+	assert_eq!(ack, TransportEnvelope::from(MuxPingPackage::new(true, opaque)));
 }
 
-/// The mux client answers a probe written on raw halves with its ack, and it
-/// discards an unsolicited ack and keeps the connection up.
-#[tokio::test]
-async fn mux_ping_wire_ack() -> Result<(), TightBeamError> {
-	let mut link = establish_client_mux_server_raw(4, TraceCollector::new()).await?;
+/// A raw link whose raw server wrote a probe to the muxed client.
+async fn after_a_probe() -> ClientMuxServerRaw {
+	let link = establish_client_mux_server_raw(4, TraceCollector::new()).await;
+	let mut link = link.expect("the raw link establishes");
 
-	let probe = MuxPingPackage::new(false, 42);
-	link.server_writer.write_envelope(probe.into()).await?;
-	expect_ping_ack(&mut link, 42).await?;
+	let probe = MuxPingPackage::new(false, PROBE);
+	let written = link.server_writer.write_envelope(probe.into()).await;
+	written.expect("the raw server writes its probe");
+	link
+}
+
+/// The mux client answers a probe written on raw halves with its ack, whose
+/// opaque value is the one of the probe.
+#[tokio::test]
+async fn a_mux_client_acks_a_probe_on_the_wire() -> TestResult {
+	let mut link = after_a_probe().await;
+	let ack = link.server_reader.read_envelope().await?;
+	assert_eq!(ack, TransportEnvelope::from(MuxPingPackage::new(true, PROBE)));
+	Ok(())
+}
+
+/// The mux client discards an unsolicited ack and keeps the connection up,
+/// so a follow-up stream echoes.
+#[tokio::test]
+async fn a_stray_ack_leaves_the_connection_up() -> TestResult {
+	let mut link = after_a_probe().await;
+	expect_ping_ack(&mut link, PROBE).await;
 
 	let stray_ack = MuxPingPackage::new(true, 999);
+	let followup = mux_frame("mux-ping-follow-up");
+
 	link.server_writer.write_envelope(stray_ack.into()).await?;
 
-	let followup_echoed = raw_echo_roundtrip(&mut link, &mux_frame("mux-ping-follow-up")).await?;
-	assert!(followup_echoed, "the connection must stay up after a stray ack");
+	let echoed = raw_echo_roundtrip(&mut link, &followup).await;
+	assert_eq!(echoed, Some(followup));
 	Ok(())
 }
 

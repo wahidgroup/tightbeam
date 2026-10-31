@@ -7,23 +7,25 @@
 //! every state of its process as visited, so its events show that a divergence
 //! event names a state where a seed diverged.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use tightbeam::instrumentation::events::{DIVERGENCE_DETECT, ENABLED_SET_SAMPLE};
 use tightbeam::instrumentation::TbInstrumentationConfig;
-use tightbeam::testing::fdr::{
-	DefaultCache, DefaultExplorationEngine, DefaultRefinementChecker, ExplorationCore, FdrConfig, FdrExplorer,
-	SeedResult, Trace,
-};
+use tightbeam::tb_cases;
+use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig, SeedResult, Trace};
 use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
-use tightbeam::trace::{TraceCollector, TraceConfig};
-use tightbeam::urn::Urn;
+use tightbeam::TightBeamError;
 
 #[cfg(feature = "testing-fault")]
 use tightbeam::testing::fdr::FaultModel;
+
+use crate::common::csp::{explorer_of, once};
+use crate::common::result::TestResult;
+use crate::common::trace::{instrumented_trace, recorded_labels};
+use crate::fdr::spinning;
 
 /// An exploration engine with a visited set of its own.
 struct OutsideEngine<'a> {
@@ -85,49 +87,65 @@ impl ExplorationCore for OutsideEngine<'_> {
 	}
 }
 
-/// An explorer of `process` under `config` that explores through `engine`
-/// and checks refinement through the house checker.
-fn explorer_over<'a, E: ExplorationCore>(
-	process: &'a Process,
-	config: Arc<FdrConfig>,
-	engine: E,
-) -> FdrExplorer<'a, E, DefaultRefinementChecker<'a, DefaultCache>> {
-	let cache = Rc::new(RefCell::new(DefaultCache::new()));
-	let checker = DefaultRefinementChecker::new(process, Arc::clone(&config), cache);
-
-	FdrExplorer::new_with_arc(process, config, engine, checker)
-}
-
-/// The labels of the `urn` events that `trace` recorded, in order.
-fn labels_of(trace: &TraceCollector, urn: Urn<'static>) -> Vec<String> {
-	let events = trace.drain_events();
-	let named = events.into_iter().filter(|event| event.urn == urn);
-	named.filter_map(|event| event.label.map(String::from)).collect()
-}
-
 /// A process that offers `go` at `Ready` and stops at `Done`.
-fn ready() -> Result<Process, ProcessBuildError> {
-	Process::builder("Ready")
+fn ready() -> Process {
+	once("Ready", ("Ready", "Done"), "go")
+}
+
+/// The process of [`ready`] beside `Island`, a state that offers `go` and that
+/// no path from `Ready` reaches, so no seed visits it.
+fn ready_beside_an_island() -> Process {
+	let built: Result<Process, ProcessBuildError> = Process::builder("Ready")
 		.initial_state(State("Ready"))
 		.add_observable(Event("go"))
 		.add_transition(State("Ready"), Event("go"), State("Done"))
+		.add_transition(State("Island"), Event("go"), State("Done"))
 		.add_terminal(State("Done"))
-		.build()
+		.build();
+
+	built.expect("a process of one event builds")
 }
 
-#[test]
-fn an_outside_engine_hands_its_visited_states_to_the_recorded_events() -> Result<(), Box<dyn std::error::Error>> {
-	let process = ready()?;
-	let config = Arc::new(FdrConfig::default());
-	let engine = OutsideEngine::new(&process, Arc::clone(&config));
+/// The label of each enabled set that an exploration of `process` records
+/// through the engine that `engine` builds, in the order of the state names.
+fn sampled_through<'a, E: ExplorationCore>(
+	process: &'a Process,
+	engine: impl FnOnce(&'a Process, Arc<FdrConfig>) -> E,
+) -> Result<Vec<Option<String>>, TightBeamError> {
 	let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
-	let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
-	let mut explorer = explorer_over(&process, config, engine);
-
+	let trace = instrumented_trace(settings);
+	let mut explorer = explorer_of(process, FdrConfig::default(), engine);
 	explorer.explore_into(&trace)?;
 
-	let labels = labels_of(&trace, ENABLED_SET_SAMPLE);
-	assert_eq!(labels, ["Ready.Done: {}", "Ready.Ready: {go}"]);
+	Ok(recorded_labels(&trace, ENABLED_SET_SAMPLE))
+}
+
+/// The explorer reads the visited set of an outside engine, so the enabled set
+/// of each state that a seed visits reaches the recorded events, and the set
+/// of `Island`, which no seed visits, stays out.
+#[test]
+fn an_outside_engine_hands_its_visited_states_to_the_recorded_events() -> TestResult {
+	let process = ready_beside_an_island();
+
+	let labels = sampled_through(&process, OutsideEngine::new)?;
+	let sampled = [Some("Ready.Done: {}".to_owned()), Some("Ready.Ready: {go}".to_owned())];
+	assert_eq!(labels, sampled);
+	Ok(())
+}
+
+/// An engine that reports `Island` gets its enabled set recorded, so the set
+/// that the engine reports decides which states the events cover.
+#[test]
+fn an_engine_that_reports_a_state_gets_its_enabled_set_recorded() -> TestResult {
+	let process = ready_beside_an_island();
+
+	let labels = sampled_through(&process, OverReportingEngine::new)?;
+	let sampled = [
+		Some("Ready.Done: {}".to_owned()),
+		Some("Ready.Island: {go}".to_owned()),
+		Some("Ready.Ready: {go}".to_owned()),
+	];
+	assert_eq!(labels, sampled);
 	Ok(())
 }
 
@@ -136,6 +154,13 @@ fn an_outside_engine_hands_its_visited_states_to_the_recorded_events() -> Result
 struct OverReportingEngine<'a> {
 	/// The engine that explores each seed.
 	inner: OutsideEngine<'a>,
+}
+
+impl<'a> OverReportingEngine<'a> {
+	/// An engine of `process` under `config`, before its first seed.
+	fn new(process: &'a Process, config: Arc<FdrConfig>) -> Self {
+		Self { inner: OutsideEngine::new(process, config) }
+	}
 }
 
 impl ExplorationCore for OverReportingEngine<'_> {
@@ -183,6 +208,14 @@ struct CountingEngine<'a> {
 	walked: Rc<Cell<u64>>,
 }
 
+impl<'a> CountingEngine<'a> {
+	/// An engine of `process` under `config` that counts its seeds into
+	/// `walked`.
+	fn new(process: &'a Process, config: Arc<FdrConfig>, walked: Rc<Cell<u64>>) -> Self {
+		Self { inner: OutsideEngine::new(process, config), walked }
+	}
+}
+
 impl ExplorationCore for CountingEngine<'_> {
 	type ForProcess<'p> = CountingEngine<'p>;
 
@@ -220,90 +253,61 @@ impl ExplorationCore for CountingEngine<'_> {
 	}
 }
 
-#[test]
-fn an_outside_engine_walks_every_seed() -> Result<(), Box<dyn std::error::Error>> {
-	let process = ready()?;
-	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
-	let walked = Rc::new(Cell::new(0));
-	let engine = CountingEngine {
-		inner: OutsideEngine::new(&process, Arc::clone(&config)),
-		walked: Rc::clone(&walked),
-	};
+// An outside engine walks each seed that the explorer hands it, the seeds of
+// each spec included.
+tb_cases! {
+	fn an_outside_engine_walks_each_seed((config, walked): (FdrConfig, u64)) -> TestResult {
+		let process = ready();
+		let counter = Rc::new(Cell::new(0));
+		let counting = |process, config| CountingEngine::new(process, config, Rc::clone(&counter));
 
-	let mut explorer = explorer_over(&process, config, engine);
-
-	explorer.explore()?;
-
-	assert_eq!(walked.get(), 4, "the explorer hands each of the four seeds to the engine");
-	Ok(())
+		let mut explorer = explorer_of(&process, config, counting);
+		explorer.explore()?;
+		assert_eq!(counter.get(), walked);
+		Ok(())
+	}
+	cases {
+		/// The explorer hands each of four seeds to the engine.
+		four_seeds => (FdrConfig { seeds: 4, ..Default::default() }, 4),
+		/// Each of two specs runs its three seeds through the engine.
+		#[cfg(feature = "testing-fault")]
+		three_seeds_of_each_of_two_specs => (
+			FdrConfig {
+				seeds: 3,
+				specs: vec![ready(), ready()],
+				fault_model: Some(FaultModel::default()),
+				..Default::default()
+			},
+			6,
+		),
+	}
 }
 
-#[cfg(feature = "testing-fault")]
+/// The provided `explore_seeds` records the result of each seed that an
+/// outside engine walks, and the verdict counts each of them.
 #[test]
-fn mode_one_explores_each_spec_through_the_outside_engine() -> Result<(), Box<dyn std::error::Error>> {
-	let process = ready()?;
-	let specs = vec![ready()?, ready()?];
-	let fault_model = Some(FaultModel::default());
-	let config = Arc::new(FdrConfig { seeds: 3, specs, fault_model, ..Default::default() });
-	let walked = Rc::new(Cell::new(0));
-	let engine = CountingEngine {
-		inner: OutsideEngine::new(&process, Arc::clone(&config)),
-		walked: Rc::clone(&walked),
-	};
-	let mut explorer = explorer_over(&process, config, engine);
-
-	explorer.explore()?;
-
-	assert_eq!(walked.get(), 6, "each of the two specs runs its three seeds through the engine");
-	Ok(())
-}
-
-#[test]
-fn the_verdict_reads_each_result_that_an_outside_engine_records() -> Result<(), Box<dyn std::error::Error>> {
-	let process = ready()?;
-	let config = Arc::new(FdrConfig { seeds: 4, ..Default::default() });
-	let engine = OutsideEngine::new(&process, Arc::clone(&config));
-	let mut explorer = explorer_over(&process, config, engine);
+fn the_verdict_reads_each_result_that_an_outside_engine_records() -> TestResult {
+	let process = ready();
+	let config = FdrConfig { seeds: 4, ..Default::default() };
+	let mut explorer = explorer_of(&process, config, OutsideEngine::new);
 
 	let verdict = explorer.explore()?;
-
-	assert_eq!(
-		verdict.seeds_completed, 4,
-		"the provided `explore_seeds` records each of the four results"
-	);
+	assert_eq!(verdict.seeds_completed, 4);
 	Ok(())
 }
 
-/// A process whose hidden `t` and `u` take `S1` to `S2` and back, with the
-/// observable exit `b` at `S2`, so each seed diverges at `S1`.
-fn spinning() -> Result<Process, ProcessBuildError> {
-	Process::builder("Spinning")
-		.initial_state(State("S0"))
-		.add_observable(Event("a"))
-		.add_observable(Event("b"))
-		.add_hidden(Event("t"))
-		.add_hidden(Event("u"))
-		.add_transition(State("S0"), Event("a"), State("S1"))
-		.add_transition(State("S1"), Event("t"), State("S2"))
-		.add_transition(State("S2"), Event("u"), State("S1"))
-		.add_transition(State("S2"), Event("b"), State("S3"))
-		.add_terminal(State("S3"))
-		.build()
-}
-
+/// An engine that reports `S2` as visited leaves the divergence event at `S1`,
+/// the one state where each seed diverged.
 #[test]
-fn a_divergence_event_names_a_state_where_a_seed_diverged() -> Result<(), Box<dyn std::error::Error>> {
-	let process = spinning()?;
-	let config = Arc::new(FdrConfig::default());
-	let engine = OverReportingEngine { inner: OutsideEngine::new(&process, Arc::clone(&config)) };
+fn a_divergence_event_names_a_state_where_a_seed_diverged() -> TestResult {
+	let process = spinning();
 	let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
-	let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
-	let mut explorer = explorer_over(&process, config, engine);
-
+	let trace = instrumented_trace(settings);
+	let mut explorer = explorer_of(&process, FdrConfig::default(), OverReportingEngine::new);
 	explorer.explore_into(&trace)?;
 
-	let labels = labels_of(&trace, DIVERGENCE_DETECT);
-	let at_s1 = ["Spinning.S1: <t, u>"];
-	assert_eq!(labels, at_s1, "no seed diverged at `S2`, which the engine reports");
+	let labels = recorded_labels(&trace, DIVERGENCE_DETECT);
+	let at_s1 = [Some("Spinning.S1: <t, u>".to_owned())];
+	assert_eq!(labels, at_s1);
 	Ok(())
 }

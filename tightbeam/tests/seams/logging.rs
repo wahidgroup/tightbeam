@@ -15,6 +15,8 @@ use tightbeam::trace::{
 };
 use tightbeam::urn::Urn;
 
+use crate::common::result::TestResult;
+
 /// The event of a record that the filter admits.
 const SENT: Urn<'static> = tightbeam::urn!("outside", "event:logging/sent");
 /// The event of a record below the level of the filter.
@@ -51,6 +53,7 @@ fn keeping_config(kept: &Kept) -> LoggerConfig {
 fn records_of(trace: &TraceCollector, kept: &Kept) -> Vec<(LogLevel, String)> {
 	let sent = trace.event(SENT).expect("the trace injects no fault");
 	sent.with_log_level(LogLevel::Error).emit();
+
 	let skipped = trace.event(SKIPPED).expect("the trace injects no fault");
 	skipped.with_log_level(LogLevel::Debug).emit();
 
@@ -58,25 +61,33 @@ fn records_of(trace: &TraceCollector, kept: &Kept) -> Vec<(LogLevel, String)> {
 	kept.clone()
 }
 
-#[test]
-fn an_outside_backend_receives_each_record_its_filter_admits() -> Result<(), Box<dyn std::error::Error>> {
-	let kept = Kept::default();
-	let trace = TraceCollector::new().with_logger(keeping_config(&kept))?;
-
-	let records = records_of(&trace, &kept);
-
-	assert_eq!(records, [(LogLevel::Error, SENT.to_string())]);
-	Ok(())
+/// A collector that a logger of `config` joins once the collector is built.
+fn built_with(config: LoggerConfig) -> TraceCollector {
+	let trace = TraceCollector::new().with_logger(config);
+	trace.expect("a new collector takes a logger")
 }
 
-#[test]
-fn a_trace_config_hands_its_outside_backend_to_the_collector() {
-	let kept = Kept::default();
-	let trace = TraceCollector::from(TraceConfig::default().with_logger(keeping_config(&kept)));
+/// A new collector whose trace config holds a logger of `config`.
+fn configured_with(config: LoggerConfig) -> TraceCollector {
+	TraceCollector::from(TraceConfig::default().with_logger(config))
+}
 
-	let records = records_of(&trace, &kept);
+// A trace hands an outside backend each record that its filter admits,
+// whichever way the backend reaches the trace.
+tightbeam::tb_cases! {
+	fn an_outside_backend_receives_each_record_its_filter_admits(attach: fn(LoggerConfig) -> TraceCollector) {
+		let kept = Kept::default();
+		let trace = attach(keeping_config(&kept));
 
-	assert_eq!(records, [(LogLevel::Error, SENT.to_string())]);
+		let records = records_of(&trace, &kept);
+		assert_eq!(records, [(LogLevel::Error, SENT.to_string())]);
+	}
+	cases {
+		/// The backend joins a built collector.
+		on_a_built_collector => built_with,
+		/// The backend reaches the collector through its trace config.
+		through_a_trace_config => configured_with,
+	}
 }
 
 /// A backend that accepts the records of `Error` and each more severe level,
@@ -100,6 +111,14 @@ impl Selective {
 	}
 }
 
+/// A [`Selective`] backend beside a trace whose filter admits `Debug` and
+/// each more severe level.
+fn selective_trace() -> (Selective, TraceCollector) {
+	let backend = Selective::default();
+	let trace = built_with(LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug)));
+	(backend, trace)
+}
+
 impl LogBackend for Selective {
 	fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
 		let mut messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
@@ -120,10 +139,8 @@ impl LogBackend for Selective {
 /// The trace reads `accepts` of an outside backend, so a record that the
 /// filter admits and the backend refuses reaches no backend.
 #[test]
-fn an_outside_backend_receives_each_record_it_accepts() -> Result<(), Box<dyn std::error::Error>> {
-	let backend = Selective::default();
-	let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
-	let trace = TraceCollector::new().with_logger(config)?;
+fn an_outside_backend_receives_each_record_it_accepts() -> TestResult {
+	let (backend, trace) = selective_trace();
 
 	trace.event(SENT)?.with_log_level(LogLevel::Error).emit();
 	trace.event(SKIPPED)?.with_log_level(LogLevel::Warning).emit();
@@ -134,10 +151,8 @@ fn an_outside_backend_receives_each_record_it_accepts() -> Result<(), Box<dyn st
 
 /// `flush_log` flushes an outside backend while the trace is live.
 #[test]
-fn flush_log_flushes_an_outside_backend() -> Result<(), Box<dyn std::error::Error>> {
-	let backend = Selective::default();
-	let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
-	let trace = TraceCollector::new().with_logger(config)?;
+fn flush_log_flushes_an_outside_backend() -> TestResult {
+	let (backend, trace) = selective_trace();
 
 	trace.flush_log()?;
 
@@ -145,15 +160,17 @@ fn flush_log_flushes_an_outside_backend() -> Result<(), Box<dyn std::error::Erro
 	Ok(())
 }
 
-/// The last handle of a trace flushes an outside backend when it drops.
+/// The last handle of a trace flushes an outside backend when it drops, and a
+/// handle that drops beside a live one leaves the backend unflushed.
 #[test]
-fn the_last_handle_of_a_trace_flushes_its_outside_backend() -> Result<(), Box<dyn std::error::Error>> {
-	let backend = Selective::default();
-	let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
-	let trace = TraceCollector::new().with_logger(config)?;
+fn the_last_handle_of_a_trace_flushes_its_outside_backend() {
+	let (backend, trace) = selective_trace();
+	let other = trace.share();
+
+	drop(other);
+	let beside_a_live_handle = backend.flushes();
 
 	drop(trace);
 
-	assert_eq!(backend.flushes(), 1);
-	Ok(())
+	assert_eq!((beside_a_live_handle, backend.flushes()), (0, 1));
 }

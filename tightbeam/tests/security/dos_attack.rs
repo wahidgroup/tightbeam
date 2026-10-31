@@ -5,9 +5,9 @@
 //! up-front bound lets a single request exhaust its memory and CPU.
 //!
 //! ## Attack
-//! A peer sends a server of each enabled backend (HPKE, CMS) a handshake
-//! message whose header declares one octet more than 16 KiB, before any
-//! handshake round.
+//! A peer sends a server of each enabled backend (HPKE, CMS) the header of a
+//! handshake message that declares one octet more than 16 KiB, before any
+//! handshake round, and holds the link open with no content.
 //!
 //! ## Expected control
 //! The read of a handshake-phase message runs under the 16 KiB handshake
@@ -21,31 +21,30 @@
 //!   <https://cwe.mitre.org/data/definitions/770.html>
 //! - CAPEC-130: Excessive Allocation <https://capec.mitre.org/data/definitions/130.html>
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use tightbeam::{
+	constants::DEFAULT_HANDSHAKE_MAX_WIRE,
 	exactly,
 	instrumentation::events,
 	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::EncryptedMessageIO,
+	transport::{EncryptedMessageIO, TransportError, TransportFailure},
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{expectation_failure, HandshakeBackendKind, ServerMaterials};
+use crate::common::poll::within_hang_guard;
+use crate::common::security::ServerMaterials;
+use crate::security::common::HandshakeBackendKind;
 
 pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> =
 	tightbeam::urn!("test", "event:dos-attack/dos-generate-oversized");
 pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = tightbeam::urn!("test", "event:dos-attack/dos-inject-oversized");
-
-/// The size ceiling of a handshake message (16 KiB) in the transport layer.
-const HANDSHAKE_MAX_SIZE: usize = 16 * 1024;
 
 tb_assert_spec! {
 	pub DosAttackSpec,
@@ -106,49 +105,41 @@ tb_scenario! {
 	}
 }
 
-/// A handshake message one octet past the cap: the header of a SEQUENCE of
-/// `HANDSHAKE_MAX_SIZE + 1` octets, then that content.
-fn oversized_message() -> Vec<u8> {
-	let length = HANDSHAKE_MAX_SIZE + 1;
+/// The header of a handshake message one octet past the cap: a SEQUENCE of
+/// `DEFAULT_HANDSHAKE_MAX_WIRE + 1` octets.
+fn oversized_header() -> [u8; 4] {
+	let length = DEFAULT_HANDSHAKE_MAX_WIRE + 1;
 	let declared = u16::try_from(length).expect("the length fits two octets").to_be_bytes();
-	let header = [0x30, 0x82, declared[0], declared[1]];
-	[header.as_slice(), &vec![0u8; length]].concat()
-}
-
-/// Sends `message` to the server at `addr` in one burst, as a peer before its
-/// first handshake round.
-async fn send(addr: SocketAddr, message: Vec<u8>) -> Result<(), TightBeamError> {
-	let mut stream = TcpStream::connect(addr).await?;
-	stream.write_all(&message).await?;
-	Ok(())
+	[0x30, 0x82, declared[0], declared[1]]
 }
 
 job! {
 	name: DosAttackScenario,
 	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
-		let materials = ServerMaterials::generate();
+		let materials = ServerMaterials::fixed();
 
-		// 1. Generate a handshake message one octet past the cap.
-		let oversized = oversized_message();
+		// 1. Generate the header of a handshake message one octet past the cap.
+		let oversized = oversized_header();
 
 		trace.event(DOS_GENERATE_OVERSIZED)?;
 
 		// 2. Send it to a server of the backend, which reads it before any
 		//    handshake round, under the handshake ceiling, and files its
-		//    refusal in the scenario trace.
+		//    refusal in the scenario trace. The peer sends no content and holds
+		//    its link open, so a reader that waits for the content hangs.
 		let (listener, addr) = kind.bind_listener(&materials).await?;
-		let sender = tokio::spawn(send(addr, oversized));
+		let mut peer = TcpStream::connect(addr).await?;
+		peer.write_all(&oversized).await?;
+
 		let (server, _) = listener.accept().await?;
 		let mut server = server.with_trace(trace.share());
 
 		trace.event(DOS_INJECT_OVERSIZED)?;
 
 		// 3. The cap refuses the message on its header, by its size.
-		let read = server.collect_step().await;
-		assert!(read.is_err(), "the server read a handshake message past its ceiling");
-
-		// 4. The sender wrote the whole message while the server held the connection.
-		sender.await.map_err(|_| expectation_failure("the sender panicked"))??;
+		let read = within_hang_guard(server.collect_step(), "the server waited for the content").await;
+		assert!(matches!(read, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))));
+		drop(peer);
 
 		Ok(())
 	}
