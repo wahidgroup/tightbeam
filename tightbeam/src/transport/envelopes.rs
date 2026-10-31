@@ -1255,8 +1255,9 @@ impl TransportEnvelope {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::TestFrame;
-	use std::error::Error;
+	use crate::asn1::admission::fixtures::{der_refusal, tlv};
+	use crate::testing::fixtures::{der_round_trip, TestEnvelope};
+	use crate::testing::{TestFrame, TestResult};
 
 	#[cfg(feature = "transport-multiplex")]
 	use crate::crypto::exchange::{EcdheShare, KeyShare};
@@ -1265,72 +1266,45 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	use crate::testing::{unhex, TestKey};
 
-	/// One package case: the message of its frame, the status of its
-	/// response, and whether the response carries the frame.
-	struct PackageTestCase {
-		message_value: &'static str,
-		expected_status: TransitStatus,
-		should_have_message: bool,
-	}
-
-	impl PackageTestCase {
-		const fn new(message_value: &'static str, expected_status: TransitStatus, should_have_message: bool) -> Self {
-			Self { message_value, expected_status, should_have_message }
-		}
-
-		fn create_request(&self) -> RequestPackage {
-			RequestPackage::new(TestFrame::v0(Some(self.message_value), None))
-		}
-
-		fn create_response(&self) -> ResponsePackage {
-			ResponsePackage {
-				status: self.expected_status,
-				message: if self.should_have_message {
-					Some(Arc::new(TestFrame::v0(Some(self.message_value), None)))
-				} else {
-					None
-				},
-			}
-		}
+	/// A response of `status` that carries a frame of `message` when one is
+	/// given.
+	fn response(status: TransitStatus, message: Option<&str>) -> ResponsePackage {
+		let message = message.map(|message| Arc::new(TestFrame::v0(Some(message), None)));
+		ResponsePackage { status, message }
 	}
 
 	/// A message of many words.
 	// cspell:disable-next-line
 	const LOREM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.";
 
-	// Each case encodes and decodes the request it builds.
+	// A request package of a frame of each message round-trips whole.
 	crate::tb_cases! {
-		fn test_request_package_encode_decode(test_case: PackageTestCase) -> Result<(), Box<dyn Error>> {
-			let original = test_case.create_request();
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_request_package_round_trips(message: &str) {
+			let original = RequestPackage::new(TestFrame::v0(Some(message), None));
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
-			short_message => PackageTestCase::new("Hi", TransitStatus::Ok, true),
-			long_message => PackageTestCase::new(LOREM, TransitStatus::Ok, true),
-			empty_message => PackageTestCase::new("", TransitStatus::Ok, true),
-			resource_exhausted => PackageTestCase::new("ResourceExhausted", TransitStatus::ResourceExhausted, false),
-			unauthenticated => PackageTestCase::new("Unauthenticated", TransitStatus::Unauthenticated, false),
-			not_found => PackageTestCase::new("NotFound", TransitStatus::NotFound, false),
+			short_message => "Hi",
+			long_message => LOREM,
+			empty_message => "",
+			resource_exhausted => "ResourceExhausted",
+			unauthenticated => "Unauthenticated",
+			not_found => "NotFound",
 		}
 	}
 
-	// Each case encodes and decodes the response it builds.
+	// A response package round-trips whole, with its frame or without one.
 	crate::tb_cases! {
-		fn test_response_package_encode_decode(test_case: PackageTestCase) -> Result<(), Box<dyn Error>> {
-			let original = test_case.create_response();
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_response_package_round_trips(original: ResponsePackage) {
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
-			short_message => PackageTestCase::new("Hi", TransitStatus::Ok, true),
-			long_message => PackageTestCase::new(LOREM, TransitStatus::Ok, true),
-			empty_message => PackageTestCase::new("", TransitStatus::Ok, true),
-			resource_exhausted => PackageTestCase::new("ResourceExhausted", TransitStatus::ResourceExhausted, false),
-			unauthenticated => PackageTestCase::new("Unauthenticated", TransitStatus::Unauthenticated, false),
-			not_found => PackageTestCase::new("NotFound", TransitStatus::NotFound, false),
+			short_message => response(TransitStatus::Ok, Some("Hi")),
+			long_message => response(TransitStatus::Ok, Some(LOREM)),
+			empty_message => response(TransitStatus::Ok, Some("")),
+			resource_exhausted => response(TransitStatus::ResourceExhausted, None),
+			unauthenticated => response(TransitStatus::Unauthenticated, None),
+			not_found => response(TransitStatus::NotFound, None),
 		}
 	}
 
@@ -1346,142 +1320,105 @@ mod tests {
 		assert_eq!(lent, (Some(&frame), None));
 	}
 
-	#[test]
-	fn test_length_validation_request() -> Result<(), Box<dyn Error>> {
-		let original = RequestPackage::new(TestFrame::v0(None, None));
-		let mut encoded = original.to_der()?;
-		assert!(encoded.len() > 10, "the encoding holds the length octets it corrupts");
-
-		// Corrupt one byte near the start of the encoding, which holds the
-		// length octets of the nested sequences.
-		let corrupt_pos = 5;
-		encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
-
-		let result = RequestPackage::from_der(&encoded);
-		assert!(result.is_err(), "Should fail with corrupted length");
-
-		Ok(())
+	/// The DER of `package` with one octet of its length fields raised by one.
+	fn with_a_corrupted_length(package: &impl Encode, position: usize) -> Vec<u8> {
+		let mut encoded = package.to_der().expect("a test package encodes");
+		encoded[position] = encoded[position].wrapping_add(1);
+		encoded
 	}
 
-	#[test]
-	fn test_length_validation_response() -> Result<(), Box<dyn Error>> {
-		let original =
-			ResponsePackage { status: TransitStatus::Ok, message: Some(Arc::new(TestFrame::v0(None, None))) };
+	/// A corrupted encoding and the decode refusal of its package type.
+	type CorruptedCase = (Vec<u8>, fn(&[u8]) -> Option<ErrorKind>);
 
-		// Corrupt one byte of the length field.
-		let mut encoded = original.to_der()?;
-		assert!(encoded.len() > 10, "the encoding holds the length octets it corrupts");
-		let corrupt_pos = 8;
-		encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
-
-		let result = ResponsePackage::from_der(&encoded);
-		assert!(result.is_err(), "Should fail with corrupted length");
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_response_empty_message() -> Result<(), Box<dyn Error>> {
-		let original = ResponsePackage { status: TransitStatus::ResourceExhausted, message: None };
-
-		let encoded = original.to_der()?;
-		let decoded = ResponsePackage::from_der(&encoded)?;
-		assert_eq!(original.status, decoded.status);
-		assert_eq!(original.message, decoded.message);
-		Ok(())
+	// A package whose length octets a corruption raised is refused at the
+	// decode. The octets near the start of an encoding hold the length octets
+	// of its nested sequences.
+	crate::tb_cases! {
+		fn a_corrupted_length_is_refused((encoded, decode): CorruptedCase) {
+			assert_eq!(decode(&encoded), Some(ErrorKind::Noncanonical { tag: Tag::Integer }));
+		}
+		cases {
+			request => (
+				with_a_corrupted_length(&RequestPackage::new(TestFrame::v0(None, None)), 5),
+				|encoded| der_refusal(RequestPackage::from_der(encoded)),
+			),
+			response => (
+				with_a_corrupted_length(&response(TransitStatus::Ok, Some("")), 8),
+				|encoded| der_refusal(ResponsePackage::from_der(encoded)),
+			),
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	fn frame_payload(label: impl AsRef<str>) -> Result<Vec<u8>, Box<dyn Error>> {
-		let label = label.as_ref();
-		let payload = TestFrame::v0(Some(label), None).to_der()?;
-		Ok(payload)
+	fn frame_payload(label: impl AsRef<str>) -> Vec<u8> {
+		let frame = TestFrame::v0(Some(label.as_ref()), None);
+		frame.to_der().expect("a test frame encodes")
 	}
 
-	/// The value that the encoding of `original` decodes back to. Reason
-	/// accessors derive from the encoded code field, so struct equality of
-	/// the two covers them.
-	fn round_trip<T>(original: &T) -> Result<T, Box<dyn Error>>
-	where
-		T: Encode + for<'a> Decode<'a>,
-	{
-		let encoded = original.to_der()?;
-		Ok(T::from_der(&encoded)?)
-	}
-
+	// A mux open package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_open_package_encode_decode(original: MuxOpenPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
+		fn a_mux_open_package_round_trips(original: MuxOpenPackage) -> TestResult {
+			assert_eq!(der_round_trip(&original), original);
 			Ok(())
 		}
 		cases {
-			unary => MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("open-unary")?)?,
-			chunked => MuxOpenPackage::new(3, false, MuxStreamKind::Streaming, frame_payload("open-chunked")?)?,
-			duplex => MuxOpenPackage::new(5, false, MuxStreamKind::Duplex, frame_payload("open-duplex")?)?,
+			unary => MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("open-unary"))?,
+			chunked => MuxOpenPackage::new(3, false, MuxStreamKind::Streaming, frame_payload("open-chunked"))?,
+			duplex => MuxOpenPackage::new(5, false, MuxStreamKind::Duplex, frame_payload("open-duplex"))?,
 			last_stream_id => MuxOpenPackage::new(u32::MAX, false, MuxStreamKind::Unary, Vec::new())?,
 		}
 	}
 
-	// The kind is the dispatch discriminator, so every variant must survive
-	// encoding unchanged.
-	#[cfg(feature = "transport-multiplex")]
-	crate::tb_cases! {
-		fn test_mux_open_package_kind_round_trips_every_variant(kind: MuxStreamKind) -> Result<(), Box<dyn Error>> {
-			let package = MuxOpenPackage::new(7, false, kind, vec![1u8; 4])?;
-			let decoded = MuxOpenPackage::from_der(&package.to_der()?)?;
-			assert_eq!(decoded.kind(), kind);
-			Ok(())
-		}
-		cases {
-			unary => MuxStreamKind::Unary,
-			streaming => MuxStreamKind::Streaming,
-			duplex => MuxStreamKind::Duplex,
-		}
-	}
-
-	// An unrouted open carries no target and the origin budget, and the
-	// grpc-style route with a spent budget survives encoding.
+	/// An unrouted open carries no target and the origin budget.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
-	fn test_mux_open_package_route_round_trips() -> Result<(), Box<dyn Error>> {
+	fn an_unrouted_open_carries_no_target_and_the_origin_budget() -> TestResult {
+		let unrouted = MuxOpenPackage::new(9, false, MuxStreamKind::Streaming, frame_payload("open-local"))?;
+		assert_eq!((unrouted.target(), unrouted.hops_remaining()), (None, DEFAULT_HOP_BUDGET));
+		Ok(())
+	}
+
+	/// The grpc-style route with a spent budget survives encoding.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn a_routed_open_round_trips_its_spent_budget() -> TestResult {
 		let target = crate::urn!("tb", "servlet:ledger");
+		let unrouted = MuxOpenPackage::new(9, false, MuxStreamKind::Streaming, frame_payload("open-local"))?;
+		let routed = unrouted.with_route(Some(target.clone()), 0);
 
-		let unrouted = MuxOpenPackage::new(9, false, MuxStreamKind::Streaming, frame_payload("open-local")?)?;
-		assert_eq!(unrouted.target(), None);
-		assert_eq!(unrouted.hops_remaining(), DEFAULT_HOP_BUDGET);
-
-		let routed = unrouted.clone().with_route(Some(target.clone()), 0);
-		let decoded = MuxOpenPackage::from_der(&routed.to_der()?)?;
-		assert_eq!(decoded.target(), Some(&target));
-		assert_eq!(decoded.hops_remaining(), 0);
-
+		let decoded = der_round_trip(&routed);
+		assert_eq!((decoded.target(), decoded.hops_remaining()), (Some(&target), 0));
 		Ok(())
 	}
 
-	// A default open must encode to the exact bytes of the unrouted shape.
-	// The DER-optional target and the DEFAULT-budget hops encode to zero
-	// octets, so a peer that knows neither field decodes it unchanged.
+	/// A default open encodes to the exact octets of the unrouted shape: the
+	/// stream ID, the last flag, the kind, and the payload. The DER-optional
+	/// target and the DEFAULT-budget hops encode to zero octets, so a peer
+	/// that knows neither field decodes the open unchanged.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
-	fn test_mux_open_package_unrouted_is_wire_stable() -> Result<(), Box<dyn Error>> {
-		let package = MuxOpenPackage::new(11, true, MuxStreamKind::Unary, frame_payload("open-stable")?)?;
-		let encoded = package.to_der()?;
-		let decoded = MuxOpenPackage::from_der(&encoded)?;
-		assert_eq!(decoded, package);
-		assert_eq!(decoded.target(), None);
-		assert_eq!(decoded.hops_remaining(), DEFAULT_HOP_BUDGET);
-		assert_eq!(decoded.to_der()?, encoded);
+	fn an_unrouted_open_is_wire_stable() -> TestResult {
+		let payload = frame_payload("open-stable");
+		let package = MuxOpenPackage::new(11, true, MuxStreamKind::Unary, payload.clone())?;
+		let fields = [
+			tlv(Tag::Integer, &[11]),
+			tlv(Tag::Boolean, &[0xFF]),
+			tlv(Tag::Enumerated, &[0x00]),
+			tlv(Tag::OctetString, &payload),
+		];
 
+		let unrouted = tlv(Tag::Sequence, &fields.concat());
+		let encoded = package.to_der()?;
+		assert_eq!(encoded, unrouted);
 		Ok(())
 	}
 
+	// A mux data package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_data_package_encode_decode(original: MuxDataPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
+		fn a_mux_data_package_round_trips(original: MuxDataPackage) -> TestResult {
+			assert_eq!(der_round_trip(&original), original);
 			Ok(())
 		}
 		cases {
@@ -1491,26 +1428,25 @@ mod tests {
 		}
 	}
 
+	// A mux end package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_end_package_encode_decode(original: MuxEndPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
+		fn a_mux_end_package_round_trips(original: MuxEndPackage) -> TestResult {
+			assert_eq!(der_round_trip(&original), original);
 			Ok(())
 		}
 		cases {
-			ok => MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("end-unary")?)?,
+			ok => MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("end-unary"))?,
 			resource_exhausted => MuxEndPackage::new(3, TransitStatus::ResourceExhausted, Vec::new())?,
 			unauthenticated => MuxEndPackage::new(u32::MAX, TransitStatus::Unauthenticated, Vec::new())?,
 		}
 	}
 
+	// A mux credit package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_credit_package_encode_decode(original: MuxCreditPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_mux_credit_package_round_trips(original: MuxCreditPackage) {
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
 			no_credit => MuxCreditPackage::new(1, 0),
@@ -1519,12 +1455,11 @@ mod tests {
 		}
 	}
 
+	// A mux cancel package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_cancel_package_encode_decode(original: MuxCancelPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_mux_cancel_package_round_trips(original: MuxCancelPackage) {
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
 			cancelled => MuxCancelPackage::new(1, CancelReason::Cancelled),
@@ -1534,12 +1469,11 @@ mod tests {
 		}
 	}
 
+	// A mux ping package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_ping_package_encode_decode(original: MuxPingPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_mux_ping_package_round_trips(original: MuxPingPackage) {
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
 			first_ping => MuxPingPackage::new(false, 0),
@@ -1551,7 +1485,7 @@ mod tests {
 	/// A `SignerInfo` the CMS signer made over an epoch receipt body, for
 	/// encoding round trips.
 	#[cfg(feature = "transport-multiplex")]
-	fn sample_signer_info() -> Result<Signed<SignerInfo>, Box<dyn Error>> {
+	fn sample_signer_info() -> Signed<SignerInfo> {
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
 		use crate::crypto::sign::{CmsSigner, SignedContent};
 		use crate::oids::SESSION_RECEIPT_CONTENT;
@@ -1559,18 +1493,20 @@ mod tests {
 
 		let key = TestIdentity::certified(TestKey::insecure_fixed_signing());
 		let content = SignedContent::new(SESSION_RECEIPT_CONTENT, b"epoch-receipt-body");
-		Ok(CmsSigner::sign_with::<Secp256k1Signature, _>(&key, content)?)
+		let signed = CmsSigner::sign_with::<Secp256k1Signature, _>(&key, content);
+		signed.expect("the test key signs the sample content")
 	}
 
 	/// A single-signer `SignedData` the CMS signer assembled, for encoding
 	/// round trips.
 	#[cfg(feature = "transport-multiplex")]
-	fn sample_signed_data() -> Result<Signed<SignedData>, Box<dyn Error>> {
+	fn sample_signed_data() -> Signed<SignedData> {
 		use crate::crypto::sign::{CmsSigner, SignedContent};
 		use crate::oids::SESSION_RECEIPT_CONTENT;
 
 		let content = SignedContent::new(SESSION_RECEIPT_CONTENT, b"epoch-receipt-body");
-		Ok(CmsSigner::signed_data(content, sample_signer_info()?, None)?)
+		let signed = CmsSigner::signed_data(content, sample_signer_info(), None);
+		signed.expect("the sample signer info signs the sample content")
 	}
 
 	/// The generator of secp256k1 (SEC 2 v2.0 §2.4.1), read from its
@@ -1601,7 +1537,7 @@ mod tests {
 	/// whatever form the point came from.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
-	fn a_secp256k1_rekey_request_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
+	fn a_secp256k1_rekey_request_matches_its_known_answer() -> TestResult {
 		let request = MuxRekeyRequestPackage::new([0x01u8; 32], secp256k1_generator())?;
 		assert_eq!(request.to_der()?, unhex(SECP256K1_REKEY_REQUEST));
 		Ok(())
@@ -1611,19 +1547,18 @@ mod tests {
 	/// whatever form the point came from.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
-	fn a_secp256k1_rekey_response_matches_its_known_answer() -> Result<(), Box<dyn Error>> {
+	fn a_secp256k1_rekey_response_matches_its_known_answer() -> TestResult {
 		let response = MuxRekeyResponsePackage::new([0x02u8; 32], secp256k1_generator(), None)?;
 		assert_eq!(response.to_der()?, unhex(SECP256K1_REKEY_RESPONSE));
 		Ok(())
 	}
 
+	// A mux rekey request package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_rekey_request_package_encode_decode(original: MuxRekeyRequestPackage)
-			-> Result<(), Box<dyn Error>>
+		fn a_mux_rekey_request_package_round_trips(original: MuxRekeyRequestPackage) -> TestResult
 		{
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
+			assert_eq!(der_round_trip(&original), original);
 			Ok(())
 		}
 		cases {
@@ -1633,51 +1568,47 @@ mod tests {
 		}
 	}
 
+	// A mux rekey response package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_rekey_response_package_encode_decode(original: MuxRekeyResponsePackage)
-			-> Result<(), Box<dyn Error>>
+		fn a_mux_rekey_response_package_round_trips(original: MuxRekeyResponsePackage) -> TestResult
 		{
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
+			assert_eq!(der_round_trip(&original), original);
 			Ok(())
 		}
 		cases {
 			with_a_receipt => {
-				MuxRekeyResponsePackage::new([7u8; 32], secp256k1_generator(), Some(sample_signed_data()?))?
+				MuxRekeyResponsePackage::new([7u8; 32], secp256k1_generator(), Some(sample_signed_data()))?
 			},
 			with_no_receipt => MuxRekeyResponsePackage::new([9u8; 32], secp256k1_generator(), None)?,
 		}
 	}
 
+	// A mux rekey ack package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_rekey_ack_package_encode_decode(original: MuxRekeyAckPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_mux_rekey_ack_package_round_trips(original: MuxRekeyAckPackage) {
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
-			with_a_countersignature => MuxRekeyAckPackage::new(Some(sample_signer_info()?)),
+			with_a_countersignature => MuxRekeyAckPackage::new(Some(sample_signer_info())),
 			with_no_countersignature => MuxRekeyAckPackage::new(None),
 		}
 	}
 
+	/// The done package of a rekey round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
-	fn test_mux_rekey_done_package_encode_decode() -> Result<(), Box<dyn Error>> {
+	fn a_mux_rekey_done_package_round_trips() {
 		let original = MuxRekeyDonePackage::default();
-		let decoded = round_trip(&original)?;
-		assert_eq!(decoded, original);
-		Ok(())
+		assert_eq!(der_round_trip(&original), original);
 	}
 
+	// A GoAway package round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_go_away_package_encode_decode(original: GoAwayPackage) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
-			Ok(())
+		fn a_go_away_package_round_trips(original: GoAwayPackage) {
+			assert_eq!(der_round_trip(&original), original);
 		}
 		cases {
 			shutdown => GoAwayPackage::new(0, GoAwayReason::Shutdown),
@@ -1690,9 +1621,10 @@ mod tests {
 		}
 	}
 
+	// A GoAway reason names its label.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_go_away_reason_labels((reason, label): (GoAwayReason, &str)) {
+		fn a_go_away_reason_names_its_label((reason, label): (GoAwayReason, &str)) {
 			assert_eq!(reason.as_str(), label);
 		}
 		cases {
@@ -1706,14 +1638,16 @@ mod tests {
 	}
 
 	// Each case is a known code and its reason. A code past the floor reads
-	// as an application reason.
+	// as an application reason. A reserved code that no reason names
+	// reads as an application reason too.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_cancel_reason_code_space_round_trip((code, reason): (u32, CancelReason)) {
+		fn a_cancel_reason_and_its_code_map_both_ways((code, reason): (u32, CancelReason)) {
 			assert_eq!(CancelReason::from(code), reason);
 			assert_eq!(u32::from(reason), code);
 		}
 		cases {
+			reserved_unknown => (0x0FFF, CancelReason::Application(0x0FFF)),
 			cancelled => (0, CancelReason::Cancelled),
 			timeout => (1, CancelReason::Timeout),
 			rejected => (2, CancelReason::Rejected),
@@ -1725,14 +1659,16 @@ mod tests {
 	}
 
 	// Each case is a known code and its reason. A code past the floor reads
-	// as an application reason.
+	// as an application reason. A reserved code that no reason names
+	// reads as an application reason too.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_go_away_reason_code_space_round_trip((code, reason): (u32, GoAwayReason)) {
+		fn a_go_away_reason_and_its_code_map_both_ways((code, reason): (u32, GoAwayReason)) {
 			assert_eq!(GoAwayReason::from(code), reason);
 			assert_eq!(u32::from(reason), code);
 		}
 		cases {
+			reserved_unknown => (0x0FFF, GoAwayReason::Application(0x0FFF)),
 			shutdown => (0, GoAwayReason::Shutdown),
 			protocol_error => (1, GoAwayReason::ProtocolError),
 			enhance_your_calm => (2, GoAwayReason::EnhanceYourCalm),
@@ -1745,33 +1681,19 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "transport-multiplex")]
-	#[test]
-	fn test_unknown_reserved_code_decodes_as_application() {
-		let reserved_unknown = 0x0FFFu32;
-		assert_eq!(
-			CancelReason::from(reserved_unknown),
-			CancelReason::Application(reserved_unknown)
-		);
-		assert_eq!(
-			GoAwayReason::from(reserved_unknown),
-			GoAwayReason::Application(reserved_unknown)
-		);
-	}
-
+	// A mux envelope round-trips whole.
 	#[cfg(feature = "transport-multiplex")]
 	crate::tb_cases! {
-		fn test_mux_envelope_variants_round_trip(original: TransportEnvelope) -> Result<(), Box<dyn Error>> {
-			let decoded = round_trip(&original)?;
-			assert_eq!(decoded, original);
+		fn a_mux_envelope_round_trips(original: TransportEnvelope) -> TestResult {
+			assert_eq!(der_round_trip(&original), original);
 			Ok(())
 		}
 		cases {
 			open => {
-				TransportEnvelope::from(MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("mux-open")?)?)
+				TransportEnvelope::from(MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("mux-open"))?)
 			},
 			data => TransportEnvelope::from(MuxDataPackage::new(1, false, vec![0xEF; 16])?),
-			end => TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("mux-end")?)?),
+			end => TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("mux-end"))?),
 			credit => TransportEnvelope::from(MuxCreditPackage::new(1, 128)),
 			cancel => TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
 			go_away => TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
@@ -1780,9 +1702,9 @@ mod tests {
 			rekey_response => TransportEnvelope::from(MuxRekeyResponsePackage::new(
 				[2u8; 32],
 				secp256k1_generator(),
-				Some(sample_signed_data()?),
+				Some(sample_signed_data()),
 			)?),
-			rekey_ack => TransportEnvelope::from(MuxRekeyAckPackage::new(Some(sample_signer_info()?))),
+			rekey_ack => TransportEnvelope::from(MuxRekeyAckPackage::new(Some(sample_signer_info()))),
 			rekey_done => TransportEnvelope::from(MuxRekeyDonePackage::default()),
 		}
 	}
@@ -1790,24 +1712,8 @@ mod tests {
 	/// An authenticated-enveloped handshake container travels under context
 	/// tag 7 of the transport envelope.
 	#[test]
-	fn an_authenticated_envelope_travels_under_tag_7() -> Result<(), Box<dyn Error>> {
-		use crate::asn1::OctetString;
-		use crate::cms::content_info::CmsVersion;
-		use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfos};
-		use crate::oids::{AES_256_GCM, DATA};
-		use crate::spki::AlgorithmIdentifierOwned;
-
-		let algorithm = AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None };
-		let info = EncryptedContentInfo { content_type: DATA, content_enc_alg: algorithm, encrypted_content: None };
-		let sealed = AuthEnvelopedData {
-			version: CmsVersion::V0,
-			originator_info: None,
-			recipient_infos: RecipientInfos::default(),
-			auth_encrypted_content_info: info,
-			auth_attrs: None,
-			mac: OctetString::new([0u8; 16])?,
-			unauth_attrs: None,
-		};
+	fn an_authenticated_envelope_travels_under_tag_7() -> TestResult {
+		let sealed = TestEnvelope::empty_auth_enveloped(crate::oids::AES_256_GCM);
 
 		let envelope = TransportEnvelope::AuthEnvelopedData(Box::new(WireDer::new(sealed)?));
 		let encoded = envelope.to_der()?;
@@ -1823,20 +1729,21 @@ mod tests {
 	fn an_envelope_under_the_reserved_tag_6_is_refused() {
 		let reserved = [0xA6, 0x04, 0x30, 0x02, 0x04, 0x00];
 		let decoded = TransportEnvelope::from_der(&reserved);
-		assert!(decoded.is_err());
+
+		let actual = Tag::ContextSpecific { constructed: true, number: TagNumber::new(6) };
+		assert_eq!(der_refusal(decoded), Some(ErrorKind::TagUnexpected { expected: None, actual }));
 	}
 
 	/// A cleartext wire envelope is its transport envelope under the
 	/// constructed context tag `[0]`, `0xA0`, tagged explicitly.
 	#[test]
-	fn a_cleartext_wire_envelope_tags_its_envelope_explicitly() -> Result<(), Box<dyn Error>> {
+	fn a_cleartext_wire_envelope_tags_its_envelope_explicitly() -> TestResult {
 		let envelope = TransportEnvelope::from(TestFrame::v0(None, None));
 		let inner = envelope.to_der()?;
 		let wire = WireEnvelope::Cleartext(envelope).to_der()?;
 
 		let tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N0 };
-		let header = Header::new(tag, Length::try_from(inner.len())?)?.to_der()?;
-		assert_eq!(wire, [header, inner].concat());
+		assert_eq!(wire, tlv(tag, &inner));
 		Ok(())
 	}
 
@@ -1844,11 +1751,10 @@ mod tests {
 	/// arm: here a transport envelope under the constructed context tag `[2]`,
 	/// `0xA2`.
 	#[test]
-	fn a_wire_envelope_under_the_unknown_tag_2_is_refused() -> Result<(), Box<dyn Error>> {
+	fn a_wire_envelope_under_the_unknown_tag_2_is_refused() -> TestResult {
 		let inner = TransportEnvelope::from(TestFrame::v0(None, None)).to_der()?;
 		let tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N2 };
-		let header = Header::new(tag, Length::try_from(inner.len())?)?.to_der()?;
-		let mut wire = [header, inner].concat();
+		let mut wire = tlv(tag, &inner);
 
 		let refused = WireEnvelope::arrive(&mut wire);
 		assert!(matches!(refused, Err(error) if error.kind() == ErrorKind::Value { tag }));
@@ -1859,7 +1765,7 @@ mod tests {
 	/// one with an octet past it before the record reaches a key.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	#[test]
-	fn an_encrypted_wire_envelope_with_a_trailing_octet_is_refused() -> Result<(), Box<dyn Error>> {
+	fn an_encrypted_wire_envelope_with_a_trailing_octet_is_refused() -> TestResult {
 		use crate::crypto::aead::SessionKeys;
 		use crate::testing::TestKey;
 

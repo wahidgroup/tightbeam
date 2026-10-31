@@ -465,71 +465,50 @@ mod tests {
 	use crate::testing::fdr::config::FdrConfig;
 	use crate::testing::fdr::explorer::{ExplorationCore, SeedResult};
 	use crate::testing::fdr::verdict::Failure;
-	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+	use crate::testing::fixtures::TestProcess;
+	use crate::testing::specs::csp::{Event, Process, State};
+
+	/// A fixture that builds the process of a row.
+	type Fixture = fn() -> Process;
+
+	/// A check of how a seed ended.
+	type Ending = fn(&SeedResult) -> bool;
 
 	/// A process whose hidden `t` sits between `a` and `c`, so `S1` enables a
 	/// hidden event and `S2` is stable though a hidden event reached it.
-	fn hiding() -> Result<Process, ProcessBuildError> {
-		Process::builder("Hiding")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("c"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("c"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
+	fn hiding() -> Process {
+		TestProcess {
+			observable: &["a", "c"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S1", "t", "S2"), ("S2", "c", "S3")],
+			terminal: &["S3"],
+			..TestProcess::of("Hiding", "S0")
+		}
+		.build()
 	}
 
 	/// The process of `hiding` with `c` at `S1` as well, so `S1` enables a
 	/// hidden and an observable event, and `t` leads to the accepting `S2`.
-	fn hiding_beside_c() -> Result<Process, ProcessBuildError> {
-		Process::builder("HidingBesideC")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("c"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S1"), Event("c"), State("S3"))
-			.add_terminal(State("S2"))
-			.add_terminal(State("S3"))
-			.build()
-	}
-
-	/// A process whose `e`, in the observable and in the hidden alphabet,
-	/// takes `S0` to the accepting `S1`.
-	fn e_in_both_alphabets() -> Result<Process, ProcessBuildError> {
-		Process::builder("EInBothAlphabets")
-			.initial_state(State("S0"))
-			.add_observable(Event("e"))
-			.add_hidden(Event("e"))
-			.add_transition(State("S0"), Event("e"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()
+	fn hiding_beside_c() -> Process {
+		TestProcess {
+			observable: &["a", "c"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S1", "t", "S2"), ("S1", "c", "S3")],
+			terminal: &["S2", "S3"],
+			..TestProcess::of("HidingBesideC", "S0")
+		}
+		.build()
 	}
 
 	/// A process whose `a` leads from `S0` to `S1`, which can neither terminate
 	/// nor act.
-	fn stuck_after_a() -> Result<Process, ProcessBuildError> {
-		Process::builder("StuckAfterA")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.build()
-	}
-
-	/// A process whose `a` leads from `S0` to `S1`, which spins on the hidden
-	/// `t`.
-	fn spinning_after_a() -> Result<Process, ProcessBuildError> {
-		Process::builder("SpinningAfterA")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S1"))
-			.build()
+	fn stuck_after_a() -> Process {
+		TestProcess {
+			observable: &["a"],
+			transitions: &[("S0", "a", "S1")],
+			..TestProcess::of("StuckAfterA", "S0")
+		}
+		.build()
 	}
 
 	/// The result of seed 0 of `process` under `config`.
@@ -550,91 +529,83 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn the_walk_records_a_failure_at_each_stable_state() -> Result<(), ProcessBuildError> {
-		let process = hiding()?;
+	// The walk records a failure at each stable state it reaches, within
+	// `max_depth` observable events.
+	crate::tb_cases! {
+		fn the_walk_records_the_failures((process, config, failures): (Fixture, FdrConfig, Vec<Failure>)) {
+			let recorded = failures_of(&process(), config);
+			assert_eq!(recorded, failures);
+		}
 
-		let failures = failures_of(&process, FdrConfig::default());
-		let expected: Vec<Failure> = vec![
-			(vec![], HashSet::from([Event("c")])),
-			(vec![Event("a")], HashSet::from([Event("a")])),
-			(vec![Event("a"), Event("c")], HashSet::from([Event("a"), Event("c")])),
-		];
-		assert_eq!(failures, expected, "`S1` enables `t`, and `S2` is stable");
-		Ok(())
+		cases {
+			/// `S1` enables `t`, and `S2` is stable.
+			at_each_stable_state => (
+				hiding,
+				FdrConfig::default(),
+				vec![
+					(vec![], HashSet::from([Event("c")])),
+					(vec![Event("a")], HashSet::from([Event("a")])),
+					(vec![Event("a"), Event("c")], HashSet::from([Event("a"), Event("c")])),
+				],
+			),
+			/// `S1` takes the hidden `t` at the bound to the stable `S2`.
+			behind_a_hidden_step_at_max_depth => (
+				hiding,
+				FdrConfig { max_depth: 1, ..Default::default() },
+				vec![(vec![], HashSet::from([Event("c")])), (vec![Event("a")], HashSet::from([Event("a")]))],
+			),
+			/// `S1` lies at the bound, so it takes `t` and leaves `c`.
+			with_no_observable_step_past_max_depth => (
+				hiding_beside_c,
+				FdrConfig { max_depth: 1, ..Default::default() },
+				vec![
+					(vec![], HashSet::from([Event("c")])),
+					(vec![Event("a")], HashSet::from([Event("a"), Event("c")])),
+				],
+			),
+			/// Seed 0 takes the observable action of `e`.
+			along_the_alphabet_of_its_action => (
+				TestProcess::e_in_both_alphabets,
+				FdrConfig::default(),
+				vec![(vec![Event("e")], HashSet::from([Event("e")]))],
+			),
+		}
 	}
 
-	#[test]
-	fn the_walk_records_the_failure_behind_a_hidden_step_at_max_depth() -> Result<(), ProcessBuildError> {
-		let process = hiding()?;
-		let config = FdrConfig { max_depth: 1, ..Default::default() };
+	// A seed ends in a deadlock at a state that can neither terminate nor act,
+	// in a divergence on a hidden cycle, and in success at an accepting state.
+	crate::tb_cases! {
+		fn a_seed_ends((process, ended): (Fixture, Ending)) {
+			let result = result_of(&process(), FdrConfig::default());
+			assert!(ended(&result));
+		}
 
-		let failures = failures_of(&process, config);
-		let expected: Vec<Failure> = vec![
-			(vec![], HashSet::from([Event("c")])),
-			(vec![Event("a")], HashSet::from([Event("a")])),
-		];
-		assert_eq!(failures, expected, "`S1` takes the hidden `t` at the bound to the stable `S2`");
-		Ok(())
-	}
-
-	#[test]
-	fn the_walk_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
-		let process = hiding_beside_c()?;
-		let config = FdrConfig { max_depth: 1, ..Default::default() };
-
-		let failures = failures_of(&process, config);
-		let expected: Vec<Failure> = vec![
-			(vec![], HashSet::from([Event("c")])),
-			(vec![Event("a")], HashSet::from([Event("a"), Event("c")])),
-		];
-		assert_eq!(failures, expected, "`S1` lies at the bound, so it takes `t` and leaves `c`");
-		Ok(())
-	}
-
-	#[test]
-	fn the_walk_extends_the_trace_by_the_alphabet_of_its_action() -> Result<(), ProcessBuildError> {
-		let process = e_in_both_alphabets()?;
-
-		let failures = failures_of(&process, FdrConfig::default());
-		let expected: Vec<Failure> = vec![(vec![Event("e")], HashSet::from([Event("e")]))];
-		assert_eq!(failures, expected, "seed 0 takes the observable action of `e`");
-		Ok(())
-	}
-
-	#[test]
-	fn a_state_that_can_neither_terminate_nor_act_ends_the_seed_in_a_deadlock() -> Result<(), ProcessBuildError> {
-		let process = stuck_after_a()?;
-		let result = result_of(&process, FdrConfig::default());
-		assert!(matches!(result, SeedResult::Deadlock(..)), "the result was {result:?}");
-		Ok(())
-	}
-
-	#[test]
-	fn a_state_on_a_hidden_cycle_ends_the_seed_in_a_divergence() -> Result<(), ProcessBuildError> {
-		let process = spinning_after_a()?;
-		let result = result_of(&process, FdrConfig::default());
-		assert!(matches!(result, SeedResult::Divergence(..)), "the result was {result:?}");
-		Ok(())
-	}
-
-	#[test]
-	fn a_seed_that_reaches_an_accepting_state_succeeds() -> Result<(), ProcessBuildError> {
-		let process = hiding()?;
-		let result = result_of(&process, FdrConfig::default());
-		assert!(matches!(result, SeedResult::Success(..)), "the result was {result:?}");
-		Ok(())
+		cases {
+			in_a_deadlock_at_a_stuck_state => (
+				stuck_after_a,
+				|result| matches!(result, SeedResult::Deadlock(_, State("S1"), ..)),
+			),
+			in_a_divergence_on_a_hidden_cycle => (
+				TestProcess::spinning_after_a,
+				|result| matches!(result, SeedResult::Divergence(_, State("S1"), ..)),
+			),
+			in_success_at_an_accepting_state => (
+				hiding,
+				|result| matches!(result, SeedResult::Success(trace, ..) if *trace == [Event("a"), Event("c")]),
+			),
+		}
 	}
 
 	// These tests cover the faults that a walk injects.
 	#[cfg(feature = "testing-fault")]
 	mod faults {
-		use super::{result_of, FdrConfig, ProcessBuildError, SeedResult};
+		use super::{result_of, FdrConfig, SeedResult};
 		use crate::basis_points::BasisPoints;
 		use crate::testing::fault::{ProcessEvent, ProcessState};
 		use crate::testing::fdr::verdict::Trace;
 		use crate::testing::fdr::{FaultModel, InjectionStrategy};
 		use crate::testing::specs::csp::{Event, Process};
+		use crate::testing::TestResult;
 		use crate::urn::Urn;
 		use crate::TightBeamError;
 
@@ -683,10 +654,10 @@ mod tests {
 
 		/// The result of seed 0 of `Beacon` under `model`, with a fault on
 		/// `PING` in `Idle` at `probability`.
-		fn walk_under(model: FaultModel, probability: BasisPoints) -> Result<SeedResult, ProcessBuildError> {
-			let process = Beacon::process()?;
+		fn walk_under(model: FaultModel, probability: BasisPoints) -> SeedResult {
+			let process = Beacon::process().expect("the beacon builds");
 			let point = (beacon::States::Idle, beacon::Event(PING));
-			Ok(walk_of(&process, point, model, probability))
+			walk_of(&process, point, model, probability)
 		}
 
 		/// The trace of a walk that a fault ended in a deadlock, or `None`.
@@ -697,38 +668,43 @@ mod tests {
 			}
 		}
 
+		/// The deterministic strategy at 30% injects at visit 4 of `Idle`, so
+		/// the walk deadlocks after three rounds.
 		#[test]
-		fn the_deterministic_strategy_injects_at_the_counted_visits_of_a_walk() -> Result<(), ProcessBuildError> {
+		fn the_deterministic_strategy_injects_at_the_counted_visits_of_a_walk() {
 			let model = FaultModel::from(InjectionStrategy::Deterministic);
 
-			let trace = deadlock_trace(walk_under(model, crate::bps!(3000))?);
-
+			let trace = deadlock_trace(walk_under(model, crate::bps!(3000)));
 			let rounds = [Event::from(PING), Event::from(PONG)].repeat(3);
 			assert_eq!(trace, Some(rounds));
-			Ok(())
 		}
 
-		#[test]
-		fn the_seed_of_the_model_decides_the_random_injections_of_a_walk() -> Result<(), ProcessBuildError> {
-			let first = FaultModel::from(InjectionStrategy::Random).with_seed(1);
-			let second = FaultModel::from(InjectionStrategy::Random).with_seed(2);
+		// The seed of the model decides the random injections of a walk at 50%:
+		// seed 1 deadlocks after four rounds, and seed 2 at once.
+		crate::tb_cases! {
+			fn the_seed_of_the_model_decides_the_random_injections_of_a_walk((seed, rounds): (u64, usize)) {
+				let model = FaultModel::from(InjectionStrategy::Random).with_seed(seed);
 
-			let first = deadlock_trace(walk_under(first, crate::bps!(5000))?);
-			let second = deadlock_trace(walk_under(second, crate::bps!(5000))?);
+				let trace = deadlock_trace(walk_under(model, crate::bps!(5000)));
+				let round = [Event::from(PING), Event::from(PONG)];
+				assert_eq!(trace, Some(round.repeat(rounds)));
+			}
 
-			let round = [Event::from(PING), Event::from(PONG)];
-			assert_eq!([first, second], [Some(round.repeat(4)), Some(round.repeat(0))]);
-			Ok(())
+			cases {
+				seed_1 => (1, 4),
+				seed_2 => (2, 0),
+			}
 		}
 
+		/// A fault on every action of an accepting state ends the walk there in
+		/// success.
 		#[test]
-		fn a_fault_on_every_action_of_an_accepting_state_ends_the_walk_there() -> Result<(), ProcessBuildError> {
+		fn a_fault_on_every_action_of_an_accepting_state_ends_the_walk_there() -> TestResult {
 			let process = DockedBeacon::process()?;
 
 			let point = (docked_beacon::States::Idle, docked_beacon::Event(PING));
-
 			let result = walk_of(&process, point, FaultModel::default(), crate::bps!(10000));
-			assert!(matches!(result, SeedResult::Success(..)));
+			assert!(matches!(result, SeedResult::Success(trace, ..) if trace.is_empty()));
 			Ok(())
 		}
 	}

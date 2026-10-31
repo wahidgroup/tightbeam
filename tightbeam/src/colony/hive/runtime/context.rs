@@ -352,17 +352,22 @@ impl<P: ColonyDialProtocol> HiveContext for HiveContextImpl<P> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::colony::protocol::ServletInfo;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::utils::CertificateExt;
-	use crate::testing::TestCertificate;
 	use std::sync::mpsc;
 	use std::thread;
 	use std::time::Duration;
 
+	use super::*;
+	use crate::colony::protocol::ServletInfo;
+	use crate::crypto::x509::utils::CertificateExt;
+	use crate::tb_cases;
+	use crate::testing::{TestCertificate, TestKey};
+
 	const TYPE: &[u8] = b"urn:tb:servlet:echo";
 	const PREFIX: &[u8] = b"urn:tb:servlet:echo/";
+
+	/// A bound on a wait that the test expects to end. A wait that reaches it
+	/// is a hang, which the test reports as a failure.
+	const HANG_GUARD: Duration = Duration::from_secs(10);
 
 	fn addr(bytes: &'static str) -> Arc<[u8]> {
 		Arc::from(bytes.as_bytes())
@@ -379,25 +384,65 @@ mod tests {
 		format!("urn:tb:servlet:echo/{tail}").into_bytes()
 	}
 
-	#[test]
-	fn first_instance_of_a_type_owns_the_index() {
+	/// The instance tail and the address of one sibling of the type.
+	type Placed = (&'static str, &'static str);
+
+	/// The first sibling of the type.
+	const FIRST: Placed = ("a", "10.0.0.1");
+
+	/// The second sibling of the type.
+	const SECOND: Placed = ("b", "10.0.0.2");
+
+	/// The routes once each sibling of `placed` registers, in order.
+	fn routes_holding(placed: &[Placed]) -> Routes {
 		let mut routes = Routes::default();
-		routes.insert(instance("a"), sibling("10.0.0.1"), TYPE);
-		routes.insert(instance("b"), sibling("10.0.0.2"), TYPE);
-		assert_eq!(routes.resolve(TYPE), Some(sibling("10.0.0.1")));
+		for &(tail, address) in placed {
+			routes.insert(instance(tail), sibling(address), TYPE);
+		}
+
+		routes
+	}
+
+	/// `routes` once each sibling of `removed` leaves, in order.
+	fn remove_each(mut routes: Routes, removed: &[Placed]) -> Routes {
+		for &(tail, address) in removed {
+			routes.remove(instance(tail), PREFIX, TYPE, &addr(address));
+		}
+
+		routes
+	}
+
+	/// The siblings that register, the siblings that then leave, and the
+	/// address of the sibling the type resolves to.
+	type Indexed = (&'static [Placed], &'static [Placed], Option<&'static str>);
+
+	// The first instance of a type owns its index. A removal of the indexed
+	// instance promotes a sibling, a removal of the last instance clears the
+	// type, and a removal of a sibling leaves the index.
+	tb_cases! {
+		fn the_type_index_follows_its_instances((placed, removed, resolved): Indexed) {
+			let routes = routes_holding(placed);
+			let routes = remove_each(routes, removed);
+			assert_eq!(routes.resolve(TYPE), resolved.map(sibling));
+		}
+		cases {
+			first_instance_owns_it => (&[FIRST, SECOND], &[], Some("10.0.0.1")),
+			removing_the_indexed_promotes_a_sibling => (&[FIRST, SECOND], &[FIRST], Some("10.0.0.2")),
+			removing_the_last_clears_the_type => (&[FIRST], &[FIRST], None),
+			removing_a_sibling_leaves_the_index => (&[FIRST, SECOND], &[SECOND], Some("10.0.0.1")),
+		}
 	}
 
 	/// A sibling that answers under a second key, at `bytes`.
 	fn resigned_sibling(bytes: &'static str) -> Sibling {
-		let key = Secp256k1SigningKey::from_bytes(&[7; 32].into()).expect("the fixture scalar is a valid key");
-		let certificate = TestCertificate::self_signed(&key);
+		let certificate = TestCertificate::self_signed(&TestKey::fixed(0x07));
 		let signer = certificate.signer_identifier().expect("the fixture certificate names its key");
 
 		Sibling { address: addr(bytes), signer: Arc::new(signer) }
 	}
 
-	// An instance that replaces the indexed one at its address takes the type
-	// over, so a call dials bound to the signer that answers there.
+	/// An instance that replaces the indexed one at its address takes the type
+	/// over, so a call dials bound to the signer that answers there.
 	#[test]
 	fn a_replacement_of_the_indexed_instance_takes_the_index() {
 		let mut routes = Routes::default();
@@ -406,30 +451,21 @@ mod tests {
 		assert_eq!(routes.resolve(TYPE), Some(resigned_sibling("10.0.0.1")));
 	}
 
-	#[test]
-	fn removing_the_indexed_instance_promotes_a_sibling() {
-		let mut routes = Routes::default();
-		routes.insert(instance("a"), sibling("10.0.0.1"), TYPE);
-		routes.insert(instance("b"), sibling("10.0.0.2"), TYPE);
-		routes.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
-		assert_eq!(routes.resolve(TYPE), Some(sibling("10.0.0.2")));
-	}
+	/// Spawns a thread that runs `step` on `routes` 20,000 times, each under
+	/// the write lock, and then sends on `done`.
+	fn spawn_repeating(
+		routes: &Arc<RwLock<Routes>>,
+		done: mpsc::Sender<()>,
+		step: impl Fn(&mut Routes) + Send + 'static,
+	) {
+		let routes = Arc::clone(routes);
+		thread::spawn(move || {
+			for _ in 0..20_000 {
+				step(&mut routes.write().expect("routes lock"));
+			}
 
-	#[test]
-	fn removing_the_last_instance_clears_the_type() {
-		let mut routes = Routes::default();
-		routes.insert(instance("a"), sibling("10.0.0.1"), TYPE);
-		routes.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
-		assert_eq!(routes.resolve(TYPE), None);
-	}
-
-	#[test]
-	fn removing_a_sibling_leaves_the_index() {
-		let mut routes = Routes::default();
-		routes.insert(instance("a"), sibling("10.0.0.1"), TYPE);
-		routes.insert(instance("b"), sibling("10.0.0.2"), TYPE);
-		routes.remove(instance("b"), PREFIX, TYPE, &addr("10.0.0.2"));
-		assert_eq!(routes.resolve(TYPE), Some(sibling("10.0.0.1")));
+			done.send(()).expect("receiver alive");
+		});
 	}
 
 	/// Insert and remove run concurrently against one lock. Two locks
@@ -439,35 +475,16 @@ mod tests {
 	fn concurrent_insert_and_remove_finish() {
 		let routes = Arc::new(RwLock::new(Routes::default()));
 		let (done, finished) = mpsc::channel();
-
-		let inserter = Arc::clone(&routes);
-		let insert_done = done.clone();
 		let inserted = sibling("10.0.0.1");
-		thread::spawn(move || {
-			for _ in 0..20_000 {
-				inserter
-					.write()
-					.expect("routes lock")
-					.insert(instance("a"), inserted.clone(), TYPE);
-			}
 
-			insert_done.send(()).expect("receiver alive");
+		spawn_repeating(&routes, done.clone(), move |routes| {
+			routes.insert(instance("a"), inserted.clone(), TYPE)
+		});
+		spawn_repeating(&routes, done, |routes| {
+			routes.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"))
 		});
 
-		let remover = Arc::clone(&routes);
-		thread::spawn(move || {
-			for _ in 0..20_000 {
-				remover
-					.write()
-					.expect("routes lock")
-					.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
-			}
-
-			done.send(()).expect("receiver alive");
-		});
-
-		for _ in 0..2 {
-			assert!(finished.recv_timeout(Duration::from_secs(10)).is_ok());
-		}
+		let both = [finished.recv_timeout(HANG_GUARD), finished.recv_timeout(HANG_GUARD)];
+		assert!(matches!(both, [Ok(()), Ok(())]));
 	}
 }

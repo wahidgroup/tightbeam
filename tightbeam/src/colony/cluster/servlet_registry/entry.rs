@@ -735,6 +735,43 @@ impl ServletEntry {
 		self.trial_count.store(trials, Ordering::Relaxed);
 		self
 	}
+
+	/// The route of `servlet_type` that the peer `peer` advertises at the
+	/// fixture socket `dial`, at the default pheromone and abandonment limit.
+	pub(crate) fn peer_fixture(servlet_type: impl AsRef<[u8]>, peer: impl AsRef<[u8]>, dial: impl AsRef<str>) -> Self {
+		let route = PeerRoute {
+			peer_id: Arc::from(peer.as_ref()),
+			servlet_type: Arc::from(servlet_type.as_ref()),
+			dial: AdmittedDial::fixture(dial),
+		};
+
+		ServletEntry::peer(route, super::DEFAULT_INITIAL_PHEROMONE, super::DEFAULT_ABANDONMENT_LIMIT)
+	}
+
+	/// Returns this entry with an abandonment limit of `limit` failures.
+	pub(crate) fn with_abandonment_limit(mut self, limit: NonZeroU32) -> Self {
+		self.abandonment_limit = limit;
+		self
+	}
+
+	/// The route of `servlet_type` from `origin` through the relay `relay`,
+	/// which dials the relay at the fixture socket `dial`, at the default
+	/// pheromone and abandonment limit.
+	pub(crate) fn relay_fixture(
+		origin: impl AsRef<[u8]>,
+		relay: impl AsRef<[u8]>,
+		servlet_type: impl AsRef<[u8]>,
+		dial: impl AsRef<str>,
+	) -> Self {
+		let route = RelayRoute {
+			origin_id: Arc::from(origin.as_ref()),
+			relay_id: Arc::from(relay.as_ref()),
+			servlet_type: Arc::from(servlet_type.as_ref()),
+			dial: AdmittedDial::fixture(dial),
+		};
+
+		ServletEntry::peer_relay(route, super::DEFAULT_INITIAL_PHEROMONE, super::DEFAULT_ABANDONMENT_LIMIT)
+	}
 }
 
 impl Clone for ServletEntry {

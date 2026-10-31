@@ -412,11 +412,11 @@ impl ForwardedStream {
 mod tests {
 	use core::task::Poll;
 
-	use super::super::testing::{body_fixture, budgeted_body_fixture, noop_cx, poll_now, FlagWake};
+	use super::super::fixtures::{noop_cx, poll_now, FlagWake};
 	use super::*;
 	use crate::constants::MAX_MUX_REASSEMBLY_BYTES;
 	use crate::der::Encode;
-	use crate::testing::TestFrame;
+	use crate::testing::{TestFrame, TestResult};
 	use crate::transport::TransportFailure;
 
 	/// The length of each chunk of the bodies that meet the reassembly
@@ -427,31 +427,49 @@ mod tests {
 	/// ceiling exactly.
 	const CEILING_CHUNKS: usize = MAX_MUX_REASSEMBLY_BYTES / CEILING_CHUNK_LEN;
 
+	/// A body of stream 7 with a window of four chunks whose forwarder carried
+	/// `events`, beside that forwarder and the drain notes of the body.
+	fn body_carrying(
+		events: impl IntoIterator<Item = BodyEvent>,
+	) -> (StreamBody, ForwardedStream, mpsc::Receiver<DrainNote>) {
+		let (body, mut forwarder, notes) = StreamBody::fixture(7, 4);
+		let carried = events.into_iter().all(|event| forwarder.forward(event));
+		assert!(carried);
+
+		(body, forwarder, notes)
+	}
+
 	/// A body whose forwarder carried `count` chunks of [`CEILING_CHUNK_LEN`]
 	/// octets and then its end, beside the drain notes it reports.
 	fn forwarded_body(count: usize) -> (StreamBody, mpsc::Receiver<DrainNote>) {
 		let window = u64::try_from(count).expect("a chunk count fits u64");
-		let (body, mut forwarder, notes) = body_fixture(7, window);
+		let (body, mut forwarder, notes) = StreamBody::fixture(7, window);
 		let chunk = vec![0xAB; CEILING_CHUNK_LEN];
+
 		let forwarded = (0..count).all(|_| forwarder.accept_and_forward(&chunk));
 		let ended = forwarder.forward(BodyEvent::End);
-		assert!(forwarded && ended, "the window carries every chunk and the end");
+		assert!(forwarded && ended);
+
 		(body, notes)
 	}
 
 	/// A body over `budget` whose forwarder carried two chunks of 100 octets
 	/// and then its end.
 	fn two_chunk_body(budget: Arc<ReassemblyBudget>) -> StreamBody {
-		let (body, mut forwarder, _notes) = budgeted_body_fixture(7, 4, budget);
+		let (body, mut forwarder, _notes) = StreamBody::budgeted_fixture(7, 4, budget);
+
 		let forwarded = (0..2).all(|_| forwarder.accept_and_forward([0xAB; 100]));
 		let ended = forwarder.forward(BodyEvent::End);
-		assert!(forwarded && ended, "the window carries both chunks and the end");
+		assert!(forwarded && ended);
+
 		body
 	}
 
+	/// A body yields its chunks, ends for good, and reports one drain per
+	/// chunk, and the end marker consumes no credit.
 	#[test]
-	fn test_stream_body_yields_chunks_and_reports_drain() {
-		let (mut body, mut forwarder, mut notes) = body_fixture(7, 4);
+	fn a_body_yields_its_chunks_and_reports_each_drain() {
+		let (mut body, mut forwarder, mut notes) = StreamBody::fixture(7, 4);
 		assert!(forwarder.accept_chunk());
 		assert!(forwarder.forward(BodyEvent::Chunk(vec![1, 2])));
 		assert!(forwarder.forward(BodyEvent::End));
@@ -461,120 +479,129 @@ mod tests {
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 		// The terminal state is sticky.
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
-
-		let note = notes.try_recv();
-		assert!(matches!(note, Ok(DrainNote { stream_id: 7, consumed: 1 })));
+		assert!(matches!(notes.try_recv(), Ok(DrainNote { stream_id: 7, consumed: 1 })));
 		// The End marker consumes no credit and reports no drain.
 		assert!(notes.try_recv().is_err());
 	}
 
+	/// The drain notes of a body coalesce while the reader stalls, and the
+	/// drained slot flushes them when the reader resumes.
 	#[test]
-	fn test_drain_notes_coalesce_while_the_reader_stalls_and_flush_on_resume() {
-		let (mut body, mut forwarder, mut notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![1])));
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![2])));
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![3])));
+	fn drain_notes_coalesce_while_the_reader_stalls_and_flush_on_resume() {
+		let (mut body, _forwarder, mut notes) =
+			body_carrying([BodyEvent::Chunk(vec![1]), BodyEvent::Chunk(vec![2]), BodyEvent::Chunk(vec![3])]);
 
-		let (flag, waker) = FlagWake::pair();
-		let mut cx = Context::from_waker(&waker);
+		let parked = FlagWake::parked();
+		let mut cx = parked.cx();
 		assert!(matches!(body.poll_chunk(&mut cx), Poll::Ready(Ok(Some(chunk))) if chunk == [1]));
 		assert!(matches!(body.poll_chunk(&mut cx), Poll::Ready(Ok(Some(chunk))) if chunk == [2]));
 		assert!(matches!(body.poll_chunk(&mut cx), Poll::Ready(Ok(Some(chunk))) if chunk == [3]));
 
 		// The stalled reader holds exactly the body's one slot.
-		assert!(!flag.woken());
+		assert!(!parked.woken());
 		assert!(matches!(notes.try_recv(), Ok(DrainNote { stream_id: 7, consumed: 1 })));
 		assert!(notes.try_recv().is_err());
 
 		// The drained slot wakes the body, whose next poll reports its current
 		// count before it waits on chunks.
-		assert!(flag.woken());
+		assert!(parked.woken());
 		assert!(matches!(body.poll_chunk(&mut cx), Poll::Pending));
 		assert!(matches!(notes.try_recv(), Ok(DrainNote { stream_id: 7, consumed: 3 })));
 		assert!(notes.try_recv().is_err());
 	}
 
+	/// A body whose forwarder dropped ends as a closed connection.
 	#[test]
-	fn test_stream_body_surfaces_severed_stream() {
-		let (mut body, forwarder, _notes) = body_fixture(7, 4);
+	fn a_body_surfaces_a_severed_stream() {
+		let (mut body, forwarder, _notes) = StreamBody::fixture(7, 4);
 		drop(forwarder);
 
 		let severed = body.poll_chunk_now();
 		assert!(matches!(severed, Poll::Ready(Err(TransportError::ConnectionClosed))));
 	}
 
+	/// A body surfaces a failed terminal once, and then ends for good.
 	#[test]
-	fn test_stream_body_surfaces_failed_terminal() {
-		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Failed(TransportError::Draining)));
+	fn a_body_surfaces_a_failed_terminal() {
+		let (mut body, _forwarder, _notes) = body_carrying([BodyEvent::Failed(TransportError::Draining)]);
 
-		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
+		let failed = body.poll_chunk_now();
+		assert!(matches!(failed, Poll::Ready(Err(TransportError::Draining))));
 		// The terminal state is sticky.
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 	}
 
+	/// A forwarder accepts no chunk past the limit it granted.
 	#[test]
-	fn test_forwarded_stream_enforces_granted_limit() {
-		let (_body, mut forwarder, _notes) = body_fixture(7, 1);
-		assert!(forwarder.accept_chunk());
+	fn a_forwarder_enforces_its_granted_limit() {
+		let (_body, mut forwarder, _notes) = StreamBody::fixture(7, 1);
+
+		let first = forwarder.accept_chunk();
+		assert!(first);
 		assert!(!forwarder.accept_chunk());
 	}
 
-	// A dropped body closes the channel, so forward must report failure. A
-	// forward that treated `Closed` as a success would keep credit draining.
+	/// A dropped body closes the channel, so forward must report failure. A
+	/// forward that treated `Closed` as a success would keep credit draining.
 	#[test]
-	fn test_forward_reports_failure_when_body_dropped() {
-		let (body, mut forwarder, _notes) = body_fixture(7, 4);
+	fn a_forward_fails_once_the_body_dropped() {
+		let (body, mut forwarder, _notes) = StreamBody::fixture(7, 4);
 		drop(body);
-		assert!(!forwarder.forward(BodyEvent::Chunk(vec![1])));
+
+		let forwarded = forwarder.forward(BodyEvent::Chunk(vec![1]));
+		assert!(!forwarded);
 	}
 
-	#[test]
-	fn test_stream_body_stream_impl_yields_then_fuses() {
-		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![1, 2])));
-		assert!(forwarder.forward(BodyEvent::End));
+	/// The first item a body stream yields, which a row tests.
+	type FirstItem = Poll<Option<TransportResult<Vec<u8>>>>;
 
-		let mut cx = noop_cx();
-		let first = Pin::new(&mut body).poll_next(&mut cx);
-		assert!(matches!(first, Poll::Ready(Some(Ok(chunk))) if chunk == [1, 2]));
-		assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(None)));
-		assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(None)));
+	// A body stream yields its first item, a chunk or a terminal failure,
+	// and then fuses.
+	crate::tb_cases! {
+		fn a_body_stream_yields_its_item_and_then_fuses(
+			(events, yielded): (Vec<BodyEvent>, fn(&FirstItem) -> bool)
+		) {
+			let (mut body, _forwarder, _notes) = body_carrying(events);
+			let mut cx = noop_cx();
+
+			let first = Pin::new(&mut body).poll_next(&mut cx);
+			assert!(yielded(&first));
+			assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(None)));
+			assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(None)));
+		}
+		cases {
+			a_chunk_then_the_end => (
+				vec![BodyEvent::Chunk(vec![1, 2]), BodyEvent::End],
+				|first| matches!(first, Poll::Ready(Some(Ok(chunk))) if chunk == &[1, 2]),
+			),
+			a_failure => (
+				vec![BodyEvent::Failed(TransportError::Draining)],
+				|first| matches!(first, Poll::Ready(Some(Err(TransportError::Draining)))),
+			),
+		}
 	}
 
-	// A terminal failure surfaces as one Err item, and then the stream fuses.
+	/// A body collects its chunks into one buffer in order.
 	#[test]
-	fn test_stream_body_stream_impl_surfaces_failure_once() {
-		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Failed(TransportError::Draining)));
-
-		let mut cx = noop_cx();
-		let first = Pin::new(&mut body).poll_next(&mut cx);
-		assert!(matches!(first, Poll::Ready(Some(Err(TransportError::Draining)))));
-		assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(None)));
-	}
-
-	#[test]
-	fn test_into_bytes_concatenates_chunks() {
-		let (body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![1, 2])));
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![3])));
-		assert!(forwarder.forward(BodyEvent::End));
+	fn a_body_concatenates_its_chunks() {
+		let (body, _forwarder, _notes) =
+			body_carrying([BodyEvent::Chunk(vec![1, 2]), BodyEvent::Chunk(vec![3]), BodyEvent::End]);
 
 		let bytes = poll_now(body.into_bytes());
 		assert!(matches!(bytes, Poll::Ready(Ok(bytes)) if bytes == [1, 2, 3]));
 	}
 
+	/// A body decodes the frame its chunks carry together.
 	#[test]
-	fn test_into_frame_decodes_collected_chunks() -> TransportResult<()> {
+	fn a_body_decodes_the_frame_its_chunks_carry() -> TestResult {
 		let frame = TestFrame::v0(Some("collected"), None);
 		let payload = frame.to_der()?;
 		let middle = payload.len() / 2;
-
-		let (body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Chunk(payload[..middle].to_vec())));
-		assert!(forwarder.forward(BodyEvent::Chunk(payload[middle..].to_vec())));
-		assert!(forwarder.forward(BodyEvent::End));
+		let (body, _forwarder, _notes) = body_carrying([
+			BodyEvent::Chunk(payload[..middle].to_vec()),
+			BodyEvent::Chunk(payload[middle..].to_vec()),
+			BodyEvent::End,
+		]);
 
 		let decoded = poll_now(body.into_frame());
 		assert!(matches!(decoded, Poll::Ready(Ok(decoded)) if decoded == frame));
@@ -582,6 +609,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// A body that meets the reassembly ceiling exactly is collected whole.
 	#[test]
 	fn a_body_at_the_reassembly_ceiling_is_collected() {
 		let (body, _notes) = forwarded_body(CEILING_CHUNKS);
@@ -590,46 +618,44 @@ mod tests {
 		assert!(matches!(collected, Poll::Ready(Ok(bytes)) if bytes.len() == MAX_MUX_REASSEMBLY_BYTES));
 	}
 
-	/// A peer stream reassembles to the bound of a unary reassembly, so one
-	/// chunk past it refuses the body.
-	#[test]
-	fn a_body_past_the_reassembly_ceiling_is_refused() {
-		let (body, _notes) = forwarded_body(CEILING_CHUNKS + 1);
-		let oversize = TransportFailure::SizeExceeded;
-
-		let collected = poll_now(body.into_bytes());
-		assert!(matches!(collected, Poll::Ready(Err(TransportError::OperationFailed(failure))) if failure == oversize));
+	// A body past a bound of its collect is refused as oversize: a peer stream
+	// reassembles to the bound of a unary reassembly, so one chunk past it
+	// refuses the body, and a body charges the reassembly budget of its
+	// connection as it collects, so a body inside its own ceiling is refused
+	// past the budget.
+	crate::tb_cases! {
+		fn a_body_past_a_bound_of_its_collect_is_refused(body: StreamBody) {
+			let collected = poll_now(body.into_bytes());
+			assert!(matches!(
+				collected,
+				Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)))
+			));
+		}
+		cases {
+			the_reassembly_ceiling => forwarded_body(CEILING_CHUNKS + 1).0,
+			the_connection_budget => two_chunk_body(Arc::new(ReassemblyBudget::with_ceiling(128))),
+		}
 	}
 
-	/// A body charges the reassembly budget of its connection as it collects,
-	/// so a body inside its own ceiling is refused past the budget.
+	/// A body whose chunks decode to no frame reports the decode error.
 	#[test]
-	fn a_body_past_the_connection_budget_is_refused() {
-		let body = two_chunk_body(Arc::new(ReassemblyBudget::with_ceiling(128)));
-		let oversize = TransportFailure::SizeExceeded;
-
-		let collected = poll_now(body.into_bytes());
-		assert!(matches!(collected, Poll::Ready(Err(TransportError::OperationFailed(failure))) if failure == oversize));
-	}
-
-	#[test]
-	fn test_into_frame_maps_garbage_to_der_error() {
-		let (body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.forward(BodyEvent::Chunk(vec![0xFF, 0xFF])));
-		assert!(forwarder.forward(BodyEvent::End));
+	fn a_body_of_garbage_reports_a_der_error() {
+		let (body, _forwarder, _notes) = body_carrying([BodyEvent::Chunk(vec![0xFF, 0xFF]), BodyEvent::End]);
 
 		let decoded = poll_now(body.into_frame());
 		assert!(matches!(decoded, Poll::Ready(Err(TransportError::DerError(_)))));
 	}
 
-	// An empty payload such as a bare trailer consumes credit and forwards no
-	// chunk event, so the consumer sees no phantom empty chunk.
+	/// An empty payload such as a bare trailer consumes credit and forwards
+	/// no chunk event, so the consumer sees no phantom empty chunk.
 	#[test]
-	fn test_forwarded_stream_skips_empty_payload_events() {
-		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
+	fn a_forwarder_skips_an_empty_payload() {
+		let (mut body, mut forwarder, _notes) = StreamBody::fixture(7, 4);
 		assert!(forwarder.accept_and_forward([]));
 		assert!(forwarder.forward(BodyEvent::End));
-		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
-		assert!(matches!(forwarder.limits(), (4, 4)));
+
+		let ended = body.poll_chunk_now();
+		assert!(matches!(ended, Poll::Ready(Ok(None))));
+		assert_eq!(forwarder.limits(), (4, 4));
 	}
 }

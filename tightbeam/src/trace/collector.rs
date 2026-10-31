@@ -2353,6 +2353,42 @@ impl ConsumedTrace {
 		trace
 	}
 
+	/// The trace of a run that records each of `urns` once, in order, drained
+	/// as [`Self::drained_from`] drains it.
+	#[cfg(test)]
+	pub(crate) fn recording(urns: impl IntoIterator<Item = impl IntoEventLabel>) -> Self {
+		let collector = TraceCollector::new();
+		for urn in urns {
+			collector.event(urn).expect("the run injects no fault").emit();
+		}
+
+		Self::drained_from(&collector)
+	}
+
+	/// The trace of `records` on a collector that keeps durations, each record
+	/// a kind, a label, and a measure in nanoseconds, or `None` for a record
+	/// that its sink files with no measure.
+	///
+	/// A deadline marker carries its measure as a timestamp, and every other
+	/// record carries it as a duration. A measure is a `u64` or an
+	/// `Option<u64>`, so a table of measured records names no `Some`.
+	#[cfg(all(test, feature = "testing-timing"))]
+	pub(crate) fn timed<M: Into<Option<u64>> + Copy>(records: &[(Urn<'static>, &'static str, M)]) -> Self {
+		let config = TbInstrumentationConfig { record_durations: true, ..TbInstrumentationConfig::default() };
+		let collector = crate::testing::fixtures::TestTrace::with_config(config);
+		for (urn, label, measure) in records {
+			let (urn, label) = (urn.clone(), *label);
+			let measure: Option<u64> = (*measure).into();
+			match measure.map(Duration::from_nanos) {
+				None => collector.emit(urn, label),
+				Some(at) if urn == events::TIMING_DEADLINE => collector.emit_with_timestamp(urn, label, at),
+				Some(span) => collector.emit_with_timing(urn, label, span),
+			}
+		}
+
+		Self::drained_from(&collector)
+	}
+
 	/// Marks the trace as one whose sink dropped events, so a test of a
 	/// reader can refuse an incomplete record without a dropping sink.
 	#[cfg(all(test, feature = "testing-timing"))]
@@ -2478,6 +2514,16 @@ mod tests {
 	const ALPHA: Urn<'static> = crate::urn!("test", "event:collector/alpha");
 	const BETA: Urn<'static> = crate::urn!("test", "event:collector/beta");
 
+	/// One emit path, which writes at [`ALPHA`] in a trace.
+	#[cfg(feature = "instrument")]
+	type Emit = fn(&crate::trace::TraceCollector) -> Result<(), crate::TightBeamError>;
+
+	/// The error each fault of these tests injects.
+	#[cfg(feature = "testing-fault")]
+	fn closed() -> crate::TightBeamError {
+		crate::TightBeamError::ChannelClosed
+	}
+
 	tb_assert_spec! {
 		pub TraceCollectorSpec,
 		V(1,0,0): {
@@ -2489,6 +2535,8 @@ mod tests {
 		}
 	}
 
+	// The trace that a scenario hands its body records into the state that
+	// its spec reads, so each event of the body counts once against the spec.
 	tb_scenario! {
 		name: trace_collector_records_shared_state,
 		spec: TraceCollectorSpec,
@@ -2509,17 +2557,16 @@ mod tests {
 
 		use super::ALPHA;
 		use crate::instrumentation::TbInstrumentationConfig;
-		use crate::trace::{TraceCollector, TraceConfig};
-		use crate::TightBeamError;
+		use crate::testing::fixtures::TestTrace;
+		use crate::testing::TestResult;
 
 		// A trace whose config keeps payloads renders the evidence of an emit,
 		// and a trace whose config drops them renders nothing.
 		crate::tb_cases! {
 			fn an_emit_renders_its_evidence_when_the_trace_keeps_payloads((enable_payloads, rendered): (bool, bool))
-				-> Result<(), TightBeamError>
+				-> TestResult
 			{
-				let config = TbInstrumentationConfig { enable_payloads, ..TbInstrumentationConfig::default() };
-				let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+				let trace = TestTrace::with_config(TbInstrumentationConfig { enable_payloads, ..Default::default() });
 				let ran = Cell::new(false);
 				let evidence = || {
 					ran.set(true);
@@ -2538,30 +2585,17 @@ mod tests {
 	}
 
 	mod poison {
-		use std::panic::{catch_unwind, AssertUnwindSafe};
-
 		use super::ALPHA;
+		use crate::testing::fixtures::poison;
+		use crate::testing::TestResult;
 		use crate::trace::TraceCollector;
-		use crate::TightBeamError;
-
-		/// Poisons the assertions lock of `collector`, as a panic while a
-		/// record holds the lock would.
-		fn poison_assertions(collector: &TraceCollector) {
-			let panicked = catch_unwind(AssertUnwindSafe(|| {
-				let _held = collector.state.assertions.lock();
-				panic!("poison the assertions lock");
-			}));
-
-			assert!(panicked.is_err());
-			assert!(collector.state.assertions.is_poisoned());
-		}
 
 		/// Each write leaves the assertion list whole, so an event that records
 		/// after a panic poisoned the lock drains too.
 		#[test]
-		fn an_event_recorded_after_a_poisoning_panic_drains() -> Result<(), TightBeamError> {
+		fn an_event_recorded_after_a_poisoning_panic_drains() -> TestResult {
 			let collector = TraceCollector::new();
-			poison_assertions(&collector);
+			poison(&collector.state.assertions);
 
 			collector.event(ALPHA)?.emit();
 			assert_eq!(collector.drain_assertions().len(), 1);
@@ -2573,10 +2607,16 @@ mod tests {
 	mod faults {
 		use std::panic::{catch_unwind, AssertUnwindSafe};
 
-		use super::{ALPHA, BETA};
+		use super::{closed, ALPHA, BETA};
 		use crate::testing::fdr::{FaultModel, InjectionStrategy};
+		use crate::testing::TestResult;
 		use crate::trace::TraceCollector;
 		use crate::TightBeamError;
+
+		#[cfg(feature = "instrument")]
+		use super::Emit;
+		#[cfg(feature = "instrument")]
+		use crate::testing::fixtures::TestTrace;
 
 		/// The seed of the random strategy in these tests.
 		const SEED: u64 = 7;
@@ -2588,28 +2628,28 @@ mod tests {
 			false, false, true, false, true, true, false, false, true, false, true, true, false, true, false,
 		];
 
-		/// The error each fault of these tests injects.
-		fn closed() -> TightBeamError {
-			TightBeamError::ChannelClosed
+		/// Whether each of `count` records of [`ALPHA`] on `collector` drew a
+		/// fault, in the order of the records.
+		fn draws(collector: &TraceCollector, count: usize) -> Vec<bool> {
+			(0..count).map(|_| collector.event(ALPHA).is_err()).collect()
 		}
 
 		/// A model installed through one handle injects at every handle that
 		/// shares its state.
 		#[test]
-		fn a_model_installed_through_one_handle_injects_at_its_shares() -> Result<(), TightBeamError> {
+		fn a_model_installed_through_one_handle_injects_at_its_shares() {
 			let collector = TraceCollector::new();
 			let shared = collector.share();
 			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
 			let _collector = collector.with_fault_model(model);
 
 			assert!(matches!(shared.event(ALPHA), Err(TightBeamError::ChannelClosed)));
-			Ok(())
 		}
 
 		/// At 5000 bps the deterministic strategy injects on the second record
 		/// of each label, and it counts each label apart.
 		#[test]
-		fn the_deterministic_strategy_counts_each_label_apart() -> Result<(), TightBeamError> {
+		fn the_deterministic_strategy_counts_each_label_apart() -> TestResult {
 			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(5000));
 			let model = model.with_event_fault(BETA, closed, crate::bps!(5000));
 			let collector = TraceCollector::new().with_fault_model(model);
@@ -2623,11 +2663,11 @@ mod tests {
 
 		/// A model installed later replaces the model the state holds.
 		#[test]
-		fn a_model_installed_later_replaces_the_first() -> Result<(), TightBeamError> {
+		fn a_model_installed_later_replaces_the_first() -> TestResult {
 			let first = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
 			let second = FaultModel::default().with_event_fault(BETA, closed, crate::bps!(10000));
-			let collector = TraceCollector::new().with_fault_model(first).with_fault_model(second);
 
+			let collector = TraceCollector::new().with_fault_model(first).with_fault_model(second);
 			collector.event(ALPHA)?;
 			assert!(matches!(collector.event(BETA), Err(TightBeamError::ChannelClosed)));
 			Ok(())
@@ -2662,80 +2702,62 @@ mod tests {
 			assert!(matches!(collector.event(BETA), Err(TightBeamError::ChannelClosed)));
 		}
 
-		/// A collector that injects a fault at every record of [`ALPHA`].
+		// A dual-write emit returns the fault that the trace injects at its
+		// event, so its caller fails, on each emit path.
 		#[cfg(feature = "instrument")]
-		fn faulting_at_alpha() -> TraceCollector {
-			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
-			TraceCollector::new().with_fault_model(model)
-		}
-
-		/// A dual-write emit returns the fault injected at its event, so its
-		/// caller fails.
-		#[cfg(feature = "instrument")]
-		#[test]
-		fn an_emit_returns_the_fault_injected_at_its_event() {
-			let refused = faulting_at_alpha().emit_event(ALPHA);
-			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
-		}
-
-		/// An emit with evidence returns the fault injected at its event.
-		#[cfg(feature = "instrument")]
-		#[test]
-		fn an_emit_with_evidence_returns_the_fault_injected_at_its_event() {
-			let refused = faulting_at_alpha().emit_event_with_evidence(ALPHA, "refused", None);
-			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
-		}
-
-		/// An emit with a value returns the fault injected at its event.
-		#[cfg(feature = "instrument")]
-		#[test]
-		fn an_emit_with_a_value_returns_the_fault_injected_at_its_event() {
-			let refused = faulting_at_alpha().emit_event_with_value(ALPHA, "refused", 7u32);
-			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+		crate::tb_cases! {
+			fn an_emit_returns_the_fault_injected_at_its_event(emit: Emit) {
+				let trace = TestTrace::faulting(ALPHA, closed, crate::bps!(10000));
+				let refused = emit(&trace);
+				assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+			}
+			cases {
+				emit_event => |trace| trace.emit_event(ALPHA),
+				emit_event_with_evidence => |trace| trace.emit_event_with_evidence(ALPHA, "refused", None),
+				emit_event_with_value => |trace| trace.emit_event_with_value(ALPHA, "refused", 7u32),
+			}
 		}
 
 		/// The random strategy draws as the FDR generator of the model's seed,
 		/// so the seed decides each fault.
 		#[test]
-		fn the_random_strategy_draws_from_the_seed_of_the_model() -> Result<(), TightBeamError> {
+		fn the_random_strategy_draws_from_the_seed_of_the_model() {
 			let model = FaultModel::from(InjectionStrategy::Random).with_seed(SEED);
 			let model = model.with_event_fault(ALPHA, closed, crate::bps!(5000));
 			let collector = TraceCollector::new().with_fault_model(model);
 
-			let drawn: Vec<bool> = (0..32).map(|_| collector.event(ALPHA).is_err()).collect();
+			let drawn = draws(&collector, SEED_DRAWS.len());
 			assert_eq!(drawn, SEED_DRAWS);
-			Ok(())
 		}
 	}
 
 	#[cfg(feature = "instrument")]
 	mod overflow {
 		use crate::instrumentation::{events, TbInstrumentationConfig};
-		use crate::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+		use crate::testing::fixtures::TestTrace;
+		use crate::trace::{ConsumedTrace, EventRecordTruncated, TraceCollector};
 
-		fn collector_with_max_events(max_events: u32) -> TraceCollector {
-			let config = TbInstrumentationConfig { max_events, ..Default::default() };
-			TraceCollector::from(TraceConfig::with_instrumentation(config))
+		/// A trace whose sink holds `max_events` events, after it records
+		/// `count` events: one [`events::START`], then [`events::END`] for each
+		/// other one.
+		fn emitted(max_events: u32, count: usize) -> TraceCollector {
+			let trace = TestTrace::with_config(TbInstrumentationConfig { max_events, ..Default::default() });
+			trace.emit(events::START, "first");
+			(1..count).for_each(|_| trace.emit(events::END, "later"));
+			trace
 		}
 
-		#[test]
-		fn events_within_bound_do_not_overflow() {
-			let collector = collector_with_max_events(2);
-			collector.emit(events::START, "first");
-			collector.emit(events::END, "second");
-			assert!(!collector.overflowed());
-			assert_eq!(collector.drain_events().len(), 2);
-		}
-
-		#[test]
-		fn events_past_bound_are_dropped_and_flagged() {
-			let collector = collector_with_max_events(2);
-			collector.emit(events::START, "first");
-			collector.emit(events::END, "second");
-			collector.emit(events::END, "third");
-			collector.emit(events::END, "fourth");
-			assert!(collector.overflowed());
-			assert_eq!(collector.drain_events().len(), 3);
+		// A trace within the bound of its sink keeps every event, and a trace
+		// past it latches the overflow and keeps one warning past the bound.
+		crate::tb_cases! {
+			fn a_bounded_trace_latches_past_its_bound((emits, overflowed, drained): (usize, bool, usize)) {
+				let trace = emitted(2, emits);
+				assert_eq!((trace.overflowed(), trace.drain_events().len()), (overflowed, drained));
+			}
+			cases {
+				within_bound => (2, false, 2),
+				past_bound => (4, true, 3),
+			}
 		}
 
 		/// A sink past its bound keeps one `core/warn` record in place of the
@@ -2743,14 +2765,8 @@ mod tests {
 		/// drops each later event.
 		#[test]
 		fn the_first_event_past_the_bound_becomes_one_warning() {
-			let collector = collector_with_max_events(1);
-			collector.emit(events::START, "kept");
-			collector.emit(events::END, "replaced");
-			collector.emit(events::END, "dropped");
-
-			let kept = collector.drain_events();
-
-			let records: Vec<_> = kept.into_iter().map(|event| (event.seq, event.urn)).collect();
+			let trace = emitted(1, 3);
+			let records = TestTrace::drained(&trace, |event| (event.seq, event.urn));
 			assert_eq!(records, [(0, events::START), (1, events::WARN)]);
 		}
 
@@ -2758,136 +2774,91 @@ mod tests {
 		/// number too, so the gap marks where the sink cut the record.
 		#[test]
 		fn a_dropped_event_still_takes_its_sequence_number() {
-			let collector = collector_with_max_events(1);
-			collector.emit(events::START, "kept");
-			collector.emit(events::END, "replaced");
-			collector.emit(events::END, "dropped");
+			let trace = emitted(1, 3);
+			let before = TestTrace::drained(&trace, |event| event.seq);
 
-			let before = collector.drain_events();
+			trace.emit(events::END, "after the drain");
 
-			collector.emit(events::END, "after the drain");
-
-			let after = collector.drain_events();
-			let seqs = [before, after].map(|kept| kept.iter().map(|event| event.seq).collect::<Vec<u64>>());
-			assert_eq!(seqs, [vec![0, 1], vec![3]]);
+			let after = TestTrace::drained(&trace, |event| event.seq);
+			assert_eq!([before, after], [vec![0, 1], vec![3]]);
 		}
 
-		/// The trace that drains `collector`.
-		fn consumed(collector: &TraceCollector) -> ConsumedTrace {
-			let mut consumed = ConsumedTrace::new();
-			consumed.populate_from_collector(collector);
-			consumed
-		}
-
-		#[test]
-		fn a_trace_that_drains_every_event_of_its_run_is_complete() -> Result<(), Box<dyn core::error::Error>> {
-			let collector = collector_with_max_events(2);
-			collector.emit(events::START, "first");
-			collector.emit(events::END, "second");
-
-			assert!(consumed(&collector).is_complete());
-			Ok(())
-		}
-
-		#[test]
-		fn a_trace_whose_sink_dropped_an_event_is_incomplete() -> Result<(), Box<dyn core::error::Error>> {
-			let collector = collector_with_max_events(1);
-			collector.emit(events::START, "first");
-			collector.emit(events::END, "second");
-
-			assert!(!consumed(&collector).is_complete());
-			Ok(())
+		// A trace that drains every event of its run is complete, and a trace
+		// whose sink dropped an event is not.
+		crate::tb_cases! {
+			fn a_drained_trace_is_complete_unless_its_sink_dropped((max_events, complete): (u32, bool)) {
+				let trace = ConsumedTrace::drained_from(&emitted(max_events, 2));
+				assert_eq!(trace.is_complete(), complete);
+			}
+			cases {
+				every_event_drained => (2, true),
+				sink_dropped_one => (1, false),
+			}
 		}
 
 		/// A reader that drained the collector first leaves the drop latch
 		/// clear, and the sequence count shows the events that the trace lacks.
 		#[test]
-		fn a_trace_that_drains_after_another_reader_is_incomplete() -> Result<(), Box<dyn core::error::Error>> {
-			let collector = collector_with_max_events(2);
-			collector.emit(events::START, "taken");
-
+		fn a_trace_that_drains_after_another_reader_is_incomplete() {
+			let collector = emitted(2, 1);
 			let _taken = collector.drain_events();
+
 			collector.emit(events::END, "left");
 
-			let trace = consumed(&collector);
-			assert!(!collector.overflowed(), "no sink dropped an event");
-			assert!(!trace.is_complete());
-			Ok(())
+			let trace = ConsumedTrace::drained_from(&collector);
+			assert_eq!((collector.overflowed(), trace.is_complete()), (false, false));
 		}
 
+		/// A trace whose sink dropped an event refuses to count the records of
+		/// any event.
 		#[test]
-		fn a_truncated_trace_counts_no_event() -> Result<(), Box<dyn core::error::Error>> {
-			let collector = collector_with_max_events(1);
-			collector.emit(events::START, "first");
-			collector.emit(events::END, "second");
-
-			let counted = consumed(&collector).count_event_urn(events::START);
-			assert_eq!(counted, Err(crate::trace::EventRecordTruncated));
-			Ok(())
+		fn a_truncated_trace_counts_no_event() {
+			let trace = ConsumedTrace::drained_from(&emitted(1, 2));
+			assert_eq!(trace.count_event_urn(events::START), Err(EventRecordTruncated));
 		}
 	}
 
 	#[cfg(feature = "instrument")]
 	mod sink {
-		use std::sync::Mutex;
-
-		use crate::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
+		use crate::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent, TbInstrumentationConfig};
+		use crate::testing::fixtures::TestTrace;
 		use crate::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 
-		/// A loss-free sink that retains every event with no cap.
-		#[derive(Default)]
-		struct UnboundedSink {
-			events: Mutex<Vec<TbEvent>>,
-		}
-
-		impl EventSink for UnboundedSink {
-			fn emit(&self, event: TbEvent) {
-				if let Ok(mut events) = self.events.lock() {
-					events.push(event);
-				}
-			}
-
-			fn drain(&self) -> Vec<TbEvent> {
-				if let Ok(mut events) = self.events.lock() {
-					events.drain(..).collect()
-				} else {
-					Vec::new()
-				}
-			}
-
-			fn overflowed(&self) -> bool {
-				false
-			}
-		}
-
+		/// A sink of its own replaces the bounded buffer that the config of the
+		/// trace sizes, so a loss-free sink keeps each event past that size.
 		#[test]
-		fn consumer_sink_replaces_bounded_buffer() {
+		fn a_sink_of_its_own_replaces_the_bounded_buffer() {
 			let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
-			let collector =
-				TraceCollector::from(TraceConfig::with_instrumentation(config).with_sink(UnboundedSink::default()));
-
+			let config = TraceConfig::with_instrumentation(config);
+			let collector = TraceCollector::from(config.with_sink(BoundedMemorySink::new(u32::MAX)));
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
 			collector.emit(events::END, "third");
-
-			assert!(!collector.overflowed());
-			assert_eq!(collector.drain_events().len(), 3);
+			assert_eq!((collector.overflowed(), collector.drain_events().len()), (false, 3));
 		}
 
+		/// A trace config with a sink and no instrumentation settings records
+		/// into that sink, so a sink of one event keeps the warning in place of
+		/// the second.
 		#[test]
 		fn sink_without_instrumentation_config_still_receives_events() {
-			let collector = TraceCollector::from(TraceConfig::default().with_sink(UnboundedSink::default()));
-			collector.emit(events::START, "only");
-			assert_eq!(collector.drain_events().len(), 1);
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(BoundedMemorySink::new(1)));
+			collector.emit(events::START, "kept");
+			collector.emit(events::END, "replaced");
+			assert_eq!(TestTrace::drained(&collector, |event| event.urn), [events::START, events::WARN]);
 		}
 
 		/// A sink that forwards each event and keeps none, or keeps each event
 		/// and reports a drop.
+		///
+		/// The house sink reports a drop only past its bound, where it keeps
+		/// its warning, so a test of a sink that loses events another way
+		/// holds this double.
 		struct Lossy {
 			/// Whether the sink keeps each event it receives.
 			keeps: bool,
 			/// The events that the sink keeps.
-			kept: UnboundedSink,
+			kept: BoundedMemorySink,
 		}
 
 		impl EventSink for Lossy {
@@ -2906,55 +2877,53 @@ mod tests {
 			}
 		}
 
-		/// The trace that drains a collector over `sink` after one event.
-		fn consumed_over(sink: Lossy) -> ConsumedTrace {
+		/// The trace that drains a collector over a [`Lossy`] sink that keeps
+		/// each event when `keeps` is set, after one event.
+		fn consumed_over(keeps: bool) -> ConsumedTrace {
+			let sink = Lossy { keeps, kept: BoundedMemorySink::new(u32::MAX) };
 			let collector = TraceCollector::from(TraceConfig::default().with_sink(sink));
 			collector.emit(events::START, "only");
-
-			let mut consumed = ConsumedTrace::new();
-			consumed.populate_from_collector(&collector);
-			consumed
+			ConsumedTrace::drained_from(&collector)
 		}
 
-		#[test]
-		fn a_trace_over_a_sink_that_keeps_no_event_is_incomplete() -> Result<(), Box<dyn core::error::Error>> {
-			let trace = consumed_over(Lossy { keeps: false, kept: UnboundedSink::default() });
-			assert!(!trace.is_complete());
-			Ok(())
+		// A trace over a sink that keeps no event, or over one that reports a
+		// drop, misses events of its run.
+		crate::tb_cases! {
+			fn a_trace_over_a_lossy_sink_is_incomplete(keeps: bool) {
+				let trace = consumed_over(keeps);
+				assert!(!trace.is_complete());
+			}
+			cases {
+				keeps_no_event => false,
+				/// The drop latch of a sink that a collector shares decides as
+				/// the sequence count does, so a sink that reports a drop
+				/// leaves the trace incomplete with every event of its
+				/// collector drained.
+				reports_a_drop => true,
+			}
 		}
 
-		/// The drop latch of a sink that a collector shares decides as the
-		/// sequence count does, so a sink that reports a drop leaves the trace
-		/// incomplete with every event of its collector drained.
+		/// A sink receives the sequence numbers of the events of its collector
+		/// with no gap.
 		#[test]
-		fn a_trace_over_a_sink_that_reports_a_drop_is_incomplete() -> Result<(), Box<dyn core::error::Error>> {
-			let trace = consumed_over(Lossy { keeps: true, kept: UnboundedSink::default() });
-			assert!(!trace.is_complete());
-			Ok(())
-		}
-
-		#[test]
-		fn sink_events_carry_contiguous_seq() {
-			let collector = TraceCollector::from(TraceConfig::default().with_sink(UnboundedSink::default()));
+		fn a_sink_receives_contiguous_sequence_numbers() {
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(BoundedMemorySink::new(u32::MAX)));
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");
-
-			let seqs: Vec<u64> = collector.drain_events().iter().map(|e| e.seq).collect();
-			assert_eq!(seqs, vec![0, 1]);
+			assert_eq!(TestTrace::drained(&collector, |event| event.seq), [0, 1]);
 		}
 
 		/// The sequence number counts past `u32::MAX`, so the events of a
 		/// long-lived trace stay in strictly increasing order.
 		#[test]
 		fn the_sequence_number_counts_past_u32_max() {
-			let collector = TraceCollector::from(TraceConfig::default().with_sink(UnboundedSink::default()));
+			let collector = TraceCollector::from(TraceConfig::default().with_sink(BoundedMemorySink::new(u32::MAX)));
 			let counter = &collector.state.seq;
 			counter.store(u64::from(u32::MAX), core::sync::atomic::Ordering::Relaxed);
 			collector.emit(events::START, "the last number of a u32");
 			collector.emit(events::END, "the first number past it");
 
-			let seqs: Vec<u64> = collector.drain_events().iter().map(|event| event.seq).collect();
-
+			let seqs = TestTrace::drained(&collector, |event| event.seq);
 			assert_eq!(seqs, [u64::from(u32::MAX), u64::from(u32::MAX) + 1]);
 		}
 	}
@@ -2967,14 +2936,15 @@ mod tests {
 
 		use crate::clock::{Clock, ManualClock};
 		use crate::instrumentation::{events, EventSink, TbEvent};
+		use crate::testing::fixtures::{TestClock, TestTrace};
+		use crate::testing::TestResult;
 		use crate::trace::{TraceCollector, TraceConfig};
 		use crate::urn::Urn;
-		use crate::TightBeamError;
 
 		/// A manual clock an hour past its start, so its readings differ from
 		/// those of the system clock.
 		fn advanced_clock() -> Arc<ManualClock> {
-			let clock = Arc::new(ManualClock::default());
+			let clock = TestClock::manual();
 			clock.advance(Duration::from_secs(3600));
 			clock
 		}
@@ -2983,50 +2953,52 @@ mod tests {
 		/// adopts, in Unix-epoch nanoseconds at the clock's millisecond
 		/// precision.
 		#[test]
-		fn a_collector_stamps_its_origin_at_the_reading_of_its_clock() -> Result<(), TightBeamError> {
-			let clock = advanced_clock();
-			let expected = (u128::from(clock.unix().get()) * 1_000_000).to_string();
-			let trace = TraceCollector::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+		fn a_collector_stamps_its_origin_at_the_reading_of_its_clock() -> TestResult {
+			// The clock reads 4,000,000,001 seconds past the epoch.
+			let trace = TestTrace::on(&TestClock::past(4_000_000_000));
 			trace.emit_event(events::START)?;
-
-			let recorded = trace.drain_events();
-			let origin = recorded.iter().find(|event| event.urn == events::TRACE_CLOCK_ORIGIN);
-			let label = origin.and_then(|event| event.label.as_deref());
-			assert_eq!(label, Some(expected.as_str()));
+			let origin = TestTrace::labels(&trace, events::TRACE_CLOCK_ORIGIN);
+			assert_eq!(origin, [Some(String::from("4000000001000000000"))]);
 			Ok(())
 		}
 
 		/// The timestamp of an event is the span the adopted clock moved since
-		/// the origin.
+		/// the origin, which records at zero.
 		#[test]
-		fn an_event_stamps_the_span_its_clock_moved() -> Result<(), TightBeamError> {
+		fn an_event_stamps_the_span_its_clock_moved() -> TestResult {
 			let clock = advanced_clock();
-			let trace = TraceCollector::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+			let trace = TestTrace::on(&clock);
 			clock.advance(Duration::from_secs(5));
 			trace.emit_event(events::START)?;
 
-			let recorded = trace.drain_events();
-			let event = recorded.iter().find(|event| event.urn == events::START);
-			let stamp = event.and_then(|event| event.timestamp_ns);
-			assert_eq!(stamp, Some(5_000_000_000));
+			let stamps = TestTrace::drained(&trace, |event| (event.urn, event.timestamp_ns));
+			assert_eq!(
+				stamps,
+				[(events::TRACE_CLOCK_ORIGIN, Some(0)), (events::START, Some(5_000_000_000))]
+			);
 			Ok(())
 		}
 
 		/// A collector records each origin it adopts once, before the first
 		/// event that counts from it.
 		#[test]
-		fn each_adopted_origin_is_recorded_before_its_events() -> Result<(), TightBeamError> {
-			let trace = TraceCollector::new().with_clock(advanced_clock() as Arc<dyn Clock>);
+		fn each_adopted_origin_is_recorded_before_its_events() -> TestResult {
+			let trace = TestTrace::on(&advanced_clock());
 			trace.emit_event(events::START)?;
 			trace.emit_event(events::START)?;
+
 			let trace = trace.with_clock(advanced_clock() as Arc<dyn Clock>);
 			trace.emit_event(events::END)?;
 
-			let recorded = trace.drain_events();
-			let stamped = recorded.iter().filter(|event| event.timestamp_ns.is_some());
-			let urns: Vec<_> = stamped.map(|event| &event.urn).collect();
-			let origin = &events::TRACE_CLOCK_ORIGIN;
-			assert_eq!(urns, [origin, &events::START, &events::START, origin, &events::END]);
+			let urns = TestTrace::drained(&trace, |event| event.urn);
+			let trail = [
+				events::TRACE_CLOCK_ORIGIN,
+				events::START,
+				events::START,
+				events::TRACE_CLOCK_ORIGIN,
+				events::END,
+			];
+			assert_eq!(urns, trail);
 			Ok(())
 		}
 
@@ -3042,6 +3014,10 @@ mod tests {
 
 		/// A sink that keeps each event, and adopts an advanced clock on its
 		/// collector when it receives its first event.
+		///
+		/// The house sink keeps its events and leaves the clock of its
+		/// collector as it is, so a test of a sink that adopts a clock holds
+		/// this double.
 		struct AdoptingSink(Arc<Adoption>);
 
 		impl EventSink for AdoptingSink {
@@ -3073,7 +3049,7 @@ mod tests {
 			let config = TraceConfig::default().with_sink(AdoptingSink(Arc::clone(&adoption)));
 			let trace = TraceCollector::from(config).with_clock(advanced_clock() as Arc<dyn Clock>);
 			let watched = adoption.trace.set(trace.share());
-			assert!(watched.is_ok(), "the sink adopts for one collector");
+			assert!(watched.is_ok());
 			trace
 		}
 
@@ -3085,7 +3061,7 @@ mod tests {
 			std::thread::spawn(move || {
 				let start = trace.emit_event(events::START);
 				let end = trace.emit_event(events::END);
-				let recorded = trace.drain_events().into_iter().map(|event| event.urn).collect::<Vec<_>>();
+				let recorded = TestTrace::drained(&trace, |event| event.urn);
 				let _receiver_left = sent.send(start.and(end).map(|()| recorded));
 			});
 
@@ -3098,7 +3074,6 @@ mod tests {
 		#[test]
 		fn a_sink_that_adopts_a_clock_on_its_first_event_does_not_deadlock() {
 			let trace = adopting_collector();
-
 			let recorded = emitted_within_a_bound(trace);
 
 			let urns = vec![
@@ -3116,21 +3091,18 @@ mod tests {
 	mod payload {
 		use super::ALPHA;
 		use crate::crypto::hash::{Digest, Sha3_256};
-		use crate::instrumentation::TbInstrumentationConfig;
-		use crate::trace::{TraceCollector, TraceConfig};
-		use crate::TightBeamError;
+		use crate::instrumentation::events;
+		use crate::testing::fixtures::TestTrace;
+		use crate::testing::TestResult;
 
-		/// An event with no value records the SHA3-256 hash of its payload.
+		/// An event with no value records the SHA3-256 hash of its payload, on
+		/// the label record that it writes.
 		#[test]
-		fn an_event_records_the_hash_of_its_payload() -> Result<(), TightBeamError> {
-			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-			let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
-			collector.event(ALPHA)?.with_payload(b"evidence").emit();
-
+		fn an_event_records_the_hash_of_its_payload() -> TestResult {
+			let trace = TestTrace::with_payloads();
+			trace.event(ALPHA)?.with_payload(b"evidence").emit();
 			let expected: [u8; 32] = Sha3_256::digest(b"evidence").into();
-			let recorded = collector.drain_events();
-			let evidence: Vec<Option<[u8; 32]>> = recorded.iter().map(|event| event.payload_hash).collect();
-			assert_eq!(evidence, [Some(expected)]);
+			assert_eq!(TestTrace::payloads(&trace, events::ASSERT_LABEL), [Some(expected)]);
 			Ok(())
 		}
 	}
@@ -3144,7 +3116,6 @@ mod tests {
 		use crate::instrumentation::events;
 		use crate::testing::fixtures::TestTrace;
 		use crate::urn::Urn;
-		use crate::TightBeamError;
 
 		/// The URN and the label of one record.
 		type Entry = (Urn<'static>, Option<Cow<'static, str>>);
@@ -3152,85 +3123,71 @@ mod tests {
 		/// The URN and the label of each event that one handler entry records
 		/// under a trace whose config sets `enable_internal_detail` to
 		/// `detail`.
-		fn recorded_entries(detail: bool) -> Result<Vec<Entry>, TightBeamError> {
+		fn recorded_entries(detail: bool) -> Vec<Entry> {
 			let trace = TestTrace::with_detail(detail);
-			trace.emit_internal_event(InternalEvent::HandlerEnter)?;
+			let entered = trace.emit_internal_event(InternalEvent::HandlerEnter);
+			entered.expect("the trace injects no fault");
 
-			let recorded = trace.drain_events();
-			let entries = recorded.into_iter().filter(|event| event.urn == events::HANDLER_ENTER);
-			Ok(entries.map(|event| (event.urn, event.label)).collect())
+			let records = TestTrace::records(&trace, events::HANDLER_ENTER).into_iter();
+			records.map(|event| (event.urn, event.label)).collect()
 		}
 
-		/// An internal event records its URN and its label when the trace
-		/// config sets the detail flag, and nothing when it clears the flag.
-		#[test]
-		fn an_internal_event_records_under_the_detail_flag_alone() -> Result<(), TightBeamError> {
-			let entry = (events::HANDLER_ENTER, Some(Cow::Borrowed("handler_enter")));
-			assert_eq!([recorded_entries(true)?, recorded_entries(false)?], [vec![entry], vec![]]);
-			Ok(())
+		// An internal event records its URN and its label when the trace config
+		// sets the detail flag, and nothing when it clears the flag.
+		crate::tb_cases! {
+			fn an_internal_event_records_under_the_detail_flag((detail, expected): (bool, Vec<Entry>)) {
+				assert_eq!(recorded_entries(detail), expected);
+			}
+			cases {
+				set => (true, vec![(events::HANDLER_ENTER, Some(Cow::Borrowed("handler_enter")))]),
+				cleared => (false, vec![]),
+			}
 		}
 
 		/// The record of an internal event borrows the static label of the
 		/// event, so the record copies no label.
 		#[test]
-		fn the_record_of_an_internal_event_borrows_its_label() -> Result<(), TightBeamError> {
-			let recorded = recorded_entries(true)?;
-			let borrowed: Vec<bool> = recorded
-				.iter()
-				.map(|(_, label)| matches!(label, Some(Cow::Borrowed(_))))
-				.collect();
-			assert_eq!(borrowed, [true]);
-			Ok(())
+		fn the_record_of_an_internal_event_borrows_its_label() {
+			let recorded = recorded_entries(true);
+			assert!(matches!(recorded.as_slice(), [(_, Some(Cow::Borrowed("handler_enter")))]));
 		}
 
-		/// The URN of each internal event names that event, and the URN of an
-		/// event outside the set names none.
+		// The URN of each internal event names that event, and the URN of an
+		// event outside the set names none.
 		#[cfg(feature = "testing-fdr")]
-		#[test]
-		fn the_urn_of_an_event_names_it_in_the_internal_set() {
-			let urns = [
-				events::HANDLER_ENTER,
-				events::HANDLER_EXIT,
-				events::CRYPTO_STEP,
-				events::COMPRESS_STEP,
-				events::ROUTE_STEP,
-				events::POLICY_EVAL,
-				events::GATE_ACCEPT,
-			];
-			let expected = [
-				Some(InternalEvent::HandlerEnter),
-				Some(InternalEvent::HandlerExit),
-				Some(InternalEvent::CryptoStep),
-				Some(InternalEvent::CompressStep),
-				Some(InternalEvent::RouteStep),
-				Some(InternalEvent::PolicyEval),
-				None,
-			];
-			assert_eq!(urns.map(|urn| InternalEvent::of(&urn)), expected);
+		crate::tb_cases! {
+			fn the_urn_of_an_event_names_it_in_the_internal_set(
+				(urn, expected): (Urn<'static>, Option<InternalEvent>)
+			) {
+				assert_eq!(InternalEvent::of(&urn), expected);
+			}
+			cases {
+				handler_enter => (events::HANDLER_ENTER, Some(InternalEvent::HandlerEnter)),
+				handler_exit => (events::HANDLER_EXIT, Some(InternalEvent::HandlerExit)),
+				crypto_step => (events::CRYPTO_STEP, Some(InternalEvent::CryptoStep)),
+				compress_step => (events::COMPRESS_STEP, Some(InternalEvent::CompressStep)),
+				route_step => (events::ROUTE_STEP, Some(InternalEvent::RouteStep)),
+				policy_eval => (events::POLICY_EVAL, Some(InternalEvent::PolicyEval)),
+				gate_accept_is_outside => (events::GATE_ACCEPT, None),
+			}
 		}
 	}
 
 	/// The sink records that one event takes.
 	#[cfg(feature = "instrument")]
 	mod records {
-		use std::sync::Arc;
-
 		use super::ALPHA;
-		use crate::clock::{Clock, ManualClock};
 		use crate::instrumentation::events;
-		use crate::trace::TraceCollector;
-		use crate::urn::Urn;
-		use crate::TightBeamError;
+		use crate::testing::fixtures::{TestClock, TestTrace};
+		use crate::testing::TestResult;
 
 		/// A dual-write takes one sink record of its own, after the record of
 		/// the clock origin, whether or not the build asserts it.
 		#[test]
-		fn a_dual_write_takes_one_sink_record() -> Result<(), TightBeamError> {
-			let trace = TraceCollector::new().with_clock(Arc::new(ManualClock::default()) as Arc<dyn Clock>);
+		fn a_dual_write_takes_one_sink_record() -> TestResult {
+			let trace = TestTrace::on(&TestClock::manual());
 			trace.emit_event_with_evidence(ALPHA, "refused", None)?;
-
-			let recorded = trace.drain_events();
-			let urns: Vec<Urn<'static>> = recorded.into_iter().map(|event| event.urn).collect();
+			let urns = TestTrace::drained(&trace, |event| event.urn);
 			assert_eq!(urns, [events::TRACE_CLOCK_ORIGIN, ALPHA]);
 			Ok(())
 		}
@@ -3262,18 +3219,15 @@ mod tests {
 
 		use super::ALPHA;
 		use crate::instrumentation::TbInstrumentationConfig;
-		use crate::trace::{TraceCollector, TraceConfig};
+		use crate::testing::fixtures::TestTrace;
 
 		/// A span past the `u64` range of nanoseconds records as `u64::MAX`.
 		#[test]
 		fn a_span_past_u64_nanoseconds_saturates() {
-			let config = TbInstrumentationConfig { record_durations: true, ..TbInstrumentationConfig::default() };
-			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
-
+			let config = TbInstrumentationConfig { record_durations: true, ..Default::default() };
+			let trace = TestTrace::with_config(config);
 			trace.emit_with_timing(ALPHA, "long", Duration::from_secs(u64::MAX));
-
-			let durations: Vec<Option<u64>> = trace.drain_events().iter().map(|event| event.duration_ns).collect();
-			assert_eq!(durations, [Some(u64::MAX)]);
+			assert_eq!(TestTrace::drained(&trace, |event| event.duration_ns), [Some(u64::MAX)]);
 		}
 	}
 
@@ -3281,45 +3235,25 @@ mod tests {
 	#[cfg(all(feature = "instrument", feature = "logging"))]
 	mod log_records {
 		use core::time::Duration;
-		use std::sync::{Arc, Mutex};
 
 		use super::ALPHA;
-		use crate::clock::{Clock, ManualClock};
-		use crate::trace::{LogBackend, LogError, LogFilter, LogLevel, LogRecord, LoggerConfig, TraceCollector};
-
-		/// A backend that keeps the timestamp of each record it receives.
-		struct Stamps(Arc<Mutex<Vec<Option<u64>>>>);
-
-		impl LogBackend for Stamps {
-			fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
-				if let Ok(mut stamps) = self.0.lock() {
-					stamps.push(record.timestamp);
-				}
-				Ok(())
-			}
-
-			fn accepts(&self, _level: LogLevel) -> bool {
-				true
-			}
-		}
+		use crate::testing::fixtures::{TestClock, TestTrace};
+		use crate::testing::TestResult;
+		use crate::trace::logging::fixtures::CaptureBackend;
+		use crate::trace::{LogFilter, LogLevel, LoggerConfig};
 
 		/// A timed event logs the Unix time of the trace clock in
 		/// milliseconds, not the duration it measured.
 		#[test]
-		fn a_timed_event_logs_the_unix_time_of_the_trace_clock() -> Result<(), Box<dyn core::error::Error>> {
-			let clock = Arc::new(ManualClock::default());
-			let stamps = Arc::new(Mutex::new(Vec::new()));
-			let filter = LogFilter::new(LogLevel::Debug);
-			let config =
-				LoggerConfig::new(Stamps(Arc::clone(&stamps)), filter).with_default_level(LogLevel::Informational);
-			let trace = TraceCollector::new()
-				.with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
-				.with_logger(config)?;
+		fn a_timed_event_logs_the_unix_time_of_the_trace_clock() -> TestResult {
+			let backend = CaptureBackend::default();
+			let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
 
+			// The clock reads 4,000,000,001 seconds past the epoch.
+			let trace = TestTrace::on(&TestClock::past(4_000_000_000));
+			let trace = trace.with_logger(config.with_default_level(LogLevel::Informational))?;
 			trace.event(ALPHA)?.with_timing(Duration::from_millis(5)).emit();
-
-			let logged = stamps.lock().map_err(|_| "the stamp lock is poisoned")?.clone();
-			assert_eq!(logged, [Some(clock.unix().get())]);
+			assert_eq!(backend.timestamps(), [Some(4_000_000_001_000)]);
 			Ok(())
 		}
 	}
@@ -3331,28 +3265,24 @@ mod tests {
 		use core::time::Duration;
 		use std::borrow::Cow;
 
-		use super::ALPHA;
-		use crate::instrumentation::TbInstrumentationConfig;
-		use crate::trace::{TraceCollector, TraceConfig};
-		use crate::TightBeamError;
+		use super::{Emit, ALPHA};
+		use crate::instrumentation::{TbEvent, TbInstrumentationConfig};
+		use crate::testing::fixtures::TestTrace;
+		use crate::testing::TestResult;
+		use crate::trace::TraceCollector;
 
 		/// The static label that each emit path writes.
 		const LABEL: &str = "refused";
 
-		/// One emit path, which writes `LABEL` at `ALPHA` in a trace.
-		type Emit = fn(&TraceCollector) -> Result<(), TightBeamError>;
-
 		// The record that a trace keeps of a static label borrows the label on
 		// every emit path, so the record copies no label.
 		crate::tb_cases! {
-			fn the_record_of_a_static_label_borrows_it(emit: Emit) -> Result<(), TightBeamError> {
+			fn the_record_of_a_static_label_borrows_it(emit: Emit) -> TestResult {
 				let trace = TraceCollector::new();
 				emit(&trace)?;
 
-				let recorded = trace.drain_events();
-				let labels = recorded.into_iter().filter(|event| event.urn == ALPHA).map(|event| event.label);
-				let borrowed: Vec<bool> = labels.map(|label| matches!(label, Some(Cow::Borrowed(LABEL)))).collect();
-				assert_eq!(borrowed, [true]);
+				let recorded = TestTrace::records(&trace, ALPHA);
+				assert!(matches!(recorded.as_slice(), [TbEvent { label: Some(Cow::Borrowed(LABEL)), .. }]));
 				Ok(())
 			}
 			cases {
@@ -3390,10 +3320,9 @@ mod tests {
 		// and renders nothing when its sink drops the record.
 		crate::tb_cases! {
 			fn an_emit_renders_its_label_when_the_sink_keeps_the_record((max_events, rendered): (u32, bool))
-				-> Result<(), TightBeamError>
+				-> TestResult
 			{
-				let config = TbInstrumentationConfig { max_events, ..TbInstrumentationConfig::default() };
-				let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+				let trace = TestTrace::with_config(TbInstrumentationConfig { max_events, ..Default::default() });
 				let ran = Cell::new(false);
 				let label = || {
 					ran.set(true);
@@ -3416,69 +3345,58 @@ mod tests {
 	mod connections {
 		use super::ALPHA;
 		use crate::trace::TraceCollector;
-		use crate::TightBeamError;
+
+		#[cfg(any(feature = "instrument", feature = "logging"))]
+		use crate::testing::TestResult;
 
 		/// A model installed after the split injects on the connection trace.
 		#[cfg(feature = "testing-fault")]
 		#[test]
-		fn a_connection_trace_injects_the_faults_of_its_parent() -> Result<(), TightBeamError> {
+		fn a_connection_trace_injects_the_faults_of_its_parent() {
+			use super::closed;
 			use crate::testing::fdr::FaultModel;
+			use crate::TightBeamError;
 
 			let parent = TraceCollector::new();
 			let connections = parent.connections();
-			let closed = || TightBeamError::ChannelClosed;
 			let model = FaultModel::default().with_event_fault(ALPHA, closed, crate::bps!(10000));
 			let _faulted = parent.with_fault_model(model);
 
 			assert!(matches!(connections.event(ALPHA), Err(TightBeamError::ChannelClosed)));
-			Ok(())
 		}
 
 		/// A connection trace logs its events through the logger of its parent.
 		#[cfg(feature = "logging")]
 		#[test]
-		fn a_connection_trace_logs_through_the_logger_of_its_parent() -> Result<(), Box<dyn core::error::Error>> {
-			use core::sync::atomic::{AtomicUsize, Ordering};
-			use std::sync::Arc;
+		fn a_connection_trace_logs_through_the_logger_of_its_parent() -> TestResult {
+			use crate::trace::logging::fixtures::CaptureBackend;
+			use crate::trace::{LogFilter, LogLevel, LoggerConfig};
 
-			use crate::trace::{LogBackend, LogError, LogFilter, LogLevel, LogRecord, LoggerConfig};
-
-			/// A backend that counts the records it receives.
-			struct Counting(Arc<AtomicUsize>);
-
-			impl LogBackend for Counting {
-				fn emit(&self, _record: &LogRecord) -> Result<(), LogError> {
-					self.0.fetch_add(1, Ordering::SeqCst);
-					Ok(())
-				}
-
-				fn accepts(&self, _level: LogLevel) -> bool {
-					true
-				}
-			}
-
-			let logged = Arc::new(AtomicUsize::new(0));
+			let backend = CaptureBackend::default();
 			let filter = LogFilter::new(LogLevel::Debug);
-			let config =
-				LoggerConfig::new(Counting(Arc::clone(&logged)), filter).with_default_level(LogLevel::Informational);
+			let config = LoggerConfig::new(backend.clone(), filter).with_default_level(LogLevel::Informational);
 			let parent = TraceCollector::new().with_logger(config)?;
 
 			parent.connections().event(ALPHA)?.emit();
 
-			assert_eq!(logged.load(Ordering::SeqCst), 1);
+			assert_eq!(backend.records(), [(LogLevel::Informational, ALPHA.to_string(), None)]);
 			Ok(())
 		}
 
 		/// A connection trace records into the sink its parent's sink names.
 		#[cfg(feature = "instrument")]
 		#[test]
-		fn a_connection_trace_records_into_the_sink_its_parent_names() -> Result<(), TightBeamError> {
+		fn a_connection_trace_records_into_the_sink_its_parent_names() -> TestResult {
 			use std::sync::Arc;
 
 			use crate::instrumentation::{BoundedMemorySink, EventSink, TbEvent};
 			use crate::trace::TraceConfig;
 
 			/// A sink that forwards each event to a shared destination.
+			///
+			/// The house sink keeps its events in a buffer of its own, so a
+			/// test of a sink that names its destination as the sibling holds
+			/// this double.
 			struct Forwarding(Arc<BoundedMemorySink>);
 
 			impl EventSink for Forwarding {

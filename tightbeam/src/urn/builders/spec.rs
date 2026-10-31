@@ -522,55 +522,68 @@ impl From<&'static str> for UrnSpecBuilder {
 
 #[cfg(test)]
 mod tests {
-	use crate::urn::UrnBuilder;
+	use std::collections::BTreeMap;
+
+	use crate::testing::TestResult;
 
 	use super::*;
 
-	/// The values of `valid` that `admits` refuses, beside the values of
-	/// `invalid` that it admits, so one case reports every value it misreads.
-	fn misread<'v>(
-		admits: impl Fn(&str) -> bool,
-		valid: &[&'v str],
-		invalid: &[&'v str],
-	) -> (Vec<&'v str>, Vec<&'v str>) {
-		let refused = valid.iter().copied().filter(|value| !admits(value)).collect();
-		let admitted = invalid.iter().copied().filter(|value| admits(value)).collect();
-		(refused, admitted)
-	}
+	/// The options that the oneof constraint of the cases lists.
+	const OPTIONS: &[&str] = &["option1", "option2", "option3"];
 
-	/// One pattern, the values it admits, and the values it refuses.
-	type PatternCase = (Pattern, &'static [&'static str], &'static [&'static str]);
+	/// The letters that the oneof constraint of the cases lists.
+	const LETTERS: &[&str] = &["a", "b", "c"];
 
+	// Each case is a pattern and a value, beside whether the pattern admits
+	// the value.
 	crate::tb_cases! {
-		fn test_pattern_matches((pattern, valid, invalid): PatternCase) {
-			let misses = misread(|value| pattern.matches(value), valid, invalid);
-
-			assert_eq!(misses, (Vec::new(), Vec::new()), "Pattern {pattern:?} misreads these values");
+		fn a_pattern_judges_a_value_by_its_class((pattern, value, admitted): (Pattern, &str, bool)) {
+			assert_eq!(pattern.matches(value), admitted);
 		}
 		cases {
-			alpha => (
-				Pattern::Alpha,
-				&["abc", "XYZ", "Hello", "WORLD"],
-				&["abc123", "123", "abc-xyz", "a1b", "space here"],
-			),
-			numeric => (Pattern::Numeric, &["123", "0", "999", "42"], &["abc", "12a", "1-2", "12.5"]),
-			alpha_numeric => (
-				Pattern::AlphaNumeric,
-				&["abc123", "XYZ999", "Hello42", "WORLD0", "abc", "123"],
-				&["abc-xyz", "space here", "12.5", "a_b"],
-			),
-			alpha_numeric_hyphen => (
-				Pattern::AlphaNumericHyphen,
-				&["abc-123", "xyz-y", "test-case", "kebab-case-id", "abc", "123"],
-				&["abc_xyz", "space here", "12.5"],
-			),
+			alpha_admits_abc => (Pattern::Alpha, "abc", true),
+			alpha_admits_upper_xyz => (Pattern::Alpha, "XYZ", true),
+			alpha_admits_hello => (Pattern::Alpha, "Hello", true),
+			alpha_admits_upper_world => (Pattern::Alpha, "WORLD", true),
+			alpha_refuses_abc123 => (Pattern::Alpha, "abc123", false),
+			alpha_refuses_123 => (Pattern::Alpha, "123", false),
+			alpha_refuses_abc_hyphen_xyz => (Pattern::Alpha, "abc-xyz", false),
+			alpha_refuses_a1b => (Pattern::Alpha, "a1b", false),
+			alpha_refuses_a_space => (Pattern::Alpha, "space here", false),
+			numeric_admits_123 => (Pattern::Numeric, "123", true),
+			numeric_admits_0 => (Pattern::Numeric, "0", true),
+			numeric_admits_999 => (Pattern::Numeric, "999", true),
+			numeric_admits_42 => (Pattern::Numeric, "42", true),
+			numeric_refuses_abc => (Pattern::Numeric, "abc", false),
+			numeric_refuses_12a => (Pattern::Numeric, "12a", false),
+			numeric_refuses_1_hyphen_2 => (Pattern::Numeric, "1-2", false),
+			numeric_refuses_12_dot_5 => (Pattern::Numeric, "12.5", false),
+			alpha_numeric_admits_abc123 => (Pattern::AlphaNumeric, "abc123", true),
+			alpha_numeric_admits_upper_xyz999 => (Pattern::AlphaNumeric, "XYZ999", true),
+			alpha_numeric_admits_hello42 => (Pattern::AlphaNumeric, "Hello42", true),
+			alpha_numeric_admits_upper_world0 => (Pattern::AlphaNumeric, "WORLD0", true),
+			alpha_numeric_admits_abc => (Pattern::AlphaNumeric, "abc", true),
+			alpha_numeric_admits_123 => (Pattern::AlphaNumeric, "123", true),
+			alpha_numeric_refuses_abc_hyphen_xyz => (Pattern::AlphaNumeric, "abc-xyz", false),
+			alpha_numeric_refuses_a_space => (Pattern::AlphaNumeric, "space here", false),
+			alpha_numeric_refuses_12_dot_5 => (Pattern::AlphaNumeric, "12.5", false),
+			alpha_numeric_refuses_a_underscore_b => (Pattern::AlphaNumeric, "a_b", false),
+			alpha_numeric_hyphen_admits_abc_hyphen_123 => (Pattern::AlphaNumericHyphen, "abc-123", true),
+			alpha_numeric_hyphen_admits_xyz_hyphen_y => (Pattern::AlphaNumericHyphen, "xyz-y", true),
+			alpha_numeric_hyphen_admits_test_case => (Pattern::AlphaNumericHyphen, "test-case", true),
+			alpha_numeric_hyphen_admits_kebab_case_id => (Pattern::AlphaNumericHyphen, "kebab-case-id", true),
+			alpha_numeric_hyphen_admits_abc => (Pattern::AlphaNumericHyphen, "abc", true),
+			alpha_numeric_hyphen_admits_123 => (Pattern::AlphaNumericHyphen, "123", true),
+			alpha_numeric_hyphen_refuses_abc_underscore_xyz => (Pattern::AlphaNumericHyphen, "abc_xyz", false),
+			alpha_numeric_hyphen_refuses_a_space => (Pattern::AlphaNumericHyphen, "space here", false),
+			alpha_numeric_hyphen_refuses_12_dot_5 => (Pattern::AlphaNumericHyphen, "12.5", false),
 		}
 	}
 
-	// One case for each `Pattern` variant.
+	// One case for each `Pattern` variant, beside the regex of its class.
 	crate::tb_cases! {
-		fn test_pattern_str((pattern, expected): (Pattern, &str)) {
-			assert_eq!(pattern.pattern_str(), expected, "Pattern {pattern:?} should have pattern_str '{expected}'");
+		fn pattern_str_writes_the_regex_of_its_class((pattern, regex): (Pattern, &str)) {
+			assert_eq!(pattern.pattern_str(), regex);
 		}
 		cases {
 			alpha => (Pattern::Alpha, "^[a-zA-Z]+$"),
@@ -601,6 +614,7 @@ mod tests {
 				.strip_prefix("^[")
 				.and_then(|rest| rest.strip_suffix('$'))
 				.expect("a `^[class]q$` regex");
+
 			let (class, quantifier) = body.split_once(']').expect("a closed class");
 			let class: Vec<char> = class.chars().collect();
 			let min_len = match quantifier {
@@ -639,233 +653,181 @@ mod tests {
 			.collect()
 	}
 
-	#[test]
-	fn alpha_matches_the_rule_of_its_pattern_str() {
-		let disagreements = disagreements(Pattern::Alpha);
-
-		assert_eq!(disagreements, Vec::<&str>::new());
-	}
-
-	#[test]
-	fn numeric_matches_the_rule_of_its_pattern_str() {
-		let disagreements = disagreements(Pattern::Numeric);
-
-		assert_eq!(disagreements, Vec::<&str>::new());
-	}
-
-	#[test]
-	fn alpha_numeric_matches_the_rule_of_its_pattern_str() {
-		let disagreements = disagreements(Pattern::AlphaNumeric);
-
-		assert_eq!(disagreements, Vec::<&str>::new());
-	}
-
-	#[test]
-	fn alpha_numeric_hyphen_matches_the_rule_of_its_pattern_str() {
-		let disagreements = disagreements(Pattern::AlphaNumericHyphen);
-
-		assert_eq!(disagreements, Vec::<&str>::new());
-	}
-
-	// The cases cover both `Constraint` variants. Each is the constraint,
-	// the values it admits, and the values it refuses.
+	// One case for each `Pattern` variant. Each case compares two oracles,
+	// `matches` and the regex of `pattern_str`, over every probe.
 	crate::tb_cases! {
-		fn test_constraint_matches((constraint, valid, invalid): (Constraint, &[&str], &[&str])) {
-			let misses = misread(|value| constraint.matches(value), valid, invalid);
-
-			assert_eq!(misses, (Vec::new(), Vec::new()), "{constraint:?} misreads these values");
+		fn a_pattern_matches_the_rule_of_its_pattern_str(pattern: Pattern) {
+			let disagreements = disagreements(pattern);
+			assert_eq!(disagreements, Vec::<&str>::new());
 		}
 		cases {
-			const_value => (
-				Constraint::Const("expected"),
-				&["expected"],
-				&["unexpected", "Expected", "EXPECTED", ""],
+			alpha => Pattern::Alpha,
+			numeric => Pattern::Numeric,
+			alpha_numeric => Pattern::AlphaNumeric,
+			alpha_numeric_hyphen => Pattern::AlphaNumericHyphen,
+		}
+	}
+
+	// The cases cover both `Constraint` variants. Each is a constraint and a
+	// value, beside whether the constraint admits the value.
+	crate::tb_cases! {
+		fn a_constraint_judges_a_value_by_its_values((constraint, value, admitted): (Constraint, &str, bool)) {
+			assert_eq!(constraint.matches(value), admitted);
+		}
+		cases {
+			const_admits_its_value => (Constraint::Const("expected"), "expected", true),
+			const_refuses_another_value => (Constraint::Const("expected"), "unexpected", false),
+			const_refuses_its_value_in_title_case => (Constraint::Const("expected"), "Expected", false),
+			const_refuses_its_value_in_upper_case => (Constraint::Const("expected"), "EXPECTED", false),
+			const_refuses_the_empty_value => (Constraint::Const("expected"), "", false),
+			options_admit_option1 => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "option1", true),
+			options_admit_option2 => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "option2", true),
+			options_admit_option3 => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "option3", true),
+			options_refuse_option4 => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "option4", false),
+			options_refuse_an_option_in_title_case => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "Option1", false),
+			options_refuse_an_option_in_upper_case => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "OPTION1", false),
+			options_refuse_the_empty_value => (Constraint::OneOf(Cow::Borrowed(OPTIONS)), "", false),
+			letters_admit_a => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "a", true),
+			letters_admit_b => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "b", true),
+			letters_admit_c => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "c", true),
+			letters_refuse_d => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "d", false),
+			letters_refuse_an_upper_case_letter => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "A", false),
+			letters_refuse_two_letters => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "ab", false),
+			letters_refuse_the_empty_value => (Constraint::OneOf(Cow::Borrowed(LETTERS)), "", false),
+		}
+	}
+
+	// One case for each `Constraint` variant, beside the pattern string it
+	// writes.
+	crate::tb_cases! {
+		fn a_constraint_writes_its_pattern_str((constraint, written): (Constraint, &str)) {
+			assert_eq!(constraint.pattern_str(), written);
+		}
+		cases {
+			const_value => (Constraint::Const("value"), "const(\"value\")"),
+			one_of => (Constraint::OneOf(Cow::Borrowed(&["a", "b"])), "oneof(...)"),
+		}
+	}
+
+	/// Returns a spec of one required field under the alpha pattern.
+	fn alpha_spec() -> UrnSpecBuilder {
+		UrnSpecBuilder::from("test")
+			.field_required("field1")
+			.field_pattern("field1", Pattern::Alpha)
+	}
+
+	/// Returns a spec of one required field whose value is the const
+	/// `expected`.
+	fn const_spec() -> UrnSpecBuilder {
+		UrnSpecBuilder::from("test")
+			.field_required("field1")
+			.field_const("field1", "expected")
+	}
+
+	/// Returns a spec of one required field whose value is one of
+	/// [`LETTERS`].
+	fn oneof_spec() -> UrnSpecBuilder {
+		UrnSpecBuilder::from("test")
+			.field_required("field1")
+			.field_oneof("field1", LETTERS)
+	}
+
+	/// A spec and the components of a URN, beside the outcome that a call of
+	/// the spec gives on them.
+	type SpecCase<T> = (fn() -> UrnSpecBuilder, &'static [(&'static str, &'static str)], T);
+
+	// Each case is a spec and the components of a URN, beside the verdict of
+	// `validate`. A constraint names no pattern, and a pattern names itself.
+	crate::tb_cases! {
+		fn a_spec_validates_the_components_of_a_urn(
+			(spec, components, verdict): SpecCase<Result<(), UrnValidationError>>
+		) {
+			let validated = spec().validate(&UrnBuilder::default().holding(components));
+
+			assert_eq!(validated, verdict);
+		}
+		cases {
+			admits_an_absent_optional_field => (|| UrnSpecBuilder::from("test").field_optional("field1"), &[], Ok(())),
+			/// A later `field_optional` makes a required field optional, so a
+			/// URN without the field validates.
+			admits_an_absent_field_made_optional_after_required => (
+				|| UrnSpecBuilder::from("test").field_required("field1").field_optional("field1"),
+				&[],
+				Ok(()),
 			),
-			one_of_options => (
-				Constraint::OneOf(Cow::Borrowed(&["option1", "option2", "option3"])),
-				&["option1", "option2", "option3"],
-				&["option4", "Option1", "OPTION1", ""],
+			refuses_an_absent_required_field => (
+				alpha_spec,
+				&[],
+				Err(UrnValidationError::RequiredFieldMissing("field1")),
 			),
-			one_of_letters => (
-				Constraint::OneOf(Cow::Borrowed(&["a", "b", "c"])),
-				&["a", "b", "c"],
-				&["d", "A", "ab", ""],
+			admits_a_value_of_its_pattern => (alpha_spec, &[("field1", "abc")], Ok(())),
+			refuses_a_value_outside_its_pattern => (
+				alpha_spec,
+				&[("field1", "abc123")],
+				Err(UrnValidationError::InvalidFormat { field: "field1", pattern: Some(Pattern::Alpha) }),
+			),
+			admits_its_const_value => (const_spec, &[("field1", "expected")], Ok(())),
+			refuses_another_value_than_its_const => (
+				const_spec,
+				&[("field1", "unexpected")],
+				Err(UrnValidationError::InvalidFormat { field: "field1", pattern: None }),
+			),
+			admits_one_of_its_values => (oneof_spec, &[("field1", "b")], Ok(())),
+			refuses_a_value_outside_its_values => (
+				oneof_spec,
+				&[("field1", "d")],
+				Err(UrnValidationError::InvalidFormat { field: "field1", pattern: None }),
 			),
 		}
 	}
 
-	#[test]
-	fn test_constraint_pattern_str() {
-		assert_eq!(Constraint::Const("value").pattern_str(), "const(\"value\")");
-		assert_eq!(Constraint::OneOf(Cow::Borrowed(&["a", "b"])).pattern_str(), "oneof(...)");
-	}
-
-	/// A later `field_optional` makes a required field optional, so a URN
-	/// without the field validates.
-	#[test]
-	fn a_field_made_optional_after_required_may_be_absent() -> Result<(), UrnValidationError> {
-		let spec = UrnSpecBuilder::from("test").field_required("field1").field_optional("field1");
-		let builder = UrnBuilder::default();
-
-		spec.validate(&builder)
-	}
-
-	#[test]
-	fn test_urn_spec_builder_validation() {
-		// These macros build the spec and the components of each case.
-		macro_rules! validate_pass {
-			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),*]) => {{
-				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
-				let builder = UrnBuilder::default()$(.set($k, $v))*;
-				assert!(spec.validate(&builder).is_ok());
-			}};
+	// Each case is a spec and the components of a URN, beside the NSS that
+	// `build_nss` writes of them or its refusal. A spec refuses components
+	// that fill no place of its format, or more places than the format has,
+	// and names the NSS components.
+	crate::tb_cases! {
+		fn build_nss_writes_the_format_of_its_spec(
+			(spec, components, nss): SpecCase<Result<String, UrnValidationError>>
+		) {
+			let built = spec().build_nss(&UrnBuilder::default().holding(components));
+			assert_eq!(built, nss);
 		}
-
-		macro_rules! validate_fail_missing {
-			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),*], field: $expected:literal) => {{
-				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
-				let builder = UrnBuilder::default()$(.set($k, $v))*;
-				assert!(matches!(
-					spec.validate(&builder),
-					Err(UrnValidationError::RequiredFieldMissing(field)) if field == $expected
-				));
-			}};
+		cases {
+			/// The default join format applies the separator of each field.
+			a_join_with_a_separator_of_its_field => (
+				|| {
+					let spec = UrnSpecBuilder::from("test").field_required("field1").field_required("field2");
+					spec.field_nss_separator("field2", "/").field_optional("field3")
+				},
+				&[("field1", "value1"), ("field2", "value2")],
+				Ok("value1/value2".into()),
+			),
+			/// A custom format places each value at its placeholder.
+			a_custom_format => (
+				|| {
+					let spec = UrnSpecBuilder::from("test").field_required("field1").field_required("field2");
+					spec.field_optional("field3").nss_format("{}:{}/{}")
+				},
+				&[("field1", "value1"), ("field2", "value2"), ("field3", "value3")],
+				Ok("value1:value2/value3".into()),
+			),
+			/// A literal ahead of the first placeholder leads the NSS.
+			a_custom_format_with_a_leading_literal => (
+				|| UrnSpecBuilder::from("test").field_required("field1").nss_format("lead-{}"),
+				&[("field1", "value1")],
+				Ok("lead-value1".into()),
+			),
+			no_field => (
+				|| UrnSpecBuilder::from("test"),
+				&[],
+				Err(UrnValidationError::RequiredFieldMissing("nss components")),
+			),
+			fewer_placeholders_than_values => (
+				|| UrnSpecBuilder::from("test").field_required("field1").field_required("field2").nss_format("{}"),
+				&[("field1", "value1"), ("field2", "value2")],
+				Err(UrnValidationError::RequiredFieldMissing("nss components")),
+			),
 		}
-
-		macro_rules! validate_fail_format {
-			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),*], field: $expected:literal) => {{
-				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
-				let builder = UrnBuilder::default()$(.set($k, $v))*;
-				assert!(matches!(
-					spec.validate(&builder),
-					Err(UrnValidationError::InvalidFormat { field, .. }) if field == $expected
-				));
-			}};
-		}
-
-		// A missing required field fails.
-		validate_fail_missing!(
-			spec: [field_required("field1"), field_pattern("field1", Pattern::Alpha)],
-			values: [],
-			field: "field1"
-		);
-
-		// A missing optional field passes.
-		validate_pass!(spec: [field_optional("field1")], values: []);
-
-		// A value that fits the pattern passes.
-		validate_pass!(
-			spec: [field_required("field1"), field_pattern("field1", Pattern::Alpha)],
-			values: ["field1" = "abc"]
-		);
-
-		// A value outside the pattern fails.
-		validate_fail_format!(
-			spec: [field_required("field1"), field_pattern("field1", Pattern::Alpha)],
-			values: ["field1" = "abc123"],
-			field: "field1"
-		);
-
-		// A value equal to the const passes.
-		validate_pass!(
-			spec: [field_required("field1"), field_const("field1", "expected")],
-			values: ["field1" = "expected"]
-		);
-
-		// Another value fails the const.
-		validate_fail_format!(
-			spec: [field_required("field1"), field_const("field1", "expected")],
-			values: ["field1" = "unexpected"],
-			field: "field1"
-		);
-
-		// A listed value passes the oneof.
-		validate_pass!(
-			spec: [field_required("field1"), field_oneof("field1", &["a", "b", "c"])],
-			values: ["field1" = "b"]
-		);
-
-		// An unlisted value fails the oneof.
-		validate_fail_format!(
-			spec: [field_required("field1"), field_oneof("field1", &["a", "b", "c"])],
-			values: ["field1" = "d"],
-			field: "field1"
-		);
-	}
-
-	#[test]
-	fn test_urn_spec_builder_build_nss() -> Result<(), UrnValidationError> {
-		// These macros build the spec and the components of each NSS case.
-		macro_rules! build_nss_pass {
-			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),+], expected: $exp:literal) => {{
-				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
-				let builder = UrnBuilder::default()$(.set($k, $v))+;
-				assert_eq!(spec.build_nss(&builder)?, $exp);
-			}};
-		}
-
-		macro_rules! build_nss_fail {
-			(spec: [$($spec_op:ident($($arg:expr),*)),*], values: [$($k:literal = $v:literal),*], error: $err_msg:literal) => {{
-				#![allow(unused_mut)]
-				let mut spec = UrnSpecBuilder::from("test");
-				$(spec = spec.$spec_op($($arg),*);)*
-				let mut builder = UrnBuilder::default();
-				$(builder = builder.set($k, $v);)*
-				assert!(matches!(
-					spec.build_nss(&builder),
-					Err(UrnValidationError::RequiredFieldMissing(msg)) if msg == $err_msg
-				));
-			}};
-		}
-
-		// The default join format applies a field's own separator.
-		build_nss_pass!(
-			spec: [
-				field_required("field1"),
-				field_required("field2"),
-				field_nss_separator("field2", "/"),
-				field_optional("field3")
-			],
-			values: ["field1" = "value1", "field2" = "value2"],
-			expected: "value1/value2"
-		);
-
-		// A custom format places each value at its placeholder.
-		build_nss_pass!(
-			spec: [
-				field_required("field1"),
-				field_required("field2"),
-				field_optional("field3"),
-				nss_format("{}:{}/{}")
-			],
-			values: ["field1" = "value1", "field2" = "value2", "field3" = "value3"],
-			expected: "value1:value2/value3"
-		);
-
-		// A spec with no field fails to build an NSS.
-		build_nss_fail!(
-			spec: [],
-			values: [],
-			error: "nss components"
-		);
-
-		// A format with fewer placeholders than values fails.
-		build_nss_fail!(
-			spec: [field_required("field1"), field_required("field2"), nss_format("{}")],
-			values: ["field1" = "value1", "field2" = "value2"],
-			error: "nss components"
-		);
-
-		Ok(())
-	}
-
-	/// A literal ahead of the first placeholder leads the NSS.
-	#[test]
-	fn a_custom_format_keeps_its_leading_literal() -> Result<(), UrnValidationError> {
-		let spec = UrnSpecBuilder::from("test").field_required("field1").nss_format("lead-{}");
-		let builder = UrnBuilder::default().set("field1", "value1");
-		assert_eq!(spec.build_nss(&builder)?, "lead-value1");
-		Ok(())
 	}
 
 	/// A join spec of a required field, a required field after `/`, and an
@@ -875,108 +837,151 @@ mod tests {
 		spec.field_nss_separator("id", "/").field_optional("tag")
 	}
 
-	/// The value that `components` holds for `key`.
-	fn value_of<'b>(components: &'b UrnBuilder<'_>, key: &'static str) -> Option<&'b str> {
-		components.get(key).map(|value| value.as_ref())
+	/// Returns a join spec of the two required fields `a` and `b`.
+	fn ab_spec() -> UrnSpecBuilder {
+		UrnSpecBuilder::from("test").field_required("a").field_required("b")
 	}
 
-	#[test]
-	fn a_join_nss_reads_back_into_its_components() -> Result<(), UrnValidationError> {
-		let components = join_spec().parse_nss("trace/abc-123")?;
-		assert_eq!(value_of(&components, "kind"), Some("trace"));
-		assert_eq!(value_of(&components, "id"), Some("abc-123"));
-		assert_eq!(value_of(&components, "tag"), None);
-		Ok(())
+	/// Returns each component that `components` holds, by key.
+	fn components_of<'b>(components: &'b UrnBuilder<'_>) -> BTreeMap<&'static str, &'b str> {
+		components.iter().map(|(key, value)| (key, value.as_ref())).collect()
 	}
 
-	#[test]
-	fn a_custom_nss_reads_back_into_its_components() -> Result<(), UrnValidationError> {
-		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
-		let spec = spec.field_optional("c").nss_format("{}:{}/{}");
-		let components = spec.parse_nss("value1:value2/value3")?;
-		assert_eq!(value_of(&components, "a"), Some("value1"));
-		assert_eq!(value_of(&components, "b"), Some("value2"));
-		assert_eq!(value_of(&components, "c"), Some("value3"));
-		Ok(())
+	// Each case is a spec and an NSS, beside the components that `parse_nss`
+	// reads back from it. A field the NSS leaves no value for is absent.
+	crate::tb_cases! {
+		fn parse_nss_reads_back_its_components(
+			(spec, nss, expected): (fn() -> UrnSpecBuilder, &str, BTreeMap<&str, &str>)
+		) -> TestResult {
+			let components = spec().parse_nss(nss)?;
+			assert_eq!(components_of(&components), expected);
+			Ok(())
+		}
+		cases {
+			a_join => (join_spec, "trace/abc-123", BTreeMap::from([("kind", "trace"), ("id", "abc-123")])),
+			a_custom_format => (
+				|| ab_spec().field_optional("c").nss_format("{}:{}/{}"),
+				"value1:value2/value3",
+				BTreeMap::from([("a", "value1"), ("b", "value2"), ("c", "value3")]),
+			),
+			/// An optional field before a required one leaves it the one value.
+			an_optional_field_before_a_required_one => (
+				|| UrnSpecBuilder::from("test").field_optional("region").field_required("host"),
+				"h1",
+				BTreeMap::from([("host", "h1")]),
+			),
+			/// Of two optional fields beside one spare value, the first in
+			/// field order takes it.
+			two_optional_fields_and_one_spare_value => (
+				|| {
+					let spec = UrnSpecBuilder::from("test").field_optional("region").field_optional("zone");
+					spec.field_required("host")
+				},
+				"eu:h1",
+				BTreeMap::from([("region", "eu"), ("host", "h1")]),
+			),
+			/// An optional field takes no value that follows the separator of
+			/// another field.
+			an_optional_field_beside_another_fields_separator => (
+				|| {
+					let spec = UrnSpecBuilder::from("test").field_required("kind").field_optional("tag");
+					let spec = spec.field_nss_separator("tag", ".").field_required("id");
+					spec.field_nss_separator("id", "/")
+				},
+				"trace/abc",
+				BTreeMap::from([("kind", "trace"), ("id", "abc")]),
+			),
+		}
 	}
 
-	/// An optional field before a required one leaves it the one value.
-	#[test]
-	fn an_optional_field_leaves_a_value_for_a_later_required_field() -> Result<(), UrnValidationError> {
-		let spec = UrnSpecBuilder::from("test").field_optional("region").field_required("host");
-		let components = spec.parse_nss("h1")?;
-		assert_eq!(value_of(&components, "region"), None);
-		assert_eq!(value_of(&components, "host"), Some("h1"));
-		Ok(())
+	// Each case is a spec and an NSS, beside the refusal of `parse_nss`.
+	crate::tb_cases! {
+		fn parse_nss_refuses_an_nss_outside_its_spec(
+			(spec, nss, refusal): (fn() -> UrnSpecBuilder, &str, UrnValidationError)
+		) {
+			let parsed = spec().parse_nss(nss);
+			assert_eq!(parsed.err(), Some(refusal));
+		}
+		cases {
+			a_value_that_no_field_takes => (ab_spec, "x:y:z", UrnValidationError::NssMismatch),
+			a_value_short_of_a_required_field => (ab_spec, "x", UrnValidationError::RequiredFieldMissing("b")),
+			no_literal_of_its_custom_format => (
+				|| ab_spec().nss_format("{}/{}"),
+				"x:y",
+				UrnValidationError::NssMismatch,
+			),
+		}
 	}
 
-	/// Of two optional fields beside one spare value, the first in field
-	/// order takes it.
-	#[test]
-	fn the_first_of_two_optional_fields_takes_the_spare_value() -> Result<(), UrnValidationError> {
-		let spec = UrnSpecBuilder::from("test").field_optional("region").field_optional("zone");
-		let components = spec.field_required("host").parse_nss("eu:h1")?;
-		assert_eq!(value_of(&components, "region"), Some("eu"));
-		assert_eq!(value_of(&components, "zone"), None);
-		assert_eq!(value_of(&components, "host"), Some("h1"));
-		Ok(())
-	}
-
-	/// An optional field takes no value that follows the separator of
-	/// another field.
-	#[test]
-	fn an_optional_field_takes_no_value_after_another_fields_separator() -> Result<(), UrnValidationError> {
-		let spec = UrnSpecBuilder::from("test").field_required("kind").field_optional("tag");
-		let spec = spec.field_nss_separator("tag", ".").field_required("id");
-		let spec = spec.field_nss_separator("id", "/");
-		let components = spec.parse_nss("trace/abc")?;
-		assert_eq!(value_of(&components, "tag"), None);
-		assert_eq!(value_of(&components, "id"), Some("abc"));
-		Ok(())
-	}
-
-	#[test]
-	fn a_value_that_no_field_takes_is_refused() {
-		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
-		assert!(matches!(spec.parse_nss("x:y:z"), Err(UrnValidationError::NssMismatch)));
-	}
-
-	#[test]
-	fn an_nss_short_of_a_required_field_is_refused() {
-		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
-		let refused = spec.parse_nss("x");
-		assert!(matches!(refused, Err(UrnValidationError::RequiredFieldMissing("b"))));
-	}
-
-	#[test]
-	fn a_custom_nss_without_a_literal_of_its_format_is_refused() {
-		let spec = UrnSpecBuilder::from("test").field_required("a").field_required("b");
-		let spec = spec.nss_format("{}/{}");
-		assert!(matches!(spec.parse_nss("x:y"), Err(UrnValidationError::NssMismatch)));
-	}
-
-	#[test]
-	fn test_urn_spec_builder_field_operations() {
-		let spec = UrnSpecBuilder::from("test")
+	/// Returns a spec of `field1` and `field2`, each with every setting that a
+	/// call makes.
+	fn operated_spec() -> UrnSpecBuilder {
+		UrnSpecBuilder::from("test")
 			.field_required("field1")
 			.field_optional("field2")
 			.field_const("field1", "const_value")
 			.field_oneof("field2", &["opt1", "opt2"])
 			.field_pattern("field1", Pattern::Alpha)
 			.field_nss_separator("field1", ":")
-			.field_nss_separator("field2", "/");
+			.field_nss_separator("field2", "/")
+	}
 
+	/// Returns the field of `spec` that `name` names.
+	fn field_named<'s>(spec: &'s UrnSpecBuilder, name: &str) -> &'s FieldConfig {
+		let found = spec.fields().iter().find(|field| field.name == name);
+		found.expect("the spec declares the field")
+	}
+
+	/// Returns the names of the fields of `spec`, in order.
+	fn field_names(spec: &UrnSpecBuilder) -> Vec<&'static str> {
+		spec.fields().iter().map(|field| field.name).collect()
+	}
+
+	/// A spec keeps the NID it was built from.
+	#[test]
+	fn a_spec_keeps_its_nid() {
+		let spec = operated_spec();
 		assert_eq!(spec.nid(), "test");
-		assert_eq!(spec.fields().len(), 2);
-		assert_eq!(spec.fields()[0].name, "field1");
-		assert!(spec.fields()[0].required);
-		assert_eq!(spec.fields()[0].constraints.len(), 1);
-		assert_eq!(spec.fields()[0].pattern, Some(Pattern::Alpha));
-		assert_eq!(spec.fields()[0].nss_separator, Some(":"));
-		assert_eq!(spec.fields()[1].name, "field2");
-		// `field_oneof` makes the field required.
-		assert!(spec.fields()[1].required);
-		assert_eq!(spec.fields()[1].constraints.len(), 1);
-		assert_eq!(spec.fields()[1].nss_separator, Some("/"));
+	}
+
+	/// A spec keeps one field per name, in the order of their declarations.
+	#[test]
+	fn a_spec_keeps_its_fields_in_declaration_order() {
+		let spec = operated_spec();
+		assert_eq!(field_names(&spec), ["field1", "field2"]);
+	}
+
+	/// Whether a field is required, beside its pattern and its separator.
+	type Settings = (bool, Option<Pattern>, Option<&'static str>);
+
+	/// A check that reads the constraints of one field.
+	type ConstraintCheck = fn(&[Constraint]) -> bool;
+
+	// Each case is a field of the operated spec, beside its constraint and
+	// whether it is required, its pattern, and its separator.
+	crate::tb_cases! {
+		fn a_field_keeps_the_settings_its_calls_made(
+			(name, constraint_is, settings): (&str, ConstraintCheck, Settings)
+		) {
+			let spec = operated_spec();
+			let field = field_named(&spec, name);
+			assert!(constraint_is(&field.constraints));
+			assert_eq!((field.required, field.pattern, field.nss_separator), settings);
+		}
+		cases {
+			field1 => (
+				"field1",
+				|constraints| matches!(constraints, [Constraint::Const("const_value")]),
+				(true, Some(Pattern::Alpha), Some(":")),
+			),
+			/// `field_oneof` makes the optional `field2` required.
+			field2 => (
+				"field2",
+				|constraints| {
+					matches!(constraints, [Constraint::OneOf(options)] if options.as_ref() == ["opt1", "opt2"])
+				},
+				(true, None, Some("/")),
+			),
+		}
 	}
 }

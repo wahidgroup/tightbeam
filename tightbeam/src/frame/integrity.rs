@@ -140,45 +140,67 @@ impl Frame {
 
 #[cfg(all(test, feature = "builder", feature = "sha3"))]
 mod tests {
+	use crate::asn1::DigestInfo;
 	use crate::core::IntegrityVerdict;
 	use crate::crypto::commitment::Opening;
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	use crate::error::Result;
-	use crate::testing::{TestFrame, TestMessage};
+	use crate::testing::{TestFrame, TestMessage, TestResult};
+	use crate::Frame;
+
+	/// A frame of the integrity fixture whose id a tamper changed after its
+	/// integrity was computed.
+	fn tampered() -> Frame {
+		let mut frame = TestFrame::with_integrity();
+		frame.metadata.id = b"tampered".to_vec();
+		frame
+	}
 
 	mod message_commitment {
 		use super::*;
 
+		/// The V1 frame of [`TestFrame::v1`], whose metadata holds
+		/// `commitment`.
+		fn committed(commitment: DigestInfo) -> Frame {
+			let mut frame = TestFrame::v1(None, Some("commit"));
+			frame.metadata.integrity = Some(commitment);
+			frame
+		}
+
+		/// The check of a commitment recomputes it over the message it is
+		/// handed, so the committed message verifies.
 		#[test]
-		fn verify_commitment_of_recomputes_over_message() -> Result<()> {
+		fn verify_commitment_of_recomputes_over_message() -> TestResult {
 			let message = TestMessage::sample(None);
 			let (commitment, _) = Opening::prove::<Sha3_256, _>(&message, [])?;
+			let frame = committed(commitment);
 
-			let mut frame = compose! { V1: id: "commit-1", order: 1u64, message: message.clone() }?;
-			frame.metadata.integrity = Some(commitment);
-
-			assert!(frame.verify_commitment_of::<Sha3_256, _>(&message, [])?);
+			let verified = frame.verify_commitment_of::<Sha3_256, _>(&message, [])?;
+			assert!(verified);
 			Ok(())
 		}
 
+		/// A message other than the committed one fails the check.
 		#[test]
-		fn verify_commitment_of_rejects_other_message() -> Result<()> {
-			let committed = TestMessage::sample(None);
-			let (commitment, _) = Opening::prove::<Sha3_256, _>(&committed, [])?;
-
-			let mut frame = compose! { V1: id: "commit-2", order: 2u64, message: committed }?;
-			frame.metadata.integrity = Some(commitment);
-
-			let other = TestMessage::sample(Some("a different body"));
-			assert!(!frame.verify_commitment_of::<Sha3_256, _>(&other, [])?);
-			Ok(())
-		}
-
-		#[test]
-		fn verify_commitment_of_is_false_without_commitment() -> Result<()> {
+		fn verify_commitment_of_rejects_other_message() -> TestResult {
 			let message = TestMessage::sample(None);
-			let frame = compose! { V1: id: "commit-3", order: 3u64, message: message.clone() }?;
-			assert!(!frame.verify_commitment_of::<Sha3_256, _>(&message, [])?);
+			let (commitment, _) = Opening::prove::<Sha3_256, _>(&message, [])?;
+			let frame = committed(commitment);
+			let other = TestMessage::sample(Some("a different body"));
+
+			let verified = frame.verify_commitment_of::<Sha3_256, _>(&other, [])?;
+			assert!(!verified);
+			Ok(())
+		}
+
+		/// A frame that holds no commitment verifies no message.
+		#[test]
+		fn verify_commitment_of_is_false_without_commitment() -> TestResult {
+			let message = TestMessage::sample(None);
+			let frame = TestFrame::v1(None, Some("commit-3"));
+
+			let verified = frame.verify_commitment_of::<Sha3_256, _>(&message, [])?;
+			assert!(!verified);
 			Ok(())
 		}
 	}
@@ -186,71 +208,63 @@ mod tests {
 	mod frame_integrity {
 		use super::*;
 
-		#[test]
-		fn verifies_intact_envelope() {
-			let frame = TestFrame::with_integrity();
-			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(true)));
+		/// A frame, the integrity check under test, and the answer it expects.
+		type IntegrityCheckCase = (Frame, fn(&Frame) -> Result<bool>, bool);
+
+		// The integrity check of a frame holds for an intact envelope alone: a
+		// tamper, another algorithm, or an absent integrity each fail it.
+		crate::tb_cases! {
+			fn the_frame_integrity_check_holds_for_an_intact_envelope_alone(
+				(frame, check, expected): IntegrityCheckCase
+			) {
+				assert!(matches!(check(&frame), Ok(verified) if verified == expected));
+			}
+			cases {
+				intact => (TestFrame::with_integrity(), |frame| frame.verify_frame_integrity::<Sha3_256>(), true),
+				tampered => (tampered(), |frame| frame.verify_frame_integrity::<Sha3_256>(), false),
+				under_another_algorithm => (
+					TestFrame::with_integrity(),
+					|frame| frame.verify_frame_integrity::<Sha3_512>(),
+					false,
+				),
+				absent => (
+					TestFrame::v0(None, Some("no-fi")),
+					|frame| frame.verify_frame_integrity::<Sha3_256>(),
+					false,
+				),
+			}
 		}
 
-		#[test]
-		fn rejects_tampered_envelope() {
-			let mut frame = TestFrame::with_integrity();
-			frame.metadata.id = b"tampered".to_vec();
-			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
-		}
+		/// A frame, the verdict under test, and the verdict it expects.
+		type IntegrityVerdictCase = (Frame, fn(&Frame) -> Result<IntegrityVerdict>, IntegrityVerdict);
 
-		#[test]
-		fn rejects_algorithm_mismatch() {
-			let frame = TestFrame::with_integrity();
-			assert!(matches!(frame.verify_frame_integrity::<Sha3_512>(), Ok(false)));
-		}
-
-		#[test]
-		fn absent_integrity_is_false() -> Result<()> {
-			let message = TestMessage::sample(None);
-			let frame = compose! { V0: id: "no-fi", order: 1u64, message: message }?;
-			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
-			Ok(())
-		}
-
-		#[test]
-		fn verdict_reports_verified() {
-			let frame = TestFrame::with_integrity();
-			assert!(matches!(
-				frame.frame_integrity_verdict::<Sha3_256>(),
-				Ok(IntegrityVerdict::Verified)
-			));
-		}
-
-		#[test]
-		fn verdict_reports_mismatch_on_tamper() {
-			let mut frame = TestFrame::with_integrity();
-			frame.metadata.id = b"tampered".to_vec();
-			assert!(matches!(
-				frame.frame_integrity_verdict::<Sha3_256>(),
-				Ok(IntegrityVerdict::Mismatch)
-			));
-		}
-
-		#[test]
-		fn verdict_reports_algorithm_mismatch() {
-			let frame = TestFrame::with_integrity();
-			assert!(matches!(
-				frame.frame_integrity_verdict::<Sha3_512>(),
-				Ok(IntegrityVerdict::AlgorithmMismatch)
-			));
-		}
-
-		#[test]
-		fn verdict_reports_absent() -> Result<()> {
-			let message = TestMessage::sample(None);
-			let frame = compose! { V0: id: "no-fi-verdict", order: 1u64, message: message }?;
-			assert!(matches!(
-				frame.frame_integrity_verdict::<Sha3_256>(),
-				Ok(IntegrityVerdict::Absent)
-			));
-
-			Ok(())
+		// The integrity verdict of a frame names why the check holds or fails.
+		crate::tb_cases! {
+			fn the_frame_integrity_verdict_names_its_reason((frame, verdict, expected): IntegrityVerdictCase) {
+				assert!(matches!(verdict(&frame), Ok(reported) if reported == expected));
+			}
+			cases {
+				verified => (
+					TestFrame::with_integrity(),
+					|frame| frame.frame_integrity_verdict::<Sha3_256>(),
+					IntegrityVerdict::Verified,
+				),
+				mismatch_on_tamper => (
+					tampered(),
+					|frame| frame.frame_integrity_verdict::<Sha3_256>(),
+					IntegrityVerdict::Mismatch,
+				),
+				algorithm_mismatch => (
+					TestFrame::with_integrity(),
+					|frame| frame.frame_integrity_verdict::<Sha3_512>(),
+					IntegrityVerdict::AlgorithmMismatch,
+				),
+				absent => (
+					TestFrame::v0(None, Some("no-fi")),
+					|frame| frame.frame_integrity_verdict::<Sha3_256>(),
+					IntegrityVerdict::Absent,
+				),
+			}
 		}
 	}
 }

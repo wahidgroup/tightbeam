@@ -403,10 +403,11 @@ mod tests {
 	use super::ServletContext;
 	use crate::crypto::aead::Decryptor;
 	use crate::instrumentation::events;
+	use crate::tb_cases;
 	use crate::testing::fixtures::TestTrace;
 	use crate::testing::{TestKey, TestMessage};
 	use crate::urn::Urn;
-	use crate::{Frame, TightBeamError};
+	use crate::Frame;
 
 	#[cfg(feature = "zstd")]
 	use crate::compress::ZstdCompression;
@@ -420,54 +421,73 @@ mod tests {
 		ServletContext::new(Arc::new(trace), Arc::new(()), [], None)
 	}
 
-	/// The crypto steps that the typed delivery of one encrypted frame records
-	/// under the detail flag `detail`.
-	async fn crypto_steps(detail: bool) -> Result<Vec<Urn<'static>>, TightBeamError> {
+	/// A context that decrypts under the fixed cipher, with the detail flag
+	/// `detail`, beside a frame that the fixed cipher encrypts.
+	fn encrypted(detail: bool) -> (ServletContext, Frame) {
 		let (_, cipher) = TestKey::insecure_fixed_cipher();
 		let (_, decryptor) = TestKey::insecure_fixed_cipher();
 		let decryptor: Arc<dyn Decryptor + Send + Sync> = Arc::new(decryptor);
 		let ctx = context_with_detail(detail).with_message_decryptor(Some(decryptor));
 		let message = TestMessage::sample(Some("crypto-step"));
 		let encrypted = compose! { V1: id: "crypto-step", order: 1u64, message: message, confidentiality: cipher };
-		let mut frame: Frame = encrypted?;
-		frame.prepare_typed(&ctx).await?;
 
-		Ok(TestTrace::trail(&ctx.trace(), &[events::CRYPTO_STEP]))
+		(ctx, encrypted.expect("the fixed cipher encrypts a frame"))
 	}
 
-	/// Typed delivery records the decrypt of a frame body when the trace
-	/// config sets the detail flag, and leaves the trail empty when the config
-	/// clears it.
-	#[tokio::test]
-	async fn a_decrypted_body_records_its_crypto_step_under_the_detail_flag_alone() -> Result<(), TightBeamError> {
-		let steps = [crypto_steps(true).await?, crypto_steps(false).await?];
-		assert_eq!(steps, [vec![events::CRYPTO_STEP], vec![]]);
-		Ok(())
-	}
-
-	/// The compress steps that the typed delivery of one compressed cleartext
-	/// frame records under the detail flag `detail`.
+	/// A context that inflates zstd, with the detail flag `detail`, beside a
+	/// cleartext frame that zstd compresses.
 	#[cfg(feature = "zstd")]
-	async fn compress_steps(detail: bool) -> Result<Vec<Urn<'static>>, TightBeamError> {
+	fn compressed(detail: bool) -> (ServletContext, Frame) {
 		let inflator: Arc<dyn Inflator + Send + Sync> = Arc::new(ZstdCompression::default());
 		let ctx = context_with_detail(detail).with_message_inflator(Some(inflator));
 		let message = TestMessage::sample(Some("compress-step"));
 		let compactness = ZstdCompression::default();
 		let compressed = compose! { V0: id: "compress-step", order: 1u64, message: message, compactness: compactness };
-		let mut frame: Frame = compressed?;
-		frame.prepare_typed(&ctx).await?;
 
-		Ok(TestTrace::trail(&ctx.trace(), &[events::COMPRESS_STEP]))
+		(ctx, compressed.expect("zstd compresses a frame"))
 	}
 
-	/// Typed delivery records the inflate of a cleartext frame body when the
-	/// trace config sets the detail flag, and leaves the trail empty when the
-	/// config clears it.
-	#[cfg(feature = "zstd")]
-	#[tokio::test]
-	async fn an_inflated_body_records_its_compress_step_under_the_detail_flag_alone() -> Result<(), TightBeamError> {
-		let steps = [compress_steps(true).await?, compress_steps(false).await?];
-		assert_eq!(steps, [vec![events::COMPRESS_STEP], vec![]]);
-		Ok(())
+	/// The records of `event` that the typed delivery of `frame` on `ctx`
+	/// leaves in its trace.
+	async fn recorded_steps(ctx: ServletContext, mut frame: Frame, event: Urn<'static>) -> Vec<Urn<'static>> {
+		let prepared = frame.prepare_typed(&ctx).await;
+		prepared.expect("the context opens the frame");
+		TestTrace::trail(&ctx.trace(), &[event])
+	}
+
+	// Typed delivery records the decrypt of a frame body when the trace
+	// config sets the detail flag, and leaves the trail empty when the config
+	// clears it.
+	tb_cases! {
+		async fn a_decrypted_body_records_its_crypto_step_under_the_detail_flag_alone(
+			(detail, steps): (bool, Vec<Urn<'static>>)
+		) {
+			let (ctx, frame) = encrypted(detail);
+			let recorded = recorded_steps(ctx, frame, events::CRYPTO_STEP).await;
+			assert_eq!(recorded, steps);
+		}
+		cases {
+			with_detail => (true, vec![events::CRYPTO_STEP]),
+			without_detail => (false, Vec::new()),
+		}
+	}
+
+	// Typed delivery records the inflate of a cleartext frame body when the
+	// trace config sets the detail flag, and leaves the trail empty when the
+	// config clears it.
+	tb_cases! {
+		async fn an_inflated_body_records_its_compress_step_under_the_detail_flag_alone(
+			(detail, steps): (bool, Vec<Urn<'static>>)
+		) {
+			let (ctx, frame) = compressed(detail);
+			let recorded = recorded_steps(ctx, frame, events::COMPRESS_STEP).await;
+			assert_eq!(recorded, steps);
+		}
+		cases {
+			#[cfg(feature = "zstd")]
+			with_detail => (true, vec![events::COMPRESS_STEP]),
+			#[cfg(feature = "zstd")]
+			without_detail => (false, Vec::new()),
+		}
 	}
 }

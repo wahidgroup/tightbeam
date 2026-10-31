@@ -22,34 +22,32 @@ macro_rules! relay {
 
 #[cfg(test)]
 mod tests {
-	use crate::der::Sequence;
-	use crate::{Beamable, TightBeamError};
+	use crate::testing::{TestMessage, TestResult};
+	use crate::TightBeamError;
 
-	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-	struct RelayMessage {
-		value: u64,
-	}
-
+	/// The relay sends a V0 frame of the message, and the receiver decodes the
+	/// message back from it.
 	#[cfg(feature = "router")]
 	#[test]
-	fn relays_frame_over_channel() -> Result<(), TightBeamError> {
+	fn relays_frame_over_channel() -> TestResult {
 		let (tx, rx) = std::sync::mpsc::channel();
 
-		relay!(RelayMessage { value: 7 }, tx)?;
+		relay!(TestMessage::sample(Some("relayed")), tx)?;
 
-		let frame = rx.recv().map_err(|_| TightBeamError::ChannelClosed)?;
-		let decoded: RelayMessage = frame.decode_message()?;
-		assert_eq!(decoded, RelayMessage { value: 7 });
+		let frame = rx.recv()?;
+		let decoded: TestMessage = frame.decode_message()?;
+		assert_eq!(decoded, TestMessage::sample(Some("relayed")));
 
 		Ok(())
 	}
 
+	/// A send to a channel whose receiver is gone fails as a closed channel.
 	#[test]
 	fn send_failure_surfaces_as_error() {
 		let (tx, rx) = std::sync::mpsc::channel::<crate::Frame>();
 		drop(rx);
 
-		let result = relay!(RelayMessage { value: 7 }, tx);
+		let result = relay!(TestMessage::sample(Some("relayed")), tx);
 		assert!(matches!(result, Err(TightBeamError::ChannelClosed)));
 	}
 }

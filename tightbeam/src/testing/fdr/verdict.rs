@@ -428,41 +428,38 @@ impl Default for FdrVerdict {
 mod tests {
 	use super::*;
 
+	/// A default verdict asserts nothing, claims determinism, and counts no
+	/// trace or state.
 	#[test]
-	fn verdict_default_asserts_nothing() {
+	fn a_default_verdict_asserts_nothing() {
 		let verdict = FdrVerdict::default();
-		assert_eq!(verdict.outcome(), Decision::NotAsserted);
-		assert_eq!(verdict.divergence_free, Decision::NotAsserted);
-		assert_eq!(verdict.deadlock_free, Decision::NotAsserted);
-		assert!(verdict.is_deterministic);
-		assert_eq!(verdict.traces_explored, 0);
-		assert_eq!(verdict.states_visited, 0);
+
+		let freedom = (verdict.outcome(), verdict.divergence_free, verdict.deadlock_free);
+		let counts = (verdict.is_deterministic, verdict.traces_explored, verdict.states_visited);
+		let not_asserted = (Decision::NotAsserted, Decision::NotAsserted, Decision::NotAsserted);
+		assert_eq!((freedom, counts), (not_asserted, (true, 0, 0)));
 	}
 
-	#[test]
-	fn a_refutation_outranks_an_undecided_check() {
-		let verdict = FdrVerdict {
-			trace_refines: Decision::Unknown,
-			deadlock_free: Decision::Refuted,
-			..Default::default()
-		};
-		assert_eq!(verdict.outcome(), Decision::Refuted);
-	}
+	// The firmest decision among the checks of a verdict decides its outcome.
+	crate::tb_cases! {
+		fn the_firmest_check_decides_the_outcome((verdict, outcome): (FdrVerdict, Decision)) {
+			let decided = verdict.outcome();
+			assert_eq!(decided, outcome);
+		}
 
-	#[test]
-	fn an_undecided_check_outranks_the_assertions_that_held() {
-		let verdict = FdrVerdict {
-			trace_refines: Decision::Holds,
-			failures_refines: Decision::Unknown,
-			..Default::default()
-		};
-		assert_eq!(verdict.outcome(), Decision::Unknown);
-	}
-
-	#[test]
-	fn verdict_tracks_witnesses() {
-		let trace = vec![Event("unexpected")];
-		let verdict = FdrVerdict { trace_refinement_witness: Some(trace.clone()), ..Default::default() };
-		assert_eq!(verdict.trace_refinement_witness, Some(trace));
+		cases {
+			a_refutation_over_an_undecided_check => (
+				FdrVerdict { trace_refines: Decision::Unknown, deadlock_free: Decision::Refuted, ..Default::default() },
+				Decision::Refuted,
+			),
+			an_undecided_check_over_one_that_held => (
+				FdrVerdict {
+					trace_refines: Decision::Holds,
+					failures_refines: Decision::Unknown,
+					..Default::default()
+				},
+				Decision::Unknown,
+			),
+		}
 	}
 }

@@ -166,66 +166,60 @@ impl TypeBuilder<WcetConfig> for WcetConfigBuilder {
 }
 
 #[cfg(test)]
+impl WcetConfig {
+	/// A bound of `millis` milliseconds on the longest measured duration.
+	pub(crate) fn of_millis(millis: u64) -> Self {
+		WcetConfig { duration: Duration::from_millis(millis), percentile: None }
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 
-	/// One row of the [`WcetConfigBuilder`] case table.
-	struct WcetConfigTestCase {
-		percentile: Option<Percentile>,
-		has_analyzer: bool,
+	/// The builder of a WCET bound of 100 ms.
+	fn of_100_ms() -> WcetConfigBuilder {
+		WcetConfigBuilder::default().with_duration(Duration::from_millis(100))
 	}
 
-	impl WcetConfigTestCase {
-		/// A WCET of 100 ms with the percentile and the analyzer of the case.
-		fn built(&self) -> Result<WcetConfig, TestingError> {
-			let duration = Duration::from_millis(100);
-			let mut builder = WcetConfigBuilder::default().with_duration(duration);
-
-			if let Some(percentile) = self.percentile {
-				builder = builder.with_percentile(percentile);
-			}
-			if self.has_analyzer {
-				builder = builder.with_analyzer(DefaultStatisticalAnalyzer);
-			}
-
-			builder.build()
-		}
-	}
-
-	// The builder keeps the duration, and each option the case sets.
+	// The builder keeps the duration, and the percentile and the analyzer that
+	// the row sets.
 	crate::tb_cases! {
-		fn wcet_config_builder(case: WcetConfigTestCase) -> Result<(), TestingError> {
-			let config = case.built()?;
-			let percentile = config.percentile.as_ref().map(|check| check.percentile);
-			let has_analyzer = config.percentile.as_ref().is_some_and(|check| check.analyzer.is_some());
-			assert_eq!(config.duration, Duration::from_millis(100));
-			assert_eq!(percentile, case.percentile);
-			assert_eq!(has_analyzer, case.has_analyzer);
+		fn wcet_config_builder(
+			(builder, percentile, has_analyzer): (WcetConfigBuilder, Option<Percentile>, bool)
+		) -> TestResult {
+			let config = builder.build()?;
+
+			let check = config.percentile.as_ref();
+			let analyzed = check.is_some_and(|check| check.analyzer.is_some());
+			let kept = (config.duration, check.map(|check| check.percentile), analyzed);
+			assert_eq!(kept, (Duration::from_millis(100), percentile, has_analyzer));
 			Ok(())
 		}
 
 		cases {
-			duration_alone => WcetConfigTestCase { percentile: None, has_analyzer: false },
-			with_a_percentile => WcetConfigTestCase { percentile: Some(Percentile::P99), has_analyzer: false },
-			with_a_percentile_and_an_analyzer => WcetConfigTestCase { percentile: Some(Percentile::P99), has_analyzer: true },
+			duration_alone => (of_100_ms(), None, false),
+			with_a_percentile => (of_100_ms().with_percentile(Percentile::P99), Some(Percentile::P99), false),
+			with_a_percentile_and_an_analyzer => (
+				of_100_ms().with_percentile(Percentile::P99).with_analyzer(DefaultStatisticalAnalyzer),
+				Some(Percentile::P99),
+				true,
+			),
 		}
 	}
 
-	#[test]
-	fn test_wcet_config_builder_missing_duration() {
-		let result = WcetConfigBuilder::default().build();
-		assert!(matches!(result, Err(TestingError::InvalidTimingConstraint)));
-	}
+	// The build refuses a bound with no duration, and an analyzer with no
+	// percentile to compute.
+	crate::tb_cases! {
+		fn the_build_refuses(builder: WcetConfigBuilder) {
+			let built = builder.build();
+			assert!(matches!(built, Err(TestingError::InvalidTimingConstraint)));
+		}
 
-	#[test]
-	fn the_build_refuses_an_analyzer_with_no_percentile() -> Result<(), TestingError> {
-		let duration = Duration::from_millis(100);
-		let builder = WcetConfigBuilder::default()
-			.with_duration(duration)
-			.with_analyzer(DefaultStatisticalAnalyzer);
-
-		let refused = builder.build();
-		assert!(matches!(refused, Err(TestingError::InvalidTimingConstraint)));
-		Ok(())
+		cases {
+			a_bound_with_no_duration => WcetConfigBuilder::default(),
+			an_analyzer_with_no_percentile => of_100_ms().with_analyzer(DefaultStatisticalAnalyzer),
+		}
 	}
 }

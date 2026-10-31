@@ -321,6 +321,22 @@ impl AdmittedPeerAd {
 	}
 }
 
+#[cfg(test)]
+impl AdmittedPeerAd {
+	/// The advertisement of `peer` at the fixture socket `dial` that carries
+	/// `slate` and was issued at `order`.
+	pub(crate) fn fixture(
+		peer: impl AsRef<[u8]>,
+		dial: impl AsRef<str>,
+		slate: impl IntoIterator<Item = ServletEntry>,
+		order: u64,
+	) -> Self {
+		let peer_hive_id = SharedId::from(peer.as_ref());
+		let (dial, slate) = (AdmittedDial::fixture(dial), slate.into_iter().collect());
+		AdmittedPeerAd { peer_hive_id, dial, slate, order: UnixMillis::new(order) }
+	}
+}
+
 /// Runs the wire-level advertisement checks, outside the registry lock.
 fn peer_advertisement_wire_ok(
 	gateway_addr: impl AsRef<[u8]>,
@@ -504,8 +520,13 @@ mod tests {
 	use super::super::RouteKind;
 	use super::*;
 	use crate::colony::cluster::{ColonyDigest, PeerAddress};
-	use crate::testing::{unhex, TestCertificate, TestKey};
+	use crate::colony::protocol::ClusterRequest;
+	use crate::constants::DEFAULT_MAX_HOPS;
+	use crate::tb_cases;
+	use crate::testing::fixtures::TestStore;
+	use crate::testing::{unhex, TestCertificate, TestKey, TestResult};
 	use crate::transport::tcp::r#async::TokioListener;
+	use crate::{decode, encode};
 
 	/// The SHA3-256 digest of the DER of the fixed test certificate, computed
 	/// with Python's `hashlib.sha3_256`.
@@ -515,20 +536,17 @@ mod tests {
 	/// its certificate, the digest its protocol's provider names.
 	#[test]
 	fn a_house_gateway_goes_by_its_sha3_256_fingerprint() {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let certificate = TestCertificate::insecure_fixed();
 		let id = certificate.fingerprint_id::<ColonyDigest<TokioListener>>();
 		assert_eq!(id.as_deref(), Some(unhex(HOUSE_GATEWAY_ID).as_slice()));
 	}
 
 	// A budget of one forward reaches a local servlet and a peer gateway, and a
 	// relay trail needs the second forward that the relay spends.
-	crate::tb_cases! {
-		fn a_budget_of_one_affords_a_peer_route_and_not_a_relay_trail(
-			(kind, afforded): (RouteKind, bool)
-		) -> Result<(), Box<dyn core::error::Error>> {
+	tb_cases! {
+		fn a_budget_of_one_affords_a_peer_route_and_not_a_relay_trail((kind, afforded): (RouteKind, bool)) {
 			let budget = HopBudget::for_test(1);
 			assert_eq!(budget.affords(kind), afforded);
-			Ok(())
 		}
 		cases {
 			a_local_route => (RouteKind::Local, true),
@@ -537,23 +555,132 @@ mod tests {
 		}
 	}
 
+	/// The budget that the wire count `wire` grants under the hop cap
+	/// `policy`.
+	fn budget(wire: u8, policy: u8) -> HopBudget {
+		HopBudget::from_wire(WireHopBudget::new(wire), policy)
+	}
+
+	/// The servlet type `ping` of the default namespace.
+	fn ping_type() -> Urn<'static> {
+		ColonyNamespace::servlet_fixture("ping")
+	}
+
+	// A relayed work request stamps the budget the gateway has left after its
+	// own forward, and a spent budget stays at zero.
+	tb_cases! {
+		fn relayed_work_stamps_the_spent_budget((budget, remaining): (HopBudget, u8)) {
+			let work = budget.relayed_work(ping_type(), vec![1]);
+			assert_eq!(work.hops_remaining, remaining);
+		}
+		cases {
+			decremented => (HopBudget::for_test(2), 1),
+			saturated_at_zero => (HopBudget::for_test(0), 0),
+		}
+	}
+
+	/// A relayed work envelope carries the decremented budget on the wire, so
+	/// a skipped decrement in `HopBudget::relayed_work` fails here even when
+	/// an integration clamp masks it.
+	#[test]
+	fn relayed_envelope_carries_the_decremented_budget_on_the_wire() -> TestResult {
+		let relayed = HopBudget::for_test(2).relayed_work(ping_type(), vec![7]);
+		let envelope = encode(&ClusterRequest::Work(relayed))?;
+
+		let decoded = decode::<ClusterRequest>(&envelope)?;
+		assert!(matches!(decoded, ClusterRequest::Work(work) if work.hops_remaining == 1));
+		Ok(())
+	}
+
+	// A missing decrement in `HopBudget::relayed_route` fails here even when
+	// integration topologies mask it with a clamp. The mux handle tests pin
+	// the stamp of the route on the Open.
+	tb_cases! {
+		fn relayed_route_stamps_the_spent_budget((budget, remaining): (HopBudget, u8)) {
+			let route = budget.relayed_route(&ColonyNamespace::servlet_fixture("stream-echo"));
+			assert_eq!(route.hops_remaining(), remaining);
+		}
+		cases {
+			decremented => (HopBudget::for_test(2), 1),
+			saturated_at_zero => (HopBudget::for_test(0), 0),
+		}
+	}
+
+	/// A relayed route keeps the target of the stream it carries.
+	#[test]
+	fn relayed_route_keeps_the_target() {
+		let target = ColonyNamespace::servlet_fixture("stream-echo");
+		let route = HopBudget::for_test(2).relayed_route(&target);
+		assert_eq!(route.target(), Some(&target));
+	}
+
+	// A budget clamps the origin sentinel to the hop cap of its gateway, keeps
+	// a relayed count below that cap, and spends to zero under a cap of zero.
+	tb_cases! {
+		fn hop_budget_wire_clamps_to_policy((wire, policy, clamped): (u8, u8, u8)) {
+			assert_eq!(budget(wire, policy).wire(), clamped);
+		}
+		cases {
+			origin_sentinel => (DEFAULT_HOP_BUDGET, 1, 1),
+			relayed_below_policy => (1, 3, 1),
+			zero_policy => (DEFAULT_HOP_BUDGET, 0, 0),
+		}
+	}
+
+	/// A hop cap of zero disables forwarding.
+	#[test]
+	fn a_zero_policy_disables_forwarding() {
+		assert!(!budget(DEFAULT_HOP_BUDGET, 0).allows_forward());
+	}
+
+	// An origin request carries the sentinel, so a count below it reached
+	// this gateway through a relay. The relayed fact reads the wire count,
+	// because the clamped count under a cap below the origin sentinel would
+	// mark every direct caller relayed and refuse it at the export boundary.
+	tb_cases! {
+		fn a_budget_reads_as_relayed_by_its_wire_count((wire, policy, relayed): (u8, u8, bool)) {
+			assert_eq!(budget(wire, policy).is_relayed(), relayed);
+		}
+		cases {
+			origin => (DEFAULT_HOP_BUDGET, DEFAULT_HOP_BUDGET, false),
+			clamped_origin => (DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS, false),
+			below_the_sentinel => (2, 4, true),
+		}
+	}
+
+	// A relay trail spends one hop at the relay, so a shorter budget could
+	// never select it.
+	tb_cases! {
+		fn a_relay_trail_needs_two_forwards((wire, allowed): (u8, bool)) {
+			assert_eq!(budget(wire, 4).allows_relay_trail(), allowed);
+		}
+		cases {
+			one_forward => (1, false),
+			two_forwards => (2, true),
+		}
+	}
+
+	/// The colony URN of `name` in the default namespace.
+	fn colony(name: &str) -> Urn<'static> {
+		ColonyNamespace::colony_fixture(name)
+	}
+
 	/// A colony URN under another naming authority.
 	fn foreign_colony() -> Urn<'static> {
-		let foreign = ColonyNamespace::new("acme", "").unwrap_or_default();
+		let foreign = ColonyNamespace::new("acme", "").expect("the fixture authority is valid");
 		foreign.colony("main").expect("static colony name")
 	}
 
-	fn nestmate_ns() -> ColonyNamespace {
-		ColonyNamespace::default()
+	/// The certificate of the fixed test key that carries each of `sans` as a
+	/// URI Subject Alternative Name.
+	fn certificate_naming(sans: &[String]) -> Certificate {
+		let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+		TestCertificate::with_uri_sans(&TestKey::insecure_fixed_signing(), &sans)
 	}
 
-	fn ping_type() -> Urn<'static> {
-		nestmate_ns().servlet("ping").expect("static servlet name")
-	}
-
-	/// A parsed dial address, which every fixture spelling names.
-	fn address(spelling: &str) -> PeerAddress {
-		PeerAddress::fixture(spelling)
+	/// The hive id of 32 octets of `fill`.
+	fn hive_id(fill: u8) -> SharedId {
+		Arc::from([fill; 32].as_slice())
 	}
 
 	/// One socket spelled two ways is one entry, so an address that passes the
@@ -562,57 +689,70 @@ mod tests {
 	/// score or eviction lookup by that address finds them.
 	#[test]
 	fn an_ad_spelling_its_socket_verbosely_routes_under_the_canonical_key() {
-		let verbose = address("[0:0:0:0:0:0:0:1]:9000");
-		let canonical = address("[::1]:9000");
+		let verbose = PeerAddress::fixture("[0:0:0:0:0:0:0:1]:9000");
+		let canonical = PeerAddress::fixture("[::1]:9000");
 		assert_eq!(verbose.route_bytes(), canonical.route_bytes());
 		assert_eq!(verbose.route_bytes().as_ref(), b"[::1]:9000");
 	}
 
+	// An advertisement names bare servlet types alone, so a list that holds
+	// an instance locator refuses as a whole.
+	tb_cases! {
+		fn advertised_types_admit_bare_types_alone((types, admitted): (Vec<Urn<'static>>, bool)) {
+			assert_eq!(ColonyNamespace::default().all_bare_servlet_types(&types), admitted);
+		}
+		cases {
+			bare => (vec![ping_type()], true),
+			instance => (vec![ColonyNamespace::instance_fixture("ping", "127.0.0.1:1")], false),
+		}
+	}
+
+	/// The slate of an advertisement of `types` by the hive `origin`, which
+	/// peers dial at the fixture socket `127.0.0.1:9000`.
+	fn slate_of(origin: &SharedId, types: &[Urn<'static>]) -> Vec<ServletEntry> {
+		PheromoneConfig::default().peer_slate(origin, AdmittedDial::fixture("127.0.0.1:9000"), types)
+	}
+
+	/// The one route of `slate`.
+	fn sole(slate: &[ServletEntry]) -> &ServletEntry {
+		let [route] = slate else { panic!("the slate holds one route") };
+		route
+	}
+
+	/// A peer slate holds one peer route per type, owned by the hive and keyed
+	/// by the hive, a separator octet, and the type.
 	#[test]
-	fn advertised_types_accept_bare_reject_instance() {
-		let ns = nestmate_ns();
-		let bare = ping_type();
-		assert!(ns.all_bare_servlet_types(core::slice::from_ref(&bare)));
+	fn a_peer_slate_keys_each_route_by_its_hive_and_type() {
+		let slate = slate_of(&hive_id(1), &[ping_type()]);
+		let route = sole(&slate);
 
-		let instance = bare
-			.servlet_instance("127.0.0.1:1")
-			.expect("a servlet type URN yields an instance URN");
-		assert!(!ns.all_bare_servlet_types(&[instance]));
+		let key = [[1u8; 32].as_slice(), &[0], b"urn:tightbeam::servlet:ping"].concat();
+		let read = (route.route_kind(), route.owner_id().as_ref(), route.route_key().as_ref());
+		assert_eq!(read, (RouteKind::Peer, [1u8; 32].as_slice(), key.as_slice()));
 	}
 
-	/// The pheromone settings the slate tests read: the shipped defaults, so a
-	/// changed default shows up in these tests.
-	fn test_pheromone() -> PheromoneConfig {
-		PheromoneConfig::default()
-	}
-
+	/// Each route of a peer slate dials the socket its advertisement claims.
 	#[test]
-	fn build_peer_slate_keys_by_hive_and_sets_dial() {
-		let hive: SharedId = Arc::from([1u8; 32].as_slice());
-		let slate = test_pheromone().peer_slate(&hive, AdmittedDial::fixture("127.0.0.1:9000"), &[ping_type()]);
-		assert_eq!(slate.len(), 1);
-		assert_eq!(slate[0].route_kind(), RouteKind::Peer);
-		assert_eq!(slate[0].dial_target().as_bytes(), b"127.0.0.1:9000");
-		assert_eq!(slate[0].owner_id().as_ref(), hive.as_ref());
-		assert_eq!(slate[0].route_key()[0], 1);
-		assert_eq!(slate[0].route_key()[32], 0);
+	fn a_peer_slate_dials_the_advertised_socket() {
+		let slate = slate_of(&hive_id(1), &[ping_type()]);
+		assert_eq!(sole(&slate).dial_target().as_bytes(), b"127.0.0.1:9000");
 	}
 
-	fn admitted_ad(origin: &SharedId, dial: impl AsRef<str>, types: impl AsRef<[Urn<'static>]>) -> AdmittedPeerAd {
-		let dial = AdmittedDial::fixture(dial);
-		let types = types.as_ref();
-		let slate = test_pheromone().peer_slate(origin, dial, types);
-		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial, slate, order: UnixMillis::new(0) }
+	/// The advertisement of `types` by the hive `origin` at the fixture socket
+	/// `127.0.0.1:9000`, issued at order zero.
+	fn ad_of(origin: &SharedId, types: &[Urn<'static>]) -> AdmittedPeerAd {
+		AdmittedPeerAd::fixture(origin, "127.0.0.1:9000", slate_of(origin, types), 0)
 	}
 
+	/// The discovery hint of an advertisement names the socket and the hive
+	/// of its advertiser.
 	#[test]
 	fn discovery_hint_names_the_advertiser() {
-		let origin: SharedId = Arc::from([1u8; 32].as_slice());
-		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
-
+		let ad = ad_of(&hive_id(1), &[ping_type()]);
 		let hint = ad.discovery_hint();
-		assert_eq!(hint.dial, AdmittedDial::fixture("127.0.0.1:9000"));
-		assert_eq!(hint.peer_id.as_deref(), Some(origin.as_ref()));
+
+		let read = (hint.dial, hint.peer_id);
+		assert_eq!(read, (AdmittedDial::fixture("127.0.0.1:9000"), Some([1u8; 32].to_vec())));
 	}
 
 	/// The fixture socket at which peers dial the relay gateway.
@@ -620,195 +760,144 @@ mod tests {
 		AdmittedDial::fixture("127.0.0.1:9001")
 	}
 
+	/// The trail of `trail`, which a distinct relay of a live slate leaves.
 	fn some_trail(trail: Option<RelayTrail>) -> RelayTrail {
 		trail.expect("relay trail for a distinct relay with a live slate")
 	}
 
-	#[test]
-	fn relay_trail_none_for_self_relay() {
-		let origin: SharedId = Arc::from([1u8; 32].as_slice());
-		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
-		let trail = ad.relay_trail(&origin, relay_dial(), &PheromoneConfig::default());
-		assert!(trail.is_none());
+	// A hive that relays its own advertisement, or an advertisement with an
+	// empty slate, leaves no relay trail.
+	tb_cases! {
+		fn relay_trail_none_for((relay, types): (SharedId, Vec<Urn<'static>>)) {
+			let ad = ad_of(&hive_id(1), &types);
+			let trail = ad.relay_trail(&relay, relay_dial(), &PheromoneConfig::default());
+			assert!(trail.is_none());
+		}
+		cases {
+			self_relay => (hive_id(1), vec![ping_type()]),
+			empty_slate => (hive_id(2), Vec::new()),
+		}
 	}
 
-	#[test]
-	fn relay_trail_none_for_empty_slate() {
-		let origin: SharedId = Arc::from([1u8; 32].as_slice());
-		let relay: SharedId = Arc::from([2u8; 32].as_slice());
-		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[]);
-		let trail = ad.relay_trail(&relay, relay_dial(), &PheromoneConfig::default());
-		assert!(trail.is_none());
-	}
-
+	/// A relay trail buckets each route under the origin, a separator octet,
+	/// and the relay, owns it by the origin, and dials the relay.
 	#[test]
 	fn relay_trail_buckets_by_origin_and_relay() {
-		let origin: SharedId = Arc::from([1u8; 32].as_slice());
-		let relay: SharedId = Arc::from([2u8; 32].as_slice());
-		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
+		let (origin, relay) = (hive_id(1), hive_id(2));
+		let ad = ad_of(&origin, &[ping_type()]);
 		let trail = some_trail(ad.relay_trail(&relay, relay_dial(), &PheromoneConfig::default()));
 
 		let expected_bucket: Vec<u8> = [origin.as_ref(), &[0u8], relay.as_ref()].concat();
+		let route = sole(&trail.slate);
 		assert_eq!(trail.bucket.as_ref(), expected_bucket.as_slice());
-		assert_eq!(trail.slate.len(), 1);
-		assert_eq!(trail.slate[0].route_kind(), RouteKind::PeerRelay);
-		assert_eq!(trail.slate[0].bucket().as_ref(), expected_bucket.as_slice());
-		assert_eq!(trail.slate[0].owner_id().as_ref(), origin.as_ref());
-		assert_eq!(trail.slate[0].relay_id().map(|id| id.as_ref()), Some(relay.as_ref()));
-		assert_eq!(trail.slate[0].dial_target().as_bytes(), b"127.0.0.1:9001");
+		assert_eq!(route.route_kind(), RouteKind::PeerRelay);
+		assert_eq!(route.bucket().as_ref(), expected_bucket.as_slice());
+		assert_eq!(route.owner_id().as_ref(), origin.as_ref());
+		assert_eq!(route.relay_id().map(|id| id.as_ref()), Some(relay.as_ref()));
+		assert_eq!(route.dial_target().as_bytes(), b"127.0.0.1:9001");
 	}
 
-	#[test]
-	fn peer_advertisement_wire_ok_refuses_bad_dial() {
-		let ns = nestmate_ns();
-		let status = peer_advertisement_wire_ok(b"", &[ping_type()], &ns, &PeerConfig::default());
-		assert_eq!(status, Err(TransitStatus::PermissionDenied));
-	}
-
-	#[test]
-	fn peer_advertisement_wire_ok_refuses_allowlist_miss() {
-		let ns = nestmate_ns();
-		let allow = PeerConfig::allowing(["10.0.0.1:9000"]);
-		let status = peer_advertisement_wire_ok(b"127.0.0.1:9000", &[ping_type()], &ns, &allow);
-		assert_eq!(status, Err(TransitStatus::PermissionDenied));
+	// The wire checks refuse an advertisement whose dial names no socket, and
+	// one whose dial the allowlist leaves out.
+	tb_cases! {
+		fn peer_advertisement_wire_ok_refuses((dial, config): (&[u8], PeerConfig)) {
+			let status = peer_advertisement_wire_ok(dial, &[ping_type()], &ColonyNamespace::default(), &config);
+			assert_eq!(status, Err(TransitStatus::PermissionDenied));
+		}
+		cases {
+			bad_dial => (b"", PeerConfig::default()),
+			allowlist_miss => (b"127.0.0.1:9000", PeerConfig::allowing(["10.0.0.1:9000"])),
+		}
 	}
 
 	mod colony_urn {
 		use super::*;
-		use crate::testing::fixtures::{TestCertificate, TestKey};
 
-		fn main_colony() -> Urn<'static> {
-			nestmate_ns().colony("main").expect("static colony name")
-		}
-
-		fn other_colony() -> Urn<'static> {
-			nestmate_ns().colony("other").expect("static colony name")
-		}
-
-		#[test]
-		fn cert_colony_urn_extracts_a_valid_san() {
-			let key = TestKey::insecure_fixed_signing();
-			let cert = TestCertificate::with_uri_sans(&key, &[&main_colony().to_string()]);
-			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
-		}
-
-		#[test]
-		fn cert_colony_urn_ignores_non_colony_entries() {
-			let key = TestKey::insecure_fixed_signing();
-			let servlet = ping_type().to_string();
-			let cert =
-				TestCertificate::with_uri_sans(&key, &[&servlet, "https://example.test", &main_colony().to_string()]);
-			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
-		}
-
-		#[test]
-		fn cert_colony_urn_tolerates_duplicate_identical_entries() {
-			let key = TestKey::insecure_fixed_signing();
-			let urn = main_colony().to_string();
-			let cert = TestCertificate::with_uri_sans(&key, &[&urn, &urn]);
-			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
-		}
-
-		#[test]
-		fn cert_colony_urn_fails_closed_on_ambiguity() {
-			let key = TestKey::insecure_fixed_signing();
-			let cert = TestCertificate::with_uri_sans(&key, &[&main_colony().to_string(), &other_colony().to_string()]);
-			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
-		}
-
-		#[test]
-		fn cert_colony_urn_is_none_without_san() {
-			let key = TestKey::insecure_fixed_signing();
-			let cert = TestCertificate::self_signed(&key);
-			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
-		}
-
-		#[test]
-		fn cert_colony_urn_is_none_for_foreign_namespace() {
-			let key = TestKey::insecure_fixed_signing();
-			let cert = TestCertificate::with_uri_sans(&key, &[&foreign_colony().to_string()]);
-			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
+		// A certificate names its colony by its one URI SAN of a colony of the
+		// namespace. It skips other entries and collapses identical ones, and
+		// it names none for two colonies, no SAN, or another namespace.
+		tb_cases! {
+			fn cert_colony_urn((certificate, named): (Certificate, Option<Urn<'static>>)) {
+				assert_eq!(ColonyNamespace::default().cert_colony_urn(&certificate), named);
+			}
+			cases {
+				extracts_a_valid_san => (certificate_naming(&[colony("main").to_string()]), Some(colony("main"))),
+				ignores_non_colony_entries => (
+					certificate_naming(&[
+						ping_type().to_string(),
+						String::from("https://example.test"),
+						colony("main").to_string(),
+					]),
+					Some(colony("main")),
+				),
+				tolerates_duplicate_identical_entries => (
+					certificate_naming(&[colony("main").to_string(), colony("main").to_string()]),
+					Some(colony("main")),
+				),
+				fails_closed_on_ambiguity => (
+					certificate_naming(&[colony("main").to_string(), colony("other").to_string()]),
+					None,
+				),
+				is_none_without_san => (TestCertificate::insecure_fixed(), None),
+				is_none_for_foreign_namespace => (certificate_naming(&[foreign_colony().to_string()]), None),
+			}
 		}
 	}
 
 	mod flood {
 		use super::*;
-		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, CertificateTrustStore, NoRevocation, TrustBuilder};
-		use crate::crypto::x509::KeyCurves;
-		use crate::tb_cases;
-		use crate::testing::fixtures::{TestCertificate, TestKey};
-
-		/// The colony URN of `name` in the test namespace.
-		fn colony(name: &str) -> String {
-			let urn = nestmate_ns().colony(name).expect("static colony name");
-			urn.to_string()
-		}
+		use crate::crypto::x509::store::CertificateTrustStore;
 
 		/// What [`Flood::member`] answers.
 		type Answer = Result<FloodMember, TransitStatus>;
 
-		/// The answer the flood of the test namespace gives a certificate that
-		/// carries `sans`.
+		/// The answer the flood of the default namespace gives a certificate
+		/// that carries `sans`, under a peer store that holds it.
 		fn membership(sans: &[String]) -> Answer {
-			let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
-			let key = TestKey::insecure_fixed_signing();
-			let cert = TestCertificate::with_uri_sans(&key, &sans);
+			let cert = certificate_naming(sans);
+			let store = TestStore::holding([cert.clone()]);
+			let ns = ColonyNamespace::default();
 
-			let ns = nestmate_ns();
-			let store = store_holding(&cert);
 			let flood = Flood::new(&ns, Some(&store));
-
 			flood.member(&cert)
-		}
-
-		/// A peer trust store that holds `cert` alone.
-		fn store_holding(cert: &Certificate) -> CertificateTrustStore {
-			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-			let builder = builder.with_certificate(cert.clone());
-			builder.expect("the test certificate satisfies the trust builder").build()
 		}
 
 		/// A certificate of colony "main" under a key no fixture store holds.
 		fn unenrolled_member_cert() -> Certificate {
-			let key = Secp256k1SigningKey::from_bytes(&[2u8; 32].into()).expect("the fixture scalar is a valid key");
-			TestCertificate::with_cn_and_uri_sans(&key, "Unenrolled", &[&colony("main")])
+			TestCertificate::with_cn_and_uri_sans(&TestKey::fixed(0x02), "Unenrolled", &[&colony("main").to_string()])
 		}
 
-		// The certificate names a colony of the namespace, and the store holds
-		// another key.
-		#[test]
-		fn a_key_the_store_does_not_hold_is_outside_the_flood() {
-			let key = TestKey::insecure_fixed_signing();
-			let enrolled = TestCertificate::with_uri_sans(&key, &[&colony("main")]);
+		// The certificate names a colony of the namespace, and the peer store
+		// holds another key or the flood has no peer store.
+		tb_cases! {
+			fn an_unenrolled_member_is_outside_the_flood(store: Option<CertificateTrustStore>) {
+				let ns = ColonyNamespace::default();
+				let flood = Flood::new(&ns, store.as_ref().map(|store| store as &dyn CertificateTrust));
 
-			let ns = nestmate_ns();
-			let store = store_holding(&enrolled);
-			let flood = Flood::new(&ns, Some(&store));
-			assert_eq!(flood.member(&unenrolled_member_cert()), OUTSIDE);
-		}
-
-		#[test]
-		fn a_flood_with_no_peer_trust_has_no_member() {
-			let ns = nestmate_ns();
-			let flood = Flood::new(&ns, None);
-			assert_eq!(flood.member(&unenrolled_member_cert()), OUTSIDE);
+				assert_eq!(flood.member(&unenrolled_member_cert()), OUTSIDE);
+			}
+			cases {
+				a_store_of_another_key => Some(TestStore::holding([certificate_naming(&[colony("main").to_string()])])),
+				no_peer_trust => None,
+			}
 		}
 
 		const MEMBER: Answer = Ok(FloodMember(()));
 		const OUTSIDE: Answer = Err(TransitStatus::PermissionDenied);
 
+		// An enrolled certificate of one colony of the namespace is a member,
+		// and one of no colony, of another namespace, or of two colonies is
+		// outside the flood.
 		tb_cases! {
 			fn the_flood_decides_membership_from_the_certificate((sans, answer): (Vec<String>, Answer)) {
 				assert_eq!(membership(&sans), answer);
 			}
 			cases {
-				one_colony => (vec![colony("main")], MEMBER),
-				another_colony => (vec![colony("other")], MEMBER),
+				one_colony => (vec![colony("main").to_string()], MEMBER),
+				another_colony => (vec![colony("other").to_string()], MEMBER),
 				no_colony => (vec![], OUTSIDE),
 				another_namespace => (vec![foreign_colony().to_string()], OUTSIDE),
-				two_colonies => (vec![colony("main"), colony("other")], OUTSIDE),
+				two_colonies => (vec![colony("main").to_string(), colony("other").to_string()], OUTSIDE),
 			}
 		}
 	}

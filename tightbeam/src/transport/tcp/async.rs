@@ -1126,33 +1126,26 @@ impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioLi
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
 
-	use core::str::FromStr;
 	use core::time::Duration;
 	use std::sync::Arc;
-	use std::time::Instant;
 
 	#[cfg(feature = "transport-hpke")]
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
 	use crate::clock::{ManualClock, SystemClock};
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::KeyCurves;
+	use crate::crypto::x509::store::CertificateTrust;
 	use crate::policy::TransitStatus;
-	use crate::prelude::TightBeamSocketAddr;
 	use crate::runtime::ParkingExecutor;
+	use crate::testing::fixtures::{TestLoopback, TestStore};
 	use crate::testing::*;
 	use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, TransportLimits};
 
-	#[cfg(feature = "instrument")]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::aead::SessionKeys;
-	#[cfg(feature = "instrument")]
-	use crate::crypto::hash::{Digest, Sha3_256};
 	#[cfg(feature = "transport-hpke")]
 	use crate::crypto::key::Secp256k1KeyProvider;
 	#[cfg(feature = "transport-hpke")]
@@ -1161,16 +1154,16 @@ mod tests {
 	use crate::crypto::x509::error::CertificateValidationError::{CertificateNotTrusted, Expired};
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
+	#[cfg(feature = "transport-cms")]
+	use crate::crypto::x509::store::TrustBuilder;
 	#[cfg(feature = "instrument")]
-	use crate::instrumentation::{events, TbInstrumentationConfig};
+	use crate::instrumentation::events;
 	#[cfg(feature = "instrument")]
-	use crate::trace::TraceConfig;
+	use crate::testing::fixtures::TestTrace;
 	#[cfg(feature = "transport-hpke")]
 	use crate::transport::client::ClientBuilder;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::tests::create_test_signed_data;
-	#[cfg(feature = "instrument")]
-	use crate::transport::handshake::EstablishedSession;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::HandshakeMessage;
 	#[cfg(feature = "transport-hpke")]
@@ -1197,6 +1190,25 @@ mod tests {
 		transport.send_response(status, message).await
 	}
 
+	/// A reply that records each frame it serves and answers with `answer`,
+	/// beside the receiver of the recorded frames.
+	fn recording(
+		answer: Option<Frame>,
+	) -> (
+		impl Fn(Frame) -> Option<Frame> + Send + 'static,
+		tokio::sync::mpsc::Receiver<Frame>,
+	) {
+		let (recorded, received) = tokio::sync::mpsc::channel(2);
+		let reply = move |frame: Frame| {
+			// The receiver lives for the whole test, so a refused send shows
+			// as the missing frame the assertion reads.
+			let _ = recorded.try_send(frame);
+			answer.clone()
+		};
+
+		(reply, received)
+	}
+
 	#[cfg(feature = "transport-hpke")]
 	use crate::policy::SessionContext;
 	#[cfg(feature = "transport-hpke")]
@@ -1209,13 +1221,16 @@ mod tests {
 		use crate::clock::{ManualClock, SystemClock};
 		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 		use crate::crypto::aead::{RecordDirection, RuntimeAead};
-		use crate::testing::{TestFrame, TestKey};
+		use crate::testing::{TestFrame, TestKey, TestResult};
 		use crate::transport::TransportLimits;
 		use crate::TightBeamError;
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
 
 		/// A frame stream that discards writes and yields empty frames.
+		///
+		/// The cases read the cipher state of a half and send no byte that a
+		/// peer reads, so the double stands in for a connection.
 		struct NullStream;
 
 		impl AsyncReadStream for NullStream {
@@ -1248,8 +1263,50 @@ mod tests {
 			RecvCipher::new(test_runtime(), 0, RecordDirection::ClientToServer)
 		}
 
+		/// A send half in `mode` over `stream` under `limits`, which reads its
+		/// deadlines on `clock`.
+		fn writer_over<S: AsyncWriteStream>(
+			stream: S,
+			mode: SplitSend,
+			limits: CheckedLimits,
+			clock: Arc<dyn Clock>,
+		) -> TransportWriter<S> {
+			TransportWriter {
+				stream,
+				mode,
+				limits,
+				clock,
+				#[cfg(feature = "instrument")]
+				trace: None,
+			}
+		}
+
+		/// A receive half in `mode` over `stream` under `limits`, which reads
+		/// its deadlines on `clock`.
+		fn reader_over<S: AsyncReadStream>(
+			stream: S,
+			mode: SplitRecv,
+			limits: CheckedLimits,
+			clock: Arc<dyn Clock>,
+		) -> TransportReader<S> {
+			TransportReader {
+				stream,
+				mode,
+				limits,
+				clock,
+				#[cfg(feature = "instrument")]
+				trace: None,
+				#[cfg(feature = "instrument")]
+				peer: None,
+			}
+		}
+
 		fn writer(mode: SplitSend) -> TransportWriter<NullStream> {
-			writer_under(mode, CheckedLimits::default())
+			writer_over(NullStream, mode, CheckedLimits::default(), Arc::new(SystemClock))
+		}
+
+		fn reader(mode: SplitRecv) -> TransportReader<NullStream> {
+			reader_over(NullStream, mode, CheckedLimits::default(), Arc::new(SystemClock))
 		}
 
 		/// A write half hands out the clock of the connection it split from, so
@@ -1258,36 +1315,15 @@ mod tests {
 		fn a_split_writer_hands_out_the_connection_clock() {
 			let clock = Arc::new(ManualClock::default());
 			clock.advance(Duration::from_secs(3600));
-
-			let mut writer = writer(SplitSend::Cleartext);
-			writer.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+			let writer = writer_over(
+				NullStream,
+				SplitSend::Cleartext,
+				CheckedLimits::default(),
+				Arc::clone(&clock) as Arc<dyn Clock>,
+			);
 
 			let handed = EnvelopeSink::clock(&writer);
 			assert_eq!(handed.monotonic(), clock.monotonic());
-		}
-
-		fn writer_under(mode: SplitSend, limits: CheckedLimits) -> TransportWriter<NullStream> {
-			TransportWriter {
-				stream: NullStream,
-				mode,
-				limits,
-				clock: Arc::new(SystemClock),
-				#[cfg(feature = "instrument")]
-				trace: None,
-			}
-		}
-
-		fn reader(mode: SplitRecv) -> TransportReader<NullStream> {
-			TransportReader {
-				stream: NullStream,
-				mode,
-				limits: CheckedLimits::default(),
-				clock: Arc::new(SystemClock),
-				#[cfg(feature = "instrument")]
-				trace: None,
-				#[cfg(feature = "instrument")]
-				peer: None,
-			}
 		}
 
 		/// The limits at twice the default encrypted-envelope ceiling, where a
@@ -1315,45 +1351,40 @@ mod tests {
 			}
 		}
 
+		/// A send install brings a fresh key and a reset counter, and the
+		/// configured record limit survives it.
 		#[test]
-		fn writer_install_swaps_cipher_and_preserves_limit() -> Result<(), TightBeamError> {
+		fn a_writer_install_swaps_the_cipher_and_keeps_its_limit() -> TestResult {
 			let send_cipher = test_sender().with_rekey_limit(1);
 			let mut writer = writer(SplitSend::Encrypted(send_cipher));
-
 			send_key(&writer).encrypt_next(PLAINTEXT)?;
-			assert_eq!(writer.remaining_records(), 0);
 
-			// The install brings a fresh key and a reset counter, and the
-			// configured record limit survives it.
-			let fresh_send = test_sender();
-			writer.install_send_cipher(fresh_send)?;
-			assert_eq!(writer.remaining_records(), 1);
+			let spent = writer.remaining_records();
 
+			writer.install_send_cipher(test_sender())?;
+
+			assert_eq!((spent, writer.remaining_records()), (0, 1));
 			send_key(&writer).encrypt_next(PLAINTEXT)?;
 			Ok(())
 		}
 
+		/// A receive install restarts the exact-next sequence, and the renewal
+		/// threshold survives it.
 		#[test]
-		fn reader_install_swaps_cipher_and_preserves_threshold() -> Result<(), TightBeamError> {
-			let sender = test_sender();
-			let record_zero = sender.encrypt_next(PLAINTEXT)?.to_der()?;
-			let recv_cipher = test_receiver().with_rekey_limit(2);
-			let mut reader = reader(SplitRecv::Encrypted(recv_cipher));
-
+		fn a_reader_install_swaps_the_cipher_and_keeps_its_threshold() -> TestResult {
+			let record_zero = test_sender().encrypt_next(PLAINTEXT)?.to_der()?;
+			let mut reader = reader(SplitRecv::Encrypted(test_receiver().with_rekey_limit(2)));
 			let mut first = record_zero.clone();
 			recv_key(&mut reader).open(&mut first)?;
 
 			let mut replayed = record_zero.clone();
-			let replay = recv_key(&mut reader).open(&mut replayed);
-			assert!(replay.is_err());
-			assert_eq!(reader.remaining_records(), 1);
+			let replay = recv_key(&mut reader).open(&mut replayed).map(<[u8]>::to_vec);
+			let before = reader.remaining_records();
 
-			// Only a fresh key restarts the exact-next sequence. The renewal
-			// threshold survives the install.
-			let fresh_recv = test_receiver();
-			reader.install_recv_cipher(fresh_recv)?;
+			reader.install_recv_cipher(test_receiver())?;
 
-			assert_eq!(reader.remaining_records(), 2);
+			assert!(matches!(replay, Err(TightBeamError::NonceReplayed(_))));
+			assert_eq!((before, reader.remaining_records()), (1, 2));
 
 			let mut reopened = record_zero;
 			recv_key(&mut reader).open(&mut reopened)?;
@@ -1364,10 +1395,10 @@ mod tests {
 		/// encrypted-envelope ceiling, so a later override stops at the lower
 		/// volume that ceiling admits (RFC 9846 § 5.5).
 		#[test]
-		fn writer_install_bounds_the_fresh_cipher_by_the_envelope_ceiling() -> Result<(), TightBeamError> {
+		fn writer_install_bounds_the_fresh_cipher_by_the_envelope_ceiling() -> TestResult {
 			let limits = doubled_ceiling();
 			let current = test_sender().with_envelope_ceiling(limits.encrypted_envelope);
-			let mut writer = writer_under(SplitSend::Encrypted(current), limits);
+			let mut writer = writer_over(NullStream, SplitSend::Encrypted(current), limits, Arc::new(SystemClock));
 			writer.install_send_cipher(test_sender())?;
 
 			let raised = writer.with_rekey_limit(u64::MAX);
@@ -1377,6 +1408,9 @@ mod tests {
 
 		/// A frame stream that stays pending on every read and write, as with a
 		/// stalled peer.
+		///
+		/// A loopback peer that stalls on a write needs its kernel buffer full,
+		/// and the double holds a half at the deadline with no buffer to fill.
 		struct StalledStream;
 
 		impl AsyncReadStream for StalledStream {
@@ -1400,92 +1434,63 @@ mod tests {
 			limits.checked().expect("a one-second deadline agrees with the defaults")
 		}
 
-		/// The operation deadline bounds a cleartext half as it bounds an
-		/// encrypted one, so a stalled peer cannot pin its task (CWE-400).
-		#[tokio::test(start_paused = true)]
-		async fn a_cleartext_reader_gives_up_at_the_operation_deadline() {
-			let mut reader = TransportReader {
-				stream: StalledStream,
-				mode: SplitRecv::Cleartext,
-				limits: one_second_deadline(),
-				clock: Arc::new(SystemClock),
-				#[cfg(feature = "instrument")]
-				trace: None,
-				#[cfg(feature = "instrument")]
-				peer: None,
-			};
-
-			let outcome = reader.read_envelope().await;
-			assert!(matches!(
-				outcome,
-				Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
-			));
+		// The operation deadline bounds a cleartext half as it bounds an
+		// encrypted one, so a stalled peer cannot pin its task (CWE-400).
+		crate::tb_cases! {
+			#[tokio::test(start_paused = true)]
+			async fn a_cleartext_half_gives_up_at_the_operation_deadline(outcome: TransportResult<()>) {
+				assert!(matches!(
+					outcome,
+					Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+				));
+			}
+			cases {
+				reader => reader_over(StalledStream, SplitRecv::Cleartext, one_second_deadline(), Arc::new(SystemClock))
+					.read_envelope()
+					.await
+					.map(drop),
+				writer => writer_over(StalledStream, SplitSend::Cleartext, one_second_deadline(), Arc::new(SystemClock))
+					.write_envelope(TransportEnvelope::from(TestFrame::v0(None, None)))
+					.await,
+			}
 		}
 
 		/// A split half sets its deadline one operation timeout past the
 		/// reading of its connection clock, so a read from a stalled peer ends
 		/// once that timeout has passed on the runtime's timer, and no later.
 		#[tokio::test(start_paused = true)]
-		async fn a_split_reader_waits_out_exactly_the_operation_timeout() -> Result<(), TightBeamError> {
+		async fn a_split_reader_waits_out_exactly_the_operation_timeout() {
 			let clock = Arc::new(ManualClock::default());
 			clock.advance(Duration::from_secs(3600));
 
 			let limits = one_second_deadline();
-			let mut reader = TransportReader {
-				stream: StalledStream,
-				mode: SplitRecv::Cleartext,
-				limits,
-				clock,
-				#[cfg(feature = "instrument")]
-				trace: None,
-				#[cfg(feature = "instrument")]
-				peer: None,
-			};
+			let mut reader = reader_over(StalledStream, SplitRecv::Cleartext, limits, clock);
 
 			let started = tokio::time::Instant::now();
 			let outcome = tokio::time::timeout(limits.operation_timeout * 2, reader.read_envelope()).await;
-			let expired = matches!(
-				outcome,
-				Ok(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
-			);
-			assert!(expired);
-			assert_eq!(started.elapsed(), limits.operation_timeout);
-			Ok(())
-		}
-
-		#[tokio::test(start_paused = true)]
-		async fn a_cleartext_writer_gives_up_at_the_operation_deadline() {
-			let mut writer = TransportWriter {
-				stream: StalledStream,
-				mode: SplitSend::Cleartext,
-				limits: one_second_deadline(),
-				clock: Arc::new(SystemClock),
-				#[cfg(feature = "instrument")]
-				trace: None,
-			};
-
-			let envelope = TransportEnvelope::from(TestFrame::v0(None, None));
-			let outcome = writer.write_envelope(envelope).await;
 			assert!(matches!(
 				outcome,
-				Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+				Ok(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
 			));
+			assert_eq!(started.elapsed(), limits.operation_timeout);
 		}
 
-		#[test]
-		fn cleartext_halves_fail_closed() {
-			let send_cipher = test_sender();
-			let recv_cipher = test_receiver();
-
-			let writer_install = writer(SplitSend::Cleartext).install_send_cipher(send_cipher);
-			assert!(matches!(writer_install, Err(TransportError::MissingEncryption)));
-
-			let reader_install = reader(SplitRecv::Cleartext).install_recv_cipher(recv_cipher);
-			assert!(matches!(reader_install, Err(TransportError::MissingEncryption)));
+		// A cleartext half holds no cipher, so it refuses an install.
+		crate::tb_cases! {
+			fn a_cleartext_half_refuses_a_cipher_install(installed: TransportResult<()>) {
+				assert!(matches!(installed, Err(TransportError::MissingEncryption)));
+			}
+			cases {
+				writer => writer(SplitSend::Cleartext).install_send_cipher(test_sender()),
+				reader => reader(SplitRecv::Cleartext).install_recv_cipher(test_receiver()),
+			}
 		}
 
 		/// A frame stream whose every read yields the one wire envelope it
 		/// holds.
+		///
+		/// The cases hand a half a malformed envelope that no peer of the house
+		/// writes, so the double serves it in place of a peer.
 		struct OneFrameStream(Vec<u8>);
 
 		impl AsyncReadStream for OneFrameStream {
@@ -1506,36 +1511,30 @@ mod tests {
 
 		/// A receive half in `mode` over a stream that yields `frame`.
 		fn reading(mode: SplitRecv, frame: impl AsRef<[u8]>) -> TransportReader<OneFrameStream> {
-			TransportReader {
-				stream: OneFrameStream(frame.as_ref().to_vec()),
-				mode,
-				limits: CheckedLimits::default(),
-				clock: Arc::new(SystemClock),
-				#[cfg(feature = "instrument")]
-				trace: None,
-				#[cfg(feature = "instrument")]
-				peer: None,
+			let stream = OneFrameStream(frame.as_ref().to_vec());
+			reader_over(stream, mode, CheckedLimits::default(), Arc::new(SystemClock))
+		}
+
+		// A half refuses an envelope of the other mode by its outer tag: an
+		// encrypted half before the contents decode, a cleartext half before
+		// the record opens.
+		crate::tb_cases! {
+			async fn a_half_refuses_an_envelope_of_the_other_mode(
+				(mut reader, refused): (TransportReader<OneFrameStream>, fn(&TransportError) -> bool)
+			) {
+				let outcome = reader.read_envelope().await;
+				assert!(matches!(&outcome, Err(error) if refused(error)));
 			}
-		}
-
-		/// An encrypted half refuses a cleartext envelope by its outer tag,
-		/// before its contents decode.
-		#[tokio::test]
-		async fn an_encrypted_half_refuses_cleartext_before_it_decodes() {
-			let mut reader = reading(SplitRecv::Encrypted(test_receiver()), UNDECODABLE_CLEARTEXT);
-			let outcome = reader.read_envelope().await;
-			assert!(matches!(outcome, Err(TransportError::MissingEncryption)));
-		}
-
-		/// A cleartext half refuses a record by its outer tag, before it opens.
-		#[tokio::test]
-		async fn a_cleartext_half_refuses_a_record_before_it_opens() {
-			let mut reader = reading(SplitRecv::Cleartext, UNOPENED_RECORD);
-			let expected = TransportFailure::EncryptionFailed;
-
-			let outcome = reader.read_envelope().await;
-			let refused = matches!(outcome, Err(TransportError::OperationFailed(failure)) if failure == expected);
-			assert!(refused);
+			cases {
+				encrypted_refuses_cleartext => (
+					reading(SplitRecv::Encrypted(test_receiver()), UNDECODABLE_CLEARTEXT),
+					|error| matches!(error, TransportError::MissingEncryption),
+				),
+				cleartext_refuses_a_record => (
+					reading(SplitRecv::Cleartext, UNOPENED_RECORD),
+					|error| matches!(error, TransportError::OperationFailed(TransportFailure::EncryptionFailed)),
+				),
+			}
 		}
 
 		/// The audit record that a traced half files for an envelope it
@@ -1543,134 +1542,91 @@ mod tests {
 		#[cfg(feature = "instrument")]
 		mod refusal_audit {
 			use super::*;
-			use crate::crypto::hash::{Digest, Sha3_256};
-			use crate::instrumentation::{events, TbInstrumentationConfig};
-			use crate::testing::TestCertificate;
-			use crate::trace::TraceConfig;
+			use crate::instrumentation::events;
+			use crate::testing::fixtures::{TestPeer, TestTrace};
+			use crate::transport::io::fixtures::{records_of, Forgery};
 
 			/// A traced half records the envelope it refuses by the failure's
 			/// name and by the canonical key of its session peer.
 			#[tokio::test]
-			async fn a_traced_half_records_the_envelope_it_refuses() -> Result<(), Box<dyn std::error::Error>> {
-				let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-				let peer = SessionPeer::try_from(Arc::new(certificate))?;
-				let expected: [u8; 32] = Sha3_256::digest(peer.key().as_der()).into();
-
-				let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-				let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			async fn a_traced_half_records_the_envelope_it_refuses() {
+				let (peer, expected) = TestPeer::fixed();
+				let trace = TestTrace::with_payloads();
 				let mut reader = reading(SplitRecv::Encrypted(test_receiver()), UNDECODABLE_CLEARTEXT);
 				reader.trace = Some(trace.share());
 				reader.peer = Some(Arc::new(peer));
 
 				let outcome = reader.read_envelope().await;
+				let evidence = records_of(&trace, events::TRANSPORT_ENVELOPE_REFUSED);
 				assert!(matches!(outcome, Err(TransportError::MissingEncryption)));
-
-				let recorded = trace.drain_events();
-				let refusal = recorded.iter().find(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED);
-				let refusal = refusal.ok_or("a traced half records the refusal")?;
-				assert_eq!(refusal.label.as_deref(), Some("MissingEncryption"));
-				assert_eq!(refusal.payload_hash, Some(expected));
-				Ok(())
+				assert_eq!(evidence, [(Some(String::from("MissingEncryption")), Some(expected))]);
 			}
 
-			/// A record that a client-to-server send cipher of `epoch` seals,
-			/// as its wire envelope.
-			fn sealed_at(epoch: u32) -> Result<Vec<u8>, TightBeamError> {
-				let sender = SendCipher::new(test_runtime(), epoch, RecordDirection::ClientToServer);
-				let record = sender.encrypt_next(PLAINTEXT)?;
-				Ok(WireEnvelope::Encrypted(record).to_der()?)
-			}
+			/// A forged record of the client direction, the cause its record
+			/// names, and the test of the error that the read returns.
+			type ForgedRecordCase = (Forgery, &'static str, fn(&TransportError) -> bool);
 
-			/// The record of epoch 0 with its last octet flipped. The octet
-			/// lies in the tag of the record, so the record fails to open.
-			fn with_its_tag_flipped() -> Result<Vec<u8>, TightBeamError> {
-				let mut forged = sealed_at(0)?;
-				let last = forged.last_mut().expect("a sealed record holds octets");
-				*last ^= 0x01;
-
-				Ok(forged)
-			}
-
-			/// A record that a client-to-server send cipher of epoch 0 seals at
-			/// `sequence`, in place of the sequence that the half expects.
-			fn sealed_at_sequence(sequence: u64) -> Result<Vec<u8>, TightBeamError> {
-				let sender = SendCipher::new(test_runtime(), 0, RecordDirection::ClientToServer);
-				let record = sender.seal_at(PLAINTEXT, sequence)?;
-				Ok(WireEnvelope::Encrypted(record).to_der()?)
-			}
-
-			/// A record that a client-to-server send cipher of epoch 0 seals
-			/// with an OCTET STRING in place of its position.
-			fn sealed_with_an_undecodable_position() -> Result<Vec<u8>, TightBeamError> {
-				let sender = SendCipher::new(test_runtime(), 0, RecordDirection::ClientToServer);
-				let position = crate::der::Any::encode_from(&crate::der::asn1::OctetString::new([0u8; 4])?)?;
-				let record = sender.seal_with_position(PLAINTEXT, position)?;
-				Ok(WireEnvelope::Encrypted(record).to_der()?)
-			}
-
-			/// The labels of the envelope refusals that `trace` recorded, in
-			/// the order it recorded them.
-			fn refusal_labels(trace: &TraceCollector) -> Vec<Option<String>> {
-				let recorded = trace.drain_events();
-				recorded
-					.into_iter()
-					.filter(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED)
-					.map(|event| event.label.map(String::from))
-					.collect()
-			}
-
-			// A traced half records a forged record by its cause, once.
+			// A traced half records a forged record by its cause, once, and its
+			// read returns the error that the open names.
 			crate::tb_cases! {
-				fn a_traced_half_records_a_forged_record((forged, cause): (Result<Vec<u8>, TightBeamError>, &str))
-					-> Result<(), Box<dyn std::error::Error>>
-				{
+				async fn a_traced_half_records_a_forged_record((forgery, cause, returned): ForgedRecordCase) {
 					let trace = TraceCollector::new();
-					let mut reader = reading(SplitRecv::Encrypted(test_receiver()), forged?);
+					let forged = forgery.record(RecordDirection::ClientToServer);
+					let mut reader = reading(SplitRecv::Encrypted(test_receiver()), forged);
 					reader.trace = Some(trace.share());
 
-					let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
-					let outcome = runtime.block_on(reader.read_envelope());
-					assert!(outcome.is_err());
-					assert_eq!(refusal_labels(&trace), [Some(String::from(cause))]);
-					Ok(())
+					let outcome = reader.read_envelope().await;
+					assert!(matches!(&outcome, Err(error) if returned(error)));
+
+					let labels = TestTrace::labels(&trace, events::TRANSPORT_ENVELOPE_REFUSED);
+					assert_eq!(labels, [Some(String::from(cause))]);
 				}
 				cases {
-					past_the_record_limit => (sealed_at_sequence(crate::constants::DEFAULT_REKEY_RECORD_LIMIT), "OpenFailed"),
-					whose_position_does_not_decode => (sealed_with_an_undecodable_position(), "OpenFailed"),
-					whose_tag_fails => (with_its_tag_flipped(), "OpenFailed"),
-					of_another_epoch => (sealed_at(1), "WrongEpoch"),
+					past_the_record_limit => (
+						Forgery::AtSequence(crate::constants::DEFAULT_REKEY_RECORD_LIMIT),
+						"OpenFailed",
+						|error| {
+							let past_the_bound = TransportFailure::RenewalBoundExceeded;
+							matches!(error, TransportError::OperationFailed(failure) if *failure == past_the_bound)
+						},
+					),
+					whose_position_does_not_decode => (
+						Forgery::UndecodablePosition,
+						"OpenFailed",
+						|error| matches!(error, TransportError::DerError(_)),
+					),
+					whose_tag_fails => (
+						Forgery::TagFlipped,
+						"OpenFailed",
+						|error| matches!(error, TransportError::InvalidMessage),
+					),
+					of_another_epoch => (
+						Forgery::AtEpoch(1),
+						"WrongEpoch",
+						|error| matches!(error, TransportError::InvalidMessage),
+					),
 				}
 			}
 		}
 	}
 
+	/// A cleartext exchange carries the request to the server and its
+	/// response back.
 	#[tokio::test]
-	async fn async_round_trip() -> TransportResult<()> {
-		let (listener, client_stream) = bind_and_connect().await?;
-
+	async fn a_cleartext_exchange_carries_the_request_and_its_response() -> TestResult {
+		let (listener, client_stream) = bind_and_connect().await;
 		let request = TestFrame::v0(None, None);
 		let expected_response = TestFrame::v0(None, None);
-
-		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
-		let response_frame = expected_response.to_owned();
+		let (reply, mut received) = recording(Some(expected_response.to_owned()));
 		let server_handle = tokio::spawn(async move {
 			let (mut transport, _peer) = listener.accept().await?;
-			respond_with(&mut transport, move |msg: Frame| {
-				// The receiver lives for the whole test, so a refused send
-				// shows as the missing message the assertion reads.
-				let _ = received_tx.try_send(msg);
-				Some(response_frame.to_owned())
-			})
-			.await
+			respond_with(&mut transport, reply).await
 		});
 
 		let mut transport = tcp_transport_from(client_stream);
 		let response = transport.emit(request.to_owned(), None).await?;
-
-		let received = received_rx.recv().await;
-		assert_eq!(Some(request), received);
-		assert_eq!(response.to_owned(), Some(expected_response));
-
+		assert_eq!(received.recv().await, Some(request));
+		assert_eq!(response, Some(expected_response));
 		server_handle.await??;
 		Ok(())
 	}
@@ -1682,11 +1638,12 @@ mod tests {
 
 	/// An endpoint of a fresh test server that signs with its signing
 	/// identity and opens the CMS opening with its key-agreement identity.
-	fn encrypted_test_server() -> TransportResult<EncryptedTestServer> {
+	fn encrypted_test_server() -> EncryptedTestServer {
 		let server = TestCmsServer::generate("Test Server");
 		let config = TransportEncryptionConfig::new(server.signing_identity());
-		let config = config.with_key_agreement(server.key_agreement_identity())?;
-		Ok(EncryptedTestServer { server, config })
+		let config = config.with_key_agreement(server.key_agreement_identity());
+		let config = config.expect("the test server holds a key-agreement identity");
+		EncryptedTestServer { server, config }
 	}
 
 	/// A store that holds the authority of `server`'s two certificates.
@@ -1696,16 +1653,17 @@ mod tests {
 
 	#[cfg(feature = "transport-cms")]
 	fn empty_trust_store() -> Arc<dyn CertificateTrust> {
-		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation).build();
-		Arc::new(trust)
+		Arc::new(TestStore::empty().build())
 	}
 
 	async fn bind_encrypted(
 		config: TransportEncryptionConfig<DefaultCryptoProvider>,
-	) -> TransportResult<(TokioListener<DefaultCryptoProvider>, SocketAddr)> {
-		let bind_addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
-		let (listener, socket_addr) = TokioListener::bind_with(bind_addr, config).await?;
-		Ok((listener, *socket_addr))
+	) -> (TokioListener<DefaultCryptoProvider>, SocketAddr) {
+		let bind_addr = <TokioListener as Protocol>::default_bind_address().expect("the loopback address parses");
+		let bound = TokioListener::bind_with(bind_addr, config).await;
+
+		let (listener, socket_addr) = bound.expect("a loopback port binds");
+		(listener, *socket_addr)
 	}
 
 	fn spawn_accept_handle_request(
@@ -1717,11 +1675,36 @@ mod tests {
 		})
 	}
 
-	async fn bind_and_connect() -> TransportResult<(TokioListener, TcpStream)> {
-		let listener = TokioListener::bind_cleartext("127.0.0.1:0").await?;
-		let listen_addr = listener.local_addr()?;
-		let client_stream = TcpStream::connect(listen_addr).await?;
-		Ok((listener, client_stream))
+	/// The task of a server of `config` that handles one request, beside a
+	/// raw stream that dialed it.
+	async fn dial_handling_server(
+		config: TransportEncryptionConfig<DefaultCryptoProvider>,
+	) -> (tokio::task::JoinHandle<TransportResult<()>>, TcpStream) {
+		let (listener, server_addr) = bind_encrypted(config).await;
+
+		let server = spawn_accept_handle_request(listener);
+		let dialed = TcpStream::connect(server_addr)
+			.await
+			.expect("the loopback server takes the dial");
+		(server, dialed)
+	}
+
+	async fn bind_and_connect() -> (TokioListener, TcpStream) {
+		let listener = TokioListener::bind_cleartext("127.0.0.1:0")
+			.await
+			.expect("a loopback port binds");
+
+		let listen_addr = listener.local_addr().expect("a bound listener has an address");
+		let client_stream = TcpStream::connect(listen_addr)
+			.await
+			.expect("the loopback listener takes the dial");
+		(listener, client_stream)
+	}
+
+	/// The handshake opening that carries signed `content`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn opening(content: &[u8]) -> HandshakeMessage {
+		HandshakeMessage::try_from(create_test_signed_data(content)).expect("signed data makes an opening")
 	}
 
 	/// A client over `stream` built from `encryption`, which must answer the
@@ -1768,35 +1751,10 @@ mod tests {
 		transport.with_handshake_protocol(HandshakeProtocolKind::Cms)
 	}
 
-	#[cfg(feature = "transport-cms")]
-	#[tokio::test]
-	async fn cleartext_cms_client_without_server_trust_fails_closed() -> TransportResult<()> {
-		let (_listener, client_stream) = bind_and_connect().await?;
-		let mut transport = cms_test_client(client_stream, None);
-
-		let handshake = transport.perform_client_handshake().await;
-		assert!(matches!(handshake, Err(TransportError::MissingServerCertificateChain)));
-		Ok(())
-	}
-
-	#[cfg(feature = "transport-cms")]
-	#[tokio::test]
-	async fn cms_client_without_server_chain_fails_closed() -> TransportResult<()> {
-		let (_listener, client_stream) = bind_and_connect().await?;
-		let trust_store = empty_trust_store();
-		let mut transport = cms_test_client(client_stream, Some(trust_store));
-
-		let handshake = transport.perform_client_handshake().await;
-		assert!(matches!(handshake, Err(TransportError::MissingServerCertificateChain)));
-		Ok(())
-	}
-
 	/// A CMS client that holds a trust store and the server chain, and no
-	/// identity, refuses before it sends anything.
+	/// identity.
 	#[cfg(feature = "transport-cms")]
-	#[tokio::test]
-	async fn cms_client_without_identity_fails_closed() -> TransportResult<()> {
-		let (_listener, client_stream) = bind_and_connect().await?;
+	fn cms_client_without_identity(stream: TcpStream) -> TcpTransport<TokioStream> {
 		let server = TestCmsServer::generate("Test Server");
 		let encryption = EncryptionConfig {
 			trust_store: Some(empty_trust_store()),
@@ -1804,67 +1762,163 @@ mod tests {
 			..EncryptionConfig::unconfigured()
 		};
 
-		let transport = client_over(client_stream, encryption);
-		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
-		let dial = transport.perform_client_handshake().await;
-
-		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
-		assert!(refused);
-		Ok(())
+		client_over(stream, encryption).with_handshake_protocol(HandshakeProtocolKind::Cms)
 	}
 
-	/// A CMS server that holds a signing identity alone holds no key for the
-	/// opening to seal to, so it refuses the handshake before it reads the
-	/// opening.
+	/// An HPKE client that names cleartext and holds no trust store.
+	#[cfg(feature = "transport-hpke")]
+	fn hpke_client_without_trust_store(stream: TcpStream) -> TcpTransport<TokioStream> {
+		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
+		client_over(stream, encryption)
+	}
+
+	/// A CMS client whose server policy refuses every certificate.
 	#[cfg(feature = "transport-cms")]
-	#[tokio::test]
-	async fn cms_server_without_key_agreement_identity_fails_closed() -> TransportResult<()> {
-		let (_listener, stream) = bind_and_connect().await?;
+	fn cms_client_under_a_refusing_policy(stream: TcpStream) -> TcpTransport<TokioStream> {
+		let server = TestCmsServer::generate("Test Server");
+		let encryption = EncryptionConfig {
+			cms_server: Some(server.trust()),
+			server_policy: refusing_policy(),
+			client_identity: Some(TestIdentity::insecure_fixed()),
+			..EncryptionConfig::unconfigured()
+		};
+
+		client_over(stream, encryption).with_handshake_protocol(HandshakeProtocolKind::Cms)
+	}
+
+	/// A CMS client whose endpoint clock reads past the validity period of
+	/// the pinned key-agreement certificate, while the host clock reads a
+	/// time inside it.
+	#[cfg(feature = "transport-cms")]
+	fn cms_client_past_validity(stream: TcpStream) -> TcpTransport<TokioStream> {
+		let server = TestCmsServer::generate("Test Server");
+		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
+			cms_server: Some(server.trust()),
+			client_identity: Some(TestIdentity::insecure_fixed()),
+			..EncryptionConfig::unconfigured()
+		};
+
+		let encryption = DialableEncryption::new(encryption).expect("the pinned server answers the dialer rule");
+		let endpoint = EndpointConfig::new(encryption, TestCertificate::clock_past_validity());
+
+		let transport = TcpTransport::new(TokioStream::from(stream), endpoint);
+		transport.with_handshake_protocol(HandshakeProtocolKind::Cms)
+	}
+
+	/// A transport over the dialing end of a loopback connection, and the test
+	/// of the error its handshake returns.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	type DialCase = (fn(TcpStream) -> TcpTransport<TokioStream>, fn(&TransportError) -> bool);
+
+	// A client refuses its handshake before it sends anything when it lacks
+	// what the server's answer needs: a CMS client with no server trust or no
+	// server chain, a CMS client with no identity, an HPKE client with no
+	// trust store, a CMS client whose server policy refuses the pinned
+	// certificate, and a CMS client whose endpoint clock reads the pinned
+	// certificate as expired.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	crate::tb_cases! {
+		async fn a_client_refuses_its_handshake_before_it_sends((client, refused): DialCase) {
+			let (_listener, client_stream) = bind_and_connect().await;
+			let mut transport = client(client_stream);
+
+			let handshake = transport.perform_client_handshake().await;
+			assert!(matches!(&handshake, Err(error) if refused(error)));
+		}
+		cases {
+			#[cfg(feature = "transport-cms")]
+			cms_without_server_trust => (
+				|stream| cms_test_client(stream, None),
+				|error| matches!(error, TransportError::MissingServerCertificateChain),
+			),
+			#[cfg(feature = "transport-cms")]
+			cms_without_server_chain => (
+				|stream| cms_test_client(stream, Some(empty_trust_store())),
+				|error| matches!(error, TransportError::MissingServerCertificateChain),
+			),
+			#[cfg(feature = "transport-cms")]
+			cms_without_identity => (
+				cms_client_without_identity,
+				|error| matches!(error, TransportError::HandshakeError(HandshakeError::MutualAuthRequired)),
+			),
+			#[cfg(feature = "transport-hpke")]
+			hpke_without_trust_store => (
+				hpke_client_without_trust_store,
+				|error| matches!(error, TransportError::HandshakeError(HandshakeError::MissingTrustStore)),
+			),
+			#[cfg(feature = "transport-cms")]
+			cms_under_a_refusing_policy => (
+				cms_client_under_a_refusing_policy,
+				|error| {
+					matches!(
+						error,
+						TransportError::HandshakeError(HandshakeError::CertificateValidationError(
+							CertificateNotTrusted
+						))
+					)
+				},
+			),
+			#[cfg(feature = "transport-cms")]
+			cms_past_validity => (
+				cms_client_past_validity,
+				|error| {
+					matches!(
+						error,
+						TransportError::HandshakeError(HandshakeError::CertificateValidationError(Expired))
+					)
+				},
+			),
+		}
+	}
+
+	/// A CMS server that holds a signing identity alone.
+	#[cfg(feature = "transport-cms")]
+	fn cms_server_without_key_agreement(stream: TcpStream) -> TcpTransport<TokioStream> {
 		let server = TestCmsServer::generate("Test Server");
 		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
-		let endpoint = EndpointConfig::try_from(config)?;
-		let transport = TcpTransport::new(TokioStream::from(stream), endpoint);
-		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
-		let opening = HandshakeMessage::try_from(create_test_signed_data(b"opening"))?;
+		let endpoint = EndpointConfig::try_from(config).expect("a server identity answers the dialer rule");
 
-		let refused = transport.perform_server_handshake(opening).await;
-		assert!(matches!(refused, Err(TransportError::MissingKeyAgreementIdentity)));
-		Ok(())
+		let transport = TcpTransport::new(TokioStream::from(stream), endpoint);
+		transport.with_handshake_protocol(HandshakeProtocolKind::Cms)
 	}
 
-	/// An HPKE server that presents no identity holds no key to sign its reply
-	/// with, so it refuses the handshake before it reads the opening.
+	/// An HPKE server that client validators provision and that presents no
+	/// identity.
 	#[cfg(feature = "transport-hpke")]
-	#[tokio::test]
-	async fn hpke_server_without_identity_fails_closed() -> TransportResult<()> {
-		let (_listener, stream) = bind_and_connect().await?;
-		// Client validators provision the endpoint, which presents no identity.
+	fn hpke_server_without_identity(stream: TcpStream) -> TcpTransport<TokioStream> {
 		let peer_authentication = PeerAuthentication::Anonymous.and(refusing_validator());
 		let unconfigured = EncryptionConfig::<DefaultCryptoProvider>::unconfigured();
 		let encryption = EncryptionConfig { peer_authentication, ..unconfigured };
-		let encryption = DialableEncryption::new(encryption)?;
+		let encryption = DialableEncryption::new(encryption).expect("client validators answer the dialer rule");
 		let endpoint = EndpointConfig::new(encryption, Arc::new(SystemClock));
-		let mut transport = TcpTransport::new(TokioStream::from(stream), endpoint);
-		let opening = HandshakeMessage::try_from(create_test_signed_data(b"opening"))?;
 
-		let refused = transport.perform_server_handshake(opening).await;
-		assert!(matches!(refused, Err(TransportError::MissingEncryption)));
-		Ok(())
+		TcpTransport::new(TokioStream::from(stream), endpoint)
 	}
 
-	/// An HPKE client that holds no trust store has no validator for the
-	/// server the reply names, so it refuses before it sends anything.
-	#[cfg(feature = "transport-hpke")]
-	#[tokio::test]
-	async fn hpke_client_without_trust_store_fails_closed() -> TransportResult<()> {
-		let (_listener, client_stream) = bind_and_connect().await?;
-		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
-		let mut transport = client_over(client_stream, encryption);
+	// A server that holds no key for its part of the handshake refuses the
+	// handshake before it reads the opening: a CMS server with no key for the
+	// opening to seal to, and an HPKE server with no key to sign its reply.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	crate::tb_cases! {
+		async fn a_server_without_its_key_refuses_the_handshake((server, refused): DialCase) {
+			let (_listener, stream) = bind_and_connect().await;
+			let mut transport = server(stream);
 
-		let dial = transport.perform_client_handshake().await;
-		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MissingTrustStore)));
-		assert!(refused);
-		Ok(())
+			let handshake = transport.perform_server_handshake(opening(b"opening")).await;
+			assert!(matches!(&handshake, Err(error) if refused(error)));
+		}
+		cases {
+			#[cfg(feature = "transport-cms")]
+			cms_without_key_agreement => (
+				cms_server_without_key_agreement,
+				|error| matches!(error, TransportError::MissingKeyAgreementIdentity),
+			),
+			#[cfg(feature = "transport-hpke")]
+			hpke_without_identity => (
+				hpke_server_without_identity,
+				|error| matches!(error, TransportError::MissingEncryption),
+			),
+		}
 	}
 
 	/// A validator that refuses every certificate: a direct-trust validator
@@ -1880,75 +1934,18 @@ mod tests {
 		ValidatorChain::new([refusing_validator()])
 	}
 
-	/// A CMS client carries its server policy into the handshake, so a
-	/// policy that refuses the pinned key-agreement certificate refuses the
-	/// server before the client sends anything.
-	#[cfg(feature = "transport-cms")]
-	#[tokio::test]
-	async fn a_cms_client_runs_its_server_policy_before_the_opening() -> TransportResult<()> {
-		let (_listener, client_stream) = bind_and_connect().await?;
-		let server = TestCmsServer::generate("Test Server");
-		let encryption = EncryptionConfig {
-			cms_server: Some(server.trust()),
-			server_policy: refusing_policy(),
-			client_identity: Some(TestIdentity::insecure_fixed()),
-			..EncryptionConfig::unconfigured()
-		};
-
-		let transport = client_over(client_stream, encryption);
-		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
-		let dial = transport.perform_client_handshake().await;
-		let refused = matches!(
-			dial,
-			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
-				CertificateNotTrusted
-			)))
-		);
-		assert!(refused);
-		Ok(())
-	}
-
-	/// A CMS client reads the validity period of the pinned key-agreement
-	/// certificate on the clock of its endpoint, so a clock past the end of
-	/// the period refuses the server before the client sends anything, while
-	/// the host clock reads a time inside that period.
-	#[cfg(feature = "transport-cms")]
-	#[tokio::test]
-	async fn a_cms_client_reads_validity_on_the_clock_of_its_endpoint() -> TransportResult<()> {
-		let (_, client_stream) = bind_and_connect().await?;
-		let server = TestCmsServer::generate("Test Server");
-		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			cms_server: Some(server.trust()),
-			client_identity: Some(TestIdentity::insecure_fixed()),
-			..EncryptionConfig::unconfigured()
-		};
-		let encryption = DialableEncryption::new(encryption)?;
-		let endpoint = EndpointConfig::new(encryption, TestCertificate::clock_past_validity());
-
-		let transport = TcpTransport::new(TokioStream::from(client_stream), endpoint);
-		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
-		let dial = transport.perform_client_handshake().await;
-		let refused = matches!(
-			dial,
-			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
-				Expired
-			)))
-		);
-		assert!(refused);
-		Ok(())
-	}
-
 	/// A mutual server reads the validity period of a client certificate on
 	/// the clock of its endpoint, so a clock past the end of the period
 	/// refuses a client that the host clock reads as current.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn a_mutual_server_reads_validity_on_the_clock_of_its_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-		let (stream, peer) = loopback_pair().await;
-		let EncryptedTestServer { server, config } = encrypted_test_server()?;
-		let anchor = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	async fn a_mutual_server_reads_validity_on_the_clock_of_its_endpoint() -> TestResult {
+		let (stream, peer) = TestLoopback::tokio_pair().await;
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let anchor = TestCertificate::insecure_fixed();
 		let anchored: Arc<dyn CertificateValidation> =
 			Arc::new(DirectTrustValidator::default().with_trust_chain([anchor])?);
+
 		let endpoint = EndpointConfig::try_from(config.with_client_validators([anchored]))?;
 		let endpoint = endpoint.with_clock(TestCertificate::clock_past_validity());
 		let mut accepted = TcpTransport::new(TokioStream::from(stream), endpoint);
@@ -1959,6 +1956,7 @@ mod tests {
 			client_identity: Some(TestIdentity::insecure_fixed()),
 			..EncryptionConfig::unconfigured()
 		};
+
 		let mut client = client_over(peer, encryption);
 		// The verdict on the closing is the server's, so the outcome of the
 		// dial drops here. The close ends a server that admitted the client.
@@ -1966,13 +1964,12 @@ mod tests {
 		drop(client);
 
 		let served = served.await?;
-		let refused = matches!(
+		assert!(matches!(
 			served,
 			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
 				Expired
 			)))
-		);
-		assert!(refused);
+		));
 		Ok(())
 	}
 
@@ -1981,12 +1978,9 @@ mod tests {
 	/// its store admits.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn an_hpke_client_runs_its_server_policy_at_the_reply() -> TransportResult<()> {
-		let EncryptedTestServer { server, config } = encrypted_test_server()?;
-		let (listener, server_addr) = bind_encrypted(config).await?;
-		let _server = spawn_accept_handle_request(listener);
-
-		let client_stream = TcpStream::connect(server_addr).await?;
+	async fn an_hpke_client_runs_its_server_policy_at_the_reply() {
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let (_server, client_stream) = dial_handling_server(config).await;
 		let encryption = EncryptionConfig {
 			trust_store: Some(trust_store_for(&server)),
 			server_policy: refusing_policy(),
@@ -1995,14 +1989,12 @@ mod tests {
 
 		let mut transport = client_over(client_stream, encryption);
 		let dial = transport.ensure_handshake_complete().await;
-		let refused = matches!(
+		assert!(matches!(
 			dial,
 			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
 				CertificateNotTrusted
 			)))
-		);
-		assert!(refused);
-		Ok(())
+		));
 	}
 
 	/// An HPKE client whose store holds the root alone admits a server whose
@@ -2010,19 +2002,15 @@ mod tests {
 	/// validates the path the reply presents to that root (RFC 5280 § 6.1).
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn an_hpke_client_of_the_root_alone_admits_an_intermediate() -> Result<(), Box<dyn std::error::Error>> {
+	async fn an_hpke_client_of_the_root_alone_admits_an_intermediate() -> TestResult {
 		let TestCertificateChain { root, intermediate, leaf, leaf_key, .. } = TestCertificate::insecure_fixed_chain()?;
-		let identity = SigningIdentity::new(leaf, Arc::new(Secp256k1KeyProvider::from(leaf_key)))?;
+		let identity = SigningIdentity::new(leaf.to_owned(), Arc::new(Secp256k1KeyProvider::from(leaf_key)))?;
 		let config = TransportEncryptionConfig::new(identity.with_chain([intermediate])?);
-		let (listener, server_addr) = bind_encrypted(config).await?;
-		let _server = spawn_accept_handle_request(listener);
+		let (_server, client_stream) = dial_handling_server(config).await;
 
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store = builder.with_certificate(root)?.build();
-		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = trusting_client(client_stream, Arc::new(store));
+		let mut transport = trusting_client(client_stream, Arc::new(TestStore::holding([root])));
 		transport.ensure_handshake_complete().await?;
-		assert!(transport.session_state().peer_certificate().is_some());
+		assert_eq!(transport.session_state().peer_certificate(), Some(&leaf));
 		Ok(())
 	}
 
@@ -2031,123 +2019,98 @@ mod tests {
 	/// that the builder's store admits, at the first exchange.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn a_client_builder_runs_its_server_policy_on_the_dial() -> TransportResult<()> {
-		let EncryptedTestServer { server, config } = encrypted_test_server()?;
-		let (listener, server_addr) = bind_encrypted(config).await?;
+	async fn a_client_builder_runs_its_server_policy_on_the_dial() -> TestResult {
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let (listener, server_addr) = bind_encrypted(config).await;
 		let _server = spawn_accept_handle_request(listener);
 
 		let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store_for(&server));
 		let mut client = builder.with_server_policy([refusing_validator()]).connect(server_addr).await?;
 
 		let exchange = client.emit(TestFrame::v0(None, None), None).await;
-		let refused = matches!(
+		assert!(matches!(
 			exchange,
 			Err(TransportError::HandshakeError(HandshakeError::CertificateValidationError(
 				CertificateNotTrusted
 			)))
-		);
-		assert!(refused);
+		));
 		Ok(())
 	}
 
+	/// A CMS exchange carries the request to the server and its response
+	/// back.
 	#[cfg(feature = "transport-cms")]
 	#[tokio::test]
-	async fn async_cms_round_trip() -> TransportResult<()> {
-		let EncryptedTestServer { server, config } = encrypted_test_server()?;
-		let (listener, server_addr) = bind_encrypted(config).await?;
-
+	async fn a_cms_exchange_carries_the_request_and_its_response() -> TestResult {
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let (listener, server_addr) = bind_encrypted(config).await;
 		let request = TestFrame::v0(None, None);
 		let expected_response = TestFrame::v0(None, None);
-
-		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
-		let response_frame = expected_response.to_owned();
+		let (reply, mut received) = recording(Some(expected_response.to_owned()));
 		let server_handle = tokio::spawn(async move {
 			let (transport, _peer) = listener.accept().await?;
 			let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
-
-			respond_with(&mut transport, move |msg: Frame| {
-				// The receiver lives for the whole test, so a refused send
-				// shows as the missing message the assertion reads.
-				let _ = received_tx.try_send(msg);
-				Some(response_frame.to_owned())
-			})
-			.await
+			respond_with(&mut transport, reply).await
 		});
-
-		let client_key = SigningKey::from_bytes(&[2u8; 32].into()).map_err(|_| TransportError::InvalidState)?;
-		let client_identity = TestIdentity::of(&client_key);
-		let trust_store = trust_store_for(&server);
 
 		let client_stream = TcpStream::connect(server_addr).await?;
 		let encryption = EncryptionConfig {
-			trust_store: Some(trust_store),
+			trust_store: Some(trust_store_for(&server)),
 			cms_server: Some(server.trust()),
-			client_identity: Some(client_identity),
+			client_identity: Some(TestIdentity::of(&TestKey::fixed(0x02))),
 			..EncryptionConfig::unconfigured()
 		};
 
 		let transport = client_over(client_stream, encryption);
 		let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
 		let response = transport.emit(request.to_owned(), None).await?;
-		let received = received_rx.recv().await;
-		assert_eq!(Some(request), received);
+		assert_eq!(received.recv().await, Some(request));
 		assert_eq!(response, Some(expected_response));
-
 		server_handle.await??;
 		Ok(())
 	}
 
-	#[tokio::test]
-	async fn handshake_read_deadline_bounds_silent_client() -> TransportResult<()> {
-		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
+	/// The handshake read deadline ends the handshake of a client that sends
+	/// nothing. The runtime clock is paused, so the deadline passes on the
+	/// runtime's timer and the test waits on no wall clock.
+	#[tokio::test(start_paused = true)]
+	async fn the_handshake_read_deadline_ends_a_silent_client() -> TestResult {
+		let EncryptedTestServer { config, .. } = encrypted_test_server();
 		let limits = TransportLimits { handshake_timeout: Duration::from_millis(500), ..*config.limits };
-		config = config.with_limits(limits)?;
+		let (server_handle, _silent_client) = dial_handling_server(config.with_limits(limits)?).await;
 
-		let (listener, server_addr) = bind_encrypted(config).await?;
-		let server_handle = spawn_accept_handle_request(listener);
-		let _silent_client = TcpStream::connect(server_addr).await?;
-
-		let deadline = Duration::from_secs(5);
-		let joined = tokio::time::timeout(deadline, server_handle).await;
-		assert!(matches!(joined, Ok(Ok(Err(_)))));
+		let joined = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+		assert!(matches!(
+			joined,
+			Ok(Ok(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))))
+		));
 		Ok(())
 	}
 
 	/// A whole frame on the wire: a NULL under the cleartext tag.
 	const WAITING_FRAME: &[u8] = &[0xa0, 0x02, 0x05, 0x00];
 
-	/// The two ends of one loopback connection: the end that the listener
-	/// accepted, and the end that dialed it.
-	async fn loopback_pair() -> (TcpStream, TcpStream) {
-		let bound = TcpListener::bind("127.0.0.1:0").await;
-		let listener = bound.expect("a loopback port binds");
-		let addr = listener.local_addr().expect("a bound listener has an address");
-		let peer = TcpStream::connect(addr).await.expect("the loopback listener takes the dial");
-		let (stream, _) = listener.accept().await.expect("the dial arrives");
-		(stream, peer)
-	}
-
 	/// A server transport over one end of a loopback connection, beside the
 	/// raw stream of its peer. The server reads its deadlines on `clock`, and
 	/// its handshake begins at the clock's reading.
 	async fn handshaking_server(clock: &Arc<ManualClock>) -> (TcpTransport<TokioStream>, TcpStream) {
-		let (stream, peer) = loopback_pair().await;
+		let (stream, peer) = TestLoopback::tokio_pair().await;
 
-		let EncryptedTestServer { config, .. } = encrypted_test_server().expect("the test server provisions");
+		let EncryptedTestServer { config, .. } = encrypted_test_server();
 		let endpoint = EndpointConfig::try_from(config).expect("a server identity answers the dialer rule");
 		let endpoint = endpoint.with_clock(Arc::clone(clock) as Arc<dyn Clock>);
 		let mut transport = TcpTransport::new(TokioStream::from(stream), endpoint);
 
 		let began = transport.state.begin_handshake(clock.monotonic());
-		assert!(began, "a provisioned server begins its handshake");
+		assert!(began);
 		(transport, peer)
 	}
 
 	/// A stream whose peer sent its FIN reads dead, though the socket still
 	/// names the address of that peer.
 	#[tokio::test]
-	async fn a_stream_whose_peer_closed_is_not_alive() -> TransportResult<()> {
-		let (stream, peer) = loopback_pair().await;
+	async fn a_stream_whose_peer_closed_is_not_alive() -> TestResult {
+		let (stream, peer) = TestLoopback::tokio_pair().await;
 		let stream = TokioStream::from(stream);
 		drop(peer);
 		stream.stream.readable().await?;
@@ -2159,26 +2122,26 @@ mod tests {
 	/// A stream whose peer holds the connection open and sends nothing reads
 	/// alive.
 	#[tokio::test]
-	async fn a_stream_whose_peer_waits_is_alive() -> TransportResult<()> {
-		let (stream, _peer) = loopback_pair().await;
+	async fn a_stream_whose_peer_waits_is_alive() {
+		let (stream, _peer) = TestLoopback::tokio_pair().await;
 		let stream = TokioStream::from(stream);
-
 		assert!(AsyncByteStream::is_alive(&stream));
-		Ok(())
 	}
 
 	/// A stream that holds bytes of its peer reads alive, and the next read
 	/// still takes each of those bytes.
 	#[tokio::test]
-	async fn a_stream_with_bytes_waiting_is_alive_and_keeps_them() -> TransportResult<()> {
-		let (stream, mut peer) = loopback_pair().await;
+	async fn a_stream_with_bytes_waiting_is_alive_and_keeps_them() -> TestResult {
+		let (stream, mut peer) = TestLoopback::tokio_pair().await;
 		let mut stream = TokioStream::from(stream);
+
 		peer.write_all(WAITING_FRAME).await?;
 		stream.stream.readable().await?;
 
 		let alive = AsyncByteStream::is_alive(&stream);
 		// The close ends a read that finds fewer bytes than the peer sent.
 		drop(peer);
+
 		let mut waiting = [0u8; WAITING_FRAME.len()];
 		AsyncByteRead::read_exact(&mut stream, &mut waiting).await?;
 		assert_eq!((alive, waiting.as_slice()), (true, WAITING_FRAME));
@@ -2188,15 +2151,17 @@ mod tests {
 	/// A read refuses once the handshake deadline has passed on the connection
 	/// clock, before it takes a byte, though a whole frame of the peer waits.
 	#[tokio::test]
-	async fn a_read_past_the_handshake_deadline_is_refused() -> TransportResult<()> {
+	async fn a_read_past_the_handshake_deadline_is_refused() -> TestResult {
 		let clock = Arc::new(ManualClock::default());
 		let (mut transport, mut peer) = handshaking_server(&clock).await;
 		peer.write_all(WAITING_FRAME).await?;
 		clock.advance(transport.limits.handshake_timeout);
 
 		let read = transport.read_envelope_bytes().await;
-		let refused = matches!(read, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)));
-		assert!(refused);
+		assert!(matches!(
+			read,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
 		Ok(())
 	}
 
@@ -2205,39 +2170,38 @@ mod tests {
 	/// message runs.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn a_handshake_message_past_the_deadline_is_refused() -> TransportResult<()> {
+	async fn a_handshake_message_past_the_deadline_is_refused() {
 		let clock = Arc::new(ManualClock::default());
 		let (mut transport, _peer) = handshaking_server(&clock).await;
-		let message = HandshakeMessage::try_from(create_test_signed_data(b"late"))?;
+
 		clock.advance(transport.limits.handshake_timeout);
 
-		let driven = transport.perform_server_handshake(message).await;
-		let refused = matches!(driven, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)));
-		assert!(refused);
-		Ok(())
+		let driven = transport.perform_server_handshake(opening(b"late")).await;
+		assert!(matches!(
+			driven,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
 	}
 
 	/// The async budget refuses a thread outside any runtime.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_budget_on_a_thread_outside_a_runtime_is_refused() -> TransportResult<()> {
+	fn a_budget_on_a_thread_outside_a_runtime_is_refused() {
 		let operation = async { Ok(7) };
 		let budget = Duration::from_secs(1);
 		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
-		let outcome = ParkingExecutor::on_current_thread().block_on(bounded);
 
-		let refused = matches!(
+		let outcome = ParkingExecutor::on_current_thread().block_on(bounded);
+		assert!(matches!(
 			outcome,
 			Err(TransportError::OperationFailed(TransportFailure::FailedPrecondition))
-		);
-		assert!(refused);
-		Ok(())
+		));
 	}
 
 	/// The async budget ends an operation that outlasts it, on the tokio timer.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test(start_paused = true)]
-	async fn a_budget_ends_an_operation_that_outlasts_it() -> TransportResult<()> {
+	async fn a_budget_ends_an_operation_that_outlasts_it() {
 		let operation = async {
 			tokio::time::sleep(Duration::from_secs(2)).await;
 			Ok(7)
@@ -2245,31 +2209,23 @@ mod tests {
 
 		let budget = Duration::from_secs(1);
 		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
-		let outcome = bounded.await;
 
-		let expired = matches!(
+		let outcome = bounded.await;
+		assert!(matches!(
 			outcome,
 			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
-		);
-		assert!(expired);
-		Ok(())
+		));
 	}
 
 	/// A split hands the peer of its session to the reader half, so the record
 	/// of an envelope that the half refuses names that peer.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
-	async fn a_split_reader_names_the_peer_of_its_session() -> Result<(), Box<dyn std::error::Error>> {
+	async fn a_split_reader_names_the_peer_of_its_session() -> TestResult {
 		let clock = Arc::new(ManualClock::default());
 		let (transport, mut raw_peer) = handshaking_server(&clock).await;
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let peer = SessionPeer::try_from(Arc::new(certificate))?;
-		let expected: [u8; 32] = Sha3_256::digest(peer.key().as_der()).into();
-
-		let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-		let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
-		let keys = SessionKeys::for_server(TestKey::insecure_directional_keys());
-		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, Some(peer))));
+		let trace = TestTrace::with_payloads();
+		let (phase, expected) = SessionPhase::peered(SessionKeys::insecure_server());
 		let mut transport = transport.with_trace(trace.share());
 		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
 
@@ -2278,11 +2234,10 @@ mod tests {
 
 		let refused = reader.read_envelope().await;
 		assert!(matches!(refused, Err(TransportError::MissingEncryption)));
-
-		let recorded = trace.drain_events();
-		let refusal = recorded.iter().find(|event| event.urn == events::TRANSPORT_ENVELOPE_REFUSED);
-		let evidence = refusal.and_then(|event| event.payload_hash);
-		assert_eq!(evidence, Some(expected));
+		assert_eq!(
+			TestTrace::payloads(&trace, events::TRANSPORT_ENVELOPE_REFUSED),
+			[Some(expected)]
+		);
 		Ok(())
 	}
 
@@ -2294,13 +2249,11 @@ mod tests {
 		record: crate::asn1::AuthEnvelopedData,
 	) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		use crate::transport::envelopes::WireEnvelope;
-		use crate::transport::handshake::EstablishedSession;
 		use crate::transport::state::{SessionPhase, SessionState};
 
 		let clock = Arc::new(ManualClock::default());
 		let (mut transport, mut peer) = handshaking_server(&clock).await;
-		let phase = SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)));
-		transport.state = SessionState::at(EncryptionConfig::unconfigured(), phase);
+		transport.state = SessionState::at(EncryptionConfig::unconfigured(), SessionPhase::encrypted(keys));
 
 		let envelope = WireEnvelope::Encrypted(record);
 		let wire = envelope.to_der().expect("a record encodes as a wire envelope");
@@ -2340,16 +2293,13 @@ mod tests {
 	/// handler.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test]
-	async fn a_spent_server_collects_no_request() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::aead::SessionKeys;
-
-		let client = SessionKeys::for_client(TestKey::insecure_directional_keys());
-		let server = SessionKeys::for_server(TestKey::insecure_directional_keys()).with_envelope_ceiling(usize::MAX);
-		let record = client.send().encrypt_next(request_der())?;
-
-		let collected = collected_under(server, record).await;
-		let refused = matches!(collected, Err(TransportError::OperationFailed(TransportFailure::RekeyRequired)));
-		assert!(refused, "a spent server collects no request, but it collected {collected:?}");
+	async fn a_spent_server_collects_no_request() -> TestResult {
+		let record = SessionKeys::insecure_client().send().encrypt_next(request_der())?;
+		let collected = collected_under(SessionKeys::insecure_server().with_envelope_ceiling(usize::MAX), record).await;
+		assert!(matches!(
+			collected,
+			Err(TransportError::OperationFailed(TransportFailure::RekeyRequired))
+		));
 		Ok(())
 	}
 
@@ -2361,17 +2311,22 @@ mod tests {
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	#[tokio::test]
-	async fn a_receive_overrun_fails_apart_from_a_spent_cipher() -> Result<(), Box<dyn std::error::Error>> {
-		let client = SessionKeys::for_client(TestKey::insecure_directional_keys());
-		let fresh = SessionKeys::for_server(TestKey::insecure_directional_keys());
-		let spent = SessionKeys::for_server(TestKey::insecure_directional_keys()).with_envelope_ceiling(usize::MAX);
+	async fn a_receive_overrun_fails_apart_from_a_spent_cipher() -> TestResult {
+		let client = SessionKeys::insecure_client();
 		let limit = crate::constants::DEFAULT_REKEY_RECORD_LIMIT;
 		let past_the_bound = client.send().seal_at(request_der(), limit)?;
 		let in_sequence = client.send().encrypt_next(request_der())?;
 
-		let overrun = collected_under(fresh, past_the_bound).await;
-		let refused = collected_under(spent, in_sequence).await;
-		assert_ne!(failure_of(&overrun), failure_of(&refused));
+		let overrun = collected_under(SessionKeys::insecure_server(), past_the_bound).await;
+		let unbounded = SessionKeys::insecure_server().with_envelope_ceiling(usize::MAX);
+		let refused = collected_under(unbounded, in_sequence).await;
+
+		let failures = (failure_of(&overrun), failure_of(&refused));
+		let expected = (
+			Some(TransportFailure::RenewalBoundExceeded),
+			Some(TransportFailure::RekeyRequired),
+		);
+		assert_eq!(failures, expected);
 		Ok(())
 	}
 
@@ -2379,150 +2334,162 @@ mod tests {
 	/// outcome of that handshake.
 	#[cfg(all(feature = "transport-hpke", feature = "instrument"))]
 	#[tokio::test]
-	async fn a_handshake_past_the_deadline_records_its_expiry() -> TransportResult<()> {
+	async fn a_handshake_past_the_deadline_records_its_expiry() {
 		let clock = Arc::new(ManualClock::default());
 		let trace = TraceCollector::new();
 		let (transport, _peer) = handshaking_server(&clock).await;
 		let mut transport = transport.with_trace(trace.share());
-		let message = HandshakeMessage::try_from(create_test_signed_data(b"late"))?;
+
 		clock.advance(transport.limits.handshake_timeout);
 
-		let driven = transport.perform_server_handshake(message).await;
+		let driven = transport.perform_server_handshake(opening(b"late")).await;
 		assert!(matches!(
 			driven,
 			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
 		));
-
-		let recorded = trace.drain_events();
-		let expiries = recorded.iter().filter(|event| event.urn == events::SESSION_HANDSHAKE_EXPIRED);
-		assert_eq!(expiries.count(), 1);
-		Ok(())
+		assert_eq!(TestTrace::records(&trace, events::SESSION_HANDSHAKE_EXPIRED).len(), 1);
 	}
 
 	/// The server refuses a handshake-phase frame by its declared length when
 	/// that length exceeds the 16 KiB handshake cap, before it reads the body.
-	#[tokio::test]
-	async fn handshake_read_rejects_oversize_frame_before_body() -> TransportResult<()> {
-		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
+	/// The runtime clock is paused and the join budget is below the handshake
+	/// deadline, so a server that waited for the body would miss the budget.
+	#[tokio::test(start_paused = true)]
+	async fn a_handshake_frame_over_the_cap_is_refused_before_its_body() -> TestResult {
+		let EncryptedTestServer { config, .. } = encrypted_test_server();
 		let limits = TransportLimits { handshake_timeout: Duration::from_secs(5), ..*config.limits };
-		config = config.with_limits(limits)?;
-
-		let (listener, server_addr) = bind_encrypted(config).await?;
-		let server_handle = spawn_accept_handle_request(listener);
-
-		let mut client_stream = TcpStream::connect(server_addr).await?;
+		let (server_handle, mut client_stream) = dial_handling_server(config.with_limits(limits)?).await;
 		let oversize_header = [0x30u8, 0x83, 0x01, 0x00, 0x00];
 		client_stream.write_all(&oversize_header).await?;
 
-		let started = Instant::now();
-		let join_budget = Duration::from_secs(4);
-		let joined = tokio::time::timeout(join_budget, server_handle).await;
-		assert!(matches!(joined, Ok(Ok(Err(_)))));
-		assert!(started.elapsed() < Duration::from_secs(2));
+		let joined = tokio::time::timeout(Duration::from_secs(4), server_handle).await;
+		assert!(matches!(
+			joined,
+			Ok(Ok(Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))))
+		));
 		Ok(())
 	}
 
+	/// A gate that answers its first request as busy and every later one as
+	/// admitted.
+	///
+	/// Each house gate decides its status from the frame and the session, so
+	/// a test that needs a status that changes between two equal requests
+	/// holds this double.
+	#[cfg(feature = "transport-hpke")]
+	struct BusyFirstGate {
+		first: AtomicBool,
+	}
+
+	#[cfg(feature = "transport-hpke")]
+	impl BusyFirstGate {
+		fn new() -> Self {
+			Self { first: AtomicBool::new(true) }
+		}
+	}
+
+	#[cfg(feature = "transport-hpke")]
+	impl GatePolicy for BusyFirstGate {
+		fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+			if self.first.swap(false, Ordering::SeqCst) {
+				TransitStatus::ResourceExhausted
+			} else {
+				TransitStatus::Ok
+			}
+		}
+	}
+
+	/// An encrypted server's collector gate refuses the first request as
+	/// exhausted, so that request reaches no handler, and the retry passes
+	/// the gate.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn async_with_encrypted_and_gate_policy() -> TransportResult<()> {
-		struct BusyFirstGate {
-			first: AtomicBool,
-		}
-
-		impl BusyFirstGate {
-			fn new() -> Self {
-				Self { first: AtomicBool::new(true) }
-			}
-		}
-
-		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-				if self.first.swap(false, Ordering::SeqCst) {
-					TransitStatus::ResourceExhausted
-				} else {
-					TransitStatus::Ok
-				}
-			}
-		}
-
-		let EncryptedTestServer { server, config } = encrypted_test_server()?;
-		let (listener, server_addr) = bind_encrypted(config).await?;
-
+	async fn a_gate_that_refuses_the_first_request_admits_the_retry() -> TestResult {
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let (listener, server_addr) = bind_encrypted(config).await;
 		let request = TestFrame::v0(None, None);
-		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(2);
+		let (echo, mut received) = recording(Some(request.to_owned()));
 		let server_handle = tokio::spawn(async move {
 			let (transport, _peer) = listener.accept().await?;
-			let echo = move |msg: Frame| {
-				// The receiver lives for the whole test, so a refused send
-				// shows as the missing message the assertion reads.
-				let _ = received_tx.try_send(msg.to_owned());
-				Some(msg)
-			};
-
-			let gate = BusyFirstGate::new();
-			let mut transport = transport.with_collector_gate(gate);
+			let mut transport = transport.with_collector_gate(BusyFirstGate::new());
 			respond_with(&mut transport, &echo).await?;
 			respond_with(&mut transport, &echo).await
 		});
 
-		let trust_store = trust_store_for(&server);
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = trusting_client(client_stream, trust_store);
+		let mut transport = trusting_client(client_stream, trust_store_for(&server));
 		let first_emit = transport.emit(request.to_owned(), None).await;
+
+		transport.emit(request.to_owned(), None).await?;
+		server_handle.await??;
+
 		assert!(matches!(
 			first_emit,
 			Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
 		));
-
-		transport.emit(request.to_owned(), None).await?;
-
-		let received = received_rx.recv().await;
-		assert_eq!(Some(request), received);
-		assert!(received_rx.try_recv().is_err());
-
-		server_handle.await??;
+		assert_eq!((received.recv().await, received.recv().await), (Some(request), None));
 		Ok(())
+	}
+
+	/// The task of a server of `config` that records the frame of the one
+	/// request it serves and answers it with no frame, beside the receiver of
+	/// the recorded frames and a dial to that server.
+	#[cfg(feature = "transport-hpke")]
+	async fn dial_recording_server(
+		config: TransportEncryptionConfig<DefaultCryptoProvider>,
+	) -> (
+		tokio::task::JoinHandle<TransportResult<()>>,
+		tokio::sync::mpsc::Receiver<Frame>,
+		TcpStream,
+	) {
+		let (listener, server_addr) = bind_encrypted(config).await;
+		let (reply, received) = recording(None);
+		let server_handle = tokio::spawn(async move {
+			let (mut transport, _peer) = listener.accept().await?;
+			respond_with(&mut transport, reply).await
+		});
+
+		let dialed = TcpStream::connect(server_addr)
+			.await
+			.expect("the loopback server takes the dial");
+		(server_handle, received, dialed)
 	}
 
 	/// The gossip membership proof reads the peer certificate before the
 	/// gateway discloses any request (CWE-668), so the deferred single-flight
-	/// handshake must run on its own. It populates the peer certificate and
-	/// sends no application frame, and a repeat does nothing.
+	/// handshake must run on its own and populate the peer certificate.
 	#[cfg(feature = "transport-hpke")]
 	#[tokio::test]
-	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {
-		let EncryptedTestServer { server, config } = encrypted_test_server()?;
-		let (listener, server_addr) = bind_encrypted(config).await?;
-
-		let request = TestFrame::v0(None, None);
-		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
-		let server_handle = tokio::spawn(async move {
-			let (mut transport, _peer) = listener.accept().await?;
-			respond_with(&mut transport, move |msg: Frame| {
-				// The receiver lives for the whole test, so a refused send
-				// shows as the missing message the assertion reads.
-				let _ = received_tx.try_send(msg);
-				None
-			})
-			.await
-		});
-
-		let trust_store = trust_store_for(&server);
-		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = trusting_client(client_stream, trust_store);
-		assert!(transport.session_state().peer_certificate().is_none());
+	async fn a_lone_handshake_populates_the_peer_certificate() -> TestResult {
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let (_server_handle, _received, client_stream) = dial_recording_server(config).await;
+		let mut transport = trusting_client(client_stream, trust_store_for(&server));
+		let before = transport.session_state().peer_certificate().is_none();
 
 		transport.ensure_handshake_complete().await?;
-		assert_eq!(transport.session_state().peer_certificate(), Some(&server.signing));
-		assert!(received_rx.try_recv().is_err());
 
+		assert!(before);
+		assert_eq!(transport.session_state().peer_certificate(), Some(&server.signing));
+		Ok(())
+	}
+
+	/// A lone handshake sends no application frame and a repeat of it does
+	/// nothing, so the one frame the server records is the request of the
+	/// later exchange.
+	#[cfg(feature = "transport-hpke")]
+	#[tokio::test]
+	async fn a_lone_handshake_sends_no_application_frame() -> TestResult {
+		let EncryptedTestServer { server, config } = encrypted_test_server();
+		let (server_handle, mut received, client_stream) = dial_recording_server(config).await;
+		let mut transport = trusting_client(client_stream, trust_store_for(&server));
+		let request = TestFrame::v0(None, None);
+
+		transport.ensure_handshake_complete().await?;
 		transport.ensure_handshake_complete().await?;
 		transport.emit(request.to_owned(), None).await?;
-
-		let received = received_rx.recv().await;
-		assert_eq!(Some(request), received);
-
 		server_handle.await??;
+
+		assert_eq!((received.recv().await, received.recv().await), (Some(request), None));
 		Ok(())
 	}
 }

@@ -371,84 +371,70 @@ where
 
 #[cfg(test)]
 mod tests {
+	use crate::testing::TestResult;
+
 	use super::*;
 
-	#[test]
-	fn test_to_snake_case() {
-		assert_eq!(to_snake_case("CreateHandshakeRequest"), "create_handshake_request");
-		assert_eq!(to_snake_case("ValidateConfig"), "validate_config");
-		assert_eq!(to_snake_case("HTTPRequest"), "h_t_t_p_request");
-		assert_eq!(to_snake_case("simple"), "simple");
+	/// The outcome of a pipeline step over an `i32`, with a text error.
+	type Outcome = Result<i32, &'static str>;
+
+	// Each uppercase letter after the first starts a new word, an acronym
+	// included.
+	crate::tb_cases! {
+		fn a_job_name_converts_to_snake_case((name, expected): (&str, &str)) {
+			assert_eq!(to_snake_case(name), expected);
+		}
+		cases {
+			three_words => ("CreateHandshakeRequest", "create_handshake_request"),
+			two_words => ("ValidateConfig", "validate_config"),
+			an_acronym => ("HTTPRequest", "h_t_t_p_request"),
+			one_word => ("simple", "simple"),
+		}
 	}
 
-	#[test]
-	fn test_make_event_urn() {
-		assert_eq!(
-			make_event_urn("create_handshake_request", "start")
-				.expect("a literal NID with a job event NSS")
-				.to_string(),
-			"urn:tightbeam:event:job/create-handshake-request-start"
-		);
-		assert_eq!(
-			make_event_urn("validate_config", "success")
-				.expect("a literal NID with a job event NSS")
-				.to_string(),
-			"urn:tightbeam:event:job/validate-config-success"
-		);
-		assert_eq!(
-			make_event_urn("send_request", "error")
-				.expect("a literal NID with a job event NSS")
-				.to_string(),
-			"urn:tightbeam:event:job/send-request-error"
-		);
+	// A job phase names its event under the job name, each underscore turned
+	// into a hyphen.
+	crate::tb_cases! {
+		fn a_job_phase_names_its_event_urn((job, phase, expected): (&str, &str, Urn<'static>)) -> TestResult {
+			let urn = make_event_urn(job, phase)?;
+			assert_eq!(urn, expected);
+			Ok(())
+		}
+		cases {
+			start => (
+				"create_handshake_request",
+				"start",
+				crate::urn!("tightbeam", "event:job/create-handshake-request-start"),
+			),
+			success => ("validate_config", "success", crate::urn!("tightbeam", "event:job/validate-config-success")),
+			error => ("send_request", "error", crate::urn!("tightbeam", "event:job/send-request-error")),
+		}
 	}
 
-	#[test]
-	fn test_result_is_pipeline() {
-		let result: Result<i32, &str> = Ok(42);
-		let doubled = result.map(|x| x * 2).run();
-		assert_eq!(doubled, Ok(84));
+	// A `Result` runs each step through its `Pipeline` impl. Method syntax on
+	// a `Result` reaches the inherent method of the same name, so each row
+	// calls the trait method by its path.
+	crate::tb_cases! {
+		fn a_result_step_runs_to_its_outcome((step, expected): (fn() -> Outcome, Outcome)) {
+			assert_eq!(step(), expected);
+		}
+		cases {
+			mapped => (|| Pipeline::map(Ok(42), |x| x * 2).run(), Ok(84)),
+			chained => (|| Pipeline::and_then(Ok(10), |x| Ok(x * 3)).run(), Ok(30)),
+			recovered => (|| Pipeline::or_else(Err("error"), |_| Ok(100)).run(), Ok(100)),
+		}
 	}
 
-	#[test]
-	fn test_pipeline_and_then() {
-		let result: Result<i32, &str> = Ok(10);
-		let computed = result.map(|x| x + 5).map(|x| x * 2).run();
-		assert_eq!(computed, Ok(30));
-	}
-
-	#[test]
-	fn test_pipeline_or_else() {
-		let result: Result<i32, &str> = Err("error");
-		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
-		assert_eq!(with_fallback, Ok(100));
-	}
-
-	#[test]
-	fn test_join_pipelines() -> Result<(), Box<dyn core::error::Error>> {
-		let pipe1: Result<i32, &str> = Ok(10);
-		let pipe2: Result<i32, &str> = Ok(20);
-
-		let (a, b) = join(pipe1, pipe2).run()?;
-		assert_eq!(a, 10);
-		assert_eq!(b, 20);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_join_with_error() {
-		let pipe1: Result<i32, &str> = Ok(10);
-		let pipe2: Result<i32, &str> = Err("failed");
-		let result = join(pipe1, pipe2).run();
-		assert_eq!(result, Err("failed"));
-	}
-
-	#[test]
-	fn test_pipeline_or_else_fallback() {
-		let result: Result<i32, &str> = Err("error");
-		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
-		assert_eq!(with_fallback, Ok(100));
+	// A join runs its two pipelines in order and pairs their outputs, and the
+	// first error ends the run.
+	crate::tb_cases! {
+		fn a_join_runs_to_its_outcome((left, right, expected): (Outcome, Outcome, Result<(i32, i32), &str>)) {
+			assert_eq!(join(left, right).run(), expected);
+		}
+		cases {
+			both_succeed => (Ok(10), Ok(20), Ok((10, 20))),
+			the_right_fails => (Ok(10), Err("failed"), Err("failed")),
+		}
 	}
 
 	/// A job that doubles its input.
@@ -468,23 +454,25 @@ mod tests {
 	const DOUBLE_COUNT_START: Urn<'static> = crate::urn!("tightbeam", "event:job/double-count-start");
 	const DOUBLE_COUNT_SUCCESS: Urn<'static> = crate::urn!("tightbeam", "event:job/double-count-success");
 
+	/// A job step records its start and its success under the snake_case form
+	/// of the job name.
 	#[test]
-	fn a_job_step_labels_its_events_with_the_job_name() -> Result<(), TightBeamError> {
+	fn a_job_step_labels_its_events_with_the_job_name() -> TestResult {
 		let trace = Arc::new(TraceCollector::new());
 		let started = PipelineBuilder::new(Arc::clone(&trace)).start((2u32,));
-
 		started.then_job::<DoubleCount, _>().run()?;
 
-		let recorded = [DOUBLE_COUNT_START, DOUBLE_COUNT_SUCCESS].map(|label| trace.recorded(label));
-		assert_eq!(recorded, [1, 1]);
+		let recorded = (trace.recorded(DOUBLE_COUNT_START), trace.recorded(DOUBLE_COUNT_SUCCESS));
+		assert_eq!(recorded, (1, 1));
 		Ok(())
 	}
 
+	/// A closure step chains its result alone, so the trace records no event
+	/// for it.
 	#[test]
-	fn a_closure_step_emits_no_job_event() -> Result<(), TightBeamError> {
+	fn a_closure_step_emits_no_job_event() -> TestResult {
 		let trace = Arc::new(TraceCollector::new());
 		let started = PipelineBuilder::new(Arc::clone(&trace)).start(1u32);
-
 		started.and_then(|count| Ok::<u32, TightBeamError>(count + 1)).run()?;
 
 		assert_eq!(trace.drain_assertions().len(), 0);

@@ -436,21 +436,16 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListene
 
 #[cfg(test)]
 mod tests {
-	#![allow(unused_imports)]
 	use std::io::{Read, Write};
-	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::mpsc::{self, RecvTimeoutError};
 	use std::thread;
-	use std::time::{Duration, Instant};
+	use std::time::Duration;
 
 	use super::*;
 	use crate::clock::{ManualClock, SystemClock};
-	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::policy::TransitStatus;
 	use crate::runtime::{rt, ParkingExecutor};
-	use crate::testing::*;
-	use crate::transport::handshake::PeerAuthentication;
-	use crate::transport::policy::PolicyConfig;
+	use crate::testing::fixtures::TestLoopback;
+	use crate::testing::TestResult;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::TransportLimits;
 
@@ -467,23 +462,10 @@ mod tests {
 	/// The server of [`validating_server`], which reads its deadlines on
 	/// `clock`.
 	fn validating_server_on(limits: TransportLimits, clock: Arc<dyn Clock>) -> EndpointConfig<DefaultCryptoProvider> {
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
-		let peer_authentication = PeerAuthentication::Anonymous.and(validator);
-
-		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
-		let encryption = DialableEncryption::new(encryption).expect("mutual authentication answers for the peer");
+		let encryption = DialableEncryption::new(EncryptionConfig::provisioned());
+		let encryption = encryption.expect("mutual authentication answers for the peer");
 		let endpoint = EndpointConfig::new(encryption, clock).with_limits(limits);
 		endpoint.expect("the test limits pass the check")
-	}
-
-	/// The accepted end and the peer end of one loopback connection.
-	fn loopback_pair() -> (NetTcpStream, NetTcpStream) {
-		let listener = NetTcpListener::bind("127.0.0.1:0").expect("a loopback port binds");
-		let addr = listener.local_addr().expect("a bound listener has an address");
-
-		let peer = NetTcpStream::connect(addr).expect("the loopback listener takes the dial");
-		let (stream, _) = listener.accept().expect("the dial arrives");
-		(stream, peer)
 	}
 
 	/// A server over one end of a loopback connection, beside the silent peer
@@ -493,11 +475,11 @@ mod tests {
 		limits: TransportLimits,
 		clock: &Arc<ManualClock>,
 	) -> (TcpTransport<NetTcpStream>, NetTcpStream) {
-		let (stream, peer) = loopback_pair();
+		let (stream, peer) = TestLoopback::std_pair();
 		let endpoint = validating_server_on(limits, Arc::clone(clock) as Arc<dyn Clock>);
 		let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, endpoint);
 		let began = transport.state.begin_handshake(clock.monotonic());
-		assert!(began, "a provisioned server begins its handshake");
+		assert!(began);
 
 		(transport, peer)
 	}
@@ -531,7 +513,7 @@ mod tests {
 	/// `DeadlineExceeded`, whichever of `WouldBlock` and `TimedOut` the
 	/// socket raises.
 	#[test]
-	fn a_blocking_read_past_its_deadline_reports_deadline_exceeded() -> TransportResult<()> {
+	fn a_blocking_read_past_its_deadline_reports_deadline_exceeded() {
 		let clock = Arc::new(ManualClock::default());
 		let limits = TransportLimits { handshake_timeout: Duration::from_secs(60), ..TransportLimits::default() };
 		let (transport, _peer) = handshaking_server(limits, &clock);
@@ -543,7 +525,6 @@ mod tests {
 			outcome,
 			Some(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
 		));
-		Ok(())
 	}
 
 	/// Sends `header` to `peer`, then drips `count` bytes on a thread, one per
@@ -562,33 +543,32 @@ mod tests {
 	}
 
 	/// A peer that drips bytes loses the read when the handshake budget ends.
+	/// The drip outlasts the budget and then closes, so a read that the
+	/// budget did not end would report a closed connection.
 	#[test]
-	fn a_peer_that_drips_bytes_loses_the_read_at_its_budget() -> TransportResult<()> {
+	fn a_peer_that_drips_bytes_loses_the_read_at_its_budget() {
 		let limits = TransportLimits { handshake_timeout: Duration::from_millis(300), ..TransportLimits::default() };
-		let (stream, peer) = loopback_pair();
+		let (stream, peer) = TestLoopback::std_pair();
 		let transport = TcpTransport::new(stream, validating_server(limits));
 		// The header declares 128 bytes, and 40 of them drip for 4s.
 		drip_after(&[0x30, 0x81, 0x80], peer, 40, Duration::from_millis(100));
 
-		let started = Instant::now();
 		let outcome = read_within(transport, READ_GUARD);
-		let elapsed = started.elapsed();
-
-		assert!(matches!(outcome, Some(Err(_))));
-		assert!(elapsed < Duration::from_secs(2));
-		Ok(())
+		assert!(matches!(
+			outcome,
+			Some(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
+		));
 	}
 
 	/// A peer that closes between frames ends the read as a closed connection.
 	#[test]
-	fn a_peer_that_closes_between_frames_ends_the_read_as_closed() -> TransportResult<()> {
-		let (stream, peer) = loopback_pair();
+	fn a_peer_that_closes_between_frames_ends_the_read_as_closed() {
+		let (stream, peer) = TestLoopback::std_pair();
 		let transport = TcpTransport::new(stream, validating_server(TransportLimits::default()));
 		drop(peer);
 
 		let outcome = read_within(transport, READ_GUARD);
 		assert!(matches!(outcome, Some(Err(TransportError::ConnectionClosed))));
-		Ok(())
 	}
 
 	/// Reads up to `chunk` bytes from `peer` on a thread, one read per
@@ -606,30 +586,29 @@ mod tests {
 	}
 
 	/// A peer that reads slowly loses the write when the operation budget ends.
+	/// The drain outlasts the budget and then closes, so a write that the
+	/// budget did not end would fail on the closed connection.
 	#[test]
-	fn a_peer_that_reads_slowly_loses_the_write_at_its_budget() -> TransportResult<()> {
+	fn a_peer_that_reads_slowly_loses_the_write_at_its_budget() {
 		let limits = TransportLimits { operation_timeout: Duration::from_millis(300), ..TransportLimits::default() };
-		let (stream, peer) = loopback_pair();
+		let (stream, peer) = TestLoopback::std_pair();
 		let mut transport = TcpTransport::new(stream, validating_server(limits));
 
 		// The peer drains 64 KiB per 50 ms for 3 s, far less than the payload.
 		drain_slowly(peer, 64 * 1024, 60, Duration::from_millis(50));
 
 		let payload = vec![0u8; 32 * 1024 * 1024];
-		let started = Instant::now();
-		let write = transport.write_envelope_bytes(&payload);
-
-		let outcome = rt::block_on(write);
-		let elapsed = started.elapsed();
-		assert!(outcome.is_err());
-		assert!(elapsed < Duration::from_secs(2));
-		Ok(())
+		let outcome = rt::block_on(transport.write_envelope_bytes(&payload));
+		assert!(matches!(
+			outcome,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
 	}
 
 	/// The blocking budget runs its operation to its end outside a runtime.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_blocking_budget_runs_its_operation_outside_a_runtime() -> TransportResult<()> {
+	fn a_blocking_budget_runs_its_operation_outside_a_runtime() -> TestResult {
 		let operation = async { Ok(7) };
 		let bounded = <TcpTransport<NetTcpStream> as ServerHandshakeSlot>::within_budget(Duration::ZERO, operation);
 
@@ -638,30 +617,19 @@ mod tests {
 		Ok(())
 	}
 
-	// The server refuses a header that declares more than the handshake cap
-	// on the header alone, before it reads or allocates any content (CWE-770).
-	#[tokio::test]
-	async fn a_handshake_header_above_the_cap_is_refused() -> TransportResult<()> {
-		let listener = NetTcpListener::bind("127.0.0.1:0")?;
-		let addr = listener.local_addr()?;
-
-		let server_handle = thread::spawn(move || -> TransportResult<TransportResult<Vec<u8>>> {
-			let (stream, _) = listener.accept()?;
-			let limits = TransportLimits { handshake_wire: 16, ..TransportLimits::default() };
-			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, validating_server(limits));
-
-			let rt = tokio::runtime::Runtime::new()?;
-			Ok(rt.block_on(transport.read_envelope_bytes()))
-		});
-
+	/// The server refuses a header that declares more than the handshake cap
+	/// on the header alone, before it reads or allocates any content
+	/// (CWE-770).
+	#[test]
+	fn a_handshake_header_above_the_cap_is_refused() -> TestResult {
+		let (stream, mut peer) = TestLoopback::std_pair();
+		let limits = TransportLimits { handshake_wire: 16, ..TransportLimits::default() };
+		let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, validating_server(limits));
 		// The SEQUENCE header declares 600 content bytes, and no content
 		// follows.
-		let mut stream = NetTcpStream::connect(addr)?;
-		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
+		Write::write_all(&mut peer, &[0x30, 0x82, 0x02, 0x58])?;
 
-		let result = server_handle
-			.join()
-			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
+		let result = rt::block_on(transport.read_envelope_bytes());
 		assert!(matches!(
 			result,
 			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))

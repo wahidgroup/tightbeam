@@ -378,10 +378,8 @@ mod tests {
 	use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 	use super::*;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::KeyCurves;
+	use crate::crypto::x509::store::TrustBuilder;
+	use crate::testing::fixtures::{TestLoopback, TestStore};
 	use crate::transport::error::TransportError;
 	use crate::transport::tcp::r#async::{TokioListener, TokioStream};
 	use crate::transport::tcp::TightBeamSocketAddr;
@@ -390,17 +388,71 @@ mod tests {
 	use crate::crypto::x509::policy::ExpiryValidator;
 
 	/// Port 1 on loopback, where a connection attempt fails fast. The refusal
-	/// under test is reached before the dial, so the first case never leaves
-	/// the builder and the second fails at the address.
+	/// under test is reached before the dial, so a refused client never
+	/// leaves the builder and an admitted one fails at the address.
 	const UNREACHABLE: TightBeamSocketAddr =
 		TightBeamSocketAddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)));
 
-	/// A client with no trust store authenticates nobody, so it is refused
-	/// before it opens a connection (CWE-295).
-	#[tokio::test]
-	async fn a_client_without_a_trust_store_is_refused() {
-		let refused = ClientBuilder::<TokioListener>::builder().connect(UNREACHABLE).await;
-		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+	/// The policy that admits every certificate within its validity period.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn expiry_policy() -> [Arc<dyn CertificateValidation>; 1] {
+		[Arc::new(ExpiryValidator::default())]
+	}
+
+	/// A client builder whose trust store, set through [`ConnectionBuilder`],
+	/// holds no certificate.
+	fn trusting_through_the_connection_builder() -> ClientBuilder<TokioListener> {
+		let store: Arc<dyn CertificateTrust> = Arc::new(TestStore::empty().build());
+		ConnectionBuilder::with_trust_store(ClientBuilder::<TokioListener>::builder(), store)
+	}
+
+	/// The outcome of a dial of a client builder.
+	type Dialed = TransportResult<GenericClient<TokioListener>>;
+
+	/// Whether `dialed` is the refusal of the peer authority rule.
+	fn is_refused(dialed: &Dialed) -> bool {
+		matches!(dialed, Err(TransportError::PeerAuthenticationUnconfigured))
+	}
+
+	/// Whether `dialed` failed at the address, past the rule.
+	fn failed_at_the_address(dialed: &Dialed) -> bool {
+		matches!(dialed, Err(TransportError::IoError(_)))
+	}
+
+	/// A builder and the test of its dial.
+	type DialRuleCase = (fn() -> ClientBuilder<TokioListener>, fn(&Dialed) -> bool);
+
+	// A dial answers the peer authority rule before it opens a connection: a
+	// client with no trust store authenticates nobody and is refused
+	// (CWE-295), a trust store set through [`ConnectionBuilder`] admits the
+	// client as the inherent setter does, and a client that names cleartext
+	// is admitted. A server policy narrows which server a trust admits and
+	// names no peer authority, so a policy alone is refused, and a cleartext
+	// dial checks no server, so cleartext beside a policy is refused too. An
+	// admitted client fails at the address.
+	crate::tb_cases! {
+		async fn a_dial_answers_the_peer_authority_rule((builder, answered): DialRuleCase) {
+			let dialed = builder().connect(UNREACHABLE).await;
+			assert!(answered(&dialed));
+		}
+		cases {
+			without_a_trust_store => (ClientBuilder::<TokioListener>::builder, is_refused),
+			with_a_trust_store_through_the_connection_builder => (
+				trusting_through_the_connection_builder,
+				failed_at_the_address,
+			),
+			naming_cleartext => (|| ClientBuilder::<TokioListener>::builder().allow_cleartext(), failed_at_the_address),
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			with_a_server_policy_alone => (
+				|| ClientBuilder::<TokioListener>::builder().with_server_policy(expiry_policy()),
+				is_refused,
+			),
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			with_a_server_policy_and_cleartext => (
+				|| ClientBuilder::<TokioListener>::builder().with_server_policy(expiry_policy()).allow_cleartext(),
+				is_refused,
+			),
+		}
 	}
 
 	/// The shortest `client!` form reaches the wire only through the same
@@ -420,65 +472,9 @@ mod tests {
 	/// A stream the caller opened answers the same rule as a dial, so no
 	/// path reaches the wire without it.
 	#[tokio::test]
-	async fn an_adopted_stream_without_a_peer_authority_is_refused() -> TransportResult<()> {
-		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-		let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
-
-		let refused = ClientBuilder::<TokioListener>::builder().adopt(TokioStream::from(stream));
-		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
-		Ok(())
-	}
-
-	/// A trust store set through [`ConnectionBuilder`] authenticates the
-	/// server as the inherent setter does, so the client passes the dialer
-	/// rule and fails at the address instead.
-	#[tokio::test]
-	async fn a_trust_store_set_through_the_connection_builder_admits_the_client() {
-		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store: Arc<dyn CertificateTrust> = Arc::new(trust.build());
-		let builder = ClientBuilder::<TokioListener>::builder();
-
-		let trusting = ConnectionBuilder::with_trust_store(builder, store);
-		let admitted = trusting.connect(UNREACHABLE).await;
-		assert!(!matches!(admitted, Err(TransportError::PeerAuthenticationUnconfigured)));
-	}
-
-	/// A client that names cleartext passes the same rule, so it reaches the
-	/// address and fails there instead.
-	#[tokio::test]
-	async fn naming_cleartext_admits_the_same_client() {
-		let admitted = ClientBuilder::<TokioListener>::builder()
-			.allow_cleartext()
-			.connect(UNREACHABLE)
-			.await;
-		assert!(!matches!(admitted, Err(TransportError::PeerAuthenticationUnconfigured)));
-	}
-
-	/// The policy that admits every certificate within its validity period.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn expiry_policy() -> [Arc<dyn CertificateValidation>; 1] {
-		[Arc::new(ExpiryValidator::default())]
-	}
-
-	/// A server policy narrows which server a trust admits and names no peer
-	/// authority, so a client with a policy alone is refused before it
-	/// opens a connection (CWE-295).
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[tokio::test]
-	async fn a_server_policy_alone_is_refused_before_it_dials() {
-		let builder = ClientBuilder::<TokioListener>::builder().with_server_policy(expiry_policy());
-		let refused = builder.connect(UNREACHABLE).await;
-		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
-	}
-
-	/// A cleartext dial checks no server, so a client that names cleartext
-	/// beside a server policy and no trust is refused before it opens a
-	/// connection (CWE-295).
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[tokio::test]
-	async fn a_server_policy_with_cleartext_is_refused_before_it_dials() {
-		let builder = ClientBuilder::<TokioListener>::builder().with_server_policy(expiry_policy());
-		let refused = builder.allow_cleartext().connect(UNREACHABLE).await;
+	async fn an_adopted_stream_without_a_peer_authority_is_refused() {
+		let (_accepted, dialing) = TestLoopback::tokio_pair().await;
+		let refused = ClientBuilder::<TokioListener>::builder().adopt(TokioStream::from(dialing));
 		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
 	}
 }

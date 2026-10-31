@@ -713,46 +713,72 @@ mod tests {
 	use super::*;
 	#[cfg(feature = "x509")]
 	use crate::crypto::x509::{policy::PublicKeyPinning, KeyListError};
+	use crate::matrix::MatrixError;
 	#[cfg(pooled_mux)]
 	use crate::policy::TransitStatus;
 
+	/// A matrix error converts into the wrapper variant that carries it.
 	#[test]
-	fn source_annotated_wrappers_expose_their_cause() {
+	fn a_matrix_error_converts_into_its_wrapper() {
 		let err = TightBeamError::from(crate::matrix::MatrixError::InvalidN(0));
-		let source = core::error::Error::source(&err);
-		assert!(matches!(err, TightBeamError::MatrixError(_)));
-		assert!(source.is_some());
+		assert!(matches!(
+			err,
+			TightBeamError::MatrixError(crate::matrix::MatrixError::InvalidN(0))
+		));
 	}
 
-	#[test]
-	fn error_chain_renders_a_readable_join() {
-		let chain = ErrorChain::from(vec![TightBeamError::InvalidBody, TightBeamError::MissingOrder]);
-		let wrapped = TightBeamError::Sequence(chain);
-		assert_eq!(
-			wrapped.to_string(),
-			"Multiple errors occurred: Invalid message body; Missing order"
-		);
+	// A wrapper annotated with its source exposes the error it wraps as the
+	// source, and a unit variant exposes none.
+	crate::tb_cases! {
+		fn a_source_annotation_exposes_the_cause((err, cause): (TightBeamError, Option<MatrixError>)) {
+			let source = core::error::Error::source(&err);
+			let exposed = source.and_then(|source| source.downcast_ref::<MatrixError>());
+			assert_eq!(exposed, cause.as_ref());
+		}
+		cases {
+			annotated_wrapper => (TightBeamError::from(MatrixError::InvalidN(0)), Some(MatrixError::InvalidN(0))),
+			unit_variant => (TightBeamError::InvalidBody, None),
+		}
 	}
 
-	#[test]
-	fn error_chain_renders_a_lone_error_without_a_separator() {
-		let wrapped = TightBeamError::Sequence(ErrorChain::from(vec![TightBeamError::InvalidBody]));
-		assert_eq!(wrapped.to_string(), "Multiple errors occurred: Invalid message body");
+	// A chain of errors renders each error once, joined by a separator, and a
+	// lone error renders with no separator.
+	crate::tb_cases! {
+		fn error_chain_renders((errors, rendered): (Vec<TightBeamError>, &str)) {
+			let wrapped = TightBeamError::Sequence(ErrorChain::from(errors));
+			assert_eq!(wrapped.to_string(), rendered);
+		}
+		cases {
+			a_readable_join => (
+				vec![TightBeamError::InvalidBody, TightBeamError::MissingOrder],
+				"Multiple errors occurred: Invalid message body; Missing order"
+			),
+			a_lone_error_without_a_separator => (
+				vec![TightBeamError::InvalidBody],
+				"Multiple errors occurred: Invalid message body"
+			),
+		}
 	}
 
-	#[test]
-	fn unit_variants_have_no_source() {
-		let err = TightBeamError::InvalidBody;
-		assert!(core::error::Error::source(&err).is_none());
+	// A chain counts the errors it collected, and reads as empty when it
+	// collected none.
+	crate::tb_cases! {
+		fn an_error_chain_counts_its_errors((errors, counted): (Vec<TightBeamError>, (usize, bool))) {
+			let chain = ErrorChain::from(errors);
+			assert_eq!((chain.len(), chain.is_empty()), counted);
+		}
+		cases {
+			two_errors => (vec![TightBeamError::InvalidBody, TightBeamError::MissingOrder], (2, false)),
+			no_error => (Vec::new(), (0, true)),
+		}
 	}
 
 	/// A runtime channel whose other end is gone converts into the channel
 	/// error of the crate, so `?` carries the fact under one name.
 	#[test]
-	fn a_closed_runtime_channel_converts_into_the_channel_error() -> Result<()> {
+	fn a_closed_runtime_channel_converts_into_the_channel_error() {
 		let converted = TightBeamError::from(crate::runtime::ChannelClosed);
 		assert!(matches!(converted, TightBeamError::ChannelClosed));
-		Ok(())
 	}
 
 	/// A protocol error converts into the transport error it names, and the
@@ -761,11 +787,21 @@ mod tests {
 	#[test]
 	fn transport_wraps_the_converted_protocol_error() {
 		use crate::policy::TransitStatus;
-		use crate::transport::error::TransportError;
+		use crate::transport::error::TransportError::OperationFailed;
+		use crate::transport::error::TransportFailure;
 
 		let err = TightBeamError::transport(TransitStatus::Unimplemented);
-		let carries_the_failure = matches!(err, TightBeamError::TransportError(TransportError::OperationFailed(_)));
-		assert!(carries_the_failure);
+		assert!(matches!(
+			err,
+			TightBeamError::TransportError(OperationFailed(TransportFailure::Unimplemented))
+		));
+	}
+
+	/// The pin list that `pins` builds, through the `?` that carries a refusal
+	/// into the crate error.
+	#[cfg(feature = "x509")]
+	fn pinned(pins: &[&[u8]]) -> Result<PublicKeyPinning> {
+		Ok(PublicKeyPinning::new(pins)?)
 	}
 
 	/// A pin list's refusal reaches the crate error under its own name, so a
@@ -773,10 +809,6 @@ mod tests {
 	#[cfg(feature = "x509")]
 	#[test]
 	fn a_key_list_refusal_propagates_under_its_own_name() {
-		fn pinned(pins: &[&[u8]]) -> Result<PublicKeyPinning> {
-			Ok(PublicKeyPinning::new(pins)?)
-		}
-
 		let refused = pinned(&[b"no SubjectPublicKeyInfo"]);
 
 		let expected = KeyListError::Unreadable { index: 0 };

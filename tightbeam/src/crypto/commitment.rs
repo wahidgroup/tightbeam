@@ -184,6 +184,8 @@ mod tests {
 	use super::*;
 	use crate::crypto::hash::Sha3_256;
 	use crate::der::Sequence;
+	use crate::error::ReceivedExpectedError;
+	use crate::testing::TestResult;
 
 	#[derive(Clone, Debug, PartialEq, Eq, Sequence)]
 	struct Body {
@@ -194,94 +196,100 @@ mod tests {
 		type Profile = crate::crypto::profiles::TightbeamProfile;
 	}
 
-	fn commit(value: u8, salt: &[u8]) -> Result<(DigestInfo, Opening)> {
-		Opening::prove::<Sha3_256, _>(&Body { value }, salt)
+	/// The commitment and the opening of a body of `value` under `salt`.
+	fn commit(value: u8, salt: &[u8]) -> (DigestInfo, Opening) {
+		let proved = Opening::prove::<Sha3_256, _>(&Body { value }, salt);
+		proved.expect("a test salt is empty or meets the floor")
 	}
 
-	// The mode byte separates the two forms, so a plain digest of a body
-	// never doubles as a commitment over it.
-	#[test]
-	fn a_plain_commitment_is_not_the_digest_of_the_body() -> Result<()> {
-		let encoded = crate::encode(&Body { value: 1 })?;
-		let plain = crate::utils::digest::<Sha3_256>(&encoded)?;
+	/// The DER of a body of `value`.
+	fn body(value: u8) -> Vec<u8> {
+		crate::encode(&Body { value }).expect("a test body encodes")
+	}
 
-		let (commitment, _) = commit(1, &[])?;
+	/// The mode byte separates the two forms, so a plain digest of a body
+	/// never doubles as a commitment over it.
+	#[test]
+	fn a_plain_commitment_is_not_the_digest_of_the_body() -> TestResult {
+		let plain = crate::utils::digest::<Sha3_256>(body(1))?;
+		let (commitment, _) = commit(1, &[]);
 		assert_ne!(commitment.digest.as_bytes(), plain.digest.as_bytes());
 		Ok(())
 	}
 
 	// The hasher reads the preimage in pieces, so the layout exists in no
-	// single buffer. These tests pin the documented bytes against a
-	// concatenation built by hand.
-	#[test]
-	fn a_plain_preimage_is_the_mode_byte_then_the_body() -> Result<()> {
-		let encoded = crate::encode(&Body { value: 1 })?;
-		let mut expected = vec![PLAIN_MODE];
-		expected.extend_from_slice(&encoded);
-
-		let (commitment, _) = commit(1, &[])?;
-		let by_hand = crate::utils::digest::<Sha3_256>(&expected)?;
-		assert_eq!(commitment.digest.as_bytes(), by_hand.digest.as_bytes());
-		Ok(())
+	// single buffer. Each row pins the documented bytes of one mode against a
+	// concatenation built by hand: the mode byte then the body, or the mode
+	// byte, the length, the salt, then the body.
+	crate::tb_cases! {
+		fn a_commitment_digests_its_documented_preimage((salt, preimage): (Vec<u8>, Vec<u8>)) -> TestResult {
+			let by_hand = crate::utils::digest::<Sha3_256>(&preimage)?;
+			let (commitment, _) = commit(1, &salt);
+			assert_eq!(commitment.digest.as_bytes(), by_hand.digest.as_bytes());
+			Ok(())
+		}
+		cases {
+			plain => (Vec::new(), [&[PLAIN_MODE][..], body(1).as_slice()].concat()),
+			hiding => (
+				vec![7; MIN_SALT_SIZE],
+				[
+					&[HIDING_MODE][..],
+					&(MIN_SALT_SIZE as u64).to_be_bytes(),
+					&[7; MIN_SALT_SIZE],
+					body(1).as_slice(),
+				]
+				.concat(),
+			),
+		}
 	}
 
+	/// A salt changes the commitment of the same body.
 	#[test]
-	fn a_hiding_preimage_is_the_mode_byte_the_length_the_salt_then_the_body() -> Result<()> {
-		let salt = [7u8; MIN_SALT_SIZE];
-		let encoded = crate::encode(&Body { value: 1 })?;
-		let mut expected = vec![HIDING_MODE];
-		expected.extend_from_slice(&(salt.len() as u64).to_be_bytes());
-		expected.extend_from_slice(&salt);
-		expected.extend_from_slice(&encoded);
-
-		let (commitment, _) = commit(1, &salt)?;
-		let by_hand = crate::utils::digest::<Sha3_256>(&expected)?;
-		assert_eq!(commitment.digest.as_bytes(), by_hand.digest.as_bytes());
-		Ok(())
-	}
-
-	#[test]
-	fn salt_hides_commitment() -> Result<()> {
-		let (unsalted, _) = commit(1, &[])?;
-		let (salted, _) = commit(1, &[7u8; 32])?;
+	fn salt_hides_commitment() {
+		let (unsalted, _) = commit(1, &[]);
+		let (salted, _) = commit(1, &[7u8; 32]);
 		assert_ne!(unsalted.digest.as_bytes(), salted.digest.as_bytes());
-		Ok(())
 	}
 
-	// A salt below the floor hides nothing, so it never commits.
+	/// A salt below the floor hides nothing, so it never commits, and the
+	/// refusal names both lengths.
 	#[test]
 	fn a_salt_below_the_floor_is_refused() {
-		let result = commit(1, &[7u8; MIN_SALT_SIZE - 1]);
-		assert!(matches!(result, Err(TightBeamError::InvalidSaltLength(_))));
+		let result = Opening::prove::<Sha3_256, _>(&Body { value: 1 }, [7u8; MIN_SALT_SIZE - 1]);
+		let lengths = ReceivedExpectedError { received: MIN_SALT_SIZE - 1, expected: MIN_SALT_SIZE };
+		assert!(matches!(result, Err(TightBeamError::InvalidSaltLength(found)) if found == lengths));
 	}
 
+	/// A salt of `0x01` octets over `02 03` and a salt one `0x02` octet longer
+	/// over `03` share one raw concatenation, and the length framing keeps
+	/// their commitments apart.
 	#[test]
-	fn salt_framing_prevents_prefix_collision() -> Result<()> {
-		// Raw concatenation collides into one preimage, and length framing
-		// must not.
-		let split_salt = CommitmentSalt::parse([1u8; MIN_SALT_SIZE])?.commit::<Sha3_256>([2, 3])?;
+	fn salt_framing_prevents_prefix_collision() -> TestResult {
 		let mut longer_salt = [1u8; MIN_SALT_SIZE + 1];
 		longer_salt[MIN_SALT_SIZE] = 2;
 
+		let split_salt = CommitmentSalt::parse([1u8; MIN_SALT_SIZE])?.commit::<Sha3_256>([2, 3])?;
 		let split_data = CommitmentSalt::parse(longer_salt)?.commit::<Sha3_256>([3])?;
 		assert_ne!(split_salt.digest.as_bytes(), split_data.digest.as_bytes());
 		Ok(())
 	}
 
-	#[test]
-	fn opening_verification() -> Result<()> {
-		// (commit_value, commit_salt, open_value, open_salt, expected)
-		let cases = [
-			(9u8, [3u8; 32], 9u8, [3u8; 32], true),
-			(9, [3u8; 32], 9, [4u8; 32], false),
-			(1, [5u8; 32], 2, [5u8; 32], false),
-		];
+	// An opening verifies against the commitment of value 9 under a salt of
+	// `0x03` octets when it opens that value under that salt, and an opening
+	// of another value or another salt fails to verify against it.
+	crate::tb_cases! {
+		fn an_opening_verifies_for_its_own_input((value, salt, verifies): (u8, [u8; 32], bool)) -> TestResult {
+			let (commitment, _) = commit(9, &[3; 32]);
+			let (_, opening) = commit(value, &salt);
 
-		for (commit_value, commit_salt, open_value, open_salt, expected) in cases {
-			let (commitment, _) = commit(commit_value, &commit_salt)?;
-			let (_, opening) = commit(open_value, &open_salt)?;
-			assert_eq!(opening.verify::<Sha3_256>(&commitment)?, expected);
+			let verified = opening.verify::<Sha3_256>(&commitment)?;
+			assert_eq!(verified, verifies);
+			Ok(())
 		}
-		Ok(())
+		cases {
+			the_same_input => (9, [3; 32], true),
+			another_salt => (9, [4; 32], false),
+			another_value => (1, [3; 32], false),
+		}
 	}
 }

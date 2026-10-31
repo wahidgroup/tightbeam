@@ -109,50 +109,47 @@ pub struct PrekeyInitialMessage {
 mod tests {
 	use super::*;
 	use crate::der::asn1::{BitString, ObjectIdentifier};
-	use crate::der::{Decode, Encode};
 	use crate::spki::AlgorithmIdentifierOwned;
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::TestResult;
 
+	/// A minimal SPKI: the EC public key algorithm over a three-octet point.
 	fn create_test_spki() -> SubjectPublicKeyInfoOwned {
-		// Create a minimal valid SPKI for testing
+		let point = BitString::from_bytes(&[0x04, 0x01, 0x02]);
+		let point = point.expect("fixed point bytes form a valid BitString");
+
 		SubjectPublicKeyInfoOwned {
 			algorithm: AlgorithmIdentifierOwned {
 				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"),
 				parameters: None,
 			},
-			subject_public_key: BitString::from_bytes(&[0x04, 0x01, 0x02])
-				.expect("fixed point bytes form a valid BitString"),
+			subject_public_key: point,
 		}
 	}
 
-	#[test]
-	fn test_prekey_identifiers_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
-		let ids = PrekeyIdentifiers { signed_prekey_id: 42, onetime_prekey_id: Some(123), pq_prekey_id: Some(999) };
-
-		let encoded = ids.to_der()?;
-		let decoded = PrekeyIdentifiers::from_der(&encoded)?;
-		assert_eq!(ids.signed_prekey_id, decoded.signed_prekey_id);
-		assert_eq!(ids.onetime_prekey_id, decoded.onetime_prekey_id);
-		assert_eq!(ids.pq_prekey_id, decoded.pq_prekey_id);
-		Ok(())
+	// Prekey identifiers decode from their DER into the fields they were
+	// encoded from.
+	crate::tb_cases! {
+		fn prekey_identifiers_round_trip_through_der((onetime, pq): (Option<u32>, Option<u32>)) {
+			let ids = PrekeyIdentifiers { signed_prekey_id: 42, onetime_prekey_id: onetime, pq_prekey_id: pq };
+			let decoded = der_round_trip(&ids);
+			assert_eq!(decoded, ids);
+		}
+		cases {
+			with_all_three => (Some(123), Some(999)),
+			/// The post-quantum identifier decodes into its own field when
+			/// the one-time identifier is absent.
+			with_pq_alone => (None, Some(999)),
+			/// The one-time identifier decodes into its own field when the
+			/// post-quantum identifier is absent.
+			with_onetime_alone => (Some(999), None),
+		}
 	}
 
-	/// Each optional identifier decodes into its own field when the other is
-	/// absent.
+	/// A prekey bundle of its mandatory fields alone decodes from its DER into
+	/// the bundle it was encoded from.
 	#[test]
-	fn a_lone_optional_identifier_decodes_into_its_own_field() -> Result<(), Box<dyn std::error::Error>> {
-		let pq_alone = PrekeyIdentifiers { signed_prekey_id: 42, onetime_prekey_id: None, pq_prekey_id: Some(999) };
-		let onetime_alone = PrekeyIdentifiers { pq_prekey_id: None, onetime_prekey_id: Some(999), ..pq_alone };
-		let pq_encoded = pq_alone.to_der()?;
-		let onetime_encoded = onetime_alone.to_der()?;
-
-		let pq_decoded = PrekeyIdentifiers::from_der(&pq_encoded)?;
-		let onetime_decoded = PrekeyIdentifiers::from_der(&onetime_encoded)?;
-		assert_eq!((pq_decoded, onetime_decoded), (pq_alone, onetime_alone));
-		Ok(())
-	}
-
-	#[test]
-	fn test_prekey_bundle_minimal() -> Result<(), Box<dyn std::error::Error>> {
+	fn a_minimal_prekey_bundle_round_trips_through_der() -> TestResult {
 		let bundle = PrekeyBundle {
 			identity_key: create_test_spki(),
 			signed_prekey: create_test_spki(),
@@ -162,8 +159,7 @@ mod tests {
 			prekey_ids: PrekeyIdentifiers { signed_prekey_id: 1, onetime_prekey_id: None, pq_prekey_id: None },
 		};
 
-		let encoded = bundle.to_der()?;
-		let decoded = PrekeyBundle::from_der(&encoded)?;
+		let decoded = der_round_trip(&bundle);
 		assert_eq!(decoded, bundle);
 		Ok(())
 	}

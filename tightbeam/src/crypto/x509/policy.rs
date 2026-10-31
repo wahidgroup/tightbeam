@@ -666,6 +666,19 @@ mod tests {
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::testing::TestCertificate;
 
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	use crate::crypto::x509::policy::DirectTrustValidator;
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	use crate::crypto::x509::Certificate;
+
+	/// A direct-trust validator that holds each of `anchors` as a trust
+	/// anchor.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	fn anchored(anchors: impl IntoIterator<Item = Certificate>) -> DirectTrustValidator {
+		let validator = DirectTrustValidator::default().with_trust_chain(anchors);
+		validator.expect("a test anchor encodes")
+	}
+
 	/// The expiry validator refuses a certificate past its validity period.
 	#[test]
 	fn the_expiry_validator_refuses_an_expired_certificate() {
@@ -678,43 +691,35 @@ mod tests {
 	/// certificate whose period the host clock reads as current.
 	#[cfg(all(host_clock, feature = "secp256k1", feature = "signature", feature = "x509"))]
 	mod clock {
-		use crate::crypto::x509::error::CertificateValidationError;
-		use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator, ExpiryValidator};
-		use crate::crypto::x509::Certificate;
-		use crate::testing::{TestCertificate, TestKey};
+		use super::*;
 
-		/// The fixed test certificate, current on the host clock.
-		fn current() -> Certificate {
-			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
-		}
-
-		#[test]
-		fn the_expiry_validator_judges_validity_on_its_own_clock() {
-			let validator = ExpiryValidator::default().with_clock(TestCertificate::clock_past_validity());
-
-			let refused = validator.evaluate(&current());
-			assert!(matches!(refused, Err(CertificateValidationError::Expired)));
-		}
-
-		#[test]
-		fn the_direct_trust_validator_judges_validity_on_its_own_clock() -> Result<(), CertificateValidationError> {
-			let validator = DirectTrustValidator::default().with_trust_chain([current()])?;
-			let validator = validator.with_clock(TestCertificate::clock_past_validity());
-
-			let refused = validator.evaluate(&current());
-			assert!(matches!(refused, Err(CertificateValidationError::Expired)));
-			Ok(())
+		// Each row names the validator that holds the clock, and the fixed test
+		// certificate is the one whose period the host clock reads as current.
+		crate::tb_cases! {
+			fn the_clock_of(validator: Box<dyn CertificateValidation>) {
+				let refused = validator.evaluate(&TestCertificate::insecure_fixed());
+				assert!(matches!(refused, Err(CertificateValidationError::Expired)));
+			}
+			cases {
+				an_expiry_validator_judges_validity => Box::new(
+					ExpiryValidator::default().with_clock(TestCertificate::clock_past_validity()),
+				),
+				a_direct_trust_validator_judges_validity => Box::new(
+					anchored([TestCertificate::insecure_fixed()]).with_clock(TestCertificate::clock_past_validity()),
+				),
+			}
 		}
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	mod fingerprint_lists {
 		use crate::crypto::hash::{Sha3_256, Sha3_512};
-		use crate::crypto::x509::error::CertificateValidationError;
-		use crate::crypto::x509::policy::{CertificateValidation, FingerprintDenylist, FingerprintPinning};
+		use crate::crypto::x509::policy::{FingerprintDenylist, FingerprintPinning};
 		use crate::crypto::x509::utils::Fingerprint;
 		use crate::error::ReceivedExpectedError;
-		use crate::testing::fixtures::{TestCertificate, TestKey};
+		use crate::testing::{TestKey, TestResult};
+
+		use super::*;
 
 		/// The fingerprint reader refuses a denylist entry one octet short of
 		/// its digest's output, before any denylist holds it.
@@ -728,8 +733,8 @@ mod tests {
 		/// A denylist under SHA3-512 refuses a certificate by its 64-octet
 		/// fingerprint.
 		#[test]
-		fn a_sha3_512_denylist_refuses_the_certificate_it_lists() -> Result<(), CertificateValidationError> {
-			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		fn a_sha3_512_denylist_refuses_the_certificate_it_lists() -> TestResult {
+			let certificate = TestCertificate::insecure_fixed();
 			let denied = Fingerprint::<Sha3_512>::from_certificate(&certificate)?;
 
 			let refused = FingerprintDenylist::new([denied]).evaluate(&certificate);
@@ -740,9 +745,8 @@ mod tests {
 		/// A pin under SHA3-512 refuses a certificate whose 64-octet
 		/// fingerprint it does not hold.
 		#[test]
-		fn a_sha3_512_pin_refuses_a_certificate_it_does_not_pin() -> Result<(), CertificateValidationError> {
-			let pinned = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-			let pin = Fingerprint::<Sha3_512>::from_certificate(&pinned)?;
+		fn a_sha3_512_pin_refuses_a_certificate_it_does_not_pin() -> TestResult {
+			let pin = Fingerprint::<Sha3_512>::from_certificate(&TestCertificate::insecure_fixed())?;
 			let other = TestCertificate::with_cn_and_uri_sans(&TestKey::insecure_fixed_signing(), "Other", &[]);
 
 			let refused = FingerprintPinning::new([pin]).evaluate(&other);
@@ -751,24 +755,28 @@ mod tests {
 		}
 	}
 
-	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	#[cfg(all(
+		feature = "std",
+		feature = "aead",
+		feature = "signature",
+		feature = "kdf",
+		feature = "ecdh"
+	))]
 	mod chain {
-		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::policy::{CertificateValidation, ChainValidator, ExpiryValidator};
-		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-		use crate::crypto::x509::KeyCurves;
-		use crate::testing::fixtures::{TestCertificate, TestCertificateChain};
+		use crate::crypto::x509::policy::ChainValidator;
+		use crate::testing::fixtures::{TestCertificateChain, TestStore};
+		use crate::testing::TestResult;
+
+		use super::*;
 
 		/// A chain that holds a store of the root alone admits a leaf beside
 		/// the intermediate it presents, so the chain hands each validator the
 		/// presented issuers.
 		#[test]
-		fn a_chained_store_admits_a_client_beside_its_presented_issuers() -> Result<(), Box<dyn core::error::Error>> {
+		fn a_chained_store_admits_a_client_beside_its_presented_issuers() -> TestResult {
 			let TestCertificateChain { root, intermediate, leaf, .. } = TestCertificate::insecure_fixed_chain()?;
-			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-			let store = builder.with_certificate(root)?.build();
+			let store = TestStore::holding([root]);
 			let chain = ChainValidator::default().add(ExpiryValidator::default()).add(store);
-
 			chain.evaluate_presented(&[intermediate], &leaf)?;
 			Ok(())
 		}
@@ -776,252 +784,214 @@ mod tests {
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	mod public_key_pinning {
-		use crate::crypto::x509::error::CertificateValidationError;
-		use crate::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
+		use crate::crypto::x509::policy::PublicKeyPinning;
 		use crate::crypto::x509::{Certificate, KeyListError};
-		use crate::der::Encode;
 		use crate::oids::CURVE_NIST_P256;
-		use crate::testing::fixtures::{TestCertificate, TestKey};
+		use crate::testing::TestResult;
 
-		/// The certificate of the fixed test key, whose point is in the
-		/// uncompressed form.
-		fn uncompressed() -> Certificate {
-			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		use super::*;
+
+		/// A pinning of the key of each of `pinned`, each pin the DER of the
+		/// SubjectPublicKeyInfo of its certificate.
+		fn pinning(pinned: impl IntoIterator<Item = Certificate>) -> PublicKeyPinning {
+			let pins = pinned.into_iter().map(|certificate| TestCertificate::spki_der(&certificate));
+			PublicKeyPinning::new(pins).expect("a test pin is a SubjectPublicKeyInfo")
 		}
 
-		/// The pin of the key of `certificate`: the DER of its
-		/// SubjectPublicKeyInfo.
-		fn pin_of(certificate: &Certificate) -> Vec<u8> {
-			let spki = &certificate.tbs_certificate.subject_public_key_info;
-			spki.to_der().expect("a test SubjectPublicKeyInfo encodes")
+		// A pinning admits a key that one of its pins names, in either SEC 1
+		// form of its point.
+		crate::tb_cases! {
+			fn a_pinning_admits((pinned, presented): (Vec<Certificate>, Certificate)) -> TestResult {
+				let validator = pinning(pinned);
+
+				validator.evaluate(&presented)?;
+				Ok(())
+			}
+			cases {
+				/// A pin of the compressed point admits the certificate of that
+				/// point in the uncompressed form.
+				the_uncompressed_key_by_its_compressed_pin => (
+					vec![TestCertificate::with_compressed_key(TestCertificate::insecure_fixed())],
+					TestCertificate::insecure_fixed(),
+				),
+				/// A pinning admits a key that any one of its pins names, so a
+				/// second pin of the key admits it after a first pin of another
+				/// key.
+				a_key_by_its_second_pin => (
+					vec![TestCertificate::insecure_fixed_negation(), TestCertificate::insecure_fixed()],
+					TestCertificate::insecure_fixed(),
+				),
+			}
 		}
 
-		/// `certificate` with its point read under P-256, the bits of its
-		/// secp256k1 key under another named curve.
-		fn on_p256(certificate: Certificate) -> Certificate {
-			let spki = &certificate.tbs_certificate.subject_public_key_info;
-			let point = spki.subject_public_key.raw_bytes().to_vec();
-			TestCertificate::with_curve_point(certificate, CURVE_NIST_P256, &point)
-		}
-
-		/// A pin of the compressed point admits the certificate of that point
-		/// in the uncompressed form.
-		#[test]
-		fn a_compressed_pin_admits_the_uncompressed_key() -> Result<(), Box<dyn core::error::Error>> {
-			let compressed = TestCertificate::with_compressed_key(uncompressed());
-			let pinning = PublicKeyPinning::new([pin_of(&compressed)])?;
-
-			pinning.evaluate(&uncompressed())?;
-			Ok(())
-		}
-
-		/// A pin of the negated point names another key, so it refuses the
-		/// certificate.
-		#[test]
-		fn a_pin_of_the_negated_point_refuses_the_key() -> Result<(), KeyListError> {
-			let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
-			let pinning = PublicKeyPinning::new([pin_of(&TestCertificate::self_signed(&negation))])?;
-
-			let refused = pinning.evaluate(&uncompressed());
-			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
-			Ok(())
-		}
-
-		/// A pinning admits a key that any one of its pins names, so a second
-		/// pin of the key admits it after a first pin of another key.
-		#[test]
-		fn the_second_pin_admits_its_key() -> Result<(), Box<dyn core::error::Error>> {
-			let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
-			let other = pin_of(&TestCertificate::self_signed(&negation));
-			let pinning = PublicKeyPinning::new([other, pin_of(&uncompressed())])?;
-
-			pinning.evaluate(&uncompressed())?;
-			Ok(())
-		}
-
-		/// An encoding of the x-coordinate and the y parity of the pinned key
-		/// that is no point of its curve names another key, so the pin refuses
-		/// it (SEC 1 v2.0 §2.3.4).
-		#[test]
-		fn a_pin_refuses_an_off_curve_alias_of_its_key() -> Result<(), KeyListError> {
-			let pinning = PublicKeyPinning::new([pin_of(&uncompressed())])?;
-			let alias = TestCertificate::with_off_curve_key(uncompressed());
-
-			let refused = pinning.evaluate(&alias);
-			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
-			Ok(())
-		}
-
-		/// A pin names its key with its curve, so a secp256k1 pin refuses a
-		/// P-256 certificate that holds the same uncompressed point bits
-		/// (RFC 5280 §4.1.2.7).
-		#[test]
-		fn a_secp256k1_pin_refuses_the_same_bits_on_p256() -> Result<(), KeyListError> {
-			let pinning = PublicKeyPinning::new([pin_of(&uncompressed())])?;
-
-			let refused = pinning.evaluate(&on_p256(uncompressed()));
-			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
-			Ok(())
-		}
-
-		/// The curve separates the two keys in the compressed form too.
-		#[test]
-		fn a_secp256k1_pin_refuses_the_same_compressed_bits_on_p256() -> Result<(), KeyListError> {
-			let compressed = TestCertificate::with_compressed_key(uncompressed());
-			let pinning = PublicKeyPinning::new([pin_of(&compressed)])?;
-
-			let refused = pinning.evaluate(&on_p256(compressed));
-			assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
-			Ok(())
+		// A pinning refuses a key that its pin names with another point or
+		// another curve.
+		crate::tb_cases! {
+			fn a_pinning_refuses((pinned, presented): (Certificate, Certificate)) {
+				let validator = pinning([pinned]);
+				let refused = validator.evaluate(&presented);
+				assert!(matches!(refused, Err(CertificateValidationError::PublicKeyNotPinned)));
+			}
+			cases {
+				/// A pin of the negated point names another key, so it refuses
+				/// the certificate.
+				a_key_by_the_pin_of_its_negation => (
+					TestCertificate::insecure_fixed_negation(),
+					TestCertificate::insecure_fixed(),
+				),
+				/// An encoding of the x-coordinate and the y parity of the
+				/// pinned key that is no point of its curve names another key,
+				/// so the pin refuses it (SEC 1 v2.0 §2.3.4).
+				an_off_curve_alias_of_its_key => (
+					TestCertificate::insecure_fixed(),
+					TestCertificate::with_off_curve_key(TestCertificate::insecure_fixed()),
+				),
+				/// A pin names its key with its curve, so a secp256k1 pin
+				/// refuses a P-256 certificate that holds the same uncompressed
+				/// point bits (RFC 5280 §4.1.2.7).
+				the_same_bits_on_p256 => (
+					TestCertificate::insecure_fixed(),
+					TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), CURVE_NIST_P256),
+				),
+				/// The curve separates the two keys in the compressed form too.
+				the_same_compressed_bits_on_p256 => (
+					TestCertificate::with_compressed_key(TestCertificate::insecure_fixed()),
+					TestCertificate::with_named_curve(
+						TestCertificate::with_compressed_key(TestCertificate::insecure_fixed()),
+						CURVE_NIST_P256,
+					),
+				),
+			}
 		}
 
 		/// A pin that is no SubjectPublicKeyInfo fails the construction, and
 		/// the error names its position.
 		#[test]
 		fn a_malformed_pin_fails_at_construction_with_its_index() {
-			let refused = PublicKeyPinning::new([pin_of(&uncompressed()), b"no key".to_vec()]);
+			let pins = [
+				TestCertificate::spki_der(&TestCertificate::insecure_fixed()),
+				b"no key".to_vec(),
+			];
+
+			let refused = PublicKeyPinning::new(pins);
 			assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 1 }));
 		}
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
 	mod direct_trust {
-		use k256::ecdsa::SigningKey;
-
 		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::error::CertificateValidationError;
-		use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator, SignatureVerification};
-		use crate::crypto::x509::Certificate;
-		use crate::oids::SIGNER_ECDSA_WITH_SHA256;
+		use crate::crypto::x509::error::CertificateValidationError::{
+			DuplicateExtension, UnprocessedCriticalExtension,
+		};
+		use crate::crypto::x509::fixtures::Refusal;
+		use crate::crypto::x509::policy::SignatureVerification;
+		use crate::der::asn1::ObjectIdentifier;
+		use crate::der::oid::db::rfc5280::ID_CE_NAME_CONSTRAINTS;
+		use crate::oids::{SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
 		use crate::spki::EncodePublicKey;
-		use crate::testing::fixtures::{TestCertificate, TestKey};
+		use crate::testing::{TestKey, TestResult};
 
-		fn test_cert() -> Certificate {
-			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		use super::*;
+
+		/// The fixed test certificate with `outer` as its `signatureAlgorithm`
+		/// and `inner` as the `signature` field of its `tbsCertificate`.
+		fn with_signature_oids(outer: ObjectIdentifier, inner: ObjectIdentifier) -> Certificate {
+			let mut certificate = TestCertificate::insecure_fixed();
+			certificate.signature_algorithm.oid = outer;
+			certificate.tbs_certificate.signature.oid = inner;
+			certificate
 		}
 
-		/// Run the default [`Secp256k1Policy`] over `cert`, with the issuer key
-		/// that matches `signing_key`.
-		fn verify(signing_key: &SigningKey, cert: &Certificate) -> Result<(), CertificateValidationError> {
-			let issuer_pub = signing_key.verifying_key().to_public_key_der()?;
-			let policy = Secp256k1Policy::default();
-			DirectTrustValidator::default().verify_with_policy(cert, 1_000, issuer_pub.as_bytes(), &policy)
-		}
-
+		/// The validator admits a certificate it holds as a trust anchor.
 		#[test]
-		fn accepts_configured_anchor() -> Result<(), CertificateValidationError> {
-			let cert = test_cert();
-			let trust_chain = vec![cert.clone()];
-			let validator = DirectTrustValidator::default().with_trust_chain(trust_chain)?;
-			assert!(validator.evaluate(&cert).is_ok());
+		fn evaluate_admits_a_configured_anchor() -> TestResult {
+			let validator = anchored([TestCertificate::insecure_fixed()]);
+			validator.evaluate(&TestCertificate::insecure_fixed())?;
 			Ok(())
 		}
 
-		#[test]
-		fn rejects_non_anchor() -> Result<(), Box<dyn core::error::Error>> {
-			let validator = DirectTrustValidator::default().with_trust_chain(vec![test_cert()])?;
-			let other = TestCertificate::self_signed(&SigningKey::from_bytes(&[7u8; 32].into())?);
-			assert!(matches!(
-				validator.evaluate(&other),
-				Err(CertificateValidationError::CertificateNotTrusted)
-			));
-			Ok(())
+		// The validator admits a configured trust anchor alone.
+		crate::tb_cases! {
+			fn evaluate_refuses((validator, certificate): (DirectTrustValidator, Certificate)) {
+				let refused = validator.evaluate(&certificate);
+				assert!(matches!(refused, Err(CertificateValidationError::CertificateNotTrusted)));
+			}
+			cases {
+				a_certificate_that_is_no_anchor => (
+					anchored([TestCertificate::insecure_fixed()]),
+					TestCertificate::self_signed(&TestKey::fixed(0x07)),
+				),
+				/// A validator that `Default` builds holds no anchor and must
+				/// fail closed. If it admitted every in-date certificate, a
+				/// forgotten `with_trust_chain` would become a silent
+				/// authentication bypass (CWE-1188). `ExpiryValidator` is the
+				/// expiry-only check.
+				every_certificate_with_no_anchor => (
+					DirectTrustValidator::default(),
+					TestCertificate::insecure_fixed(),
+				),
+			}
 		}
 
-		/// A validator that `Default` builds holds no anchor and must fail
-		/// closed. If it admitted every in-date certificate, a forgotten
-		/// `with_trust_chain` would become a silent authentication bypass
-		/// (CWE-1188). `ExpiryValidator` is the expiry-only check.
-		#[test]
-		fn without_anchor_fails_closed() {
-			assert!(matches!(
-				DirectTrustValidator::default().evaluate(&test_cert()),
-				Err(CertificateValidationError::CertificateNotTrusted)
-			));
+		// The validator refuses an anchor that breaks an extension rule, so the
+		// anchor match does not stand in for the extension rules (RFC 5280
+		// §4.2). Each row builds its anchor anew for the validator and for the
+		// evaluation.
+		crate::tb_cases! {
+			fn evaluate_refuses_an_anchor((anchor, refusal): (fn() -> Certificate, Refusal)) {
+				let validator = anchored([anchor()]);
+				let refused = validator.evaluate(&anchor());
+				assert!(matches!(refused, Err(ref error) if refusal(error)));
+			}
+			cases {
+				that_repeats_an_extension => (
+					|| TestCertificate::with_repeated_extension(TestCertificate::insecure_fixed(), "2.5.29.30"),
+					|e| matches!(e, DuplicateExtension(oid) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+				with_an_unknown_critical_extension => (
+					|| TestCertificate::with_unknown_critical_extension(TestCertificate::insecure_fixed()),
+					|e| matches!(e, UnprocessedCriticalExtension(oid) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+			}
 		}
 
-		#[test]
-		fn rejects_algorithm_mismatch() {
-			let key = TestKey::insecure_fixed_signing();
-			let mut cert = TestCertificate::self_signed(&key);
-			// signatureAlgorithm and tbsCertificate.signature disagree, which
-			// RFC 5280 §4.1.1.2 forbids.
-			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
-			assert!(matches!(
-				verify(&key, &cert),
-				Err(CertificateValidationError::AlgorithmMismatch)
-			));
-		}
+		// The signature check under the issuer key refuses a certificate whose
+		// algorithm identifiers disagree or name an algorithm the policy
+		// refuses, and one that breaks an extension rule (RFC 5280 §4.1.1.2,
+		// §4.2).
+		crate::tb_cases! {
+			fn verify_refuses((certificate, refusal): (Certificate, Refusal)) -> TestResult {
+				let issuer = TestKey::insecure_fixed_signing().verifying_key().to_public_key_der()?;
+				let validator = DirectTrustValidator::default();
+				let policy = Secp256k1Policy::default();
 
-		#[test]
-		fn rejects_foreign_algorithm() {
-			let key = TestKey::insecure_fixed_signing();
-			let mut cert = TestCertificate::self_signed(&key);
-			// The identifiers agree on an algorithm that the default policy
-			// refuses.
-			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
-			cert.tbs_certificate.signature.oid = SIGNER_ECDSA_WITH_SHA256;
-			assert!(matches!(
-				verify(&key, &cert),
-				Err(CertificateValidationError::UnsupportedAlgorithm(_))
-			));
-		}
-
-		/// [`test_cert`] with the extension `oid` twice.
-		fn with_repeated(oid: &str) -> Certificate {
-			let extension = TestCertificate::opaque_extension(oid, false);
-			let cert = TestCertificate::with_extension(test_cert(), extension.clone());
-			TestCertificate::with_extension(cert, extension)
-		}
-
-		/// [`test_cert`] with `nameConstraints`, which the crate does not
-		/// process, as a critical extension.
-		fn with_unknown_critical() -> Certificate {
-			let extension = TestCertificate::opaque_extension("2.5.29.30", true);
-			TestCertificate::with_extension(test_cert(), extension)
-		}
-
-		/// The validator refuses an anchor that repeats an extension, so the
-		/// anchor match does not stand in for the extension rules
-		/// (RFC 5280 §4.2).
-		#[test]
-		fn evaluate_refuses_an_anchor_that_repeats_an_extension() -> Result<(), CertificateValidationError> {
-			let cert = with_repeated("2.5.29.30");
-			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()])?;
-
-			let refused = validator.evaluate(&cert);
-			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-			Ok(())
-		}
-
-		#[test]
-		fn evaluate_refuses_an_anchor_with_an_unknown_critical_extension() -> Result<(), CertificateValidationError> {
-			let cert = with_unknown_critical();
-			let validator = DirectTrustValidator::default().with_trust_chain([cert.clone()])?;
-
-			let refused = validator.evaluate(&cert);
-			assert!(matches!(
-				refused,
-				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-			));
-			Ok(())
-		}
-
-		#[test]
-		fn verify_refuses_a_certificate_that_repeats_an_extension() {
-			let key = TestKey::insecure_fixed_signing();
-			let refused = verify(&key, &with_repeated("2.5.29.30"));
-			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-		}
-
-		#[test]
-		fn verify_refuses_a_certificate_with_an_unknown_critical_extension() {
-			let key = TestKey::insecure_fixed_signing();
-			let refused = verify(&key, &with_unknown_critical());
-			assert!(matches!(
-				refused,
-				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-			));
+				let refused = validator.verify_with_policy(&certificate, 1_000, issuer.as_bytes(), &policy);
+				assert!(matches!(refused, Err(ref error) if refusal(error)));
+				Ok(())
+			}
+			cases {
+				/// `signatureAlgorithm` and `tbsCertificate.signature`
+				/// disagree, which RFC 5280 §4.1.1.2 forbids.
+				a_certificate_whose_algorithm_identifiers_disagree => (
+					with_signature_oids(SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256),
+					|e| matches!(e, CertificateValidationError::AlgorithmMismatch),
+				),
+				/// The identifiers agree on an algorithm that the default
+				/// policy refuses.
+				a_certificate_of_an_algorithm_the_policy_refuses => (
+					with_signature_oids(SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA256),
+					|e| matches!(e, CertificateValidationError::UnsupportedAlgorithm(_)),
+				),
+				a_certificate_that_repeats_an_extension => (
+					TestCertificate::with_repeated_extension(TestCertificate::insecure_fixed(), "2.5.29.30"),
+					|e| matches!(e, DuplicateExtension(oid) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+				a_certificate_with_an_unknown_critical_extension => (
+					TestCertificate::with_unknown_critical_extension(TestCertificate::insecure_fixed()),
+					|e| matches!(e, UnprocessedCriticalExtension(oid) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+			}
 		}
 	}
 }

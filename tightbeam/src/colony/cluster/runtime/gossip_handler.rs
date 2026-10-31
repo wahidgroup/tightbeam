@@ -364,61 +364,51 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 #[cfg(all(test, feature = "instrument"))]
 mod tests {
 	use super::*;
-	use crate::colony::cluster::runtime::bounds::fixtures::self_peering_config;
+	use crate::colony::cluster::runtime::bounds::fixtures::Audited;
 	use crate::colony::protocol::ClusterRequest;
 	use crate::colony::urn::ColonyNamespace;
 	use crate::instrumentation::events::{CLUSTER_GOSSIP_REFUSED, CLUSTER_PEER_ADVERTISE_REFUSED};
 	use crate::policy::SessionContext;
-	use crate::trace::TraceCollector;
+	use crate::tb_cases;
+	use crate::testing::fixtures::TestTrace;
+	use crate::testing::TestResult;
 	use crate::transport::TokioListener;
 
 	/// The gateway socket the test advertisement claims, which the default
 	/// dial policy admits.
 	const AD_GATEWAY: &[u8] = b"192.0.2.7:9000";
 
-	/// The request context of a gateway under [`self_peering_config`] that
-	/// records on `trace`. It binds no listener, so a test hands each frame to
-	/// a handler.
-	fn self_peering_gateway(trace: &Arc<TraceCollector>) -> GatewayRuntimeCtx<TokioListener> {
-		GatewayRuntimeCtx::for_test(self_peering_config(), trace, trace)
-	}
-
 	/// The label of each [`CLUSTER_PEER_ADVERTISE_REFUSED`] that `gateway`
 	/// records as it answers one advertisement that it signed itself.
 	async fn refused_labels(gateway: &GatewayRuntimeCtx<TokioListener>) -> Result<Vec<Option<String>>, TightBeamError> {
-		let types = vec![ColonyNamespace::default().servlet("ping")?];
+		let types = vec![ColonyNamespace::servlet_fixture("ping")];
 		let signed = gateway.config.mint_ad_frame(AD_GATEWAY, types.clone()).await?;
 		let advertisement = PeerAdvertisement { gateway_addr: AD_GATEWAY.to_vec(), advertised_types: types };
 		let audit = gateway.audit(&SessionContext::default());
 		gateway.handle_peer_ad(signed.frame().clone(), advertisement, &audit).await?;
 
-		let recorded = gateway.trace.drain_events().into_iter();
-		let refused = recorded.filter(|record| record.urn == CLUSTER_PEER_ADVERTISE_REFUSED);
-		Ok(refused.map(|record| record.label.as_deref().map(String::from)).collect())
+		Ok(TestTrace::labels(&gateway.trace, CLUSTER_PEER_ADVERTISE_REFUSED))
 	}
 
-	// A peer table that cannot record the advertiser's hint is this gateway's
+	/// A step that poisons one store of a gateway.
+	type Poison = fn(&GatewayRuntimeCtx<TokioListener>);
+
+	// A peer table that cannot record the advertiser's hint, or a route
+	// registry that cannot install the advertiser's slate, is this gateway's
 	// own fault, and the refusal names that fault in its record (CWE-778).
-	#[tokio::test]
-	async fn an_advertisement_refused_by_a_poisoned_table_names_the_fault() -> Result<(), TightBeamError> {
-		let gateway = self_peering_gateway(&Arc::new(TraceCollector::default()));
-		gateway.config.peer.table.poison();
+	tb_cases! {
+		async fn an_advertisement_refused_by_a_poisoned_store_names_the_fault(poison: Poison) -> TestResult {
+			let audited = Audited::of(ClusterConfig::self_peering());
+			poison(&audited.gateway);
 
-		let labels = refused_labels(&gateway).await?;
-		assert_eq!(labels, [Some(String::from("Unavailable/lock-poisoned"))]);
-		Ok(())
-	}
-
-	// A route registry that cannot install the advertiser's slate is this
-	// gateway's own fault, and the refusal names that fault in its record.
-	#[tokio::test]
-	async fn an_advertisement_refused_by_a_poisoned_registry_names_the_fault() -> Result<(), TightBeamError> {
-		let gateway = self_peering_gateway(&Arc::new(TraceCollector::default()));
-		gateway.servlet_registry.poison_routes();
-
-		let labels = refused_labels(&gateway).await?;
-		assert_eq!(labels, [Some(String::from("Unavailable/lock-poisoned"))]);
-		Ok(())
+			let labels = refused_labels(&audited.gateway).await?;
+			assert_eq!(labels, [Some(String::from("Unavailable/lock-poisoned"))]);
+			Ok(())
+		}
+		cases {
+			table => |gateway| gateway.config.peer.table.poison(),
+			registry => |gateway| gateway.servlet_registry.poison_routes(),
+		}
 	}
 
 	/// The label of each [`CLUSTER_GOSSIP_REFUSED`] that `gateway` records as
@@ -428,33 +418,24 @@ mod tests {
 		gateway: &GatewayRuntimeCtx<TokioListener>,
 	) -> Result<Vec<Option<String>>, TightBeamError> {
 		let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held: Vec::new() });
-		let builder = FrameBuilder::from(Version::V2)
-			.with_id(b"gossip-reconcile")
-			.with_order(gateway.config.clock.unix().get())
-			.with_message(request);
-
-		let mut frame = gateway.config.witnessed(builder).build()?;
-		frame.sign_with_provider(gateway.config.tls.identity()).await?;
-
+		let frame = gateway.config.self_signed(b"gossip-reconcile", request);
 		let reconciliation = GossipReconciliation { held: Vec::new() };
 		let audit = gateway.audit(&SessionContext::default());
 
 		gateway.handle_reconcile(frame, reconciliation, &audit).await?;
 
-		let recorded = gateway.trace.drain_events().into_iter();
-		let refused = recorded.filter(|record| record.urn == CLUSTER_GOSSIP_REFUSED);
-		Ok(refused.map(|record| record.label.as_deref().map(String::from)).collect())
+		Ok(TestTrace::labels(&gateway.trace, CLUSTER_GOSSIP_REFUSED))
 	}
 
-	// A peer table that cannot draw the peer-exchange sample is this
-	// gateway's own fault, and the refusal of the reconcile round names that
-	// fault in its record (CWE-778).
+	/// A peer table that cannot draw the peer-exchange sample is this
+	/// gateway's own fault, and the refusal of the reconcile round names that
+	/// fault in its record (CWE-778).
 	#[tokio::test]
-	async fn a_reconcile_refused_by_a_poisoned_table_names_the_fault() -> Result<(), TightBeamError> {
-		let gateway = self_peering_gateway(&Arc::new(TraceCollector::default()));
-		gateway.config.peer.table.poison();
+	async fn a_reconcile_refused_by_a_poisoned_table_names_the_fault() -> TestResult {
+		let audited = Audited::of(ClusterConfig::self_peering());
+		audited.gateway.config.peer.table.poison();
 
-		let labels = reconcile_refusal_labels(&gateway).await?;
+		let labels = reconcile_refusal_labels(&audited.gateway).await?;
 		assert_eq!(labels, [Some(String::from("Unavailable/lock-poisoned"))]);
 		Ok(())
 	}

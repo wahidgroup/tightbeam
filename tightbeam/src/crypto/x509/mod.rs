@@ -67,3 +67,31 @@ impl TryFrom<CertificateSpec> for Certificate {
 		}
 	}
 }
+
+/// The verdict columns of the owner-test tables of the certificate checks.
+#[cfg(test)]
+pub(crate) mod fixtures {
+	use crate::der::asn1::ObjectIdentifier;
+
+	use super::error::CertificateValidationError;
+	use super::{Certificate, CertificateUse, PeerCertificate};
+
+	/// The parse of a certificate for one use, in the role of a key purpose.
+	pub(crate) type Parse = fn(Certificate, ObjectIdentifier) -> Result<(), CertificateValidationError>;
+
+	/// The match of the refusal that a row expects, with its payload.
+	pub(crate) type Refusal = fn(&CertificateValidationError) -> bool;
+
+	/// The match of the verdict that a row expects: a pass, or a refusal with
+	/// its payload.
+	pub(crate) type Verdict = fn(&Result<(), CertificateValidationError>) -> bool;
+
+	/// Admit `certificate` for the use `U` in the role of `role`, and drop the
+	/// parsed key.
+	pub(crate) fn parse<U: CertificateUse>(
+		certificate: Certificate,
+		role: ObjectIdentifier,
+	) -> Result<(), CertificateValidationError> {
+		PeerCertificate::<U>::parse(certificate, role).map(drop)
+	}
+}

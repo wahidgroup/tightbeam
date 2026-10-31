@@ -516,16 +516,46 @@ impl ColonyNamespace {
 }
 
 #[cfg(test)]
+impl ColonyNamespace {
+	/// The servlet type `name` in the default namespace.
+	pub(crate) fn servlet_fixture(name: impl AsRef<str>) -> Urn<'static> {
+		let minted = ColonyNamespace::default().servlet(name);
+		minted.expect("a fixture name satisfies the mint grammar")
+	}
+
+	/// The instance of the servlet type `name` at `locator`, in the default
+	/// namespace.
+	pub(crate) fn instance_fixture(name: impl AsRef<str>, locator: impl AsRef<str>) -> Urn<'static> {
+		let minted = ColonyNamespace::servlet_fixture(name).servlet_instance(locator);
+		minted.expect("a fixture locator satisfies the mint grammar")
+	}
+
+	/// The hive at `locator` in the default namespace.
+	pub(crate) fn hive_fixture(locator: impl AsRef<str>) -> Urn<'static> {
+		let minted = ColonyNamespace::default().hive(locator);
+		minted.expect("a fixture locator satisfies the mint grammar")
+	}
+
+	/// The colony `name` in the default namespace.
+	pub(crate) fn colony_fixture(name: impl AsRef<str>) -> Urn<'static> {
+		let minted = ColonyNamespace::default().colony(name);
+		minted.expect("a fixture name satisfies the mint grammar")
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 
+	/// The namespace of the realm `prod-us`.
 	fn prod() -> ColonyNamespace {
-		ColonyNamespace::new("tightbeam", "prod-us").unwrap_or_default()
+		ColonyNamespace::new("tightbeam", "prod-us").expect("the fixture realm is valid")
 	}
 
 	/// A namespace whose realm holds a percent-encoded space.
 	fn encoded() -> ColonyNamespace {
-		ColonyNamespace::new("tightbeam", "prod%20us").unwrap_or_default()
+		ColonyNamespace::new("tightbeam", "prod%20us").expect("the fixture realm is valid")
 	}
 
 	fn servlet(namespace: &ColonyNamespace, name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
@@ -535,16 +565,14 @@ mod tests {
 
 	/// An instance of the servlet type `beam` whose locator is empty.
 	fn empty_instance() -> Urn<'static> {
-		servlet(&prod(), "beam")
-			.servlet_instance("")
-			.expect("a servlet type URN yields an instance URN")
+		instance_at(&servlet(&prod(), "beam"), "")
 	}
 
-	/// An instance locator in this namespace, which names a servlet but is
-	/// not a bare type.
-	fn instance_of(bare: &Urn<'static>) -> Urn<'static> {
-		bare.servlet_instance("10.0.0.5:9100")
-			.expect("a servlet type URN yields an instance URN")
+	/// The instance of `bare` at `locator`, which names a servlet but is not a
+	/// bare type.
+	fn instance_at(bare: &Urn<'static>, locator: &str) -> Urn<'static> {
+		let instance = bare.servlet_instance(locator);
+		instance.expect("a servlet type URN yields an instance URN")
 	}
 
 	/// The same servlet name in another realm.
@@ -553,25 +581,19 @@ mod tests {
 		servlet(&other, "beam")
 	}
 
-	#[test]
-	fn a_bare_servlet_type_yields_its_route_key() {
-		let prod = prod();
-		let bare = servlet(&prod, "beam");
-		let key = prod.servlet_type_key(&bare);
-		assert_eq!(key.map(|key| key.as_bytes().to_vec()), Some(bare.canonical_bytes()));
-	}
+	// A bare servlet type of the namespace mints its canonical form as its
+	// route key, and an instance locator or a foreign realm mints none.
+	crate::tb_cases! {
+		fn only_a_bare_servlet_type_mints_a_route_key((urn, key): (Urn<'static>, Option<&[u8]>)) {
+			let minted = prod().servlet_type_key(&urn);
 
-	#[test]
-	fn an_instance_locator_yields_no_route_key() {
-		let prod = prod();
-		let instance = instance_of(&servlet(&prod, "beam"));
-		assert!(prod.servlet_type_key(&instance).is_none());
-	}
-
-	#[test]
-	fn a_foreign_realm_yields_no_route_key() {
-		let prod = prod();
-		assert!(prod.servlet_type_key(&foreign_servlet()).is_none());
+			assert_eq!(minted.as_ref().map(ServletTypeKey::as_bytes), key);
+		}
+		cases {
+			bare => (servlet(&prod(), "beam"), Some(b"urn:tightbeam:prod-us:servlet:beam".as_slice())),
+			instance_locator => (instance_at(&servlet(&prod(), "beam"), "10.0.0.5:9100"), None),
+			foreign_realm => (foreign_servlet(), None),
+		}
 	}
 
 	fn hive(namespace: &ColonyNamespace, addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
@@ -588,6 +610,8 @@ mod tests {
 	/// form, and the resource it names.
 	type MintedCase = (ColonyNamespace, Urn<'static>, &'static str, ColonyResource<'static>);
 
+	// Each minted URN displays in its canonical form and validates as the
+	// resource it names.
 	crate::tb_cases! {
 		fn minted_urns_round_trip_through_validate((namespace, urn, display, resource): MintedCase) {
 			assert_eq!(urn.to_string(), display);
@@ -602,7 +626,7 @@ mod tests {
 			),
 			servlet_instance => (
 				prod(),
-				instance_of(&servlet(&prod(), "beam")),
+				instance_at(&servlet(&prod(), "beam"), "10.0.0.5:9100"),
 				"urn:tightbeam:prod-us:servlet:beam/10.0.0.5:9100",
 				ColonyResource::Servlet { name: "beam", instance: Some(NssText::segment("10.0.0.5:9100")) },
 			),
@@ -639,6 +663,8 @@ mod tests {
 		}
 	}
 
+	// The namespace refuses a URN of another authority or realm, and each URN
+	// outside its grammar.
 	crate::tb_cases! {
 		fn foreign_or_malformed_urns_are_refused((urn, error): (Urn<'static>, UrnValidationError)) {
 			assert_eq!(prod().validate(&urn), Err(error));
@@ -670,6 +696,8 @@ mod tests {
 		}
 	}
 
+	// A namespace refuses a realm or an authority outside its grammar at
+	// construction.
 	crate::tb_cases! {
 		fn invalid_namespace_parts_are_refused_at_construction((nid, realm, error): (&str, &str, UrnValidationError)) {
 			assert_eq!(ColonyNamespace::new(nid, realm).err(), Some(error));
@@ -694,7 +722,7 @@ mod tests {
 	// Each case is a URN that RFC 8141 § 3.1 makes URN-equivalent to the
 	// servlet type `be%2Aam` of `prod-us`.
 	crate::tb_cases! {
-		fn equivalent_servlet_types_mint_one_route_key(text: &str) -> Result<(), UrnValidationError> {
+		fn equivalent_servlet_types_mint_one_route_key(text: &str) -> TestResult {
 			let urn: Urn<'static> = text.parse()?;
 			let key = prod().servlet_type_key(&urn).map(|key| key.as_bytes().to_vec());
 			assert_eq!(key, Some(b"urn:tightbeam:prod-us:servlet:be%2Aam".to_vec()));
@@ -711,9 +739,7 @@ mod tests {
 	// Each case is a colony URN that carries an optional component, beside
 	// the component the refusal names.
 	crate::tb_cases! {
-		fn a_colony_urn_with_an_optional_component_is_refused((text, component): (&str, &'static str))
-			-> Result<(), UrnValidationError>
-		{
+		fn a_colony_urn_with_an_optional_component_is_refused((text, component): (&str, &'static str)) -> TestResult {
 			let urn: Urn<'static> = text.parse()?;
 			assert_eq!(prod().validate(&urn), Err(UrnValidationError::ForbiddenFieldPresent(component)));
 			Ok(())
@@ -731,7 +757,7 @@ mod tests {
 	/// A realm compares as the rest of the NSS does, with the hex digits of
 	/// each percent-encoded triplet in any case (RFC 8141 § 3.1).
 	#[test]
-	fn a_realm_compares_the_hex_digits_of_its_triplets_in_any_case() -> Result<(), UrnValidationError> {
+	fn a_realm_compares_the_hex_digits_of_its_triplets_in_any_case() -> TestResult {
 		let namespace = ColonyNamespace::new("tightbeam", "prod%2Cus")?;
 		let urn: Urn<'static> = "urn:tightbeam:prod%2cus:servlet:beam".parse()?;
 		let servlet = ColonyResource::Servlet { name: "beam", instance: None };
@@ -739,11 +765,13 @@ mod tests {
 		Ok(())
 	}
 
-	// Each case is (a URN, its canonical bytes, its type canonical bytes).
+	// A URN's canonical bytes spell its scheme and its NID in lower case, the
+	// hex digits of each triplet in upper case, and no optional component, and
+	// its type canonical bytes spell its bare type the same way.
 	crate::tb_cases! {
-		fn the_canonical_bytes_are_the_normalized_form((text, canonical, type_canonical): (&str, &str, &str))
-			-> Result<(), UrnValidationError>
-		{
+		fn the_canonical_bytes_are_the_normalized_form(
+			(text, canonical, type_canonical): (&str, &str, &str)
+		) -> TestResult {
 			let urn: Urn<'static> = text.parse()?;
 			let written = (urn.canonical_bytes(), urn.type_canonical_bytes());
 			assert_eq!(written, (canonical.as_bytes().to_vec(), type_canonical.as_bytes().to_vec()));
@@ -768,39 +796,36 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn type_canonical_bytes_strips_instance_tail() {
-		let namespace = prod();
-		let servlet_type = servlet(&namespace, "beam");
-		let instance = servlet_type
-			.servlet_instance("10.0.0.5:9100")
-			.expect("a servlet type URN yields an instance URN");
-
-		assert_eq!(instance.type_canonical_bytes(), servlet_type.canonical_bytes());
-		assert_eq!(servlet_type.type_canonical_bytes(), servlet_type.canonical_bytes());
+	// The type canonical bytes of a servlet URN are the canonical bytes of
+	// its bare type, with or without an instance tail.
+	crate::tb_cases! {
+		fn type_canonical_bytes_name_the_bare_type(urn: Urn<'static>) {
+			let written = urn.type_canonical_bytes();
+			assert_eq!(written, b"urn:tightbeam:prod-us:servlet:beam");
+		}
+		cases {
+			of_an_instance => instance_at(&servlet(&prod(), "beam"), "10.0.0.5:9100"),
+			of_a_bare_type => servlet(&prod(), "beam"),
+		}
 	}
 
-	#[test]
-	fn type_prefix_bounds_instance_keys_to_one_type() {
-		let namespace = prod();
-		let beam = servlet(&namespace, "beam");
-		let beam_instance = beam
-			.servlet_instance("10.0.0.5:9100")
-			.expect("a servlet type URN yields an instance URN")
-			.canonical_bytes();
-		let beam2_instance = servlet(&namespace, "beam2")
-			.servlet_instance("10.0.0.5:9200")
-			.expect("a servlet type URN yields an instance URN")
-			.canonical_bytes();
-
-		let prefix = beam.type_prefix_bytes();
-		assert!(beam_instance.starts_with(&prefix));
-		assert!(!beam2_instance.starts_with(&prefix));
+	// The type prefix of `beam` starts the key of each `beam` instance, and
+	// the key of no instance of a type whose name extends `beam`.
+	crate::tb_cases! {
+		fn the_type_prefix_bounds_instance_keys_to_one_type((instance, inside): (Urn<'static>, bool)) {
+			let prefix = servlet(&prod(), "beam").type_prefix_bytes();
+			assert_eq!(instance.canonical_bytes().starts_with(&prefix), inside);
+		}
+		cases {
+			an_instance_of_the_type => (instance_at(&servlet(&prod(), "beam"), "10.0.0.5:9100"), true),
+			an_instance_of_a_longer_name => (instance_at(&servlet(&prod(), "beam2"), "10.0.0.5:9200"), false),
+		}
 	}
 
 	/// The outcome of one mint, and the refusal it must be.
 	type MintCase = (Result<Urn<'static>, UrnValidationError>, UrnValidationError);
 
+	// A mint refuses a name outside the mint grammar.
 	crate::tb_cases! {
 		fn names_outside_the_mint_grammar_are_refused_at_mint((minted, error): MintCase) {
 			assert_eq!(minted.err(), Some(error));

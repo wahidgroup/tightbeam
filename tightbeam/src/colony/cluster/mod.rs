@@ -416,6 +416,26 @@ impl core::fmt::Debug for ClusterTlsConfig {
 	}
 }
 
+#[cfg(test)]
+impl ClusterTlsConfig {
+	/// The TLS material of a gateway that presents the self-signed certificate
+	/// of the fixed test key.
+	pub(crate) fn fixture() -> Self {
+		let key = crate::testing::TestKey::insecure_fixed_signing();
+		ClusterTlsConfig::fixture_of(crate::testing::TestCertificate::insecure_fixed(), key)
+	}
+
+	/// The TLS material of a gateway that presents `certificate` on `key`.
+	pub(crate) fn fixture_of(
+		certificate: crate::x509::Certificate,
+		key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
+	) -> Self {
+		let spec = CertificateSpec::Built(Box::new(certificate));
+		let provider = crate::testing::TestKey::provider(key);
+		ClusterTlsConfig::new(spec, provider).expect("the fixture key proves its certificate")
+	}
+}
+
 /// The peer-federation dial list, the advertise beat and address, and the
 /// policy that admits the dial addresses peers claim.
 ///
@@ -849,6 +869,32 @@ impl core::fmt::Debug for ClusterConfig {
 	}
 }
 
+#[cfg(test)]
+impl ClusterConfig {
+	/// A config with every default, on [`ClusterTlsConfig::fixture`].
+	pub(crate) fn fixture() -> Self {
+		ClusterConfig::new(ClusterTlsConfig::fixture())
+	}
+
+	/// A colony member whose peer trust enrolls its own certificate, so it
+	/// admits a peer advertisement that it signs itself.
+	pub(crate) fn self_peering() -> Self {
+		use crate::crypto::x509::store::CertificateTrust;
+		use crate::testing::fixtures::TestStore;
+		use crate::testing::{TestCertificate, TestKey};
+
+		let key = TestKey::insecure_fixed_signing();
+		let colony = ColonyNamespace::colony_fixture("main");
+		let certificate = TestCertificate::with_uri_sans(&key, &[&colony.to_string()]);
+		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(TestStore::holding([certificate.clone()]));
+		let tls = ClusterTlsConfig::fixture_of(certificate, key).with_peer_trust(peer_trust);
+
+		let mut config = ClusterConfig::new(tls);
+		config.bind_colony_membership();
+		config
+	}
+}
+
 /// The trait a cluster gateway implements.
 pub trait Cluster: Sized + Send + Sync {
 	/// The protocol this gateway serves.
@@ -1008,113 +1054,135 @@ pub trait ClusterHeartbeat: Cluster {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::protocol::{ClusterWorkResponse, ServletInfo};
+	use crate::colony::hive::HiveTlsConfig;
+	use crate::colony::protocol::ServletInfo;
 	use crate::colony::urn::ColonyNamespace;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
-	use crate::crypto::x509::policy::ExpiryValidator;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::KeyCurves;
+	use crate::crypto::x509::store::CertificateTrust;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
-	use crate::policy::TransitStatus;
 	use crate::tb_cases;
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::fixtures::{TestIdentity, TestStore};
+	use crate::testing::{TestCertificate, TestKey, TestResult};
 	use crate::transport::client::ConnectionPool;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::TokioListener;
 
-	fn test_tls_config() -> ClusterTlsConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		ClusterTlsConfig::new(
-			CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
-			Arc::new(Secp256k1KeyProvider::from(key)),
-		)
-		.expect("the test certificate must decode")
+	/// The two configs that install a signing identity: the TLS of a cluster
+	/// gateway and the TLS of a hive control plane.
+	#[derive(Clone, Copy)]
+	enum TlsBackend {
+		Cluster,
+		Hive,
 	}
 
-	/// A signer purpose of an implementor's own, outside the house purposes.
-	const OWN_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.12");
+	impl TlsBackend {
+		/// Installs `identity` under `key_purposes` in the config of this
+		/// backend.
+		fn install(
+			self,
+			identity: SigningIdentity,
+			key_purposes: KeyPurposes,
+		) -> Result<(), CertificateValidationError> {
+			match self {
+				TlsBackend::Cluster => ClusterTlsConfig::from_identity(identity, key_purposes).map(drop),
+				TlsBackend::Hive => {
+					HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, key_purposes).map(drop)
+				}
+			}
+		}
 
-	/// An identity on the fixed test key whose certificate names `purpose` as
-	/// its one key purpose, or carries no `extendedKeyUsage` for `None`.
-	fn identity_naming(purpose: Option<ObjectIdentifier>) -> SigningIdentity {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let certificate = match purpose {
-			Some(purpose) => TestCertificate::with_key_purposes(certificate, [purpose]),
-			None => certificate,
-		};
-
-		let provider = Arc::new(Secp256k1KeyProvider::from(key));
-		SigningIdentity::new(certificate, provider).expect("the fixture key proves its certificate")
+		/// Builds the config of this backend through `new`, from a certificate
+		/// on the fixed test key that names `purpose` alone.
+		fn build_naming(self, purpose: ObjectIdentifier) -> Result<(), TightBeamError> {
+			let key = TestKey::insecure_fixed_signing();
+			let certificate = TestCertificate::with_key_purposes(TestCertificate::self_signed(&key), [purpose]);
+			let spec = CertificateSpec::Built(Box::new(certificate));
+			let provider = TestKey::provider(key);
+			match self {
+				TlsBackend::Cluster => ClusterTlsConfig::new(spec, provider).map(drop),
+				TlsBackend::Hive => HiveTlsConfig::new(spec, provider, PeerAuthentication::Anonymous).map(drop),
+			}
+		}
 	}
 
-	// `from_identity` installs a certificate that names the signer purpose,
-	// any purpose, or none (RFC 5280 §4.2.1.12).
+	/// The house purposes with an implementor's own signer purpose in place of
+	/// the house signer.
+	const OWN_SIGNER_PURPOSES: KeyPurposes = KeyPurposes { signer: TestIdentity::OWN_SIGNER, ..KeyPurposes::HOUSE };
+
+	// `from_identity` installs a certificate that names the signer purpose of
+	// the purposes it installs under, any purpose, or none
+	// (RFC 5280 §4.2.1.12), on each backend.
 	tb_cases! {
-		fn from_identity_admits_an_identity_for_the_signer(
-			purpose: Option<ObjectIdentifier>
-		) -> Result<(), TightBeamError> {
-			ClusterTlsConfig::from_identity(identity_naming(purpose), KeyPurposes::HOUSE)?;
+		fn from_identity_installs_an_identity_that_names_the_signer(
+			(backend, purpose, key_purposes): (TlsBackend, Option<ObjectIdentifier>, KeyPurposes)
+		) -> TestResult {
+			backend.install(TestIdentity::naming(purpose), key_purposes)?;
 
 			Ok(())
 		}
 		cases {
-			an_identity_for_the_signer => Some(KeyPurposes::HOUSE.signer),
-			an_identity_for_any_purpose => Some(ANY_EXTENDED_KEY_USAGE),
-			an_identity_with_no_key_purpose => None,
+			cluster_the_house_signer => (TlsBackend::Cluster, Some(KeyPurposes::HOUSE.signer), KeyPurposes::HOUSE),
+			cluster_any_purpose => (TlsBackend::Cluster, Some(ANY_EXTENDED_KEY_USAGE), KeyPurposes::HOUSE),
+			cluster_no_key_purpose => (TlsBackend::Cluster, None, KeyPurposes::HOUSE),
+			cluster_an_own_signer_under_its_purposes => (
+				TlsBackend::Cluster,
+				Some(TestIdentity::OWN_SIGNER),
+				OWN_SIGNER_PURPOSES,
+			),
+			hive_the_house_signer => (TlsBackend::Hive, Some(KeyPurposes::HOUSE.signer), KeyPurposes::HOUSE),
+			hive_any_purpose => (TlsBackend::Hive, Some(ANY_EXTENDED_KEY_USAGE), KeyPurposes::HOUSE),
+			hive_no_key_purpose => (TlsBackend::Hive, None, KeyPurposes::HOUSE),
+			hive_an_own_signer_under_its_purposes => (
+				TlsBackend::Hive,
+				Some(TestIdentity::OWN_SIGNER),
+				OWN_SIGNER_PURPOSES,
+			),
 		}
 	}
 
-	// `from_identity` refuses a certificate whose key purposes leave the
-	// signer out.
+	// `from_identity` refuses a certificate whose key purposes leave the house
+	// signer out, on each backend.
 	tb_cases! {
-		fn from_identity_refuses_an_identity_outside_the_signer(purpose: ObjectIdentifier) {
-			let installed = ClusterTlsConfig::from_identity(identity_naming(Some(purpose)), KeyPurposes::HOUSE);
-			let excluded = matches!(installed, Err(ExcludedKeyPurpose));
-			assert!(excluded);
+		fn from_identity_refuses_an_identity_outside_the_signer((backend, purpose): (TlsBackend, ObjectIdentifier)) {
+			let installed = backend.install(TestIdentity::naming(purpose), KeyPurposes::HOUSE);
+			assert!(matches!(installed, Err(ExcludedKeyPurpose)));
 		}
 		cases {
-			an_identity_for_servers_alone => KeyPurposes::HOUSE.server,
-			an_identity_for_clients_alone => KeyPurposes::HOUSE.client,
+			cluster_servers_alone => (TlsBackend::Cluster, KeyPurposes::HOUSE.server),
+			cluster_clients_alone => (TlsBackend::Cluster, KeyPurposes::HOUSE.client),
+			cluster_an_own_signer_under_the_house_purposes => (TlsBackend::Cluster, TestIdentity::OWN_SIGNER),
+			hive_servers_alone => (TlsBackend::Hive, KeyPurposes::HOUSE.server),
+			hive_clients_alone => (TlsBackend::Hive, KeyPurposes::HOUSE.client),
+			hive_an_own_signer_under_the_house_purposes => (TlsBackend::Hive, TestIdentity::OWN_SIGNER),
 		}
 	}
 
-	// An identity that names an implementor's own signer purpose alone
-	// installs under the purposes that name it.
-	#[test]
-	fn from_identity_installs_an_own_signer_purpose_under_the_purposes_that_name_it() -> Result<(), TightBeamError> {
-		let key_purposes = KeyPurposes { signer: OWN_SIGNER, ..KeyPurposes::HOUSE };
-		ClusterTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), key_purposes)?;
-		Ok(())
-	}
-
-	// The house purposes refuse an identity that names an implementor's own
-	// signer purpose alone.
-	#[test]
-	fn from_identity_refuses_an_own_signer_purpose_under_the_house_purposes() {
-		let installed = ClusterTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), KeyPurposes::HOUSE);
-		let excluded = matches!(installed, Err(ExcludedKeyPurpose));
-		assert!(excluded);
+	// `new` installs through `from_identity`, so each backend refuses the same
+	// identity in its own error.
+	tb_cases! {
+		fn new_refuses_an_identity_for_servers_alone(backend: TlsBackend) {
+			let refused = backend.build_naming(KeyPurposes::HOUSE.server);
+			assert!(matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose))));
+		}
+		cases {
+			cluster => TlsBackend::Cluster,
+			hive => TlsBackend::Hive,
+		}
 	}
 
 	/// A client purpose of an implementor's own, outside the house purposes.
 	const OWN_CLIENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.13");
 
-	// The outbound pool checks the client purpose at the dial, before any
-	// handshake, so a dial under an own client purpose returns its lease.
+	/// The outbound pool checks the client purpose at the dial, before any
+	/// handshake, so a dial under an own client purpose returns its lease.
 	#[tokio::test]
-	async fn the_outbound_pool_takes_the_configured_key_purposes() -> Result<(), Box<dyn core::error::Error>> {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+	async fn the_outbound_pool_takes_the_configured_key_purposes() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
 		let certificate = TestCertificate::self_signed(&key);
 		let certificate = TestCertificate::with_key_purposes(certificate, [OWN_CLIENT, KeyPurposes::HOUSE.signer]);
-		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let trust = trust.with_certificate(certificate.clone())?;
-		let trust: Arc<dyn CertificateTrust> = Arc::new(trust.build());
-		let identity = SigningIdentity::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+		let trust: Arc<dyn CertificateTrust> = Arc::new(TestStore::holding([certificate.clone()]));
+		let identity = TestIdentity::presenting(certificate, &key);
 		let tls = ClusterTlsConfig::from_identity(identity, KeyPurposes { client: OWN_CLIENT, ..KeyPurposes::HOUSE })?;
 		let pool = tls.outbound(ConnectionPool::<TokioListener>::builder()).with_trust_store(trust);
 		let pool = Arc::new(pool.build());
@@ -1125,65 +1193,30 @@ mod tests {
 		Ok(())
 	}
 
-	// `new` installs through `from_identity`, so it refuses the same identity
-	// in its own error.
-	#[test]
-	fn new_refuses_an_identity_for_servers_alone() -> Result<(), TightBeamError> {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
-		let spec = CertificateSpec::Built(Box::new(certificate));
-
-		let refused = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
-		assert!(excluded);
-		Ok(())
-	}
-
 	// The config keeps the client authentication its operator named, so an
 	// anonymous plane and a mutual plane each come back as named (CWE-1188).
 	tb_cases! {
 		fn a_cluster_config_keeps_the_authentication_it_was_given(
 			(authentication, requires_certificate): (PeerAuthentication, bool)
-		) -> Result<(), ClusterError> {
-			let tls = test_tls_config().with_client_authentication(authentication);
+		) {
+			let tls = ClusterTlsConfig::fixture().with_client_authentication(authentication);
 			let kept = tls.peer_authentication();
 			assert_eq!(kept.requires_certificate(), requires_certificate);
-			Ok(())
 		}
 		cases {
 			anonymous => (PeerAuthentication::Anonymous, false),
-			mutual => (PeerAuthentication::Anonymous.and(Arc::new(ExpiryValidator::default())), true),
+			mutual => (PeerAuthentication::mutual_by_expiry(), true),
 		}
-	}
-
-	fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> crate::urn::Urn<'static> {
-		let name = name.as_ref();
-		ColonyNamespace::default()
-			.servlet(name)
-			.expect("test names satisfy the mint grammar")
-	}
-
-	/// The instance URN of servlet type `name` at `addr`.
-	fn instance_urn(name: &(impl AsRef<str> + ?Sized), addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
-		servlet_urn(name)
-			.servlet_instance(addr)
-			.expect("a servlet type URN yields an instance URN")
 	}
 
 	/// A servlet that advertises one address under the locator of another
 	/// gets no slate, so no route can redirect that locator's traffic.
 	#[test]
 	fn a_slate_refuses_a_locator_that_names_another_address() {
-		let config = ClusterConfig::new(test_tls_config());
 		let hive_addr: SharedId = Arc::from(b"127.0.0.1:9000".as_slice());
-		let mismatched = ServletInfo {
-			servlet_id: instance_urn("ping", "127.0.0.1:9001"),
-			address: b"127.0.0.1:9002".to_vec(),
-			signer: ServletInfo::fixture_signer(),
-		};
+		let mismatched = ServletInfo { address: b"127.0.0.1:9002".to_vec(), ..ServletInfo::fixture("127.0.0.1:9001") };
 
-		let refused = config.servlet_slate(&[mismatched], &hive_addr);
+		let refused = ClusterConfig::fixture().servlet_slate(&[mismatched], &hive_addr);
 		assert!(matches!(refused, Err(ClusterError::InvalidAddress(address)) if address == b"127.0.0.1:9002"));
 	}
 
@@ -1191,17 +1224,12 @@ mod tests {
 	/// under percent-encoded locators, and the parse gives back the address of
 	/// the hive, of each added servlet, and of each removed one.
 	#[test]
-	fn an_update_of_a_hive_at_an_ipv6_literal_parses_to_its_addresses() -> Result<(), Box<dyn core::error::Error>> {
-		let config = ClusterConfig::new(test_tls_config());
-		let added = ServletInfo {
-			servlet_id: instance_urn("ping", "[::1]:9001"),
-			address: b"[::1]:9001".to_vec(),
-			signer: ServletInfo::fixture_signer(),
-		};
+	fn an_update_of_a_hive_at_an_ipv6_literal_parses_to_its_addresses() -> TestResult {
+		let config = ClusterConfig::fixture();
 		let update = ServletAddressUpdate {
-			hive_id: ColonyNamespace::default().hive("[::1]:9000")?,
-			added: vec![added],
-			removed: vec![instance_urn("ping", "[::1]:9002")],
+			hive_id: ColonyNamespace::hive_fixture("[::1]:9000"),
+			added: vec![ServletInfo::fixture("[::1]:9001")],
+			removed: vec![ColonyNamespace::instance_fixture("ping", "[::1]:9002")],
 		};
 
 		let (slate, removed) = config.parse_address_update(&update)?;
@@ -1212,48 +1240,48 @@ mod tests {
 		Ok(())
 	}
 
+	/// A config built from TLS alone beats on the default heartbeat, applies
+	/// no gate policy, and dials every admitted peer.
 	#[test]
-	fn cluster_config_defaults() {
-		let config = ClusterConfig::new(test_tls_config());
-		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
-		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
-		assert!(config.policies.is_empty());
-		assert!(config.peer.peer_dial_allowlist.is_none());
+	fn a_new_config_takes_the_default_heartbeat_and_no_restriction() {
+		let config = ClusterConfig::fixture();
+		let heartbeat = (config.heartbeat.interval, config.heartbeat.timeout);
+		let restrictions = (config.policies.len(), config.peer.peer_dial_allowlist.is_none());
+
+		let defaults = (Duration::from_secs(5), Duration::from_secs(15));
+		assert_eq!((heartbeat, restrictions), (defaults, (0, true)));
 	}
 
 	/// A config whose configured refresh and gossip window are set apart,
 	/// so a test can assert each side of the clamp on its own.
 	fn config_refreshing(refresh: Duration, seen_ttl: Duration) -> ClusterConfig {
-		let mut config = ClusterConfig::builder(test_tls_config()).with_rumor_refresh(refresh).build();
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let mut config = builder.with_rumor_refresh(refresh).build();
 		config.gossip.seen_ttl = seen_ttl;
 		config
 	}
 
-	#[test]
-	fn a_refresh_slower_than_the_window_is_clamped_to_it() {
-		let config = config_refreshing(Duration::from_millis(900), Duration::from_millis(400));
-		// The window narrows at startup, so a refresh stored clamped at
-		// build would re-publish rumors peers refuse as stale.
-		assert_eq!(config.rumor_refresh(), Duration::from_millis(400));
-	}
-
-	#[test]
-	fn a_refresh_inside_the_window_is_the_one_configured() {
-		let config = config_refreshing(Duration::from_millis(300), Duration::from_millis(400));
-		// The clamp is a ceiling, so an operator who asks to refresh more often
-		// than the window gets the interval they asked for.
-		assert_eq!(config.rumor_refresh(), Duration::from_millis(300));
+	// The window narrows at startup, so a refresh stored clamped at build
+	// would re-publish rumors peers refuse as stale. The clamp is a ceiling,
+	// so an operator who asks to refresh more often than the window gets the
+	// interval they asked for.
+	tb_cases! {
+		fn the_rumor_refresh_is_clamped_to_the_window((refresh, window, refreshed): (u64, u64, u64)) {
+			let config = config_refreshing(Duration::from_millis(refresh), Duration::from_millis(window));
+			assert_eq!(config.rumor_refresh(), Duration::from_millis(refreshed));
+		}
+		cases {
+			slower_than_the_window => (900, 400, 400),
+			inside_the_window => (300, 400, 300),
+		}
 	}
 
 	// A relay trail outlives three missed refreshes, and an aggressive
 	// refresh keeps the default interval as its floor.
 	tb_cases! {
-		fn a_relay_trail_ttl_is_three_refreshes_floored_at_the_default(
-			(refresh, ttl): (Duration, Duration)
-		) -> Result<(), ClusterError> {
+		fn a_relay_trail_ttl_is_three_refreshes_floored_at_the_default((refresh, ttl): (Duration, Duration)) {
 			let config = config_refreshing(refresh, Duration::from_secs(120));
 			assert_eq!(config.relay_trail_ttl(), ttl);
-			Ok(())
 		}
 		cases {
 			three_refreshes => (Duration::from_secs(20), Duration::from_secs(60)),
@@ -1261,103 +1289,99 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn cluster_config_peers_accept_str_slices() -> Result<(), ClusterError> {
-		let config = ClusterConfig::builder(test_tls_config())
-			.with_peers(["127.0.0.1:9000", "127.0.0.1:9001"])?
-			.with_peer_dial_allowlist(["127.0.0.1:9000"])?
-			.build();
-
-		let anchors: Vec<String> = config.peer.peers().iter().map(AdmittedDial::to_string).collect();
-		assert_eq!(anchors, ["127.0.0.1:9000", "127.0.0.1:9001"]);
-
-		let allowed = config.peer.admit_dial(PeerAddress::fixture("127.0.0.1:9000"));
-		assert_eq!(allowed.map(|dial| dial.address()), Ok(PeerAddress::fixture("127.0.0.1:9000")));
-
-		let refused = config.peer.admit_dial(PeerAddress::fixture("127.0.0.1:9001"));
-		assert_eq!(refused, Err(DialRefusal::OffAllowlist));
-		Ok(())
+	/// A config that dials two peers and allows the first alone.
+	fn config_with_two_peers() -> ClusterConfig {
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let builder = builder.with_peers(["127.0.0.1:9000", "127.0.0.1:9001"]);
+		let builder = builder.expect("each fixture peer parses");
+		let builder = builder.with_peer_dial_allowlist(["127.0.0.1:9000"]);
+		builder.expect("the fixture allowlist parses").build()
 	}
 
-	/// The builder refuses a peer the operator mistyped where the operator
-	/// wrote it, rather than drop it into a federation with no anchors.
+	/// The builder takes its peers as string slices, and keeps them in the
+	/// order the operator wrote them.
 	#[test]
-	fn cluster_config_refuses_a_peer_that_names_no_socket() {
-		let refusal = ClusterConfig::builder(test_tls_config()).with_peers(["not-an-address"]);
-		assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
+	fn the_builder_takes_peers_as_str_slices() {
+		let config = config_with_two_peers();
+		let anchors = config.peer.peers();
+
+		let in_order = ["127.0.0.1:9000", "127.0.0.1:9001"].map(AdmittedDial::fixture);
+		assert_eq!(anchors, in_order);
 	}
 
-	// The builder parses the advertise address once, so the beat advertises the
-	// canonical socket and a typo fails at build.
+	// The allowlist admits a dial to the peer it names and refuses a dial to
+	// a peer it leaves out, even one the config dials.
+	tb_cases! {
+		fn the_allowlist_admits_only_what_it_names((peer, admitted): (&str, Result<PeerAddress, DialRefusal>)) {
+			let verdict = config_with_two_peers().peer.admit_dial(PeerAddress::fixture(peer));
+			assert_eq!(verdict.map(|dial| dial.address()), admitted);
+		}
+		cases {
+			a_listed_peer => ("127.0.0.1:9000", Ok(PeerAddress::fixture("127.0.0.1:9000"))),
+			an_unlisted_peer => ("127.0.0.1:9001", Err(DialRefusal::OffAllowlist)),
+		}
+	}
+
+	/// A builder setter that takes a socket spelling.
+	type SocketSetter = fn(ClusterConfigBuilder) -> Result<ClusterConfigBuilder, ClusterError>;
+
+	// The builder refuses a socket the operator mistyped where the operator
+	// wrote it, rather than drop a peer into a federation with no anchors or
+	// advertise an address no peer can dial.
+	tb_cases! {
+		fn a_socket_setter_refuses_a_spelling_that_names_no_socket(setter: SocketSetter) {
+			let refusal = setter(ClusterConfig::builder(ClusterTlsConfig::fixture()));
+			assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
+		}
+		cases {
+			peers => |builder| builder.with_peers(["not-an-address"]),
+			advertise_addr => |builder| builder.with_advertise_addr("gateway.example"),
+		}
+	}
+
+	/// The builder parses the advertise address once, so the beat advertises
+	/// the canonical socket and a typo fails at build.
 	#[test]
-	fn with_advertise_addr_stores_the_canonical_socket() -> Result<(), ClusterError> {
-		let config = ClusterConfig::builder(test_tls_config())
-			.with_advertise_addr("[::ffff:192.0.2.1]:9000")?
-			.with_advertise_interval(Duration::from_secs(5))
-			.build();
+	fn with_advertise_addr_stores_the_canonical_socket() -> TestResult {
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let builder = builder.with_advertise_addr("[::ffff:192.0.2.1]:9000")?;
+		let config = builder.with_advertise_interval(Duration::from_secs(5)).build();
 
 		let advertised = config.peer.advertised_address(b"0.0.0.0:9000")?;
 		assert_eq!(advertised.as_ref(), b"192.0.2.1:9000");
 		Ok(())
 	}
 
-	#[test]
-	fn with_advertise_addr_refuses_a_spelling_that_names_no_socket() {
-		let refusal = ClusterConfig::builder(test_tls_config()).with_advertise_addr("gateway.example");
-		assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
-	}
-
-	#[test]
-	fn work_response_ok() {
-		let response = ClusterWorkResponse::ok(b"test".to_vec());
-		assert_eq!(response.status, TransitStatus::Ok);
-		assert_eq!(response.payload, Some(b"test".to_vec()));
-	}
-
-	#[test]
-	fn work_response_ok_accepts_byte_slices() {
-		let response = ClusterWorkResponse::ok(b"test");
-		assert_eq!(response.status, TransitStatus::Ok);
-		assert_eq!(response.payload.as_deref(), Some(b"test".as_slice()));
-	}
-
-	#[test]
-	fn work_response_err() {
-		let response = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
-		assert_eq!(response.status, TransitStatus::PermissionDenied);
-		assert!(response.payload.is_none());
-	}
-
 	/// The builder refuses an unroutable URN where the operator configures it.
 	#[test]
-	fn gossip_ingress_refuses_a_urn_no_route_can_answer() -> Result<(), UrnValidationError> {
-		let instance = servlet_urn("ping").servlet_instance("10.0.0.5:9100")?;
-
-		let refused = ClusterConfig::builder(test_tls_config()).with_gossip_ingress(instance);
+	fn gossip_ingress_refuses_a_urn_no_route_can_answer() {
+		let instance = ColonyNamespace::instance_fixture("ping", "10.0.0.5:9100");
+		let refused = ClusterConfig::builder(ClusterTlsConfig::fixture()).with_gossip_ingress(instance);
 		assert!(matches!(refused, Err(ClusterError::UnknownServletType(_))));
-		Ok(())
 	}
 
 	/// The ingress key of a configuration is the route key of its ingress
 	/// under its namespace.
 	#[test]
-	fn the_gossip_ingress_key_is_the_route_key_of_the_ingress() -> Result<(), ClusterError> {
-		let bare = servlet_urn("ping");
-		let builder = ClusterConfig::builder(test_tls_config()).with_gossip_ingress(bare.clone())?;
-		let conf = builder.build();
+	fn the_gossip_ingress_key_is_the_route_key_of_the_ingress() -> TestResult {
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let conf = builder.with_gossip_ingress(ColonyNamespace::servlet_fixture("ping"))?.build();
 
-		assert_eq!(conf.gossip_ingress_key()?, ColonyNamespace::default().servlet_type_key(&bare));
+		let key = conf.gossip_ingress_key()?;
+		let named = key.as_ref().map(ServletTypeKey::as_bytes);
+		assert_eq!(named, Some(b"urn:tightbeam::servlet:ping".as_slice()));
 		Ok(())
 	}
 
 	/// A gossip section whose ingress names a servlet type of another
 	/// namespace mints no key, as an ingress set through the builder does.
 	#[test]
-	fn a_gossip_section_of_another_namespace_mints_no_ingress_key() -> Result<(), Box<dyn std::error::Error>> {
+	fn a_gossip_section_of_another_namespace_mints_no_ingress_key() -> TestResult {
 		let ingress = ColonyNamespace::new("acme", "prod")?.servlet("feed")?;
 		let gossip = GossipConfig { ingress: Some(ingress), ..GossipConfig::default() };
 
-		let config = ClusterConfig::builder(test_tls_config()).with_gossip_config(gossip).build();
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let config = builder.with_gossip_config(gossip).build();
 		let minted = config.gossip_ingress_key();
 		assert!(matches!(minted, Err(ClusterError::UnknownServletType(_))));
 		Ok(())

@@ -37,11 +37,9 @@ impl FmeaArtifact {
 	pub fn new(evidence: EvidenceArtifact, report: FmeaReport) -> Self {
 		let severity_scale = report.severity_scale.wire_code();
 		let failure_modes = report.failure_modes.iter().map(FailureMode::to_asn1).collect();
+		let fmea_report = FmeaReportAsn1 { severity_scale, total_rpn: report.total_rpn, failure_modes };
 
-		Self {
-			evidence,
-			fmea_report: FmeaReportAsn1 { severity_scale, total_rpn: report.total_rpn, failure_modes },
-		}
+		Self { evidence, fmea_report }
 	}
 }
 
@@ -64,9 +62,29 @@ impl FailureMode {
 
 #[cfg(test)]
 mod tests {
+	use super::*;
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::fmea::SeverityScale;
+	use crate::testing::TestResult;
+	use crate::trace::ConsumedTrace;
+	use crate::urn::Urn;
+
+	const STEP: Urn<'static> = crate::urn!("test", "event:fmea-export/step");
+
+	/// An artifact decodes from its DER to the artifact that encoded it, with
+	/// the evidence of a recorded trace and a report of two failure modes.
 	#[test]
-	#[ignore]
-	fn test_fmea_artifact_asn1_round_trip() {
-		// Stub: Future ASN.1 encode/decode test
+	fn an_fmea_artifact_decodes_to_the_artifact_it_encodes() -> TestResult {
+		let evidence = EvidenceArtifact::of([7u8; 32], &ConsumedTrace::recording([STEP]))?;
+		let effects = ["Can reach terminal state(s): Done".to_string()];
+		let modes = [
+			FailureMode::new("Link.Ready", "send", effects, 8, 50, 6),
+			FailureMode::new("Link.Sent", "ack", Vec::new(), 4, 2, 3),
+		];
+
+		let artifact = FmeaArtifact::new(evidence, FmeaReport::new(modes, SeverityScale::Iso26262, 100));
+		let decoded = der_round_trip(&artifact);
+		assert_eq!(decoded, artifact);
+		Ok(())
 	}
 }

@@ -433,8 +433,10 @@ mod tests {
 	use std::collections::HashSet;
 
 	use super::*;
+	use crate::testing::fixtures::TestProcess;
 	use crate::testing::specs::composition::CompositionOperator;
 	use crate::testing::specs::csp::{Event, State};
+	use crate::testing::TestResult;
 	use crate::urn::Urn;
 
 	const CONNECT: Urn<'static> = crate::urn!("test", "event:cspm/connect");
@@ -464,65 +466,76 @@ mod tests {
 		terminal { Idle }
 	}
 
-	/// The CSPM script that the export of `process` writes.
-	fn cspm_of(process: &Process) -> Result<String, Box<dyn core::error::Error>> {
+	/// The script that `export` writes, read as UTF-8.
+	fn written<E: core::fmt::Debug>(export: impl FnOnce(&mut Vec<u8>) -> Result<(), E>) -> String {
 		let mut script = Vec::new();
-		CspmExporter::new(process).export(&mut script)?;
-
-		let script = String::from_utf8(script)?;
-		Ok(script)
+		export(&mut script).expect("the export writes to a vector");
+		String::from_utf8(script).expect("the export writes UTF-8")
 	}
 
-	/// The CSPM script that the export of the composition `expression` writes.
-	fn composition_cspm_of(expression: &ProcessExpr) -> Result<String, Box<dyn core::error::Error>> {
-		let mut script = Vec::new();
-		CspmExporter::export_composition(expression, &mut script)?;
+	/// The CSPM script that the export of `process` writes.
+	fn cspm_of(process: &Process) -> String {
+		written(|script| CspmExporter::new(process).export(script))
+	}
 
-		let script = String::from_utf8(script)?;
-		Ok(script)
+	/// The CSPM script that the export of the composition of two `ping`
+	/// processes under `operator` writes.
+	fn composition_cspm_of(operator: CompositionOperator) -> String {
+		written(|script| CspmExporter::export_composition(&ping_pair(operator), script))
+	}
+
+	/// The CSPM script that the trace export writes for a run that records
+	/// `CONNECT`, a gate decision of `Ok`, and `DISCONNECT`.
+	#[cfg(feature = "instrument")]
+	fn trace_cspm() -> String {
+		use crate::instrumentation::events::GATE_ACCEPT;
+		use crate::testing::fdr::FdrTraceExt;
+		use crate::trace::{ConsumedTrace, TraceCollector};
+
+		let collector = TraceCollector::new();
+		collector.event(CONNECT).expect("the run injects no fault").emit();
+
+		let gated = collector.emit_event_with_evidence(GATE_ACCEPT, "Ok", None);
+		gated.expect("the run injects no fault");
+
+		collector.event(DISCONNECT).expect("the run injects no fault").emit();
+
+		let trace = ConsumedTrace::drained_from(&collector);
+		written(|script| trace.export_cspm(script))
+	}
+
+	/// The settling session of [`SettlingSession`].
+	fn settling_session() -> Process {
+		SettlingSession::process().expect("the settling session builds")
 	}
 
 	/// A process whose event `name` takes `S0` to the accepting `S1`.
 	fn one_event(name: &'static str) -> Process {
-		Process::builder("OneEvent")
-			.initial_state(State("S0"))
-			.add_observable(Event(name))
-			.add_transition(State("S0"), Event(name), State("S1"))
-			.add_terminal(State("S1"))
-			.build()
-			.expect("a process with one transition to its terminal state builds")
+		TestProcess::chain("OneEvent", &["S0", "S1"], &[name])
 	}
 
 	/// A process whose `go` takes the accepting `Idle` to `Busy`, and whose
 	/// `done` takes `Busy` back.
 	fn cycle() -> Process {
-		Process::builder("Cycle")
-			.initial_state(State("Idle"))
-			.add_observable(Event("go"))
-			.add_observable(Event("done"))
-			.add_transition(State("Idle"), Event("go"), State("Busy"))
-			.add_transition(State("Busy"), Event("done"), State("Idle"))
-			.add_terminal(State("Idle"))
-			.build()
-			.expect("a cycle through an accepting state builds")
+		TestProcess {
+			observable: &["go", "done"],
+			transitions: &[("Idle", "go", "Busy"), ("Busy", "done", "Idle")],
+			terminal: &["Idle"],
+			..TestProcess::of("Cycle", "Idle")
+		}
+		.build()
 	}
 
 	/// A process whose `a` takes `S0` to `S1` or to `S2`.
 	fn branching() -> Process {
-		Process::builder("Branching")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S0"), Event("a"), State("S2"))
-			.add_terminal(State("S1"))
-			.add_terminal(State("S2"))
-			.build()
-			.expect("a nondeterministic transition builds")
+		TestProcess::fan_out("Branching", "S0", "a", &["S1", "S2"])
 	}
 
 	/// A process of every equation form: a description of two lines, a name
 	/// outside the identifier alphabet, a hidden event, a nondeterministic
 	/// event, an accepting state with a transition, and a state with neither.
+	///
+	/// A [`TestProcess`] holds no description, so the builder writes this one.
 	fn every_form() -> Process {
 		Process::builder("Every form")
 			.description("A process of every equation form,\nover two lines")
@@ -546,12 +559,18 @@ mod tests {
 		Box::new(ProcessExpr::atomic(name, one_event("ping")))
 	}
 
+	/// The composition of the `ping` processes `P` and `Q` under `operator`.
+	fn ping_pair(operator: CompositionOperator) -> ProcessExpr {
+		ProcessExpr::Parallel { operator, left: ping("P"), right: ping("Q") }
+	}
+
+	/// A house model exports its header, its events, its states, one equation
+	/// per state, and its main process.
 	#[test]
-	fn a_house_model_exports_one_equation_per_state() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_house_model_exports_one_equation_per_state() -> TestResult {
 		let process = Session::process()?;
 
-		let cspm = cspm_of(&process)?;
-
+		let cspm = cspm_of(&process);
 		let expected = "\
 -- Generated by tightbeam testing framework
 -- Process: Session
@@ -574,152 +593,113 @@ Main_Session = P_Idle
 		Ok(())
 	}
 
-	#[test]
-	fn an_event_name_outside_the_identifier_alphabet_exports_escaped() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&one_event("probe/a_b"))?;
-		assert!(cspm.contains("\ndatatype Events = E_probe_2f_a_5f_b\n"));
-		Ok(())
+	// The export writes the line of each equation form: an escaped name for
+	// an event outside the identifier alphabet, termination beside the
+	// transitions of an accepting state, an internal choice for a
+	// nondeterministic event, and a comment for each line of a description.
+	crate::tb_cases! {
+		fn the_export_writes((cspm, line): (String, &str)) {
+			assert!(cspm.contains(line));
+		}
+
+		cases {
+			an_escaped_event_name => (cspm_of(&one_event("probe/a_b")), "\ndatatype Events = E_probe_2f_a_5f_b\n"),
+			termination_beside_the_transitions_of_an_accepting_state => (
+				cspm_of(&cycle()),
+				"\nP_Idle = SKIP [] obs.E_go -> P_Busy\n",
+			),
+			an_internal_choice_for_a_nondeterministic_event => (
+				cspm_of(&branching()),
+				"\nP_S0 = obs.E_a -> (P_S1 |~| P_S2)\n",
+			),
+			a_comment_for_each_line_of_a_description => (
+				cspm_of(&every_form()),
+				"\n-- Description: A process of every equation form,\n-- over two lines\n",
+			),
+		}
 	}
 
+	/// A process with no hidden event declares the channel of its observable
+	/// events alone.
 	#[test]
-	fn a_process_with_no_hidden_event_declares_one_channel() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&cycle())?;
-
+	fn a_process_with_no_hidden_event_declares_one_channel() {
+		let cspm = cspm_of(&cycle());
 		let channels: Vec<&str> = cspm.lines().filter(|line| line.starts_with("channel")).collect();
 		assert_eq!(channels, ["channel obs : Events"]);
-		Ok(())
 	}
 
+	/// The main process of a model with a hidden event hides the channel of
+	/// its hidden events.
 	#[test]
-	fn an_accepting_state_offers_termination_beside_its_transitions() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&cycle())?;
-		assert!(cspm.contains("\nP_Idle = SKIP [] obs.E_go -> P_Busy\n"));
-		Ok(())
-	}
-
-	#[test]
-	fn a_nondeterministic_event_leads_to_an_internal_choice() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&branching())?;
-		assert!(cspm.contains("\nP_S0 = obs.E_a -> (P_S1 |~| P_S2)\n"));
-		Ok(())
-	}
-
-	#[test]
-	fn each_line_of_a_description_is_a_comment() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&every_form())?;
-
-		let comment = "\n-- Description: A process of every equation form,\n-- over two lines\n";
-		assert!(cspm.contains(comment));
-		Ok(())
-	}
-
-	#[test]
-	fn the_main_process_hides_the_hidden_channel() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&SettlingSession::process()?)?;
+	fn the_main_process_hides_the_hidden_channel() {
+		let cspm = cspm_of(&settling_session());
 		assert!(cspm.ends_with("\nMain_SettlingSession = P_Idle \\ {| hid |}\n"));
-		Ok(())
 	}
 
+	/// A composition exports the process it evaluates to, whose states pair
+	/// the states of its operands.
 	#[test]
-	fn a_composition_exports_the_process_it_evaluates_to() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_composition_exports_the_process_it_evaluates_to() {
 		let operator = CompositionOperator::Interface { events: HashSet::from([Event("ping")]) };
-		let expression = ProcessExpr::Parallel { operator, left: ping("P"), right: ping("Q") };
 
-		let cspm = composition_cspm_of(&expression)?;
-
+		let cspm = composition_cspm_of(operator);
 		let synchronized = "\nP__28_S0_2c_S0_29_ = obs.E_ping -> P__28_S1_2c_S1_29_\n";
 		assert!(cspm.contains(synchronized));
-		Ok(())
 	}
 
+	/// An expression that does not evaluate refuses the export with the error
+	/// of its composition.
 	#[test]
 	fn an_expression_that_does_not_evaluate_refuses_the_export_with_its_composition_error() {
 		let operator = CompositionOperator::Interface { events: HashSet::from([Event("pnig")]) };
-		let expression = ProcessExpr::Parallel { operator, left: ping("P"), right: ping("Q") };
+		let expression = ping_pair(operator);
 
 		let refused = CspmExporter::export_composition(&expression, &mut Vec::new());
-
 		assert!(matches!(
 			refused,
 			Err(CspmExportError::Composition(CompositionError::AlphabetMismatch { .. }))
 		));
 	}
 
+	/// A writer that refuses the script refuses the export with its I/O
+	/// error.
 	#[test]
 	fn a_writer_that_refuses_the_script_refuses_the_export_with_its_io_error() {
-		let operator = CompositionOperator::Interleaved;
-		let expression = ProcessExpr::Parallel { operator, left: ping("P"), right: ping("Q") };
+		let expression = ping_pair(CompositionOperator::Interleaved);
 		let mut full: &mut [u8] = &mut [];
 
 		let refused = CspmExporter::export_composition(&expression, &mut full);
-
 		assert!(matches!(refused, Err(CspmExportError::Io(error)) if error.kind() == io::ErrorKind::WriteZero));
 	}
 
-	#[test]
-	fn the_export_of_a_house_model_is_cspm() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&SettlingSession::process()?)?;
-		grammar::check(&cspm)?;
-		Ok(())
+	// The export of a house model, of every equation form, of a composition,
+	// and of a trace is CSPM that the grammar of FDR4 reads.
+	crate::tb_cases! {
+		fn the_export_of(cspm: String) -> TestResult {
+			grammar::check(&cspm)?;
+			Ok(())
+		}
+
+		cases {
+			a_house_model_is_cspm => cspm_of(&settling_session()),
+			every_equation_form_is_cspm => cspm_of(&every_form()),
+			a_composition_is_cspm => composition_cspm_of(CompositionOperator::Interleaved),
+			#[cfg(feature = "instrument")]
+			a_trace_is_cspm => trace_cspm(),
+		}
 	}
 
-	#[test]
-	fn the_export_of_every_equation_form_is_cspm() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = cspm_of(&every_form())?;
-		grammar::check(&cspm)?;
-		Ok(())
-	}
-
-	#[test]
-	fn the_export_of_a_composition_is_cspm() -> Result<(), Box<dyn core::error::Error>> {
-		let operator = CompositionOperator::Interleaved;
-		let expression = ProcessExpr::Parallel { operator, left: ping("P"), right: ping("Q") };
-
-		let cspm = composition_cspm_of(&expression)?;
-		grammar::check(&cspm)?;
-		Ok(())
-	}
-
-	/// The CSPM script that the trace export writes for a run that records
-	/// `CONNECT`, a gate decision of `Ok`, and `DISCONNECT`.
-	#[cfg(feature = "instrument")]
-	fn trace_cspm() -> Result<String, Box<dyn core::error::Error>> {
-		use crate::instrumentation::events::GATE_ACCEPT;
-		use crate::testing::fdr::FdrTraceExt;
-		use crate::trace::{ConsumedTrace, TraceCollector};
-
-		let collector = TraceCollector::new();
-		collector.event(CONNECT)?.emit();
-		collector.emit_event_with_evidence(GATE_ACCEPT, "Ok", None)?;
-		collector.event(DISCONNECT)?.emit();
-		let mut trace = ConsumedTrace::new();
-		trace.populate_from_collector(&collector);
-
-		let mut script = Vec::new();
-		trace.export_cspm(&mut script)?;
-
-		let script = String::from_utf8(script)?;
-		Ok(script)
-	}
-
+	/// A trace exports its observable events as one CSPM sequence, with the
+	/// gate decision in its place.
 	#[cfg(feature = "instrument")]
 	#[test]
-	fn a_trace_exports_its_observable_events_as_a_cspm_sequence() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = trace_cspm()?;
+	fn a_trace_exports_its_observable_events_as_a_cspm_sequence() {
+		let cspm = trace_cspm();
 
 		let connect = "obs.E_urn_3a_test_3a_event_3a_cspm_2f_connect";
 		let disconnect = "obs.E_urn_3a_test_3a_event_3a_cspm_2f_disconnect";
 		let sequence = format!("\nTrace = <{connect}, obs.E_Ok, {disconnect}>\n");
 		assert!(cspm.ends_with(&sequence));
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn the_export_of_a_trace_is_cspm() -> Result<(), Box<dyn core::error::Error>> {
-		let cspm = trace_cspm()?;
-		grammar::check(&cspm)?;
-		Ok(())
 	}
 
 	/// A check of a script against the CSPM that the export writes, to the

@@ -1773,40 +1773,44 @@ mod tests {
 
 	use super::*;
 	use crate::clock::{Clock, ManualClock};
-	use crate::colony::cluster::{CertificateSpec, Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
-	use crate::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
+	use crate::colony::cluster::{Cluster, ClusterGateway, ClusterTlsConfig, PeerConfig};
+	use crate::colony::cluster::{ServletEntry, DEFAULT_ABANDONMENT_LIMIT};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::constants::MAX_PEER_TRIED_FAILURES;
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::{Certificate, KeyCurves};
+	use crate::crypto::x509::store::CertificateTrust;
+	use crate::crypto::x509::Certificate;
 	use crate::instrumentation::events::CLUSTER_RECONCILE_ANSWERED;
 	use crate::oids::HASH_SHA3_256;
-	use crate::testing::{unhex, SetupEnv, TestCertificate, TestKey, TestRumor};
+	use crate::testing::fixtures::{TestClock, TestStore};
+	use crate::testing::{unhex, SetupEnv, TestCertificate, TestKey, TestResult, TestRumor};
+	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::TokioListener;
 	use crate::{absent, exactly, tb_assert_spec, tb_cases, tb_scenario};
 
 	/// The window a refusal stands for in these tests.
 	const WINDOW: Duration = Duration::from_secs(120);
 
-	#[test]
-	fn ledger_holds_a_refused_origin_for_one_window() {
-		let mut ledger = PeerLedger::default();
-		ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
+	// A ledger refuses an origin for one window from its refusal, and offers
+	// every other origin.
+	tb_cases! {
+		fn a_ledger_offers_an_origin_by_its_refusal((origin, at, offers): (&[u8], u64, bool)) {
+			let mut ledger = PeerLedger::default();
+			ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000));
 
-		let offers = [
-			ledger.offers(b"origin-a", UnixMillis::new(1_000), WINDOW),
-			ledger.offers(b"origin-a", UnixMillis::new(120_999), WINDOW),
-			ledger.offers(b"origin-a", UnixMillis::new(121_000), WINDOW),
-			ledger.offers(b"origin-b", UnixMillis::new(1_000), WINDOW),
-		];
-
-		assert_eq!(offers, [false, false, true, true]);
+			assert_eq!(ledger.offers(origin, UnixMillis::new(at), WINDOW), offers);
+		}
+		cases {
+			at_the_refusal => (b"origin-a", 1_000, false),
+			last_millisecond => (b"origin-a", 120_999, false),
+			window_end => (b"origin-a", 121_000, true),
+			another_origin => (b"origin-b", 1_000, true),
+		}
 	}
 
+	/// An expiry drops each refusal whose window has passed, and keeps the
+	/// rest.
 	#[test]
 	fn ledger_expires_a_refusal_once_its_window_has_passed() {
 		let mut ledger = PeerLedger::default();
@@ -1823,24 +1827,27 @@ mod tests {
 		GossipDigest::read::<Sha3_256>([fill; 32]).expect("32 octets read as a SHA3-256 digest")
 	}
 
+	/// A peer that wants again a digest it acknowledged signals one drop.
 	#[test]
 	fn ledger_reads_an_acknowledged_digest_wanted_again_as_a_drop() {
 		let mut ledger = PeerLedger::default();
 		ledger.ack(digest_of(1));
+
 		let signals = [
 			ledger.drop_signal([digest_of(2)]),
 			ledger.drop_signal([digest_of(1)]),
 			ledger.drop_signal([digest_of(1)]),
 		];
-
 		assert_eq!(signals, [false, true, false]);
 	}
 
+	/// A prune keeps the ledgers of the live targets alone.
 	#[test]
 	fn ledgers_keep_the_live_targets_alone() {
 		let ledgers = PeerLedgers::default();
-		let live = dial("10.0.0.1:9000");
-		let gone = dial("10.0.0.2:9000");
+		let live = AdmittedDial::fixture("10.0.0.1:9000");
+		let gone = AdmittedDial::fixture("10.0.0.2:9000");
+
 		ledgers.with(live, |ledger| ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000)));
 		ledgers.with(gone, |ledger| ledger.refuse_origin(b"origin-a", UnixMillis::new(1_000)));
 		ledgers.prune(|target| *target == live, UnixMillis::new(2_000), WINDOW);
@@ -1857,22 +1864,35 @@ mod tests {
 	/// computed with Python's `hashlib.sha3_256`.
 	const HOUSE_RUMOR_DIGEST: &str = "6d94eba786b7f0f7dc8edf6f96289336b4d2fe4ffeddec6052ee8ccafbf70e20";
 
+	/// The configuration of a house gateway on the default fixture config,
+	/// whose colony digest is SHA3-256.
+	fn house_config() -> ColonyConfig<TokioListener> {
+		ColonyConfig::house(ClusterConfig::fixture())
+	}
+
+	/// The configuration of a house gateway that reads `clock`.
+	fn house_on(clock: &Arc<ManualClock>) -> ColonyConfig<TokioListener> {
+		let mut config = ClusterConfig::fixture();
+		config.clock = TestClock::erased(clock);
+		ColonyConfig::house(config)
+	}
+
 	/// A house gateway admits a rumor under the SHA3-256 digest its provider
 	/// names, over the to-be-signed encoding and then the origin signature.
 	#[test]
-	fn a_house_gateway_digests_a_rumor_under_sha3_256() -> Result<(), TransitStatus> {
-		let config = house_config();
-		let rumor = TestRumor::verified(TestRumor::application(1_000, [1, 2, 3]));
+	fn a_house_gateway_digests_a_rumor_under_sha3_256() {
+		let rumor = TestRumor::verified(TestRumor::fixed());
 
-		let admitted = config.admit_rumor(&rumor, 0, UnixMillis::new(1_000))?;
-		assert_eq!(admitted.digest().as_bytes(), unhex(HOUSE_RUMOR_DIGEST));
-		Ok(())
+		let admitted = house_config().admit_rumor(&rumor, 0, UnixMillis::new(1_000));
+
+		let digest = admitted.map(|admitted| admitted.digest().as_bytes().to_vec());
+		assert_eq!(digest, Ok(unhex(HOUSE_RUMOR_DIGEST)));
 	}
 
 	/// A house gateway witnesses each frame it builds under SHA3-256, the
 	/// digest its protocol's provider names.
 	#[test]
-	fn a_house_gateway_witnesses_its_frames_under_sha3_256() -> Result<(), TightBeamError> {
+	fn a_house_gateway_witnesses_its_frames_under_sha3_256() -> TestResult {
 		let config = house_config();
 		let message = GossipRumor::application(vec![1, 2, 3]);
 		let builder = FrameBuilder::from(Version::V2).with_id(b"witnessed").with_order(1_000);
@@ -1887,11 +1907,9 @@ mod tests {
 	/// two orders, one millisecond apart, so the replay guard of a receiver
 	/// admits both (README §5.7.1).
 	#[test]
-	fn two_control_frames_at_one_instant_state_two_orders() -> Result<(), TightBeamError> {
-		let clock = Arc::new(ManualClock::default());
-		let mut config = test_config();
-		config.clock = Arc::<ManualClock>::clone(&clock);
-		let config = ColonyConfig::<TokioListener>::new(config)?;
+	fn two_control_frames_at_one_instant_state_two_orders() -> TestResult {
+		let clock = TestClock::manual();
+		let config = house_on(&clock);
 
 		let control = |id: &[u8]| config.control_frame(id, config.issue_order(), GossipRumor::application(vec![1]));
 		let first = control(b"first").build()?;
@@ -1901,37 +1919,6 @@ mod tests {
 		let at = clock.unix().get();
 		assert_eq!(orders, (at, at.saturating_add(1)));
 		Ok(())
-	}
-
-	/// A config that holds the fields these tests read.
-	fn test_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-
-		ClusterConfig::new(
-			ClusterTlsConfig::new(
-				CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
-				Arc::new(Secp256k1KeyProvider::from(key)),
-			)
-			.expect("the test certificate must decode"),
-		)
-	}
-
-	/// The configuration of a house gateway under [`test_config`], whose colony
-	/// digest is SHA3-256.
-	fn house_config() -> ColonyConfig<TokioListener> {
-		ColonyConfig::new(test_config()).expect("the test configuration names no gossip ingress")
-	}
-
-	fn config_with_window(window_ms: u64) -> ClusterConfig {
-		let mut config = test_config();
-		config.control_freshness_window = Duration::from_millis(window_ms);
-		config
-	}
-
-	fn config_allowing(allowlist: impl IntoIterator<Item = String>) -> ClusterConfig {
-		let mut config = test_config();
-		config.peer = PeerConfig::allowing(allowlist);
-		config
 	}
 
 	fn reply(want_len: usize, pex_len: usize) -> GossipWant {
@@ -1958,153 +1945,137 @@ mod tests {
 		PeerGossip { peer_id: Vec::new(), gateway_addr: addr.as_bytes().to_vec() }
 	}
 
+	/// The dial of each hint that `config` admits from a peer exchange of
+	/// `10.0.0.1:9000` and `10.66.0.1:9000`.
+	fn admitted_pex_dials(config: &ClusterConfig) -> Vec<AdmittedDial> {
+		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
+		config.admissible_pex_hints(pex).map(|hint| hint.dial).collect()
+	}
+
+	/// A gateway with no allowlist admits each hint of a peer exchange.
 	#[test]
 	fn pex_hints_admitted_without_allowlist() {
-		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
-		let admitted: Vec<PeerHint> = test_config().admissible_pex_hints(pex).collect();
-		assert_eq!(admitted.len(), 2);
+		let dials = admitted_pex_dials(&ClusterConfig::fixture());
+		let both = ["10.0.0.1:9000", "10.66.0.1:9000"].map(AdmittedDial::fixture);
+		assert_eq!(dials, both);
 	}
 
+	/// A gateway with an allowlist admits the hints that it names alone.
 	#[test]
 	fn pex_hints_off_allowlist_refused() {
-		let config = config_allowing(vec![String::from("10.0.0.1:9000")]);
-		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
-		let admitted: Vec<PeerHint> = config.admissible_pex_hints(pex).collect();
-		assert_eq!(admitted.len(), 1);
-		assert_eq!(admitted[0].dial.to_string(), "10.0.0.1:9000");
-	}
-
-	/// A fixture dial target, which the beat carries admitted.
-	fn dial(text: &str) -> AdmittedDial {
-		AdmittedDial::fixture(text)
+		let config = ClusterConfig { peer: PeerConfig::allowing(["10.0.0.1:9000"]), ..ClusterConfig::fixture() };
+		let dials = admitted_pex_dials(&config);
+		assert_eq!(dials, [AdmittedDial::fixture("10.0.0.1:9000")]);
 	}
 
 	fn ad_slate(names: &[&str]) -> Vec<Urn<'static>> {
-		names
-			.iter()
-			.map(|name| {
-				ColonyNamespace::default()
-					.servlet(name)
-					.expect("test names satisfy the mint grammar")
-			})
-			.collect()
+		names.iter().map(ColonyNamespace::servlet_fixture).collect()
 	}
 
-	#[test]
-	fn ad_order_inside_window_is_fresh() {
-		assert!(config_with_window(500).ad_order_fresh(UnixMillis::new(1_500), UnixMillis::new(2_000)));
-		assert!(config_with_window(500).ad_order_fresh(UnixMillis::new(2_500), UnixMillis::new(2_000)));
+	// Under a window of 500 ms around a clock at 2 s, an ad order is fresh up
+	// to each edge and stale past either one.
+	tb_cases! {
+		fn an_ad_order_is_fresh_inside_a_500ms_window((order, fresh): (u64, bool)) {
+			let window = Duration::from_millis(500);
+			let config = ClusterConfig { control_freshness_window: window, ..ClusterConfig::fixture() };
+			assert_eq!(config.ad_order_fresh(UnixMillis::new(order), UnixMillis::new(2_000)), fresh);
+		}
+		cases {
+			past_edge => (1_500, true),
+			future_edge => (2_500, true),
+			older_than_the_window => (1_499, false),
+			past_the_future_window => (2_501, false),
+			far_future => (u64::MAX, false),
+		}
 	}
 
-	#[test]
-	fn ad_order_older_than_window_is_stale() {
-		assert!(!config_with_window(500).ad_order_fresh(UnixMillis::new(1_499), UnixMillis::new(2_000)));
+	/// A publish state of a refresh of one second whose first beat at 0 has
+	/// claimed the publish.
+	fn claimed_state() -> AdPublishState {
+		let state = AdPublishState::new(Duration::from_millis(1_000));
+		let due = state.take_due(UnixMillis::new(0), [], []);
+		assert!(due);
+		state
 	}
 
-	#[test]
-	fn ad_order_past_future_window_is_stale() {
-		assert!(!config_with_window(500).ad_order_fresh(UnixMillis::new(2_501), UnixMillis::new(2_000)));
-		assert!(!config_with_window(500).ad_order_fresh(UnixMillis::new(u64::MAX), UnixMillis::new(2_000)));
+	/// A [`claimed_state`] whose publish at 0 of no slate and no target has
+	/// committed.
+	fn committed_state() -> AdPublishState {
+		let state = claimed_state();
+		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
+		state
 	}
 
+	/// The first beat of a publish state is due.
 	#[test]
 	fn ad_publish_first_beat_is_due() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
 		assert!(state.take_due(UnixMillis::new(0), [], []));
 	}
 
+	/// A publish of an unchanged state waits for the refresh.
 	#[test]
 	fn ad_publish_unchanged_state_suppresses_until_refresh() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
-		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
-		assert!(!state.take_due(UnixMillis::new(999), [], []));
-		assert!(state.take_due(UnixMillis::new(1_000), [], []));
+		let state = committed_state();
+
+		let early = state.take_due(UnixMillis::new(999), [], []);
+		let refreshed = state.take_due(UnixMillis::new(1_000), [], []);
+		assert_eq!((early, refreshed), (false, true));
 	}
 
-	#[test]
-	fn ad_publish_slate_change_fires_before_refresh() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
-		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
-		assert!(state.take_due(UnixMillis::new(1), ad_slate(&["ping"]), []));
+	// A change of the slate or of the targets fires before the refresh.
+	tb_cases! {
+		fn ad_publish_a_change_fires_before_refresh((slate, targets): (Vec<Urn<'static>>, Vec<AdmittedDial>)) {
+			let state = committed_state();
+			assert!(state.take_due(UnixMillis::new(1), slate, targets));
+		}
+		cases {
+			slate => (ad_slate(&["ping"]), Vec::new()),
+			target => (Vec::new(), vec![AdmittedDial::fixture("10.0.0.1:9000")]),
+		}
 	}
 
-	#[test]
-	fn ad_publish_target_change_fires_before_refresh() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
-		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
-		assert!(state.take_due(UnixMillis::new(1), [], [dial("10.0.0.1:9000")]));
-	}
-
+	/// A suppressed beat keeps the baseline of the refresh, so the refresh
+	/// fires one interval after the commit.
 	#[test]
 	fn ad_publish_suppressed_beat_keeps_the_refresh_baseline() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
-		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
-		state.take_due(UnixMillis::new(500), [], []);
-		assert!(state.take_due(UnixMillis::new(1_000), [], []));
+		let state = committed_state();
+
+		let suppressed = state.take_due(UnixMillis::new(500), [], []);
+		let refreshed = state.take_due(UnixMillis::new(1_000), [], []);
+		assert_eq!((suppressed, refreshed), (false, true));
 	}
 
+	/// A claim in flight blocks a second claim, even of a changed slate.
 	#[test]
 	fn ad_publish_claim_in_flight_blocks_reentry() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
+		let state = claimed_state();
 		assert!(!state.take_due(UnixMillis::new(1), ad_slate(&["ping"]), []));
 	}
 
+	/// An aborted claim retries on the next beat.
 	#[test]
 	fn ad_publish_aborted_claim_retries_on_the_next_beat() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
+		let state = claimed_state();
 		state.abort();
 		assert!(state.take_due(UnixMillis::new(1), [], []));
 	}
 
+	/// A commit settles the claim and moves the refresh baseline to its time.
 	#[test]
 	fn ad_publish_commit_settles_the_claim_and_the_baseline() {
-		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(UnixMillis::new(0), [], []);
+		let state = claimed_state();
 		state.commit(UnixMillis::new(500), Vec::new(), Vec::new());
-		assert!(!state.take_due(UnixMillis::new(1_499), [], []));
-		assert!(state.take_due(UnixMillis::new(1_500), [], []));
+
+		let early = state.take_due(UnixMillis::new(1_499), [], []);
+		let refreshed = state.take_due(UnixMillis::new(1_500), [], []);
+		assert_eq!((early, refreshed), (false, true));
 	}
 
-	/// The key of a gateway in no colony.
-	fn stranger_key() -> Secp256k1SigningKey {
-		Secp256k1SigningKey::from_bytes(&[3u8; 32].into()).expect("the fixture scalar is a valid key")
-	}
-
-	/// A live gateway in no colony, and its certificate. With no colony URN,
-	/// a member that dials it finds it outside the flood.
-	async fn stranger_gateway() -> (ClusterGateway<TokioListener>, Certificate) {
-		let key = stranger_key();
-		let certificate = TestCertificate::self_signed(&key);
-		let spec = CertificateSpec::Built(Box::new(certificate.clone()));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-		let config = ClusterConfig::new(tls.expect("the stranger certificate must decode"));
-
-		let trace = Arc::new(TraceCollector::default());
-		let gateway = ClusterGateway::start(trace, config).await.expect("the stranger gateway starts");
-		(gateway, certificate)
-	}
-
-	/// The gossip arm of a colony member whose peer trust enrolls `stranger`,
-	/// which records on `trace`.
-	fn member_beat(stranger: &Certificate, trace: Arc<TraceCollector>) -> FloodBeat<TokioListener> {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let colony = ColonyNamespace::default().colony("main").expect("a literal colony name");
-		let certificate = TestCertificate::with_uri_sans(&key, &[&colony.to_string()]);
-		let spec = CertificateSpec::Built(Box::new(certificate));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-		let enrolled = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let enrolled = enrolled.with_certificate(stranger.clone());
-		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the stranger enrolls").build());
-		let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
-
-		let minted = ColonyConfig::new(ClusterConfig::new(tls));
-		let config = minted.expect("the member configuration names no gossip ingress");
+	/// The gossip arm of a colony member under `config`, which records on
+	/// `trace`.
+	fn flood_beat(config: ClusterConfig, trace: Arc<TraceCollector>) -> FloodBeat<TokioListener> {
+		let config = ColonyConfig::house(config);
 		let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
 		let peer_pool = pools.peer.expect("a peer trust builds a peer pool");
 		let peer_plane = PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
@@ -2113,20 +2084,49 @@ mod tests {
 		FloodBeat::new(config, peer_plane, registry, trace, Arc::default()).expect("a colony member is in a flood")
 	}
 
-	// A poisoned peer table at an expulsion ends the beat as a local fault, so
-	// the score of the peer that answered from outside the flood stands.
+	/// The colony URN `main` of the default namespace, as a URI SAN.
+	fn main_colony() -> String {
+		ColonyNamespace::colony_fixture("main").to_string()
+	}
+
+	/// The TLS of the fixed test key under a certificate of colony `main`,
+	/// whose peer trust holds each of `enrolled`.
+	fn member_tls(enrolled: impl IntoIterator<Item = Certificate>) -> ClusterTlsConfig {
+		let key = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::with_uri_sans(&key, &[&main_colony()]);
+		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(TestStore::holding(enrolled));
+		ClusterTlsConfig::fixture_of(certificate, key).with_peer_trust(peer_trust)
+	}
+
+	/// The certificate of a gateway in no colony. With no colony URN, a member
+	/// that dials it finds it outside the flood.
+	fn stranger_certificate() -> Certificate {
+		TestCertificate::self_signed(&TestKey::fixed(0x03))
+	}
+
+	/// The gossip arm of a colony member whose peer trust enrolls the
+	/// stranger, which records on `trace`.
+	fn member_beat(trace: Arc<TraceCollector>) -> FloodBeat<TokioListener> {
+		flood_beat(ClusterConfig::new(member_tls([stranger_certificate()])), trace)
+	}
+
+	/// The reconcile round of `beat` with the peer that answers at `address`.
+	async fn round_to(beat: &FloodBeat<TokioListener>, address: TightBeamSocketAddr) -> Result<Round, LoopFault> {
+		beat.reconcile_round(address, AdmittedDial::fixture(address.to_string())).await
+	}
+
+	/// A poisoned peer table at an expulsion ends the beat as a local fault, so
+	/// the score of the peer that answered from outside the flood stands.
 	#[tokio::test]
-	async fn a_poisoned_table_at_an_expulsion_is_a_local_fault() -> Result<(), TightBeamError> {
-		let (stranger, certificate) = stranger_gateway().await;
-		let beat = member_beat(&certificate, Arc::default());
+	async fn a_poisoned_table_at_an_expulsion_is_a_local_fault() {
+		let tls = ClusterTlsConfig::fixture_of(stranger_certificate(), TestKey::fixed(0x03));
+		let stranger = ClusterGateway::started(ClusterConfig::new(tls), Arc::default()).await;
+		let beat = member_beat(Arc::default());
 		beat.config.peer.table.poison();
 
-		let address = *stranger.addr();
-		let peer = dial(&address.to_string());
+		let round = round_to(&beat, *stranger.addr()).await;
 
-		let round = beat.reconcile_round(address, peer).await;
 		assert!(matches!(round, Err(LoopFault::Registry(ClusterError::LockPoisoned))));
-		Ok(())
 	}
 
 	/// The name of the authority that issues both certificates of
@@ -2149,11 +2149,8 @@ mod tests {
 		/// Starts the member's beat and both gateways, which record on
 		/// `scenario`.
 		async fn start(scenario: &TraceCollector) -> Self {
-			let colony = ColonyNamespace::default().colony("main");
-			let colony = colony.expect("a literal colony name").to_string();
-			let authority_key = Secp256k1SigningKey::from_bytes(&[6u8; 32].into()).expect("a valid fixture scalar");
-			let gateway_key = Secp256k1SigningKey::from_bytes(&[7u8; 32].into()).expect("a valid fixture scalar");
-			let member_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+			let colony = main_colony();
+			let (authority_key, gateway_key) = (TestKey::fixed(0x06), TestKey::fixed(0x07));
 			let authority = TestCertificate::authority(&authority_key, AUTHORITY);
 			let authority = authority.expect("the authority issues its certificate");
 			let issue = |cn: &str| {
@@ -2164,28 +2161,12 @@ mod tests {
 
 			let enrolled = issue("Signer Gateway");
 			let rotated = issue("Signer Gateway Rotated");
-			let member = TestCertificate::with_uri_sans(&member_key, &[&colony]);
-
-			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-			let builder = builder.with_certificate(authority).expect("the store admits it");
-			let builder = builder.with_certificate(enrolled.clone()).expect("the store admits it");
-			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(builder.build());
-
-			let spec = CertificateSpec::Built(Box::new(member.clone()));
-			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(member_key)));
-			let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
-			let config = ClusterConfig::builder(tls).with_tried_per_signer(NonZeroUsize::MIN).build();
-			let config = ColonyConfig::new(config).expect("the member configuration names no gossip ingress");
-
-			let trace = Arc::new(scenario.share());
-			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, &trace);
-			let peer_pool = pools.peer.expect("a peer trust builds a peer pool");
-			let peer_plane = PeerPlane::new(peer_pool, config.clone(), Arc::clone(&trace));
-			let registry = Arc::new(ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock)));
-			let beat = FloodBeat::new(config, peer_plane, registry, trace, Arc::default());
+			let member = TestCertificate::with_uri_sans(&TestKey::insecure_fixed_signing(), &[&colony]);
+			let builder = ClusterConfig::builder(member_tls([authority, enrolled.clone()]));
+			let config = builder.with_tried_per_signer(NonZeroUsize::MIN).build();
 
 			Self {
-				beat: beat.expect("a colony member is in a flood"),
+				beat: flood_beat(config, Arc::new(scenario.share())),
 				enrolled: Self::serve(enrolled, &gateway_key, &member, scenario).await,
 				rotated: Self::serve(rotated, &gateway_key, &member, scenario).await,
 			}
@@ -2199,55 +2180,53 @@ mod tests {
 			member: &Certificate,
 			trace: &TraceCollector,
 		) -> ClusterGateway<TokioListener> {
-			let spec = CertificateSpec::Built(Box::new(certificate));
-			let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key.clone())));
-			let enrolled = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-			let enrolled = enrolled.with_certificate(member.clone());
-			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the member enrolls").build());
-			let tls = tls.expect("the gateway certificate must decode").with_peer_trust(peer_trust);
+			let peer_trust: Arc<dyn CertificateTrust> = Arc::new(TestStore::holding([member.clone()]));
+			let tls = ClusterTlsConfig::fixture_of(certificate, key.clone()).with_peer_trust(peer_trust);
 
-			let gateway = ClusterGateway::start(Arc::new(trace.share()), ClusterConfig::new(tls)).await;
-			gateway.expect("the gateway starts")
+			ClusterGateway::started(ClusterConfig::new(tls), Arc::new(trace.share())).await
+		}
+
+		/// The reconcile round of the member's beat with the gateway that
+		/// serves under the enrolled certificate.
+		async fn enrolled_round(&self) -> Result<Round, LoopFault> {
+			round_to(&self.beat, *self.enrolled.addr()).await
 		}
 	}
 
-	// The discovery table names a gateway by the certificate the member
-	// enrolls for its key, so a second certificate of that key at another
-	// address takes no second slot under the signer cap (CWE-770).
+	/// The discovery table names a gateway by the certificate the member
+	/// enrolls for its key, so a second certificate of that key at another
+	/// address takes no second slot under the signer cap (CWE-770).
 	#[tokio::test]
-	async fn a_rotated_certificate_counts_as_the_signer_its_key_enrolls() -> Result<(), TightBeamError> {
+	async fn a_rotated_certificate_counts_as_the_signer_its_key_enrolls() -> TestResult {
 		let rotation = SignerRotation::start(&TraceCollector::default()).await;
-		let beat = &rotation.beat;
-		let enrolled = *rotation.enrolled.addr();
-		let rotated = *rotation.rotated.addr();
+		let first = rotation.enrolled_round().await;
+		let second = round_to(&rotation.beat, *rotation.rotated.addr()).await;
 
-		let first = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
-		let second = beat.reconcile_round(rotated, dial(&rotated.to_string())).await;
-		let learned = beat.config.peer.table.learned()?;
-		assert_eq!([first.ok(), second.ok()], [Some(Round::Settled); 2]);
+		let learned = rotation.beat.config.peer.table.learned()?;
+		assert!(matches!([first, second], [Ok(Round::Settled), Ok(Round::Settled)]));
 		assert_eq!(learned, (0, 1));
 		Ok(())
 	}
 
 	/// The advertisement frame that a `MintedAdRumor` slate rumor carries.
-	fn carried_ad_frame(minted: Option<MintedAdRumor>) -> Frame {
-		let minted = minted.expect("the test identity mints a rumor");
+	fn carried_ad_frame(minted: MintedAdRumor) -> Frame {
 		let rumor: GossipRumor = decode(minted.rumor.message()).expect("a minted rumor decodes");
 		decode(&rumor.payload).expect("a slate rumor carries a frame")
 	}
 
-	/// The slate rumor that the test identity creates.
-	fn minted_rumor(minted: Option<MintedAdRumor>) -> MintedAdRumor {
+	/// The slate rumor of `advertisement` that `config` mints.
+	async fn minted_rumor(config: &ColonyConfig<TokioListener>, advertisement: &SignedAdvertisement) -> MintedAdRumor {
+		let minted = config.mint_slate_rumor(advertisement).await;
 		minted.expect("the test identity mints a rumor")
 	}
 
-	// A beat witnesses its slate rumor under the digest its echo admits under,
-	// so the journal refuses the echo that a peer floods back as a duplicate.
+	/// A beat witnesses its slate rumor under the digest its echo admits under,
+	/// so the journal refuses the echo that a peer floods back as a duplicate.
 	#[tokio::test]
-	async fn a_slate_rumor_carries_the_digest_its_echo_admits_under() -> Result<(), TightBeamError> {
+	async fn a_slate_rumor_carries_the_digest_its_echo_admits_under() -> TestResult {
 		let config = house_config();
 		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
-		let minted = minted_rumor(config.mint_slate_rumor(&advertisement).await);
+		let minted = minted_rumor(&config, &advertisement).await;
 
 		let echo = config.tls.verify_own(minted.rumor)?;
 		let admitted = config.admit_rumor(&echo, 0, minted.minted_at);
@@ -2255,21 +2234,19 @@ mod tests {
 		Ok(())
 	}
 
-	// A beat's slate rumor wraps the frame the beat dials out directly, so both
-	// copies carry one order. A receiver that admits either copy first then
-	// admits the other, because its order ledger refuses only an older order.
+	/// A beat's slate rumor wraps the frame the beat dials out directly, so
+	/// both copies carry one order. A receiver that admits either copy first
+	/// then admits the other, because its order ledger refuses only an older
+	/// order.
 	#[tokio::test]
-	async fn a_slate_rumor_wraps_the_frame_its_beat_dials_out() -> Result<(), TightBeamError> {
-		let clock = Arc::new(ManualClock::default());
-		let mut config = test_config();
-		config.clock = Arc::<ManualClock>::clone(&clock);
-
-		let config = ColonyConfig::<TokioListener>::new(config)?;
+	async fn a_slate_rumor_wraps_the_frame_its_beat_dials_out() -> TestResult {
+		let clock = TestClock::manual();
+		let config = house_on(&clock);
 		let advertisement = config.mint_ad_frame(b"127.0.0.1:9000", ad_slate(&["ping"])).await?;
 
 		clock.advance(Duration::from_millis(1));
 
-		let minted = config.mint_slate_rumor(&advertisement).await;
+		let minted = minted_rumor(&config, &advertisement).await;
 		assert_eq!(&carried_ad_frame(minted), advertisement.frame());
 		Ok(())
 	}
@@ -2312,12 +2289,11 @@ mod tests {
 		spec: UnreachableRoundSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
-				let stranger = TestCertificate::self_signed(&stranger_key());
-				let beat = member_beat(&stranger, Arc::new(trace.share()));
-				let closed = closed_address();
+				let beat = member_beat(Arc::new(trace.share()));
 
-				let round = beat.reconcile_round(closed.into(), dial(&closed.to_string())).await;
-				assert_eq!(round.ok(), Some(Round::Failed));
+				let round = round_to(&beat, closed_address().into()).await;
+
+				assert!(matches!(round, Ok(Round::Failed)));
 				Ok(())
 			}
 		}
@@ -2325,25 +2301,20 @@ mod tests {
 
 	/// Records, in `beat`'s journal, one application rumor that `beat`'s own
 	/// identity signs at its clock reading, and returns its digest.
-	async fn journal_a_rumor(beat: &FloodBeat<TokioListener>) -> Result<GossipDigest, TightBeamError> {
+	fn journal_a_rumor(beat: &FloodBeat<TokioListener>) -> GossipDigest {
 		let config = &beat.config;
 		let now = config.clock.unix();
-		let builder = FrameBuilder::from(Version::V2)
-			.with_id(b"repaired")
-			.with_order(now.get())
-			.with_message(GossipRumor::application(vec![1, 2, 3]));
+		let rumor = config.self_signed(b"repaired", GossipRumor::application(vec![1, 2, 3]));
 
-		let mut rumor = config.witnessed(builder).build()?;
-		rumor.sign_with_provider(config.tls.identity()).await?;
-
-		let verified = config.tls.verify_own(rumor)?;
+		let verified = config.tls.verify_own(rumor).expect("the member verifies its own rumor");
 		let admitted = config.admit_rumor(&verified, 0, now).expect("the member admits its own rumor");
 		let rumor = verified.into_frame();
 		let signer = rumor.signer_id().expect("a signed rumor names its signer");
 
 		let digest = *admitted.digest();
-		config.gossip.journal.record(&signer, digest, &rumor, rumor.issued_at(), now)?;
-		Ok(digest)
+		let recorded = config.gossip.journal.record(&signer, digest, &rumor, rumor.issued_at(), now);
+		recorded.expect("the member's journal records its own rumor");
+		digest
 	}
 
 	tb_assert_spec! {
@@ -2369,31 +2340,23 @@ mod tests {
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
 				let rotation = SignerRotation::start(&trace).await;
-				let beat = &rotation.beat;
-				journal_a_rumor(beat).await?;
+				journal_a_rumor(&rotation.beat);
 
-				let enrolled = *rotation.enrolled.addr();
-				let round = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
-				assert_eq!(round.ok(), Some(Round::Settled));
+				let round = rotation.enrolled_round().await;
+
+				assert!(matches!(round, Ok(Round::Settled)));
 				Ok(())
 			}
 		}
 	}
 
-	/// A discovery hint for each socket of `sockets`.
-	fn hints(sockets: &[&str]) -> Vec<PeerHint> {
-		let config = test_config();
-		let entries = sockets.iter().map(pex_entry);
-		config.admissible_pex_hints(entries).collect()
-	}
-
-	/// The error a test reports for `fault`: the trace's own error, or the
-	/// local fault that it carries.
-	fn loop_error(fault: LoopFault) -> TightBeamError {
-		match fault {
-			LoopFault::Runtime(error) => error,
-			LoopFault::Registry(error) => error.into(),
-		}
+	/// Learns, on the table of `config`, a discovery hint of each socket of
+	/// `sockets` that a peer exchange from `10.0.0.9:9000` offers at 1 s.
+	fn learn(config: &ClusterConfig, trace: &TraceCollector, sockets: &[&str]) {
+		let source = HintSource::Pex(PeerAddress::fixture("10.0.0.9:9000"));
+		let offered: Vec<PeerHint> = config.admissible_pex_hints(sockets.iter().map(pex_entry)).collect();
+		let learned = config.learn_hints(trace, source, offered, UnixMillis::new(1_000));
+		learned.expect("a live table learns the hints");
 	}
 
 	tb_assert_spec! {
@@ -2412,12 +2375,7 @@ mod tests {
 		spec: LearnedHintsSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let config = test_config();
-				let source = HintSource::Pex(PeerAddress::fixture("10.0.0.9:9000"));
-				let now = UnixMillis::new(1_000);
-				let offered = hints(&["10.0.0.1:9000", "10.1.0.1:9000"]);
-
-				config.learn_hints(&trace, source, offered, now).map_err(loop_error)?;
+				learn(&ClusterConfig::fixture(), &trace, &["10.0.0.1:9000", "10.1.0.1:9000"]);
 				Ok(())
 			}
 		}
@@ -2441,45 +2399,36 @@ mod tests {
 		spec: EmptyLearnSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let config = test_config();
-				let source = HintSource::Pex(PeerAddress::fixture("10.0.0.9:9000"));
-				let now = UnixMillis::new(1_000);
-
-				config.learn_hints(&trace, source, hints(&[]), now).map_err(loop_error)?;
-				config.learn_hints(&trace, source, hints(&["10.0.0.1:9000"]), now).map_err(loop_error)?;
+				let config = ClusterConfig::fixture();
+				learn(&config, &trace, &[]);
+				learn(&config, &trace, &["10.0.0.1:9000"]);
 				Ok(())
 			}
 		}
 	}
 
-	/// The advertisement of `peer` at `dial`, at `order`, whose slate names
-	/// `types`, each route abandoned after `limit` failures.
-	fn advertisement(
-		peer: &[u8],
-		dial: AdmittedDial,
-		types: &[&[u8]],
-		order: u64,
-		limit: NonZeroU32,
-	) -> AdmittedPeerAd {
+	/// The advertisement of `gw` at the fixture socket `dial`, at `order`,
+	/// whose slate names `types`, each route abandoned after `limit` failures.
+	fn advertisement(dial: &str, types: &[&[u8]], order: u64, limit: NonZeroU32) -> AdmittedPeerAd {
 		let route = |servlet_type: &&[u8]| {
-			let route = PeerRoute { peer_id: Arc::from(peer), servlet_type: Arc::from(*servlet_type), dial };
-			ServletEntry::peer(route, DEFAULT_INITIAL_PHEROMONE, limit)
+			let route = ServletEntry::peer_fixture(servlet_type, b"gw", dial);
+			route.with_abandonment_limit(limit)
 		};
 
-		let slate = types.iter().map(route).collect();
-		AdmittedPeerAd { peer_hive_id: Arc::from(peer), dial, slate, order: UnixMillis::new(order) }
+		AdmittedPeerAd::fixture(b"gw", dial, types.iter().map(route), order)
 	}
 
-	/// The advertisement of `gw` at the fixture socket, at `order`, whose
-	/// slate names `types`.
-	fn fixture_advertisement(types: &[&[u8]], order: u64) -> AdmittedPeerAd {
-		advertisement(b"gw", dial("127.0.0.1:9000"), types, order, DEFAULT_ABANDONMENT_LIMIT)
-	}
-
-	/// A registry on the fixture config, which holds no route yet.
-	fn empty_registry() -> ServletRegistry {
-		let config = test_config();
-		ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock))
+	/// Installs each slate of `slates` that `gw` advertises at the fixture
+	/// socket, with its order, in a registry that holds no route at first,
+	/// and records what each slate changed on `trace`.
+	fn record_slates(trace: &TraceCollector, slates: &[(&[&[u8]], u64)]) {
+		let registry = ServletRegistry::fixture();
+		for &(types, order) in slates {
+			let slate = advertisement("127.0.0.1:9000", types, order, DEFAULT_ABANDONMENT_LIMIT);
+			let change = registry.reconcile_peer_slate(slate, PeerCaps::default());
+			let recorded = change.expect("the registry installs the slate").record_direct(trace, b"gw");
+			recorded.expect("the trace takes the record");
+		}
 	}
 
 	tb_assert_spec! {
@@ -2499,10 +2448,7 @@ mod tests {
 		spec: FirstSlateSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let registry = empty_registry();
-				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
-				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
-				first.record_direct(&trace, b"gw")?;
+				record_slates(&trace, &[(&[b"ping", b"echo"], 1)]);
 				Ok(())
 			}
 		}
@@ -2525,14 +2471,7 @@ mod tests {
 		spec: ShrunkSlateSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let registry = empty_registry();
-				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
-				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
-				first.record_direct(&trace, b"gw")?;
-
-				let shrunk = fixture_advertisement(&[b"ping"], 2);
-				let shrunk = registry.reconcile_peer_slate(shrunk, PeerCaps::default())?;
-				shrunk.record_direct(&trace, b"gw")?;
+				record_slates(&trace, &[(&[b"ping", b"echo"], 1), (&[b"ping"], 2)]);
 				Ok(())
 			}
 		}
@@ -2546,32 +2485,20 @@ mod tests {
 		spec: FirstSlateSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let registry = empty_registry();
-				let first = fixture_advertisement(&[b"ping", b"echo"], 1);
-				let first = registry.reconcile_peer_slate(first, PeerCaps::default())?;
-				first.record_direct(&trace, b"gw")?;
-
-				let refreshed = fixture_advertisement(&[b"ping", b"echo"], 2);
-				let refreshed = registry.reconcile_peer_slate(refreshed, PeerCaps::default())?;
-				refreshed.record_direct(&trace, b"gw")?;
+				record_slates(&trace, &[(&[b"ping", b"echo"], 1), (&[b"ping", b"echo"], 2)]);
 				Ok(())
 			}
 		}
 	}
 
-	/// Runs `rounds` reconcile rounds against `peer` at the closed `address`,
-	/// each of which fails, and returns the first fault of a round.
-	async fn fail_rounds(
-		beat: &FloodBeat<TokioListener>,
-		address: core::net::SocketAddr,
-		peer: AdmittedDial,
-		rounds: usize,
-	) -> Result<(), LoopFault> {
+	/// Runs `rounds` reconcile rounds of `beat` against `peer` at the closed
+	/// `address`, each of which fails.
+	async fn fail_rounds(beat: &FloodBeat<TokioListener>, address: core::net::SocketAddr, rounds: usize) {
+		let peer = AdmittedDial::fixture(address.to_string());
 		for _ in 0..rounds {
-			beat.reconcile_target(address.into(), peer, &beat.trace).await?;
+			let round = beat.reconcile_target(address.into(), peer, &beat.trace).await;
+			round.expect("a failed round ends the round and leaves the beat");
 		}
-
-		Ok(())
 	}
 
 	tb_assert_spec! {
@@ -2593,16 +2520,15 @@ mod tests {
 		spec: EvictedPeerSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
-				let stranger = TestCertificate::self_signed(&stranger_key());
-				let beat = member_beat(&stranger, Arc::new(trace.share()));
+				let beat = member_beat(Arc::new(trace.share()));
 				let closed = closed_address();
-				let peer = dial(&closed.to_string());
-				beat.config.peer.table.promote(peer, None, UnixMillis::now())?;
+				let peer = AdmittedDial::fixture(closed.to_string());
+				beat.config.peer.table.promote(peer, None, UnixMillis::new(1_000))?;
 
-				let slate = advertisement(b"gw", peer, &[b"ping"], 1, DEFAULT_ABANDONMENT_LIMIT);
+				let slate = advertisement(&closed.to_string(), &[b"ping"], 1, DEFAULT_ABANDONMENT_LIMIT);
 				beat.servlet_registry.reconcile_peer_slate(slate, PeerCaps::default())?;
 
-				fail_rounds(&beat, closed, peer, MAX_PEER_TRIED_FAILURES).await.map_err(loop_error)?;
+				fail_rounds(&beat, closed, MAX_PEER_TRIED_FAILURES).await;
 				Ok(())
 			}
 		}
@@ -2628,16 +2554,16 @@ mod tests {
 			exec: |SetupEnv { trace, .. }| async move {
 				let rotation = SignerRotation::start(&trace).await;
 				let beat = &rotation.beat;
-				let digest = journal_a_rumor(beat).await?;
-				let enrolled = *rotation.enrolled.addr();
-				let peer = dial(&enrolled.to_string());
+				let digest = journal_a_rumor(beat);
+				let enrolled = rotation.enrolled.addr().to_string();
 
-				beat.ledgers.with(peer, |ledger| ledger.ack(digest));
-				let slate = advertisement(b"gw", peer, &[b"ping"], 1, NonZeroU32::MIN);
+				beat.ledgers.with(AdmittedDial::fixture(&enrolled), |ledger| ledger.ack(digest));
+
+				let slate = advertisement(&enrolled, &[b"ping"], 1, NonZeroU32::MIN);
 				beat.servlet_registry.reconcile_peer_slate(slate, PeerCaps::default())?;
 
-				let round = beat.reconcile_round(enrolled, peer).await;
-				assert_eq!(round.ok(), Some(Round::Settled));
+				let round = rotation.enrolled_round().await;
+				assert!(matches!(round, Ok(Round::Settled)));
 				Ok(())
 			}
 		}
@@ -2662,37 +2588,29 @@ mod tests {
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
 				let rotation = SignerRotation::start(&trace).await;
-				let beat = &rotation.beat;
-				beat.config.peer.table.poison();
+				rotation.beat.config.peer.table.poison();
 
-				let enrolled = *rotation.enrolled.addr();
-				let round = beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
-				assert_eq!(round.ok(), Some(Round::Settled));
+				let round = rotation.enrolled_round().await;
+
+				assert!(matches!(round, Ok(Round::Settled)));
 				Ok(())
 			}
 		}
 	}
 
-	/// The error each fault of these tests injects.
-	#[cfg(feature = "testing-fault")]
-	fn closed() -> TightBeamError {
-		TightBeamError::ChannelClosed
-	}
-
-	// A trace that refuses a bookkeeping event ends the beat, so a fault
-	// injected at the promotion reaches the beat's exit.
+	/// A trace that refuses a bookkeeping event ends the beat, so a fault
+	/// injected at the promotion reaches the beat's exit.
 	#[cfg(feature = "testing-fault")]
 	#[tokio::test]
-	async fn a_trace_fault_in_the_bookkeeping_ends_the_beat() -> Result<(), TightBeamError> {
+	async fn a_trace_fault_in_the_bookkeeping_ends_the_beat() {
 		use crate::testing::fdr::FaultModel;
 
+		let closed = || TightBeamError::ChannelClosed;
 		let model = FaultModel::default().with_event_fault(CLUSTER_PEER_DISCOVERED, closed, crate::bps!(10000));
 		let trace = TraceCollector::new().with_fault_model(model);
 		let rotation = SignerRotation::start(&trace).await;
-		let enrolled = *rotation.enrolled.addr();
 
-		let round = rotation.beat.reconcile_round(enrolled, dial(&enrolled.to_string())).await;
+		let round = rotation.enrolled_round().await;
 		assert!(matches!(round, Err(LoopFault::Runtime(TightBeamError::ChannelClosed))));
-		Ok(())
 	}
 }

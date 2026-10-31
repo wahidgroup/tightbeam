@@ -36,16 +36,18 @@ impl TimingVerificationArtifact {
 mod tests {
 	use super::*;
 	use crate::instrumentation::EvidenceArtifact;
+	use crate::testing::fixtures::der_round_trip;
 	use crate::testing::specs::csp::Event;
 	use crate::testing::timing::violations::{DeadlineMiss, JitterViolation, TimingSlackViolation, TimingViolation};
 	use crate::testing::timing::{ConfidenceIntervals, Percentile, PercentileValue};
+	use crate::testing::TestResult;
 	use crate::trace::ConsumedTrace;
-	use crate::utils::{decode, encode};
-	use crate::TightBeamError;
 
-	#[ignore]
+	/// An artifact with a violation of each kind and a statistical analysis
+	/// decodes from its DER as the artifact it was.
+	#[ignore = "decode fails: Event::decode reads its tag and length as its name (TagUnexpected at octet 162)"]
 	#[test]
-	fn test_timing_verification_artifact_asn1_round_trip() -> Result<(), TightBeamError> {
+	fn an_artifact_decodes_from_its_der_as_itself() -> TestResult {
 		// The evidence is that of an empty trace.
 		let evidence = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::new())?;
 
@@ -99,40 +101,8 @@ mod tests {
 		});
 
 		let artifact = TimingVerificationArtifact::new(evidence, timing_results, statistical_analysis);
-
-		// The artifact goes through DER and back.
-		let encoded = encode(&artifact)?;
-		let decoded: TimingVerificationArtifact = decode(&encoded)?;
-
-		// The decoded artifact keeps the hash, the verdict, and each count.
-		assert_eq!(
-			artifact.evidence.spec_hash().as_bytes(),
-			decoded.evidence.spec_hash().as_bytes()
-		);
-		assert_eq!(artifact.timing_results.passed, decoded.timing_results.passed);
-		assert_eq!(
-			artifact.timing_results.wcet_violations.len(),
-			decoded.timing_results.wcet_violations.len()
-		);
-		assert_eq!(
-			artifact.timing_results.deadline_misses.len(),
-			decoded.timing_results.deadline_misses.len()
-		);
-		assert_eq!(
-			artifact.timing_results.jitter_violations.len(),
-			decoded.timing_results.jitter_violations.len()
-		);
-		assert_eq!(
-			artifact.timing_results.slack_violations.len(),
-			decoded.timing_results.slack_violations.len()
-		);
-		let Some(decoded_stats) = decoded.statistical_analysis.as_ref() else {
-			return Err(crate::testing::error::TestingError::InvariantViolated.into());
-		};
-		assert_eq!(decoded_stats.count, 100);
-		assert_eq!(decoded_stats.mean, 50_000_000);
-		assert_eq!(decoded_stats.percentiles.len(), 2);
-
+		let decoded = der_round_trip(&artifact);
+		assert_eq!(decoded, artifact);
 		Ok(())
 	}
 }

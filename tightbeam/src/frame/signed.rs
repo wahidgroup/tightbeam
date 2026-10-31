@@ -242,15 +242,7 @@ mod tests {
 	use crate::der::oid::db::rfc4519::{CN, OU};
 	use crate::der::{Decode, Encode, ErrorKind};
 	use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256};
-
-	/// The wrapper admits its contents before the typed decode, so the walk
-	/// refuses an `Attribute` of descending values before the `SignerInfo`
-	/// decode reads it.
-	#[test]
-	fn a_descending_set_is_refused() {
-		let refused = Signed::<SignerInfo>::from_der(&descending_attribute());
-		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
-	}
+	use crate::testing::TestResult;
 
 	/// The DER of an `AttributeTypeAndValue` of `oid` whose value is the
 	/// UTF8String `value`.
@@ -289,18 +281,27 @@ mod tests {
 	/// shorter `OU` goes first, though the OID of `CN` sorts first. `der`
 	/// writes that order back, so the hold admits it.
 	#[test]
-	fn a_signer_whose_issuer_holds_a_two_valued_rdn_in_der_order_is_admitted() -> DerResult<()> {
+	fn a_signer_whose_issuer_holds_a_two_valued_rdn_in_der_order_is_admitted() -> TestResult {
 		let arrived = signer_info_issued_by([unit(), common_name()]);
 		let admitted = Signed::<SignerInfo>::from_der(&arrived)?;
 		assert_eq!(admitted.to_der()?, arrived);
 		Ok(())
 	}
 
-	/// The same RDN in the order of its OIDs is not its DER.
-	#[test]
-	fn a_two_valued_rdn_in_the_order_of_its_oids_is_refused() {
-		let arrived = signer_info_issued_by([common_name(), unit()]);
-		let refused = Signed::<SignerInfo>::from_der(&arrived);
-		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
+	// The wrapper admits its contents before the typed decode, so the walk
+	// refuses a SET whose values stand out of DER order before the
+	// `SignerInfo` decode reads it.
+	crate::tb_cases! {
+		fn a_set_out_of_der_order_is_refused(arrived: Vec<u8>) {
+			let refused = Signed::<SignerInfo>::from_der(&arrived);
+			assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
+		}
+		cases {
+			/// An `Attribute` whose values descend.
+			in_an_attribute_of_descending_values => descending_attribute(),
+			/// An RDN whose two values stand in the order of their OIDs, which
+			/// is not their DER.
+			in_a_two_valued_rdn_in_the_order_of_its_oids => signer_info_issued_by([common_name(), unit()]),
+		}
 	}
 }

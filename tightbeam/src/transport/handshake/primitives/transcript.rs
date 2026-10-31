@@ -326,26 +326,34 @@ pub(crate) struct ServerFinishedLegs<'a> {
 mod tests {
 	use super::*;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::testing::TestResult;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::crypto::hash::{Sha3_256, Sha3_512};
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::oids::HASH_SHA3_512;
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	use crate::testing::Aes256Sha3_512Provider;
+	use crate::testing::{unhex, Aes256Sha3_512Provider};
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	use crate::transport::handshake::tests::fixture_transcript;
+	use crate::transport::handshake::tests::{fixture_transcript_hash, wide_transcript_hash};
 
+	/// A transcript that sealed its hash over the bytes `key exchange`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn sealed_transcript() -> Transcript {
+		let mut transcript = Transcript::new();
+		transcript.append(b"key exchange").expect("an open transcript takes bytes");
+		transcript.seal::<Sha3_256>().expect("an open transcript seals");
+		transcript
+	}
+
+	/// A sealed transcript refuses more bytes, so its hash covers every byte
+	/// it held.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_sealed_transcript_refuses_more_bytes() -> Result<(), HandshakeError> {
-		let mut transcript = Transcript::new();
-		transcript.append(b"key exchange")?;
-		transcript.seal::<Sha3_256>()?;
-
+	fn a_sealed_transcript_refuses_more_bytes() {
+		let mut transcript = sealed_transcript();
 		let refusal = transcript.append(b"server finished");
 		assert!(matches!(refusal, Err(HandshakeError::InvalidState)));
-		Ok(())
 	}
 
 	/// The transcript-hash attribute is `HANDSHAKE_TRANSCRIPT_HASH` with the
@@ -355,10 +363,10 @@ mod tests {
 	/// RFC 5652 § 5.3 `Attribute` module and the OID `1.3.6.1.4.1.64586.1.8`.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn the_transcript_hash_attribute_encodes_as_its_known_answer() -> Result<(), Box<dyn core::error::Error>> {
+	fn the_transcript_hash_attribute_encodes_as_its_known_answer() -> TestResult {
 		use crate::der::Encode;
 
-		let attribute = fixture_transcript::<Sha3_256>([0x07u8; 32]).attribute()?;
+		let attribute = fixture_transcript_hash().attribute()?;
 		let sequence = [0x30, 0x30];
 		let oid = [0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xf8, 0x4a, 0x01, 0x08];
 		let values = [0x31, 0x22, 0x04, 0x20];
@@ -368,16 +376,13 @@ mod tests {
 		Ok(())
 	}
 
+	/// A sealed transcript refuses a second seal, so it fixes one hash.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_sealed_transcript_refuses_a_second_seal() -> Result<(), HandshakeError> {
-		let mut transcript = Transcript::new();
-		transcript.append(b"key exchange")?;
-		transcript.seal::<Sha3_256>()?;
-
+	fn a_sealed_transcript_refuses_a_second_seal() {
+		let mut transcript = sealed_transcript();
 		let refusal = transcript.seal::<Sha3_256>();
 		assert!(matches!(refusal, Err(HandshakeError::InvalidState)));
-		Ok(())
 	}
 
 	/// The CMS transcript hash of a key exchange followed by server Finished
@@ -406,7 +411,7 @@ mod tests {
 	/// differently, so the Finished signature binds the ephemeral.
 	#[cfg(feature = "transport-cms")]
 	#[test]
-	fn the_cms_transcript_binds_the_server_ephemeral() -> Result<(), HandshakeError> {
+	fn the_cms_transcript_binds_the_server_ephemeral() -> TestResult {
 		let first = cms_hash_with_ephemeral(&[0x02u8; 33])?;
 		let second = cms_hash_with_ephemeral(&[0x03u8; 33])?;
 		assert_ne!(first, second);
@@ -418,7 +423,7 @@ mod tests {
 	/// order, which the `sha3` crate computes outside the transcript.
 	#[cfg(feature = "transport-cms")]
 	#[test]
-	fn the_cms_transcript_binds_the_certificates_after_the_ephemeral() -> Result<(), HandshakeError> {
+	fn the_cms_transcript_binds_the_certificates_after_the_ephemeral() -> TestResult {
 		let bound = cms_hash_of(&[0x02u8; 33], b"certificates")?;
 		let legs = [b"key exchange".as_slice(), b"accept", &[0x02u8; 33], b"certificates"].concat();
 		let expected = Sha3_256::digest(&legs);
@@ -426,27 +431,24 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn test_transcript_hash_single_message() -> Result<(), HandshakeError> {
-		let msg = b"Hello, World!";
-		let hash = transcript_hash::<DefaultCryptoProvider>(&[msg])?;
-		assert_eq!(hash.as_bytes().len(), 32);
-		Ok(())
+	// The default provider digests under SHA3-256, so its transcript hash is
+	// 32 bytes over one message or more.
+	crate::tb_cases! {
+		fn a_default_transcript_hash_is_32_bytes(messages: &[&[u8]]) -> TestResult {
+			let hash = transcript_hash::<DefaultCryptoProvider>(messages)?;
+			assert_eq!(hash.as_bytes().len(), 32);
+			Ok(())
+		}
+		cases {
+			over_one_message => &[b"Hello, World!"],
+			over_three_messages => &[b"Message 1", b"Message 2", b"Message 3"],
+		}
 	}
 
+	/// Two hashes of one message sequence are equal, so both endpoints of a
+	/// handshake compute one transcript hash.
 	#[test]
-	fn test_transcript_hash_multiple_messages() -> Result<(), HandshakeError> {
-		let msg1 = b"Message 1";
-		let msg2 = b"Message 2";
-		let msg3 = b"Message 3";
-
-		let hash = transcript_hash::<DefaultCryptoProvider>(&[msg1, msg2, msg3])?;
-		assert_eq!(hash.as_bytes().len(), 32);
-		Ok(())
-	}
-
-	#[test]
-	fn test_transcript_hash_deterministic() -> Result<(), HandshakeError> {
+	fn a_transcript_hash_is_deterministic() -> TestResult {
 		let msg1 = b"Test";
 		let msg2 = b"Data";
 
@@ -456,8 +458,10 @@ mod tests {
 		Ok(())
 	}
 
+	/// A transcript hash binds the order of its messages, so the same
+	/// messages in another order hash differently.
 	#[test]
-	fn test_transcript_hash_order_matters() -> Result<(), HandshakeError> {
+	fn a_transcript_hash_binds_the_message_order() -> TestResult {
 		let msg1 = b"First";
 		let msg2 = b"Second";
 
@@ -473,53 +477,43 @@ mod tests {
 	/// `hashlib`), so a truncation to any width fails here.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_sha3_512_transcript_hash_is_the_whole_digest() -> Result<(), HandshakeError> {
-		use crate::crypto::hash::Sha3_512;
-
+	fn a_sha3_512_transcript_hash_is_the_whole_digest() -> TestResult {
 		let wide = Transcript::digest::<Sha3_512>(b"transcript")?;
-		let expected = [
-			0x7a, 0x03, 0x50, 0x48, 0xdf, 0x98, 0xb5, 0x57, 0xe4, 0xa6, 0x77, 0x2a, 0x7b, 0x5f, 0x78, 0x17, 0x94, 0xcc,
-			0x4f, 0xde, 0xc8, 0x16, 0x39, 0x4f, 0x56, 0x6d, 0x20, 0x4a, 0x68, 0x9f, 0xe1, 0xf1, 0x36, 0x70, 0xca, 0x10,
-			0x6d, 0x8a, 0x7a, 0x82, 0xc4, 0xf8, 0xd7, 0xea, 0xba, 0x53, 0x04, 0x3e, 0x23, 0x25, 0xd8, 0x2e, 0x92, 0x4f,
-			0xc1, 0x37, 0xc2, 0x07, 0x7c, 0x0a, 0x9a, 0x0c, 0x8f, 0x5b,
-		];
+		let expected = unhex(
+			"7a035048df98b557e4a6772a7b5f781794cc4fdec816394f566d204a689fe1f1\
+				3670ca106d8a7a82c4f8d7eaba53043e2325d82e924fc137c2077c0a9a0c8f5b",
+		);
 		assert_eq!(wide.as_bytes(), expected);
 		Ok(())
 	}
 
-	/// [`DigestOutput::parse`] refuses the output of a digest narrower than 256
-	/// bits.
-	#[test]
-	fn a_digest_output_narrower_than_32_bytes_is_refused() {
-		let narrow = DigestOutput::parse([0u8; 28]);
-		assert!(matches!(
-			narrow,
-			Err(HandshakeError::TranscriptDigestLength { min: 32, max: 64, received: 28 })
-		));
-	}
-
-	/// [`DigestOutput::parse`] refuses the output of a digest wider than 512
-	/// bits.
-	#[test]
-	fn a_digest_output_wider_than_64_bytes_is_refused() {
-		let wide = DigestOutput::parse([0u8; 65]);
-		assert!(matches!(
-			wide,
-			Err(HandshakeError::TranscriptDigestLength { min: 32, max: 64, received: 65 })
-		));
+	// `DigestOutput::parse` refuses the output of a digest narrower than 256
+	// bits or wider than 512 bits, and names the width it received.
+	crate::tb_cases! {
+		fn a_digest_output_outside_32_to_64_bytes_is_refused(len: usize) {
+			let refused = DigestOutput::parse(vec![0u8; len]);
+			assert!(matches!(
+				refused,
+				Err(HandshakeError::TranscriptDigestLength { min: 32, max: 64, received }) if received == len
+			));
+		}
+		cases {
+			at_28_bytes => 28,
+			at_65_bytes => 65,
+		}
 	}
 
 	/// An output hashes as its bytes, as it compares, so two equal outputs
 	/// whose buffers differ past their width hash alike.
 	#[cfg(feature = "std")]
 	#[test]
-	fn equal_outputs_hash_alike() -> Result<(), HandshakeError> {
-		use std::hash::{BuildHasher, RandomState};
+	fn equal_outputs_hash_alike() -> TestResult {
+		use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
 		let parsed = DigestOutput::parse([0x07u8; 32])?;
 		let padded = DigestOutput { bytes: [0x07u8; MAX_DIGEST_OUTPUT_LEN], len: 32 };
 
-		let state = RandomState::new();
+		let state = BuildHasherDefault::<DefaultHasher>::default();
 		assert_eq!(parsed, padded);
 		assert_eq!(state.hash_one(parsed), state.hash_one(padded));
 		Ok(())
@@ -528,8 +522,8 @@ mod tests {
 	/// The `DigestInfo` of a 64-byte transcript hash carries all 64 bytes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_sha3_512_digest_info_carries_all_64_bytes() -> Result<(), HandshakeError> {
-		let info = fixture_transcript::<Sha3_512>([0x07u8; 64]).digest_info()?;
+	fn a_sha3_512_digest_info_carries_all_64_bytes() -> TestResult {
+		let info = wide_transcript_hash().digest_info()?;
 		assert_eq!(info.digest.as_bytes(), [0x07u8; 64]);
 		Ok(())
 	}
@@ -538,7 +532,7 @@ mod tests {
 	/// it.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_digest_info_names_the_digest_of_its_hash() -> Result<(), HandshakeError> {
+	fn a_digest_info_names_the_digest_of_its_hash() -> TestResult {
 		let info = Transcript::digest::<Sha3_512>(b"transcript")?.digest_info()?;
 		assert_eq!(info.algorithm.oid, HASH_SHA3_512);
 		Ok(())
@@ -547,7 +541,7 @@ mod tests {
 	/// The transcript hash of a provider names the digest of that provider.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_provider_transcript_hash_names_the_provider_digest() -> Result<(), HandshakeError> {
+	fn a_provider_transcript_hash_names_the_provider_digest() -> TestResult {
 		let hash = transcript_hash::<Aes256Sha3_512Provider>(&[b"transcript"])?;
 
 		let info = hash.digest_info()?;

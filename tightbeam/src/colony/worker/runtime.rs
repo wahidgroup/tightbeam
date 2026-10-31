@@ -250,7 +250,6 @@ where
 	fn drop(&mut self) {
 		let phase = self.phase.get_mut().unwrap_or_else(PoisonError::into_inner);
 		let closed = mem::replace(phase, Phase::Unstarted).close();
-
 		// The closed loop drops unjoined, which aborts it.
 		drop(closed);
 	}
@@ -286,33 +285,42 @@ async fn run_loop<I, O, C, F, Fut>(
 
 #[cfg(test)]
 mod tests {
-	use core::error::Error;
 	use core::time::Duration;
 
 	use tokio::sync::Notify;
 
 	use super::*;
-	use crate::testing::TestMessage;
+	use crate::testing::{TestMessage, TestResult};
 
 	/// A bound on a wait that the test expects to end. A wait that reaches it
 	/// is a hang, which the test reports as a failure.
 	const HANG_GUARD: Duration = Duration::from_secs(10);
 
+	/// `runtime` started on a queue of `queue_capacity`, with no receptor gate
+	/// and a trace of its own, answering through `handler`.
+	fn start_on<F, Fut>(
+		runtime: WorkerRuntime<TestMessage, usize>,
+		queue_capacity: usize,
+		handler: F,
+	) -> WorkerRuntime<TestMessage, usize>
+	where
+		F: Fn(Arc<TestMessage>, Arc<TraceCollector>, Arc<()>) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = usize> + Send + 'static,
+	{
+		let policies = WorkerPolicies { receptor_gates: Vec::new() };
+		runtime.start(Arc::new(TraceCollector::new()), queue_capacity, policies, handler)
+	}
+
 	/// A worker with no receptor gate that answers the length of the
 	/// message it was handed, on a queue of `queue_capacity`.
 	fn started(queue_capacity: usize) -> WorkerRuntime<TestMessage, usize> {
-		let policies = WorkerPolicies { receptor_gates: Vec::new() };
-		let trace = Arc::new(TraceCollector::new());
 		let handler = |message: Arc<TestMessage>, _trace, _config| async move { message.content.len() };
-
-		WorkerRuntime::new(()).start(trace, queue_capacity, policies, handler)
+		start_on(WorkerRuntime::new(()), queue_capacity, handler)
 	}
 
 	/// A started worker whose handler gives notice on `entered` and never
 	/// answers. Its run loop holds `alive` until the loop ends.
 	fn held(entered: &Arc<Notify>, alive: rt::Sender<()>) -> WorkerRuntime<TestMessage, usize> {
-		let policies = WorkerPolicies { receptor_gates: Vec::new() };
-		let trace = Arc::new(TraceCollector::new());
 		let entered = Arc::clone(entered);
 		let handler = move |_message: Arc<TestMessage>, _trace, _config| {
 			let entered = Arc::clone(&entered);
@@ -324,59 +332,53 @@ mod tests {
 			}
 		};
 
-		WorkerRuntime::new(()).start(trace, 8, policies, handler)
+		start_on(WorkerRuntime::new(()), 8, handler)
 	}
 
 	fn ping() -> Arc<TestMessage> {
 		Arc::new(TestMessage { content: "ping".into() })
 	}
 
+	/// A worker that never started holds no queue, so a relay meets a closed
+	/// queue.
 	#[tokio::test]
-	async fn an_unstarted_worker_has_no_queue() -> Result<(), Box<dyn Error>> {
+	async fn an_unstarted_worker_has_no_queue() {
 		let runtime: WorkerRuntime<TestMessage, usize> = WorkerRuntime::new(());
 
 		let capacity = runtime.queue_capacity();
 		let relayed = runtime.relay(ping()).await;
-		assert_eq!(capacity, 0);
-		assert!(matches!(relayed, Err(WorkerRelayError::QueueClosed)));
-		Ok(())
+		assert!(matches!((capacity, relayed), (0, Err(WorkerRelayError::QueueClosed))));
 	}
 
+	/// A started worker holds its queue, and its run loop answers a relay.
 	#[tokio::test]
-	async fn a_started_worker_holds_its_queue_and_run_loop_together() -> Result<(), Box<dyn Error>> {
+	async fn a_started_worker_holds_its_queue_and_run_loop_together() -> TestResult {
 		let runtime = started(8);
 
 		let capacity = runtime.queue_capacity();
 		let answered = runtime.relay(ping()).await?;
 		runtime.kill().await?;
 
-		assert_eq!(capacity, 8);
-		assert_eq!(answered, 4);
+		assert_eq!((capacity, answered), (8, 4));
 		Ok(())
 	}
 
 	/// A relay whose handler ends before it answers reads the dropped answer
 	/// channel as a dropped response.
 	#[tokio::test]
-	async fn a_relay_whose_handler_panics_reads_a_dropped_response() -> Result<(), Box<dyn Error>> {
-		let policies = WorkerPolicies { receptor_gates: Vec::new() };
-		let trace = Arc::new(TraceCollector::new());
-		let handler =
-			|_message: Arc<TestMessage>, _trace, _config| async move { panic!("the handler ends unanswered") };
+	async fn a_relay_whose_handler_panics_reads_a_dropped_response() {
+		let handler = |_message, _trace, _config| async move { panic!("the handler ends unanswered") };
+		let runtime = start_on(WorkerRuntime::new(()), 8, handler);
 
-		let runtime: WorkerRuntime<TestMessage, usize> = WorkerRuntime::new(()).start(trace, 8, policies, handler);
 		let relayed = runtime.relay(ping()).await;
 		assert!(matches!(relayed, Err(WorkerRelayError::ResponseDropped)));
-		Ok(())
 	}
 
+	/// A start of a started worker keeps the queue of the first start.
 	#[tokio::test]
-	async fn a_second_start_keeps_the_first_queue() -> Result<(), Box<dyn Error>> {
+	async fn a_second_start_keeps_the_first_queue() -> TestResult {
 		let runtime = started(8);
-		let policies = WorkerPolicies { receptor_gates: Vec::new() };
-		let trace = Arc::new(TraceCollector::new());
-
-		let restarted = runtime.start(trace, 16, policies, |_message, _trace, _config| async move { 0 });
+		let restarted = start_on(runtime, 16, |_message, _trace, _config| async move { 0 });
 		assert_eq!(restarted.queue_capacity(), 8);
 		restarted.kill().await?;
 		Ok(())
@@ -385,9 +387,8 @@ mod tests {
 	/// A worker killed in place closes its queue, so a later relay meets a
 	/// closed queue.
 	#[tokio::test]
-	async fn a_killed_worker_refuses_a_later_relay() -> Result<(), Box<dyn Error>> {
+	async fn a_killed_worker_refuses_a_later_relay() -> TestResult {
 		let runtime = started(8);
-
 		runtime.kill().await?;
 
 		let relayed = runtime.relay(ping()).await;
@@ -398,7 +399,7 @@ mod tests {
 	/// A kill that drops before its run loop ends aborts the loop, so a caller
 	/// that stops waiting on the kill leaves no handler running.
 	#[tokio::test]
-	async fn a_kill_dropped_before_its_loop_ends_aborts_the_loop() -> Result<(), Box<dyn Error>> {
+	async fn a_kill_dropped_before_its_loop_ends_aborts_the_loop() -> TestResult {
 		let entered = Arc::new(Notify::new());
 		let (alive, mut released) = rt::channel::<()>(1);
 		let runtime = held(&entered, alive);

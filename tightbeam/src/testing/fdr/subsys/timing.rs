@@ -201,23 +201,9 @@ impl Process {
 #[cfg(feature = "testing-timing")]
 mod tests {
 	use super::*;
-	use crate::builder::TypeBuilder;
-	use crate::testing::error::TestingError;
 	use crate::testing::fdr::verdict::Trace;
-	use crate::testing::timing::{Deadline, DeadlineBuilder, PathWcet, WcetConfigBuilder};
-
-	/// A deadline of `ms` milliseconds from `start` to `end`.
-	fn create_deadline_constraint(ms: u64, start: &'static str, end: &'static str) -> Result<Deadline, TestingError> {
-		let duration = Duration::from_millis(ms);
-		let start_event = Event(start);
-		let end_event = Event(end);
-
-		DeadlineBuilder::default()
-			.with_duration(duration)
-			.with_start_event(start_event)
-			.with_end_event(end_event)
-			.build()
-	}
+	use crate::testing::timing::{Deadline, WcetConfig};
+	use crate::testing::TestResult;
 
 	/// One case of the timing violation table.
 	struct TimingViolationTestCase {
@@ -242,8 +228,7 @@ mod tests {
 				.collect();
 
 			if let Some(deadline_ms) = self.deadline_ms {
-				let deadline = create_deadline_constraint(deadline_ms, "start", "end").expect("the deadline builds");
-				constraints.add_deadline(deadline);
+				constraints.add_deadline(Deadline::of_millis(deadline_ms, "start", "end"));
 			}
 
 			if let Some(path_wcet_ms) = self.path_wcet_ms {
@@ -256,8 +241,10 @@ mod tests {
 		}
 	}
 
-	// Exploration charges each event its WCET apart from this aggregate check,
-	// so the table covers the deadline and the path WCET.
+	// A trace violates its constraints when its deadline window or its run of
+	// the path takes longer than the bound. Exploration charges each event its
+	// WCET apart from this aggregate check, so the table covers the deadline
+	// and the path WCET.
 	crate::tb_cases! {
 		fn timing_violation(case: TimingViolationTestCase) {
 			let violated = case.violated();
@@ -313,29 +300,24 @@ mod tests {
 				path_wcet_ms: Some(100),
 				expected_violation: false,
 			},
+			with_no_constraint => TimingViolationTestCase {
+				trace_events: &["process"],
+				elapsed_time_ms: 100,
+				event_times_ms: &[],
+				deadline_ms: None,
+				path_wcet_ms: None,
+				expected_violation: false,
+			},
 		}
 	}
 
+	/// An event with a WCET constraint adds the duration of that bound to the
+	/// elapsed time of a path.
 	#[test]
-	fn test_no_constraints() {
-		let constraints = TimingConstraints::default();
-		let trace: Trace = vec![Event("process")];
-		let elapsed_time = Duration::from_millis(100);
-		let event_times = vec![];
-
-		let has_violation = constraints.violated_by(&trace, elapsed_time, &event_times);
-		assert!(!has_violation);
-	}
-
-	#[test]
-	fn an_event_adds_the_wcet_its_constraint_names() -> Result<(), Box<dyn core::error::Error>> {
+	fn an_event_adds_the_wcet_its_constraint_names() -> TestResult {
 		let mut constraints = TimingConstraints::default();
-		let duration = Duration::from_millis(100);
-		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
-
-		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config))?;
-
-		assert_eq!(constraints.wcet_of(&Event("process")), duration);
+		constraints.add(Event("process"), TimingConstraint::Wcet(WcetConfig::of_millis(100)))?;
+		assert_eq!(constraints.wcet_of(&Event("process")), Duration::from_millis(100));
 		Ok(())
 	}
 }

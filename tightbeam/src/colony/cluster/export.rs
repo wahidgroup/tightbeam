@@ -663,121 +663,124 @@ impl<'a> TrustPlanes<'a> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::colony::urn::ColonyNamespace;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::KeyCurves;
-	use crate::testing::{TestCertificate, TestKey};
 	use std::panic::{catch_unwind, AssertUnwindSafe};
 	use std::sync::Arc;
 
-	fn servlet(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
-		let name = name.as_ref();
-		ColonyNamespace::default()
-			.servlet(name)
-			.expect("test names satisfy the mint grammar")
+	use super::*;
+	use crate::colony::urn::ColonyNamespace;
+	use crate::tb_cases;
+	use crate::testing::fixtures::{poison_write, TestStore};
+	use crate::testing::{TestCertificate, TestKey, TestResult};
+
+	fn servlet(name: impl AsRef<str>) -> Urn<'static> {
+		ColonyNamespace::servlet_fixture(name)
 	}
 
-	fn test_certificate() -> Certificate {
-		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
-	}
-
-	/// A certificate under a distinct key, so a trust store built from
-	/// [`test_certificate`] does not hold it.
+	/// A certificate under a distinct key, so a trust store that holds
+	/// [`TestCertificate::insecure_fixed`] does not hold it.
 	fn foreign_certificate() -> Certificate {
-		let key = k256::ecdsa::SigningKey::from_bytes(&[2u8; 32].into()).expect("distinct test key");
-		TestCertificate::self_signed(&key)
+		TestCertificate::self_signed(&TestKey::fixed(0x02))
 	}
 
-	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(cert.clone())
-			.expect("test certificates satisfy the trust builder")
-			.build();
-		Arc::new(store)
-	}
-
-	#[test]
-	fn first_party_classifies_hive_anchored_cert() {
-		let cert = test_certificate();
-		let hive = trust_of(&cert);
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: None });
-		assert_eq!(planes.classify(Some(&cert)), Party::FirstParty);
-	}
-
-	/// Named plane fields keep hive and peer stores distinct under classify.
-	#[test]
-	fn trust_plane_stores_named_fields_are_distinct() {
-		let hive_cert = test_certificate();
-		let peer_cert = foreign_certificate();
-		let hive = trust_of(&hive_cert);
-		let peer = trust_of(&peer_cert);
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
-		assert_eq!(planes.classify(Some(&hive_cert)), Party::FirstParty);
-		assert_eq!(planes.classify(Some(&peer_cert)), Party::Peer);
-	}
-
-	#[test]
-	fn first_party_rejects_peer_only_cert() {
-		let cert = foreign_certificate();
-		let hive = trust_of(&test_certificate());
-		let peer = trust_of(&cert);
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
-
-		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
-	}
-
-	#[test]
-	fn first_party_rejects_dual_anchored_cert() {
-		let cert = test_certificate();
-		let hive = trust_of(&cert);
-		let peer = trust_of(&cert);
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
-		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
-	}
-
-	#[test]
-	fn peer_wins_when_same_key_has_distinct_certificates() {
+	/// The certificate of the fixed key that names `cn`, under the colony URN
+	/// `urn:tightbeam:colony:test`.
+	fn named(cn: &str) -> Certificate {
 		let key = TestKey::insecure_fixed_signing();
-		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
-		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
+		TestCertificate::with_cn_and_uri_sans(&key, cn, &["urn:tightbeam:colony:test"])
+	}
 
-		let hive = trust_of(&hive_cert);
-		let peer = trust_of(&peer_cert);
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
-		assert_eq!(planes.classify(Some(&hive_cert)), Party::Peer);
-		assert_eq!(planes.classify(Some(&peer_cert)), Party::Peer);
+	/// The trust stores and the export list of one export boundary, which
+	/// the planes and the policy borrow.
+	struct Boundary {
+		exported: Option<StaticExportList>,
+		hive: Option<Arc<dyn CertificateTrust>>,
+		peer: Option<Arc<dyn CertificateTrust>>,
+	}
+
+	impl Boundary {
+		/// The boundary that exports `exported` (every type for `None`), whose
+		/// hive and peer planes each anchor the certificate they name.
+		fn of(exported: Option<&[&str]>, hive: Option<&Certificate>, peer: Option<&Certificate>) -> Self {
+			let store = |certificate: &Certificate| -> Arc<dyn CertificateTrust> {
+				Arc::new(TestStore::holding([certificate.clone()]))
+			};
+
+			let exported = exported.map(|names| StaticExportList::new(names.iter().map(servlet)));
+			Self { exported, hive: hive.map(store), peer: peer.map(store) }
+		}
+
+		/// The hive and peer planes of this boundary.
+		fn planes(&self) -> TrustPlanes<'_> {
+			TrustPlanes::new(TrustPlaneStores { hive: self.hive.as_deref(), peer: self.peer.as_deref() })
+		}
+
+		/// The policy of this boundary, with no grant and no gate.
+		fn policy(&self) -> ExportPolicy<'_> {
+			let exported = self.exported.as_ref().map(|list| list as &dyn ExportAllowlist);
+			policy(exported, self.planes())
+		}
+	}
+
+	/// The planes that anchor a certificate, and the certificate a party
+	/// presents to them.
+	type Classified = (Option<Certificate>, Option<Certificate>, Certificate, Party);
+
+	// The hive plane alone names the first party. A certificate the peer
+	// plane anchors is a peer, even when the hive plane anchors it too or
+	// anchors another certificate of the same key, and a certificate no plane
+	// anchors is untrusted.
+	tb_cases! {
+		fn a_certificate_classifies_by_the_planes_that_anchor_it((hive, peer, presented, party): Classified) {
+			let boundary = Boundary::of(None, hive.as_ref(), peer.as_ref());
+			assert_eq!(boundary.planes().classify(Some(&presented)), party);
+		}
+		cases {
+			hive_anchored => (
+				Some(TestCertificate::insecure_fixed()),
+				None,
+				TestCertificate::insecure_fixed(),
+				Party::FirstParty,
+			),
+			hive_anchored_beside_a_peer_store => (
+				Some(TestCertificate::insecure_fixed()),
+				Some(foreign_certificate()),
+				TestCertificate::insecure_fixed(),
+				Party::FirstParty,
+			),
+			peer_only => (
+				Some(TestCertificate::insecure_fixed()),
+				Some(foreign_certificate()),
+				foreign_certificate(),
+				Party::Peer,
+			),
+			dual_anchored => (
+				Some(TestCertificate::insecure_fixed()),
+				Some(TestCertificate::insecure_fixed()),
+				TestCertificate::insecure_fixed(),
+				Party::Peer,
+			),
+			same_key_hive_named => (Some(named("hive")), Some(named("peer")), named("hive"), Party::Peer),
+			same_key_peer_named => (Some(named("hive")), Some(named("peer")), named("peer"), Party::Peer),
+			no_hive_trust => (None, None, TestCertificate::insecure_fixed(), Party::Untrusted),
+		}
 	}
 
 	/// A session classifies by the canonical key it holds, so a peer that
 	/// presented the compressed form of a peer-plane key is a peer.
 	#[test]
 	fn a_session_classifies_by_its_canonical_key() {
-		let hive = trust_of(&test_certificate());
 		let peer_cert = foreign_certificate();
-		let peer = trust_of(&peer_cert);
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
+		let boundary = Boundary::of(None, Some(&TestCertificate::insecure_fixed()), Some(&peer_cert));
 
 		let session = SessionContext::for_peer(Arc::new(TestCertificate::with_compressed_key(peer_cert)));
-		assert_eq!(planes.classify_session(&session), Party::Peer);
+		assert_eq!(boundary.planes().classify_session(&session), Party::Peer);
 	}
 
+	/// A session that proved no peer classifies as untrusted.
 	#[test]
 	fn first_party_rejects_anonymous_session() {
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: None, peer: None });
+		let planes = no_planes();
 		assert_eq!(planes.classify_session(&SessionContext::default()), Party::Untrusted);
-	}
-
-	#[test]
-	fn first_party_without_hive_trust_classifies_nobody() {
-		let cert = test_certificate();
-		let planes = TrustPlanes::new(TrustPlaneStores { hive: None, peer: None });
-		assert_eq!(planes.classify(Some(&cert)), Party::Untrusted);
-	}
-
-	fn static_list(types: impl IntoIterator<Item = Urn<'static>>) -> StaticExportList {
-		StaticExportList::new(types)
 	}
 
 	/// The boundary of `exported` over `planes`, with no grant and no gate.
@@ -795,136 +798,126 @@ mod tests {
 		TrustPlanes::new(TrustPlaneStores { hive: None, peer: None })
 	}
 
-	/// The hive plane `hive` beside the peer plane `peer`.
-	fn planes<'a>(hive: &'a Arc<dyn CertificateTrust>, peer: Option<&'a Arc<dyn CertificateTrust>>) -> TrustPlanes<'a> {
-		let peer = peer.map(|peer| peer.as_ref());
-		TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer })
+	/// One export decision: the boundary, the session of the request, its
+	/// target, whether a relay hop carried it, and the verdict.
+	type Decision = (Boundary, SessionContext, &'static str, bool, TransitStatus);
+
+	// A gateway with no export list passes every target. Under a list, a
+	// relayed request passes an exported target alone, and an origin request
+	// for an unexported target passes for the first party alone.
+	tb_cases! {
+		fn the_export_verdict((boundary, session, target, relayed, status): Decision) {
+			let verdict = boundary.policy().allowlist(&servlet(target), &session, relayed);
+
+			assert_eq!(verdict, status);
+		}
+		cases {
+			no_list_passes_every_target => (
+				Boundary::of(None, None, None),
+				session_of(&TestCertificate::insecure_fixed()),
+				"ledger",
+				true,
+				TransitStatus::Ok,
+			),
+			exported_target_for_an_external_peer => (
+				Boundary::of(Some(&["ping"]), None, None),
+				session_of(&TestCertificate::insecure_fixed()),
+				"ping",
+				true,
+				TransitStatus::Ok,
+			),
+			unexported_target_for_an_external_peer => (
+				Boundary::of(Some(&["ping"]), Some(&TestCertificate::insecure_fixed()), Some(&foreign_certificate())),
+				session_of(&foreign_certificate()),
+				"ledger",
+				false,
+				TransitStatus::PermissionDenied,
+			),
+			/// The hop marker refuses an unexported relayed request even for a
+			/// first-party session, which the origin rule would admit.
+			unexported_relayed_request => (
+				Boundary::of(Some(&["ping"]), Some(&TestCertificate::insecure_fixed()), None),
+				session_of(&TestCertificate::insecure_fixed()),
+				"ledger",
+				true,
+				TransitStatus::PermissionDenied,
+			),
+			unexported_origin_target_for_the_first_party => (
+				Boundary::of(Some(&["ping"]), Some(&TestCertificate::insecure_fixed()), Some(&foreign_certificate())),
+				session_of(&TestCertificate::insecure_fixed()),
+				"ledger",
+				false,
+				TransitStatus::Ok,
+			),
+			unexported_origin_target_for_a_dual_anchored_cert => (
+				Boundary::of(
+					Some(&["ping"]),
+					Some(&TestCertificate::insecure_fixed()),
+					Some(&TestCertificate::insecure_fixed()),
+				),
+				session_of(&TestCertificate::insecure_fixed()),
+				"ledger",
+				false,
+				TransitStatus::PermissionDenied,
+			),
+			unexported_anonymous_origin_target => (
+				Boundary::of(Some(&["ping"]), Some(&TestCertificate::insecure_fixed()), None),
+				SessionContext::default(),
+				"ledger",
+				false,
+				TransitStatus::PermissionDenied,
+			),
+			empty_list_for_an_external_peer => (
+				Boundary::of(Some(&[]), Some(&TestCertificate::insecure_fixed()), None),
+				session_of(&foreign_certificate()),
+				"ping",
+				false,
+				TransitStatus::PermissionDenied,
+			),
+		}
 	}
 
+	/// A type inserted into a dynamic list reaches the verdict and the
+	/// canonical keys at once.
 	#[test]
-	fn verdict_without_export_list_passes_every_target() {
-		let cert = test_certificate();
-
-		let verdict = policy(None, no_planes()).allowlist(&servlet("ledger"), &session_of(&cert), true);
-
-		assert_eq!(verdict, TransitStatus::Ok);
-	}
-
-	#[test]
-	fn verdict_passes_exported_target_for_external_peer() {
-		let cert = test_certificate();
-		let exported = static_list([servlet("ping")]);
-
-		let verdict = policy(Some(&exported), no_planes()).allowlist(&servlet("ping"), &session_of(&cert), true);
-
-		assert_eq!(verdict, TransitStatus::Ok);
-	}
-
-	#[test]
-	fn verdict_refuses_unexported_target_for_external_peer() {
-		let cert = foreign_certificate();
-		let hive = trust_of(&test_certificate());
-		let peer = trust_of(&cert);
-		let exported = static_list([servlet("ping")]);
-		let boundary = policy(Some(&exported), planes(&hive, Some(&peer)));
-
-		let verdict = boundary.allowlist(&servlet("ledger"), &session_of(&cert), false);
-
-		assert_eq!(verdict, TransitStatus::PermissionDenied);
-	}
-
-	/// The hop marker refuses an unexported relayed request even for a
-	/// first-party session, which the origin rule would admit.
-	#[test]
-	fn verdict_refuses_unexported_relayed_request() {
-		let cert = test_certificate();
-		let hive = trust_of(&cert);
-		let exported = static_list([servlet("ping")]);
-		let boundary = policy(Some(&exported), planes(&hive, None));
-
-		let verdict = boundary.allowlist(&servlet("ledger"), &session_of(&cert), true);
-
-		assert_eq!(verdict, TransitStatus::PermissionDenied);
-	}
-
-	#[test]
-	fn verdict_passes_unexported_origin_target_for_first_party() {
-		let cert = test_certificate();
-		let hive = trust_of(&cert);
-		let peer = trust_of(&foreign_certificate());
-		let exported = static_list([servlet("ping")]);
-		let boundary = policy(Some(&exported), planes(&hive, Some(&peer)));
-
-		let verdict = boundary.allowlist(&servlet("ledger"), &session_of(&cert), false);
-
-		assert_eq!(verdict, TransitStatus::Ok);
-	}
-
-	#[test]
-	fn verdict_refuses_unexported_origin_target_for_dual_anchored_cert() {
-		let cert = test_certificate();
-		let hive = trust_of(&cert);
-		let peer = trust_of(&cert);
-		let exported = static_list([servlet("ping")]);
-		let boundary = policy(Some(&exported), planes(&hive, Some(&peer)));
-
-		let verdict = boundary.allowlist(&servlet("ledger"), &session_of(&cert), false);
-
-		assert_eq!(verdict, TransitStatus::PermissionDenied);
-	}
-
-	#[test]
-	fn verdict_refuses_unexported_anonymous_origin_target() {
-		let hive = trust_of(&test_certificate());
-		let exported = static_list([servlet("ping")]);
-		let boundary = policy(Some(&exported), planes(&hive, None));
-
-		let verdict = boundary.allowlist(&servlet("ledger"), &SessionContext::default(), false);
-
-		assert_eq!(verdict, TransitStatus::PermissionDenied);
-	}
-
-	#[test]
-	fn empty_export_list_refuses_every_target_for_external_peer() {
-		let cert = foreign_certificate();
-		let hive = trust_of(&test_certificate());
-		let exported = static_list([]);
-		let boundary = policy(Some(&exported), planes(&hive, None));
-
-		let verdict = boundary.allowlist(&servlet("ping"), &session_of(&cert), false);
-
-		assert_eq!(verdict, TransitStatus::PermissionDenied);
-	}
-
-	#[test]
-	fn dynamic_allowlist_mutation_visible_to_verdict_and_keys() -> Result<(), ClusterError> {
+	fn an_inserted_type_passes_the_verdict_and_the_keys() -> TestResult {
 		let list = DynamicExportList::new([servlet("ping")]);
-		let ledger = servlet("ledger");
-		let ledger_key = ledger.canonical_bytes();
+		list.insert(servlet("ledger"))?;
+
 		let boundary = policy(Some(&list), no_planes());
-		let anonymous = SessionContext::default();
-		assert_eq!(boundary.allowlist(&ledger, &anonymous, true), TransitStatus::PermissionDenied);
-		assert!(!list.allows_canonical(&ledger_key));
-
-		list.insert(ledger.clone())?;
-
-		assert_eq!(boundary.allowlist(&ledger, &anonymous, true), TransitStatus::Ok);
-		assert!(list.allows_canonical(&ledger_key));
-
-		list.remove(&ledger)?;
-
-		assert_eq!(boundary.allowlist(&ledger, &anonymous, true), TransitStatus::PermissionDenied);
-		assert!(!list.allows_canonical(&ledger_key));
+		let verdict = boundary.allowlist(&servlet("ledger"), &SessionContext::default(), true);
+		let allowed = list.allows_canonical(&servlet("ledger").canonical_bytes());
+		assert_eq!((verdict, allowed), (TransitStatus::Ok, true));
 		Ok(())
 	}
 
+	/// A type removed from a dynamic list leaves the verdict and the
+	/// canonical keys at once.
+	#[test]
+	fn a_removed_type_fails_the_verdict_and_the_keys() -> TestResult {
+		let list = DynamicExportList::new([servlet("ping"), servlet("ledger")]);
+		list.remove(&servlet("ledger"))?;
+
+		let boundary = policy(Some(&list), no_planes());
+		let verdict = boundary.allowlist(&servlet("ledger"), &SessionContext::default(), true);
+		let allowed = list.allows_canonical(&servlet("ledger").canonical_bytes());
+		assert_eq!((verdict, allowed), (TransitStatus::PermissionDenied, false));
+		Ok(())
+	}
+
+	/// A static list admits the canonical key of each type it exports, and no
+	/// other key.
 	#[test]
 	fn static_list_filters_slate_to_exported_keys() {
-		let exports = static_list([servlet("ping")]);
+		let exports = StaticExportList::new([servlet("ping")]);
 		assert!(exports.allows_canonical(&servlet("ping").canonical_bytes()));
 		assert!(!exports.allows_canonical(&servlet("ledger").canonical_bytes()));
 	}
 
+	/// A list of one type that implements `contains` alone.
+	///
+	/// Each house list overrides the canonical lookup, so a list of its own
+	/// runs the default lookup of the trait.
 	struct ContainsOnlyList(Urn<'static>);
 
 	impl ExportAllowlist for ContainsOnlyList {
@@ -933,6 +926,8 @@ mod tests {
 		}
 	}
 
+	/// The default canonical lookup of a list answers as its `contains` does,
+	/// and admits no key that names no type.
 	#[test]
 	fn default_canonical_lookup_delegates_to_contains() {
 		let list = ContainsOnlyList(servlet("ping"));
@@ -941,6 +936,9 @@ mod tests {
 		assert!(!list.allows_canonical(&[0xFF]));
 	}
 
+	/// A grant of the type `ledger` alone.
+	///
+	/// The crate holds no house grant, so a grant is an implementor's own.
 	struct GrantTarget;
 
 	impl ExportGrant for GrantTarget {
@@ -956,31 +954,30 @@ mod tests {
 		ExportPolicy { scope: ExportScope(None), planes, grants, gates: &[] }
 	}
 
-	#[test]
-	fn granted_matches_any_grant() {
-		let grants: Vec<Arc<dyn ExportGrant>> = vec![Arc::new(GrantTarget)];
-		let policy = granting(&grants);
-		assert!(policy.granted(&servlet("ledger"), &SessionContext::default(), false));
-		assert!(!policy.granted(&servlet("ping"), &SessionContext::default(), false));
-	}
+	// A grant list grants a target when one of its grants names it, so an
+	// empty list grants nothing.
+	tb_cases! {
+		fn a_grant_list_grants_what_one_grant_names(
+			(grants, target, granted): (Vec<Arc<dyn ExportGrant>>, &str, bool)
+		) {
+			let policy = granting(&grants);
 
-	#[test]
-	fn empty_grant_list_allows_nothing() {
-		let policy = granting(&[]);
-		assert!(!policy.granted(&servlet("ledger"), &SessionContext::default(), false));
+			let verdict = policy.granted(&servlet(target), &SessionContext::default(), false);
+
+			assert_eq!(verdict, granted);
+		}
+		cases {
+			a_named_target => (vec![Arc::new(GrantTarget)], "ledger", true),
+			an_unnamed_target => (vec![Arc::new(GrantTarget)], "ping", false),
+			no_grants => (Vec::new(), "ledger", false),
+		}
 	}
 
 	/// A list whose lock a writer poisoned when it panicked while it held the
 	/// guard.
 	fn poisoned_list() -> DynamicExportList {
 		let list = DynamicExportList::new([servlet("ping")]);
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = list.membership.write().expect("the lock is live until this panic");
-			panic!("poison the export list lock");
-		}));
-
-		assert!(panicked.is_err());
-		assert!(list.membership.is_poisoned());
+		poison_write(&list.membership);
 		list
 	}
 
@@ -993,38 +990,25 @@ mod tests {
 		let types = core::iter::from_fn(|| -> Option<Urn<'static>> { panic!("the caller's iterator panics") });
 
 		let panicked = catch_unwind(AssertUnwindSafe(|| list.set(types)));
-
 		assert!(panicked.is_err());
 		assert!(!list.membership.is_poisoned());
 	}
 
-	/// A replacement on a poisoned lock reports the fault to the operator.
-	#[test]
-	fn a_set_on_a_poisoned_list_reports_the_poisoned_lock() {
-		let list = poisoned_list();
+	/// One write of a dynamic list.
+	type ListWrite = fn(&DynamicExportList) -> Result<(), ClusterError>;
 
-		let set = list.set([servlet("ledger")]);
-
-		assert!(matches!(set, Err(ClusterError::LockPoisoned)));
-	}
-
-	/// An insertion on a poisoned lock reports the fault to the operator.
-	#[test]
-	fn an_insert_on_a_poisoned_list_reports_the_poisoned_lock() {
-		let list = poisoned_list();
-
-		let inserted = list.insert(servlet("ledger"));
-
-		assert!(matches!(inserted, Err(ClusterError::LockPoisoned)));
-	}
-
-	/// A removal on a poisoned lock reports the fault to the operator.
-	#[test]
-	fn a_remove_on_a_poisoned_list_reports_the_poisoned_lock() {
-		let list = poisoned_list();
-
-		let removed = list.remove(&servlet("ping"));
-
-		assert!(matches!(removed, Err(ClusterError::LockPoisoned)));
+	// A replacement, an insertion, and a removal on a poisoned lock each
+	// report the fault to the operator.
+	tb_cases! {
+		fn a_poisoned_list_reports_the_poisoned_lock(write: ListWrite) {
+			let list = poisoned_list();
+			let written = write(&list);
+			assert!(matches!(written, Err(ClusterError::LockPoisoned)));
+		}
+		cases {
+			on_set => |list| list.set([servlet("ledger")]),
+			on_insert => |list| list.insert(servlet("ledger")),
+			on_remove => |list| list.remove(&servlet("ping")),
+		}
 	}
 }

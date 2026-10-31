@@ -5,8 +5,9 @@
 //! - Earliest Deadline First (EDF).
 //! - Response Time Analysis, the exact test.
 
-use crate::Errorizable;
 use core::time::Duration;
+
+use crate::Errorizable;
 
 /// A task of the real-time task model.
 #[derive(Debug, Clone, PartialEq)]
@@ -427,21 +428,28 @@ impl Task {
 }
 
 #[cfg(test)]
+impl TaskResponseTime {
+	/// Each response time of `times` under the ID of its task, in order.
+	pub(crate) fn named(times: &[TaskResponseTime]) -> Vec<(&str, ResponseTime)> {
+		times.iter().map(|time| (time.task.id.as_str(), time.response_time)).collect()
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
+
+	/// One task row: its ID, period, deadline, and WCET in milliseconds, and
+	/// its declared priority.
+	type TaskRow = (&'static str, u64, u64, u64, Option<u32>);
 
 	/// One case of the RMA and EDF schedulability tables.
 	struct SchedulabilityTestCase {
-		/// The task rows, each (id, period_ms, deadline_ms, wcet_ms, priority).
-		tasks: &'static [(&'static str, u64, u64, u64, Option<u32>)],
+		/// The task rows.
+		tasks: &'static [TaskRow],
 		expected_schedulable: bool,
 		expected_utilization: f64,
-	}
-
-	/// Each response time of `response_times` under the ID of its task.
-	fn named(response_times: &[TaskResponseTime]) -> Vec<(&str, ResponseTime)> {
-		let named = response_times.iter().map(|time| (time.task.id.as_str(), time.response_time));
-		named.collect()
 	}
 
 	/// A converged response time of `millis` milliseconds.
@@ -449,30 +457,24 @@ mod tests {
 		ResponseTime::Converged(Duration::from_millis(millis))
 	}
 
-	/// Creates a [`TaskSet`] from the task rows.
-	fn create_task_set_from_data(
-		tasks_data: &[(&'static str, u64, u64, u64, Option<u32>)],
-		scheduler: SchedulerType,
-	) -> TaskSet {
-		let tasks: Vec<Task> = tasks_data
-			.iter()
-			.map(|(id, period_ms, deadline_ms, wcet_ms, priority)| Task {
-				id: id.to_string(),
-				period: Duration::from_millis(*period_ms),
-				deadline: Duration::from_millis(*deadline_ms),
-				wcet: Duration::from_millis(*wcet_ms),
-				priority: *priority,
-			})
-			.collect();
+	/// The task set of `rows` under `scheduler`.
+	fn task_set(rows: &[TaskRow], scheduler: SchedulerType) -> TaskSet {
+		let tasks = rows.iter().map(|&(id, period_ms, deadline_ms, wcet_ms, priority)| Task {
+			id: id.to_string(),
+			period: Duration::from_millis(period_ms),
+			deadline: Duration::from_millis(deadline_ms),
+			wcet: Duration::from_millis(wcet_ms),
+			priority,
+		});
 
-		TaskSet { tasks, scheduler }
+		TaskSet { tasks: tasks.collect(), scheduler }
 	}
 
 	// Each task set gets the rate-monotonic verdict and the utilization of its
 	// row.
 	crate::tb_cases! {
-		fn rm_schedulability(case: SchedulabilityTestCase) -> Result<(), SchedulabilityError> {
-			let task_set = create_task_set_from_data(case.tasks, SchedulerType::RateMonotonic);
+		fn rm_schedulability(case: SchedulabilityTestCase) -> TestResult {
+			let task_set = task_set(case.tasks, SchedulerType::RateMonotonic);
 			let result = task_set.is_rm_schedulable()?;
 			assert_eq!(result.is_schedulable, case.expected_schedulable);
 			assert!((result.utilization - case.expected_utilization).abs() < 0.01);
@@ -511,14 +513,23 @@ mod tests {
 				expected_schedulable: true,
 				expected_utilization: 0.55,
 			},
+			/// The declared priorities reverse the rate order. RMA ranks the
+			/// tasks by rate, and R1 = 1 <= 2, R2 = 2 <= 4, and R3 = 8 <= 8
+			/// prove the set schedulable. The declared order would give
+			/// R1 = 1 + ⌈1/8⌉ * 2 + ⌈1/4⌉ * 1 = 4 > 2.
+			declared_priorities_against_the_rate => SchedulabilityTestCase {
+				tasks: &[("T1", 2, 2, 1, Some(3)), ("T2", 4, 4, 1, Some(2)), ("T3", 8, 8, 2, Some(1))],
+				expected_schedulable: true,
+				expected_utilization: 1.0,
+			},
 		}
 	}
 
 	// Each task set gets the EDF verdict and the utilization of its row. The
 	// EDF bound is a utilization of 1.0.
 	crate::tb_cases! {
-		fn edf_schedulability(case: SchedulabilityTestCase) -> Result<(), SchedulabilityError> {
-			let task_set = create_task_set_from_data(case.tasks, SchedulerType::EarliestDeadlineFirst);
+		fn edf_schedulability(case: SchedulabilityTestCase) -> TestResult {
+			let task_set = task_set(case.tasks, SchedulerType::EarliestDeadlineFirst);
 			let result = task_set.is_edf_schedulable()?;
 			assert_eq!(result.is_schedulable, case.expected_schedulable);
 			assert!((result.utilization - case.expected_utilization).abs() < 0.01);
@@ -553,99 +564,83 @@ mod tests {
 		}
 	}
 
-	// T1 (higher priority): R1 = C1 = 3ms
-	// T2 (lower priority): R2 = C2 + ⌈R2/T1⌉ * C1
-	// Iteration: R2 = 5 + ⌈5/10⌉ * 3 = 5 + 1 * 3 = 8
-	// R2 = 5 + ⌈8/10⌉ * 3 = 5 + 1 * 3 = 8 (converged)
-	#[test]
-	fn test_response_time_analysis() -> Result<(), SchedulabilityError> {
-		let tasks = [("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, Some(2))];
-		let task_set = create_task_set_from_data(&tasks, SchedulerType::RateMonotonic);
+	// Response time analysis gives each task of a fixed-priority set its
+	// response time, in the order the tasks run.
+	crate::tb_cases! {
+		fn response_time_analysis((rows, times): (&[TaskRow], Vec<(&str, ResponseTime)>)) -> TestResult {
+			let task_set = task_set(rows, SchedulerType::RateMonotonic);
+			let response_times = task_set.response_time_analysis()?;
+			assert_eq!(TaskResponseTime::named(&response_times), times);
+			Ok(())
+		}
 
-		let response_times = task_set.response_time_analysis()?;
-		let expected = [("T1", converged(3)), ("T2", converged(8))];
-		assert_eq!(named(&response_times), expected);
-		Ok(())
+		cases {
+			/// T1 runs first: R1 = C1 = 3 ms. T2 takes
+			/// R2 = 5 + ⌈5/10⌉ * 3 = 8, and R2 = 5 + ⌈8/10⌉ * 3 = 8 converges.
+			converges_by_rate => (
+				&[("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, Some(2))],
+				vec![("T1", converged(3)), ("T2", converged(8))],
+			),
+			/// R2 steps through 5, 13, and 21 ms, and 21 ms passes its 20 ms
+			/// deadline, so it reports that lower bound.
+			reports_a_lower_bound_past_a_deadline => (
+				&[("T1", 10, 10, 8, Some(1)), ("T2", 20, 20, 5, Some(2))],
+				vec![
+					("T1", converged(8)),
+					("T2", ResponseTime::ExceedsDeadline { lower_bound: Duration::from_millis(21) }),
+				],
+			),
+			/// T2 declares the higher priority, so it runs first:
+			/// R2 = C2 = 5 ms. T1 takes R1 = 3 + ⌈3/20⌉ * 5 = 8, and
+			/// R1 = 3 + ⌈8/20⌉ * 5 = 8 converges.
+			ranks_the_tasks_by_declared_priority => (
+				&[("T1", 10, 10, 3, Some(2)), ("T2", 20, 20, 5, Some(1))],
+				vec![("T2", converged(5)), ("T1", converged(8))],
+			),
+		}
 	}
 
-	// R2 steps through 5, 13, and 21 ms, and 21 ms passes its 20 ms deadline.
-	#[test]
-	fn a_task_past_its_deadline_reports_a_lower_bound() -> Result<(), SchedulabilityError> {
-		let tasks = [("T1", 10, 10, 8, Some(1)), ("T2", 20, 20, 5, Some(2))];
-		let task_set = create_task_set_from_data(&tasks, SchedulerType::RateMonotonic);
+	// Response time analysis refuses a set that declares the priority of some
+	// tasks alone, and a set under a scheduler of dynamic priorities.
+	crate::tb_cases! {
+		fn response_time_analysis_refuses(
+			(rows, scheduler, refused): (&[TaskRow], SchedulerType, SchedulabilityError)
+		) {
+			let task_set = task_set(rows, scheduler);
+			let analyzed = task_set.response_time_analysis();
+			assert_eq!(analyzed, Err(refused));
+		}
 
-		let response_times = task_set.response_time_analysis()?;
-		let past = ResponseTime::ExceedsDeadline { lower_bound: Duration::from_millis(21) };
-		assert_eq!(named(&response_times), [("T1", converged(8)), ("T2", past)]);
-		Ok(())
+		cases {
+			a_set_that_declares_some_priorities => (
+				&[("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, None)],
+				SchedulerType::RateMonotonic,
+				SchedulabilityError::PriorityMissing { task: "T2".to_string() },
+			),
+			an_edf_set => (
+				&[("T1", 10, 10, 3, None)],
+				SchedulerType::EarliestDeadlineFirst,
+				SchedulabilityError::FixedPriorityRequired { scheduler: SchedulerType::EarliestDeadlineFirst },
+			),
+		}
 	}
 
-	// T2 declares the higher priority, so it runs first: R2 = C2 = 5ms.
-	// T1: R1 = 3 + ⌈3/20⌉ * 5 = 8, and R1 = 3 + ⌈8/20⌉ * 5 = 8 (converged)
-	#[test]
-	fn response_time_analysis_ranks_the_tasks_by_declared_priority() -> Result<(), SchedulabilityError> {
-		let tasks = [("T1", 10, 10, 3, Some(2)), ("T2", 20, 20, 5, Some(1))];
-		let task_set = create_task_set_from_data(&tasks, SchedulerType::RateMonotonic);
+	// Rate-monotonic analysis refuses a set with no task, a task with no
+	// period, and a task whose deadline passes its period.
+	crate::tb_cases! {
+		fn rm_analysis_refuses((rows, refused): (&[TaskRow], SchedulabilityError)) {
+			let task_set = task_set(rows, SchedulerType::RateMonotonic);
+			let analyzed = task_set.is_rm_schedulable();
+			assert_eq!(analyzed, Err(refused));
+		}
 
-		let response_times = task_set.response_time_analysis()?;
-		let expected = [("T2", converged(5)), ("T1", converged(8))];
-		assert_eq!(named(&response_times), expected);
-		Ok(())
-	}
-
-	// The declared priorities reverse the rate order. RMA ranks by rate, and
-	// R1 = 1 <= 2, R2 = 2 <= 4, and R3 = 8 <= 8 prove the set schedulable.
-	// The declared order would give R1 = 1 + ⌈1/8⌉ * 2 + ⌈1/4⌉ * 1 = 4 > 2.
-	#[test]
-	fn rate_monotonic_analysis_ranks_the_tasks_by_rate() -> Result<(), SchedulabilityError> {
-		let tasks = [("T1", 2, 2, 1, Some(3)), ("T2", 4, 4, 1, Some(2)), ("T3", 8, 8, 2, Some(1))];
-		let task_set = create_task_set_from_data(&tasks, SchedulerType::RateMonotonic);
-
-		let result = task_set.is_rm_schedulable()?;
-		assert!(result.is_schedulable);
-		Ok(())
-	}
-
-	#[test]
-	fn response_time_analysis_refuses_a_set_that_declares_some_priorities() -> Result<(), SchedulabilityError> {
-		let tasks = [("T1", 10, 10, 3, Some(1)), ("T2", 20, 20, 5, None)];
-		let task_set = create_task_set_from_data(&tasks, SchedulerType::RateMonotonic);
-
-		let refused = task_set.response_time_analysis();
-		assert_eq!(refused, Err(SchedulabilityError::PriorityMissing { task: "T2".to_string() }));
-		Ok(())
-	}
-
-	#[test]
-	fn test_rta_rejects_edf() {
-		let task_set = create_task_set_from_data(&[("T1", 10, 10, 3, None)], SchedulerType::EarliestDeadlineFirst);
-		assert!(matches!(
-			task_set.response_time_analysis(),
-			Err(SchedulabilityError::FixedPriorityRequired { scheduler: SchedulerType::EarliestDeadlineFirst })
-		));
-	}
-
-	#[test]
-	fn test_empty_task_set_rejected() {
-		let task_set = TaskSet { tasks: Vec::new(), scheduler: SchedulerType::RateMonotonic };
-		assert!(matches!(task_set.is_rm_schedulable(), Err(SchedulabilityError::EmptyTaskSet)));
-	}
-
-	#[test]
-	fn test_zero_period_rejected() {
-		let task_set = create_task_set_from_data(&[("T1", 0, 10, 3, Some(1))], SchedulerType::RateMonotonic);
-		assert!(matches!(
-			task_set.is_rm_schedulable(),
-			Err(SchedulabilityError::ZeroPeriod { task }) if task == "T1"
-		));
-	}
-
-	#[test]
-	fn test_deadline_exceeding_period_rejected() {
-		let task_set = create_task_set_from_data(&[("T1", 10, 20, 3, Some(1))], SchedulerType::RateMonotonic);
-		assert!(matches!(
-			task_set.is_rm_schedulable(),
-			Err(SchedulabilityError::DeadlineExceedsPeriod { task }) if task == "T1"
-		));
+		cases {
+			an_empty_task_set => (&[], SchedulabilityError::EmptyTaskSet),
+			a_zero_period => (&[("T1", 0, 10, 3, Some(1))], SchedulabilityError::ZeroPeriod { task: "T1".to_string() }),
+			a_deadline_past_the_period => (
+				&[("T1", 10, 20, 3, Some(1))],
+				SchedulabilityError::DeadlineExceedsPeriod { task: "T1".to_string() },
+			),
+		}
 	}
 }

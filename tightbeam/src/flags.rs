@@ -185,27 +185,29 @@ impl<const N: usize> TryFrom<&crate::flags::Flags<N>> for crate::matrix::MatrixD
 
 #[cfg(test)]
 mod tests {
+	use crate::testing::TestResult;
+
 	use super::*;
 
 	// Flags are position-stable, so padding a short slice or dropping the tail
 	// of a long one silently changes which flag each byte sets.
-	#[test]
-	fn a_slice_shorter_than_the_set_is_refused() {
-		let refused = Flags::<4>::try_from([1u8, 2].as_slice());
-		assert_eq!(refused, Err(FlagsError::LengthMismatch { expected: 4, len: 2 }));
+	crate::tb_cases! {
+		fn a_slice_of_another_length_is_refused((bytes, len): (&[u8], usize)) {
+			let refused = Flags::<3>::try_from(bytes);
+			assert_eq!(refused, Err(FlagsError::LengthMismatch { expected: 3, len }));
+		}
+		cases {
+			shorter => (&[1, 2], 2),
+			longer => (&[1, 2, 3, 4], 4),
+		}
 	}
 
+	/// A slice of exactly the length of the set names each flag in order.
 	#[test]
-	fn a_slice_longer_than_the_set_is_refused() {
-		let refused = Flags::<2>::try_from([1u8, 2, 3, 4].as_slice());
-		assert_eq!(refused, Err(FlagsError::LengthMismatch { expected: 2, len: 4 }));
-	}
-
-	#[test]
-	fn a_slice_of_exactly_the_set_length_is_accepted() {
-		let accepted = Flags::<3>::try_from([7u8, 8, 9].as_slice()).expect("three bytes name three flags");
-		assert_eq!(accepted.get_at(0), 7);
-		assert_eq!(accepted.get_at(2), 9);
+	fn a_slice_of_exactly_the_set_length_is_accepted() -> TestResult {
+		let accepted = Flags::<3>::try_from([7u8, 8, 9].as_slice())?;
+		assert_eq!(accepted.as_ref(), [7u8, 8, 9]);
+		Ok(())
 	}
 
 	/// The flags sit on the diagonal of the matrix view, so a cell off the
@@ -213,7 +215,6 @@ mod tests {
 	#[test]
 	fn a_cell_off_the_diagonal_reads_zero() {
 		let flags = Flags::<2>::from([1u8, 1]);
-
 		assert_eq!(MatrixLike::get(&flags, 0, 1), 0);
 	}
 }

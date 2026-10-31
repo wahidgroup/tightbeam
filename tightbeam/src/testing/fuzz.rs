@@ -229,7 +229,6 @@ impl FuzzTraceCollector {
 	pub fn new(input: impl Into<Vec<u8>>, process: Process) -> Self {
 		let oracle = FuzzContext::new(input, process);
 		let trace = TraceCollector::with_fuzz_context(oracle.clone());
-
 		Self { trace, oracle }
 	}
 
@@ -534,6 +533,7 @@ impl CspOracle {
 		if total_states == 0 {
 			return 0.0;
 		}
+
 		(self.visited_states.len() as f64) / (total_states as f64) * 100.0
 	}
 
@@ -894,7 +894,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- no input byte remains.
 	pub fn fuzz_u8(&self) -> Result<u8, TestingError> {
 		let mut guard = self.lock()?;
-
 		Ok(u8::from_be_bytes(guard.take_array()?))
 	}
 
@@ -906,7 +905,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than two bytes remain.
 	pub fn fuzz_u16(&self) -> Result<u16, TestingError> {
 		let mut guard = self.lock()?;
-
 		Ok(u16::from_be_bytes(guard.take_array()?))
 	}
 
@@ -918,7 +916,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than four bytes remain.
 	pub fn fuzz_u32(&self) -> Result<u32, TestingError> {
 		let mut guard = self.lock()?;
-
 		Ok(u32::from_be_bytes(guard.take_array()?))
 	}
 
@@ -930,7 +927,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than eight bytes remain.
 	pub fn fuzz_u64(&self) -> Result<u64, TestingError> {
 		let mut guard = self.lock()?;
-
 		Ok(u64::from_be_bytes(guard.take_array()?))
 	}
 
@@ -942,7 +938,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than `n` bytes remain.
 	pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
 		let mut guard = self.lock()?;
-
 		Ok(guard.take(n)?.to_vec())
 	}
 
@@ -963,7 +958,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	pub fn fuzz_has_bytes(&self, n: usize) -> Result<bool, TestingError> {
 		let guard = self.lock()?;
-
 		Ok(guard.remaining() >= n)
 	}
 
@@ -974,7 +968,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputLockPoisoned`] -- the context mutex is poisoned.
 	pub fn fuzz_remaining(&self) -> Result<usize, TestingError> {
 		let guard = self.lock()?;
-
 		Ok(guard.remaining())
 	}
 
@@ -986,7 +979,6 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- no input byte remains.
 	pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError> {
 		let guard = self.lock()?;
-
 		Ok(guard.peek(1)?[0])
 	}
 
@@ -999,534 +991,505 @@ impl FuzzContext {
 	/// - [`TestingError::FuzzInputExhausted`] -- fewer than `n` bytes remain.
 	pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
 		let guard = self.lock()?;
-
 		Ok(guard.peek(n)?.to_vec())
 	}
 }
 
-/// Unit tests of the oracle and the fuzz context, which macros group into one
-/// module per concern.
+/// Unit tests of the oracle and the fuzz context, in one module per concern.
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::fixtures::TestProcess;
+	use crate::testing::TestResult;
 	use crate::urn::Urn;
+
+	/// The text of the crash context of the process of [`one_step`] once it
+	/// took `go`.
+	const CRASH_AFTER_GO: &str = "AFL Crash Context:\n\
+		Current State: State(\"S1\")\n\
+		Terminal: true\n\
+		Trace: [Event(\"go\")]\n\
+		State Coverage: 100.0% (2/2)\n\
+		Transition Coverage: 100.0% (1/1)\n\
+		Valid Events: []";
 
 	// The fixtures below build small CSP processes for the tests.
 
-	/// Builds a one-step process in which `event` moves `S0` to the terminal
-	/// `S1`.
-	fn build_simple_process(event: &'static str) -> Process {
-		Process::builder("TestProc")
-			.initial_state(State("S0"))
-			.add_observable(Event(event))
-			.add_transition(State("S0"), Event(event), State("S1"))
-			.add_terminal(State("S1"))
-			.build()
-			.expect("fixture process builder has a valid initial state")
+	/// The one-step process in which `event` moves `S0` to the terminal `S1`.
+	fn one_step(event: &'static str) -> Process {
+		TestProcess::chain("TestProc", &["S0", "S1"], &[event])
 	}
 
-	/// Builds a two-step process in which `e1` moves `S0` to `S1` and `e2`
+	/// The two-step process in which `first` moves `S0` to `S1` and `second`
 	/// moves `S1` to the terminal `S2`.
-	fn build_two_step_process(e1: &'static str, e2: &'static str) -> Process {
-		Process::builder("TestProc")
-			.initial_state(State("S0"))
-			.add_observable(Event(e1))
-			.add_observable(Event(e2))
-			.add_transition(State("S0"), Event(e1), State("S1"))
-			.add_transition(State("S1"), Event(e2), State("S2"))
-			.add_terminal(State("S2"))
-			.build()
-			.expect("fixture process builder has a valid initial state")
+	fn two_steps(first: &'static str, second: &'static str) -> Process {
+		TestProcess::chain("TestProc", &["S0", "S1", "S2"], &[first, second])
 	}
 
-	/// Builds a three-step process in which `a`, `b`, and `c` move `S0`
-	/// through `S1` and `S2` to the terminal `S3`.
-	fn build_three_step_process() -> Process {
-		Process::builder("TestProc")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_observable(Event("c"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("b"), State("S2"))
-			.add_transition(State("S2"), Event("c"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
-			.expect("fixture process builder has a valid initial state")
+	/// The three-step process in which `a`, `b`, and `c` move `S0` through
+	/// `S1` and `S2` to the terminal `S3`.
+	fn three_steps() -> Process {
+		TestProcess::chain("TestProc", &["S0", "S1", "S2", "S3"], &["a", "b", "c"])
 	}
 
-	/// Builds a choice process in which `choice` moves `S0` to `S1` or `S2`,
-	/// both terminal.
-	fn build_choice_process() -> Process {
-		Process::builder("TestProc")
-			.initial_state(State("S0"))
-			.add_observable(Event("choice"))
-			.add_transition(State("S0"), Event("choice"), State("S1"))
-			.add_transition(State("S0"), Event("choice"), State("S2"))
-			.add_choice(State("S0"))
-			.add_terminal(State("S1"))
-			.add_terminal(State("S2"))
-			.build()
-			.expect("fixture process builder has a valid initial state")
+	/// The choice process in which `choice` moves `S0` to `S1` or `S2`, both
+	/// terminal.
+	fn choice() -> Process {
+		TestProcess::choosing("TestProc", "S0", "choice", &["S1", "S2"])
 	}
 
-	/// Builds a branching process in which `a`, `b`, and `c` move `S0` to
-	/// `S1`, `S2`, and `S3`, all terminal.
-	fn build_branching_process() -> Process {
-		Process::builder("TestProc")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_observable(Event("c"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S0"), Event("b"), State("S2"))
-			.add_transition(State("S0"), Event("c"), State("S3"))
-			.add_terminal(State("S1"))
-			.add_terminal(State("S2"))
-			.add_terminal(State("S3"))
-			.build()
-			.expect("fixture process builder has a valid initial state")
+	/// The branching process in which `a`, `b`, and `c` move `S0` to `S1`,
+	/// `S2`, and `S3`, all terminal.
+	fn branching() -> Process {
+		TestProcess {
+			observable: &["a", "b", "c"],
+			transitions: &[("S0", "a", "S1"), ("S0", "b", "S2"), ("S0", "c", "S3")],
+			terminal: &["S1", "S2", "S3"],
+			..TestProcess::of("TestProc", "S0")
+		}
+		.build()
 	}
 
-	/// Builds a one-step process whose transition label is the full URN
-	/// `event`, which moves `S0` to the terminal `S1`.
-	fn build_urn_step_process(event: Urn<'static>) -> Process {
-		Process::builder("UrnStep")
-			.initial_state(State("S0"))
-			.add_observable(event.clone())
-			.add_transition(State("S0"), event, State("S1"))
-			.add_terminal(State("S1"))
-			.build()
-			.expect("fixture process builder has a valid initial state")
+	/// The process in which `go` moves `S0` to `Stuck`, which is not terminal
+	/// and enables no event.
+	fn stuck() -> Process {
+		TestProcess {
+			observable: &["go"],
+			transitions: &[("S0", "go", "Stuck")],
+			..TestProcess::of("TestProc", "S0")
+		}
+		.build()
+	}
+
+	/// The oracle of `process` once it took each of `steps` in turn.
+	fn stepped(process: Process, steps: &[&'static str]) -> CspOracle {
+		let mut oracle = CspOracle::new(process);
+		for &event in steps {
+			let taken = oracle.step(&Event(event));
+			taken.then_some(()).expect("each step of a test run is enabled");
+		}
+
+		oracle
+	}
+
+	/// The distinct traces of `count` fresh oracles of [`branching`], each
+	/// run over `input`.
+	fn traces_of_fresh_oracles(count: usize, input: &[u8]) -> HashSet<Vec<Event>> {
+		let runs = (0..count).map(|_| {
+			let mut oracle = CspOracle::new(branching());
+			oracle.fuzz_from_bytes(input).expect("the branching process ends in one step");
+			oracle.trace().to_vec()
+		});
+
+		runs.collect()
+	}
+
+	/// The coverage score, the state hash, the terminal flag, and the current
+	/// state that a reader of a context sees.
+	type Reading = (u64, u32, bool, Option<State>);
+
+	/// What one reader of `context` sees.
+	fn reading_of(context: &FuzzContext) -> Reading {
+		(
+			context.coverage_score(),
+			context.track_state(),
+			context.is_terminal(),
+			context.current_state(),
+		)
+	}
+
+	/// What each of `threads` threads reads from `context` at once.
+	fn read_from_threads(context: &Arc<FuzzContext>, threads: usize) -> Vec<Reading> {
+		let spawned = (0..threads).map(|_| {
+			let context = Arc::clone(context);
+			std::thread::spawn(move || reading_of(&context))
+		});
+
+		let handles: Vec<_> = spawned.collect();
+		let joined = handles.into_iter().map(|handle| handle.join().expect("a reading thread ends"));
+		joined.collect()
 	}
 
 	// These tests cover the IJON feature, URN labels, and timed transitions.
 
+	/// An IJON build runs a byte-driven fuzz run as a plain build runs it.
+	///
+	/// `report_ijon` is `cfg(fuzzing)`, so `cargo test` runs the empty arm, and
+	/// a cargo-afl build compiles the real IJON calls.
 	#[cfg(feature = "testing-fuzz-ijon")]
 	#[test]
-	fn oracle_ijon_feature_enabled() {
-		// `report_ijon` is `cfg(fuzzing)`, so cargo test runs the empty arm,
-		// and cargo-afl builds compile the real IJON calls.
-		let proc = build_simple_process("go");
-		let mut oracle = CspOracle::new(proc);
+	fn an_ijon_build_fuzzes_as_a_plain_build() {
+		let mut oracle = CspOracle::new(one_step("go"));
 
-		let input = vec![0];
-		let result = oracle.fuzz_from_bytes(&input);
-		assert!(result.is_ok(), "IJON feature should not break fuzzing");
-		assert_eq!(oracle.visited_states().len(), 2);
-		assert_eq!(oracle.visited_transitions().len(), 1);
-
-		let _ = oracle.track_state();
-		let _ = oracle.coverage_score();
+		let fuzzed = oracle.fuzz_from_bytes([0]);
+		let visited = (oracle.visited_states().len(), oracle.visited_transitions().len());
+		assert_eq!((fuzzed, visited, oracle.coverage_score()), (Ok(()), (2, 1), (2 << 32) | 1));
 	}
 
+	/// A step takes an event that the full URN of a transition label names.
 	#[test]
-	fn step_event_accepts_full_urn_label() {
+	fn a_step_takes_an_event_named_by_its_full_urn() -> TestResult {
 		const GO: Urn<'static> = crate::urn!("fuzz", "event:test/go");
-		let proc = build_urn_step_process(GO);
+		let go = Event::from(GO);
 
-		let ctx = FuzzContext::new(Vec::new(), proc);
-		let event = Event::from(GO);
-		assert!(matches!(ctx.step_event(&event), Ok(true)));
-		assert!(matches!(ctx.current_state(), Some(State("S1"))));
+		let context = FuzzContext::new(Vec::new(), one_step(go.0));
+		let stepped = context.step_event(&go)?;
+		assert_eq!((stepped, context.current_state()), (true, Some(State("S1"))));
+		Ok(())
 	}
 
+	/// A timed transition counts toward the transitions a run can cover.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_timed_transition_counts_toward_transition_coverage() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_timed_transition_counts_toward_transition_coverage() -> TestResult {
 		let process = Process::builder("Timed")
 			.initial_state(State("S0"))
 			.add_observable(Event("arm"))
 			.add_timed_transition(State("S0"), Event("arm"), State("S1"), None, Vec::new())
 			.add_terminal(State("S1"))
 			.build()?;
-		let oracle = CspOracle::new(process);
 
+		let oracle = CspOracle::new(process);
 		assert_eq!(oracle.transition_coverage(), (0, 1));
 		Ok(())
 	}
 
-	/// Generates the core oracle tests: steps, refusals, reset, and choice
-	/// points.
-	macro_rules! generate_oracle_core_tests {
-		($module_name:ident) => {
-			mod $module_name {
-				#[test]
-				fn tracks_state_transitions() {
-					let mut oracle = super::CspOracle::new(super::build_two_step_process("go", "stop"));
-					assert_eq!(oracle.current_state(), super::State("S0"));
-					assert_eq!(oracle.visited_states().len(), 1);
-					assert!(!oracle.is_terminal());
+	/// The core oracle tests: steps, refusals, reset, and choice points.
+	mod oracle_core {
+		use super::*;
 
-					let valid = oracle.valid_events();
-					assert_eq!(valid.len(), 1);
-					assert_eq!(valid[0].0, "go");
+		/// A new oracle stands at the initial state, which offers the first
+		/// event alone.
+		#[test]
+		fn a_new_oracle_stands_at_its_initial_state() {
+			let oracle = CspOracle::new(two_steps("go", "stop"));
+			let standing = (oracle.current_state(), oracle.visited_states().len(), oracle.is_terminal());
+			assert_eq!((standing, oracle.valid_events()), ((State("S0"), 1, false), vec![Event("go")]));
+		}
 
-					assert!(oracle.step(&super::Event("go")));
-					assert_eq!(oracle.current_state(), super::State("S1"));
-					assert_eq!(oracle.visited_states().len(), 2);
-					assert_eq!(oracle.visited_transitions().len(), 1);
-					assert_eq!(oracle.trace().len(), 1);
+		/// A valid step moves the oracle and records the state, the transition,
+		/// and the event it took.
+		#[test]
+		fn a_valid_step_moves_the_oracle_and_records_the_transition() {
+			let mut oracle = CspOracle::new(two_steps("go", "stop"));
 
-					assert!(oracle.step(&super::Event("stop")));
-					assert_eq!(oracle.current_state(), super::State("S2"));
-					assert!(oracle.is_terminal());
-					assert_eq!(oracle.valid_events().len(), 0);
-				}
+			let taken = oracle.step(&Event("go"));
+			let visited = (oracle.visited_states().len(), oracle.visited_transitions().len());
+			assert_eq!((taken, oracle.current_state(), visited), (true, State("S1"), (2, 1)));
+			assert_eq!(oracle.trace(), [Event("go")]);
+		}
 
-				#[test]
-				fn rejects_invalid_events() {
-					let mut oracle = super::CspOracle::new(super::build_simple_process("valid"));
-					assert!(!oracle.step(&super::Event("invalid")));
-					assert_eq!(oracle.current_state(), super::State("S0"));
-					assert_eq!(oracle.visited_transitions().len(), 0);
-				}
+		/// The last step reaches a terminal state, which offers no event.
+		#[test]
+		fn the_last_step_reaches_a_terminal_state_that_offers_no_event() {
+			let mut oracle = stepped(two_steps("go", "stop"), &["go"]);
 
-				#[test]
-				fn oracle_reset() {
-					let mut oracle = super::CspOracle::new(super::build_simple_process("go"));
-					oracle.step(&super::Event("go"));
-					assert_eq!(oracle.current_state(), super::State("S1"));
+			let taken = oracle.step(&Event("stop"));
 
-					oracle.reset();
-					assert_eq!(oracle.current_state(), super::State("S0"));
-					assert_eq!(oracle.visited_states().len(), 1);
-					assert_eq!(oracle.visited_transitions().len(), 0);
-					assert_eq!(oracle.trace().len(), 0);
-				}
+			let ended = (oracle.current_state(), oracle.is_terminal(), oracle.valid_events());
+			assert_eq!((taken, ended), (true, (State("S2"), true, Vec::new())));
+		}
 
-				#[test]
-				fn oracle_with_choice_points() {
-					let mut oracle = super::CspOracle::new(super::build_choice_process());
-					let valid = oracle.valid_events();
-					assert_eq!(valid.len(), 1);
-					assert_eq!(valid[0].0, "choice");
+		/// An event that the current state does not enable leaves the oracle
+		/// where it stands.
+		#[test]
+		fn an_event_the_state_does_not_enable_leaves_the_oracle_in_place() {
+			let mut oracle = CspOracle::new(one_step("valid"));
 
-					assert!(oracle.step(&super::Event("choice")));
-					assert_eq!(oracle.current_state(), super::State("S1"));
-				}
-			}
-		};
+			let taken = oracle.step(&Event("invalid"));
+			let standing = (oracle.current_state(), oracle.visited_transitions().len());
+			assert_eq!((taken, standing), (false, (State("S0"), 0)));
+		}
+
+		/// A reset returns the oracle to its initial state and clears what the
+		/// run recorded.
+		#[test]
+		fn a_reset_returns_the_oracle_to_its_initial_state() {
+			let mut oracle = stepped(one_step("go"), &["go"]);
+			oracle.reset();
+
+			let visited = (oracle.visited_states().len(), oracle.visited_transitions().len());
+			let standing = (oracle.current_state(), oracle.trace().len());
+			assert_eq!((standing, visited), ((State("S0"), 0), (1, 0)));
+		}
+
+		/// A choice point offers its event once, and the event steps to the
+		/// first target.
+		#[test]
+		fn a_choice_point_offers_its_event_once_and_steps_to_the_first_target() {
+			let mut oracle = CspOracle::new(choice());
+			let offered = oracle.valid_events();
+
+			let taken = oracle.step(&Event("choice"));
+			let moved = (taken, oracle.current_state());
+			assert_eq!((offered, moved), (vec![Event("choice")], (true, State("S1"))));
+		}
 	}
 
-	/// Generates the tests of the coverage metrics and the state hash.
-	macro_rules! generate_coverage_tests {
-		($module_name:ident) => {
-			mod $module_name {
-				#[test]
-				fn oracle_coverage_metrics() {
-					let mut oracle = super::CspOracle::new(super::build_two_step_process("a", "b"));
-					let coverage = oracle.state_coverage();
-					assert!((coverage - 33.33).abs() < 0.1);
+	/// The tests of the coverage metrics and the state hash.
+	mod coverage {
+		use super::*;
 
-					oracle.step(&super::Event("a"));
-					let coverage = oracle.state_coverage();
-					assert!((coverage - 66.66).abs() < 0.1);
-
-					oracle.step(&super::Event("b"));
-					let coverage = oracle.state_coverage();
-					assert!((coverage - 100.0).abs() < 0.1);
-
-					let (visited, _total) = oracle.transition_coverage();
-					assert_eq!(visited, 2);
-				}
-
-				#[test]
-				fn oracle_track_state_is_stable() {
-					let proc = super::build_simple_process("go");
-					let oracle1 = super::CspOracle::new(proc.clone());
-					let oracle2 = super::CspOracle::new(proc);
-					assert_eq!(oracle1.track_state(), oracle2.track_state());
-				}
-
-				#[test]
-				fn oracle_coverage_score_increases() {
-					let mut oracle = super::CspOracle::new(super::build_simple_process("go"));
-					let score1 = oracle.coverage_score();
-
-					oracle.step(&super::Event("go"));
-					let score2 = oracle.coverage_score();
-					assert!(score2 > score1);
-				}
+		// The state coverage is the share of the three states of the process
+		// that its steps visited.
+		crate::tb_cases! {
+			fn the_state_coverage_after((steps, coverage): (&[&'static str], f64)) {
+				let oracle = stepped(two_steps("a", "b"), steps);
+				let measured = oracle.state_coverage();
+				assert!((measured - coverage).abs() < 0.1);
 			}
-		};
+
+			cases {
+				no_step => (&[], 33.33),
+				one_step => (&["a"], 66.66),
+				both_steps => (&["a", "b"], 100.0),
+			}
+		}
+
+		/// Both steps of the process cover both of its transitions.
+		#[test]
+		fn both_steps_cover_both_transitions() {
+			let oracle = stepped(two_steps("a", "b"), &["a", "b"]);
+			let covered = oracle.transition_coverage();
+			assert_eq!(covered, (2, 2));
+		}
+
+		/// Two oracles of one process hash their initial states alike.
+		#[test]
+		fn two_oracles_of_one_process_hash_their_state_alike() {
+			let process = one_step("go");
+			let first = CspOracle::new(process.clone());
+			let second = CspOracle::new(process);
+
+			let hashes = (first.track_state(), second.track_state());
+			assert_eq!(hashes.0, hashes.1);
+		}
+
+		/// A step raises the coverage score by one state in the upper half and
+		/// one transition in the lower half.
+		#[test]
+		fn a_step_raises_the_coverage_score() {
+			let mut oracle = CspOracle::new(one_step("go"));
+			let before = oracle.coverage_score();
+
+			let taken = oracle.step(&Event("go"));
+			assert_eq!((taken, before, oracle.coverage_score()), (true, 1 << 32, (2 << 32) | 1));
+		}
 	}
 
-	/// Generates the tests of byte-driven fuzzing.
-	macro_rules! generate_fuzzing_tests {
-		($module_name:ident) => {
-			mod $module_name {
-				#[test]
-				fn oracle_fuzz_from_bytes_reaches_terminal() {
-					let mut oracle = super::CspOracle::new(super::build_simple_process("go"));
-					let input = vec![0];
-					assert!(oracle.fuzz_from_bytes(&input).is_ok());
-					assert_eq!(oracle.current_state(), super::State("S1"));
-					assert!(oracle.is_terminal());
-				}
+	/// The tests of byte-driven fuzzing.
+	mod fuzzing {
+		use super::*;
 
-				#[test]
-				fn oracle_fuzz_from_bytes_multiple_transitions() {
-					let mut oracle = super::CspOracle::new(super::build_two_step_process("a", "b"));
-					let input = vec![0, 0];
-					assert!(oracle.fuzz_from_bytes(&input).is_ok());
-					assert_eq!(oracle.current_state(), super::State("S2"));
-					assert_eq!(oracle.trace().len(), 2);
-				}
+		/// A process, the bytes of a run of it, and the state and the trace
+		/// that the run ends with.
+		type Reach = (fn() -> Process, &'static [u8], State, &'static [Event]);
 
-				#[test]
-				fn oracle_fuzz_from_bytes_fails_on_insufficient_input() {
-					let mut oracle = super::CspOracle::new(super::build_two_step_process("a", "b"));
-					let input = vec![0];
-					assert!(matches!(
-						oracle.fuzz_from_bytes(&input),
-						Err(super::FuzzError::InputExhausted { .. })
-					));
-				}
+		// A run over enough bytes ends at the terminal state that the bytes
+		// choose, after the events it took. A choice takes one byte for its
+		// event and one byte for its target.
+		crate::tb_cases! {
+			fn a_run_reaches((process, input, state, trace): Reach) {
+				let mut oracle = CspOracle::new(process());
 
-				#[test]
-				fn oracle_deadlock_reported_as_deadlock() {
-					let process = super::Process::builder("TestProc")
-						.initial_state(super::State("S0"))
-						.add_observable(super::Event("go"))
-						.add_transition(super::State("S0"), super::Event("go"), super::State("Stuck"))
-						.build()
-						.expect("fixture process builder has a valid initial state");
-
-					let mut oracle = super::CspOracle::new(process);
-					assert!(matches!(
-						oracle.fuzz_from_bytes(&[0, 0]),
-						Err(super::FuzzError::Deadlock { state: super::State("Stuck") })
-					));
-				}
-
-				#[test]
-				fn oracle_byte_mapping_deterministic_across_oracles() {
-					let traces: Vec<Vec<super::Event>> = (0..8)
-						.map(|_| {
-							let mut oracle = super::CspOracle::new(super::build_branching_process());
-							oracle.fuzz_from_bytes(&[1]).expect("branching process reaches terminal");
-							oracle.trace().to_vec()
-						})
-						.collect();
-
-					let distinct: std::collections::HashSet<&Vec<super::Event>> = traces.iter().collect();
-					assert_eq!(distinct.len(), 1, "every oracle maps the byte to one trace");
-				}
-
-				#[test]
-				fn oracle_coverage_increases_during_fuzzing() {
-					let mut oracle = super::CspOracle::new(super::build_two_step_process("a", "b"));
-					let initial_score = oracle.coverage_score();
-
-					let input = vec![0, 0];
-					let _ = oracle.fuzz_from_bytes(&input);
-					let final_score = oracle.coverage_score();
-					assert!(final_score > initial_score);
-
-					assert_eq!(oracle.visited_states().len(), 3);
-					assert_eq!(oracle.visited_transitions().len(), 2);
-				}
-
-				#[test]
-				fn oracle_track_state_differs_between_states() {
-					let mut oracle = super::CspOracle::new(super::build_simple_process("go"));
-					let hash_s0 = oracle.track_state();
-
-					oracle.step(&super::Event("go"));
-
-					let hash_s1 = oracle.track_state();
-					assert_ne!(hash_s0, hash_s1);
-				}
-
-				#[test]
-				fn oracle_crash_context_provides_debug_info() {
-					let mut oracle = super::CspOracle::new(super::build_simple_process("go"));
-					oracle.step(&super::Event("go"));
-
-					let context = oracle.crash_context();
-					assert!(context.contains("Current State:"));
-					assert!(context.contains("S1"));
-					assert!(context.contains("Terminal: true"));
-					assert!(context.contains("Trace:"));
-					assert!(context.contains("Coverage:"));
-				}
+				let fuzzed = oracle.fuzz_from_bytes(input);
+				let ended = (oracle.current_state(), oracle.is_terminal(), oracle.trace());
+				assert_eq!((fuzzed, ended), (Ok(()), (state, true, trace)));
 			}
-		};
+
+			cases {
+				the_terminal_state_of_one_step => (|| one_step("go"), &[0], State("S1"), &[Event("go")]),
+				the_terminal_state_of_two_steps => (
+					|| two_steps("a", "b"),
+					&[0, 0],
+					State("S2"),
+					&[Event("a"), Event("b")],
+				),
+				the_first_target_of_a_choice => (choice, &[0, 0], State("S1"), &[Event("choice")]),
+				the_second_target_of_a_choice => (choice, &[0, 1], State("S2"), &[Event("choice")]),
+			}
+		}
+
+		// A run that stops short of a terminal state fails with the state it
+		// stopped in.
+		crate::tb_cases! {
+			fn a_run_that_stops_short_fails_with((process, input, failure): (fn() -> Process, &[u8], FuzzError)) {
+				let mut oracle = CspOracle::new(process());
+				let fuzzed = oracle.fuzz_from_bytes(input);
+				assert_eq!(fuzzed, Err(failure));
+			}
+
+			cases {
+				an_exhausted_input => (|| two_steps("a", "b"), &[0], FuzzError::InputExhausted { state: State("S1") }),
+				a_deadlock => (stuck, &[0, 0], FuzzError::Deadlock { state: State("Stuck") }),
+			}
+		}
+
+		/// Every fresh oracle maps one byte to one trace.
+		#[test]
+		fn every_oracle_maps_a_byte_to_one_trace() {
+			let traces = traces_of_fresh_oracles(8, &[1]);
+			assert_eq!(traces, HashSet::from([vec![Event("b")]]));
+		}
+
+		/// A run raises the coverage score by the states and the transitions
+		/// it took.
+		#[test]
+		fn a_run_raises_the_coverage_score() {
+			let mut oracle = CspOracle::new(two_steps("a", "b"));
+			let before = oracle.coverage_score();
+
+			let fuzzed = oracle.fuzz_from_bytes([0, 0]);
+			let visited = (oracle.visited_states().len(), oracle.visited_transitions().len());
+			assert_eq!((fuzzed, before, oracle.coverage_score()), (Ok(()), 1 << 32, (3 << 32) | 2));
+			assert_eq!(visited, (3, 2));
+		}
+
+		/// Two states of one process hash apart.
+		#[test]
+		fn two_states_hash_apart() {
+			let mut oracle = CspOracle::new(one_step("go"));
+			let at_s0 = oracle.track_state();
+
+			let taken = oracle.step(&Event("go"));
+			assert!(taken);
+			assert_ne!(at_s0, oracle.track_state());
+		}
+
+		/// The crash context names the state, the terminal flag, the trace,
+		/// the coverage, and the open events of the oracle.
+		#[test]
+		fn the_crash_context_reports_where_the_run_stands() {
+			let oracle = stepped(one_step("go"), &["go"]);
+			let context = oracle.crash_context();
+			assert_eq!(context, CRASH_AFTER_GO);
+		}
 	}
 
-	/// Generates the tests of the `FuzzContext` wrapper.
-	macro_rules! generate_context_tests {
-		($module_name:ident) => {
-			mod $module_name {
-				#[test]
-				fn fuzz_context_executes_oracle() {
-					let proc = super::build_simple_process("go");
-					let ctx = super::FuzzContext::new(vec![0], proc);
-					assert!(ctx.fuzz_from_bytes().is_ok());
-					assert!(ctx.is_terminal());
-					assert_eq!(ctx.trace().len(), 1);
-				}
+	/// The tests of the `FuzzContext` wrapper.
+	mod context {
+		use super::*;
 
-				#[test]
-				fn fuzz_context_ijon_accessors() {
-					let proc = super::build_two_step_process("a", "b");
-					let ctx = super::FuzzContext::new(vec![0, 0], proc);
+		/// A context runs its oracle over its input.
+		#[test]
+		fn a_context_runs_its_oracle_over_its_input() -> TestResult {
+			let context = FuzzContext::new(vec![0], one_step("go"));
+			context.fuzz_from_bytes()?;
 
-					let initial_score = ctx.coverage_score();
-					let initial_hash = ctx.track_state();
+			assert_eq!((context.is_terminal(), context.trace()), (true, vec![Event("go")]));
+			Ok(())
+		}
 
-					let _ = ctx.fuzz_from_bytes();
+		/// A run of a context raises its coverage score and moves its state
+		/// hash.
+		#[test]
+		fn a_context_run_raises_the_score_and_moves_the_state_hash() -> TestResult {
+			let context = FuzzContext::new(vec![0, 0], two_steps("a", "b"));
+			let (score, hash) = (context.coverage_score(), context.track_state());
 
-					let final_score = ctx.coverage_score();
-					let final_hash = ctx.track_state();
-					assert!(final_score > initial_score);
-					assert_ne!(initial_hash, final_hash);
-				}
+			context.fuzz_from_bytes()?;
 
-				#[test]
-				fn fuzz_context_crash_context() {
-					let proc = super::build_simple_process("go");
-					let ctx = super::FuzzContext::new(vec![0], proc);
-					let _ = ctx.fuzz_from_bytes();
+			assert_eq!((score, context.coverage_score()), (1 << 32, (3 << 32) | 2));
+			assert_ne!(hash, context.track_state());
+			Ok(())
+		}
 
-					let context = ctx.crash_context();
-					assert!(context.contains("AFL Crash Context"));
-					assert!(context.contains("Current State:"));
-					assert!(context.contains("S1"));
-					assert!(context.contains("Coverage:"));
-				}
+		/// A context reports the crash context of its oracle.
+		#[test]
+		fn a_context_reports_the_crash_context_of_its_oracle() -> TestResult {
+			let context = FuzzContext::new(vec![0], one_step("go"));
+			context.fuzz_from_bytes()?;
+			assert_eq!(context.crash_context(), CRASH_AFTER_GO);
+			Ok(())
+		}
 
-				#[test]
-				fn fuzz_context_thread_safe_clone() {
-					let proc = super::build_simple_process("go");
-					let ctx1 = super::FuzzContext::new(vec![0], proc);
-					let ctx2 = ctx1.clone();
+		/// A clone of a context shares its oracle, so a run of one moves the
+		/// other.
+		#[test]
+		fn a_clone_of_a_context_shares_its_oracle() -> TestResult {
+			let context = FuzzContext::new(vec![0], one_step("go"));
+			let clone = context.clone();
 
-					let _ = ctx1.fuzz_from_bytes();
-					assert_eq!(ctx1.current_state(), ctx2.current_state());
-				}
-			}
-		};
+			context.fuzz_from_bytes()?;
+
+			assert_eq!(clone.current_state(), Some(State("S1")));
+			Ok(())
+		}
 	}
 
-	/// Generates the tests of byte selection, choice points, reset, and
-	/// concurrent access.
-	macro_rules! generate_advanced_tests {
-		($module_name:ident) => {
-			mod $module_name {
-				// A byte picks the event at `byte % 3` among the three
-				// that `S0` enables, in the name order `a`, `b`, `c`.
-				crate::tb_cases! {
-					fn oracle_input_modulo_selection((input_byte, expected): (u8, super::State)) {
-						let mut oracle = super::CspOracle::new(super::build_branching_process());
+	/// The tests of byte selection, reset between runs, and concurrent
+	/// access.
+	mod advanced {
+		use super::*;
 
-						let stepped = oracle.fuzz_from_bytes(&[input_byte]);
-
-						assert!(stepped.is_ok());
-						assert_eq!(oracle.current_state(), expected);
-					}
-
-					cases {
-						first_event => (0, super::State("S1")),
-						second_event => (1, super::State("S2")),
-						third_event => (2, super::State("S3")),
-						wraps_to_the_first_event => (3, super::State("S1")),
-						wraps_from_the_top_byte => (255, super::State("S1")),
-					}
-				}
-
-				#[test]
-				fn oracle_choice_point_fuzzing() {
-					let proc = super::build_choice_process();
-					let mut oracle = super::CspOracle::new(proc);
-					assert!(oracle.fuzz_from_bytes(&[0, 0]).is_ok());
-					assert_eq!(oracle.current_state(), super::State("S1"));
-				}
-
-				#[test]
-				fn oracle_target_byte_reaches_second_nondeterministic_target() {
-					let proc = super::build_choice_process();
-					let mut oracle = super::CspOracle::new(proc);
-					assert!(oracle.fuzz_from_bytes(&[0, 1]).is_ok());
-					assert_eq!(oracle.current_state(), super::State("S2"));
-				}
-
-				#[test]
-				fn oracle_reset_between_fuzz_runs() {
-					let proc = super::build_simple_process("go");
-					let mut oracle = super::CspOracle::new(proc);
-					assert!(oracle.fuzz_from_bytes(&[0]).is_ok());
-					assert_eq!(oracle.current_state(), super::State("S1"));
-					assert_eq!(oracle.trace().len(), 1);
-					assert!(oracle.fuzz_from_bytes(&[0]).is_ok());
-					assert_eq!(oracle.current_state(), super::State("S1"));
-					assert_eq!(oracle.trace().len(), 1);
-				}
-
-				#[test]
-				fn oracle_exhaustive_state_exploration() {
-					let proc = super::build_three_step_process();
-					let mut oracle = super::CspOracle::new(proc);
-
-					let input = vec![0, 0, 0];
-					assert!(oracle.fuzz_from_bytes(&input).is_ok());
-					assert_eq!(oracle.visited_states().len(), 4);
-					assert_eq!(oracle.visited_transitions().len(), 3);
-					assert_eq!(oracle.state_coverage(), 100.0);
-				}
-
-				#[test]
-				fn fuzz_context_concurrent_access() {
-					let proc = super::build_simple_process("go");
-					let ctx = std::sync::Arc::new(super::FuzzContext::new(vec![0], proc));
-
-					let handles: Vec<_> = (0..4)
-						.map(|_| {
-							let ctx_clone = std::sync::Arc::clone(&ctx);
-							std::thread::spawn(move || {
-								let _ = ctx_clone.coverage_score();
-								let _ = ctx_clone.track_state();
-								let _ = ctx_clone.is_terminal();
-								let _ = ctx_clone.current_state();
-							})
-						})
-						.collect();
-
-					for handle in handles {
-						handle.join().expect("Thread should not panic");
-					}
-				}
+		// A byte picks the event at `byte % 3` among the three that `S0`
+		// enables, in the name order `a`, `b`, `c`.
+		crate::tb_cases! {
+			fn oracle_input_modulo_selection((input_byte, expected): (u8, State)) {
+				let mut oracle = CspOracle::new(branching());
+				let stepped = oracle.fuzz_from_bytes([input_byte]);
+				assert_eq!((stepped, oracle.current_state()), (Ok(()), expected));
 			}
-		};
-	}
 
-	generate_oracle_core_tests!(oracle_core);
-	generate_coverage_tests!(coverage);
-	generate_fuzzing_tests!(fuzzing);
-	generate_context_tests!(context);
-	generate_advanced_tests!(advanced);
+			cases {
+				first_event => (0, State("S1")),
+				second_event => (1, State("S2")),
+				third_event => (2, State("S3")),
+				wraps_to_the_first_event => (3, State("S1")),
+				wraps_from_the_top_byte => (255, State("S1")),
+			}
+		}
+
+		/// A second run starts from the initial state, so it ends where the
+		/// first run ended, with the trace of its own events alone.
+		#[test]
+		fn a_second_run_starts_from_the_initial_state() {
+			let mut oracle = CspOracle::new(one_step("go"));
+
+			let first = oracle.fuzz_from_bytes([0]);
+			let second = oracle.fuzz_from_bytes([0]);
+			assert_eq!((first, second, oracle.current_state()), (Ok(()), Ok(()), State("S1")));
+			assert_eq!(oracle.trace(), [Event("go")]);
+		}
+
+		/// A run through every state of a chain covers every state and every
+		/// transition.
+		#[test]
+		fn a_run_through_every_state_covers_them_all() {
+			let mut oracle = CspOracle::new(three_steps());
+
+			let fuzzed = oracle.fuzz_from_bytes([0, 0, 0]);
+			let visited = (oracle.visited_states().len(), oracle.visited_transitions().len());
+			assert_eq!((fuzzed, visited, oracle.state_coverage()), (Ok(()), (4, 3), 100.0));
+		}
+
+		/// Threads that share one context read what one thread reads alone.
+		#[test]
+		fn threads_that_share_a_context_read_what_one_thread_reads() {
+			let context = Arc::new(FuzzContext::new(vec![0], one_step("go")));
+
+			let readings = read_from_threads(&context, 4);
+			let alone = (1 << 32, context.track_state(), false, Some(State("S0")));
+			assert_eq!(readings, vec![alone; 4]);
+		}
+	}
 
 	/// An event the guided collector records steps the oracle that
 	/// `oracle` returns.
 	#[test]
-	fn a_guided_collector_steps_the_oracle_it_holds() -> Result<(), crate::TightBeamError> {
-		let trace = FuzzTraceCollector::new(Vec::new(), build_simple_process("go"));
-
+	fn a_guided_collector_steps_the_oracle_it_holds() -> TestResult {
+		let trace = FuzzTraceCollector::new(Vec::new(), one_step("go"));
 		trace.collector().event(Event("go"))?;
-
 		assert_eq!(trace.oracle().current_state(), Some(State("S1")));
 		Ok(())
 	}
 
 	/// An event a share records steps the oracle of the collector it shares.
 	#[test]
-	fn a_share_of_a_guided_collector_steps_the_same_oracle() -> Result<(), crate::TightBeamError> {
-		let trace = FuzzTraceCollector::new(Vec::new(), build_simple_process("go"));
+	fn a_share_of_a_guided_collector_steps_the_same_oracle() -> TestResult {
+		let trace = FuzzTraceCollector::new(Vec::new(), one_step("go"));
 		let share = trace.share();
-
 		share.collector().event(Event("go"))?;
-
 		assert_eq!(trace.oracle().current_state(), Some(State("S1")));
 		Ok(())
 	}

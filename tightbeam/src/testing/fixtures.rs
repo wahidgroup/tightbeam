@@ -12,10 +12,10 @@ use crate::trace::{IntoEventLabel, TraceCollector};
 use crate::Beamable;
 use crate::{Message, TightBeamError, Version};
 
+#[cfg(all(test, host_clock))]
+use crate::clock::Clock;
 #[cfg(host_clock)]
-use crate::clock::UnixMillis;
-#[cfg(all(host_clock, feature = "secp256k1", feature = "signature", feature = "x509"))]
-use crate::clock::{Clock, ManualClock};
+use crate::clock::{ManualClock, UnixMillis};
 #[cfg(feature = "aead")]
 use aead::*;
 
@@ -46,17 +46,6 @@ mod hash {
 ))]
 use hash::*;
 
-#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
-mod random_id {
-	pub use std::borrow::Cow;
-
-	pub use crate::crypto::hash::Digest;
-	pub use crate::random::generate_random_bytes;
-}
-
-#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
-use random_id::*;
-
 #[cfg(feature = "x509")]
 mod x509_certs {
 	pub use crate::cms::cert::CertificateChoices;
@@ -85,20 +74,65 @@ use sha3_512_profile::*;
 
 #[cfg(feature = "transport-cms")]
 mod cms_server {
-	pub use crate::crypto::cms::KeyAgreementIdentity;
-	pub use crate::crypto::hpke::DhKemSecp256k1;
-	pub use crate::crypto::key::DiffieHellman;
-	pub use crate::crypto::policy::Secp256k1Policy;
-	pub use crate::crypto::sign::ecdsa::Secp256k1;
-	pub use crate::crypto::x509::store::{
-		CertificateTrustBuilder, CertificateTrustStore, NoRevocation, RevocationChecker, TrustBuilder,
-	};
-	pub use crate::crypto::x509::KeyCurves;
 	pub use crate::transport::handshake::{CmsIdentityPair, ProvisionedTrust};
 }
 
 #[cfg(feature = "transport-cms")]
 use cms_server::*;
+
+#[cfg(any(
+	feature = "transport-cms",
+	all(test, feature = "hpke", feature = "signature", feature = "x509")
+))]
+mod agreement {
+	pub use crate::crypto::cms::KeyAgreementIdentity;
+	pub use crate::crypto::hpke::DhKemSecp256k1;
+	pub use crate::crypto::key::DiffieHellman;
+	pub use crate::crypto::sign::ecdsa::Secp256k1;
+}
+
+#[cfg(any(
+	feature = "transport-cms",
+	all(test, feature = "hpke", feature = "signature", feature = "x509")
+))]
+use agreement::*;
+
+#[cfg(all(
+	any(test, feature = "transport-cms"),
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+mod store {
+	pub use crate::crypto::policy::Secp256k1Policy;
+	pub use crate::crypto::x509::store::{
+		CertificateTrustBuilder, CertificateTrustStore, NoRevocation, RevocationChecker, TrustBuilder,
+	};
+	pub use crate::crypto::x509::KeyCurves;
+}
+
+#[cfg(all(
+	any(test, feature = "transport-cms"),
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+use store::*;
+
+#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+mod trust {
+	pub use crate::cms::signed_data::SignerIdentifier;
+	pub use crate::crypto::policy::VerificationPolicy;
+	pub use crate::crypto::x509::error::CertificateValidationError;
+	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::crypto::x509::store::CertificateTrust;
+	pub use crate::crypto::x509::{ErasedSigning, PeerCertificate};
+}
+
+#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+use trust::*;
 
 /// A message of one text field that the tests encode and send.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -139,6 +173,26 @@ pub struct ConfidentialNonrepudiableNote {
 pub struct IntegralNote {
 	/// The text the note carries.
 	pub content: String,
+}
+
+/// A message whose type requires a signature. Its DER is the DER of
+/// [`TestMessage`].
+#[cfg(test)]
+#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+#[beam(nonrepudiable)]
+pub(crate) struct SignedNote {
+	/// The text the note carries.
+	pub(crate) content: String,
+}
+
+/// A message whose type requires a frame of version V2 or later. Its DER is
+/// the DER of [`TestMessage`].
+#[cfg(test)]
+#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+#[beam(min_version = "V2")]
+pub(crate) struct RecentNote {
+	/// The text the note carries.
+	pub(crate) content: String,
 }
 
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
@@ -201,6 +255,16 @@ mod instrumented {
 
 #[cfg(feature = "instrument")]
 use instrumented::*;
+
+#[cfg(all(test, feature = "testing-csp"))]
+mod csp {
+	pub use crate::testing::specs::csp::{Event, Process, ProcessBuilder, State};
+	#[cfg(feature = "testing-timing")]
+	pub use crate::testing::timing::{TimingConstraint, TimingConstraints, WcetConfig};
+}
+
+#[cfg(all(test, feature = "testing-csp"))]
+use csp::*;
 
 /// The fixed test validity window, from the epoch through
 /// [`TestCertificate::END_OF_VALIDITY`], both as UtcTime.
@@ -418,12 +482,6 @@ impl TestCertificateChain {
 	pub fn to_arc(&self) -> Arc<[Certificate]> {
 		Arc::from([self.root.to_owned(), self.intermediate.to_owned(), self.leaf.to_owned()])
 	}
-}
-
-/// The fixed test key whose secret scalar is thirty-two `scalar` bytes.
-#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-fn test_fixed_key(scalar: u8) -> SigningKey {
-	SigningKey::from_bytes(&[scalar; 32].into()).expect("a small nonzero scalar is a key")
 }
 
 /// Builds the single-AVA `CN=<cn>` distinguished name for test certificates.
@@ -666,6 +724,10 @@ macro_rules! test_worker {
 pub struct TestFrame;
 
 impl TestFrame {
+	/// The order that the fixed frames of the tests carry:
+	/// 2023-10-05T16:00:00Z in Unix seconds.
+	pub(crate) const ORDER: u64 = 1_696_521_600;
+
 	/// The message of `frame`, opened with `decryptor` and decoded as `T`.
 	///
 	/// `inflator` inflates a compressed body. [`rt::block_on`] drives the open,
@@ -684,42 +746,72 @@ impl TestFrame {
 		rt::block_on(opened)
 	}
 
-	/// A V0 frame of [`TestMessage::sample`] with `content`, under `id`.
-	///
-	/// With no `id`, a build with `std`, `digest`, and `random` draws a fresh
-	/// id, and any other build takes `test-message-id`.
+	/// A V0 frame of [`TestMessage::sample`] with `content`, under `id` or
+	/// `test-message-id`, at the fixed order of the test frames.
 	pub fn v0(content: Option<&str>, id: Option<&str>) -> Frame {
 		let message = TestMessage::sample(content);
-
-		#[cfg(host_clock)]
-		let order = core::time::Duration::from_millis(UnixMillis::now().get()).as_secs();
-
-		#[cfg(not(host_clock))]
-		let order: u64 = 1_700_000_000;
-
-		#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
-		let id = id.map_or_else(|| Cow::Owned(Self::random_id()), Cow::Borrowed);
-
-		#[cfg(not(all(feature = "std", feature = "digest", feature = "random")))]
 		let id = id.unwrap_or("test-message-id");
 
 		let result = compose! {
 			V0: id: id.as_bytes(),
-				order: order,
+				order: Self::ORDER,
 				message: message
 		};
 
 		result.expect("Failed to create TightBeam message")
 	}
 
-	/// A fresh frame id: the hex SHA3-256 digest of 32 random octets.
-	#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
-	fn random_id() -> String {
-		let mut bytes: [u8; 32] = [0; 32];
-		generate_random_bytes(&mut bytes, None).expect("Failed to generate random bytes");
+	/// A V1 frame of [`TestMessage::sample`] with `content`, under `id` or
+	/// `test-message-id`, at [`Self::ORDER`].
+	#[cfg(test)]
+	pub(crate) fn v1(content: Option<&str>, id: Option<&str>) -> Frame {
+		let message = TestMessage::sample(content);
+		let id = id.unwrap_or("test-message-id");
+		let built = compose! { V1: id: id, order: Self::ORDER, message: message };
+		built.expect("a V1 frame of a sample message builds")
+	}
 
-		let hash = Sha3_256::digest(bytes);
-		format!("{hash:x}")
+	/// A V1 frame of [`TestMessage::sample`] under `id` at [`Self::ORDER`],
+	/// sealed to [`TestKey::insecure_fixed_cipher`].
+	#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub(crate) fn sealed(id: impl AsRef<[u8]>) -> Frame {
+		TestFrame::sealed_with(TestMessage::sample(None), id)
+	}
+
+	/// A V1 frame of `message` under `id` at [`Self::ORDER`], sealed to
+	/// [`TestKey::insecure_fixed_cipher`].
+	#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub(crate) fn sealed_with<T>(message: T, id: impl AsRef<[u8]>) -> Frame
+	where
+		T: Message + crate::builder::CheckAeadOid<crate::crypto::aead::Aes256GcmOid>,
+	{
+		use crate::builder::{FrameBuilder, TypeBuilder};
+		use crate::testing::SeededStream;
+
+		let (_, cipher) = TestKey::insecure_fixed_cipher();
+		let builder = FrameBuilder::<T>::from(Version::V1).with_message(message).with_id(id);
+		let builder = builder.with_order(Self::ORDER).with_encryptor(cipher).with_rng(SeededStream(0));
+
+		let built = builder.build();
+		built.expect("a V1 frame seals to the fixed test cipher")
+	}
+
+	/// A frame of `version` of [`TestMessage::sample`] under `id` at
+	/// [`Self::ORDER`], sealed to [`TestKey::insecure_fixed_cipher`] and
+	/// signed by the [`TestIdentity::certified`] key of
+	/// [`TestKey::insecure_fixed_signing`].
+	#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	pub(crate) fn sealed_signed(version: Version, id: impl AsRef<[u8]>) -> Frame {
+		use crate::builder::{FrameBuilder, TypeBuilder};
+		use crate::testing::SeededStream;
+
+		let (_, cipher) = TestKey::insecure_fixed_cipher();
+		let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+		let builder = FrameBuilder::from(version).with_message(TestMessage::sample(None)).with_id(id);
+		let builder = builder.with_order(Self::ORDER).with_encryptor(cipher).with_rng(SeededStream(0));
+
+		let built = builder.with_signer::<Secp256k1Signature, _>(signer).build();
+		built.expect("the frame version carries a seal and a signature")
 	}
 
 	/// Builds a V1 frame that carries a SHA3-256 frame integrity (FI) digest.
@@ -786,8 +878,7 @@ impl TestFrame {
 		let signer_info = signed.as_ref().clone();
 		let der = Secp256k1Signature::from_bytes(signer_info.signature.as_bytes()).expect("the signature is DER");
 		let scalars = Signature::<Secp256k1>::try_from(der).expect("a DER signature holds two scalars");
-		let (r, s) = scalars.split_scalars();
-		let high = Signature::<Secp256k1>::from_scalars(r, -s).expect("n - s is a scalar");
+		let high = TestKey::high_s_twin(scalars);
 		let signature = OctetString::new(high.to_der().as_bytes()).expect("a signature wraps in an OCTET STRING");
 
 		let flipped = SignerInfo { signature, ..signer_info };
@@ -799,6 +890,17 @@ impl TestFrame {
 			.attach_signer_info(decoded)
 			.expect("the frame version carries a signature");
 		rewritten
+	}
+
+	/// `frame` signed by `identity`.
+	///
+	/// `rt::block_on` drives the signature, so a synchronous test reads it on
+	/// any thread.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn signed_by(mut frame: Frame, identity: &SigningIdentity) -> Frame {
+		let signing = frame.sign_with_provider(identity);
+		crate::runtime::rt::block_on(signing).expect("the frame version carries a signature");
+		frame
 	}
 
 	/// Returns the DER of `container` with the version of its embedded `frame`
@@ -957,6 +1059,18 @@ impl TestKey {
 		0x85, 0x54, 0x19, 0x9c, 0x47, 0xd0, 0x8f, 0xfb, 0x10, 0xd4, 0xb8,
 	];
 
+	/// The secp256k1 signing key whose secret scalar is thirty-two `seed`
+	/// octets.
+	///
+	/// # Panics
+	///
+	/// - `seed` is `0x00` or `0xff`, whose octets name no scalar below the group order.
+	#[cfg(all(feature = "secp256k1", feature = "signature"))]
+	pub(crate) fn fixed(seed: u8) -> SigningKey {
+		let scalar = SigningKey::from_bytes(&[seed; 32].into());
+		scalar.expect("a seed from 0x01 to 0xfe names a scalar")
+	}
+
 	/// Returns the secp256k1 signing key whose secret scalar is thirty-two
 	/// `0x01` bytes.
 	///
@@ -967,8 +1081,7 @@ impl TestKey {
 	/// [`SigningKey::random`](crate::SigningKey::random) from a CSPRNG.
 	#[cfg(all(feature = "secp256k1", feature = "signature"))]
 	pub fn insecure_fixed_signing() -> SigningKey {
-		let secret_bytes = [1u8; 32];
-		SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
+		TestKey::fixed(0x01)
 	}
 
 	/// The signing key whose public point is the negation of the point of
@@ -978,6 +1091,29 @@ impl TestKey {
 		let negated = -*key.as_nonzero_scalar();
 		SigningKey::from(negated)
 	}
+
+	/// The house key provider of `key`, shared.
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn provider(key: impl Into<Secp256k1KeyProvider>) -> Arc<Secp256k1KeyProvider> {
+		Arc::new(key.into())
+	}
+
+	/// The `(r, n - s)` twin of `signature`. ECDSA verifies both (SEC 1 v2.0
+	/// §4.1.4), and the twin of a low-s signature is high-s.
+	#[cfg(all(feature = "secp256k1", feature = "signature"))]
+	pub(crate) fn high_s_twin(
+		signature: crate::crypto::sign::ecdsa::Signature<crate::crypto::sign::ecdsa::Secp256k1>,
+	) -> crate::crypto::sign::ecdsa::Signature<crate::crypto::sign::ecdsa::Secp256k1> {
+		let (r, s) = signature.split_scalars();
+		let twin = crate::crypto::sign::ecdsa::Signature::from_scalars(r, -s);
+		twin.expect("n - s is a scalar")
+	}
+
+	/// Content whose raw `s` under [`Self::insecure_fixed_signing`] lies in
+	/// the high half, so a signer that skips the low-s rule fails a test that
+	/// signs it.
+	#[cfg(test)]
+	pub(crate) const HIGH_S_CONTENT: &[u8] = b"cms signer content";
 
 	/// The RFC 7093 §2 method 1 key identifier of the public key of
 	/// [`Self::insecure_fixed_signing`]: the leftmost 160 bits of SHA-256 of
@@ -1055,6 +1191,30 @@ impl TestCertificate {
 		test_certificate_with_extensions(signing_key, None)
 	}
 
+	/// The [`Self::self_signed`] certificate of
+	/// [`TestKey::insecure_fixed_signing`].
+	///
+	/// # Security
+	///
+	/// The key is public, so every signature it makes is forgeable.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn insecure_fixed() -> Certificate {
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+	}
+
+	/// The [`Self::self_signed`] certificate of the negation of
+	/// [`TestKey::insecure_fixed_signing`], whose point shares the
+	/// x-coordinate of the point of [`Self::insecure_fixed`].
+	///
+	/// # Security
+	///
+	/// The key is public, so every signature it makes is forgeable.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn insecure_fixed_negation() -> Certificate {
+		let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
+		TestCertificate::self_signed(&negation)
+	}
+
 	/// Builds a [`Self::self_signed`] variant that carries each of `uris` as a
 	/// URI Subject Alternative Name entry (RFC 5280 §4.2.1.6).
 	///
@@ -1091,6 +1251,15 @@ impl TestCertificate {
 		extensions.retain(|extension| extension.extn_id != SubjectKeyIdentifier::OID);
 		extensions.push(Extension { extn_id: SubjectKeyIdentifier::OID, critical: false, extn_value });
 
+		certificate
+	}
+
+	/// `certificate` with `serial` as its serial number, and its subject, its
+	/// key, and its extensions unchanged.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn with_serial(mut certificate: Certificate, serial: u8) -> Certificate {
+		let serial_number = SerialNumber::new(&[serial]).expect("a one-octet serial number encodes");
+		certificate.tbs_certificate.serial_number = serial_number;
 		certificate
 	}
 
@@ -1284,6 +1453,40 @@ impl TestCertificate {
 		certificate
 	}
 
+	/// `certificate` with no `extensions` field.
+	#[cfg(all(test, feature = "x509"))]
+	pub(crate) fn without_extensions(mut certificate: Certificate) -> Certificate {
+		certificate.tbs_certificate.extensions = None;
+		certificate
+	}
+
+	/// `certificate` with two non-critical extensions of `oid`, each with an
+	/// empty value, after the extensions it carries. RFC 5280 §4.2 refuses the
+	/// repeat.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn with_repeated_extension(certificate: Certificate, oid: impl AsRef<str>) -> Certificate {
+		let extension = TestCertificate::opaque_extension(oid, false);
+		let once = TestCertificate::with_extension(certificate, extension.clone());
+		TestCertificate::with_extension(once, extension)
+	}
+
+	/// `certificate` with a critical `nameConstraints` extension of an empty
+	/// value after the extensions it carries. The crate processes no
+	/// `nameConstraints`, so RFC 5280 §4.2 refuses the certificate.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn with_unknown_critical_extension(certificate: Certificate) -> Certificate {
+		let extension = TestCertificate::opaque_extension("2.5.29.30", true);
+		TestCertificate::with_extension(certificate, extension)
+	}
+
+	/// The DER of the SubjectPublicKeyInfo of `certificate`, the form a pin or
+	/// a key list names a key in.
+	#[cfg(all(test, feature = "secp256k1", feature = "signature", feature = "x509"))]
+	pub(crate) fn spki_der(certificate: &Certificate) -> Vec<u8> {
+		let spki = &certificate.tbs_certificate.subject_public_key_info;
+		spki.to_der().expect("a test SubjectPublicKeyInfo encodes")
+	}
+
 	/// The extension of `value`, critical when `critical` holds (RFC 5280
 	/// §4.2).
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
@@ -1325,7 +1528,7 @@ impl TestCertificate {
 	/// stranger to every path.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn strangers(count: u8) -> Vec<Certificate> {
-		let stranger = |offset: u8| TestCertificate::self_signed(&test_fixed_key(offset.saturating_add(16)));
+		let stranger = |offset: u8| TestCertificate::self_signed(&TestKey::fixed(offset.saturating_add(16)));
 		(0..count).map(stranger).collect()
 	}
 
@@ -1337,10 +1540,10 @@ impl TestCertificate {
 	pub fn looping_issuers(intermediate: &Certificate) -> [Certificate; 2] {
 		let looping = test_cn_name("Looping issuer").expect("a test common name satisfies PrintableString");
 		let subject = intermediate.tbs_certificate.subject.to_owned();
-		let mut first = TestCertificate::self_signed(&test_fixed_key(0x60));
+		let mut first = TestCertificate::self_signed(&TestKey::fixed(0x60));
 		first.tbs_certificate.subject = subject.to_owned();
 		first.tbs_certificate.issuer = looping.to_owned();
-		let mut second = TestCertificate::self_signed(&test_fixed_key(0x61));
+		let mut second = TestCertificate::self_signed(&TestKey::fixed(0x61));
 		second.tbs_certificate.subject = looping;
 		second.tbs_certificate.issuer = subject;
 		[first, second]
@@ -1502,12 +1705,39 @@ impl TestCertificate {
 	/// ```
 	#[cfg(all(host_clock, feature = "secp256k1", feature = "signature", feature = "x509"))]
 	pub fn clock_past_validity() -> Arc<ManualClock> {
-		let clock = Arc::new(ManualClock::default());
-		let since_epoch = clock.unix().saturating_since(UnixMillis::new(0));
-		let past = Duration::from_secs(Self::END_OF_VALIDITY.saturating_add(1));
+		TestClock::past(Self::END_OF_VALIDITY)
+	}
+}
 
-		clock.advance(past.saturating_sub(since_epoch));
-		clock
+/// The manual clocks of the tests, each of which moves only when its test
+/// advances it.
+#[cfg(host_clock)]
+pub(crate) struct TestClock;
+
+#[cfg(host_clock)]
+impl TestClock {
+	/// The Unix time that [`Self::manual`] starts at (2023-11-14), inside the
+	/// fixed test validity window.
+	#[cfg(test)]
+	pub(crate) const START: UnixMillis = UnixMillis::new(1_700_000_000_000);
+
+	/// A manual clock at [`Self::START`].
+	#[cfg(test)]
+	pub(crate) fn manual() -> Arc<ManualClock> {
+		Arc::new(ManualClock::at(Self::START))
+	}
+
+	/// `clock` as the erased handle that a store, a gate, or a trace builds
+	/// on.
+	#[cfg(test)]
+	pub(crate) fn erased<C: Clock + 'static>(clock: &Arc<C>) -> Arc<dyn Clock> {
+		Arc::clone(clock) as Arc<dyn Clock>
+	}
+
+	/// A manual clock one second past the Unix time `seconds`.
+	pub(crate) fn past(seconds: u64) -> Arc<ManualClock> {
+		let past = core::time::Duration::from_secs(seconds.saturating_add(1));
+		Arc::new(ManualClock::at(UnixMillis::new(0).saturating_add(past)))
 	}
 }
 
@@ -1577,6 +1807,106 @@ impl TestAttributes {
 	}
 }
 
+/// The house trust stores of the tests, each under the default secp256k1
+/// policy and the house curves.
+#[cfg(all(
+	any(test, feature = "transport-cms"),
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+pub(crate) struct TestStore;
+
+#[cfg(all(
+	any(test, feature = "transport-cms"),
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+impl TestStore {
+	/// The builder of a house store that holds no certificate and consults no
+	/// revocation list.
+	#[cfg(test)]
+	pub(crate) fn empty() -> CertificateTrustBuilder {
+		CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
+	}
+
+	/// A house store that holds `certificates` and consults no revocation
+	/// list.
+	#[cfg(test)]
+	pub(crate) fn holding(certificates: impl IntoIterator<Item = Certificate>) -> CertificateTrustStore {
+		TestStore::revoking(certificates, NoRevocation)
+	}
+
+	/// A house store that holds `certificates` and consults `revocation` on
+	/// revocation.
+	pub(crate) fn revoking(
+		certificates: impl IntoIterator<Item = Certificate>,
+		revocation: impl RevocationChecker + 'static,
+	) -> CertificateTrustStore {
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, revocation);
+		let builder = certificates.into_iter().try_fold(builder, TrustBuilder::with_certificate);
+		builder.expect("the store takes each test certificate").build()
+	}
+}
+
+/// A trust that admits every certificate, names one anchor for each, reads
+/// no validity period, and verifies each signature under the house policy.
+///
+/// The house store reads each validity period and walks each path, so a test
+/// of a check that runs outside the store holds this double.
+#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+#[derive(Debug)]
+pub(crate) struct AcceptsEveryCertificate {
+	/// The anchor the trust names for every certificate.
+	anchor: Arc<Certificate>,
+}
+
+#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl AcceptsEveryCertificate {
+	/// A trust that names `anchor` for every certificate and resolves no
+	/// signer.
+	pub(crate) fn under(anchor: impl Into<Arc<Certificate>>) -> Self {
+		AcceptsEveryCertificate { anchor: anchor.into() }
+	}
+}
+
+#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl CertificateValidation for AcceptsEveryCertificate {
+	fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
+		Ok(())
+	}
+}
+
+#[cfg(all(test, feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+impl CertificateTrust for AcceptsEveryCertificate {
+	fn is_trusted(&self, _cert: &Certificate) -> bool {
+		true
+	}
+
+	fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
+		Ok(Arc::clone(&self.anchor))
+	}
+
+	fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
+		Ok(Arc::clone(&self.anchor))
+	}
+
+	fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
+		None
+	}
+
+	fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
+		None
+	}
+
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
+		&const { Secp256k1Policy::new() }
+	}
+}
+
 /// The two identities of a test CMS server under one test authority: a
 /// signing certificate with `digitalSignature` alone, and a key-agreement
 /// certificate of the same subject with `keyAgreement` alone, each beside its
@@ -1603,21 +1933,26 @@ pub struct TestCmsServer {
 
 #[cfg(feature = "transport-cms")]
 impl TestCmsServer {
-	/// A server `CN=<cn>` with fresh keys, both certificates issued by the
-	/// authority `CN=<cn> authority`.
+	/// A server `CN=<cn>` whose keys derive from `cn`, both certificates
+	/// issued by the authority `CN=<cn> authority`, so one name gives one
+	/// server.
 	pub fn generate(cn: impl AsRef<str>) -> Self {
 		let cn = cn.as_ref();
-		let signing_key = SigningKey::random(&mut crate::random::OsRng);
-		let key_agreement_key = SigningKey::random(&mut crate::random::OsRng);
+		let signing_key = TestCmsServer::derived_key(cn, "signing");
+		let key_agreement_key = TestCmsServer::derived_key(cn, "key agreement");
 		TestCmsServer::of(cn, signing_key, key_agreement_key)
 	}
 
 	/// A server `CN=<cn>` of `signing_key` and `key_agreement_key`, both
-	/// certificates issued by a fresh authority `CN=<cn> authority`.
+	/// certificates issued by the authority `CN=<cn> authority`.
+	///
+	/// The authority key is the SHA3-256 digest of the scalar of `signing_key`
+	/// followed by the label `authority`, read as a scalar, so equal inputs
+	/// give equal servers.
 	pub fn of(cn: impl AsRef<str>, signing_key: SigningKey, key_agreement_key: SigningKey) -> Self {
 		let cn = cn.as_ref();
 		let authority_cn = format!("{cn} authority");
-		let authority_key = SigningKey::random(&mut crate::random::OsRng);
+		let authority_key = TestCmsServer::derived_key(signing_key.to_bytes(), "authority");
 		let authority = TestCertificate::authority(&authority_key, &authority_cn);
 		let authority = authority.expect("a test authority issues itself");
 
@@ -1632,8 +1967,18 @@ impl TestCmsServer {
 		TestCmsServer { authority, authority_key, signing, signing_key, key_agreement, key_agreement_key }
 	}
 
-	/// A server with fresh keys whose fresh authority issues both
-	/// certificates to `subject`, a name of the caller's shape.
+	/// The key whose scalar is the SHA3-256 digest of `input` followed by
+	/// `label`.
+	fn derived_key(input: impl AsRef<[u8]>, label: impl AsRef<[u8]>) -> SigningKey {
+		use crate::crypto::hash::Digest;
+
+		let digest = Sha3_256::new().chain_update(input).chain_update(label).finalize();
+		let key = SigningKey::from_bytes(&digest);
+		key.expect("a SHA3-256 digest names a scalar below the group order")
+	}
+
+	/// A server of fixed keys whose authority issues both certificates to
+	/// `subject`, a name of the caller's shape.
 	pub fn named(subject: RdnSequence) -> Self {
 		let server = TestCmsServer::generate("tightbeam named server");
 		let signing = server.issue_signing(&server.signing_key, subject.to_owned(), 2);
@@ -1654,8 +1999,7 @@ impl TestCmsServer {
 	/// The key-agreement identity of the server, whose backend holds
 	/// [`Self::key_agreement_key`].
 	pub fn key_agreement_identity(&self) -> KeyAgreementIdentity<DhKemSecp256k1> {
-		let backend: Arc<dyn DiffieHellman<Secp256k1>> =
-			Arc::new(Secp256k1KeyProvider::from(self.key_agreement_key.to_owned()));
+		let backend: Arc<dyn DiffieHellman<Secp256k1>> = TestKey::provider(self.key_agreement_key.to_owned());
 		let identity = KeyAgreementIdentity::new(self.key_agreement.to_owned(), backend);
 		identity.expect("the test key matches its key-agreement certificate")
 	}
@@ -1674,9 +2018,7 @@ impl TestCmsServer {
 	/// A store that holds the authority of both certificates and consults
 	/// `checker` on revocation.
 	pub fn store_with(&self, checker: impl RevocationChecker + 'static) -> CertificateTrustStore {
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, checker);
-		let builder = builder.with_certificate(self.authority.to_owned());
-		builder.expect("the store takes the test authority").build()
+		TestStore::revoking([self.authority.to_owned()], checker)
 	}
 
 	/// The trust of a client that pins this server's key-agreement
@@ -1738,6 +2080,46 @@ impl TestCmsServer {
 	}
 }
 
+/// The key-agreement holders and recipients of a secp256k1 key under the
+/// house KEM.
+#[cfg(all(test, feature = "hpke", feature = "signature", feature = "x509"))]
+pub(crate) struct TestAgreement;
+
+#[cfg(all(test, feature = "hpke", feature = "signature", feature = "x509"))]
+impl TestAgreement {
+	/// The key-agreement identity of `key` under its
+	/// [`TestCertificate::self_signed`] certificate.
+	pub(crate) fn identity(key: &SigningKey) -> KeyAgreementIdentity<DhKemSecp256k1> {
+		let identity = KeyAgreementIdentity::new(TestCertificate::self_signed(key), TestAgreement::backend(key));
+		identity.expect("the test key matches its certificate")
+	}
+
+	/// The bare key of `key` beside the backend of its private half, for a
+	/// decryptor that names its recipient by the key alone.
+	pub(crate) fn bare(key: &SigningKey) -> crate::crypto::cms::BareKemKey<DhKemSecp256k1> {
+		let public = PublicKey::from(key.verifying_key());
+		let bare = crate::crypto::cms::BareKemKey::new(public, TestAgreement::backend(key));
+		bare.expect("the backend holds the key")
+	}
+
+	/// The bare recipient of `key`, named by the key alone, as an encryptor
+	/// seals to it.
+	pub(crate) fn recipient(key: &SigningKey) -> crate::crypto::cms::KemRecipient<DhKemSecp256k1> {
+		use crate::crypto::key::KeyBackend;
+
+		let backend = Secp256k1KeyProvider::from(key.to_owned());
+		let spki = backend.to_public_key_bytes().expect("the house backend encodes its key");
+		let recipient = crate::crypto::cms::KemRecipient::bare(spki);
+		recipient.expect("the key is a secp256k1 key")
+	}
+
+	/// The house backend of `key`, as the trait object the house KEM
+	/// decapsulates through.
+	fn backend(key: &SigningKey) -> Arc<dyn DiffieHellman<Secp256k1>> {
+		TestKey::provider(key.to_owned())
+	}
+}
+
 /// The signing identities, each a certificate beside the key that proves it.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestIdentity;
@@ -1753,7 +2135,7 @@ impl TestIdentity {
 
 	/// The identity of `certificate`, whose key is `key`.
 	pub fn presenting(certificate: impl Into<Arc<Certificate>>, key: &SigningKey) -> SigningIdentity {
-		let provider = Arc::new(Secp256k1KeyProvider::from(key.clone()));
+		let provider = TestKey::provider(key.to_owned());
 		SigningIdentity::new(certificate, provider).expect("the test key matches its certificate")
 	}
 
@@ -1771,6 +2153,29 @@ impl TestIdentity {
 	pub fn certified(key: SigningKey) -> CertifiedKey<SigningKey> {
 		let certificate = TestCertificate::self_signed(&key);
 		CertifiedKey::new(&certificate, key).expect("the test key matches its certificate")
+	}
+
+	/// A signer purpose of an implementor's own, outside the house purposes.
+	#[cfg(test)]
+	pub(crate) const OWN_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.12");
+
+	/// The identity of [`TestKey::insecure_fixed_signing`] whose certificate
+	/// names `purpose` as its one key purpose, or carries no
+	/// `extendedKeyUsage` for `None`.
+	///
+	/// # Security
+	///
+	/// The key is public, so every signature it makes is forgeable.
+	#[cfg(all(test, feature = "colony"))]
+	pub(crate) fn naming(purpose: impl Into<Option<ObjectIdentifier>>) -> SigningIdentity {
+		let key = TestKey::insecure_fixed_signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let certificate = match purpose.into() {
+			Some(purpose) => TestCertificate::with_key_purposes(certificate, [purpose]),
+			None => certificate,
+		};
+
+		TestIdentity::presenting(certificate, &key)
 	}
 }
 
@@ -1805,6 +2210,21 @@ impl TestRumor {
 
 		VerifiedRumor::new(rumor, signature)
 	}
+
+	/// The [`Self::application`] rumor of the payload `[1, 2, 3]`, issued at
+	/// order 1,000.
+	#[cfg(test)]
+	pub(crate) fn fixed() -> Frame {
+		TestRumor::application(1_000, [1, 2, 3])
+	}
+
+	/// The SHA3-256 gossip digest of `rumor`, once its signature verifies
+	/// under [`TestIdentity::insecure_fixed`].
+	#[cfg(test)]
+	pub(crate) fn digest(rumor: &Frame) -> crate::colony::cluster::GossipDigest {
+		let verified = TestRumor::verified(rumor.clone());
+		verified.gossip_digest::<Sha3_256>().expect("a test rumor frame encodes")
+	}
 }
 
 /// The traces of the tests of the internal events, and the trail a test
@@ -1830,7 +2250,85 @@ impl TestTrace {
 	/// ```
 	pub fn with_detail(detail: bool) -> TraceCollector {
 		let config = TbInstrumentationConfig { enable_internal_detail: detail, ..Default::default() };
+		TestTrace::with_config(config)
+	}
+
+	/// A trace under the instrumentation settings `config`.
+	pub(crate) fn with_config(config: TbInstrumentationConfig) -> TraceCollector {
 		TraceCollector::from(TraceConfig::with_instrumentation(config))
+	}
+
+	/// A trace whose config sets `enable_payloads`, so each event keeps the
+	/// SHA3-256 hash of its payload.
+	#[cfg(test)]
+	pub(crate) fn with_payloads() -> TraceCollector {
+		let config = TbInstrumentationConfig { enable_payloads: true, ..Default::default() };
+		TestTrace::with_config(config)
+	}
+
+	/// The instrumentation settings that ask for every exploration event:
+	/// the enabled sets, the refusals, and the divergences.
+	#[cfg(all(test, feature = "testing-fdr"))]
+	pub(crate) fn every_flag() -> TbInstrumentationConfig {
+		TbInstrumentationConfig {
+			sample_enabled_sets: true,
+			sample_refusals: true,
+			divergence_heuristics: true,
+			..Default::default()
+		}
+	}
+
+	/// A trace that stamps its events with the readings of `clock`.
+	#[cfg(test)]
+	pub(crate) fn on<C: crate::clock::Clock + 'static>(clock: &Arc<C>) -> TraceCollector {
+		TraceCollector::new().with_clock(Arc::clone(clock) as Arc<dyn crate::clock::Clock>)
+	}
+
+	/// A trace whose fault model injects the error of `fault` at the records
+	/// of `event`, at the rate `bps`.
+	#[cfg(all(test, feature = "testing-fault"))]
+	pub(crate) fn faulting<E: Into<TightBeamError>>(
+		event: impl crate::testing::fault::ProcessEvent,
+		fault: impl Fn() -> E + Send + Sync + 'static,
+		bps: crate::basis_points::BasisPoints,
+	) -> TraceCollector {
+		let model = crate::testing::fdr::FaultModel::default().with_event_fault(event, fault, bps);
+		TraceCollector::new().with_fault_model(model)
+	}
+
+	/// Drains `trace`, and returns its records of `event`, in the order it
+	/// recorded them.
+	#[cfg(test)]
+	pub(crate) fn records(trace: &TraceCollector, event: Urn<'static>) -> Vec<crate::instrumentation::TbEvent> {
+		let recorded = trace.drain_events();
+		recorded.into_iter().filter(|record| record.urn == event).collect()
+	}
+
+	/// Drains `trace`, and returns the label of each of its records of
+	/// `event`, in the order it recorded them.
+	#[cfg(test)]
+	pub(crate) fn labels(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<String>> {
+		let records = TestTrace::records(trace, event).into_iter();
+		records.map(|record| record.label.map(String::from)).collect()
+	}
+
+	/// Drains `trace`, and returns the payload hash of each of its records of
+	/// `event`, in the order it recorded them.
+	#[cfg(test)]
+	pub(crate) fn payloads(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<[u8; 32]>> {
+		let records = TestTrace::records(trace, event).into_iter();
+		records.map(|record| record.payload_hash).collect()
+	}
+
+	/// Drains `trace`, and returns `field` of each event it recorded, in the
+	/// order it recorded them.
+	#[cfg(test)]
+	pub(crate) fn drained<T>(
+		trace: &TraceCollector,
+		field: impl FnMut(crate::instrumentation::TbEvent) -> T,
+	) -> Vec<T> {
+		let recorded = trace.drain_events();
+		recorded.into_iter().map(field).collect()
 	}
 
 	/// Drains `trace`, and returns the URNs among `kept` that it recorded, in
@@ -1862,6 +2360,339 @@ impl TestDigest {
 	pub fn info() -> DigestInfo {
 		let digest = OctetString::new(vec![0u8; 32]).expect("Failed to create OctetString");
 		DigestInfo { algorithm: AlgorithmIdentifier { oid: HASH_SHA256, parameters: None }, digest }
+	}
+}
+
+/// The algorithm identifiers that a test names a CMS or key algorithm by.
+#[cfg(test)]
+pub(crate) struct TestAlgorithm;
+
+#[cfg(test)]
+impl TestAlgorithm {
+	/// The identifier of the algorithm `oid`, with its parameters absent.
+	pub(crate) fn of(oid: ObjectIdentifier) -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned { oid, parameters: None }
+	}
+}
+
+/// The session peers that a test builds a session from.
+#[cfg(all(test, feature = "transport", feature = "instrument"))]
+pub(crate) struct TestPeer;
+
+#[cfg(all(test, feature = "transport", feature = "instrument"))]
+impl TestPeer {
+	/// The peer of [`TestCertificate::insecure_fixed`], beside the SHA3-256
+	/// hash of the canonical form of its key.
+	pub(crate) fn fixed() -> (crate::transport::handshake::SessionPeer, [u8; 32]) {
+		use crate::crypto::hash::Digest;
+
+		let certificate = Arc::new(TestCertificate::insecure_fixed());
+		let peer = crate::transport::handshake::SessionPeer::try_from(certificate);
+		let peer = peer.expect("a test certificate records its peer");
+		let key_hash = Sha3_256::digest(peer.key().as_der()).into();
+		(peer, key_hash)
+	}
+}
+
+/// The CMS envelopes in the shapes that the decoders read.
+#[cfg(test)]
+pub(crate) struct TestEnvelope;
+
+#[cfg(test)]
+impl TestEnvelope {
+	/// An `AuthEnvelopedData` of `id-data` content under `algorithm`, with no
+	/// recipient, no content, no attribute, and sixteen zero octets as its
+	/// MAC.
+	pub(crate) fn empty_auth_enveloped(algorithm: ObjectIdentifier) -> crate::asn1::AuthEnvelopedData {
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfos};
+		use crate::oids::DATA;
+
+		let content_enc_alg = TestAlgorithm::of(algorithm);
+		let info = EncryptedContentInfo { content_type: DATA, content_enc_alg, encrypted_content: None };
+		let mac = OctetString::new([0u8; 16]).expect("16 octets fit an OCTET STRING");
+
+		crate::asn1::AuthEnvelopedData {
+			version: CmsVersion::V0,
+			originator_info: None,
+			recipient_infos: RecipientInfos::default(),
+			auth_encrypted_content_info: info,
+			auth_attrs: None,
+			mac,
+			unauth_attrs: None,
+		}
+	}
+
+	/// `content` of `content_type` inside a CMS `ContentInfo` (RFC 5652 §3),
+	/// the form a CMS parser reads.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	pub(crate) fn content_info<T>(content_type: ObjectIdentifier, content: &T) -> Vec<u8>
+	where
+		T: crate::der::EncodeValue + crate::der::Tagged,
+	{
+		let content = Any::encode_from(content).expect("the content encodes");
+		let content_info = crate::asn1::ContentInfo { content_type, content };
+		content_info.to_der().expect("the ContentInfo encodes")
+	}
+}
+
+/// A gate that answers every request with the status it holds.
+///
+/// Each house gate decides its status from the frame and the session, so a
+/// test that needs one status from a gate holds this double.
+#[cfg(all(test, feature = "policy"))]
+pub(crate) struct TestGate(pub(crate) crate::policy::TransitStatus);
+
+#[cfg(all(test, feature = "policy"))]
+impl crate::policy::GatePolicy for TestGate {
+	fn evaluate(
+		&self,
+		_frame: Option<&Frame>,
+		_session: &crate::policy::SessionContext,
+	) -> crate::policy::TransitStatus {
+		self.0
+	}
+}
+
+/// The two ends of one loopback TCP connection.
+#[cfg(test)]
+pub(crate) struct TestLoopback;
+
+#[cfg(test)]
+impl TestLoopback {
+	/// The end that the listener accepted and the end that dialed it, as
+	/// tokio streams.
+	#[cfg(feature = "tokio")]
+	pub(crate) async fn tokio_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+		let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+		let listener = bound.expect("a loopback port binds");
+		let address = listener.local_addr().expect("a bound listener has an address");
+		let dialed = tokio::net::TcpStream::connect(address).await;
+
+		let dialing = dialed.expect("the loopback listener takes the dial");
+		let (accepted, _) = listener.accept().await.expect("the dial arrives");
+		(accepted, dialing)
+	}
+
+	/// The end that the listener accepted and the end that dialed it, as std
+	/// streams.
+	pub(crate) fn std_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port binds");
+		let address = listener.local_addr().expect("a bound listener has an address");
+
+		let dialing = std::net::TcpStream::connect(address).expect("the loopback listener takes the dial");
+		let (accepted, _) = listener.accept().expect("the dial arrives");
+		(accepted, dialing)
+	}
+}
+
+/// A labelled transition system over named states and events, which
+/// [`Self::build`] turns into a [`Process`].
+///
+/// [`Self::of`] names a process with empty lists, and a struct update sets
+/// the lists a test needs.
+#[cfg(all(test, feature = "testing-csp"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestProcess {
+	/// The name of the process.
+	pub(crate) name: &'static str,
+	/// The state the process starts in.
+	pub(crate) initial: &'static str,
+	/// The events of the observable alphabet.
+	pub(crate) observable: &'static [&'static str],
+	/// The events of the hidden alphabet.
+	pub(crate) hidden: &'static [&'static str],
+	/// Each transition as its source state, its event, and its target state.
+	pub(crate) transitions: &'static [(&'static str, &'static str, &'static str)],
+	/// The states the process may stop in.
+	pub(crate) terminal: &'static [&'static str],
+	/// The states the process declares as choice points.
+	pub(crate) choice: &'static [&'static str],
+}
+
+#[cfg(all(test, feature = "testing-csp"))]
+impl TestProcess {
+	/// The process `name` that starts in `initial`, with empty alphabets and
+	/// no transition, terminal state, or choice point.
+	pub(crate) const fn of(name: &'static str, initial: &'static str) -> Self {
+		TestProcess {
+			name,
+			initial,
+			observable: &[],
+			hidden: &[],
+			transitions: &[],
+			terminal: &[],
+			choice: &[],
+		}
+	}
+
+	/// The process `Idle`, which offers no event from `S0` and accepts a run
+	/// that records none.
+	pub(crate) fn idle() -> Process {
+		let builder = Process::builder("Idle").initial_state(State("S0")).permits_no_progress();
+		builder.build().expect("an idle process names its initial state")
+	}
+
+	/// The [`Process`] of this system.
+	pub(crate) fn build(self) -> Process {
+		let mut builder = Process::builder(self.name).initial_state(State(self.initial));
+		for &event in self.observable {
+			builder = builder.add_observable(Event(event));
+		}
+		for &event in self.hidden {
+			builder = builder.add_hidden(Event(event));
+		}
+		for &(from, event, to) in self.transitions {
+			builder = builder.add_transition(State(from), Event(event), State(to));
+		}
+		for &state in self.terminal {
+			builder = builder.add_terminal(State(state));
+		}
+		for &state in self.choice {
+			builder = builder.add_choice(State(state));
+		}
+
+		builder.build().expect("a test process names its initial state")
+	}
+
+	/// The process `name` that takes the events of `events` in turn, through
+	/// the states of `states`, to its accepting last state.
+	pub(crate) fn chain(name: &'static str, states: &[&'static str], events: &[&'static str]) -> Process {
+		let first = states.first().copied().expect("a chain has a first state");
+		let last = states.last().copied().expect("a chain has a last state");
+		let mut builder = Process::builder(name).initial_state(State(first));
+		for ((&from, &to), &event) in states.iter().zip(states.iter().skip(1)).zip(events) {
+			builder = builder.add_observable(Event(event));
+			builder = builder.add_transition(State(from), Event(event), State(to));
+		}
+
+		builder.add_terminal(State(last)).build().expect("a chain of events builds")
+	}
+
+	/// The process `name` in which each event of `wcets` takes `s0` to the
+	/// terminal `s1`, under a WCET bound of its milliseconds.
+	#[cfg(feature = "testing-timing")]
+	pub(crate) fn timed(name: &'static str, wcets: &[(&'static str, u64)]) -> Process {
+		let mut constraints = TimingConstraints::default();
+		let mut builder = Process::builder(name).initial_state(State("s0")).add_terminal(State("s1"));
+		for &(event, millis) in wcets {
+			let wcet = TimingConstraint::Wcet(WcetConfig::of_millis(millis));
+			let added = constraints.add(Event(event), wcet);
+			added.expect("each event of a timed process takes one bound");
+
+			let observed = builder.add_observable(Event(event));
+			builder = observed.add_transition(State("s0"), Event(event), State("s1"));
+		}
+
+		let built = builder.timing_constraints(constraints).build();
+		built.expect("a timed process names its initial state")
+	}
+
+	/// The process `name` whose `event` takes `from` to each of `targets`,
+	/// each an accepting state.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn fan_out(
+		name: &'static str,
+		from: &'static str,
+		event: &'static str,
+		targets: &[&'static str],
+	) -> Process {
+		let built = TestProcess::fanning(name, from, event, targets).build();
+		built.expect("a fan of one event builds")
+	}
+
+	/// The [`Self::fan_out`] process whose `from` is a declared choice point.
+	pub(crate) fn choosing(
+		name: &'static str,
+		from: &'static str,
+		event: &'static str,
+		targets: &[&'static str],
+	) -> Process {
+		let built = TestProcess::fanning(name, from, event, targets).add_choice(State(from)).build();
+		built.expect("a choice of one event builds")
+	}
+
+	/// The builder of [`Self::fan_out`].
+	fn fanning(
+		name: &'static str,
+		from: &'static str,
+		event: &'static str,
+		targets: &[&'static str],
+	) -> ProcessBuilder {
+		let mut builder = Process::builder(name).initial_state(State(from)).add_observable(Event(event));
+		for &target in targets {
+			builder = builder.add_transition(State(from), Event(event), State(target));
+			builder = builder.add_terminal(State(target));
+		}
+
+		builder
+	}
+
+	/// The process `Spinning`, whose hidden `t` and `u` take `S1` to `S2` and
+	/// back after `a`, with the exit `b` at `S2` to the accepting `S3`, so it
+	/// can diverge after one event.
+	pub(crate) fn spinning() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["t", "u"],
+			transitions: &[("S0", "a", "S1"), ("S1", "t", "S2"), ("S2", "u", "S1"), ("S2", "b", "S3")],
+			terminal: &["S3"],
+			..TestProcess::of("Spinning", "S0")
+		}
+		.build()
+	}
+
+	/// The process `Accepting`, which can stop at `Idle`, which also offers
+	/// `a`, and at `Done`, which `a` leads to. Its alphabet holds `b` too.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn accepting() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			transitions: &[("Idle", "a", "Done")],
+			terminal: &["Idle", "Done"],
+			..TestProcess::of("Accepting", "Idle")
+		}
+		.build()
+	}
+
+	/// The process `SpinningAfterA`, which takes `a`, then spins on the
+	/// hidden `t` at `S1`, so it can diverge after one event.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn spinning_after_a() -> Process {
+		TestProcess {
+			observable: &["a"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S1", "t", "S1")],
+			..TestProcess::of("SpinningAfterA", "S0")
+		}
+		.build()
+	}
+
+	/// The process `EInBothAlphabets`, whose `e`, in the observable and in the
+	/// hidden alphabet, takes `S0` to the accepting `S1`.
+	#[cfg(feature = "testing-fdr")]
+	pub(crate) fn e_in_both_alphabets() -> Process {
+		TestProcess {
+			observable: &["e"],
+			hidden: &["e"],
+			transitions: &[("S0", "e", "S1")],
+			terminal: &["S1"],
+			..TestProcess::of("EInBothAlphabets", "S0")
+		}
+		.build()
+	}
+
+	/// The process `test`, which takes `start`, then `process`, to the
+	/// accepting `s2`, where `end` returns to `s2`.
+	#[cfg(feature = "testing-timing")]
+	pub(crate) fn start_process_end() -> Process {
+		TestProcess {
+			observable: &["start", "process", "end"],
+			transitions: &[("s0", "start", "s1"), ("s1", "process", "s2"), ("s2", "end", "s2")],
+			terminal: &["s2"],
+			..TestProcess::of("test", "s0")
+		}
+		.build()
 	}
 }
 
@@ -1930,13 +2761,128 @@ impl CryptoProvider for Aes256Sha3_512Provider {
 	}
 }
 
+/// `value` decoded again from its DER.
+#[cfg(test)]
+pub(crate) fn der_round_trip<T>(value: &T) -> T
+where
+	T: crate::der::Encode + for<'a> crate::der::Decode<'a>,
+{
+	let encoded = value.to_der().expect("the value encodes");
+	T::from_der(&encoded).expect("what the encoder wrote, the decoder reads")
+}
+
+/// Poisons `lock`, as a panic while a holder holds its guard does.
+#[cfg(test)]
+pub(crate) fn poison<T: ?Sized>(lock: &std::sync::Mutex<T>) {
+	let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		let _held = lock.lock();
+		panic!("poison the lock");
+	}));
+	assert!(panicked.is_err());
+	assert!(lock.is_poisoned());
+}
+
+/// Poisons `lock`, as a panic while a writer holds its guard does.
+#[cfg(all(test, feature = "colony"))]
+pub(crate) fn poison_write<T: ?Sized>(lock: &std::sync::RwLock<T>) {
+	let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		let _held = lock.write();
+		panic!("poison the lock");
+	}));
+	assert!(panicked.is_err());
+	assert!(lock.is_poisoned());
+}
+
+/// `bytes` with the lowest bit of its last octet flipped.
+#[cfg(test)]
+pub(crate) fn flip_last(bytes: impl AsRef<[u8]>) -> Vec<u8> {
+	let mut flipped = bytes.as_ref().to_vec();
+	let last = flipped.last_mut().expect("the bytes hold an octet");
+	*last ^= 0x01;
+	flipped
+}
+
+/// The directory `scripts/cms-interop.sh` reads its samples from.
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+const SAMPLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/cms-samples");
+
+/// The variable that asks a sample test to write its samples.
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+const SAMPLE_VARIABLE: &str = "TIGHTBEAM_CMS_SAMPLES";
+
+/// The key, the `kekid`, and the plaintext an outside CMS reader recovers
+/// from one `KEKRecipientInfo` sample, all from fixed test keys.
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+pub(crate) struct KekOpening {
+	kek: Vec<u8>,
+	key_identifier: Vec<u8>,
+	plaintext: Vec<u8>,
+}
+
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+impl KekOpening {
+	/// Collects what opens a seal under `kek`, which `key_identifier` names,
+	/// over `plaintext`.
+	pub(crate) fn new(
+		kek: impl Into<Vec<u8>>,
+		key_identifier: impl Into<Vec<u8>>,
+		plaintext: impl Into<Vec<u8>>,
+	) -> Self {
+		Self {
+			kek: kek.into(),
+			key_identifier: key_identifier.into(),
+			plaintext: plaintext.into(),
+		}
+	}
+}
+
+/// `bytes` as lowercase hexadecimal, the form `openssl cms -secretkey`
+/// reads.
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+fn hex(bytes: &[u8]) -> String {
+	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Write each of `samples` to [`SAMPLE_DIR`] under its name, what opens each
+/// `KEKRecipientInfo` sample of `openings`, and the DER of each of
+/// `certificates`, when the environment holds [`SAMPLE_VARIABLE`].
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
+pub(crate) fn write_interop_samples(
+	samples: &[(&str, Vec<u8>)],
+	openings: &[(&str, &KekOpening)],
+	certificates: &[(&str, &Certificate)],
+) {
+	if std::env::var_os(SAMPLE_VARIABLE).is_none() {
+		return;
+	}
+
+	let write = |path: String, contents: &[u8]| {
+		std::fs::write(path, contents).expect("the sample directory takes the sample");
+	};
+
+	std::fs::create_dir_all(SAMPLE_DIR).expect("the sample directory exists or is created");
+
+	for (name, der) in samples {
+		write(format!("{SAMPLE_DIR}/{name}.der"), der);
+	}
+	for (name, opening) in openings {
+		write(format!("{SAMPLE_DIR}/{name}.kek"), hex(&opening.kek).as_bytes());
+		write(format!("{SAMPLE_DIR}/{name}.kekid"), hex(&opening.key_identifier).as_bytes());
+		write(format!("{SAMPLE_DIR}/{name}.plain"), &opening.plaintext);
+	}
+	for (name, certificate) in certificates {
+		let der = certificate.to_der().expect("a test certificate encodes");
+		write(format!("{SAMPLE_DIR}/{name}.crt"), &der);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	use crate::builder::MetadataBuilder;
 	use crate::decode;
-	use crate::error::Result as TbResult;
+	use crate::testing::TestResult;
 	use crate::{Metadata, Version};
 
 	#[cfg(all(feature = "builder", feature = "compress"))]
@@ -1948,14 +2894,15 @@ mod tests {
 	#[cfg(all(feature = "builder", feature = "compress"))]
 	use crate::CompressedData;
 
+	/// A sample message carries the content its caller names.
 	#[test]
 	#[cfg(feature = "std")]
-	fn test_create_test_message() -> TbResult<()> {
+	fn a_sample_message_carries_the_content_its_caller_names() {
 		let message = TestMessage::sample(Some("Test content"));
-		assert_eq!(message.content, "Test content");
-		Ok(())
+		assert_eq!(message, TestMessage { content: "Test content".into() });
 	}
 
+	/// A V0 test frame carries the id its caller names.
 	#[test]
 	fn a_test_frame_carries_the_id_its_caller_names() {
 		let frame = TestFrame::v0(None, Some("named-id"));
@@ -1964,17 +2911,16 @@ mod tests {
 
 	/// A value matches the cleartext frame that carries it.
 	#[test]
-	fn an_expected_message_matches_the_frame_that_carries_it() -> TbResult<()> {
+	fn an_expected_message_matches_the_frame_that_carries_it() {
 		let frame = TestFrame::v0(Some("carried"), None);
 		assert!(TestMessage::sample(Some("carried")).matches(&frame));
-		Ok(())
 	}
 
 	/// A cleartext frame is no carrier of a type that requires
 	/// confidentiality, so a value of that type matches no such frame, though
 	/// the body decodes as that type.
 	#[test]
-	fn an_expected_message_matches_no_frame_that_fails_a_requirement_of_its_type() -> TbResult<()> {
+	fn an_expected_message_matches_no_frame_that_fails_a_requirement_of_its_type() -> TestResult {
 		let frame = TestFrame::v0(Some("sealed"), None);
 		let expected = ConfidentialNote { content: "sealed".into() };
 
@@ -1988,7 +2934,7 @@ mod tests {
 	/// compressed frame, though the body holds the encoding of that value.
 	#[cfg(all(feature = "builder", feature = "compress"))]
 	#[test]
-	fn an_expected_message_matches_no_frame_whose_body_needs_an_inflate() -> TbResult<()> {
+	fn an_expected_message_matches_no_frame_whose_body_needs_an_inflate() -> TestResult {
 		let message = TestMessage::sample(Some("stored"));
 		let frame = compose! { V0: id: "stored", order: 1u64, message: message, compactness: Stored }?;
 
@@ -2018,6 +2964,7 @@ mod tests {
 			let encap_content_info =
 				content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: DATA, econtent: None });
 			let compressed = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
+
 			Ok((data.to_vec(), compressed))
 		}
 	}
@@ -2036,13 +2983,8 @@ mod tests {
 		feature = "tokio"
 	))]
 	#[tokio::test]
-	async fn a_sealed_frame_opens_inside_a_runtime() -> TbResult<()> {
-		use crate::builder::frame::FrameBuilder;
-		use crate::builder::TypeBuilder;
-
-		let (_, cipher) = TestKey::insecure_fixed_cipher();
-		let builder = FrameBuilder::<TestMessage>::from(Version::V1).with_message(TestMessage::sample(None));
-		let frame = builder.with_id("sealed").with_order(1).with_encryptor(cipher).build()?;
+	async fn a_sealed_frame_opens_inside_a_runtime() -> TestResult {
+		let frame = TestFrame::sealed("sealed");
 
 		let (_, key) = TestKey::insecure_fixed_cipher();
 		let opened = TestFrame::decrypted::<TestMessage>(frame, &key, None)?;
@@ -2050,22 +2992,23 @@ mod tests {
 		Ok(())
 	}
 
+	// A V0 metadata build keeps the id and the order it names, and carries no
+	// integrity digest.
 	test_builder! {
-		name: test_metadata_builder_basic,
+		name: a_v0_metadata_build_keeps_its_id_and_order,
 		builder_type: MetadataBuilder,
 		version: Version::V0,
 		message: (),
 		setup: |builder, _msg| {
 			builder
 				.with_id("test-id")
-				.with_order(1696521600)
+				.with_order(TestFrame::ORDER)
 				.build()
 		},
 		assertions: |_msg, result| {
 			let metadata: Metadata = result?;
-			assert_eq!(metadata.id(), b"test-id");
-			assert_eq!(metadata.order(), 1696521600);
-			assert!(metadata.integrity().is_none());
+			let built = (metadata.id(), metadata.order(), metadata.integrity());
+			assert_eq!(built, (b"test-id".as_slice(), TestFrame::ORDER, None));
 			Ok(())
 		}
 	}

@@ -561,52 +561,88 @@ mod tests {
 	use super::*;
 	use crate::crypto::k256::Secp256k1;
 	use crate::der::referenced::OwnedToRef;
-	use crate::random::OsRng;
+	use crate::testing::fixtures::TestAlgorithm;
+	use crate::testing::{SeededStream, TestResult};
 
-	/// The point of a fresh secp256k1 scalar.
-	pub(super) fn fresh_point() -> PublicKey<Secp256k1> {
-		SecretKey::<Secp256k1>::random(&mut OsRng).public_key()
+	/// The point of the secp256k1 scalar whose 32 octets each hold `octet`.
+	pub(super) fn point_of(octet: u8) -> PublicKey<Secp256k1> {
+		let scalar = SecretKey::<Secp256k1>::from_bytes(&[octet; 32].into());
+		scalar.expect("an octet from 0x01 to 0xfe names a scalar").public_key()
+	}
+
+	/// The point of the P-256 scalar whose 32 octets each hold `0x11`.
+	fn p256_point() -> PublicKey<NistP256> {
+		let scalar = SecretKey::<NistP256>::from_bytes(&[0x11; 32].into());
+		scalar.expect("0x11 octets name a P-256 scalar").public_key()
+	}
+
+	/// The SPKI of [`point_of`] `0x11` under `algorithm`, with the
+	/// parameters of secp256k1.
+	fn spki_under(algorithm: ObjectIdentifier) -> SubjectPublicKeyInfoOwned {
+		let spki = SubjectPublicKeyInfoOwned::from_key(point_of(0x11));
+		let mut spki = spki.expect("a secp256k1 point encodes");
+		spki.algorithm.oid = algorithm;
+		spki
 	}
 
 	/// The octets of `secret`, to compare with a vector or another secret.
-	#[cfg(feature = "preview-pqc")]
 	pub(super) fn octets_of(secret: &SecretSlice<u8>) -> Vec<u8> {
 		secret.with(|octets| octets.to_vec())
 	}
 
-	#[test]
-	fn both_ends_of_an_exchange_derive_one_secret() -> Result<(), KeyExchangeError> {
-		let (pending, offer) = Ecdhe::<Secp256k1>::offer(&mut OsRng);
-		let (reply, responder) = Ecdhe::<Secp256k1>::respond(&offer, &mut OsRng)?;
-		let initiator = Ecdhe::<Secp256k1>::complete(&pending, &reply)?;
-
-		let equal = initiator.with(|secret| responder.with(|other| secret == other));
-		assert!(equal);
-		Ok(())
+	/// The secrets that the initiator and the responder of an exchange under
+	/// `X` derive, each side drawing from a seeded stream of its own.
+	pub(super) fn secrets_of_both_ends<X: KeyExchange>() -> (Vec<u8>, Vec<u8>) {
+		let (pending, offer) = X::offer(&mut SeededStream(0x10));
+		let responded = X::respond(&offer, &mut SeededStream(0x20));
+		let (reply, responder) = responded.expect("an exchange answers its own offer");
+		let initiator = X::complete(&pending, &reply).expect("an exchange completes its own reply");
+		(octets_of(&initiator), octets_of(&responder))
 	}
 
-	#[test]
-	fn a_share_of_another_width_is_refused() {
-		let uncompressed = fresh_point().to_encoded_point(false);
-		let refused = EcdheShare::<Secp256k1>::from_octets(uncompressed.as_bytes());
-		assert_eq!(refused, Err(KeyExchangeError::Width { expected: 33, actual: 65 }));
+	/// The identifier and the ciphertext that `attribute` carries, when it
+	/// travels as a `KemCiphertext`.
+	#[cfg(feature = "preview-pqc")]
+	pub(super) fn kem_ciphertext_of(attribute: ReplyAttribute) -> Option<(ObjectIdentifier, Vec<u8>)> {
+		match attribute {
+			ReplyAttribute::KemCiphertext(KemCiphertext { kem, kemct }) => Some((kem.oid, kemct.as_bytes().to_vec())),
+			ReplyAttribute::OriginatorKey(_) => None,
+		}
 	}
 
+	/// Both ends of an ECDH exchange derive one secret.
 	#[test]
-	fn a_share_in_the_compact_form_is_refused() {
-		let mut compact = fresh_point().to_encoded_point(true).as_bytes().to_vec();
-		compact[0] = 0x05;
+	fn both_ends_of_an_exchange_derive_one_secret() {
+		let (initiator, responder) = secrets_of_both_ends::<Ecdhe<Secp256k1>>();
+		assert_eq!(initiator, responder);
+	}
 
-		let refused = EcdheShare::<Secp256k1>::from_octets(&compact);
-		assert_eq!(refused, Err(KeyExchangeError::Malformed));
+	// A share travels in the compressed form, so the 65-octet uncompressed
+	// form is refused at its width, and a share whose tag names the compact
+	// form is malformed.
+	crate::tb_cases! {
+		fn a_share_is_refused_for((octets, refusal): (Vec<u8>, KeyExchangeError)) {
+			let refused = EcdheShare::<Secp256k1>::from_octets(&octets);
+			assert_eq!(refused, Err(refusal));
+		}
+		cases {
+			another_width => (
+				point_of(0x11).to_encoded_point(false).as_bytes().to_vec(),
+				KeyExchangeError::Width { expected: 33, actual: 65 },
+			),
+			the_compact_form => {
+				let mut compact = point_of(0x11).to_encoded_point(true).as_bytes().to_vec();
+				compact[0] = 0x05;
+				(compact, KeyExchangeError::Malformed)
+			},
+		}
 	}
 
 	/// The opening's `agreementKey` names `id-ecPublicKey` on the curve, so an
 	/// originator key of another curve names another algorithm.
 	#[test]
-	fn an_originator_key_of_another_curve_is_refused() -> Result<(), KeyExchangeError> {
-		let point = p256::SecretKey::random(&mut OsRng).public_key();
-		let key = EcdheShare::<NistP256>::from(point).to_originator_key()?;
+	fn an_originator_key_of_another_curve_is_refused() -> TestResult {
+		let key = EcdheShare::<NistP256>::from(p256_point()).to_originator_key()?;
 
 		let refused = EcdheShare::<Secp256k1>::from_originator_key(&key);
 		assert_eq!(refused, Err(KeyExchangeError::Algorithm));
@@ -616,12 +652,12 @@ mod tests {
 	/// The CMS carriers admit a point in both SEC 1 forms that RFC 5480 §2.2
 	/// names, as one share.
 	#[test]
-	fn an_originator_key_admits_both_point_forms() -> Result<(), KeyExchangeError> {
-		let point = fresh_point();
+	fn an_originator_key_admits_both_point_forms() -> TestResult {
+		let point = point_of(0x11);
 		let share = EcdheShare::<Secp256k1>::from(point);
 		let uncompressed = share.to_originator_key()?;
 		let compressed_point = point.to_encoded_point(true);
-		let public_key = BitString::from_bytes(compressed_point.as_bytes()).map_err(|_| KeyExchangeError::Encoding)?;
+		let public_key = BitString::from_bytes(compressed_point.as_bytes())?;
 		let compressed = OriginatorPublicKey { algorithm: uncompressed.algorithm.clone(), public_key };
 
 		let parse = EcdheShare::<Secp256k1>::from_originator_key;
@@ -632,10 +668,10 @@ mod tests {
 	/// A DH share travels as an `OriginatorPublicKey`, so a reply in the KEM
 	/// carrier names another kind of reply.
 	#[test]
-	fn a_ciphertext_reply_is_refused_for_a_dh_share() -> Result<(), KeyExchangeError> {
-		let compressed = fresh_point().to_encoded_point(true);
-		let kem = AlgorithmIdentifierOwned { oid: Secp256k1::OID, parameters: None };
-		let kemct = OctetString::new(compressed.as_bytes()).map_err(|_| KeyExchangeError::Encoding)?;
+	fn a_ciphertext_reply_is_refused_for_a_dh_share() -> TestResult {
+		let compressed = point_of(0x11).to_encoded_point(true);
+		let kem = TestAlgorithm::of(Secp256k1::OID);
+		let kemct = OctetString::new(compressed.as_bytes())?;
 		let attribute = ReplyAttribute::KemCiphertext(KemCiphertext { kem, kemct });
 
 		let refused = attribute.reply::<Ecdhe<Secp256k1>>();
@@ -643,42 +679,52 @@ mod tests {
 		Ok(())
 	}
 
-	/// A key of the curve reads as a static key under each algorithm that RFC
-	/// 5480 §2.1.1 and §2.1.2 publish it under, and as none under another
-	/// algorithm or for another curve.
-	#[test]
-	fn the_house_exchange_reads_a_static_key_under_each_ec_algorithm() -> Result<(), crate::spki::Error> {
-		let key = fresh_point();
-		let mut spki = SubjectPublicKeyInfoOwned::from_key(key)?;
-		for algorithm in [ID_EC_PUBLIC_KEY, ID_EC_DH, ID_EC_MQV] {
-			spki.algorithm.oid = algorithm;
+	// A key of the curve reads as a static key under each algorithm that RFC
+	// 5480 §2.1.1 and §2.1.2 publish it under.
+	crate::tb_cases! {
+		fn the_house_exchange_reads_a_static_key_under(algorithm: ObjectIdentifier) {
+			let spki = spki_under(algorithm);
+
 			let read = Ecdhe::<Secp256k1>::static_key(spki.owned_to_ref());
-			assert_eq!(read, Some(key));
+			assert_eq!(read, Some(point_of(0x11)));
 		}
+		cases {
+			ec_public_key => ID_EC_PUBLIC_KEY,
+			ec_dh => ID_EC_DH,
+			ec_mqv => ID_EC_MQV,
+		}
+	}
 
-		// A point of P-256 under the parameters of secp256k1 decodes on P-256,
-		// so only the parameters refuse it.
-		let p256_key = p256::SecretKey::random(&mut OsRng).public_key();
-		let mut mislabeled = SubjectPublicKeyInfoOwned::from_key(p256_key)?;
-		mislabeled.algorithm.parameters = spki.algorithm.parameters.clone();
+	/// A key of the curve under another algorithm reads as no static key.
+	#[test]
+	fn the_house_exchange_reads_no_static_key_under_another_algorithm() {
+		let spki = spki_under(Secp256k1::OID);
+		let read = Ecdhe::<Secp256k1>::static_key(spki.owned_to_ref());
+		assert_eq!(read, None);
+	}
 
-		let other_curve = Ecdhe::<NistP256>::static_key(mislabeled.owned_to_ref());
-		assert_eq!(other_curve, None);
+	/// A point of P-256 under the parameters of secp256k1 decodes on P-256,
+	/// so only the parameters refuse it.
+	#[test]
+	fn the_house_exchange_reads_no_static_key_under_the_parameters_of_another_curve() -> TestResult {
+		let mut mislabeled = SubjectPublicKeyInfoOwned::from_key(p256_point())?;
+		mislabeled.algorithm.parameters = spki_under(ID_EC_PUBLIC_KEY).algorithm.parameters;
 
-		spki.algorithm.oid = Secp256k1::OID;
-
-		let other_algorithm = Ecdhe::<Secp256k1>::static_key(spki.owned_to_ref());
-		assert_eq!(other_algorithm, None);
+		let read = Ecdhe::<NistP256>::static_key(mislabeled.owned_to_ref());
+		assert_eq!(read, None);
 		Ok(())
 	}
 
-	/// NIST SP 800-57 Part 1 Rev. 5 Table 2 rates an ECC key by the size
-	/// of its base point's order: 256 bits rate 128, 384 rate 192, and 521
-	/// rate 256.
-	#[test]
-	fn the_house_exchange_rates_the_order_of_its_curve() {
-		assert_eq!(Ecdhe::<Secp256k1>::strength(), SecurityStrength::BITS_128);
-		assert_eq!(Ecdhe::<NistP384>::strength(), SecurityStrength::BITS_192);
-		assert_eq!(Ecdhe::<NistP521>::strength(), SecurityStrength::BITS_256);
+	// NIST SP 800-57 Part 1 Rev. 5 Table 2 rates an ECC key by the size of its
+	// base point's order: 256 bits rate 128, 384 rate 192, and 521 rate 256.
+	crate::tb_cases! {
+		fn the_house_exchange_rates_the_order_of_its_curve((strength, expected): (SecurityStrength, SecurityStrength)) {
+			assert_eq!(strength, expected);
+		}
+		cases {
+			secp256k1 => (Ecdhe::<Secp256k1>::strength(), SecurityStrength::BITS_128),
+			p384 => (Ecdhe::<NistP384>::strength(), SecurityStrength::BITS_192),
+			p521 => (Ecdhe::<NistP521>::strength(), SecurityStrength::BITS_256),
+		}
 	}
 }

@@ -173,7 +173,7 @@ mod tests {
 	/// The capacity grows toward the stream ceiling and stops there, where a
 	/// plain `Vec` would double past it.
 	#[test]
-	fn a_reassembly_holds_no_capacity_past_its_ceiling() -> TransportResult<()> {
+	fn a_reassembly_holds_no_capacity_past_its_ceiling() -> crate::testing::TestResult {
 		let mut reassembly = Reassembly::with_ceiling(CEILING, Arc::new(ReassemblyBudget::default()));
 		reassembly.append([0u8; 30])?;
 		reassembly.append([0u8; 30])?;
@@ -189,16 +189,17 @@ mod tests {
 	#[test]
 	fn a_payload_past_the_stream_ceiling_is_refused() {
 		let mut reassembly = Reassembly::with_ceiling(CEILING, Arc::new(ReassemblyBudget::default()));
-
 		let refusal = reassembly.append([0u8; CEILING + 1]);
-		let oversize = matches!(refusal, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)));
-		assert!(oversize);
+		assert!(matches!(
+			refusal,
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
+		));
 	}
 
 	/// Bytes handed over leave the reassembly, so they return to the
 	/// connection budget.
 	#[test]
-	fn handing_bytes_over_returns_them_to_the_connection() -> TransportResult<()> {
+	fn handing_bytes_over_returns_them_to_the_connection() -> crate::testing::TestResult {
 		let budget = Arc::new(ReassemblyBudget::with_ceiling(CEILING));
 		let mut reassembly = Reassembly::with_ceiling(CEILING, Arc::clone(&budget));
 		reassembly.append([0u8; CEILING])?;

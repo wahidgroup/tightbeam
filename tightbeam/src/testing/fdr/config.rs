@@ -585,6 +585,22 @@ impl FdrConfig {
 	}
 }
 
+#[cfg(test)]
+impl FdrConfig {
+	/// The config that checks refinement against `spec` alone.
+	pub(crate) fn refining(spec: Process) -> Self {
+		FdrConfig { specs: vec![spec], ..FdrConfig::default() }
+	}
+
+	/// The config that explores the fault runs of `specs` under the empty
+	/// fault model.
+	#[cfg(feature = "testing-fault")]
+	pub(crate) fn under_faults(specs: impl IntoIterator<Item = Process>) -> Self {
+		let specs = specs.into_iter().collect();
+		FdrConfig { specs, fault_model: Some(FaultModel::default()), ..FdrConfig::default() }
+	}
+}
+
 /// The exploration that a run of an [`FdrConfig`] performs, which its specs
 /// and its fault model select ([`FdrConfig::mode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,263 +630,182 @@ pub struct InjectedFaultRecord {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashSet;
-
 	use super::*;
-	use crate::testing::specs::csp::{Components, Observation, State, TransitionRelation};
+	use crate::testing::fixtures::TestProcess;
 
 	// These unit tests cover `FaultModel`.
 
 	#[cfg(feature = "testing-fault")]
 	mod fault_model {
 		use super::*;
+		use crate::urn::Urn;
 
-		#[derive(Debug, Clone, Copy)]
-		struct TestError;
+		const PING: Urn<'static> = crate::urn!("test", "event:fdr-config/ping");
+		const PONG: Urn<'static> = crate::urn!("test", "event:fdr-config/pong");
 
-		impl core::fmt::Display for TestError {
-			fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-				write!(f, "test error")
-			}
+		/// The label that a trace records for `PING`, which keys its faults.
+		const PING_LABEL: &str = "urn:test:event:fdr-config/ping";
+
+		/// The label that a trace records for `PONG`, which keys its faults.
+		const PONG_LABEL: &str = "urn:test:event:fdr-config/pong";
+
+		crate::tb_gen_process_types!(Probe, Idle, Busy);
+
+		/// A model with one fault on `PING` in `Probe.Idle` at `probability`.
+		fn one_fault(probability: BasisPoints) -> FaultModel {
+			let closed = || TightBeamError::ChannelClosed;
+			FaultModel::default().with_fault(probe::States::Idle, probe::Event(PING), closed, probability)
 		}
 
-		impl From<TestError> for TightBeamError {
-			fn from(e: TestError) -> Self {
-				TightBeamError::InjectedFault(Box::new(e))
-			}
-		}
-
-		#[derive(Debug, Clone, Copy)]
-		struct TestState;
-
-		impl ProcessState for TestState {
-			fn process_name(&self) -> &'static str {
-				"TestProcess"
-			}
-			fn state_name(&self) -> &'static str {
-				"TestState"
-			}
-		}
-
-		#[derive(Debug, Clone, Copy)]
-		struct TestEvent;
-
-		impl ProcessEvent for TestEvent {
-			fn event_label(&self) -> Cow<'static, str> {
-				Cow::Borrowed("test_event")
-			}
-		}
-
-		#[derive(Debug, Clone, Copy)]
-		struct AnotherState;
-
-		impl ProcessState for AnotherState {
-			fn process_name(&self) -> &'static str {
-				"TestProcess"
-			}
-			fn state_name(&self) -> &'static str {
-				"AnotherState"
-			}
-		}
-
-		#[derive(Debug, Clone, Copy)]
-		struct AnotherEvent;
-
-		impl ProcessEvent for AnotherEvent {
-			fn event_label(&self) -> Cow<'static, str> {
-				Cow::Borrowed("another_event")
-			}
-		}
-
-		/// Looks up the injection registered under a `Process.State` key and
-		/// event label.
+		/// The injection of `model` at the event `event` in the state `state`,
+		/// named `Process.State`.
 		fn injection<'a>(model: &'a FaultModel, state: &'static str, event: &'static str) -> &'a FaultInjection {
-			model
-				.state_injection(state, event)
-				.expect("fault registered for the requested state and event")
+			let injection = model.state_injection(state, event);
+			injection.expect("a fault is registered at the state and event")
 		}
 
-		#[test]
-		fn default_initializes_empty() {
-			let model = FaultModel::default();
-			assert_eq!(model.injection_points.len(), 0);
-			assert_eq!(model.injection_strategy, InjectionStrategy::Deterministic);
+		/// The one injection of a model that [`one_fault`] builds.
+		fn only_injection(model: &FaultModel) -> &FaultInjection {
+			injection(model, "Probe.Idle", PING_LABEL)
 		}
 
-		#[test]
-		fn from_strategy_sets_strategy() {
-			let model = FaultModel::from(InjectionStrategy::Random);
-			assert_eq!(model.injection_strategy, InjectionStrategy::Random);
+		/// A model with a fault at three keys, each at its own probability.
+		fn three_faults() -> FaultModel {
+			let closed = || TightBeamError::ChannelClosed;
+			let (idle, busy) = (probe::States::Idle, probe::States::Busy);
+
+			let model = FaultModel::default().with_fault(idle, probe::Event(PING), closed, crate::bps!(1000));
+			let model = model.with_fault(idle, probe::Event(PONG), closed, crate::bps!(2000));
+			model.with_fault(busy, probe::Event(PING), closed, crate::bps!(3000))
 		}
 
-		#[test]
-		fn with_fault_adds_typed_injection() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(5000));
-			assert_eq!(model.injection_points.len(), 1);
+		// A new model holds no injection point, under the strategy it names.
+		crate::tb_cases! {
+			fn a_new_model_holds_no_point_under_its_strategy((model, strategy): (FaultModel, InjectionStrategy)) {
+				let held = (model.injection_points.len(), model.injection_strategy);
+				assert_eq!(held, (0, strategy));
+			}
 
-			let injection = injection(&model, "TestProcess.TestState", "test_event");
-			assert_eq!(injection.probability_bps, crate::bps!(5000));
+			cases {
+				by_default => (FaultModel::default(), InjectionStrategy::Deterministic),
+				from_the_random_strategy => (FaultModel::from(InjectionStrategy::Random), InjectionStrategy::Random),
+			}
 		}
 
+		/// A fault at each of three keys holds three injection points.
 		#[test]
-		fn with_fault_io_error() {
-			let model = FaultModel::default().with_fault(
-				TestState,
-				TestEvent,
-				|| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
-				crate::bps!(100),
-			);
-
-			let error = (injection(&model, "TestProcess.TestState", "test_event").error_factory)();
-			assert!(matches!(error, TightBeamError::IoError(_)));
-		}
-
-		#[test]
-		fn hashmap_provides_o1_lookup() {
-			let model = FaultModel::default()
-				.with_fault(TestState, TestEvent, || TestError, crate::bps!(1000))
-				.with_fault(TestState, AnotherEvent, || TestError, crate::bps!(2000))
-				.with_fault(AnotherState, TestEvent, || TestError, crate::bps!(3000));
+		fn a_fault_at_each_of_three_keys_holds_three_points() {
+			let model = three_faults();
 			assert_eq!(model.injection_points.len(), 3);
-
-			assert_eq!(
-				injection(&model, "TestProcess.TestState", "test_event").probability_bps,
-				crate::bps!(1000)
-			);
-			assert_eq!(
-				injection(&model, "TestProcess.TestState", "another_event").probability_bps,
-				crate::bps!(2000)
-			);
-			assert_eq!(
-				injection(&model, "TestProcess.AnotherState", "test_event").probability_bps,
-				crate::bps!(3000)
-			);
 		}
 
-		#[test]
-		fn should_inject_probability_0_percent() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(0));
-			let injection = injection(&model, "TestProcess.TestState", "test_event");
-			assert!(!injection.should_inject(0));
-			assert!(!injection.should_inject(9999));
+		// Each `Process.State` key and event label finds the injection that its
+		// fault registered.
+		crate::tb_cases! {
+			fn each_key_finds_its_injection((state, event, probability): (&'static str, &'static str, BasisPoints)) {
+				let model = three_faults();
+				let found = injection(&model, state, event).probability_bps;
+				assert_eq!(found, probability);
+			}
+
+			cases {
+				idle_on_ping => ("Probe.Idle", PING_LABEL, crate::bps!(1000)),
+				idle_on_pong => ("Probe.Idle", PONG_LABEL, crate::bps!(2000)),
+				busy_on_ping => ("Probe.Busy", PING_LABEL, crate::bps!(3000)),
+			}
 		}
 
+		/// The error factory of a fault converts the error that the fault
+		/// builds into the `TightBeamError` it names.
 		#[test]
-		fn should_inject_probability_100_percent() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(10000));
-			let injection = injection(&model, "TestProcess.TestState", "test_event");
-			assert!(injection.should_inject(0));
-			assert!(injection.should_inject(9999));
+		fn a_fault_builds_the_error_of_its_factory() {
+			let refused = || std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test");
+			let model = FaultModel::default();
+			let model = model.with_fault(probe::States::Idle, probe::Event(PING), refused, crate::bps!(100));
+
+			let error = (only_injection(&model).error_factory)();
+			assert!(matches!(error, TightBeamError::IoError(io) if io.kind() == std::io::ErrorKind::ConnectionRefused));
 		}
 
-		#[test]
-		fn should_inject_probability_50_percent() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(5000));
-			let injection = injection(&model, "TestProcess.TestState", "test_event");
-			assert!(injection.should_inject(0));
-			assert!(injection.should_inject(4999));
-			assert!(!injection.should_inject(5000));
-			assert!(!injection.should_inject(9999));
+		// A draw injects when its value modulo 10,000 falls under the
+		// probability of the point.
+		crate::tb_cases! {
+			fn a_draw_under_the_probability_injects((probability, draw, injects): (BasisPoints, u64, bool)) {
+				let model = one_fault(probability);
+				let injected = only_injection(&model).should_inject(draw);
+				assert_eq!(injected, injects);
+			}
+
+			cases {
+				zero_bps_at_draw_0 => (crate::bps!(0), 0, false),
+				zero_bps_at_draw_9999 => (crate::bps!(0), 9999, false),
+				full_bps_at_draw_0 => (crate::bps!(10000), 0, true),
+				full_bps_at_draw_9999 => (crate::bps!(10000), 9999, true),
+				half_bps_at_draw_0 => (crate::bps!(5000), 0, true),
+				half_bps_at_draw_4999 => (crate::bps!(5000), 4999, true),
+				half_bps_at_draw_5000 => (crate::bps!(5000), 5000, false),
+				half_bps_at_draw_9999 => (crate::bps!(5000), 9999, false),
+			}
 		}
 
+		/// A clone keeps the injection points, the strategy, and the seed of
+		/// its model.
 		#[test]
-		fn clone_preserves_injection_points() {
-			let model1 = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(5000));
-			let model2 = model1.clone();
-			assert_eq!(model2.injection_points.len(), 1);
-			assert_eq!(model2.injection_strategy, InjectionStrategy::Deterministic);
+		fn a_clone_keeps_the_points_strategy_and_seed_of_its_model() {
+			let closed = || TightBeamError::ChannelClosed;
+			let model = FaultModel::from(InjectionStrategy::Random).with_seed(7);
+			let model = model.with_fault(probe::States::Idle, probe::Event(PING), closed, crate::bps!(5000));
+			let cloned = model.clone();
+
+			let point = cloned.state_injection("Probe.Idle", PING_LABEL);
+			let points = (cloned.injection_points.len(), point.map(|point| point.probability_bps));
+			let draws = (cloned.injection_strategy, cloned.seed);
+			assert_eq!((points, draws), ((1, Some(crate::bps!(5000))), (InjectionStrategy::Random, 7)));
 		}
 	}
 
 	// These tests cover `FdrConfig`.
 
-	#[test]
-	fn default_configuration() {
-		let config = FdrConfig::default();
-		assert_eq!(config.seeds, 64);
-		assert_eq!(config.max_depth, 128);
-		assert_eq!(config.max_internal_run, 32);
-		assert_eq!(config.timeout_ms, 5000);
-		assert!(config.specs.is_empty());
-		assert!(config.fail_fast);
-	}
-
 	/// A spec of one state, which is its initial state and a terminal one.
 	fn one_state_spec() -> Process {
-		Process {
-			name: "Spec",
-			observation: Observation::Model,
-			requires_progress: true,
-			description: Some("Test spec"),
-			initial: State("S0"),
-			states: vec![State("S0")].into_iter().collect(),
-			observable: HashSet::new(),
-			hidden: HashSet::new(),
-			choice: HashSet::new(),
-			terminal: vec![State("S0")].into_iter().collect(),
-			transitions: TransitionRelation::new(),
-			#[cfg(feature = "testing-timing")]
-			timing_constraints: None,
-			#[cfg(feature = "testing-timing")]
-			timed_transitions: None,
-			#[cfg(feature = "testing-schedulability")]
-			schedulability_periods: None,
-			components: Components::default(),
+		TestProcess { terminal: &["S0"], ..TestProcess::of("Spec", "S0") }.build()
+	}
+
+	/// A default config runs 64 seeds of at most 128 events and 32 hidden
+	/// events, within 5 s per search, against no spec, and stops at its first
+	/// counterexample.
+	#[test]
+	fn a_default_config_holds_the_documented_bounds() {
+		let config = FdrConfig::default();
+
+		let bounds = (config.seeds, config.max_depth, config.max_internal_run, config.timeout_ms);
+		let held = (bounds, config.specs.len(), config.fail_fast);
+		assert_eq!(held, ((64, 128, 32, 5000), 0, true));
+	}
+
+	// The specs and the fault model of a config select the exploration that
+	// its run performs.
+	crate::tb_cases! {
+		fn the_specs_and_faults_of_a_config_pick_its_mode((config, mode): (FdrConfig, ExplorationMode)) {
+			let picked = config.mode();
+			assert_eq!(picked, mode);
+		}
+
+		cases {
+			no_spec => (FdrConfig::default(), ExplorationMode::StateSpace),
+			a_spec => (FdrConfig::refining(one_state_spec()), ExplorationMode::Refinement),
+			#[cfg(feature = "testing-fault")]
+			a_spec_under_faults => (FdrConfig::under_faults([one_state_spec()]), ExplorationMode::UnderFaults),
+			/// Only a spec runs under the faults.
+			#[cfg(feature = "testing-fault")]
+			faults_and_no_spec => (FdrConfig::under_faults([]), ExplorationMode::StateSpace),
 		}
 	}
 
-	#[test]
-	fn dual_mode_support() {
-		// Mode 1: Single-process exploration
-		let config_exploration = FdrConfig::default();
-		assert!(config_exploration.specs.is_empty());
-
-		// Mode 2: Refinement checking
-		let spec = one_state_spec();
-
-		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
-		assert!(!config_refinement.specs.is_empty());
-	}
-
-	/// A configuration that names no spec explores the state space.
-	#[test]
-	fn a_config_with_no_spec_explores_the_state_space() {
-		assert_eq!(FdrConfig::default().mode(), ExplorationMode::StateSpace);
-	}
-
-	/// A configuration that names a spec and no fault model runs the refinement
-	/// checks.
-	#[test]
-	fn a_config_with_a_spec_runs_the_refinement_checks() {
-		let config = FdrConfig { specs: vec![one_state_spec()], ..FdrConfig::default() };
-
-		assert_eq!(config.mode(), ExplorationMode::Refinement);
-	}
-
-	/// A configuration that names a spec and a fault model runs each spec under
-	/// the faults.
+	/// A scheduler constraint refuses more schedulers than processes.
 	#[cfg(feature = "testing-fault")]
 	#[test]
-	fn a_config_with_a_spec_and_a_fault_model_runs_each_spec_under_faults() {
-		let fault_model = Some(FaultModel::default());
-		let config = FdrConfig { specs: vec![one_state_spec()], fault_model, ..FdrConfig::default() };
-
-		assert_eq!(config.mode(), ExplorationMode::UnderFaults);
-	}
-
-	/// A fault model with no spec explores the state space, because only a
-	/// spec runs under the faults.
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn a_config_with_a_fault_model_and_no_spec_explores_the_state_space() {
-		let config = FdrConfig { fault_model: Some(FaultModel::default()), ..FdrConfig::default() };
-
-		assert_eq!(config.mode(), ExplorationMode::StateSpace);
-	}
-
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn an_fdr_config_cannot_hold_more_schedulers_than_processes() -> Result<(), Box<dyn core::error::Error>> {
+	fn an_fdr_config_cannot_hold_more_schedulers_than_processes() -> crate::testing::TestResult {
 		let counts = SchedulerCounts { schedulers: NonZeroU32::try_from(3)?, processes: NonZeroU32::try_from(2)? };
 		let refused = SchedulerConstraint::new(SchedulerModel::Cooperative, counts);
 		assert!(matches!(refused, Err(FdrConfigError { field: "schedulers", .. })));

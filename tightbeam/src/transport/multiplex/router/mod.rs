@@ -18,7 +18,7 @@ mod transport;
 mod writer;
 
 #[cfg(test)]
-mod testing;
+mod fixtures;
 
 pub use body::StreamBody;
 pub use flow::BufferedGrantor;

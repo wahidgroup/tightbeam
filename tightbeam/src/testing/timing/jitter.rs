@@ -156,59 +156,53 @@ impl JitterCalculator for DecorrelatedJitterCalculator {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 
-	#[test]
-	fn test_min_max_jitter() -> Result<(), Box<dyn core::error::Error>> {
-		let calculator = MinMaxJitter;
-		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100])?, 0);
-		assert_eq!(calculator.calculate(&[100, 200])?, 100);
-		assert_eq!(calculator.calculate(&[50, 100, 150, 200])?, 150);
+	// Each calculator measures the jitter of the samples of its row, and one
+	// sample has no jitter.
+	crate::tb_cases! {
+		fn a_calculator_measures_the_jitter_of_its_samples(
+			(calculator, samples, jitter): (&dyn JitterCalculator, &[u64], u64)
+		) -> TestResult {
+			let measured = calculator.calculate(samples)?;
+			assert_eq!(measured, jitter);
+			Ok(())
+		}
 
-		Ok(())
+		cases {
+			min_max_of_one_sample => (&MinMaxJitter, &[100], 0),
+			min_max_of_two_samples => (&MinMaxJitter, &[100, 200], 100),
+			min_max_of_four_samples => (&MinMaxJitter, &[50, 100, 150, 200], 150),
+			variance_of_one_sample => (&VarianceJitter, &[100], 0),
+			/// The mean of 100 and 200 is 150, so the variance is
+			/// ((100 - 150)² + (200 - 150)²) / 2 = 2500.
+			variance_of_two_samples => (&VarianceJitter, &[100, 200], 2500),
+			std_dev_of_one_sample => (&StdDevJitter, &[100], 0),
+			/// The variance of 100 and 200 is 2500, so the standard deviation
+			/// is 50.
+			std_dev_of_two_samples => (&StdDevJitter, &[100, 200], 50),
+			decorrelated_of_one_sample => (&DecorrelatedJitterCalculator, &[100], 0),
+			/// The largest sample, 300, sets the window from 300 / 3 to 300,
+			/// which is 200 wide.
+			decorrelated_up_to_300 => (&DecorrelatedJitterCalculator, &[100, 200, 300], 200),
+			/// The largest sample, 150, sets the window from 150 / 3 to 150,
+			/// which is 100 wide.
+			decorrelated_up_to_150 => (&DecorrelatedJitterCalculator, &[50, 100, 150], 100),
+		}
 	}
 
-	#[test]
-	fn test_variance_jitter() -> Result<(), Box<dyn core::error::Error>> {
-		let calculator = VarianceJitter;
-		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100])?, 0);
+	// Each calculator refuses a sample set with no sample.
+	crate::tb_cases! {
+		fn a_calculator_refuses_an_empty_sample(calculator: &dyn JitterCalculator) {
+			let measured = calculator.calculate(&[]);
+			assert!(matches!(measured, Err(TightBeamError::InvalidMetadata)));
+		}
 
-		// For [100, 200], the mean is 150 and the variance is
-		// ((100-150)² + (200-150)²) / 2
-		// = (2500 + 2500) / 2 = 2500.
-		let result = calculator.calculate(&[100, 200])?;
-		assert_eq!(result, 2500);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_std_dev_jitter() -> Result<(), Box<dyn core::error::Error>> {
-		let calculator = StdDevJitter;
-		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100])?, 0);
-
-		// For [100, 200], the variance is 2500 and
-		// std_dev = sqrt(2500) = 50.
-		let result = calculator.calculate(&[100, 200])?;
-		assert_eq!(result, 50);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_decorrelated_jitter() -> Result<(), Box<dyn core::error::Error>> {
-		let calculator = DecorrelatedJitterCalculator;
-		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100])?, 0);
-
-		// With max = 300, range = 300 - (300/3) = 300 - 100 = 200.
-		assert_eq!(calculator.calculate(&[100, 200, 300])?, 200);
-
-		// With max = 150, range = 150 - (150/3) = 150 - 50 = 100.
-		assert_eq!(calculator.calculate(&[50, 100, 150])?, 100);
-
-		Ok(())
+		cases {
+			min_max => &MinMaxJitter,
+			variance => &VarianceJitter,
+			std_dev => &StdDevJitter,
+			decorrelated => &DecorrelatedJitterCalculator,
+		}
 	}
 }

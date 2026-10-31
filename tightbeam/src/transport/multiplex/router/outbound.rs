@@ -55,3 +55,23 @@ impl Outbound {
 		)
 	}
 }
+
+#[cfg(test)]
+impl Outbound {
+	/// The mux envelope this command writes, or `None` for a command that
+	/// writes another envelope or none.
+	pub(crate) fn mux(&self) -> Option<&MuxEnvelope> {
+		match self {
+			Outbound::Envelope(TransportEnvelope::Mux(envelope)) => Some(envelope),
+			_ => None,
+		}
+	}
+
+	/// The mux envelope this command writes, taken out of the command.
+	pub(crate) fn into_mux(self) -> Option<MuxEnvelope> {
+		match self {
+			Outbound::Envelope(TransportEnvelope::Mux(envelope)) => Some(envelope),
+			_ => None,
+		}
+	}
+}

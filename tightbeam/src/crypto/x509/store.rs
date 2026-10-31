@@ -1614,28 +1614,30 @@ impl Debug for CertificateTrustBuilder {
 
 #[cfg(test)]
 mod tests {
+	use core::str::FromStr;
 	use core::sync::atomic::{AtomicUsize, Ordering};
 	use core::time::Duration;
 
-	use super::*;
-	use crate::clock::{ManualClock, UnixMillis};
 	use crate::crypto::k256::sha2::{Sha256, Sha384};
 	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, SigningKey};
-	use crate::crypto::sign::{CanonicalSigner, CmsSigner, SignatureEncoding, SignedContent, SigningIdentity};
-	use crate::crypto::x509::error::CertificateValidationError::PublicKeyCollision;
-	use crate::der::asn1::{BitString, GeneralizedTime, ObjectIdentifier, OctetString};
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+	use crate::crypto::sign::{CmsSigner, SignedContent, SigningIdentity};
+	use crate::crypto::x509::error::CertificateValidationError::{
+		DuplicateExtension, PublicKeyCollision, UnprocessedCriticalExtension,
+	};
+	use crate::crypto::x509::fixtures::{Refusal, Verdict};
+	use crate::der::asn1::{GeneralizedTime, ObjectIdentifier, OctetString};
+	use crate::der::oid::db::rfc5280::{ID_CE_KEY_USAGE, ID_CE_POLICY_CONSTRAINTS, ID_CE_SUBJECT_KEY_IDENTIFIER};
 	use crate::der::oid::AssociatedOid;
 	use crate::der::Decode;
-	use crate::oids::CURVE_NIST_P256;
-	use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestIdentity};
-	use crate::testing::{TestFrame, TestKey};
+	use crate::oids::{CURVE_NIST_P256, SIGNER_ECDSA_WITH_SHA256};
+	use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestClock, TestIdentity, TestStore};
+	use crate::testing::{TestFrame, TestKey, TestResult};
 	use crate::x509::ext::pkix::name::GeneralName;
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 	use crate::x509::time::Time;
-	use std::str::FromStr;
 
-	type TestResult = Result<(), Box<dyn std::error::Error>>;
+	use super::*;
 
 	/// The certificates that a test adds to the trust store.
 	#[derive(Debug, Clone, Copy)]
@@ -1654,25 +1656,14 @@ mod tests {
 	}
 
 	/// Build a trust store that holds `certs` from `chain`.
-	fn build_store(
-		chain: &TestCertificateChain,
-		certs: StoreCerts,
-	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = match certs {
-			StoreCerts::None => builder,
-			StoreCerts::Root => {
-				let certificate = chain.root.to_owned();
-				builder.with_certificate(certificate)?
-			}
-			StoreCerts::RootAndIntermediate => {
-				let root = chain.root.to_owned();
-				let intermediate = chain.intermediate.to_owned();
-				builder.with_certificate(root)?.with_certificate(intermediate)?
-			}
+	fn build_store(chain: &TestCertificateChain, certs: StoreCerts) -> CertificateTrustStore {
+		let held = match certs {
+			StoreCerts::None => vec![],
+			StoreCerts::Root => vec![chain.root.to_owned()],
+			StoreCerts::RootAndIntermediate => vec![chain.root.to_owned(), chain.intermediate.to_owned()],
 		};
 
-		Ok(builder.build())
+		TestStore::holding(held)
 	}
 
 	/// Returns the certificate in `chain` that `target` names.
@@ -1684,89 +1675,160 @@ mod tests {
 		}
 	}
 
+	/// Returns the certificates in `chain` that `targets` name, in their
+	/// order.
+	fn path_of<'c>(chain: &'c TestCertificateChain, targets: &[EvalTarget]) -> Vec<&'c Certificate> {
+		targets.iter().map(|target| target_cert(chain, *target)).collect()
+	}
+
+	/// Returns the chain that a peer presents of the certificates in `chain`
+	/// that `targets` name.
+	fn presented(chain: &TestCertificateChain, targets: &[EvalTarget]) -> Vec<Certificate> {
+		path_of(chain, targets).into_iter().cloned().collect()
+	}
+
+	/// A SHA3-256 certificate fingerprint holds the 32 octets of its digest.
 	#[test]
-	fn fingerprint_is_32_bytes() -> TestResult {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		assert_eq!(Fingerprint::<Sha3_256>::from_certificate(&cert)?.as_slice().len(), 32);
+	fn a_sha3_fingerprint_holds_32_octets() -> TestResult {
+		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&TestCertificate::insecure_fixed())?;
+		assert_eq!(fingerprint.as_slice().len(), 32);
 		Ok(())
 	}
 
-	#[test]
-	fn is_trusted_matches_fingerprint() -> TestResult {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let certificate = cert.to_owned();
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(certificate)?
-			.build();
-		assert!(store.is_trusted(&cert));
-		assert!(!store.is_trusted(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
-		Ok(())
-	}
+	/// A membership query of a store, by fingerprint or by key.
+	type Query = fn(&CertificateTrustStore, &Certificate) -> bool;
 
-	#[test]
-	fn trusts_public_key_matches_rotated_certificate() -> TestResult {
+	/// The membership query by fingerprint, which names one certificate.
+	const BY_FINGERPRINT: Query = CertificateTrustStore::is_trusted;
+
+	/// The membership query by key, which each certificate of a held key
+	/// passes.
+	const BY_KEY: Query = CertificateTrustStore::trusts_public_key;
+
+	/// One membership case: the certificate that the store holds, the
+	/// certificate that the query names, the query, and its answer.
+	type MembershipCase = (fn() -> Certificate, fn() -> Certificate, Query, bool);
+
+	/// The certificate `enrolled` of the fixed key, with the URI of a colony.
+	fn enrolled() -> Certificate {
 		let key = TestKey::insecure_fixed_signing();
-		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
-		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
-
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(enrolled.clone())?
-			.build();
-		assert!(store.is_trusted(&enrolled));
-		assert!(!store.is_trusted(&rotated));
-		assert!(store.trusts_public_key(&rotated));
-		assert!(!store.trusts_public_key(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
-		Ok(())
+		TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"])
 	}
 
+	/// The certificate `rotated` of the fixed key, which re-issues
+	/// [`enrolled`] for the same key.
+	fn rotated() -> Certificate {
+		let key = TestKey::insecure_fixed_signing();
+		TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"])
+	}
+
+	/// The self-signed certificate of the key of [`STRANGER_SEED`], a key
+	/// apart from each key that a store of these tests holds.
+	fn stranger() -> Certificate {
+		TestCertificate::self_signed(&TestKey::fixed(STRANGER_SEED))
+	}
+
+	// A store trusts a certificate it holds by its fingerprint, and each
+	// certificate of a key it holds by that key.
+	crate::tb_cases! {
+		fn a_store_trusts_what_it_holds((held, subject, query, expected): MembershipCase) {
+			let store = TestStore::holding([held()]);
+
+			let member = query(&store, &subject());
+			assert_eq!(member, expected);
+		}
+		cases {
+			a_held_certificate_by_fingerprint => (
+				TestCertificate::insecure_fixed,
+				TestCertificate::insecure_fixed,
+				BY_FINGERPRINT,
+				true,
+			),
+			a_stranger_by_fingerprint => (TestCertificate::insecure_fixed, stranger, BY_FINGERPRINT, false),
+			an_enrolled_certificate_by_fingerprint => (enrolled, enrolled, BY_FINGERPRINT, true),
+			a_rotated_certificate_by_fingerprint => (enrolled, rotated, BY_FINGERPRINT, false),
+			a_rotated_certificate_by_key => (enrolled, rotated, BY_KEY, true),
+			a_stranger_by_key => (enrolled, stranger, BY_KEY, false),
+		}
+	}
+
+	/// A builder takes a chain whose issuer names link each certificate to
+	/// the one above it.
 	#[test]
-	fn builder_validates_chain_structure() -> TestResult {
+	fn a_builder_takes_a_well_formed_chain() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-		let chain = vec![chain.root, chain.intermediate, chain.leaf];
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		assert!(builder.with_chain(chain).is_ok());
+
+		TestStore::empty().with_chain([chain.root, chain.intermediate, chain.leaf])?;
 		Ok(())
 	}
+
+	/// One walk case: the store, the certificate that the walk starts from,
+	/// and the verdict on its path.
+	type WalkCase = (StoreCerts, EvalTarget, Verdict);
 
 	// The cases run `evaluate` over the issuer walk. An intermediate presented
 	// as an end entity asserts the CA bit (`EndEntityIsCa`), and a leaf with no
 	// held issuer reaches no anchor.
 	crate::tb_cases! {
-		fn evaluate_chain_walking((store_certs, eval_target, should_succeed): (StoreCerts, EvalTarget, bool))
-			-> TestResult
-		{
+		fn the_walk_reaches_an_anchor((store_certs, eval_target, expected): WalkCase) -> TestResult {
 			let chain = TestCertificate::insecure_fixed_chain()?;
-			let store = build_store(&chain, store_certs)?;
-			let cert = target_cert(&chain, eval_target);
+			let store = build_store(&chain, store_certs);
 
-			let result = store.evaluate(cert);
-			assert_eq!(
-				result.is_ok(),
-				should_succeed,
-				"store={store_certs:?} target={eval_target:?}: expected {should_succeed}, got {result:?}"
-			);
+			let verdict = store.evaluate(target_cert(&chain, eval_target));
+			assert!(expected(&verdict));
 			Ok(())
 		}
 		cases {
-			a_trusted_root => (StoreCerts::Root, EvalTarget::Root, true),
-			an_intermediate_presented_as_an_end_entity => (StoreCerts::Root, EvalTarget::Intermediate, false),
-			a_leaf_under_a_held_intermediate => (StoreCerts::RootAndIntermediate, EvalTarget::Leaf, true),
-			a_leaf_with_no_held_issuer => (StoreCerts::Root, EvalTarget::Leaf, false),
-			an_empty_store => (StoreCerts::None, EvalTarget::Leaf, false),
+			a_trusted_root => (StoreCerts::Root, EvalTarget::Root, |verdict| matches!(verdict, Ok(()))),
+			an_intermediate_presented_as_an_end_entity => (
+				StoreCerts::Root,
+				EvalTarget::Intermediate,
+				|verdict| matches!(verdict, Err(CertificateValidationError::EndEntityIsCa)),
+			),
+			a_leaf_under_a_held_intermediate => (
+				StoreCerts::RootAndIntermediate,
+				EvalTarget::Leaf,
+				|verdict| matches!(verdict, Ok(())),
+			),
+			a_leaf_with_no_held_issuer => (
+				StoreCerts::Root,
+				EvalTarget::Leaf,
+				|verdict| matches!(verdict, Err(CertificateValidationError::CertificateNotTrusted)),
+			),
+			an_empty_store => (
+				StoreCerts::None,
+				EvalTarget::Leaf,
+				|verdict| matches!(verdict, Err(CertificateValidationError::CertificateNotTrusted)),
+			),
 		}
 	}
 
+	/// The issuer walk refuses a leaf whose issuers the store lacks, though
+	/// the store holds another certificate of the key of the leaf's root.
 	#[test]
 	fn evaluate_rejects_cross_chain_cert() -> TestResult {
-		// The store holds one chain's root, and the leaf comes from another
-		// chain.
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()))?
-			.build();
-
+		let store = TestStore::holding([TestCertificate::insecure_fixed()]);
 		let other_chain = TestCertificate::insecure_fixed_chain()?;
-		assert!(store.evaluate(&other_chain.leaf).is_err());
+
+		let refused = store.evaluate(&other_chain.leaf);
+		assert!(matches!(refused, Err(CertificateValidationError::CertificateNotTrusted)));
 		Ok(())
+	}
+
+	/// Returns the authority `Rollover CA` of the key of `seed`, beside that
+	/// key.
+	fn rollover_authority(seed: u8) -> (Secp256k1SigningKey, Certificate) {
+		let key = TestKey::fixed(seed);
+		let authority = TestCertificate::authority(&key, "Rollover CA");
+		(key, authority.expect("a test authority signs its own certificate"))
+	}
+
+	/// Returns a leaf of the key of the seed 6 with `serial` as its serial
+	/// number, which the authority `Rollover CA` of `issuer_key` issues.
+	fn rollover_leaf(issuer_key: &Secp256k1SigningKey, serial: u8) -> Certificate {
+		let usage = KeyUsage(KeyUsages::DigitalSignature.into());
+		let leaf = TestCertificate::issued(issuer_key, "Rollover CA", &TestKey::fixed(6), "Leaf", serial, usage);
+		leaf.expect("a test authority issues a leaf")
 	}
 
 	/// Of two authorities of one subject name, the walk takes the one whose
@@ -1774,17 +1836,11 @@ mod tests {
 	/// each authority, the check holds in any order the store keeps them in.
 	#[test]
 	fn the_walk_takes_the_authority_whose_key_signed_the_leaf() -> TestResult {
-		let first_key = SigningKey::from_bytes(&[4u8; 32].into())?;
-		let second_key = SigningKey::from_bytes(&[5u8; 32].into())?;
-		let leaf_key = SigningKey::from_bytes(&[6u8; 32].into())?;
-		let first = TestCertificate::authority(&first_key, "Rollover CA")?;
-		let second = TestCertificate::authority(&second_key, "Rollover CA")?;
-		let usage = KeyUsage(KeyUsages::DigitalSignature.into());
-		let first_leaf = TestCertificate::issued(&first_key, "Rollover CA", &leaf_key, "Leaf", 2, usage)?;
-		let second_leaf = TestCertificate::issued(&second_key, "Rollover CA", &leaf_key, "Leaf", 3, usage)?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(first.to_owned())?;
-		let store = builder.with_certificate(second.to_owned())?.build();
+		let (first_key, first) = rollover_authority(4);
+		let (second_key, second) = rollover_authority(5);
+		let first_leaf = rollover_leaf(&first_key, 2);
+		let second_leaf = rollover_leaf(&second_key, 3);
+		let store = TestStore::holding([first.clone(), second.clone()]);
 
 		let first_anchor = store.trust_anchor(&first_leaf)?;
 		let second_anchor = store.trust_anchor(&second_leaf)?;
@@ -1798,66 +1854,67 @@ mod tests {
 	#[test]
 	fn the_anchor_of_a_leaf_under_an_intermediate_is_its_root() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-		let store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
+		let store = build_store(&chain, StoreCerts::RootAndIntermediate);
 
 		let anchor = store.trust_anchor(&chain.leaf)?;
 		assert_eq!(anchor.as_ref(), &chain.root);
 		Ok(())
 	}
 
-	/// Returns a store of two authorities of one subject name, `Rollover CA`,
-	/// beside the two: the authority of `named_key` with its key identifier,
-	/// and the authority of `unnamed_key` with none.
-	fn mixed_store(
-		named_key: &Secp256k1SigningKey,
-		unnamed_key: &Secp256k1SigningKey,
-	) -> Result<(CertificateTrustStore, Certificate, Certificate), Box<dyn std::error::Error>> {
-		let named = TestCertificate::authority(named_key, "Rollover CA")?;
-		let unnamed = TestCertificate::authority(unnamed_key, "Rollover CA")?;
-		let unnamed = TestCertificate::without_extension(unnamed, SubjectKeyIdentifier::OID);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(named.to_owned())?;
-		let store = builder.with_certificate(unnamed.to_owned())?.build();
-
-		Ok((store, named, unnamed))
+	/// One of the two authorities of the subject name `Rollover CA` that
+	/// [`mixed_store`] holds, each of which issues the leaf of one walk.
+	#[derive(Debug, Clone, Copy)]
+	enum Issuer {
+		/// The authority of the seed 4, with its key identifier.
+		Named,
+		/// The authority of the seed 5, with no key identifier.
+		Unnamed,
 	}
 
-	/// Returns a leaf that the authority `Rollover CA` of `issuer_key` issues.
-	fn rollover_leaf(issuer_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn std::error::Error>> {
-		let leaf_key = SigningKey::from_bytes(&[6u8; 32].into())?;
-		let usage = KeyUsage(KeyUsages::DigitalSignature.into());
-		Ok(TestCertificate::issued(issuer_key, "Rollover CA", &leaf_key, "Leaf", 2, usage)?)
+	impl Issuer {
+		/// The seed of the key of the authority.
+		fn seed(self) -> u8 {
+			match self {
+				Issuer::Named => 4,
+				Issuer::Unnamed => 5,
+			}
+		}
+
+		/// The certificate of the authority, as [`mixed_store`] holds it.
+		fn authority(self) -> Certificate {
+			let (_, authority) = rollover_authority(self.seed());
+			match self {
+				Issuer::Named => authority,
+				Issuer::Unnamed => TestCertificate::without_extension(authority, SubjectKeyIdentifier::OID),
+			}
+		}
 	}
 
-	/// Of two authorities of one subject name, the walk takes the one whose
-	/// key identifier the leaf names over one that states none
-	/// (RFC 4158 §3.5.12).
-	#[test]
-	fn the_walk_takes_a_matching_authority_over_one_of_no_key_identifier() -> TestResult {
-		let named_key = SigningKey::from_bytes(&[4u8; 32].into())?;
-		let unnamed_key = SigningKey::from_bytes(&[5u8; 32].into())?;
-		let (store, named, _) = mixed_store(&named_key, &unnamed_key)?;
-		let leaf = rollover_leaf(&named_key)?;
-
-		let anchor = store.trust_anchor(&leaf)?;
-		assert_eq!(anchor.as_ref(), &named);
-		Ok(())
+	/// Returns a store that holds the authority of each [`Issuer`].
+	fn mixed_store() -> CertificateTrustStore {
+		TestStore::holding([Issuer::Named.authority(), Issuer::Unnamed.authority()])
 	}
 
-	/// Of two authorities of one subject name, the walk takes one that states
-	/// no key identifier over one whose key identifier differs from the one
-	/// the leaf names, and the self-signed authority it takes ends the walk
-	/// (RFC 4158 §3.5.12, RFC 5280 §4.2.1.1).
-	#[test]
-	fn the_walk_takes_an_authority_of_no_key_identifier_over_one_that_differs() -> TestResult {
-		let named_key = SigningKey::from_bytes(&[4u8; 32].into())?;
-		let unnamed_key = SigningKey::from_bytes(&[5u8; 32].into())?;
-		let (store, _, unnamed) = mixed_store(&named_key, &unnamed_key)?;
-		let leaf = rollover_leaf(&unnamed_key)?;
-
-		let anchor = store.trust_anchor(&leaf)?;
-		assert_eq!(anchor.as_ref(), &unnamed);
-		Ok(())
+	// Of two authorities of one subject name, the walk ranks the one whose key
+	// identifier the leaf names first, then one that states none, then one
+	// whose key identifier differs (RFC 4158 §3.5.12).
+	crate::tb_cases! {
+		fn the_walk_between_a_named_and_an_unnamed_authority(issuer: Issuer) -> TestResult {
+			let leaf = rollover_leaf(&TestKey::fixed(issuer.seed()), 2);
+			let anchor = mixed_store().trust_anchor(&leaf)?;
+			assert_eq!(anchor.as_ref(), &issuer.authority());
+			Ok(())
+		}
+		cases {
+			/// The walk takes the authority whose key identifier the leaf
+			/// names over one that states none.
+			takes_the_matching_named_authority => Issuer::Named,
+			/// The walk takes an authority that states no key identifier over
+			/// one whose key identifier differs from the one the leaf names,
+			/// and the self-signed authority it takes ends the walk
+			/// (RFC 5280 §4.2.1.1).
+			takes_the_unnamed_over_one_that_differs => Issuer::Unnamed,
+		}
 	}
 
 	/// Returns the two authorities of the name `Rollover CA` of the keys of
@@ -1866,8 +1923,7 @@ mod tests {
 	/// of the lower fingerprint first.
 	fn tied_authorities() -> [(Certificate, Secp256k1SigningKey); 2] {
 		let tied = |seed: u8| {
-			let key = SigningKey::from_bytes(&[seed; 32].into()).expect("a test seed is a scalar");
-			let authority = TestCertificate::authority(&key, "Rollover CA").expect("a test authority signs");
+			let (key, authority) = rollover_authority(seed);
 			(TestCertificate::without_extension(authority, SubjectKeyIdentifier::OID), key)
 		};
 		let fingerprint = |authority: &Certificate| {
@@ -1880,25 +1936,15 @@ mod tests {
 		tied
 	}
 
-	/// Returns a store that holds `authorities`, added in the order given.
-	fn store_of(authorities: [&Certificate; 2]) -> CertificateTrustStore {
-		let [first, second] = authorities;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(first.to_owned());
-		let builder = builder.expect("the store holds a test authority");
-		let builder = builder.with_certificate(second.to_owned());
-		builder.expect("the store holds a test authority").build()
-	}
-
 	/// Of two authorities of one subject name and one rank, the walk takes the
 	/// one of the lower fingerprint, whichever one the store took first, so
 	/// one store gives one path in every process.
 	#[test]
 	fn the_walk_takes_the_lower_fingerprint_of_two_equal_rank_authorities() -> TestResult {
 		let [(lower, lower_key), (higher, _)] = tied_authorities();
-		let leaf = rollover_leaf(&lower_key)?;
-		let lower_first = store_of([&lower, &higher]);
-		let higher_first = store_of([&higher, &lower]);
+		let leaf = rollover_leaf(&lower_key, 2);
+		let lower_first = TestStore::holding([lower.clone(), higher.clone()]);
+		let higher_first = TestStore::holding([higher, lower.clone()]);
 
 		let anchors = (lower_first.trust_anchor(&leaf)?, higher_first.trust_anchor(&leaf)?);
 		assert_eq!((anchors.0.as_ref(), anchors.1.as_ref()), (&lower, &lower));
@@ -1910,13 +1956,9 @@ mod tests {
 	/// key over another of its name (RFC 5280 §4.2.1.1).
 	#[test]
 	fn a_self_signed_certificate_names_the_authority_of_its_own_key() -> TestResult {
-		let named_key = SigningKey::from_bytes(&[4u8; 32].into())?;
-		let other_key = SigningKey::from_bytes(&[5u8; 32].into())?;
-		let named = TestCertificate::authority(&named_key, "Rollover CA")?;
-		let other = TestCertificate::authority(&other_key, "Rollover CA")?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(named.to_owned())?;
-		let store = builder.with_certificate(other)?.build();
+		let (named_key, named) = rollover_authority(4);
+		let (_, other) = rollover_authority(5);
+		let store = TestStore::holding([named.clone(), other]);
 		let usage = KeyUsage(KeyUsages::DigitalSignature.into());
 		let reissued = TestCertificate::issued(&named_key, "Rollover CA", &named_key, "Rollover CA", 7, usage)?;
 
@@ -1931,15 +1973,13 @@ mod tests {
 	fn self_issued_without_authority(
 		issuer_key: &Secp256k1SigningKey,
 		subject_key: &Secp256k1SigningKey,
-	) -> Result<Certificate, Box<dyn std::error::Error>> {
+	) -> Certificate {
 		let usage = KeyUsage(KeyUsages::KeyCertSign.into());
-		let issued = TestCertificate::issued(issuer_key, "Rollover CA", subject_key, "Rollover CA", 7, usage)?;
-		let mut certificate = TestCertificate::without_extension(issued, AuthorityKeyIdentifier::OID);
+		let issued = TestCertificate::issued(issuer_key, "Rollover CA", subject_key, "Rollover CA", 7, usage);
+		let issued = issued.expect("a test authority issues a certificate");
+		let certificate = TestCertificate::without_extension(issued, AuthorityKeyIdentifier::OID);
 
-		let tbs = certificate.tbs_certificate.to_der()?;
-		let signature: Secp256k1Signature = issuer_key.sign_canonical::<Sha3_256>(&tbs)?;
-		certificate.signature = BitString::new(0, signature.to_vec())?;
-		Ok(certificate)
+		TestCertificate::signed_by(certificate, issuer_key)
 	}
 
 	/// A self-issued certificate that another key signs is no self-signed
@@ -1947,11 +1987,8 @@ mod tests {
 	/// (RFC 5280 §4.2.1.1).
 	#[test]
 	fn a_self_issued_certificate_that_another_key_signs_names_no_authority() -> TestResult {
-		let subject_key = SigningKey::from_bytes(&[4u8; 32].into())?;
-		let issuer_key = SigningKey::from_bytes(&[5u8; 32].into())?;
-		let certificate = self_issued_without_authority(&issuer_key, &subject_key)?;
-
-		let authority = KeyIdentifiers::authority_of(&certificate, &Secp256k1Policy::default())?;
+		let certificate = self_issued_without_authority(&TestKey::fixed(5), &TestKey::fixed(4));
+		let authority: Option<&[u8]> = KeyIdentifiers::authority_of(&certificate, &Secp256k1Policy::default())?;
 		assert_eq!(authority, None);
 		Ok(())
 	}
@@ -1960,7 +1997,7 @@ mod tests {
 	/// `subjectKeyIdentifier` names its authority (RFC 5280 §4.2.1.1).
 	#[test]
 	fn the_self_signed_fixture_names_its_own_key_for_its_authority() -> TestResult {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let certificate = TestCertificate::insecure_fixed();
 		let own = certificate.extension::<SubjectKeyIdentifierRef<'_>>()?;
 		let own = own.ok_or("the fixture carries its key identifier")?;
 
@@ -1999,22 +2036,20 @@ mod tests {
 		}
 	}
 
-	/// The key of the authority `Held Root`, which [`checks_to_answer`] holds.
-	fn held_root_key() -> Secp256k1SigningKey {
-		SigningKey::from_bytes(&[7u8; 32].into()).expect("a small nonzero scalar is a key")
-	}
+	/// The seed of the key of the authority `Held Root`, which
+	/// [`checks_to_answer`] holds.
+	const HELD_ROOT_SEED: u8 = 7;
 
-	/// The key of each certificate the store of [`checks_to_answer`] does not
-	/// hold.
-	fn stranger_key() -> Secp256k1SigningKey {
-		SigningKey::from_bytes(&[9u8; 32].into()).expect("a small nonzero scalar is a key")
-	}
+	/// The seed of the key of each stranger, a key apart from each key that a
+	/// store of these tests holds.
+	const STRANGER_SEED: u8 = 9;
 
 	/// Returns whether a store that holds the authority `Held Root` trusts the
 	/// chain of `presented` alone, beside the count of the signature checks
 	/// that its answer spends.
 	fn checks_to_answer(presented: Certificate) -> (bool, usize) {
-		let held = TestCertificate::authority(&held_root_key(), "Held Root").expect("the authority issues");
+		let held = TestCertificate::authority(&TestKey::fixed(HELD_ROOT_SEED), "Held Root");
+		let held = held.expect("the authority issues");
 		let checks = Arc::new(AtomicUsize::new(0));
 		let policy = CountingPolicy { checks: Arc::clone(&checks) };
 		let builder = CertificateTrustBuilder::new(policy, KeyCurves::HOUSE, NoRevocation).with_certificate(held);
@@ -2030,7 +2065,7 @@ mod tests {
 	/// signature of that root.
 	#[test]
 	fn a_held_root_presented_first_spends_no_check_on_its_own_signature() -> TestResult {
-		let held = TestCertificate::authority(&held_root_key(), "Held Root")?;
+		let held = TestCertificate::authority(&TestKey::fixed(HELD_ROOT_SEED), "Held Root")?;
 		assert_eq!(checks_to_answer(held), (true, 0));
 		Ok(())
 	}
@@ -2040,7 +2075,7 @@ mod tests {
 	/// is refused with no check of its signature.
 	#[test]
 	fn a_self_issued_stranger_under_a_name_the_store_lacks_spends_no_check() -> TestResult {
-		let stranger = TestCertificate::authority(&stranger_key(), "Stranger Root")?;
+		let stranger = TestCertificate::authority(&TestKey::fixed(STRANGER_SEED), "Stranger Root")?;
 		assert_eq!(checks_to_answer(stranger), (false, 0));
 		Ok(())
 	}
@@ -2050,9 +2085,10 @@ mod tests {
 	/// signature (RFC 5280 §4.2.1.1).
 	#[test]
 	fn a_self_issued_certificate_with_no_key_identifier_spends_no_check() -> TestResult {
-		let named = TestCertificate::authority(&stranger_key(), "Held Root")?;
+		let stranger_key = TestKey::fixed(STRANGER_SEED);
+		let named = TestCertificate::authority(&stranger_key, "Held Root")?;
 		let unnamed = TestCertificate::without_extension(named, SubjectKeyIdentifier::OID);
-		let unnamed = TestCertificate::signed_by(unnamed, &stranger_key());
+		let unnamed = TestCertificate::signed_by(unnamed, &stranger_key);
 		assert_eq!(checks_to_answer(unnamed), (false, 0));
 		Ok(())
 	}
@@ -2060,13 +2096,13 @@ mod tests {
 	/// Returns the RFC 7093 §2 method 3 key identifier of the key of
 	/// `certificate`: the leftmost 160 bits of the SHA-512 hash of its
 	/// `subjectPublicKey` value. The fixtures derive theirs by method 1.
-	fn method_three_identifier(certificate: &Certificate) -> Result<SubjectKeyIdentifier, Box<dyn std::error::Error>> {
-		use k256::sha2::Sha512;
+	fn method_three_identifier(certificate: &Certificate) -> SubjectKeyIdentifier {
+		use crate::crypto::k256::sha2::Sha512;
 
 		let spki = &certificate.tbs_certificate.subject_public_key_info;
 		let digest = Sha512::digest(spki.subject_public_key.raw_bytes());
-		let leftmost = digest.get(..20).ok_or("a SHA-512 hash holds 160 bits")?;
-		Ok(SubjectKeyIdentifier::from(OctetString::new(leftmost)?))
+		let leftmost = digest.get(..20).expect("a SHA-512 hash holds 160 bits");
+		SubjectKeyIdentifier::from(OctetString::new(leftmost).expect("160 bits fit an octet string"))
 	}
 
 	/// A key identifier sorts the candidates and the signature decides, so a
@@ -2075,13 +2111,11 @@ mod tests {
 	/// (RFC 4158 §3.5.12).
 	#[test]
 	fn the_walk_takes_an_authority_whose_key_identifier_another_method_derived() -> TestResult {
-		let authority_key = SigningKey::from_bytes(&[4u8; 32].into())?;
-		let authority = TestCertificate::authority(&authority_key, "Rollover CA")?;
-		let identifier = method_three_identifier(&authority)?;
+		let (authority_key, authority) = rollover_authority(4);
+		let identifier = method_three_identifier(&authority);
 		let authority = TestCertificate::with_key_identifier(authority, identifier);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store = builder.with_certificate(authority.to_owned())?.build();
-		let leaf = rollover_leaf(&authority_key)?;
+		let store = TestStore::holding([authority.clone()]);
+		let leaf = rollover_leaf(&authority_key, 2);
 
 		let anchor = store.trust_anchor(&leaf)?;
 		assert_eq!(anchor.as_ref(), &authority);
@@ -2108,146 +2142,186 @@ mod tests {
 	}
 
 	/// One `verify_chain` case: the store, the certificates of the presented
-	/// chain, and whether the chain passes.
-	type ChainCase = (StoreCerts, &'static [EvalTarget], bool);
+	/// chain, and the verdict on the chain.
+	type ChainCase = (StoreCerts, &'static [EvalTarget], Verdict);
 
+	// `verify_chain` validates the chain a peer presents to an anchor that
+	// the store holds.
 	crate::tb_cases! {
-		fn verify_chain_cases((store_certs, presented, should_succeed): ChainCase) -> TestResult {
+		fn verify_chain_validates_a_presented_chain((store_certs, targets, expected): ChainCase) -> TestResult {
 			let chain = TestCertificate::insecure_fixed_chain()?;
-			let store = build_store(&chain, store_certs)?;
-			let chain_vec: Vec<_> = presented.iter().map(|target| target_cert(&chain, *target).to_owned()).collect();
+			let store = build_store(&chain, store_certs);
+			let presented_chain = presented(&chain, targets);
 
-			let result: Result<Arc<Certificate>, CertificateValidationError> = store.verify_chain(&chain_vec);
-			assert_eq!(
-				result.is_ok(),
-				should_succeed,
-				"verify_chain: store={store_certs:?} chain_len={}: expected {should_succeed}, got {result:?}",
-				presented.len()
-			);
+			let verdict = store.verify_chain(&presented_chain).map(drop);
+			assert!(expected(&verdict));
 			Ok(())
 		}
 		cases {
-			an_empty_chain => (StoreCerts::Root, &[], false),
-			an_untrusted_root => (StoreCerts::None, &[EvalTarget::Root], false),
-			a_trusted_root_alone => (StoreCerts::Root, &[EvalTarget::Root], true),
+			an_empty_chain => (
+				StoreCerts::Root,
+				&[],
+				|verdict| matches!(verdict, Err(CertificateValidationError::EmptyChain)),
+			),
+			an_untrusted_root => (
+				StoreCerts::None,
+				&[EvalTarget::Root],
+				|verdict| matches!(verdict, Err(CertificateValidationError::CertificateNotTrusted)),
+			),
+			a_trusted_root_alone => (StoreCerts::Root, &[EvalTarget::Root], |verdict| matches!(verdict, Ok(()))),
 			a_full_chain_under_a_trusted_root => (
 				StoreCerts::Root,
 				&[EvalTarget::Root, EvalTarget::Intermediate, EvalTarget::Leaf],
-				true,
+				|verdict| matches!(verdict, Ok(())),
 			),
 		}
 	}
 
 	/// One case of the RFC 5280 §6.1.4 path constraints: the CA bit, the
-	/// `keyCertSign` bit, and the path length of the root, and the error that
-	/// `verify_chain` returns for the otherwise-valid chain.
-	type IssuerConstraintCase = (bool, bool, Option<u8>, CertificateValidationError);
+	/// `keyCertSign` bit, and the path length of the root, and the refusal
+	/// that `verify_chain` returns for the otherwise-valid chain.
+	type IssuerConstraintCase = (bool, bool, Option<u8>, Refusal);
 
 	// Each case replaces the root's extensions, then expects `verify_chain` to
 	// reject the otherwise-valid chain with the error that the case names.
 	crate::tb_cases! {
-		fn verify_chain_enforces_issuer_constraints((ca, key_cert_sign, path_len, expected): IssuerConstraintCase)
+		fn verify_chain_enforces_issuer_constraints((ca, key_cert_sign, path_len, refusal): IssuerConstraintCase)
 			-> TestResult
 		{
 			let chain = TestCertificate::insecure_fixed_chain()?;
-			let mut root = chain.root.to_owned();
+			let mut root = chain.root;
 			root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(ca, key_cert_sign, path_len));
 
-			let certificate = root.to_owned();
-			let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-				.with_certificate(certificate)?
-				.build();
-
-			let result = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
-			assert!(matches!(result, Err(ref e) if core::mem::discriminant(e) == core::mem::discriminant(&expected)));
+			let store = TestStore::holding([root.clone()]);
+			let refused = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
+			assert!(matches!(refused, Err(ref error) if refusal(error)));
 			Ok(())
 		}
 		cases {
-			an_issuer_with_no_ca_bit => (false, true, None, CertificateValidationError::IssuerNotCa),
-			an_issuer_with_no_key_cert_sign => (true, false, None, CertificateValidationError::MissingKeyCertSign),
-			a_path_past_its_length => (true, true, Some(0), CertificateValidationError::PathLenExceeded),
+			an_issuer_with_no_ca_bit => (
+				false,
+				true,
+				None,
+				|error| matches!(error, CertificateValidationError::IssuerNotCa),
+			),
+			an_issuer_with_no_key_cert_sign => (
+				true,
+				false,
+				None,
+				|error| matches!(error, CertificateValidationError::MissingKeyCertSign),
+			),
+			a_path_past_its_length => (
+				true,
+				true,
+				Some(0),
+				|error| matches!(error, CertificateValidationError::PathLenExceeded),
+			),
 		}
 	}
 
+	/// The issuer walk holds the leaf to the path length of the root it
+	/// reaches (RFC 5280 §4.2.1.9).
 	#[test]
 	fn evaluate_enforces_path_len_constraint() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-		let mut root = chain.root.to_owned();
+		let mut root = chain.root;
 		root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, Some(0)));
 
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(root)?
-			.with_certificate(chain.intermediate)?
-			.build();
-		assert!(matches!(
-			store.evaluate(&chain.leaf),
-			Err(CertificateValidationError::PathLenExceeded)
-		));
+		let store = TestStore::holding([root, chain.intermediate]);
+		let refused = store.evaluate(&chain.leaf);
+		assert!(matches!(refused, Err(CertificateValidationError::PathLenExceeded)));
 		Ok(())
 	}
 
-	#[test]
-	fn verify_chain_rejects_unknown_critical_extension() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let mut leaf = chain.leaf.to_owned();
+	/// One malformed leaf case: the change to the leaf, and the refusal that
+	/// names it.
+	type MalformedLeaf = (fn(Certificate) -> Certificate, Refusal);
+
+	/// `leaf` with one critical `policyConstraints` extension in place of its
+	/// extensions. The crate leaves `policyConstraints` unprocessed.
+	fn with_only_critical_policy_constraints(mut leaf: Certificate) -> Certificate {
 		leaf.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.36", true)]);
-
-		let store = build_store(&chain, StoreCerts::Root)?;
-		let result = store.verify_chain(&[chain.root, chain.intermediate, leaf]);
-		assert!(matches!(
-			result,
-			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-		));
-		Ok(())
+		leaf
 	}
 
-	/// `verify_chain` refuses a chain whose leaf repeats its `keyUsage`
-	/// (RFC 5280 §4.2).
-	#[test]
-	fn verify_chain_rejects_a_repeated_extension() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let mut leaf = chain.leaf.to_owned();
+	/// `leaf` with two `keyUsage` extensions in place of its extensions.
+	fn with_only_a_repeated_key_usage(mut leaf: Certificate) -> Certificate {
 		let key_usage = TestCertificate::opaque_extension("2.5.29.15", true);
-		let repeated = vec![key_usage.clone(), key_usage];
-
-		leaf.tbs_certificate.extensions = Some(repeated);
-
-		let store = build_store(&chain, StoreCerts::Root)?;
-		let result = store.verify_chain(&[chain.root, chain.intermediate, leaf]);
-		assert!(matches!(result, Err(CertificateValidationError::DuplicateExtension(_))));
-		Ok(())
+		leaf.tbs_certificate.extensions = Some(vec![key_usage.clone(), key_usage]);
+		leaf
 	}
 
-	/// The issuer walk refuses a leaf that repeats an extension, as the chain
-	/// path does (RFC 5280 §4.2).
-	#[test]
-	fn evaluate_rejects_a_repeated_extension() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let key_identifier = TestCertificate::opaque_extension("2.5.29.14", false);
-		let leaf = TestCertificate::with_extension(chain.leaf.to_owned(), key_identifier.clone());
-		let leaf = TestCertificate::with_extension(leaf, key_identifier);
-
-		let store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
-		let refused = store.evaluate(&leaf);
-		assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-		Ok(())
-	}
-
-	/// The issuer walk refuses a leaf that bears a critical extension the
-	/// crate does not process, as the chain path does (RFC 5280 §4.2).
-	#[test]
-	fn evaluate_rejects_an_unknown_critical_extension() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
+	/// `leaf` with a critical `policyConstraints` extension after its own, so
+	/// the walk still reads its `authorityKeyIdentifier`. The store refuses a
+	/// `nameConstraints` extension before it reads criticality.
+	fn with_critical_policy_constraints(leaf: Certificate) -> Certificate {
 		let policy_constraints = TestCertificate::opaque_extension("2.5.29.36", true);
-		let leaf = TestCertificate::with_extension(chain.leaf.to_owned(), policy_constraints);
+		TestCertificate::with_extension(leaf, policy_constraints)
+	}
 
-		let store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
-		let refused = store.evaluate(&leaf);
-		assert!(matches!(
-			refused,
-			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-		));
-		Ok(())
+	/// `leaf` with an outer signature algorithm that differs from the one its
+	/// `tbsCertificate` names (RFC 5280 §4.1.1.2).
+	fn with_a_mismatched_algorithm(mut leaf: Certificate) -> Certificate {
+		leaf.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
+		leaf
+	}
+
+	// `verify_chain` refuses a presented chain whose leaf repeats an extension
+	// or bears a critical extension the crate leaves unprocessed (RFC 5280
+	// §4.2), or names two signature algorithms (RFC 5280 §4.1.1.2).
+	crate::tb_cases! {
+		fn verify_chain_refuses_a_malformed_leaf((malformed, refusal): MalformedLeaf) -> TestResult {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let store = build_store(&chain, StoreCerts::Root);
+			let leaf = malformed(chain.leaf);
+
+			let refused = store.verify_chain(&[chain.root, chain.intermediate, leaf]);
+			assert!(matches!(refused, Err(ref error) if refusal(error)));
+			Ok(())
+		}
+		cases {
+			an_unknown_critical_extension => (
+				with_only_critical_policy_constraints,
+				|error| matches!(error, UnprocessedCriticalExtension(oid) if *oid == ID_CE_POLICY_CONSTRAINTS),
+			),
+			/// `verify_chain` refuses a chain whose leaf repeats its
+			/// `keyUsage`.
+			a_repeated_extension => (
+				with_only_a_repeated_key_usage,
+				|error| matches!(error, DuplicateExtension(oid) if *oid == ID_CE_KEY_USAGE),
+			),
+			a_mismatched_algorithm => (
+				with_a_mismatched_algorithm,
+				|error| matches!(error, CertificateValidationError::AlgorithmMismatch),
+			),
+		}
+	}
+
+	// The issuer walk refuses a malformed leaf as the chain path does.
+	crate::tb_cases! {
+		fn evaluate_refuses_a_malformed_leaf((malformed, refusal): MalformedLeaf) -> TestResult {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let store = build_store(&chain, StoreCerts::RootAndIntermediate);
+			let leaf = malformed(chain.leaf);
+
+			let refused = store.evaluate(&leaf);
+			assert!(matches!(refused, Err(ref error) if refusal(error)));
+			Ok(())
+		}
+		cases {
+			a_repeated_extension => (
+				|leaf| TestCertificate::with_repeated_extension(leaf, "2.5.29.14"),
+				|error| matches!(error, DuplicateExtension(oid) if *oid == ID_CE_SUBJECT_KEY_IDENTIFIER),
+			),
+			an_unknown_critical_extension => (
+				with_critical_policy_constraints,
+				|error| matches!(error, UnprocessedCriticalExtension(oid) if *oid == ID_CE_POLICY_CONSTRAINTS),
+			),
+			a_mismatched_algorithm => (
+				with_a_mismatched_algorithm,
+				|error| matches!(error, CertificateValidationError::AlgorithmMismatch),
+			),
+		}
 	}
 
 	/// Returns the intermediate of `chain` with a `nameConstraints` extension,
@@ -2259,31 +2333,24 @@ mod tests {
 		TestCertificate::signed_by(intermediate, &chain.root_key)
 	}
 
-	/// Path validation refuses a presented intermediate that states critical
-	/// name constraints, because it does not apply them (RFC 5280 §6.1.4(g)).
-	#[test]
-	fn a_presented_intermediate_with_critical_name_constraints_is_refused() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let intermediate = constrained_intermediate(&chain, true);
-		let store = build_store(&chain, StoreCerts::Root)?;
+	// Path validation refuses a presented intermediate that states name
+	// constraints, because it applies none (RFC 5280 §6.1.4(g)).
+	crate::tb_cases! {
+		fn a_presented_intermediate_with_name_constraints_is_refused(critical: bool) -> TestResult {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let intermediate = constrained_intermediate(&chain, critical);
+			let store = build_store(&chain, StoreCerts::Root);
 
-		let refused = store.verify_presented(&[intermediate], &chain.leaf);
-		assert!(matches!(refused, Err(CertificateValidationError::NameConstraintsUnapplied)));
-		Ok(())
-	}
-
-	/// Path validation refuses a presented intermediate that states name
-	/// constraints in a non-critical extension too, because RFC 5280 §6.1.4(g)
-	/// applies them whatever their criticality.
-	#[test]
-	fn a_presented_intermediate_with_noncritical_name_constraints_is_refused() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let intermediate = constrained_intermediate(&chain, false);
-		let store = build_store(&chain, StoreCerts::Root)?;
-
-		let refused = store.verify_presented(&[intermediate], &chain.leaf);
-		assert!(matches!(refused, Err(CertificateValidationError::NameConstraintsUnapplied)));
-		Ok(())
+			let refused = store.verify_presented(&[intermediate], &chain.leaf);
+			assert!(matches!(refused, Err(CertificateValidationError::NameConstraintsUnapplied)));
+			Ok(())
+		}
+		cases {
+			critical => true,
+			/// RFC 5280 §6.1.4(g) applies name constraints whatever their
+			/// criticality, so a non-critical extension is refused too.
+			noncritical => false,
+		}
 	}
 
 	/// A store that holds the root alone validates the path a peer presents
@@ -2292,7 +2359,7 @@ mod tests {
 	#[test]
 	fn a_store_of_the_root_alone_anchors_a_presented_path() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-		let store = build_store(&chain, StoreCerts::Root)?;
+		let store = build_store(&chain, StoreCerts::Root);
 
 		let anchor = store.verify_presented(&[chain.intermediate], &chain.leaf)?;
 		assert_eq!(anchor.as_ref(), &chain.root);
@@ -2304,58 +2371,45 @@ mod tests {
 	#[test]
 	fn a_store_of_the_root_alone_evaluates_a_presented_path() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
-		let store = build_store(&chain, StoreCerts::Root)?;
+		let store = build_store(&chain, StoreCerts::Root);
 		store.evaluate_presented(&[chain.intermediate], &chain.leaf)?;
 		Ok(())
 	}
 
-	// The end-entity CA-bit check is defense in depth.
-	#[test]
-	fn terminal_with_ca_bit_rejected() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		// The intermediate carries `basicConstraints.cA = true` as the terminal
-		// of `[root, intermediate]`.
-		let path = [&chain.root, &chain.intermediate];
-		assert!(matches!(
-			ensure_terminal_is_end_entity(&path),
-			Err(CertificateValidationError::EndEntityIsCa)
-		));
-		Ok(())
+	// The end-entity CA-bit check is defense in depth. The terminal of a
+	// multi-certificate path is the identity it authenticates.
+	crate::tb_cases! {
+		fn a_path_ends_at_an_end_entity((targets, expected): (&'static [EvalTarget], Verdict)) -> TestResult {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let path = path_of(&chain, targets);
+
+			let verdict = ensure_terminal_is_end_entity(&path);
+			assert!(expected(&verdict));
+			Ok(())
+		}
+		cases {
+			/// The intermediate carries `basicConstraints.cA = true` as the
+			/// terminal of `[root, intermediate]`.
+			a_ca_terminal_is_refused => (
+				&[EvalTarget::Root, EvalTarget::Intermediate],
+				|verdict| matches!(verdict, Err(CertificateValidationError::EndEntityIsCa)),
+			),
+			an_end_entity_terminal_passes => (
+				&[EvalTarget::Root, EvalTarget::Intermediate, EvalTarget::Leaf],
+				|verdict| matches!(verdict, Ok(())),
+			),
+			/// A pinned CA root that validates itself is the direct-trust
+			/// model.
+			a_lone_pinned_root_is_exempt => (&[EvalTarget::Root], |verdict| matches!(verdict, Ok(()))),
+		}
 	}
 
-	#[test]
-	fn terminal_without_ca_bit_accepted() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let path = [&chain.root, &chain.intermediate, &chain.leaf];
-		assert!(ensure_terminal_is_end_entity(&path).is_ok());
-		Ok(())
-	}
-
-	#[test]
-	fn single_certificate_path_exempt_from_ca_bit_check() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		// A pinned CA root that validates itself is the direct-trust model.
-		let path = [&chain.root];
-		assert!(ensure_terminal_is_end_entity(&path).is_ok());
-		Ok(())
-	}
-
-	/// Build a store that trusts the chain root under `revocation`, for the
-	/// RFC 5280 §6.1.3(a)(3) revocation tests.
-	fn build_store_with_revocation(
-		chain: &TestCertificateChain,
-		revocation: impl RevocationChecker + 'static,
-	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let root = chain.root.to_owned();
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, revocation);
-		Ok(builder.with_certificate(root)?.build())
-	}
-
+	/// A revocation list passes a certificate outside the list.
 	#[test]
 	fn static_revocation_list_passes_unlisted_certificate() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(&chain.intermediate)?;
-		assert!(revocation.check(&chain.intermediate, &chain.leaf).is_ok());
+		revocation.check(&chain.intermediate, &chain.leaf)?;
 		Ok(())
 	}
 
@@ -2369,153 +2423,78 @@ mod tests {
 		let revocation = StaticRevocationList::<D>::default().with_certificate(&chain.leaf);
 		let revocation = revocation.expect("the leaf has a fingerprint");
 
-		let store = build_store_with_revocation(&chain, revocation).expect("the store holds the root");
+		let store = TestStore::revoking([chain.root.to_owned()], revocation);
 		store.verify_chain(&[chain.root, chain.intermediate, chain.leaf])
 	}
 
-	/// A list under SHA3-256 revokes the leaf by its SHA3-256 fingerprint.
-	#[test]
-	fn verify_chain_rejects_leaf_revoked_by_fingerprint() {
-		let verdict = verdict_with_the_leaf_revoked_under::<Sha3_256>();
-		assert!(matches!(verdict, Err(CertificateValidationError::CertificateRevoked)));
+	// A revocation list under a digest revokes the leaf by its fingerprint
+	// under that digest (RFC 5280 §6.1.3(a)(3)).
+	crate::tb_cases! {
+		fn verify_chain_rejects_a_leaf_revoked_by_its_fingerprint(
+			verdict_of: fn() -> Result<Arc<Certificate>, CertificateValidationError>
+		) {
+			let verdict = verdict_of();
+			assert!(matches!(verdict, Err(CertificateValidationError::CertificateRevoked)));
+		}
+		cases {
+			/// A list under SHA3-256 revokes the leaf by its SHA3-256
+			/// fingerprint.
+			sha3_256 => verdict_with_the_leaf_revoked_under::<Sha3_256>,
+			/// A list under SHA-384 revokes the leaf by its 48-octet
+			/// fingerprint.
+			sha384 => verdict_with_the_leaf_revoked_under::<Sha384>,
+			/// A list under SHA-256 revokes the leaf by its SHA-256
+			/// fingerprint, the digest an operator's list names.
+			sha256 => verdict_with_the_leaf_revoked_under::<Sha256>,
+		}
 	}
 
-	/// A list under SHA-384 revokes the leaf by its 48-octet fingerprint.
-	#[test]
-	fn verify_chain_rejects_leaf_revoked_by_a_sha384_fingerprint() {
-		let verdict = verdict_with_the_leaf_revoked_under::<Sha384>();
-		assert!(matches!(verdict, Err(CertificateValidationError::CertificateRevoked)));
-	}
+	// A revocation list names a serial under one issuer, so the serial of the
+	// leaf revokes the leaf under the issuer of the leaf alone.
+	crate::tb_cases! {
+		fn serial_revocation_is_scoped_to_its_issuer((issuer_of, expected): (fn(&Certificate) -> Name, Verdict))
+			-> TestResult
+		{
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let issuer = issuer_of(&chain.leaf);
+			let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
+			let revocation = StaticRevocationList::<Sha3_256>::default().with_serial(&issuer, serial)?;
+			let store = TestStore::revoking([chain.root.to_owned()], revocation);
 
-	#[test]
-	fn verify_chain_rejects_leaf_revoked_by_serial() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let issuer = chain.leaf.tbs_certificate.issuer.to_owned();
-		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
-		let revocation = StaticRevocationList::<Sha3_256>::default().with_serial(&issuer, serial)?;
-
-		let store = build_store_with_revocation(&chain, revocation)?;
-		let result = store.verify_chain(&[chain.root, chain.intermediate, chain.leaf]);
-		assert!(matches!(result, Err(CertificateValidationError::CertificateRevoked)));
-		Ok(())
-	}
-
-	#[test]
-	fn serial_revocation_is_scoped_to_issuer() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let other_issuer = chain.leaf.tbs_certificate.subject.to_owned();
-		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
-		let revocation = StaticRevocationList::<Sha3_256>::default().with_serial(&other_issuer, serial)?;
-
-		let store = build_store_with_revocation(&chain, revocation)?;
-		let result = store.verify_chain(&[chain.root, chain.intermediate, chain.leaf]);
-		assert!(result.is_ok());
-		Ok(())
-	}
-
-	/// A list under SHA-256 revokes the leaf by its SHA-256 fingerprint, the
-	/// digest an operator's list names.
-	#[test]
-	fn verify_chain_rejects_a_leaf_revoked_by_its_sha256_fingerprint() {
-		let verdict = verdict_with_the_leaf_revoked_under::<Sha256>();
-		assert!(matches!(verdict, Err(CertificateValidationError::CertificateRevoked)));
+			let verdict = store.verify_chain(&[chain.root, chain.intermediate, chain.leaf]).map(drop);
+			assert!(expected(&verdict));
+			Ok(())
+		}
+		cases {
+			under_the_issuer_of_the_leaf => (
+				|leaf| leaf.tbs_certificate.issuer.to_owned(),
+				|verdict| matches!(verdict, Err(CertificateValidationError::CertificateRevoked)),
+			),
+			under_another_issuer => (
+				|leaf| leaf.tbs_certificate.subject.to_owned(),
+				|verdict| matches!(verdict, Ok(())),
+			),
+		}
 	}
 
 	/// The P-256 key of RFC 6979 §A.2.5 reads as a SEC 1 point under a curve
 	/// set with no decoder of P-256, so a store that holds it uncompressed
 	/// finds it by its compressed form.
 	#[test]
-	fn a_store_finds_the_rfc6979_p256_key_by_its_compressed_form() -> TestResult {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	fn a_store_finds_the_rfc6979_p256_key_by_its_compressed_form() {
+		let certificate = TestCertificate::insecure_fixed();
 		let point = &TestKey::RFC6979_P256_UNCOMPRESSED;
 		let uncompressed = TestCertificate::with_curve_point(certificate.clone(), CURVE_NIST_P256, point);
 		let point = &TestKey::RFC6979_P256_COMPRESSED;
 		let compressed = TestCertificate::with_curve_point(certificate, CURVE_NIST_P256, point);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store = builder.with_certificate(uncompressed.clone())?.build();
+		let store = TestStore::holding([uncompressed.clone()]);
 
 		let found = store.find_by_public_key(&compressed.tbs_certificate.subject_public_key_info);
 		assert_eq!(found, Some(&uncompressed));
-		Ok(())
-	}
-
-	/// Returns a store that holds the certificate of `identity` under a
-	/// revocation list of that certificate.
-	fn store_revoking(identity: &SigningIdentity) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(identity.certificate())?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, revocation);
-		Ok(builder.with_certificate(identity.certificate().clone())?.build())
-	}
-
-	/// A store whose revocation list names a frame signer resolves no signer
-	/// for its frame, so a revoked certificate verifies no frame.
-	#[tokio::test]
-	async fn a_revoked_signer_verifies_no_frame() -> TestResult {
-		let identity = TestIdentity::insecure_fixed();
-		let store = store_revoking(&identity)?;
-		let mut frame = TestFrame::with_integrity();
-		frame.sign_with_provider(&identity).await?;
-
-		let verification = store.verify_frame(&frame);
-		assert!(matches!(verification, TrustVerification::UnknownSigner));
-		Ok(())
-	}
-
-	/// A store whose revocation list names a certificate holds no key of it,
-	/// so a revoked certificate counts as enrolled for no plane.
-	#[test]
-	fn a_revoked_certificate_is_no_member_by_its_key() -> TestResult {
-		let identity = TestIdentity::insecure_fixed();
-		let store = store_revoking(&identity)?;
-
-		let member = store.trusts_public_key(identity.certificate());
-		assert!(!member);
-		Ok(())
-	}
-
-	/// A store trusts no certificate that its revocation list names.
-	#[test]
-	fn a_store_trusts_no_revoked_certificate() -> TestResult {
-		let identity = TestIdentity::insecure_fixed();
-		let store = store_revoking(&identity)?;
-
-		let trusted = store.is_trusted(identity.certificate());
-		assert!(!trusted);
-		Ok(())
-	}
-
-	/// A lookup runs revocation over the path of the certificate it finds, so
-	/// the leaf under a revoked intermediate is no member by its key.
-	#[test]
-	fn a_certificate_under_a_revoked_issuer_is_no_member() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(&chain.intermediate)?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, revocation);
-		let held = [chain.root, chain.intermediate, chain.leaf.clone()];
-		let store = builder.with_chain(held)?.build();
-
-		let member = store.trusts_public_key(&chain.leaf);
-		assert!(!member);
-		Ok(())
-	}
-
-	/// A lookup runs revocation over the path of the certificate it finds
-	/// alone, so a root above a revoked intermediate stays a member.
-	#[test]
-	fn a_certificate_above_a_revoked_issuer_stays_a_member() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(&chain.intermediate)?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, revocation);
-		let held = [chain.root.clone(), chain.intermediate, chain.leaf];
-		let store = builder.with_chain(held)?.build();
-
-		let member = store.trusts_public_key(&chain.root);
-		assert!(member);
-		Ok(())
 	}
 
 	/// The end of the validity period of an [`expiring`] certificate, in Unix
-	/// seconds: ahead of the system clock, and before the end of the test
+	/// seconds: after [`TestClock::START`], and before the end of the test
 	/// validity window at 2,000,000,000.
 	const END_OF_PERIOD: u64 = 1_999_999_000;
 
@@ -2531,107 +2510,139 @@ mod tests {
 
 	/// A store on a manual clock that holds `certificates`, as it stands once
 	/// the clock passes [`END_OF_PERIOD`].
-	fn store_past_expiry(
-		certificates: impl IntoIterator<Item = Certificate>,
-	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let clock = Arc::new(ManualClock::default());
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
-		let builder = certificates.into_iter().try_fold(builder, TrustBuilder::with_certificate)?;
-		let store = builder.build();
+	///
+	/// The store admits each certificate inside its period, so the clock
+	/// moves past the period after the build.
+	fn store_past_expiry(certificates: impl IntoIterator<Item = Certificate>) -> CertificateTrustStore {
+		let clock = TestClock::manual();
+		let builder = TestStore::empty().with_clock(TestClock::erased(&clock));
+		let builder = certificates.into_iter().try_fold(builder, TrustBuilder::with_certificate);
+		let store = builder.expect("the store admits each certificate inside its period").build();
 
-		let since_epoch = clock.unix().saturating_since(UnixMillis::new(0));
-		clock.advance(Duration::from_secs(END_OF_PERIOD + 1).saturating_sub(since_epoch));
-		Ok(store)
+		let past = TestClock::past(END_OF_PERIOD).unix();
+		clock.advance(past.saturating_since(clock.unix()));
+		store
 	}
 
-	/// A store reads the validity period of a certificate on the clock it was
-	/// built on, so a certificate whose period ends on that clock is refused
-	/// while the host clock reads a time inside the period.
-	#[test]
-	fn a_store_judges_validity_on_its_own_clock() -> TestResult {
+	/// The store of a lapsed certificate, beside the identity that presents
+	/// that certificate.
+	type Lapsed = fn() -> (CertificateTrustStore, SigningIdentity);
+
+	/// Returns the fixed identity beside a store that holds its certificate
+	/// under a revocation list of that certificate.
+	fn revoked() -> (CertificateTrustStore, SigningIdentity) {
+		let identity = TestIdentity::insecure_fixed();
+		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(identity.certificate());
+		let revocation = revocation.expect("a test certificate has a fingerprint");
+		let store = TestStore::revoking([identity.certificate().clone()], revocation);
+
+		(store, identity)
+	}
+
+	/// Returns an identity of the fixed key under an [`expiring`] certificate,
+	/// beside a store that holds that certificate past [`END_OF_PERIOD`].
+	fn expired() -> (CertificateTrustStore, SigningIdentity) {
 		let key = TestKey::insecure_fixed_signing();
-		let certificate = expiring(TestCertificate::self_signed(&key), &key);
-		let store = store_past_expiry([certificate.clone()])?;
+		let certificate = expiring(TestCertificate::insecure_fixed(), &key);
+		let store = store_past_expiry([certificate.clone()]);
 
-		let trusted = store.is_trusted(&certificate);
-		assert!(!trusted);
-		Ok(())
+		(store, TestIdentity::presenting(certificate, &key))
 	}
 
-	/// A store resolves no signer whose certificate is past its validity
-	/// period, so an expired certificate verifies no frame (RFC 5280
-	/// §6.1.3(a)(2), CWE-324).
-	#[tokio::test]
-	async fn an_expired_signer_verifies_no_frame() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let certificate = expiring(TestCertificate::self_signed(&key), &key);
-		let identity = TestIdentity::presenting(certificate.clone(), &key);
-		let store = store_past_expiry([certificate])?;
-		let mut frame = TestFrame::with_integrity();
-		frame.sign_with_provider(&identity).await?;
+	// A store resolves no signer whose certificate its revocation list names
+	// or whose validity period ended on its own clock, so a lapsed
+	// certificate verifies no frame.
+	crate::tb_cases! {
+		fn a_lapsed_signer_verifies_no_frame(lapsed: Lapsed) {
+			let (store, identity) = lapsed();
+			let frame = TestFrame::signed_by(TestFrame::with_integrity(), &identity);
 
-		let verification = store.verify_frame(&frame);
-		assert!(matches!(verification, TrustVerification::UnknownSigner));
-		Ok(())
+			let verification = store.verify_frame(&frame);
+			assert!(matches!(verification, TrustVerification::UnknownSigner));
+		}
+		cases {
+			/// A store whose revocation list names a frame signer resolves no
+			/// signer for its frame.
+			revoked => revoked,
+			/// A store resolves no signer whose certificate is past its
+			/// validity period (RFC 5280 §6.1.3(a)(2), CWE-324).
+			expired => expired,
+		}
 	}
 
-	/// A store holds no key of a certificate past its validity period, so an
-	/// expired certificate counts as enrolled for no plane.
-	#[test]
-	fn an_expired_certificate_is_no_member_by_its_key() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let certificate = expiring(TestCertificate::self_signed(&key), &key);
-		let store = store_past_expiry([certificate.clone()])?;
-
-		let member = store.trusts_public_key(&certificate);
-		assert!(!member);
-		Ok(())
+	// A store holds no certificate that its revocation list names or whose
+	// validity period ended on its own clock, by fingerprint or by key, so a
+	// lapsed certificate counts as enrolled for no plane.
+	crate::tb_cases! {
+		fn a_lapsed_certificate_is_no_member((lapsed, query): (Lapsed, Query)) {
+			let (store, identity) = lapsed();
+			let member = query(&store, identity.certificate());
+			assert!(!member);
+		}
+		cases {
+			revoked_by_key => (revoked, BY_KEY),
+			revoked_by_fingerprint => (revoked, BY_FINGERPRINT),
+			/// A store reads the validity period of a certificate on the clock
+			/// it was built on, so a certificate whose period ends on that
+			/// clock is refused while the host clock reads a time inside the
+			/// period.
+			expired_by_fingerprint => (expired, BY_FINGERPRINT),
+			expired_by_key => (expired, BY_KEY),
+		}
 	}
 
-	/// A lookup holds the path of the certificate it finds to its validity
-	/// period, so the leaf under an expired intermediate is no member by its
-	/// key.
-	#[test]
-	fn a_certificate_under_an_expired_issuer_is_no_member() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-		let intermediate = expiring(chain.intermediate, &chain.root_key);
-		let store = store_past_expiry([chain.root, intermediate, chain.leaf.clone()])?;
+	/// One lookup case: the store of the fixed chain, the certificate that
+	/// the lookup names, and its answer.
+	type LookupCase = (fn(&TestCertificateChain) -> CertificateTrustStore, EvalTarget, bool);
 
-		let member = store.trusts_public_key(&chain.leaf);
-		assert!(!member);
-		Ok(())
+	/// Returns a store that holds `chain` under a revocation list of its
+	/// intermediate.
+	fn revoking_the_intermediate(chain: &TestCertificateChain) -> CertificateTrustStore {
+		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(&chain.intermediate);
+		let revocation = revocation.expect("a test certificate has a fingerprint");
+		let held = [chain.root.to_owned(), chain.intermediate.to_owned(), chain.leaf.to_owned()];
+
+		TestStore::revoking(held, revocation)
 	}
 
+	/// Returns a store that holds `chain` with an [`expiring`] intermediate,
+	/// past [`END_OF_PERIOD`].
+	fn expiring_the_intermediate(chain: &TestCertificateChain) -> CertificateTrustStore {
+		let intermediate = expiring(chain.intermediate.to_owned(), &chain.root_key);
+		store_past_expiry([chain.root.to_owned(), intermediate, chain.leaf.to_owned()])
+	}
+
+	// A lookup runs revocation and validity over the path of the certificate
+	// it finds alone, so a lapsed intermediate ends the membership of the leaf
+	// under it and leaves the root above it a member.
+	crate::tb_cases! {
+		fn a_lookup_judges_the_path_of_the_certificate_it_finds((store_of, subject, expected): LookupCase)
+			-> TestResult
+		{
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let store = store_of(&chain);
+
+			let member = store.trusts_public_key(target_cert(&chain, subject));
+			assert_eq!(member, expected);
+			Ok(())
+		}
+		cases {
+			under_a_revoked_issuer => (revoking_the_intermediate, EvalTarget::Leaf, false),
+			above_a_revoked_issuer => (revoking_the_intermediate, EvalTarget::Root, true),
+			under_an_expired_issuer => (expiring_the_intermediate, EvalTarget::Leaf, false),
+		}
+	}
+
+	/// A store refuses a chain whose anchor its revocation list names
+	/// (RFC 5280 §6.1.3(a)(3)).
 	#[test]
 	fn verify_chain_rejects_revoked_anchor() -> TestResult {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let revocation = StaticRevocationList::<Sha3_256>::default().with_certificate(&chain.root)?;
 
-		let store = build_store_with_revocation(&chain, revocation)?;
+		let store = TestStore::revoking([chain.root.to_owned()], revocation);
 		let result = store.verify_chain(&[chain.root]);
 		assert!(matches!(result, Err(CertificateValidationError::CertificateRevoked)));
-		Ok(())
-	}
-
-	// RFC 5280 §4.1.1.2 requires algorithm identifier consistency.
-	#[test]
-	fn rejects_algorithm_identifier_mismatch() -> TestResult {
-		let chain = TestCertificate::insecure_fixed_chain()?;
-
-		let mut leaf = chain.leaf.to_owned();
-		leaf.signature_algorithm.oid = crate::oids::SIGNER_ECDSA_WITH_SHA256;
-
-		// Both the `evaluate` walk and `verify_chain` must reject it.
-		let walk_store = build_store(&chain, StoreCerts::RootAndIntermediate)?;
-		assert!(matches!(
-			walk_store.evaluate(&leaf),
-			Err(CertificateValidationError::AlgorithmMismatch)
-		));
-
-		let chain_store = build_store(&chain, StoreCerts::Root)?;
-		let result = chain_store.verify_chain(&[chain.root, chain.intermediate, leaf]);
-		assert!(matches!(result, Err(CertificateValidationError::AlgorithmMismatch)));
 		Ok(())
 	}
 
@@ -2639,21 +2650,14 @@ mod tests {
 	/// extension value resolves to that certificate (RFC 5652 §5.3).
 	#[test]
 	fn a_key_identifier_sid_resolves_through_the_extension() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let cert = TestCertificate::self_signed(&key);
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(cert.to_owned())?
-			.build();
+		let cert = TestCertificate::insecure_fixed();
+		let store = TestStore::holding([cert.to_owned()]);
 
-		let signer = TestIdentity::certified(key);
+		let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
 		let signer_info = CmsSigner::sign_with::<Secp256k1Signature, _>(&signer, SignedContent::data(b"test"))?;
 
 		let found = store.find_by_signer_info(&signer_info);
-		let fingerprint = found.map(|signer| Fingerprint::<Sha3_256>::from_certificate(signer.certificate()));
-		assert_eq!(
-			fingerprint.transpose()?,
-			Some(Fingerprint::<Sha3_256>::from_certificate(&cert)?)
-		);
+		assert_eq!(found.map(|signer| signer.certificate().as_ref()), Some(&cert));
 		Ok(())
 	}
 
@@ -2661,80 +2665,71 @@ mod tests {
 	/// and serial number.
 	#[test]
 	fn an_issuer_and_serial_sid_resolves_through_the_certificate() -> TestResult {
-		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let cert = TestCertificate::without_extension(cert, SubjectKeyIdentifier::OID);
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(cert.to_owned())?
-			.build();
+		let cert = TestCertificate::without_extension(TestCertificate::insecure_fixed(), SubjectKeyIdentifier::OID);
+		let store = TestStore::holding([cert.to_owned()]);
 
 		let sid = cert.signer_identifier()?;
 		let found = store.find_by_signer_identifier(&sid);
-
-		let fingerprint = found.map(|signer| Fingerprint::<Sha3_256>::from_certificate(signer.certificate()));
-		assert_eq!(
-			fingerprint.transpose()?,
-			Some(Fingerprint::<Sha3_256>::from_certificate(&cert)?)
-		);
+		assert_eq!(found.map(|signer| signer.certificate().as_ref()), Some(&cert));
 		Ok(())
 	}
 
-	/// An authority whose `keyUsage` asserts `keyCertSign` alone stays a path
-	/// certificate of the store, and resolves no signer.
-	#[test]
-	fn a_certificate_that_only_certifies_resolves_no_signer() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let authority = TestCertificate::authority(&key, "Authority")?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(authority.to_owned())?;
-		let store = builder.build();
-
-		let sid = authority.signer_identifier()?;
-		let found = store.find_by_signer_identifier(&sid);
-		assert!(found.is_none());
-		Ok(())
+	/// The authority `Authority` of the fixed key, whose `keyUsage` asserts
+	/// `keyCertSign` alone.
+	fn certifying_authority() -> Certificate {
+		let authority = TestCertificate::authority(&TestKey::insecure_fixed_signing(), "Authority");
+		authority.expect("a test authority signs its own certificate")
 	}
 
-	/// A certificate whose `extendedKeyUsage` names the server's purpose alone
-	/// is no frame signer, so it resolves no signer (RFC 5280 §4.2.1.12).
-	#[test]
-	fn a_certificate_of_the_server_purpose_resolves_no_signer() -> TestResult {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store = builder.with_certificate(certificate.to_owned())?.build();
+	/// The fixed certificate with the server's purpose alone in its
+	/// `extendedKeyUsage`.
+	fn server_certificate() -> Certificate {
+		TestCertificate::with_key_purposes(TestCertificate::insecure_fixed(), [KeyPurposes::HOUSE.server])
+	}
 
-		let sid = certificate.signer_identifier()?;
-		let found = store.find_by_signer_identifier(&sid);
-		assert!(found.is_none());
-		Ok(())
+	// A store holds a certificate that the signing use refuses as a path
+	// certificate alone, so its `sid` resolves no signer.
+	crate::tb_cases! {
+		fn a_non_signing_certificate_resolves_no_signer(certificate: fn() -> Certificate) -> TestResult {
+			let certificate = certificate();
+			let store = TestStore::holding([certificate.to_owned()]);
+
+			let sid = certificate.signer_identifier()?;
+			let found = store.find_by_signer_identifier(&sid);
+			assert!(found.is_none());
+			Ok(())
+		}
+		cases {
+			/// An authority whose `keyUsage` asserts `keyCertSign` alone
+			/// stays a path certificate of the store.
+			one_that_only_certifies => certifying_authority,
+			/// A certificate whose `extendedKeyUsage` names the server's
+			/// purpose alone is no frame signer (RFC 5280 §4.2.1.12).
+			one_of_the_server_purpose => server_certificate,
+		}
 	}
 
 	/// A store configured with an implementor's own signer purpose resolves
 	/// a certificate that names it.
 	#[test]
 	fn a_certificate_of_a_configured_signer_purpose_resolves_its_signer() -> TestResult {
-		let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.2");
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let certificate = TestCertificate::with_key_purposes(certificate, [own]);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let own = TestIdentity::OWN_SIGNER;
+		let certificate = TestCertificate::with_key_purposes(TestCertificate::insecure_fixed(), [own]);
+		let builder = TestStore::empty();
 		let builder = builder.with_key_purposes(KeyPurposes { signer: own, ..KeyPurposes::HOUSE });
 		let store = builder.with_certificate(certificate.to_owned())?.build();
 
 		let sid = certificate.signer_identifier()?;
 		let found = store.find_by_signer_identifier(&sid);
-		assert!(found.is_some());
+		assert_eq!(found.map(|signer| signer.certificate().as_ref()), Some(&certificate));
 		Ok(())
 	}
 
 	/// A key identifier the store holds no certificate for resolves to none.
 	#[test]
 	fn an_unknown_key_identifier_resolves_to_no_certificate() -> TestResult {
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()))?
-			.build();
-
-		let other_key = crate::crypto::sign::ecdsa::Secp256k1SigningKey::from_bytes(&[99u8; 32].into())?;
-		let signer = TestIdentity::certified(other_key);
+		let store = TestStore::holding([TestCertificate::insecure_fixed()]);
+		let signer = TestIdentity::certified(TestKey::fixed(99));
 		let signer_info = CmsSigner::sign_with::<Secp256k1Signature, _>(&signer, SignedContent::data(b"test"))?;
 
 		let found = store.find_by_signer_info(&signer_info);
@@ -2747,103 +2742,87 @@ mod tests {
 	/// computes.
 	#[test]
 	fn a_sid_resolves_by_the_extension_value_as_written() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
 		let written = SubjectKeyIdentifier::from(OctetString::new([0x42u8; 20])?);
-		let cert = TestCertificate::with_key_identifier(TestCertificate::self_signed(&key), written.clone());
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(cert.to_owned())?
-			.build();
+		let cert = TestCertificate::with_key_identifier(TestCertificate::insecure_fixed(), written.clone());
+		let store = TestStore::holding([cert.to_owned()]);
 
 		let sid = SignerIdentifier::SubjectKeyIdentifier(written);
 		let found = store.find_by_signer_identifier(&sid);
-		assert!(found.is_some());
+		assert_eq!(found.map(|signer| signer.certificate().as_ref()), Some(&cert));
 		Ok(())
 	}
 
 	/// A trust store verifies a frame under the certificate its `sid` names,
 	/// and returns the verified signature.
-	#[tokio::test]
-	async fn a_trust_store_verifies_a_frame_of_a_certificate_it_holds() -> TestResult {
+	#[test]
+	fn a_trust_store_verifies_a_frame_of_a_certificate_it_holds() {
 		let identity = TestIdentity::insecure_fixed();
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(identity.certificate().clone())?
-			.build();
-
-		let mut frame = TestFrame::with_integrity();
-		frame.sign_with_provider(&identity).await?;
+		let store = TestStore::holding([identity.certificate().clone()]);
+		let frame = TestFrame::signed_by(TestFrame::with_integrity(), &identity);
 
 		let verification = store.verify_frame(&frame);
 		assert!(matches!(verification, TrustVerification::Verified(_, _)));
-		Ok(())
 	}
 
 	/// A trust store refuses a frame whose signer it holds only as a
 	/// certificate the signing use refuses, so the key of an authority signs
 	/// no frame the store accepts.
-	#[tokio::test]
-	async fn a_trust_store_resolves_no_signer_for_a_certifying_key() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let authority = TestCertificate::authority(&key, "Authority")?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(authority)?;
-		let store = builder.build();
-
-		let mut frame = TestFrame::with_integrity();
-		frame.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
+	#[test]
+	fn a_trust_store_resolves_no_signer_for_a_certifying_key() {
+		let store = TestStore::holding([certifying_authority()]);
+		let frame = TestFrame::signed_by(TestFrame::with_integrity(), &TestIdentity::insecure_fixed());
 
 		let verification = store.verify_frame(&frame);
 		assert!(matches!(verification, TrustVerification::UnknownSigner));
-		Ok(())
+	}
+
+	/// Returns the builder of a house store that holds `first`, the
+	/// certificate that a second certificate collides with.
+	fn builder_holding(first: Certificate) -> CertificateTrustBuilder {
+		let builder = TestStore::empty().with_certificate(first);
+		builder.expect("the empty store admits the first certificate")
 	}
 
 	/// Two certificates of two keys under one `subjectKeyIdentifier` value
-	/// collide in the extension index, because a `sid` would name both.
+	/// collide in the extension index, because a `sid` would name both. The
+	/// refusal names that value in hex, so the operator finds the entry.
 	#[test]
 	fn two_certificates_under_one_key_identifier_collide() -> TestResult {
-		let first = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let other_key = SigningKey::from_bytes(&[3u8; 32].into())?;
+		let first = TestCertificate::insecure_fixed();
 		let identifier = first.extension::<SubjectKeyIdentifier>()?;
 		let identifier = identifier.ok_or("the fixture carries a key identifier")?;
-		let second = TestCertificate::with_key_identifier(TestCertificate::self_signed(&other_key), identifier);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(first)?;
+		let second = TestCertificate::with_key_identifier(TestCertificate::self_signed(&TestKey::fixed(3)), identifier);
+		let builder = builder_holding(first);
 
 		let refused = builder.with_certificate(second);
-		assert!(matches!(refused, Err(CertificateValidationError::SkidCollision { .. })));
+		let named = "c0c5e0d927e4ccbb5bbf03d50dae76a79114a296";
+		assert!(matches!(refused, Err(CertificateValidationError::SkidCollision { skid }) if skid == named));
 		Ok(())
 	}
 
 	/// Two certificates of one key, the second with no key identifier,
 	/// collide in the key index, because a key lookup would name both.
 	#[test]
-	fn two_certificates_of_one_key_collide() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let first = TestCertificate::self_signed(&key);
-		let mut second = TestCertificate::self_signed(&key);
-		second.tbs_certificate.extensions = None;
+	fn two_certificates_of_one_key_collide() {
+		let second = TestCertificate::without_extensions(TestCertificate::insecure_fixed());
 
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(first)?;
+		let builder = builder_holding(TestCertificate::insecure_fixed());
 		let refused = builder.with_certificate(second);
 		assert!(matches!(refused, Err(CertificateValidationError::PublicKeyCollision { .. })));
-		Ok(())
 	}
 
 	/// A key collision names the certificate that holds the key by its serial
 	/// number and its issuer (RFC 5280 §4.1.2.2).
 	#[test]
 	fn a_key_collision_names_the_holder_by_serial_and_issuer() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let mut first = TestCertificate::self_signed(&key);
+		let mut first = TestCertificate::insecure_fixed();
 		first.tbs_certificate.issuer = Name::from_str("CN=held")?;
 
-		let mut second = TestCertificate::self_signed(&key);
-		second.tbs_certificate.extensions = None;
+		let mut second = TestCertificate::without_extensions(TestCertificate::insecure_fixed());
 		second.tbs_certificate.serial_number = SerialNumber::new(&[0x2a])?;
 		second.tbs_certificate.issuer = Name::from_str("CN=refused")?;
 
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(first)?;
+		let builder = builder_holding(first);
 		let refused = builder.with_certificate(second);
 
 		let expected = "serial number 01 of issuer CN=held";
@@ -2855,64 +2834,55 @@ mod tests {
 	/// One secp256k1 point in its compressed and its uncompressed form is one
 	/// key, so two certificates of the two forms collide in the key index.
 	#[test]
-	fn two_certificates_of_one_point_in_two_forms_collide() -> TestResult {
-		let key = TestKey::insecure_fixed_signing();
-		let first = TestCertificate::self_signed(&key);
-		let mut second = TestCertificate::with_compressed_key(TestCertificate::self_signed(&key));
-		second.tbs_certificate.extensions = None;
+	fn two_certificates_of_one_point_in_two_forms_collide() {
+		let compressed = TestCertificate::with_compressed_key(TestCertificate::insecure_fixed());
+		let second = TestCertificate::without_extensions(compressed);
 
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(first)?;
+		let builder = builder_holding(TestCertificate::insecure_fixed());
 		let refused = builder.with_certificate(second);
 		assert!(matches!(refused, Err(CertificateValidationError::PublicKeyCollision { .. })));
-		Ok(())
 	}
 
-	/// A store that holds a secp256k1 key in the uncompressed form holds it in
-	/// the compressed form too, so a re-issued certificate of the other form
-	/// stays a member.
-	#[test]
-	fn a_store_holds_its_key_in_the_compressed_form() -> TestResult {
-		let (store, _) = self_signed_store()?;
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let compressed = TestCertificate::with_compressed_key(certificate);
-		assert!(store.trusts_public_key(&compressed));
-		Ok(())
-	}
-
-	/// A point and its negation are two keys, so a store that holds one
-	/// holds no certificate of the other.
-	#[test]
-	fn a_store_holds_no_negation_of_its_key() -> TestResult {
-		let (store, _) = self_signed_store()?;
-		let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
-		let negated = TestCertificate::self_signed(&negation);
-		assert!(!store.trusts_public_key(&negated));
-		Ok(())
+	// A store holds its key in each encoding of the point, and the negation of
+	// the point is another key.
+	crate::tb_cases! {
+		fn membership_follows_the_point_of_the_held_key((certificate, expected): (fn() -> Certificate, bool)) {
+			let (store, _) = self_signed_store();
+			let member = store.trusts_public_key(&certificate());
+			assert_eq!(member, expected);
+		}
+		cases {
+			/// A store that holds a secp256k1 key in the uncompressed form
+			/// holds it in the compressed form too, so a re-issued certificate
+			/// of the other form stays a member.
+			the_compressed_form => (|| TestCertificate::with_compressed_key(TestCertificate::insecure_fixed()), true),
+			/// A point and its negation are two keys, so a store that holds
+			/// one holds no certificate of the other.
+			the_negation => (TestCertificate::insecure_fixed_negation, false),
+		}
 	}
 
 	/// An encoding of the x-coordinate and the y parity of the held key that
 	/// is no point of its curve names another key, so the store finds no
 	/// certificate by it (SEC 1 v2.0 §2.3.4).
 	#[test]
-	fn a_store_finds_no_certificate_by_an_off_curve_alias_of_its_key() -> TestResult {
-		let (store, _) = self_signed_store()?;
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let alias = TestCertificate::with_off_curve_key(certificate);
+	fn a_store_finds_no_certificate_by_an_off_curve_alias_of_its_key() {
+		let (store, _) = self_signed_store();
+		let alias = TestCertificate::with_off_curve_key(TestCertificate::insecure_fixed());
 
 		let found = store.find_by_public_key(&alias.tbs_certificate.subject_public_key_info);
 		assert!(found.is_none());
-		Ok(())
 	}
 
 	/// Returns a store that holds a self-signed test authority of the fixed
 	/// key, whose one key identifier extension is its `subjectKeyIdentifier`,
 	/// beside the certificate's fingerprint.
-	fn self_signed_store() -> Result<(CertificateTrustStore, Sha3Fingerprint), Box<dyn std::error::Error>> {
-		let certificate = TestCertificate::authority(&TestKey::insecure_fixed_signing(), "Self-Signed CA")?;
-		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		Ok((builder.with_certificate(certificate)?.build(), fingerprint))
+	fn self_signed_store() -> (CertificateTrustStore, Sha3Fingerprint) {
+		let certificate = TestCertificate::authority(&TestKey::insecure_fixed_signing(), "Self-Signed CA");
+		let certificate = certificate.expect("a test authority signs its own certificate");
+		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate);
+		let fingerprint = fingerprint.expect("a test certificate has a fingerprint");
+		(TestStore::holding([certificate]), fingerprint)
 	}
 
 	/// The store holds each `subjectKeyIdentifier` value once, in one
@@ -2920,7 +2890,7 @@ mod tests {
 	/// share.
 	#[test]
 	fn the_sid_index_shares_the_key_identifier_of_its_certificate() -> TestResult {
-		let (store, fingerprint) = self_signed_store()?;
+		let (store, fingerprint) = self_signed_store();
 		let held = store.certificates.get(&fingerprint).ok_or("a held certificate")?;
 
 		let subject = held.identifiers.subject.as_ref().ok_or("a key identifier")?;
@@ -2934,7 +2904,7 @@ mod tests {
 	/// allocation.
 	#[test]
 	fn a_self_signed_certificate_shares_its_key_identifier_with_its_authority() -> TestResult {
-		let (store, fingerprint) = self_signed_store()?;
+		let (store, fingerprint) = self_signed_store();
 		let held = store.certificates.get(&fingerprint).ok_or("a held certificate")?;
 
 		let subject = held.identifiers.subject.as_ref().ok_or("a key identifier")?;

@@ -255,36 +255,35 @@ impl AsRef<ExchangeSecret> for DistinctSecret {
 mod tests {
 	use super::*;
 	use crate::crypto::exchange::{Ecdhe, EcdheShare};
-	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
+	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 	use crate::crypto::sign::elliptic_curve::PublicKey;
 	use crate::oids::CURVE_NIST_P384;
-	use crate::random::OsRng;
-	use crate::testing::TestCertificate;
-	use crate::transport::handshake::tests::{create_test_certificate, negated};
+	use crate::testing::{SeededStream, TestCertificate, TestResult};
+	use crate::transport::handshake::tests::{create_test_certificate, fixture_ephemeral, negated};
 
 	/// The house exchange of the tests.
 	type House = Ecdhe<Secp256k1>;
 
-	/// The certificate of a fresh secp256k1 key, beside that key.
-	fn static_peer() -> (Certificate, PublicKey<Secp256k1>) {
-		let peer = create_test_certificate();
+	/// The certificate of the fixed secp256k1 key of `seed`, beside that key.
+	fn static_peer(seed: u8) -> (Certificate, PublicKey<Secp256k1>) {
+		let peer = create_test_certificate(seed);
 		let key = PublicKey::from(peer.signing_key.verifying_key());
 		(peer.certificate, key)
 	}
 
-	/// The statics of a peer that signs under a fresh secp256k1 key, beside
-	/// that key.
+	/// The statics of a peer that signs under the fixed secp256k1 key of seed
+	/// `0xb0`, beside that key.
 	fn signer_statics() -> (PeerStatics<House>, PublicKey<Secp256k1>) {
-		let (signing, key) = static_peer();
+		let (signing, key) = static_peer(0xb0);
 		(PeerStatics::of(&signing, None), key)
 	}
 
-	/// A certificate of a fresh P-384 key, a key outside the group of
-	/// secp256k1.
+	/// A certificate of a P-384 key, a key outside the group of secp256k1.
 	fn p384_certificate() -> Certificate {
-		let point = p384::SecretKey::random(&mut OsRng).public_key().to_encoded_point(false);
-		TestCertificate::with_curve_point(create_test_certificate().certificate, CURVE_NIST_P384, point.as_bytes())
+		let key = p384::SecretKey::random(&mut SeededStream(0x30));
+		let point = key.public_key().to_encoded_point(false);
+		TestCertificate::with_curve_point(create_test_certificate(0xb1).certificate, CURVE_NIST_P384, point.as_bytes())
 	}
 
 	/// The share of `key`.
@@ -294,7 +293,7 @@ mod tests {
 
 	/// The share of a valid point that belongs to no party of the test.
 	fn stray_share() -> EcdheShare<Secp256k1> {
-		share(&SecretKey::random(&mut OsRng).public_key())
+		share(&fixture_ephemeral(0x21).public_key())
 	}
 
 	/// The client share an opening carries as `key`.
@@ -302,10 +301,12 @@ mod tests {
 		OpenedShare(share(key))
 	}
 
+	/// A server share distinct from both static keys of the server is
+	/// admitted as the share it is.
 	#[test]
-	fn a_server_share_other_than_the_static_keys_is_admitted() -> Result<(), HandshakeError> {
-		let (signing, _) = static_peer();
-		let (key_agreement, _) = static_peer();
+	fn a_server_share_other_than_the_static_keys_is_admitted() -> TestResult {
+		let (signing, _) = static_peer(0xb2);
+		let (key_agreement, _) = static_peer(0xb3);
 		let statics = PeerStatics::<House>::of(&signing, Some(&key_agreement));
 		let other = stray_share();
 
@@ -314,22 +315,20 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn a_server_share_equal_to_the_signing_key_is_refused() {
-		let (statics, signing_key) = signer_statics();
-
-		let refused = statics.server_ephemeral(share(&signing_key));
-		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
-	}
-
-	/// ECDH keeps the x-coordinate alone, so the negation of a static key
-	/// agrees to the secret the key itself agrees to.
-	#[test]
-	fn the_negation_of_the_signing_key_is_refused_as_the_server_share() {
-		let (statics, signing_key) = signer_statics();
-
-		let refused = statics.server_ephemeral(share(&negated(&signing_key)));
-		assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+	// A server share of the signing key is refused, in each form whose
+	// agreement collapses into the static one.
+	crate::tb_cases! {
+		fn a_server_share_of_the_signing_key_is_refused(form: fn(&PublicKey<Secp256k1>) -> PublicKey<Secp256k1>) {
+			let (statics, signing_key) = signer_statics();
+			let refused = statics.server_ephemeral(share(&form(&signing_key)));
+			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+		}
+		cases {
+			itself => |key| *key,
+			/// ECDH keeps the x-coordinate alone, so the negation of a static
+			/// key agrees to the secret the key itself agrees to.
+			negation => negated,
+		}
 	}
 
 	/// A server that signs under a key on P-384 holds no static key of the
@@ -337,7 +336,7 @@ mod tests {
 	/// differ from.
 	#[test]
 	fn a_signer_on_another_curve_leaves_the_key_agreement_key_to_compare() {
-		let (key_agreement, agreement_key) = static_peer();
+		let (key_agreement, agreement_key) = static_peer(0xb3);
 		let statics = PeerStatics::<House>::of(&p384_certificate(), Some(&key_agreement));
 
 		let refused = statics.server_ephemeral(share(&agreement_key));
@@ -347,7 +346,7 @@ mod tests {
 	/// A signing key outside the group of the curve collapses no agreement on
 	/// the curve, so every share of the curve is distinct from it.
 	#[test]
-	fn a_signer_on_another_curve_admits_every_share_of_the_curve() -> Result<(), HandshakeError> {
+	fn a_signer_on_another_curve_admits_every_share_of_the_curve() -> TestResult {
 		let statics = PeerStatics::<House>::of(&p384_certificate(), None);
 		let other = stray_share();
 
@@ -356,18 +355,26 @@ mod tests {
 		Ok(())
 	}
 
+	// A client share of the static key of the client is refused, in each
+	// form whose agreement collapses into the static one.
 	#[cfg(mux_rekey)]
-	#[test]
-	fn a_client_share_equal_to_the_client_static_key_is_refused() {
-		let (statics, signing_key) = signer_statics();
-
-		let refused = statics.client_ephemeral(share(&signing_key));
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	crate::tb_cases! {
+		fn a_client_share_of_the_static_key_is_refused(form: fn(&PublicKey<Secp256k1>) -> PublicKey<Secp256k1>) {
+			let (statics, signing_key) = signer_statics();
+			let refused = statics.client_ephemeral(share(&form(&signing_key)));
+			assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+		}
+		cases {
+			itself => |key| *key,
+			negation => negated,
+		}
 	}
 
+	/// A client share distinct from the static key of the client is
+	/// admitted as the share it is.
 	#[cfg(mux_rekey)]
 	#[test]
-	fn a_client_share_other_than_the_static_key_is_admitted() -> Result<(), HandshakeError> {
+	fn a_client_share_other_than_the_static_key_is_admitted() -> TestResult {
 		let (statics, _) = signer_statics();
 		let other = stray_share();
 
@@ -376,50 +383,40 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(mux_rekey)]
-	#[test]
-	fn the_negation_of_the_client_static_key_is_refused_as_its_share() {
-		let (statics, signing_key) = signer_statics();
-
-		let refused = statics.client_ephemeral(share(&negated(&signing_key)));
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	// The share an opening carries is refused at its admission when it is a
+	// form of the client key whose agreement collapses into the static one.
+	crate::tb_cases! {
+		fn an_opened_share_of_the_client_key_is_refused(form: fn(&PublicKey<Secp256k1>) -> PublicKey<Secp256k1>) {
+			let (statics, signing_key) = signer_statics();
+			let refused = statics.admit_client(opened(&form(&signing_key)));
+			assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+		}
+		cases {
+			itself => |key| *key,
+			negation => negated,
+		}
 	}
 
+	/// An opened share distinct from the client key is admitted.
 	#[test]
-	fn an_opened_share_equal_to_the_client_key_is_refused_at_admission() {
-		let (statics, signing_key) = signer_statics();
-
-		let refused = statics.admit_client(opened(&signing_key));
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	#[test]
-	fn an_opened_share_of_the_negated_client_key_is_refused_at_admission() {
-		let (statics, signing_key) = signer_statics();
-
-		let refused = statics.admit_client(opened(&negated(&signing_key)));
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	#[test]
-	fn an_opened_share_other_than_the_client_key_is_admitted() -> Result<(), HandshakeError> {
+	fn an_opened_share_other_than_the_client_key_is_admitted() -> TestResult {
 		let (statics, _) = signer_statics();
 		let other = OpenedShare(stray_share());
-
-		statics.admit_client(other)
+		statics.admit_client(other)?;
+		Ok(())
 	}
 
 	/// The agreement on a proof share is the exchange itself, so both ends of
 	/// a handshake derive one secret.
 	#[test]
-	fn both_ends_agree_on_their_proof_shares() -> Result<(), HandshakeError> {
-		let (pending, offer) = House::offer(&mut OsRng);
-		let (reply, responder) = OpenedShare(offer).respond::<House>(&mut OsRng)?;
+	fn both_ends_agree_on_their_proof_shares() -> TestResult {
+		let (pending, offer) = House::offer(&mut SeededStream(0x10));
+		let (reply, responder) = OpenedShare(offer).respond::<House>(&mut SeededStream(0x20))?;
 		let reply = PeerStatics::<House>::none().server_ephemeral(reply)?;
 		let initiator = reply.complete::<House>(&pending)?;
 
-		let equal = initiator.as_ref().with(|secret| responder.with(|other| secret == other));
-		assert!(equal);
+		let initiator = initiator.as_ref().with(<[u8]>::to_vec);
+		assert_eq!(initiator, responder.with(<[u8]>::to_vec));
 		Ok(())
 	}
 }

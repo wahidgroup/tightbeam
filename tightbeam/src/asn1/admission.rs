@@ -167,6 +167,7 @@ impl DerAdmission {
 			} else {
 				element.encoding.len()
 			};
+
 			at = at.checked_add(step).ok_or(ErrorKind::Overflow)?;
 		}
 
@@ -473,7 +474,9 @@ impl Writer for Comparing<'_> {
 #[cfg(test)]
 pub(crate) mod fixtures {
 	use crate::der::asn1::ObjectIdentifier;
-	use crate::der::{Encode, Header, Length, Tag};
+	use crate::der::{Encode, ErrorKind, Header, Length, Result as DerResult, Tag};
+
+	use super::{Element, Run};
 
 	/// The number of elements in every descending set an owner test sends. At
 	/// four thousand, the quadratic sort is measurable.
@@ -486,6 +489,29 @@ pub(crate) mod fixtures {
 		let mut encoding = header.to_der().expect("a test header encodes");
 		encoding.extend_from_slice(contents);
 		encoding
+	}
+
+	/// The elements inside the constructed element that `der` starts with,
+	/// each as it arrived: its header and its contents.
+	pub(crate) fn elements_of(der: impl AsRef<[u8]>) -> Vec<Vec<u8>> {
+		let element = Element::first(der.as_ref()).expect("a test encoding starts with a whole element");
+		let children = Run(element.contents()).map(|read| read.map(|child| child.encoding.to_vec()));
+		let children = children.collect::<DerResult<_>>();
+		children.expect("the contents of a test element are DER elements")
+	}
+
+	/// The kind of the DER error that `result` holds, or `None` when it holds
+	/// a value.
+	pub(crate) fn der_refusal<T>(result: DerResult<T>) -> Option<ErrorKind> {
+		result.err().map(|error| error.kind())
+	}
+
+	/// A universal SET OF `count` two-octet OCTET STRING values, in ascending
+	/// order.
+	pub(crate) fn ascending_set_of(count: usize) -> Vec<u8> {
+		let value = |value: usize| u16::try_from(value).expect("a test count fits a u16").to_be_bytes();
+		let values = (0..count).map(|count| tlv(Tag::OctetString, &value(count)));
+		tlv(Tag::Set, &values.collect::<Vec<_>>().concat())
 	}
 
 	/// The contents of a SET OF `count` two-octet OCTET STRING values, in
@@ -511,26 +537,16 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-	use super::fixtures::{descending_set, tlv};
-	use super::*;
 	use crate::der::asn1::OctetString;
 	use crate::der::TagNumber;
+	use crate::testing::TestResult;
 
-	/// The error kind `admit` returns for `der` under `rules`.
-	fn refusal(rules: DerAdmission, der: &[u8]) -> Option<ErrorKind> {
-		rules.admit(der).err().map(|error| error.kind())
-	}
+	use super::fixtures::{ascending_set_of, der_refusal, descending_set, tlv};
+	use super::*;
 
 	/// A SET OF three values in ascending order.
 	fn ascending_set() -> Vec<u8> {
 		tlv(Tag::Set, &[0x04, 0x01, 0x01, 0x04, 0x01, 0x02, 0x04, 0x01, 0x03])
-	}
-
-	/// A universal SET of `count` OCTET STRING values in ascending order.
-	fn ascending_set_of(count: usize) -> Vec<u8> {
-		let value = |value: usize| u16::try_from(value).expect("a test count fits a u16").to_be_bytes();
-		let values = (0..count).map(|count| tlv(Tag::OctetString, &value(count)));
-		tlv(Tag::Set, &values.collect::<Vec<_>>().concat())
 	}
 
 	/// A constructed `[0]` of `count` NULL elements.
@@ -539,72 +555,66 @@ mod tests {
 		tlv(tag, &[0x05, 0x00].repeat(count))
 	}
 
-	#[test]
-	fn a_set_in_der_order_is_admitted() -> DerResult<()> {
-		DerAdmission::SetOrder.admit(ascending_set())?;
-		Ok(())
-	}
-
-	#[test]
-	fn a_descending_set_is_refused() {
-		assert_eq!(refusal(DerAdmission::SetOrder, &descending_set()), Some(ErrorKind::SetOrdering));
-	}
-
-	#[test]
-	fn a_set_that_repeats_an_encoding_is_refused() {
-		let repeated = tlv(Tag::Set, &[0x04, 0x01, 0x01, 0x04, 0x01, 0x01]);
-		assert_eq!(refusal(DerAdmission::SetOrder, &repeated), Some(ErrorKind::SetDuplicate));
-	}
-
-	/// The walk reaches a set at any depth, inside sequences and tagged
-	/// elements.
-	#[test]
-	fn a_nested_descending_set_is_refused() {
+	/// A [`descending_set`] in a SEQUENCE, in a constructed `[3]`, in a
+	/// SEQUENCE.
+	fn nested_descending_set() -> Vec<u8> {
 		let tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N3 };
-		let nested = tlv(Tag::Sequence, &tlv(tag, &tlv(Tag::Sequence, &descending_set())));
-		assert_eq!(refusal(DerAdmission::SetOrder, &nested), Some(ErrorKind::SetOrdering));
+		tlv(Tag::Sequence, &tlv(tag, &tlv(Tag::Sequence, &descending_set())))
 	}
 
-	/// The contents of an OCTET STRING may be ciphertext, so the owner that
-	/// decodes them walks them.
-	#[test]
-	fn the_contents_of_an_octet_string_are_admitted_as_octets() -> DerResult<()> {
-		let wrapped = tlv(Tag::OctetString, &descending_set());
-		DerAdmission::SetOrder.admit(wrapped)?;
-		Ok(())
-	}
-
-	#[test]
-	fn a_tagged_element_at_the_cap_is_admitted() -> DerResult<()> {
-		DerAdmission::Cms.admit(tagged_of(MAX_CMS_SET_LEN))?;
-		Ok(())
-	}
-
-	#[test]
-	fn a_tagged_element_past_the_cap_is_refused() {
-		let past = tagged_of(MAX_CMS_SET_LEN + 1);
-		assert_eq!(refusal(DerAdmission::Cms, &past), Some(ErrorKind::Overlength));
-	}
-
-	/// `der` sorts a SET OF a CHOICE of CMS in another order than DER's, so
-	/// rule B bounds a universal SET at the CMS owners too.
-	#[test]
-	fn a_universal_set_past_the_cap_is_refused_under_cms() {
-		let past = ascending_set_of(MAX_CMS_SET_LEN + 1);
-		assert_eq!(refusal(DerAdmission::Cms, &past), Some(ErrorKind::Overlength));
-	}
-
-	/// Rule B binds the CMS owners alone.
-	#[test]
-	fn a_tagged_element_past_the_cap_is_admitted_under_set_order() -> DerResult<()> {
-		DerAdmission::SetOrder.admit(tagged_of(MAX_CMS_SET_LEN + 1))?;
-		Ok(())
+	// The walk admits the DER its rules accept, and refuses the rest with the
+	// kind of the rule it breaks.
+	crate::tb_cases! {
+		fn the_walk_holds_der_to_its_rules((rules, der, expected): (DerAdmission, Vec<u8>, Option<ErrorKind>)) {
+			assert_eq!(der_refusal(rules.admit(der)), expected);
+		}
+		cases {
+			a_set_in_der_order => (DerAdmission::SetOrder, ascending_set(), None),
+			a_descending_set => (DerAdmission::SetOrder, descending_set(), Some(ErrorKind::SetOrdering)),
+			a_set_that_repeats_an_encoding => (
+				DerAdmission::SetOrder,
+				tlv(Tag::Set, &[0x04, 0x01, 0x01, 0x04, 0x01, 0x01]),
+				Some(ErrorKind::SetDuplicate),
+			),
+			/// The walk reaches a set at any depth, inside sequences and tagged
+			/// elements.
+			a_nested_descending_set => (DerAdmission::SetOrder, nested_descending_set(), Some(ErrorKind::SetOrdering)),
+			/// The contents of an OCTET STRING may be ciphertext, so the owner
+			/// that decodes them walks them.
+			the_contents_of_an_octet_string => (DerAdmission::SetOrder, tlv(Tag::OctetString, &descending_set()), None),
+			a_tagged_element_at_the_cap => (DerAdmission::Cms, tagged_of(MAX_CMS_SET_LEN), None),
+			a_tagged_element_past_the_cap => (
+				DerAdmission::Cms,
+				tagged_of(MAX_CMS_SET_LEN + 1),
+				Some(ErrorKind::Overlength),
+			),
+			/// `der` sorts a SET OF a CHOICE of CMS in another order than
+			/// DER's, so rule B bounds a universal SET at the CMS owners too.
+			a_universal_set_past_the_cap_under_cms => (
+				DerAdmission::Cms,
+				ascending_set_of(MAX_CMS_SET_LEN + 1),
+				Some(ErrorKind::Overlength),
+			),
+			/// Rule B binds the CMS owners alone.
+			a_tagged_element_past_the_cap_under_set_order => (
+				DerAdmission::SetOrder,
+				tagged_of(MAX_CMS_SET_LEN + 1),
+				None,
+			),
+			/// An element whose length runs past its parent is refused at the
+			/// parent, before the walk reads into it.
+			an_element_past_its_parent => (
+				DerAdmission::SetOrder,
+				vec![0x30, 0x03, 0x30, 0x05, 0x05, 0x00, 0x05, 0x00],
+				Some(ErrorKind::Length { tag: Tag::Sequence }),
+			),
+		}
 	}
 
 	/// A set of a CHOICE that `der` sorts in another order than DER's goes
 	/// out in DER's.
 	#[test]
-	fn a_set_out_of_der_order_is_arranged_into_it() -> DerResult<()> {
+	fn a_set_out_of_der_order_is_arranged_into_it() -> TestResult {
 		let mut arranged = tlv(Tag::Set, &[0x04, 0x01, 0x02, 0x04, 0x01, 0x01]);
 
 		DerAdmission::arrange(&mut arranged)?;
@@ -616,55 +626,37 @@ mod tests {
 	/// octets of that element, here from after its sibling to before it, so
 	/// the outer set is arranged again.
 	#[test]
-	fn a_set_is_arranged_after_the_sets_inside_it() -> DerResult<()> {
+	fn a_set_is_arranged_after_the_sets_inside_it() -> TestResult {
 		let first_once_sorted = tlv(Tag::Sequence, &tlv(Tag::Set, &[0x04, 0x01, 0x03, 0x04, 0x01, 0x01]));
 		let sibling = tlv(Tag::Sequence, &tlv(Tag::Set, &[0x04, 0x01, 0x02, 0x04, 0x01, 0x05]));
-		let mut nested = tlv(Tag::Set, &[first_once_sorted, sibling].concat());
+		let mut nested = tlv(Tag::Set, &[first_once_sorted, sibling.clone()].concat());
 
 		DerAdmission::arrange(&mut nested)?;
-		DerAdmission::SetOrder.admit(nested)?;
-		Ok(())
-	}
 
-	/// An element whose length runs past its parent is refused at the parent,
-	/// before the walk reads into it.
-	#[test]
-	fn an_element_past_its_parent_is_refused() {
-		let overrun = [0x30, 0x03, 0x30, 0x05, 0x05, 0x00, 0x05, 0x00];
-		let past_parent = ErrorKind::Length { tag: Tag::Sequence };
-		assert_eq!(refusal(DerAdmission::SetOrder, &overrun), Some(past_parent));
+		let first_sorted = tlv(Tag::Sequence, &tlv(Tag::Set, &[0x04, 0x01, 0x01, 0x04, 0x01, 0x03]));
+		assert_eq!(nested, tlv(Tag::Set, &[first_sorted, sibling].concat()));
+		Ok(())
 	}
 
 	/// An OCTET STRING is its contents octets in DER.
 	impl Canonical for OctetString {}
 
-	/// The kind of the refusal that holds `value` to `arrived`, or `None` when
-	/// the hold admits it.
-	fn arrival_refusal(value: &[u8], arrived: &[u8]) -> Option<ErrorKind> {
-		let value = OctetString::new(value).expect("a test OCTET STRING fits a DER length");
-		DerAdmission::arrived_as(&value, arrived).err().map(|error| error.kind())
-	}
-
 	/// The refusal of an arrival in another encoding than its value's.
 	const NONCANONICAL: Option<ErrorKind> = Some(ErrorKind::Noncanonical { tag: Tag::OctetString });
 
-	#[test]
-	fn an_arrival_equal_to_the_canonical_encoding_is_admitted() {
-		assert_eq!(arrival_refusal(b"abc", b"abc"), None);
-	}
-
-	#[test]
-	fn an_arrival_that_differs_in_its_last_octet_is_refused() {
-		assert_eq!(arrival_refusal(b"abc", b"abx"), NONCANONICAL);
-	}
-
-	#[test]
-	fn an_arrival_that_runs_past_the_canonical_encoding_is_refused() {
-		assert_eq!(arrival_refusal(b"abc", b"abc\x00"), NONCANONICAL);
-	}
-
-	#[test]
-	fn an_arrival_that_ends_short_of_the_canonical_encoding_is_refused() {
-		assert_eq!(arrival_refusal(b"abc", b"ab"), NONCANONICAL);
+	// The hold of a value to its arrival admits the canonical encoding of the
+	// value alone.
+	crate::tb_cases! {
+		fn an_arrival_is_held_to_the_canonical_encoding((arrived, expected): (&[u8], Option<ErrorKind>)) -> TestResult {
+			let value = OctetString::new(b"abc")?;
+			assert_eq!(der_refusal(DerAdmission::arrived_as(&value, arrived)), expected);
+			Ok(())
+		}
+		cases {
+			equal_to_it => (b"abc", None),
+			differing_in_its_last_octet => (b"abx", NONCANONICAL),
+			running_past_it => (b"abc\x00", NONCANONICAL),
+			ending_short_of_it => (b"ab", NONCANONICAL),
+		}
 	}
 }

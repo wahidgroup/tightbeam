@@ -21,3 +21,22 @@ pub use config::*;
 pub use explorer::*;
 #[cfg(feature = "testing-fdr")]
 pub use subsys::*;
+
+#[cfg(all(test, feature = "testing-fdr"))]
+use crate::testing::specs::csp::{Event, Process};
+
+#[cfg(all(test, feature = "testing-fdr"))]
+impl Process {
+	/// The verdict of an exploration of this process under `config`.
+	pub(crate) fn verdict_under(&self, config: FdrConfig) -> FdrVerdict {
+		let mut explorer = DefaultFdrExplorer::with_defaults(self, config);
+		explorer.explore().expect("a test exploration completes")
+	}
+
+	/// The hidden run that an exploration of this process under `config`
+	/// reports as its divergence witness.
+	pub(crate) fn divergence_run_under(&self, config: FdrConfig) -> Option<Vec<Event>> {
+		let witness = self.verdict_under(config).divergence_witness;
+		witness.map(|(_seed, run)| run)
+	}
+}

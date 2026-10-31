@@ -1357,32 +1357,35 @@ impl GatePolicy for PeerListGate {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::LazyLock;
+
 	use super::*;
 	use crate::builder::TypeBuilder;
 	use crate::clock::ManualClock;
-	use crate::cms::signed_data::SignerIdentifier;
 	use crate::colony::protocol::{ClusterStatus, HeartbeatParams};
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
-	use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Signature};
-	use crate::crypto::sign::{PrehashVerifier, SigningIdentity};
-	use crate::crypto::x509::error::CertificateValidationError;
-	use crate::crypto::x509::policy::CertificateValidation;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::{Certificate, ErasedSigning, PeerCertificate};
+	use crate::crypto::sign::ecdsa::Secp256k1Signature;
+	use crate::crypto::sign::PrehashSigner;
+	use crate::crypto::x509::store::CertificateTrustStore;
+	use crate::crypto::x509::Certificate;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::oid::db::rfc5912::ID_EC_DH;
 	use crate::der::oid::db::rfc8410::ID_ED_25519;
 	use crate::oids::CURVE_NIST_P256;
-	use crate::spki::SubjectPublicKeyInfoOwned;
 	use crate::tb_cases;
-	use crate::testing::fixtures::{TestCertificate, TestIdentity, TestKey, TestP256Points};
-	use crate::testing::TestFrame;
-	use crate::testing::TestMessage;
+	use crate::testing::fixtures::{
+		flip_last, TestCertificate, TestClock, TestIdentity, TestKey, TestP256Points, TestStore,
+	};
+	use crate::testing::{TestFrame, TestMessage, TestResult};
 	use crate::{MessagePriority, Version};
-	use std::sync::LazyLock;
 
 	const SIGNER: &[u8] = b"signer-under-test";
+
+	/// The first signer of the replay tests.
+	const S1: &[u8] = b"signer-1";
+
+	/// The second signer of the replay tests.
+	const S2: &[u8] = b"signer-2";
 
 	/// The key identity of [`listed_peer`], the signer under test.
 	static SIGNER_KEY: LazyLock<CanonicalKey> = LazyLock::new(|| key_of(&listed_peer()));
@@ -1396,36 +1399,24 @@ mod tests {
 	/// The freshness window every gate fixture judges against.
 	const FRESHNESS_WINDOW: Duration = Duration::from_millis(60_000);
 
-	/// Builds a clock that moves only when the test advances it.
-	fn manual_clock() -> Arc<ManualClock> {
-		Arc::new(ManualClock::default())
-	}
-
-	/// Returns `clock` as the erased handle a breaker or gate builds on.
-	fn erased(clock: &Arc<ManualClock>) -> Arc<dyn Clock> {
-		Arc::clone(clock) as Arc<dyn Clock>
-	}
-
 	/// Builds a breaker that opens after `failure_threshold` failures and
 	/// waits out [`COOLDOWN`] on `clock`.
 	fn breaker_on(clock: &Arc<ManualClock>, failure_threshold: u8) -> ClusterCircuitBreaker {
-		ClusterCircuitBreaker::new(failure_threshold, COOLDOWN, erased(clock))
+		ClusterCircuitBreaker::new(failure_threshold, COOLDOWN, TestClock::erased(clock))
 	}
 
 	/// Builds a breaker that opens after three failures, on a clock that
 	/// stays still.
 	fn breaker() -> ClusterCircuitBreaker {
-		breaker_on(&manual_clock(), 3)
+		breaker_on(&TestClock::manual(), 3)
 	}
 
-	/// Builds a [`breaker`] with the circuit of [`signer`] already open.
-	fn tripped_breaker() -> ClusterCircuitBreaker {
-		let breaker = breaker();
-		breaker.record_auth_failure(signer());
-		breaker.record_auth_failure(signer());
-		breaker.record_auth_failure(signer());
-
-		breaker
+	/// Records three authentication failures of `peer` on `breaker`, which
+	/// open the circuit of `peer` on a breaker of three.
+	fn trip(breaker: &ClusterCircuitBreaker, peer: ProvenPeer<'_>) {
+		breaker.record_auth_failure(peer);
+		breaker.record_auth_failure(peer);
+		breaker.record_auth_failure(peer);
 	}
 
 	/// Returns gate limits that open after three failures and wait out
@@ -1459,15 +1450,10 @@ mod tests {
 		session.proven_peer().expect("the session proved a peer")
 	}
 
-	/// Returns the key the handshake proved for `session`.
-	fn peer_key(session: &SessionContext) -> CanonicalKey {
-		proven(session).as_key().clone()
-	}
-
 	/// Builds the certificate of the fixed test key, whose point is
 	/// uncompressed.
 	fn listed_peer() -> Certificate {
-		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		TestCertificate::insecure_fixed()
 	}
 
 	/// Builds [`listed_peer`] with the P-256 key of RFC 6979 §A.2.5 in the
@@ -1479,7 +1465,12 @@ mod tests {
 	/// Builds the certificate of the negation of the fixed test key, another
 	/// key.
 	fn unlisted_peer() -> Certificate {
-		TestCertificate::self_signed(&TestKey::negation_of(&TestKey::insecure_fixed_signing()))
+		TestCertificate::insecure_fixed_negation()
+	}
+
+	/// A session whose handshake proved the holder of `certificate`.
+	fn session_of(certificate: Certificate) -> SessionContext {
+		SessionContext::for_peer(Arc::new(certificate))
 	}
 
 	/// `sect233k1`, a SEC 2 curve over a binary field.
@@ -1498,12 +1489,6 @@ mod tests {
 		certificate
 	}
 
-	/// Returns the refusal of a deny list whose second entry is the key of
-	/// `entry`.
-	fn refusal_of(entry: &Certificate) -> Option<KeyListError> {
-		PeerListGate::deny([listed(&listed_peer()), listed(entry)]).err()
-	}
-
 	/// Returns the SubjectPublicKeyInfo DER of `certificate`, as an operator
 	/// lists it.
 	fn listed(certificate: &Certificate) -> Vec<u8> {
@@ -1520,8 +1505,7 @@ mod tests {
 	/// Builds a session whose peer holds the key of [`listed_peer`] in the
 	/// compressed form.
 	fn compressed_session() -> SessionContext {
-		let compressed = TestCertificate::with_compressed_key(listed_peer());
-		SessionContext::for_peer(Arc::new(compressed))
+		session_of(TestCertificate::with_compressed_key(listed_peer()))
 	}
 
 	/// Returns the signer identifier `frame`'s signature names.
@@ -1529,40 +1513,37 @@ mod tests {
 		frame.signer_id().expect("the signed frame carries a signer id")
 	}
 
-	/// A verifier that accepts every signature, so a test reaches a
-	/// [`VerifiedSignature`] of any canonical value through the one producer.
-	struct AcceptAll;
+	/// The verified signatures of the fixed test key over the prehashes `1`
+	/// to one past the replay capacity, each distinct from the rest.
+	static SIGNATURES: LazyLock<Vec<VerifiedSignature>> = LazyLock::new(|| {
+		let key = TestKey::insecure_fixed_signing();
+		let sign = |index: u64| {
+			let mut prehash = [0u8; 32];
+			prehash[24..].copy_from_slice(&index.to_be_bytes());
 
-	impl PrehashVerifier<Secp256k1Signature> for AcceptAll {
-		fn verify_prehash(&self, _prehash: &[u8], _signature: &Secp256k1Signature) -> Result<(), signature::Error> {
-			Ok(())
-		}
-	}
+			let signed: Secp256k1Signature = key.sign_prehash(&prehash).expect("the fixed key signs a prehash");
+			let verified = VerifiedSignature::verify::<Secp256k1Signature, _>(key.verifying_key(), prehash, signed);
+			verified.expect("a signature of the fixed key verifies under its key")
+		};
 
-	/// Returns a low-s signature value distinct for each `index`, as
-	/// [`AcceptAll`] verifies it.
+		(1..=REPLAY_GUARD_CAPACITY as u64 + 2).map(sign).collect()
+	});
+
+	/// Returns the verified signature `index` of [`SIGNATURES`].
 	fn accepted(index: usize) -> VerifiedSignature {
-		let mut r = [0u8; 32];
-		r[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-		let mut s = [0u8; 32];
-		s[31] = 1;
-
-		let scalars = Signature::<Secp256k1>::from_scalars(r, s).expect("small scalars are in range");
-		let encoded = scalars.to_der();
-		let verifying = VerifiedSignature::verify::<Secp256k1Signature, _>(&AcceptAll, [0u8; 32], encoded.as_bytes());
-		verifying.expect("the test verifier accepts every canonical value")
+		SIGNATURES[index].clone()
 	}
 
-	/// Fills `signer`'s replay partition to capacity with frames issued one
-	/// millisecond apart after `now`, so no filler states the order `now`.
-	fn fill_replay_partition(gate: &ClusterSecurityGate, signer: impl AsRef<[u8]>, now: UnixMillis) {
+	/// Fills `signer`'s replay partition of `guard` to capacity with frames
+	/// issued one millisecond apart after `now`, so no filler states the order
+	/// `now`.
+	fn fill_replay_partition(guard: &ReplayGuard, signer: impl AsRef<[u8]>, now: UnixMillis) {
 		let signer = signer.as_ref();
-		let guard = gate.replay_guard.as_ref();
 		let issued = |index: usize| now.saturating_add(Duration::from_millis(index as u64 + 1));
 		let spend = |index: usize| guard.check_and_insert(signer, &accepted(index), issued(index), now);
 
 		let filled = (0..REPLAY_GUARD_CAPACITY).all(spend);
-		assert!(filled, "the partition takes every filler up to capacity");
+		assert!(filled);
 	}
 
 	/// Spends the slot of `signature` under `signer` for a frame issued at
@@ -1572,24 +1553,26 @@ mod tests {
 		guard.check_and_insert(signer, signature, at, at)
 	}
 
+	/// A breaker of three opens on its third failure.
 	#[test]
 	fn breaker_trips_after_threshold() {
 		let breaker = breaker();
 		breaker.record_auth_failure(signer());
 		breaker.record_auth_failure(signer());
-		assert_eq!(breaker.state(signer()), CircuitState::Closed);
+
+		let below = breaker.state(signer());
 
 		breaker.record_auth_failure(signer());
 
-		assert_eq!(breaker.state(signer()), CircuitState::Open);
-		assert!(!breaker.admit_verified(signer()));
+		let verdict = (below, breaker.state(signer()), breaker.admit_verified(signer()));
+		assert_eq!(verdict, (CircuitState::Closed, CircuitState::Open, false));
 	}
 
 	// The cooldown runs on the breaker's clock, so an open circuit admits a
 	// request again once that clock reaches the cooldown and not before.
 	tb_cases! {
 		fn breaker_cooldown_runs_on_its_clock((advance, admitted): (Duration, bool)) {
-			let clock = manual_clock();
+			let clock = TestClock::manual();
 			let breaker = breaker_on(&clock, 1);
 			breaker.record_auth_failure(signer());
 			clock.advance(advance);
@@ -1605,26 +1588,23 @@ mod tests {
 	/// cooldown starts over.
 	#[test]
 	fn a_failure_after_the_cooldown_restarts_it() {
-		let clock = manual_clock();
+		let clock = TestClock::manual();
 		let breaker = breaker_on(&clock, 1);
 		breaker.record_auth_failure(signer());
 		clock.advance(COOLDOWN);
-
 		breaker.record_auth_failure(signer());
-
 		assert!(!breaker.would_allow(signer()));
 	}
 
+	/// A reset closes an open circuit, so its peer is admitted again.
 	#[test]
 	fn breaker_reset_clears_state() {
-		let breaker = breaker_on(&manual_clock(), 1);
+		let breaker = breaker_on(&TestClock::manual(), 1);
 		breaker.record_auth_failure(signer());
-		assert!(breaker.is_open(signer()));
-
 		breaker.reset(signer());
 
-		assert_eq!(breaker.state(signer()), CircuitState::Closed);
-		assert!(breaker.admit_verified(signer()));
+		let verdict = (breaker.state(signer()), breaker.admit_verified(signer()));
+		assert_eq!(verdict, (CircuitState::Closed, true));
 	}
 
 	/// A step that puts the circuit of [`signer`] in the state a case names.
@@ -1652,14 +1632,13 @@ mod tests {
 	tb_cases! {
 		fn admit_verified_admits_a_closed_and_a_cooled_circuit_and_refuses_an_open_one(
 			(prepare, verdict): (Prepare, Verdict)
-		) -> Result<(), Box<dyn std::error::Error>> {
-			let clock = manual_clock();
+		) {
+			let clock = TestClock::manual();
 			let breaker = breaker_on(&clock, 1);
 			prepare(&breaker, &clock);
 
 			let admitted = breaker.admit_verified(signer());
 			assert_eq!((admitted, breaker.state(signer())), verdict);
-			Ok(())
 		}
 		cases {
 			a_closed_circuit => (leave_closed, (true, CircuitState::Closed)),
@@ -1668,107 +1647,100 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn replay_guard_accepts_first_rejects_second() {
-		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 1_000));
-		assert!(!spend_at(&guard, b"signer-1", &accepted(1), 2_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(2), 2_000));
+	/// One spend of a replay slot: the signer, the index of the signature in
+	/// [`SIGNATURES`], the order the frame states, and the clock reading.
+	type Spend = (&'static [u8], usize, u64, u64);
+
+	/// Spends `spend` on `guard`.
+	fn spend(guard: &ReplayGuard, (signer, signature, order, now): Spend) -> bool {
+		guard.check_and_insert(signer, &accepted(signature), UnixMillis::new(order), UnixMillis::new(now))
 	}
 
-	#[test]
-	fn replay_guard_prunes_expired_entries() {
-		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 1_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 3_000));
+	// The guard records the first spend, and judges a second spend by its
+	// signature, its signer, its order, and the window. A signature the guard
+	// recorded is a replay under any signer, and a second signature of one
+	// signer at a recorded order is a duplicate (README §5.7.1). A record
+	// leaves the guard once its order leaves the window, whichever way the
+	// clock moved, and a record whose order leads the clock stays while that
+	// order is fresh.
+	tb_cases! {
+		fn replay_guard_judges_a_second_spend((window_ms, first, second, admitted): (u64, Spend, Spend, bool)) {
+			let guard = ReplayGuard::new(Duration::from_millis(window_ms));
+			let first = spend(&guard, first);
+
+			let second = spend(&guard, second);
+			assert_eq!((first, second), (true, admitted));
+		}
+		cases {
+			the_same_signature_later => (30_000, (S1, 1, 1_000, 1_000), (S1, 1, 2_000, 2_000), false),
+			a_new_signature_later => (30_000, (S1, 1, 1_000, 1_000), (S1, 2, 2_000, 2_000), true),
+			the_same_signature_past_the_window => (1_000, (S1, 1, 1_000, 1_000), (S1, 1, 3_000, 3_000), true),
+			the_same_signature_after_a_clock_regression => (
+				1_000,
+				(S1, 1, 10_000, 10_000),
+				(S1, 1, 5_000, 5_000),
+				true,
+			),
+			a_future_dated_order_while_it_is_fresh => (1_000, (S1, 1, 1_900, 1_000), (S1, 1, 1_900, 2_100), false),
+			the_same_signature_under_another_signer => (30_000, (S1, 1, 1_000, 1_000), (S2, 1, 1_000, 1_000), false),
+			a_new_signature_at_the_same_order => (30_000, (S1, 1, 1_000, 1_000), (S1, 2, 1_000, 1_000), false),
+			another_signer_at_the_same_order => (30_000, (S1, 1, 1_000, 1_000), (S2, 2, 1_000, 1_000), true),
+			/// An alternate `SignerIdentifier` encoding grants no extra replay.
+			the_same_signature_under_another_encoding_of_the_signer => (
+				60_000,
+				(SIGNER, 1, 1_000, 1_000),
+				(b"other-signer", 1, 1_000, 1_000),
+				false,
+			),
+			/// The window bounds retention, so the partition holds its size.
+			an_expired_record => (1_000, (SIGNER, 1, 1_000, 1_000), (SIGNER, 1, 5_000, 5_000), true),
+		}
 	}
 
-	#[test]
-	fn replay_guard_prunes_future_dated_entries_after_clock_regression() {
-		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 10_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 5_000));
-	}
-
-	/// A record keeps the order its frame states, so a frame whose order
-	/// leads the clock stays a replay until that order leaves the window.
-	#[test]
-	fn replay_guard_keeps_a_record_while_its_order_is_fresh() {
-		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		let order = UnixMillis::new(1_900);
-
-		let first = guard.check_and_insert(b"signer-1", &accepted(1), order, UnixMillis::new(1_000));
-		let replayed = guard.check_and_insert(b"signer-1", &accepted(1), order, UnixMillis::new(2_100));
-		assert!(first);
-		assert!(!replayed);
-	}
-
+	/// A signer whose partition is full refuses its next frame, and leaves
+	/// every other signer its own partition.
 	#[test]
 	fn replay_guard_saturated_signer_does_not_block_others() {
-		// Each seed states an order of its own, one millisecond apart, so the
-		// partition fills to capacity with no duplicate order.
 		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		let at = |index: usize| 1_000 + index as u64;
-		let seeded = (0..REPLAY_GUARD_CAPACITY).all(|i| spend_at(&guard, b"signer-1", &accepted(i + 10), at(i)));
-		assert!(seeded);
-		let full = at(REPLAY_GUARD_CAPACITY);
-		assert!(!spend_at(&guard, b"signer-1", &accepted(REPLAY_GUARD_CAPACITY + 10), full));
-		assert!(spend_at(&guard, b"signer-2", &accepted(1), full));
+		let now = UnixMillis::new(1_000);
+		fill_replay_partition(&guard, b"signer-1", now);
+
+		let full = guard.check_and_insert(b"signer-1", &accepted(REPLAY_GUARD_CAPACITY), now, now);
+		let other = guard.check_and_insert(b"signer-2", &accepted(REPLAY_GUARD_CAPACITY + 1), now, now);
+		assert_eq!((full, other), (false, true));
 	}
 
-	#[test]
-	fn replay_guard_rejects_replay_across_signer_partitions() {
-		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 1_000));
-		assert!(!spend_at(&guard, b"signer-2", &accepted(1), 1_000));
+	// A released record frees its slot and its order, so the signer's retry
+	// passes, under the same signature later or under a new signature at the
+	// same order.
+	tb_cases! {
+		fn replay_guard_forget_frees_the_slot(retry: Spend) {
+			let guard = ReplayGuard::new(Duration::from_millis(30_000));
+			let first = spend_at(&guard, S1, &accepted(1), 1_000);
+			guard.forget(&accepted(1));
+
+			let retried = spend(&guard, retry);
+			assert_eq!((first, retried), (true, true));
+		}
+		cases {
+			the_same_signature_later => (S1, 1, 2_000, 2_000),
+			a_new_signature_at_the_same_order => (S1, 2, 1_000, 1_000),
+		}
 	}
 
-	#[test]
-	fn replay_guard_forget_permits_retry() {
-		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 1_000));
-		guard.forget(&accepted(1));
-		assert!(spend_at(&guard, b"signer-1", &accepted(1), 2_000));
-	}
-
-	/// A second frame of one signer at the order of a live record is a
-	/// duplicate (README §5.7.1), whatever its signature.
-	#[test]
-	fn replay_guard_refuses_a_second_signature_at_one_order() {
-		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		let first = spend_at(&guard, b"signer-1", &accepted(1), 1_000);
-		let duplicate = spend_at(&guard, b"signer-1", &accepted(2), 1_000);
-		assert_eq!((first, duplicate), (true, false));
-	}
-
-	/// The orders of each signer are a namespace of their own, so two
-	/// signers each spend one order once.
-	#[test]
-	fn replay_guard_admits_one_order_once_per_signer() {
-		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		let first = spend_at(&guard, b"signer-1", &accepted(1), 1_000);
-		let other = spend_at(&guard, b"signer-2", &accepted(2), 1_000);
-		assert_eq!((first, other), (true, true));
-	}
-
-	/// A released record frees its order, so the signer's retry under a new
-	/// signature passes.
-	#[test]
-	fn replay_guard_forget_frees_the_order() {
-		let guard = ReplayGuard::new(Duration::from_millis(30_000));
-		let first = spend_at(&guard, b"signer-1", &accepted(1), 1_000);
-		guard.forget(&accepted(1));
-		let retried = spend_at(&guard, b"signer-1", &accepted(2), 1_000);
-		assert_eq!((first, retried), (true, true));
-	}
-
-	#[test]
-	fn replay_guard_freshness_window_is_bidirectional() {
-		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(guard.is_fresh(UnixMillis::new(9_500), UnixMillis::new(10_000)));
-		assert!(guard.is_fresh(UnixMillis::new(10_500), UnixMillis::new(10_000)));
-		assert!(!guard.is_fresh(UnixMillis::new(8_999), UnixMillis::new(10_000)));
-		assert!(!guard.is_fresh(UnixMillis::new(11_001), UnixMillis::new(10_000)));
+	// The window of one second reaches half a second each way from the clock
+	// at 10 s, and an order past it either way is stale.
+	tb_cases! {
+		fn replay_guard_freshness_window_is_bidirectional((order, fresh): (u64, bool)) {
+			let guard = ReplayGuard::new(Duration::from_millis(1_000));
+			assert_eq!(guard.is_fresh(UnixMillis::new(order), UnixMillis::new(10_000)), fresh);
+		}
+		cases {
+			half_a_window_behind => (9_500, true),
+			half_a_window_ahead => (10_500, true),
+			past_the_window_behind => (8_999, false),
+			past_the_window_ahead => (11_001, false),
+		}
 	}
 
 	/// A verdict of the guard spends no slot, so the admission after it
@@ -1793,145 +1765,160 @@ mod tests {
 		assert!(!spent);
 	}
 
-	fn work_frame(priority: Option<MessagePriority>) -> Result<Frame, TightBeamError> {
+	/// A V2 work frame that states `priority`, or no priority for `None`.
+	fn work_frame(priority: Option<MessagePriority>) -> Frame {
 		// Priority is a metadata field of V2 or later, so the frame is V2.
-		let mut builder = Version::V2
-			.compose()
-			.with_id(b"work")
-			.with_order(0)
-			.with_message(TestMessage { content: "payload".into() });
-		if let Some(priority) = priority {
-			builder = builder.with_priority(priority);
+		let builder = Version::V2.compose().with_id(b"work").with_order(0);
+		let builder = builder.with_message(TestMessage { content: "payload".into() });
+		let builder = match priority {
+			Some(priority) => builder.with_priority(priority),
+			None => builder,
+		};
+
+		builder.build().expect("a work frame builds")
+	}
+
+	// The backpressure gate judges by the utilization of the hive alone, so a
+	// network-control frame meets a hive past its threshold, and any frame
+	// passes below it.
+	tb_cases! {
+		fn a_backpressure_gate_judges_utilization_alone(
+			(utilization, priority, status): (u16, Option<MessagePriority>, TransitStatus)
+		) {
+			let utilization = Arc::new(AtomicU16::new(utilization));
+			let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
+
+			let verdict = GatePolicy::evaluate(&gate, Some(&work_frame(priority)), &SessionContext::default());
+			assert_eq!(verdict, status);
 		}
-
-		builder.build()
+		cases {
+			ignores_priority => (9_500, Some(MessagePriority::NetworkControl), TransitStatus::ResourceExhausted),
+			accepts_below_threshold => (1_000, None, TransitStatus::Ok),
+		}
 	}
 
-	#[test]
-	fn backpressure_gate_ignores_priority() -> Result<(), TightBeamError> {
-		let utilization = Arc::new(AtomicU16::new(9_500));
-		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
-		let frame = work_frame(Some(MessagePriority::NetworkControl))?;
-		assert_eq!(
-			GatePolicy::evaluate(&gate, Some(&frame), &SessionContext::default()),
-			TransitStatus::ResourceExhausted
-		);
+	/// A constructor of a peer list of one SubjectPublicKeyInfo entry, read
+	/// under [`KeyCurves::HOUSE`].
+	type ListOf = fn([Vec<u8>; 1]) -> Result<PeerListGate, KeyListError>;
 
-		Ok(())
+	// An allow list admits the key it names alone and fails closed without a
+	// proven key. A deny list refuses the key it names alone and admits a
+	// session with no proven key.
+	tb_cases! {
+		fn a_peer_list_admits_by_key(
+			(list_of, peer, status): (ListOf, Option<CanonicalKey>, TransitStatus)
+		) -> TestResult {
+			let gate = list_of([listed(&listed_peer())])?;
+			assert_eq!(gate.admit(peer.as_ref()), status);
+			Ok(())
+		}
+		cases {
+			allow_listed => (PeerListGate::allow, Some(key_of(&listed_peer())), TransitStatus::Ok),
+			allow_unlisted => (PeerListGate::allow, Some(key_of(&unlisted_peer())), TransitStatus::PermissionDenied),
+			allow_absent => (PeerListGate::allow, None, TransitStatus::Unauthenticated),
+			deny_listed => (PeerListGate::deny, Some(key_of(&listed_peer())), TransitStatus::PermissionDenied),
+			deny_unlisted => (PeerListGate::deny, Some(key_of(&unlisted_peer())), TransitStatus::Ok),
+			deny_absent => (PeerListGate::deny, None, TransitStatus::Ok),
+		}
 	}
 
-	#[test]
-	fn backpressure_gate_accepts_below_threshold() -> Result<(), TightBeamError> {
-		let utilization = Arc::new(AtomicU16::new(1_000));
-		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
-		let frame = work_frame(None)?;
-		assert_eq!(
-			GatePolicy::evaluate(&gate, Some(&frame), &SessionContext::default()),
-			TransitStatus::Ok
-		);
+	/// A peer list of one entry under a decoder set, the session it judges,
+	/// and its verdict.
+	type ListedSession = (PeerListMode, KeyCurves, Certificate, SessionContext, TransitStatus);
 
-		Ok(())
+	// A session with no proven peer answers as an absent peer. One point in
+	// either SEC 1 form is one key, so a list of the uncompressed key judges
+	// a session of its compressed form as that key, on secp256k1 and on
+	// P-256 (RFC 6979 §A.2.5) alike. A key of another algorithm names no
+	// point of a curve, so a deny list holds it and refuses its session.
+	tb_cases! {
+		fn a_peer_list_evaluates_a_session((mode, curves, entry, session, status): ListedSession) -> TestResult {
+			let gate = PeerListGate::new(mode, curves, [listed(&entry)])?;
+
+			let verdict = GatePolicy::evaluate(&gate, None, &session);
+			assert_eq!(verdict, status);
+			Ok(())
+		}
+		cases {
+			an_empty_session_under_an_allow_list => (
+				PeerListMode::Allow,
+				KeyCurves::HOUSE,
+				listed_peer(),
+				SessionContext::default(),
+				TransitStatus::Unauthenticated,
+			),
+			an_empty_session_under_a_deny_list => (
+				PeerListMode::Deny,
+				KeyCurves::HOUSE,
+				listed_peer(),
+				SessionContext::default(),
+				TransitStatus::Ok,
+			),
+			a_compressed_key_under_a_deny_list => (
+				PeerListMode::Deny,
+				KeyCurves::HOUSE,
+				listed_peer(),
+				compressed_session(),
+				TransitStatus::PermissionDenied,
+			),
+			/// The store admits a certificate re-issued in the compressed form
+			/// too.
+			a_compressed_key_under_an_allow_list => (
+				PeerListMode::Allow,
+				KeyCurves::HOUSE,
+				listed_peer(),
+				compressed_session(),
+				TransitStatus::Ok,
+			),
+			a_compressed_p256_key_under_a_deny_list => (
+				PeerListMode::Deny,
+				P256,
+				with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED),
+				session_of(with_p256_point(&TestKey::RFC6979_P256_COMPRESSED)),
+				TransitStatus::PermissionDenied,
+			),
+			a_key_of_another_algorithm_under_a_deny_list => (
+				PeerListMode::Deny,
+				KeyCurves::HOUSE,
+				under_algorithm(ID_ED_25519),
+				session_of(under_algorithm(ID_ED_25519)),
+				TransitStatus::PermissionDenied,
+			),
+		}
 	}
 
-	#[test]
-	fn peer_allow_list_admits_listed_key_only() -> Result<(), KeyListError> {
-		let gate = PeerListGate::allow([listed(&listed_peer())])?;
-		assert_eq!(gate.admit(Some(&key_of(&listed_peer()))), TransitStatus::Ok);
-		assert_eq!(gate.admit(Some(&key_of(&unlisted_peer()))), TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	#[test]
-	fn peer_allow_list_fails_closed_without_identity() -> Result<(), KeyListError> {
-		let gate = PeerListGate::allow([listed(&listed_peer())])?;
-		assert_eq!(gate.admit(None), TransitStatus::Unauthenticated);
-		Ok(())
-	}
-
-	#[test]
-	fn peer_deny_list_refuses_listed_key_only() -> Result<(), KeyListError> {
-		let gate = PeerListGate::deny([listed(&listed_peer())])?;
-		assert_eq!(gate.admit(Some(&key_of(&listed_peer()))), TransitStatus::PermissionDenied);
-		assert_eq!(gate.admit(Some(&key_of(&unlisted_peer()))), TransitStatus::Ok);
-		Ok(())
-	}
-
-	#[test]
-	fn peer_deny_list_admits_absent_identity() -> Result<(), KeyListError> {
-		let gate = PeerListGate::deny([listed(&listed_peer())])?;
-		assert_eq!(gate.admit(None), TransitStatus::Ok);
-		Ok(())
-	}
-
-	#[test]
-	fn peer_list_empty_context_answers_as_absent_peer() -> Result<(), Box<dyn std::error::Error>> {
-		let frame = work_frame(None)?;
-		let empty = SessionContext::default();
-		let allow = PeerListGate::allow([listed(&listed_peer())])?;
-		let deny = PeerListGate::deny([listed(&listed_peer())])?;
-		assert_eq!(
-			GatePolicy::evaluate(&allow, Some(&frame), &empty),
-			TransitStatus::Unauthenticated
-		);
-		assert_eq!(GatePolicy::evaluate(&deny, Some(&frame), &empty), TransitStatus::Ok);
-
-		Ok(())
-	}
-
-	/// One secp256k1 point in either SEC 1 form is one key, so a deny list of
-	/// the uncompressed key refuses a session of its compressed form.
-	#[test]
-	fn a_deny_list_refuses_its_key_in_the_compressed_form() -> Result<(), KeyListError> {
-		let gate = PeerListGate::deny([listed(&listed_peer())])?;
-		let refused = GatePolicy::evaluate(&gate, None, &compressed_session());
-		assert_eq!(refused, TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	/// An allow list of the uncompressed key admits a session of its
-	/// compressed form, as the store admits a certificate re-issued in it.
-	#[test]
-	fn an_allow_list_admits_its_key_in_the_compressed_form() -> Result<(), KeyListError> {
-		let gate = PeerListGate::allow([listed(&listed_peer())])?;
-		let admitted = GatePolicy::evaluate(&gate, None, &compressed_session());
-		assert_eq!(admitted, TransitStatus::Ok);
-		Ok(())
-	}
-
-	/// A deny list of the P-256 key of RFC 6979 §A.2.5 in the uncompressed
-	/// form, read under a decoder of P-256, refuses a session of its
-	/// compressed form.
-	#[test]
-	fn a_deny_list_refuses_a_p256_key_in_the_compressed_form() -> Result<(), KeyListError> {
-		let uncompressed = with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED);
-		let compressed = with_p256_point(&TestKey::RFC6979_P256_COMPRESSED);
-		let gate = PeerListGate::new(PeerListMode::Deny, P256, [listed(&uncompressed)])?;
-
-		let session = SessionContext::for_peer(Arc::new(compressed));
-		let refused = GatePolicy::evaluate(&gate, None, &session);
-		assert_eq!(refused, TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	/// A list under the house set holds no decoder of P-256, so an entry of
-	/// the P-256 key of RFC 6979 §A.2.5 refuses the list.
-	#[test]
-	fn a_list_entry_on_a_curve_without_a_decoder_refuses_the_list() {
-		let p256 = with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED);
-		assert_eq!(refusal_of(&p256), Some(KeyListError::NoDecoder { index: 1 }));
-	}
-
-	/// A key of another algorithm names no point of a curve, so a deny list
-	/// holds it and refuses its session.
-	#[test]
-	fn a_deny_list_of_a_key_of_another_algorithm_refuses_its_session() -> Result<(), KeyListError> {
-		let ed25519 = under_algorithm(ID_ED_25519);
-		let gate = PeerListGate::deny([listed(&ed25519)])?;
-		let session = SessionContext::for_peer(Arc::new(ed25519));
-
-		let refused = GatePolicy::evaluate(&gate, None, &session);
-		assert_eq!(refused, TransitStatus::PermissionDenied);
-		Ok(())
+	// An entry the house decoders cannot read as a point refuses the deny
+	// list that holds it, at its index, so a deny list never lets the peer
+	// it meant to name pass. The house set holds no decoder of P-256. An
+	// off-curve encoding names a key no session holds. RFC 5480 §2.2 refuses
+	// the compact and the hybrid form, a key on a binary-field curve reads
+	// as its bits, and no key use reads a key under `id-ecDH`
+	// (RFC 5480 §2.1.2).
+	tb_cases! {
+		fn a_list_entry_refuses_the_list((entry, refusal): (Certificate, KeyListError)) {
+			let refused = PeerListGate::deny([listed(&listed_peer()), listed(&entry)]);
+			assert_eq!(refused.err(), Some(refusal));
+		}
+		cases {
+			on_a_curve_without_a_decoder => (
+				with_p256_point(&TestKey::RFC6979_P256_UNCOMPRESSED),
+				KeyListError::NoDecoder { index: 1 },
+			),
+			off_its_curve => (TestCertificate::with_off_curve_key(listed_peer()), KeyListError::NoPoint { index: 1 }),
+			in_the_compact_form => (
+				TestCertificate::with_compact_key(listed_peer()),
+				KeyListError::NoPoint { index: 1 },
+			),
+			in_the_hybrid_form => (
+				TestCertificate::with_key_form(listed_peer(), 0x06),
+				KeyListError::NoPoint { index: 1 },
+			),
+			on_a_binary_field_curve => (
+				TestCertificate::with_named_curve(listed_peer(), SECT233K1),
+				KeyListError::NoPoint { index: 1 },
+			),
+			under_ec_dh => (under_algorithm(ID_EC_DH), KeyListError::NoPoint { index: 1 }),
+		}
 	}
 
 	/// An entry that is no SubjectPublicKeyInfo refuses the list, so a deny
@@ -1942,209 +1929,55 @@ mod tests {
 		assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 0 }));
 	}
 
-	/// An entry that names an off-curve encoding of a secp256k1 key refuses
-	/// the list, because no session holds that key.
-	#[test]
-	fn a_list_entry_off_its_curve_refuses_the_list() {
-		let alias = TestCertificate::with_off_curve_key(listed_peer());
-		assert_eq!(refusal_of(&alias), Some(KeyListError::NoPoint { index: 1 }));
-	}
-
-	/// RFC 5480 §2.2 refuses the compact form, so an entry in it names no
-	/// point and refuses the list.
-	#[test]
-	fn a_list_entry_in_the_compact_form_refuses_the_list() {
-		let compact = TestCertificate::with_compact_key(listed_peer());
-		assert_eq!(refusal_of(&compact), Some(KeyListError::NoPoint { index: 1 }));
-	}
-
-	/// RFC 5480 §2.2 refuses the hybrid form, so an entry in it names no
-	/// point and refuses the list.
-	#[test]
-	fn a_list_entry_in_the_hybrid_form_refuses_the_list() {
-		let hybrid = TestCertificate::with_key_form(listed_peer(), 0x06);
-		assert_eq!(refusal_of(&hybrid), Some(KeyListError::NoPoint { index: 1 }));
-	}
-
-	/// A key on a binary-field curve reads as its bits, so an entry of one
-	/// names no point and refuses the list.
-	#[test]
-	fn a_list_entry_on_a_binary_field_curve_refuses_the_list() {
-		let binary = TestCertificate::with_named_curve(listed_peer(), SECT233K1);
-		assert_eq!(refusal_of(&binary), Some(KeyListError::NoPoint { index: 1 }));
-	}
-
-	/// No key use reads a key under `id-ecDH` (RFC 5480 §2.1.2), so an entry
-	/// of one names no point and refuses the list.
-	#[test]
-	fn a_list_entry_under_ec_dh_refuses_the_list() {
-		let restricted = under_algorithm(ID_EC_DH);
-		assert_eq!(refusal_of(&restricted), Some(KeyListError::NoPoint { index: 1 }));
-	}
-
 	/// The breaker keys on the identity of the peer's key, so the failures of
 	/// a session of one form open the circuit of a session of the other.
 	#[test]
 	fn the_breaker_counts_one_point_in_either_form_as_one_peer() {
-		let uncompressed = SessionContext::for_peer(Arc::new(listed_peer()));
-		let compressed = compressed_session();
-
+		let uncompressed = session_of(listed_peer());
 		let breaker = breaker();
-		breaker.record_auth_failure(proven(&uncompressed));
-		breaker.record_auth_failure(proven(&uncompressed));
-		breaker.record_auth_failure(proven(&uncompressed));
-		assert!(breaker.is_open(proven(&compressed)));
+
+		trip(&breaker, proven(&uncompressed));
+
+		assert!(breaker.is_open(proven(&compressed_session())));
 	}
 
-	/// A trust store that resolves every signer and fails every signature,
-	/// which drives [`TrustVerification::Invalid`] deterministically.
-	#[derive(Debug)]
-	struct AlwaysInvalid {
-		signer: PeerCertificate<ErasedSigning>,
-	}
-
-	impl CertificateValidation for AlwaysInvalid {
-		fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-			Ok(())
-		}
-	}
-
-	impl VerificationPolicy for AlwaysInvalid {
-		fn verify_signature(
-			&self,
-			_algorithm: &ObjectIdentifier,
-			_public_key_der: &[u8],
-			_message: &[u8],
-			_signature: &[u8],
-		) -> Result<VerifiedSignature, CertificateValidationError> {
-			Err(CertificateValidationError::SignatureVerificationFailed(signature::Error::new()))
-		}
-
-		fn digest(
-			&self,
-			signature: &ObjectIdentifier,
-			digest: &ObjectIdentifier,
-			content: &[u8],
-		) -> Result<Vec<u8>, CertificateValidationError> {
-			Secp256k1Policy::default().digest(signature, digest, content)
-		}
-	}
-
-	impl CertificateTrust for AlwaysInvalid {
-		fn is_trusted(&self, _cert: &Certificate) -> bool {
-			true
-		}
-
-		fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
-			Ok(Arc::clone(self.signer.certificate()))
-		}
-
-		fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
-			Ok(Arc::clone(self.signer.certificate()))
-		}
-
-		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
-			Some(&self.signer)
-		}
-
-		fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-			Some(self.signer.certificate())
-		}
-
-		fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-			self
-		}
-	}
-
-	/// A trust store that resolves every signer and accepts every signature,
-	/// which drives [`TrustVerification::Verified`] deterministically.
-	#[derive(Debug)]
-	struct AlwaysVerified {
-		signer: PeerCertificate<ErasedSigning>,
-	}
-
-	impl CertificateValidation for AlwaysVerified {
-		fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-			Ok(())
-		}
-	}
-
-	impl VerificationPolicy for AlwaysVerified {
-		fn verify_signature(
-			&self,
-			_algorithm: &ObjectIdentifier,
-			_public_key_der: &[u8],
-			_message: &[u8],
-			signature: &[u8],
-		) -> Result<VerifiedSignature, CertificateValidationError> {
-			Ok(VerifiedSignature::verify::<Secp256k1Signature, _>(
-				&AcceptAll, [0u8; 32], signature,
-			)?)
-		}
-
-		fn digest(
-			&self,
-			signature: &ObjectIdentifier,
-			digest: &ObjectIdentifier,
-			content: &[u8],
-		) -> Result<Vec<u8>, CertificateValidationError> {
-			Secp256k1Policy::default().digest(signature, digest, content)
-		}
-	}
-
-	impl CertificateTrust for AlwaysVerified {
-		fn is_trusted(&self, _cert: &Certificate) -> bool {
-			true
-		}
-
-		fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
-			Ok(Arc::clone(self.signer.certificate()))
-		}
-
-		fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
-			Ok(Arc::clone(self.signer.certificate()))
-		}
-
-		fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
-			Some(&self.signer)
-		}
-
-		fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-			Some(self.signer.certificate())
-		}
-
-		fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-			self
-		}
-	}
-
-	/// Builds a signed heartbeat issued at `clock`'s current instant.
-	async fn signed_heartbeat(clock: &ManualClock, identity: &SigningIdentity) -> Result<Frame, TightBeamError> {
-		signed_heartbeat_at(clock.unix(), identity).await
-	}
-
-	/// Builds a signed heartbeat whose frame states `order` as its issue time.
-	async fn signed_heartbeat_at(order: UnixMillis, identity: &SigningIdentity) -> Result<Frame, TightBeamError> {
-		signed_heartbeat_named(b"command", order, identity).await
-	}
-
-	/// Builds a signed heartbeat of message id `id`, whose frame states
-	/// `order` as its issue time. Two ids give two signatures at one order.
-	async fn signed_heartbeat_named(
-		id: &[u8],
-		order: UnixMillis,
-		identity: &SigningIdentity,
-	) -> Result<Frame, TightBeamError> {
+	/// A heartbeat of message id `id` that states `order` as its issue time,
+	/// signed by the fixed test identity. Two ids give two signatures at one
+	/// order.
+	fn heartbeat_named(id: &[u8], order: UnixMillis) -> Frame {
 		let probe = ClusterCommand::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
-		let mut signed = Version::V2
+		let built = Version::V2
 			.compose()
 			.with_id(id)
 			.with_order(order.get())
 			.with_message(probe)
 			.with_witness_hasher::<Sha3_256>()
-			.build()?;
-		signed.sign_with_provider(identity).await?;
-		Ok(signed)
+			.build();
+
+		TestFrame::signed_by(built.expect("a witnessed heartbeat builds"), &TestIdentity::insecure_fixed())
+	}
+
+	/// A heartbeat that states `order` as its issue time, signed by the fixed
+	/// test identity.
+	fn heartbeat_at(order: UnixMillis) -> Frame {
+		heartbeat_named(b"command", order)
+	}
+
+	/// A session whose handshake proved the fixed test identity, the signer of
+	/// each fixture command.
+	fn member() -> SessionContext {
+		session_of(TestCertificate::insecure_fixed())
+	}
+
+	/// The admission of `frame` from `sender`, which the gate takes.
+	fn admit_ok(gate: &ClusterSecurityGate, frame: Frame, sender: &SessionContext) -> AdmittedCommand {
+		gate.admit(frame, sender).expect("the gate admits a fresh signed command")
+	}
+
+	/// The status of the refusal of `frame` from `sender`, or `None` for an
+	/// admission.
+	fn refusal_status(gate: &ClusterSecurityGate, frame: Frame, sender: &SessionContext) -> Option<TransitStatus> {
+		gate.admit(frame, sender).err().map(|refusal| refusal.status())
 	}
 
 	/// A gate that verifies a frame and a session that proves its peer, the
@@ -2159,244 +1992,233 @@ mod tests {
 		clock: Arc<ManualClock>,
 	}
 
-	/// Builds a [`VerifiedGate`] under `limits`.
-	async fn verified_gate_with(limits: GateLimits) -> Result<VerifiedGate, TightBeamError> {
-		let clock = manual_clock();
-		let identity = TestIdentity::insecure_fixed();
-		let certificate = identity.certificate().clone();
-		let signed = signed_heartbeat(&clock, &identity).await?;
-		let signer = identity.signing_certificate().clone();
-		let trust_store = Arc::new(AlwaysVerified { signer });
-		let gate = ClusterSecurityGate::new(trust_store, limits, erased(&clock));
-		let sender = SessionContext::for_peer(Arc::new(certificate));
+	/// Builds a [`VerifiedGate`] under `limits`, whose house store enrolls
+	/// the certificate of the fixed test identity.
+	fn verified_gate_with(limits: GateLimits) -> VerifiedGate {
+		let clock = TestClock::manual();
+		let trust: Arc<dyn CertificateTrust> = Arc::new(TestStore::holding([TestCertificate::insecure_fixed()]));
+		let gate = ClusterSecurityGate::new(trust, limits, TestClock::erased(&clock));
 
-		Ok(VerifiedGate { gate, sender, signed, clock })
+		VerifiedGate { gate, sender: member(), signed: heartbeat_at(clock.unix()), clock }
 	}
 
 	/// Builds a [`VerifiedGate`] under [`limits`].
-	async fn verified_gate() -> Result<VerifiedGate, TightBeamError> {
-		verified_gate_with(limits()).await
+	fn verified_gate() -> VerifiedGate {
+		verified_gate_with(limits())
+	}
+
+	/// A gate whose house store enrolls the certificate of the fixed test
+	/// identity, beside that store and the clock the gate reads.
+	struct EnrolledGate {
+		gate: ClusterSecurityGate,
+		store: Arc<CertificateTrustStore>,
+		clock: Arc<ManualClock>,
+	}
+
+	/// Builds an [`EnrolledGate`] under [`limits`].
+	fn enrolled_gate() -> EnrolledGate {
+		let clock = TestClock::manual();
+		let store = Arc::new(TestStore::holding([TestCertificate::insecure_fixed()]));
+		let trust: Arc<dyn CertificateTrust> = Arc::clone(&store) as Arc<dyn CertificateTrust>;
+		let gate = ClusterSecurityGate::new(trust, limits(), TestClock::erased(&clock));
+
+		EnrolledGate { gate, store, clock }
 	}
 
 	/// A verdict judges a frame and leaves it unspent, so the control plane
 	/// that gated on the verdict can admit the same frame afterward.
-	#[tokio::test]
-	async fn a_gate_verdict_leaves_the_admission_unspent() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
-		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::Ok);
-		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::Ok);
-		assert!(gate.admit(signed, &sender).is_ok());
-		Ok(())
+	#[test]
+	fn a_gate_verdict_leaves_the_admission_unspent() {
+		let VerifiedGate { gate, sender, signed, .. } = verified_gate();
+
+		let verdicts = [gate.evaluate(Some(&signed), &sender), gate.evaluate(Some(&signed), &sender)];
+		let admitted = gate.admit(signed, &sender);
+		assert!(matches!((verdicts, admitted), ([TransitStatus::Ok, TransitStatus::Ok], Ok(_))));
 	}
 
 	/// A verdict refuses a signed frame that lacks the frame integrity that a
 	/// cluster command requires.
-	#[tokio::test]
-	async fn a_gate_verdict_refuses_a_frame_without_frame_integrity() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, clock, .. } = verified_gate().await?;
-		let message = TestMessage::sample(None);
+	#[test]
+	fn a_gate_verdict_refuses_a_frame_without_frame_integrity() -> TestResult {
+		let VerifiedGate { gate, sender, clock, .. } = verified_gate();
 		let builder = Version::V2.compose().with_id(b"unwitnessed").with_order(clock.unix().get());
-		let mut unwitnessed = builder.with_message(message).build()?;
-		unwitnessed.sign_with_provider(&TestIdentity::insecure_fixed()).await?;
+		let built = builder.with_message(TestMessage::sample(None)).build()?;
+		let unwitnessed = TestFrame::signed_by(built, &TestIdentity::insecure_fixed());
 
-		assert_eq!(gate.evaluate(Some(&unwitnessed), &sender), TransitStatus::Unauthenticated);
+		let verdict = gate.evaluate(Some(&unwitnessed), &sender);
+		assert_eq!(verdict, TransitStatus::Unauthenticated);
 		Ok(())
 	}
 
-	/// A verdict refuses a captured frame, because the guard already recorded
-	/// the signature the frame carries (CWE-294).
-	#[tokio::test]
-	async fn a_gate_verdict_refuses_a_frame_already_admitted() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
-		assert!(gate.admit(signed.to_owned(), &sender).is_ok());
-		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::PermissionDenied);
-		Ok(())
+	/// The frame of `verified`, once an admission spends it.
+	fn admitted_frame(verified: &VerifiedGate) -> Frame {
+		drop(admit_ok(&verified.gate, verified.signed.clone(), &verified.sender));
+		verified.signed.clone()
+	}
+
+	/// A second command of the signer of `verified`, at the order of its frame
+	/// once an admission spends that frame.
+	fn sibling_of_an_admitted_frame(verified: &VerifiedGate) -> Frame {
+		drop(admit_ok(&verified.gate, verified.signed.clone(), &verified.sender));
+		heartbeat_named(b"sibling", verified.clock.unix())
+	}
+
+	/// The frame of `verified`, once the replay partition of its signer is
+	/// full.
+	fn frame_of_a_full_partition(verified: &VerifiedGate) -> Frame {
+		let signer = signer_id(&verified.signed);
+		fill_replay_partition(verified.gate.replay_guard.as_ref(), signer, verified.clock.unix());
+		verified.signed.clone()
+	}
+
+	/// A step that spends the replay slot of a command, and returns the frame
+	/// a verdict then judges.
+	type Spent = fn(&VerifiedGate) -> Frame;
+
+	// A verdict refuses a command the replay guard already holds as an
+	// admission does: a captured frame, whose signature the guard recorded
+	// (CWE-294), a second command of one signer at an admitted order, and a
+	// command of a signer whose replay partition is full.
+	tb_cases! {
+		fn a_gate_verdict_refuses_a_spent_command(spent: Spent) {
+			let verified = verified_gate();
+			let frame = spent(&verified);
+
+			let verdict = verified.gate.evaluate(Some(&frame), &verified.sender);
+			assert_eq!(verdict, TransitStatus::PermissionDenied);
+		}
+		cases {
+			already_admitted => admitted_frame,
+			at_an_admitted_order => sibling_of_an_admitted_frame,
+			of_a_full_partition => frame_of_a_full_partition,
+		}
 	}
 
 	/// The gate refuses a second command of one signer at the order of an
-	/// admitted one (README §5.7.1), though the second carries a new signature.
-	#[tokio::test]
-	async fn a_second_command_at_an_admitted_order_is_refused() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, clock } = verified_gate().await?;
-		let sibling = signed_heartbeat_named(b"sibling", clock.unix(), &TestIdentity::insecure_fixed()).await?;
+	/// admitted one (README §5.7.1), though its signature is new.
+	#[test]
+	fn a_second_command_at_an_admitted_order_is_refused() {
+		let VerifiedGate { gate, sender, signed, clock } = verified_gate();
+		let sibling = heartbeat_named(b"sibling", clock.unix());
+		let admitted = refusal_status(&gate, signed, &sender);
 
-		let admitted = gate.admit(signed, &sender).is_ok();
-		let duplicate = gate.admit(sibling, &sender).err().map(|refusal| refusal.status());
-		assert_eq!((admitted, duplicate), (true, Some(TransitStatus::PermissionDenied)));
-		Ok(())
-	}
-
-	/// A verdict refuses a second command of one signer at the order of an
-	/// admitted one, as the admission does.
-	#[tokio::test]
-	async fn a_gate_verdict_refuses_a_second_command_at_an_admitted_order() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, clock } = verified_gate().await?;
-		let sibling = signed_heartbeat_named(b"sibling", clock.unix(), &TestIdentity::insecure_fixed()).await?;
-
-		assert!(gate.admit(signed, &sender).is_ok());
-		assert_eq!(gate.evaluate(Some(&sibling), &sender), TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	/// A verdict refuses a command of a signer whose replay partition is
-	/// full, as the admission does.
-	#[tokio::test]
-	async fn a_gate_verdict_refuses_a_command_of_a_full_partition() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, clock } = verified_gate().await?;
-
-		fill_replay_partition(&gate, signer_id(&signed), clock.unix());
-
-		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::PermissionDenied);
-		Ok(())
+		let duplicate = refusal_status(&gate, sibling, &sender);
+		assert_eq!((admitted, duplicate), (None, Some(TransitStatus::PermissionDenied)));
 	}
 
 	/// The gate refuses a command that a trusted member signs and another
 	/// peer delivers. It binds the signer it verifies to the peer the
 	/// handshake proved, so the record of each command it admits names the
 	/// party that signed it (CWE-778).
-	#[tokio::test]
-	async fn a_command_that_another_peer_delivers_is_refused() -> Result<(), TightBeamError> {
-		let clock = manual_clock();
-		let identity = TestIdentity::insecure_fixed();
-		let certificate = identity.certificate().clone();
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(certificate)?
-			.build();
+	#[test]
+	fn a_command_that_another_peer_delivers_is_refused() {
+		let EnrolledGate { gate, clock, .. } = enrolled_gate();
+		let courier = session_of(unlisted_peer());
 
-		let gate = ClusterSecurityGate::new(Arc::new(store), limits(), erased(&clock));
-		let courier = SessionContext::for_peer(Arc::new(unlisted_peer()));
-		let signed = signed_heartbeat(&clock, &identity).await?;
-
-		let refused = gate.admit(signed, &courier).err().map(|refusal| refusal.status());
+		let refused = refusal_status(&gate, heartbeat_at(clock.unix()), &courier);
 		assert_eq!(refused, Some(TransitStatus::PermissionDenied));
-		Ok(())
 	}
 
 	/// A captured command replayed with its signature's `s` flipped to
 	/// `n - s` verifies under a real trust store (SEC 1 v2.0 §4.1.4), to the
 	/// value its original verifies to. The gate refuses it as a replay, not as
 	/// a forgery, because both forms key one replay slot.
-	#[tokio::test]
-	async fn a_command_replayed_with_its_s_flipped_is_refused() -> Result<(), TightBeamError> {
-		let clock = manual_clock();
-		let identity = TestIdentity::insecure_fixed();
-		let certificate = identity.certificate().clone();
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(certificate.clone())?
-			.build();
-
-		let store = Arc::new(store);
-		let gate = ClusterSecurityGate::new(Arc::clone(&store) as Arc<dyn CertificateTrust>, limits(), erased(&clock));
-		let sender = SessionContext::for_peer(Arc::new(certificate));
-		let signed = signed_heartbeat(&clock, &identity).await?;
+	#[test]
+	fn a_command_replayed_with_its_s_flipped_is_refused() {
+		let EnrolledGate { gate, store, clock } = enrolled_gate();
+		let sender = member();
+		let signed = heartbeat_at(clock.unix());
 		let flipped = TestFrame::with_flipped_s(&signed);
-		let original = store.verify_frame(&signed);
-		let twin = store.verify_frame(&flipped);
-		let admitted = gate.admit(signed, &sender).is_ok();
-		let inspected = gate.inspect(&flipped, &sender, clock.unix()).err();
-		let replayed = gate.admit(flipped, &sender).err().map(|refusal| refusal.status());
+		let verified = (store.verify_frame(&signed), store.verify_frame(&flipped));
+		let admitted = refusal_status(&gate, signed, &sender);
 
-		let verified = (original, twin);
+		let inspected = gate.inspect(&flipped, &sender, clock.unix()).err();
+		let replayed = refusal_status(&gate, flipped, &sender);
 		assert!(matches!(verified, (TrustVerification::Verified(_, a), TrustVerification::Verified(_, b)) if a == b));
-		assert!(admitted);
 		assert!(matches!(
 			inspected,
 			Some(InspectRefusal::Plain(TransitStatus::PermissionDenied))
 		));
-		assert_eq!(replayed, Some(TransitStatus::PermissionDenied));
-		Ok(())
+		assert_eq!((admitted, replayed), (None, Some(TransitStatus::PermissionDenied)));
 	}
 
 	/// A command whose signer's clock leads the hive's by 59 s, inside the
 	/// 60 s window, stays fresh until its stated order leaves the window. A
 	/// capture replayed 61 s after its admission stays fresh, so the gate
 	/// refuses it as a replay (CWE-294).
-	#[tokio::test]
-	async fn a_future_dated_command_is_refused_as_a_replay_while_it_is_fresh() -> Result<(), TightBeamError> {
-		let clock = manual_clock();
-		let identity = TestIdentity::insecure_fixed();
-		let certificate = identity.certificate().clone();
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(certificate.clone())?
-			.build();
-
-		let gate = ClusterSecurityGate::new(Arc::new(store), limits(), erased(&clock));
-		let sender = SessionContext::for_peer(Arc::new(certificate));
+	#[test]
+	fn a_future_dated_command_is_refused_as_a_replay_while_it_is_fresh() {
+		let EnrolledGate { gate, clock, .. } = enrolled_gate();
+		let sender = member();
 		let order = clock.unix().saturating_add(Duration::from_millis(59_000));
-		let signed = signed_heartbeat_at(order, &identity).await?;
-		let admitted = gate.admit(signed.to_owned(), &sender).is_ok();
-
+		let signed = heartbeat_at(order);
+		let admitted = refusal_status(&gate, signed.clone(), &sender);
 		clock.advance(Duration::from_millis(61_000));
 
+		let replayed = refusal_status(&gate, signed, &sender);
+
 		let fresh = gate.replay_guard.is_fresh(order, clock.unix());
-		let replayed = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
-		assert!(admitted);
-		assert!(fresh);
-		assert_eq!(replayed, Some(TransitStatus::PermissionDenied));
-		Ok(())
+		assert_eq!((admitted, fresh, replayed), (None, true, Some(TransitStatus::PermissionDenied)));
 	}
 
 	/// A verdict leaves a tripped breaker as it found it, so the admission
 	/// alone closes the circuit.
-	#[tokio::test]
-	async fn a_gate_verdict_leaves_the_breaker_to_the_admission() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, .. } = verified_gate_with(instant_cooldown()).await?;
-		let peer_key = peer_key(&sender);
-		let breaker_key = || ProvenPeer::for_test(&peer_key);
+	#[test]
+	fn a_gate_verdict_leaves_the_breaker_to_the_admission() {
+		let VerifiedGate { gate, sender, signed, .. } = verified_gate_with(instant_cooldown());
+		gate.circuit_breaker.record_auth_failure(proven(&sender));
 
-		gate.circuit_breaker.record_auth_failure(breaker_key());
+		let verdict = gate.evaluate(Some(&signed), &sender);
+		let open_after_the_verdict = gate.circuit_breaker.is_open(proven(&sender));
+		let admitted = gate.admit(signed, &sender);
 
-		assert!(gate.circuit_breaker.is_open(breaker_key()));
 		// The cooldown has passed, so the verdict admits and leaves the
-		// circuit open.
-		assert_eq!(gate.evaluate(Some(&signed), &sender), TransitStatus::Ok);
-		assert!(gate.circuit_breaker.is_open(breaker_key()));
-		assert!(gate.admit(signed, &sender).is_ok());
-		assert!(!gate.circuit_breaker.is_open(breaker_key()));
-
-		Ok(())
+		// circuit open, and the admission closes it.
+		let open_after_the_admission = gate.circuit_breaker.is_open(proven(&sender));
+		assert!(matches!(
+			(verdict, open_after_the_verdict, admitted, open_after_the_admission),
+			(TransitStatus::Ok, true, Ok(_), false)
+		));
 	}
 
 	/// A refused admission leaves the breaker as it found it.
-	#[tokio::test]
-	async fn a_refused_admission_leaves_the_breaker_open() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, clock } = verified_gate_with(instant_cooldown()).await?;
-		let peer_key = peer_key(&sender);
-		let breaker_key = || ProvenPeer::for_test(&peer_key);
-
-		gate.circuit_breaker.record_auth_failure(breaker_key());
-
-		assert!(gate.circuit_breaker.is_open(breaker_key()));
+	#[test]
+	fn a_refused_admission_leaves_the_breaker_open() {
+		let VerifiedGate { gate, sender, signed, clock } = verified_gate_with(instant_cooldown());
+		gate.circuit_breaker.record_auth_failure(proven(&sender));
 
 		// Fill this signer's replay partition, so the admission refuses the
 		// command at the guard's rule.
-		fill_replay_partition(&gate, signer_id(&signed), clock.unix());
+		fill_replay_partition(gate.replay_guard.as_ref(), signer_id(&signed), clock.unix());
 
-		let refusal = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
+		let refusal = refusal_status(&gate, signed, &sender);
 		assert_eq!(refusal, Some(TransitStatus::PermissionDenied));
-		assert!(gate.circuit_breaker.is_open(breaker_key()));
-		Ok(())
+		assert!(gate.circuit_breaker.is_open(proven(&sender)));
 	}
 
 	/// The breaker a gate builds cools on the gate's clock, so a circuit
 	/// the gate opened admits a command again once that one clock reaches the
 	/// cooldown.
-	#[tokio::test]
-	async fn a_gates_breaker_cools_on_the_gates_clock() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, clock, .. } = verified_gate().await?;
-		let peer_key = peer_key(&sender);
-		let breaker_key = || ProvenPeer::for_test(&peer_key);
+	#[test]
+	fn a_gates_breaker_cools_on_the_gates_clock() {
+		let VerifiedGate { gate, sender, clock, .. } = verified_gate();
+		trip(&gate.circuit_breaker, proven(&sender));
 
-		gate.circuit_breaker.record_auth_failure(breaker_key());
-		gate.circuit_breaker.record_auth_failure(breaker_key());
-		gate.circuit_breaker.record_auth_failure(breaker_key());
-
-		assert!(!gate.circuit_breaker.would_allow(breaker_key()));
+		let before = gate.circuit_breaker.would_allow(proven(&sender));
 
 		clock.advance(COOLDOWN);
 
-		assert!(gate.circuit_breaker.would_allow(breaker_key()));
-		Ok(())
+		let after = gate.circuit_breaker.would_allow(proven(&sender));
+		assert_eq!((before, after), (false, true));
+	}
+
+	/// `frame` with the last octet of its signature flipped, so its signer
+	/// identifier still names its signer, and its signature verifies under
+	/// no key.
+	fn forged(frame: &Frame) -> Frame {
+		let signer = frame.nonrepudiation().expect("the frame carries a signature");
+		let signature = signer.signature.as_bytes();
+		TestFrame::tamper(frame, signature, flip_last(signature))
 	}
 
 	/// The gate counts a caller who copies a trusted `SignerIdentifier` and
@@ -2405,68 +2227,31 @@ mod tests {
 	///
 	/// The count runs through `admit`, because a caller submits a frame
 	/// there. A verdict judges the same frame and counts nothing.
-	#[tokio::test]
-	async fn a_forged_signer_id_gates_the_sender_not_the_signer() -> Result<(), TightBeamError> {
-		let clock = manual_clock();
-		let identity = TestIdentity::insecure_fixed();
-
-		let mut signed = Version::V2
-			.compose()
-			.with_id(b"control")
-			.with_order(clock.unix().get())
-			.with_message(TestMessage { content: "payload".into() })
-			.with_witness_hasher::<Sha3_256>()
-			.build()?;
-		signed.sign_with_provider(&identity).await?;
-
-		let signer_key = key_of(identity.certificate());
-		let signer = identity.signing_certificate().clone();
-		let trust_store = Arc::new(AlwaysInvalid { signer });
-		let gate = ClusterSecurityGate::new(trust_store, limits(), erased(&clock));
-
-		let sender = SessionContext::for_peer(Arc::new(unlisted_peer()));
-		let sender_key = peer_key(&sender);
+	#[test]
+	fn a_forged_signer_id_gates_the_sender_not_the_signer() {
+		let EnrolledGate { gate, clock, .. } = enrolled_gate();
+		let forged = forged(&heartbeat_at(clock.unix()));
+		let courier = session_of(unlisted_peer());
 		let refusals = [
-			gate.admit(signed.to_owned(), &sender).err().map(|refusal| refusal.status()),
-			gate.admit(signed.to_owned(), &sender).err().map(|refusal| refusal.status()),
-			gate.admit(signed.to_owned(), &sender).err().map(|refusal| refusal.status()),
+			refusal_status(&gate, forged.clone(), &courier),
+			refusal_status(&gate, forged.clone(), &courier),
+			refusal_status(&gate, forged, &courier),
 		];
-		assert_eq!(refusals, [Some(TransitStatus::PermissionDenied); 3]);
-		assert!(gate.circuit_breaker.is_open(ProvenPeer::for_test(&sender_key)));
-		assert!(!gate.circuit_breaker.is_open(ProvenPeer::for_test(&signer_key)));
 
-		Ok(())
+		let circuits = (gate.circuit_breaker.is_open(other()), gate.circuit_breaker.is_open(signer()));
+		assert_eq!(refusals, [Some(TransitStatus::PermissionDenied); 3]);
+		assert_eq!(circuits, (true, false));
 	}
 
 	/// One signer's failures leave every other signer admitted, so a
 	/// compromised member leaves the colony control plane open (CWE-645).
 	#[test]
 	fn a_tripped_signer_does_not_gate_another() {
-		let breaker = tripped_breaker();
-		assert!(breaker.is_open(signer()));
-		assert!(!breaker.admit_verified(signer()));
-		assert!(breaker.admit_verified(other()));
-	}
+		let breaker = breaker();
+		trip(&breaker, signer());
 
-	/// The guard refuses a signature recorded under one signer when it
-	/// arrives under another, so an alternate `SignerIdentifier` encoding
-	/// grants no extra replay.
-	#[test]
-	fn a_replay_is_refused_across_partitions() {
-		const OTHER: &[u8] = b"other-signer";
-
-		let guard = ReplayGuard::new(Duration::from_millis(60_000));
-		assert!(spend_at(&guard, SIGNER, &accepted(1), 1_000));
-		assert!(!spend_at(&guard, OTHER, &accepted(1), 1_000));
-	}
-
-	/// An expired record frees its capacity and admits the same signature
-	/// again, so the window bounds retention and the partition holds its size.
-	#[test]
-	fn an_expired_record_is_admitted_again() {
-		let guard = ReplayGuard::new(Duration::from_millis(1_000));
-		assert!(spend_at(&guard, SIGNER, &accepted(1), 1_000));
-		assert!(spend_at(&guard, SIGNER, &accepted(1), 5_000));
+		let verdicts = (breaker.admit_verified(signer()), breaker.admit_verified(other()));
+		assert_eq!(verdicts, (false, true));
 	}
 
 	// A refusal releases the replay slot only where the hive could answer a
@@ -2491,45 +2276,34 @@ mod tests {
 		}
 	}
 
-	/// A transient refusal releases the slot, so the gate admits the same
-	/// signed frame again.
-	#[tokio::test]
-	async fn a_transient_refusal_admits_the_same_frame_again() -> Result<(), TightBeamError> {
-		let trace = TraceCollector::default();
-		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
-		let admitted = gate
-			.admit(signed.to_owned(), &sender)
-			.ok()
-			.ok_or(TightBeamError::MissingResponse)?;
-		admitted.refuse(CommandRefusal::Backpressure, &CommandAudit::new(&trace, &trace, &sender))?;
+	// A transient refusal releases the slot, so the gate admits the same
+	// signed frame again. A permanent refusal keeps the slot spent, so the
+	// gate refuses the same signed frame as a replay.
+	tb_cases! {
+		fn a_refusal_decides_whether_the_same_frame_passes_again(
+			(refusal, replay): (CommandRefusal, Option<TransitStatus>)
+		) -> TestResult {
+			let trace = TraceCollector::default();
+			let VerifiedGate { gate, sender, signed, .. } = verified_gate();
+			let admitted = admit_ok(&gate, signed.clone(), &sender);
 
-		assert!(gate.admit(signed, &sender).is_ok());
-		Ok(())
-	}
+			admitted.refuse(refusal, &CommandAudit::new(&trace, &trace, &sender))?;
 
-	/// A permanent refusal keeps the slot spent, so the gate refuses the same
-	/// signed frame as a replay.
-	#[tokio::test]
-	async fn a_permanent_refusal_refuses_the_same_frame_as_a_replay() -> Result<(), TightBeamError> {
-		let trace = TraceCollector::default();
-		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
-		let admitted = gate
-			.admit(signed.to_owned(), &sender)
-			.ok()
-			.ok_or(TightBeamError::MissingResponse)?;
-		admitted.refuse(CommandRefusal::Draining, &CommandAudit::new(&trace, &trace, &sender))?;
-
-		let replay = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
-		assert_eq!(replay, Some(TransitStatus::PermissionDenied));
-		Ok(())
+			assert_eq!(refusal_status(&gate, signed, &sender), replay);
+			Ok(())
+		}
+		cases {
+			transient => (CommandRefusal::Backpressure, None),
+			permanent => (CommandRefusal::Draining, Some(TransitStatus::PermissionDenied)),
+		}
 	}
 
 	/// A refusal of an admitted command records on the trace of the hive alone.
 	#[cfg(feature = "testing")]
-	#[tokio::test]
-	async fn a_refusal_records_its_event_on_the_trace_of_its_audit() -> Result<(), TightBeamError> {
-		let VerifiedGate { gate, sender, signed, .. } = verified_gate().await?;
-		let admitted = gate.admit(signed, &sender).ok().ok_or(TightBeamError::MissingResponse)?;
+	#[test]
+	fn a_refusal_records_its_event_on_the_trace_of_its_audit() -> TestResult {
+		let VerifiedGate { gate, sender, signed, .. } = verified_gate();
+		let admitted = admit_ok(&gate, signed, &sender);
 		let (trace, connections) = (TraceCollector::default(), TraceCollector::default());
 
 		admitted.refuse(CommandRefusal::Draining, &CommandAudit::new(&trace, &connections, &sender))?;
@@ -2542,7 +2316,7 @@ mod tests {
 	/// A refusal of an unproven peer records on the connection trace alone.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn a_refusal_of_an_unproven_peer_records_on_the_connection_trace() -> Result<(), TightBeamError> {
+	fn a_refusal_of_an_unproven_peer_records_on_the_connection_trace() -> TestResult {
 		let (trace, connections) = (TraceCollector::default(), TraceCollector::default());
 		let session = SessionContext::default();
 		let frame = TestFrame::v0(None, Some("command"));

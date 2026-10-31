@@ -1984,7 +1984,6 @@ impl ProcessBuilder {
 	fn undeclared_clock(&self) -> Option<&str> {
 		let edges = self.timed_transitions.iter().flat_map(HashMap::values).flatten();
 		let named = edges.flat_map(TimedTransition::clocks);
-
 		named.filter(|clock| !self.clocks.contains(*clock)).min()
 	}
 }
@@ -1992,271 +1991,270 @@ impl ProcessBuilder {
 #[cfg(test)]
 mod tests {
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use core::sync::atomic::{AtomicBool, Ordering};
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::testing::fixtures::TestProcess;
 	use crate::testing::{ScenarioConfig, SetupEnv};
-	use crate::trace::TraceCollector;
 	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::servlet;
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::testing::TestMessage;
+	use crate::testing::macros::fixtures::send_one;
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::testing::{ClientEnv, TestHooks};
+	use crate::testing::{ClientEnv, TestFrame};
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::trace::{Exchange, TraceCollector};
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::transport::tcp::r#async::TokioListener;
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::transport::tcp::TightBeamSocketAddr;
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::transport::{EndpointConfig, MessageEmitter, Protocol};
+	use crate::transport::Protocol;
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::TightBeamError;
+
+	#[cfg(feature = "testing-timing")]
+	use crate::testing::TestResult;
 
 	#[cfg(feature = "testing-timing")]
 	const ARM: Urn<'static> = crate::urn!("test", "event:csp/arm");
 
-	/// A spec that models `start` and `send` as observable and `prepare` as
-	/// hidden, and leaves every other event out of both alphabets.
-	fn alphabet_spec() -> Result<Process, ProcessBuildError> {
-		Process::builder("AlphabetSpec")
-			.initial_state(State("S0"))
-			.add_observable(Event("start"))
-			.add_observable(Event("send"))
-			.add_hidden(Event("prepare"))
-			.add_transition(State("S0"), Event("start"), State("S1"))
-			.add_transition(State("S1"), Event("prepare"), State("S2"))
-			.add_transition(State("S2"), Event("send"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
+	/// The description that the handshake spec annotates its process with.
+	const HANDSHAKE: &str = "Comprehensive handshake with queued or direct send";
+
+	/// The process whose `go` leads from `S0` to `S1` or to `S2`, an
+	/// undeclared choice, where `x` and `y` lead to the terminal `T`.
+	const BRANCHING: TestProcess = TestProcess {
+		observable: &["go", "x", "y"],
+		transitions: &[("S0", "go", "S1"), ("S0", "go", "S2"), ("S1", "x", "T"), ("S2", "y", "T")],
+		terminal: &["T"],
+		..TestProcess::of("Branching", "S0")
+	};
+
+	/// The states of `names`.
+	fn states_named(names: &[&'static str]) -> HashSet<State> {
+		names.iter().copied().map(State).collect()
 	}
 
+	/// The events of `names`.
+	fn events_named(names: &[&'static str]) -> HashSet<Event> {
+		names.iter().copied().map(Event).collect()
+	}
+
+	/// A spec that models `start` and `send` as observable and `prepare` as
+	/// hidden, and leaves every other event out of both alphabets.
+	fn alphabet_spec() -> Process {
+		TestProcess {
+			observable: &["start", "send"],
+			hidden: &["prepare"],
+			transitions: &[("S0", "start", "S1"), ("S1", "prepare", "S2"), ("S2", "send", "S3")],
+			terminal: &["S3"],
+			..TestProcess::of("AlphabetSpec", "S0")
+		}
+		.build()
+	}
+
+	/// A process whose `S0` offers the observable `a` and the hidden `tau`,
+	/// each to a terminal state, with `b` in its alphabet too.
+	fn observable_and_hidden() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["tau"],
+			transitions: &[("S0", "a", "S1"), ("S0", "tau", "S2")],
+			terminal: &["S1", "S2"],
+			..TestProcess::of("EnabledTest", "S0")
+		}
+		.build()
+	}
+
+	/// A process whose `S0` offers `b`, `a`, and the hidden `c`, declared in
+	/// that order, each to the terminal `S1`.
+	fn declared_out_of_order() -> Process {
+		TestProcess {
+			observable: &["b", "a"],
+			hidden: &["c"],
+			transitions: &[("S0", "b", "S1"), ("S0", "a", "S1"), ("S0", "c", "S1")],
+			terminal: &["S1"],
+			..TestProcess::of("Sorted", "S0")
+		}
+		.build()
+	}
+
+	/// The process of [`BRANCHING`], with `S0` declared as a choice point.
+	fn declared_branching() -> Process {
+		TestProcess { choice: &["S0"], ..BRANCHING }.build()
+	}
+
+	/// A process whose hidden `tau` leads from `S0` to `S1`, where `a` leads
+	/// to the terminal `T`.
+	fn tau_bridge() -> Process {
+		TestProcess {
+			observable: &["a"],
+			hidden: &["tau"],
+			transitions: &[("S0", "tau", "S1"), ("S1", "a", "T")],
+			terminal: &["T"],
+			..TestProcess::of("TauBridge", "S0")
+		}
+		.build()
+	}
+
+	/// A process whose `a` leads to a run of the hidden `tau-1` and `tau-2`,
+	/// and whose `b` leads from the end of the run to the terminal `T`.
+	fn tau_chain() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["tau-1", "tau-2"],
+			transitions: &[
+				("S0", "a", "S1"),
+				("S1", "tau-1", "S2"),
+				("S2", "tau-2", "S3"),
+				("S3", "b", "T"),
+			],
+			terminal: &["T"],
+			..TestProcess::of("TauChain", "S0")
+		}
+		.build()
+	}
+
+	/// A process whose hidden `tau` alone leads from `S0` to the terminal
+	/// `S1`.
+	fn hidden_only() -> Process {
+		TestProcess {
+			hidden: &["tau"],
+			transitions: &[("S0", "tau", "S1")],
+			terminal: &["S1"],
+			..TestProcess::of("HiddenOnly", "S0")
+		}
+		.build()
+	}
+
+	/// A projection keeps the events that the spec observes, in their order.
 	#[test]
-	fn project_keeps_only_what_the_spec_observes() -> Result<(), ProcessBuildError> {
-		let spec = alphabet_spec()?;
+	fn project_keeps_only_what_the_spec_observes() {
+		let spec = alphabet_spec();
 		let recorded = [Event("start"), Event("prepare"), Event("audit"), Event("send")];
 		let projected = spec.project(recorded);
 		assert_eq!(projected, vec![Event("start"), Event("send")]);
-		Ok(())
 	}
 
+	/// The unmodelled events are those that the spec leaves out of both
+	/// alphabets, so its own hidden `prepare` is modelled.
 	#[test]
-	fn unmodelled_names_what_the_spec_leaves_out_of_both_alphabets() -> Result<(), ProcessBuildError> {
-		let spec = alphabet_spec()?;
-		let subject = Process::builder("Subject")
-			.initial_state(State("T0"))
-			.add_observable(Event("start"))
-			.add_observable(Event("prepare"))
-			.add_observable(Event("audit"))
-			.add_transition(State("T0"), Event("start"), State("T1"))
-			.add_terminal(State("T1"))
-			.build()?;
+	fn unmodelled_names_what_the_spec_leaves_out_of_both_alphabets() {
+		let spec = alphabet_spec();
+		let subject = TestProcess {
+			observable: &["start", "prepare", "audit"],
+			transitions: &[("T0", "start", "T1")],
+			terminal: &["T1"],
+			..TestProcess::of("Subject", "T0")
+		}
+		.build();
 
 		let outside = spec.unmodelled(&subject);
-		assert_eq!(outside, vec![Event("audit")], "`prepare` is modelled, as the spec's own τ");
-		Ok(())
+		assert_eq!(outside, vec![Event("audit")]);
 	}
 
-	#[test]
-	fn builder_creates_valid_process() -> Result<(), Box<dyn core::error::Error>> {
-		let proc = Process::builder("TestProc")
-			.initial_state(State("S0"))
-			.add_observable(Event("start"))
-			.add_observable(Event("send"))
-			.add_hidden(Event("prepare"))
-			.add_transition(State("S0"), Event("start"), State("S1"))
-			.add_transition(State("S1"), Event("prepare"), State("S2"))
-			.add_transition(State("S2"), Event("send"), State("S3"))
-			.add_terminal(State("S3"))
-			.description("Simple test process")
-			.build()?;
-
-		assert_eq!(proc.name, "TestProc");
-		assert_eq!(proc.initial, State("S0"));
-		assert_eq!(proc.observable.len(), 2);
-		assert_eq!(proc.hidden.len(), 1);
-		assert!(proc.is_terminal(State("S3")));
-		Ok(())
-	}
-
-	#[test]
-	fn step_executes_transitions() -> Result<(), Box<dyn core::error::Error>> {
-		let proc = Process::builder("StepTest")
-			.initial_state(State("S0"))
-			.add_observable(Event("go"))
-			.add_transition(State("S0"), Event("go"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()?;
-
-		let targets = proc.step(State("S0"), &Event("go"));
-		assert_eq!(targets.len(), 1);
-		assert_eq!(targets[0], State("S1"));
-
-		let no_targets = proc.step(State("S0"), &Event("missing"));
-		assert_eq!(no_targets.len(), 0);
-		Ok(())
-	}
-
-	#[test]
-	fn enabled_returns_possible_actions() -> Result<(), Box<dyn core::error::Error>> {
-		let proc = Process::builder("EnabledTest")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("tau"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S0"), Event("tau"), State("S2"))
-			.add_terminal(State("S1"))
-			.add_terminal(State("S2"))
-			.build()?;
-
-		let enabled = proc.enabled(State("S0"));
-		assert_eq!(enabled.len(), 2);
-
-		let events: Vec<&str> = enabled.iter().map(|a| a.event.0).collect();
-		assert!(events.contains(&"a"));
-		assert!(events.contains(&"tau"));
-		Ok(())
-	}
-
-	#[test]
-	fn nondeterministic_choice() -> Result<(), Box<dyn core::error::Error>> {
-		let proc = Process::builder("ChoiceTest")
-			.initial_state(State("S0"))
-			.add_observable(Event("choice"))
-			.add_transition(State("S0"), Event("choice"), State("S1"))
-			.add_transition(State("S0"), Event("choice"), State("S2"))
-			.add_choice(State("S0"))
-			.add_terminal(State("S1"))
-			.add_terminal(State("S2"))
-			.build()?;
-
-		let targets = proc.step(State("S0"), &Event("choice"));
-		assert_eq!(targets.len(), 2);
-		assert!(targets.contains(&State("S1")));
-		assert!(targets.contains(&State("S2")));
-
-		assert!(proc.is_choice(State("S0")));
-		Ok(())
-	}
-
-	const GO: Urn<'static> = crate::urn!("test", "event:csp/go");
-	const X: Urn<'static> = crate::urn!("test", "event:csp/x");
-	const Y: Urn<'static> = crate::urn!("test", "event:csp/y");
-	const A: Urn<'static> = crate::urn!("test", "event:csp/a");
-	const B: Urn<'static> = crate::urn!("test", "event:csp/b");
-	const TAU: Urn<'static> = crate::urn!("test", "event:csp/tau");
-	const TAU_1: Urn<'static> = crate::urn!("test", "event:csp/tau-1");
-	const TAU_2: Urn<'static> = crate::urn!("test", "event:csp/tau-2");
-
-	/// The trace of a run that records each of `labels` once, in order.
-	fn trace_of(labels: &[Urn<'static>]) -> ConsumedTrace {
-		let collector = TraceCollector::new();
-		for label in labels {
-			collector.event(label).expect("the run injects no fault").emit();
+	// A step leads to the targets of an event that the state offers, and to
+	// no state for an event that the state lacks.
+	crate::tb_cases! {
+		fn a_step_leads_to_the_targets_of_an_event((event, targets): (&'static str, Vec<State>)) {
+			let process = TestProcess::chain("StepTest", &["S0", "S1"], &["go"]);
+			let stepped = process.step(State("S0"), &Event(event));
+			assert_eq!(stepped, targets);
 		}
 
-		ConsumedTrace::drained_from(&collector)
-	}
-
-	fn branching_process(declared_choice: bool) -> Result<Process, ProcessBuildError> {
-		let builder = Process::builder("Branching")
-			.initial_state(State("S0"))
-			.add_observable(GO)
-			.add_observable(X)
-			.add_observable(Y)
-			.add_transition(State("S0"), GO, State("S1"))
-			.add_transition(State("S0"), GO, State("S2"))
-			.add_transition(State("S1"), X, State("T"))
-			.add_transition(State("S2"), Y, State("T"))
-			.add_terminal(State("T"));
-
-		if declared_choice {
-			builder.add_choice(State("S0")).build()
-		} else {
-			builder.build()
+		cases {
+			the_state_offers => ("go", vec![State("S1")]),
+			the_state_lacks => ("missing", Vec::new()),
 		}
 	}
 
-	#[test]
-	fn declared_choice_validates_both_branches() -> Result<(), ProcessBuildError> {
-		let proc = branching_process(true)?;
-		let via_first = proc.validate_trace(&trace_of(&[GO, X]));
-		let via_second = proc.validate_trace(&trace_of(&[GO, Y]));
-		assert!(via_first.valid);
-		assert!(via_second.valid);
-		Ok(())
+	// The enabled actions of a state come sorted by event name, each in its
+	// alphabet.
+	crate::tb_cases! {
+		fn the_enabled_actions_come_sorted_by_event_name((process, actions): (Process, Vec<Action>)) {
+			let enabled = process.enabled(State("S0"));
+			assert_eq!(enabled, actions);
+		}
+
+		cases {
+			of_an_observable_and_a_hidden_event => (
+				observable_and_hidden(),
+				vec![Action::observable("a"), Action::hidden("tau")],
+			),
+			of_events_declared_out_of_order => (
+				declared_out_of_order(),
+				vec![Action::observable("a"), Action::observable("b"), Action::hidden("c")],
+			),
+		}
 	}
 
+	/// A declared choice point leads its event to each of its targets.
 	#[test]
-	fn tau_transitions_traversed_silently() -> Result<(), ProcessBuildError> {
-		let proc = Process::builder("TauBridge")
-			.initial_state(State("S0"))
-			.add_hidden(TAU)
-			.add_observable(A)
-			.add_transition(State("S0"), TAU, State("S1"))
-			.add_transition(State("S1"), A, State("T"))
-			.add_terminal(State("T"))
-			.build()?;
-
-		let result = proc.validate_trace(&trace_of(&[A]));
-		assert!(result.valid);
-		Ok(())
+	fn a_declared_choice_point_leads_its_event_to_each_target() {
+		let process = TestProcess::choosing("ChoiceTest", "S0", "choice", &["S1", "S2"]);
+		let targets = process.step(State("S0"), &Event("choice"));
+		assert_eq!(
+			(targets, process.is_choice(State("S0"))),
+			(vec![State("S1"), State("S2")], true)
+		);
 	}
 
-	#[test]
-	fn tau_chain_traversed_across_multiple_hidden_steps() -> Result<(), ProcessBuildError> {
-		let proc = Process::builder("TauChain")
-			.initial_state(State("S0"))
-			.add_hidden(TAU_1)
-			.add_hidden(TAU_2)
-			.add_observable(A)
-			.add_observable(B)
-			.add_transition(State("S0"), A, State("S1"))
-			.add_transition(State("S1"), TAU_1, State("S2"))
-			.add_transition(State("S2"), TAU_2, State("S3"))
-			.add_transition(State("S3"), B, State("T"))
-			.add_terminal(State("T"))
-			.build()?;
+	// A process validates a trace of its events through a declared choice and
+	// across its hidden steps.
+	crate::tb_cases! {
+		fn a_process_validates_a_trace((process, trace): (Process, ConsumedTrace)) {
+			let result = process.validate_trace(&trace);
+			assert_eq!(result, CspValidationResult { valid: true, violations: Vec::new() });
+		}
 
-		let result = proc.validate_trace(&trace_of(&[A, B]));
-		assert!(result.valid);
-		Ok(())
+		cases {
+			through_the_first_branch_of_a_choice => (
+				declared_branching(),
+				ConsumedTrace::recording([Event("go"), Event("x")]),
+			),
+			through_the_second_branch_of_a_choice => (
+				declared_branching(),
+				ConsumedTrace::recording([Event("go"), Event("y")]),
+			),
+			across_a_hidden_step => (tau_bridge(), ConsumedTrace::recording([Event("a")])),
+			across_a_run_of_hidden_steps => (tau_chain(), ConsumedTrace::recording([Event("a"), Event("b")])),
+		}
 	}
 
-	#[test]
-	fn undeclared_nondeterminism_is_flagged() -> Result<(), ProcessBuildError> {
-		let proc = branching_process(false)?;
-		let result = proc.validate_trace(&trace_of(&[GO, X]));
-		assert!(!result.valid);
-		assert!(result
-			.violations
-			.iter()
-			.any(|v| matches!(v, CspViolation::NondeterministicChoice { .. })));
+	// A process refuses a trace with the violation that the trace commits.
+	crate::tb_cases! {
+		fn a_process_refuses_a_trace((process, trace, violation): (Process, ConsumedTrace, CspViolation)) {
+			let result = process.validate_trace(&trace);
+			assert_eq!(result, CspValidationResult { valid: false, violations: vec![violation] });
+		}
 
-		Ok(())
+		cases {
+			through_an_undeclared_choice => (
+				BRANCHING.build(),
+				ConsumedTrace::recording([Event("go"), Event("x")]),
+				CspViolation::NondeterministicChoice {
+					event: Event("go"),
+					state: State("S0"),
+					next_states: vec![State("S1"), State("S2")],
+				},
+			),
+			of_an_event_that_a_hidden_action_alone_enables => (
+				hidden_only(),
+				ConsumedTrace::recording([Event("tau")]),
+				CspViolation::EventNotEnabled {
+					event: Event("tau"),
+					state: State("S0"),
+					enabled: vec![Action::hidden("tau")],
+				},
+			),
+		}
 	}
 
-	#[test]
-	fn hidden_only_event_in_trace_is_not_enabled() -> Result<(), ProcessBuildError> {
-		let proc = Process::builder("HiddenOnly")
-			.initial_state(State("S0"))
-			.add_hidden(TAU)
-			.add_transition(State("S0"), TAU, State("S1"))
-			.add_terminal(State("S1"))
-			.build()?;
-
-		let result = proc.validate_trace(&trace_of(&[TAU]));
-		assert!(!result.valid);
-		assert!(result
-			.violations
-			.iter()
-			.any(|v| matches!(v, CspViolation::EventNotEnabled { .. })));
-		Ok(())
-	}
-
+	/// Interning one text twice returns one copy of it.
 	#[test]
 	fn intern_deduplicates_across_calls() {
 		let first = intern(String::from("intern_dedupe_probe"));
@@ -2264,27 +2262,11 @@ mod tests {
 		assert_eq!(first.as_ptr(), second.as_ptr());
 	}
 
-	#[test]
-	fn enabled_is_sorted_by_event_name() -> Result<(), ProcessBuildError> {
-		let proc = Process::builder("Sorted")
-			.initial_state(State("S0"))
-			.add_observable(Event("b"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("c"))
-			.add_transition(State("S0"), Event("b"), State("S1"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S0"), Event("c"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()?;
-
-		let names: Vec<&str> = proc.enabled(State("S0")).iter().map(|a| a.event.0).collect();
-		assert_eq!(names, vec!["a", "b", "c"]);
-		Ok(())
-	}
-
+	/// A timed transition adds its source and target to the states of the
+	/// process.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_timed_transition_adds_its_states() -> Result<(), ProcessBuildError> {
+	fn a_timed_transition_adds_its_states() -> TestResult {
 		let process = Process::builder("States")
 			.initial_state(State("S0"))
 			.add_timed_transition(State("S1"), Event("arm"), State("S2"), None, Vec::new())
@@ -2293,56 +2275,49 @@ mod tests {
 		Ok(())
 	}
 
-	/// A process that declares the clock `declared`, in which `arm` takes
-	/// `S0` to `S1` while `clk` reads at most 5 ms, and `fire` takes `S1`
-	/// back to `S0` and resets the clock `reset`.
+	/// The builder of a process that declares the clock `declared`, in which
+	/// `arm` takes `S0` to `S1` while `clk` reads at most 5 ms, and `fire`
+	/// takes `S1` back to `S0` and resets the clock `reset`.
 	#[cfg(feature = "testing-timing")]
-	fn clocked(declared: &str, reset: &str) -> Result<Process, ProcessBuildError> {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
+	fn clocked(declared: &str, reset: &str) -> ProcessBuilder {
+		let guard = Some(TimingGuard::clk_within(5));
 		Process::builder("Clocked")
 			.initial_state(State("S0"))
 			.clock(declared)
 			.add_observable(Event("arm"))
 			.add_observable(Event("fire"))
-			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), guard, Vec::new())
 			.add_timed_transition(State("S1"), Event("fire"), State("S0"), None, [reset.to_string()])
-			.build()
 	}
 
+	// A build refuses a guard or a reset that names an undeclared clock.
 	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_guard_on_an_undeclared_clock_is_refused() -> Result<(), Box<dyn core::error::Error>> {
-		let refused = clocked("other", "other");
-		assert_eq!(
-			refused.err(),
-			Some(ProcessBuildError::UndeclaredClock { clock: "clk".to_string() })
-		);
-		Ok(())
+	crate::tb_cases! {
+		fn an_undeclared_clock_is_refused((declared, reset, clock): (&'static str, &'static str, &'static str)) {
+			let built = clocked(declared, reset).build();
+			assert_eq!(built.err(), Some(ProcessBuildError::UndeclaredClock { clock: clock.to_string() }));
+		}
+
+		cases {
+			in_a_guard => ("other", "other", "clk"),
+			in_a_misspelt_reset => ("clk", "clck", "clck"),
+		}
 	}
 
+	/// Every clock that a process names starts at zero.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_misspelt_reset_is_refused() -> Result<(), Box<dyn core::error::Error>> {
-		let refused = clocked("clk", "clck");
-		assert_eq!(
-			refused.err(),
-			Some(ProcessBuildError::UndeclaredClock { clock: "clck".to_string() })
-		);
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn every_clock_that_a_process_names_starts_at_zero() -> Result<(), Box<dyn core::error::Error>> {
-		let process = clocked("clk", "clk")?;
+	fn every_clock_that_a_process_names_starts_at_zero() -> TestResult {
+		let process = clocked("clk", "clk").build()?;
 		let clocks = process.initial_clocks();
 		assert_eq!(clocks, HashMap::from([("clk".to_string(), Duration::ZERO)]));
 		Ok(())
 	}
 
+	/// A timed transition takes an event as a URN as well as by name.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_timed_transition_takes_an_event_in_any_form() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_timed_transition_takes_an_event_in_any_form() -> TestResult {
 		let process = Process::builder("Urn")
 			.initial_state(State("S0"))
 			.add_observable(ARM)
@@ -2352,10 +2327,40 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn handshake_process_example() -> Result<(), Box<dyn core::error::Error>> {
+	// `tb_process_spec!` builds the handshake process, and each numbered step
+	// checks one part of the LTS it yields.
+	tb_process_spec! {
+		pub ComprehensiveHandshake,
+		events {
+			observable { Event("start"), Event("send"), Event("ack"), Event("fail") }
+			hidden { Event("serialize"), Event("encrypt"), Event("queue"), Event("dispatch") }
+		}
+		states {
+			S0  => { Event("start") => S1 },
+			S1  => { Event("serialize") => S1s, Event("queue") => S1q },
+			S1s => { Event("encrypt") => S1e },
+			S1e => { Event("send") => S2 },
+			S1q => { Event("dispatch") => S1d },
+			S1d => { Event("send") => S2 },
+			S2  => { Event("ack") => S3, Event("fail") => S3f },
+			S3  => {},
+			S3f => {}
+		}
+		terminal { S3, S3f }
+		choice { S1 }
+		annotations { description: HANDSHAKE }
+	}
+
+	/// The process of [`ComprehensiveHandshake`].
+	fn handshake() -> Process {
+		ComprehensiveHandshake::process().expect("the handshake spec builds")
+	}
+
+	/// The handshake of [`ComprehensiveHandshake`], as the process builder
+	/// declares it.
+	fn built_handshake() -> Process {
 		// A CSP handshake that sends either directly or through a queue.
-		let proc = Process::builder("Handshake")
+		Process::builder("ComprehensiveHandshake")
 			.initial_state(State("S0"))
 			// Σ holds the four events an observer sees.
 			.add_observable(Event("start"))
@@ -2382,233 +2387,186 @@ mod tests {
 			.add_terminal(State("S3f"))
 			// S1 is a declared choice point, so both branches are legal.
 			.add_choice(State("S1"))
-			.description("Queued or direct send")
-			.build()?;
-
-		assert_eq!(proc.initial, State("S0"));
-
-		assert!(proc.is_choice(State("S1")));
-		let s1_enabled = proc.enabled(State("S1"));
-		assert_eq!(s1_enabled.len(), 2); // S1 enables serialize and queue.
-
-		assert_eq!(proc.observable_alphabet().len(), 4);
-		assert!(proc.observable_alphabet().contains(&Event("start")));
-		assert!(proc.observable_alphabet().contains(&Event("send")));
-		assert!(proc.observable_alphabet().contains(&Event("ack")));
-		assert!(proc.observable_alphabet().contains(&Event("fail")));
-
-		assert_eq!(proc.hidden_alphabet().len(), 4);
-
-		assert!(proc.is_terminal(State("S3")));
-		assert!(proc.is_terminal(State("S3f")));
-
-		Ok(())
+			.description(HANDSHAKE)
+			.build()
+			.expect("the handshake builds")
 	}
 
-	// `tb_process_spec!` builds the handshake process, and each numbered step
-	// checks one part of the LTS it yields.
+	/// The parts of a process that its declaration decides, apart from its
+	/// transitions.
+	#[derive(Debug, PartialEq)]
+	struct Declared {
+		name: &'static str,
+		description: Option<&'static str>,
+		initial: State,
+		states: HashSet<State>,
+		observable: HashSet<Event>,
+		hidden: HashSet<Event>,
+		terminal: HashSet<State>,
+		choice: HashSet<State>,
+	}
+
+	impl Declared {
+		/// The declared parts of `process`.
+		fn of(process: &Process) -> Self {
+			Declared {
+				name: process.name,
+				description: process.description,
+				initial: process.initial,
+				states: process.states.clone(),
+				observable: process.observable_alphabet().clone(),
+				hidden: process.hidden_alphabet().clone(),
+				terminal: process.terminal.clone(),
+				choice: process.choice.clone(),
+			}
+		}
+	}
+
+	/// The targets of each state and event of `process`.
+	fn relation_of(process: &Process) -> HashMap<(State, Event), Vec<State>> {
+		let transitions = process.transitions.iter();
+		transitions.map(|(edge, targets)| (*edge, targets.clone())).collect()
+	}
+
+	/// The names of the states that `events` lead `process` through from its
+	/// initial state, where each event leads to one state.
+	fn walk(process: &Process, events: &[&'static str]) -> Vec<&'static str> {
+		let states = events.iter().scan(process.initial, |state, event| {
+			let successors = process.step(*state, &Event(event));
+			let [next] = <[State; 1]>::try_from(successors).expect("each event of a walk leads to one state");
+			*state = next;
+			Some(next.0)
+		});
+
+		states.collect()
+	}
+
+	/// The builder and the spec macro build one handshake, with the same
+	/// declared parts and the same transitions.
 	#[test]
-	fn test_csp_process_spec_structure() -> Result<(), ProcessBuildError> {
-		tb_process_spec! {
-			pub ComprehensiveHandshake,
-			events {
-				observable { Event("start"), Event("send"), Event("ack"), Event("fail") }
-				hidden { Event("serialize"), Event("encrypt"), Event("queue"), Event("dispatch") }
-			}
-			states {
-				S0  => { Event("start") => S1 },
-				S1  => { Event("serialize") => S1s, Event("queue") => S1q },
-				S1s => { Event("encrypt") => S1e },
-				S1e => { Event("send") => S2 },
-				S1q => { Event("dispatch") => S1d },
-				S1d => { Event("send") => S2 },
-				S2  => { Event("ack") => S3, Event("fail") => S3f },
-				S3  => {},
-				S3f => {}
-			}
-			terminal { S3, S3f }
-			choice { S1 }
-			annotations { description: "Comprehensive handshake with queued or direct send" }
+	fn the_builder_and_the_macro_build_one_handshake() {
+		let built = built_handshake();
+
+		let declared = handshake();
+		let parts = (Declared::of(&built), relation_of(&built));
+		assert_eq!(parts, (Declared::of(&declared), relation_of(&declared)));
+	}
+
+	/// The handshake spec declares its name, its states, its alphabets, its
+	/// terminal states, and its choice points.
+	#[test]
+	fn the_handshake_spec_declares_its_parts() {
+		let process = handshake();
+
+		let declared = Declared::of(&process);
+		let expected = Declared {
+			// 1. The name, the description, and the initial state.
+			name: "ComprehensiveHandshake",
+			description: Some(HANDSHAKE),
+			initial: State("S0"),
+			// 2. The state space.
+			states: states_named(&["S0", "S1", "S1s", "S1e", "S1q", "S1d", "S2", "S3", "S3f"]),
+			// 3. The observable alphabet (Σ).
+			observable: events_named(&["start", "send", "ack", "fail"]),
+			// 4. The hidden alphabet (τ).
+			hidden: events_named(&["serialize", "encrypt", "queue", "dispatch"]),
+			// 5. The terminal states (STOP).
+			terminal: states_named(&["S3", "S3f"]),
+			// 6. The nondeterministic choice points (⊓).
+			choice: states_named(&["S1"]),
+		};
+		assert_eq!(declared, expected);
+	}
+
+	// Each event of the handshake takes its state to one state.
+	crate::tb_cases! {
+		fn a_handshake_event_leads_to_one_state((from, event, to): (&'static str, &'static str, &'static str)) {
+			let process = handshake();
+			let successors = process.step(State(from), &Event(event));
+			assert_eq!(successors, [State(to)]);
 		}
 
-		let proc = ComprehensiveHandshake::process()?;
-
-		// 1. The name, the description, and the initial state.
-		assert_eq!(proc.name, "ComprehensiveHandshake");
-		assert_eq!(proc.description, Some("Comprehensive handshake with queued or direct send"));
-		assert_eq!(proc.initial, State("S0"));
-
-		// 2. The state space.
-		assert_eq!(proc.states.len(), 9); // S0, S1, S1s, S1e, S1q, S1d, S2, S3, S3f
-		assert!(proc.states.contains(&State("S0")));
-		assert!(proc.states.contains(&State("S1")));
-		assert!(proc.states.contains(&State("S1s")));
-		assert!(proc.states.contains(&State("S1e")));
-		assert!(proc.states.contains(&State("S1q")));
-		assert!(proc.states.contains(&State("S1d")));
-		assert!(proc.states.contains(&State("S2")));
-		assert!(proc.states.contains(&State("S3")));
-		assert!(proc.states.contains(&State("S3f")));
-
-		// 3. The observable alphabet (Σ).
-		assert_eq!(proc.observable_alphabet().len(), 4);
-		assert!(proc.observable_alphabet().contains(&Event("start")));
-		assert!(proc.observable_alphabet().contains(&Event("send")));
-		assert!(proc.observable_alphabet().contains(&Event("ack")));
-		assert!(proc.observable_alphabet().contains(&Event("fail")));
-
-		// 4. The hidden alphabet (τ).
-		assert_eq!(proc.hidden_alphabet().len(), 4);
-		assert!(proc.hidden_alphabet().contains(&Event("serialize")));
-		assert!(proc.hidden_alphabet().contains(&Event("encrypt")));
-		assert!(proc.hidden_alphabet().contains(&Event("queue")));
-		assert!(proc.hidden_alphabet().contains(&Event("dispatch")));
-
-		// 5. The terminal states (STOP).
-		assert_eq!(proc.terminal.len(), 2);
-		assert!(proc.is_terminal(State("S3"))); // S3 is the success STOP.
-		assert!(proc.is_terminal(State("S3f"))); // S3f is the failure STOP.
-
-		// 6. The nondeterministic choice points (⊓).
-		assert_eq!(proc.choice.len(), 1);
-		assert!(proc.is_choice(State("S1"))); // S1 chooses serialize or queue.
-
-		// 7. The observable transitions of the transition relation.
-		let s0_start = proc.step(State("S0"), &Event("start"));
-		assert_eq!(s0_start.len(), 1);
-		assert_eq!(s0_start[0], State("S1"));
-
-		let s1e_send = proc.step(State("S1e"), &Event("send"));
-		assert_eq!(s1e_send.len(), 1);
-		assert_eq!(s1e_send[0], State("S2"));
-
-		let s1d_send = proc.step(State("S1d"), &Event("send"));
-		assert_eq!(s1d_send.len(), 1);
-		assert_eq!(s1d_send[0], State("S2"));
-
-		let s2_ack = proc.step(State("S2"), &Event("ack"));
-		assert_eq!(s2_ack.len(), 1);
-		assert_eq!(s2_ack[0], State("S3"));
-
-		let s2_fail = proc.step(State("S2"), &Event("fail"));
-		assert_eq!(s2_fail.len(), 1);
-		assert_eq!(s2_fail[0], State("S3f"));
-
-		// 8. The hidden (τ) transitions of the transition relation.
-		let s1_serialize = proc.step(State("S1"), &Event("serialize"));
-		assert_eq!(s1_serialize.len(), 1);
-		assert_eq!(s1_serialize[0], State("S1s"));
-
-		let s1_queue = proc.step(State("S1"), &Event("queue"));
-		assert_eq!(s1_queue.len(), 1);
-		assert_eq!(s1_queue[0], State("S1q"));
-
-		let s1s_encrypt = proc.step(State("S1s"), &Event("encrypt"));
-		assert_eq!(s1s_encrypt.len(), 1);
-		assert_eq!(s1s_encrypt[0], State("S1e"));
-
-		let s1q_dispatch = proc.step(State("S1q"), &Event("dispatch"));
-		assert_eq!(s1q_dispatch.len(), 1);
-		assert_eq!(s1q_dispatch[0], State("S1d"));
-
-		// 9. The enabled actions at each state.
-		// S0 enables only the observable `start`.
-		let s0_enabled = proc.enabled(State("S0"));
-		assert_eq!(s0_enabled.len(), 1);
-		assert!(s0_enabled.iter().any(|a| a.event.0 == "start" && a.is_observable()));
-
-		// S1 offers a nondeterministic choice of hidden `serialize` or `queue`.
-		let s1_enabled = proc.enabled(State("S1"));
-		assert_eq!(s1_enabled.len(), 2);
-		assert!(s1_enabled.iter().any(|a| a.event.0 == "serialize" && a.is_hidden()));
-		assert!(s1_enabled.iter().any(|a| a.event.0 == "queue" && a.is_hidden()));
-
-		// S2 enables the observable `ack` and `fail`, one for each outcome.
-		let s2_enabled = proc.enabled(State("S2"));
-		assert_eq!(s2_enabled.len(), 2);
-		assert!(s2_enabled.iter().any(|a| a.event.0 == "ack" && a.is_observable()));
-		assert!(s2_enabled.iter().any(|a| a.event.0 == "fail" && a.is_observable()));
-
-		// S3 is terminal and enables no action.
-		let s3_enabled = proc.enabled(State("S3"));
-		assert_eq!(s3_enabled.len(), 0);
-
-		// 10. A trace along the direct success path.
-		let mut current = proc.initial;
-
-		current = proc.step(current, &Event("start"))[0];
-		assert_eq!(current, State("S1"));
-		assert!(proc.is_choice(current));
-
-		current = proc.step(current, &Event("serialize"))[0];
-		assert_eq!(current, State("S1s"));
-
-		current = proc.step(current, &Event("encrypt"))[0];
-		assert_eq!(current, State("S1e"));
-
-		current = proc.step(current, &Event("send"))[0];
-		assert_eq!(current, State("S2"));
-
-		current = proc.step(current, &Event("ack"))[0];
-		assert_eq!(current, State("S3"));
-		assert!(proc.is_terminal(current));
-
-		// 11. A trace along the queued success path.
-		let mut current = proc.initial;
-
-		current = proc.step(current, &Event("start"))[0];
-		assert_eq!(current, State("S1"));
-
-		current = proc.step(current, &Event("queue"))[0];
-		assert_eq!(current, State("S1q"));
-
-		current = proc.step(current, &Event("dispatch"))[0];
-		assert_eq!(current, State("S1d"));
-
-		current = proc.step(current, &Event("send"))[0];
-		assert_eq!(current, State("S2"));
-
-		current = proc.step(current, &Event("ack"))[0];
-		assert_eq!(current, State("S3"));
-		assert!(proc.is_terminal(current));
-
-		// 12. A trace along the failure path.
-		let mut current = proc.initial;
-
-		current = proc.step(current, &Event("start"))[0];
-
-		current = proc.step(current, &Event("serialize"))[0];
-
-		current = proc.step(current, &Event("encrypt"))[0];
-
-		current = proc.step(current, &Event("send"))[0];
-
-		current = proc.step(current, &Event("fail"))[0];
-		assert_eq!(current, State("S3f"));
-		assert!(proc.is_terminal(current));
-
-		// 13. An invalid transition yields no successor states.
-		assert_eq!(proc.step(State("S0"), &Event("send")).len(), 0);
-		assert_eq!(proc.step(State("S1"), &Event("ack")).len(), 0);
-		assert_eq!(proc.step(State("S3"), &Event("start")).len(), 0); // S3 is terminal.
-
-		// 14. Each event classifies as observable or hidden.
-		for action in proc.enabled(State("S0")) {
-			if action.event.0 == "start" {
-				assert!(action.is_observable());
-				assert!(!action.is_hidden());
-				assert_eq!(action.alphabet, Alphabet::Observable);
-			}
+		cases {
+			// 7. The observable transitions of the transition relation.
+			start_from_s0 => ("S0", "start", "S1"),
+			send_from_s1e => ("S1e", "send", "S2"),
+			send_from_s1d => ("S1d", "send", "S2"),
+			ack_from_s2 => ("S2", "ack", "S3"),
+			fail_from_s2 => ("S2", "fail", "S3f"),
+			// 8. The hidden (τ) transitions of the transition relation.
+			serialize_from_s1 => ("S1", "serialize", "S1s"),
+			queue_from_s1 => ("S1", "queue", "S1q"),
+			encrypt_from_s1s => ("S1s", "encrypt", "S1e"),
+			dispatch_from_s1q => ("S1q", "dispatch", "S1d"),
 		}
-		for action in proc.enabled(State("S1")) {
-			if action.event.0 == "serialize" || action.event.0 == "queue" {
-				assert!(action.is_hidden());
-				assert!(!action.is_observable());
-				assert_eq!(action.alphabet, Alphabet::Hidden);
-			}
+	}
+
+	// Each state of the handshake enables its actions, each in its alphabet.
+	crate::tb_cases! {
+		fn the_handshake_enables_its_actions_at((state, actions): (&'static str, Vec<Action>)) {
+			let process = handshake();
+			let enabled = process.enabled(State(state));
+			assert_eq!(enabled, actions);
 		}
 
-		Ok(())
+		cases {
+			// 9. The enabled actions at each state.
+			// 14. Each event classifies as observable or hidden.
+			/// S0 enables only the observable `start`.
+			s0 => ("S0", vec![Action::observable("start")]),
+			/// S1 offers a nondeterministic choice of hidden `serialize` or
+			/// `queue`.
+			s1 => ("S1", vec![Action::hidden("queue"), Action::hidden("serialize")]),
+			/// S2 enables the observable `ack` and `fail`, one for each
+			/// outcome.
+			s2 => ("S2", vec![Action::observable("ack"), Action::observable("fail")]),
+			/// S3 is terminal and enables no action.
+			s3 => ("S3", Vec::new()),
+		}
+	}
+
+	// Each path of the handshake walks through its states to a STOP.
+	crate::tb_cases! {
+		fn a_handshake_path_walks((events, trail): (&[&'static str], &[&'static str])) {
+			let process = handshake();
+			let walked = walk(&process, events);
+			assert_eq!(walked, trail);
+		}
+
+		cases {
+			// 10. A trace along the direct success path.
+			the_direct_success_path => (
+				&["start", "serialize", "encrypt", "send", "ack"],
+				&["S1", "S1s", "S1e", "S2", "S3"],
+			),
+			// 11. A trace along the queued success path.
+			the_queued_success_path => (
+				&["start", "queue", "dispatch", "send", "ack"],
+				&["S1", "S1q", "S1d", "S2", "S3"],
+			),
+			// 12. A trace along the failure path.
+			the_failure_path => (
+				&["start", "serialize", "encrypt", "send", "fail"],
+				&["S1", "S1s", "S1e", "S2", "S3f"],
+			),
+		}
+	}
+
+	// 13. An invalid transition yields no successor states.
+	crate::tb_cases! {
+		fn the_handshake_refuses((state, event): (&'static str, &'static str)) {
+			let process = handshake();
+
+			let successors = process.step(State(state), &Event(event));
+			assert!(successors.is_empty());
+		}
+
+		cases {
+			send_at_s0 => ("S0", "send"),
+			ack_at_s1 => ("S1", "ack"),
+			/// S3 is terminal.
+			start_at_s3 => ("S3", "start"),
+		}
 	}
 
 	const STEP1: Urn<'static> = crate::urn!("test", "event:csp/step1");
@@ -2640,8 +2598,9 @@ mod tests {
 		terminal { S2 }
 	}
 
+	// A bare run that records both steps meets its spec and its process.
 	tb_scenario! {
-		name: test_csp_with_bare_environment,
+		name: a_bare_run_of_both_steps_meets_its_spec_and_process,
 		config: ScenarioConfig::builder()
 			.with_spec(SimpleBareFlowSpec::latest())
 			.with_csp(SimpleBareFlowProc)
@@ -2658,11 +2617,13 @@ mod tests {
 	const RECEIVED: Urn<'static> = crate::urn!("test", "event:csp/received");
 	const RESPONDED: Urn<'static> = crate::urn!("test", "event:csp/responded");
 
-	// The assertion spec counts the events that the run must record.
+	// The assertion spec counts the events that the run must record, and
+	// requires the answer of the server.
 	tb_assert_spec! {
 		pub ClientServerFlowSpec,
 		V(1,0,0): {
 			mode: Accept,
+			response: Present,
 			assertions: [
 				(RECEIVED, exactly!(2)),
 				(RESPONDED, exactly!(2))
@@ -2688,26 +2649,37 @@ mod tests {
 		annotations { description: "Client-server request-response with 2 client + 2 server assertions" }
 	}
 
+	/// Sends one request to the server at `addr`, records `RESPONDED` before
+	/// it and `RECEIVED` after the answer, and records the exchange.
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	static HOOK_CALLED: AtomicBool = AtomicBool::new(false);
+	async fn send_one_and_record(trace: TraceCollector, addr: TightBeamSocketAddr) -> Result<(), TightBeamError> {
+		let request = TestFrame::v0(None, Some("test"));
 
+		// The client records its first event before it sends.
+		trace.event(RESPONDED)?;
+
+		let response = send_one(addr, request.clone()).await?;
+
+		// The client records its second event after the reply arrives.
+		trace.event(RECEIVED)?;
+		trace.record_exchange(Exchange::Accepted { request, response: response.map(Box::new) });
+		Ok(())
+	}
+
+	// A client and a server that each record both events of one exchange meet
+	// the spec and the process of the flow.
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	crate::tb_scenario! {
-		name: test_csp_process_with_assert_spec_integration,
+		name: a_client_and_server_run_meets_its_spec_and_process,
 		config: ScenarioConfig::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
-			.with_hooks(TestHooks::on_pass(|_context| {
-					HOOK_CALLED.store(true, Ordering::SeqCst);
-				}).with_on_fail(|_context, violations| {
-					panic!("Test should not fail! Violations: {violations}")
-				}))
 			.build(),
 		environment ServiceClient {
 			worker_threads: 2,
 			server: |SetupEnv { trace, .. }| async move {
-				let bind_addr = TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
-				let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(bind_addr).await?;
+				let loopback = <TokioListener as Protocol>::default_bind_address()?;
+				let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback).await?;
 
 				let handle = crate::server! {
 					protocol TokioListener: listener,
@@ -2722,25 +2694,7 @@ mod tests {
 
 				Ok((handle, addr))
 			},
-			client: |ClientEnv { trace, addr, .. }| async move {
-				let stream = <TokioListener as Protocol>::connect(addr).await?;
-				let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
-
-				// The client records its first event before it sends.
-				trace.event(RESPONDED)?;
-
-				let test_message = TestMessage::sample(None);
-				let test_frame = compose! {
-					V0: id: "test", order: 1u64, message: test_message
-				}?;
-
-				let _response = client.emit(test_frame, None).await?;
-
-				// The client records its second event after the reply arrives.
-				trace.event(RECEIVED)?;
-
-				Ok(())
-			}
+			client: |ClientEnv { trace, addr, .. }| send_one_and_record(trace, addr)
 		}
 	}
 
@@ -2759,10 +2713,10 @@ mod tests {
 	}
 
 	// The scenario serves the flow from the servlet in the ServiceClient
-	// environment.
+	// environment, and the run meets the spec and the process of the flow.
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	tb_scenario! {
-		name: test_servlet_environment_integration,
+		name: a_servlet_run_meets_its_spec_and_process,
 		config: ScenarioConfig::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
@@ -2773,28 +2727,9 @@ mod tests {
 				let servlet = TestServletForScenario::start(Arc::new(trace), crate::colony::servlet::ServletConfig::cleartext()).await?;
 				let addr = servlet.addr().to_owned();
 				let server_handle = tokio::spawn(servlet.join());
-
 				Ok((server_handle, addr))
 			},
-			client: |ClientEnv { trace, addr, .. }| async move {
-				let stream = <TokioListener as Protocol>::connect(addr).await?;
-				let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
-
-				// The client records its first event before it sends.
-				trace.event(RESPONDED)?;
-
-				let test_message = TestMessage::sample(None);
-				let test_frame = compose! {
-					V0: id: "test", order: 1u64, message: test_message
-				}?;
-
-				let _response = client.emit(test_frame, None).await?;
-
-				// The client records its second event after the reply arrives.
-				trace.event(RECEIVED)?;
-
-				Ok(())
-			}
+			client: |ClientEnv { trace, addr, .. }| send_one_and_record(trace, addr)
 		}
 	}
 }

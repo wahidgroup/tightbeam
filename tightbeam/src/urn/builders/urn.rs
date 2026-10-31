@@ -252,9 +252,24 @@ impl<'a> TypeBuilder<Urn<'a>> for UrnBuilder<'a> {
 }
 
 #[cfg(test)]
+impl<'a> UrnBuilder<'a> {
+	/// This builder with each of `components`, a key beside its value, set in
+	/// their order.
+	pub(crate) fn holding<'c>(self, components: impl IntoIterator<Item = &'c (&'static str, &'a str)>) -> Self
+	where
+		'a: 'c,
+	{
+		let components = components.into_iter();
+		components.fold(self, |builder, &(key, value)| builder.set(key, value))
+	}
+}
+
+#[cfg(test)]
 mod tests {
-	use super::*;
+	use crate::testing::TestResult;
 	use crate::urn::builders::spec::Pattern;
+
+	use super::*;
 
 	crate::urn_spec! {
 		/// The URN spec that the builder tests use.
@@ -268,207 +283,180 @@ mod tests {
 		nss_format: "{}:{}/{}"
 	}
 
-	// Each case is (nid, nss, the rendered URN).
-	crate::tb_cases! {
-		fn test_urn_builder_with_nss((nid, nss, expected): (&str, &str, &str)) -> Result<(), UrnValidationError> {
-			let urn = UrnBuilder::default().with_nid(nid).with_nss(nss).build()?;
-			assert_eq!(urn.nid, nid);
-			assert_eq!(urn.nss, nss);
-			assert_eq!(urn.to_string(), expected);
-			Ok(())
-		}
-		cases {
-			colon_path => ("tightbeam", "test:resource", "urn:tightbeam:test:resource"),
-			slash_path => ("example", "path/to/resource", "urn:example:path/to/resource"),
-			simple => ("test", "simple", "urn:test:simple"),
-		}
-	}
-
-	/// The NID of one component case, its components, and the URN it renders.
-	type ComponentsTestCase = (&'static str, &'static [(&'static str, &'static str)], &'static str);
-
-	/// A builder of `nid` that holds each of `components`, in their order.
-	fn builder_of(nid: &'static str, components: &'static [(&'static str, &'static str)]) -> UrnBuilder<'static> {
-		let builder = UrnBuilder::default().with_nid(nid);
-		components
-			.iter()
-			.fold(builder, |builder, (key, value)| builder.set(key, *value))
-	}
-
-	// The builder sorts the components by key, in lexicographic order.
-	crate::tb_cases! {
-		fn test_urn_builder_with_components((nid, components, expected): ComponentsTestCase)
-			-> Result<(), UrnValidationError>
-		{
-			let urn = builder_of(nid, components).build()?;
-			assert_eq!(urn.nid, nid);
-			assert_eq!(urn.to_string(), expected);
-			Ok(())
-		}
-		cases {
-			two_keys => ("example", &[("type", "book"), ("id", "123")], "urn:example:123:book"),
-			sorted_keys => ("test", &[("a", "1"), ("b", "2"), ("c", "3")], "urn:test:1:2:3"),
-			reversed_keys => ("ns", &[("z", "last"), ("a", "first")], "urn:ns:first:last"),
-		}
-	}
-
-	crate::tb_cases! {
-		fn test_urn_builder_missing_nid(nss: &str) {
-			let result = UrnBuilder::default().with_nss(nss).build();
-			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
-		}
-		cases {
-			simple => "test",
-			path => "resource:path",
-			empty => "",
-		}
-	}
-
-	#[test]
-	fn test_urn_builder_with_spec() -> Result<(), UrnValidationError> {
-		// The spec-based builder cases share one body through this macro.
-		macro_rules! build_with_spec {
-			(values: [$($k:literal = $v:literal),+], nss: $expected_nss:literal, urn: $expected_urn:literal) => {{
-				let urn = UrnBuilder::from(TestUrnSpec)
-					$(.set($k, $v))+
-					.build()?;
-				assert_eq!(urn.nid, TestUrnSpec::NID);
-				assert_eq!(urn.nss, $expected_nss);
-				assert_eq!(urn.to_string(), $expected_urn);
-			}};
-		}
-
-		// Each resource type builds from valid data.
-		build_with_spec!(
-			values: ["category" = "instrumentation", "type" = "trace", "id" = "abc-123"],
-			nss: "instrumentation:trace/abc-123",
-			urn: "urn:test:instrumentation:trace/abc-123"
-		);
-
-		build_with_spec!(
-			values: ["category" = "instrumentation", "type" = "event", "id" = "test-456"],
-			nss: "instrumentation:event/test-456",
-			urn: "urn:test:instrumentation:event/test-456"
-		);
-
-		build_with_spec!(
-			values: ["category" = "instrumentation", "type" = "seed", "id" = "xyz-789"],
-			nss: "instrumentation:seed/xyz-789",
-			urn: "urn:test:instrumentation:seed/xyz-789"
-		);
-
-		build_with_spec!(
-			values: ["category" = "instrumentation", "type" = "verdict", "id" = "result-1"],
-			nss: "instrumentation:verdict/result-1",
-			urn: "urn:test:instrumentation:verdict/result-1"
-		);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_urn_builder_with_spec_missing_fields() {
-		// The missing-field cases share one body through this macro.
-		macro_rules! missing_field {
-			(values: [$($k:literal = $v:literal),*], field: $expected:literal) => {{
-				let mut builder = UrnBuilder::from(TestUrnSpec);
-				$(builder = builder.set($k, $v);)*
-				let result = builder.build();
-				assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(field)) if field == $expected));
-			}};
-		}
-
-		// Each case leaves one required field out.
-		missing_field!(values: ["type" = "trace", "id" = "123"], field: "category");
-		missing_field!(values: ["category" = "instrumentation", "id" = "123"], field: "type");
-		missing_field!(values: ["category" = "instrumentation", "type" = "trace"], field: "id");
-	}
-
-	#[test]
-	fn test_urn_builder_with_spec_invalid_fields() {
-		// The invalid-field cases share one body through this macro.
-		macro_rules! invalid_field {
-			(values: [$($k:literal = $v:literal),+], field: $expected:literal) => {{
-				let result = UrnBuilder::from(TestUrnSpec)
-					$(.set($k, $v))+
-					.build();
-				assert!(matches!(result, Err(UrnValidationError::InvalidFormat { field, .. }) if field == $expected));
-			}};
-		}
-
-		// A value outside the allowed set breaks a constraint.
-		invalid_field!(values: ["category" = "invalid", "type" = "trace", "id" = "123"], field: "category");
-		invalid_field!(values: ["category" = "instrumentation", "type" = "invalid", "id" = "123"], field: "type");
-
-		// A value outside the allowed characters breaks a pattern.
-		invalid_field!(values: ["category" = "instrumentation", "type" = "trace", "id" = "invalid_chars!"], field: "id");
-		invalid_field!(values: ["category" = "instrumentation", "type" = "trace", "id" = "space here"], field: "id");
-		invalid_field!(values: ["category" = "instrumentation", "type" = "trace", "id" = "underscore_here"], field: "id");
-	}
-
-	crate::tb_cases! {
-		fn test_urn_builder_empty_components(nid: &str) {
-			let result = UrnBuilder::default().with_nid(nid).build();
-			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
-		}
-		cases {
-			tightbeam => "tightbeam",
-			test => "test",
-			example => "example",
-		}
-	}
-
-	// The builder assembles its `Urn` through the one checked constructor, so
-	// it refuses an empty NSS as the constructors do. Each row is one way to
-	// reach an empty NSS.
-	#[test]
-	fn the_builder_refuses_an_empty_nss() {
-		let direct = UrnBuilder::default().with_nid("test").with_nss("").build();
-		assert!(
-			matches!(direct, Err(UrnValidationError::RequiredFieldMissing("nss"))),
-			"direct: {direct:?}"
-		);
-
-		let mut with_empty_component = UrnBuilder::default().with_nid("test");
-		with_empty_component.set_component("only", Cow::Borrowed(""));
-
-		let empty_component = with_empty_component.build();
-		assert!(
-			matches!(empty_component, Err(UrnValidationError::RequiredFieldMissing("nss"))),
-			"one empty component: {empty_component:?}"
-		);
-	}
-
-	// The builder names a malformed NID before it checks the NSS.
-	#[test]
-	fn the_builder_names_a_malformed_nid_before_an_empty_nss() {
-		let result = UrnBuilder::default().with_nid("-bad").with_nss("").build();
-		assert!(matches!(result, Err(UrnValidationError::InvalidNidStart)), "got {result:?}");
-	}
-
 	/// A builder of the [`TestUrnSpec`] NID that holds components the spec
 	/// accepts, and no NSS mode.
 	fn component_builder() -> UrnBuilder<'static> {
-		UrnBuilder::default()
-			.with_nid(TestUrnSpec::NID)
-			.set("category", "instrumentation")
-			.set("type", "trace")
-			.set("id", "abc-123")
+		let components = [("category", "instrumentation"), ("type", "trace"), ("id", "abc-123")];
+		UrnBuilder::default().with_nid(TestUrnSpec::NID).holding(&components)
 	}
 
-	// A builder that holds both a direct NSS and a spec refuses to build,
-	// whichever of the two calls came first.
+	// Each case is a NID and a direct NSS, which the URN carries as the
+	// builder was given them.
 	crate::tb_cases! {
-		fn a_builder_that_holds_an_nss_and_a_spec_refuses_to_build(builder: fn() -> UrnBuilder<'static>)
-			-> Result<(), UrnValidationError>
-		{
-			let built = builder().build();
-			assert!(matches!(built, Err(UrnValidationError::ConflictingNssModes)), "got {built:?}");
+		fn a_builder_carries_the_nid_and_nss_it_is_given((nid, nss): (&str, &str)) -> TestResult {
+			let urn = UrnBuilder::default().with_nid(nid).with_nss(nss).build()?;
+			assert_eq!((urn.nid.as_ref(), urn.nss.as_ref()), (nid, nss));
 			Ok(())
 		}
 		cases {
-			spec_then_nss => || component_builder().with_spec::<TestUrnSpec>().with_nss("direct"),
-			nss_then_spec => || component_builder().with_nss("direct").with_spec::<TestUrnSpec>(),
+			colon_path => ("tightbeam", "test:resource"),
+			slash_path => ("example", "path/to/resource"),
+			simple => ("test", "simple"),
+		}
+	}
+
+	// The builder joins the components in the lexicographic order of their
+	// keys. Each case is a NID and its components, beside the NSS they join
+	// into.
+	crate::tb_cases! {
+		fn a_builder_joins_its_components_in_key_order(
+			(nid, components, nss): (&str, &'static [(&'static str, &'static str)], &str)
+		) -> TestResult {
+			let urn = UrnBuilder::default().with_nid(nid).holding(components).build()?;
+			assert_eq!((urn.nid.as_ref(), urn.nss.as_ref()), (nid, nss));
+			Ok(())
+		}
+		cases {
+			two_keys => ("example", &[("type", "book"), ("id", "123")], "123:book"),
+			sorted_keys => ("test", &[("a", "1"), ("b", "2"), ("c", "3")], "1:2:3"),
+			reversed_keys => ("ns", &[("z", "last"), ("a", "first")], "first:last"),
+		}
+	}
+
+	// Each case is the components of a builder of [`TestUrnSpec`], beside the
+	// NSS that the spec writes of them.
+	crate::tb_cases! {
+		fn a_spec_builder_writes_its_nss((components, nss): (&'static [(&'static str, &'static str)], &str))
+			-> TestResult
+		{
+			let urn = UrnBuilder::from(TestUrnSpec).holding(components).build()?;
+			assert_eq!((urn.nid.as_ref(), urn.nss.as_ref()), ("test", nss));
+			Ok(())
+		}
+		cases {
+			trace => (
+				&[("category", "instrumentation"), ("type", "trace"), ("id", "abc-123")],
+				"instrumentation:trace/abc-123",
+			),
+			event => (
+				&[("category", "instrumentation"), ("type", "event"), ("id", "test-456")],
+				"instrumentation:event/test-456",
+			),
+			seed => (
+				&[("category", "instrumentation"), ("type", "seed"), ("id", "xyz-789")],
+				"instrumentation:seed/xyz-789",
+			),
+			verdict => (
+				&[("category", "instrumentation"), ("type", "verdict"), ("id", "result-1")],
+				"instrumentation:verdict/result-1",
+			),
+		}
+	}
+
+	// Each case is the components of a builder of [`TestUrnSpec`], beside the
+	// refusal that names the field they leave out or break. A constraint names
+	// no pattern, and the pattern of `id` names itself.
+	crate::tb_cases! {
+		fn a_spec_builder_names_the_field_it_refuses(
+			(components, refusal): (&'static [(&'static str, &'static str)], UrnValidationError)
+		) {
+			let built = UrnBuilder::from(TestUrnSpec).holding(components).build();
+			assert_eq!(built, Err(refusal));
+		}
+		cases {
+			missing_category => (
+				&[("type", "trace"), ("id", "123")],
+				UrnValidationError::RequiredFieldMissing("category"),
+			),
+			missing_type => (
+				&[("category", "instrumentation"), ("id", "123")],
+				UrnValidationError::RequiredFieldMissing("type"),
+			),
+			missing_id => (
+				&[("category", "instrumentation"), ("type", "trace")],
+				UrnValidationError::RequiredFieldMissing("id"),
+			),
+			category_outside_its_value => (
+				&[("category", "invalid"), ("type", "trace"), ("id", "123")],
+				UrnValidationError::InvalidFormat { field: "category", pattern: None },
+			),
+			type_outside_its_values => (
+				&[("category", "instrumentation"), ("type", "invalid"), ("id", "123")],
+				UrnValidationError::InvalidFormat { field: "type", pattern: None },
+			),
+			bang_in_the_id => (
+				&[("category", "instrumentation"), ("type", "trace"), ("id", "invalid_chars!")],
+				UrnValidationError::InvalidFormat { field: "id", pattern: Some(Pattern::AlphaNumericHyphen) },
+			),
+			space_in_the_id => (
+				&[("category", "instrumentation"), ("type", "trace"), ("id", "space here")],
+				UrnValidationError::InvalidFormat { field: "id", pattern: Some(Pattern::AlphaNumericHyphen) },
+			),
+			underscore_in_the_id => (
+				&[("category", "instrumentation"), ("type", "trace"), ("id", "underscore_here")],
+				UrnValidationError::InvalidFormat { field: "id", pattern: Some(Pattern::AlphaNumericHyphen) },
+			),
+		}
+	}
+
+	// Each case is a builder that refuses to build, beside its refusal.
+	crate::tb_cases! {
+		fn a_builder_refuses_to_build((builder, refusal): (fn() -> UrnBuilder<'static>, UrnValidationError)) {
+			let built = builder().build();
+			assert_eq!(built, Err(refusal));
+		}
+		cases {
+			no_nid_beside_a_simple_nss => (
+				|| UrnBuilder::default().with_nss("test"),
+				UrnValidationError::RequiredFieldMissing("nid"),
+			),
+			no_nid_beside_a_path_nss => (
+				|| UrnBuilder::default().with_nss("resource:path"),
+				UrnValidationError::RequiredFieldMissing("nid"),
+			),
+			no_nid_beside_an_empty_nss => (
+				|| UrnBuilder::default().with_nss(""),
+				UrnValidationError::RequiredFieldMissing("nid"),
+			),
+			no_component_under_tightbeam => (
+				|| UrnBuilder::default().with_nid("tightbeam"),
+				UrnValidationError::RequiredFieldMissing("nss components"),
+			),
+			no_component_under_test => (
+				|| UrnBuilder::default().with_nid("test"),
+				UrnValidationError::RequiredFieldMissing("nss components"),
+			),
+			no_component_under_example => (
+				|| UrnBuilder::default().with_nid("example"),
+				UrnValidationError::RequiredFieldMissing("nss components"),
+			),
+			/// The builder assembles its `Urn` through the one checked
+			/// constructor, so it refuses an empty NSS as the constructors do.
+			a_direct_empty_nss => (
+				|| UrnBuilder::default().with_nid("test").with_nss(""),
+				UrnValidationError::RequiredFieldMissing("nss"),
+			),
+			/// One empty component joins into an empty NSS.
+			one_empty_component => (
+				|| UrnBuilder::default().with_nid("test").set("only", ""),
+				UrnValidationError::RequiredFieldMissing("nss"),
+			),
+			/// The builder names a malformed NID before it checks the NSS.
+			a_malformed_nid_before_an_empty_nss => (
+				|| UrnBuilder::default().with_nid("-bad").with_nss(""),
+				UrnValidationError::InvalidNidStart,
+			),
+			/// A builder that holds both a direct NSS and a spec refuses to
+			/// build, whichever of the two calls came first.
+			a_spec_then_an_nss => (
+				|| component_builder().with_spec::<TestUrnSpec>().with_nss("direct"),
+				UrnValidationError::ConflictingNssModes,
+			),
+			/// The same conflict, with the NSS first.
+			an_nss_then_a_spec => (
+				|| component_builder().with_nss("direct").with_spec::<TestUrnSpec>(),
+				UrnValidationError::ConflictingNssModes,
+			),
 		}
 	}
 }

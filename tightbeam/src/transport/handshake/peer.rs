@@ -348,6 +348,21 @@ impl PeerAuthentication {
 	}
 }
 
+#[cfg(test)]
+impl PeerAuthentication {
+	/// Mutual authentication against `validator` alone.
+	pub(crate) fn mutual_with(validator: impl CertificateValidation + 'static) -> Self {
+		let validator: Arc<dyn CertificateValidation> = Arc::new(validator);
+		PeerAuthentication::Anonymous.and(validator)
+	}
+
+	/// Mutual authentication under the default expiry check alone.
+	pub(crate) fn mutual_by_expiry() -> Self {
+		let expiry = crate::crypto::x509::policy::ExpiryValidator::default();
+		PeerAuthentication::mutual_with(expiry)
+	}
+}
+
 /// The admitted party a role records as its peer.
 ///
 /// It is sealed to this module, so its implementors are the admissions of
@@ -1073,21 +1088,23 @@ mod learned {
 
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
 mod tests {
-	use std::error::Error;
-
 	use super::*;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::x509::error::CertificateValidationError;
-	use crate::crypto::x509::policy::RuntimeCertificatePinning;
 	use crate::crypto::x509::KeyPurposes;
-	use crate::transport::handshake::tests::{create_test_certificate, put_off_curve_key};
+	use crate::testing::TestResult;
+	use crate::transport::handshake::tests::{create_test_certificate, pin_of, put_off_curve_key};
 
 	/// A server admitted under the house provider.
 	type HouseServer = AdmittedServer<DefaultCryptoProvider>;
 
 	/// The house server purpose, which a trust admits a server under.
 	const SERVER: ObjectIdentifier = KeyPurposes::HOUSE.server;
+
+	/// A server purpose that an implementor names for its own servers, outside
+	/// the house purposes.
+	const OWN_PURPOSE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
 
 	/// The admission under the house server purpose on the crate clock, with
 	/// no server policy.
@@ -1098,12 +1115,6 @@ mod tests {
 	/// crate clock.
 	fn admission_under(policy: &ValidatorChain) -> ServerAdmission<'_> {
 		ServerAdmission { purpose: SERVER, policy: Some(policy), clock: &ValidityClock::CRATE }
-	}
-
-	/// The validator that pins `certificate` alone, by its fingerprint.
-	fn pin_of(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
-		let pinning = RuntimeCertificatePinning::<Sha3_256>::from_certificates([certificate.to_owned()]);
-		Arc::new(pinning.expect("the test certificate has a fingerprint"))
 	}
 
 	/// The server policy of `validators`, a non-empty set.
@@ -1122,6 +1133,11 @@ mod tests {
 		path.expect("a lone certificate is a path")
 	}
 
+	/// The test certificate of the fixed key of `seed`.
+	fn test_certificate(seed: u8) -> Certificate {
+		create_test_certificate(seed).certificate
+	}
+
 	/// An empty validator set names no demand, so the caller names its
 	/// fallback (CWE-1188).
 	#[test]
@@ -1133,7 +1149,7 @@ mod tests {
 	/// its chain runs, so a config that holds the rule writes it whole.
 	#[test]
 	fn a_rule_writes_its_name_and_the_count_of_its_validators() {
-		let certificate = create_test_certificate().certificate;
+		let certificate = test_certificate(0xf0);
 		let mutual = PeerAuthentication::Anonymous
 			.and(pin_of(&certificate))
 			.and(pin_of(&certificate));
@@ -1148,7 +1164,7 @@ mod tests {
 	/// validator reads it, so a validator never reads an off-curve key.
 	#[test]
 	fn a_signer_off_the_curve_never_reaches_the_validator() {
-		let mut named = create_test_certificate().certificate;
+		let mut named = test_certificate(0xf1);
 		put_off_curve_key(&mut named);
 
 		let validate = |_: &Certificate| Err::<(), _>(CertificateValidationError::CertificateDenied);
@@ -1164,33 +1180,33 @@ mod tests {
 	#[cfg(feature = "transport-cms")]
 	mod provisioned {
 		use super::*;
-		use crate::cms::signed_data::SignerIdentifier;
 		use crate::crypto::exchange::{EcdheShare, KeyShare};
-		use crate::crypto::policy::{Secp256k1Policy, VerificationPolicy};
 		use crate::crypto::sign::ecdsa::k256::Secp256k1;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::crypto::sign::elliptic_curve::PublicKey;
-		use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
 		use crate::crypto::x509::error::CertificateValidationError::{
 			CertificateNotPinned, CertificateRevoked, Expired,
 		};
 		use crate::crypto::x509::ext::pkix::AuthorityKeyIdentifier;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, StaticRevocationList, TrustBuilder};
-		use crate::crypto::x509::{ErasedSigning, KeyCurves};
-		use crate::der::asn1::{BitString, ObjectIdentifier};
+		use crate::crypto::x509::store::{CertificateTrustStore, StaticRevocationList};
+		use crate::der::asn1::ObjectIdentifier;
 		use crate::der::oid::AssociatedOid;
-		use crate::der::Any;
 		use crate::oids::CURVE_SECP256K1;
-		use crate::random::OsRng;
-		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-		use crate::testing::fixtures::{TestCertificate, TestCertificateChain, TestCmsServer};
-		use crate::transport::handshake::tests::{negated, LaterRevocation};
+		use crate::testing::fixtures::{
+			AcceptsEveryCertificate, TestCertificate, TestCertificateChain, TestCmsServer, TestStore,
+		};
+		use crate::testing::TestKey;
+		use crate::transport::handshake::tests::LaterRevocation;
 		use crate::transport::handshake::CmsServerChain;
 		use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
 
 		/// The key-agreement certificate a client of the house provider holds
 		/// from the admission before the opening.
 		type HouseKeyAgreement = ProvisionedKeyAgreement<DefaultCryptoProvider>;
+
+		/// The pin of the key-agreement certificate of a test server, as a
+		/// row of a table builds it.
+		type PinOf = fn(&TestCmsServer) -> CmsServerIdentity;
 
 		/// The key-agreement certificate `trust` admits under `admission` for a
 		/// client of the house provider. [`ProvisionedTrust`] admits under any
@@ -1202,64 +1218,26 @@ mod tests {
 			ServerTrust::<DefaultCryptoProvider>::admit_provisioned(trust, admission)
 		}
 
-		/// A consumer's store that accepts every certificate under one trust
-		/// anchor and reads no validity period, which the [`CertificateTrust`]
-		/// contract permits outside path validation.
-		#[derive(Debug)]
-		struct ExpiryBlindStore {
-			/// The anchor the store names for every certificate.
-			anchor: Arc<Certificate>,
-		}
-
-		impl ExpiryBlindStore {
-			/// A store that names the authority of `server` as every anchor.
-			fn under(server: &TestCmsServer) -> Arc<dyn CertificateTrust> {
-				Arc::new(Self { anchor: Arc::new(server.authority.to_owned()) })
-			}
-		}
-
-		impl CertificateValidation for ExpiryBlindStore {
-			fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-				Ok(())
-			}
-		}
-
-		impl CertificateTrust for ExpiryBlindStore {
-			fn is_trusted(&self, _cert: &Certificate) -> bool {
-				true
-			}
-
-			fn verify_chain(&self, _chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
-				Ok(Arc::clone(&self.anchor))
-			}
-
-			fn trust_anchor(&self, _cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
-				Ok(Arc::clone(&self.anchor))
-			}
-
-			fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
-				None
-			}
-
-			fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-				None
-			}
-
-			fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-				&const { Secp256k1Policy::new() }
-			}
-		}
-
-		/// The built-in store that holds `trusted`.
-		fn store_holding(trusted: impl IntoIterator<Item = Certificate>) -> Arc<dyn CertificateTrust> {
-			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-			let builder = trusted.into_iter().try_fold(builder, TrustBuilder::with_certificate);
-			Arc::new(builder.expect("the store takes valid test certificates").build())
-		}
-
 		/// `certificate`, bare, as a client pins it.
 		fn bare(certificate: &Certificate) -> CmsServerIdentity {
 			CmsServerIdentity::Certificate(Arc::new(certificate.to_owned()))
+		}
+
+		/// The pinned chain of `certificates`, ordered root to leaf.
+		fn chain_of(certificates: impl IntoIterator<Item = Certificate>) -> CmsServerIdentity {
+			let chain = CmsServerChain::new(certificates.into_iter().collect::<Arc<[Certificate]>>());
+			CmsServerIdentity::Chain(chain.expect("a chain of certificates holds a leaf"))
+		}
+
+		/// The key-agreement certificate of `server`, bare.
+		fn bare_pin(server: &TestCmsServer) -> CmsServerIdentity {
+			bare(&server.key_agreement)
+		}
+
+		/// The key-agreement certificate of `server` as the leaf of a chain
+		/// under its authority.
+		fn chain_pin(server: &TestCmsServer) -> CmsServerIdentity {
+			chain_of([server.authority.to_owned(), server.key_agreement.to_owned()])
 		}
 
 		/// A fresh test server.
@@ -1271,6 +1249,32 @@ mod tests {
 		fn pinning(key_agreement: CmsServerIdentity, store: Arc<dyn CertificateTrust>) -> ProvisionedTrust {
 			let trust = ProvisionedTrust::new(key_agreement, store);
 			trust.expect("the store admits the pinned test certificate")
+		}
+
+		/// A store that accepts every certificate under the authority of
+		/// `server`, so the checks of the trust itself decide each admission.
+		fn blind_store(server: &TestCmsServer) -> Arc<dyn CertificateTrust> {
+			Arc::new(AcceptsEveryCertificate::under(server.authority.to_owned()))
+		}
+
+		/// A trust that pins `key_agreement`, bare, against the
+		/// [`blind_store`] of `server`.
+		fn blind_trust(server: &TestCmsServer, key_agreement: &Certificate) -> ProvisionedTrust {
+			pinning(bare(key_agreement), blind_store(server))
+		}
+
+		/// A trust that pins `pinned` against the store of `server`, which
+		/// revokes `revoked` once the trust is built.
+		fn revoked_after_build(
+			server: &TestCmsServer,
+			revoked: &Certificate,
+			pinned: CmsServerIdentity,
+		) -> ProvisionedTrust {
+			let revocation = LaterRevocation::of(revoked.to_owned());
+			let trust = pinning(pinned, Arc::new(server.store_with(revocation.clone())));
+
+			revocation.revoke();
+			trust
 		}
 
 		/// The server `trust` admits under `purpose` from a reply that names
@@ -1293,45 +1297,28 @@ mod tests {
 			admitted.expect("the store admits both test certificates as one server")
 		}
 
-		/// `certificate` with an `id-ecPublicKey` SPKI on the curve `curve`
-		/// whose bits are `point`.
-		fn with_point(certificate: Certificate, curve: ObjectIdentifier, point: &[u8]) -> Certificate {
-			let named_curve = Any::encode_from(&curve).expect("a curve OID encodes");
-			let algorithm = AlgorithmIdentifierOwned { oid: EC_PUBLIC_KEY, parameters: Some(named_curve) };
-			let subject_public_key = BitString::from_bytes(point).expect("a point is a BIT STRING");
-
-			let mut certificate = certificate;
-			let spki = SubjectPublicKeyInfoOwned { algorithm, subject_public_key };
-			certificate.tbs_certificate.subject_public_key_info = spki;
-			certificate
-		}
-
-		/// The compressed SEC 1 point of the key of `key`, as the house
-		/// exchange encodes a share.
-		fn point_of(key: &Secp256k1SigningKey) -> Vec<u8> {
-			share_of(key).to_octets()
-		}
-
 		/// The house share of the key of `key`.
 		fn share_of(key: &Secp256k1SigningKey) -> EcdheShare<Secp256k1> {
 			EcdheShare::from(PublicKey::from(key.verifying_key()))
 		}
 
-		/// The house share of the negation of the key of `key`.
-		fn negated_share_of(key: &Secp256k1SigningKey) -> EcdheShare<Secp256k1> {
-			EcdheShare::from(negated(&PublicKey::from(key.verifying_key())))
+		/// The signing certificate of `server`, marked for key agreement, so
+		/// it holds the signing key itself.
+		fn signing_as_key_agreement(server: &TestCmsServer) -> Certificate {
+			TestCertificate::with_key_usage(server.signing.to_owned(), KeyUsage(KeyUsages::KeyAgreement.into()))
 		}
 
-		/// The chain of `leaf` under `root`, ordered root to leaf.
-		fn chain_of(root: &Certificate, leaf: &Certificate) -> CmsServerIdentity {
-			let chain = CmsServerChain::new([root.to_owned(), leaf.to_owned()]);
-			CmsServerIdentity::Chain(chain.expect("a chain of two certificates holds a leaf"))
+		/// The key-agreement certificate of `server` with the compressed SEC 1
+		/// point of `key` in place of its own key.
+		fn holding_key_of(server: &TestCmsServer, key: &Secp256k1SigningKey) -> Certificate {
+			let point = share_of(key).to_octets();
+			TestCertificate::with_curve_point(server.key_agreement.to_owned(), CURVE_SECP256K1, &point)
 		}
 
 		/// A key-agreement leaf of the subject of the fixed chain's leaf,
 		/// which `issuer_key` issues as `issuer_cn`.
 		fn key_agreement_leaf(issuer_key: &Secp256k1SigningKey, issuer_cn: &str) -> Certificate {
-			let key = Secp256k1SigningKey::random(&mut OsRng);
+			let key = TestKey::fixed(0x44);
 			let usage = KeyUsage(KeyUsages::KeyAgreement.into());
 
 			let issued = TestCertificate::issued(issuer_key, issuer_cn, &key, "Leaf", 4, usage);
@@ -1343,29 +1330,54 @@ mod tests {
 			TestCertificate::insecure_fixed_chain().expect("the fixed test chain issues")
 		}
 
-		/// `certificate` with an `extendedKeyUsage` that names `purpose` alone.
-		fn of_purpose(certificate: Certificate, purpose: ObjectIdentifier) -> Certificate {
-			TestCertificate::with_key_purposes(certificate, [purpose])
+		/// The pinned chain from the root of `chain` through its intermediate
+		/// to a key-agreement leaf that the intermediate issued.
+		fn through_intermediate(chain: &TestCertificateChain) -> CmsServerIdentity {
+			let key_agreement = key_agreement_leaf(&chain.intermediate_key, "Intermediate");
+			chain_of([chain.root.to_owned(), chain.intermediate.to_owned(), key_agreement])
+		}
+
+		/// The pinned chain from the intermediate of `chain` to a key-agreement
+		/// leaf that the intermediate issued.
+		fn from_intermediate(chain: &TestCertificateChain) -> CmsServerIdentity {
+			let key_agreement = key_agreement_leaf(&chain.intermediate_key, "Intermediate");
+			chain_of([chain.intermediate.to_owned(), key_agreement])
+		}
+
+		/// The signing certificate of `server`'s subject and key that the
+		/// authority of `other` issues.
+		fn issued_by_other(server: &TestCmsServer, other: &TestCmsServer) -> Certificate {
+			let subject = server.signing.tbs_certificate.subject.to_owned();
+			other.issue_signing(&server.signing_key, subject, 7)
 		}
 
 		/// The trust admits the pinned key-agreement certificate under its
 		/// authority before the opening, as the certificate it pins.
 		#[test]
-		fn a_pinned_key_agreement_certificate_under_its_authority_is_admitted() -> Result<(), HandshakeError> {
+		fn a_pinned_key_agreement_certificate_under_its_authority_is_admitted() -> TestResult {
 			let server = fresh_server();
 			let admitted = admit_provisioned(&server.trust(), ADMISSION)?;
 			assert_eq!(admitted.pinned.certificate.as_ref(), &server.key_agreement);
 			Ok(())
 		}
 
-		/// The reply's signing certificate under the pinned certificate's
-		/// authority pairs with it, and the client reads the reply against it.
-		#[test]
-		fn a_signing_certificate_the_reply_names_is_paired() -> Result<(), HandshakeError> {
-			let server = fresh_server();
-			let paired = admit_reply(&server.trust(), &server.signing, SERVER)?;
-			assert_eq!(paired.signing().certificate().as_ref(), &server.signing);
-			Ok(())
+		// The reply's signing certificate under the authority of the pinned
+		// certificate pairs with it, and the client reads the reply against it.
+		crate::tb_cases! {
+			fn a_signing_certificate_the_reply_names_is_paired(pinned: PinOf) -> TestResult {
+				let server = fresh_server();
+				let trust = pinning(pinned(&server), Arc::new(server.store()));
+
+				let paired = admit_reply(&trust, &server.signing, SERVER)?;
+				assert_eq!(paired.signing().certificate().as_ref(), &server.signing);
+				Ok(())
+			}
+			cases {
+				bare => bare_pin,
+				/// A pinned chain and the signing certificate its root issued
+				/// name one anchor, the root.
+				chain => chain_pin,
+			}
 		}
 
 		/// The admitted pair keeps the key-agreement certificate the opening
@@ -1389,13 +1401,31 @@ mod tests {
 			assert_eq!(certificate, Some(&server.signing));
 		}
 
-		#[test]
-		fn a_pinned_certificate_the_store_does_not_anchor_is_refused() {
-			let server = fresh_server();
-			let store = store_holding([create_test_certificate().certificate]);
-
-			let refused = ProvisionedTrust::new(bare(&server.key_agreement), store);
-			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(_))));
+		// The trust admits its pin against the store at its construction, so
+		// it refuses a pin whose path the store does not validate
+		// (RFC 5280 §6.1).
+		crate::tb_cases! {
+			fn a_pin_the_store_does_not_validate_is_refused((pin, store): (CmsServerIdentity, CertificateTrustStore)) {
+				let refused = ProvisionedTrust::new(pin, Arc::new(store));
+				assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(_))));
+			}
+			cases {
+				/// The store holds another certificate in place of the
+				/// authority of the pinned certificate.
+				store_lacks_anchor => (bare_pin(&fresh_server()), TestStore::holding([test_certificate(0xf2)])),
+				/// The store holds the root of the fixed chain, which did not
+				/// issue the leaf of the pinned chain.
+				leaf_not_issued_by_root => (
+					chain_of([fixed_chain().root, fresh_server().key_agreement]),
+					TestStore::holding([fixed_chain().root]),
+				),
+				/// The store holds another certificate in place of the root of
+				/// the pinned chain.
+				chain_root_not_held => (
+					through_intermediate(&fixed_chain()),
+					TestStore::holding([test_certificate(0xf3)]),
+				),
+			}
 		}
 
 		/// A store may accept a bare certificate and leave its validity period
@@ -1403,7 +1433,7 @@ mod tests {
 		#[test]
 		fn a_pinned_certificate_past_its_validity_is_refused() {
 			let server = fresh_server();
-			let refused = ProvisionedTrust::new(bare(&TestCertificate::expired()), ExpiryBlindStore::under(&server));
+			let refused = ProvisionedTrust::new(bare(&TestCertificate::expired()), blind_store(&server));
 			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(Expired))));
 		}
 
@@ -1412,7 +1442,7 @@ mod tests {
 		#[test]
 		fn a_named_signing_certificate_past_its_validity_is_refused() {
 			let server = fresh_server();
-			let trust = pinning(bare(&server.key_agreement), ExpiryBlindStore::under(&server));
+			let trust = blind_trust(&server, &server.key_agreement);
 
 			let refused = admit_reply(&trust, &TestCertificate::expired(), SERVER);
 			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(Expired))));
@@ -1427,7 +1457,7 @@ mod tests {
 			let mut signing = server.signing.to_owned();
 			put_off_curve_key(&mut signing);
 
-			let trust = pinning(bare(&server.key_agreement), ExpiryBlindStore::under(&server));
+			let trust = blind_trust(&server, &server.key_agreement);
 			let refused = admit_reply(&trust, &signing, SERVER);
 			assert!(matches!(
 				refused,
@@ -1443,7 +1473,7 @@ mod tests {
 			let server = fresh_server();
 			let usage = KeyUsage(KeyUsages::KeyAgreement.into());
 			let signing = TestCertificate::with_key_usage(server.signing.to_owned(), usage);
-			let trust = pinning(bare(&server.key_agreement), ExpiryBlindStore::under(&server));
+			let trust = blind_trust(&server, &server.key_agreement);
 
 			let refused = admit_reply(&trust, &signing, SERVER);
 			assert!(matches!(
@@ -1461,7 +1491,7 @@ mod tests {
 			let server = fresh_server();
 			let usage = KeyUsage(KeyUsages::DigitalSignature.into());
 			let key_agreement = TestCertificate::with_key_usage(server.key_agreement.to_owned(), usage);
-			let trust = pinning(bare(&key_agreement), ExpiryBlindStore::under(&server));
+			let trust = blind_trust(&server, &key_agreement);
 
 			let refused = admit_provisioned(&trust, ADMISSION);
 			assert!(matches!(
@@ -1472,215 +1502,108 @@ mod tests {
 			));
 		}
 
+		/// The two certificates of a pair name one subject, so the trust
+		/// refuses a signing certificate of another subject.
 		#[test]
 		fn a_named_signing_certificate_of_another_subject_is_refused() {
 			let server = fresh_server();
 			let other = TestCmsServer::generate("another server");
-			let trust = pinning(bare(&server.key_agreement), ExpiryBlindStore::under(&server));
+			let trust = blind_trust(&server, &server.key_agreement);
 
 			let refused = admit_reply(&trust, &other.signing, SERVER);
 			assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
 		}
 
-		/// The signing certificate of `server`'s subject and key that the
-		/// authority of `other` issues.
-		fn issued_by_other(server: &TestCmsServer, other: &TestCmsServer) -> Certificate {
-			let subject = server.signing.tbs_certificate.subject.to_owned();
-			other.issue_signing(&server.signing_key, subject, 7)
+		// Two certificates of one subject that two authorities issued name two
+		// trust anchors, so the trust refuses the pair, whether it pins the
+		// key-agreement certificate bare or as a chain under its root.
+		crate::tb_cases! {
+			fn a_signing_certificate_of_another_anchor_is_refused(pinned: PinOf) {
+				let server = fresh_server();
+				let other = TestCmsServer::generate("another server");
+				let store = TestStore::holding([server.authority.to_owned(), other.authority.to_owned()]);
+				let trust = pinning(pinned(&server), Arc::new(store));
+
+				let refused = admit_reply(&trust, &issued_by_other(&server, &other), SERVER);
+				assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
+			}
+			cases {
+				bare => bare_pin,
+				chain => chain_pin,
+			}
 		}
 
-		/// Two certificates of one subject that two authorities issued name two
-		/// trust anchors, so the trust refuses the pair.
-		#[test]
-		fn a_named_signing_certificate_of_another_anchor_is_refused() {
-			let server = fresh_server();
-			let other = TestCmsServer::generate("another server");
-			let store = store_holding([server.authority.to_owned(), other.authority.to_owned()]);
-			let trust = pinning(bare(&server.key_agreement), store);
+		// One key in both certificates of a pair would serve two purposes, so
+		// the trust refuses the pair, in each form whose agreement collapses
+		// into the signing key.
+		crate::tb_cases! {
+			fn a_pair_of_one_key_is_refused(key_agreement: fn(&TestCmsServer) -> Certificate) {
+				let server = fresh_server();
+				let trust = blind_trust(&server, &key_agreement(&server));
 
-			let refused = admit_reply(&trust, &issued_by_other(&server, &other), SERVER);
-			assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
-		}
-
-		/// One point in its compressed SEC 1 encoding is the key of the signing
-		/// certificate, so the trust refuses the pair.
-		#[test]
-		fn a_pair_of_one_key_in_two_encodings_is_refused() {
-			let server = fresh_server();
-			let compressed = point_of(&server.signing_key);
-			let key_agreement = with_point(server.key_agreement.to_owned(), CURVE_SECP256K1, &compressed);
-			let trust = pinning(bare(&key_agreement), ExpiryBlindStore::under(&server));
-
-			let refused = admit_reply(&trust, &server.signing, SERVER);
-			assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
-		}
-
-		/// A key and its negation agree alike (SEC 1 v2.0 §3.3.1), so the trust
-		/// refuses the pair.
-		#[test]
-		fn a_pair_of_a_key_and_its_negation_is_refused() {
-			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
-			let negated_key = Secp256k1SigningKey::from(-*signing_key.as_nonzero_scalar());
-			let server = TestCmsServer::of("tightbeam provisioned server", signing_key, negated_key);
-
-			let refused = admit_reply(&server.trust(), &server.signing, SERVER);
-			assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
-		}
-
-		#[test]
-		fn a_pair_of_one_key_is_refused() {
-			let server = fresh_server();
-			let key_usage = KeyUsage(KeyUsages::KeyAgreement.into());
-			let key_agreement = TestCertificate::without_extension(server.signing.to_owned(), KeyUsage::OID);
-			let key_agreement = TestCertificate::with_key_usage(key_agreement, key_usage);
-			let trust = pinning(bare(&key_agreement), ExpiryBlindStore::under(&server));
-
-			let refused = admit_reply(&trust, &server.signing, SERVER);
-			assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
-		}
-
-		/// A pinned chain under one root and a signing certificate of another
-		/// root name two trust anchors.
-		#[test]
-		fn a_pinned_chain_beside_a_signing_certificate_of_another_root_is_refused() {
-			let server = fresh_server();
-			let other = TestCmsServer::generate("another server");
-			let store = store_holding([server.authority.to_owned(), other.authority.to_owned()]);
-			let trust = pinning(chain_of(&server.authority, &server.key_agreement), store);
-
-			let refused = admit_reply(&trust, &issued_by_other(&server, &other), SERVER);
-			assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
-		}
-
-		/// A pinned chain and the signing certificate its root issued name one
-		/// anchor, the root.
-		#[test]
-		fn a_pinned_chain_beside_a_signing_certificate_its_root_issued_is_paired() -> Result<(), HandshakeError> {
-			let server = fresh_server();
-			let store = store_holding([server.authority.to_owned()]);
-			let trust = pinning(chain_of(&server.authority, &server.key_agreement), store);
-
-			let paired = admit_reply(&trust, &server.signing, SERVER)?;
-			assert_eq!(paired.signing().certificate().as_ref(), &server.signing);
-			Ok(())
-		}
-
-		/// Path validation reads the leaf of a pinned chain, so the trust
-		/// refuses a chain whose leaf its root did not issue (RFC 5280 §6.1).
-		#[test]
-		fn a_pinned_chain_whose_leaf_its_root_did_not_issue_is_refused() {
-			let server = fresh_server();
-			let other = TestCmsServer::generate("another server");
-			let store = store_holding([server.authority.to_owned()]);
-
-			let refused = ProvisionedTrust::new(chain_of(&server.authority, &other.key_agreement), store);
-			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(_))));
-		}
-
-		/// A store that revokes the leaf of a pinned chain after the test
-		/// builds the trust refuses it at the next opening.
-		#[test]
-		fn a_pinned_chain_whose_leaf_is_revoked_after_the_trust_is_refused() -> Result<(), Box<dyn Error>> {
-			let server = fresh_server();
-			let revocation = LaterRevocation::of(server.key_agreement.to_owned());
-			let store = Arc::new(server.store_with(revocation.clone()));
-			let trust = ProvisionedTrust::new(chain_of(&server.authority, &server.key_agreement), store)?;
-
-			revocation.revoke();
-
-			let refused = admit_provisioned(&trust, ADMISSION);
-			assert!(matches!(
-				refused,
-				Err(HandshakeError::CertificateValidationError(CertificateRevoked))
-			));
-			Ok(())
+				let refused = admit_reply(&trust, &server.signing, SERVER);
+				assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
+			}
+			cases {
+				same_key => signing_as_key_agreement,
+				/// One point in its compressed SEC 1 encoding is the key of the
+				/// signing certificate.
+				compressed_twin => |server| holding_key_of(server, &server.signing_key),
+				/// A key and its negation agree alike (SEC 1 v2.0 §3.3.1).
+				negation => |server| holding_key_of(server, &TestKey::negation_of(&server.signing_key)),
+			}
 		}
 
 		/// A self-issued certificate is its own anchor, so two of one subject
 		/// that the store trusts each name two anchors.
 		#[test]
-		fn self_issued_certificates_of_one_subject_are_refused() -> Result<(), Box<dyn Error>> {
-			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+		fn self_issued_certificates_of_one_subject_are_refused() -> TestResult {
+			let signing_key = TestKey::fixed(0x45);
 			let signing = TestCertificate::authority(&signing_key, "self-issued server")?;
 			let signing = TestCertificate::without_extension(signing, AuthorityKeyIdentifier::OID);
 			let signing = TestCertificate::with_key_usage(signing, KeyUsage(KeyUsages::DigitalSignature.into()));
-			let key_agreement_key = Secp256k1SigningKey::random(&mut OsRng);
+			let key_agreement_key = TestKey::fixed(0x46);
 			let key_agreement = TestCertificate::authority(&key_agreement_key, "self-issued server")?;
 			let key_agreement = TestCertificate::without_extension(key_agreement, AuthorityKeyIdentifier::OID);
-			let key_agreement =
-				TestCertificate::with_key_usage(key_agreement, KeyUsage(KeyUsages::KeyAgreement.into()));
+			let agreement_usage = KeyUsage(KeyUsages::KeyAgreement.into());
+			let key_agreement = TestCertificate::with_key_usage(key_agreement, agreement_usage);
 
-			let store = PinnedAnchors::of([signing.to_owned(), key_agreement.to_owned()]);
-			let trust = ProvisionedTrust::new(bare(&key_agreement), store)?;
+			let store = TestStore::holding([signing.to_owned(), key_agreement.to_owned()]);
+			let trust = ProvisionedTrust::new(bare(&key_agreement), Arc::new(store))?;
 
 			let refused = admit_reply(&trust, &signing, SERVER);
 			assert!(matches!(refused, Err(HandshakeError::AnchorMismatch)));
 			Ok(())
 		}
 
-		/// Path validation refuses a pinned chain whose root the store does
-		/// not hold (RFC 5280 §6.1).
-		#[test]
-		fn a_pinned_chain_the_store_does_not_anchor_is_refused() -> Result<(), HandshakeError> {
-			let chain = fixed_chain();
-			let key_agreement = key_agreement_leaf(&chain.intermediate_key, "Intermediate");
-			let pinned = [chain.root.to_owned(), chain.intermediate.to_owned(), key_agreement];
-			let pinned = CmsServerIdentity::Chain(CmsServerChain::new(pinned)?);
-			let store = store_holding([create_test_certificate().certificate]);
+		// The anchor is the one the store's path validation ends at
+		// (RFC 5280 §6.1.1(d)), so a pin under the root of the fixed chain
+		// pairs with the signing certificate under its intermediate.
+		crate::tb_cases! {
+			fn chains_under_one_root_are_paired(pinned: fn(&TestCertificateChain) -> CmsServerIdentity) -> TestResult {
+				let chain = fixed_chain();
+				let store = TestStore::holding([chain.root.to_owned(), chain.intermediate.to_owned()]);
+				let trust = ProvisionedTrust::new(pinned(&chain), Arc::new(store))?;
 
-			let refused = ProvisionedTrust::new(pinned, store);
-			assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(_))));
-			Ok(())
+				let paired = admit_reply(&trust, &chain.leaf, SERVER)?;
+				assert_eq!(paired.signing().certificate().as_ref(), &chain.leaf);
+				Ok(())
+			}
+			cases {
+				/// A key-agreement certificate the root issued pairs with a
+				/// signing certificate under the intermediate.
+				root_issued_key_agreement => |chain| bare(&key_agreement_leaf(&chain.root_key, "Root")),
+				/// A pinned chain through the intermediate ends at the root of
+				/// the signing certificate.
+				chain_through_intermediate => through_intermediate,
+				/// A pinned chain that starts at an intermediate the store
+				/// holds ends at the store's root, as the walk of the signing
+				/// certificate under that intermediate does.
+				chain_from_held_intermediate => from_intermediate,
+			}
 		}
 
-		/// The anchor is the one the store's path validation ends at
-		/// (RFC 5280 §6.1.1(d)), so a signing certificate under an
-		/// intermediate pairs with a key-agreement certificate the root issued.
-		#[test]
-		fn a_signing_certificate_under_an_intermediate_pairs_with_one_the_root_issued() -> Result<(), HandshakeError> {
-			let chain = fixed_chain();
-			let key_agreement = key_agreement_leaf(&chain.root_key, "Root");
-			let store = store_holding([chain.root.to_owned(), chain.intermediate.to_owned()]);
-			let trust = ProvisionedTrust::new(bare(&key_agreement), store)?;
-
-			let paired = admit_reply(&trust, &chain.leaf, SERVER)?;
-			assert_eq!(paired.signing().certificate().as_ref(), &chain.leaf);
-			Ok(())
-		}
-
-		/// A pinned chain through the intermediate and a signing certificate
-		/// of the same intermediate end at one root.
-		#[test]
-		fn chains_under_one_root_are_paired() -> Result<(), HandshakeError> {
-			let chain = fixed_chain();
-			let key_agreement = key_agreement_leaf(&chain.intermediate_key, "Intermediate");
-			let pinned = [chain.root.to_owned(), chain.intermediate.to_owned(), key_agreement];
-			let pinned = CmsServerIdentity::Chain(CmsServerChain::new(pinned)?);
-			let store = store_holding([chain.root.to_owned(), chain.intermediate.to_owned()]);
-			let trust = ProvisionedTrust::new(pinned, store)?;
-
-			let paired = admit_reply(&trust, &chain.leaf, SERVER)?;
-			assert_eq!(paired.signing().certificate().as_ref(), &chain.leaf);
-			Ok(())
-		}
-
-		/// A pinned chain that starts at an intermediate the store holds ends
-		/// at the store's root, as the walk of a signing certificate under that
-		/// intermediate does (RFC 5280 §6.1.1(d)).
-		#[test]
-		fn a_chain_from_a_held_intermediate_pairs_with_its_signing_certificate() -> Result<(), HandshakeError> {
-			let chain = fixed_chain();
-			let key_agreement = key_agreement_leaf(&chain.intermediate_key, "Intermediate");
-			let pinned = [chain.intermediate.to_owned(), key_agreement];
-			let pinned = CmsServerIdentity::Chain(CmsServerChain::new(pinned)?);
-			let store = store_holding([chain.root.to_owned(), chain.intermediate.to_owned()]);
-			let trust = ProvisionedTrust::new(pinned, store)?;
-
-			let paired = admit_reply(&trust, &chain.leaf, SERVER)?;
-			assert_eq!(paired.signing().certificate().as_ref(), &chain.leaf);
-			Ok(())
-		}
-
+		/// A chain holds its leaf, so the trust refuses an empty chain.
 		#[test]
 		fn an_empty_provisioned_chain_is_refused() {
 			let refused = CmsServerChain::new(Vec::new());
@@ -1690,55 +1613,51 @@ mod tests {
 		/// A store that revokes the signing certificate after the test builds
 		/// the trust refuses it at the next reply.
 		#[test]
-		fn a_signing_certificate_revoked_after_the_trust_is_refused() -> Result<(), Box<dyn Error>> {
+		fn a_signing_certificate_revoked_after_the_trust_is_refused() {
 			let server = fresh_server();
-			let revocation = LaterRevocation::of(server.signing.to_owned());
-			let store = Arc::new(server.store_with(revocation.clone()));
-			let trust = ProvisionedTrust::new(bare(&server.key_agreement), store)?;
-			revocation.revoke();
+			let trust = revoked_after_build(&server, &server.signing, bare_pin(&server));
 
 			let refused = admit_reply(&trust, &server.signing, SERVER);
 			assert!(matches!(
 				refused,
 				Err(HandshakeError::CertificateValidationError(CertificateRevoked))
 			));
-			Ok(())
 		}
 
-		#[test]
-		fn a_key_agreement_certificate_revoked_after_the_trust_is_refused() -> Result<(), Box<dyn Error>> {
-			let server = fresh_server();
-			let revocation = LaterRevocation::of(server.key_agreement.to_owned());
-			let store = Arc::new(server.store_with(revocation.clone()));
-			let trust = ProvisionedTrust::new(bare(&server.key_agreement), store)?;
-			revocation.revoke();
+		// A store that revokes the pinned key-agreement certificate after the
+		// test builds the trust refuses it at the next opening, whether the
+		// trust pins it bare or as the leaf of a chain.
+		crate::tb_cases! {
+			fn a_pin_revoked_after_the_trust_is_refused(pinned: PinOf) {
+				let server = fresh_server();
+				let trust = revoked_after_build(&server, &server.key_agreement, pinned(&server));
 
-			let refused = admit_provisioned(&trust, ADMISSION);
-			assert!(matches!(
-				refused,
-				Err(HandshakeError::CertificateValidationError(CertificateRevoked))
-			));
-			Ok(())
+				let refused = admit_provisioned(&trust, ADMISSION);
+				assert!(matches!(refused, Err(HandshakeError::CertificateValidationError(CertificateRevoked))));
+			}
+			cases {
+				bare => bare_pin,
+				chain => chain_pin,
+			}
 		}
 
-		/// A control of the two tests above: the revocation of the signing
-		/// certificate leaves the key-agreement certificate admitted, so each
-		/// test reads the revocation of its own certificate.
+		/// A control of the revocation tests above: the revocation of the
+		/// signing certificate leaves the pinned key-agreement certificate
+		/// admitted, so each test reads the revocation of its own certificate.
 		#[test]
-		fn a_later_revocation_admits_the_other_certificate() {
+		fn a_later_revocation_admits_the_other_certificate() -> TestResult {
 			let server = fresh_server();
-			let revocation = LaterRevocation::of(server.signing.to_owned());
-			let store = server.store_with(revocation.clone());
-			revocation.revoke();
+			let trust = revoked_after_build(&server, &server.signing, bare_pin(&server));
 
-			let admitted = store.evaluate(&server.key_agreement);
-			assert!(admitted.is_ok());
+			let admitted = admit_provisioned(&trust, ADMISSION)?;
+			assert_eq!(admitted.pinned.certificate.as_ref(), &server.key_agreement);
+			Ok(())
 		}
 
 		/// The trust admits its pinned certificate against the store at its
 		/// construction, so it refuses a revoked one there.
 		#[test]
-		fn a_revoked_pinned_certificate_is_refused() -> Result<(), Box<dyn Error>> {
+		fn a_revoked_pinned_certificate_is_refused() -> TestResult {
 			let server = fresh_server();
 			let revoked = StaticRevocationList::<Sha3_256>::default().with_certificate(&server.key_agreement)?;
 			let store = server.store_with(revoked);
@@ -1756,8 +1675,8 @@ mod tests {
 		#[test]
 		fn a_named_signing_certificate_of_the_client_purpose_is_refused() {
 			let server = fresh_server();
-			let signing = of_purpose(server.signing.to_owned(), KeyPurposes::HOUSE.client);
-			let trust = pinning(bare(&server.key_agreement), ExpiryBlindStore::under(&server));
+			let signing = TestCertificate::with_key_purposes(server.signing.to_owned(), [KeyPurposes::HOUSE.client]);
+			let trust = blind_trust(&server, &server.key_agreement);
 
 			let refused = admit_reply(&trust, &signing, SERVER);
 			assert!(matches!(
@@ -1773,8 +1692,9 @@ mod tests {
 		#[test]
 		fn a_pinned_certificate_of_the_client_purpose_is_refused() {
 			let server = fresh_server();
-			let key_agreement = of_purpose(server.key_agreement.to_owned(), KeyPurposes::HOUSE.client);
-			let trust = pinning(bare(&key_agreement), ExpiryBlindStore::under(&server));
+			let key_agreement = server.key_agreement.to_owned();
+			let key_agreement = TestCertificate::with_key_purposes(key_agreement, [KeyPurposes::HOUSE.client]);
+			let trust = blind_trust(&server, &key_agreement);
 
 			let refused = admit_provisioned(&trust, ADMISSION);
 			assert!(matches!(
@@ -1788,43 +1708,34 @@ mod tests {
 		/// The trust admits a pair that names an implementor's own server
 		/// purpose under that purpose.
 		#[test]
-		fn a_pair_is_admitted_under_its_own_purpose() -> Result<(), HandshakeError> {
+		fn a_pair_is_admitted_under_its_own_purpose() -> TestResult {
 			let server = fresh_server();
-			let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
-			let signing = of_purpose(server.signing.to_owned(), own);
-			let key_agreement = of_purpose(server.key_agreement.to_owned(), own);
-			let trust = pinning(bare(&key_agreement), ExpiryBlindStore::under(&server));
+			let signing = TestCertificate::with_key_purposes(server.signing.to_owned(), [OWN_PURPOSE]);
+			let key_agreement = TestCertificate::with_key_purposes(server.key_agreement.to_owned(), [OWN_PURPOSE]);
+			let trust = blind_trust(&server, &key_agreement);
 
-			let admitted = admit_reply(&trust, &signing, own)?;
+			let admitted = admit_reply(&trust, &signing, OWN_PURPOSE)?;
 			assert_eq!(admitted.signing().certificate().as_ref(), &signing);
 			Ok(())
 		}
 
-		/// The server policy reads the pinned key-agreement certificate before
-		/// the opening, so a pin of that certificate admits it.
-		#[test]
-		fn a_policy_that_pins_the_key_agreement_certificate_admits_it() -> Result<(), HandshakeError> {
-			let server = fresh_server();
-			let policy = pinning_policy(&server.key_agreement);
-			let admission = admission_under(&policy);
+		// The server policy reads the pinned key-agreement certificate before
+		// the opening, so a pin of that certificate admits it, whether the
+		// trust pins it bare or as the leaf of a chain under its authority.
+		crate::tb_cases! {
+			fn a_policy_that_pins_the_key_agreement_certificate_admits_it(pinned: PinOf) -> TestResult {
+				let server = fresh_server();
+				let trust = pinning(pinned(&server), Arc::new(server.store()));
+				let policy = pinning_policy(&server.key_agreement);
 
-			let admitted = admit_provisioned(&server.trust(), admission)?;
-			assert_eq!(admitted.pinned.certificate.as_ref(), &server.key_agreement);
-			Ok(())
-		}
-
-		/// The server policy reads the leaf of a pinned chain, so a pin of the
-		/// key-agreement certificate admits a chain of it under its authority.
-		#[test]
-		fn a_policy_that_pins_the_leaf_of_a_pinned_chain_admits_it() -> Result<(), HandshakeError> {
-			let server = fresh_server();
-			let chain = chain_of(&server.authority, &server.key_agreement);
-			let trust = pinning(chain, Arc::new(server.store()));
-			let policy = pinning_policy(&server.key_agreement);
-
-			let admitted = admit_provisioned(&trust, admission_under(&policy))?;
-			assert_eq!(admitted.pinned.certificate.as_ref(), &server.key_agreement);
-			Ok(())
+				let admitted = admit_provisioned(&trust, admission_under(&policy))?;
+				assert_eq!(admitted.pinned.certificate.as_ref(), &server.key_agreement);
+				Ok(())
+			}
+			cases {
+				bare => bare_pin,
+				chain => chain_pin,
+			}
 		}
 
 		/// The server policy reads the key-agreement certificate, so a policy
@@ -1843,98 +1754,32 @@ mod tests {
 			));
 		}
 
-		/// The admitted server refuses a server ephemeral equal to the key of
-		/// its signing certificate.
-		#[test]
-		fn a_server_ephemeral_equal_to_the_signing_key_is_refused() {
-			let server = fresh_server();
-			let refused = admitted(&server).server_ephemeral(share_of(&server.signing_key));
-			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
-		}
+		// The admitted server refuses a server ephemeral of either of its
+		// static keys, in each form whose agreement collapses into the key.
+		crate::tb_cases! {
+			fn a_server_ephemeral_of_a_static_key_is_refused(share: fn(&TestCmsServer) -> EcdheShare<Secp256k1>) {
+				let server = fresh_server();
 
-		/// The admitted server refuses a server ephemeral equal to the key of
-		/// its key-agreement certificate.
-		#[test]
-		fn a_server_ephemeral_equal_to_the_key_agreement_key_is_refused() {
-			let server = fresh_server();
-			let refused = admitted(&server).server_ephemeral(share_of(&server.key_agreement_key));
-			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
-		}
-
-		/// The negation of the key-agreement key agrees as the key does, so the
-		/// admitted server refuses it as the server ephemeral.
-		#[test]
-		fn a_server_ephemeral_of_the_negated_key_agreement_key_is_refused() {
-			let server = fresh_server();
-			let negation = negated_share_of(&server.key_agreement_key);
-
-			let refused = admitted(&server).server_ephemeral(negation);
-			assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+				let refused = admitted(&server).server_ephemeral(share(&server));
+				assert!(matches!(refused, Err(HandshakeError::ServerEphemeralIsStatic)));
+			}
+			cases {
+				signing_key => |server| share_of(&server.signing_key),
+				key_agreement_key => |server| share_of(&server.key_agreement_key),
+				/// The negated key-agreement key agrees as the key does.
+				negated_key_agreement_key => |server| share_of(&TestKey::negation_of(&server.key_agreement_key)),
+			}
 		}
 
 		/// The admitted server admits a server ephemeral distinct from both of
 		/// its keys.
 		#[test]
-		fn a_server_ephemeral_of_neither_key_is_admitted() {
+		fn a_server_ephemeral_of_neither_key_is_admitted() -> TestResult {
 			let server = fresh_server();
-			let ephemeral = Secp256k1SigningKey::random(&mut OsRng);
-			let admitted = admitted(&server).server_ephemeral(share_of(&ephemeral));
-			assert!(admitted.is_ok());
-		}
+			let ephemeral = TestKey::fixed(0x47);
 
-		/// A store that trusts each certificate it pins as its own anchor.
-		#[derive(Debug)]
-		struct PinnedAnchors(Vec<Arc<Certificate>>);
-
-		impl PinnedAnchors {
-			/// A store that pins each of `pinned` as an anchor.
-			fn of(pinned: impl IntoIterator<Item = Certificate>) -> Arc<dyn CertificateTrust> {
-				Arc::new(Self(pinned.into_iter().map(Arc::new).collect()))
-			}
-
-			/// The pin that equals `cert`.
-			fn pin(&self, cert: &Certificate) -> Option<&Arc<Certificate>> {
-				self.0.iter().find(|pin| pin.as_ref() == cert)
-			}
-		}
-
-		impl CertificateValidation for PinnedAnchors {
-			fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-				self.pin(cert)
-					.map(drop)
-					.ok_or(CertificateValidationError::CertificateNotTrusted)
-			}
-		}
-
-		impl CertificateTrust for PinnedAnchors {
-			fn is_trusted(&self, cert: &Certificate) -> bool {
-				self.pin(cert).is_some()
-			}
-
-			/// Each pin is its own anchor, so a chain ends at the pin of its
-			/// leaf.
-			fn verify_chain(&self, chain: &[Certificate]) -> Result<Arc<Certificate>, CertificateValidationError> {
-				let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
-				self.trust_anchor(leaf)
-			}
-
-			fn trust_anchor(&self, cert: &Certificate) -> Result<Arc<Certificate>, CertificateValidationError> {
-				self.pin(cert)
-					.map(Arc::clone)
-					.ok_or(CertificateValidationError::CertificateNotTrusted)
-			}
-
-			fn find_by_signer_identifier(&self, _sid: &SignerIdentifier) -> Option<&PeerCertificate<ErasedSigning>> {
-				None
-			}
-
-			fn find_by_public_key(&self, _spki: &SubjectPublicKeyInfoOwned) -> Option<&Certificate> {
-				None
-			}
-
-			fn to_policy_ref(&self) -> &dyn VerificationPolicy {
-				&const { Secp256k1Policy::new() }
-			}
+			admitted(&server).server_ephemeral(share_of(&ephemeral))?;
+			Ok(())
 		}
 	}
 
@@ -1942,8 +1787,7 @@ mod tests {
 	mod learned {
 		use super::*;
 		use crate::crypto::x509::error::CertificateValidationError::{CertificateNotPinned, Expired};
-		use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
-		use crate::der::asn1::ObjectIdentifier;
+		use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning};
 		use crate::testing::fixtures::TestCertificate;
 		use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
 
@@ -1954,10 +1798,21 @@ mod tests {
 			LearnedTrust::new(pinning)
 		}
 
+		/// The server that a trust that pins `certificate` admits under
+		/// `admission` from a reply that names `certificate`.
+		fn learned_admission(
+			certificate: &Certificate,
+			admission: ServerAdmission<'_>,
+		) -> Result<HouseServer, HandshakeError> {
+			pinned(certificate).admit_named(named(certificate), admission)
+		}
+
+		/// The trust admits a certificate its validator accepts, as the server
+		/// the reply names.
 		#[test]
-		fn a_learned_certificate_the_validator_accepts_is_admitted() -> Result<(), Box<dyn Error>> {
-			let server = create_test_certificate().certificate;
-			let admitted: HouseServer = pinned(&server).admit_named(named(&server), ADMISSION)?;
+		fn a_learned_certificate_the_validator_accepts_is_admitted() -> TestResult {
+			let server = test_certificate(0xf4);
+			let admitted = learned_admission(&server, ADMISSION)?;
 			let certificate = admitted.signing().certificate();
 			assert_eq!(certificate.as_ref(), &server);
 			Ok(())
@@ -1967,7 +1822,7 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_the_validator_refuses_is_refused() {
 			let trust = LearnedTrust::new(DirectTrustValidator::default());
-			let unknown = create_test_certificate().certificate;
+			let unknown = test_certificate(0xf5);
 			let refusal: Result<HouseServer, _> = trust.admit_named(named(&unknown), ADMISSION);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 		}
@@ -1976,8 +1831,7 @@ mod tests {
 		/// trust refuses an expired certificate itself.
 		#[test]
 		fn a_learned_certificate_past_its_validity_is_refused() {
-			let expired = TestCertificate::expired();
-			let refusal: Result<HouseServer, _> = pinned(&expired).admit_named(named(&expired), ADMISSION);
+			let refusal = learned_admission(&TestCertificate::expired(), ADMISSION);
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 		}
 
@@ -1985,11 +1839,10 @@ mod tests {
 		/// refuses a certificate whose key is off the curve at admission.
 		#[test]
 		fn a_learned_certificate_whose_key_is_off_the_curve_is_refused() {
-			let mut server = create_test_certificate().certificate;
+			let mut server = test_certificate(0xf6);
 			put_off_curve_key(&mut server);
 
-			let learned = pinned(&server);
-			let refusal: Result<HouseServer, _> = learned.admit_named(named(&server), ADMISSION);
+			let refusal = learned_admission(&server, ADMISSION);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(
@@ -2003,9 +1856,9 @@ mod tests {
 		#[test]
 		fn a_learned_certificate_without_digital_signature_is_refused() {
 			let usage = KeyUsage(KeyUsages::KeyAgreement.into());
-			let server = TestCertificate::with_key_usage(create_test_certificate().certificate, usage);
+			let server = TestCertificate::with_key_usage(test_certificate(0xf7), usage);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), ADMISSION);
+			let refusal = learned_admission(&server, ADMISSION);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(
@@ -2018,10 +1871,8 @@ mod tests {
 		/// alone as the server the reply names (RFC 5280 §4.2.1.12).
 		#[test]
 		fn a_learned_client_certificate_is_refused_as_the_server() {
-			let server = create_test_certificate().certificate;
-			let server = TestCertificate::with_key_purposes(server, [KeyPurposes::HOUSE.client]);
-
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), ADMISSION);
+			let server = TestCertificate::with_key_purposes(test_certificate(0xf8), [KeyPurposes::HOUSE.client]);
+			let refusal = learned_admission(&server, ADMISSION);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(
@@ -2033,25 +1884,24 @@ mod tests {
 		/// The trust admits a certificate that names an implementor's own
 		/// server purpose under that purpose.
 		#[test]
-		fn a_learned_certificate_is_admitted_under_its_own_purpose() {
-			let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
-			let server = TestCertificate::with_key_purposes(create_test_certificate().certificate, [own]);
-			let trust = pinned(&server);
-			let admission = ServerAdmission { purpose: own, policy: None, clock: &ValidityClock::CRATE };
+		fn a_learned_certificate_is_admitted_under_its_own_purpose() -> TestResult {
+			let server = TestCertificate::with_key_purposes(test_certificate(0xf9), [OWN_PURPOSE]);
+			let admission = ServerAdmission { purpose: OWN_PURPOSE, policy: None, clock: &ValidityClock::CRATE };
 
-			let admitted: Result<HouseServer, _> = trust.admit_named(named(&server), admission);
-			assert!(admitted.is_ok());
+			let admitted = learned_admission(&server, admission)?;
+			assert_eq!(admitted.signing().certificate().as_ref(), &server);
+			Ok(())
 		}
 
 		/// The server policy reads the certificate the reply names, so a pin
 		/// of that certificate admits the server.
 		#[test]
-		fn a_policy_that_pins_the_learned_certificate_admits_it() -> Result<(), HandshakeError> {
-			let server = create_test_certificate().certificate;
+		fn a_policy_that_pins_the_learned_certificate_admits_it() -> TestResult {
+			let server = test_certificate(0xfa);
 			let policy = pinning_policy(&server);
 			let admission = admission_under(&policy);
 
-			let admitted: HouseServer = pinned(&server).admit_named(named(&server), admission)?;
+			let admitted = learned_admission(&server, admission)?;
 			assert_eq!(admitted.signing().certificate().as_ref(), &server);
 			Ok(())
 		}
@@ -2060,11 +1910,11 @@ mod tests {
 		/// the reply names, though its trust admits it.
 		#[test]
 		fn a_policy_that_pins_another_certificate_refuses_the_learned_one() {
-			let server = create_test_certificate().certificate;
-			let policy = pinning_policy(&create_test_certificate().certificate);
+			let server = test_certificate(0xfb);
+			let policy = pinning_policy(&test_certificate(0xfc));
 			let admission = admission_under(&policy);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), admission);
+			let refusal = learned_admission(&server, admission);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(CertificateNotPinned))
@@ -2075,12 +1925,12 @@ mod tests {
 		/// certificate after an expiry check the server passes refuses it.
 		#[test]
 		fn the_second_validator_of_a_policy_refuses_the_learned_certificate() {
-			let server = create_test_certificate().certificate;
+			let server = test_certificate(0xfd);
 			let expiry: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
-			let policy = policy_of([expiry, pin_of(&create_test_certificate().certificate)]);
+			let policy = policy_of([expiry, pin_of(&test_certificate(0xfe))]);
 			let admission = admission_under(&policy);
 
-			let refusal: Result<HouseServer, _> = pinned(&server).admit_named(named(&server), admission);
+			let refusal = learned_admission(&server, admission);
 			assert!(matches!(
 				refusal,
 				Err(HandshakeError::CertificateValidationError(CertificateNotPinned))

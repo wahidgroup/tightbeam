@@ -187,63 +187,45 @@ pub fn kdf_chain<P: CryptoProvider>(
 mod tests {
 	use super::*;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::testing::TestResult;
 
-	#[test]
-	fn test_multi_input_kdf() -> Result<(), Box<dyn core::error::Error>> {
-		let input1 = [0x42u8; 32];
-		let input2 = [0x99u8; 32];
-		let salt_bytes = [0xAAu8; 32];
-		let salt = KdfSalt::try_from(salt_bytes.as_slice())?;
-		let info = KdfInfo::new(b"test-info");
+	/// The salt of the derivations below, 32 octets of `0xaa`.
+	const SALT: &[u8] = &[0xaa; 32];
 
-		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], salt, info, 32);
-		assert!(result.is_ok());
-
-		let key = result?;
-		assert_eq!(key.len(), 32);
-
-		Ok(())
+	// A multi-input derivation frames each input behind its length, so it
+	// derives the requested length from inputs of one length and of two.
+	crate::tb_cases! {
+		fn a_multi_input_derivation_is_as_long_as_its_key_size((first, second): (&[u8], &[u8])) -> TestResult {
+			let salt = KdfSalt::try_from(SALT)?;
+			let key = multi_input_kdf::<DefaultCryptoProvider>(&[first, second], salt, KdfInfo::new(b"test-info"), 32)?;
+			assert_eq!(key.len(), 32);
+			Ok(())
+		}
+		cases {
+			over_inputs_of_one_length => (&[0x42; 32], &[0x99; 32]),
+			over_inputs_of_two_lengths => (&[0x42; 16], &[0x99; 48]),
+		}
 	}
 
-	#[test]
-	fn test_multi_input_kdf_different_lengths() -> Result<(), Box<dyn core::error::Error>> {
-		let input1 = [0x42u8; 16];
-		let input2 = [0x99u8; 48];
-		let salt_bytes = [0xAAu8; 32];
-		let salt = KdfSalt::try_from(salt_bytes.as_slice())?;
-		let info = KdfInfo::new(b"test-info");
-
-		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], salt, info, 32);
-		assert!(result.is_ok());
-		Ok(())
-	}
-
-	#[test]
-	fn test_kdf_chain() -> Result<(), Box<dyn core::error::Error>> {
-		let input1 = [0x11u8; 32];
-		let input2 = [0x22u8; 32];
-		let initial_salt = [0xFFu8; 32];
-		let first = KdfStage { input: &input1, info: KdfInfo::new(b"stage1") };
-		let second = KdfStage { input: &input2, info: KdfInfo::new(b"stage2") };
-
-		let result = kdf_chain::<DefaultCryptoProvider>(&[first, second], KdfSalt::try_from(initial_salt.as_slice())?);
-		assert!(result.is_ok());
-
-		let key = result?;
-		assert_eq!(key.len(), 32);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_kdf_chain_single_stage() -> Result<(), Box<dyn core::error::Error>> {
-		let input = [0x42u8; 32];
-		let salt = [0xAAu8; 32];
-
-		let only = KdfStage { input: &input, info: KdfInfo::new(b"single") };
-		let result = kdf_chain::<DefaultCryptoProvider>(&[only], KdfSalt::try_from(salt.as_slice())?);
-		assert!(result.is_ok());
-		Ok(())
+	// Each stage of a KDF chain derives 32 bytes, so the key of one stage or
+	// more is 32 bytes.
+	crate::tb_cases! {
+		fn a_kdf_chain_derives_32_bytes((stages, salt): (&[KdfStage<'_>], &[u8])) -> TestResult {
+			let salt = KdfSalt::try_from(salt)?;
+			let key = kdf_chain::<DefaultCryptoProvider>(stages, salt)?;
+			assert_eq!(key.len(), 32);
+			Ok(())
+		}
+		cases {
+			over_two_stages => (
+				&[
+					KdfStage { input: &[0x11; 32], info: KdfInfo::new(b"stage1") },
+					KdfStage { input: &[0x22; 32], info: KdfInfo::new(b"stage2") },
+				],
+				&[0xff; 32],
+			),
+			over_one_stage => (&[KdfStage { input: &[0x42; 32], info: KdfInfo::new(b"single") }], SALT),
+		}
 	}
 
 	/// [`length_prefixed_inputs`] allocates the combined buffer once at its
@@ -252,7 +234,7 @@ mod tests {
 	/// would over-allocate to the next power of two, so its capacity would
 	/// exceed its length.
 	#[test]
-	fn the_combined_kdf_buffer_is_allocated_once() -> Result<(), Box<dyn core::error::Error>> {
+	fn the_combined_kdf_buffer_is_allocated_once() -> TestResult {
 		let first = [0u8; 10];
 		let second = [0u8; 20];
 

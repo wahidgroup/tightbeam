@@ -167,95 +167,9 @@ impl ConsumedTrace {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::instrumentation::{events, TbInstrumentationConfig};
-	use crate::testing::specs::csp::{Process, ProcessBuildError, State};
-	use crate::trace::{TraceCollector, TraceConfig};
+	use crate::instrumentation::events;
+	use crate::testing::fixtures::TestProcess;
 	use crate::urn::Urn;
-
-	#[test]
-	fn test_execution_path_new() {
-		let events = vec![Event("start"), Event("process"), Event("end")];
-		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
-		let path = ExecutionPath::new(events.clone(), durations.clone());
-		assert_eq!(path.events, events);
-		assert_eq!(path.durations, durations);
-		assert_eq!(path.total_duration, 35_000_000);
-	}
-
-	#[test]
-	fn test_execution_path_matches_pattern() {
-		let events = vec![Event("start"), Event("process"), Event("end")];
-		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
-		let path = ExecutionPath::new(events, durations);
-		// The whole path matches.
-		assert!(path.matches_pattern([Event("start"), Event("process"), Event("end")]));
-		// A prefix matches.
-		assert!(path.matches_pattern([Event("start"), Event("process")]));
-		// A pattern with another event fails to match.
-		assert!(!path.matches_pattern([Event("start"), Event("wrong")]));
-		// A pattern longer than the path fails to match.
-		assert!(!path.matches_pattern([Event("start"), Event("process"), Event("end"), Event("extra")]));
-	}
-
-	#[test]
-	fn test_path_wcet_new() {
-		let path = vec![Event("start"), Event("process"), Event("end")];
-		let max_duration = Duration::from_millis(50);
-		let path_wcet = PathWcet::new(path.clone(), max_duration);
-		assert_eq!(path_wcet.path, path);
-		assert_eq!(path_wcet.max_duration, max_duration);
-		assert_eq!(path_wcet.max_duration_ns(), 50_000_000);
-	}
-
-	#[test]
-	fn a_path_total_saturates_at_the_largest_duration() -> Result<(), Box<dyn core::error::Error>> {
-		let events = [Event("start"), Event("end")];
-		let path = ExecutionPath::new(events, [Some(u64::MAX), Some(1)]);
-		assert_eq!(path.total_duration, u64::MAX);
-		Ok(())
-	}
-
-	/// A process that takes `start`, then `process`, then `end`.
-	fn create_test_process() -> Result<Process, ProcessBuildError> {
-		Process::builder("test")
-			.initial_state(State("s0"))
-			.add_terminal(State("s2"))
-			.add_observable(Event("start"))
-			.add_observable(Event("process"))
-			.add_observable(Event("end"))
-			.add_transition(State("s0"), Event("start"), State("s1"))
-			.add_transition(State("s1"), Event("process"), State("s2"))
-			.add_transition(State("s2"), Event("end"), State("s2"))
-			.build()
-	}
-
-	/// The trace that a collector records of one `TIMING_WCET` run for each
-	/// label and duration of `runs`, in order.
-	fn create_trace_with_timing_events(runs: &[(&'static str, u64)]) -> ConsumedTrace {
-		let records: Vec<_> = runs
-			.iter()
-			.map(|(label, duration_ns)| (events::TIMING_WCET, *label, *duration_ns))
-			.collect();
-		trace_of(&records)
-	}
-
-	/// The trace that a collector records of `records`, each a kind, a label,
-	/// and a value, in order. A deadline marker carries its value as a
-	/// timestamp, and every other record carries it as a duration.
-	fn trace_of(records: &[(Urn<'static>, &'static str, u64)]) -> ConsumedTrace {
-		let config = TbInstrumentationConfig { record_durations: true, ..TbInstrumentationConfig::default() };
-		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
-		for (urn, label, value) in records {
-			let value = Duration::from_nanos(*value);
-			if *urn == events::TIMING_DEADLINE {
-				collector.emit_with_timestamp(urn.clone(), *label, value);
-			} else {
-				collector.emit_with_timing(urn.clone(), *label, value);
-			}
-		}
-
-		ConsumedTrace::drained_from(&collector)
-	}
 
 	/// The path of the `start`, `process`, and `end` runs of 10, 20, and 5 ms.
 	fn start_process_end() -> ExecutionPath {
@@ -263,47 +177,88 @@ mod tests {
 		ExecutionPath::new(events, [Some(10_000_000), Some(20_000_000), Some(5_000_000)])
 	}
 
+	/// A path keeps its events and their durations, and totals the durations.
 	#[test]
-	fn a_run_outside_the_alphabet_leaves_the_path_whole() -> Result<(), ProcessBuildError> {
-		let process = create_test_process()?;
-		let trace = trace_of(&[
-			(events::TIMING_WCET, "start", 10_000_000),
-			(events::TIMING_WCET, "other", 1_000_000),
-			(events::TIMING_WCET, "process", 20_000_000),
-			(events::TIMING_WCET, "end", 5_000_000),
-		]);
+	fn a_path_totals_the_durations_of_its_events() {
+		let events = [Event("start"), Event("process"), Event("end")];
+		let durations = [Some(10_000_000), Some(20_000_000), Some(5_000_000)];
 
-		let paths = trace.execution_paths(&process);
-		assert_eq!(paths, [start_process_end()]);
-		Ok(())
+		let path = ExecutionPath::new(events, durations);
+		let totalled = ExecutionPath {
+			events: events.to_vec(),
+			durations: durations.to_vec(),
+			total_duration: 35_000_000,
+		};
+		assert_eq!(path, totalled);
 	}
 
-	#[test]
-	fn a_deadline_marker_lies_on_no_path() -> Result<(), ProcessBuildError> {
-		let process = create_test_process()?;
-		let trace = trace_of(&[
-			(events::TIMING_WCET, "start", 10_000_000),
-			(events::TIMING_DEADLINE, "process", 15_000_000),
-			(events::TIMING_WCET, "process", 20_000_000),
-			(events::TIMING_WCET, "end", 5_000_000),
-		]);
+	// A pattern matches the path of `start`, `process`, and `end` when it is a
+	// prefix of that path.
+	crate::tb_cases! {
+		fn a_pattern_matches_a_prefix_of_the_path((pattern, matches): (&[Event], bool)) {
+			let path = start_process_end();
 
-		let paths = trace.execution_paths(&process);
-		assert_eq!(paths, [start_process_end()]);
-		Ok(())
+			let matched = path.matches_pattern(pattern);
+			assert_eq!(matched, matches);
+		}
+
+		cases {
+			the_whole_path => (&[Event("start"), Event("process"), Event("end")], true),
+			a_prefix => (&[Event("start"), Event("process")], true),
+			another_event => (&[Event("start"), Event("wrong")], false),
+			longer_than_the_path => (&[Event("start"), Event("process"), Event("end"), Event("extra")], false),
+		}
 	}
 
+	/// A path bound keeps its path and its bound, which reads in nanoseconds.
 	#[test]
-	fn test_extract_paths_simple() -> Result<(), ProcessBuildError> {
-		let process = create_test_process()?;
-		let events = vec![("start", 10_000_000), ("process", 20_000_000), ("end", 5_000_000)];
-		let trace = create_trace_with_timing_events(&events);
+	fn a_path_bound_keeps_its_path_and_its_bound() {
+		let path = [Event("start"), Event("process"), Event("end")];
+		let path_wcet = PathWcet::new(path, Duration::from_millis(50));
 
-		// The trace yields one path that holds all three events.
-		let paths = trace.execution_paths(&process);
-		assert_eq!(paths.len(), 1);
-		assert_eq!(paths[0].events.len(), 3);
-		assert_eq!(paths[0].total_duration, 35_000_000);
-		Ok(())
+		let max_duration_ns = path_wcet.max_duration_ns();
+		let kept = PathWcet { path: path.to_vec(), max_duration: Duration::from_millis(50) };
+		assert_eq!((path_wcet, max_duration_ns), (kept, 50_000_000));
+	}
+
+	/// A path total saturates at the largest duration.
+	#[test]
+	fn a_path_total_saturates_at_the_largest_duration() {
+		let events = [Event("start"), Event("end")];
+		let path = ExecutionPath::new(events, [Some(u64::MAX), Some(1)]);
+		assert_eq!(path.total_duration, u64::MAX);
+	}
+
+	// A trace of the `start`, `process`, and `end` runs of 10, 20, and 5 ms
+	// yields that one path through the process of those events, past a run
+	// outside its alphabet and past a deadline marker.
+	crate::tb_cases! {
+		fn the_trace_yields_its_one_path(records: &[(Urn<'static>, &'static str, u64)]) {
+			let process = TestProcess::start_process_end();
+			let trace = ConsumedTrace::timed(records);
+
+			let paths = trace.execution_paths(&process);
+			assert_eq!(paths, [start_process_end()]);
+		}
+
+		cases {
+			of_its_three_runs => &[
+				(events::TIMING_WCET, "start", 10_000_000),
+				(events::TIMING_WCET, "process", 20_000_000),
+				(events::TIMING_WCET, "end", 5_000_000),
+			],
+			past_a_run_outside_the_alphabet => &[
+				(events::TIMING_WCET, "start", 10_000_000),
+				(events::TIMING_WCET, "other", 1_000_000),
+				(events::TIMING_WCET, "process", 20_000_000),
+				(events::TIMING_WCET, "end", 5_000_000),
+			],
+			past_a_deadline_marker => &[
+				(events::TIMING_WCET, "start", 10_000_000),
+				(events::TIMING_DEADLINE, "process", 15_000_000),
+				(events::TIMING_WCET, "process", 20_000_000),
+				(events::TIMING_WCET, "end", 5_000_000),
+			],
+		}
 	}
 }

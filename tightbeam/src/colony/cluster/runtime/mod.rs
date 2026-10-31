@@ -70,6 +70,7 @@ use crate::instrumentation::events::{
 /// either can refuse. The two variants keep the refusals apart, so the exit
 /// records a local fault by name and lets a trace fault end the loop silently,
 /// which is the effect a `testing-fault` injection observes.
+#[cfg_attr(test, derive(Debug))]
 pub(crate) enum LoopFault {
 	/// The trace refused an event, or a task the loop awaited did not join.
 	Runtime(TightBeamError),
@@ -705,136 +706,139 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 mod tests {
 	use super::*;
 	use crate::colony::cluster::ClusterTlsConfig;
-	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::sign::SigningIdentity;
 	use crate::crypto::x509::KeyPurposes;
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::fixtures::TestIdentity;
+	use crate::testing::TestResult;
 
-	// The accept planes hold the gateway's identity to the purposes its TLS
-	// config names, so the transport and the colony read one purpose set.
+	/// The accept planes hold the gateway's identity to the purposes its TLS
+	/// config names, so the transport and the colony read one purpose set.
 	#[test]
-	fn the_accept_planes_take_the_configured_key_purposes() -> Result<(), TightBeamError> {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let identity = SigningIdentity::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))?;
+	fn the_accept_planes_take_the_configured_key_purposes() -> TestResult {
 		let configured = KeyPurposes { server: KeyPurposes::HOUSE.client, ..KeyPurposes::HOUSE };
-		let tls = ClusterTlsConfig::from_identity(identity, configured)?;
+		let tls = ClusterTlsConfig::from_identity(TestIdentity::insecure_fixed(), configured)?;
 
 		let accept = tls.accept_encryption::<DefaultCryptoProvider>();
 		assert_eq!(accept.key_purposes, configured);
 		Ok(())
 	}
 
-	/// Whether `started` failed on a bind address that names `octets`.
-	fn refused_the_address<T>(started: &Result<T, TightBeamError>, octets: &[u8]) -> bool {
-		let Err(TightBeamError::ClusterError(error)) = started else {
-			return false;
-		};
-
-		matches!(error.as_ref(), ClusterError::InvalidAddress(named) if named.as_slice() == octets)
+	/// The cluster error of a gateway start that `started` refused.
+	fn cluster_error<T>(started: Result<T, TightBeamError>) -> ClusterError {
+		match started {
+			Err(TightBeamError::ClusterError(error)) => *error,
+			_ => panic!("the start refuses with a cluster error"),
+		}
 	}
 
-	// A bind address that does not parse is a fault of the operator's
-	// configuration, so the start names it as a cluster error with the
-	// octets it refused.
+	/// A bind address that does not parse is a fault of the operator's
+	/// configuration, so the start names it as a cluster error with the
+	/// octets it refused.
 	#[tokio::test]
-	async fn a_malformed_bind_address_is_a_cluster_error() -> Result<(), TightBeamError> {
-		use crate::colony::cluster::CertificateSpec;
+	async fn a_malformed_bind_address_is_a_cluster_error() {
 		use crate::transport::TokioListener;
 
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)))?;
-		let config = ClusterConfig { bind_addr: Some(String::from("not-a-socket")), ..ClusterConfig::new(tls) };
-
+		let config = ClusterConfig { bind_addr: Some(String::from("not-a-socket")), ..ClusterConfig::fixture() };
 		let started = ClusterGateway::<TokioListener>::start(Arc::new(TraceCollector::new()), config).await;
-
-		assert!(refused_the_address(&started, b"not-a-socket"));
-		Ok(())
+		assert!(matches!(cluster_error(started), ClusterError::InvalidAddress(named) if named == b"not-a-socket"));
 	}
 
-	/// Whether `started` failed on a servlet type that names `octets`.
-	fn refused_the_servlet_type<T>(started: &Result<T, TightBeamError>, octets: &[u8]) -> bool {
-		let Err(TightBeamError::ClusterError(error)) = started else {
-			return false;
-		};
-
-		matches!(error.as_ref(), ClusterError::UnknownServletType(named) if named.as_slice() == octets)
-	}
-
-	// The namespace stays writable after the gossip ingress is set, so the
-	// start refuses an ingress that the namespace it serves cannot route.
+	/// The namespace stays writable after the gossip ingress is set, so the
+	/// start refuses an ingress that the namespace it serves cannot route.
 	#[tokio::test]
-	async fn a_gossip_ingress_outside_the_namespace_refuses_the_start() -> Result<(), TightBeamError> {
-		use crate::colony::cluster::CertificateSpec;
+	async fn a_gossip_ingress_outside_the_namespace_refuses_the_start() -> TestResult {
 		use crate::colony::urn::ColonyNamespace;
 		use crate::transport::TokioListener;
 
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)))?;
-		let ingress = ColonyNamespace::default().servlet("feed")?;
 		let acme = ColonyNamespace::new("acme", "prod")?;
-		let builder = ClusterConfig::builder(tls).with_gossip_ingress(ingress)?;
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let builder = builder.with_gossip_ingress(ColonyNamespace::servlet_fixture("feed"))?;
 		let config = builder.with_namespace(acme).build();
 
 		let started = ClusterGateway::<TokioListener>::start(Arc::new(TraceCollector::new()), config).await;
-
-		assert!(refused_the_servlet_type(&started, b"urn:tightbeam::servlet:feed"));
+		assert!(matches!(
+			cluster_error(started),
+			ClusterError::UnknownServletType(named) if named == b"urn:tightbeam::servlet:feed"
+		));
 		Ok(())
 	}
 
-	// A runtime fault passes up to the caller of a request, so the request
-	// ends with the fault the trace observed, and a request refuses a local
-	// fault alone.
+	/// A runtime fault passes up to the caller of a request, so the request
+	/// ends with the fault the trace observed.
 	#[test]
-	fn a_runtime_fault_passes_up_and_a_local_fault_refuses() -> Result<(), TightBeamError> {
+	fn a_runtime_fault_passes_up() {
 		let runtime = LoopFault::Runtime(TightBeamError::ChannelClosed).local();
-		let local = LoopFault::Registry(ClusterError::LockPoisoned).local();
 		assert!(matches!(runtime, Err(TightBeamError::ChannelClosed)));
+	}
+
+	/// A request refuses a local fault, and the fault comes back for the
+	/// refusal to name.
+	#[test]
+	fn a_local_fault_refuses() {
+		let local = LoopFault::Registry(ClusterError::LockPoisoned).local();
 		assert!(matches!(local, Ok(ClusterError::LockPoisoned)));
-		Ok(())
 	}
 
 	/// An anonymous stream gate refusal records on the connection trace.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn an_anonymous_stream_gate_refusal_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		use crate::colony::cluster::CertificateSpec;
+	fn an_anonymous_stream_gate_refusal_records_on_the_connection_trace() {
+		use crate::colony::cluster::runtime::bounds::fixtures::Audited;
 		use crate::colony::urn::ColonyNamespace;
 		use crate::instrumentation::events::CLUSTER_GATE_BLOCKED;
-		use crate::policy::GatePolicy;
+		use crate::testing::fixtures::TestGate;
+		use crate::transport::error::{TransportError, TransportFailure};
 		use crate::transport::multiplex::StreamRoute;
-		use crate::transport::TokioListener;
 
-		/// A gate policy that refuses every request.
-		struct RefuseAll;
+		let mut config = ClusterConfig::fixture();
+		config.policies.push(Arc::new(TestGate(TransitStatus::PermissionDenied)));
 
-		impl GatePolicy for RefuseAll {
-			fn evaluate(&self, _frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-				TransitStatus::PermissionDenied
-			}
-		}
+		let audited = Audited::of(config);
+		let route = StreamRoute::to(ColonyNamespace::servlet_fixture("ping"));
+		let cx = CallContext::new(SessionContext::default(), route);
+		let audit = audited.gateway.audit(cx.session());
 
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
-		let mut config = ClusterConfig::new(ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)))?);
-		config.policies.push(Arc::new(RefuseAll));
+		let opened = audited.gateway.guard_stream_open(&cx, &audit);
+		assert!(matches!(
+			opened,
+			Err(TightBeamError::TransportError(TransportError::OperationFailed(
+				TransportFailure::PermissionDenied
+			)))
+		));
+		assert_eq!(audited.counts(CLUSTER_GATE_BLOCKED), (0, 1));
+	}
 
-		let (trace, connections) = (Arc::new(TraceCollector::new()), Arc::new(TraceCollector::new()));
-		let gateway = GatewayRuntimeCtx::<TokioListener>::for_test(config, &trace, &connections);
-		let target = ColonyNamespace::default().servlet("ping")?;
-		let cx = CallContext::new(SessionContext::default(), StreamRoute::to(target));
-		let audit = gateway.audit(cx.session());
+	/// The request context ages the tombstone of a withdrawn advertisement on
+	/// the control freshness window of its gateway, as the start does, so a
+	/// replay of the older advertisement stays refused for that window
+	/// (CWE-294). The advertisement is a minute old, past the default window.
+	#[test]
+	fn a_withdrawal_tombstone_lasts_the_control_freshness_window() -> TestResult {
+		use crate::colony::cluster::runtime::bounds::fixtures::Audited;
+		use crate::colony::cluster::{AdmittedPeerAd, PeerCaps, ServletEntry};
+		use crate::testing::fixtures::TestClock;
 
-		// The open fails, and the test reads the record of its refusal.
-		let _refused = gateway.guard_stream_open(&cx, &audit);
+		let clock = TestClock::manual();
+		let window = core::time::Duration::from_secs(3_600);
+		let config = ClusterConfig {
+			control_freshness_window: window,
+			clock: TestClock::erased(&clock),
+			..ClusterConfig::fixture()
+		};
 
-		let audited = trace.recorded(&CLUSTER_GATE_BLOCKED);
-		let connected = connections.recorded(&CLUSTER_GATE_BLOCKED);
-		assert_eq!((audited, connected), (0, 1));
+		let audited = Audited::of(config);
+		let routes = &audited.gateway.servlet_registry;
+		let (dial, issued) = ("127.0.0.1:9000", clock.unix().get() - 60_000);
+		let route = || ServletEntry::peer_fixture(b"calc", b"origin", dial);
+		let install = AdmittedPeerAd::fixture(b"origin", dial, [route()], issued);
+		let withdrawal = AdmittedPeerAd::fixture(b"origin", dial, Vec::new(), issued + 1);
+
+		routes.reconcile_peer_slate(install, PeerCaps::default())?;
+		routes.reconcile_peer_slate(withdrawal, PeerCaps::default())?;
+
+		let replay = AdmittedPeerAd::fixture(b"origin", dial, [route()], issued);
+		let replayed = routes.reconcile_peer_slate(replay, PeerCaps::default());
+		assert!(matches!(replayed, Err(ClusterError::StalePeerAd)));
 		Ok(())
 	}
 }

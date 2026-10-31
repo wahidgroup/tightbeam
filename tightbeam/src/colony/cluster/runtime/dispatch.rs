@@ -147,61 +147,27 @@ mod tests {
 	use super::*;
 	use crate::builder::frame::FrameBuilder;
 	use crate::builder::TypeBuilder;
-	use crate::colony::cluster::runtime::bounds::fixtures::self_peering_config;
-	use crate::colony::cluster::{CertificateSpec, ClusterConfig, ClusterTlsConfig, StaticExportList};
+	use crate::colony::cluster::runtime::bounds::fixtures::Audited;
+	use crate::colony::cluster::{ClusterConfig, ClusterTlsConfig, StaticExportList};
 	use crate::colony::protocol::{PeerAdvertisement, RegisterHiveRequest};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::constants::DEFAULT_HOP_BUDGET;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::KeyCurves;
+	use crate::crypto::x509::store::CertificateTrust;
 	use crate::encode;
 	use crate::instrumentation::events::{
 		CLUSTER_EDGE_REFUSED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED, CLUSTER_GOSSIP_REFUSED,
 		CLUSTER_PEER_ADVERTISE_REFUSED, CLUSTER_REGISTER_REFUSED, CLUSTER_WORK_UNAVAILABLE,
 	};
-	use crate::policy::GatePolicy;
-	use crate::testing::{TestCertificate, TestFrame, TestKey};
-	use crate::trace::TraceCollector;
-	use crate::transport::TokioListener;
+	use crate::tb_cases;
+	use crate::testing::fixtures::{TestGate, TestStore};
+	use crate::testing::{TestCertificate, TestFrame, TestResult};
 	use crate::urn::Urn;
 	use crate::Version;
 
 	/// The gateway socket that a test advertisement claims.
 	const AD_GATEWAY: &[u8] = b"192.0.2.7:9000";
 
-	/// A gate policy that refuses every request.
-	struct RefuseAll;
-
-	impl GatePolicy for RefuseAll {
-		fn evaluate(&self, _frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-			TransitStatus::PermissionDenied
-		}
-	}
-
-	/// A gateway request context beside the trace and the connection trace
-	/// that it records on.
-	struct Audited {
-		gateway: GatewayRuntimeCtx<TokioListener>,
-		trace: Arc<TraceCollector>,
-		connections: Arc<TraceCollector>,
-	}
-
 	impl Audited {
-		/// A gateway under `config`, with two traces of its own.
-		fn of(config: ClusterConfig) -> Self {
-			let (trace, connections) = (Arc::new(TraceCollector::new()), Arc::new(TraceCollector::new()));
-			let gateway = GatewayRuntimeCtx::for_test(config, &trace, &connections);
-			Self { gateway, trace, connections }
-		}
-
-		/// The count of `event` on the trace, then on the connection trace.
-		fn counts(&self, event: Urn<'static>) -> (usize, usize) {
-			(self.trace.recorded(&event), self.connections.recorded(&event))
-		}
-
 		/// The counts of `event` once the colony plane answers `frame` on
 		/// `session`.
 		async fn records(
@@ -221,61 +187,45 @@ mod tests {
 			gateway.handle_edge_request(frame, SessionContext::default()).await?;
 			Ok(self.counts(event))
 		}
-
-		/// `request` in a frame that the gateway's own identity signs.
-		async fn signed(&self, request: ClusterRequest) -> Result<Frame, TightBeamError> {
-			let config = &self.gateway.config;
-			let order = config.clock.unix().get();
-			let builder = FrameBuilder::from(Version::V2)
-				.with_id(b"signed")
-				.with_order(order)
-				.with_message(request);
-
-			let mut frame = config.witnessed(builder).build()?;
-			frame.sign_with_provider(config.tls.identity()).await?;
-			Ok(frame)
-		}
-	}
-
-	/// The TLS material of a gateway under the fixed test key.
-	fn house_tls() -> ClusterTlsConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-		tls.expect("the test certificate must decode")
 	}
 
 	/// A gateway whose hive trust enrolls its own certificate.
 	fn hive_trusting_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(certificate);
-
-		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(builder.expect("the hive enrolls").build());
-		ClusterConfig::new(house_tls().with_hive_trust(hive_trust))
+		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(TestStore::holding([TestCertificate::insecure_fixed()]));
+		ClusterConfig::new(ClusterTlsConfig::fixture().with_hive_trust(hive_trust))
 	}
 
-	/// The servlet type `name` of the default namespace.
-	fn servlet(name: &str) -> Urn<'static> {
-		ColonyNamespace::default()
-			.servlet(name)
-			.expect("test names satisfy the mint grammar")
+	/// A gateway whose gate refuses every request.
+	fn refusing_config() -> ClusterConfig {
+		let mut config = ClusterConfig::fixture();
+		config.policies.push(Arc::new(TestGate(TransitStatus::PermissionDenied)));
+		config
+	}
+
+	/// A gateway that exports the servlet type `name` alone.
+	fn exporting_only(name: &str) -> ClusterConfig {
+		let mut config = ClusterConfig::fixture();
+		let exported = StaticExportList::new([ColonyNamespace::servlet_fixture(name)]);
+		config.peer.exported_types = Some(Arc::new(exported));
+		config
 	}
 
 	/// `request` in a frame that no signature covers.
-	fn unsigned(request: ClusterRequest) -> Result<Frame, TightBeamError> {
-		FrameBuilder::from(Version::V0)
+	fn unsigned(request: ClusterRequest) -> Frame {
+		let built = FrameBuilder::from(Version::V0)
 			.with_id(b"anonymous")
 			.with_order(1)
 			.with_message(request)
-			.build()
+			.build();
+
+		built.expect("an unsigned request builds")
 	}
 
 	/// An unsigned work request for the servlet type `name`.
-	fn work_for(name: &str) -> Result<Frame, TightBeamError> {
-		let payload = encode(&TestFrame::v0(Some("client"), Some("work")))?;
-		let work = ClusterWorkRequest { servlet_type: servlet(name), payload, hops_remaining: DEFAULT_HOP_BUDGET };
+	fn work_for(name: &str) -> Frame {
+		let payload = encode(&TestFrame::v0(Some("client"), Some("work"))).expect("a test frame encodes");
+		let servlet_type = ColonyNamespace::servlet_fixture(name);
+		let work = ClusterWorkRequest { servlet_type, payload, hops_remaining: DEFAULT_HOP_BUDGET };
 		unsigned(ClusterRequest::Work(work))
 	}
 
@@ -285,117 +235,120 @@ mod tests {
 		ClusterRequest::RegisterHive(request)
 	}
 
-	/// Work of an anonymous session records on the connection trace alone.
-	#[tokio::test]
-	async fn anonymous_work_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(ClusterConfig::new(house_tls()));
-		let records = audited.records(work_for("nobody")?, SessionContext::default(), CLUSTER_WORK_UNAVAILABLE);
-		assert_eq!(records.await?, (0, 1));
-		Ok(())
+	/// A session whose handshake proved the holder of the fixed test key.
+	fn proven_peer() -> SessionContext {
+		SessionContext::for_peer(Arc::new(TestCertificate::insecure_fixed()))
 	}
 
-	/// Work of a session that proved its peer records on the audit trace.
-	#[tokio::test]
-	async fn work_of_a_proven_peer_records_on_the_audit_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(ClusterConfig::new(house_tls()));
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let session = SessionContext::for_peer(Arc::new(TestCertificate::self_signed(&key)));
+	/// The config of a gateway, a frame its colony plane answers on a
+	/// session, the event the answer records, and the count of that event on
+	/// the audit trace, then on the connection trace.
+	type Refused = (ClusterConfig, Frame, SessionContext, Urn<'static>, (usize, usize));
 
-		let records = audited.records(work_for("nobody")?, session, CLUSTER_WORK_UNAVAILABLE);
-		assert_eq!(records.await?, (1, 0));
-		Ok(())
-	}
-
-	/// A gate refusal of an anonymous request records on the connection trace.
-	#[tokio::test]
-	async fn an_anonymous_gate_refusal_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let mut config = ClusterConfig::new(house_tls());
-		config.policies.push(Arc::new(RefuseAll));
-
-		let audited = Audited::of(config);
-		let records = audited.records(work_for("ping")?, SessionContext::default(), CLUSTER_GATE_BLOCKED);
-		assert_eq!(records.await?, (0, 1));
-		Ok(())
-	}
-
-	/// An export refusal of anonymous work records on the connection trace.
-	#[tokio::test]
-	async fn an_anonymous_export_refusal_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let mut config = ClusterConfig::new(house_tls());
-		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("other")])));
-
-		let audited = Audited::of(config);
-		let records = audited.records(work_for("ping")?, SessionContext::default(), CLUSTER_EXPORT_REFUSED);
-		assert_eq!(records.await?, (0, 1));
-		Ok(())
+	// A refusal records on the audit trace when the session proved its peer,
+	// and on the connection trace alone when it proved none: the work of
+	// either session that no route answers, a gate refusal, an export
+	// refusal, and each request that a signature must cover and none covers.
+	tb_cases! {
+		async fn a_refusal_records_on_the_trace_its_session_names(
+			(config, frame, session, event, counts): Refused
+		) -> TestResult {
+			let audited = Audited::of(config);
+			let records = audited.records(frame, session, event).await?;
+			assert_eq!(records, counts);
+			Ok(())
+		}
+		cases {
+			anonymous_work => (
+				ClusterConfig::fixture(),
+				work_for("nobody"),
+				SessionContext::default(),
+				CLUSTER_WORK_UNAVAILABLE,
+				(0, 1),
+			),
+			proven_peer_work => (
+				ClusterConfig::fixture(),
+				work_for("nobody"),
+				proven_peer(),
+				CLUSTER_WORK_UNAVAILABLE,
+				(1, 0),
+			),
+			anonymous_gate_refusal => (
+				refusing_config(),
+				work_for("ping"),
+				SessionContext::default(),
+				CLUSTER_GATE_BLOCKED,
+				(0, 1),
+			),
+			anonymous_export_refusal => (
+				exporting_only("other"),
+				work_for("ping"),
+				SessionContext::default(),
+				CLUSTER_EXPORT_REFUSED,
+				(0, 1),
+			),
+			unsigned_registration => (
+				hive_trusting_config(),
+				unsigned(nameless_registration()),
+				SessionContext::default(),
+				CLUSTER_REGISTER_REFUSED,
+				(0, 1),
+			),
+			unsigned_advertisement => (
+				ClusterConfig::self_peering(),
+				unsigned(ClusterRequest::AdvertisePeer(PeerAdvertisement {
+					gateway_addr: AD_GATEWAY.to_vec(),
+					advertised_types: Vec::new(),
+				})),
+				SessionContext::default(),
+				CLUSTER_PEER_ADVERTISE_REFUSED,
+				(0, 1),
+			),
+			unsigned_rumor => (
+				ClusterConfig::self_peering(),
+				unsigned(ClusterRequest::Gossip(Box::new(TestFrame::v0(Some("rumor"), None)))),
+				SessionContext::default(),
+				CLUSTER_GOSSIP_REFUSED,
+				(0, 1),
+			),
+		}
 	}
 
 	/// An edge refusal of an anonymous call records on the connection trace.
 	#[tokio::test]
-	async fn an_anonymous_edge_refusal_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(ClusterConfig::new(house_tls()));
-		let records = audited.edge_records(unsigned(nameless_registration())?, CLUSTER_EDGE_REFUSED);
-		assert_eq!(records.await?, (0, 1));
-		Ok(())
-	}
+	async fn an_anonymous_edge_refusal_records_on_the_connection_trace() -> TestResult {
+		let audited = Audited::of(ClusterConfig::fixture());
+		let frame = unsigned(nameless_registration());
 
-	/// An unsigned registration records its refusal on the connection trace.
-	#[tokio::test]
-	async fn an_unsigned_registration_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(hive_trusting_config());
-		let frame = unsigned(nameless_registration())?;
-
-		let records = audited.records(frame, SessionContext::default(), CLUSTER_REGISTER_REFUSED);
-		assert_eq!(records.await?, (0, 1));
+		let records = audited.edge_records(frame, CLUSTER_EDGE_REFUSED).await?;
+		assert_eq!(records, (0, 1));
 		Ok(())
 	}
 
 	/// A verified registration's refusal records on the audit trace.
 	#[tokio::test]
-	async fn a_verified_registration_refusal_records_on_the_audit_trace() -> Result<(), TightBeamError> {
+	async fn a_verified_registration_refusal_records_on_the_audit_trace() -> TestResult {
 		let audited = Audited::of(hive_trusting_config());
-		let frame = audited.signed(nameless_registration()).await?;
+		let frame = audited.gateway.config.self_signed(b"signed", nameless_registration());
+		let session = SessionContext::default();
 
-		let records = audited.records(frame, SessionContext::default(), CLUSTER_REGISTER_REFUSED);
-		assert_eq!(records.await?, (1, 0));
-		Ok(())
-	}
-
-	/// An unsigned advertisement records its refusal on the connection trace.
-	#[tokio::test]
-	async fn an_unsigned_advertisement_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(self_peering_config());
-		let advertisement = PeerAdvertisement { gateway_addr: AD_GATEWAY.to_vec(), advertised_types: Vec::new() };
-		let frame = unsigned(ClusterRequest::AdvertisePeer(advertisement))?;
-
-		let records = audited.records(frame, SessionContext::default(), CLUSTER_PEER_ADVERTISE_REFUSED);
-		assert_eq!(records.await?, (0, 1));
+		let records = audited.records(frame, session, CLUSTER_REGISTER_REFUSED).await?;
+		assert_eq!(records, (1, 0));
 		Ok(())
 	}
 
 	/// A verified advertisement's refusal records on the audit trace.
 	#[tokio::test]
-	async fn a_verified_advertisement_refusal_records_on_the_audit_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(self_peering_config());
+	async fn a_verified_advertisement_refusal_records_on_the_audit_trace() -> TestResult {
+		let audited = Audited::of(ClusterConfig::self_peering());
 		audited.gateway.config.peer.table.poison();
 
-		let signed = audited.gateway.config.mint_ad_frame(AD_GATEWAY, vec![servlet("ping")]).await?;
-		let frame = signed.frame().clone();
+		let ping = vec![ColonyNamespace::servlet_fixture("ping")];
+		let signed = audited.gateway.config.mint_ad_frame(AD_GATEWAY, ping).await?;
 
-		let records = audited.records(frame, SessionContext::default(), CLUSTER_PEER_ADVERTISE_REFUSED);
-		assert_eq!(records.await?, (1, 0));
-		Ok(())
-	}
-
-	/// An unsigned rumor relay records its refusal on the connection trace.
-	#[tokio::test]
-	async fn an_unsigned_rumor_records_on_the_connection_trace() -> Result<(), TightBeamError> {
-		let audited = Audited::of(self_peering_config());
-		let rumor = Box::new(TestFrame::v0(Some("rumor"), None));
-		let frame = unsigned(ClusterRequest::Gossip(rumor))?;
-
-		let records = audited.records(frame, SessionContext::default(), CLUSTER_GOSSIP_REFUSED);
-		assert_eq!(records.await?, (0, 1));
+		let (frame, session) = (signed.frame().clone(), SessionContext::default());
+		let records = audited.records(frame, session, CLUSTER_PEER_ADVERTISE_REFUSED).await?;
+		assert_eq!(records, (1, 0));
 		Ok(())
 	}
 }

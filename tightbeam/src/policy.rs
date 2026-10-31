@@ -482,101 +482,107 @@ where
 
 #[cfg(all(test, feature = "digest", feature = "builder", feature = "sha3"))]
 mod tests {
-	use std::sync::atomic::{AtomicBool, Ordering};
-	use std::sync::Arc;
+	use std::sync::mpsc;
+
+	use crate::crypto::hash::Sha3_256;
+	use crate::testing::fixtures::TestGate;
+	use crate::testing::TestFrame;
 
 	use super::*;
-	use crate::crypto::hash::Sha3_256;
-	use crate::testing::{TestFrame, TestMessage};
 
-	struct StaticGate(TransitStatus);
+	/// An accept-all gate under a middleware whose observer sends the id of
+	/// each frame that reaches the gate, beside the receiver of those ids.
+	fn observed_accept_all() -> (impl GatePolicy, mpsc::Receiver<Option<Vec<u8>>>) {
+		let (reached, ids) = mpsc::channel();
+		let observer = move |frame: Option<&Frame>, _: &TransitStatus| {
+			let id = frame.map(|frame| frame.metadata().id().to_vec());
+			// The test holds the receiver until it reads it, so the send lands.
+			let _ = reached.send(id);
+		};
 
-	impl GatePolicy for StaticGate {
-		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
-			self.0
+		(GateMiddleware::new(AcceptAllGate, observer), ids)
+	}
+
+	// A chain answers with the first refusal of its gates, in the order they
+	// joined, and an empty chain accepts.
+	crate::tb_cases! {
+		fn a_chain_answers((chain, expected): (GateChain, TransitStatus)) {
+			let frame = TestFrame::with_integrity();
+			let verdict = chain.evaluate(Some(&frame), &SessionContext::default());
+			assert_eq!(verdict, expected);
+		}
+		cases {
+			ok_with_no_gates => (GateChain::default(), TransitStatus::Ok),
+			with_its_first_refusal => (
+				GateChain::default()
+					.with(TestGate(TransitStatus::Ok))
+					.with(TestGate(TransitStatus::ResourceExhausted))
+					.with(TestGate(TransitStatus::PermissionDenied)),
+				TransitStatus::ResourceExhausted
+			),
 		}
 	}
 
-	struct ProbeGate(Arc<AtomicBool>);
-
-	impl GatePolicy for ProbeGate {
-		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
-			self.0.store(true, Ordering::SeqCst);
-			TransitStatus::Ok
-		}
-	}
-
-	#[test]
-	fn empty_chain_accepts() {
-		let chain = GateChain::default();
-		assert!(matches!(
-			chain.evaluate(Some(&TestFrame::with_integrity()), &SessionContext::default()),
-			TransitStatus::Ok
-		));
-	}
-
-	#[test]
-	fn chain_returns_first_refusal() {
-		let chain = GateChain::default()
-			.with(StaticGate(TransitStatus::Ok))
-			.with(StaticGate(TransitStatus::ResourceExhausted))
-			.with(StaticGate(TransitStatus::PermissionDenied));
-
-		let frame = TestFrame::with_integrity();
-		assert!(matches!(
-			chain.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::ResourceExhausted
-		));
-	}
-
+	/// A refusal ends the chain, so the frame reaches no gate after it.
 	#[test]
 	fn chain_short_circuits_after_refusal() {
-		let evaluated = Arc::new(AtomicBool::new(false));
+		let (observed, reached) = observed_accept_all();
 		let chain = GateChain::default()
-			.with(StaticGate(TransitStatus::PermissionDenied))
-			.with(ProbeGate(Arc::clone(&evaluated)));
+			.with(TestGate(TransitStatus::PermissionDenied))
+			.with(observed);
 
 		let frame = TestFrame::with_integrity();
-		let _ = chain.evaluate(Some(&frame), &SessionContext::default());
-		assert!(!evaluated.load(Ordering::SeqCst));
+		let verdict = chain.evaluate(Some(&frame), &SessionContext::default());
+
+		assert_eq!(verdict, TransitStatus::PermissionDenied);
+		assert!(matches!(reached.try_recv(), Err(mpsc::TryRecvError::Empty)));
 	}
 
-	#[test]
-	fn accepts_intact_frame() {
-		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		let frame = TestFrame::with_integrity();
-		assert!(matches!(
-			gate.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::Ok
-		));
+	// The frame integrity gate accepts a frame whose digest recomputes, and a
+	// stream open with no frame. It denies every other frame.
+	crate::tb_cases! {
+		fn the_integrity_gate_answers((frame, expected): (Option<Frame>, TransitStatus)) {
+			let gate = FrameIntegrityGate::<Sha3_256>::default();
+			let verdict = gate.evaluate(frame.as_ref(), &SessionContext::default());
+			assert_eq!(verdict, expected);
+		}
+		cases {
+			ok_to_an_intact_frame => (Some(TestFrame::with_integrity()), TransitStatus::Ok),
+			denied_to_a_tampered_frame => (
+				Some(TestFrame::tamper(&TestFrame::with_integrity(), b"fi-frame", b"tampered")),
+				TransitStatus::PermissionDenied
+			),
+			denied_to_a_frame_without_integrity => (
+				Some(TestFrame::v0(None, Some("gate-no-fi"))),
+				TransitStatus::PermissionDenied
+			),
+			ok_to_the_session_path => (None, TransitStatus::Ok),
+		}
 	}
 
-	#[test]
-	fn rejects_tampered_frame() {
-		let frame = TestFrame::tamper(&TestFrame::with_integrity(), b"fi-frame", b"tampered");
-
-		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		assert!(matches!(
-			gate.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::PermissionDenied
-		));
-	}
-
-	#[test]
-	fn rejects_frame_without_integrity() -> crate::error::Result<()> {
-		let message = TestMessage::sample(None);
-		let frame = compose! { V0: id: "gate-no-fi", order: 1u64, message: message }?;
-		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		assert!(matches!(
-			gate.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::PermissionDenied
-		));
-		Ok(())
-	}
-
-	#[test]
-	fn session_path_skips_frame_integrity() {
-		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		assert!(matches!(gate.evaluate(None, &SessionContext::default()), TransitStatus::Ok));
+	// Each status names its variant, the label that an audit event writes.
+	crate::tb_cases! {
+		fn a_status_names_its_variant((status, name): (TransitStatus, &str)) {
+			assert_eq!(status.as_str(), name);
+		}
+		cases {
+			ok => (TransitStatus::Ok, "Ok"),
+			cancelled => (TransitStatus::Cancelled, "Cancelled"),
+			unknown => (TransitStatus::Unknown, "Unknown"),
+			invalid_argument => (TransitStatus::InvalidArgument, "InvalidArgument"),
+			deadline_exceeded => (TransitStatus::DeadlineExceeded, "DeadlineExceeded"),
+			not_found => (TransitStatus::NotFound, "NotFound"),
+			already_exists => (TransitStatus::AlreadyExists, "AlreadyExists"),
+			permission_denied => (TransitStatus::PermissionDenied, "PermissionDenied"),
+			resource_exhausted => (TransitStatus::ResourceExhausted, "ResourceExhausted"),
+			failed_precondition => (TransitStatus::FailedPrecondition, "FailedPrecondition"),
+			aborted => (TransitStatus::Aborted, "Aborted"),
+			out_of_range => (TransitStatus::OutOfRange, "OutOfRange"),
+			unimplemented => (TransitStatus::Unimplemented, "Unimplemented"),
+			internal => (TransitStatus::Internal, "Internal"),
+			unavailable => (TransitStatus::Unavailable, "Unavailable"),
+			data_loss => (TransitStatus::DataLoss, "DataLoss"),
+			unauthenticated => (TransitStatus::Unauthenticated, "Unauthenticated"),
+		}
 	}
 }

@@ -739,6 +739,7 @@ impl TestHooks {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 	use crate::urn::Urn;
 
 	const STEP: Urn<'static> = crate::urn!("test", "event:config/step");
@@ -751,14 +752,16 @@ mod tests {
 		},
 	}
 
+	/// A configuration that names no verifier does not build.
 	#[test]
 	fn build_refuses_zero_effective_verifiers() {
 		let refused = ScenarioConfig::builder().build();
 		assert_eq!(refused.err(), Some(ScenarioConfigError::NoEffectiveVerifier));
 	}
 
+	/// A spec in `Error` mode passes a run whose body returned an error.
 	#[test]
-	fn an_error_mode_spec_passes_a_body_that_errored() -> Result<(), Box<dyn core::error::Error>> {
+	fn an_error_mode_spec_passes_a_body_that_errored() -> TestResult {
 		let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
 		let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError))?;
 		assert_eq!(verdict.outcome(Expect::Pass), Ok(()));
@@ -768,62 +771,53 @@ mod tests {
 	#[cfg(feature = "testing-csp")]
 	mod with_csp {
 		use core::sync::atomic::{AtomicUsize, Ordering};
-		use std::borrow::Cow;
 
 		use super::*;
+		use crate::testing::fixtures::TestProcess;
 		use crate::testing::specs::composition::{CompositionError, CompositionSpec, DeadlockChecker};
-		use crate::testing::specs::csp::{CspValidationResult, Process, ProcessSpec, State};
+		use crate::testing::specs::csp::Process;
 		use crate::trace::ConsumedTrace;
 
-		/// A CSP layer that accepts every trace, so the configuration runs
-		/// [`Layer::Csp`].
-		struct AcceptsEveryTrace;
-
-		impl ProcessSpec for AcceptsEveryTrace {
-			fn validate_trace(&self, _process: &Process, _trace: &ConsumedTrace) -> CspValidationResult {
-				CspValidationResult { valid: true, violations: vec![] }
-			}
-
-			fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
-				let process = Process::builder("accepts_every_trace").initial_state(State("start")).build()?;
-				Ok(Cow::Owned(process))
-			}
-		}
-
+		/// An expectation of a layer that the configuration does not run does
+		/// not build.
 		#[test]
 		fn build_refuses_expectation_with_no_producer() {
 			let refused = ScenarioConfig::builder()
-				.with_csp(AcceptsEveryTrace)
+				.with_csp(TestProcess::idle())
 				.with_expect(Expect::Violation(Layer::Refinement))
 				.build();
-
 			assert_eq!(
 				refused.err(),
 				Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Refinement))
 			);
 		}
 
+		/// A guided run takes its CSP process from the `csp:` key.
 		#[test]
-		fn a_guided_run_takes_its_process_from_the_csp_key() -> Result<(), ScenarioConfigError> {
+		fn a_guided_run_takes_its_process_from_the_csp_key() -> TestResult {
 			let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
-			let guided = config.guided_by(AcceptsEveryTrace)?;
-			assert!(guided.csp().is_some());
+			let guided = config.guided_by(TestProcess::idle())?;
+			let held = guided.csp().map(|csp| csp.to_process_cow()).transpose()?;
+			assert_eq!(held.map(|process| process.name), Some("Idle"));
 			Ok(())
 		}
 
+		/// A guided run refuses a configuration that already names a process.
 		#[test]
-		fn a_guided_run_refuses_a_config_that_names_a_process() -> Result<(), ScenarioConfigError> {
-			let config = ScenarioConfig::builder().with_csp(AcceptsEveryTrace).build()?;
-			let refused = config.guided_by(AcceptsEveryTrace);
+		fn a_guided_run_refuses_a_config_that_names_a_process() -> TestResult {
+			let config = ScenarioConfig::builder().with_csp(TestProcess::idle()).build()?;
+			let refused = config.guided_by(TestProcess::idle());
 			assert_eq!(refused.err(), Some(ScenarioConfigError::CspNamedTwice));
 			Ok(())
 		}
 
+		/// A body error under a configuration with no assertion spec fails
+		/// layer 1 with the error.
 		#[test]
-		fn a_body_error_with_no_spec_fails_layer1() -> Result<(), Box<dyn core::error::Error>> {
-			let config = ScenarioConfig::builder().with_csp(AcceptsEveryTrace).build()?;
+		fn a_body_error_with_no_spec_fails_layer1() -> TestResult {
+			let config = ScenarioConfig::builder().with_csp(TestProcess::idle()).build()?;
 			let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError))?;
-			let expected = SpecViolation::ExecutionFailed(format!("{:?}", TightBeamError::RecvTimeoutError));
+			let expected = SpecViolation::ExecutionFailed("RecvTimeoutError".to_string());
 			assert_eq!(verdict.spec(), Some(&expected));
 			Ok(())
 		}
@@ -891,8 +885,10 @@ mod tests {
 			}
 		}
 
+		/// A scenario checks the claims of its composition once, however many
+		/// runs it grades.
 		#[test]
-		fn a_scenario_decides_its_claims_once_for_every_grade() -> Result<(), Box<dyn core::error::Error>> {
+		fn a_scenario_decides_its_claims_once_for_every_grade() -> TestResult {
 			let config = ScenarioConfig::builder().with_csp(CountsItsClaims).build()?;
 			config.verify(&ConsumedTrace::new(), Ok(()))?;
 			config.verify(&ConsumedTrace::new(), Ok(()))?;
@@ -900,27 +896,25 @@ mod tests {
 			Ok(())
 		}
 
+		/// A composition whose claimed property fails does not build.
 		#[test]
-		fn build_refuses_a_composition_whose_claimed_property_fails() -> Result<(), Box<dyn core::error::Error>> {
+		fn build_refuses_a_composition_whose_claimed_property_fails() {
 			let refused = ScenarioConfig::builder().with_csp(StallsBesideSends).build();
-			let refuted = matches!(
+			assert!(matches!(
 				refused,
 				Err(ScenarioConfigError::CspRefused(CompositionError::DeadlockDetected { .. }))
-			);
-			assert!(refuted, "{:?}", refused.err());
-			Ok(())
+			));
 		}
 
+		/// A guided run refuses a composition whose claimed property fails.
 		#[test]
-		fn a_guided_run_refuses_a_claim_that_fails() -> Result<(), Box<dyn core::error::Error>> {
+		fn a_guided_run_refuses_a_claim_that_fails() -> TestResult {
 			let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
-
 			let refused = config.guided_by(StallsBesideSends);
-			let refuted = matches!(
+			assert!(matches!(
 				refused,
 				Err(ScenarioConfigError::CspRefused(CompositionError::DeadlockDetected { .. }))
-			);
-			assert!(refuted, "{:?}", refused.err());
+			));
 			Ok(())
 		}
 	}
@@ -928,15 +922,16 @@ mod tests {
 	/// A scenario records its FDR exploration into a trace of its own.
 	#[cfg(all(feature = "testing-fdr", feature = "instrument"))]
 	mod exploration {
-		use std::sync::{Arc, Mutex, PoisonError};
+		use std::sync::Arc;
 
 		use crate::instrumentation::events::{DIVERGENCE_DETECT, ENABLED_SET_SAMPLE, REFUSAL_SNAPSHOT};
-		use crate::instrumentation::{EventSink, TbEvent, TbInstrumentationConfig};
-		use crate::testing::config::{Expect, HookContext, ScenarioConfig, TestHooks};
+		use crate::instrumentation::{BoundedMemorySink, EventSink, TbEvent, TbInstrumentationConfig};
+		use crate::testing::config::{Expect, HookContext, ScenarioConfig, ScenarioConfigBuilder, TestHooks};
 		use crate::testing::fdr::FdrConfig;
+		use crate::testing::fixtures::TestTrace;
 		use crate::testing::specs::csp::{Process, State};
 		use crate::testing::specs::Layer;
-		use crate::testing::SetupEnv;
+		use crate::testing::{SetupEnv, TestResult};
 		use crate::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 		use crate::urn::Urn;
 
@@ -947,18 +942,20 @@ mod tests {
 		/// The three exploration events.
 		const EXPLORATION_EVENTS: [Urn<'static>; 3] = [ENABLED_SET_SAMPLE, REFUSAL_SNAPSHOT, DIVERGENCE_DETECT];
 
-		/// Returns the settings that ask for every exploration event.
-		fn every_flag() -> TbInstrumentationConfig {
-			TbInstrumentationConfig {
-				sample_enabled_sets: true,
-				sample_refusals: true,
-				divergence_heuristics: true,
-				..Default::default()
-			}
-		}
+		/// The enabled-set samples of [`spinning`]: `S0` offers `SEND`, and
+		/// `S1` offers `DONE`.
+		const OFFERS: [&str; 2] = [
+			"Spinning.S0: {urn:test:event:exploration/send}",
+			"Spinning.S1: {urn:test:event:exploration/done}",
+		];
 
 		/// A process that sends at `S0`, and spins on the hidden `SPIN` between
 		/// `S1` and `S2` until it is done, so each seed diverges at `S1`.
+		///
+		/// Its events are URN constants, which [`TestProcess`] names as plain
+		/// strings, so it keeps the builder.
+		///
+		/// [`TestProcess`]: crate::testing::fixtures::TestProcess
 		fn spinning() -> Process {
 			Process::builder("Spinning")
 				.initial_state(State("S0"))
@@ -974,6 +971,13 @@ mod tests {
 				.expect("the spinning process names its initial state")
 		}
 
+		/// The configuration that explores [`spinning`] under the default FDR
+		/// settings, and records the run into `trace`.
+		fn exploring(trace: TraceCollector) -> ScenarioConfigBuilder {
+			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
+			builder.with_trace(trace)
+		}
+
 		/// The labels of the `urn` events in `trace`, or none for `None`.
 		fn labels(trace: Option<&ConsumedTrace>, urn: Urn<'static>) -> Vec<String> {
 			let events = trace.into_iter().flat_map(|trace| trace.instrument_events().iter());
@@ -981,30 +985,22 @@ mod tests {
 			named.filter_map(|event| event.label.clone().map(String::from)).collect()
 		}
 
-		/// The URNs a [`ReceivingSink`] received, in order.
-		#[derive(Default)]
-		struct Received(Mutex<Vec<Urn<'static>>>);
-
-		impl Received {
-			/// Keeps `urn` after the URNs received so far.
-			fn keep(&self, urn: Urn<'static>) {
-				let mut urns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-				urns.push(urn);
-			}
-
-			/// The URNs received so far.
-			fn urns(&self) -> Vec<Urn<'static>> {
-				let urns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-				urns.clone()
-			}
+		/// The URNs of the exploration events that `sink` received, in order.
+		fn leaked(sink: &BoundedMemorySink) -> Vec<Urn<'static>> {
+			let urns = sink.drain().into_iter().map(|event| event.urn);
+			urns.filter(|urn| EXPLORATION_EVENTS.contains(urn)).collect()
 		}
 
-		/// A sink that keeps the URN of each event it receives.
-		struct ReceivingSink(Arc<Received>);
+		/// A sink that forwards each event it receives to a shared
+		/// [`BoundedMemorySink`], which the test drains after the run.
+		///
+		/// The configuration takes its sink by value, so the test reads what
+		/// the run received from the house sink that this forward shares.
+		struct ReceivingSink(Arc<BoundedMemorySink>);
 
 		impl EventSink for ReceivingSink {
 			fn emit(&self, event: TbEvent) {
-				self.0.keep(event.urn);
+				self.0.emit(event);
 			}
 
 			fn drain(&self) -> Vec<TbEvent> {
@@ -1012,26 +1008,21 @@ mod tests {
 			}
 
 			fn overflowed(&self) -> bool {
-				false
+				self.0.overflowed()
 			}
 		}
 
+		// A scenario records the offers, the refusals, and the divergence of
+		// its exploration into the exploration trace of its verdict.
 		crate::tb_scenario! {
 			name: a_scenario_records_each_exploration_event_its_trace_asks_for,
-			config: ScenarioConfig::builder()
-				.with_csp(spinning())
-				.with_fdr(FdrConfig::default())
-				.with_trace(TraceCollector::from(TraceConfig::with_instrumentation(every_flag())))
+			config: exploring(TestTrace::with_config(TestTrace::every_flag()))
 				.with_expect(Expect::Violation(Layer::Refinement))
 				.with_hooks(TestHooks::on_pass(|context| {
 					let exploration = context.verdict().exploration();
-					let offers = [
-						"Spinning.S0: {urn:test:event:exploration/send}",
-						"Spinning.S1: {urn:test:event:exploration/done}",
-					];
 					let refusals = ["Spinning.S0: {urn:test:event:exploration/done}"];
 					let cycle = ["Spinning.S1: <urn:test:event:exploration/spin, urn:test:event:exploration/spin>"];
-					assert_eq!(labels(exploration, ENABLED_SET_SAMPLE), offers);
+					assert_eq!(labels(exploration, ENABLED_SET_SAMPLE), OFFERS);
 					assert_eq!(labels(exploration, REFUSAL_SNAPSHOT), refusals);
 					assert_eq!(labels(exploration, DIVERGENCE_DETECT), cycle);
 				}))
@@ -1045,64 +1036,43 @@ mod tests {
 			}
 		}
 
+		/// The sink of the run receives none of the exploration events, which
+		/// the exploration trace holds.
 		#[test]
-		fn the_trace_of_the_run_receives_no_exploration_event() -> Result<(), Box<dyn core::error::Error>> {
-			let received = Arc::new(Received::default());
+		fn the_trace_of_the_run_receives_no_exploration_event() -> TestResult {
+			let received = Arc::new(BoundedMemorySink::default());
 			let sink = ReceivingSink(Arc::clone(&received));
-			let settings = TraceConfig::with_instrumentation(every_flag()).with_sink(sink);
-			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
-			let config = builder.with_trace(TraceCollector::from(settings)).build()?;
+			let settings = TraceConfig::with_instrumentation(TestTrace::every_flag()).with_sink(sink);
+			let config = exploring(TraceCollector::from(settings)).build()?;
 
 			let context = HookContext::build(&config, &config.trace(), Ok(()))?;
 
-			let urns = received.urns();
-			let leaked: Vec<_> = urns.iter().filter(|urn| EXPLORATION_EVENTS.contains(urn)).collect();
 			let exploration = context.verdict().exploration();
 			let explored = exploration.map(|exploration| exploration.count_event_urn(DIVERGENCE_DETECT));
-			assert_eq!(explored.transpose()?, Some(1), "the exploration trace holds the divergence");
-			assert!(leaked.is_empty(), "the trace of the run received {leaked:?}");
+			assert_eq!((explored.transpose()?, leaked(&received)), (Some(1), Vec::new()));
 			Ok(())
 		}
 
+		/// An exploration that overflows its sink reports an incomplete trace.
 		#[test]
-		fn a_truncated_exploration_says_so() -> Result<(), Box<dyn core::error::Error>> {
-			let settings = TbInstrumentationConfig { max_events: 2, ..every_flag() };
-			let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
-			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
-			let config = builder.with_trace(trace).build()?;
+		fn a_truncated_exploration_says_so() -> TestResult {
+			let settings = TbInstrumentationConfig { max_events: 2, ..TestTrace::every_flag() };
+			let config = exploring(TestTrace::with_config(settings)).build()?;
 
 			let verdict = config.verify(&ConsumedTrace::new(), Ok(()))?;
 			let complete = verdict.exploration().map(ConsumedTrace::is_complete);
-			assert_eq!(complete, Some(false), "the sink holds two events");
+			assert_eq!(complete, Some(false));
 			Ok(())
-		}
-
-		/// The trace of a run that sends and is done.
-		fn sent_and_done() -> ConsumedTrace {
-			let collector = TraceCollector::new();
-			collector.event(SEND).expect("the run injects no fault").emit();
-			collector.event(DONE).expect("the run injects no fault").emit();
-
-			let mut run = ConsumedTrace::new();
-			run.populate_from_collector(&collector);
-			run
 		}
 
 		/// A configuration that names no FDR spec explores the CSP model alone.
 		#[test]
-		fn a_configuration_with_no_spec_explores_the_model_alone() -> Result<(), Box<dyn core::error::Error>> {
+		fn a_configuration_with_no_spec_explores_the_model_alone() -> TestResult {
 			let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..TbInstrumentationConfig::default() };
-			let trace = TraceCollector::from(TraceConfig::with_instrumentation(settings));
-			let builder = ScenarioConfig::builder().with_csp(spinning()).with_fdr(FdrConfig::default());
-			let config = builder.with_trace(trace).build()?;
+			let config = exploring(TestTrace::with_config(settings)).build()?;
 
-			let verdict = config.verify(&sent_and_done(), Ok(()))?;
-
-			let offers = [
-				"Spinning.S0: {urn:test:event:exploration/send}",
-				"Spinning.S1: {urn:test:event:exploration/done}",
-			];
-			assert_eq!(labels(verdict.exploration(), ENABLED_SET_SAMPLE), offers);
+			let verdict = config.verify(&ConsumedTrace::recording([SEND, DONE]), Ok(()))?;
+			assert_eq!(labels(verdict.exploration(), ENABLED_SET_SAMPLE), OFFERS);
 			Ok(())
 		}
 	}

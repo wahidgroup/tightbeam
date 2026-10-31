@@ -43,23 +43,17 @@ impl TraceHandle {
 
 #[cfg(test)]
 mod tests {
-	use std::panic::{catch_unwind, AssertUnwindSafe};
 	use std::sync::Arc;
 
 	use super::TraceHandle;
+	use crate::testing::fixtures::poison_write;
 	use crate::trace::TraceCollector;
 
 	/// A handle whose lock a holder poisoned with a panic while it held the
 	/// lock for a write.
 	fn poisoned_handle() -> TraceHandle {
 		let handle = TraceHandle::new(Arc::new(TraceCollector::default()));
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = handle.0.write().expect("the lock is live until this panic");
-			panic!("poison the trace handle");
-		}));
-
-		assert!(panicked.is_err());
-		assert!(handle.0.is_poisoned());
+		poison_write(&handle.0);
 		handle
 	}
 
@@ -69,9 +63,7 @@ mod tests {
 	fn a_poisoned_handle_takes_the_replacement() {
 		let handle = poisoned_handle();
 		let trace = Arc::new(TraceCollector::default());
-
 		handle.replace(Arc::clone(&trace));
-
 		assert!(Arc::ptr_eq(&handle.current(), &trace));
 	}
 

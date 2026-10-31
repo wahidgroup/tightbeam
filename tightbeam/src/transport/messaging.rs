@@ -3,14 +3,14 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::future::Future;
+
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-use core::future::Future;
 
 use crate::asn1::Frame;
 use crate::error::TightBeamError;
@@ -23,15 +23,13 @@ use crate::transport::policy::{RestartPolicy, RetryAction};
 use crate::transport::TransportResult;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::state::CollectStep;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod x509 {
 	pub use crate::der::Encode;
 	pub use crate::transport::builders::EnvelopeBuilder;
 	pub use crate::transport::envelopes::ResponsePackage;
 	pub use crate::transport::handshake::HandshakeProvider;
 	pub use crate::transport::io::EncryptedMessageIO;
+	pub use crate::transport::state::CollectStep;
 	pub use crate::transport::state::{EncryptedProtocolState, ServerHandshakeSlot};
 }
 
@@ -630,33 +628,37 @@ impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
 #[cfg(all(test, feature = "instrument", feature = "testing"))]
 mod tests {
 	use super::*;
-	use crate::clock::{Clock, MonotonicInstant, UnixMillis};
-	use crate::instrumentation::events;
+	use crate::clock::{Clock, ManualClock, MonotonicInstant, UnixMillis};
+	use crate::instrumentation::{events, TbEvent};
 	use crate::marker::MaybeSendFuture;
-	use crate::policy::{GateChain, GatePolicy};
+	use crate::policy::GateChain;
 	use crate::testing::TestFrame;
 	use crate::trace::{AssertionLabel, AssertionValue, TraceCollector};
 	use crate::transport::policy::RestartLinearBackoff;
 	use crate::urn::Urn;
 	use crate::TightBeamError;
 
-	#[cfg(feature = "testing-fault")]
-	use crate::testing::fdr::FaultModel;
+	use crate::testing::fixtures::{TestGate, TestTrace};
 
-	struct DenyGate;
+	/// A gate that denies every request.
+	const DENY: TestGate = TestGate(TransitStatus::PermissionDenied);
 
-	impl GatePolicy for DenyGate {
-		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
-			TransitStatus::PermissionDenied
-		}
-	}
-
+	/// A gate audit that records into the trace it holds.
+	///
+	/// The house audit is a multiplexed stream handle, which needs a live
+	/// link, and the cases read the trace of the audit alone.
 	struct AuditProbe(TraceCollector);
 
 	/// A clock that records every sleep and resolves it at once.
+	///
+	/// The house clocks keep no record of the sleeps they serve, and the case
+	/// reads each span that the restart policy asked for.
 	#[derive(Debug, Default)]
 	struct RecordingClock {
+		/// The span of each sleep the clock served, in order.
 		sleeps: std::sync::Mutex<Vec<core::time::Duration>>,
+		/// The clock that answers each monotonic reading, which stands still.
+		held: ManualClock,
 	}
 
 	impl Clock for RecordingClock {
@@ -665,7 +667,7 @@ mod tests {
 		}
 
 		fn monotonic(&self) -> MonotonicInstant {
-			MonotonicInstant::from_std(std::time::Instant::now())
+			self.held.monotonic()
 		}
 
 		fn sleep(&self, span: core::time::Duration) -> MaybeSendFuture<'_, ()> {
@@ -676,6 +678,9 @@ mod tests {
 
 	/// An emitter whose every send fails with `failure`, so every attempt
 	/// reaches the restart policy.
+	///
+	/// The restart policy under test reads the failure of each attempt, and a
+	/// real connection fails no send on demand.
 	struct FailingEmitter {
 		clock: RecordingClock,
 		gate: GateChain,
@@ -739,7 +744,10 @@ mod tests {
 		let mut emitter = FailingEmitter::failing_with(TransportFailure::DeadlineExceeded);
 
 		let outcome = emitter.emit(TestFrame::v0(None, None), None).await;
-		assert!(outcome.is_err());
+		assert!(matches!(
+			outcome,
+			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+		));
 
 		let schedule = [1, 2, 3].map(core::time::Duration::from_secs);
 		assert_eq!(emitter.sleeps(), schedule);
@@ -762,36 +770,53 @@ mod tests {
 		}
 	}
 
+	/// A gate verdict records its reason as its label and the time it fell.
 	#[test]
-	fn gate_verdict_records_reason_and_time() -> Result<(), TightBeamError> {
+	fn gate_verdict_records_reason_and_time() -> crate::testing::TestResult {
 		let audit = AuditProbe(TraceCollector::new());
 		let frame = TestFrame::v0(Some("gated"), None);
+		let status = audit.gate_inbound(&DENY, Some(&frame), &SessionContext::default())?;
 
-		let status = audit.gate_inbound(&DenyGate, Some(&frame), &SessionContext::default())?;
+		let rejects = TestTrace::records(&audit.0, events::GATE_REJECT).into_iter();
+		let verdict = |reject: TbEvent| (reject.label.map(String::from), reject.timestamp_ns.is_some());
+		let verdicts: Vec<_> = rejects.map(verdict).collect();
 		assert_eq!(status, TransitStatus::PermissionDenied);
-
-		let recorded = audit.0.drain_events();
-		let reject = recorded
-			.iter()
-			.find(|event| event.urn == events::GATE_REJECT)
-			.ok_or(TightBeamError::MissingResponse)?;
-		assert_eq!(reject.label.as_deref(), Some("PermissionDenied"));
-		assert!(reject.timestamp_ns.is_some());
+		assert_eq!(verdicts, [(Some(String::from("PermissionDenied")), true)]);
 		Ok(())
 	}
 
-	/// A fault the trace injects at the event of a verdict fails the gate, so
-	/// the collector that gates the request fails with it.
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn a_fault_at_the_verdict_fails_the_gate() {
-		let fault = || TightBeamError::ChannelClosed;
-		let model = FaultModel::default().with_event_fault(events::GATE_REJECT, fault, crate::bps!(10000));
-		let audit = AuditProbe(TraceCollector::new().with_fault_model(model));
-		let frame = TestFrame::v0(Some("gated"), None);
+	/// A probe whose trace config sets `enable_internal_detail` to `detail`.
+	fn probe_with_detail(detail: bool) -> AuditProbe {
+		AuditProbe(TestTrace::with_detail(detail))
+	}
 
-		let refused = audit.gate_inbound(&DenyGate, Some(&frame), &SessionContext::default());
-		assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+	/// A probe whose trace records the internal events and injects
+	/// [`TightBeamError::ChannelClosed`] at every record of `event`.
+	#[cfg(feature = "testing-fault")]
+	fn probe_faulting_at(event: Urn<'static>) -> AuditProbe {
+		let fault = || TightBeamError::ChannelClosed;
+		let model = crate::testing::fdr::FaultModel::default().with_event_fault(event, fault, crate::bps!(10000));
+		let AuditProbe(trace) = probe_with_detail(true);
+		AuditProbe(trace.with_fault_model(model))
+	}
+
+	// A fault the trace injects at the event of a verdict, or at the policy
+	// step ahead of it, fails the gate, so the collector that gates the
+	// request fails with it.
+	#[cfg(feature = "testing-fault")]
+	crate::tb_cases! {
+		fn a_fault_the_trace_injects_fails_the_gate(audit: AuditProbe) {
+			let frame = TestFrame::v1(Some("gated"), None);
+			let refused = audit.gate_inbound(&DENY, Some(&frame), &SessionContext::default());
+			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+		}
+		cases {
+			at_the_verdict => {
+				let fault = || TightBeamError::ChannelClosed;
+				AuditProbe(TestTrace::faulting(events::GATE_REJECT, fault, crate::bps!(10000)))
+			},
+			at_the_policy_step => probe_faulting_at(events::POLICY_EVAL),
+		}
 	}
 
 	/// The values that `trace` recorded for `event`, in the order it recorded
@@ -809,9 +834,9 @@ mod tests {
 	/// A gate verdict records its normalized status as the value that a spec
 	/// asserts.
 	#[test]
-	fn a_gate_verdict_records_its_status_as_its_value() -> Result<(), TightBeamError> {
+	fn a_gate_verdict_records_its_status_as_its_value() -> crate::testing::TestResult {
 		let audit = AuditProbe(TraceCollector::new());
-		audit.gate_inbound(&DenyGate, None, &SessionContext::default())?;
+		audit.gate_inbound(&DENY, None, &SessionContext::default())?;
 
 		let denied = Some(AssertionValue::from(TransitStatus::PermissionDenied));
 		assert_eq!(recorded_values(&audit.0, events::GATE_REJECT), [denied]);
@@ -821,7 +846,7 @@ mod tests {
 	/// A plane records the answer of a failed handler as `HANDLER_FAILED`,
 	/// with the status that the call answers as its value.
 	#[test]
-	fn a_failed_handler_records_the_status_it_answers() -> Result<(), TightBeamError> {
+	fn a_failed_handler_records_the_status_it_answers() -> crate::testing::TestResult {
 		let audit = AuditProbe(TraceCollector::new());
 		audit.audit_failure(TransitStatus::PermissionDenied)?;
 
@@ -830,19 +855,13 @@ mod tests {
 		Ok(())
 	}
 
-	/// The outcome of a handler, the record of its exit, and the name of the
+	/// The outcome of a handler, the record of its exit, and the test of the
 	/// outcome that the two make.
-	type OutcomeCase = (Result<(), TightBeamError>, Result<(), TightBeamError>, &'static str);
-
-	/// The name of the variant of `outcome`.
-	fn outcome_name(outcome: &HandlerOutcome<()>) -> &'static str {
-		match outcome {
-			HandlerOutcome::Answered(()) => "answered",
-			HandlerOutcome::Failed(_) => "failed",
-			HandlerOutcome::NotServed => "not-served",
-			HandlerOutcome::Faulted(_) => "faulted",
-		}
-	}
+	type OutcomeCase = (
+		Result<(), TightBeamError>,
+		Result<(), TightBeamError>,
+		fn(&HandlerOutcome<()>) -> bool,
+	);
 
 	// A call comes to what its handler returned, and the error of a handler
 	// comes ahead of a fault at its exit. A default that refuses its kind is
@@ -850,51 +869,71 @@ mod tests {
 	crate::tb_cases! {
 		fn a_call_comes_to_what_its_handler_returned((outcome, exited, expected): OutcomeCase) {
 			let settled = HandlerOutcome::of(outcome, exited);
-			assert_eq!(outcome_name(&settled), expected);
+			assert!(expected(&settled));
 		}
 		cases {
-			answered => (Ok(()), Ok(()), "answered"),
-			failed => (Err(TightBeamError::MissingResponse), Ok(()), "failed"),
+			answered => (Ok(()), Ok(()), |settled| matches!(settled, HandlerOutcome::Answered(()))),
+			failed => (
+				Err(TightBeamError::MissingResponse),
+				Ok(()),
+				|settled| matches!(settled, HandlerOutcome::Failed(TightBeamError::MissingResponse)),
+			),
 			failed_ahead_of_a_fault_at_its_exit => (
 				Err(TightBeamError::MissingResponse),
 				Err(TightBeamError::ChannelClosed),
-				"failed",
+				|settled| matches!(settled, HandlerOutcome::Failed(TightBeamError::MissingResponse)),
 			),
-			not_served => (Err(TransportError::NotServed.into()), Ok(()), "not-served"),
-			faulted_at_its_exit => (Ok(()), Err(TightBeamError::ChannelClosed), "faulted"),
-			unimplemented_of_its_own => (Err(TransportError::from(TransitStatus::Unimplemented).into()), Ok(()), "failed"),
+			not_served => (
+				Err(TransportError::NotServed.into()),
+				Ok(()),
+				|settled| matches!(settled, HandlerOutcome::NotServed),
+			),
+			faulted_at_its_exit => (
+				Ok(()),
+				Err(TightBeamError::ChannelClosed),
+				|settled| matches!(settled, HandlerOutcome::Faulted(TightBeamError::ChannelClosed)),
+			),
+			unimplemented_of_its_own => (
+				Err(TransportError::from(TransitStatus::Unimplemented).into()),
+				Ok(()),
+				|settled| {
+					matches!(
+						settled,
+						HandlerOutcome::Failed(TightBeamError::TransportError(TransportError::OperationFailed(
+							TransportFailure::Unimplemented
+						)))
+					)
+				},
+			),
 		}
 	}
 
 	/// The evidence a gate verdict records of its peer, read from a session
 	/// that `SessionContext::for_peer` binds to a certificate.
-	#[cfg(feature = "colony")]
+	#[cfg(all(feature = "colony", feature = "instrument"))]
 	mod evidence {
 		use super::*;
 		use crate::crypto::hash::{Digest, Sha3_256};
-		use crate::instrumentation::TbInstrumentationConfig;
+		use crate::testing::fixtures::TestTrace;
 		use crate::testing::{TestCertificate, TestKey};
-		use crate::trace::TraceConfig;
 
 		/// The SHA3-256 digest of the evidence that a gate refusal of
 		/// `session` records, under a collector that records the digest of
 		/// every evidence payload.
 		fn rejection_evidence(session: &SessionContext) -> Option<[u8; 32]> {
-			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-			let audit = AuditProbe(TraceCollector::from(TraceConfig::with_instrumentation(config)));
-			let verdict = audit.gate_inbound(&DenyGate, None, session);
-			assert!(verdict.is_ok(), "a collector with no fault model records the verdict");
+			let audit = AuditProbe(TestTrace::with_payloads());
+			let verdict = audit.gate_inbound(&DENY, None, session);
+			verdict.expect("a collector with no fault model records the verdict");
 
-			let recorded = audit.0.drain_events();
-			let reject = recorded.iter().find(|event| event.urn == events::GATE_REJECT);
-			reject.and_then(|event| event.payload_hash)
+			let recorded = TestTrace::payloads(&audit.0, events::GATE_REJECT);
+			recorded.into_iter().next().flatten()
 		}
 
 		/// The audit evidence of a gate verdict names the peer by the canonical
 		/// form of its key, so a peer whose certificate holds an uncompressed
 		/// point leaves the identity of its compressed form.
 		#[test]
-		fn gate_evidence_names_the_peer_by_its_canonical_key() -> Result<(), Box<dyn std::error::Error>> {
+		fn gate_evidence_names_the_peer_by_its_canonical_key() -> crate::testing::TestResult {
 			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 			let canonical = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
 
@@ -915,49 +954,29 @@ mod tests {
 		#[cfg(all(feature = "testing-fault", feature = "tokio"))]
 		use core::sync::atomic::{AtomicBool, Ordering};
 
-		/// A probe whose trace config sets `enable_internal_detail` to
-		/// `detail`.
-		fn probe_with_detail(detail: bool) -> AuditProbe {
-			AuditProbe(TestTrace::with_detail(detail))
-		}
-
 		/// The URNs of the policy steps and the verdicts that one refused gate
 		/// evaluation records, in order, under the detail flag `detail`.
-		fn gate_trail(detail: bool) -> Result<Vec<Urn<'static>>, TightBeamError> {
+		fn gate_trail(detail: bool) -> Vec<Urn<'static>> {
 			let audit = probe_with_detail(detail);
-			audit.gate_inbound(&DenyGate, None, &SessionContext::default())?;
+			let verdict = audit.gate_inbound(&DENY, None, &SessionContext::default());
+			verdict.expect("a collector with no fault model records the verdict");
 
-			Ok(TestTrace::trail(&audit.0, &[events::POLICY_EVAL, events::GATE_REJECT]))
+			TestTrace::trail(&audit.0, &[events::POLICY_EVAL, events::GATE_REJECT])
 		}
 
-		/// A gate evaluation records its policy step ahead of its verdict when
-		/// the trace config sets the detail flag, and its verdict alone when
-		/// the config clears it.
-		#[test]
-		fn a_gate_records_its_policy_step_under_the_detail_flag_alone() -> Result<(), TightBeamError> {
-			let detailed = vec![events::POLICY_EVAL, events::GATE_REJECT];
-			assert_eq!([gate_trail(true)?, gate_trail(false)?], [detailed, vec![events::GATE_REJECT]]);
-			Ok(())
-		}
-
-		/// A probe whose trace records the internal events and injects
-		/// [`TightBeamError::ChannelClosed`] at every record of `event`.
-		#[cfg(feature = "testing-fault")]
-		fn probe_faulting_at(event: Urn<'static>) -> AuditProbe {
-			let fault = || TightBeamError::ChannelClosed;
-			let model = FaultModel::default().with_event_fault(event, fault, crate::bps!(10000));
-			let AuditProbe(trace) = probe_with_detail(true);
-			AuditProbe(trace.with_fault_model(model))
-		}
-
-		/// A fault the trace injects at the policy step fails the gate, so the
-		/// collector that gates the request fails with it.
-		#[cfg(feature = "testing-fault")]
-		#[test]
-		fn a_fault_at_the_policy_step_fails_the_gate() {
-			let audit = probe_faulting_at(events::POLICY_EVAL);
-			let refused = audit.gate_inbound(&DenyGate, None, &SessionContext::default());
-			assert!(matches!(refused, Err(TightBeamError::ChannelClosed)));
+		// A gate evaluation records its policy step ahead of its verdict when
+		// the trace config sets the detail flag, and its verdict alone when the
+		// config clears it.
+		crate::tb_cases! {
+			fn a_gate_records_its_policy_step_under_the_detail_flag_alone(
+				(detail, expected): (bool, Vec<Urn<'static>>)
+			) {
+				assert_eq!(gate_trail(detail), expected);
+			}
+			cases {
+				detailed => (true, vec![events::POLICY_EVAL, events::GATE_REJECT]),
+				plain => (false, vec![events::GATE_REJECT]),
+			}
 		}
 
 		/// A fault the trace injects at the entry of a handler fails the call
@@ -977,25 +996,31 @@ mod tests {
 			assert!(!ran.load(Ordering::SeqCst));
 		}
 
-		/// A fault the trace injects at the exit of a handler that succeeded
-		/// fails the call.
-		#[cfg(all(feature = "testing-fault", feature = "tokio"))]
-		#[tokio::test]
-		async fn a_fault_at_the_handler_exit_fails_the_call() {
-			let audit = probe_faulting_at(events::HANDLER_EXIT);
-			let outcome = audit.run_handler(async { Ok(()) }).await;
-			assert!(matches!(outcome, HandlerOutcome::Faulted(TightBeamError::ChannelClosed)));
-		}
+		/// What a handler returned and the test of the call a fault at its
+		/// exit settles.
+		#[cfg(feature = "testing-fault")]
+		type ExitCase = (Result<(), TightBeamError>, fn(&HandlerOutcome<()>) -> bool);
 
-		/// The error of a handler comes ahead of a fault the trace injects at
-		/// its exit, so the call fails with why the handler failed.
-		#[cfg(all(feature = "testing-fault", feature = "tokio"))]
-		#[tokio::test]
-		async fn a_handler_error_comes_ahead_of_a_fault_at_its_exit() {
-			let audit = probe_faulting_at(events::HANDLER_EXIT);
-			let handler = async { Err::<(), _>(TightBeamError::MissingResponse) };
-			let outcome = audit.run_handler(handler).await;
-			assert!(matches!(outcome, HandlerOutcome::Failed(TightBeamError::MissingResponse)));
+		// A fault the trace injects at the exit of a handler that succeeded
+		// fails the call. The error of a handler that failed comes ahead of
+		// the fault, so the call fails with why the handler failed.
+		#[cfg(feature = "testing-fault")]
+		crate::tb_cases! {
+			fn a_fault_at_the_handler_exit_settles_the_call((returned, settled): ExitCase) {
+				let audit = probe_faulting_at(events::HANDLER_EXIT);
+				let outcome = crate::runtime::rt::block_on(audit.run_handler(async move { returned }));
+				assert!(settled(&outcome));
+			}
+			cases {
+				as_faulted_after_a_success => (
+					Ok(()),
+					|outcome| matches!(outcome, HandlerOutcome::Faulted(TightBeamError::ChannelClosed)),
+				),
+				as_failed_after_a_handler_error => (
+					Err(TightBeamError::MissingResponse),
+					|outcome| matches!(outcome, HandlerOutcome::Failed(TightBeamError::MissingResponse)),
+				),
+			}
 		}
 	}
 }

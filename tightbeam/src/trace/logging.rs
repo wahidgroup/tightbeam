@@ -326,12 +326,97 @@ impl LogBackend for MultiplexBackend {
 	}
 }
 
+/// The log backend of the owner tests of the logger and the trace.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::{Arc, Mutex, PoisonError};
 
+	use super::{LogBackend, LogError, LogLevel, LogRecord};
+
+	/// The level, the message, and the component of a captured record.
+	pub(crate) type Captured = (LogLevel, String, Option<String>);
+
+	/// One record as a [`CaptureBackend`] keeps it: its fields, and the
+	/// timestamp it carries.
+	type Kept = (Captured, Option<u64>);
+
+	/// A real in-process [`LogBackend`] that keeps in memory each record it
+	/// receives, so a test reads back the records that crossed the backend
+	/// seam.
+	///
+	/// - It accepts the level it holds and each more severe level, and [`Default`] accepts every level.
+	/// - It counts the flushes it runs.
+	/// - Its clones share one list of records and one count of flushes, so a
+	///   test keeps a clone and hands the backend to a logger.
+	#[derive(Clone)]
+	pub(crate) struct CaptureBackend {
+		/// The least severe level that the backend accepts.
+		accepts_up_to: LogLevel,
+		/// The fields of each record, beside the timestamp it carries.
+		records: Arc<Mutex<Vec<Kept>>>,
+		/// The count of the flushes the backend ran.
+		flushes: Arc<AtomicUsize>,
+	}
+
+	impl Default for CaptureBackend {
+		fn default() -> Self {
+			Self::accepting(LogLevel::Debug)
+		}
+	}
+
+	impl CaptureBackend {
+		/// A backend that accepts the records of `level` and of each more
+		/// severe level.
+		pub(crate) fn accepting(level: LogLevel) -> Self {
+			Self { accepts_up_to: level, records: Arc::default(), flushes: Arc::default() }
+		}
+
+		/// The level, the message, and the component of each record this
+		/// backend received, in order.
+		pub(crate) fn records(&self) -> Vec<Captured> {
+			let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+			records.iter().map(|(captured, _)| captured.clone()).collect()
+		}
+
+		/// The timestamp of each record this backend received, in order.
+		#[cfg(feature = "instrument")]
+		pub(crate) fn timestamps(&self) -> Vec<Option<u64>> {
+			let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+			records.iter().map(|(_, timestamp)| *timestamp).collect()
+		}
+
+		/// The count of the flushes this backend ran.
+		pub(crate) fn flushes(&self) -> usize {
+			self.flushes.load(Ordering::Relaxed)
+		}
+	}
+
+	// Each push adds one whole record, so a poisoned lock holds a whole list.
+	impl LogBackend for CaptureBackend {
+		fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
+			let captured = (record.level, record.message.to_string(), record.component.map(String::from));
+			let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+			records.push((captured, record.timestamp));
+			Ok(())
+		}
+
+		fn accepts(&self, level: LogLevel) -> bool {
+			level <= self.accepts_up_to
+		}
+
+		fn flush(&self) -> Result<(), LogError> {
+			self.flushes.fetch_add(1, Ordering::Relaxed);
+			Ok(())
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::fixtures::CaptureBackend;
 	use super::*;
+	use crate::testing::TestResult;
 	use crate::trace::{TraceCollector, TraceStateShared};
 	use crate::urn::Urn;
 
@@ -347,129 +432,109 @@ mod tests {
 	const DEBUG: Urn<'static> = crate::urn!("test", "event:log/debug");
 	const TEST: Urn<'static> = crate::urn!("test", "event:log/test");
 
-	#[test]
-	fn test_log_level_ordering() {
-		assert!(LogLevel::Emergency < LogLevel::Alert);
-		assert!(LogLevel::Alert < LogLevel::Critical);
-		assert!(LogLevel::Critical < LogLevel::Error);
-		assert!(LogLevel::Error < LogLevel::Warning);
-		assert!(LogLevel::Warning < LogLevel::Notice);
-		assert!(LogLevel::Notice < LogLevel::Informational);
-		assert!(LogLevel::Informational < LogLevel::Debug);
+	/// A fresh trace that logs through `config`.
+	fn logging_through(config: LoggerConfig) -> TraceCollector {
+		let trace = TraceCollector::default().with_logger(config);
+		trace.expect("a fresh trace owns its state alone")
 	}
 
-	#[test]
-	fn test_log_level_display() {
-		assert_eq!(format!("{}", LogLevel::Emergency), "EMERGENCY");
-		assert_eq!(format!("{}", LogLevel::Error), "ERROR");
-		assert_eq!(format!("{}", LogLevel::Debug), "DEBUG");
-	}
-
-	#[test]
-	fn test_log_filter_global_level() {
-		let filter = LogFilter::new(LogLevel::Warning);
-		assert!(filter.should_log(LogLevel::Emergency, None));
-		assert!(filter.should_log(LogLevel::Error, None));
-		assert!(filter.should_log(LogLevel::Warning, None));
-		assert!(!filter.should_log(LogLevel::Notice, None));
-		assert!(!filter.should_log(LogLevel::Informational, None));
-		assert!(!filter.should_log(LogLevel::Debug, None));
-	}
-
-	#[test]
-	fn test_log_filter_component_override() {
-		let filter = LogFilter::new(LogLevel::Warning).with_component("security", LogLevel::Debug);
-		assert!(!filter.should_log(LogLevel::Informational, Some("database")));
-		assert!(filter.should_log(LogLevel::Error, Some("database")));
-		assert!(filter.should_log(LogLevel::Debug, Some("security")));
-		assert!(filter.should_log(LogLevel::Informational, Some("security")));
-	}
-
-	// A spy backend: it records the emitted output in a shared `Vec` for the
-	// tests to assert on.
-	#[derive(Debug, Clone)]
-	struct CaptureBackend {
-		captured: Arc<Mutex<Vec<Captured>>>,
-	}
-
-	/// The level, the message, and the component of a captured record.
-	type Captured = (LogLevel, String, Option<String>);
-
-	impl CaptureBackend {
-		fn with_captured(captured: Arc<Mutex<Vec<Captured>>>) -> Self {
-			Self { captured }
+	// A more severe level orders before each less severe one, as RFC 5424
+	// numbers the severities.
+	crate::tb_cases! {
+		fn a_more_severe_level_orders_first((more, less): (LogLevel, LogLevel)) {
+			assert!(more < less);
+		}
+		cases {
+			emergency_before_alert => (LogLevel::Emergency, LogLevel::Alert),
+			alert_before_critical => (LogLevel::Alert, LogLevel::Critical),
+			critical_before_error => (LogLevel::Critical, LogLevel::Error),
+			error_before_warning => (LogLevel::Error, LogLevel::Warning),
+			warning_before_notice => (LogLevel::Warning, LogLevel::Notice),
+			notice_before_informational => (LogLevel::Notice, LogLevel::Informational),
+			informational_before_debug => (LogLevel::Informational, LogLevel::Debug),
 		}
 	}
 
-	impl LogBackend for CaptureBackend {
-		fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
-			let component = record.component.map(String::from);
-			let entry = (record.level, record.message.to_string(), component);
-			self.captured.lock().map_err(|_| LogError::BackendUnavailable)?.push(entry);
-			Ok(())
+	// A level displays its RFC 5424 name in upper case.
+	crate::tb_cases! {
+		fn a_log_level_displays_its_name((level, name): (LogLevel, &str)) {
+			assert_eq!(level.to_string(), name);
 		}
-
-		fn accepts(&self, _level: LogLevel) -> bool {
-			true
+		cases {
+			emergency => (LogLevel::Emergency, "EMERGENCY"),
+			error => (LogLevel::Error, "ERROR"),
+			debug => (LogLevel::Debug, "DEBUG"),
 		}
 	}
 
-	#[test]
-	fn test_logger_config_default_level() -> Result<(), Box<dyn core::error::Error>> {
-		let captured = Arc::new(Mutex::new(Vec::new()));
-		let backend = {
-			let captured = Arc::clone(&captured);
-			CaptureBackend::with_captured(captured)
-		};
-		let config =
-			LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Informational);
-		let trace = TraceCollector::default().with_logger(config)?;
+	// A filter admits a record of its own level and of each more severe
+	// level, and refuses each less severe one.
+	crate::tb_cases! {
+		fn a_global_filter_admits_its_level_and_each_more_severe((level, admitted): (LogLevel, bool)) {
+			assert_eq!(LogFilter::new(LogLevel::Warning).should_log(level, None), admitted);
+		}
+		cases {
+			emergency => (LogLevel::Emergency, true),
+			error => (LogLevel::Error, true),
+			warning => (LogLevel::Warning, true),
+			notice => (LogLevel::Notice, false),
+			informational => (LogLevel::Informational, false),
+			debug => (LogLevel::Debug, false),
+		}
+	}
 
+	// An override sets the level of its own component, and each other
+	// component keeps the global level.
+	crate::tb_cases! {
+		fn a_component_override_sets_the_level_of_its_component(
+			(level, component, admitted): (LogLevel, &str, bool)
+		) {
+			let filter = LogFilter::new(LogLevel::Warning).with_component("security", LogLevel::Debug);
+			assert_eq!(filter.should_log(level, Some(component)), admitted);
+		}
+		cases {
+			database_informational => (LogLevel::Informational, "database", false),
+			database_error => (LogLevel::Error, "database", true),
+			security_debug => (LogLevel::Debug, "security", true),
+			security_informational => (LogLevel::Informational, "security", true),
+		}
+	}
+
+	/// An event that names no level logs at the default level of the logger,
+	/// and an event that names a level logs at that level.
+	#[test]
+	fn an_event_without_a_level_logs_at_the_default_level() -> TestResult {
+		let backend = CaptureBackend::default();
+		let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
+		let trace = logging_through(config.with_default_level(LogLevel::Informational));
 		trace.event(TEST1)?.emit();
 		trace.event(TEST2)?.with_log_level(LogLevel::Error).emit();
 
-		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
-		assert_eq!(records.len(), 2);
-		assert_eq!(records[0].0, LogLevel::Informational);
-		assert_eq!(records[0].1, TEST1.to_string());
-		assert_eq!(records[1].0, LogLevel::Error);
-		assert_eq!(records[1].1, TEST2.to_string());
-
+		let logged = [
+			(LogLevel::Informational, TEST1.to_string(), None),
+			(LogLevel::Error, TEST2.to_string(), None),
+		];
+		assert_eq!(backend.records(), logged);
 		Ok(())
 	}
 
+	/// A logger with no default level logs the events that name a level alone.
 	#[test]
-	fn test_logger_config_no_default_level() -> Result<(), Box<dyn core::error::Error>> {
-		let captured = Arc::new(Mutex::new(Vec::new()));
-		let backend = {
-			let captured = Arc::clone(&captured);
-			CaptureBackend::with_captured(captured)
-		};
-
-		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config)?;
-
+	fn an_event_without_a_level_logs_nothing_without_a_default() -> TestResult {
+		let backend = CaptureBackend::default();
+		let trace = logging_through(LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug)));
 		trace.event(NO_LOG)?.emit();
 		trace.event(SHOULD_LOG)?.with_log_level(LogLevel::Warning).emit();
-
-		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
-		assert_eq!(records.len(), 1);
-		assert_eq!(records[0].0, LogLevel::Warning);
-		assert_eq!(records[0].1, SHOULD_LOG.to_string());
-
+		assert_eq!(backend.records(), [(LogLevel::Warning, SHOULD_LOG.to_string(), None)]);
 		Ok(())
 	}
 
+	/// A logger hands its backend the records at the level of its filter and
+	/// at each more severe level.
 	#[test]
-	fn test_log_filter_with_logger() -> Result<(), Box<dyn core::error::Error>> {
-		let captured = Arc::new(Mutex::new(Vec::new()));
-		let backend = {
-			let captured = Arc::clone(&captured);
-			CaptureBackend::with_captured(captured)
-		};
-
-		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Warning));
-		let trace = TraceCollector::default().with_logger(config)?;
+	fn a_logger_drops_records_below_its_filter_level() -> TestResult {
+		let backend = CaptureBackend::default();
+		let trace = logging_through(LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Warning)));
 		trace.event(EMERGENCY)?.with_log_level(LogLevel::Emergency).emit();
 		trace.event(ERROR)?.with_log_level(LogLevel::Error).emit();
 		trace.event(WARNING)?.with_log_level(LogLevel::Warning).emit();
@@ -477,65 +542,48 @@ mod tests {
 		trace.event(INFO)?.with_log_level(LogLevel::Informational).emit();
 		trace.event(DEBUG)?.with_log_level(LogLevel::Debug).emit();
 
-		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
-		assert_eq!(records.len(), 3);
-		assert_eq!(records[0].1, EMERGENCY.to_string());
-		assert_eq!(records[1].1, ERROR.to_string());
-		assert_eq!(records[2].1, WARNING.to_string());
-
+		let logged = [
+			(LogLevel::Emergency, EMERGENCY.to_string(), None),
+			(LogLevel::Error, ERROR.to_string(), None),
+			(LogLevel::Warning, WARNING.to_string(), None),
+		];
+		assert_eq!(backend.records(), logged);
 		Ok(())
 	}
 
+	/// A multiplex backend hands each record to every backend it holds.
 	#[test]
-	fn test_multiplex_backend() -> Result<(), Box<dyn core::error::Error>> {
-		let captured1 = Arc::new(Mutex::new(Vec::new()));
-		let captured2 = Arc::new(Mutex::new(Vec::new()));
-
-		let backend1 = {
-			let captured = Arc::clone(&captured1);
-			CaptureBackend::with_captured(captured)
-		};
-		let backend2 = {
-			let captured = Arc::clone(&captured2);
-			CaptureBackend::with_captured(captured)
-		};
-
-		let multiplex = MultiplexBackend::new(vec![Box::new(backend1), Box::new(backend2)]);
-		let config = LoggerConfig::new(multiplex, LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config)?;
-
+	fn a_multiplex_backend_hands_each_record_to_every_backend() -> TestResult {
+		let (first, second) = (CaptureBackend::default(), CaptureBackend::default());
+		let multiplex = MultiplexBackend::new(vec![Box::new(first.clone()), Box::new(second.clone())]);
+		let trace = logging_through(LoggerConfig::new(multiplex, LogFilter::new(LogLevel::Debug)));
 		trace.event(TEST)?.with_log_level(LogLevel::Informational).emit();
 
-		let records1 = captured1.lock().ok().map(|r| r.clone()).unwrap_or_default();
-		let records2 = captured2.lock().ok().map(|r| r.clone()).unwrap_or_default();
-		assert_eq!(records1.len(), 1);
-		assert_eq!(records2.len(), 1);
-		assert_eq!(records1[0].1, TEST.to_string());
-		assert_eq!(records2[0].1, TEST.to_string());
-
+		let logged = || vec![(LogLevel::Informational, TEST.to_string(), None)];
+		assert_eq!([first.records(), second.records()], [logged(), logged()]);
 		Ok(())
 	}
 
+	/// A component override admits a debug record of its component, which the
+	/// global level refuses.
 	#[test]
-	fn a_component_override_admits_a_debug_record_of_that_component() -> Result<(), Box<dyn core::error::Error>> {
-		let captured = Arc::new(Mutex::new(Vec::new()));
-		let backend = CaptureBackend::with_captured(Arc::clone(&captured));
+	fn a_component_override_admits_a_debug_record_of_that_component() -> TestResult {
+		let backend = CaptureBackend::default();
 		let filter = LogFilter::new(LogLevel::Informational).with_component("security", LogLevel::Debug);
-		let trace = TraceCollector::default().with_logger(LoggerConfig::new(backend, filter))?;
+		let trace = logging_through(LoggerConfig::new(backend.clone(), filter));
 
 		let security_event = trace.event(DEBUG)?.with_component("security");
 		security_event.with_log_level(LogLevel::Debug).emit();
 
-		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
 		let security = Some("security".to_string());
-		assert_eq!(records, [(LogLevel::Debug, DEBUG.to_string(), security)]);
+		assert_eq!(backend.records(), [(LogLevel::Debug, DEBUG.to_string(), security)]);
 		Ok(())
 	}
 
 	/// The writer is a pipe whose reader closed, which refuses a write with
 	/// `BrokenPipe`, as stdout does when the reader of its pipe exits.
 	#[test]
-	fn a_failed_stdout_write_returns_io_error() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_failed_stdout_write_returns_io_error() -> TestResult {
 		let (reader, mut writer) = std::io::pipe()?;
 		drop(reader);
 		let record = LogRecord {
@@ -547,7 +595,6 @@ mod tests {
 		};
 
 		let written = StdoutBackend::write_record(&mut writer, &record);
-
 		assert_eq!(written, Err(LogError::IoError));
 		Ok(())
 	}
@@ -555,19 +602,18 @@ mod tests {
 	/// A collector whose state another handle shares refuses a logger config,
 	/// which only the sole owner of the state can set.
 	#[test]
-	fn a_shared_collector_refuses_a_logger_config() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_shared_collector_refuses_a_logger_config() {
 		let trace = TraceCollector::default();
 		let _shared = trace.share();
 
 		let config = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Debug));
 		assert!(matches!(trace.with_logger(config), Err(TraceStateShared { .. })));
-		Ok(())
 	}
 
 	/// The refusal of a shared collector holds the collector, which still
 	/// records into the shared state.
 	#[test]
-	fn a_refused_logger_hands_the_collector_back() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_refused_logger_hands_the_collector_back() -> TestResult {
 		let trace = TraceCollector::default();
 		let shared = trace.share();
 		let config = LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Debug));
@@ -579,67 +625,24 @@ mod tests {
 		Ok(())
 	}
 
-	/// A backend that accepts the records of `Warning` and each more severe
-	/// level, keeps the message of each record it receives, and counts its
-	/// flushes.
-	#[derive(Clone, Default)]
-	struct Gated {
-		messages: Arc<Mutex<Vec<String>>>,
-		flushes: Arc<AtomicUsize>,
-	}
-
-	impl Gated {
-		/// The messages of the records this backend received, in order.
-		fn messages(&self) -> Vec<String> {
-			let messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
-			messages.clone()
-		}
-
-		/// The count of the flushes this backend ran.
-		fn flushes(&self) -> usize {
-			self.flushes.load(Ordering::Relaxed)
-		}
-	}
-
-	impl LogBackend for Gated {
-		fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
-			let mut messages = self.messages.lock().map_err(|_| LogError::BackendUnavailable)?;
-			messages.push(record.message.to_string());
-			Ok(())
-		}
-
-		fn accepts(&self, level: LogLevel) -> bool {
-			level <= LogLevel::Warning
-		}
-
-		fn flush(&self) -> Result<(), LogError> {
-			self.flushes.fetch_add(1, Ordering::Relaxed);
-			Ok(())
-		}
-	}
-
 	/// The trace reads `accepts` of its backend, so a record that the filter
 	/// admits and the backend refuses reaches no backend.
 	#[test]
-	fn a_record_that_its_backend_refuses_reaches_no_backend() -> Result<(), Box<dyn core::error::Error>> {
-		let backend = Gated::default();
-		let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config)?;
-
+	fn a_record_that_its_backend_refuses_reaches_no_backend() -> TestResult {
+		let backend = CaptureBackend::accepting(LogLevel::Warning);
+		let trace = logging_through(LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug)));
 		trace.event(ERROR)?.with_log_level(LogLevel::Error).emit();
 		trace.event(DEBUG)?.with_log_level(LogLevel::Debug).emit();
-
-		assert_eq!(backend.messages(), [ERROR.to_string()]);
+		assert_eq!(backend.records(), [(LogLevel::Error, ERROR.to_string(), None)]);
 		Ok(())
 	}
 
 	/// The backend of a trace flushes once, when the last handle that shares
 	/// the trace drops.
 	#[test]
-	fn the_last_handle_of_a_trace_flushes_its_backend() -> Result<(), Box<dyn core::error::Error>> {
-		let backend = Gated::default();
-		let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config)?;
+	fn the_last_handle_of_a_trace_flushes_its_backend() {
+		let backend = CaptureBackend::default();
+		let trace = logging_through(LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug)));
 		let shared = trace.share();
 
 		drop(trace);
@@ -647,11 +650,13 @@ mod tests {
 		drop(shared);
 
 		assert_eq!([after_the_first, backend.flushes()], [0, 1]);
-		Ok(())
 	}
 
 	/// A backend whose flush fails, as a SIEM backend does when its endpoint
 	/// is gone.
+	///
+	/// The house backends flush in process with no failure of their own, so a
+	/// test of a failed flush holds this double.
 	struct Unflushable;
 
 	impl LogBackend for Unflushable {
@@ -668,28 +673,38 @@ mod tests {
 		}
 	}
 
-	/// `flush_log` flushes the backend of the trace, and returns the error of
-	/// the flush to its caller.
-	#[test]
-	fn flush_log_returns_the_error_of_the_backend() -> Result<(), Box<dyn core::error::Error>> {
-		let config = LoggerConfig::new(Unflushable, LogFilter::new(LogLevel::Debug));
-		let trace = TraceCollector::default().with_logger(config)?;
-
-		assert_eq!(trace.flush_log(), Err(LogError::BackendUnavailable));
-		Ok(())
+	// `flush_log` flushes the backend of the trace, and returns the result of
+	// the flush to its caller.
+	crate::tb_cases! {
+		fn flush_log_returns_the_result_of_the_backend_flush((config, expected): (LoggerConfig, Result<(), LogError>)) {
+			let trace = logging_through(config);
+			let flushed = trace.flush_log();
+			assert_eq!(flushed, expected);
+		}
+		cases {
+			/// A backend whose flush fails hands its error to the caller.
+			a_failed_flush => (
+				LoggerConfig::new(Unflushable, LogFilter::new(LogLevel::Debug)),
+				Err(LogError::BackendUnavailable),
+			),
+			/// The stdout backend keeps the default flush, which flushes
+			/// nothing and succeeds.
+			the_default_flush => (LoggerConfig::new(StdoutBackend, LogFilter::new(LogLevel::Debug)), Ok(())),
+		}
 	}
 
-	#[test]
-	fn test_trace_collector_default() -> Result<(), crate::TightBeamError> {
-		let trace = TraceCollector::default();
-		trace.event(TEST)?.emit();
-		Ok(())
-	}
-
-	#[test]
-	fn test_trace_collector_new() -> Result<(), crate::TightBeamError> {
-		let trace = TraceCollector::new();
-		trace.event(TEST)?.emit();
-		Ok(())
+	// A fresh collector records each event its caller emits, whichever
+	// constructor builds it.
+	crate::tb_cases! {
+		fn a_fresh_collector_records_an_event(fresh: fn() -> TraceCollector) -> TestResult {
+			let trace = fresh();
+			trace.event(TEST)?.emit();
+			assert_eq!(trace.recorded(TEST), 1);
+			Ok(())
+		}
+		cases {
+			default => TraceCollector::default,
+			new => TraceCollector::new,
+		}
 	}
 }

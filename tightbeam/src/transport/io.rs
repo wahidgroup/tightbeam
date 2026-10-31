@@ -848,31 +848,101 @@ impl TransportRefusal {
 	}
 }
 
+/// The forged records and the trace reads that the transport tests share.
+#[cfg(all(test, feature = "instrument"))]
+pub(crate) mod fixtures {
+	use super::*;
+	use crate::testing::fixtures::TestTrace;
+	use crate::urn::Urn;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::crypto::aead::RecordDirection;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::testing::TestKey;
+
+	/// The label and the payload hash of each event of kind `event` that
+	/// `trace` holds, in the order it recorded them.
+	pub(crate) fn records_of(trace: &TraceCollector, event: Urn<'static>) -> Vec<(Option<String>, Option<[u8; 32]>)> {
+		let records = TestTrace::records(trace, event).into_iter();
+		records
+			.map(|record| (record.label.map(String::from), record.payload_hash))
+			.collect()
+	}
+
+	/// The fault that a forged record carries.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[derive(Clone, Copy, Debug)]
+	pub(crate) enum Forgery {
+		/// A record of epoch 0 whose last octet is flipped. The octet lies in
+		/// the tag of the record, so the record fails to open.
+		TagFlipped,
+		/// A record of the epoch this variant holds.
+		AtEpoch(u32),
+		/// A record of epoch 0 at the sequence this variant holds.
+		AtSequence(u64),
+		/// A record of epoch 0 with an OCTET STRING in place of its position.
+		UndecodablePosition,
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	impl Forgery {
+		/// The wire envelope of a record that the test keys of `direction` seal
+		/// under this forgery.
+		pub(crate) fn record(self, direction: RecordDirection) -> Vec<u8> {
+			const PLAINTEXT: &[u8] = b"forged";
+
+			let keys = TestKey::insecure_directional_keys();
+			let key = match direction {
+				RecordDirection::ClientToServer => keys.client_to_server,
+				RecordDirection::ServerToClient => keys.server_to_client,
+			};
+			let epoch = match self {
+				Forgery::AtEpoch(epoch) => epoch,
+				_ => 0,
+			};
+
+			let sender = SendCipher::new(key, epoch, direction);
+			let record = match self {
+				Forgery::AtSequence(sequence) => sender.seal_at(PLAINTEXT, sequence),
+				Forgery::UndecodablePosition => {
+					let position = crate::der::asn1::OctetString::new([0u8; 4]);
+					let position = position.expect("four octets fit an OCTET STRING");
+					let position = crate::der::Any::encode_from(&position).expect("an OCTET STRING encodes");
+					sender.seal_with_position(PLAINTEXT, position)
+				}
+				Forgery::TagFlipped | Forgery::AtEpoch(_) => sender.encrypt_next(PLAINTEXT),
+			};
+			let record = record.expect("the test keys seal a record");
+			let wire = WireEnvelope::Encrypted(record)
+				.to_der()
+				.expect("a record encodes as a wire envelope");
+
+			match self {
+				Forgery::TagFlipped => crate::testing::fixtures::flip_last(wire),
+				_ => wire,
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::clock::ManualClock;
+	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::testing::TestFrame;
+	use crate::der::{ErrorKind, Tag};
+	use crate::testing::{TestFrame, TestResult};
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
-	use crate::transport::handshake::EstablishedSession;
+	use crate::transport::error::TransportFailure;
 	use crate::transport::state::{EncryptionConfig, SessionPhase, SessionState};
+	use crate::transport::{CheckedLimits, TransportLimits};
 	use crate::Version;
 
-	use crate::crypto::aead::SessionKeys;
-	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::transport::error::TransportFailure;
-	use crate::transport::handshake::PeerAuthentication;
-	use crate::transport::{CheckedLimits, TransportLimits};
-
-	#[cfg(all(
-		feature = "instrument",
-		feature = "testing-fault",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	use crate::testing::FaultModel;
 	#[cfg(feature = "instrument")]
-	use crate::urn::Urn;
+	use super::fixtures::records_of;
+	#[cfg(feature = "instrument")]
+	use crate::testing::fixtures::TestTrace;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	mod slot_fixtures {
@@ -882,30 +952,27 @@ mod tests {
 		pub use crate::marker::MaybeSendFuture;
 		pub(super) use crate::transport::framing::{FrameAssembler, Step};
 		pub use crate::transport::handshake::tests::create_test_signed_data;
-		pub use crate::transport::handshake::{HandshakeError, ServerHandshakeProtocol};
+		pub use crate::transport::handshake::{EstablishedSession, HandshakeError, ServerHandshakeProtocol};
 		pub use crate::transport::state::HandshakeSlot;
 	}
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use slot_fixtures::*;
 
-	#[cfg(feature = "instrument")]
-	mod audit_fixtures {
-		pub use crate::crypto::hash::{Digest, Sha3_256};
-		pub use crate::instrumentation::TbInstrumentationConfig;
-		pub use crate::testing::{TestCertificate, TestKey};
-		pub use crate::trace::TraceConfig;
-	}
-
+	#[cfg(all(
+		feature = "instrument",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	use super::fixtures::Forgery;
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	use crate::crypto::aead::RecordDirection;
-	#[cfg(feature = "instrument")]
-	use audit_fixtures::*;
 
 	/// A minimal `MessageIO` probe, so ingress goes through `decode_envelope`.
+	///
+	/// The decode under test reads no stream, so the probe holds none.
 	#[derive(Default)]
 	struct DecodeProbe {
 		clock: ManualClock,
@@ -927,6 +994,9 @@ mod tests {
 
 	/// A probe whose stream yields at most one envelope and then reads EOF, in
 	/// the session phase that the case under test sets.
+	///
+	/// The cases place a session directly in a phase and hand it envelopes
+	/// that no peer of the house writes, so the probe stands in for a stream.
 	struct StreamProbe {
 		state: SessionState<DefaultCryptoProvider>,
 		limits: CheckedLimits,
@@ -942,12 +1012,8 @@ mod tests {
 		/// Returns a provisioned endpoint placed directly in `phase`, whose
 		/// stream is closed.
 		fn at(phase: SessionPhase) -> Self {
-			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
-			let peer_authentication = PeerAuthentication::Anonymous.and(validator);
-			let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
-
 			Self {
-				state: SessionState::at(encryption, phase),
+				state: SessionState::at(EncryptionConfig::provisioned(), phase),
 				limits: CheckedLimits::default(),
 				clock: ManualClock::default(),
 				inbound: None,
@@ -1016,6 +1082,9 @@ mod tests {
 	/// A server orchestrator that answers every request with `reply`, and
 	/// counts the rounds it ran in `rounds`. Its completion fails with
 	/// `InvalidState`.
+	///
+	/// The cases read whether a round reaches the orchestrator, which no
+	/// house orchestrator reports, so the double counts the rounds.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	struct CountingServer {
 		rounds: Arc<AtomicUsize>,
@@ -1093,98 +1162,76 @@ mod tests {
 		}
 	}
 
-	fn encrypted_phase() -> SessionPhase {
-		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-		SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)))
-	}
-
-	fn handshaking_phase() -> SessionPhase {
-		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
-	}
-
 	// The session phase decides how an end of stream reads. A session that
 	// agreed its terms reports an ordinary close, so a pool evicts the
 	// connection on a close that is distinct from a handshake failure.
 	crate::tb_cases! {
-		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError))
-			-> TransportResult<()>
-		{
+		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError)) {
 			let mut probe = StreamProbe::at(phase);
-			let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-			let outcome = runtime.block_on(probe.read_session_bytes());
-			assert!(
-				matches!(&outcome, Err(error) if core::mem::discriminant(error) == core::mem::discriminant(&expected)),
-				"expected {expected:?}, got {outcome:?}"
-			);
-			Ok(())
+
+			let outcome = crate::runtime::rt::block_on(probe.read_session_bytes());
+			let expected = core::mem::discriminant(&expected);
+			assert!(matches!(&outcome, Err(error) if core::mem::discriminant(error) == expected));
 		}
 		cases {
 			cleartext_session => (SessionPhase::Cleartext, TransportError::ConnectionClosed),
 			provisioned_before_the_handshake => (SessionPhase::Provisioned, TransportError::PeerClosedBeforeHandshake),
-			handshake_in_flight => (handshaking_phase(), TransportError::PeerClosedBeforeHandshake),
-			established_session => (encrypted_phase(), TransportError::ConnectionClosed),
+			handshake_in_flight => (SessionPhase::handshaking(), TransportError::PeerClosedBeforeHandshake),
+			established_session => (
+				SessionPhase::encrypted(SessionKeys::insecure_client()),
+				TransportError::ConnectionClosed,
+			),
 		}
 	}
 
-	/// A cleartext envelope that is no handshake container, read while a
-	/// handshake is in flight, trips the circuit breaker. The step refuses it,
-	/// and the session drops the handshake and returns to its provisioned
-	/// start.
+	// An arrival that the session refuses trips the circuit breaker, so the
+	// session drops what it held and returns to its provisioned start: a
+	// cleartext envelope that is no handshake container during a handshake, a
+	// cleartext envelope to an established session, which refuses it by its
+	// outer tag before the contents decode, and a record during a handshake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[tokio::test]
-	async fn a_cleartext_request_during_the_handshake_trips_the_breaker() {
-		let request = TransportEnvelope::Request(RequestPackage::new(TestFrame::prioritized()));
-		let mut probe = StreamProbe::reading(handshaking_phase(), WireEnvelope::Cleartext(request));
-
-		let refusal = probe.collect_step().await;
-		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
-		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
-	}
-
-	/// An established session refuses a cleartext envelope by its outer tag,
-	/// before its contents decode, so contents that decode to nothing trip the
-	/// breaker as any cleartext does.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[tokio::test]
-	async fn an_established_session_refuses_cleartext_before_it_decodes() {
-		let mut probe = StreamProbe::reading_bytes(encrypted_phase(), &UNDECODABLE_CLEARTEXT);
-
-		let refusal = probe.collect_step().await;
-		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
-		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+	crate::tb_cases! {
+		fn a_refused_arrival_trips_the_breaker((mut probe, refused): (StreamProbe, fn(&TransportError) -> bool)) {
+			let refusal = crate::runtime::rt::block_on(probe.collect_step());
+			assert!(matches!(&refusal, Err(error) if refused(error)));
+			assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+		}
+		cases {
+			a_cleartext_request_during_the_handshake => (
+				StreamProbe::reading(
+					SessionPhase::handshaking(),
+					WireEnvelope::Cleartext(TransportEnvelope::Request(RequestPackage::new(TestFrame::prioritized()))),
+				),
+				|error| matches!(error, TransportError::MissingEncryption),
+			),
+			undecodable_cleartext_to_an_established_session => (
+				StreamProbe::reading_bytes(
+					SessionPhase::encrypted(SessionKeys::insecure_client()),
+					&UNDECODABLE_CLEARTEXT,
+				),
+				|error| matches!(error, TransportError::MissingEncryption),
+			),
+			a_record_during_the_handshake => (
+				StreamProbe::reading_bytes(SessionPhase::handshaking(), &UNOPENED_RECORD),
+				|error| matches!(error, TransportError::OperationFailed(TransportFailure::EncryptionFailed)),
+			),
+		}
 	}
 
 	/// An answer reads under the phase rule of the inbound collector, so an
 	/// established session refuses a cleartext answer before it decodes.
 	#[tokio::test]
 	async fn an_established_session_refuses_a_cleartext_answer_before_it_decodes() {
-		let mut probe = StreamProbe::at(encrypted_phase());
-
+		let mut probe = StreamProbe::at(SessionPhase::encrypted(SessionKeys::insecure_client()));
 		let refusal = probe.decrypt_response(UNDECODABLE_CLEARTEXT).await;
 		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
-	}
-
-	/// A record that arrives while a handshake is pending trips the circuit
-	/// breaker, so the session drops the handshake and returns to its
-	/// provisioned start.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[tokio::test]
-	async fn a_record_during_the_handshake_trips_the_breaker() {
-		let mut probe = StreamProbe::reading_bytes(handshaking_phase(), &UNOPENED_RECORD);
-		let expected = TransportFailure::EncryptionFailed;
-
-		let refusal = probe.collect_step().await;
-		let refused = matches!(refusal, Err(TransportError::OperationFailed(failure)) if failure == expected);
-		assert!(refused);
-		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
 	}
 
 	/// An answer that fails to open on an established session trips the
 	/// circuit breaker, as a record on the inbound collector does.
 	#[tokio::test]
 	async fn an_answer_that_fails_to_open_trips_the_breaker() {
-		let mut probe = StreamProbe::at(encrypted_phase());
-
+		let mut probe = StreamProbe::at(SessionPhase::encrypted(SessionKeys::insecure_client()));
 		let refusal = probe.decrypt_response(UNOPENED_RECORD).await;
 		assert!(matches!(refusal, Err(TransportError::InvalidMessage)));
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
@@ -1194,7 +1241,7 @@ mod tests {
 	/// refuses a cleartext answer past the cleartext ceiling, though it fits
 	/// the encrypted one.
 	#[tokio::test]
-	async fn a_cleartext_answer_past_its_ceiling_is_refused() -> crate::error::Result<()> {
+	async fn a_cleartext_answer_past_its_ceiling_is_refused() -> TestResult {
 		let mut probe = StreamProbe::at(SessionPhase::Cleartext);
 		// A handshake message of two octets takes four on the wire, so the
 		// set admits a cleartext ceiling of four.
@@ -1209,8 +1256,10 @@ mod tests {
 		let answer = WireEnvelope::Cleartext(response).to_der()?;
 
 		let refusal = probe.decrypt_response(answer).await;
-		let oversize = matches!(refusal, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)));
-		assert!(oversize);
+		assert!(matches!(
+			refusal,
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
+		));
 		Ok(())
 	}
 
@@ -1224,13 +1273,14 @@ mod tests {
 	#[test]
 	fn a_fault_at_the_record_of_a_refused_handshake_keeps_its_error() {
 		let injected = || TransportError::InvalidAddress;
-		let model = FaultModel::default().with_event_fault(events::SESSION_CERT_REJECTED, injected, crate::bps!(10000));
-		let mut probe = StreamProbe::at(handshaking_phase());
-		probe.trace = Some(TraceCollector::new().with_fault_model(model));
+		let mut probe = StreamProbe::at(SessionPhase::handshaking());
+		probe.trace = Some(TestTrace::faulting(events::SESSION_CERT_REJECTED, injected, crate::bps!(10000)));
 
 		let refusal = probe.emit_handshake_outcome(Err(HandshakeError::MutualAuthRequired.into()));
-		let kept = matches!(refusal, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
-		assert!(kept);
+		assert!(matches!(
+			refusal,
+			Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired))
+		));
 	}
 
 	/// The error of a refused envelope names why the read failed, so a fault
@@ -1243,66 +1293,16 @@ mod tests {
 	#[tokio::test]
 	async fn a_fault_at_the_record_of_a_refused_envelope_keeps_its_error() {
 		let injected = || TransportError::InvalidAddress;
-		let event = events::TRANSPORT_ENVELOPE_REFUSED;
-		let model = FaultModel::default().with_event_fault(event, injected, crate::bps!(10000));
-		let mut probe = StreamProbe::reading_bytes(handshaking_phase(), &UNOPENED_RECORD);
-		probe.trace = Some(TraceCollector::new().with_fault_model(model));
+		let mut probe = StreamProbe::reading_bytes(SessionPhase::handshaking(), &UNOPENED_RECORD);
+		probe.trace = Some(TestTrace::faulting(
+			events::TRANSPORT_ENVELOPE_REFUSED,
+			injected,
+			crate::bps!(10000),
+		));
+
 		let expected = TransportFailure::EncryptionFailed;
-
 		let refusal = probe.collect_step().await;
-		let kept = matches!(refusal, Err(TransportError::OperationFailed(failure)) if failure == expected);
-		assert!(kept);
-	}
-
-	/// A collector that keeps the hash of every payload.
-	#[cfg(feature = "instrument")]
-	fn payload_trace() -> TraceCollector {
-		let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-		TraceCollector::from(TraceConfig::with_instrumentation(config))
-	}
-
-	/// An established session whose peer holds the self-signed test
-	/// certificate, beside the hash of the canonical key of that peer.
-	#[cfg(feature = "instrument")]
-	fn peered_phase() -> (SessionPhase, [u8; 32]) {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let peer = SessionPeer::try_from(Arc::new(certificate)).expect("a test certificate records its peer");
-		let key_hash: [u8; 32] = Sha3_256::digest(peer.key().as_der()).into();
-
-		let keys = SessionKeys::for_client(TestKey::insecure_directional_keys());
-		let session = EstablishedSession::forged(keys, None, Some(peer));
-		(SessionPhase::Encrypted(Box::new(session)), key_hash)
-	}
-
-	/// The label and the payload hash of each event of kind `event` that
-	/// `trace` holds, in the order it recorded them.
-	#[cfg(feature = "instrument")]
-	fn records_of(trace: &TraceCollector, event: Urn<'static>) -> Vec<(Option<String>, Option<[u8; 32]>)> {
-		let recorded = trace.drain_events();
-		recorded
-			.into_iter()
-			.filter(|record| record.urn == event)
-			.map(|record| (record.label.map(String::from), record.payload_hash))
-			.collect()
-	}
-
-	/// A traced session records an arrival that its inbound collector refuses,
-	/// by the name of the failure and by the key of the peer of the session,
-	/// which the refusal resets.
-	#[cfg(all(
-		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	#[tokio::test]
-	async fn a_traced_session_records_the_arrival_it_refuses() {
-		let trace = payload_trace();
-		let (phase, peer_key) = peered_phase();
-		let mut probe = StreamProbe::reading_bytes(phase, &UNDECODABLE_CLEARTEXT).with_trace(trace.share());
-		let expected = (Some(String::from("MissingEncryption")), Some(peer_key));
-
-		let refusal = probe.collect_step().await;
-		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
-		assert_eq!(records_of(&trace, events::TRANSPORT_ENVELOPE_REFUSED), [expected]);
+		assert!(matches!(refusal, Err(TransportError::OperationFailed(failure)) if failure == expected));
 	}
 
 	/// A traced session records an answer that it refuses, by the name of the
@@ -1311,68 +1311,14 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
 	async fn a_traced_session_records_the_answer_it_refuses() {
-		let trace = payload_trace();
-		let (phase, peer_key) = peered_phase();
+		let trace = TestTrace::with_payloads();
+		let (phase, peer_key) = SessionPhase::peered(SessionKeys::insecure_client());
 		let mut probe = StreamProbe::at(phase).with_trace(trace.share());
 		let expected = (Some(String::from("MissingEncryption")), Some(peer_key));
 
 		let refusal = probe.decrypt_response(UNDECODABLE_CLEARTEXT).await;
 		assert!(matches!(refusal, Err(TransportError::MissingEncryption)));
 		assert_eq!(records_of(&trace, events::TRANSPORT_ENVELOPE_REFUSED), [expected]);
-	}
-
-	/// A record that the server-to-client key of the test keys seals at
-	/// `epoch`, as the wire envelope that a client session reads.
-	#[cfg(all(
-		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	fn sealed_for_client(epoch: u32) -> TransportResult<Vec<u8>> {
-		let key = TestKey::insecure_directional_keys().server_to_client;
-		let sender = SendCipher::new(key, epoch, RecordDirection::ServerToClient);
-		let record = sender.encrypt_next(b"forged".to_vec())?;
-		Ok(WireEnvelope::Encrypted(record).to_der()?)
-	}
-
-	/// The record of epoch 0 with its last octet flipped. The octet lies in
-	/// the tag of the record, so the record fails to open.
-	#[cfg(all(
-		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	fn with_its_tag_flipped() -> TransportResult<Vec<u8>> {
-		let mut forged = sealed_for_client(0)?;
-		let last = forged.last_mut().expect("a sealed record holds octets");
-		*last ^= 0x01;
-
-		Ok(forged)
-	}
-
-	/// A record that the server-to-client key of the test keys seals at
-	/// `sequence` of epoch 0, past the sequence that a client session expects.
-	#[cfg(all(
-		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	fn sealed_for_client_at(sequence: u64) -> TransportResult<Vec<u8>> {
-		let key = TestKey::insecure_directional_keys().server_to_client;
-		let sender = SendCipher::new(key, 0, RecordDirection::ServerToClient);
-		let record = sender.seal_at(b"forged".to_vec(), sequence)?;
-		Ok(WireEnvelope::Encrypted(record).to_der()?)
-	}
-
-	/// A record that the server-to-client key of the test keys seals with an
-	/// OCTET STRING in place of its position.
-	#[cfg(all(
-		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	fn sealed_for_client_with_an_undecodable_position() -> TransportResult<Vec<u8>> {
-		let key = TestKey::insecure_directional_keys().server_to_client;
-		let sender = SendCipher::new(key, 0, RecordDirection::ServerToClient);
-		let position = crate::der::Any::encode_from(&crate::der::asn1::OctetString::new([0u8; 4])?)?;
-		let record = sender.seal_with_position(b"forged".to_vec(), position)?;
-		Ok(WireEnvelope::Encrypted(record).to_der()?)
 	}
 
 	/// Whether `error` is the [`TransportError::InvalidMessage`] of a record
@@ -1404,67 +1350,73 @@ mod tests {
 		matches!(error, TransportError::DerError(_))
 	}
 
-	/// A forged record, the cause its record names, and the test of the error
-	/// that the read returns.
+	/// Whether `error` is the refusal of a cleartext envelope by a session
+	/// that holds keys.
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
-	type ForgedRecordCase = (TransportResult<Vec<u8>>, &'static str, fn(&TransportError) -> bool);
+	fn is_missing_encryption(error: &TransportError) -> bool {
+		matches!(error, TransportError::MissingEncryption)
+	}
 
-	// A traced session records a forged record by its cause and by the key of
-	// its peer, and its read returns the error that the open names.
+	/// The wire octets of an arrival, the cause its record names, and the
+	/// test of the error that the read returns.
+	#[cfg(all(
+		feature = "instrument",
+		any(feature = "transport-cms", feature = "transport-hpke")
+	))]
+	type RefusedArrivalCase = (Vec<u8>, &'static str, fn(&TransportError) -> bool);
+
+	// A traced session records an arrival that its inbound collector refuses,
+	// by its cause and by the key of the peer of the session, which the
+	// refusal resets, and its read returns the error of that cause. The
+	// arrivals are a cleartext envelope to an established session, a wire
+	// envelope that does not decode, and a forged record.
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-hpke")
 	))]
 	crate::tb_cases! {
-		fn a_traced_session_records_a_forged_record((forged, cause, returned): ForgedRecordCase)
-			-> TransportResult<()>
-		{
-			let trace = payload_trace();
-			let (phase, peer_key) = peered_phase();
-			let mut probe = StreamProbe::reading_bytes(phase, &forged?).with_trace(trace.share());
+		async fn a_traced_session_records_an_arrival_it_refuses((arrival, cause, returned): RefusedArrivalCase) {
+			let trace = TestTrace::with_payloads();
+			let (phase, peer_key) = SessionPhase::peered(SessionKeys::insecure_client());
+			let mut probe = StreamProbe::reading_bytes(phase, &arrival).with_trace(trace.share());
 			let expected = (Some(String::from(cause)), Some(peer_key));
 
-			let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-			let refusal = runtime.block_on(probe.collect_step());
+			let refusal = probe.collect_step().await;
 			assert!(matches!(&refusal, Err(error) if returned(error)));
 			assert_eq!(records_of(&trace, events::TRANSPORT_ENVELOPE_REFUSED), [expected]);
-			Ok(())
 		}
 		cases {
-			whose_tag_fails => (with_its_tag_flipped(), "OpenFailed", is_invalid_message),
-			of_another_epoch => (sealed_for_client(1), "WrongEpoch", is_invalid_message),
+			of_cleartext_to_an_established_session => (
+				UNDECODABLE_CLEARTEXT.to_vec(),
+				"MissingEncryption",
+				is_missing_encryption,
+			),
+			that_does_not_decode => (vec![0x05, 0x00], "DerError", is_der_error),
+			whose_tag_fails => (
+				Forgery::TagFlipped.record(RecordDirection::ServerToClient),
+				"OpenFailed",
+				is_invalid_message,
+			),
+			of_another_epoch => (
+				Forgery::AtEpoch(1).record(RecordDirection::ServerToClient),
+				"WrongEpoch",
+				is_invalid_message,
+			),
 			past_the_record_limit => (
-				sealed_for_client_at(crate::constants::DEFAULT_REKEY_RECORD_LIMIT),
+				Forgery::AtSequence(crate::constants::DEFAULT_REKEY_RECORD_LIMIT)
+					.record(RecordDirection::ServerToClient),
 				"OpenFailed",
 				is_past_the_renewal_bound,
 			),
 			whose_position_does_not_decode => (
-				sealed_for_client_with_an_undecodable_position(),
+				Forgery::UndecodablePosition.record(RecordDirection::ServerToClient),
 				"OpenFailed",
 				is_der_error,
 			),
 		}
-	}
-
-	/// A traced session records an arrival whose wire envelope does not
-	/// decode, by the name of the failure and by the key of its peer.
-	#[cfg(all(
-		feature = "instrument",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	#[tokio::test]
-	async fn a_traced_session_records_an_envelope_that_does_not_decode() {
-		let trace = payload_trace();
-		let (phase, peer_key) = peered_phase();
-		let mut probe = StreamProbe::reading_bytes(phase, &[0x05, 0x00]).with_trace(trace.share());
-		let expected = (Some(String::from("DerError")), Some(peer_key));
-
-		let refusal = probe.collect_step().await;
-		assert!(matches!(refusal, Err(TransportError::DerError(_))));
-		assert_eq!(records_of(&trace, events::TRANSPORT_ENVELOPE_REFUSED), [expected]);
 	}
 
 	/// An established session whose send cipher holds a record limit of zero.
@@ -1472,9 +1424,7 @@ mod tests {
 	fn spent_phase() -> SessionPhase {
 		// A ceiling larger than the renewal volume sets the record limit of
 		// the send cipher to zero.
-		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-		let keys = keys.with_envelope_ceiling(usize::MAX);
-		SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)))
+		SessionPhase::encrypted(SessionKeys::insecure_client().with_envelope_ceiling(usize::MAX))
 	}
 
 	/// A traced session records a send that its cipher refuses at the record
@@ -1484,11 +1434,13 @@ mod tests {
 	async fn a_traced_session_records_the_send_its_cipher_refuses() {
 		let trace = TraceCollector::new();
 		let mut probe = StreamProbe::at(spent_phase()).with_trace(trace.share());
-		let expected = (Some(String::from("send")), None);
 
+		let expected = (Some(String::from("send")), None);
 		let refusal = probe.wrap_and_encrypt_message(TestFrame::prioritized()).await;
-		let at_limit = matches!(refusal, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
-		assert!(at_limit);
+		assert!(matches!(
+			refusal,
+			Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))
+		));
 		assert_eq!(records_of(&trace, events::TRANSPORT_REKEY_REQUIRED), [expected]);
 	}
 
@@ -1529,7 +1481,7 @@ mod tests {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test]
 	async fn a_reset_mid_handshake_empties_the_slot() {
-		let (mut probe, rounds) = counting_slot(handshaking_phase());
+		let (mut probe, rounds) = counting_slot(SessionPhase::handshaking());
 		probe.session_state_mut().reset();
 
 		let refused = probe.drive_server_handshake(handshake_round()).await;
@@ -1541,7 +1493,7 @@ mod tests {
 	/// the endpoint writes a byte of it.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test]
-	async fn a_handshake_reply_past_the_wire_ceiling_is_refused_before_the_write() -> TransportResult<()> {
+	async fn a_handshake_reply_past_the_wire_ceiling_is_refused_before_the_write() -> TestResult {
 		let (mut probe, _rounds) = counting_slot(SessionPhase::Provisioned);
 		probe.limits = TransportLimits { handshake_wire: 16, ..*probe.limits }.checked()?;
 
@@ -1583,14 +1535,14 @@ mod tests {
 	/// is one the peer takes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test]
-	async fn a_handshake_message_at_the_wire_ceiling_passes_the_cap_of_the_peer() -> TransportResult<()> {
+	async fn a_handshake_message_at_the_wire_ceiling_passes_the_cap_of_the_peer() -> TestResult {
 		let message = handshake_round();
 		let mut probe = StreamProbe::at(SessionPhase::Provisioned);
 		probe.limits = TransportLimits { handshake_wire: envelope_len(&message), ..*probe.limits }.checked()?;
 		probe.write_handshake(message).await?;
 
 		let wire = probe.sent.concat();
-		let policy = handshaking_phase().read_policy(&probe.limits, probe.clock.monotonic());
+		let policy = SessionPhase::handshaking().read_policy(&probe.limits, probe.clock.monotonic());
 		let frame = framed(&wire, policy.cap())?;
 		assert_eq!(frame, wire);
 		Ok(())
@@ -1601,7 +1553,7 @@ mod tests {
 	/// alone fits. The writer measures the envelope that the reader caps.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[tokio::test]
-	async fn a_handshake_envelope_past_the_wire_ceiling_is_refused_before_the_write() -> TransportResult<()> {
+	async fn a_handshake_envelope_past_the_wire_ceiling_is_refused_before_the_write() -> TestResult {
 		let message = handshake_round();
 		let mut probe = StreamProbe::at(SessionPhase::Provisioned);
 		probe.limits = TransportLimits { handshake_wire: envelope_len(&message) - 1, ..*probe.limits }.checked()?;
@@ -1647,18 +1599,37 @@ mod tests {
 		crate::encode(&envelope).expect("a test envelope encodes")
 	}
 
+	/// The decode of an envelope at ingress.
+	type Ingress = TransportResult<TransportEnvelope>;
+
+	/// Whether `decoded` is the refusal of a frame that holds a field its
+	/// version forbids.
+	fn is_refused_by_its_version(decoded: &Ingress) -> bool {
+		let refusal = ErrorKind::Value { tag: Tag::Sequence };
+		matches!(decoded, Err(TransportError::DerError(error)) if error.kind() == refusal)
+	}
+
+	/// An encoding and the test of its decode at ingress.
+	type IngressCase = (Vec<u8>, fn(&Ingress) -> bool);
+
 	// Ingress admits a frame that holds the fields its version allows, and
 	// refuses a frame that holds a field its version forbids.
 	crate::tb_cases! {
-		fn decode_ingress_refuses_a_field_the_frame_version_forbids((bytes, accepted): (Vec<u8>, bool)) {
+		fn decode_ingress_refuses_a_field_the_frame_version_forbids((bytes, decoded_as): IngressCase) {
 			let decoded = <DecodeProbe as MessageIO>::decode_envelope(&bytes);
-			assert_eq!(decoded.is_ok(), accepted);
+			assert!(decoded_as(&decoded));
 		}
 		cases {
-			request_v0_with_priority => (forged_as_v0(request_with), false),
-			request_v2_with_priority => (encoded(request_with(TestFrame::prioritized())), true),
-			response_v0_with_priority => (forged_as_v0(|frame| response_with(Some(frame))), false),
-			response_without_frame => (encoded(response_with(None)), true),
+			request_v0_with_priority => (forged_as_v0(request_with), is_refused_by_its_version),
+			request_v2_with_priority => (
+				encoded(request_with(TestFrame::prioritized())),
+				|decoded| matches!(decoded, Ok(TransportEnvelope::Request(_))),
+			),
+			response_v0_with_priority => (forged_as_v0(|frame| response_with(Some(frame))), is_refused_by_its_version),
+			response_without_frame => (
+				encoded(response_with(None)),
+				|decoded| matches!(decoded, Ok(TransportEnvelope::Response(_))),
+			),
 		}
 	}
 }

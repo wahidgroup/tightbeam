@@ -477,42 +477,61 @@ impl HandshakeAlertAttribute for HandshakeAttribute {
 mod tests {
 	use super::*;
 	use crate::cms::signed_data::{SignerInfo, SignerInfos};
+	use crate::crypto::sign::SignedDataSigners;
 	use crate::der::asn1::Any;
 	use crate::der::asn1::{OctetString as DerOctetString, SetOfVec, UintRef};
 	use crate::oids::HANDSHAKE_SECURITY_ACCEPT;
+	use crate::testing::TestResult;
 	use crate::transport::handshake::tests::create_test_signed_data;
 
-	fn mk_integer(bytes: impl AsRef<[u8]>) -> Result<Any, der::Error> {
-		let bytes = bytes.as_ref();
-		let u = UintRef::new(bytes)?;
-		Any::encode_from(&u)
+	/// The INTEGER whose unsigned big-endian octets are `bytes`.
+	fn integer_of(bytes: impl AsRef<[u8]>) -> Any {
+		let integer = UintRef::new(bytes.as_ref()).expect("the octets are an unsigned INTEGER");
+		Any::encode_from(&integer).expect("an INTEGER encodes")
 	}
 
-	fn mk_octet(bytes: impl AsRef<[u8]>) -> Result<Any, der::Error> {
-		let bytes = bytes.as_ref();
-		let os = DerOctetString::new(bytes)?;
-		Any::encode_from(&os)
+	/// The OCTET STRING of `bytes`.
+	fn octets_of(bytes: impl AsRef<[u8]>) -> Any {
+		let octets = DerOctetString::new(bytes.as_ref()).expect("the octets are an OCTET STRING");
+		Any::encode_from(&octets).expect("an OCTET STRING encodes")
 	}
 
-	fn mk_alert_attr(bytes: impl AsRef<[u8]>) -> Result<HandshakeAttribute, der::Error> {
-		let bytes = bytes.as_ref();
-		Ok(HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, mk_integer(bytes)?))
+	/// The abort alert whose code is the INTEGER of `bytes`.
+	fn alert_of(bytes: impl AsRef<[u8]>) -> HandshakeAttribute {
+		HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, integer_of(bytes))
 	}
 
-	fn mk_attr(oid: ObjectIdentifier, value: Any) -> Result<Attribute, der::Error> {
-		Ok(Attribute { oid, values: SetOfVec::try_from(vec![value])? })
+	/// The attribute of type `oid` that carries `values`.
+	fn attribute_of(oid: ObjectIdentifier, values: impl IntoIterator<Item = Any>) -> Attribute {
+		let values = SetOfVec::try_from(values.into_iter().collect::<Vec<Any>>());
+		Attribute { oid, values: values.expect("distinct values form a SET OF") }
+	}
+
+	/// The security offer whose value is 32 octets of `fill`.
+	fn offer_attr(fill: u8) -> Attribute {
+		attribute_of(HANDSHAKE_SECURITY_OFFER, [octets_of([fill; 32])])
+	}
+
+	/// A set that carries the abort alert twice, of codes 3 and 4.
+	fn duplicate_alerts() -> Attributes {
+		let first = attribute_of(HANDSHAKE_ABORT_ALERT, [integer_of([0x03])]);
+		let second = attribute_of(HANDSHAKE_ABORT_ALERT, [integer_of([0x04])]);
+		Attributes::try_from(vec![first, second]).expect("two distinct attributes form a SET OF")
+	}
+
+	/// A security offer of two values.
+	fn two_valued_offer() -> Attribute {
+		attribute_of(HANDSHAKE_SECURITY_OFFER, [octets_of([0x33u8; 32]), octets_of([0x34u8; 32])])
 	}
 
 	/// The one `SignerInfo` of a fresh test `SignedData`, which carries the
 	/// same security offer as an unsigned attribute on every call.
 	fn signer_with_offer() -> SignerInfo {
 		let signed_data = create_test_signed_data([0x07u8; 32]);
-		let value = mk_octet([0x11u8; 32]).expect("a 32-byte OCTET STRING encodes");
-		let offer = mk_attr(HANDSHAKE_SECURITY_OFFER, value).expect("one value forms a SET OF");
-		let attrs = Attributes::try_from(vec![offer]).expect("one attribute forms a SET OF");
+		let attrs = Attributes::try_from(vec![offer_attr(0x11)]).expect("one attribute forms a SET OF");
 
-		let signer = signed_data.signer_infos.0.iter().next().cloned();
-		let mut signer = signer.expect("the test SignedData has one signer");
+		let signer = signed_data.sole_signer().expect("the test SignedData has one signer");
+		let mut signer = signer.to_owned();
 		signer.unsigned_attrs = Some(attrs);
 		signer
 	}
@@ -520,20 +539,24 @@ mod tests {
 	/// A receiver binds the bytes that arrived. `der` sorts a `SET OF` at
 	/// decode, so a re-encoding would erase tamper evidence (CWE-345).
 	#[test]
-	fn the_transcript_binds_the_bytes_an_attribute_arrived_as() -> Result<(), HandshakeError> {
-		use crate::der::{Decode, Encode};
+	fn the_transcript_binds_the_bytes_an_attribute_arrived_as() -> TestResult {
+		use crate::der::Decode;
 
-		// The members of this SET OF are out of DER order. Decoding sorts
-		// them, so the decoded value differs from what was sent.
-		let unsorted = Any::from_der(&[0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01])?;
-		let attribute = HandshakeAttribute::new(HANDSHAKE_SECURITY_ACCEPT, unsorted.to_owned());
-		assert_eq!(attribute.received_bytes()?, unsorted.to_der()?);
+		// The members of this SET OF are out of DER order, so a decode into a
+		// SET OF would sort them into a value that differs from what was sent.
+		const ARRIVED: [u8; 8] = [0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01];
+		let attribute = HandshakeAttribute::new(HANDSHAKE_SECURITY_ACCEPT, Any::from_der(&ARRIVED)?);
+
+		let bound = attribute.received_bytes()?;
+		assert_eq!(bound, ARRIVED);
 		Ok(())
 	}
 
+	/// An abort alert in a message refuses the message with the alert it
+	/// carries.
 	#[test]
-	fn an_abort_alert_attribute_is_refused() -> Result<(), HandshakeError> {
-		let alert = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
+	fn an_abort_alert_attribute_is_refused() -> TestResult {
+		let alert = attribute_of(HANDSHAKE_ABORT_ALERT, [integer_of([0x03])]);
 		let attrs = Attributes::try_from(vec![alert])?;
 
 		let refused = attrs.refuse_alert();
@@ -545,51 +568,41 @@ mod tests {
 	/// A repeated abort alert fails closed as a duplicate attribute. Read as
 	/// no alert, it would let processing continue into the message body.
 	#[test]
-	fn a_duplicate_abort_alert_fails_closed() -> Result<(), HandshakeError> {
-		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
-		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
-		let attrs = Attributes::try_from(vec![first, second])?;
-
-		let refused = attrs.refuse_alert();
+	fn a_duplicate_abort_alert_fails_closed() {
+		let refused = duplicate_alerts().refuse_alert();
 		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));
-		Ok(())
 	}
 
 	/// The unprotected attributes of a CMS container are an optional set, and
 	/// a present set that repeats the abort alert fails closed as the set does.
 	#[test]
-	fn a_duplicate_abort_alert_in_an_optional_set_fails_closed() -> Result<(), HandshakeError> {
-		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
-		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
-		let attrs = Some(Attributes::try_from(vec![first, second])?);
-
-		let refused = attrs.refuse_alert();
+	fn a_duplicate_abort_alert_in_an_optional_set_fails_closed() {
+		let refused = Some(duplicate_alerts()).refuse_alert();
 		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));
-		Ok(())
 	}
 
 	/// A message without an abort alert passes the alert check.
 	#[test]
-	fn a_message_without_an_alert_passes() -> Result<(), HandshakeError> {
-		let offer = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x11u8; 32])?)?;
-		let attrs = Attributes::try_from(vec![offer])?;
-		attrs.refuse_alert()
-	}
-
-	#[test]
-	fn duplicate_detected() -> Result<(), HandshakeError> {
-		let a1 = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x11u8; 32])?)?;
-		let a2 = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x12u8; 32])?)?;
-		let attrs = Attributes::try_from(vec![a1, a2])?;
-		assert!(matches!(
-			attrs.find_unsigned_attr(HANDSHAKE_SECURITY_OFFER),
-			Err(HandshakeError::DuplicateAttribute)
-		));
+	fn a_message_without_an_alert_passes() -> TestResult {
+		let attrs = Attributes::try_from(vec![offer_attr(0x11)])?;
+		attrs.refuse_alert()?;
 		Ok(())
 	}
 
+	/// A lookup of an attribute that a set carries twice fails closed as a
+	/// duplicate attribute.
 	#[test]
-	fn duplicate_across_signers_detected() -> Result<(), HandshakeError> {
+	fn a_lookup_of_a_repeated_attribute_is_refused() -> TestResult {
+		let attrs = Attributes::try_from(vec![offer_attr(0x11), offer_attr(0x12)])?;
+		let found = attrs.find_unsigned_attr(HANDSHAKE_SECURITY_OFFER);
+		assert!(matches!(found, Err(HandshakeError::DuplicateAttribute)));
+		Ok(())
+	}
+
+	/// A lookup of an attribute that two signers each carry fails closed as a
+	/// duplicate attribute.
+	#[test]
+	fn a_lookup_of_an_attribute_across_signers_is_refused() -> TestResult {
 		let mut signed_data = create_test_signed_data([0x07u8; 32]);
 		let signers = vec![signer_with_offer(), signer_with_offer()];
 		signed_data.signer_infos = SignerInfos::try_from(signers)?;
@@ -599,37 +612,32 @@ mod tests {
 		Ok(())
 	}
 
+	/// A lookup of an attribute absent from a set finds none.
 	#[test]
-	fn missing_attribute_detected() -> Result<(), HandshakeError> {
-		let only = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x22u8; 32])?)?;
-		let attrs = Attributes::try_from(vec![only])?;
-		assert!(matches!(attrs.find_unsigned_attr(HANDSHAKE_SECURITY_ACCEPT), Ok(None)));
+	fn a_lookup_of_an_absent_attribute_finds_none() -> TestResult {
+		let attrs = Attributes::try_from(vec![offer_attr(0x22)])?;
+		let found = attrs.find_unsigned_attr(HANDSHAKE_SECURITY_ACCEPT);
+		assert!(matches!(found, Ok(None)));
 		Ok(())
 	}
 
 	/// A received attribute carries one value, so the boundary refuses an
 	/// attribute of two values before any reader sees it (RFC 5652 § 5.3).
 	#[test]
-	fn an_attribute_with_two_values_is_refused_at_the_boundary() -> Result<(), der::Error> {
-		let values = vec![mk_octet([0x33u8; 32])?, mk_octet([0x34u8; 32])?];
-		let attribute = Attribute { oid: HANDSHAKE_SECURITY_OFFER, values: SetOfVec::try_from(values)? };
-
-		let refused = HandshakeAttribute::try_from(&attribute);
+	fn an_attribute_with_two_values_is_refused_at_the_boundary() {
+		let refused = HandshakeAttribute::try_from(&two_valued_offer());
 		assert!(matches!(refused, Err(HandshakeError::InvalidAttributeArity)));
-		Ok(())
 	}
 
 	/// The DER decode of a handshake attribute reads an RFC 5652 § 5.3
 	/// `Attribute` and passes its arity check, so an attribute of two values
 	/// is a value error of its SET OF.
 	#[test]
-	fn an_attribute_with_two_values_does_not_decode() -> Result<(), der::Error> {
+	fn an_attribute_with_two_values_does_not_decode() -> TestResult {
 		use crate::der::{Decode, Encode, ErrorKind, Tag};
 
-		let values = vec![mk_octet([0x33u8; 32])?, mk_octet([0x34u8; 32])?];
-		let attribute = Attribute { oid: HANDSHAKE_SECURITY_OFFER, values: SetOfVec::try_from(values)? };
-
-		let refused = HandshakeAttribute::from_der(&attribute.to_der()?).map_err(|error| error.kind());
+		let encoded = two_valued_offer().to_der()?;
+		let refused = HandshakeAttribute::from_der(&encoded).map_err(|error| error.kind());
 		assert!(matches!(refused, Err(ErrorKind::Value { tag: Tag::Set })));
 		Ok(())
 	}
@@ -637,78 +645,81 @@ mod tests {
 	/// A handshake attribute encodes as the RFC 5652 § 5.3 `Attribute` of its
 	/// one value.
 	#[test]
-	fn a_handshake_attribute_encodes_as_an_rfc_attribute() -> Result<(), der::Error> {
+	fn a_handshake_attribute_encodes_as_an_rfc_attribute() -> TestResult {
 		use crate::der::{Decode, Encode};
 
-		let value = mk_octet([0x35u8; 32])?;
+		let value = octets_of([0x35u8; 32]);
 		let attribute = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, value.clone());
 
 		let decoded = Attribute::from_der(&attribute.to_der()?)?;
-		assert_eq!(decoded, mk_attr(HANDSHAKE_SECURITY_OFFER, value)?);
+		assert_eq!(decoded, attribute_of(HANDSHAKE_SECURITY_OFFER, [value]));
 		Ok(())
 	}
 
 	/// An alert of two values is refused at the boundary of its set, as any
 	/// attribute of the handshake profile is.
 	#[test]
-	fn a_multi_valued_alert_is_refused_at_the_boundary() -> Result<(), der::Error> {
-		let values = vec![mk_integer([0x01])?, mk_integer([0x02])?];
-		let alert = Attribute { oid: HANDSHAKE_ABORT_ALERT, values: SetOfVec::try_from(values)? };
+	fn a_multi_valued_alert_is_refused_at_the_boundary() -> TestResult {
+		let alert = attribute_of(HANDSHAKE_ABORT_ALERT, [integer_of([0x01]), integer_of([0x02])]);
 		let attrs = Attributes::try_from(vec![alert])?;
-
 		assert!(matches!(attrs.refuse_alert(), Err(HandshakeError::InvalidAttributeArity)));
 		Ok(())
 	}
 
-	#[test]
-	fn alert_code_mapping() -> Result<(), HandshakeError> {
-		let alerts = [
-			(HandshakeAlert::AuthRequired, 1u8),
-			(HandshakeAlert::VersionMismatch, 2u8),
-			(HandshakeAlert::AlgorithmMismatch, 3u8),
-			(HandshakeAlert::DecryptFail, 4u8),
-			(HandshakeAlert::FinishedIntegrityFail, 5u8),
-		];
-		for (alert, code) in alerts.iter() {
-			let attr = mk_alert_attr([*code])?;
-			assert_eq!(attr.handshake_alert()?, *alert);
+	// Each alert code of the alert domain reads as its alert.
+	crate::tb_cases! {
+		fn an_alert_code_maps_to_its_alert((code, alert): (u8, HandshakeAlert)) -> TestResult {
+			let read = alert_of([code]).handshake_alert()?;
+			assert_eq!(read, alert);
+			Ok(())
 		}
-
-		let unknown = mk_alert_attr([0x07])?;
-		assert!(matches!(unknown.handshake_alert(), Err(HandshakeError::UnknownAlertCode(7))));
-		Ok(())
+		cases {
+			auth_required => (1, HandshakeAlert::AuthRequired),
+			version_mismatch => (2, HandshakeAlert::VersionMismatch),
+			algorithm_mismatch => (3, HandshakeAlert::AlgorithmMismatch),
+			decrypt_fail => (4, HandshakeAlert::DecryptFail),
+			finished_integrity_fail => (5, HandshakeAlert::FinishedIntegrityFail),
+		}
 	}
 
+	/// A code inside the decode domain that names no alert is refused with
+	/// the code it carries.
 	#[test]
-	fn alert_integer_out_of_range_rejected() -> Result<(), der::Error> {
-		// A three-byte INTEGER exceeds the u16 decode domain.
-		let wide = mk_alert_attr([0x01, 0x02, 0x03])?;
-		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
-
-		// 0x0101 is 257, which a truncation to u8 would alias to alert code 1
-		// (AuthRequired).
-		let above = mk_alert_attr([0x01, 0x01])?;
-		assert!(matches!(above.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
-		Ok(())
+	fn an_unknown_alert_code_is_refused() {
+		let refused = alert_of([0x07]).handshake_alert();
+		assert!(matches!(refused, Err(HandshakeError::UnknownAlertCode(7))));
 	}
 
-	/// A two-octet alert code reads big-endian: `0x0100` is 256, past the
-	/// alert domain, and never alert 1.
-	#[test]
-	fn a_two_octet_alert_code_reads_big_endian() -> Result<(), der::Error> {
-		let wide = mk_alert_attr([0x01, 0x00])?;
-
-		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
-		Ok(())
+	// An alert code past the `u16` decode domain or past the alert domain is
+	// refused as out of range.
+	crate::tb_cases! {
+		fn an_alert_code_past_its_domain_is_refused(bytes: &[u8]) {
+			let refused = alert_of(bytes).handshake_alert();
+			assert!(matches!(refused, Err(HandshakeError::IntegerOutOfRange)));
+		}
+		cases {
+			/// A three-octet INTEGER exceeds the `u16` decode domain.
+			three_octets => &[0x01, 0x02, 0x03],
+			/// `0x0101` is 257, which a truncation to `u8` would alias to
+			/// alert code 1 (`AuthRequired`).
+			value_257 => &[0x01, 0x01],
+			/// A two-octet alert code reads big-endian: `0x0100` is 256, past
+			/// the alert domain, and never alert 1.
+			value_256 => &[0x01, 0x00],
+		}
 	}
 
-	#[test]
-	fn attribute_ord_tiebreaks_on_value() -> Result<(), der::Error> {
-		let low = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, mk_integer([0x01])?);
-		let high = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, mk_integer([0x02])?);
-		assert_eq!(low.cmp(&high), Ordering::Less);
-		assert_eq!(high.cmp(&low), Ordering::Greater);
-		assert_eq!(low.cmp(&low.to_owned()), Ordering::Equal);
-		Ok(())
+	// Two attributes of one type order by their values.
+	crate::tb_cases! {
+		fn attributes_of_one_type_order_by_value((first, second, ordering): (u8, u8, Ordering)) {
+			let first = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, integer_of([first]));
+			let second = HandshakeAttribute::new(HANDSHAKE_SECURITY_OFFER, integer_of([second]));
+			assert_eq!(first.cmp(&second), ordering);
+		}
+		cases {
+			less => (0x01, 0x02, Ordering::Less),
+			greater => (0x02, 0x01, Ordering::Greater),
+			equal => (0x01, 0x01, Ordering::Equal),
+		}
 	}
 }

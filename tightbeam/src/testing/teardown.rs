@@ -67,6 +67,7 @@ mod tests {
 
 	use super::*;
 
+	/// A guard whose action counts its runs, beside the count.
 	fn counting_teardown() -> (Teardown, Arc<AtomicUsize>) {
 		let runs = Arc::new(AtomicUsize::new(0));
 		let recorded = Arc::clone(&runs);
@@ -79,14 +80,16 @@ mod tests {
 		)
 	}
 
+	/// A guard that drops runs its action once.
 	#[test]
 	fn dropping_the_guard_runs_the_action() {
 		let (guard, runs) = counting_teardown();
 		drop(guard);
-
 		assert_eq!(runs.load(Ordering::SeqCst), 1);
 	}
 
+	/// A panic that unwinds past the guard reaches the caller, and the guard
+	/// runs its action on the way.
 	#[test]
 	fn unwinding_past_the_guard_runs_the_action() {
 		let (guard, runs) = counting_teardown();
@@ -94,15 +97,16 @@ mod tests {
 			let _guard = guard;
 			panic!("the scenario body failed");
 		}));
-		assert!(panicked.is_err(), "the panic must reach the caller");
+		assert!(panicked.is_err());
 		assert_eq!(runs.load(Ordering::SeqCst), 1);
 	}
 
+	/// An action that runs early runs once in all, though the guard then
+	/// drops.
 	#[test]
 	fn running_the_action_early_does_not_run_it_again_on_drop() {
 		let (guard, runs) = counting_teardown();
 		guard.run();
-
 		assert_eq!(runs.load(Ordering::SeqCst), 1);
 	}
 }

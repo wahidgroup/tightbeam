@@ -800,38 +800,43 @@ impl<'a> DecodeValue<'a> for Urn<'static> {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
+
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::TestResult;
+
 	use super::*;
 
-	/// Each NID beside the outcome of the NID production of RFC 8141 § 2,
-	/// `(alphanum) 0*30(ldh) (alphanum)`.
-	const NID_CASES: [(&str, Result<(), UrnValidationError>); 15] = [
-		// The two `alphanum` ends alone give the shortest NID.
-		("ab", Ok(())),
-		("a", Err(UrnValidationError::InvalidNidLength)),
-		("", Err(UrnValidationError::InvalidNidLength)),
-		// Two ends and 30 `ldh` give the longest NID.
-		("a123456789012345678901234567890b", Ok(())),
-		("a1234567890123456789012345678901b", Err(UrnValidationError::InvalidNidLength)),
-		// An `ldh` is a letter, a digit, or a hyphen, and hyphens may repeat.
-		("my-namespace", Ok(())),
-		("a--b", Ok(())),
-		("a_b", Err(UrnValidationError::InvalidNidCharacters)),
-		("a.b", Err(UrnValidationError::InvalidNidCharacters)),
-		("a\u{e9}b", Err(UrnValidationError::InvalidNidCharacters)),
-		// The last character is an `alphanum`.
-		("a9", Ok(())),
-		("ab-", Err(UrnValidationError::InvalidNidCharacters)),
-		// The first character is an `alphanum`: a letter of either case, or a
-		// digit.
-		("Ab", Ok(())),
-		("1ab", Ok(())),
-		("-ab", Err(UrnValidationError::InvalidNidStart)),
-	];
-
-	#[test]
-	fn validate_nid_follows_the_rfc_8141_production() {
-		let outcomes = NID_CASES.map(|(nid, _)| (nid, Urn::validate_nid(nid)));
-		assert_eq!(outcomes, NID_CASES);
+	// Each case is a NID beside the outcome of the NID production of RFC 8141
+	// § 2, `(alphanum) 0*30(ldh) (alphanum)`.
+	crate::tb_cases! {
+		fn validate_nid_follows_the_rfc_8141_production((nid, outcome): (&str, Result<(), UrnValidationError>)) {
+			assert_eq!(Urn::validate_nid(nid), outcome);
+		}
+		cases {
+			// The two `alphanum` ends alone give the shortest NID.
+			shortest => ("ab", Ok(())),
+			one_alphanum => ("a", Err(UrnValidationError::InvalidNidLength)),
+			empty => ("", Err(UrnValidationError::InvalidNidLength)),
+			// Two ends and 30 `ldh` give the longest NID.
+			longest => ("a123456789012345678901234567890b", Ok(())),
+			one_too_long => ("a1234567890123456789012345678901b", Err(UrnValidationError::InvalidNidLength)),
+			// An `ldh` is a letter, a digit, or a hyphen, and hyphens may
+			// repeat.
+			hyphenated => ("my-namespace", Ok(())),
+			repeated_hyphens => ("a--b", Ok(())),
+			underscore => ("a_b", Err(UrnValidationError::InvalidNidCharacters)),
+			dot => ("a.b", Err(UrnValidationError::InvalidNidCharacters)),
+			non_ascii => ("a\u{e9}b", Err(UrnValidationError::InvalidNidCharacters)),
+			// The last character is an `alphanum`.
+			digit_last => ("a9", Ok(())),
+			hyphen_last => ("ab-", Err(UrnValidationError::InvalidNidCharacters)),
+			// The first character is an `alphanum`: a letter of either case, or
+			// a digit.
+			upper_first => ("Ab", Ok(())),
+			digit_first => ("1ab", Ok(())),
+			hyphen_first => ("-ab", Err(UrnValidationError::InvalidNidStart)),
+		}
 	}
 
 	/// The example URNs of RFC 8141 § 3.2, by group. Each URN of a group is
@@ -863,47 +868,52 @@ mod tests {
 	];
 
 	/// Each example URN of RFC 8141 § 3.2 beside the index of its group.
-	fn parsed_rfc_8141_examples() -> Result<Vec<(usize, Urn<'static>)>, UrnValidationError> {
+	fn parsed_rfc_8141_examples() -> Vec<(usize, Urn<'static>)> {
 		let grouped = RFC_8141_EXAMPLES.iter().enumerate();
-		let examples = grouped.flat_map(|(group, urns)| urns.iter().map(move |urn| (group, urn)));
-		examples.map(|(group, urn)| Ok((group, urn.parse()?))).collect()
+		let examples = grouped.flat_map(|(group, urns)| urns.iter().map(move |urn| (group, *urn)));
+		let parsed = examples.map(|(group, urn)| (group, urn.parse().expect("each RFC 8141 example parses")));
+		parsed.collect()
+	}
+
+	/// Returns the pairs of `examples` whose equality disagrees with their
+	/// groups: two equal URNs of two groups, or two unequal URNs of one group.
+	fn misgrouped<'e>(examples: &'e [(usize, Urn<'static>)]) -> Vec<(&'e Urn<'static>, &'e Urn<'static>)> {
+		let pairs = examples
+			.iter()
+			.flat_map(|first| examples.iter().map(move |second| (first, second)));
+		let wrong = pairs.filter(|((group, urn), (other_group, other))| (urn == other) != (group == other_group));
+		wrong.map(|((_, urn), (_, other))| (urn, other)).collect()
+	}
+
+	/// Returns the distinct URNs of `examples` under the hash and the equality
+	/// of [`Urn`].
+	fn distinct(examples: Vec<(usize, Urn<'static>)>) -> HashSet<Urn<'static>> {
+		examples.into_iter().map(|(_, urn)| urn).collect()
 	}
 
 	/// Two example URNs of RFC 8141 § 3.2 are equal when the RFC places them
 	/// in one group.
 	#[test]
-	fn the_rfc_8141_examples_compare_by_urn_equivalence() -> Result<(), UrnValidationError> {
-		let examples = parsed_rfc_8141_examples()?;
-
-		let pairs = examples
-			.iter()
-			.flat_map(|first| examples.iter().map(move |second| (first, second)));
-		let wrong = pairs.filter(|((group, urn), (other_group, other))| (urn == other) != (group == other_group));
-		let wrong: Vec<_> = wrong
-			.map(|((_, urn), (_, other))| (urn.to_string(), other.to_string()))
-			.collect();
-
-		assert_eq!(wrong, Vec::<(String, String)>::new());
-		Ok(())
+	fn the_rfc_8141_examples_compare_by_urn_equivalence() {
+		let examples = parsed_rfc_8141_examples();
+		let wrong = misgrouped(&examples);
+		assert_eq!(wrong, Vec::<(&Urn<'static>, &Urn<'static>)>::new());
 	}
 
 	/// Equal example URNs of RFC 8141 § 3.2 hash alike, so a set of them
 	/// holds one URN per group.
 	#[test]
-	fn the_rfc_8141_examples_hash_by_urn_equivalence() -> Result<(), UrnValidationError> {
-		let examples = parsed_rfc_8141_examples()?;
-
-		let distinct: std::collections::HashSet<Urn<'static>> = examples.into_iter().map(|(_, urn)| urn).collect();
-
-		assert_eq!(distinct.len(), RFC_8141_EXAMPLES.len());
-		Ok(())
+	fn the_rfc_8141_examples_hash_by_urn_equivalence() {
+		let examples = parsed_rfc_8141_examples();
+		let urns = distinct(examples);
+		assert_eq!(urns.len(), RFC_8141_EXAMPLES.len());
 	}
 
 	// Each case is (a text, another text, whether RFC 8141 § 3.1 makes the two
 	// equal).
 	crate::tb_cases! {
 		fn nss_text_compares_under_the_case_normalization_of_rfc_8141((first, second, equal): (&str, &str, bool))
-			-> Result<(), UrnValidationError>
+			-> TestResult
 		{
 			assert_eq!(NssText::new(first)? == NssText::new(second)?, equal);
 			Ok(())
@@ -916,18 +926,31 @@ mod tests {
 		}
 	}
 
-	/// Each example URN of RFC 8141 § 3.2 writes its own text, with the scheme
-	/// in lower case.
-	#[test]
-	fn the_rfc_8141_examples_display_with_a_lower_case_scheme() -> Result<(), UrnValidationError> {
-		let examples = parsed_rfc_8141_examples()?;
+	// Each case is an example URN of RFC 8141 § 3.2, beside the text it
+	// writes, with the scheme in lower case.
+	crate::tb_cases! {
+		fn an_rfc_8141_example_displays_with_a_lower_case_scheme((input, displayed): (&str, &str)) -> TestResult {
+			let urn: Urn<'static> = input.parse()?;
 
-		let written: Vec<String> = examples.iter().map(|(_, urn)| urn.to_string()).collect();
-
-		let texts = RFC_8141_EXAMPLES.iter().flat_map(|urns| urns.iter());
-		let expected: Vec<String> = texts.map(|text| format!("urn:{}", text.get(4..).unwrap_or_default())).collect();
-		assert_eq!(written, expected);
-		Ok(())
+			assert_eq!(urn.to_string(), displayed);
+			Ok(())
+		}
+		cases {
+			lower_case => ("urn:example:a123,z456", "urn:example:a123,z456"),
+			upper_case_scheme => ("URN:example:a123,z456", "urn:example:a123,z456"),
+			upper_case_nid => ("urn:EXAMPLE:a123,z456", "urn:EXAMPLE:a123,z456"),
+			an_r_component => ("urn:example:a123,z456?+abc", "urn:example:a123,z456?+abc"),
+			a_q_component => ("urn:example:a123,z456?=xyz", "urn:example:a123,z456?=xyz"),
+			an_f_component => ("urn:example:a123,z456#789", "urn:example:a123,z456#789"),
+			a_slash_and_foo => ("urn:example:a123,z456/foo", "urn:example:a123,z456/foo"),
+			a_slash_and_bar => ("urn:example:a123,z456/bar", "urn:example:a123,z456/bar"),
+			a_slash_and_baz => ("urn:example:a123,z456/baz", "urn:example:a123,z456/baz"),
+			an_upper_case_triplet => ("urn:example:a123%2Cz456", "urn:example:a123%2Cz456"),
+			a_lower_case_triplet_under_an_upper_case_scheme => ("URN:EXAMPLE:a123%2cz456", "urn:EXAMPLE:a123%2cz456"),
+			an_upper_case_first_letter => ("urn:example:A123,z456", "urn:example:A123,z456"),
+			an_upper_case_later_letter => ("urn:example:a123,Z456", "urn:example:a123,Z456"),
+			a_cyrillic_letter => ("urn:example:%D0%B0123,z456", "urn:example:%D0%B0123,z456"),
+		}
 	}
 
 	// Each case is (input, the refusal of RFC 8141 § 2).
@@ -948,6 +971,12 @@ mod tests {
 			r_component_that_starts_with_a_slash => ("urn:example:a?+/r", UrnValidationError::InvalidUrnSyntax),
 			second_hash => ("urn:example:a#b#c", UrnValidationError::InvalidUrnSyntax),
 			space_in_a_component => ("urn:example:a?=b c", UrnValidationError::InvalidUrnSyntax),
+			empty => ("", UrnValidationError::InvalidUrnSyntax),
+			scheme_alone => ("urn:", UrnValidationError::InvalidUrnSyntax),
+			nid_alone => ("urn:onlynid", UrnValidationError::InvalidUrnSyntax),
+			empty_nss => ("urn:nid:", UrnValidationError::RequiredFieldMissing("nss")),
+			no_scheme => ("no-prefix:nid:nss", UrnValidationError::InvalidUrnSyntax),
+			hyphen_first_nid => ("urn:-bad:nss", UrnValidationError::InvalidNidStart),
 		}
 	}
 
@@ -963,45 +992,61 @@ mod tests {
 	/// A spec verifies the URN it built itself, so `verify` reads the
 	/// components the NSS carries.
 	#[test]
-	fn urn_verify_admits_the_urn_its_own_spec_built() -> Result<(), UrnValidationError> {
+	fn urn_verify_admits_the_urn_its_own_spec_built() -> TestResult {
 		let urn = UrnBuilder::from(ProbeSpec).set("kind", "a").build()?;
-		urn.verify::<ProbeSpec>()
-	}
-
-	/// A spec of a custom format verifies the URN it built, through the
-	/// literals of its format.
-	#[test]
-	fn urn_verify_admits_a_urn_of_a_custom_format() -> Result<(), UrnValidationError> {
-		let urn: Urn<'static> = "urn:tightbeam:instrumentation:trace/abc-123".parse()?;
-		urn.verify::<specs::TightbeamUrnSpec>()
-	}
-
-	/// The spec lowercases a resource type, so it builds another NSS from the
-	/// components of an uppercase one, and `verify` refuses it.
-	#[test]
-	fn urn_verify_refuses_a_form_its_spec_writes_another_way() -> Result<(), UrnValidationError> {
-		let urn: Urn<'static> = "urn:tightbeam:instrumentation:TRACE/abc-123".parse()?;
-		assert_eq!(urn.verify::<specs::TightbeamUrnSpec>(), Err(UrnValidationError::NssMismatch));
+		let verdict = urn.verify::<ProbeSpec>();
+		assert_eq!(verdict, Ok(()));
 		Ok(())
 	}
 
-	/// The format of the spec places a `/` before the resource id, so it
-	/// refuses an NSS without one.
-	#[test]
-	fn urn_verify_refuses_an_nss_without_a_literal_of_its_format() -> Result<(), UrnValidationError> {
-		let urn: Urn<'static> = "urn:tightbeam:instrumentation:trace".parse()?;
-		assert_eq!(urn.verify::<specs::TightbeamUrnSpec>(), Err(UrnValidationError::NssMismatch));
-		Ok(())
-	}
+	/// The `verify` that a case calls under one spec.
+	type Verify = fn(&Urn<'static>) -> Result<(), UrnValidationError>;
 
-	// Each case is (input, nid, nss).
+	// Each case is a URN text and the `verify` of one spec, beside the
+	// verdict of the spec.
 	crate::tb_cases! {
-		fn test_urn_from_str_round_trips_display((input, nid, nss): (&str, &str, &str))
-			-> Result<(), UrnValidationError>
+		fn urn_verify_decides_by_its_spec((input, verify, verdict): (&str, Verify, Result<(), UrnValidationError>))
+			-> TestResult
 		{
 			let urn: Urn<'static> = input.parse()?;
-			assert_eq!(urn.nid, nid);
-			assert_eq!(urn.nss, nss);
+			assert_eq!(verify(&urn), verdict);
+			Ok(())
+		}
+		cases {
+			/// A spec of a custom format verifies the URN it built, through
+			/// the literals of its format.
+			admits_a_urn_of_a_custom_format => (
+				"urn:tightbeam:instrumentation:trace/abc-123",
+				Urn::verify::<specs::TightbeamUrnSpec>,
+				Ok(()),
+			),
+			/// The spec lowercases a resource type, so it builds another NSS
+			/// from the components of an uppercase one.
+			refuses_a_form_its_spec_writes_another_way => (
+				"urn:tightbeam:instrumentation:TRACE/abc-123",
+				Urn::verify::<specs::TightbeamUrnSpec>,
+				Err(UrnValidationError::NssMismatch),
+			),
+			/// The format of the spec places a `/` before the resource id, so
+			/// it refuses an NSS without one.
+			refuses_an_nss_without_a_literal_of_its_format => (
+				"urn:tightbeam:instrumentation:trace",
+				Urn::verify::<specs::TightbeamUrnSpec>,
+				Err(UrnValidationError::NssMismatch),
+			),
+			/// A spec verifies a URN whose NID differs from its own in case
+			/// alone, because the NID compares in any case.
+			compares_the_nid_in_any_case => ("urn:PROBE:a", Urn::verify::<ProbeSpec>, Ok(())),
+		}
+	}
+
+	// Each case is a URN text, beside the NID and the NSS it parses into. The
+	// URN writes the text back.
+	crate::tb_cases! {
+		fn a_urn_round_trips_through_its_display((input, nid, nss): (&str, &str, &str)) -> TestResult {
+			let urn: Urn<'static> = input.parse()?;
+
+			assert_eq!((urn.nid.as_ref(), urn.nss.as_ref()), (nid, nss));
 			assert_eq!(urn.to_string(), input);
 			Ok(())
 		}
@@ -1013,29 +1058,15 @@ mod tests {
 		}
 	}
 
+	// Each case is (nid, nss) of a URN that borrows both.
 	crate::tb_cases! {
-		fn test_urn_from_str_rejects_malformed(input: &str) {
-			assert!(input.parse::<Urn<'static>>().is_err());
-		}
-		cases {
-			empty => "",
-			scheme_alone => "urn:",
-			nid_alone => "urn:onlynid",
-			empty_nss => "urn:nid:",
-			no_scheme => "no-prefix:nid:nss",
-			hyphen_first_nid => "urn:-bad:nss",
-		}
-	}
-
-	// Each case is (nid, nss).
-	crate::tb_cases! {
-		fn test_urn_to_owned((nid, nss): (&str, &str)) {
+		fn into_owned_owns_both_components((nid, nss): (&str, &str)) {
 			let urn = Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss), optional: None };
-			let owned_urn = urn.into_owned();
-			assert!(matches!(owned_urn.nid, Cow::Owned(_)));
-			assert!(matches!(owned_urn.nss, Cow::Owned(_)));
-			assert_eq!(owned_urn.nid, nid);
-			assert_eq!(owned_urn.nss, nss);
+			let owned = urn.into_owned();
+			assert!(matches!(
+				(&owned.nid, &owned.nss),
+				(Cow::Owned(owned_nid), Cow::Owned(owned_nss)) if owned_nid == nid && owned_nss == nss
+			));
 		}
 		cases {
 			tightbeam => ("tightbeam", "test:resource"),
@@ -1044,38 +1075,25 @@ mod tests {
 		}
 	}
 
-	/// A URN with each optional component writes the same DER text it
-	/// parsed, and decodes with each component in its place.
+	/// A URN with each optional component decodes from its DER with each part
+	/// in its place.
 	#[test]
-	fn a_urn_with_its_optional_components_survives_a_der_round_trip() -> Result<(), Box<dyn core::error::Error>> {
-		use crate::der::{Decode, Encode};
-
+	fn a_urn_with_its_optional_components_survives_a_der_round_trip() -> TestResult {
 		let urn: Urn<'static> = "urn:example:a123,z456?+r/1?=q?2#f/3?".parse()?;
+		let decoded = der_round_trip(&urn);
 
-		let decoded = Urn::from_der(&urn.to_der()?)?;
-
+		let parts = (decoded.nid.as_ref(), decoded.nss.as_ref());
 		let components = (decoded.r_component(), decoded.q_component(), decoded.f_component());
+		assert_eq!(parts, ("example", "a123,z456"));
 		assert_eq!(components, (Some("r/1"), Some("q?2"), Some("f/3?")));
-		assert_eq!(decoded.to_string(), "urn:example:a123,z456?+r/1?=q?2#f/3?");
 		Ok(())
-	}
-
-	/// A spec verifies a URN whose NID differs from its own in case alone,
-	/// because the NID compares in any case.
-	#[test]
-	fn urn_verify_compares_the_nid_in_any_case() -> Result<(), UrnValidationError> {
-		let urn: Urn<'static> = "urn:PROBE:a".parse()?;
-		urn.verify::<ProbeSpec>()
 	}
 
 	// Each case is (an address, the NSS text that the colony writes of it).
 	#[cfg(feature = "colony")]
 	crate::tb_cases! {
-		fn an_address_percent_encodes_into_the_nss_and_back((address, encoded): (&str, &str))
-			-> Result<(), UrnValidationError>
-		{
+		fn an_address_percent_encodes_into_the_nss_and_back((address, encoded): (&str, &str)) -> TestResult {
 			let written = NssText::encode(address);
-
 			let text = NssText::new(&written)?;
 			assert_eq!(written, encoded);
 			assert_eq!(text.decoded().as_ref(), address.as_bytes());

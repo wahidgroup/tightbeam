@@ -90,8 +90,6 @@ impl AssertionContract {
 
 #[cfg(test)]
 mod tests {
-	use core::error::Error;
-
 	use super::{Assertion, AssertionContract, AssertionLabel, AssertionValue};
 	use crate::testing::macros::Cardinality;
 	use crate::trace::IntoEventLabel;
@@ -104,6 +102,11 @@ mod tests {
 		AssertionLabel::Custom(STEP.into_label())
 	}
 
+	/// A contract that `STEP` holds `count` times.
+	fn counting(count: u32) -> AssertionContract {
+		AssertionContract::new(step(), Cardinality::exactly(count))
+	}
+
 	/// An assertion of `STEP` that carries `tags` and no value.
 	fn tagged(seq: usize, tags: Vec<&'static str>) -> Assertion {
 		Assertion::new(seq, step(), tags, None)
@@ -114,43 +117,32 @@ mod tests {
 		Assertion::with_value(seq, step(), Vec::new(), None, AssertionValue::from(value))
 	}
 
-	#[test]
-	fn a_contract_holds_when_its_label_reaches_its_count() -> Result<(), Box<dyn Error>> {
-		let contract = AssertionContract::new(step(), Cardinality::exactly(1));
-		let held = contract.is_satisfied_by([tagged(0, Vec::new())]);
-		assert!(held);
-		Ok(())
-	}
+	// A contract holds when the assertions of its label, after its tag filter,
+	// reach its count and carry its expected value.
+	crate::tb_cases! {
+		fn a_contract((contract, assertions, held): (AssertionContract, Vec<Assertion>, bool)) {
+			let satisfied = contract.is_satisfied_by(assertions);
+			assert_eq!(satisfied, held);
+		}
 
-	#[test]
-	fn a_contract_fails_when_its_label_misses_its_count() -> Result<(), Box<dyn Error>> {
-		let contract = AssertionContract::new(step(), Cardinality::exactly(2));
-		let held = contract.is_satisfied_by([tagged(0, Vec::new())]);
-		assert!(!held);
-		Ok(())
-	}
-
-	#[test]
-	fn a_tag_filter_counts_only_the_assertions_that_carry_its_tags() -> Result<(), Box<dyn Error>> {
-		let contract = AssertionContract::new(step(), Cardinality::exactly(1)).with_tag_filter(vec!["hot"]);
-		let held = contract.is_satisfied_by([tagged(0, vec!["cold"])]);
-		assert!(!held);
-		Ok(())
-	}
-
-	#[test]
-	fn a_tag_filter_counts_the_assertion_that_carries_its_tags() -> Result<(), Box<dyn Error>> {
-		let contract = AssertionContract::new(step(), Cardinality::exactly(1)).with_tag_filter(vec!["hot"]);
-		let held = contract.is_satisfied_by([tagged(0, vec!["hot"]), tagged(1, vec!["cold"])]);
-		assert!(held);
-		Ok(())
-	}
-
-	#[test]
-	fn an_expected_value_fails_on_another_value() -> Result<(), Box<dyn Error>> {
-		let contract = AssertionContract::new(step(), Cardinality::exactly(1)).with_value(AssertionValue::from(1u32));
-		let held = contract.is_satisfied_by([valued(0, 2)]);
-		assert!(!held);
-		Ok(())
+		cases {
+			holds_when_its_label_reaches_its_count => (counting(1), vec![tagged(0, Vec::new())], true),
+			fails_when_its_label_misses_its_count => (counting(2), vec![tagged(0, Vec::new())], false),
+			with_a_tag_filter_counts_only_the_assertions_that_carry_its_tags => (
+				counting(1).with_tag_filter(vec!["hot"]),
+				vec![tagged(0, vec!["cold"])],
+				false,
+			),
+			with_a_tag_filter_counts_the_assertion_that_carries_its_tags => (
+				counting(1).with_tag_filter(vec!["hot"]),
+				vec![tagged(0, vec!["hot"]), tagged(1, vec!["cold"])],
+				true,
+			),
+			with_an_expected_value_fails_on_another_value => (
+				counting(1).with_value(AssertionValue::from(1u32)),
+				vec![valued(0, 2)],
+				false,
+			),
+		}
 	}
 }

@@ -323,10 +323,14 @@ impl TransportError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 
-	// Each case is (first length octet, remaining octets, expected decode).
+	// A DER length parses in its short form and in its minimal long form, and
+	// parses to nothing in the indefinite form, in a long form that a short
+	// form or fewer octets could hold, past a `usize`, or cut short. Each case
+	// is (first length octet, remaining octets, expected decode).
 	crate::tb_cases! {
-		fn parse_der_length_cases((first, rest, expected): (u8, &[u8], Option<usize>)) {
+		fn a_der_length_parses_in_its_minimal_definite_form_alone((first, rest, expected): (u8, &[u8], Option<usize>)) {
 			assert_eq!(parse_der_length(first, rest), expected);
 		}
 		cases {
@@ -381,31 +385,44 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "std")]
-	#[test]
-	fn boundary_classification_maps_eof_to_clean_close() {
-		let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-		assert!(matches!((eof).at_frame_boundary(), TransportError::ConnectionClosed));
+	/// An error and the test of how a reader classifies it.
+	type Reading = (TransportError, fn(&TransportError) -> bool);
 
-		let reset = TransportError::IoError(ErrorKind::ConnectionReset.into());
-		assert!(matches!((reset).at_frame_boundary(), TransportError::IoError(_)));
+	// An error at a frame boundary reads as a clean close when the stream
+	// ended there, and keeps its cause otherwise. Each case is (the error,
+	// the test of its boundary reading).
+	#[cfg(feature = "std")]
+	crate::tb_cases! {
+		fn an_error_at_a_frame_boundary_reads_by_its_cause((error, read): Reading) {
+			assert!(read(&error.at_frame_boundary()));
+		}
+		cases {
+			an_end_of_stream => (
+				TransportError::IoError(ErrorKind::UnexpectedEof.into()),
+				|read| matches!(read, TransportError::ConnectionClosed),
+			),
+			a_reset => (
+				TransportError::IoError(ErrorKind::ConnectionReset.into()),
+				|read| matches!(read, TransportError::IoError(_)),
+			),
+		}
 	}
 
-	#[test]
-	fn truncation_classification_maps_eof_to_invalid_message() {
-		assert!(matches!(
-			(TransportError::ConnectionClosed).inside_frame(),
-			TransportError::InvalidMessage
-		));
-		assert!(matches!(
-			(TransportError::ConnectionFailed).inside_frame(),
-			TransportError::ConnectionFailed
-		));
-
-		#[cfg(feature = "std")]
-		{
-			let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-			assert!(matches!((eof).inside_frame(), TransportError::InvalidMessage));
+	// An end inside a frame reads as a truncated message, and a failed
+	// connection keeps its failure. Each case is (the error, the test of its
+	// reading inside a frame).
+	crate::tb_cases! {
+		fn an_error_inside_a_frame_reads_as_a_truncation((error, read): Reading) {
+			assert!(read(&error.inside_frame()));
+		}
+		cases {
+			a_close => (TransportError::ConnectionClosed, |read| matches!(read, TransportError::InvalidMessage)),
+			a_failure => (TransportError::ConnectionFailed, |read| matches!(read, TransportError::ConnectionFailed)),
+			#[cfg(feature = "std")]
+			an_end_of_stream => (
+				TransportError::IoError(ErrorKind::UnexpectedEof.into()),
+				|read| matches!(read, TransportError::InvalidMessage),
+			),
 		}
 	}
 
@@ -438,7 +455,7 @@ mod tests {
 	// Each case is the read of each stage of one frame. The frame assembles as
 	// the octets it arrived as, in the short and the long form of its length.
 	crate::tb_cases! {
-		fn a_frame_assembles_as_it_arrived(stages: &[&[u8]]) -> TransportResult<()> {
+		fn a_frame_assembles_as_it_arrived(stages: &[&[u8]]) -> TestResult {
 			let arrived = stages.concat();
 			assert_eq!(assembled(stages)?, Some(arrived));
 			Ok(())
@@ -454,7 +471,7 @@ mod tests {
 	/// wants a byte of the content, so the header alone refuses a length
 	/// past the cap (CWE-770).
 	#[test]
-	fn a_length_past_the_cap_is_refused_before_the_content_is_wanted() -> TransportResult<()> {
+	fn a_length_past_the_cap_is_refused_before_the_content_is_wanted() -> TestResult {
 		let mut assembler = FrameAssembler::new(16);
 		fed(&mut assembler, &[0x30])?;
 		fed(&mut assembler, &[0x82])?;
@@ -471,7 +488,7 @@ mod tests {
 	/// so the assembler refuses a length wider than a `usize` before it
 	/// buffers one octet past the first.
 	#[test]
-	fn a_length_wider_than_a_usize_is_refused_at_its_first_octet() -> TransportResult<()> {
+	fn a_length_wider_than_a_usize_is_refused_at_its_first_octet() -> TestResult {
 		let mut assembler = FrameAssembler::new(256);
 		fed(&mut assembler, &[0x30])?;
 
@@ -484,7 +501,7 @@ mod tests {
 	/// A whole frame returns the assembler to the tag of the next frame, so
 	/// one assembler frames each envelope of a stream in turn.
 	#[test]
-	fn one_assembler_frames_two_envelopes_in_a_row() -> TransportResult<()> {
+	fn one_assembler_frames_two_envelopes_in_a_row() -> TestResult {
 		let mut assembler = FrameAssembler::new(256);
 		let first = assembled_by(&mut assembler, &[&[0x30], &[0x02], &[0x01, 0x02]])?;
 		let second = assembled_by(&mut assembler, &[&[0x04], &[0x01], &[0xAA]])?;
@@ -501,14 +518,13 @@ mod tests {
 	fn an_eof_before_the_tag_is_a_close() {
 		let assembler = FrameAssembler::new(16);
 		let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-
 		assert!(matches!(assembler.classify(eof), TransportError::ConnectionClosed));
 	}
 
 	/// An end of stream after the tag cuts a frame short, so it reads as a
 	/// truncation.
 	#[test]
-	fn an_eof_inside_the_frame_is_a_truncation() -> TransportResult<()> {
+	fn an_eof_inside_the_frame_is_a_truncation() -> TestResult {
 		let mut assembler = FrameAssembler::new(16);
 		fed(&mut assembler, &[0x30])?;
 

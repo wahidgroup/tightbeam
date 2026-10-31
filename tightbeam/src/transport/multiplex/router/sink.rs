@@ -272,13 +272,13 @@ mod tests {
 
 	use futures::channel::{mpsc, oneshot};
 
+	use super::super::fixtures::{next_mux, poll_now, FIXTURE_PEER_CAP};
 	use super::super::outbound::Outbound;
-	use super::super::shared::MuxShared;
-	use super::super::shared::StreamOutcome;
-	use super::super::testing::{client_shared, poll_now};
+	use super::super::shared::{MuxShared, StreamOutcome};
 	use super::*;
 	use crate::constants::DEFAULT_HOP_BUDGET;
 	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
+	use crate::transport::multiplex::{MuxRole, MuxSettings};
 	use crate::transport::TransportError;
 
 	/// Reserved (unopened) request sink on a fresh client with the
@@ -292,9 +292,8 @@ mod tests {
 		mpsc::Receiver<Outbound>,
 		oneshot::Receiver<StreamOutcome>,
 	) {
-		let shared = client_shared();
-		let (outbound, sent) = mpsc::channel(8);
-		let (link, _) = MuxLink::new(Arc::clone(&shared), outbound);
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
+		let (link, sent, _notes) = MuxLink::over(Arc::clone(&shared), 8);
 		let (sender, receiver) = oneshot::channel();
 		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
 		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, link, target, DEFAULT_HOP_BUDGET);
@@ -312,152 +311,126 @@ mod tests {
 		routed_sink_fixture(None)
 	}
 
-	// Pushes reach the wire eagerly. The bare close carries the
-	// `last` flag on an empty trailer record: push/push/close must
-	// travel as Open(!last), Data(!last), Data(last, empty).
+	/// Pushes reach the wire eagerly. The bare close carries the `last` flag
+	/// on an empty trailer record: push/push/close must travel as
+	/// Open(!last), Data(!last), Data(last, empty).
 	#[test]
-	fn test_request_sink_pushes_eagerly_and_closes_with_empty_trailer() {
+	fn a_sink_pushes_eagerly_and_closes_with_an_empty_trailer() {
 		let (_shared, mut sink, mut sent, _outcome) = sink_fixture();
 		assert!(matches!(poll_now(sink.push([1u8, 1])), Poll::Ready(Ok(()))));
 		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if !package.last() && package.payload() == [1u8, 1]
+			next_mux(&mut sent),
+			Some(MuxEnvelope::Open(package)) if !package.last() && package.payload() == [1u8, 1]
 		));
 		assert!(matches!(poll_now(sink.push([2u8, 2])), Poll::Ready(Ok(()))));
 		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Data(package))))
-				if !package.last() && package.payload() == [2u8, 2]
+			next_mux(&mut sent),
+			Some(MuxEnvelope::Data(package)) if !package.last() && package.payload() == [2u8, 2]
 		));
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Data(package))))
-				if package.last() && package.payload().is_empty()
+			next_mux(&mut sent),
+			Some(MuxEnvelope::Data(package)) if package.last() && package.payload().is_empty()
 		));
 	}
 
-	// A known final chunk carries the `last` flag itself: no empty
-	// trailer follows it.
+	/// A known final chunk carries the `last` flag itself: no empty trailer
+	/// follows it.
 	#[test]
-	fn test_request_sink_close_with_flags_final_chunk() {
+	fn a_close_with_a_final_chunk_flags_that_chunk() {
 		let (_shared, mut sink, mut sent, _outcome) = sink_fixture();
 		assert!(matches!(poll_now(sink.push([1u8, 1])), Poll::Ready(Ok(()))));
-		assert!(matches!(poll_now(sink.close_with([2u8, 2])), Poll::Ready(Ok(()))));
+
+		let closed = poll_now(sink.close_with([2u8, 2]));
+		assert!(matches!(closed, Poll::Ready(Ok(()))));
 		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if !package.last() && package.payload() == [1u8, 1]
+			next_mux(&mut sent),
+			Some(MuxEnvelope::Open(package)) if !package.last() && package.payload() == [1u8, 1]
 		));
 		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Data(package))))
-				if package.last() && package.payload() == [2u8, 2]
+			next_mux(&mut sent),
+			Some(MuxEnvelope::Data(package)) if package.last() && package.payload() == [2u8, 2]
 		));
 		assert!(sent.try_recv().is_err());
 	}
 
-	// An opened sink abandoned without close still owes the peer a
-	// cancel: its Open is on the wire.
+	/// An opened sink abandoned without close still owes the peer a cancel:
+	/// its Open is on the wire.
 	#[test]
-	fn test_request_sink_drop_after_open_cancels_stream() {
+	fn a_sink_dropped_after_its_open_cancels_the_stream() {
 		let (_shared, mut sink, mut sent, mut receiver) = sink_fixture();
-
-		let pushed = poll_now(sink.push([1u8]));
-		assert!(matches!(pushed, Poll::Ready(Ok(()))));
-
-		let open = sent.try_recv();
-		assert!(matches!(
-			open,
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(_))))
-		));
+		assert!(matches!(poll_now(sink.push([1u8])), Poll::Ready(Ok(()))));
+		assert!(matches!(next_mux(&mut sent), Some(MuxEnvelope::Open(_))));
 
 		drop(sink);
 
-		let outcome = receiver.try_recv();
-		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
-
-		let cancel = sent.try_recv();
 		assert!(matches!(
-			cancel,
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package))))
-				if package.stream_id() == 1
+			receiver.try_recv(),
+			Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))
 		));
+		assert!(matches!(next_mux(&mut sent), Some(MuxEnvelope::Cancel(package)) if package.stream_id() == 1));
 	}
 
-	// A sink dropped before any push never reached the wire: the
-	// reservation resolves the caller locally and releases the cap
-	// slot without a wire cancel.
+	/// A sink dropped before any push never reached the wire: the
+	/// reservation resolves the caller locally and releases the cap slot
+	/// without a wire cancel.
 	#[test]
-	fn test_request_sink_drop_unopened_releases_reservation_silently() {
+	fn a_sink_dropped_before_its_open_releases_its_reservation_silently() {
 		let (shared, sink, mut sent, mut receiver) = sink_fixture();
 
 		drop(sink);
 
-		let outcome = receiver.try_recv();
-		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+		assert!(matches!(
+			receiver.try_recv(),
+			Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))
+		));
 		assert!(sent.try_recv().is_err());
 		assert!(shared.has_stream_headroom());
 	}
 
-	// A close that fails to reach the wire still owes the peer a
-	// cancel: Drop must tear the stream down (resolving the caller's
-	// outcome), not treat the failed close as complete.
-	#[test]
-	fn test_request_sink_failed_close_still_cancels_stream() {
-		let (_shared, mut sink, sent, mut receiver) = sink_fixture();
+	// A close that fails to reach the wire still owes the peer a cancel: Drop
+	// must tear the stream down (resolving the caller's outcome), not treat
+	// the failed close as complete. The flagged-final-chunk close keeps the
+	// same contract.
+	crate::tb_cases! {
+		fn a_failed_close_still_cancels_the_stream(close: fn(RequestSink) -> Poll<TransportResult<()>>) {
+			let (_shared, mut sink, sent, mut receiver) = sink_fixture();
+			assert!(matches!(poll_now(sink.push([1u8])), Poll::Ready(Ok(()))));
+			drop(sent);
 
-		let pushed = poll_now(sink.push([1u8]));
-		assert!(matches!(pushed, Poll::Ready(Ok(()))));
-		drop(sent);
-
-		let closed = poll_now(sink.close());
-		assert!(matches!(closed, Poll::Ready(Err(TransportError::ConnectionClosed))));
-
-		let outcome = receiver.try_recv();
-		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+			let closed = close(sink);
+			assert!(matches!(closed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+			assert!(matches!(receiver.try_recv(), Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+		}
+		cases {
+			close => |sink| poll_now(sink.close()),
+			close_with_a_final_chunk => |sink| poll_now(sink.close_with([2u8, 2])),
+		}
 	}
 
-	// The flagged-final-chunk close keeps the same contract.
+	/// A failed open keeps the route on the sink, so a retried first chunk
+	/// still opens routed.
 	#[test]
-	fn test_request_sink_failed_close_with_still_cancels_stream() {
-		let (_shared, mut sink, sent, mut receiver) = sink_fixture();
-
-		let pushed = poll_now(sink.push([1u8]));
-		assert!(matches!(pushed, Poll::Ready(Ok(()))));
-
-		drop(sent);
-
-		let closed = poll_now(sink.close_with([2u8, 2]));
-		assert!(matches!(closed, Poll::Ready(Err(TransportError::ConnectionClosed))));
-
-		let outcome = receiver.try_recv();
-		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
-	}
-
-	// A failed open must not strip the route: the target stays on
-	// the sink so a retried first chunk still opens routed.
-	#[test]
-	fn test_request_sink_failed_open_keeps_route() {
-		let (_shared, mut sink, sent, _outcome) = routed_sink_fixture(Some(crate::urn!("tb", "servlet:ledger")));
+	fn a_failed_open_keeps_the_route() {
+		let target = crate::urn!("tb", "servlet:ledger");
+		let (_shared, mut sink, sent, _outcome) = routed_sink_fixture(Some(target.clone()));
 		drop(sent);
 
 		let pushed = poll_now(sink.push([1u8]));
 		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
-		assert!(sink.target.is_some());
+		assert_eq!(sink.target, Some(target));
 	}
 
-	// An empty request body still travels: close without a push
-	// sends the stream's Open with the last flag and no payload.
+	/// An empty request body still travels: close without a push sends the
+	/// stream's Open with the last flag and no payload.
 	#[test]
-	fn test_request_sink_close_without_push_sends_empty_last_open() {
+	fn a_close_without_a_push_sends_an_empty_last_open() {
 		let (_shared, sink, mut sent, _outcome) = sink_fixture();
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
+		let closed = poll_now(sink.close());
+		assert!(matches!(closed, Poll::Ready(Ok(()))));
 		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.last() && package.payload().is_empty()
+			next_mux(&mut sent),
+			Some(MuxEnvelope::Open(package)) if package.last() && package.payload().is_empty()
 		));
 	}
 }

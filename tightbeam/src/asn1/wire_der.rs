@@ -207,54 +207,54 @@ fn contents_offset(der: &[u8]) -> DerResult<usize> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::asn1::admission::fixtures::descending_attribute;
+	use crate::asn1::admission::fixtures::{der_refusal, descending_attribute};
 	use crate::der::asn1::{Any, ObjectIdentifier, OctetString};
 	use crate::der::ErrorKind;
+	use crate::testing::TestResult;
 	use crate::x509::attr::Attribute;
 
+	use super::*;
+
 	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.3.4");
+
+	/// A decode of the bytes a peer sent into a [`WireDer`] of `T`.
+	type DecodePath<T> = fn(&[u8]) -> DerResult<WireDer<T>>;
 
 	/// `der` 0.7 orders the values of an `Attribute` as DER does.
 	impl Canonical for Attribute {}
 
+	/// The decode of the sent bytes holds the sent value and keeps those bytes.
 	#[test]
-	fn a_decoded_value_keeps_the_bytes_it_arrived_as() -> DerResult<()> {
+	fn a_decoded_value_keeps_the_bytes_it_arrived_as() -> TestResult {
 		let values = [Any::encode_from(&OctetString::new(*b"a")?)?].try_into()?;
 		let value = Attribute { oid: OID, values };
 		let sent = WireDer::new(value)?;
 		let bytes = sent.to_der()?;
 
 		let received = WireDer::<Attribute>::from_der(&bytes)?;
-		assert_eq!(received.der(), sent.der());
-		assert_eq!(received.value(), sent.value());
+		assert_eq!(received, sent);
 		Ok(())
 	}
 
-	/// A SET OF out of DER order is refused before the decoder sorts it
-	/// into another encoding than the received bytes (X.690 § 11.6).
-	#[test]
-	fn a_misordered_value_is_refused() {
-		let misordered = [
-			0x30, 0x0d, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x31, 0x06, 0x04, 0x01, b'b', 0x04, 0x01, b'a',
-		];
+	/// An `Attribute` whose two values arrive as `b` then `a`, out of DER
+	/// order.
+	const MISORDERED: [u8; 15] = [
+		0x30, 0x0d, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x31, 0x06, 0x04, 0x01, b'b', 0x04, 0x01, b'a',
+	];
 
-		let refused = WireDer::<Attribute>::try_from(&misordered[..]);
-		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
-	}
-
-	#[test]
-	fn a_descending_set_is_refused_as_bytes() {
-		let refused = WireDer::<Attribute>::try_from(descending_attribute().as_slice());
-		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
-	}
-
-	/// The decode under an enclosing tag admits the contents as the decode of
-	/// the bytes alone does.
-	#[test]
-	fn a_descending_set_is_refused_as_a_value() {
-		let refused = WireDer::<Attribute>::from_der(&descending_attribute());
-		assert_eq!(refused.map_err(|error| error.kind()), Err(ErrorKind::SetOrdering));
+	// A SET OF out of DER order is refused before the decoder sorts it into
+	// another encoding than the received bytes (X.690 § 11.6).
+	crate::tb_cases! {
+		fn a_set_out_of_der_order_is_refused((decode, der): (DecodePath<Attribute>, Vec<u8>)) {
+			assert_eq!(der_refusal(decode(&der)), Some(ErrorKind::SetOrdering));
+		}
+		cases {
+			misordered_as_bytes => (|der| WireDer::try_from(der), MISORDERED.to_vec()),
+			descending_as_bytes => (|der| WireDer::try_from(der), descending_attribute()),
+			/// The decode under an enclosing tag admits the contents as the
+			/// decode of the bytes alone does.
+			descending_as_a_value => (|der| WireDer::from_der(der), descending_attribute()),
+		}
 	}
 
 	/// The fields of `AuthEnvelopedData` (RFC 5083 § 2.1), with its
@@ -310,27 +310,26 @@ mod tests {
 	/// The refusal of a value that arrived in another encoding than its DER.
 	const NONCANONICAL: ErrorKind = ErrorKind::Noncanonical { tag: Tag::Sequence };
 
+	/// A value whose bytes are its DER is admitted and keeps those bytes.
 	#[test]
-	fn a_value_in_its_der_is_admitted() -> DerResult<()> {
+	fn a_value_in_its_der_is_admitted() -> TestResult {
 		let admitted = WireDer::<EnvelopeLayout>::try_from(&CANONICAL_LAYOUT[..])?;
 		assert_eq!(admitted.der(), CANONICAL_LAYOUT);
 		Ok(())
 	}
 
-	/// `der` skips a context-specific element whose number is below the one
-	/// it looks for, so the hold of the decoded value to its arrival refuses
-	/// the stray `[0]`.
-	#[test]
-	fn a_stray_context_tag_is_refused_as_bytes() {
-		let refused = WireDer::<EnvelopeLayout>::try_from(&STRAY_BEFORE_ATTRIBUTES[..]);
-		assert_eq!(refused.map_err(|error| error.kind()), Err(NONCANONICAL));
-	}
-
-	/// The decode under an enclosing tag holds the value to its arrival as
-	/// the decode of the bytes alone does.
-	#[test]
-	fn a_stray_context_tag_is_refused_as_a_value() {
-		let refused = WireDer::<EnvelopeLayout>::from_der(&STRAY_AFTER_MAC);
-		assert_eq!(refused.map_err(|error| error.kind()), Err(NONCANONICAL));
+	// The hold of a decoded value to its arrival refuses a stray context tag.
+	crate::tb_cases! {
+		fn a_stray_context_tag_is_refused((decode, der): (DecodePath<EnvelopeLayout>, &[u8])) {
+			assert_eq!(der_refusal(decode(der)), Some(NONCANONICAL));
+		}
+		cases {
+			/// `der` skips a context-specific element whose number is below
+			/// the one it looks for, so the hold refuses the stray `[0]`.
+			as_bytes => (|der| WireDer::try_from(der), &STRAY_BEFORE_ATTRIBUTES),
+			/// The decode under an enclosing tag holds the value to its
+			/// arrival as the decode of the bytes alone does.
+			as_a_value => (|der| WireDer::from_der(der), &STRAY_AFTER_MAC),
+		}
 	}
 }

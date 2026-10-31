@@ -1018,30 +1018,38 @@ pub(crate) struct ConfirmedClosing<P: HandshakeProvider> {
 
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
 mod tests {
-	use std::error::Error;
 	use std::sync::Arc;
 
 	use super::*;
-	use crate::crypto::exchange::EcdheShare;
-	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::asn1::admission::fixtures::tlv;
+	use crate::crypto::exchange::{EcdheShare, KeyExchangeError, KeyShare};
+	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 	use crate::crypto::sign::elliptic_curve::PublicKey;
 	use crate::crypto::sign::PresentedPath;
+	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::KeyPurposes;
-	use crate::random::OsRng;
+	use crate::der::{Any, ErrorKind, Tag, TagNumber};
+	use crate::oids::HANDSHAKE_ABORT_ALERT;
+	use crate::testing::{Aes256Sha3_512Provider, TestCmsServer, TestResult};
+	use crate::transport::envelopes::TransportEnvelope;
 	use crate::transport::handshake::tests::{
-		create_test_certificate, create_test_signed_data, fixture_confirmation, fixture_transcript, negated,
-		same_key_twin, signing_identity,
+		acknowledgement, build_test_client_finished, create_default_test_profile, create_test_certificate,
+		create_test_server, create_test_signed_data, finished_attribute, fixture_confirmation, fixture_ephemeral,
+		fixture_sealer, fixture_transcript_hash, foreign_profile, foreign_transcript_hash, negated, off_curve_point,
+		over_each_flow, put_off_curve_key, replied, same_key_twin, sealed_finished, two_valued_name,
+		with_certificate_set, with_unsigned_attrs, without_attribute, TestFlow,
 	};
+	use crate::transport::handshake::{Handshake, HandshakeAlert, HandshakePhase, PeerAuthentication};
 	use crate::x509::Certificate;
 
 	/// A client certificate admitted for signing under the house provider.
 	type HouseSigner = PeerCertificate<Signing<DefaultCryptoProvider>>;
 
-	/// A fresh client identity, beside its static key.
+	/// The client identity of the fixed key of seed `0xb4`, beside its static
+	/// key.
 	fn identity() -> (HouseSigner, PublicKey<Secp256k1>) {
-		let client = create_test_certificate();
+		let client = create_test_certificate(0xb4);
 		let static_key = PublicKey::from(client.signing_key.verifying_key());
 		let identity = PeerCertificate::parse(client.certificate, KeyPurposes::HOUSE.client);
 		(identity.expect("the test certificate holds a point"), static_key)
@@ -1051,11 +1059,6 @@ mod tests {
 	/// any signed content serves here.
 	fn finished() -> ClientFinished {
 		ClientFinished(create_test_signed_data(b"client finished"))
-	}
-
-	/// The public key of a fresh ephemeral.
-	fn ephemeral() -> PublicKey<Secp256k1> {
-		SecretKey::random(&mut OsRng).public_key()
 	}
 
 	/// The offer of `identity`, which presents its certificate alone, beside
@@ -1074,32 +1077,30 @@ mod tests {
 	/// An offer whose ephemeral differs from the key of its identity holds
 	/// that identity.
 	#[test]
-	fn an_offer_of_a_distinct_ephemeral_holds_its_identity() -> Result<(), HandshakeError> {
+	fn an_offer_of_a_distinct_ephemeral_holds_its_identity() -> TestResult {
 		let (identity, _) = identity();
 		let expected = Arc::clone(identity.certificate());
-		let offer = offer_of(identity, &ephemeral())?;
+		let offer = offer_of(identity, &fixture_ephemeral(0x05).public_key())?;
 
 		let held = offer.into_identity().map(|(identity, _)| Arc::clone(identity.certificate()));
 		assert_eq!(held, Some(expected));
 		Ok(())
 	}
 
-	#[test]
-	fn an_offer_refuses_an_ephemeral_equal_to_the_identity_key() {
-		let (identity, static_key) = identity();
-		let refused = offer_of(identity, &static_key);
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
-	}
-
-	/// ECDH keeps the x-coordinate alone, so the negation of the identity key
-	/// collapses the agreement as the key itself does.
-	#[test]
-	fn an_offer_refuses_the_negation_of_the_identity_key() {
-		let (identity, static_key) = identity();
-		let negation = negated(&static_key);
-
-		let refused = offer_of(identity, &negation);
-		assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+	// An offer refuses an ephemeral of the key of its identity, in each form
+	// whose agreement collapses into the static one.
+	crate::tb_cases! {
+		fn an_offer_refuses_an_ephemeral_of_the_identity_key(form: fn(&PublicKey<Secp256k1>) -> PublicKey<Secp256k1>) {
+			let (identity, static_key) = identity();
+			let refused = offer_of(identity, &form(&static_key));
+			assert!(matches!(refused, Err(HandshakeError::ClientEphemeralIsStatic)));
+		}
+		cases {
+			itself => |key| *key,
+			/// ECDH keeps the x-coordinate alone, so the negation of the
+			/// identity key collapses the agreement as the key itself does.
+			negation => negated,
+		}
 	}
 
 	/// A client Finished of `identity` over `transcript_hash`, signed and
@@ -1108,9 +1109,8 @@ mod tests {
 		let draft = FinishedRole::Client.draft::<DefaultCryptoProvider>(identity, transcript_hash);
 		let draft = draft.expect("the Finished drafts");
 		let signature = identity.sign_prehash(draft.prehash()).await.expect("the client key signs");
-		let tag = HandshakeAttribute::encode(&fixture_confirmation()).expect("a tag encodes as an attribute");
-		let tag = Attribute::try_from(tag).expect("the attribute encodes");
-		let attributes = Attributes::try_from(vec![tag]).expect("one attribute is a SET");
+		let attributes = Attributes::try_from(vec![finished_attribute(&fixture_confirmation())]);
+		let attributes = attributes.expect("one attribute is a SET");
 		let certificates = identity.presented().set();
 
 		let finished = draft.finish(signature, attributes, Some(certificates));
@@ -1119,14 +1119,13 @@ mod tests {
 
 	/// A client Finished verifies under the certificate it carries.
 	#[tokio::test]
-	async fn a_client_finished_verifies_under_the_certificate_it_carries() -> Result<(), Box<dyn Error>> {
-		let client = create_test_certificate();
-		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
-		let finished = client_finished(&signing_identity(&client), &transcript_hash).await;
+	async fn a_client_finished_verifies_under_the_certificate_it_carries() -> TestResult {
+		let client = create_test_certificate(0xb5);
+		let transcript_hash = fixture_transcript_hash();
+		let finished = client_finished(&client.signing_identity(), &transcript_hash).await;
 		let carried = HouseSigner::parse(client.certificate, KeyPurposes::HOUSE.client)?;
 
-		let verified = FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &carried, &transcript_hash);
-		assert!(verified.is_ok());
+		FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &carried, &transcript_hash)?;
 		Ok(())
 	}
 
@@ -1134,14 +1133,383 @@ mod tests {
 	/// it verifies under no other certificate of its key, as a TLS 1.3
 	/// signature covers the Certificate (RFC 9846 §4.5.2).
 	#[tokio::test]
-	async fn a_client_finished_verifies_under_no_other_certificate_of_its_key() -> Result<(), Box<dyn Error>> {
-		let client = create_test_certificate();
-		let transcript_hash = fixture_transcript::<Sha3_256>([0x07u8; 32]);
-		let finished = client_finished(&signing_identity(&client), &transcript_hash).await;
+	async fn a_client_finished_verifies_under_no_other_certificate_of_its_key() -> TestResult {
+		let client = create_test_certificate(0xb6);
+		let transcript_hash = fixture_transcript_hash();
+		let finished = client_finished(&client.signing_identity(), &transcript_hash).await;
 		let twin = HouseSigner::parse(same_key_twin(&client), KeyPurposes::HOUSE.client)?;
 
 		let refused = FinishedRole::Client.verify::<DefaultCryptoProvider>(&finished, &twin, &transcript_hash);
 		assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
 		Ok(())
+	}
+
+	/// The share of `point` as the octets an OCTET STRING carrier holds.
+	fn share_of(point: PublicKey<Secp256k1>) -> Vec<u8> {
+		EcdheShare::from(point).to_octets()
+	}
+
+	/// The abort alert of `code`, as a peer attaches it outside a seal or a
+	/// signature.
+	fn abort_alert(code: u8) -> Attribute {
+		let value = Any::encode_from(&code).expect("an alert code encodes");
+		let alert = HandshakeAttribute::new(HANDSHAKE_ABORT_ALERT, value);
+		Attribute::try_from(alert).expect("the alert is an attribute")
+	}
+
+	/// What a client of flow `F` that offered `offer` answers to the reply
+	/// that the key of `server` signs by hand, which selects `accept` and
+	/// carries `server_ephemeral` as the octets of the server share.
+	async fn answer_to_hand_built_reply<F: TestFlow>(
+		server: &TestCmsServer,
+		offer: Option<SecurityOffer>,
+		accept: Option<SecurityProfileDesc>,
+		server_ephemeral: impl AsRef<[u8]>,
+	) -> Result<HandshakeMessage, HandshakeError> {
+		let mut config = F::client(server, &create_test_certificate(0xb7));
+		config.security_offer = offer;
+
+		let mut client = Handshake::client(config);
+		let opening = client.start().expect("a fresh client builds its opening");
+		let reply = F::hand_built_reply(server, &opening, accept, server_ephemeral);
+		client.respond(reply).await
+	}
+
+	/// The client refuses a validly signed reply that selects no profile, so
+	/// no session forms without an agreed profile.
+	async fn a_reply_without_a_security_accept_is_refused<F: TestFlow>() -> TestResult {
+		let server = create_test_server();
+		let share = share_of(fixture_ephemeral(0x31).public_key());
+
+		let refusal = answer_to_hand_built_reply::<F>(&server, None, None, share).await;
+		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
+		Ok(())
+	}
+
+	/// The client refuses a validly signed reply that selects a profile
+	/// outside its offer.
+	async fn a_client_refuses_a_profile_it_did_not_offer<F: TestFlow>() -> TestResult {
+		let server = create_test_server();
+		let offer = SecurityOffer::new(vec![foreign_profile()]);
+		let share = share_of(fixture_ephemeral(0x32).public_key());
+		let accept = Some(create_default_test_profile());
+
+		let refusal = answer_to_hand_built_reply::<F>(&server, Some(offer), accept, share).await;
+		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
+		Ok(())
+	}
+
+	/// The client refuses, at the parse, a validly signed server ephemeral
+	/// whose x-coordinate lies off the curve, before any scalar
+	/// multiplication.
+	async fn an_off_curve_server_ephemeral_is_refused<F: TestFlow>() -> TestResult {
+		let server = create_test_server();
+		let accept = Some(create_default_test_profile());
+
+		let refusal = answer_to_hand_built_reply::<F>(&server, None, accept, off_curve_point()).await;
+		assert!(matches!(refusal, Err(HandshakeError::KeyExchange(KeyExchangeError::Malformed))));
+		Ok(())
+	}
+
+	/// The client refuses a validly signed server ephemeral that is the
+	/// server's own static key, so the agreement cannot collapse into the
+	/// static one.
+	async fn a_server_ephemeral_equal_to_the_static_key_is_refused<F: TestFlow>() -> TestResult {
+		let server = create_test_server();
+		let share = share_of(PublicKey::from(server.signing_key.verifying_key()));
+		let accept = Some(create_default_test_profile());
+
+		let refusal = answer_to_hand_built_reply::<F>(&server, None, accept, share).await;
+		assert!(matches!(refusal, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// A server ephemeral swapped for another point of the curve after the
+	/// server signed its reply changes what the signature covers, so the
+	/// signature fails before any agreement.
+	async fn a_tampered_server_ephemeral_fails_the_reply_signature<F: TestFlow>() -> TestResult {
+		let (mut client, reply) = replied::<F>(&create_test_server()).await;
+		let tampered = F::with_server_ephemeral(&reply, share_of(fixture_ephemeral(0x33).public_key()));
+
+		let refusal = client.respond(tampered).await;
+		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
+		Ok(())
+	}
+
+	/// A reply whose accept was stripped after the server signed it fails its
+	/// signature. The client verifies the signature before it reads the
+	/// selection, so the refusal names the signature and not the selection.
+	async fn a_stripped_accept_fails_the_reply_signature<F: TestFlow>() -> TestResult {
+		let (mut client, reply) = replied::<F>(&create_test_server()).await;
+		let stripped = F::without_accept(&reply);
+
+		let refusal = client.respond(stripped).await;
+		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
+		Ok(())
+	}
+
+	/// The client refuses a reply whose signer carries an abort alert among
+	/// its unsigned attributes.
+	async fn a_reply_with_an_abort_alert_is_refused<F: TestFlow>() -> TestResult {
+		let (mut client, reply) = replied::<F>(&create_test_server()).await;
+		let alerted = reply.with_unsigned(|carried| [carried, vec![abort_alert(4)]].concat());
+
+		let refusal = client.respond(alerted).await;
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::AbortReceived(HandshakeAlert::DecryptFail))
+		));
+		Ok(())
+	}
+
+	/// The client refuses a reply whose signature verifies but that carries
+	/// no server Finished, before it builds any closing, and admits no
+	/// further step.
+	async fn a_reply_without_a_server_finished_is_refused_before_the_closing<F: TestFlow>() -> TestResult {
+		let (mut client, reply) = replied::<F>(&create_test_server()).await;
+		let unconfirmed = reply.with_unsigned(|carried| without_attribute(carried, KeyConfirmation::OID));
+
+		let refusal = client.respond(unconfirmed).await;
+		assert!(matches!(refusal, Err(HandshakeError::MissingAttribute)));
+		assert_eq!(client.phase(), HandshakePhase::Spent);
+		Ok(())
+	}
+
+	/// The reply carries the server's signing certificate, and its one signer
+	/// names that certificate (RFC 5652 §5.1, §5.3).
+	async fn the_reply_carries_the_certificate_its_signer_names<F: TestFlow>() -> TestResult {
+		let server = create_test_server();
+		let (_, reply) = replied::<F>(&server).await;
+
+		let signed_data = reply.signed()?;
+		let named = signed_data.value().signer_certificate()?;
+		assert_eq!(named, Some(&server.signing));
+		Ok(())
+	}
+
+	/// The client refuses a reply without the certificate its signer names,
+	/// because it names no server to admit.
+	async fn a_reply_without_its_certificate_is_refused<F: TestFlow>() -> TestResult {
+		let (mut client, reply) = replied::<F>(&create_test_server()).await;
+		let bare = with_certificate_set(reply.signed()?.into_value(), None);
+
+		let refusal = client.respond(HandshakeMessage::try_from(bare)?).await;
+		assert!(matches!(refusal, Err(HandshakeError::MissingServerCertificate)));
+		Ok(())
+	}
+
+	/// A reply whose certificate carries its RDN values out of DER order,
+	/// which would decode to the same value, is refused as it arrives under
+	/// its `[3]` envelope, before the client binds a byte of it (X.690 §11.6,
+	/// CWE-345).
+	async fn a_reply_whose_certificate_bytes_were_reordered_is_refused<F: TestFlow>() -> TestResult {
+		let (_, reply) = replied::<F>(&TestCmsServer::named(two_valued_name())).await;
+		let envelope_tag = Tag::ContextSpecific { constructed: true, number: TagNumber::N3 };
+		let arrived = tlv(envelope_tag, &reply.with_rdn_values_swapped());
+
+		let refused = TransportEnvelope::from_der(&arrived).err().map(|error| error.kind());
+		assert_eq!(refused, Some(ErrorKind::SetOrdering));
+		Ok(())
+	}
+
+	/// A handshake under a provider whose digest is SHA3-512 seals the whole
+	/// 64-byte digest as its transcript hash, and its closing confirms and
+	/// opens under that hash.
+	async fn a_sha3_512_profile_carries_a_64_byte_transcript_hash<F: TestFlow>() -> TestResult {
+		let agreed = F::agreed_under::<Aes256Sha3_512Provider>().await;
+		assert_eq!(agreed.transcript_hash.as_bytes().len(), 64);
+		Ok(())
+	}
+
+	/// A handshake under the house provider of the hybrid key exchange runs to
+	/// its closing under the identifier of the hybrid.
+	#[cfg(feature = "preview-pqc")]
+	async fn the_preview_provider_runs_the_flow<F: TestFlow>() -> TestResult {
+		use crate::crypto::profiles::PreviewPqcProvider;
+		use crate::oids::KEM_SECP256K1_ML_KEM_768;
+
+		let agreed = F::agreed_under::<PreviewPqcProvider>().await;
+		assert_eq!(agreed.profile.key_exchange, Some(KEM_SECP256K1_ML_KEM_768));
+		Ok(())
+	}
+
+	/// A mutual server admits the hand-built identified closing and records
+	/// its certificate, so each refusal of that fixture comes from the one
+	/// part its test changes.
+	async fn a_hand_built_identified_closing_is_admitted<F: TestFlow>() -> TestResult {
+		let client = create_test_certificate(0xb8);
+		let mut awaiting = F::awaiting_closing(PeerAuthentication::mutual_by_expiry(), fixture_ephemeral(0x41)).await;
+		let finished = awaiting.finished_of(&client);
+
+		awaiting.finish(&finished).await?;
+
+		assert_eq!(awaiting.server.phase(), HandshakePhase::Agreed);
+		assert_eq!(awaiting.server.peer_certificate(), Some(&client.certificate));
+		Ok(())
+	}
+
+	/// The server refuses, at the tag, a closing that opens under the right
+	/// key but confirms another secret, and admits no further step. The
+	/// Finished signature verifies, so the tag is what refuses it.
+	async fn a_closing_that_confirms_another_secret_is_refused<F: TestFlow>() -> TestResult {
+		let client = create_test_certificate(0xb9);
+		let mut awaiting = F::awaiting_closing(PeerAuthentication::Anonymous, fixture_ephemeral(0x42)).await;
+		let finished = build_test_client_finished(&client, awaiting.transcript_hash(), &fixture_confirmation());
+		let closing = awaiting.sealed(&finished);
+
+		let refused = awaiting.server.finish(closing.to_owned()).await;
+		assert!(matches!(refused, Err(HandshakeError::KeyConfirmationFailed)));
+		assert_eq!(awaiting.server.phase(), HandshakePhase::Spent);
+
+		let replayed = awaiting.server.finish(closing).await;
+		assert!(matches!(replayed, Err(HandshakeError::InvalidState)));
+		Ok(())
+	}
+
+	/// A server that demands no identity still verifies the client Finished
+	/// of an offered identity, so a Finished over another transcript, as from
+	/// another handshake, cannot close this one.
+	async fn a_client_finished_over_another_transcript_is_refused<F: TestFlow>() -> TestResult {
+		let client = create_test_certificate(0xba);
+		let mut awaiting = F::awaiting_closing(PeerAuthentication::Anonymous, fixture_ephemeral(0x43)).await;
+		let foreign = build_test_client_finished(&client, &foreign_transcript_hash(), &awaiting.tag());
+
+		let refusal = awaiting.finish(&foreign).await;
+		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
+		Ok(())
+	}
+
+	/// What a server of flow `F` under `peer_authentication` answers to the
+	/// closing of an identity whose opening sent its static key as its
+	/// agreement ephemeral.
+	async fn finish_with_a_static_ephemeral<F: TestFlow>(
+		peer_authentication: PeerAuthentication,
+	) -> Result<(), HandshakeError> {
+		let client = create_test_certificate(0xbb);
+		let ephemeral = SecretKey::from(&client.signing_key);
+		let mut awaiting = F::awaiting_closing(peer_authentication, ephemeral).await;
+		let finished = awaiting.finished_of(&client);
+
+		awaiting.finish(&finished).await
+	}
+
+	/// A client that sends its static key as its ephemeral leaves the session
+	/// to the secrecy of the two static keys, so a server that demands an
+	/// identity refuses the closing of the one it admitted.
+	async fn a_demanded_identity_that_sends_its_static_key_as_its_ephemeral_is_refused<F: TestFlow>() -> TestResult {
+		let refusal = finish_with_a_static_ephemeral::<F>(PeerAuthentication::mutual_by_expiry()).await;
+		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// A server that demands no identity still holds the key of a certificate
+	/// the client offers, and refuses that key as the client ephemeral.
+	async fn an_offered_identity_that_sends_its_static_key_as_its_ephemeral_is_refused<F: TestFlow>() -> TestResult {
+		let refusal = finish_with_a_static_ephemeral::<F>(PeerAuthentication::Anonymous).await;
+		assert!(matches!(refusal, Err(HandshakeError::ClientEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// The server refuses an offered certificate whose key is off the curve,
+	/// where the opened Finished names it, before any key comparison or
+	/// signature check.
+	async fn an_offered_certificate_whose_key_is_off_the_curve_is_refused<F: TestFlow>() -> TestResult {
+		let mut client = create_test_certificate(0xbc);
+		put_off_curve_key(&mut client.certificate);
+
+		let mut awaiting = F::awaiting_closing(PeerAuthentication::Anonymous, fixture_ephemeral(0x44)).await;
+		let finished = awaiting.finished_of(&client);
+
+		let refusal = awaiting.finish(&finished).await;
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::CertificateValidationError(
+				CertificateValidationError::SpkiError(_)
+			))
+		));
+		Ok(())
+	}
+
+	/// A server that granted no budgets issued no receipt, so it refuses a
+	/// closing that acknowledges one.
+	///
+	/// The closing signs the sealed transcript hash and confirms the
+	/// handshake secret, so confirmation and admission pass and settlement is
+	/// what refuses.
+	async fn an_acknowledgement_with_no_issued_receipt_is_refused<F: TestFlow>() -> TestResult {
+		let client = create_test_certificate(0xbd);
+		let mut awaiting = F::awaiting_closing(PeerAuthentication::Anonymous, fixture_ephemeral(0x45)).await;
+		let finished = awaiting.finished_of(&client);
+		let ack = acknowledgement([0x41; 48]);
+		let acknowledging = with_unsigned_attrs(finished, |carried| [carried, vec![ack]].concat());
+
+		let refusal = awaiting.finish(&acknowledging).await;
+		assert!(matches!(refusal, Err(HandshakeError::ReceiptMismatch)));
+		Ok(())
+	}
+
+	/// What a server of flow `F` answers to a closing that carries the abort
+	/// alert of `code` among its unauthenticated attributes, beside a client
+	/// Finished sealed under a key foreign to the server.
+	async fn finish_with_an_abort_alert<F: TestFlow>(code: u8) -> Result<(), HandshakeError> {
+		let client = create_test_certificate(0xbe);
+		let mut awaiting = F::awaiting_closing(PeerAuthentication::Anonymous, fixture_ephemeral(0x46)).await;
+		let finished = awaiting.finished_of(&client);
+		let sealed = sealed_finished(fixture_sealer(SecretSeal::Closing), &finished);
+		let alert = Attributes::try_from(vec![abort_alert(code)]).expect("one attribute is a SET");
+		let alerted = AuthEnvelopedData { unauth_attrs: Some(alert), ..sealed };
+		let closing = HandshakeMessage::try_from(alerted).expect("the closing encodes");
+
+		awaiting.server.finish(closing).await
+	}
+
+	/// A closing that carries the alert of a failed decryption is refused
+	/// before the server opens it. The seal is under a key foreign to the
+	/// server, and the refusal names the alert, so the server reads the alert
+	/// first.
+	async fn a_closing_with_a_decrypt_fail_alert_is_refused<F: TestFlow>() -> TestResult {
+		let refusal = finish_with_an_abort_alert::<F>(4).await;
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::AbortReceived(HandshakeAlert::DecryptFail))
+		));
+		Ok(())
+	}
+
+	/// A closing that carries the alert of a failed Finished is refused before
+	/// the server opens it, and the refusal names that alert.
+	async fn a_closing_with_a_finished_integrity_fail_alert_is_refused<F: TestFlow>() -> TestResult {
+		let refusal = finish_with_an_abort_alert::<F>(5).await;
+		assert!(matches!(
+			refusal,
+			Err(HandshakeError::AbortReceived(HandshakeAlert::FinishedIntegrityFail))
+		));
+		Ok(())
+	}
+
+	over_each_flow! {
+		a_reply_without_a_security_accept_is_refused,
+		a_client_refuses_a_profile_it_did_not_offer,
+		an_off_curve_server_ephemeral_is_refused,
+		a_server_ephemeral_equal_to_the_static_key_is_refused,
+		a_tampered_server_ephemeral_fails_the_reply_signature,
+		a_stripped_accept_fails_the_reply_signature,
+		a_reply_with_an_abort_alert_is_refused,
+		a_reply_without_a_server_finished_is_refused_before_the_closing,
+		the_reply_carries_the_certificate_its_signer_names,
+		a_reply_without_its_certificate_is_refused,
+		a_reply_whose_certificate_bytes_were_reordered_is_refused,
+		a_sha3_512_profile_carries_a_64_byte_transcript_hash,
+		#[cfg(feature = "preview-pqc")]
+		the_preview_provider_runs_the_flow,
+		a_hand_built_identified_closing_is_admitted,
+		a_closing_that_confirms_another_secret_is_refused,
+		a_client_finished_over_another_transcript_is_refused,
+		a_demanded_identity_that_sends_its_static_key_as_its_ephemeral_is_refused,
+		an_offered_identity_that_sends_its_static_key_as_its_ephemeral_is_refused,
+		an_offered_certificate_whose_key_is_off_the_curve_is_refused,
+		an_acknowledgement_with_no_issued_receipt_is_refused,
+		a_closing_with_a_decrypt_fail_alert_is_refused,
+		a_closing_with_a_finished_integrity_fail_alert_is_refused,
 	}
 }

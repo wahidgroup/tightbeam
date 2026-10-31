@@ -698,120 +698,85 @@ mod tests {
 
 	use super::Decision;
 	use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+	use crate::testing::fixtures::TestProcess;
 	use crate::testing::specs::composition::DeterminismChecker;
-	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+	use crate::testing::specs::csp::{Event, Process, State};
+	use crate::testing::TestResult;
 	use crate::trace::TraceCollector;
 
-	#[cfg(feature = "testing-fault")]
-	use crate::testing::fdr::FaultModel;
 	#[cfg(feature = "testing-timing")]
 	use crate::testing::timing::TimingGuard;
 
-	/// The error type of a test that builds processes and records an
-	/// exploration.
-	type TestResult = Result<(), Box<dyn core::error::Error>>;
+	/// A fixture that builds the process of a row.
+	type Fixture = fn() -> Process;
 
 	/// A spec that models `start` and nothing else.
-	fn narrow_spec() -> Result<Process, ProcessBuildError> {
-		Process::builder("NarrowSpec")
-			.initial_state(State("S0"))
-			.add_observable(Event("start"))
-			.add_transition(State("S0"), Event("start"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()
+	fn narrow_spec() -> Process {
+		TestProcess::chain("NarrowSpec", &["S0", "S1"], &["start"])
 	}
 
 	/// A subject in which `arm` takes `S0` to `S1` when `clk` reads at most
 	/// 5 ms, and `S1` is not terminal and offers no event.
 	#[cfg(feature = "testing-timing")]
-	fn guarded_deadlock() -> Result<Process, ProcessBuildError> {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-
+	fn guarded_deadlock() -> Process {
+		let guard = Some(TimingGuard::clk_within(5));
 		Process::builder("GuardedDeadlock")
 			.initial_state(State("S0"))
 			.clock("clk")
 			.add_observable(Event("arm"))
-			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), guard, Vec::new())
 			.build()
+			.expect("a timed process with an initial state builds")
 	}
 
 	/// A subject in which `start` takes `S0` to `S1` and resets `clk`, and
 	/// `arm` takes `S1` to the terminal `S2` when `clk` reads at most 5 ms.
 	#[cfg(feature = "testing-timing")]
-	fn reset_then_guard() -> Result<Process, ProcessBuildError> {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-
+	fn reset_then_guard() -> Process {
+		let guard = Some(TimingGuard::clk_within(5));
 		Process::builder("ResetThenGuard")
 			.initial_state(State("S0"))
 			.clock("clk")
 			.add_observable(Event("start"))
 			.add_observable(Event("arm"))
 			.add_timed_transition(State("S0"), Event("start"), State("S1"), None, ["clk".to_string()])
-			.add_timed_transition(State("S1"), Event("arm"), State("S2"), Some(guard), Vec::new())
+			.add_timed_transition(State("S1"), Event("arm"), State("S2"), guard, Vec::new())
 			.add_terminal(State("S2"))
 			.build()
+			.expect("a timed process with an initial state builds")
 	}
 
 	/// A subject in which `arm` takes `S0` to the terminal `S1` when `clk`
 	/// reads at most 5 ms, and no transition resets `clk`.
 	#[cfg(feature = "testing-timing")]
-	fn guarded_from_the_start() -> Result<Process, ProcessBuildError> {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-
+	fn guarded_from_the_start() -> Process {
+		let guard = Some(TimingGuard::clk_within(5));
 		Process::builder("GuardedFromTheStart")
 			.initial_state(State("S0"))
 			.clock("clk")
 			.add_observable(Event("arm"))
-			.add_timed_transition(State("S0"), Event("arm"), State("S1"), Some(guard), Vec::new())
+			.add_timed_transition(State("S0"), Event("arm"), State("S1"), guard, Vec::new())
 			.add_terminal(State("S1"))
 			.build()
-	}
-
-	/// A subject whose hidden `t` and `u` take `S1` to `S2` and back, with
-	/// the exit `b` at `S2`, so a seed that takes `b` never runs past
-	/// `max_internal_run` hidden events.
-	fn spinning() -> Result<Process, ProcessBuildError> {
-		Process::builder("Spinning")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("u"), State("S1"))
-			.add_transition(State("S2"), Event("b"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
+			.expect("a timed process with an initial state builds")
 	}
 
 	/// A subject that performs `start`, then an event no spec mentions.
-	fn wider_subject() -> Result<Process, ProcessBuildError> {
-		Process::builder("WiderSubject")
-			.initial_state(State("T0"))
-			.add_observable(Event("start"))
-			.add_observable(Event("audit"))
-			.add_transition(State("T0"), Event("start"), State("T1"))
-			.add_transition(State("T1"), Event("audit"), State("T2"))
-			.add_terminal(State("T2"))
-			.build()
+	fn wider_subject() -> Process {
+		TestProcess::chain("WiderSubject", &["T0", "T1", "T2"], &["start", "audit"])
 	}
 
 	/// A subject whose hidden `p` takes `S0` onto the hidden cycle of `t` and
 	/// `u` between `S1` and `S2`, so `S0` lies off the cycle and reaches it.
-	fn lasso() -> Result<Process, ProcessBuildError> {
-		Process::builder("Lasso")
-			.initial_state(State("S0"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("p"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("p"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("u"), State("S1"))
-			.add_transition(State("S2"), Event("b"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
+	fn lasso() -> Process {
+		TestProcess {
+			observable: &["b"],
+			hidden: &["p", "t", "u"],
+			transitions: &[("S0", "p", "S1"), ("S1", "t", "S2"), ("S2", "u", "S1"), ("S2", "b", "S3")],
+			terminal: &["S3"],
+			..TestProcess::of("Lasso", "S0")
+		}
+		.build()
 	}
 
 	/// A subject in which `a` takes `I` to `X`, whose two hidden runs meet at
@@ -819,8 +784,9 @@ mod tests {
 	///
 	/// The run through `P` takes `first` twice, and the run that `second`
 	/// names takes one hidden event, so the order of the event names decides
-	/// which run a search takes first.
-	fn meeting(first: &'static str, second: &'static str) -> Result<Process, ProcessBuildError> {
+	/// which run a search takes first. The two names vary, so the process
+	/// takes the builder that [`TestProcess`] wraps.
+	fn meeting(first: &'static str, second: &'static str) -> Process {
 		Process::builder("Meeting")
 			.initial_state(State("I"))
 			.add_observable(Event("a"))
@@ -832,82 +798,83 @@ mod tests {
 			.add_transition(State("X"), Event(second), State("Q"))
 			.add_transition(State("Q"), Event(first), State("Q"))
 			.build()
+			.expect("a process with an initial state builds")
 	}
 
 	/// A subject whose hidden `t` and `u` take `S0` through `S1` to `S2`, a run
 	/// of two hidden events with no cycle, before `c` ends it at `S3`.
-	fn hidden_chain() -> Result<Process, ProcessBuildError> {
-		Process::builder("HiddenChain")
-			.initial_state(State("S0"))
-			.add_observable(Event("c"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("t"), State("S1"))
-			.add_transition(State("S1"), Event("u"), State("S2"))
-			.add_transition(State("S2"), Event("c"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
+	fn hidden_chain() -> Process {
+		TestProcess {
+			observable: &["c"],
+			hidden: &["t", "u"],
+			transitions: &[("S0", "t", "S1"), ("S1", "u", "S2"), ("S2", "c", "S3")],
+			terminal: &["S3"],
+			..TestProcess::of("HiddenChain", "S0")
+		}
+		.build()
 	}
 
 	/// A subject whose hidden `p` comes before the observable `a`, and whose
 	/// hidden run `t`, `u` comes after it.
-	fn chain_after_a_run() -> Result<Process, ProcessBuildError> {
-		Process::builder("ChainAfterARun")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("c"))
-			.add_hidden(Event("p"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("p"), State("S1"))
-			.add_transition(State("S1"), Event("a"), State("S2"))
-			.add_transition(State("S2"), Event("t"), State("S3"))
-			.add_transition(State("S3"), Event("u"), State("S4"))
-			.add_transition(State("S4"), Event("c"), State("S5"))
-			.add_terminal(State("S5"))
-			.build()
+	fn chain_after_a_run() -> Process {
+		TestProcess {
+			observable: &["a", "c"],
+			hidden: &["p", "t", "u"],
+			transitions: &[
+				("S0", "p", "S1"),
+				("S1", "a", "S2"),
+				("S2", "t", "S3"),
+				("S3", "u", "S4"),
+				("S4", "c", "S5"),
+			],
+			terminal: &["S5"],
+			..TestProcess::of("ChainAfterARun", "S0")
+		}
+		.build()
 	}
 
 	/// A spec whose accepting `S0` spins on the hidden `t`, so it diverges at
 	/// once and its one trace is the empty trace.
-	fn spinning_at_once() -> Result<Process, ProcessBuildError> {
-		Process::builder("SpinningAtOnce")
-			.initial_state(State("S0"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("t"), State("S0"))
-			.add_terminal(State("S0"))
-			.build()
+	fn spinning_at_once() -> Process {
+		TestProcess {
+			observable: &["b"],
+			hidden: &["t"],
+			transitions: &[("S0", "t", "S0")],
+			terminal: &["S0"],
+			..TestProcess::of("SpinningAtOnce", "S0")
+		}
+		.build()
 	}
 
 	/// A subject whose accepting `Idle` offers `b`, which leads to a spin on
 	/// the hidden `t` at `D`.
-	fn spinning_after_b() -> Result<Process, ProcessBuildError> {
-		Process::builder("SpinningAfterB")
-			.initial_state(State("Idle"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_transition(State("Idle"), Event("b"), State("D"))
-			.add_transition(State("D"), Event("t"), State("D"))
-			.add_terminal(State("Idle"))
-			.build()
+	fn spinning_after_b() -> Process {
+		TestProcess {
+			observable: &["b"],
+			hidden: &["t"],
+			transitions: &[("Idle", "b", "D"), ("D", "t", "D")],
+			terminal: &["Idle"],
+			..TestProcess::of("SpinningAfterB", "Idle")
+		}
+		.build()
 	}
 
 	/// A subject whose accepting `Idle` offers `b`, which leads to `D`, a
 	/// state that can neither terminate nor act.
-	fn stuck_after_b() -> Result<Process, ProcessBuildError> {
-		Process::builder("StuckAfterB")
-			.initial_state(State("Idle"))
-			.add_observable(Event("b"))
-			.add_transition(State("Idle"), Event("b"), State("D"))
-			.add_terminal(State("Idle"))
-			.build()
+	fn stuck_after_b() -> Process {
+		TestProcess {
+			observable: &["b"],
+			transitions: &[("Idle", "b", "D")],
+			terminal: &["Idle"],
+			..TestProcess::of("StuckAfterB", "Idle")
+		}
+		.build()
 	}
 
 	/// A subject whose `start` resets `clk` on its way to the accepting `S1`,
 	/// where the hidden `t` spins under `guard`.
 	#[cfg(feature = "testing-timing")]
-	fn guarded_spin(guard: TimingGuard) -> Result<Process, ProcessBuildError> {
+	fn guarded_spin(guard: TimingGuard) -> Process {
 		Process::builder("GuardedSpin")
 			.initial_state(State("S0"))
 			.clock("clk")
@@ -917,268 +884,195 @@ mod tests {
 			.add_timed_transition(State("S1"), Event("t"), State("S1"), Some(guard), Vec::new())
 			.add_terminal(State("S1"))
 			.build()
+			.expect("a timed process with an initial state builds")
 	}
 
 	/// A subject whose hidden `t` resets `clk` on its way from `S0` to `S1`,
 	/// where the hidden `u` spins while `clk` reads at most 5 ms.
 	#[cfg(feature = "testing-timing")]
-	fn spinning_after_a_reset() -> Result<Process, ProcessBuildError> {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-
+	fn spinning_after_a_reset() -> Process {
+		let guard = Some(TimingGuard::clk_within(5));
 		Process::builder("SpinningAfterAReset")
 			.initial_state(State("S0"))
 			.clock("clk")
 			.add_hidden(Event("t"))
 			.add_hidden(Event("u"))
 			.add_timed_transition(State("S0"), Event("t"), State("S1"), None, ["clk".to_string()])
-			.add_timed_transition(State("S1"), Event("u"), State("S1"), Some(guard), Vec::new())
+			.add_timed_transition(State("S1"), Event("u"), State("S1"), guard, Vec::new())
 			.build()
+			.expect("a timed process with an initial state builds")
 	}
 
-	/// What an exploration of `subject` under `config` decided about
-	/// divergence freedom.
-	fn divergence_of(subject: &Process, config: FdrConfig) -> Decision {
-		let mut explorer = DefaultFdrExplorer::with_defaults(subject, config);
-		let verdict = explorer.explore().expect("the run asks for no FMEA report");
-		verdict.divergence_free
-	}
-
+	/// A refinement check projects away an event that no spec models, so the
+	/// event is coverage and not a counterexample.
 	#[test]
-	fn refinement_reports_what_the_projection_discarded() -> TestResult {
-		let subject = wider_subject()?;
-		let config = FdrConfig { specs: vec![narrow_spec()?], ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let verdict = explorer.explore()?;
-		assert_eq!(verdict.unmodelled_events, vec![Event("audit")]);
-		assert_eq!(
-			verdict.trace_refines,
-			Decision::Holds,
-			"`audit` is projected away, so it is coverage and not a counterexample"
-		);
-
-		Ok(())
+	fn refinement_reports_what_the_projection_discarded() {
+		let verdict = wider_subject().verdict_under(FdrConfig::refining(narrow_spec()));
+		let reported = (verdict.unmodelled_events, verdict.trace_refines);
+		assert_eq!(reported, (vec![Event("audit")], Decision::Holds));
 	}
 
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_guarded_process_over_a_deadlock_is_not_deadlock_free() -> TestResult {
-		let subject = guarded_deadlock()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
+	// An exploration decides deadlock freedom over each state it reaches,
+	// with each clock at zero at the start and at each reset.
+	crate::tb_cases! {
+		fn deadlock_freedom_of((subject, decided): (Fixture, Decision)) {
+			let verdict = subject().verdict_under(FdrConfig::default());
+			assert_eq!(verdict.deadlock_free, decided);
+		}
 
-		let verdict = explorer.explore()?;
+		cases {
+			#[cfg(feature = "testing-timing")]
+			a_guard_over_a_deadlock => (guarded_deadlock, Decision::Refuted),
+			#[cfg(feature = "testing-timing")]
+			a_guard_behind_a_reset_clock => (reset_then_guard, Decision::Holds),
+			#[cfg(feature = "testing-timing")]
+			a_guard_on_a_clock_at_zero => (guarded_from_the_start, Decision::Holds),
+			/// `b` leads from the accepting `Idle` to `D`.
+			a_deadlock_behind_an_accepting_state => (stuck_after_b, Decision::Refuted),
+		}
+	}
+
+	// An exploration decides divergence freedom over each hidden cycle it
+	// reaches and each hidden run past `max_internal_run`.
+	crate::tb_cases! {
+		fn divergence_freedom_of((subject, config, decided): (Fixture, FdrConfig, Decision)) {
+			let verdict = subject().verdict_under(config);
+			assert_eq!(verdict.divergence_free, decided);
+		}
+
+		cases {
+			a_reachable_hidden_cycle => (TestProcess::spinning, FdrConfig::default(), Decision::Refuted),
+			/// `X` reaches the loop at `Q` whichever run a search takes first.
+			a_meeting_that_loops_on_t => (
+				|| meeting("t", "u"),
+				FdrConfig { seeds: 8, max_depth: 1, max_internal_run: 2, ..Default::default() },
+				Decision::Refuted,
+			),
+			/// `X` reaches the loop at `Q` whichever run a search takes first.
+			a_meeting_that_loops_on_z => (
+				|| meeting("z", "u"),
+				FdrConfig { seeds: 8, max_depth: 1, max_internal_run: 2, ..Default::default() },
+				Decision::Refuted,
+			),
+			/// `a` reaches `S1` at the depth cut-off.
+			a_hidden_cycle_at_the_depth_cut_off => (
+				TestProcess::spinning,
+				FdrConfig { max_depth: 1, ..Default::default() },
+				Decision::Refuted,
+			),
+			a_hidden_run_at_max_internal_run => (
+				hidden_chain,
+				FdrConfig { max_internal_run: 2, ..Default::default() },
+				Decision::Holds,
+			),
+			a_hidden_run_past_max_internal_run => (
+				hidden_chain,
+				FdrConfig { max_internal_run: 1, ..Default::default() },
+				Decision::Refuted,
+			),
+			/// The accepting `Idle` offers `b` into the spin.
+			a_hidden_cycle_behind_an_accepting_state => (spinning_after_b, FdrConfig::default(), Decision::Refuted),
+			/// `clk` reads 0 at `S1`, so `t` never fires.
+			#[cfg(feature = "testing-timing")]
+			a_hidden_cycle_that_a_guard_blocks => (
+				|| guarded_spin(TimingGuard::ClockGreaterThan("clk".to_string(), Duration::from_millis(5))),
+				FdrConfig::default(),
+				Decision::Holds,
+			),
+		}
+	}
+
+	// The divergence witness of an exploration is the hidden run that diverged.
+	crate::tb_cases! {
+		fn the_divergence_witness_is_the_diverging_run((subject, config, run): (Fixture, FdrConfig, Vec<Event>)) {
+			let witnessed = subject().divergence_run_under(config);
+			assert_eq!(witnessed, Some(run));
+		}
+
+		cases {
+			of_a_reachable_hidden_cycle => (TestProcess::spinning, FdrConfig::default(), vec![Event("t"), Event("u")]),
+			/// `S0` reaches the cycle of `t` and `u`.
+			from_a_state_off_its_cycle => (
+				lasso,
+				FdrConfig { max_internal_run: 1, ..Default::default() },
+				vec![Event("p"), Event("t"), Event("u")],
+			),
+			/// `a` ends the run of `p`.
+			past_max_internal_run_alone => (
+				chain_after_a_run,
+				FdrConfig { max_internal_run: 1, ..Default::default() },
+				vec![Event("t"), Event("u")],
+			),
+			/// `clk` reads 0 at `S1`, so `t` fires forever.
+			#[cfg(feature = "testing-timing")]
+			of_a_hidden_cycle_that_a_guard_admits => (
+				|| guarded_spin(TimingGuard::clk_within(5)),
+				FdrConfig::default(),
+				vec![Event("t")],
+			),
+			/// `t` starts `clk`, which `u` reads.
+			#[cfg(feature = "testing-timing")]
+			through_a_clock_that_a_hidden_step_resets => (
+				spinning_after_a_reset,
+				FdrConfig::default(),
+				vec![Event("t"), Event("u")],
+			),
+		}
+	}
+
+	/// A spec whose one trace is the empty trace refutes a subject that takes
+	/// an event.
+	#[test]
+	fn a_spec_that_diverges_at_once_refutes_an_event_that_it_lacks() {
+		let verdict = spinning_after_b().verdict_under(FdrConfig::refining(spinning_at_once()));
+		let decided = verdict.outcome();
+		assert_eq!(decided, Decision::Refuted);
+	}
+
+	/// A spec with no schedulability block leaves schedulability unasserted,
+	/// since no analysis runs.
+	#[cfg(feature = "testing-schedulability")]
+	#[test]
+	fn a_spec_with_no_schedulability_block_leaves_schedulability_unasserted() {
+		let verdict = wider_subject().verdict_under(FdrConfig::refining(narrow_spec()));
+		let decided = verdict.schedulable;
+		assert_eq!(decided, Decision::NotAsserted);
+	}
+
+	/// A state-space exploration decides deadlock freedom whatever specs the
+	/// config names, so `b` from the accepting `Idle` to `D` refutes it.
+	#[test]
+	fn a_state_space_exploration_decides_freedom_whatever_specs_the_configuration_names() -> TestResult {
+		let subject = stuck_after_b();
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::refining(narrow_spec()));
+
+		let verdict = explorer.explore_state_space_into(&TraceCollector::new())?;
 		assert_eq!(verdict.deadlock_free, Decision::Refuted);
 		Ok(())
 	}
 
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_reset_clock_lets_exploration_take_the_guard_behind_it() -> TestResult {
-		let subject = reset_then_guard()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
-		assert_eq!(verdict.deadlock_free, Decision::Holds);
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn exploration_starts_each_clock_at_zero() -> TestResult {
-		let subject = guarded_from_the_start()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
-		assert_eq!(verdict.deadlock_free, Decision::Holds);
-		Ok(())
-	}
-
-	#[test]
-	fn a_reachable_hidden_cycle_refutes_divergence_freedom() -> TestResult {
-		let subject = spinning()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
-		let run = verdict.divergence_witness.map(|(_seed, run)| run);
-		assert_eq!(verdict.divergence_free, Decision::Refuted);
-		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "the witness is the run of the cycle");
-		Ok(())
-	}
-
-	#[test]
-	fn a_renamed_process_keeps_its_divergence_verdict() -> Result<(), ProcessBuildError> {
-		let config = FdrConfig { seeds: 8, max_depth: 1, max_internal_run: 2, ..Default::default() };
-		let named_t = divergence_of(&meeting("t", "u")?, config.clone());
-		let named_z = divergence_of(&meeting("z", "u")?, config);
-
-		let refuted = [Decision::Refuted, Decision::Refuted];
-		assert_eq!([named_t, named_z], refuted, "`X` reaches the loop at `Q`");
-		Ok(())
-	}
-
-	#[test]
-	fn a_state_off_a_hidden_cycle_diverges_along_the_run_that_reaches_it() -> TestResult {
-		let subject = lasso()?;
-		let config = FdrConfig { max_internal_run: 1, ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let verdict = explorer.explore()?;
-
-		let run = verdict.divergence_witness.map(|(_seed, run)| run);
-		let to_the_cycle_and_around = vec![Event("p"), Event("t"), Event("u")];
-		assert_eq!(run, Some(to_the_cycle_and_around), "`S0` reaches the cycle of `t` and `u`");
-		Ok(())
-	}
-
-	#[test]
-	fn a_hidden_cycle_at_the_depth_cut_off_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
-		let subject = spinning()?;
-		let config = FdrConfig { max_depth: 1, ..Default::default() };
-
-		let decided = divergence_of(&subject, config);
-
-		assert_eq!(decided, Decision::Refuted, "`a` reaches `S1` at the depth cut-off");
-		Ok(())
-	}
-
-	#[test]
-	fn a_hidden_run_past_max_internal_run_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
-		let subject = hidden_chain()?;
-
-		let at_the_bound = divergence_of(&subject, FdrConfig { max_internal_run: 2, ..Default::default() });
-		let past_the_bound = divergence_of(&subject, FdrConfig { max_internal_run: 1, ..Default::default() });
-
-		assert_eq!([at_the_bound, past_the_bound], [Decision::Holds, Decision::Refuted]);
-		Ok(())
-	}
-
-	#[test]
-	fn a_hidden_run_past_max_internal_run_reports_that_run_alone() -> TestResult {
-		let subject = chain_after_a_run()?;
-		let config = FdrConfig { max_internal_run: 1, ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let verdict = explorer.explore()?;
-		let run = verdict.divergence_witness.map(|(_seed, run)| run);
-		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "`a` ends the run of `p`");
-		Ok(())
-	}
-
-	#[test]
-	fn a_hidden_cycle_behind_an_accepting_state_refutes_divergence_freedom() -> Result<(), ProcessBuildError> {
-		let subject = spinning_after_b()?;
-		let decided = divergence_of(&subject, FdrConfig::default());
-		assert_eq!(decided, Decision::Refuted, "the accepting `Idle` offers `b` into the spin");
-		Ok(())
-	}
-
-	#[test]
-	fn a_deadlock_behind_an_accepting_state_refutes_deadlock_freedom() -> TestResult {
-		let subject = stuck_after_b()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let decided = explorer.explore()?.deadlock_free;
-		assert_eq!(decided, Decision::Refuted, "`b` leads from the accepting `Idle` to `D`");
-		Ok(())
-	}
-
-	#[test]
-	fn a_spec_that_diverges_at_once_refutes_an_event_that_it_lacks() -> TestResult {
-		let subject = spinning_after_b()?;
-		let config = FdrConfig { specs: vec![spinning_at_once()?], ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let verdict = explorer.explore()?;
-		assert_eq!(verdict.outcome(), Decision::Refuted, "the spec has the empty trace alone");
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_hidden_cycle_that_a_guard_blocks_leaves_divergence_freedom_held() -> Result<(), ProcessBuildError> {
-		let guard = TimingGuard::ClockGreaterThan("clk".to_string(), Duration::from_millis(5));
-		let subject = guarded_spin(guard)?;
-
-		let decided = divergence_of(&subject, FdrConfig::default());
-		assert_eq!(decided, Decision::Holds, "`clk` reads 0 at `S1`, so `t` never fires");
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_hidden_cycle_that_a_guard_admits_refutes_divergence_freedom() -> TestResult {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-		let subject = guarded_spin(guard)?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
-		let run = verdict.divergence_witness.map(|(_seed, run)| run);
-		assert_eq!(run, Some(vec![Event("t")]), "`clk` reads 0 at `S1`, so `t` fires forever");
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_clock_that_a_hidden_step_resets_opens_the_guard_of_a_cycle() -> TestResult {
-		let subject = spinning_after_a_reset()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
-		let run = verdict.divergence_witness.map(|(_seed, run)| run);
-		assert_eq!(run, Some(vec![Event("t"), Event("u")]), "`t` starts `clk`, which `u` reads");
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-schedulability")]
-	#[test]
-	fn a_spec_with_no_schedulability_block_leaves_schedulability_unasserted() -> TestResult {
-		let subject = wider_subject()?;
-		let config = FdrConfig { specs: vec![narrow_spec()?], ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let verdict = explorer.explore()?;
-		assert_eq!(verdict.schedulable, Decision::NotAsserted, "no analysis ran");
-		Ok(())
-	}
-
-	#[test]
-	fn a_state_space_exploration_decides_freedom_whatever_specs_the_configuration_names() -> TestResult {
-		let subject = stuck_after_b()?;
-		let config = FdrConfig { specs: vec![narrow_spec()?], ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let verdict = explorer.explore_state_space_into(&TraceCollector::new())?;
-		let decided = verdict.deadlock_free;
-		assert_eq!(decided, Decision::Refuted, "`b` leads from the accepting `Idle` to `D`");
-		Ok(())
-	}
-
+	/// A fault run counts the states, traces, and seeds of the spec runs it
+	/// judged: the spec visits `S0` and `S1` on each of four seeds.
 	#[cfg(feature = "testing-fault")]
 	#[test]
-	fn a_fault_run_describes_the_spec_runs_it_judged() -> TestResult {
-		let subject = wider_subject()?;
-		let specs = vec![narrow_spec()?];
-		let fault_model = Some(FaultModel::default());
-		let config = FdrConfig { specs, fault_model, seeds: 4, ..Default::default() };
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+	fn a_fault_run_describes_the_spec_runs_it_judged() {
+		let config = FdrConfig { seeds: 4, ..FdrConfig::under_faults([narrow_spec()]) };
 
-		let verdict = explorer.explore()?;
+		let verdict = wider_subject().verdict_under(config);
 		let statistics = (verdict.states_visited, verdict.traces_explored, verdict.seeds_completed);
-		assert_eq!(statistics, (2, 4, 4), "the spec visits `S0` and `S1` on each of four seeds");
-		Ok(())
+		assert_eq!(statistics, (2, 4, 4));
 	}
 
+	/// The explorer and the composition claim name one hidden action as the
+	/// determinism witness.
 	#[test]
-	fn a_hidden_action_is_one_determinism_witness_for_the_explorer_and_the_composition_claim() -> TestResult {
-		let subject = hidden_chain()?;
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
+	fn a_hidden_action_is_one_determinism_witness_for_the_explorer_and_the_composition_claim() {
+		let subject = hidden_chain();
+		let verdict = subject.verdict_under(FdrConfig::default());
 		let refused = DeterminismChecker::check(&subject).err();
-		let claimed = refused.map(|refused| (refused.state, refused.event));
 
+		let claimed = refused.map(|refused| (refused.state, refused.event));
 		let hidden_t = Some((State("S0"), Event("t")));
 		assert_eq!((verdict.determinism_witness, claimed), (hidden_t, hidden_t));
-		Ok(())
 	}
 }

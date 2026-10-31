@@ -1354,89 +1354,102 @@ mod tests {
 
 	use futures::channel::oneshot;
 
+	use super::super::body::StreamBody;
+	use super::super::fixtures::{next_mux, noop_cx, poll_times, FIXTURE_PEER_CAP};
 	use super::super::shared::MuxShared;
-	use super::super::testing::{body_fixture, noop_cx, poll_times, FIXTURE_PEER_CAP};
 	use super::*;
 	use crate::marker::MaybeSend;
+	use crate::testing::TestResult;
 	use crate::transport::multiplex::MuxRole;
 
+	/// A receive stream refuses a chunk past the limit it granted.
 	#[test]
-	fn test_recv_stream_enforces_granted_limit() {
+	fn a_recv_stream_enforces_its_granted_limit() {
 		let mut stream = RecvStream::new(2, Arc::new(ReassemblyBudget::default()));
 		assert!(stream.accept_chunk(b"ab"));
 		assert!(stream.accept_chunk(b"cd"));
-		assert!(!stream.accept_chunk(b"ef"));
+
+		let refused = !stream.accept_chunk(b"ef");
+		assert!(refused);
 		assert_eq!(stream.bytes.as_slice(), b"abcd");
 	}
 
-	// A peer that spreads its payload across many streams must hit the same
-	// total as one stream reaching its own ceiling. A per-stream ceiling alone
-	// multiplies by the number of streams opened (CWE-770).
+	/// The octets that one `chunk` on each of `streams` charges, where a
+	/// refused chunk charges none.
+	fn charge_each(streams: &mut [RecvStream], chunk: [u8; 64]) -> usize {
+		let accepted = streams
+			.iter_mut()
+			.map(|stream| stream.accept_chunk(chunk))
+			.filter(|admitted| *admitted)
+			.count();
+		accepted * chunk.len()
+	}
+
+	/// A peer that spreads its payload across many streams must hit the same
+	/// total as one stream reaching its own ceiling. A per-stream ceiling
+	/// alone multiplies by the number of streams opened (CWE-770).
 	#[test]
 	fn connection_ceiling_binds_across_streams() {
 		let connection_ceiling = 256usize;
 		let budget = Arc::new(ReassemblyBudget::with_ceiling(connection_ceiling));
-		let chunk = [0u8; 64];
-
 		// Eight streams, each far below its own ceiling, together stop at the
 		// connection ceiling after four chunks.
 		let mut streams: Vec<RecvStream> = (0..8).map(|_| RecvStream::new(u64::MAX, Arc::clone(&budget))).collect();
 
-		let mut charged = 0usize;
-		for stream in &mut streams {
-			if stream.accept_chunk(chunk) {
-				charged += chunk.len();
-			}
-		}
+		let charged = charge_each(&mut streams, [0u8; 64]);
 
 		assert_eq!(charged, connection_ceiling);
 		assert_eq!(budget.used(), connection_ceiling);
 	}
 
-	// A dropped stream returns its bytes, so a long-lived connection that
-	// opens and closes streams does not exhaust the budget.
+	/// A dropped stream returns its bytes, so a long-lived connection that
+	/// opens and closes streams does not exhaust the budget.
 	#[test]
 	fn dropping_a_stream_returns_its_bytes() {
 		let budget = Arc::new(ReassemblyBudget::with_ceiling(128));
-		{
-			let mut stream = RecvStream::new(u64::MAX, Arc::clone(&budget));
-			assert!(stream.accept_chunk([0u8; 128]));
-			assert_eq!(budget.used(), 128);
-		}
+		let mut stream = RecvStream::new(u64::MAX, Arc::clone(&budget));
+		assert!(stream.accept_chunk([0u8; 128]));
 
-		assert_eq!(budget.used(), 0);
+		let held = budget.used();
+
+		drop(stream);
 
 		let mut reused = RecvStream::new(u64::MAX, Arc::clone(&budget));
+		assert_eq!((held, budget.used()), (128, 0));
 		assert!(reused.accept_chunk([0u8; 128]));
 	}
 
-	// Unary reassembly must refuse past a hard byte ceiling even when
-	// the grantor keeps raising the chunk limit (CWE-770).
-	#[test]
-	fn test_recv_stream_rejects_past_reassembly_ceiling() {
-		let ceiling = 256usize;
-		let bytes = Reassembly::with_ceiling(ceiling, Arc::new(ReassemblyBudget::default()));
-		let mut stream = RecvStream { bytes, received: 0, limit: 1 };
-		let chunk = [0u8; 64];
-		let mut accepted = 0usize;
+	/// Offers `chunk` to `stream` until it refuses one, raising the chunk
+	/// limit before each offer as a grantor that keeps granting would, and
+	/// returns the chunks it accepted.
+	fn fill_raising_limit(stream: &mut RecvStream, chunk: [u8; 64]) -> usize {
+		let mut accepted = 0;
 		loop {
-			if stream.received >= stream.limit {
-				stream.limit = stream.received.saturating_add(1);
-			}
+			stream.limit = stream.limit.max(stream.received.saturating_add(1));
 			if !stream.accept_chunk(chunk) {
-				break;
+				return accepted;
 			}
 
-			accepted = accepted.saturating_add(1);
-			assert!(accepted.saturating_mul(chunk.len()) <= ceiling);
+			accepted += 1;
 		}
+	}
 
-		assert!(stream.bytes.as_slice().len() <= ceiling);
-		assert!(accepted > 0);
+	/// Unary reassembly refuses past a hard byte ceiling even when the
+	/// grantor keeps raising the chunk limit (CWE-770).
+	#[test]
+	fn a_recv_stream_refuses_past_its_reassembly_ceiling() {
+		let bytes = Reassembly::with_ceiling(256, Arc::new(ReassemblyBudget::default()));
+		let mut stream = RecvStream { bytes, received: 0, limit: 1 };
+
+		let accepted = fill_raising_limit(&mut stream, [0u8; 64]);
+		assert_eq!((accepted, stream.bytes.as_slice().len()), (4, 256));
 	}
 
 	/// An envelope source that yields a fixed sequence and then stays pending
 	/// forever.
+	///
+	/// The reader under test drives a source to its end, and a scripted
+	/// source holds that end open with no peer behind it.
 	struct ScriptedSource {
 		envelopes: VecDeque<TransportEnvelope>,
 		delivered: Arc<AtomicUsize>,
@@ -1459,6 +1472,9 @@ mod tests {
 	}
 
 	/// A grantor that raises the limit on every consultation.
+	///
+	/// The house grantor grants at a low-water mark, and the cases need a
+	/// grant on every chunk to reach the backlog bounds.
 	struct AlwaysGrant;
 
 	impl CreditGrantor for AlwaysGrant {
@@ -1477,6 +1493,14 @@ mod tests {
 		inbound: mpsc::Receiver<InboundEvent>,
 		/// The count of envelopes that the source has delivered.
 		delivered: Arc<AtomicUsize>,
+	}
+
+	impl ReaderFixture {
+		/// The control commands the driver buffered while its writer queue
+		/// stayed full, in queue order.
+		fn buffered(&self) -> Vec<&Outbound> {
+			self.driver.pending_control.iter().collect()
+		}
 	}
 
 	/// A reader driver over a scripted source whose outbound queue is already
@@ -1508,42 +1532,63 @@ mod tests {
 		ReaderFixture { driver, outbound: outbound_receiver, inbound: inbound_receiver, delivered }
 	}
 
+	/// An open package of `kind` for stream 1 that carries `payload`.
+	fn open_package_of(kind: MuxStreamKind, payload: Vec<u8>) -> MuxOpenPackage {
+		MuxOpenPackage::new(1, false, kind, payload).expect("fixture payload fits an open package")
+	}
+
 	/// A fixture unary open package for stream 1 that carries a four-byte
 	/// payload.
 	fn open_package() -> MuxOpenPackage {
-		MuxOpenPackage::new(1, false, MuxStreamKind::Unary, vec![0u8; 4]).expect("fixture payload fits an open package")
+		open_package_of(MuxStreamKind::Unary, vec![0u8; 4])
 	}
 
-	// Empty payloads are trailer-only grammar, so an empty data record without
-	// the `last` flag is a protocol violation. The `last` form is the close
-	// trailer of a request body.
-	#[test]
-	fn test_reader_rejects_empty_data_without_last_flag() -> TransportResult<()> {
-		let open = open_package();
-		let empty = MuxDataPackage::new(1, false, Vec::new())?;
-		let fixture = reader_with_full_queue(vec![open.into(), empty.into()]);
+	/// A data package of stream 1 that carries `payload` and the `last` flag
+	/// when `last` is set.
+	fn data_package(last: bool, payload: Vec<u8>) -> MuxDataPackage {
+		MuxDataPackage::new(1, last, payload).expect("fixture chunk fits a package")
+	}
 
+	/// The body of the streaming open of stream 1 that the reader dispatched
+	/// first on `inbound`.
+	fn opened_body(inbound: &mut mpsc::Receiver<InboundEvent>) -> Box<StreamBody> {
+		match inbound.try_recv() {
+			Ok(InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, body, _)) => body,
+			_ => panic!("the reader dispatches the streaming open of stream 1 first"),
+		}
+	}
+
+	/// Buffers a ping ack of each value of `opaques` on the driver of
+	/// `fixture`.
+	fn queue_ping_acks(fixture: &mut ReaderFixture, opaques: impl IntoIterator<Item = u64>) {
+		for opaque in opaques {
+			let queued = fixture.driver.queue_ping_ack(MuxPingPackage::new(true, opaque));
+			queued.expect("an ack is buffered or dropped");
+		}
+	}
+
+	/// Empty payloads are trailer-only grammar, so an empty data record
+	/// without the `last` flag is a protocol violation. The `last` form is
+	/// the close trailer of a request body.
+	#[test]
+	fn the_reader_refuses_an_empty_data_record_without_the_last_flag() {
+		let fixture = reader_with_full_queue(vec![open_package().into(), data_package(false, Vec::new()).into()]);
 		let mut driver = Box::pin(fixture.driver.drive());
-		let mut cx = noop_cx();
 
-		let outcome = driver.as_mut().poll(&mut cx);
+		let outcome = driver.as_mut().poll(&mut noop_cx());
 		assert!(matches!(outcome, Poll::Ready(Err(TransportError::InvalidMessage))));
-		Ok(())
 	}
 
-	// A refusal cancel drawn while the writer queue is full buffers in the
-	// control queue instead of vanishing, because a lost refusal leaves the
-	// peer's stream pending forever.
+	/// A refusal cancel drawn while the writer queue is full buffers in the
+	/// control queue instead of vanishing, because a lost refusal leaves the
+	/// peer's stream pending forever.
 	#[test]
-	fn test_refusal_cancel_buffers_when_queue_full() -> TransportResult<()> {
+	fn a_refusal_cancel_buffers_while_the_queue_is_full() -> TestResult {
 		let mut fixture = reader_with_full_queue(vec![]);
 		fixture.driver.refuse_stream(1)?;
 
-		assert!(matches!(
-			fixture.driver.pending_control.front(),
-			Some(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package))))
-				if package.stream_id() == 1
-		));
+		let front = fixture.driver.pending_control.front().and_then(Outbound::mux);
+		assert!(matches!(front, Some(MuxEnvelope::Cancel(package)) if package.stream_id() == 1));
 		Ok(())
 	}
 
@@ -1556,10 +1601,8 @@ mod tests {
 	/// - RFC 9113 § 5.2.2, the h2 flow-control deadlock:
 	///   <https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2>
 	#[test]
-	fn test_reader_reads_while_outbound_queue_full() {
-		let open = open_package();
-		let probe = MuxPingPackage::new(false, 7);
-		let fixture = reader_with_full_queue(vec![open.into(), probe.into()]);
+	fn the_reader_reads_while_the_outbound_queue_is_full() {
+		let fixture = reader_with_full_queue(vec![open_package().into(), MuxPingPackage::new(false, 7).into()]);
 		let delivered = Arc::clone(&fixture.delivered);
 
 		let mut driver = Box::pin(fixture.driver.drive());
@@ -1567,64 +1610,49 @@ mod tests {
 		assert_eq!(delivered.load(Ordering::SeqCst), 2);
 	}
 
+	/// Buffered control commands flush in order as the writer queue returns
+	/// capacity: the filler, the credit grant, then the ping ack.
 	#[test]
-	fn test_buffered_control_flushes_as_capacity_returns() {
-		let open = open_package();
-		let probe = MuxPingPackage::new(false, 7);
-		let mut fixture = reader_with_full_queue(vec![open.into(), probe.into()]);
-
+	fn buffered_control_flushes_as_capacity_returns() {
+		let mut fixture = reader_with_full_queue(vec![open_package().into(), MuxPingPackage::new(false, 7).into()]);
 		let mut driver = Box::pin(fixture.driver.drive());
 		poll_times(&mut driver, 4);
 
-		let filler = fixture.outbound.try_recv();
-		assert!(matches!(
-			filler,
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Ping(_))))
-		));
-
+		let filler = next_mux(&mut fixture.outbound);
 		poll_times(&mut driver, 4);
-
-		let grant = fixture.outbound.try_recv();
-		assert!(matches!(
-			grant,
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package))))
-				if package.stream_id() == 1
-		));
-
+		let grant = next_mux(&mut fixture.outbound);
 		poll_times(&mut driver, 4);
-
-		let ack = fixture.outbound.try_recv();
-		assert!(matches!(
-			ack,
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Ping(package))))
-				if package.ack() && package.opaque() == 7
-		));
+		let ack = next_mux(&mut fixture.outbound);
+		assert!(matches!(filler, Some(MuxEnvelope::Ping(_))));
+		assert!(matches!(grant, Some(MuxEnvelope::Credit(package)) if package.stream_id() == 1));
+		assert!(matches!(ack, Some(MuxEnvelope::Ping(package)) if package.ack() && package.opaque() == 7));
 	}
 
+	/// Buffered credit grants coalesce per stream, so a later grant of a
+	/// stream replaces its earlier one at the back of the queue.
 	#[test]
-	fn test_buffered_credit_grants_coalesce_per_stream() -> TransportResult<()> {
+	fn buffered_credit_grants_coalesce_per_stream() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
 		fixture.driver.queue_credit(1, 2)?;
 		fixture.driver.queue_credit(3, 2)?;
 		fixture.driver.queue_credit(1, 4)?;
 
-		let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
+		let buffered = fixture.buffered();
 		assert_eq!(buffered.len(), 2);
 		assert!(buffered[0].is_credit_grant_for(3));
 		assert!(matches!(
-			buffered[1],
-			Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
-				if package.stream_id() == 1 && package.limit() == 4
+			buffered[1].mux(),
+			Some(MuxEnvelope::Credit(package)) if package.stream_id() == 1 && package.limit() == 4
 		));
 
 		Ok(())
 	}
 
-	// Stream IDs never repeat, so per-stream coalescing alone lets grants for
-	// dead streams pile up under churn while the writer stays backpressured.
-	// A stream that closes must drop its buffered grant.
+	/// Stream IDs never repeat, so per-stream coalescing alone lets grants
+	/// for dead streams pile up under churn while the writer stays
+	/// backpressured. A stream that closes must drop its buffered grant.
 	#[test]
-	fn test_buffered_grant_evicted_when_stream_closes() -> TransportResult<()> {
+	fn a_closed_stream_drops_its_buffered_grant() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
 		fixture.driver.queue_credit(1, 2)?;
 		fixture.driver.queue_credit(2, 2)?;
@@ -1638,7 +1666,7 @@ mod tests {
 		poll_times(&mut local_cancel, 1);
 		drop(local_cancel);
 
-		let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
+		let buffered = fixture.buffered();
 		assert_eq!(buffered.len(), 1);
 		assert!(buffered[0].is_credit_grant_for(3));
 
@@ -1646,6 +1674,9 @@ mod tests {
 	}
 
 	/// A grantor that always answers with an unbounded raise.
+	///
+	/// The clamp under test bounds every grantor, so the case needs one whose
+	/// raise no house grantor would make.
 	struct GreedyGrant;
 
 	impl CreditGrantor for GreedyGrant {
@@ -1654,76 +1685,60 @@ mod tests {
 		}
 	}
 
-	// Streaming grants clamp to the consumed watermark plus the channel window,
-	// so no grantor implementation can outgrow the body channel.
+	/// Streaming grants clamp to the consumed watermark plus the channel
+	/// window, so no grantor implementation can outgrow the body channel.
 	#[test]
-	fn test_streaming_grant_clamps_to_channel_window() -> TransportResult<()> {
+	fn a_streaming_grant_clamps_to_the_channel_window() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
 		fixture.driver.grantor = Arc::new(GreedyGrant);
 
-		let (_body, forwarder, _notes) = body_fixture(5, 2);
+		let (_body, forwarder, _notes) = StreamBody::fixture(5, 2);
 		fixture.driver.peer_bodies.insert(5, forwarder);
 		fixture.driver.grant_streaming(DrainNote { stream_id: 5, consumed: 1 })?;
 
 		let limit = fixture.driver.peer_bodies.get(&5).map(|stream| stream.limits().0);
+		let buffered = fixture.buffered();
 		assert_eq!(limit, Some(3));
-
-		let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
 		assert_eq!(buffered.len(), 1);
 		assert!(matches!(
-			buffered[0],
-			Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
-				if package.stream_id() == 5 && package.limit() == 3
+			buffered[0].mux(),
+			Some(MuxEnvelope::Credit(package)) if package.stream_id() == 5 && package.limit() == 3
 		));
 
 		Ok(())
 	}
 
+	/// A streaming open forwards each chunk to its body as it arrives, with
+	/// no reassembly.
 	#[test]
-	fn test_streaming_open_forwards_chunks_without_reassembly() {
-		let kind = MuxStreamKind::Streaming;
-		let open = MuxOpenPackage::new(1, false, kind, vec![1u8; 4]).expect("fixture open fits a package");
-		let data = MuxDataPackage::new(1, true, vec![2u8; 4]).expect("fixture chunk fits a package");
-		let mut fixture = reader_with_full_queue(vec![open.into(), data.into()]);
-
+	fn a_streaming_open_forwards_its_chunks_without_reassembly() {
+		let open = open_package_of(MuxStreamKind::Streaming, vec![1u8; 4]);
+		let mut fixture = reader_with_full_queue(vec![open.into(), data_package(true, vec![2u8; 4]).into()]);
 		let mut driver = Box::pin(fixture.driver.drive());
 		poll_times(&mut driver, 8);
 		drop(driver);
 
-		let dispatched = fixture.inbound.try_recv();
-		assert!(matches!(
-			dispatched,
-			Ok(InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, _, _))
-		));
-
-		let Ok(InboundEvent::StreamOpen(_, _, mut body, _)) = dispatched else {
-			return;
-		};
-
-		let first = body.poll_chunk_now();
-		assert!(matches!(first, Poll::Ready(Ok(Some(chunk))) if chunk == [1u8; 4]));
-
-		let second = body.poll_chunk_now();
-		assert!(matches!(second, Poll::Ready(Ok(Some(chunk))) if chunk == [2u8; 4]));
+		let mut body = opened_body(&mut fixture.inbound);
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(Some(chunk))) if chunk == [1u8; 4]));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(Some(chunk))) if chunk == [2u8; 4]));
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 	}
 
-	// A refused or abandoned body evicts its forwarder on the next chunk, so
-	// later flushes route through the tolerated refused-stream path instead
-	// of a dead channel.
+	/// A refused or abandoned body evicts its forwarder on the next chunk, so
+	/// later flushes route through the tolerated refused-stream path instead
+	/// of a dead channel.
 	#[test]
-	fn test_forward_request_chunk_evicts_severed_body() {
+	fn a_chunk_for_a_severed_body_evicts_its_forwarder() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
-		let (body, forwarder, _notes) = body_fixture(1, 4);
+		let (body, forwarder, _notes) = StreamBody::fixture(1, 4);
 
 		drop(body);
 
 		fixture.driver.peer_bodies.insert(1, forwarder);
+		fixture.driver.forward_request_chunk(&data_package(false, vec![7u8; 4]))?;
 
-		let package = MuxDataPackage::new(1, false, vec![7u8; 4]).expect("fixture chunk fits a package");
-		let routed = fixture.driver.forward_request_chunk(&package);
-		assert!(routed.is_ok());
 		assert!(fixture.driver.peer_bodies.is_empty());
+		Ok(())
 	}
 
 	/// Refuses every stream in `stream_ids` on the fixture's driver, as a
@@ -1742,40 +1757,31 @@ mod tests {
 	/// the refusals it can buffer while the writer is stalled stop at the
 	/// fixture's peer cap (CWE-770).
 	#[test]
-	fn test_refusal_backlog_is_capped_at_the_peer_cap() {
+	fn the_refusal_backlog_stops_at_the_peer_cap() {
 		let mut fixture = reader_with_full_queue(Vec::new());
 		refuse_streams(&mut fixture, &[1, 2, 3, 4, 5, 6, 7, 8]);
 
-		let buffered_refusals = fixture
-			.driver
-			.pending_control
-			.iter()
-			.filter(|command| command.is_refusal())
-			.count();
+		let buffered = fixture.buffered();
+		let buffered_refusals = buffered.iter().filter(|command| command.is_refusal()).count();
 		assert_eq!(u32::try_from(buffered_refusals), Ok(FIXTURE_PEER_CAP));
 	}
 
+	/// The ping acks a stalled writer buffers stop at their cap.
 	#[test]
-	fn test_ping_ack_backlog_is_capped() -> TransportResult<()> {
+	fn the_ping_ack_backlog_stops_at_its_cap() {
 		let mut fixture = reader_with_full_queue(Vec::new());
-		for opaque in 0..8 {
-			fixture.driver.queue_ping_ack(MuxPingPackage::new(true, opaque))?;
-		}
 
-		let buffered_acks = fixture
-			.driver
-			.pending_control
-			.iter()
-			.filter(|envelope| envelope.is_ping_ack())
-			.count();
+		queue_ping_acks(&mut fixture, 0..8);
+
+		let buffered = fixture.buffered();
+		let buffered_acks = buffered.iter().filter(|command| command.is_ping_ack()).count();
 		assert_eq!(buffered_acks, MAX_PENDING_PING_ACKS);
-		Ok(())
 	}
 
-	// A reader future dropped in the middle of a read never returns from
-	// `drive`, and the connection has ended all the same.
+	/// A reader future dropped in the middle of a read never returns from
+	/// `drive`, and the connection has ended all the same.
 	#[test]
-	fn test_dropped_drive_fails_the_connection() {
+	fn a_dropped_drive_fails_the_connection() {
 		let fixture = reader_with_full_queue([]);
 		let shared = Arc::clone(fixture.driver.link.shared());
 
@@ -1784,8 +1790,7 @@ mod tests {
 		drop(driving);
 
 		let (sender, _ack) = oneshot::channel();
-		let pinged = shared.allocate_ping(sender);
-		assert!(matches!(pinged, Err(TransportError::ConnectionClosed)));
+		assert!(matches!(shared.allocate_ping(sender), Err(TransportError::ConnectionClosed)));
 	}
 
 	// The reader names its end by the error that ended it: a refusal of what

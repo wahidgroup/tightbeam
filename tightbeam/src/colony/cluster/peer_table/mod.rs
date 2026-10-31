@@ -232,6 +232,14 @@ pub struct PeerHint {
 	pub peer_id: Option<Vec<u8>>,
 }
 
+#[cfg(test)]
+impl PeerHint {
+	/// A hint of the fixture socket `spelling` that names no fingerprint.
+	pub(crate) fn fixture(spelling: impl AsRef<str>) -> Self {
+		PeerHint { dial: AdmittedDial::fixture(spelling), peer_id: None }
+	}
+}
+
 /// One learned peer, as a [`PeerStore`] driver stores it.
 ///
 /// Every field is public and the struct is exhaustive, so a driver outside
@@ -741,19 +749,18 @@ impl PeerTable {
 
 #[cfg(test)]
 mod tests {
+	use core::num::NonZeroUsize;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::mpsc::{self, Receiver, Sender};
+	use std::sync::TryLockError;
+	use std::thread::JoinHandle;
+
 	use super::*;
 	use crate::constants::{
 		MAX_PEER_BUCKET, MAX_PEER_TRIED_FAILURES, PEER_PROBE_BACKOFF_MAX_MS, PEER_PROBE_BACKOFF_MS, PEER_PROBE_PER_BEAT,
 	};
 	use crate::tb_cases;
-	use core::num::NonZeroUsize;
-	use core::time::Duration;
-	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-	/// Parse a fixture address, admitted the way the table takes it.
-	fn addr(text: impl AsRef<str>) -> AdmittedDial {
-		AdmittedDial::fixture(text)
-	}
+	use crate::testing::TestResult;
 
 	/// A fixture IPv6 socket with the flow label and scope id given, which
 	/// socket syntax cannot spell.
@@ -835,10 +842,6 @@ mod tests {
 		}
 	}
 
-	fn hint(text: impl AsRef<str>) -> PeerHint {
-		PeerHint { dial: addr(text), peer_id: None }
-	}
-
 	/// A table over `store` whose one anchor the operator configured at
 	/// `anchor`.
 	fn anchored(anchor: impl AsRef<str>, store: Arc<dyn PeerStore>) -> PeerTable {
@@ -856,25 +859,35 @@ mod tests {
 		PeerTable::new(&PeerConfig::default(), store)
 	}
 
-	struct CountingStore {
+	/// A driver that hydrates the records it was seeded with, and keeps the
+	/// row count of each snapshot that crossed into it.
+	///
+	/// The house memory driver keeps no snapshot, so a test that reads what
+	/// crossed the driver boundary holds this driver.
+	#[derive(Default)]
+	struct RecordingStore {
 		seed: Vec<PeerRecord>,
-		persists: AtomicUsize,
+		widths: Mutex<Vec<usize>>,
 	}
 
-	impl CountingStore {
+	impl RecordingStore {
 		fn seeded(seed: impl IntoIterator<Item = PeerRecord>) -> Self {
-			let seed: Vec<PeerRecord> = seed.into_iter().collect();
-			Self { seed, persists: AtomicUsize::new(0) }
+			Self { seed: seed.into_iter().collect(), widths: Mutex::default() }
+		}
+
+		/// The row count of each snapshot the driver took, in order.
+		fn widths(&self) -> Vec<usize> {
+			self.widths.lock().expect("the driver lock is live").clone()
 		}
 	}
 
-	impl PeerStore for CountingStore {
+	impl PeerStore for RecordingStore {
 		fn hydrate(&self) -> Result<Vec<PeerRecord>, ClusterError> {
 			Ok(self.seed.clone())
 		}
 
-		fn persist(&self, _records: &[PeerRecord]) -> Result<(), ClusterError> {
-			self.persists.fetch_add(1, Ordering::SeqCst);
+		fn persist(&self, records: &[PeerRecord]) -> Result<(), ClusterError> {
+			self.widths.lock().expect("the driver lock is live").push(records.len());
 			Ok(())
 		}
 	}
@@ -888,91 +901,168 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn address_group_prefixes_v4_and_v6() {
-		let v6 = PeerAddress::fixture("[2001:db8::1]:80");
-		assert_eq!(PeerAddress::fixture("10.1.2.3:80").group(), AddressGroup::V4([10, 1]));
-		assert_eq!(v6.group(), AddressGroup::V6([0x20, 0x01, 0x0d, 0xb8]));
+	/// The hints of the first `count` hosts of `10.0.0.0/24`, from
+	/// `10.0.0.1` upward.
+	fn bucket_hints(count: usize) -> Vec<PeerHint> {
+		(1..=count)
+			.map(|host| PeerHint::fixture(format!("10.0.0.{host}:9000")))
+			.collect()
 	}
 
-	#[test]
-	fn learn_admits_hints_and_skips_anchors() -> Result<(), ClusterError> {
-		let table = table_with_anchor("127.0.0.1:9000");
-		let admitted = table.learn(vec![hint("127.0.0.1:9000"), hint("10.0.0.1:9000")], UnixMillis::default())?;
-		assert_eq!(admitted, 1);
-		assert_eq!(table.learned()?, (1, 0));
-		Ok(())
+	/// The records of the first `count` hosts of `10.0.0.0/24`, from
+	/// `10.0.0.1` upward, each a candidate that no probe verified.
+	fn bucket_records(count: usize) -> Vec<PeerRecord> {
+		(1..=count).map(|host| record(format!("10.0.0.{host}:9000"), false)).collect()
 	}
 
-	#[test]
-	// A hint always carries an address the dial policy admitted, so a duplicate
-	// is the one refusal left for `learn` to apply here.
-	fn learn_drops_duplicate_hints() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		let admitted = table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.1:9000")], UnixMillis::default())?;
-		assert_eq!(admitted, 1);
-		Ok(())
-	}
-
-	#[test]
-	fn learn_caps_one_prefix_bucket() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		let hints: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 3)
-			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
-			.collect();
-		let admitted = table.learn(hints, UnixMillis::default())?;
-		assert_eq!(admitted, MAX_PEER_BUCKET);
-		Ok(())
-	}
-
-	#[test]
-	fn promote_moves_candidate_into_tried_once() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-
-		let first = table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-		let second = table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(2_000))?;
-		assert!(first);
-		assert!(!second);
-		assert_eq!(table.learned()?, (0, 1));
-		Ok(())
-	}
-
-	#[test]
-	fn promote_never_tracks_anchors() -> Result<(), ClusterError> {
-		let table = table_with_anchor("127.0.0.1:9000");
-		let promoted = table.promote(addr("127.0.0.1:9000"), None, UnixMillis::new(1_000))?;
-		assert!(!promoted);
-		assert_eq!(table.learned()?, (0, 0));
-		Ok(())
-	}
-
-	#[test]
-	fn verified_anchor_becomes_shareable_over_pex() -> Result<(), ClusterError> {
-		let table = table_with_anchor("127.0.0.1:9000");
-		assert!(table.sample_for_pex(8)?.is_empty());
-
-		table.promote(addr("127.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-
-		let sample = table.sample_for_pex(8)?;
-		assert_eq!(sample.len(), 1);
-		assert_eq!(sample[0].gateway_addr.to_string(), "127.0.0.1:9000");
-		assert_eq!(sample[0].peer_id.as_deref(), Some(b"fp-a".as_slice()));
-		Ok(())
-	}
-
-	#[test]
-	fn promote_keeps_residents_of_full_tried_bucket() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		for host in 0..MAX_PEER_BUCKET {
-			table.promote(addr(format!("10.0.0.{}:9000", host + 1)), None, UnixMillis::new(1_000))?;
+	/// `table` once each of `peers` answers a verified probe at 1 s under the
+	/// fingerprint it names.
+	fn with_tried(table: PeerTable, peers: &[(&str, Option<&[u8]>)]) -> PeerTable {
+		for &(spelling, fingerprint) in peers {
+			let promoted = table.promote(AdmittedDial::fixture(spelling), fingerprint, UnixMillis::new(1_000));
+			promoted.expect("a fresh table lock is not poisoned");
 		}
 
-		table.learn(vec![hint("10.0.9.9:9000")], UnixMillis::default())?;
+		table
+	}
 
-		let promoted = table.promote(addr("10.0.9.9:9000"), None, UnixMillis::new(2_000))?;
-		assert!(!promoted);
-		assert_eq!(table.learned()?, (1, MAX_PEER_BUCKET));
+	/// `table` once it learns the candidate `10.0.0.1` and promotes
+	/// `10.1.0.1` to tried.
+	fn with_new_and_tried(table: PeerTable) -> PeerTable {
+		let learned = table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default());
+		learned.expect("a fresh table lock is not poisoned");
+		with_tried(table, &[("10.1.0.1:9000", None)])
+	}
+
+	/// A table whose `10.0.0.0/16` bucket of tried peers is full.
+	fn table_with_a_full_tried_bucket() -> PeerTable {
+		let residents: Vec<String> = (1..=MAX_PEER_BUCKET).map(|host| format!("10.0.0.{host}:9000")).collect();
+		let peers: Vec<(&str, Option<&[u8]>)> = residents.iter().map(|spelling| (spelling.as_str(), None)).collect();
+		with_tried(PeerTable::default(), &peers)
+	}
+
+	/// The address of each of `records`, in order.
+	fn addresses(records: &[PeerRecord]) -> Vec<PeerAddress> {
+		records.iter().map(|record| record.gateway_addr).collect()
+	}
+
+	// The diversity bucket of a v4 address is its `/16`, and of a v6 address
+	// its `/32`.
+	tb_cases! {
+		fn group_of((spelling, group): (&str, AddressGroup)) {
+			assert_eq!(PeerAddress::fixture(spelling).group(), group);
+		}
+		cases {
+			v4 => ("10.1.2.3:80", AddressGroup::V4([10, 1])),
+			v6 => ("[2001:db8::1]:80", AddressGroup::V6([0x20, 0x01, 0x0d, 0xb8])),
+		}
+	}
+
+	/// A full `10.0.0.0/16` bucket of untested candidates.
+	fn table_with_a_full_bucket() -> PeerTable {
+		let table = PeerTable::default();
+		let learned = table.learn(bucket_hints(MAX_PEER_BUCKET), UnixMillis::default());
+		learned.expect("a fresh table lock is not poisoned");
+
+		table
+	}
+
+	/// A table, the hints it learns, how many of them it admits, and the
+	/// learned counts after.
+	type Learned = (PeerTable, Vec<PeerHint>, usize, (usize, usize));
+
+	// A learn admits each new hint, and skips a configured anchor, a
+	// duplicate, and each hint past the cap of its prefix bucket. A full
+	// bucket refuses a newcomer while no candidate has failed. A hint always
+	// carries an address the dial policy admitted, so these are the
+	// refusals left for `learn` to apply.
+	tb_cases! {
+		fn learn_admits((table, hints, admitted, learned): Learned) -> TestResult {
+			let taken = table.learn(hints, UnixMillis::default())?;
+
+			assert_eq!((taken, table.learned()?), (admitted, learned));
+			Ok(())
+		}
+		cases {
+			skips_anchors => (
+				table_with_anchor("127.0.0.1:9000"),
+				vec![PeerHint::fixture("127.0.0.1:9000"), PeerHint::fixture("10.0.0.1:9000")],
+				1,
+				(1, 0),
+			),
+			drops_duplicates => (
+				PeerTable::default(),
+				vec![PeerHint::fixture("10.0.0.1:9000"), PeerHint::fixture("10.0.0.1:9000")],
+				1,
+				(1, 0),
+			),
+			caps_one_prefix_bucket => (
+				PeerTable::default(),
+				bucket_hints(MAX_PEER_BUCKET + 3),
+				MAX_PEER_BUCKET,
+				(MAX_PEER_BUCKET, 0),
+			),
+			full_bucket_refuses_a_newcomer => (
+				table_with_a_full_bucket(),
+				vec![PeerHint::fixture("10.0.0.200:9000")],
+				0,
+				(MAX_PEER_BUCKET, 0),
+			),
+		}
+	}
+
+	/// A candidate moves into tried on its first verified probe, and a second
+	/// probe moves nothing.
+	#[test]
+	fn promote_moves_candidate_into_tried_once() -> TestResult {
+		let table = PeerTable::default();
+		table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
+
+		let first = table.promote(AdmittedDial::fixture("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
+		let second = table.promote(AdmittedDial::fixture("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(2_000))?;
+
+		assert_eq!((first, second, table.learned()?), (true, false, (0, 1)));
+		Ok(())
+	}
+
+	/// The table tracks no configured anchor.
+	#[test]
+	fn promote_never_tracks_anchors() -> TestResult {
+		let table = table_with_anchor("127.0.0.1:9000");
+
+		let promoted = table.promote(AdmittedDial::fixture("127.0.0.1:9000"), None, UnixMillis::new(1_000))?;
+
+		assert_eq!((promoted, table.learned()?), (false, (0, 0)));
+		Ok(())
+	}
+
+	/// An anchor that a probe verified joins the peer exchange sample, under
+	/// the fingerprint it answered with.
+	#[test]
+	fn verified_anchor_becomes_shareable_over_pex() -> TestResult {
+		let table = table_with_anchor("127.0.0.1:9000");
+		let before = table.sample_for_pex(8)?;
+
+		table.promote(AdmittedDial::fixture("127.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
+
+		let sample = table.sample_for_pex(8)?;
+		let shared: Vec<(PeerAddress, Option<Vec<u8>>)> =
+			sample.into_iter().map(|record| (record.gateway_addr, record.peer_id)).collect();
+
+		let anchor = (PeerAddress::fixture("127.0.0.1:9000"), Some(b"fp-a".to_vec()));
+		assert_eq!((before.len(), shared), (0, vec![anchor]));
+		Ok(())
+	}
+
+	/// A full bucket of tried peers keeps its residents, so a newcomer stays
+	/// a candidate.
+	#[test]
+	fn promote_keeps_residents_of_full_tried_bucket() -> TestResult {
+		let table = table_with_a_full_tried_bucket();
+		table.learn(vec![PeerHint::fixture("10.0.9.9:9000")], UnixMillis::default())?;
+
+		let promoted = table.promote(AdmittedDial::fixture("10.0.9.9:9000"), None, UnixMillis::new(2_000))?;
+		assert_eq!((promoted, table.learned()?), (false, (1, MAX_PEER_BUCKET)));
 		Ok(())
 	}
 
@@ -996,8 +1086,7 @@ mod tests {
 	/// which promotions `table` made.
 	fn promotions_of_two_signers(table: &PeerTable) -> [bool; 3] {
 		let now = UnixMillis::new(1_000);
-		let promote = |text: &str, signer: &[u8]| table.promote(addr(text), Some(signer), now);
-
+		let promote = |text: &str, signer: &[u8]| table.promote(AdmittedDial::fixture(text), Some(signer), now);
 		[
 			promote("10.0.0.1:9000", b"signer-a"),
 			promote("10.1.0.1:9000", b"signer-a"),
@@ -1006,297 +1095,280 @@ mod tests {
 		.map(|promoted| promoted.expect("a fresh table lock is not poisoned"))
 	}
 
-	#[test]
-	fn promote_holds_a_signer_at_its_cap_back() {
-		let table = table_capping_signers(1);
-		assert_eq!(promotions_of_two_signers(&table), [true, false, true]);
+	// A cap of one holds a signer at its cap back, and a table with no cap
+	// promotes every signer.
+	tb_cases! {
+		fn promotions_of_two_signers_under((table, promoted): (PeerTable, [bool; 3])) {
+			assert_eq!(promotions_of_two_signers(&table), promoted);
+		}
+		cases {
+			a_cap_of_one => (table_capping_signers(1), [true, false, true]),
+			no_cap => (PeerTable::default(), [true, true, true]),
+		}
 	}
 
-	// The store holds two tried peers of one signer, as a run with no cap
-	// leaves it. The operator then sets a cap of one.
+	/// Hydration holds a signer to its cap. The store holds two tried peers of
+	/// one signer, as a run with no cap leaves it. The operator then sets a cap
+	/// of one.
 	#[test]
-	fn hydration_holds_a_signer_to_its_cap() -> Result<(), ClusterError> {
+	fn hydration_holds_a_signer_to_its_cap() -> TestResult {
 		let seed = [
 			tried_record_of("10.0.0.1:9000", b"signer-a"),
 			tried_record_of("10.1.0.1:9000", b"signer-a"),
 		];
-		let table = table_capping_signers_over(1, Arc::new(CountingStore::seeded(seed)));
+
+		let table = table_capping_signers_over(1, Arc::new(RecordingStore::seeded(seed)));
 		assert_eq!(table.learned()?, (0, 1));
 		Ok(())
 	}
 
-	// Two signers hold one slot each, which is the cap. The second address
-	// then answers as the first signer.
-	#[test]
-	fn a_resident_that_answers_as_a_signer_at_its_cap_gives_up_its_slot() -> Result<(), ClusterError> {
-		let table = table_capping_signers(1);
-		let now = UnixMillis::new(1_000);
-		table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), now)?;
-		table.promote(addr("10.1.0.1:9000"), Some(b"signer-b"), now)?;
+	/// The tried residents of a table under a cap of one, the address and
+	/// the signer of the next verified probe, whether the probe promoted, and
+	/// the learned counts after.
+	type Answered = (
+		&'static [(&'static str, Option<&'static [u8]>)],
+		(&'static str, &'static [u8]),
+		bool,
+		(usize, usize),
+	);
 
-		let promoted = table.promote(addr("10.1.0.1:9000"), Some(b"signer-a"), now)?;
-		assert!(!promoted);
-		assert_eq!(table.target_set()?, vec![addr("10.0.0.1:9000")]);
-		assert_eq!(table.learned()?, (1, 1));
-		Ok(())
+	// A resident that answers as another signer at its cap gives up its slot
+	// to the candidate set and leaves the target set. A resident with a
+	// reissued certificate answers as a signer below its cap, keeps its slot,
+	// and is no new discovery. A resident at its cap keeps its slot when it
+	// answers again, so its probe counts no slot against it.
+	tb_cases! {
+		fn a_resident_answering_under_a_cap_of_one(
+			(residents, (spelling, signer), promoted, learned): Answered
+		) -> TestResult {
+			let table = with_tried(table_capping_signers(1), residents);
+
+			let answered = table.promote(AdmittedDial::fixture(spelling), Some(signer), UnixMillis::new(2_000))?;
+
+			let targets = table.target_set()?;
+			assert_eq!((answered, table.learned()?), (promoted, learned));
+			assert_eq!(targets, vec![AdmittedDial::fixture("10.0.0.1:9000")]);
+			Ok(())
+		}
+		cases {
+			/// Two signers hold one slot each, and the second address then
+			/// answers as the first signer.
+			another_signer_at_its_cap => (
+				&[("10.0.0.1:9000", Some(b"signer-a")), ("10.1.0.1:9000", Some(b"signer-b"))],
+				("10.1.0.1:9000", b"signer-a"),
+				false,
+				(1, 1),
+			),
+			a_signer_below_its_cap => (
+				&[("10.0.0.1:9000", Some(b"signer-a"))],
+				("10.0.0.1:9000", b"signer-b"),
+				false,
+				(0, 1),
+			),
+			its_own_signer_again => (
+				&[("10.0.0.1:9000", Some(b"signer-a"))],
+				("10.0.0.1:9000", b"signer-a"),
+				false,
+				(0, 1),
+			),
+		}
 	}
 
-	// A resident with a reissued certificate answers as a signer outside the
-	// table's count. It keeps its slot, and it is no new discovery.
+	/// A gateway that excludes its own address neither learns nor promotes
+	/// it.
 	#[test]
-	fn a_resident_keeps_its_slot_under_a_signer_below_its_cap() -> Result<(), ClusterError> {
-		let table = table_capping_signers(1);
-		let now = UnixMillis::new(1_000);
-
-		table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), now)?;
-
-		let promoted = table.promote(addr("10.0.0.1:9000"), Some(b"signer-b"), now)?;
-		assert!(!promoted);
-		assert_eq!(table.learned()?, (0, 1));
-		Ok(())
-	}
-
-	// The resident holds the one slot its signer may have, and its next
-	// verified probe must not count that slot against it.
-	#[test]
-	fn a_resident_at_its_cap_keeps_its_slot_when_it_answers_again() -> Result<(), ClusterError> {
-		let table = table_capping_signers(1);
-		table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), UnixMillis::new(1_000))?;
-
-		let promoted = table.promote(addr("10.0.0.1:9000"), Some(b"signer-a"), UnixMillis::new(2_000))?;
-		assert!(!promoted);
-		assert_eq!(table.learned()?, (0, 1));
-		Ok(())
-	}
-
-	#[test]
-	fn promote_sets_no_cap_by_default() {
-		let table = PeerTable::default();
-		assert_eq!(promotions_of_two_signers(&table), [true, true, true]);
-	}
-
-	#[test]
-	fn exclude_self_blocks_learning_own_address() -> Result<(), ClusterError> {
+	fn exclude_self_blocks_learning_own_address() -> TestResult {
 		let table = PeerTable::default();
 		table.exclude_self(PeerAddress::fixture("10.0.0.1:9000"))?;
 
-		let admitted = table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		let promoted = table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
-		assert_eq!(admitted, 0);
-		assert!(!promoted);
+		let admitted = table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
+		let promoted = table.promote(AdmittedDial::fixture("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
+		assert_eq!((admitted, promoted), (0, false));
 		Ok(())
 	}
 
-	// A gateway learns its own address before it excludes it when a PEX
-	// reply lands first, so exclusion evicts what the table already holds.
-	#[test]
-	fn exclude_self_evicts_an_address_already_learned() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
+	/// A removal of the candidate `10.0.0.1` and of the tried peer
+	/// `10.1.0.1`.
+	type Remove = fn(&PeerTable, &str) -> Result<(), ClusterError>;
 
-		table.exclude_self(PeerAddress::fixture("10.0.0.1:9000"))?;
-		table.exclude_self(PeerAddress::fixture("10.1.0.1:9000"))?;
+	// An exclusion of the gateway's own address evicts what the table already
+	// holds, as a gateway does when a PEX reply lands before its exclusion. A
+	// discard prunes the candidates alone, and an expulsion clears both
+	// learned sets.
+	tb_cases! {
+		fn removing_a_new_and_a_tried_address((remove, learned): (Remove, (usize, usize))) -> TestResult {
+			let table = with_new_and_tried(PeerTable::default());
 
-		assert_eq!(table.learned()?, (0, 0));
-		Ok(())
-	}
+			remove(&table, "10.0.0.1:9000")?;
+			remove(&table, "10.1.0.1:9000")?;
 
-	#[test]
-	fn discard_prunes_only_the_new_table() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
-
-		table.discard(addr("10.0.0.1:9000"))?;
-		table.discard(addr("10.1.0.1:9000"))?;
-		assert_eq!(table.learned()?, (0, 1));
-		Ok(())
+			assert_eq!(table.learned()?, learned);
+			Ok(())
+		}
+		cases {
+			exclude_self => (|table, spelling| table.exclude_self(PeerAddress::fixture(spelling)), (0, 0)),
+			discard => (|table, spelling| table.discard(AdmittedDial::fixture(spelling)), (0, 1)),
+			expel => (|table, spelling| table.expel(AdmittedDial::fixture(spelling)), (0, 0)),
+		}
 	}
 
 	/// Records `failures` beat failures against `peer` and answers whether
 	/// each one evicted it.
-	fn evictions_over(table: &PeerTable, peer: AdmittedDial, failures: usize) -> Result<Vec<bool>, ClusterError> {
-		let mut evictions = Vec::with_capacity(failures);
-		for _ in 0..failures {
-			evictions.push(table.record_failure(peer)?);
-		}
-
-		Ok(evictions)
+	fn evictions_over(table: &PeerTable, peer: &str, failures: usize) -> Vec<bool> {
+		let record = |_| table.record_failure(AdmittedDial::fixture(peer));
+		let evictions: Result<Vec<bool>, ClusterError> = (0..failures).map(record).collect();
+		evictions.expect("a fresh table lock is not poisoned")
 	}
 
+	/// A tried peer that fails at the threshold leaves the table on that
+	/// failure.
 	#[test]
-	fn record_failure_evicts_tried_peer_at_threshold() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
+	fn record_failure_evicts_tried_peer_at_threshold() -> TestResult {
+		let table = with_tried(PeerTable::default(), &[("10.0.0.1:9000", None)]);
 
-		let evictions = evictions_over(&table, addr("10.0.0.1:9000"), MAX_PEER_TRIED_FAILURES)?;
+		let evictions = evictions_over(&table, "10.0.0.1:9000", MAX_PEER_TRIED_FAILURES);
 
-		assert_eq!(evictions, vec![false, false, true]);
-		assert_eq!(table.learned()?, (0, 0));
+		assert_eq!((evictions, table.learned()?), (vec![false, false, true], (0, 0)));
 		Ok(())
 	}
 
+	/// A verified probe resets the failure count, so the failures after it
+	/// count from zero.
 	#[test]
-	fn verified_probe_resets_failure_count() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
-		table.record_failure(addr("10.0.0.1:9000"))?;
-		table.record_failure(addr("10.0.0.1:9000"))?;
+	fn verified_probe_resets_failure_count() -> TestResult {
+		let table = with_tried(PeerTable::default(), &[("10.0.0.1:9000", None)]);
+		evictions_over(&table, "10.0.0.1:9000", 2);
 
-		table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(2_000))?;
+		table.promote(AdmittedDial::fixture("10.0.0.1:9000"), None, UnixMillis::new(2_000))?;
 
-		table.record_failure(addr("10.0.0.1:9000"))?;
-		table.record_failure(addr("10.0.0.1:9000"))?;
-		assert_eq!(table.learned()?, (0, 1));
+		let evictions = evictions_over(&table, "10.0.0.1:9000", 2);
+		assert_eq!((evictions, table.learned()?), (vec![false, false], (0, 1)));
 		Ok(())
 	}
 
+	/// A failure evicts no anchor and no address the table never learned.
 	#[test]
-	fn record_failure_ignores_anchors_and_unknown_addresses() -> Result<(), ClusterError> {
+	fn record_failure_ignores_anchors_and_unknown_addresses() -> TestResult {
 		let table = table_with_anchor("127.0.0.1:9000");
-		let anchor_evicted = table.record_failure(addr("127.0.0.1:9000"))?;
-		let unknown_evicted = table.record_failure(addr("10.0.0.1:9000"))?;
-		assert!(!anchor_evicted);
-		assert!(!unknown_evicted);
+
+		let anchor_evicted = table.record_failure(AdmittedDial::fixture("127.0.0.1:9000"))?;
+		let unknown_evicted = table.record_failure(AdmittedDial::fixture("10.0.0.1:9000"))?;
+		assert_eq!((anchor_evicted, unknown_evicted), (false, false));
 		Ok(())
 	}
 
+	/// An eviction frees the slot of its prefix bucket for the next peer.
 	#[test]
-	fn eviction_frees_the_prefix_bucket_slot() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		for host in 0..MAX_PEER_BUCKET {
-			table.promote(addr(format!("10.0.0.{}:9000", host + 1)), None, UnixMillis::new(1_000))?;
-		}
+	fn eviction_frees_the_prefix_bucket_slot() -> TestResult {
+		let table = table_with_a_full_tried_bucket();
+		let refused = table.promote(AdmittedDial::fixture("10.0.9.9:9000"), None, UnixMillis::new(2_000))?;
 
-		assert!(!table.promote(addr("10.0.9.9:9000"), None, UnixMillis::new(2_000))?);
+		evictions_over(&table, "10.0.0.1:9000", MAX_PEER_TRIED_FAILURES);
 
-		for _ in 0..MAX_PEER_TRIED_FAILURES {
-			table.record_failure(addr("10.0.0.1:9000"))?;
-		}
-
-		assert!(table.promote(addr("10.0.9.9:9000"), None, UnixMillis::new(3_000))?);
+		let admitted = table.promote(AdmittedDial::fixture("10.0.9.9:9000"), None, UnixMillis::new(3_000))?;
+		assert_eq!((refused, admitted), (false, true));
 		Ok(())
 	}
 
+	/// A failed probe keeps the candidate, so a relearn of it adds nothing.
 	#[test]
-	fn record_probe_failure_keeps_the_candidate_in_new() -> Result<(), ClusterError> {
+	fn record_probe_failure_keeps_the_candidate_in_new() -> TestResult {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
+		table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
+		table.record_probe_failure(AdmittedDial::fixture("10.0.0.1:9000"), UnixMillis::new(1_000))?;
 
-		table.record_probe_failure(addr("10.0.0.1:9000"), UnixMillis::new(1_000))?;
-		let relearned = table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-
-		assert_eq!(relearned, 0);
-		assert_eq!(table.learned()?, (1, 0));
+		let relearned = table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
+		assert_eq!((relearned, table.learned()?), (0, (1, 0)));
 		Ok(())
 	}
 
-	// The failed candidate carries the older stamp, so the stamp alone would
-	// draw it first.
+	/// A probe sample draws a failed candidate after a fresher one. The failed
+	/// candidate carries the older stamp, so the stamp alone would draw it
+	/// first.
 	#[test]
-	fn probe_sample_draws_a_failed_candidate_after_a_fresher_one() -> Result<(), ClusterError> {
+	fn probe_sample_draws_a_failed_candidate_after_a_fresher_one() -> TestResult {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.2:9000")], UnixMillis::default())?;
+		let hints = vec![PeerHint::fixture("10.0.0.1:9000"), PeerHint::fixture("10.0.0.2:9000")];
+		table.learn(hints, UnixMillis::default())?;
 		table.probe_sample(UnixMillis::new(2_000))?;
-		table.record_probe_failure(addr("10.0.0.1:9000"), UnixMillis::new(1_000))?;
+		table.record_probe_failure(AdmittedDial::fixture("10.0.0.1:9000"), UnixMillis::new(1_000))?;
 
 		let sample = table.probe_sample(UnixMillis::new(3_000))?;
-		assert_eq!(sample, vec![addr("10.0.0.2:9000"), addr("10.0.0.1:9000")]);
+		let fresher_first = vec![AdmittedDial::fixture("10.0.0.2:9000"), AdmittedDial::fixture("10.0.0.1:9000")];
+		assert_eq!(sample, fresher_first);
 		Ok(())
 	}
 
-	/// A table whose `10.0.0.0/16` bucket is full of untested candidates.
-	fn table_with_a_full_bucket() -> PeerTable {
-		let table = PeerTable::default();
-		let residents: Vec<PeerHint> = (1..=MAX_PEER_BUCKET).map(|host| hint(format!("10.0.0.{host}:9000"))).collect();
-		let learned = table.learn(residents, UnixMillis::default());
-		learned.expect("a fresh table lock is not poisoned");
-
-		table
-	}
-
+	/// A full bucket gives the slot of a failed candidate to a newcomer. The
+	/// table admits the failed address again at the end, which it can do only
+	/// if the newcomer took its slot.
 	#[test]
-	fn a_full_bucket_refuses_a_newcomer_while_no_candidate_has_failed() -> Result<(), ClusterError> {
+	fn a_full_bucket_gives_the_slot_of_a_failed_candidate_to_a_newcomer() -> TestResult {
 		let table = table_with_a_full_bucket();
-		let admitted = table.learn(vec![hint("10.0.0.200:9000")], UnixMillis::default())?;
-		assert_eq!(admitted, 0);
-		Ok(())
-	}
+		table.record_probe_failure(AdmittedDial::fixture("10.0.0.3:9000"), UnixMillis::new(1_000))?;
 
-	// The table admits the failed address again at the end, which it can do
-	// only if the newcomer took its slot.
-	#[test]
-	fn a_full_bucket_gives_the_slot_of_a_failed_candidate_to_a_newcomer() -> Result<(), ClusterError> {
-		let table = table_with_a_full_bucket();
-		table.record_probe_failure(addr("10.0.0.3:9000"), UnixMillis::new(1_000))?;
+		let newcomer = table.learn(vec![PeerHint::fixture("10.0.0.200:9000")], UnixMillis::default())?;
+		table.record_probe_failure(AdmittedDial::fixture("10.0.0.5:9000"), UnixMillis::new(2_000))?;
 
-		let newcomer = table.learn(vec![hint("10.0.0.200:9000")], UnixMillis::default())?;
-		table.record_probe_failure(addr("10.0.0.5:9000"), UnixMillis::new(2_000))?;
-
-		let returned = table.learn(vec![hint("10.0.0.3:9000")], UnixMillis::default())?;
+		let returned = table.learn(vec![PeerHint::fixture("10.0.0.3:9000")], UnixMillis::default())?;
 		assert_eq!((newcomer, returned), (1, 1));
 		assert_eq!(table.learned()?, (MAX_PEER_BUCKET, 0));
 		Ok(())
 	}
 
+	/// An expelled anchor leaves the peer exchange sample and stays a target.
 	#[test]
-	fn expel_clears_both_learned_tables() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
-		table.expel(addr("10.0.0.1:9000"))?;
-		table.expel(addr("10.1.0.1:9000"))?;
-		assert_eq!(table.learned()?, (0, 0));
+	fn expel_takes_a_verified_anchor_out_of_the_pex_sample() -> TestResult {
+		let table = with_tried(table_with_anchor("127.0.0.1:9000"), &[("127.0.0.1:9000", Some(b"fp-a"))]);
+		table.expel(AdmittedDial::fixture("127.0.0.1:9000"))?;
+
+		let shared = table.sample_for_pex(8)?;
+		let anchor = AdmittedDial::fixture("127.0.0.1:9000");
+		assert_eq!((shared.len(), table.target_set()?), (0, vec![anchor]));
 		Ok(())
 	}
 
+	/// The target set leads with the anchors, then the tried peers, and
+	/// leaves the candidates out.
 	#[test]
-	fn expel_takes_a_verified_anchor_out_of_the_pex_sample() -> Result<(), ClusterError> {
-		let table = table_with_anchor("127.0.0.1:9000");
-		table.promote(addr("127.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-		table.expel(addr("127.0.0.1:9000"))?;
-		assert!(table.sample_for_pex(8)?.is_empty());
-		assert_eq!(table.target_set()?, vec![addr("127.0.0.1:9000")]);
-		Ok(())
-	}
-
-	#[test]
-	fn target_set_leads_with_anchors_and_hides_new() -> Result<(), ClusterError> {
-		let table = table_with_anchor("127.0.0.1:9000");
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
+	fn target_set_leads_with_anchors_and_hides_new() -> TestResult {
+		let table = with_new_and_tried(table_with_anchor("127.0.0.1:9000"));
 
 		let targets = table.target_set()?;
-		assert_eq!(targets, vec![addr("127.0.0.1:9000"), addr("10.1.0.1:9000")]);
+		let anchor_then_tried = vec![AdmittedDial::fixture("127.0.0.1:9000"), AdmittedDial::fixture("10.1.0.1:9000")];
+		assert_eq!(targets, anchor_then_tried);
 		Ok(())
 	}
 
+	/// A probe sample takes one beat's worth of candidates across the prefix
+	/// buckets, so a crowded bucket leaves room for another prefix.
 	#[test]
-	fn probe_sample_spans_prefix_buckets() -> Result<(), ClusterError> {
+	fn probe_sample_spans_prefix_buckets() -> TestResult {
 		let table = PeerTable::default();
-		let crowded: Vec<PeerHint> = (0..PEER_PROBE_PER_BEAT + 2)
-			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
-			.collect();
-
-		table.learn(crowded, UnixMillis::default())?;
-		table.learn(vec![hint("10.1.0.1:9000")], UnixMillis::default())?;
+		table.learn(bucket_hints(PEER_PROBE_PER_BEAT + 2), UnixMillis::default())?;
+		table.learn(vec![PeerHint::fixture("10.1.0.1:9000")], UnixMillis::default())?;
 
 		let sample = table.probe_sample(UnixMillis::new(1_000))?;
-		assert_eq!(sample.len(), PEER_PROBE_PER_BEAT);
-		assert!(sample.contains(&addr("10.1.0.1:9000")));
+		let spans = sample.contains(&AdmittedDial::fixture("10.1.0.1:9000"));
+		assert_eq!((sample.len(), spans), (PEER_PROBE_PER_BEAT, true));
 		Ok(())
 	}
 
+	/// The walk of a probe sample starts after the last prefix it served and
+	/// wraps, so a backlog that fits one beat is drawn whole, from its lowest
+	/// prefix, on each beat.
 	#[test]
-	fn probe_sample_rotates_through_backlog() -> Result<(), ClusterError> {
+	fn probe_sample_rotates_through_backlog() -> TestResult {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000"), hint("10.1.0.1:9000")], UnixMillis::default())?;
+		let hints = vec![PeerHint::fixture("10.0.0.1:9000"), PeerHint::fixture("10.1.0.1:9000")];
+		table.learn(hints, UnixMillis::default())?;
 
 		let first = table.probe_sample(UnixMillis::new(1_000))?;
 		let second = table.probe_sample(UnixMillis::new(2_000))?;
-		assert_eq!(first.len(), 2);
-		assert_eq!(second.len(), 2);
+
+		let low = AdmittedDial::fixture("10.0.0.1:9000");
+		let high = AdmittedDial::fixture("10.1.0.1:9000");
+		assert_eq!((first, second), (vec![low, high], vec![low, high]));
 		Ok(())
 	}
 
@@ -1304,20 +1376,22 @@ mod tests {
 	/// from `10.0.0.1` upward.
 	fn table_with_a_candidate_per_prefix(prefixes: usize) -> PeerTable {
 		let table = PeerTable::default();
-		let hints: Vec<PeerHint> = (0..prefixes).map(|prefix| hint(format!("10.{prefix}.0.1:9000"))).collect();
+		let hint = |prefix| PeerHint::fixture(format!("10.{prefix}.0.1:9000"));
+		let hints: Vec<PeerHint> = (0..prefixes).map(hint).collect();
 		let learned = table.learn(hints, UnixMillis::default());
 		learned.expect("a fresh table lock is not poisoned");
 		table
 	}
 
-	// One more prefix holds a candidate than a beat can probe. A walk that
-	// always starts at the lowest prefix never reaches the last one.
+	/// A probe sample starts after the last prefix it served. One more prefix
+	/// holds a candidate than a beat can probe, and a walk that always starts
+	/// at the lowest prefix never reaches the last one.
 	#[test]
-	fn probe_sample_starts_after_the_last_prefix_it_served() -> Result<(), ClusterError> {
+	fn probe_sample_starts_after_the_last_prefix_it_served() -> TestResult {
 		let table = table_with_a_candidate_per_prefix(PEER_PROBE_PER_BEAT + 1);
 		table.probe_sample(UnixMillis::new(1_000))?;
 
-		let last_prefix = addr(format!("10.{PEER_PROBE_PER_BEAT}.0.1:9000"));
+		let last_prefix = AdmittedDial::fixture(format!("10.{PEER_PROBE_PER_BEAT}.0.1:9000"));
 		let second = table.probe_sample(UnixMillis::new(2_000))?;
 		assert_eq!(second.first(), Some(&last_prefix));
 		Ok(())
@@ -1327,31 +1401,31 @@ mod tests {
 	/// `prefixes` prefixes of [`table_with_a_candidate_per_prefix`].
 	fn fail_lowest_prefixes(table: &PeerTable, prefixes: usize, now: UnixMillis) {
 		for prefix in 0..prefixes {
-			let failed = table.record_probe_failure(addr(format!("10.{prefix}.0.1:9000")), now);
+			let failed = table.record_probe_failure(AdmittedDial::fixture(format!("10.{prefix}.0.1:9000")), now);
 			failed.expect("a fresh table lock is not poisoned");
 		}
 	}
 
-	// The sample skips the candidate one millisecond before its wait ends.
+	/// The sample skips a failed candidate one millisecond before its wait
+	/// ends, and draws it once the wait has passed.
 	#[test]
-	fn probe_sample_skips_a_failed_candidate_until_its_wait_has_passed() -> Result<(), ClusterError> {
+	fn probe_sample_skips_a_failed_candidate_until_its_wait_has_passed() -> TestResult {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		table.record_probe_failure(addr("10.0.0.1:9000"), UnixMillis::new(10_000))?;
+		table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
+		table.record_probe_failure(AdmittedDial::fixture("10.0.0.1:9000"), UnixMillis::new(10_000))?;
 
 		let early = table.probe_sample(UnixMillis::new(10_000 + PEER_PROBE_BACKOFF_MS - 1))?;
 		let due = table.probe_sample(UnixMillis::new(10_000 + PEER_PROBE_BACKOFF_MS))?;
-		assert!(early.is_empty());
-		assert_eq!(due, vec![addr("10.0.0.1:9000")]);
+		assert_eq!((early, due), (vec![], vec![AdmittedDial::fixture("10.0.0.1:9000")]));
 		Ok(())
 	}
 
-	// Dead addresses fill the lowest prefixes, as many as a beat probes. While
-	// they wait, the one live prefix above them takes the probe.
+	/// Dead addresses fill the lowest prefixes, as many as a beat probes. While
+	/// they wait, the one live prefix above them takes the probe.
 	#[test]
-	fn waiting_candidates_yield_their_slots_to_another_prefix() -> Result<(), ClusterError> {
+	fn waiting_candidates_yield_their_slots_to_another_prefix() -> TestResult {
 		let table = table_with_a_candidate_per_prefix(PEER_PROBE_PER_BEAT + 1);
-		let live_prefix = addr(format!("10.{PEER_PROBE_PER_BEAT}.0.1:9000"));
+		let live_prefix = AdmittedDial::fixture(format!("10.{PEER_PROBE_PER_BEAT}.0.1:9000"));
 		fail_lowest_prefixes(&table, PEER_PROBE_PER_BEAT, UnixMillis::new(10_000));
 
 		let sample = table.probe_sample(UnixMillis::new(10_000 + PEER_PROBE_BACKOFF_MS - 1))?;
@@ -1359,39 +1433,38 @@ mod tests {
 		Ok(())
 	}
 
+	/// The stamp of the last probe of each entry that the backoff cases read.
+	const LAST_PROBE: u64 = 1_000_000;
+
+	// A failed probe doubles the wait up to its ceiling. The last probe stamp
+	// of the backward row lies after `now`, as a backward clock step leaves
+	// it, and the step holds no failed candidate out.
 	tb_cases! {
-		fn a_failed_probe_doubles_the_wait_up_to_its_ceiling((failures, waited_ms, due): (usize, u64, bool)) {
-			let entry = PeerEntry { peer_id: None, last_probe: UnixMillis::new(1_000_000), failures };
-			let now = UnixMillis::new(1_000_000 + waited_ms);
-			assert_eq!(entry.probe_due(now), due);
+		fn a_failed_probe_doubles_the_wait_up_to_its_ceiling((failures, now, due): (usize, u64, bool)) {
+			let entry = PeerEntry { peer_id: None, last_probe: UnixMillis::new(LAST_PROBE), failures };
+			assert_eq!(entry.probe_due(UnixMillis::new(now)), due);
 		}
 		cases {
-			never_failed => (0, 0, true),
-			one_failure_early => (1, PEER_PROBE_BACKOFF_MS - 1, false),
-			one_failure_due => (1, PEER_PROBE_BACKOFF_MS, true),
-			two_failures_early => (2, 2 * PEER_PROBE_BACKOFF_MS - 1, false),
-			two_failures_due => (2, 2 * PEER_PROBE_BACKOFF_MS, true),
-			ceiling_early => (usize::MAX, PEER_PROBE_BACKOFF_MAX_MS - 1, false),
-			ceiling_due => (usize::MAX, PEER_PROBE_BACKOFF_MAX_MS, true),
+			never_failed => (0, LAST_PROBE, true),
+			one_failure_early => (1, LAST_PROBE + PEER_PROBE_BACKOFF_MS - 1, false),
+			one_failure_due => (1, LAST_PROBE + PEER_PROBE_BACKOFF_MS, true),
+			two_failures_early => (2, LAST_PROBE + 2 * PEER_PROBE_BACKOFF_MS - 1, false),
+			two_failures_due => (2, LAST_PROBE + 2 * PEER_PROBE_BACKOFF_MS, true),
+			ceiling_early => (usize::MAX, LAST_PROBE + PEER_PROBE_BACKOFF_MAX_MS - 1, false),
+			ceiling_due => (usize::MAX, LAST_PROBE + PEER_PROBE_BACKOFF_MAX_MS, true),
+			backward_clock_step => (1, LAST_PROBE - PEER_PROBE_BACKOFF_MS, true),
 		}
 	}
 
-	// The last probe stamp lies after `now`, as a backward clock step leaves
-	// it.
+	/// Of the advertised sockets, the table holds its candidate and its tried
+	/// peer and drops the one it expelled. The anchor is configured and no
+	/// beat has verified it, so the table holds no entry for it. The table
+	/// never learned the last address.
 	#[test]
-	fn a_backward_clock_step_does_not_hold_a_failed_candidate_out() {
-		let entry = PeerEntry { peer_id: None, last_probe: UnixMillis::new(1_000_000), failures: 1 };
-		assert!(entry.probe_due(UnixMillis::new(1_000_000 - PEER_PROBE_BACKOFF_MS)));
-	}
-
-	// The anchor is configured and no beat has verified it, so the table holds
-	// no entry for it. The table never learned the last address.
-	#[test]
-	fn held_among_keeps_what_the_table_holds_and_drops_what_it_expelled() -> Result<(), ClusterError> {
-		let table = table_with_anchor("127.0.0.1:9000");
-		table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.2:9000")], UnixMillis::default())?;
-		table.promote(addr("10.1.0.1:9000"), None, UnixMillis::new(1_000))?;
-		table.expel(addr("10.0.0.2:9000"))?;
+	fn held_among_keeps_what_the_table_holds_and_drops_what_it_expelled() -> TestResult {
+		let table = with_new_and_tried(table_with_anchor("127.0.0.1:9000"));
+		table.learn(vec![PeerHint::fixture("10.0.0.2:9000")], UnixMillis::default())?;
+		table.expel(AdmittedDial::fixture("10.0.0.2:9000"))?;
 
 		let advertised = [
 			"10.0.0.1:9000",
@@ -1407,110 +1480,123 @@ mod tests {
 		Ok(())
 	}
 
-	// The same walk serves peer exchange, so a second reply starts where the
-	// first one stopped.
+	/// The same walk serves peer exchange, so a second reply starts where the
+	/// first one stopped.
 	#[test]
-	fn sample_for_pex_starts_after_the_last_prefix_it_served() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-		table.promote(addr("10.1.0.1:9000"), Some(b"fp-b"), UnixMillis::new(1_000))?;
-		table.promote(addr("10.2.0.1:9000"), Some(b"fp-c"), UnixMillis::new(1_000))?;
+	fn sample_for_pex_starts_after_the_last_prefix_it_served() -> TestResult {
+		let tried: &[(&str, Option<&[u8]>)] = &[
+			("10.0.0.1:9000", Some(b"fp-a")),
+			("10.1.0.1:9000", Some(b"fp-b")),
+			("10.2.0.1:9000", Some(b"fp-c")),
+		];
+		let table = with_tried(PeerTable::default(), tried);
 		table.sample_for_pex(2)?;
 
 		let second = table.sample_for_pex(2)?;
-		let addrs: Vec<PeerAddress> = second.iter().map(|record| record.gateway_addr).collect();
+
 		let wrapped = vec![PeerAddress::fixture("10.2.0.1:9000"), PeerAddress::fixture("10.0.0.1:9000")];
-		assert_eq!(addrs, wrapped);
+		assert_eq!(addresses(&second), wrapped);
 		Ok(())
 	}
 
+	/// A peer exchange sample takes the cap across the prefix buckets.
 	#[test]
-	fn sample_for_pex_caps_and_spans_buckets() -> Result<(), ClusterError> {
-		let table = PeerTable::default();
-		table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), UnixMillis::new(1_000))?;
-		table.promote(addr("10.0.0.2:9000"), Some(b"fp-b"), UnixMillis::new(1_000))?;
-		table.promote(addr("10.1.0.1:9000"), Some(b"fp-c"), UnixMillis::new(1_000))?;
+	fn sample_for_pex_caps_and_spans_buckets() -> TestResult {
+		let tried: &[(&str, Option<&[u8]>)] = &[
+			("10.0.0.1:9000", Some(b"fp-a")),
+			("10.0.0.2:9000", Some(b"fp-b")),
+			("10.1.0.1:9000", Some(b"fp-c")),
+		];
+		let table = with_tried(PeerTable::default(), tried);
 
 		let sample = table.sample_for_pex(2)?;
-		let addrs: Vec<PeerAddress> = sample.iter().map(|record| record.gateway_addr).collect();
-		assert_eq!(sample.len(), 2);
-		assert!(addrs.contains(&PeerAddress::fixture("10.1.0.1:9000")));
+		let spans = addresses(&sample).contains(&PeerAddress::fixture("10.1.0.1:9000"));
+		assert_eq!((sample.len(), spans), (2, true));
 		Ok(())
 	}
 
+	/// A peer exchange sample shares tried peers alone.
 	#[test]
-	fn sample_for_pex_shares_only_tried_peers() -> Result<(), ClusterError> {
+	fn sample_for_pex_shares_only_tried_peers() -> TestResult {
 		let table = PeerTable::default();
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
+		table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
 
 		let sample = table.sample_for_pex(8)?;
 		assert!(sample.is_empty());
 		Ok(())
 	}
 
+	/// Hydration replays each record through the caps of a learn.
 	#[test]
-	fn hydrate_replays_records_through_caps() -> Result<(), ClusterError> {
-		let mut seed: Vec<PeerRecord> = (0..MAX_PEER_BUCKET + 2)
-			.map(|host| record(format!("10.0.0.{}:9000", host + 1), false))
-			.collect();
+	fn hydrate_replays_records_through_caps() -> TestResult {
+		let mut seed = bucket_records(MAX_PEER_BUCKET + 2);
 		seed.push(record("10.1.0.1:9000", true));
 
-		let table = table_over(Arc::new(CountingStore::seeded(seed)));
+		let table = table_over(Arc::new(RecordingStore::seeded(seed)));
 		assert_eq!(table.learned()?, (MAX_PEER_BUCKET, 1));
 		Ok(())
 	}
 
-	// Hydration drops a record the current dial policy refuses, so a policy
-	// the operator tightened between runs binds the persisted peers too.
+	/// Hydration drops a record the current dial policy refuses, so a policy
+	/// the operator tightened between runs binds the persisted peers too.
 	#[test]
-	fn hydrate_drops_records_the_dial_policy_refuses() -> Result<(), ClusterError> {
+	fn hydrate_drops_records_the_dial_policy_refuses() -> TestResult {
 		let seed = vec![record("192.0.2.7:9000", true), record("10.0.0.1:9000", true)];
+		let store = Arc::new(RecordingStore::seeded(seed));
 
-		let table = PeerTable::new(&PeerConfig::allowing(["10.0.0.1:9000"]), Arc::new(CountingStore::seeded(seed)));
-
+		let table = PeerTable::new(&PeerConfig::allowing(["10.0.0.1:9000"]), store);
 		let targets: Vec<PeerAddress> = table.target_set()?.iter().map(AdmittedDial::address).collect();
 		assert_eq!(targets, vec![PeerAddress::fixture("10.0.0.1:9000")]);
 		Ok(())
 	}
 
+	/// Each mutation writes the whole table through the driver.
 	#[test]
-	fn mutations_persist_through_the_driver() -> Result<(), ClusterError> {
-		let store = Arc::new(CountingStore::seeded(Vec::new()));
-		let driver: Arc<dyn PeerStore> = store.clone();
-		let table = table_over(driver);
-
-		table.learn(vec![hint("10.0.0.1:9000")], UnixMillis::default())?;
-		table.promote(addr("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
-		assert_eq!(store.persists.load(Ordering::SeqCst), 2);
+	fn mutations_persist_through_the_driver() -> TestResult {
+		let store = Arc::new(RecordingStore::default());
+		let table = table_over(Arc::clone(&store) as Arc<dyn PeerStore>);
+		table.learn(vec![PeerHint::fixture("10.0.0.1:9000")], UnixMillis::default())?;
+		table.promote(AdmittedDial::fixture("10.0.0.1:9000"), None, UnixMillis::new(1_000))?;
+		assert_eq!(store.widths(), vec![1, 1]);
 		Ok(())
+	}
+
+	/// A newer snapshot written first leaves a stale one no slot, so the
+	/// driver keeps the newer one alone (CWE-362).
+	#[test]
+	fn a_stale_snapshot_that_lands_after_a_newer_one_is_dropped() {
+		let store = Arc::new(RecordingStore::default());
+		let table = table_over(Arc::clone(&store) as Arc<dyn PeerStore>);
+		table.persist_at(2, bucket_records(2));
+
+		table.persist_at(1, bucket_records(1));
+
+		assert_eq!(store.widths(), vec![2]);
 	}
 
 	/// A driver that stalls its first write until the test releases it, and
 	/// records the row count each snapshot carried.
-	#[derive(Debug, Default)]
+	///
+	/// The house memory driver writes at once, so a test of the order of two
+	/// writes that one stall holds apart holds this driver.
 	struct StallingStore {
-		widths: Mutex<Vec<usize>>,
-		started: AtomicUsize,
-		released: AtomicBool,
+		recorded: RecordingStore,
+		entered: Sender<()>,
+		release: Mutex<Receiver<()>>,
+		stalled: AtomicUsize,
 	}
 
 	impl StallingStore {
-		/// Blocks until the driver has entered its first write.
-		fn await_first_write(&self) {
-			while self.started.load(Ordering::SeqCst) == 0 {
-				std::thread::yield_now();
+		/// A driver that signals `entered` as its first write starts, and
+		/// stalls that write until `release` receives.
+		fn new(entered: Sender<()>, release: Receiver<()>) -> Self {
+			let release = Mutex::new(release);
+			Self {
+				recorded: RecordingStore::default(),
+				entered,
+				release,
+				stalled: AtomicUsize::new(0),
 			}
-		}
-
-		/// Blocks the caller until [`StallingStore::release`] runs.
-		fn await_release(&self) {
-			while !self.released.load(Ordering::SeqCst) {
-				std::thread::yield_now();
-			}
-		}
-
-		fn release(&self) {
-			self.released.store(true, Ordering::SeqCst);
 		}
 	}
 
@@ -1520,56 +1606,73 @@ mod tests {
 		}
 
 		fn persist(&self, records: &[PeerRecord]) -> Result<(), ClusterError> {
-			if self.started.fetch_add(1, Ordering::SeqCst) == 0 {
-				self.await_release();
+			if self.stalled.fetch_add(1, Ordering::SeqCst) == 0 {
+				self.entered.send(()).expect("the test awaits the first write");
+				let release = self.release.lock().expect("the release lock is live");
+				release.recv().expect("the test releases the first write");
 			}
 
-			if let Ok(mut widths) = self.widths.lock() {
-				widths.push(records.len());
-			}
-
-			Ok(())
+			self.recorded.persist(records)
 		}
 	}
 
+	/// The value of the thread of `handle`, once it ends.
+	fn joined<T>(handle: JoinHandle<T>) -> T {
+		handle.join().expect("the thread ends without a panic")
+	}
+
+	/// A thread that has `table` learn the hint of `spelling`.
+	fn learn_on(table: &Arc<PeerTable>, spelling: &'static str) -> JoinHandle<Result<usize, ClusterError>> {
+		let table = Arc::clone(table);
+		std::thread::spawn(move || table.learn(vec![PeerHint::fixture(spelling)], UnixMillis::default()))
+	}
+
+	/// Whether a writer that reached the driver gate of `table` now would wait
+	/// for the write that holds the gate.
+	fn gate_held(table: &PeerTable) -> bool {
+		let attempt = table.persisted.try_lock();
+		matches!(attempt, Err(TryLockError::WouldBlock))
+	}
+
 	/// A snapshot taken under the guard holds every earlier change, so the
-	/// driver's rows only ever grow. A stale snapshot that lands after a newer
-	/// one would hydrate peers a later mutation removed (CWE-362).
+	/// driver's rows only ever grow (CWE-362).
 	///
-	/// The first write stalls inside the driver while a second mutation
-	/// runs, which is the interleaving that reorders unguarded writes.
+	/// The test reaches the driver gate while the first write stalls in the
+	/// driver, and finds the gate held until that write lands.
 	#[test]
-	fn driver_writes_land_in_generation_order() -> Result<(), ClusterError> {
-		let store = Arc::new(StallingStore::default());
+	fn driver_writes_land_in_generation_order() -> TestResult {
+		let ((entered, first_write), (release, released)) = (mpsc::channel(), mpsc::channel());
+		let store = Arc::new(StallingStore::new(entered, released));
 		let table = Arc::new(table_over(Arc::clone(&store) as Arc<dyn PeerStore>));
-		let first = Arc::clone(&table);
-		let stalled = std::thread::spawn(move || first.learn(vec![hint("10.1.0.1:9000")], UnixMillis::default()));
+		let stalled = learn_on(&table, "10.1.0.1:9000");
+		first_write.recv()?;
 
-		store.await_first_write();
+		let held = gate_held(&table);
+		let follower = learn_on(&table, "10.2.0.1:9000");
+		release.send(())?;
 
-		let second = Arc::clone(&table);
-		let follower = std::thread::spawn(move || second.learn(vec![hint("10.2.0.1:9000")], UnixMillis::default()));
-
-		std::thread::sleep(Duration::from_millis(50));
-		store.release();
-		stalled.join().expect("thread joins")?;
-		follower.join().expect("thread joins")?;
-
-		let widths = store.widths.lock().expect("driver handle").clone();
-		assert!(widths.windows(2).all(|pair| pair[0] <= pair[1]));
-		assert_eq!(widths.last().copied(), Some(2));
-
+		let learned = (joined(stalled)?, joined(follower)?);
+		assert_eq!((held, learned, store.recorded.widths()), (true, (1, 1), vec![1, 2]));
 		Ok(())
 	}
 
 	/// A driver that reaches back into the table while the table writes to
-	/// it.
+	/// it, and keeps the learned total it read.
 	///
 	/// The write runs after the table releases its guard, so this re-entry
-	/// reads the table that called it (CWE-667).
+	/// reads the table that called it (CWE-667). The house memory driver
+	/// holds no table, so a test of that order holds this driver.
+	#[derive(Default)]
 	struct ReentrantStore {
 		table: Mutex<Option<Arc<PeerTable>>>,
 		observed: AtomicUsize,
+	}
+
+	impl ReentrantStore {
+		/// Hands this driver the table it reads back into.
+		fn attach(&self, table: &Arc<PeerTable>) {
+			*self.table.lock().expect("the driver lock is live") = Some(Arc::clone(table));
+		}
 	}
 
 	impl PeerStore for ReentrantStore {
@@ -1588,13 +1691,15 @@ mod tests {
 		}
 	}
 
+	/// The table guard is free while the driver writes, so a driver that reads
+	/// the table back reads it.
 	#[test]
-	fn the_table_lock_is_free_while_the_driver_writes() -> Result<(), ClusterError> {
-		let store = Arc::new(ReentrantStore { table: Mutex::new(None), observed: AtomicUsize::new(0) });
+	fn the_table_lock_is_free_while_the_driver_writes() -> TestResult {
+		let store = Arc::new(ReentrantStore::default());
 		let table = Arc::new(anchored("10.0.0.1:9000", Arc::clone(&store) as Arc<dyn PeerStore>));
+		store.attach(&table);
 
-		*store.table.lock().expect("driver handle") = Some(Arc::clone(&table));
-		table.learn(vec![hint("10.1.0.1:9000")], UnixMillis::default())?;
+		table.learn(vec![PeerHint::fixture("10.1.0.1:9000")], UnixMillis::default())?;
 
 		assert_eq!(store.observed.load(Ordering::SeqCst), 1);
 		Ok(())

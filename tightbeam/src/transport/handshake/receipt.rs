@@ -1027,53 +1027,29 @@ impl SessionReceipt {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::der::{Decode, Encode, Error as DerError};
-
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	use crate::crypto::hash::Sha3_256;
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	use crate::transport::handshake::tests::fixture_transcript;
-
 	#[cfg(all(not(feature = "std"), feature = "transport-hpke"))]
 	use alloc::format;
 	#[cfg(all(feature = "std", feature = "transport-hpke"))]
 	use std::format;
 
-	const SAMPLE_TRANSCRIPT: [u8; 32] = [7u8; 32];
-	const SAMPLE_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 1024 };
-	const SAMPLE_CREDIT_UNIT: u32 = 1024;
+	use super::*;
+	use crate::der::Encode;
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::vectors::unhex;
+	use crate::testing::TestResult;
+	use crate::transport::handshake::tests::fixture_receipt;
 
-	/// [`SAMPLE_TRANSCRIPT`] as the transcript hash a receipt binds.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn sample_transcript() -> TranscriptHash {
-		fixture_transcript::<Sha3_256>(SAMPLE_TRANSCRIPT)
-	}
+	use crate::transport::handshake::tests::{fixture_transcript_hash, FIXTURE_CREDIT_UNIT};
 
-	fn sample_receipt(ancillary: Option<&[u8]>) -> Result<SessionReceipt, DerError> {
-		let ancillary = match ancillary {
-			Some(bytes) => Some(OctetString::new(bytes)?),
-			None => None,
-		};
+	const SAMPLE_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 1024 };
 
-		let algorithm = crate::asn1::AlgorithmIdentifier { oid: crate::oids::HASH_SHA3_256, parameters: None };
-		let digest = OctetString::new(SAMPLE_TRANSCRIPT)?;
-		let receipt = SessionReceipt {
-			transcript_hash: DigestInfo { algorithm, digest },
-			budgets: SAMPLE_BUDGETS,
-			credit_unit: SAMPLE_CREDIT_UNIT,
-			ancillary,
-		};
-		Ok(receipt)
-	}
-
+	// A receipt decodes from its DER to itself, with and without a settlement
+	// challenge: (the challenge).
 	crate::tb_cases! {
-		fn test_session_receipt_der_round_trip(ancillary: Option<&[u8]>) -> Result<(), DerError> {
-			let receipt = sample_receipt(ancillary)?;
-			let der = receipt.to_der()?;
-			let decoded = SessionReceipt::from_der(&der)?;
-			assert_eq!(decoded, receipt);
-			Ok(())
+		fn a_session_receipt_decodes_back_to_itself(ancillary: Option<&[u8]>) {
+			let receipt = fixture_receipt(SAMPLE_BUDGETS, ancillary);
+			assert_eq!(der_round_trip(&receipt), receipt);
 		}
 		cases {
 			with_ancillary_data => Some(b"lnbc-invoice".as_slice()),
@@ -1081,21 +1057,25 @@ mod tests {
 		}
 	}
 
-	// The known answer locks the receipt body DER encoding, because an
-	// encoding change invalidates every signed receipt already issued.
+	/// The receipt body encodes to its known answer. The answer locks the
+	/// encoding, because an encoding change invalidates every signed receipt
+	/// already issued.
 	#[test]
-	fn receipt_body_encoding_known_answer() -> Result<(), DerError> {
-		const KAT_BODY_DER: [u8; 78] = [
-			0x30, 0x4c, 0x30, 0x2f, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08, 0x04,
-			0x20, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-			0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x30, 0x07, 0x02,
-			0x01, 0x40, 0x02, 0x02, 0x04, 0x00, 0x02, 0x02, 0x04, 0x00, 0x04, 0x0c, 0x6c, 0x6e, 0x62, 0x63, 0x2d, 0x69,
-			0x6e, 0x76, 0x6f, 0x69, 0x63, 0x65,
-		];
+	fn the_receipt_body_encodes_to_its_known_answer() -> TestResult {
+		// The body is the SEQUENCE of the SHA3-256 `DigestInfo` over 32 octets
+		// of `0x07`, the budgets 64 and 1024, the credit unit 1024, and the
+		// challenge.
+		const KAT_BODY_DER: &str = concat!(
+			"304c",
+			"302f300b0609608648016503040208",
+			"04200707070707070707070707070707070707070707070707070707070707070707",
+			"300702014002020400",
+			"02020400",
+			"040c6c6e62632d696e766f696365",
+		);
 
-		let receipt = sample_receipt(Some(b"lnbc-invoice"))?;
-		let body_der = receipt.to_der()?;
-		assert_eq!(body_der, KAT_BODY_DER);
+		let receipt = fixture_receipt(SAMPLE_BUDGETS, Some(b"lnbc-invoice"));
+		assert_eq!(receipt.to_der()?, unhex(KAT_BODY_DER));
 		Ok(())
 	}
 
@@ -1103,44 +1083,72 @@ mod tests {
 	mod matching {
 		use super::*;
 
+		// An accept admits the receipt whose presence and terms match its own:
+		// (the receipt, the granted budgets, the credit unit, the receipt the
+		// match keeps).
+		crate::tb_cases! {
+			fn an_accept_admits_the_receipt_that_matches_it(
+				(receipt, granted, unit, kept): (
+					Option<SessionReceipt>,
+					Option<MuxBudgets>,
+					Option<u32>,
+					Option<SessionReceipt>,
+				)
+			) {
+				let matched = SessionReceipt::match_accept(receipt, granted, unit, &fixture_transcript_hash());
+				assert!(matches!(matched, Ok(receipt) if receipt == kept));
+			}
+			cases {
+				unmetered => (None, None, None, None),
+				metered => (
+					Some(fixture_receipt(SAMPLE_BUDGETS, None)),
+					Some(SAMPLE_BUDGETS),
+					Some(FIXTURE_CREDIT_UNIT),
+					Some(fixture_receipt(SAMPLE_BUDGETS, None)),
+				),
+			}
+		}
+
+		/// A grant that arrives with no receipt is a missing receipt.
 		#[test]
-		fn presence_matrix_fails_closed() -> Result<(), DerError> {
-			let receipt = sample_receipt(None)?;
-			let granted = receipt.budgets;
-			let unit = receipt.credit_unit;
-			let match_accept = SessionReceipt::match_accept;
-			assert!(matches!(match_accept(None, None, None, &sample_transcript()), Ok(None)));
-			assert!(matches!(
-				match_accept(None, Some(granted), Some(unit), &sample_transcript()),
-				Err(HandshakeError::ReceiptMissing)
-			));
-			assert!(matches!(
-				match_accept(Some(receipt.to_owned()), None, Some(unit), &sample_transcript()),
-				Err(HandshakeError::ReceiptMismatch)
-			));
-			assert!(matches!(
-				match_accept(Some(receipt), Some(granted), Some(unit), &sample_transcript()),
-				Ok(Some(_))
-			));
-			Ok(())
+		fn a_grant_with_no_receipt_is_a_missing_receipt() {
+			let (granted, unit) = (Some(SAMPLE_BUDGETS), Some(FIXTURE_CREDIT_UNIT));
+			let matched = SessionReceipt::match_accept(None, granted, unit, &fixture_transcript_hash());
+			assert!(matches!(matched, Err(HandshakeError::ReceiptMissing)));
+		}
+
+		// A receipt is a mismatch against an accept that lacks one of its
+		// terms: (the granted budgets, the credit unit).
+		crate::tb_cases! {
+			fn a_receipt_without_its_negotiated_terms_is_a_mismatch(
+				(granted, unit): (Option<MuxBudgets>, Option<u32>)
+			) {
+				let receipt = fixture_receipt(SAMPLE_BUDGETS, None);
+				let matched = SessionReceipt::match_accept(Some(receipt), granted, unit, &fixture_transcript_hash());
+				assert!(matches!(matched, Err(HandshakeError::ReceiptMismatch)));
+			}
+			cases {
+				no_grant => (None, Some(FIXTURE_CREDIT_UNIT)),
+				no_credit_unit => (Some(SAMPLE_BUDGETS), None),
+			}
 		}
 
 		/// A change of one binding of a receipt.
-		type Drift = fn(&mut SessionReceipt) -> Result<(), DerError>;
+		type Drift = fn(&mut SessionReceipt) -> TestResult;
 
 		// Each case drifts one binding of the receipt away from the session.
 		crate::tb_cases! {
-			fn every_binding_drift_is_a_mismatch(drift: Drift) -> Result<(), DerError> {
-				let receipt = sample_receipt(None)?;
+			fn every_binding_drift_is_a_mismatch(drift: Drift) -> TestResult {
+				let receipt = fixture_receipt(SAMPLE_BUDGETS, None);
 				let granted = receipt.budgets;
 				let unit = receipt.credit_unit;
+				let transcript = fixture_transcript_hash();
 
 				let mut drifted = receipt;
 				drift(&mut drifted)?;
-				assert!(matches!(
-					SessionReceipt::match_accept(Some(drifted), Some(granted), Some(unit), &sample_transcript()),
-					Err(HandshakeError::ReceiptMismatch)
-				));
+
+				let matched = SessionReceipt::match_accept(Some(drifted), Some(granted), Some(unit), &transcript);
+				assert!(matches!(matched, Err(HandshakeError::ReceiptMismatch)));
 				Ok(())
 			}
 			cases {
@@ -1162,17 +1170,6 @@ mod tests {
 				},
 			}
 		}
-
-		#[test]
-		fn a_receipt_with_no_negotiated_credit_unit_is_a_mismatch() -> Result<(), DerError> {
-			let receipt = sample_receipt(None)?;
-			let granted = receipt.budgets;
-			assert!(matches!(
-				SessionReceipt::match_accept(Some(receipt), Some(granted), None, &sample_transcript()),
-				Err(HandshakeError::ReceiptMismatch)
-			));
-			Ok(())
-		}
 	}
 
 	#[cfg(feature = "transport-hpke")]
@@ -1181,14 +1178,13 @@ mod tests {
 		use crate::cms::content_info::CmsVersion;
 		use crate::cms::signed_data::SignerInfo;
 		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::crypto::sign::{Signed, SigningIdentity};
 		use crate::crypto::x509::utils::CertificateExt;
 		use crate::crypto::x509::KeyPurposes;
 		use crate::der::asn1::SetOfVec;
 		use crate::oids::{ATTR_CMS_ALGORITHM_PROTECTION, ATTR_CONTENT_TYPE, ATTR_MESSAGE_DIGEST};
-		use crate::random::OsRng;
-		use crate::testing::{TestAttributes, TestIdentity};
+		use crate::testing::fixtures::flip_last;
+		use crate::testing::{TestAttributes, TestIdentity, TestKey};
 		use crate::transport::handshake::tests::RefusingAuthorizer;
 		use crate::x509::attr::Attribute;
 		use crate::x509::Certificate;
@@ -1201,9 +1197,20 @@ mod tests {
 		}
 
 		impl Party {
-			/// A party of a fresh key, under the test certificate of that key.
-			fn fresh() -> Self {
-				let identity = TestIdentity::of(&Secp256k1SigningKey::random(&mut OsRng));
+			/// The party that issues each receipt.
+			fn server() -> Self {
+				Self::fixed(0x11)
+			}
+
+			/// The party that countersigns each receipt.
+			fn client() -> Self {
+				Self::fixed(0x22)
+			}
+
+			/// A party of the fixed key of `seed`, under the test certificate
+			/// of that key.
+			fn fixed(seed: u8) -> Self {
+				let identity = TestIdentity::of(&TestKey::fixed(seed));
 				let signer = PeerCertificate::parse(identity.certificate_arc(), KeyPurposes::HOUSE.signer);
 				let signer = signer.expect("the test certificate is admitted for signing");
 				Self { identity, signer }
@@ -1214,34 +1221,49 @@ mod tests {
 			}
 		}
 
-		async fn server_signed(
-			challenge: Option<&[u8]>,
-		) -> Result<(SessionReceipt, Signed<SignedData>, Party), HandshakeError> {
-			let server = Party::fresh();
-			let challenge = match challenge {
-				Some(bytes) => Some(OctetString::new(bytes)?),
-				None => None,
-			};
-
-			let (receipt, artifact) = SessionReceipt::issue(
-				sample_transcript(),
+		/// The receipt the server party issues over the fixture transcript with
+		/// `challenge`, beside the artifact it signed and that party.
+		async fn server_signed(challenge: Option<&[u8]>) -> (SessionReceipt, Signed<SignedData>, Party) {
+			let server = Party::server();
+			let challenge = challenge.map(OctetString::new).transpose().expect("the challenge encodes");
+			let issuing = SessionReceipt::issue(
+				fixture_transcript_hash(),
 				SAMPLE_BUDGETS,
-				SAMPLE_CREDIT_UNIT,
+				FIXTURE_CREDIT_UNIT,
 				challenge,
 				&server.identity,
-			)
-			.await?;
-			Ok((receipt, artifact, server))
+			);
+
+			let (receipt, artifact) = issuing.await.expect("the server key signs the receipt");
+			(receipt, artifact, server)
 		}
 
-		async fn dual_signed(answer: Option<&[u8]>) -> Result<(StoredReceipt, Party, Party), HandshakeError> {
-			let (receipt, artifact, server) = server_signed(Some(b"challenge")).await?;
-			let client = Party::fresh();
-			let countersignature = receipt.countersign(answer, &client.identity).await?;
-			let completed = artifact.with_certified_signer(countersignature)?;
+		/// The countersignature the client party makes over `receipt` with
+		/// `answer`, beside that party.
+		async fn countersigned(receipt: &SessionReceipt, answer: Option<&[u8]>) -> (Party, CertifiedSigner) {
+			let client = Party::client();
+			let countersignature = receipt.countersign(answer, &client.identity).await;
+			(client, countersignature.expect("the client key countersigns the receipt"))
+		}
 
-			let stored = StoredReceipt::try_from(completed)?;
-			Ok((stored, server, client))
+		/// The receipt both parties signed, with `answer` to the challenge of
+		/// the server, beside the server and the client.
+		async fn dual_signed(answer: Option<&[u8]>) -> (StoredReceipt, Party, Party) {
+			let (receipt, artifact, server) = server_signed(Some(b"challenge")).await;
+			let (client, countersignature) = countersigned(&receipt, answer).await;
+			let completed = artifact.with_certified_signer(countersignature);
+			let completed = completed.expect("the countersignature joins the artifact");
+
+			let stored = StoredReceipt::try_from(completed);
+			let stored = stored.expect("a dual-signed artifact is a stored receipt");
+			(stored, server, client)
+		}
+
+		/// The server `SignerInfo` of `artifact`.
+		fn server_signer(artifact: &Signed<SignedData>) -> &SignerInfo {
+			let signer = artifact.signer_for_role(ReceiptRole::Server);
+			let signer = signer.expect("the role of each signer decodes");
+			signer.expect("the artifact holds a server signer")
 		}
 
 		/// `certificate` admitted for signing, as a third-party verifier
@@ -1251,43 +1273,64 @@ mod tests {
 			admitted.expect("a receipt's test certificate is admitted for signing")
 		}
 
+		/// The artifact of `stored` without the certificate of `role`, read
+		/// again as a stored receipt.
+		fn without_certificate_of(stored: &StoredReceipt, role: ReceiptRole) -> Result<StoredReceipt, HandshakeError> {
+			let dropped = stored.certificate(role);
+			let dropped = dropped.expect("a stored receipt carries the certificate of each role");
+			let dropped = CertificateChoices::Certificate(dropped.to_owned());
+			let mut artifact = stored.artifact().to_owned().into_inner();
+
+			let carried = artifact.certificates.take().expect("a stored receipt carries its certificates");
+			let others = carried.0.into_vec().into_iter().filter(|held| *held != dropped);
+			let kept = SetOfVec::try_from(others.collect::<Vec<_>>());
+			let kept = kept.expect("the kept certificates stay distinct");
+			artifact.certificates = Some(CertificateSet(kept));
+
+			let der = crate::encode(&artifact).expect("the artifact encodes");
+			let received = Signed::<SignedData>::from_der(&der).expect("an encoded artifact decodes");
+			StoredReceipt::try_from(received)
+		}
+
 		/// The server's artifact carries the certificate its signer names, so
 		/// it verifies from itself alone (RFC 5652 §5.1).
 		#[tokio::test]
-		async fn a_server_signed_artifact_carries_the_server_certificate() -> Result<(), Box<dyn std::error::Error>> {
-			let (_, artifact, server) = server_signed(None).await?;
-			let server_signer = artifact.signer_for_role(ReceiptRole::Server)?;
-			let signer = server_signer.ok_or("the artifact holds a server signer")?;
+		async fn a_server_signed_artifact_carries_the_server_certificate() -> TestResult {
+			let (_, artifact, server) = server_signed(None).await;
+			let signer = server_signer(&artifact);
 
 			let carried = artifact.named_certificate(signer)?;
 			assert_eq!(carried, Some(server.certificate()));
 			Ok(())
 		}
 
-		#[tokio::test]
-		async fn a_stored_receipt_returns_the_server_certificate() -> Result<(), HandshakeError> {
-			let (stored, server, _) = dual_signed(None).await?;
-			assert_eq!(stored.certificate(ReceiptRole::Server)?, server.certificate());
-			Ok(())
-		}
-
-		#[tokio::test]
-		async fn a_stored_receipt_returns_the_client_certificate() -> Result<(), HandshakeError> {
-			let (stored, _, client) = dual_signed(None).await?;
-			assert_eq!(stored.certificate(ReceiptRole::Client)?, client.certificate());
-			Ok(())
+		// A stored receipt returns the certificate of each party by its role:
+		// (the role, the party).
+		crate::tb_cases! {
+			async fn a_stored_receipt_returns_the_certificate_of_each_role(
+				(role, party): (ReceiptRole, fn() -> Party)
+			) -> TestResult {
+				let (stored, _, _) = dual_signed(None).await;
+				let certificate = stored.certificate(role)?;
+				assert_eq!(certificate, party().certificate());
+				Ok(())
+			}
+			cases {
+				server => (ReceiptRole::Server, Party::server),
+				client => (ReceiptRole::Client, Party::client),
+			}
 		}
 
 		/// A third party that holds the artifact alone takes both certificates
 		/// from it, admits each, and verifies both signatures.
 		#[tokio::test]
-		async fn a_stored_receipt_verifies_under_the_certificates_it_carries() -> Result<(), HandshakeError> {
-			let (stored, _, _) = dual_signed(Some(b"preimage")).await?;
+		async fn a_stored_receipt_verifies_under_the_certificates_it_carries() -> TestResult {
+			let (stored, _, _) = dual_signed(Some(b"preimage")).await;
 			let der = stored.to_der()?;
 			let received = StoredReceipt::try_from(Signed::<SignedData>::from_der(&der)?)?;
+
 			let server = admitted(received.certificate(ReceiptRole::Server)?);
 			let client = admitted(received.certificate(ReceiptRole::Client)?);
-
 			received.verify(&server, &client)?;
 			Ok(())
 		}
@@ -1296,37 +1339,26 @@ mod tests {
 		/// it names fails to parse as a stored receipt, because no third party
 		/// can verify it alone.
 		#[tokio::test]
-		async fn an_artifact_without_the_client_certificate_is_not_a_stored_receipt() -> Result<(), HandshakeError> {
-			let (stored, _, _) = dual_signed(None).await?;
-			let mut artifact = stored.artifact().to_owned().into_inner();
-			let server = stored.certificate(ReceiptRole::Server)?;
-			let kept = CertificateChoices::Certificate(server.to_owned());
-
-			artifact.certificates = Some(CertificateSet(SetOfVec::try_from(vec![kept])?));
-
-			let der = crate::encode(&artifact)?;
-			let refused = StoredReceipt::try_from(Signed::<SignedData>::from_der(&der)?);
+		async fn an_artifact_without_the_client_certificate_is_not_a_stored_receipt() {
+			let (stored, _, _) = dual_signed(None).await;
+			let refused = without_certificate_of(&stored, ReceiptRole::Client);
 			assert!(matches!(refused, Err(HandshakeError::MissingClientCertificate)));
-			Ok(())
 		}
 
+		/// An artifact whose server signer names a certificate it leaves out
+		/// fails to parse as a stored receipt.
 		#[tokio::test]
-		async fn an_artifact_without_the_server_certificate_is_not_a_stored_receipt() -> Result<(), HandshakeError> {
-			let (stored, _, _) = dual_signed(None).await?;
-			let mut artifact = stored.artifact().to_owned().into_inner();
-			let client = stored.certificate(ReceiptRole::Client)?;
-			let kept = CertificateChoices::Certificate(client.to_owned());
-
-			artifact.certificates = Some(CertificateSet(SetOfVec::try_from(vec![kept])?));
-
-			let refused = StoredReceipt::try_from(Signed::<SignedData>::from_der(&crate::encode(&artifact)?)?);
+		async fn an_artifact_without_the_server_certificate_is_not_a_stored_receipt() {
+			let (stored, _, _) = dual_signed(None).await;
+			let refused = without_certificate_of(&stored, ReceiptRole::Server);
 			assert!(matches!(refused, Err(HandshakeError::MissingServerCertificate)));
-			Ok(())
 		}
 
+		/// A receipt both parties signed verifies under their certificates and
+		/// keeps the answer of the client.
 		#[tokio::test]
-		async fn dual_signed_artifact_verifies() -> Result<(), HandshakeError> {
-			let (stored, server, client) = dual_signed(Some(b"preimage")).await?;
+		async fn a_dual_signed_receipt_verifies_with_its_answer() -> TestResult {
+			let (stored, server, client) = dual_signed(Some(b"preimage")).await;
 			stored.verify(&server.signer, &client.signer)?;
 
 			let answer = stored.ancillary_response().map(OctetString::as_bytes);
@@ -1337,29 +1369,26 @@ mod tests {
 		/// A receipt signer carries the content type, the message digest, and
 		/// the algorithm protection beside its role (RFC 5652 §5.3, RFC 6211).
 		#[tokio::test]
-		async fn a_receipt_signer_carries_the_three_signed_attributes() -> Result<(), HandshakeError> {
-			let (_, artifact, _) = server_signed(None).await?;
-			let signer = artifact
-				.signer_for_role(ReceiptRole::Server)?
-				.ok_or(HandshakeError::ReceiptMissing)?;
+		async fn a_receipt_signer_carries_the_three_signed_attributes() {
+			let (_, artifact, _) = server_signed(None).await;
+			let signer = server_signer(&artifact);
 
 			let oids = TestAttributes::oids(signer);
-			assert!(oids.contains(&ATTR_CONTENT_TYPE));
-			assert!(oids.contains(&ATTR_MESSAGE_DIGEST));
-			assert!(oids.contains(&ATTR_CMS_ALGORITHM_PROTECTION));
-			assert!(oids.contains(&RECEIPT_ROLE));
-			Ok(())
+			let expected = vec![
+				RECEIPT_ROLE,
+				ATTR_CONTENT_TYPE,
+				ATTR_CMS_ALGORITHM_PROTECTION,
+				ATTR_MESSAGE_DIGEST,
+			];
+			assert_eq!(oids, expected);
 		}
 
 		/// A receipt signer names its certificate by its key identifier, so it
 		/// is version 3, and so is the receipt `SignedData` (RFC 5652 §5.1).
 		#[tokio::test]
-		async fn a_receipt_signer_is_version_3_under_its_key_identifier() -> Result<(), HandshakeError> {
-			let (_, artifact, server) = server_signed(None).await?;
-			let signer = artifact
-				.signer_for_role(ReceiptRole::Server)?
-				.ok_or(HandshakeError::ReceiptMissing)?;
-
+		async fn a_receipt_signer_is_version_3_under_its_key_identifier() -> TestResult {
+			let (_, artifact, server) = server_signed(None).await;
+			let signer = server_signer(&artifact);
 			assert_eq!(signer.version, CmsVersion::V3);
 			assert_eq!(signer.sid, server.certificate().signer_identifier()?);
 			assert_eq!(artifact.version, CmsVersion::V3);
@@ -1369,21 +1398,20 @@ mod tests {
 		/// The receipt check refuses a receipt signer whose version breaks the
 		/// RFC 5652 §5.3 rule.
 		#[tokio::test]
-		async fn a_receipt_signer_of_the_wrong_version_is_refused() -> Result<(), HandshakeError> {
-			let (receipt, artifact, server) = server_signed(None).await?;
-			let signer = artifact
-				.signer_for_role(ReceiptRole::Server)?
-				.ok_or(HandshakeError::ReceiptMissing)?;
+		async fn a_receipt_signer_of_the_wrong_version_is_refused() {
+			let (receipt, artifact, server) = server_signed(None).await;
+			let signer = server_signer(&artifact);
 
 			let downgraded = SignerInfo { version: CmsVersion::V1, ..signer.clone() };
 			let refused = receipt.verify_signer(&downgraded, ReceiptRole::Server, &server.signer);
 			assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
-			Ok(())
 		}
 
+		/// A stored receipt decodes from the DER it persists to the receipt it
+		/// encodes.
 		#[tokio::test]
-		async fn artifact_der_round_trip_preserves_equality() -> Result<(), HandshakeError> {
-			let (stored, _, _) = dual_signed(None).await?;
+		async fn a_stored_receipt_decodes_back_to_itself() -> TestResult {
+			let (stored, _, _) = dual_signed(None).await;
 			let der = stored.to_der()?;
 			let artifact = Signed::<SignedData>::from_der(&der)?;
 
@@ -1392,50 +1420,51 @@ mod tests {
 			Ok(())
 		}
 
+		/// A stored receipt fails to verify with the certificates of its two
+		/// parties in swapped roles.
 		#[tokio::test]
-		async fn swapped_certificates_fail_verification() -> Result<(), HandshakeError> {
-			let (stored, server, client) = dual_signed(None).await?;
+		async fn a_stored_receipt_under_swapped_certificates_fails_verification() {
+			let (stored, server, client) = dual_signed(None).await;
 			let swapped = stored.verify(&client.signer, &server.signer);
 			assert!(matches!(swapped, Err(HandshakeError::SignatureVerificationFailed)));
-			Ok(())
 		}
 
+		/// The signer of the server fails to verify in the role of the client,
+		/// so a splice of one signer into the other role is refused.
 		#[tokio::test]
-		async fn server_signer_rejected_in_client_role() -> Result<(), HandshakeError> {
-			let (receipt, artifact, server) = server_signed(None).await?;
-			let server_role = ReceiptRole::Server;
-			let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-			let client_role = ReceiptRole::Client;
+		async fn a_server_signer_is_refused_in_the_client_role() {
+			let (receipt, artifact, server) = server_signed(None).await;
+			let signer = server_signer(&artifact);
 
-			let spliced = receipt.verify_signer(server_signer, client_role, &server.signer);
+			let spliced = receipt.verify_signer(signer, ReceiptRole::Client, &server.signer);
 			assert!(matches!(spliced, Err(HandshakeError::SignatureVerificationFailed)));
-			Ok(())
 		}
 
+		/// An artifact the server alone signed lacks the countersignature of a
+		/// stored receipt.
 		#[tokio::test]
-		async fn server_only_artifact_is_not_a_stored_receipt() -> Result<(), HandshakeError> {
-			let (_, artifact, _) = server_signed(None).await?;
+		async fn an_artifact_the_server_alone_signed_is_not_a_stored_receipt() {
+			let (_, artifact, _) = server_signed(None).await;
 			let incomplete = StoredReceipt::try_from(artifact);
 			assert!(matches!(incomplete, Err(HandshakeError::CountersignatureMissing)));
-			Ok(())
 		}
 
+		/// The debug form of a stored receipt redacts its settlement answer.
 		#[tokio::test]
-		async fn debug_redacts_settlement_answer() -> Result<(), HandshakeError> {
-			let (stored, _, _) = dual_signed(Some(b"preimage")).await?;
+		async fn the_debug_form_of_a_stored_receipt_redacts_its_answer() {
+			let (stored, _, _) = dual_signed(Some(b"preimage")).await;
 			let rendered = format!("{stored:?}");
 			assert!(rendered.contains("<redacted 8 bytes>"));
 			assert!(!rendered.contains("preimage"));
-			Ok(())
 		}
 
-		// The countersignature SignerInfo carries the settlement answer in
-		// its signed attributes, so its raw bytes are as secret as the answer.
+		/// The countersignature `SignerInfo` carries the settlement answer in
+		/// its signed attributes, so its raw bytes are as secret as the answer,
+		/// and the debug form of an outcome redacts them.
 		#[tokio::test]
-		async fn outcome_debug_redacts_countersignature() -> Result<(), HandshakeError> {
-			let (receipt, artifact, _) = server_signed(Some(b"challenge")).await?;
-			let client = Party::fresh();
-			let countersignature = receipt.countersign(Some(b"preimage"), &client.identity).await?;
+		async fn the_debug_form_of_an_outcome_redacts_its_countersignature() -> TestResult {
+			let (receipt, artifact, _) = server_signed(Some(b"challenge")).await;
+			let (_, countersignature) = countersigned(&receipt, Some(b"preimage")).await;
 			let countersignature_der = OctetString::new(countersignature.signer().to_der()?)?;
 			let raw_debug = format!("{countersignature_der:?}");
 			let countersignature_len = countersignature_der.as_bytes().len();
@@ -1455,34 +1484,20 @@ mod tests {
 			Ok(())
 		}
 
+		/// An empty answer countersigns as no answer, and the receipt still
+		/// verifies.
 		#[tokio::test]
-		async fn empty_answer_countersigns_as_absent() -> Result<(), HandshakeError> {
-			let (stored, server, client) = dual_signed(Some(b"")).await?;
+		async fn an_empty_answer_countersigns_as_no_answer() -> TestResult {
+			let (stored, server, client) = dual_signed(Some(b"")).await;
 			stored.verify(&server.signer, &client.signer)?;
 			assert_eq!(stored.ancillary_response(), None);
 			Ok(())
 		}
 
-		// A tampered acknowledgement is a verdict instead of an early error,
-		// so the invalid attempt must surface as settleable evidence.
-		#[tokio::test]
-		async fn tampered_ack_settles_as_invalid_verdict() -> Result<(), HandshakeError> {
-			let (receipt, _, _) = server_signed(None).await?;
-			let client = Party::fresh();
-			let countersigned = receipt.countersign(Some(b"preimage"), &client.identity).await?;
-			let mut ack = countersigned.signer().to_owned().into_inner();
-
-			let mut forged = ack.signature.as_bytes().to_vec();
-			let last = forged.len() - 1;
-			forged[last] ^= 0x01;
-			ack.signature = OctetString::new(forged)?;
-
-			let received = Signed::<SignerInfo>::from_der(&ack.to_der()?)?;
-			let (verdict, answer, countersigner) = receipt.settle_ack(Some(received), &client.signer, None).await?;
-			assert!(matches!(verdict, SessionVerdict::CountersignatureInvalid));
-			assert!(answer.is_none());
-			assert!(countersigner.is_none());
-			Ok(())
+		/// `ack` with the last octet of its signature flipped.
+		fn with_flipped_signature(ack: &mut SignerInfo) {
+			let flipped = flip_last(ack.signature.as_bytes());
+			ack.signature = OctetString::new(flipped).expect("the signature octets encode");
 		}
 
 		/// `ack` with a second value on its answer attribute, a shape only the
@@ -1505,35 +1520,41 @@ mod tests {
 			ack.signed_attrs = Some(SetOfVec::try_from(rebuilt).expect("the attribute set stays distinct"));
 		}
 
-		#[tokio::test]
-		async fn a_malformed_answer_settles_as_invalid_verdict() -> Result<(), HandshakeError> {
-			let (receipt, _, _) = server_signed(None).await?;
-			let client = Party::fresh();
-			let countersigned = receipt.countersign(Some(b"preimage"), &client.identity).await?;
-			let mut ack = countersigned.signer().to_owned().into_inner();
+		// A forged acknowledgement is a verdict instead of an early error, so
+		// the invalid attempt surfaces as settleable evidence: (the forgery).
+		crate::tb_cases! {
+			async fn a_forged_acknowledgement_settles_as_an_invalid_countersignature(
+				forge: fn(&mut SignerInfo)
+			) -> TestResult {
+				let (receipt, _, _) = server_signed(None).await;
+				let (client, countersignature) = countersigned(&receipt, Some(b"preimage")).await;
+				let mut ack = countersignature.signer().to_owned().into_inner();
+				forge(&mut ack);
 
-			with_two_answer_values(&mut ack);
-
-			let received = Signed::<SignerInfo>::from_der(&ack.to_der()?)?;
-			let (verdict, answer, countersigner) = receipt.settle_ack(Some(received), &client.signer, None).await?;
-			assert!(matches!(verdict, SessionVerdict::CountersignatureInvalid));
-			assert!(answer.is_none());
-			assert!(countersigner.is_none());
-			Ok(())
+				let received = Signed::<SignerInfo>::from_der(&ack.to_der()?)?;
+				let settled = receipt.settle_ack(Some(received), &client.signer, None).await?;
+				assert!(matches!(settled, (SessionVerdict::CountersignatureInvalid, None, None)));
+				Ok(())
+			}
+			cases {
+				flipped_signature => with_flipped_signature,
+				two_answer_values => with_two_answer_values,
+			}
 		}
 
 		/// A countersignature that verifies, with no authorizer to settle it,
 		/// activates the session beside its countersigner, which the artifact
 		/// then joins.
 		#[tokio::test]
-		async fn a_verified_ack_activates_beside_its_countersigner() -> Result<(), HandshakeError> {
-			let (receipt, _, _) = server_signed(None).await?;
-			let client = Party::fresh();
-			let countersigned = receipt.countersign(None, &client.identity).await?;
-			let received = countersigned.signer().to_owned();
+		async fn a_verified_ack_activates_beside_its_countersigner() -> TestResult {
+			let (receipt, _, _) = server_signed(None).await;
+			let (client, countersignature) = countersigned(&receipt, None).await;
+			let received = countersignature.signer().to_owned();
+			let expected = (SessionVerdict::Activated, Some(received.to_owned()));
 
 			let (verdict, _, countersigner) = receipt.settle_ack(Some(received), &client.signer, None).await?;
-			assert!(matches!((verdict, countersigner), (SessionVerdict::Activated, Some(_))));
+			let joined = countersigner.map(|countersigner| countersigner.signer().to_owned());
+			assert_eq!((verdict, joined), expected);
 			Ok(())
 		}
 
@@ -1541,28 +1562,34 @@ mod tests {
 		/// returns beside its countersigner, so the refused artifact carries it
 		/// as the evidence of the dispute.
 		#[tokio::test]
-		async fn a_refused_settlement_returns_beside_its_countersigner() -> Result<(), HandshakeError> {
-			let (receipt, _, _) = server_signed(Some(b"challenge")).await?;
-			let client = Party::fresh();
-			let countersigned = receipt.countersign(Some(b"preimage"), &client.identity).await?;
-			let received = countersigned.signer().to_owned();
+		async fn a_refused_settlement_returns_beside_its_countersigner() -> TestResult {
+			let (receipt, _, _) = server_signed(Some(b"challenge")).await;
+			let (client, countersignature) = countersigned(&receipt, Some(b"preimage")).await;
+			let received = countersignature.signer().to_owned();
+			let rejected = SessionVerdict::SettlementRejected { code: SETTLEMENT_UNSUPPORTED_CODE };
+			let expected = (rejected, Some(received.to_owned()));
 
 			let authorizer: &dyn TransportAuthorizer = &RefusingAuthorizer;
 			let settling = receipt.settle_ack(Some(received), &client.signer, Some(authorizer));
 			let (verdict, _, countersigner) = settling.await?;
-			assert!(matches!(
-				(verdict, countersigner),
-				(SessionVerdict::SettlementRejected { .. }, Some(_))
-			));
+
+			let joined = countersigner.map(|countersigner| countersigner.signer().to_owned());
+			assert_eq!((verdict, joined), expected);
 			Ok(())
 		}
 	}
 
+	// An answer normalizes to itself, and an empty one to no answer: (the
+	// answer, its normal form).
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[test]
-	fn test_normalize_answer_maps_empty_to_absent() {
-		assert_eq!(normalize_answer(Some(b"".as_slice())), None);
-		assert_eq!(normalize_answer(Some(b"preimage".as_slice())), Some(b"preimage".as_slice()));
-		assert_eq!(normalize_answer(None::<&[u8]>), None);
+	crate::tb_cases! {
+		fn an_answer_normalizes_to_absent_only_when_empty((answer, normal): (Option<&[u8]>, Option<&[u8]>)) {
+			assert_eq!(normalize_answer(answer), normal);
+		}
+		cases {
+			empty => (Some(b"".as_slice()), None),
+			preimage => (Some(b"preimage".as_slice()), Some(b"preimage".as_slice())),
+			none => (None, None),
+		}
 	}
 }

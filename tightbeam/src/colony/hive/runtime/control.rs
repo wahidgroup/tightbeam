@@ -454,6 +454,7 @@ mod tests {
 
 	use super::*;
 	use crate::clock::ManualClock;
+	use crate::testing::fixtures::TestClock;
 
 	/// The drain timeout every wait in this module races against.
 	const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -462,22 +463,32 @@ mod tests {
 	/// reaches it is a hang, which the test reports as a failure.
 	const HANG_GUARD: Duration = Duration::from_secs(5);
 
-	/// A clock that moves only when the test advances it.
-	fn manual_clock() -> Arc<ManualClock> {
-		Arc::new(ManualClock::default())
+	/// The in-flight count of a hive, beside the manual clock that its drain
+	/// reads.
+	struct Drain {
+		in_flight: InFlight,
+		clock: Arc<ManualClock>,
+		hive_clock: Arc<dyn Clock>,
 	}
 
-	/// Returns `clock` as the erased handle that a settle reads.
-	fn erased(clock: &Arc<ManualClock>) -> Arc<dyn Clock> {
-		Arc::clone(clock) as Arc<dyn Clock>
+	impl Drain {
+		/// A hive with no command in flight, at the start of its clock.
+		fn new() -> Self {
+			let clock = TestClock::manual();
+			Self { in_flight: InFlight::default(), hive_clock: TestClock::erased(&clock), clock }
+		}
+
+		/// The deadline of a drain of [`DRAIN_TIMEOUT`] that starts now.
+		fn deadline(&self) -> DrainDeadline<'_> {
+			DrainDeadline::start(self.hive_clock.as_ref(), DRAIN_TIMEOUT)
+		}
 	}
 
 	/// Bounds `settle` by [`HANG_GUARD`], so a wait that never ends fails its
 	/// test.
-	async fn bounded(settle: impl Future<Output = Settled>) -> Result<Settled, TightBeamError> {
-		tokio::time::timeout(HANG_GUARD, settle)
-			.await
-			.map_err(|_| TightBeamError::RecvTimeoutError)
+	async fn bounded(settle: impl Future<Output = Settled>) -> Settled {
+		let settled = tokio::time::timeout(HANG_GUARD, settle).await;
+		settled.expect("the settle ends inside the hang guard")
 	}
 
 	/// Polls `settle` once, so the waits inside it register with the clock
@@ -488,51 +499,44 @@ mod tests {
 
 	/// A hive with no command in flight settles at once.
 	#[tokio::test]
-	async fn an_idle_hive_settles_at_once() -> Result<(), TightBeamError> {
-		let in_flight = InFlight::default();
-		let clock = erased(&manual_clock());
-		let deadline = DrainDeadline::start(clock.as_ref(), DRAIN_TIMEOUT);
+	async fn an_idle_hive_settles_at_once() {
+		let drain = Drain::new();
+		let deadline = drain.deadline();
 
-		let settled = bounded(in_flight.settle(&deadline)).await?;
+		let settled = bounded(drain.in_flight.settle(&deadline)).await;
 		assert_eq!(settled, Settled::Idle);
-		Ok(())
 	}
 
 	/// The wait ends the moment the last command finishes, while the hive
 	/// clock stands still, so a drain on a manual clock settles on the drop of
 	/// its last guard.
 	#[tokio::test]
-	async fn a_settle_ends_when_the_last_command_finishes() -> Result<(), TightBeamError> {
-		let in_flight = InFlight::default();
-		let clock = erased(&manual_clock());
-		let deadline = DrainDeadline::start(clock.as_ref(), DRAIN_TIMEOUT);
-		let guard = in_flight.enter();
-		let mut settle = pin!(in_flight.settle(&deadline));
-		assert!(poll_once(&mut settle).await.is_pending());
+	async fn a_settle_ends_when_the_last_command_finishes() {
+		let drain = Drain::new();
+		let deadline = drain.deadline();
+		let guard = drain.in_flight.enter();
+		let mut settle = pin!(drain.in_flight.settle(&deadline));
+		let before = poll_once(&mut settle).await;
 
 		drop(guard);
 
-		let settled = bounded(settle).await?;
-		assert_eq!(settled, Settled::Idle);
-		Ok(())
+		let settled = bounded(settle).await;
+		assert_eq!((before, settled), (Poll::Pending, Settled::Idle));
 	}
 
 	/// The timeout fires on the hive clock while a command is in flight, so
 	/// the drain's backstop holds on a manual clock too.
 	#[tokio::test]
-	async fn a_settle_times_out_on_the_hive_clock() -> Result<(), TightBeamError> {
-		let in_flight = InFlight::default();
-		let clock = manual_clock();
-		let hive_clock = erased(&clock);
-		let deadline = DrainDeadline::start(hive_clock.as_ref(), DRAIN_TIMEOUT);
-		let _guard = in_flight.enter();
-		let mut settle = pin!(in_flight.settle(&deadline));
-		assert!(poll_once(&mut settle).await.is_pending());
+	async fn a_settle_times_out_on_the_hive_clock() {
+		let drain = Drain::new();
+		let deadline = drain.deadline();
+		let _guard = drain.in_flight.enter();
+		let mut settle = pin!(drain.in_flight.settle(&deadline));
+		let before = poll_once(&mut settle).await;
 
-		clock.advance(DRAIN_TIMEOUT);
+		drain.clock.advance(DRAIN_TIMEOUT);
 
-		let settled = bounded(settle).await?;
-		assert_eq!(settled, Settled::TimedOut);
-		Ok(())
+		let settled = bounded(settle).await;
+		assert_eq!((before, settled), (Poll::Pending, Settled::TimedOut));
 	}
 }

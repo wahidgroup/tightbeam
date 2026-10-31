@@ -91,8 +91,15 @@ mod tests {
 
 	#[cfg(feature = "std")]
 	mod statics {
+		use std::sync::{Arc, Mutex, RwLock};
+
+		use crate::error::Result;
+
 		#[derive(Debug, Default, PartialEq)]
 		struct Counter(u64);
+
+		/// The accessor of a static lock that `rwlock!` or `mutex!` declares.
+		type Accessor<L> = fn() -> Arc<L>;
 
 		rwlock!(SHARED_RWLOCK_DEFAULTED: Counter = Counter(7));
 		rwlock!(SHARED_RWLOCK: Counter);
@@ -107,29 +114,60 @@ mod tests {
 			MULTI_MUTEX_B: Counter = Counter(3),
 		}
 
+		// The write tests alone take these locks, so a parallel run leaves the
+		// declared values that the other tests read in place.
+		rwlock!(WRITTEN_RWLOCK: Counter);
+		mutex!(WRITTEN_MUTEX: Counter);
+
+		// Each arm of `rwlock!` starts its lock at the value the declaration
+		// names, or at `Default` where it names none.
+		crate::tb_cases! {
+			fn a_rwlock_starts_at_its_declared_value((lock, start): (Accessor<RwLock<Counter>>, Counter)) -> Result<()> {
+				let held = lock();
+				assert_eq!(*held.read()?, start);
+				Ok(())
+			}
+			cases {
+				defaulted => (SHARED_RWLOCK_DEFAULTED, Counter(7)),
+				plain => (SHARED_RWLOCK, Counter(0)),
+				multi_plain => (MULTI_RWLOCK_A, Counter(0)),
+				multi_defaulted => (MULTI_RWLOCK_B, Counter(3)),
+			}
+		}
+
+		// Each arm of `mutex!` starts its lock at the value the declaration
+		// names, or at `Default` where it names none.
+		crate::tb_cases! {
+			fn a_mutex_starts_at_its_declared_value((lock, start): (Accessor<Mutex<Counter>>, Counter)) -> Result<()> {
+				let held = lock();
+				assert_eq!(*held.lock()?, start);
+				Ok(())
+			}
+			cases {
+				defaulted => (SHARED_MUTEX_DEFAULTED, Counter(7)),
+				plain => (SHARED_MUTEX, Counter(0)),
+				multi_plain => (MULTI_MUTEX_A, Counter(0)),
+				multi_defaulted => (MULTI_MUTEX_B, Counter(3)),
+			}
+		}
+
+		/// Each call of a `rwlock!` accessor hands out the one lock of its
+		/// static, so a write through one handle is what the next one reads.
 		#[test]
-		fn rwlock_arms_initialize_and_share_state() -> crate::error::Result<()> {
-			assert_eq!(*SHARED_RWLOCK_DEFAULTED().read()?, Counter(7));
-			assert_eq!(*SHARED_RWLOCK().read()?, Counter(0));
-			assert_eq!(*MULTI_RWLOCK_A().read()?, Counter(0));
-			assert_eq!(*MULTI_RWLOCK_B().read()?, Counter(3));
+		fn a_rwlock_write_is_shared() -> Result<()> {
+			WRITTEN_RWLOCK().write()?.0 = 42;
 
-			SHARED_RWLOCK().write()?.0 = 42;
-			assert_eq!(*SHARED_RWLOCK().read()?, Counter(42));
-
+			assert_eq!(*WRITTEN_RWLOCK().read()?, Counter(42));
 			Ok(())
 		}
 
+		/// Each call of a `mutex!` accessor hands out the one lock of its
+		/// static, so a write through one handle is what the next one reads.
 		#[test]
-		fn mutex_arms_initialize_and_share_state() -> crate::error::Result<()> {
-			assert_eq!(*SHARED_MUTEX_DEFAULTED().lock()?, Counter(7));
-			assert_eq!(*SHARED_MUTEX().lock()?, Counter(0));
-			assert_eq!(*MULTI_MUTEX_A().lock()?, Counter(0));
-			assert_eq!(*MULTI_MUTEX_B().lock()?, Counter(3));
+		fn a_mutex_write_is_shared() -> Result<()> {
+			WRITTEN_MUTEX().lock()?.0 = 42;
 
-			SHARED_MUTEX().lock()?.0 = 42;
-			assert_eq!(*SHARED_MUTEX().lock()?, Counter(42));
-
+			assert_eq!(*WRITTEN_MUTEX().lock()?, Counter(42));
 			Ok(())
 		}
 	}

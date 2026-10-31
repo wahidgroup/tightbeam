@@ -322,54 +322,50 @@ mod tests {
 	use crate::crypto::x509::ext::pkix::{
 		AuthorityKeyIdentifier, BasicConstraints, KeyUsage, KeyUsages, SubjectKeyIdentifier,
 	};
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use crate::crypto::x509::store::CertificateTrust;
 	use crate::crypto::x509::utils::CertificateExt;
-	use crate::crypto::x509::KeyCurves;
 	use crate::der::asn1::OctetString;
 	use crate::der::Encode;
 	use crate::spki::SubjectPublicKeyInfoOwned;
-	use crate::testing::TestKey;
+	use crate::testing::fixtures::TestStore;
+	use crate::testing::{TestKey, TestResult};
 	use crate::x509::Certificate;
 
 	const SUBJECT: &str = "CN=Test Root CA,O=Test Org,C=US";
 
-	type TestResult = Result<(), Box<dyn core::error::Error>>;
-
-	// `Sha3Signer` borrows its key, so callers own the key and build the signer
-	// locally to keep the borrow alive across the `cert!` invocation.
-	fn signing_material() -> Result<(Secp256k1SigningKey, SubjectPublicKeyInfoOwned), Box<dyn core::error::Error>> {
-		let signing_key = Secp256k1SigningKey::random(&mut rand_core::OsRng);
+	/// Returns the key of `seed` beside its SubjectPublicKeyInfo.
+	///
+	/// `Sha3Signer` borrows its key, so callers own the key and build the
+	/// signer locally to keep the borrow alive across the `cert!` invocation.
+	fn signing_material(seed: u8) -> (Secp256k1SigningKey, SubjectPublicKeyInfoOwned) {
+		let signing_key = TestKey::fixed(seed);
 		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
-		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
-		Ok((signing_key, spki))
+		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key);
+		(signing_key, spki.expect("a secp256k1 key encodes as a SubjectPublicKeyInfo"))
 	}
 
 	fn one_year() -> core::time::Duration {
 		core::time::Duration::from_secs(365 * 24 * 60 * 60)
 	}
 
-	#[test]
-	fn test_cert_macro_root() -> TestResult {
-		let (signing_key, spki) = signing_material()?;
-		let signer = Sha3Signer::from(&signing_key);
-
-		let cert = cert!(
-			profile: Root,
-			subject: SUBJECT,
-			serial: 1u32,
-			duration: one_year(),
-			signer: &signer,
-			subject_public_key: spki
-		)?;
-
-		assert_eq!(cert.tbs_certificate.subject, cert.tbs_certificate.issuer);
-
-		Ok(())
+	/// Returns the certificate that `issue` issues. The expansion of `cert!`
+	/// returns each error it meets with `?`, so `issue` returns a `Result`.
+	fn issued(issue: impl FnOnce() -> Result<Certificate, Box<dyn core::error::Error>>) -> Certificate {
+		issue().expect("a cert! invocation issues its certificate")
 	}
 
+	/// A `cert!` root names its own subject as its issuer.
 	#[test]
-	fn test_cert_macro_root_path_len() -> TestResult {
-		let (signing_key, spki) = signing_material()?;
+	fn a_cert_macro_root_is_self_issued() {
+		let (_, certificate) = root(1);
+		assert_eq!(certificate.tbs_certificate.subject, certificate.tbs_certificate.issuer);
+	}
+
+	/// A `cert!` root with `path_len:` states that path length in its
+	/// `basicConstraints` (RFC 5280 §4.2.1.9).
+	#[test]
+	fn a_cert_macro_root_carries_the_path_length_it_names() -> TestResult {
+		let (signing_key, spki) = signing_material(1);
 		let signer = Sha3Signer::from(&signing_key);
 
 		let cert = cert!(
@@ -392,43 +388,46 @@ mod tests {
 		Ok(())
 	}
 
-	/// A self-signed `cert!` root under the fixed scalar `fill`.
-	fn root(fill: u8) -> Result<(Secp256k1SigningKey, Certificate), Box<dyn core::error::Error>> {
-		let signing_key = Secp256k1SigningKey::from_bytes(&[fill; 32].into())?;
-		let spki = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key())?;
+	/// A self-signed `cert!` root under the key of `seed`.
+	fn root(seed: u8) -> (Secp256k1SigningKey, Certificate) {
+		let (signing_key, spki) = signing_material(seed);
 		let signer = Sha3Signer::from(&signing_key);
-		let certificate = cert!(
-			profile: Root,
-			subject: SUBJECT,
-			serial: 1u32,
-			duration: one_year(),
-			signer: &signer,
-			subject_public_key: spki
-		)?;
-		Ok((signing_key, certificate))
+		let certificate = issued(|| {
+			Ok(cert!(
+				profile: Root,
+				subject: SUBJECT,
+				serial: 1u32,
+				duration: one_year(),
+				signer: &signer,
+				subject_public_key: spki
+			)?)
+		});
+		(signing_key, certificate)
 	}
 
-	/// A `cert!` leaf of a fresh key that the root of `root_key` issues.
-	fn leaf_of(root_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn core::error::Error>> {
-		let (_, spki) = signing_material()?;
+	/// A `cert!` leaf of the key of the seed 2 that the root of `root_key`
+	/// issues.
+	fn leaf_of(root_key: &Secp256k1SigningKey) -> Certificate {
+		let (_, spki) = signing_material(2);
 		let signer = Sha3Signer::from(root_key);
-		let certificate = cert!(
-			profile: Leaf,
-			subject: "CN=Test Leaf,O=Test Org,C=US",
-			issuer: SUBJECT,
-			serial: 2u32,
-			duration: one_year(),
-			subject_public_key: spki,
-			signer: &signer
-		)?;
-		Ok(certificate)
+		issued(|| {
+			Ok(cert!(
+				profile: Leaf,
+				subject: "CN=Test Leaf,O=Test Org,C=US",
+				issuer: SUBJECT,
+				serial: 2u32,
+				duration: one_year(),
+				subject_public_key: spki,
+				signer: &signer
+			)?)
+		})
 	}
 
 	/// The signature of a `cert!` root is a DER `ECDSA-Sig-Value`, so it
 	/// verifies under the crate's own policy (RFC 3279 §2.2.3).
 	#[test]
 	fn a_cert_macro_root_verifies_under_the_secp256k1_policy() -> TestResult {
-		let (_, certificate) = root(1)?;
+		let (_, certificate) = root(1);
 		let public_key_der = certificate.tbs_certificate.subject_public_key_info.to_der()?;
 		let message = certificate.tbs_certificate.to_der()?;
 		let algorithm = certificate.signature_algorithm.oid;
@@ -445,7 +444,7 @@ mod tests {
 	/// `hashlib` over the independently computed point, not from the crate.
 	#[test]
 	fn a_cert_macro_root_carries_its_rfc_7093_key_identifier() -> TestResult {
-		let (_, certificate) = root(1)?;
+		let (_, certificate) = root(1);
 		let expected = SubjectKeyIdentifier::from(OctetString::new(TestKey::INSECURE_FIXED_KEY_IDENTIFIER)?);
 
 		let carried = certificate.extension::<SubjectKeyIdentifier>()?;
@@ -457,15 +456,14 @@ mod tests {
 	/// identifier (RFC 5280 §4.2.1.1).
 	#[test]
 	fn a_cert_macro_leaf_names_its_issuer_by_its_key_identifier() -> TestResult {
-		let (root_key, root_certificate) = root(1)?;
-		let leaf = leaf_of(&root_key)?;
+		let (root_key, root_certificate) = root(1);
+		let leaf = leaf_of(&root_key);
 
 		let issuer = root_certificate.extension::<SubjectKeyIdentifier>()?;
 		let authority = leaf.extension::<AuthorityKeyIdentifier>()?;
-		assert_eq!(
-			authority.and_then(|authority| authority.key_identifier),
-			issuer.map(|issuer| issuer.0)
-		);
+		let named = authority.and_then(|authority| authority.key_identifier);
+		let identifier = issuer.map(|issuer| issuer.0);
+		assert_eq!(named, identifier);
 		Ok(())
 	}
 
@@ -473,11 +471,9 @@ mod tests {
 	/// signature and key identifiers included.
 	#[test]
 	fn a_cert_macro_chain_validates_under_the_secp256k1_policy() -> TestResult {
-		let (root_key, root_certificate) = root(1)?;
-		let leaf = leaf_of(&root_key)?;
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(root_certificate.clone())?
-			.build();
+		let (root_key, root_certificate) = root(1);
+		let leaf = leaf_of(&root_key);
+		let store = TestStore::holding([root_certificate.clone()]);
 
 		store.verify_chain(&[root_certificate, leaf])?;
 
@@ -488,8 +484,8 @@ mod tests {
 	/// nonRepudiation` (RFC 5280 §4.2.1.3).
 	#[test]
 	fn a_cert_macro_leaf_signs_by_default() -> TestResult {
-		let (root_key, _) = root(1)?;
-		let leaf = leaf_of(&root_key)?;
+		let (root_key, _) = root(1);
+		let leaf = leaf_of(&root_key);
 
 		let key_usage = leaf.extension::<KeyUsage>()?;
 		let expected = KeyUsages::DigitalSignature | KeyUsages::NonRepudiation;
@@ -501,8 +497,8 @@ mod tests {
 	/// of the default, so a CMS server certificate permits key agreement.
 	#[test]
 	fn a_cert_macro_leaf_carries_the_key_usage_it_names() -> TestResult {
-		let (root_key, _) = root(1)?;
-		let (_, spki) = signing_material()?;
+		let (root_key, _) = root(1);
+		let (_, spki) = signing_material(3);
 		let signer = Sha3Signer::from(&root_key);
 		let usage = KeyUsages::DigitalSignature | KeyUsages::KeyAgreement;
 		let leaf = cert!(

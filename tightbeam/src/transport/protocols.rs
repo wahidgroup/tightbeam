@@ -514,11 +514,16 @@ mod tests {
 	use std::io::{Error as IoError, ErrorKind};
 
 	use super::*;
+	use crate::runtime::rt;
+	use crate::testing::TestResult;
 	use crate::transport::error::TransportFailure;
 
 	/// Byte-level fixture that replays a scripted wire image. It implements
 	/// only the byte traits, so the blanket impls recover every frame below.
 	/// Exhaustion surfaces as `UnexpectedEof`, as on a real byte transport.
+	///
+	/// The blanket frame impls under test read bytes alone, and a scripted
+	/// image hands them each malformed header that no peer would send.
 	struct ScriptedBytes {
 		data: Vec<u8>,
 		pos: usize,
@@ -562,73 +567,69 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
-	async fn blanket_recovers_short_form_frame() -> Result<(), TransportError> {
-		let wire = [0x30, 0x03, 0x01, 0x02, 0x03];
+	/// The frame that the blanket read takes off `wire` under `cap`.
+	fn read_frame(wire: impl AsRef<[u8]>, cap: usize) -> TransportResult<Vec<u8>> {
 		let mut stream = ScriptedBytes::new(wire);
-		let frame = AsyncProtocolStream::read_frame(&mut stream, 64).await?;
-		assert_eq!(frame, wire);
-		Ok(())
+		rt::block_on(AsyncProtocolStream::read_frame(&mut stream, cap))
 	}
 
-	#[tokio::test]
-	async fn blanket_recovers_long_form_frame() -> Result<(), TransportError> {
+	/// A frame of a long-form length: 128 content octets.
+	fn long_form_frame() -> Vec<u8> {
 		let mut wire = vec![0x30, 0x81, 0x80];
 		wire.extend_from_slice(&[0xAB; 0x80]);
-
-		let mut stream = ScriptedBytes::new(&wire);
-		let frame = AsyncProtocolStream::read_frame(&mut stream, 256).await?;
-		assert_eq!(frame, wire);
-		Ok(())
+		wire
 	}
 
-	#[tokio::test]
-	async fn blanket_rejects_non_canonical_length() {
-		let mut stream = ScriptedBytes::new([0x30, 0x81, 0x05]);
-		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
-		assert!(matches!(result, Err(TransportError::InvalidMessage)));
+	// The blanket read recovers a whole frame under a length of either form.
+	// Each case is (wire, cap).
+	crate::tb_cases! {
+		fn the_blanket_read_recovers_a_whole_frame((wire, cap): (Vec<u8>, usize)) -> TestResult {
+			let frame = read_frame(&wire, cap)?;
+			assert_eq!(frame, wire);
+			Ok(())
+		}
+		cases {
+			short_form => (vec![0x30, 0x03, 0x01, 0x02, 0x03], 64),
+			long_form => (long_form_frame(), 256),
+		}
 	}
 
-	#[tokio::test]
-	async fn blanket_rejects_indefinite_length() {
-		let mut stream = ScriptedBytes::new([0x30, 0x80]);
-		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
-		assert!(matches!(result, Err(TransportError::InvalidMessage)));
+	// The blanket read refuses a malformed frame as an invalid message: a
+	// non-canonical length, an indefinite length, and a frame that promises
+	// three content bytes and delivers one, whose end inside the frame is a
+	// truncation and not a clean close. An end at the frame boundary is a
+	// clean close.
+	crate::tb_cases! {
+		fn the_blanket_read_names_a_bad_frame((wire, refused): (Vec<u8>, fn(&TransportError) -> bool)) {
+			let result = read_frame(&wire, 1024);
+			assert!(matches!(&result, Err(error) if refused(error)));
+		}
+		cases {
+			a_non_canonical_length => (vec![0x30, 0x81, 0x05], |error| matches!(error, TransportError::InvalidMessage)),
+			an_indefinite_length => (vec![0x30, 0x80], |error| matches!(error, TransportError::InvalidMessage)),
+			a_truncated_frame => (vec![0x30, 0x03, 0x01], |error| matches!(error, TransportError::InvalidMessage)),
+			an_end_at_the_boundary => (vec![], |error| matches!(error, TransportError::ConnectionClosed)),
+		}
 	}
 
-	#[tokio::test]
-	async fn blanket_rejects_over_cap_before_reading_content() {
+	/// The blanket read refuses a frame over its cap from the header alone,
+	/// so the cap fires before any content allocation or read.
+	#[test]
+	fn the_blanket_read_refuses_a_frame_over_its_cap_before_its_content() {
 		let mut stream = ScriptedBytes::new([0x30, 0x82, 0x01, 0x00]);
-		let result = AsyncProtocolStream::read_frame(&mut stream, 64).await;
+		let result = rt::block_on(AsyncProtocolStream::read_frame(&mut stream, 64));
 		assert!(matches!(
 			result,
 			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
 		));
-		// The read took only the header, so the cap fired before any content
-		// allocation or read.
 		assert_eq!(stream.pos, 4);
 	}
 
-	#[tokio::test]
-	async fn boundary_eof_maps_to_connection_closed() {
+	/// The blanket write passes the bytes of its frame through unchanged.
+	#[test]
+	fn the_blanket_write_passes_its_bytes_through() -> TestResult {
 		let mut stream = ScriptedBytes::new([]);
-		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
-		assert!(matches!(result, Err(TransportError::ConnectionClosed)));
-	}
-
-	#[tokio::test]
-	async fn truncated_frame_maps_to_invalid_message() {
-		// The frame promises three content bytes and delivers one, so EOF
-		// mid-frame is truncation and not a clean close.
-		let mut stream = ScriptedBytes::new([0x30, 0x03, 0x01]);
-		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
-		assert!(matches!(result, Err(TransportError::InvalidMessage)));
-	}
-
-	#[tokio::test]
-	async fn blanket_write_frame_passes_bytes_through() -> Result<(), TransportError> {
-		let mut stream = ScriptedBytes::new([]);
-		AsyncProtocolStream::write_frame(&mut stream, &[0x30, 0x01, 0xFF]).await?;
+		rt::block_on(AsyncProtocolStream::write_frame(&mut stream, &[0x30, 0x01, 0xFF]))?;
 		assert_eq!(stream.written, vec![0x30, 0x01, 0xFF]);
 		Ok(())
 	}

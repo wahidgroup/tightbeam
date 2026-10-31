@@ -392,132 +392,119 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(feature = "testing-timing")]
-	use core::time::Duration;
-
 	use super::*;
+	use crate::testing::fixtures::TestProcess;
 	use crate::testing::specs::composition::ProcessExpr;
-	use crate::testing::specs::csp::Process;
+	use crate::testing::TestResult;
 
 	#[cfg(feature = "testing-timing")]
-	use crate::builder::TypeBuilder;
-	#[cfg(feature = "testing-timing")]
-	use crate::testing::timing::{TimingConstraint, TimingConstraints, TimingGuard, WcetConfigBuilder};
-
-	fn simple_process_p() -> Process {
-		Process::builder("P")
-			.initial_state(State("p0"))
-			.add_state(State("p0"))
-			.add_state(State("p1"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("p0"), Event("a"), State("p1"))
-			.add_terminal(State("p1"))
-			.build()
-			.expect("Failed to build process P")
-	}
-
-	fn simple_process_q() -> Process {
-		Process::builder("Q")
-			.initial_state(State("q0"))
-			.add_state(State("q0"))
-			.add_state(State("q1"))
-			.add_observable(Event("b"))
-			.add_observable(Event("c"))
-			.add_transition(State("q0"), Event("b"), State("q1"))
-			.add_terminal(State("q1"))
-			.build()
-			.expect("Failed to build process Q")
-	}
-
-	#[test]
-	fn test_synchronized_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process_p();
-		let q = simple_process_q();
-
-		let composed = Process::synchronized_parallel(&p, &q)?;
-		assert_eq!(composed.name, "(P || Q)");
-		assert!(composed.states.len() >= 2);
-		Ok(())
-	}
-
-	#[test]
-	fn test_interleaved_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process_p();
-		let q = simple_process_q();
-
-		let composed = Process::interleaved_parallel(&p, &q)?;
-		assert_eq!(composed.name, "(P ||| Q)");
-		assert!(composed.states.len() >= 2);
-		Ok(())
-	}
-
-	#[test]
-	fn test_interface_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process_p();
-		let q = simple_process_q();
-		let sync_alphabet = [Event("b")].iter().copied().collect();
-
-		let composed = Process::interface_parallel(&p, &q, sync_alphabet)?;
-		assert_eq!(composed.name, "(P [|A|] Q)");
-		assert!(composed.states.len() >= 2);
-		Ok(())
-	}
-
-	#[test]
-	fn test_alphabetized_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process_p();
-		let q = simple_process_q();
-		let alpha_p = [Event("a"), Event("b")].iter().copied().collect();
-		let alpha_q = [Event("b"), Event("c")].iter().copied().collect();
-
-		let composed = Process::alphabetized_parallel(&p, alpha_p, &q, alpha_q)?;
-		assert!(composed.states.len() >= 2);
-
-		Ok(())
-	}
+	use crate::testing::timing::TimingGuard;
 
 	/// One parallel operator over two processes.
 	type Compose = fn(&Process, &Process) -> Result<Process, CompositionError>;
 
+	/// A process `P` in which `a` takes `p0` to the terminal `p1`, with `b` in
+	/// its alphabet too.
+	fn simple_process_p() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			transitions: &[("p0", "a", "p1")],
+			terminal: &["p1"],
+			..TestProcess::of("P", "p0")
+		}
+		.build()
+	}
+
+	/// A process `Q` in which `b` takes `q0` to the terminal `q1`, with `c` in
+	/// its alphabet too.
+	fn simple_process_q() -> Process {
+		TestProcess {
+			observable: &["b", "c"],
+			transitions: &[("q0", "b", "q1")],
+			terminal: &["q1"],
+			..TestProcess::of("Q", "q0")
+		}
+		.build()
+	}
+
 	/// A process `P` that takes its hidden `tau_p` and then `a`.
 	fn hiding_p() -> Process {
-		Process::builder("P")
-			.initial_state(State("p0"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("tau_p"))
-			.add_transition(State("p0"), Event("tau_p"), State("p1"))
-			.add_transition(State("p1"), Event("a"), State("p2"))
-			.add_terminal(State("p2"))
-			.build()
-			.expect("Failed to build process P")
+		TestProcess {
+			observable: &["a"],
+			hidden: &["tau_p"],
+			transitions: &[("p0", "tau_p", "p1"), ("p1", "a", "p2")],
+			terminal: &["p2"],
+			..TestProcess::of("P", "p0")
+		}
+		.build()
 	}
 
 	/// A process `Q` that takes its hidden `tau_q` and then `b`.
 	fn hiding_q() -> Process {
-		Process::builder("Q")
-			.initial_state(State("q0"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("tau_q"))
-			.add_transition(State("q0"), Event("tau_q"), State("q1"))
-			.add_transition(State("q1"), Event("b"), State("q2"))
-			.add_terminal(State("q2"))
-			.build()
-			.expect("Failed to build process Q")
+		TestProcess {
+			observable: &["b"],
+			hidden: &["tau_q"],
+			transitions: &[("q0", "tau_q", "q1"), ("q1", "b", "q2")],
+			terminal: &["q2"],
+			..TestProcess::of("Q", "q0")
+		}
+		.build()
+	}
+
+	/// A process in which `a` or `c` takes `p0` to the terminal `p1`.
+	fn a_or_c() -> Process {
+		TestProcess {
+			observable: &["a", "c"],
+			transitions: &[("p0", "a", "p1"), ("p0", "c", "p1")],
+			terminal: &["p1"],
+			..TestProcess::of("AC", "p0")
+		}
+		.build()
+	}
+
+	/// A process `name` that takes `ping` from `idle` to the terminal `done`.
+	fn ping(name: &'static str) -> Process {
+		TestProcess::chain(name, &["idle", "done"], &["ping"])
+	}
+
+	/// The alphabetized composition of `p` over `a` and `b` with `q` over `b`
+	/// and `c`.
+	fn alphabetized(p: &Process, q: &Process) -> Result<Process, CompositionError> {
+		let alpha_p = HashSet::from([Event("a"), Event("b")]);
+		let alpha_q = HashSet::from([Event("b"), Event("c")]);
+		Process::alphabetized_parallel(p, alpha_p, q, alpha_q)
+	}
+
+	// Each parallel operator names its composition in CSP notation, over the
+	// product of the states of both operands.
+	crate::tb_cases! {
+		fn a_parallel_operator_names_its_product((compose, name): (Compose, &str)) -> TestResult {
+			let product = HashSet::from([State("(p0,q0)"), State("(p0,q1)"), State("(p1,q0)"), State("(p1,q1)")]);
+
+			let composed = compose(&simple_process_p(), &simple_process_q())?;
+			assert_eq!((composed.name, composed.states), (name, product));
+			Ok(())
+		}
+
+		cases {
+			synchronized => (Process::synchronized_parallel, "(P || Q)"),
+			interleaved => (Process::interleaved_parallel, "(P ||| Q)"),
+			interface => (|p, q| Process::interface_parallel(p, q, HashSet::from([Event("b")])), "(P [|A|] Q)"),
+			alphabetized => (alphabetized, "(P [|α|] Q)"),
+		}
 	}
 
 	// Each parallel operator keeps the hidden events of both operands hidden.
 	crate::tb_cases! {
-		fn parallel_composition_preserves_hidden_alphabet(compose: Compose) -> Result<(), CompositionError> {
+		fn parallel_composition_preserves_hidden_alphabet(compose: Compose) -> TestResult {
 			let p = hiding_p();
 			let q = hiding_q();
 
 			let composed = compose(&p, &q)?;
 
-			assert!(composed.hidden.contains(&Event("tau_p")));
-			assert!(composed.hidden.contains(&Event("tau_q")));
-			assert!(!composed.observable.contains(&Event("tau_p")));
-			assert!(!composed.observable.contains(&Event("tau_q")));
+			let observable = HashSet::from([Event("a"), Event("b")]);
+			let hidden = HashSet::from([Event("tau_p"), Event("tau_q")]);
+			assert_eq!((composed.observable, composed.hidden), (observable, hidden));
 			Ok(())
 		}
 
@@ -528,56 +515,26 @@ mod tests {
 		}
 	}
 
+	/// A parallel composition refuses an operand with a timed transition.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_timed_operand_does_not_compose_in_parallel() -> Result<(), Box<dyn core::error::Error>> {
-		let guard = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-		let timed = Process::builder("T")
+	fn a_timed_operand_does_not_compose_in_parallel() -> TestResult {
+		let guard = Some(TimingGuard::clk_within(5));
+		let guarded = Process::builder("T")
 			.initial_state(State("t0"))
 			.clock("clk")
 			.add_observable(Event("a"))
-			.add_timed_transition(State("t0"), Event("a"), State("t1"), Some(guard), Vec::new())
+			.add_timed_transition(State("t0"), Event("a"), State("t1"), guard, Vec::new())
 			.build()?;
 
-		let composed = Process::interleaved_parallel(&timed, &simple_process_q());
+		let composed = Process::interleaved_parallel(&guarded, &simple_process_q());
 		assert!(matches!(composed, Err(CompositionError::InvalidComposition { .. })));
 		Ok(())
 	}
 
-	/// A process in which `a` or `c` takes `p0` to the terminal `p1`.
-	fn a_or_c() -> Process {
-		Process::builder("AC")
-			.initial_state(State("p0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("c"))
-			.add_transition(State("p0"), Event("a"), State("p1"))
-			.add_transition(State("p0"), Event("c"), State("p1"))
-			.add_terminal(State("p1"))
-			.build()
-			.expect("a process with an initial state builds")
-	}
-
-	/// The process of `simple_process_p`, with a WCET of 10 ms on `a`.
-	#[cfg(feature = "testing-timing")]
-	fn timed_p() -> Result<Process, crate::testing::error::TestingError> {
-		let wcet = WcetConfigBuilder::default().with_duration(Duration::from_millis(10)).build();
-		let wcet = wcet.expect("a WCET with a duration builds");
-		let mut constraints = TimingConstraints::default();
-		constraints.add(Event("a"), TimingConstraint::Wcet(wcet))?;
-
-		let process = Process::builder("P")
-			.initial_state(State("p0"))
-			.add_observable(Event("a"))
-			.add_transition(State("p0"), Event("a"), State("p1"))
-			.add_terminal(State("p1"))
-			.timing_constraints(constraints)
-			.build()
-			.expect("a process with an initial state builds");
-		Ok(process)
-	}
-
+	/// An alphabetized operand performs the events of its own alphabet alone.
 	#[test]
-	fn an_alphabetized_operand_performs_its_own_alphabet_alone() -> Result<(), Box<dyn core::error::Error>> {
+	fn an_alphabetized_operand_performs_its_own_alphabet_alone() -> TestResult {
 		let alpha_p = HashSet::from([Event("a")]);
 		let alpha_q = HashSet::from([Event("b"), Event("c")]);
 
@@ -586,63 +543,61 @@ mod tests {
 		Ok(())
 	}
 
+	/// An interleaving holds the timing constraints of its operands.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn an_interleaving_holds_the_timing_of_its_operands() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::interleaved_parallel(&timed_p()?, &simple_process_q())?;
+	fn an_interleaving_holds_the_timing_of_its_operands() -> TestResult {
+		let composed = Process::interleaved_parallel(&TestProcess::timed("P", &[("a", 10)]), &simple_process_q())?;
 		let constraints = composed.timing_constraints.as_ref();
 		assert!(constraints.is_some_and(|constraints| constraints.has_constraint(&Event("a"))));
 		Ok(())
 	}
 
-	/// A process `name` that takes `ping` from `idle` to the terminal `done`.
-	fn ping(name: &'static str) -> Process {
-		Process::builder(name)
-			.initial_state(State("idle"))
-			.add_observable(Event("ping"))
-			.add_transition(State("idle"), Event("ping"), State("done"))
-			.add_terminal(State("done"))
-			.build()
-			.expect("a process with an initial state builds")
-	}
-
+	/// An interface on an event of both operands moves both operands on it.
 	#[test]
-	fn an_interface_on_an_event_of_both_operands_moves_them_together() -> Result<(), CompositionError> {
+	fn an_interface_on_an_event_of_both_operands_moves_them_together() -> TestResult {
 		let interface = CompositionOperator::Interface { events: HashSet::from([Event("ping")]) };
 		let composed = interface.compose(&ping("P"), &ping("Q"))?;
 
 		let after_ping = composed.step(composed.initial, &Event("ping"));
-		assert_eq!(after_ping, vec![State::product(State("done"), State("done"))]);
+		assert_eq!(after_ping, [State("(done,done)")]);
 		Ok(())
 	}
 
-	#[test]
-	fn an_interface_that_names_an_event_outside_both_operands_is_refused() -> Result<(), CompositionError> {
-		let interface = CompositionOperator::Interface { events: HashSet::from([Event("pnig")]) };
-		let composed = interface.compose(&ping("P"), &ping("Q"));
-		assert!(matches!(composed, Err(CompositionError::AlphabetMismatch { .. })));
-		Ok(())
+	// An operator refuses a declared alphabet that holds an event outside the
+	// alphabet of its operands.
+	crate::tb_cases! {
+		fn an_alphabet_beyond_the_operands_is_refused((operator, declared): (CompositionOperator, &'static str)) {
+			let refused = operator.compose(&ping("P"), &ping("Q")).err();
+
+			let expected = HashSet::from([Event(declared)]);
+			let actual = HashSet::from([Event("ping")]);
+			assert_eq!(refused, Some(CompositionError::AlphabetMismatch { expected, actual }));
+		}
+
+		cases {
+			as_an_interface => (CompositionOperator::Interface { events: HashSet::from([Event("pnig")]) }, "pnig"),
+			as_the_alphabet_of_an_operand => (
+				CompositionOperator::Alphabetized {
+					left: HashSet::from([Event("ping")]),
+					right: HashSet::from([Event("pong")]),
+				},
+				"pong",
+			),
+		}
 	}
 
+	/// A synchronized composition synchronizes on the events that both
+	/// operands share.
 	#[test]
-	fn an_alphabetized_operand_that_declares_an_event_it_lacks_is_refused() -> Result<(), CompositionError> {
-		let left = HashSet::from([Event("ping")]);
-		let alphabetized = CompositionOperator::Alphabetized { left, right: HashSet::from([Event("pong")]) };
-
-		let composed = alphabetized.compose(&ping("P"), &ping("Q"));
-		assert!(matches!(composed, Err(CompositionError::AlphabetMismatch { .. })));
-		Ok(())
-	}
-
-	#[test]
-	fn a_synchronized_composition_synchronizes_on_the_shared_events() -> Result<(), CompositionError> {
+	fn a_synchronized_composition_synchronizes_on_the_shared_events() {
 		let synchronized = CompositionOperator::Synchronized.sync_alphabet(&simple_process_p(), &simple_process_q());
 		assert_eq!(synchronized, HashSet::from([Event("b")]));
-		Ok(())
 	}
 
+	/// An expression names each parallel operator by its symbol.
 	#[test]
-	fn an_expression_names_each_parallel_operator_by_its_symbol() -> Result<(), CompositionError> {
+	fn an_expression_names_each_parallel_operator_by_its_symbol() {
 		let atom = |name| Box::new(ProcessExpr::atomic(name, ping(name)));
 		let operator = CompositionOperator::Synchronized;
 		let synchronized = ProcessExpr::Parallel { operator, left: atom("P"), right: atom("Q") };
@@ -650,17 +605,20 @@ mod tests {
 
 		let interleaved = ProcessExpr::Parallel { operator, left: Box::new(synchronized), right: atom("R") };
 		assert_eq!(interleaved.name(), "((P || Q) ||| R)");
-		Ok(())
 	}
 
+	/// An expression refuses an interface that names an event outside its
+	/// operands.
 	#[test]
-	fn an_expression_with_an_interface_outside_its_operands_is_refused() -> Result<(), CompositionError> {
+	fn an_expression_with_an_interface_outside_its_operands_is_refused() {
 		let left = Box::new(ProcessExpr::atomic("P", ping("P")));
 		let right = Box::new(ProcessExpr::atomic("Q", ping("Q")));
 		let operator = CompositionOperator::Interface { events: HashSet::from([Event("pnig")]) };
-
 		let expression = ProcessExpr::Parallel { operator, left, right };
-		assert!(matches!(expression.evaluate(), Err(CompositionError::AlphabetMismatch { .. })));
-		Ok(())
+		let refused = expression.evaluate().err();
+
+		let expected = HashSet::from([Event("pnig")]);
+		let actual = HashSet::from([Event("ping")]);
+		assert_eq!(refused, Some(CompositionError::AlphabetMismatch { expected, actual }));
 	}
 }

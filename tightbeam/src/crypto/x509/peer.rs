@@ -335,21 +335,19 @@ impl SubjectKey for SubjectPublicKeyInfoOwned {
 
 #[cfg(all(test, feature = "transport-cms"))]
 mod tests {
-	use super::*;
 	use crate::crypto::hpke::DhKemSecp256k1;
 	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
-	use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
-	use crate::crypto::sign::elliptic_curve::PublicKey;
-	use crate::crypto::sign::elliptic_curve::ALGORITHM_OID as EC_PUBLIC_KEY;
-	use crate::der::asn1::{BitString, ObjectIdentifier};
-	use crate::der::oid::db::rfc5280::{ANY_EXTENDED_KEY_USAGE, ID_KP_EMAIL_PROTECTION, ID_KP_TIME_STAMPING};
-	use crate::der::Any;
+	use crate::crypto::x509::error::CertificateValidationError::{DuplicateExtension, UnprocessedCriticalExtension};
+	use crate::crypto::x509::fixtures::{parse, Parse, Refusal};
+	use crate::der::flagset::FlagSet;
+	use crate::der::oid::db::rfc5280::{
+		ANY_EXTENDED_KEY_USAGE, ID_CE_NAME_CONSTRAINTS, ID_KP_EMAIL_PROTECTION, ID_KP_TIME_STAMPING,
+	};
 	use crate::oids::{CURVE_NIST_P256, CURVE_SECP256K1};
-	use crate::random::OsRng;
-	use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::{TestCertificate, TestKey, TestResult};
 	use crate::x509::ext::pkix::KeyUsage;
+
+	use super::*;
 
 	/// The signing use under the house provider.
 	type HouseSigning = Signing<DefaultCryptoProvider>;
@@ -366,145 +364,260 @@ mod tests {
 	/// The house purpose of a frame signer.
 	const SIGNER: ObjectIdentifier = KeyPurposes::HOUSE.signer;
 
-	/// A self-signed certificate of the fixed test key, whose `keyUsage`
-	/// carries `digitalSignature` and `keyAgreement`.
-	fn both_uses() -> Certificate {
-		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+	/// The tightbeam signer purpose, named by its number under the crate's
+	/// arc.
+	const TIGHTBEAM_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.3.1");
+
+	/// A purpose that an implementor names under its own arc.
+	const OWN_PURPOSE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
+
+	/// The fixed test certificate with `usages` as the bits of its `keyUsage`.
+	fn with_usages(usages: impl Into<FlagSet<KeyUsages>>) -> Certificate {
+		TestCertificate::with_key_usage(TestCertificate::insecure_fixed(), KeyUsage(usages.into()))
 	}
 
-	/// [`both_uses`] with `usage` as the one bit of its `keyUsage`.
-	fn only(usage: KeyUsages) -> Certificate {
-		TestCertificate::with_key_usage(both_uses(), KeyUsage(usage.into()))
+	/// The fixed test certificate with an `extendedKeyUsage` that names
+	/// `purposes` alone.
+	fn with_purposes(purposes: impl IntoIterator<Item = ObjectIdentifier>) -> Certificate {
+		TestCertificate::with_key_purposes(TestCertificate::insecure_fixed(), purposes)
 	}
 
-	/// [`both_uses`] with `extendedKeyUsage` naming `purposes` alone.
-	fn with_purposes(purposes: Vec<ObjectIdentifier>) -> Certificate {
-		TestCertificate::with_key_purposes(both_uses(), purposes)
+	// The parse admits a certificate for a use whose `keyUsage` bit it
+	// carries, in a role whose purpose its `extendedKeyUsage` names. A
+	// certificate with no `extendedKeyUsage` serves every role.
+	crate::tb_cases! {
+		fn the_parse_admits((parse, certificate, role): (Parse, Certificate, ObjectIdentifier)) -> TestResult {
+			parse(certificate, role)?;
+			Ok(())
+		}
+		cases {
+			a_certificate_with_both_bits_for_signing => (
+				parse::<HouseSigning>,
+				TestCertificate::insecure_fixed(),
+				SERVER,
+			),
+			a_certificate_with_both_bits_for_key_agreement => (
+				parse::<HouseAgreement>,
+				TestCertificate::insecure_fixed(),
+				SERVER,
+			),
+			a_certificate_with_both_bits_for_erased_signing => (
+				parse::<ErasedSigning>,
+				TestCertificate::insecure_fixed(),
+				SIGNER,
+			),
+			/// `encipherOnly` beside `keyAgreement` leaves the key for
+			/// enciphering, which a sender does (RFC 5480 §3).
+			an_encipher_only_certificate_for_key_agreement => (
+				parse::<HouseAgreement>,
+				with_usages(KeyUsages::KeyAgreement | KeyUsages::EncipherOnly),
+				SERVER,
+			),
+			/// `decipherOnly` restricts the key-agreement use alone, so a
+			/// certificate of both bits that asserts it serves the signing use
+			/// (RFC 5280 §4.2.1.3).
+			a_decipher_only_certificate_for_signing => (
+				parse::<HouseSigning>,
+				with_usages(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement | KeyUsages::DecipherOnly),
+				SERVER,
+			),
+			a_server_certificate_for_the_server_role => (parse::<HouseSigning>, with_purposes([SERVER]), SERVER),
+			a_server_certificate_for_the_server_key_agreement => (
+				parse::<HouseAgreement>,
+				with_purposes([SERVER]),
+				SERVER,
+			),
+			a_client_certificate_for_the_client_role => (parse::<HouseSigning>, with_purposes([CLIENT]), CLIENT),
+			a_signer_certificate_for_the_signer_role => (parse::<ErasedSigning>, with_purposes([SIGNER]), SIGNER),
+			/// The house server role admits `id-kp-serverAuth`, named here by
+			/// the OID database of RFC 5280.
+			a_server_auth_certificate_for_the_house_server_role => (
+				parse::<HouseSigning>,
+				with_purposes([ID_KP_SERVER_AUTH]),
+				KeyPurposes::HOUSE.server,
+			),
+			/// The house client role admits `id-kp-clientAuth`, named here by
+			/// the OID database of RFC 5280.
+			a_client_auth_certificate_for_the_house_client_role => (
+				parse::<HouseSigning>,
+				with_purposes([ID_KP_CLIENT_AUTH]),
+				KeyPurposes::HOUSE.client,
+			),
+			/// The house signer role admits the tightbeam signer purpose, named
+			/// here by its number under the crate's arc.
+			a_tightbeam_signer_certificate_for_the_house_signer_role => (
+				parse::<ErasedSigning>,
+				with_purposes([TIGHTBEAM_SIGNER]),
+				KeyPurposes::HOUSE.signer,
+			),
+			/// `anyExtendedKeyUsage` admits every role (RFC 5280 §4.2.1.12).
+			any_extended_key_usage_for_the_client_role => (
+				parse::<HouseSigning>,
+				with_purposes([ANY_EXTENDED_KEY_USAGE]),
+				CLIENT,
+			),
+			/// A certificate that names two roles serves each of them.
+			a_certificate_of_two_roles_for_the_second => (
+				parse::<HouseSigning>,
+				with_purposes([SERVER, CLIENT]),
+				CLIENT,
+			),
+			/// A certificate of an implementor's own purpose is admitted for
+			/// the role read under that purpose.
+			an_own_purpose_for_its_role => (parse::<HouseSigning>, with_purposes([OWN_PURPOSE]), OWN_PURPOSE),
+		}
 	}
 
-	/// [`both_uses`] with an `id-ecPublicKey` SPKI on the curve `curve` whose
-	/// bits are `point`.
-	fn with_key(curve: ObjectIdentifier, point: &[u8]) -> Certificate {
-		let named_curve = Any::encode_from(&curve).expect("a curve OID encodes");
-		let algorithm = AlgorithmIdentifierOwned { oid: EC_PUBLIC_KEY, parameters: Some(named_curve) };
-		let subject_public_key = BitString::from_bytes(point).expect("a point is a BIT STRING");
-
-		let mut certificate = both_uses();
-		let spki = SubjectPublicKeyInfoOwned { algorithm, subject_public_key };
-		certificate.tbs_certificate.subject_public_key_info = spki;
-		certificate
-	}
-
-	/// The SubjectPublicKeyInfo of [`with_key`].
-	fn key_info(curve: ObjectIdentifier, point: &[u8]) -> SubjectPublicKeyInfoOwned {
-		with_key(curve, point).tbs_certificate.subject_public_key_info
-	}
-
-	/// [`both_uses`] under the P-256 OID over the bits of its own secp256k1
-	/// point, so the curve OID alone is foreign.
-	fn on_another_curve() -> Certificate {
-		let point = fixed_point().to_encoded_point(false);
-		with_key(CURVE_NIST_P256, point.as_bytes())
-	}
-
-	/// [`both_uses`] under the secp256k1 OID over bits that are no point of
-	/// the curve.
-	fn off_the_curve() -> Certificate {
-		with_key(CURVE_SECP256K1, &[0x04; 65])
-	}
-
-	/// [`both_uses`] over the SEC 1 compact form of [`fixed_point`]: `0x05`
-	/// and its x-coordinate, a form RFC 5480 §2.2 refuses.
-	fn compact_twin() -> Certificate {
-		let point = fixed_point().to_encoded_point(false);
-		let x = point.x().expect("an uncompressed point has an x-coordinate");
-		let compact = [&[0x05][..], x.as_slice()].concat();
-		with_key(CURVE_SECP256K1, &compact)
-	}
-
-	/// The fixed test key as a point of secp256k1.
-	fn fixed_point() -> PublicKey<Secp256k1> {
-		PublicKey::from(TestKey::insecure_fixed_signing().verifying_key())
-	}
-
-	/// The negation of [`fixed_point`], which shares its x-coordinate.
-	fn negated_fixed_point() -> PublicKey<Secp256k1> {
-		let negation = PublicKey::<Secp256k1>::from_affine(-*fixed_point().as_affine());
-		negation.expect("the negation of a public key is a public key")
-	}
-
-	#[test]
-	fn a_certificate_with_both_bits_is_admitted_for_signing() {
-		assert!(PeerCertificate::<HouseSigning>::parse(both_uses(), SERVER).is_ok());
-	}
-
-	#[test]
-	fn a_certificate_with_both_bits_is_admitted_for_key_agreement() {
-		assert!(PeerCertificate::<HouseAgreement>::parse(both_uses(), SERVER).is_ok());
-	}
-
-	#[test]
-	fn a_certificate_with_both_bits_is_admitted_for_erased_signing() {
-		assert!(PeerCertificate::<ErasedSigning>::parse(both_uses(), SIGNER).is_ok());
-	}
-
-	#[test]
-	fn a_key_agreement_certificate_is_refused_for_signing() {
-		let refused = PeerCertificate::<HouseSigning>::parse(only(KeyUsages::KeyAgreement), SERVER);
-		assert!(matches!(
-			refused,
-			Err(CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature))
-		));
-	}
-
-	#[test]
-	fn a_key_agreement_certificate_is_refused_for_erased_signing() {
-		let refused = PeerCertificate::<ErasedSigning>::parse(only(KeyUsages::KeyAgreement), SIGNER);
-		assert!(matches!(
-			refused,
-			Err(CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature))
-		));
-	}
-
-	#[test]
-	fn a_signing_certificate_is_refused_for_key_agreement() {
-		let refused = PeerCertificate::<HouseAgreement>::parse(only(KeyUsages::DigitalSignature), SERVER);
-		assert!(matches!(
-			refused,
-			Err(CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement))
-		));
-	}
-
-	/// `decipherOnly` beside `keyAgreement` restricts the key to deciphering,
-	/// so the key a sender enciphers to is refused (RFC 5280 §4.2.1.3).
-	#[test]
-	fn a_decipher_only_certificate_is_refused_for_key_agreement() {
-		let usage = KeyUsage(KeyUsages::KeyAgreement | KeyUsages::DecipherOnly);
-		let certificate = TestCertificate::with_key_usage(both_uses(), usage);
-		let refused = PeerCertificate::<HouseAgreement>::parse(certificate, SERVER);
-		assert!(matches!(
-			refused,
-			Err(CertificateValidationError::ExcludedKeyUsage(KeyUsages::DecipherOnly))
-		));
-	}
-
-	/// `encipherOnly` beside `keyAgreement` leaves the key for enciphering,
-	/// which a sender does (RFC 5480 §3).
-	#[test]
-	fn an_encipher_only_certificate_is_admitted_for_key_agreement() {
-		let usage = KeyUsage(KeyUsages::KeyAgreement | KeyUsages::EncipherOnly);
-		let certificate = TestCertificate::with_key_usage(both_uses(), usage);
-		assert!(PeerCertificate::<HouseAgreement>::parse(certificate, SERVER).is_ok());
-	}
-
-	/// `decipherOnly` restricts the key-agreement use alone, so a certificate
-	/// of both bits that asserts it serves the signing use (RFC 5280
-	/// §4.2.1.3).
-	#[test]
-	fn a_decipher_only_certificate_is_admitted_for_signing() {
-		let usage = KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyAgreement | KeyUsages::DecipherOnly);
-		let certificate = TestCertificate::with_key_usage(both_uses(), usage);
-		assert!(PeerCertificate::<HouseSigning>::parse(certificate, SERVER).is_ok());
+	// The parse refuses a certificate for a use whose `keyUsage` bit it lacks,
+	// for a role its `extendedKeyUsage` omits, for an extension that breaks
+	// RFC 5280 §4.2, and for a key that is no point of the use's curve. Each
+	// row names the refusal with its payload.
+	crate::tb_cases! {
+		fn the_parse_refuses((parse, certificate, role, refusal): (Parse, Certificate, ObjectIdentifier, Refusal)) {
+			let refused = parse(certificate, role);
+			assert!(matches!(refused, Err(ref error) if refusal(error)));
+		}
+		cases {
+			a_key_agreement_certificate_for_signing => (
+				parse::<HouseSigning>,
+				with_usages(KeyUsages::KeyAgreement),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature)),
+			),
+			a_key_agreement_certificate_for_erased_signing => (
+				parse::<ErasedSigning>,
+				with_usages(KeyUsages::KeyAgreement),
+				SIGNER,
+				|e| matches!(e, CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature)),
+			),
+			a_signing_certificate_for_key_agreement => (
+				parse::<HouseAgreement>,
+				with_usages(KeyUsages::DigitalSignature),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement)),
+			),
+			/// `decipherOnly` beside `keyAgreement` restricts the key to
+			/// deciphering, so the key a sender enciphers to is refused
+			/// (RFC 5280 §4.2.1.3).
+			a_decipher_only_certificate_for_key_agreement => (
+				parse::<HouseAgreement>,
+				with_usages(KeyUsages::KeyAgreement | KeyUsages::DecipherOnly),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyUsage(KeyUsages::DecipherOnly)),
+			),
+			/// A client's certificate names a purpose of the client role alone,
+			/// so the server role refuses it (RFC 5280 §4.2.1.12).
+			a_client_certificate_for_the_server_role => (
+				parse::<HouseSigning>,
+				with_purposes([CLIENT]),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			a_client_certificate_for_the_server_key_agreement => (
+				parse::<HouseAgreement>,
+				with_purposes([CLIENT]),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			a_server_certificate_for_the_client_role => (
+				parse::<HouseSigning>,
+				with_purposes([SERVER]),
+				CLIENT,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			a_server_certificate_for_the_signer_role => (
+				parse::<ErasedSigning>,
+				with_purposes([SERVER]),
+				SIGNER,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			a_signer_certificate_for_the_server_role => (
+				parse::<HouseSigning>,
+				with_purposes([SIGNER]),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			/// `id-kp-emailProtection` names S/MIME, so the client role refuses
+			/// it.
+			an_email_protection_certificate_for_the_client_role => (
+				parse::<HouseSigning>,
+				with_purposes([ID_KP_EMAIL_PROTECTION]),
+				CLIENT,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			/// A certificate whose `extendedKeyUsage` names
+			/// `id-kp-timeStamping` alone serves time stamping alone, so the
+			/// server's key agreement refuses it.
+			a_certificate_of_another_purpose_for_key_agreement => (
+				parse::<HouseAgreement>,
+				with_purposes([ID_KP_TIME_STAMPING]),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::ExcludedKeyPurpose),
+			),
+			/// A certificate that repeats an extension is refused for every use
+			/// (RFC 5280 §4.2).
+			a_certificate_that_repeats_an_extension_for_signing => (
+				parse::<HouseSigning>,
+				TestCertificate::with_repeated_extension(TestCertificate::insecure_fixed(), "2.5.29.30"),
+				SERVER,
+				|e| matches!(e, DuplicateExtension(oid) if *oid == ID_CE_NAME_CONSTRAINTS),
+			),
+			/// A certificate with a critical extension the crate does not
+			/// process is refused for every use (RFC 5280 §4.2).
+			a_certificate_with_an_unknown_critical_extension_for_erased_signing => (
+				parse::<ErasedSigning>,
+				TestCertificate::with_unknown_critical_extension(TestCertificate::insecure_fixed()),
+				SIGNER,
+				|e| matches!(e, UnprocessedCriticalExtension(oid) if *oid == ID_CE_NAME_CONSTRAINTS),
+			),
+			/// The signing use parses the SPKI as the provider's verifying key,
+			/// which names its curve, so a key under another curve's OID is
+			/// refused.
+			a_key_on_another_curve_for_signing => (
+				parse::<HouseSigning>,
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), CURVE_NIST_P256),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::SpkiError(_)),
+			),
+			/// The key-agreement use parses the SPKI as the KEM's recipient
+			/// key, which names its curve, so a key under another curve's OID
+			/// is refused.
+			a_key_on_another_curve_for_key_agreement => (
+				parse::<HouseAgreement>,
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), CURVE_NIST_P256),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::SpkiError(_)),
+			),
+			/// Bits that are no point of the curve the SPKI names are refused
+			/// for signing.
+			a_key_off_the_curve_for_signing => (
+				parse::<HouseSigning>,
+				TestCertificate::with_curve_point(TestCertificate::insecure_fixed(), CURVE_SECP256K1, &[0x04; 65]),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::SpkiError(_)),
+			),
+			a_key_off_the_curve_for_key_agreement => (
+				parse::<HouseAgreement>,
+				TestCertificate::with_curve_point(TestCertificate::insecure_fixed(), CURVE_SECP256K1, &[0x04; 65]),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::SpkiError(_)),
+			),
+			/// The compact twin of the signing key would decompact to a point
+			/// that agrees as the signing key does, so the key-agreement use
+			/// refuses its form (RFC 5480 §2.2).
+			a_compact_twin_of_the_signing_key_for_key_agreement => (
+				parse::<HouseAgreement>,
+				TestCertificate::with_compact_key(TestCertificate::insecure_fixed()),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::SpkiError(_)),
+			),
+			a_compact_signing_key_for_signing => (
+				parse::<HouseSigning>,
+				TestCertificate::with_compact_key(TestCertificate::insecure_fixed()),
+				SERVER,
+				|e| matches!(e, CertificateValidationError::SpkiError(_)),
+			),
+		}
 	}
 
 	/// The house KEM's certificate profile asserts `keyAgreement`, the bit
@@ -514,239 +627,46 @@ mod tests {
 		assert_eq!(HouseAgreement::USAGE, KeyUsages::KeyAgreement);
 	}
 
-	/// A client's certificate names a purpose of the client role alone, so
-	/// the server role refuses it (RFC 5280 §4.2.1.12).
-	#[test]
-	fn a_client_certificate_is_refused_for_the_server_role() {
-		let refused = PeerCertificate::<HouseSigning>::parse(with_purposes(vec![CLIENT]), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	#[test]
-	fn a_client_certificate_is_refused_for_the_server_key_agreement() {
-		let refused = PeerCertificate::<HouseAgreement>::parse(with_purposes(vec![CLIENT]), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	#[test]
-	fn a_server_certificate_is_refused_for_the_client_role() {
-		let refused = PeerCertificate::<HouseSigning>::parse(with_purposes(vec![SERVER]), CLIENT);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	#[test]
-	fn a_server_certificate_is_refused_for_the_signer_role() {
-		let refused = PeerCertificate::<ErasedSigning>::parse(with_purposes(vec![SERVER]), SIGNER);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	#[test]
-	fn a_signer_certificate_is_refused_for_the_server_role() {
-		let refused = PeerCertificate::<HouseSigning>::parse(with_purposes(vec![SIGNER]), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	/// `id-kp-emailProtection` names S/MIME, so the client role refuses it.
-	#[test]
-	fn an_email_protection_certificate_is_refused_for_the_client_role() {
-		let refused = PeerCertificate::<HouseSigning>::parse(with_purposes(vec![ID_KP_EMAIL_PROTECTION]), CLIENT);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	/// A certificate whose `extendedKeyUsage` names `id-kp-timeStamping` alone
-	/// serves time stamping alone, so the server's key agreement refuses it.
-	#[test]
-	fn a_certificate_of_another_purpose_is_refused_for_key_agreement() {
-		let refused = PeerCertificate::<HouseAgreement>::parse(with_purposes(vec![ID_KP_TIME_STAMPING]), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-	}
-
-	#[test]
-	fn a_server_certificate_is_admitted_for_the_server_role() {
-		assert!(PeerCertificate::<HouseSigning>::parse(with_purposes(vec![SERVER]), SERVER).is_ok());
-	}
-
-	#[test]
-	fn a_server_certificate_is_admitted_for_the_server_key_agreement() {
-		assert!(PeerCertificate::<HouseAgreement>::parse(with_purposes(vec![SERVER]), SERVER).is_ok());
-	}
-
-	#[test]
-	fn a_client_certificate_is_admitted_for_the_client_role() {
-		assert!(PeerCertificate::<HouseSigning>::parse(with_purposes(vec![CLIENT]), CLIENT).is_ok());
-	}
-
-	#[test]
-	fn a_signer_certificate_is_admitted_for_the_signer_role() {
-		assert!(PeerCertificate::<ErasedSigning>::parse(with_purposes(vec![SIGNER]), SIGNER).is_ok());
-	}
-
-	/// The house server role admits `id-kp-serverAuth`, named here by the
-	/// OID database of RFC 5280.
-	#[test]
-	fn a_server_auth_certificate_is_admitted_for_the_house_server_role() {
-		let certificate = with_purposes(vec![ID_KP_SERVER_AUTH]);
-		assert!(PeerCertificate::<HouseSigning>::parse(certificate, KeyPurposes::HOUSE.server).is_ok());
-	}
-
-	/// The house client role admits `id-kp-clientAuth`, named here by the
-	/// OID database of RFC 5280.
-	#[test]
-	fn a_client_auth_certificate_is_admitted_for_the_house_client_role() {
-		let certificate = with_purposes(vec![ID_KP_CLIENT_AUTH]);
-		assert!(PeerCertificate::<HouseSigning>::parse(certificate, KeyPurposes::HOUSE.client).is_ok());
-	}
-
-	/// The house signer role admits the tightbeam signer purpose, named here
-	/// by its number under the crate's arc.
-	#[test]
-	fn a_tightbeam_signer_certificate_is_admitted_for_the_house_signer_role() {
-		let signer = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.64586.3.1");
-		let certificate = with_purposes(vec![signer]);
-		assert!(PeerCertificate::<ErasedSigning>::parse(certificate, KeyPurposes::HOUSE.signer).is_ok());
-	}
-
-	/// `anyExtendedKeyUsage` admits every role (RFC 5280 §4.2.1.12).
-	#[test]
-	fn any_extended_key_usage_is_admitted_for_the_client_role() {
-		let certificate = with_purposes(vec![ANY_EXTENDED_KEY_USAGE]);
-		assert!(PeerCertificate::<HouseSigning>::parse(certificate, CLIENT).is_ok());
-	}
-
-	/// A certificate that names two roles serves each of them.
-	#[test]
-	fn a_certificate_of_two_roles_is_admitted_for_the_second() {
-		let certificate = with_purposes(vec![SERVER, CLIENT]);
-		assert!(PeerCertificate::<HouseSigning>::parse(certificate, CLIENT).is_ok());
-	}
-
-	/// A certificate of an implementor's own purpose is admitted for the role
-	/// read under that purpose.
-	#[test]
-	fn an_own_purpose_is_admitted_for_its_role() {
-		let own = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
-		let certificate = with_purposes(vec![own]);
-		assert!(PeerCertificate::<HouseSigning>::parse(certificate, own).is_ok());
-	}
-
-	/// A certificate that repeats an extension is refused for every use
-	/// (RFC 5280 §4.2).
-	#[test]
-	fn a_certificate_that_repeats_an_extension_is_refused_for_signing() {
-		let extension = TestCertificate::opaque_extension("2.5.29.30", false);
-		let certificate = TestCertificate::with_extension(both_uses(), extension.clone());
-		let certificate = TestCertificate::with_extension(certificate, extension);
-
-		let refused = PeerCertificate::<HouseSigning>::parse(certificate, SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-	}
-
-	/// A certificate with a critical extension the crate does not process is
-	/// refused for every use (RFC 5280 §4.2).
-	#[test]
-	fn a_certificate_with_an_unknown_critical_extension_is_refused_for_erased_signing() {
-		let extension = TestCertificate::opaque_extension("2.5.29.30", true);
-		let certificate = TestCertificate::with_extension(both_uses(), extension);
-
-		let refused = PeerCertificate::<ErasedSigning>::parse(certificate, SIGNER);
-		assert!(matches!(
-			refused,
-			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-		));
-	}
-
-	/// The signing use parses the SPKI as the provider's verifying key, which
-	/// names its curve, so a key under another curve's OID is refused.
-	#[test]
-	fn a_key_on_another_curve_is_refused_for_signing() {
-		let refused = PeerCertificate::<HouseSigning>::parse(on_another_curve(), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
-	/// The key-agreement use parses the SPKI as the KEM's recipient key,
-	/// which names its curve, so a key under another curve's OID is refused.
-	#[test]
-	fn a_key_on_another_curve_is_refused_for_key_agreement() {
-		let refused = PeerCertificate::<HouseAgreement>::parse(on_another_curve(), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
-	/// Bits that are no point of the curve the SPKI names are refused for
-	/// signing.
-	#[test]
-	fn a_key_off_the_curve_is_refused_for_signing() {
-		let refused = PeerCertificate::<HouseSigning>::parse(off_the_curve(), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
-	#[test]
-	fn a_key_off_the_curve_is_refused_for_key_agreement() {
-		let refused = PeerCertificate::<HouseAgreement>::parse(off_the_curve(), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
-	/// The compact twin of the signing key would decompact to a point that
-	/// agrees as the signing key does, so the key-agreement use refuses its
-	/// form (RFC 5480 §2.2).
-	#[test]
-	fn a_compact_twin_of_the_signing_key_is_refused_for_key_agreement() {
-		let refused = PeerCertificate::<HouseAgreement>::parse(compact_twin(), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
-	#[test]
-	fn a_compact_signing_key_is_refused_for_signing() {
-		let refused = PeerCertificate::<HouseSigning>::parse(compact_twin(), SERVER);
-		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
-	}
-
 	/// An uncompressed point whose two halves differ in length holds no x and
 	/// y of one field, so its form is refused.
 	#[test]
 	fn an_uncompressed_point_of_uneven_halves_fails_the_point_form() {
-		let point = fixed_point().to_encoded_point(false);
-		let uneven = [point.as_bytes(), &[0][..]].concat();
-		let spki = key_info(CURVE_SECP256K1, &uneven);
+		let fixed = TestCertificate::insecure_fixed();
+		let point = fixed.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+		let uneven = [point, &[0][..]].concat();
+		let certificate = TestCertificate::with_curve_point(fixed, CURVE_SECP256K1, &uneven);
+		let spki = certificate.tbs_certificate.subject_public_key_info;
 
 		let refused = spki.owned_to_ref().require_point_form();
 		assert!(matches!(refused, Err(CertificateValidationError::SpkiError(_))));
 	}
 
-	/// One point in its compressed and its uncompressed SEC 1 encoding is one
-	/// key.
-	#[test]
-	fn a_compressed_twin_is_the_same_key() {
-		let uncompressed = fixed_point().to_encoded_point(false);
-		let compressed = fixed_point().to_encoded_point(true);
-		let own = key_info(CURVE_SECP256K1, uncompressed.as_bytes());
-		let twin = key_info(CURVE_SECP256K1, compressed.as_bytes());
-		assert!(own.same_key(&twin));
-	}
+	// An agreement reads a point by its curve and its x-coordinate, so the
+	// fixed key is one key with each SEC 1 form of its point and with its
+	// negation, and another key on another curve or at another point.
+	crate::tb_cases! {
+		fn the_fixed_key((other, same): (Certificate, bool)) {
+			let own = TestCertificate::insecure_fixed().tbs_certificate.subject_public_key_info;
 
-	/// A point and its negation agree alike, so they are one key.
-	#[test]
-	fn a_negated_point_is_the_same_key() {
-		let point = fixed_point().to_encoded_point(false);
-		let negation = negated_fixed_point().to_encoded_point(false);
-		let own = key_info(CURVE_SECP256K1, point.as_bytes());
-		let negated = key_info(CURVE_SECP256K1, negation.as_bytes());
-		assert!(own.same_key(&negated));
-	}
-
-	/// One x-coordinate on two curves names two points.
-	#[test]
-	fn one_x_coordinate_on_two_curves_is_two_keys() {
-		let point = fixed_point().to_encoded_point(false);
-		let own = key_info(CURVE_SECP256K1, point.as_bytes());
-		let other = on_another_curve().tbs_certificate.subject_public_key_info;
-		assert!(!own.same_key(&other));
-	}
-
-	#[test]
-	fn two_points_are_two_keys() {
-		let other = SecretKey::random(&mut OsRng).public_key().to_encoded_point(false);
-		let own = both_uses().tbs_certificate.subject_public_key_info;
-		let other = key_info(CURVE_SECP256K1, other.as_bytes());
-		assert!(!own.same_key(&other));
+			let compared = own.same_key(&other.tbs_certificate.subject_public_key_info);
+			assert_eq!(compared, same);
+		}
+		cases {
+			/// One point in its compressed and its uncompressed SEC 1 encoding
+			/// is one key.
+			is_one_key_with_its_compressed_twin => (
+				TestCertificate::with_compressed_key(TestCertificate::insecure_fixed()),
+				true,
+			),
+			/// A point and its negation agree alike, so they are one key.
+			is_one_key_with_its_negation => (TestCertificate::insecure_fixed_negation(), true),
+			/// One x-coordinate on two curves names two points.
+			is_another_key_on_another_curve => (
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), CURVE_NIST_P256),
+				false,
+			),
+			/// A seeded key other than the fixed one holds another point.
+			is_another_key_than_another_point => (TestCertificate::self_signed(&TestKey::fixed(0x0b)), false),
+		}
 	}
 }

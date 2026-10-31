@@ -1559,6 +1559,48 @@ pub(crate) trait SettledExchange: EncryptedProtocolState + Sized {
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 impl<E: EncryptedProtocolState> SettledExchange for E {}
 
+/// The session phases and the provisioning that the transport tests place a
+/// session in.
+#[cfg(test)]
+mod fixtures {
+	use super::*;
+	use crate::clock::ManualClock;
+	use crate::crypto::aead::SessionKeys;
+	use crate::crypto::profiles::DefaultCryptoProvider;
+
+	impl EncryptionConfig<DefaultCryptoProvider> {
+		/// Provisioning that authenticates a peer by the expiry of its
+		/// certificate, so a session over it expects a handshake.
+		pub(crate) fn provisioned() -> Self {
+			let peer_authentication = PeerAuthentication::mutual_by_expiry();
+			EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() }
+		}
+	}
+
+	impl SessionPhase {
+		/// A handshake that began at the first reading of a manual clock.
+		pub(crate) fn handshaking() -> Self {
+			SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
+		}
+
+		/// The phase of an endpoint that holds a session of `keys` with no
+		/// receipt and no peer.
+		pub(crate) fn encrypted(keys: SessionKeys) -> Self {
+			SessionPhase::Encrypted(Box::new(EstablishedSession::forged(keys, None, None)))
+		}
+
+		/// The phase of an endpoint that holds a session of `keys` whose peer
+		/// is [`TestPeer::fixed`](crate::testing::fixtures::TestPeer::fixed),
+		/// beside the hash of the canonical key of that peer.
+		#[cfg(feature = "instrument")]
+		pub(crate) fn peered(keys: SessionKeys) -> (Self, [u8; 32]) {
+			let (peer, key_hash) = crate::testing::fixtures::TestPeer::fixed();
+			let session = EstablishedSession::forged(keys, None, Some(peer));
+			(SessionPhase::Encrypted(Box::new(session)), key_hash)
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1566,21 +1608,23 @@ mod tests {
 	use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::testing::TestFrame;
+	use crate::testing::{TestFrame, TestResult};
 
 	#[cfg(feature = "testing")]
 	use crate::crypto::x509::CanonicalKey;
 	#[cfg(feature = "testing")]
 	use crate::policy::SessionContext;
+	#[cfg(feature = "testing")]
+	use crate::testing::fixtures::TestCertificate;
 	#[cfg(all(feature = "transport-cms", feature = "testing"))]
 	use crate::testing::fixtures::TestCmsServer;
-	#[cfg(feature = "testing")]
-	use crate::testing::fixtures::{TestCertificate, TestKey};
 	#[cfg(feature = "testing")]
 	use crate::transport::handshake::SessionPeer;
 
 	/// A probe that holds the phase the trait reads back.
+	///
+	/// A transport holds its session behind a socket and a handshake, and the
+	/// cases read the phase rules of the session alone.
 	struct PhaseProbe {
 		state: SessionState<DefaultCryptoProvider>,
 		limits: CheckedLimits,
@@ -1589,7 +1633,7 @@ mod tests {
 	impl PhaseProbe {
 		/// Mutual authentication alone makes the probe expect encryption.
 		fn provisioned(phase: SessionPhase) -> Self {
-			Self::holding(provisioned_encryption(), phase)
+			Self::holding(EncryptionConfig::provisioned(), phase)
 		}
 
 		fn cleartext(phase: SessionPhase) -> Self {
@@ -1598,6 +1642,25 @@ mod tests {
 
 		fn holding(encryption: EncryptionConfig<DefaultCryptoProvider>, phase: SessionPhase) -> Self {
 			Self { state: SessionState::at(encryption, phase), limits: CheckedLimits::default() }
+		}
+
+		/// A provisioned probe that a fresh session reached and then reset.
+		fn reset_from_its_start() -> Self {
+			let encryption = DialableEncryption::new(EncryptionConfig::provisioned());
+			let mut state = SessionState::new(encryption.expect("mutual authentication answers for the peer"));
+			state.reset();
+
+			Self { state, limits: CheckedLimits::default() }
+		}
+
+		/// A provisioned probe whose handshake installed
+		/// [`established_session`].
+		#[cfg(feature = "testing")]
+		fn established() -> Self {
+			let mut probe = Self::provisioned(SessionPhase::handshaking());
+			let installed = probe.install_established(established_session());
+			installed.expect("a handshaking probe installs a session");
+			probe
 		}
 	}
 
@@ -1626,26 +1689,59 @@ mod tests {
 		}
 	}
 
-	fn provisioned_encryption() -> EncryptionConfig<DefaultCryptoProvider> {
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
-		let peer_authentication = PeerAuthentication::Anonymous.and(validator);
-		EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() }
+	/// A handshake that began at the current reading of `clock`.
+	fn handshaking_at(clock: &ManualClock) -> SessionPhase {
+		SessionPhase::Handshaking { initiated_at: clock.monotonic() }
 	}
 
-	fn handshaking() -> SessionPhase {
-		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
+	fn cleartext() -> SessionPhase {
+		SessionPhase::Cleartext
 	}
 
-	/// A provisioned endpoint starts where it expects a handshake, and a
-	/// cleartext one only where its provisioning names cleartext (CWE-311).
-	#[test]
-	fn a_session_starts_where_its_provisioning_says() -> TransportResult<()> {
-		let provisioned = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
-		assert!(matches!(provisioned.phase(), SessionPhase::Provisioned));
+	fn provisioned() -> SessionPhase {
+		SessionPhase::Provisioned
+	}
 
-		let cleartext = SessionState::<DefaultCryptoProvider>::new(DialableEncryption::cleartext());
-		assert!(matches!(cleartext.phase(), SessionPhase::Cleartext));
-		Ok(())
+	#[cfg(feature = "testing")]
+	fn failed() -> SessionPhase {
+		SessionPhase::Failed
+	}
+
+	/// The phase of a session whose peer authorization reads.
+	#[cfg(feature = "testing")]
+	fn established() -> SessionPhase {
+		SessionPhase::Encrypted(Box::new(established_session()))
+	}
+
+	#[cfg(feature = "testing")]
+	fn begin() -> SessionEvent {
+		SessionEvent::BeginHandshake(ManualClock::default().monotonic())
+	}
+
+	#[cfg(feature = "testing")]
+	fn install() -> SessionEvent {
+		SessionEvent::Install(Box::new(established_session()))
+	}
+
+	#[cfg(feature = "testing")]
+	fn reset() -> SessionEvent {
+		SessionEvent::Reset
+	}
+
+	// A provisioned endpoint starts where it expects a handshake, and a
+	// cleartext one only where its provisioning names cleartext (CWE-311).
+	crate::tb_cases! {
+		fn a_session_starts_where_its_provisioning_says(
+			(encryption, start): (DialableEncryption<DefaultCryptoProvider>, fn() -> SessionPhase)
+		) -> TestResult {
+			let session = SessionState::new(encryption);
+			assert_eq!(core::mem::discriminant(session.phase()), core::mem::discriminant(&start()));
+			Ok(())
+		}
+		cases {
+			provisioned => (DialableEncryption::new(EncryptionConfig::provisioned())?, provisioned),
+			cleartext => (DialableEncryption::cleartext(), cleartext),
+		}
 	}
 
 	/// A CMS client with a provisioned server trust holds a peer authority,
@@ -1653,7 +1749,7 @@ mod tests {
 	/// cleartext (CWE-311).
 	#[cfg(all(feature = "transport-cms", feature = "testing"))]
 	#[test]
-	fn a_cms_client_of_a_provisioned_server_starts_provisioned() -> TransportResult<()> {
+	fn a_cms_client_of_a_provisioned_server_starts_provisioned() -> TestResult {
 		let server = TestCmsServer::generate("tightbeam provisioned client");
 		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
 			cms_server: Some(server.trust()),
@@ -1674,63 +1770,85 @@ mod tests {
 		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
 	}
 
-	/// The breaker returns a provisioned session to `Provisioned` whatever
-	/// phase it reached, so a broken session never writes in the clear
-	/// (CWE-311).
-	#[test]
-	fn resetting_a_provisioned_session_returns_it_to_provisioned() {
-		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.session_state_mut().reset();
-		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+	// The breaker returns a session to the start its provisioning names
+	// whatever phase it reached: a provisioned session to `Provisioned`, so a
+	// broken session never writes in the clear (CWE-311), and a cleartext
+	// session to `Cleartext`.
+	crate::tb_cases! {
+		fn a_reset_returns_a_session_to_its_start((mut probe, start): (PhaseProbe, fn() -> SessionPhase)) {
+			probe.session_state_mut().reset();
+			assert_eq!(core::mem::discriminant(probe.session_state().phase()), core::mem::discriminant(&start()));
+		}
+		cases {
+			provisioned => (PhaseProbe::provisioned(SessionPhase::handshaking()), provisioned),
+			cleartext => (PhaseProbe::cleartext(SessionPhase::Cleartext), cleartext),
+		}
 	}
 
-	#[test]
-	fn resetting_a_cleartext_session_returns_it_to_cleartext() {
-		let mut probe = PhaseProbe::cleartext(SessionPhase::Cleartext);
-		probe.session_state_mut().reset();
-		assert!(matches!(probe.session_state().phase(), SessionPhase::Cleartext));
+	// A session writes from the phases that carry frames alone: cleartext and
+	// encrypted.
+	crate::tb_cases! {
+		fn a_phase_is_writable_when_it_carries_frames((phase, writable): (SessionPhase, bool)) {
+			assert_eq!(phase.is_writable(), writable);
+		}
+		cases {
+			cleartext => (SessionPhase::Cleartext, true),
+			encrypted => (SessionPhase::encrypted(SessionKeys::insecure_client()), true),
+			provisioned => (SessionPhase::Provisioned, false),
+			handshaking => (SessionPhase::handshaking(), false),
+			failed => (SessionPhase::Failed, false),
+		}
 	}
 
-	#[test]
-	fn only_cleartext_and_encrypted_phases_are_writable() {
-		assert!(SessionPhase::Cleartext.is_writable());
-		assert!(!SessionPhase::Provisioned.is_writable());
-		assert!(!handshaking().is_writable());
-		assert!(!SessionPhase::Failed.is_writable());
-	}
-
-	/// A failed session writes nothing, because its stream has no sound
-	/// position.
-	#[test]
-	fn a_failed_session_refuses_to_apply_a_wire_mode() -> TransportResult<()> {
-		let probe = PhaseProbe::cleartext(SessionPhase::Failed);
-		let builder = EnvelopeBuilder::request(TestFrame::v0(None, None));
-		let refusal = probe.apply_wire_mode(builder);
-		assert!(matches!(refusal, Err(TransportError::ConnectionFailed)));
-		Ok(())
+	// Every envelope path applies the wire mode, so a refusal here is the one
+	// guard against a write from a session with no sound way to send: a
+	// failed session has no sound position, and a provisioned session that
+	// stalls in its handshake or resets from its start, even through the
+	// public `reset` method, has no encryptor (CWE-311).
+	crate::tb_cases! {
+		fn a_session_without_a_sound_send_refuses_to_apply_a_wire_mode(
+			(probe, refused): (PhaseProbe, fn(&TransportError) -> bool)
+		) {
+			let builder = EnvelopeBuilder::request(TestFrame::v0(None, None));
+			let refusal = probe.apply_wire_mode(builder);
+			assert!(matches!(&refusal, Err(error) if refused(error)));
+		}
+		cases {
+			failed => (
+				PhaseProbe::cleartext(SessionPhase::Failed),
+				|error| matches!(error, TransportError::ConnectionFailed),
+			),
+			pending => (
+				PhaseProbe::provisioned(SessionPhase::handshaking()),
+				|error| matches!(error, TransportError::OperationFailed(TransportFailure::EncryptorUnavailable)),
+			),
+			reset_from_its_start => (
+				PhaseProbe::reset_from_its_start(),
+				|error| matches!(error, TransportError::OperationFailed(TransportFailure::EncryptorUnavailable)),
+			),
+		}
 	}
 
 	/// A failed session reads nothing, because its stream has no sound
 	/// position.
 	#[test]
-	fn a_failed_session_refuses_an_arrival() -> TransportResult<()> {
-		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Failed);
+	fn a_failed_session_refuses_an_arrival() {
+		let mut state = SessionState::at(EncryptionConfig::provisioned(), SessionPhase::Failed);
 		let mut wire = [0x30u8, 0x00];
 		let limits = TransportLimits::default();
 		let admitted = state.admit_arrival(&mut wire, &limits).map_err(TransportError::from);
 		assert!(matches!(admitted, Err(TransportError::ConnectionFailed)));
-		Ok(())
 	}
 
 	/// An exchange in flight keeps its connection out of a pool, and its
 	/// settlement returns the connection.
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	#[test]
-	fn an_exchange_in_flight_is_leasable_once_it_settles() -> TransportResult<()> {
-		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Cleartext);
+	fn an_exchange_in_flight_is_leasable_once_it_settles() -> TestResult {
+		let mut state = SessionState::at(EncryptionConfig::provisioned(), SessionPhase::Cleartext);
 		state.begin_exchange();
-		let in_flight = state.is_leasable();
 
+		let in_flight = state.is_leasable();
 		state.settle_exchange(Ok(()))?;
 		assert_eq!((in_flight, state.is_leasable()), (false, true));
 		Ok(())
@@ -1742,9 +1860,8 @@ mod tests {
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	crate::tb_cases! {
 		fn an_established_session_is_leasable_while_its_cipher_has_a_record((ceiling, expected): (usize, bool)) {
-			let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-			let session = EstablishedSession::forged(keys.with_envelope_ceiling(ceiling), None, None);
-			let state = SessionState::at(provisioned_encryption(), SessionPhase::Encrypted(Box::new(session)));
+			let phase = SessionPhase::encrypted(SessionKeys::insecure_client().with_envelope_ceiling(ceiling));
+			let state = SessionState::at(EncryptionConfig::provisioned(), phase);
 			assert_eq!(state.is_leasable(), expected);
 		}
 		cases {
@@ -1757,118 +1874,93 @@ mod tests {
 	/// of the pool. A ceiling of the whole renewal volume leaves one record.
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	#[test]
-	fn the_last_seal_of_a_send_cipher_takes_its_session_out_of_the_pool() -> TransportResult<()> {
+	fn the_last_seal_of_a_send_cipher_takes_its_session_out_of_the_pool() -> TestResult {
 		let ceiling = crate::constants::RENEWAL_VOLUME_BYTES as usize;
-		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
-		let session = EstablishedSession::forged(keys.with_envelope_ceiling(ceiling), None, None);
-		let state = SessionState::at(provisioned_encryption(), SessionPhase::Encrypted(Box::new(session)));
-		let before = state.is_leasable();
+		let state = SessionState::at(
+			EncryptionConfig::provisioned(),
+			SessionPhase::encrypted(SessionKeys::insecure_client().with_envelope_ceiling(ceiling)),
+		);
 
+		let before = state.is_leasable();
 		state.encryptor()?.encrypt_next(b"the last record".to_vec())?;
 		assert_eq!((before, state.is_leasable()), (true, false));
 		Ok(())
 	}
+
+	/// The phase a session sits in, the error of its exchange, and the phase
+	/// it lands in.
+	#[cfg(all(feature = "testing", any(feature = "tcp", feature = "async-transport")))]
+	type SettleCase = (fn() -> SessionPhase, TransportError, fn() -> SessionPhase);
 
 	// An exchange settles under one rule: every phase but `Failed` fails on
 	// an error that leaves the stream unsound, a handshake error included, and
 	// keeps its phase on an error that proves the frame never left.
 	#[cfg(all(feature = "testing", any(feature = "tcp", feature = "async-transport")))]
 	crate::tb_cases! {
-		fn an_exchange_settles_its_session((phase, error, landing): (&str, TransportError, &str)) -> TransportResult<()> {
-			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
+		fn an_exchange_settles_its_session(
+			(phase, error, landing): SettleCase
+		) {
+			let mut state = SessionState::at(EncryptionConfig::provisioned(), phase());
+			let kind = core::mem::discriminant(&error);
+
 			let settled = state.settle_exchange::<()>(Err(error));
-			assert!(settled.is_err());
-			assert_eq!(
-				core::mem::discriminant(state.phase()),
-				core::mem::discriminant(&phase_named(landing)),
-				"{phase} must land in {landing}"
-			);
-			Ok(())
+			assert!(matches!(&settled, Err(returned) if core::mem::discriminant(returned) == kind));
+			assert_eq!(core::mem::discriminant(state.phase()), core::mem::discriminant(&landing()));
 		}
 		cases {
-			a_close_fails_an_encrypted_session => ("encrypted", TransportError::ConnectionClosed, "failed"),
+			a_close_fails_an_encrypted_session => (established, TransportError::ConnectionClosed, failed),
 			a_deadline_fails_a_cleartext_session => (
-				"cleartext",
+				cleartext,
 				TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
-				"failed"
+				failed,
 			),
 			a_handshake_error_fails_a_handshaking_session => (
-				"handshaking",
+				SessionPhase::handshaking,
 				TransportError::HandshakeError(crate::transport::handshake::HandshakeError::InvalidState),
-				"failed"
+				failed,
 			),
-			an_undecodable_answer_fails_a_cleartext_session => ("cleartext", TransportError::InvalidMessage, "failed"),
+			an_undecodable_answer_fails_a_cleartext_session => (cleartext, TransportError::InvalidMessage, failed),
 			a_missing_encryptor_keeps_a_provisioned_session => (
-				"provisioned",
+				provisioned,
 				TransportError::OperationFailed(TransportFailure::EncryptorUnavailable),
-				"provisioned"
+				provisioned,
 			),
-			a_failed_session_stays_failed => ("failed", TransportError::ConnectionClosed, "failed"),
+			a_failed_session_stays_failed => (failed, TransportError::ConnectionClosed, failed),
 		}
 	}
 
-	/// Every envelope path applies the wire mode here, so this refusal is the
-	/// one guard against a cleartext write from a stalled session (CWE-311).
-	#[test]
-	fn pending_session_refuses_to_apply_a_wire_mode() {
-		let probe = PhaseProbe::provisioned(handshaking());
-		let frame = TestFrame::v0(None, None);
-
-		let builder = EnvelopeBuilder::request(frame);
-		let refusal = probe.apply_wire_mode(builder);
-		assert!(matches!(
-			refusal,
-			Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
-		));
-	}
-
-	/// A provisioned session writes nothing in the clear after a reset from
-	/// any phase, even a reset through the public `reset` method.
-	#[test]
-	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
-		let mut state = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
-		state.reset();
-
-		let probe = PhaseProbe { state, limits: CheckedLimits::default() };
-		let builder = EnvelopeBuilder::request(TestFrame::v0(None, None));
-		let refusal = probe.apply_wire_mode(builder);
-		assert!(matches!(
-			refusal,
-			Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
-		));
-		Ok(())
-	}
+	/// A phase, an event, whether the table admits the event from the phase,
+	/// and the phase the session lands in.
+	#[cfg(feature = "testing")]
+	type PhaseTableCase = (fn() -> SessionPhase, fn() -> SessionEvent, bool, fn() -> SessionPhase);
 
 	// The cases check every event a session can raise from every phase it can
 	// sit in against the table. `SessionState::apply` is the only writer of
 	// the phase, so a pair the table omits is a move no caller can make.
 	#[cfg(feature = "testing")]
 	crate::tb_cases! {
-		fn the_phase_table((phase, event, admitted, landing): (&str, &str, bool, &str)) {
-			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
-			assert_eq!(state.apply(event_named(event)).is_some(), admitted, "{phase} on {event}");
-			assert_eq!(
-				core::mem::discriminant(state.phase()),
-				core::mem::discriminant(&phase_named(landing)),
-				"{phase} on {event} must land in {landing}"
-			);
+		fn the_phase_table((phase, event, admitted, landing): PhaseTableCase) {
+			let mut state = SessionState::at(EncryptionConfig::provisioned(), phase());
+			let replaced = state.apply(event());
+			assert_eq!(replaced.is_some(), admitted);
+			assert_eq!(core::mem::discriminant(state.phase()), core::mem::discriminant(&landing()));
 		}
 		cases {
-			cleartext_refuses_begin => ("cleartext", "begin", false, "cleartext"),
-			cleartext_refuses_install => ("cleartext", "install", false, "cleartext"),
-			cleartext_resets_to_start => ("cleartext", "reset", true, "provisioned"),
-			provisioned_begins => ("provisioned", "begin", true, "handshaking"),
-			provisioned_refuses_install => ("provisioned", "install", false, "provisioned"),
-			provisioned_resets_to_start => ("provisioned", "reset", true, "provisioned"),
-			handshaking_begins_again => ("handshaking", "begin", true, "handshaking"),
-			handshaking_installs => ("handshaking", "install", true, "encrypted"),
-			handshaking_resets_to_start => ("handshaking", "reset", true, "provisioned"),
-			encrypted_refuses_begin => ("encrypted", "begin", false, "encrypted"),
-			encrypted_refuses_install => ("encrypted", "install", false, "encrypted"),
-			encrypted_resets_to_start => ("encrypted", "reset", true, "provisioned"),
-			failed_refuses_begin => ("failed", "begin", false, "failed"),
-			failed_refuses_install => ("failed", "install", false, "failed"),
-			failed_refuses_reset => ("failed", "reset", false, "failed"),
+			cleartext_refuses_begin => (cleartext, begin, false, cleartext),
+			cleartext_refuses_install => (cleartext, install, false, cleartext),
+			cleartext_resets_to_start => (cleartext, reset, true, provisioned),
+			provisioned_begins => (provisioned, begin, true, SessionPhase::handshaking),
+			provisioned_refuses_install => (provisioned, install, false, provisioned),
+			provisioned_resets_to_start => (provisioned, reset, true, provisioned),
+			handshaking_begins_again => (SessionPhase::handshaking, begin, true, SessionPhase::handshaking),
+			handshaking_installs => (SessionPhase::handshaking, install, true, established),
+			handshaking_resets_to_start => (SessionPhase::handshaking, reset, true, provisioned),
+			encrypted_refuses_begin => (established, begin, false, established),
+			encrypted_refuses_install => (established, install, false, established),
+			encrypted_resets_to_start => (established, reset, true, provisioned),
+			failed_refuses_begin => (failed, begin, false, failed),
+			failed_refuses_install => (failed, install, false, failed),
+			failed_refuses_reset => (failed, reset, false, failed),
 		}
 	}
 
@@ -1876,38 +1968,19 @@ mod tests {
 	// failed session refuses it again. A build with a TCP transport raises it.
 	#[cfg(all(feature = "testing", any(feature = "tcp", feature = "async-transport")))]
 	crate::tb_cases! {
-		fn the_failure_rows_of_the_phase_table((phase, admitted): (&str, bool)) -> TransportResult<()> {
-			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
-			assert_eq!(state.apply(SessionEvent::Fail).is_some(), admitted, "{phase} on fail");
-			assert!(matches!(state.phase(), SessionPhase::Failed), "{phase} on fail must land in failed");
-			Ok(())
+		fn the_failure_rows_of_the_phase_table((phase, admitted): (fn() -> SessionPhase, bool)) {
+			let mut state = SessionState::at(EncryptionConfig::provisioned(), phase());
+
+			let replaced = state.apply(SessionEvent::Fail);
+			assert_eq!(replaced.is_some(), admitted);
+			assert!(matches!(state.phase(), SessionPhase::Failed));
 		}
 		cases {
-			cleartext_fails => ("cleartext", true),
-			provisioned_fails => ("provisioned", true),
-			handshaking_fails => ("handshaking", true),
-			encrypted_fails => ("encrypted", true),
-			failed_refuses_fail => ("failed", false),
-		}
-	}
-
-	#[cfg(feature = "testing")]
-	fn phase_named(name: &str) -> SessionPhase {
-		match name {
-			"cleartext" => SessionPhase::Cleartext,
-			"provisioned" => SessionPhase::Provisioned,
-			"handshaking" => handshaking(),
-			"failed" => SessionPhase::Failed,
-			_ => SessionPhase::Encrypted(Box::new(established_session())),
-		}
-	}
-
-	#[cfg(feature = "testing")]
-	fn event_named(name: &str) -> SessionEvent {
-		match name {
-			"begin" => SessionEvent::BeginHandshake(ManualClock::default().monotonic()),
-			"install" => SessionEvent::Install(Box::new(established_session())),
-			_ => SessionEvent::Reset,
+			cleartext_fails => (cleartext, true),
+			provisioned_fails => (provisioned, true),
+			handshaking_fails => (SessionPhase::handshaking, true),
+			encrypted_fails => (established, true),
+			failed_refuses_fail => (failed, false),
 		}
 	}
 
@@ -1917,7 +1990,7 @@ mod tests {
 	fn a_later_handshake_round_keeps_the_first_rounds_deadline() {
 		let clock = ManualClock::default();
 		let started = clock.monotonic();
-		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Provisioned);
+		let mut state = SessionState::at(EncryptionConfig::provisioned(), SessionPhase::Provisioned);
 		assert!(state.begin_handshake(started));
 
 		clock.advance(Duration::from_secs(5));
@@ -1926,23 +1999,61 @@ mod tests {
 		assert_eq!(state.phase().initiated_at(), Some(started));
 	}
 
-	/// A handshake read admits the handshake ceiling and counts its deadline
-	/// from the first round, so a later reading gets what is left of the one
-	/// allowance.
-	#[test]
-	fn a_handshake_read_counts_from_the_first_round() -> TransportResult<()> {
-		let clock = ManualClock::default();
-		let started = clock.monotonic();
-		let limits = TransportLimits { handshake_timeout: Duration::from_secs(10), ..TransportLimits::default() };
-		let phase = SessionPhase::Handshaking { initiated_at: started };
+	/// A phase that a clock dates, the time that clock then moves, the ceiling
+	/// a read of the phase admits, and the allowance the read gets.
+	type ReadPolicyCase = (
+		fn(&ManualClock) -> SessionPhase,
+		Duration,
+		fn(&TransportLimits) -> usize,
+		Duration,
+	);
 
-		clock.advance(Duration::from_secs(4));
+	// A read takes the ceiling and the allowance of its phase. A handshake
+	// read admits the handshake ceiling and counts its deadline from the first
+	// round, so a later reading gets what is left of the one allowance. A read
+	// before the first handshake round faces an unauthenticated peer too, so
+	// it takes the handshake ceiling and the full allowance from the reading
+	// it starts at. A read outside the handshake admits the larger envelope
+	// ceiling and runs under the operation timeout.
+	crate::tb_cases! {
+		fn a_read_takes_the_ceiling_and_the_allowance_of_its_phase(
+			(phase_at, elapsed, ceiling, allowance): ReadPolicyCase
+		) -> TestResult {
+			let clock = ManualClock::default();
+			let limits = TransportLimits {
+				handshake_timeout: Duration::from_secs(10),
+				operation_timeout: Duration::from_secs(3),
+				..TransportLimits::default()
+			};
+			let phase = phase_at(&clock);
 
-		let policy = phase.read_policy(&limits, clock.monotonic());
-		let remaining = policy.remaining(clock.monotonic())?;
-		assert_eq!(policy.cap(), limits.handshake_wire);
-		assert_eq!(remaining, Some(Duration::from_secs(6)));
-		Ok(())
+			clock.advance(elapsed);
+
+			let policy = phase.read_policy(&limits, clock.monotonic());
+			let remaining = policy.remaining(clock.monotonic())?;
+			assert_eq!((policy.cap(), remaining), (ceiling(&limits), Some(allowance)));
+			Ok(())
+		}
+		cases {
+			a_handshake_four_seconds_in => (
+				handshaking_at,
+				Duration::from_secs(4),
+				|limits| limits.handshake_wire,
+				Duration::from_secs(6),
+			),
+			provisioned => (
+				|_| SessionPhase::Provisioned,
+				Duration::ZERO,
+				|limits| limits.handshake_wire,
+				Duration::from_secs(10),
+			),
+			cleartext => (
+				|_| SessionPhase::Cleartext,
+				Duration::ZERO,
+				TransportLimits::max_envelope,
+				Duration::from_secs(3),
+			),
+		}
 	}
 
 	/// The policy refuses a handshake read at or past its deadline before the
@@ -1950,9 +2061,8 @@ mod tests {
 	#[test]
 	fn a_handshake_read_past_its_deadline_is_refused() {
 		let clock = ManualClock::default();
-		let started = clock.monotonic();
 		let limits = TransportLimits { handshake_timeout: Duration::from_secs(10), ..TransportLimits::default() };
-		let phase = SessionPhase::Handshaking { initiated_at: started };
+		let phase = handshaking_at(&clock);
 
 		clock.advance(Duration::from_secs(10));
 
@@ -1964,36 +2074,6 @@ mod tests {
 		));
 	}
 
-	/// A read before the first handshake round faces an unauthenticated peer
-	/// too, so it takes the handshake ceiling and the full allowance from the
-	/// reading it starts at.
-	#[test]
-	fn a_provisioned_read_gets_the_full_handshake_allowance() -> TransportResult<()> {
-		let clock = ManualClock::default();
-		let limits = TransportLimits { handshake_timeout: Duration::from_secs(10), ..TransportLimits::default() };
-
-		let policy = SessionPhase::Provisioned.read_policy(&limits, clock.monotonic());
-		let remaining = policy.remaining(clock.monotonic())?;
-
-		assert_eq!(policy.cap(), limits.handshake_wire);
-		assert_eq!(remaining, Some(Duration::from_secs(10)));
-		Ok(())
-	}
-
-	/// A read outside the handshake admits the larger envelope ceiling and runs
-	/// under the operation timeout.
-	#[test]
-	fn a_cleartext_read_admits_the_envelope_ceiling_under_the_operation_timeout() -> TransportResult<()> {
-		let clock = ManualClock::default();
-		let limits = TransportLimits { operation_timeout: Duration::from_secs(3), ..TransportLimits::default() };
-
-		let policy = SessionPhase::Cleartext.read_policy(&limits, clock.monotonic());
-		let remaining = policy.remaining(clock.monotonic())?;
-		assert_eq!(policy.cap(), limits.max_envelope());
-		assert_eq!(remaining, Some(Duration::from_secs(3)));
-		Ok(())
-	}
-
 	/// An admitted event hands back the phase it replaced, whole, so the
 	/// instant a handshake recorded leaves through the table, which is the one
 	/// writer of the phase.
@@ -2001,7 +2081,8 @@ mod tests {
 	fn an_admitted_event_hands_back_the_phase_it_replaced() {
 		let clock = ManualClock::default();
 		let started = clock.monotonic();
-		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Handshaking { initiated_at: started });
+		let handshaking = SessionPhase::Handshaking { initiated_at: started };
+		let mut state = SessionState::at(EncryptionConfig::provisioned(), handshaking);
 
 		let replaced = state.apply(SessionEvent::Reset);
 		assert!(matches!(replaced, Some(SessionPhase::Handshaking { initiated_at }) if initiated_at == started));
@@ -2012,10 +2093,8 @@ mod tests {
 	/// at its start, through the same table every other move takes.
 	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
 	#[test]
-	fn a_split_takes_the_keys_and_returns_the_session_to_its_start() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.install_established(established_session())?;
-
+	fn a_split_takes_the_keys_and_returns_the_session_to_its_start() -> TestResult {
+		let mut probe = PhaseProbe::established();
 		let keys = probe.session_state_mut().take_split_keys()?;
 		assert!(keys.is_some());
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
@@ -2029,42 +2108,42 @@ mod tests {
 	fn a_split_of_a_pending_handshake_leaves_its_deadline_in_place() {
 		let clock = ManualClock::default();
 		let started = clock.monotonic();
-		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Handshaking { initiated_at: started });
+		let handshaking = SessionPhase::Handshaking { initiated_at: started };
+		let mut state = SessionState::at(EncryptionConfig::provisioned(), handshaking);
 
 		let refused = state.take_split_keys();
 		assert!(matches!(refused, Err(TransportError::InvalidState)));
 		assert_eq!(state.phase().initiated_at(), Some(started));
 	}
 
+	/// The answer of a split of a session.
+	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
+	type SplitAnswer = TransportResult<Option<(SendCipher, RecvCipher)>>;
+
+	/// The phase of a session and the test of the answer of its split.
+	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
+	type SplitCase = (fn() -> SessionPhase, fn(&SplitAnswer) -> bool);
+
 	// A split answers on the phase alone: a cleartext session splits with no
 	// keys, an established one hands over its keys, a pending handshake is
 	// refused as invalid, and a failed session as failed.
 	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
 	crate::tb_cases! {
-		fn a_split_answers_by_phase((phase, answer): (&str, &str)) {
-			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
+		fn a_split_answers_by_phase((phase, answered): SplitCase) {
+			let mut state = SessionState::at(EncryptionConfig::provisioned(), phase());
+
 			let split = state.take_split_keys();
-			assert_eq!(split_named(&split), answer, "{phase} must split as {answer}");
+			assert!(answered(&split));
 		}
 		cases {
-			cleartext_splits_without_keys => ("cleartext", "cleartext"),
-			encrypted_hands_over_its_keys => ("encrypted", "keys"),
-			provisioned_is_refused => ("provisioned", "invalid"),
-			handshaking_is_refused => ("handshaking", "invalid"),
-			failed_is_refused_as_failed => ("failed", "failed"),
-		}
-	}
-
-	/// The name of the answer of a split, as the cases of
-	/// `a_split_answers_by_phase` spell it.
-	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
-	fn split_named(split: &TransportResult<Option<(SendCipher, RecvCipher)>>) -> &'static str {
-		match split {
-			Ok(None) => "cleartext",
-			Ok(Some(_)) => "keys",
-			Err(TransportError::InvalidState) => "invalid",
-			Err(TransportError::ConnectionFailed) => "failed",
-			Err(_) => "another error",
+			cleartext_splits_without_keys => (cleartext, |split| matches!(split, Ok(None))),
+			encrypted_hands_over_its_keys => (established, |split| matches!(split, Ok(Some(_)))),
+			provisioned_is_refused => (provisioned, |split| matches!(split, Err(TransportError::InvalidState))),
+			handshaking_is_refused => (
+				SessionPhase::handshaking,
+				|split| matches!(split, Err(TransportError::InvalidState)),
+			),
+			failed_is_refused_as_failed => (failed, |split| matches!(split, Err(TransportError::ConnectionFailed))),
 		}
 	}
 
@@ -2072,37 +2151,31 @@ mod tests {
 	/// table refuses the move and the session survives it.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn the_phase_table_refuses_restarting_a_handshake_on_a_live_session() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.install_established(established_session())?;
-
+	fn the_phase_table_refuses_restarting_a_handshake_on_a_live_session() {
+		let mut probe = PhaseProbe::established();
 		let now = ManualClock::default().monotonic();
-		assert!(!probe.session_state_mut().begin_handshake(now));
-		assert!(probe.session_state().peer_certificate().is_some());
-		Ok(())
+
+		let restarted = probe.session_state_mut().begin_handshake(now);
+		assert!(!restarted);
+		assert_eq!(probe.session_state().peer_certificate(), Some(&fixture_certificate()));
 	}
 
 	/// An established session admits encrypted records alone, so an injected
 	/// handshake container cannot draw a cleartext reply out of it (CWE-319).
 	#[cfg(feature = "testing")]
 	#[test]
-	fn an_established_session_reads_only_encrypted() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.install_established(established_session())?;
+	fn an_established_session_reads_only_encrypted() {
+		let probe = PhaseProbe::established();
 		assert!(probe.session_state().phase().requires_encryption());
-		Ok(())
 	}
 
 	/// A completed handshake and the terms it agreed enter the phase together.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn installing_a_session_lands_every_term_it_agreed() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
+	fn installing_a_session_lands_every_term_it_agreed() -> TestResult {
+		let mut probe = PhaseProbe::provisioned(SessionPhase::handshaking());
 		probe.install_established(established_session())?;
-
-		let session = probe.session_state().established().ok_or(TransportError::InvalidState)?;
-		assert!(session.peer().is_some());
-		assert!(probe.session_state().peer_certificate().is_some());
+		assert_eq!(probe.session_state().peer_certificate(), Some(&fixture_certificate()));
 		Ok(())
 	}
 
@@ -2112,8 +2185,8 @@ mod tests {
 	/// limit, because it bounds the volume by the bytes it opens.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn installing_a_session_bounds_its_send_cipher_by_the_envelope_ceiling() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
+	fn installing_a_session_bounds_its_send_cipher_by_the_envelope_ceiling() -> TestResult {
+		let mut probe = PhaseProbe::provisioned(SessionPhase::handshaking());
 		let limits = TransportLimits { encrypted_envelope: 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE, ..*probe.limits };
 		probe.limits = limits.checked()?;
 		probe.install_established(established_session())?;
@@ -2129,23 +2202,20 @@ mod tests {
 	/// dropped session must not stay readable, because authorization reads it.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn a_reset_drops_the_peer_the_dead_session_established() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.install_established(established_session())?;
-		assert!(probe.session_state().peer_certificate().is_some());
-
+	fn a_reset_drops_the_peer_the_dead_session_established() {
+		let mut probe = PhaseProbe::established();
+		let held = probe.session_state().peer_certificate().cloned();
 		probe.session_state_mut().reset();
+		assert_eq!(held, Some(fixture_certificate()));
 		assert!(probe.session_state().peer_certificate().is_none());
-		Ok(())
 	}
 
 	/// A split takes the keys out, and the state left behind holds none, so a
 	/// second split is refused.
 	#[cfg(all(feature = "testing", any(feature = "tokio", feature = "async-transport")))]
 	#[test]
-	fn a_split_leaves_no_keys_behind() -> TransportResult<()> {
-		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.install_established(established_session())?;
+	fn a_split_leaves_no_keys_behind() -> TestResult {
+		let mut probe = PhaseProbe::established();
 		let _keys = probe.session_state_mut().take_split_keys()?;
 
 		let again = probe.session_state_mut().take_split_keys();
@@ -2159,11 +2229,11 @@ mod tests {
 	/// identity of that key in the uncompressed form.
 	#[cfg(feature = "testing")]
 	#[test]
-	fn a_capture_proves_the_peer_of_a_key_in_either_form() -> TransportResult<()> {
+	fn a_capture_proves_the_peer_of_a_key_in_either_form() -> TestResult {
 		let certificate = fixture_certificate();
 		let expected = CanonicalKey::of(&certificate.tbs_certificate.subject_public_key_info)?;
 		let compressed = TestCertificate::with_compressed_key(certificate);
-		let mut probe = PhaseProbe::provisioned(handshaking());
+		let mut probe = PhaseProbe::provisioned(SessionPhase::handshaking());
 		probe.install_established(session_of(compressed))?;
 
 		let captured = SessionContext::capture(&probe);
@@ -2177,7 +2247,7 @@ mod tests {
 	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	#[test]
 	fn a_session_reports_the_handshake_protocol_it_selected() {
-		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Provisioned);
+		let mut state = SessionState::at(EncryptionConfig::provisioned(), SessionPhase::Provisioned);
 		state.select_handshake(HandshakeProtocolKind::Cms);
 		assert_eq!(state.handshake_protocol(), HandshakeProtocolKind::Cms);
 	}
@@ -2191,13 +2261,12 @@ mod tests {
 	/// A completed session whose peer is `certificate`.
 	#[cfg(feature = "testing")]
 	fn session_of(certificate: Certificate) -> EstablishedSession {
-		let keys = SessionKeys::for_client(crate::testing::TestKey::insecure_directional_keys());
 		let peer = SessionPeer::try_from(Arc::new(certificate)).expect("a test certificate records its peer");
-		EstablishedSession::forged(keys, None, Some(peer))
+		EstablishedSession::forged(SessionKeys::insecure_client(), None, Some(peer))
 	}
 
 	#[cfg(feature = "testing")]
 	fn fixture_certificate() -> Certificate {
-		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		TestCertificate::insecure_fixed()
 	}
 }

@@ -233,8 +233,9 @@ impl PendingReplies {
 mod tests {
 	use core::task::Poll;
 
-	use super::super::testing::body_fixture;
+	use super::super::body::StreamBody;
 	use super::*;
+	use crate::testing::TestResult;
 	use crate::transport::error::TransportFailure;
 
 	fn closed() -> PendingReplies {
@@ -249,178 +250,196 @@ mod tests {
 		pending
 	}
 
-	#[test]
-	fn test_reservation_refused_once_closed() {
-		let (outcome, _receiver) = oneshot::channel();
-		let reserved = closed().reserve(outcome, None);
-		assert!(matches!(reserved, Err(TransportError::ConnectionClosed)));
-	}
-
-	#[test]
-	fn test_ping_refused_once_closed() {
-		let (sender, _receiver) = oneshot::channel();
-		let admitted = closed().admit_ping(0, sender);
-		assert!(matches!(admitted, Err(TransportError::ConnectionClosed)));
-	}
-
-	#[test]
-	fn test_reservation_refused_once_draining() {
-		let (outcome, _receiver) = oneshot::channel();
-		let reserved = draining().reserve(outcome, None);
-		assert!(matches!(reserved, Err(TransportError::Draining)));
-	}
-
-	#[test]
-	fn test_ping_refused_once_draining() {
-		let (sender, _receiver) = oneshot::channel();
-		let admitted = draining().admit_ping(0, sender);
-		assert!(matches!(admitted, Err(TransportError::Draining)));
-	}
-
-	// A drain could still finish, and a failed connection cannot, so the end
-	// wins in either order.
-	#[test]
-	fn test_close_outranks_a_drain() {
-		let mut drained_first = draining();
-		drained_first.close();
-
-		let mut closed_first = closed();
-		closed_first.drain();
-
-		assert!(matches!(drained_first.refusal(), Some(TransportError::ConnectionClosed)));
-		assert!(matches!(closed_first.refusal(), Some(TransportError::ConnectionClosed)));
-		assert!(!closed_first.is_draining());
-	}
-
-	#[test]
-	fn test_open_moves_a_reservation_to_the_open_streams() -> TransportResult<()> {
+	/// A fresh table that holds one reservation with `reply` as its reply
+	/// forwarder, beside the key of that reservation and the receiver of its
+	/// outcome.
+	fn reserved(reply: Option<ForwardedStream>) -> (PendingReplies, ReservationKey, oneshot::Receiver<StreamOutcome>) {
 		let mut pending = PendingReplies::default();
-		let (outcome, _receiver) = oneshot::channel();
-		let key = pending.reserve(outcome, None)?;
-		assert_eq!((pending.open_load(), pending.stream_count()), (1, 0));
+		let (outcome, receiver) = oneshot::channel();
+		let key = pending.reserve(outcome, reply).expect("a fresh table admits a reservation");
+		(pending, key, receiver)
+	}
+
+	/// A reservation in `pending`, whose outcome no one reads.
+	fn reservation(pending: &mut PendingReplies) -> TransportResult<ReservationKey> {
+		pending.reserve(oneshot::channel().0, None)
+	}
+
+	/// A ping admission in `pending`, whose ack no one reads.
+	fn ping(pending: &mut PendingReplies) -> TransportResult<()> {
+		pending.admit_ping(0, oneshot::channel().0)
+	}
+
+	/// Whether `admitted` refuses as [`TransportError::ConnectionClosed`].
+	fn is_closed(admitted: &TransportResult<()>) -> bool {
+		matches!(admitted, Err(TransportError::ConnectionClosed))
+	}
+
+	/// Whether `admitted` refuses as [`TransportError::Draining`].
+	fn is_draining(admitted: &TransportResult<()>) -> bool {
+		matches!(admitted, Err(TransportError::Draining))
+	}
+
+	/// A table that ended, an admission into it, and the test of its refusal.
+	type EndedCase = (
+		PendingReplies,
+		fn(&mut PendingReplies) -> TransportResult<()>,
+		fn(&TransportResult<()>) -> bool,
+	);
+
+	// A table that ended refuses an admission by its end: a closed table as
+	// closed, a draining table as draining.
+	crate::tb_cases! {
+		fn an_ended_table_refuses_an_admission((mut pending, admit, refused): EndedCase) {
+			let admitted = admit(&mut pending);
+
+			assert!(refused(&admitted));
+		}
+		cases {
+			closed_reservation => (closed(), |pending| reservation(pending).map(drop), is_closed),
+			closed_ping => (closed(), ping, is_closed),
+			draining_reservation => (draining(), |pending| reservation(pending).map(drop), is_draining),
+			draining_ping => (draining(), ping, is_draining),
+		}
+	}
+
+	// A drain could still finish, and a failed connection cannot, so the
+	// close wins in either order.
+	crate::tb_cases! {
+		fn a_close_outranks_a_drain(pending: PendingReplies) {
+			assert!(matches!(pending.refusal(), Some(TransportError::ConnectionClosed)));
+			assert!(!pending.is_draining());
+		}
+		cases {
+			drained_first => {
+				let mut pending = draining();
+				pending.close();
+				pending
+			},
+			closed_first => {
+				let mut pending = closed();
+				pending.drain();
+				pending
+			},
+		}
+	}
+
+	/// An open moves a reservation to the open streams, and its load stays.
+	#[test]
+	fn an_open_moves_a_reservation_to_the_open_streams() -> TestResult {
+		let (mut pending, key, _receiver) = reserved(None);
+		let reserved_load = (pending.open_load(), pending.stream_count());
 
 		let reply = pending.open(key, 1)?;
 		assert!(reply.is_none());
 		assert!(pending.holds_stream(1));
+		assert_eq!(reserved_load, (1, 0));
 		assert_eq!((pending.open_load(), pending.stream_count()), (1, 1));
 		Ok(())
 	}
 
+	/// An open hands back the reply forwarder its reservation held.
 	#[test]
-	fn test_open_returns_the_reply_forwarder() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (outcome, _receiver) = oneshot::channel();
-		let (_body, forwarder, _notes) = body_fixture(1, 4);
-		let key = pending.reserve(outcome, Some(forwarder))?;
+	fn an_open_returns_the_reply_forwarder() -> TestResult {
+		let (_body, forwarder, _notes) = StreamBody::fixture(1, 4);
+		let (mut pending, key, _receiver) = reserved(Some(forwarder));
 
 		let reply = pending.open(key, 1)?;
 		assert!(reply.is_some());
 		Ok(())
 	}
 
+	/// A cancel frees the cap slot and tells both halves of the stream.
 	#[test]
-	fn test_cancel_frees_the_cap_slot_and_tells_both_halves() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (outcome, mut response) = oneshot::channel();
-		let (mut body, forwarder, _notes) = body_fixture(1, 4);
-		let key = pending.reserve(outcome, Some(forwarder))?;
+	fn a_cancel_frees_the_cap_slot_and_tells_both_halves() {
+		let (mut body, forwarder, _notes) = StreamBody::fixture(1, 4);
+		let (mut pending, key, mut response) = reserved(Some(forwarder));
 
-		assert!(pending.cancel(key));
+		let cancelled = pending.cancel(key);
+		assert!(cancelled);
 		assert_eq!(pending.open_load(), 0);
-
-		let told = response.try_recv();
-		assert!(matches!(told, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
-
-		let ended = body.poll_chunk_now();
 		assert!(matches!(
-			ended,
+			response.try_recv(),
+			Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))
+		));
+		assert!(matches!(
+			body.poll_chunk_now(),
 			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
 		));
-		Ok(())
 	}
 
+	/// A drain resolves a reservation, so a later cancel of it finds nothing.
 	#[test]
-	fn test_cancel_after_a_drain_finds_nothing() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (outcome, _receiver) = oneshot::channel();
-		let key = pending.reserve(outcome, None)?;
-
+	fn a_cancel_after_a_drain_finds_nothing() {
+		let (mut pending, key, _receiver) = reserved(None);
 		pending.drain();
 
-		assert!(!pending.cancel(key));
-		Ok(())
+		let cancelled = pending.cancel(key);
+
+		assert!(!cancelled);
 	}
 
+	/// A close cancels every reservation, open stream, and ping it holds.
 	#[test]
-	fn test_close_cancels_every_slot() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (reserved, mut reserved_outcome) = oneshot::channel();
+	fn a_close_cancels_every_slot() -> TestResult {
+		let (mut body, forwarder, _notes) = StreamBody::fixture(1, 4);
+		let (mut pending, _reserved_key, mut reserved_outcome) = reserved(Some(forwarder));
 		let (opened, mut opened_outcome) = oneshot::channel();
 		let (ping, mut ack) = oneshot::channel();
-		let (mut body, forwarder, _notes) = body_fixture(1, 4);
-
-		pending.reserve(reserved, Some(forwarder))?;
-
 		let key = pending.reserve(opened, None)?;
+
 		pending.open(key, 1)?;
 		pending.admit_ping(0, ping)?;
 		pending.close();
 
-		assert!(reserved_outcome.try_recv().is_err());
-		assert!(opened_outcome.try_recv().is_err());
-		assert!(ack.try_recv().is_err());
-
-		let ended = body.poll_chunk_now();
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		assert!(matches!(reserved_outcome.try_recv(), Err(oneshot::Canceled)));
+		assert!(matches!(opened_outcome.try_recv(), Err(oneshot::Canceled)));
+		assert!(matches!(ack.try_recv(), Err(oneshot::Canceled)));
+		assert!(matches!(
+			body.poll_chunk_now(),
+			Poll::Ready(Err(TransportError::ConnectionClosed))
+		));
 		assert_eq!(pending.open_load(), 0);
 		Ok(())
 	}
 
+	/// A drain resolves the reservations as draining and keeps the open
+	/// streams.
 	#[test]
-	fn test_drain_resolves_the_reserved_and_keeps_the_open() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (reserved, mut reserved_outcome) = oneshot::channel();
+	fn a_drain_resolves_the_reserved_and_keeps_the_open() -> TestResult {
+		let (mut body, forwarder, _notes) = StreamBody::fixture(1, 4);
+		let (mut pending, _reserved_key, mut reserved_outcome) = reserved(Some(forwarder));
 		let (opened, mut opened_outcome) = oneshot::channel();
-		let (mut body, forwarder, _notes) = body_fixture(1, 4);
-
-		pending.reserve(reserved, Some(forwarder))?;
-
 		let key = pending.reserve(opened, None)?;
+
 		pending.open(key, 1)?;
 		pending.drain();
 
 		assert!(matches!(reserved_outcome.try_recv(), Ok(Some(StreamOutcome::Draining))));
 		assert!(matches!(opened_outcome.try_recv(), Ok(None)));
-
-		let ended = body.poll_chunk_now();
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		assert_eq!(pending.open_load(), 1);
 		Ok(())
 	}
 
-	#[test]
-	fn test_open_after_close_is_refused() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (outcome, _receiver) = oneshot::channel();
-		let key = pending.reserve(outcome, None)?;
+	/// An end of the table and the test of the open it leaves.
+	type TableEndCase = (fn(&mut PendingReplies), fn(&TransportResult<Option<ForwardedStream>>) -> bool);
 
-		pending.close();
+	// A reservation that the table ended before its open is refused the open
+	// by that end: a close as closed, a drain as draining.
+	crate::tb_cases! {
+		fn an_open_after_the_table_ended_is_refused(
+			(end, refused): TableEndCase
+		) {
+			let (mut pending, key, _receiver) = reserved(None);
+			end(&mut pending);
 
-		let opened = pending.open(key, 1);
-		assert!(matches!(opened, Err(TransportError::ConnectionClosed)));
-		Ok(())
-	}
-
-	#[test]
-	fn test_open_after_a_drain_is_refused() -> TransportResult<()> {
-		let mut pending = PendingReplies::default();
-		let (outcome, _receiver) = oneshot::channel();
-		let key = pending.reserve(outcome, None)?;
-
-		pending.drain();
-
-		let opened = pending.open(key, 1);
-		assert!(matches!(opened, Err(TransportError::Draining)));
-		Ok(())
+			let opened = pending.open(key, 1);
+			assert!(refused(&opened));
+		}
+		cases {
+			close => (PendingReplies::close, |opened| matches!(opened, Err(TransportError::ConnectionClosed))),
+			drain => (PendingReplies::drain, |opened| matches!(opened, Err(TransportError::Draining))),
+		}
 	}
 }

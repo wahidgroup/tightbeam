@@ -978,6 +978,16 @@ impl LocalRole {
 	}
 }
 
+#[cfg(all(test, feature = "transport-multiplex"))]
+impl MuxSettings {
+	/// Settings of one stream and 1,024-octet chunks whose send budget holds
+	/// `credits`.
+	pub(crate) fn budgeted(credits: u64) -> Self {
+		let settings = MuxSettings::symmetric(1).with_chunk_size(1024);
+		settings.with_send_budget(Some(credits))
+	}
+}
+
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 impl MuxSettings {
 	/// Client-side settings derived from the offer and the accept.
@@ -1439,40 +1449,48 @@ impl SecurityOffer {
 
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-hpke")))]
 mod tests {
-	use core::error::Error;
-
 	use super::*;
-	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
 	use crate::crypto::profiles::{DefaultCryptoProvider, DefaultStrengthFloor, SecurityStrength};
+	use crate::der::asn1::ObjectIdentifier;
 	use crate::oids::{
-		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
-		HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
+		AES_128_GCM, AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256,
+		HASH_SHA3_256, HASH_SHA3_512, HKDF_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_512,
 	};
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::{TestCertificate, TestResult};
+	use crate::transport::handshake::tests::{create_default_test_profile, fixture_receipt, foreign_profile};
 
-	fn sample_profile(id: u8) -> SecurityProfileDesc {
-		let key_wrap = match id {
-			1 => Some(AES_128_WRAP),
-			2 => Some(AES_256_WRAP),
-			3 => Some(AES_192_WRAP),
-			_ => None,
-		};
+	/// A SHA3-256 descriptor that wraps keys under `key_wrap`.
+	fn profile(key_wrap: ObjectIdentifier) -> SecurityProfileDesc {
 		SecurityProfileDesc {
 			digest: Some(HASH_SHA3_256),
 			aead: Some(AES_256_GCM),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			kdf: Some(HKDF_SHA3_256),
 			key_exchange: Some(CURVE_SECP256K1),
-			key_wrap,
+			key_wrap: Some(key_wrap),
 		}
 	}
 
+	/// A SHA-256 descriptor under AES-128-GCM.
+	const AES_128_SHA256: SecurityProfileDesc = SecurityProfileDesc {
+		digest: Some(HASH_SHA256),
+		aead: Some(AES_128_GCM),
+		signature: Some(SIGNER_ECDSA_WITH_SHA256),
+		kdf: Some(HASH_SHA256),
+		key_exchange: Some(CURVE_SECP256K1),
+		key_wrap: Some(AES_128_WRAP),
+	};
+
+	/// The descriptor of [`AES_128_SHA256`] under AES-256-GCM.
+	const AES_256_SHA256: SecurityProfileDesc =
+		SecurityProfileDesc { aead: Some(AES_256_GCM), key_wrap: Some(AES_256_WRAP), ..AES_128_SHA256 };
+
+	/// A single offer holds the one profile it names.
 	#[test]
-	fn test_offer_single() {
-		let profile = sample_profile(1);
-		let offer = SecurityOffer::single(profile);
-		assert_eq!(offer.profiles.len(), 1);
-		assert_eq!(offer.profiles[0], profile);
+	fn a_single_offer_holds_its_one_profile() {
+		let named = profile(AES_128_WRAP);
+		let offer = SecurityOffer::single(named);
+		assert_eq!(offer.profiles, vec![named]);
 	}
 
 	/// Settings with a cap of 1 in each direction, a 1024-byte chunk, and the
@@ -1482,94 +1500,140 @@ mod tests {
 		MuxSettings::symmetric(1).with_chunk_size(1024)
 	}
 
+	/// The drain reserve covers a response and a cancel on each stream that
+	/// either side may open, and one GoAway.
 	#[test]
-	fn test_drain_reserve_covers_responses_cancels_goaway() {
+	fn the_drain_reserve_covers_each_stream_and_a_goaway() {
 		let settings = MuxSettings { local_initiated_cap: 3, peer_initiated_cap: 5, ..MuxSettings::symmetric(1) };
 		assert_eq!(settings.drain_reserve_records(), 17);
 	}
 
-	#[test]
-	fn test_send_budget_reserve_prices_records() {
-		let mut settings = reserve_settings();
-		assert_eq!(settings.send_budget_reserve(), 5);
-
-		settings.credit_unit = clamp_credit_unit(512);
-		assert_eq!(settings.send_budget_reserve(), 10);
+	// The reserve prices each reserved record at the credits of one chunk:
+	// (the settings, the reserve in credits).
+	crate::tb_cases! {
+		fn the_send_budget_reserve_prices_each_record_by_the_credit_unit((settings, reserve): (MuxSettings, u64)) {
+			assert_eq!(settings.send_budget_reserve(), reserve);
+		}
+		cases {
+			default_unit => (reserve_settings(), 5),
+			half_unit => (MuxSettings { credit_unit: clamp_credit_unit(512), ..reserve_settings() }, 10),
+		}
 	}
 
-	#[test]
-	fn test_usable_send_budget_subtracts_reserve() {
-		let mut settings = reserve_settings();
-		assert_eq!(settings.usable_send_budget(), None);
-
-		settings.send_budget = Some(10);
-		assert_eq!(settings.usable_send_budget(), Some(5));
-
-		settings.send_budget = Some(3);
-		assert_eq!(settings.usable_send_budget(), Some(0));
+	// The usable budget is the send budget less the reserve, and zero at the
+	// least: (the send budget, the usable budget).
+	crate::tb_cases! {
+		fn the_usable_send_budget_subtracts_the_reserve((send_budget, usable): (Option<u64>, Option<u64>)) {
+			let settings = MuxSettings { send_budget, ..reserve_settings() };
+			assert_eq!(settings.usable_send_budget(), usable);
+		}
+		cases {
+			unmetered => (None, None),
+			above_the_reserve => (Some(10), Some(5)),
+			below_the_reserve => (Some(3), Some(0)),
+		}
 	}
 
-	#[test]
-	fn test_select_first_mutual() -> Result<(), Box<dyn Error>> {
-		let p1 = sample_profile(1);
-		let p2 = sample_profile(2);
-		let p3 = sample_profile(3);
-
-		let offer = SecurityOffer::new(Vec::from([p1, p2, p3]));
-		let supported = [p2, p3];
-
-		let selected = offer.select_profile(supported)?;
-		assert_eq!(selected, p2);
-
-		Ok(())
+	// A server takes the first profile of its own list that the client also
+	// offered, in the order of its list: (the offer, the list of the server,
+	// the selection).
+	crate::tb_cases! {
+		fn a_server_selects_its_first_profile_the_client_offered(
+			(offered, supported, selected): (Vec<SecurityProfileDesc>, Vec<SecurityProfileDesc>, SecurityProfileDesc)
+		) {
+			let offer = SecurityOffer::new(offered);
+			assert_eq!(offer.select_profile(supported), Ok(selected));
+		}
+		cases {
+			first_mutual => (
+				vec![profile(AES_128_WRAP), profile(AES_256_WRAP), profile(AES_192_WRAP)],
+				vec![profile(AES_256_WRAP), profile(AES_192_WRAP)],
+				profile(AES_256_WRAP),
+			),
+			/// The client prefers the first profile and the server prefers the
+			/// second. The server preference wins, so a MITM that reorders the
+			/// offer cannot force the weaker profile.
+			server_preference => (
+				vec![profile(AES_128_WRAP), profile(AES_256_WRAP)],
+				vec![profile(AES_256_WRAP), profile(AES_128_WRAP)],
+				profile(AES_256_WRAP),
+			),
+			aead_of_the_server_order => (
+				vec![AES_128_SHA256, AES_256_SHA256],
+				vec![AES_256_SHA256, AES_128_SHA256],
+				AES_256_SHA256,
+			),
+			aead_both_orders_name_first => (
+				vec![AES_256_SHA256, AES_128_SHA256],
+				vec![AES_256_SHA256, AES_128_SHA256],
+				AES_256_SHA256,
+			),
+			aead_of_the_server_order_against_the_client => (
+				vec![AES_256_SHA256, AES_128_SHA256],
+				vec![AES_128_SHA256, AES_256_SHA256],
+				AES_128_SHA256,
+			),
+			aead_the_server_runs_alone => (vec![AES_128_SHA256, AES_256_SHA256], vec![AES_256_SHA256], AES_256_SHA256),
+		}
 	}
 
-	#[test]
-	fn test_select_follows_server_preference_not_client_order() -> Result<(), Box<dyn Error>> {
-		let p1 = sample_profile(1);
-		let p2 = sample_profile(2);
-
-		// The client prefers p1 and the server prefers p2. The server
-		// preference must win, so a MITM that reorders the offer cannot force
-		// the weaker profile.
-		let offer = SecurityOffer::new(Vec::from([p1, p2]));
-		let supported = [p2, p1];
-
-		let selected = offer.select_profile(supported)?;
-		assert_eq!(selected, p2);
-
-		Ok(())
+	// A server refuses an offer it has no selection from: (the offer, the
+	// list of the server, the refusal).
+	crate::tb_cases! {
+		fn a_server_refuses_an_unselectable_offer(
+			(offered, supported, refusal): (Vec<SecurityProfileDesc>, Vec<SecurityProfileDesc>, NegotiationError)
+		) {
+			let offer = SecurityOffer::new(offered);
+			assert_eq!(offer.select_profile(supported), Err(refusal));
+		}
+		cases {
+			no_mutual_profile => (
+				vec![profile(AES_128_WRAP), profile(AES_256_WRAP)],
+				vec![profile(AES_192_WRAP)],
+				NegotiationError::NoMutualProfile,
+			),
+			oversized => (
+				vec![profile(AES_128_WRAP); MAX_OFFER_PROFILES + 1],
+				vec![profile(AES_128_WRAP)],
+				NegotiationError::OfferTooLarge { count: 33, max: 32 },
+			),
+			empty => (Vec::new(), vec![profile(AES_128_WRAP)], NegotiationError::EmptyOffer),
+		}
 	}
 
-	#[test]
-	fn test_no_mutual_profile() {
-		let p1 = sample_profile(1);
-		let p2 = sample_profile(2);
-		let p3 = sample_profile(3);
+	/// The budgets a client requests.
+	const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 100, server_to_client: 900 };
 
-		let offer = SecurityOffer::new(Vec::from([p1, p2]));
-		let supported = [p3];
+	/// The ceiling a server grants under.
+	const CEILING: MuxBudgets = MuxBudgets { client_to_server: 500, server_to_client: 300 };
 
-		let result = offer.select_profile(supported);
-		assert!(matches!(result, Err(NegotiationError::NoMutualProfile)));
+	/// The componentwise minimum of [`REQUEST`] and [`CEILING`], the grant a
+	/// server derives from the two.
+	const GRANT: MuxBudgets = MuxBudgets { client_to_server: 100, server_to_client: 300 };
+
+	/// The budgets an authorizer rules.
+	const VERDICT: MuxBudgets = MuxBudgets { client_to_server: 40, server_to_client: 60 };
+
+	/// Budgets one credit past the session cap from client to server.
+	const OVER_CAP: MuxBudgets = MuxBudgets { client_to_server: MAX_MUX_SESSION_BUDGET + 1, server_to_client: 1 };
+
+	/// The settlement challenge of the authorizer tests.
+	const INVOICE: &[u8] = b"invoice";
+
+	/// [`INVOICE`] as the challenge an authorizer issues.
+	fn invoice() -> OctetString {
+		OctetString::new(INVOICE).expect("short octets encode")
 	}
 
-	#[test]
-	fn test_oversized_offer_rejected() {
-		let profile = sample_profile(1);
-		let offer = SecurityOffer::new(vec![profile; MAX_OFFER_PROFILES + 1]);
-		let supported = [profile];
-
-		let result = offer.select_profile(supported);
-		assert!(matches!(result, Err(NegotiationError::OfferTooLarge { count: 33, max: 32 })));
+	/// A client offer of a cap of 8 that requests `budgets`.
+	fn offer(budgets: impl Into<Option<MuxBudgets>>) -> TransportOffer {
+		TransportOffer { requested_budgets: budgets.into(), ..TransportOffer::mux(8) }
 	}
 
-	#[test]
-	fn test_empty_offer() {
-		let offer = SecurityOffer::new(Vec::new());
-		let supported = [sample_profile(1)];
-		let result = offer.select_profile(supported);
-		assert!(matches!(result, Err(NegotiationError::EmptyOffer)));
+	/// A server configuration of a cap of 4 that grants under the ceiling
+	/// `budgets`.
+	fn local(budgets: impl Into<Option<MuxBudgets>>) -> TransportOffer {
+		TransportOffer { requested_budgets: budgets.into(), ..TransportOffer::mux(4) }
 	}
 
 	fn disabled_offer(cap: u32) -> TransportOffer {
@@ -1594,95 +1658,73 @@ mod tests {
 		}
 	}
 
-	fn require_client_mux(offer: &TransportOffer, accept: &TransportAccept) -> Result<MuxSettings, NegotiationError> {
-		let settings = MuxSettings::for_client(Some(offer), Some(accept))?;
-		settings.ok_or(NegotiationError::UnsolicitedTransportAccept)
+	/// The accept of [`plain_accept`] of a cap of 4 that grants `budgets`.
+	fn granting(budgets: MuxBudgets) -> TransportAccept {
+		TransportAccept { granted_budgets: Some(budgets), ..plain_accept(4) }
 	}
 
-	#[test]
-	fn test_accept_transport_activates_when_both_enable_mux() {
-		let offer = TransportOffer::mux(8);
-		let local = TransportOffer::mux(4);
+	/// The settings a client derives from `offer` and an `accept` it admits.
+	fn client_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
+		let settings = MuxSettings::for_client(Some(offer), Some(accept));
+		let settings = settings.expect("the client admits the accept");
+		settings.expect("the accept enables multiplexing")
+	}
 
-		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
+	/// The rule accepts when both sides enable multiplexing, under the cap the
+	/// server configured.
+	#[test]
+	fn the_rule_accepts_when_both_sides_enable_mux() {
+		let accept = rule_accept(Some(&offer(None)), Some(&local(None)));
 		assert!(matches!(
 			accept,
 			Some(TransportAccept { mux: true, max_peer_initiated_streams: 4, .. })
 		));
 	}
 
-	#[test]
-	fn test_accept_transport_absent_offer_declines() {
-		let local = TransportOffer::mux(4);
-		assert!(rule_accept(&transport_negotiation(None, Some(&local))).is_none());
+	// The rule declines unless both sides enable multiplexing: (the offer of
+	// the client, the configuration of the server).
+	crate::tb_cases! {
+		fn the_rule_declines_unless_both_sides_enable_mux(
+			(offered, configured): (Option<TransportOffer>, Option<TransportOffer>)
+		) {
+			let accept = rule_accept(offered.as_ref(), configured.as_ref());
+			assert_eq!(accept, None);
+		}
+		cases {
+			absent_offer => (None, Some(local(None))),
+			absent_local => (Some(offer(None)), None),
+			disabled_offer => (Some(disabled_offer(8)), Some(local(None))),
+			disabled_local => (Some(offer(None)), Some(disabled_offer(4))),
+		}
 	}
 
-	#[test]
-	fn test_accept_transport_absent_local_declines() {
-		let offer = TransportOffer::mux(8);
-		assert!(rule_accept(&transport_negotiation(Some(&offer), None)).is_none());
+	// The rule grants the minimum of a request and a ceiling, and nothing
+	// without both: (the request, the ceiling, the grant of the accept).
+	crate::tb_cases! {
+		fn the_rule_grants_budgets_under_a_request_and_a_ceiling(
+			(request, ceiling, granted): (Option<MuxBudgets>, Option<MuxBudgets>, Option<MuxBudgets>)
+		) {
+			let accept = rule_accept(Some(&offer(request)), Some(&local(ceiling)));
+			assert_eq!(accept.map(|accept| accept.granted_budgets), Some(granted));
+		}
+		cases {
+			min_of_request_and_ceiling => (Some(REQUEST), Some(CEILING), Some(GRANT)),
+			nothing_unrequested => (None, Some(CEILING), None),
+			no_ceiling => (Some(REQUEST), None, None),
+		}
 	}
 
-	#[test]
-	fn test_accept_transport_disabled_offer_declines() {
-		let disabled = disabled_offer(8);
-		let local = TransportOffer::mux(4);
-		let negotiation = transport_negotiation(Some(&disabled), Some(&local));
-
-		let accepted = rule_accept(&negotiation);
-		assert!(accepted.is_none());
-	}
-
-	#[test]
-	fn test_accept_transport_disabled_local_declines() {
-		let offer = TransportOffer::mux(8);
-		let disabled = disabled_offer(4);
-		let negotiation = transport_negotiation(Some(&offer), Some(&disabled));
-
-		let accepted = rule_accept(&negotiation);
-		assert!(accepted.is_none());
-	}
-
-	#[test]
-	fn test_accept_transport_grants_min_of_request_and_ceiling() {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let ceiling = MuxBudgets { client_to_server: 500, server_to_client: 300 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4).with_budgets(ceiling);
-
-		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
-		let granted = accept.and_then(|accept| accept.granted_budgets);
-		assert_eq!(granted, Some(MuxBudgets { client_to_server: 100, server_to_client: 300 }));
-	}
-
-	#[test]
-	fn test_accept_transport_grants_nothing_unrequested() {
-		let ceiling = MuxBudgets { client_to_server: 500, server_to_client: 300 };
-		let offer = TransportOffer::mux(8);
-		let local = TransportOffer::mux(4).with_budgets(ceiling);
-
-		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
-		let granted = accept.and_then(|accept| accept.granted_budgets);
-		assert_eq!(granted, None);
-	}
-
-	#[test]
-	fn test_accept_transport_without_ceiling_grants_nothing() {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4);
-
-		let accept = rule_accept(&transport_negotiation(Some(&offer), Some(&local)));
-		let granted = accept.and_then(|accept| accept.granted_budgets);
-		assert_eq!(granted, None);
-	}
-
-	/// The accept of the pre-authorizer rule alone.
-	fn rule_accept(negotiation: &TransportNegotiation<'_>) -> Option<TransportAccept> {
-		let (_, accept) = negotiation.offered_accept()?;
+	/// The accept of the pre-authorizer rule alone, for `offer` under `local`.
+	fn rule_accept(offer: Option<&TransportOffer>, local: Option<&TransportOffer>) -> Option<TransportAccept> {
+		let (_, accept) = TransportNegotiation { offer, local }.offered_accept()?;
 		Some(accept)
 	}
 
+	/// An authorizer that answers every offer with the verdict and the
+	/// challenge it holds.
+	///
+	/// Each embedder supplies its own authorizer as its policy, so a test of
+	/// the negotiation around a verdict holds this double.
 	struct FixedAuthorizer {
 		verdict: Result<Option<MuxBudgets>, AuthorizationRefusal>,
 		challenge: Option<OctetString>,
@@ -1706,32 +1748,54 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
-	async fn test_authorize_transport_defaults_to_local_config() -> Result<(), NegotiationError> {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let ceiling = MuxBudgets { client_to_server: 500, server_to_client: 300 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4).with_budgets(ceiling);
+	// The verdict of an authorizer replaces the rule, within the request of
+	// the client: (the request, the ceiling, the authorizer, the grant of the
+	// accept).
+	crate::tb_cases! {
+		async fn the_authorized_grant_stays_within_the_request(
+			(request, ceiling, authorizer, granted): (
+				Option<MuxBudgets>,
+				Option<MuxBudgets>,
+				Option<FixedAuthorizer>,
+				Option<MuxBudgets>,
+			)
+		) -> TestResult {
+			let (offered, configured) = (offer(request), local(ceiling));
+			let authorizer = authorizer.as_ref().map(|fixed| fixed as &dyn TransportAuthorizer);
 
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
-		let accept = negotiation.authorize(None).await?;
-		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
-		assert_eq!(granted, Some(MuxBudgets { client_to_server: 100, server_to_client: 300 }));
-
-		Ok(())
+			let negotiation = transport_negotiation(Some(&offered), Some(&configured));
+			let authorized = negotiation.authorize(authorizer).await?;
+			assert_eq!(authorized.map(|authorized| authorized.accept.granted_budgets), Some(granted));
+			Ok(())
+		}
+		cases {
+			/// With no authorizer, the rule grants under the local ceiling.
+			local_config => (Some(REQUEST), Some(CEILING), None, Some(GRANT)),
+			verdict_replaces_the_rule => (
+				Some(REQUEST),
+				Some(REQUEST),
+				Some(FixedAuthorizer::budgets(Ok(Some(VERDICT)))),
+				Some(VERDICT),
+			),
+			bounded_by_request => (
+				Some(REQUEST),
+				Some(REQUEST),
+				Some(FixedAuthorizer::budgets(Ok(Some(MuxBudgets { client_to_server: 250, server_to_client: 60 })))),
+				Some(MuxBudgets { client_to_server: 100, server_to_client: 60 }),
+			),
+			unsolicited_masked => (None, None, Some(FixedAuthorizer::budgets(Ok(Some(VERDICT)))), None),
+		}
 	}
 
 	/// The verdict carries the server's settings: it initiates up to the cap
 	/// the client offered, and admits up to the cap it advertised.
 	#[tokio::test]
-	async fn an_authorized_transport_carries_the_stream_caps_of_its_accept() -> Result<(), Box<dyn Error>> {
-		let offer = TransportOffer::mux(8);
-		let local = TransportOffer::mux(4);
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+	async fn an_authorized_transport_carries_the_stream_caps_of_its_accept() -> TestResult {
+		let (offered, configured) = (offer(None), local(None));
+		let negotiation = transport_negotiation(Some(&offered), Some(&configured));
 
 		let outcome = negotiation.authorize(None).await?;
 		let authorized = outcome.ok_or("both sides offer multiplexing")?;
-
 		assert_eq!(authorized.mux.local_initiated_cap, 8);
 		assert_eq!(authorized.mux.peer_initiated_cap, 4);
 		Ok(())
@@ -1740,270 +1804,210 @@ mod tests {
 	/// The settings follow the grant the authorizer settled, which lands on
 	/// the accept after the pre-authorizer rule ran.
 	#[tokio::test]
-	async fn an_authorized_transport_carries_the_budgets_of_the_grant() -> Result<(), Box<dyn Error>> {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let verdict = MuxBudgets { client_to_server: 40, server_to_client: 60 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4);
-		let authorizer = FixedAuthorizer::budgets(Ok(Some(verdict)));
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+	async fn an_authorized_transport_carries_the_budgets_of_the_grant() -> TestResult {
+		let (offered, configured) = (offer(REQUEST), local(None));
+		let authorizer = FixedAuthorizer::budgets(Ok(Some(VERDICT)));
+		let negotiation = transport_negotiation(Some(&offered), Some(&configured));
 
 		let outcome = negotiation.authorize(Some(&authorizer)).await?;
 		let authorized = outcome.ok_or("both sides offer multiplexing")?;
-
 		assert_eq!(authorized.mux.send_budget, Some(60));
 		assert_eq!(authorized.mux.recv_budget, Some(40));
 		Ok(())
 	}
 
+	/// A refusal of the authorizer fails the negotiation with the code it
+	/// carries.
 	#[tokio::test]
-	async fn test_authorize_transport_verdict_replaces_local_grant() -> Result<(), NegotiationError> {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let verdict = MuxBudgets { client_to_server: 40, server_to_client: 60 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4).with_budgets(request);
-		let authorizer = FixedAuthorizer::budgets(Ok(Some(verdict)));
-
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
-		let accept = negotiation.authorize(Some(&authorizer)).await?;
-		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
-		assert_eq!(granted, Some(verdict));
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_authorize_transport_grant_bounded_by_request() -> Result<(), NegotiationError> {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let verdict = MuxBudgets { client_to_server: 250, server_to_client: 60 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4).with_budgets(request);
-		let authorizer = FixedAuthorizer::budgets(Ok(Some(verdict)));
-
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
-		let accept = negotiation.authorize(Some(&authorizer)).await?;
-		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
-		assert_eq!(granted, Some(MuxBudgets { client_to_server: 100, server_to_client: 60 }));
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_authorize_transport_refusal_carries_code() {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4);
+	async fn an_authorizer_refusal_carries_its_code() {
+		let (offered, configured) = (offer(REQUEST), local(None));
 		let authorizer = FixedAuthorizer::budgets(Err(AuthorizationRefusal { code: 7 }));
 
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+		let negotiation = transport_negotiation(Some(&offered), Some(&configured));
 		let result = negotiation.authorize(Some(&authorizer)).await;
 		assert!(matches!(result, Err(NegotiationError::AuthorizationRefused { code: 7 })));
 	}
 
+	/// A negotiation that activates no multiplexing skips the authorizer, so a
+	/// refusing one yields neither an accept nor its refusal.
 	#[tokio::test]
-	async fn test_authorize_transport_masks_unsolicited_grant() -> Result<(), NegotiationError> {
-		let verdict = MuxBudgets { client_to_server: 40, server_to_client: 60 };
-		let offer = TransportOffer::mux(8);
-		let local = TransportOffer::mux(4);
-		let authorizer = FixedAuthorizer::budgets(Ok(Some(verdict)));
-
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
-		let accept = negotiation.authorize(Some(&authorizer)).await?;
-		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
-		assert_eq!(granted, None);
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_authorize_transport_inactive_mux_skips_authorizer() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(8);
+	async fn an_inactive_mux_skips_the_authorizer() {
+		let offered = offer(None);
 		let authorizer = FixedAuthorizer::budgets(Err(AuthorizationRefusal { code: 7 }));
 
-		let negotiation = transport_negotiation(Some(&offer), None);
-		let accept = negotiation.authorize(Some(&authorizer)).await?;
-		assert!(accept.is_none());
-
-		Ok(())
+		let negotiation = transport_negotiation(Some(&offered), None);
+		let accept = negotiation.authorize(Some(&authorizer)).await;
+		assert!(matches!(accept, Ok(None)));
 	}
 
+	/// The challenge of the authorizer rides beside the budgets it grants.
 	#[tokio::test]
-	async fn test_authorize_transport_carries_challenge_with_budgets() -> Result<(), NegotiationError> {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let local = TransportOffer::mux(4);
-		let challenge = OctetString::new(b"invoice".as_slice()).map_err(NegotiationError::DerError)?;
-		let authorizer = FixedAuthorizer { verdict: Ok(Some(request)), challenge: Some(challenge.to_owned()) };
+	async fn an_authorizer_challenge_rides_beside_its_budgets() -> TestResult {
+		let (offered, configured) = (offer(REQUEST), local(None));
+		let authorizer = FixedAuthorizer { verdict: Ok(Some(REQUEST)), challenge: Some(invoice()) };
 
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+		let negotiation = transport_negotiation(Some(&offered), Some(&configured));
 		let authorized = negotiation.authorize(Some(&authorizer)).await?;
 		let challenge_out = authorized.and_then(|authorized| authorized.challenge);
-		assert_eq!(challenge_out, Some(challenge));
+		assert_eq!(challenge_out, Some(invoice()));
 
 		Ok(())
 	}
 
+	/// A challenge with no budgets fails closed, because no receipt exists to
+	/// carry it.
 	#[tokio::test]
-	async fn test_authorize_transport_challenge_without_budgets_fails_closed() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(8);
-		let local = TransportOffer::mux(4);
-		let challenge = OctetString::new(b"invoice".as_slice()).map_err(NegotiationError::DerError)?;
-		let authorizer = FixedAuthorizer { verdict: Ok(None), challenge: Some(challenge) };
+	async fn a_challenge_without_budgets_fails_closed() {
+		let (offered, configured) = (offer(None), local(None));
+		let authorizer = FixedAuthorizer { verdict: Ok(None), challenge: Some(invoice()) };
 
-		let negotiation = transport_negotiation(Some(&offer), Some(&local));
+		let negotiation = transport_negotiation(Some(&offered), Some(&configured));
 		let result = negotiation.authorize(Some(&authorizer)).await;
 		assert!(matches!(result, Err(NegotiationError::ChallengeWithoutBudgets)));
-
-		Ok(())
 	}
 
-	fn settle_receipt(ancillary: Option<OctetString>) -> Result<SessionReceipt, DerDecodeError> {
-		let algorithm = AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None };
-		Ok(SessionReceipt {
-			transcript_hash: DigestInfo { algorithm, digest: OctetString::new([0u8; 32])? },
-			budgets: MuxBudgets { client_to_server: 1, server_to_client: 1 },
-			credit_unit: 1024,
-			ancillary,
-		})
+	// The default settlement admits a receipt with no challenge and refuses
+	// one that carries a challenge: (the challenge of the receipt, the
+	// settlement).
+	crate::tb_cases! {
+		async fn the_default_settlement_admits_only_a_challenge_free_receipt(
+			(challenge, settled): (Option<&[u8]>, Result<(), AuthorizationRefusal>)
+		) {
+			let receipt = fixture_receipt(GRANT, challenge);
+			let authorizer = FixedAuthorizer::budgets(Ok(None));
+
+			let settlement = authorizer.settle(&receipt, None, &TestCertificate::insecure_fixed()).await;
+			assert_eq!(settlement, settled);
+		}
+		cases {
+			challenge_free => (None, Ok(())),
+			challenge_bearing => (Some(INVOICE), Err(AuthorizationRefusal { code: SETTLEMENT_UNSUPPORTED_CODE })),
+		}
 	}
 
-	/// The certificate of the client a settlement test names.
-	fn settling_client() -> Certificate {
-		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
-	}
-
+	/// The default renewal issues no challenge, even after an initial receipt
+	/// that carried one, so the epoch receipt settles under the default
+	/// settlement.
 	#[tokio::test]
-	async fn test_default_settle_accepts_challenge_free_receipt() -> Result<(), DerDecodeError> {
+	async fn the_default_renewal_issues_no_challenge() {
+		let prior = fixture_receipt(GRANT, Some(INVOICE));
 		let authorizer = FixedAuthorizer::budgets(Ok(None));
-		let receipt = settle_receipt(None)?;
-		assert_eq!(authorizer.settle(&receipt, None, &settling_client()).await, Ok(()));
-		Ok(())
+
+		let renewal = authorizer.challenge_renewal(&prior).await;
+		assert_eq!(renewal, Ok(None));
 	}
 
-	#[tokio::test]
-	async fn test_default_settle_refuses_challenge_bearing_receipt() -> Result<(), DerDecodeError> {
-		let authorizer = FixedAuthorizer::budgets(Ok(None));
-		let receipt = settle_receipt(Some(OctetString::new(b"invoice".as_slice())?))?;
-		let settled = authorizer.settle(&receipt, None, &settling_client()).await;
-		assert_eq!(settled, Err(AuthorizationRefusal { code: SETTLEMENT_UNSUPPORTED_CODE }));
-		Ok(())
+	/// The settings one endpoint derives from an offer and an accept, by its
+	/// role.
+	type Role = fn(&TransportOffer, &TransportAccept) -> MuxSettings;
+
+	// Each endpoint initiates up to the clamped cap its peer advertised and
+	// admits up to its own: (the role, the caps of the offer and the accept,
+	// the caps the endpoint initiates and admits).
+	crate::tb_cases! {
+		fn an_endpoint_initiates_up_to_the_cap_of_its_peer(
+			(settings_of, (offered, accepted), caps): (Role, (u32, u32), (u32, u32))
+		) {
+			let settings = settings_of(&TransportOffer::mux(offered), &plain_accept(accepted));
+			assert_eq!((settings.local_initiated_cap, settings.peer_initiated_cap), caps);
+		}
+		cases {
+			client => (client_settings, (8, 4), (4, 8)),
+			server => (MuxSettings::for_server, (8, 4), (8, 4)),
+			client_past_the_cap => (client_settings, (u32::MAX, u32::MAX), (MAX_MUX_STREAM_CAP, MAX_MUX_STREAM_CAP)),
+			server_past_the_cap => (
+				MuxSettings::for_server,
+				(u32::MAX, u32::MAX),
+				(MAX_MUX_STREAM_CAP, MAX_MUX_STREAM_CAP),
+			),
+		}
 	}
 
+	// Each endpoint sends by the chunk size and the stream credit its peer
+	// advertised and receives by its own, under the credit unit of the accept:
+	// (the role, the send and receive chunk sizes, the credit unit, the
+	// initial send and receive credit).
+	crate::tb_cases! {
+		fn an_endpoint_takes_its_chunk_and_credit_terms_by_role(
+			(settings_of, terms): (Role, (u32, u32, u32, u64, u64))
+		) {
+			let offered = offer(None)
+				.with_chunk_payload_size(8 * 1024)
+				.with_credit_unit(512)
+				.with_initial_stream_credit(16);
+			let accept = TransportAccept {
+				chunk_payload_size: 32 * 1024,
+				credit_unit: 2048,
+				initial_stream_credit: 32,
+				..plain_accept(4)
+			};
+
+			let settings = settings_of(&offered, &accept);
+
+			let read = (
+				settings.send_chunk_size,
+				settings.recv_chunk_size,
+				settings.credit_unit().get(),
+				settings.initial_send_credit,
+				settings.initial_recv_credit,
+			);
+			assert_eq!(read, terms);
+		}
+		cases {
+			client => (client_settings, (32 * 1024, 8 * 1024, 2048, 32, 16)),
+			server => (MuxSettings::for_server, (8 * 1024, 32 * 1024, 2048, 16, 32)),
+		}
+	}
+
+	// Each endpoint spends the grant of its own direction and meters the grant
+	// of its peer: (the role, the send and receive budgets).
+	crate::tb_cases! {
+		fn an_endpoint_takes_its_budgets_by_role((settings_of, budgets): (Role, (Option<u64>, Option<u64>))) {
+			let settings = settings_of(&offer(GRANT), &granting(GRANT));
+			assert_eq!((settings.send_budget, settings.recv_budget), budgets);
+		}
+		cases {
+			client => (client_settings, (Some(100), Some(300))),
+			server => (MuxSettings::for_server, (Some(300), Some(100))),
+		}
+	}
+
+	/// A grant of zero credits meters the session with nothing to spend.
 	#[test]
-	fn test_mux_settings_directional_caps() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(8);
-		let accept = plain_accept(4);
-
-		let client = require_client_mux(&offer, &accept)?;
-		assert_eq!(client.local_initiated_cap, 4);
-		assert_eq!(client.peer_initiated_cap, 8);
-
-		let server = MuxSettings::for_server(&offer, &accept);
-		assert_eq!(server.local_initiated_cap, 8);
-		assert_eq!(server.peer_initiated_cap, 4);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_mux_settings_directional_chunk_and_credit_views() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(8)
-			.with_chunk_payload_size(8 * 1024)
-			.with_credit_unit(512)
-			.with_initial_stream_credit(16);
-		let accept = TransportAccept {
-			chunk_payload_size: 32 * 1024,
-			credit_unit: 2048,
-			initial_stream_credit: 32,
-			..plain_accept(4)
-		};
-
-		let client = require_client_mux(&offer, &accept)?;
-		assert_eq!(client.send_chunk_size, 32 * 1024);
-		assert_eq!(client.recv_chunk_size, 8 * 1024);
-		assert_eq!(client.credit_unit().get(), 2048);
-		assert_eq!(client.initial_send_credit, 32);
-		assert_eq!(client.initial_recv_credit, 16);
-
-		let server = MuxSettings::for_server(&offer, &accept);
-		assert_eq!(server.send_chunk_size, 8 * 1024);
-		assert_eq!(server.recv_chunk_size, 32 * 1024);
-		assert_eq!(server.credit_unit().get(), 2048);
-		assert_eq!(server.initial_send_credit, 16);
-		assert_eq!(server.initial_recv_credit, 32);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_mux_settings_budget_views_by_role() -> Result<(), NegotiationError> {
-		let budgets = MuxBudgets { client_to_server: 100, server_to_client: 300 };
-		let offer = TransportOffer::mux(8).with_budgets(budgets);
-		let accept = TransportAccept { granted_budgets: Some(budgets), ..plain_accept(4) };
-
-		let client = require_client_mux(&offer, &accept)?;
-		assert_eq!(client.send_budget, Some(100));
-		assert_eq!(client.recv_budget, Some(300));
-
-		let server = MuxSettings::for_server(&offer, &accept);
-		assert_eq!(server.send_budget, Some(300));
-		assert_eq!(server.recv_budget, Some(100));
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_mux_settings_zero_budget_is_metered() -> Result<(), NegotiationError> {
+	fn a_zero_budget_grant_meters_the_session() {
 		let budgets = MuxBudgets { client_to_server: 0, server_to_client: 0 };
-		let offer = TransportOffer::mux(8).with_budgets(budgets);
-		let accept = TransportAccept { granted_budgets: Some(budgets), ..plain_accept(4) };
+		let offered = offer(budgets);
+		let accept = granting(budgets);
 
-		let client = require_client_mux(&offer, &accept)?;
+		let client = client_settings(&offered, &accept);
 		assert_eq!(client.send_budget, Some(0));
 		assert_eq!(client.recv_budget, Some(0));
-
-		Ok(())
 	}
 
+	/// An initial stream credit of zero clamps to one chunk, so every stream
+	/// can start.
 	#[test]
-	fn test_mux_settings_clamp_peer_advertised_caps() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(u32::MAX);
-		let accept = plain_accept(u32::MAX);
-
-		let client = require_client_mux(&offer, &accept)?;
-		assert_eq!(client.local_initiated_cap, MAX_MUX_STREAM_CAP);
-		assert_eq!(client.peer_initiated_cap, MAX_MUX_STREAM_CAP);
-
-		let server = MuxSettings::for_server(&offer, &accept);
-		assert_eq!(server.local_initiated_cap, MAX_MUX_STREAM_CAP);
-		assert_eq!(server.peer_initiated_cap, MAX_MUX_STREAM_CAP);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_mux_settings_stream_credit_floor() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(8).with_initial_stream_credit(0);
+	fn a_zero_stream_credit_clamps_to_one_chunk() {
+		let offered = offer(None).with_initial_stream_credit(0);
 		let accept = TransportAccept { initial_stream_credit: 0, ..plain_accept(4) };
 
-		let client = require_client_mux(&offer, &accept)?;
+		let client = client_settings(&offered, &accept);
 		assert_eq!(client.initial_send_credit, 1);
 		assert_eq!(client.initial_recv_credit, 1);
-
-		Ok(())
 	}
 
+	/// A client clamps each term the offer and the accept advertise into its
+	/// range, and admits a grant at the session cap.
 	#[test]
-	fn test_mux_settings_clamp_chunk_credit_and_budget() -> Result<(), NegotiationError> {
+	fn a_client_clamps_each_advertised_term_into_its_range() {
 		let at_cap = MuxBudgets {
 			client_to_server: MAX_MUX_SESSION_BUDGET,
 			server_to_client: MAX_MUX_SESSION_BUDGET,
 		};
-		let offer = TransportOffer::mux(8)
+		let offered = offer(at_cap)
 			.with_chunk_payload_size(1)
 			.with_credit_unit(0)
-			.with_initial_stream_credit(u64::MAX)
-			.with_budgets(at_cap);
+			.with_initial_stream_credit(u64::MAX);
 		let accept = TransportAccept {
 			chunk_payload_size: u32::MAX,
 			credit_unit: 0,
@@ -2012,7 +2016,7 @@ mod tests {
 			..plain_accept(4)
 		};
 
-		let client = require_client_mux(&offer, &accept)?;
+		let client = client_settings(&offered, &accept);
 		assert_eq!(client.send_chunk_size, MAX_MUX_CHUNK_SIZE);
 		assert_eq!(client.recv_chunk_size, MIN_MUX_CHUNK_SIZE);
 		assert_eq!(client.credit_unit().get(), 1);
@@ -2020,19 +2024,20 @@ mod tests {
 		assert_eq!(client.initial_recv_credit, MAX_MUX_STREAM_CREDIT);
 		assert_eq!(client.send_budget, Some(MAX_MUX_SESSION_BUDGET));
 		assert_eq!(client.recv_budget, Some(MAX_MUX_SESSION_BUDGET));
-
-		Ok(())
 	}
 
+	/// Symmetric settings clamp the stream cap to [`MAX_MUX_STREAM_CAP`].
 	#[test]
-	fn test_symmetric_settings_clamp_cap() {
+	fn symmetric_settings_clamp_the_stream_cap() {
 		let settings = MuxSettings::symmetric(u32::MAX);
 		assert_eq!(settings.local_initiated_cap, MAX_MUX_STREAM_CAP);
 		assert_eq!(settings.peer_initiated_cap, MAX_MUX_STREAM_CAP);
 	}
 
+	/// Symmetric settings start unmetered, under the default chunking and
+	/// credit.
 	#[test]
-	fn test_symmetric_settings_default_flow_control_unmetered() {
+	fn symmetric_settings_start_unmetered_under_default_flow_control() {
 		let settings = MuxSettings::symmetric(8);
 		assert_eq!(settings.send_chunk_size, DEFAULT_MUX_CHUNK_SIZE);
 		assert_eq!(settings.recv_chunk_size, DEFAULT_MUX_CHUNK_SIZE);
@@ -2048,143 +2053,66 @@ mod tests {
 	#[test]
 	fn a_chunk_size_below_the_floor_clamps_to_it() {
 		let settings = MuxSettings::symmetric(4).with_chunk_size(1);
-
 		let chunk_sizes = (settings.send_chunk_size(), settings.recv_chunk_size());
 		assert_eq!(chunk_sizes, (MIN_MUX_CHUNK_SIZE, MIN_MUX_CHUNK_SIZE));
 	}
 
-	#[test]
-	fn test_unsolicited_transport_accept_fails_closed() {
-		let accept = plain_accept(4);
-
-		let result = MuxSettings::for_client(None, Some(&accept));
-		assert!(matches!(result, Err(NegotiationError::UnsolicitedTransportAccept)));
-
-		let disabled = disabled_offer(8);
-		let result = MuxSettings::for_client(Some(&disabled), Some(&accept));
-		assert!(matches!(result, Err(NegotiationError::UnsolicitedTransportAccept)));
+	// A client refuses an accept that departs from its offer: (the offer, the
+	// accept, the refusal).
+	crate::tb_cases! {
+		fn a_client_refuses_an_accept_that_departs_from_its_offer(
+			(offered, accept, refusal): (Option<TransportOffer>, TransportAccept, NegotiationError)
+		) {
+			let settings = MuxSettings::for_client(offered.as_ref(), Some(&accept));
+			assert_eq!(settings, Err(refusal));
+		}
+		cases {
+			no_offer => (None, plain_accept(4), NegotiationError::UnsolicitedTransportAccept),
+			disabled_offer => (Some(disabled_offer(8)), plain_accept(4), NegotiationError::UnsolicitedTransportAccept),
+			unsolicited_budget => (Some(offer(None)), granting(GRANT), NegotiationError::UnsolicitedTransportAccept),
+			over_cap => (Some(offer(OVER_CAP)), granting(OVER_CAP), NegotiationError::BudgetBeyondCap),
+			over_request => (
+				Some(offer(GRANT)),
+				granting(MuxBudgets { client_to_server: 100, server_to_client: 301 }),
+				NegotiationError::BudgetBeyondRequest,
+			),
+			withheld => (Some(offer(GRANT)), plain_accept(4), NegotiationError::BudgetGrantWithheld),
+		}
 	}
 
-	#[test]
-	fn test_unsolicited_granted_budget_fails_closed() {
-		let offer = TransportOffer::mux(8);
-		let budgets = MuxBudgets { client_to_server: 100, server_to_client: 300 };
-		let accept = TransportAccept { granted_budgets: Some(budgets), ..plain_accept(4) };
-
-		let result = MuxSettings::for_client(Some(&offer), Some(&accept));
-		assert!(matches!(result, Err(NegotiationError::UnsolicitedTransportAccept)));
+	// A client whose server accepts no multiplexing runs without it: (the
+	// offer, the accept).
+	crate::tb_cases! {
+		fn a_client_without_a_mux_accept_stays_unmultiplexed(
+			(offered, accept): (Option<TransportOffer>, Option<TransportAccept>)
+		) {
+			let settings = MuxSettings::for_client(offered.as_ref(), accept.as_ref());
+			assert_eq!(settings, Ok(None));
+		}
+		cases {
+			no_accept => (Some(offer(None)), None),
+			nothing => (None, None),
+			declined => (Some(offer(None)), Some(TransportAccept { mux: false, ..plain_accept(0) })),
+		}
 	}
 
-	#[test]
-	fn test_over_cap_granted_budget_fails_closed() {
-		let over_cap = MuxBudgets { client_to_server: MAX_MUX_SESSION_BUDGET + 1, server_to_client: 1 };
-		let offer = TransportOffer::mux(8).with_budgets(over_cap);
-		let accept = TransportAccept { granted_budgets: Some(over_cap), ..plain_accept(4) };
-
-		let result = MuxSettings::for_client(Some(&offer), Some(&accept));
-		assert!(matches!(result, Err(NegotiationError::BudgetBeyondCap)));
+	// A descriptor that names an algorithm other than those of the provider
+	// is not runnable: (the descriptor).
+	crate::tb_cases! {
+		fn a_descriptor_that_names_another_algorithm_is_not_runnable(descriptor: SecurityProfileDesc) {
+			let result = RunnableProfile::<DefaultCryptoProvider>::try_from(descriptor);
+			assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
+		}
+		cases {
+			foreign_digest => SecurityProfileDesc { digest: Some(HASH_SHA3_512), ..create_default_test_profile() },
+			/// The KDF has an OID of its own, so a descriptor that names it by
+			/// the OID of its digest names another algorithm.
+			kdf_by_its_digest_oid => SecurityProfileDesc { kdf: Some(HASH_SHA3_256), ..create_default_test_profile() },
+		}
 	}
 
-	#[test]
-	fn test_over_request_granted_budget_fails_closed() {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 300 };
-		let over_request = MuxBudgets { client_to_server: 100, server_to_client: 301 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let accept = TransportAccept { granted_budgets: Some(over_request), ..plain_accept(4) };
-
-		let result = MuxSettings::for_client(Some(&offer), Some(&accept));
-		assert!(matches!(result, Err(NegotiationError::BudgetBeyondRequest)));
-	}
-
-	#[test]
-	fn test_withheld_budget_grant_fails_closed() {
-		let request = MuxBudgets { client_to_server: 100, server_to_client: 300 };
-		let offer = TransportOffer::mux(8).with_budgets(request);
-		let accept = plain_accept(4);
-
-		let result = MuxSettings::for_client(Some(&offer), Some(&accept));
-		assert!(matches!(result, Err(NegotiationError::BudgetGrantWithheld)));
-	}
-
-	#[test]
-	fn test_no_accept_means_mux_inactive() -> Result<(), NegotiationError> {
-		let offer = TransportOffer::mux(8);
-		assert!(MuxSettings::for_client(Some(&offer), None)?.is_none());
-		assert!(MuxSettings::for_client(None, None)?.is_none());
-
-		let declined = TransportAccept { mux: false, ..plain_accept(0) };
-		assert!(MuxSettings::for_client(Some(&offer), Some(&declined))?.is_none());
-		Ok(())
-	}
-
-	#[test]
-	fn test_select_profile_follows_server_aead_preference() -> Result<(), Box<dyn Error>> {
-		use crate::oids::{
-			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256,
-			SIGNER_ECDSA_WITH_SHA256,
-		};
-
-		let aes128_gcm = SecurityProfileDesc {
-			digest: Some(HASH_SHA256),
-			aead: Some(AES_128_GCM),
-			signature: Some(SIGNER_ECDSA_WITH_SHA256),
-			kdf: Some(HASH_SHA256),
-			key_exchange: Some(CURVE_SECP256K1),
-			key_wrap: Some(AES_128_WRAP),
-		};
-		let aes256_gcm = SecurityProfileDesc {
-			digest: Some(HASH_SHA256),
-			aead: Some(AES_256_GCM),
-			signature: Some(SIGNER_ECDSA_WITH_SHA256),
-			kdf: Some(HASH_SHA256),
-			key_exchange: Some(CURVE_SECP256K1),
-			key_wrap: Some(AES_256_WRAP),
-		};
-
-		let selected_aead = |client: &[SecurityProfileDesc], server: &[SecurityProfileDesc]| {
-			SecurityOffer::new(client.to_vec())
-				.select_profile(server)
-				.map(|selected| selected.aead)
-		};
-
-		assert_eq!(
-			selected_aead(&[aes128_gcm, aes256_gcm], &[aes256_gcm, aes128_gcm])?,
-			Some(AES_256_GCM)
-		);
-		assert_eq!(
-			selected_aead(&[aes256_gcm, aes128_gcm], &[aes256_gcm, aes128_gcm])?,
-			Some(AES_256_GCM)
-		);
-		assert_eq!(
-			selected_aead(&[aes256_gcm, aes128_gcm], &[aes128_gcm, aes256_gcm])?,
-			Some(AES_128_GCM)
-		);
-		assert_eq!(selected_aead(&[aes128_gcm, aes256_gcm], &[aes256_gcm])?, Some(AES_256_GCM));
-		Ok(())
-	}
-
-	#[test]
-	fn a_descriptor_that_names_a_foreign_algorithm_is_not_runnable() {
-		let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
-		let foreign = SecurityProfileDesc { digest: Some(crate::oids::HASH_SHA3_512), ..native };
-
-		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(foreign);
-
-		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
-	}
-
-	/// The KDF has an OID of its own, so a descriptor that names it by the OID
-	/// of its digest names another algorithm.
-	#[test]
-	fn a_descriptor_that_names_its_kdf_by_the_digest_oid_is_not_runnable() {
-		let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
-		let by_digest = SecurityProfileDesc { kdf: Some(crate::oids::HASH_SHA3_256), ..native };
-
-		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(by_digest);
-
-		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
-	}
-
+	/// A runnable profile reports the key size of the cipher and the output
+	/// size of the digest its provider runs.
 	#[test]
 	fn a_runnable_profile_reports_the_provider_key_and_digest_sizes() {
 		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
@@ -2192,26 +2120,28 @@ mod tests {
 		assert_eq!(strength.digest_bytes, 32);
 	}
 
-	#[test]
-	fn the_default_floor_refuses_a_128_bit_aead_key() {
-		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
-		let weak = ProfileStrength { aead_key_bytes: 16, ..strength };
-		assert!(DefaultStrengthFloor.meets_floor(&strength));
-		assert!(!DefaultStrengthFloor.meets_floor(&weak));
-	}
-
-	/// An exchange that rates 112 bits, such as ECDH on a curve whose order is
-	/// 224 to 255 bits, falls below the floor (NIST SP 800-57 Part 1 Rev. 5
-	/// Table 2, CWE-757).
-	#[test]
-	fn the_default_floor_refuses_a_112_bit_key_exchange() {
-		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
-		let weak = ProfileStrength { key_exchange: SecurityStrength::BITS_112, ..strength };
-		assert!(DefaultStrengthFloor.meets_floor(&strength));
-		assert!(!DefaultStrengthFloor.meets_floor(&weak));
+	// The default floor admits the native strength and refuses it weakened in
+	// one term: (the weakening).
+	crate::tb_cases! {
+		fn the_default_floor_refuses_a_weakened_profile(weaken: fn(ProfileStrength) -> ProfileStrength) {
+			let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+			let weak = weaken(strength);
+			assert!(DefaultStrengthFloor.meets_floor(&strength));
+			assert!(!DefaultStrengthFloor.meets_floor(&weak));
+		}
+		cases {
+			aead_128_bit_key => |strength| ProfileStrength { aead_key_bytes: 16, ..strength },
+			/// An exchange that rates 112 bits, such as ECDH on a curve whose
+			/// order is 224 to 255 bits, falls below the floor (NIST SP 800-57
+			/// Part 1 Rev. 5 Table 2, CWE-757).
+			key_exchange_112_bit => |strength| ProfileStrength { key_exchange: SecurityStrength::BITS_112, ..strength },
+		}
 	}
 
 	/// A policy that refuses every profile.
+	///
+	/// Each house floor admits the native profile, so a test of a refusal by
+	/// the floor holds this double.
 	struct RefuseAll;
 
 	impl ProfileStrengthPolicy for RefuseAll {
@@ -2222,127 +2152,113 @@ mod tests {
 
 	type DefaultPolicy = ProfilePolicy<DefaultCryptoProvider>;
 
-	/// The descriptor the default provider runs.
-	fn native_profile() -> SecurityProfileDesc {
-		RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
+	// A server chooses the profile its provider runs from a list that also
+	// names a foreign profile, with or without an offer: (the offer).
+	crate::tb_cases! {
+		fn a_server_chooses_the_profile_its_provider_runs(offered: Option<SecurityOffer>) -> TestResult {
+			let supported = SupportedProfiles::try_from(vec![foreign_profile(), create_default_test_profile()])?;
+			let chosen = DefaultPolicy::new().choose(&supported, offered.as_ref())?;
+			assert_eq!(chosen.descriptor(), create_default_test_profile());
+			Ok(())
+		}
+		cases {
+			offered => Some(SecurityOffer::new(vec![foreign_profile(), create_default_test_profile()])),
+			dealers_choice => None,
+		}
 	}
 
-	/// A descriptor that names an AEAD the default provider does not run.
-	fn foreign_profile() -> SecurityProfileDesc {
-		SecurityProfileDesc { aead: Some(AES_128_GCM), ..native_profile() }
+	// A server refuses to choose from a list of one profile its policy refuses:
+	// (the policy, the profile of the list, the refusal).
+	crate::tb_cases! {
+		fn a_server_refuses_to_choose_an_ineligible_profile(
+			(policy, listed, refusal): (DefaultPolicy, SecurityProfileDesc, NegotiationError)
+		) {
+			let supported = SupportedProfiles::from(listed);
+			let chosen = policy.choose(&supported, None);
+			assert!(matches!(chosen, Err(HandshakeError::NegotiationError(error)) if error == refusal));
+		}
+		cases {
+			unrunnable => (DefaultPolicy::new(), foreign_profile(), NegotiationError::UnrunnableProfile),
+			below_its_floor => (
+				DefaultPolicy::with_floor(Arc::new(RefuseAll)),
+				create_default_test_profile(),
+				NegotiationError::BelowStrengthFloor,
+			),
+		}
 	}
 
-	#[test]
-	fn a_server_chooses_the_offered_profile_the_provider_runs() -> Result<(), HandshakeError> {
-		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
-		let offer = SecurityOffer::new(vec![foreign_profile(), native_profile()]);
-
-		let chosen = DefaultPolicy::new().choose(&supported, Some(&offer))?;
-		assert_eq!(chosen.descriptor(), native_profile());
-		Ok(())
-	}
-
-	#[test]
-	fn dealers_choice_skips_a_profile_the_provider_does_not_run() -> Result<(), HandshakeError> {
-		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
-		let chosen = DefaultPolicy::new().choose(&supported, None)?;
-		assert_eq!(chosen.descriptor(), native_profile());
-		Ok(())
-	}
-
-	#[test]
-	fn a_server_with_no_runnable_profile_refuses_to_choose() {
-		let supported = SupportedProfiles::from(foreign_profile());
-		let refusal = DefaultPolicy::new().choose(&supported, None);
-		let expected = NegotiationError::UnrunnableProfile;
-		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
-	}
-
-	#[test]
-	fn a_server_refuses_to_choose_a_profile_below_its_floor() {
-		let policy = DefaultPolicy::with_floor(Arc::new(RefuseAll));
-		let supported = SupportedProfiles::from(native_profile());
-
-		let refusal = policy.choose(&supported, None);
-		let expected = NegotiationError::BelowStrengthFloor;
-		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
-	}
-
+	/// A profile list holds at least one profile.
 	#[test]
 	fn an_empty_profile_list_is_refused() {
 		let refusal = SupportedProfiles::try_from(Vec::new());
 		assert!(matches!(refusal, Err(HandshakeError::NoSupportedProfiles)));
 	}
 
+	/// A profile list holds its profiles in the order it took them.
 	#[test]
-	fn a_profile_list_keeps_its_preference_order() -> Result<(), HandshakeError> {
-		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
-		assert_eq!(supported.as_slice(), [foreign_profile(), native_profile()]);
+	fn a_profile_list_keeps_its_preference_order() -> TestResult {
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), create_default_test_profile()])?;
+		assert_eq!(supported.as_slice(), [foreign_profile(), create_default_test_profile()]);
 		Ok(())
 	}
 
-	#[test]
-	fn a_client_admits_an_offered_profile_it_runs() -> Result<(), HandshakeError> {
-		let offer = SecurityOffer::new(vec![foreign_profile(), native_profile()]);
-		let accept = SecurityAccept::new(native_profile());
-
-		let admitted = DefaultPolicy::new().admit(Some(&offer), Some(&accept))?;
-		assert_eq!(admitted.descriptor(), native_profile());
-		Ok(())
+	// A client admits a selection its provider runs, with or without an offer:
+	// (the offer).
+	crate::tb_cases! {
+		fn a_client_admits_a_selected_profile_it_runs(offered: Option<SecurityOffer>) -> TestResult {
+			let accept = SecurityAccept::new(create_default_test_profile());
+			let admitted = DefaultPolicy::new().admit(offered.as_ref(), Some(&accept))?;
+			assert_eq!(admitted.descriptor(), create_default_test_profile());
+			Ok(())
+		}
+		cases {
+			offered => Some(SecurityOffer::new(vec![foreign_profile(), create_default_test_profile()])),
+			dealers_choice => None,
+		}
 	}
 
-	#[test]
-	fn a_client_refuses_a_profile_it_did_not_offer() {
-		let offer = SecurityOffer::new(vec![foreign_profile()]);
-		let accept = SecurityAccept::new(native_profile());
-
-		let refusal = DefaultPolicy::new().admit(Some(&offer), Some(&accept));
-		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
+	// A client refuses a selection outside its offer and a reply that selects
+	// nothing: (the offer, the selection).
+	crate::tb_cases! {
+		fn a_client_refuses_an_invalid_profile_selection(
+			(offered, selected): (Option<SecurityOffer>, Option<SecurityAccept>)
+		) {
+			let admitted = DefaultPolicy::new().admit(offered.as_ref(), selected.as_ref());
+			assert!(matches!(admitted, Err(HandshakeError::InvalidProfileSelection)));
+		}
+		cases {
+			not_offered => (
+				Some(SecurityOffer::new(vec![foreign_profile()])),
+				Some(SecurityAccept::new(create_default_test_profile())),
+			),
+			unanswered => (Some(SecurityOffer::new(vec![create_default_test_profile()])), None),
+			/// Without an offer the server still names the profile it chose, so
+			/// the client refuses a reply that selects nothing.
+			missing_selection => (None, None),
+		}
 	}
 
-	#[test]
-	fn a_client_refuses_an_offer_the_server_did_not_answer() {
-		let offer = SecurityOffer::new(vec![native_profile()]);
-		let refusal = DefaultPolicy::new().admit(Some(&offer), None);
-		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
-	}
-
-	/// Without an offer the server still names the profile it chose, so the
-	/// client refuses a reply that selects nothing.
-	#[test]
-	fn a_dealers_choice_client_refuses_a_missing_selection() {
-		let refusal = DefaultPolicy::new().admit(None, None);
-		assert!(matches!(refusal, Err(HandshakeError::InvalidProfileSelection)));
-	}
-
-	#[test]
-	fn a_dealers_choice_client_admits_a_profile_it_runs() -> Result<(), HandshakeError> {
-		let accept = SecurityAccept::new(native_profile());
-		let admitted = DefaultPolicy::new().admit(None, Some(&accept))?;
-		assert_eq!(admitted.descriptor(), native_profile());
-		Ok(())
-	}
-
-	/// The client refuses a selection that names an algorithm its provider does
-	/// not run, so a session runs only under its provider's algorithms.
-	#[test]
-	fn a_dealers_choice_client_refuses_a_profile_it_does_not_run() {
-		let accept = SecurityAccept::new(foreign_profile());
-
-		let refusal = DefaultPolicy::new().admit(None, Some(&accept));
-		let expected = NegotiationError::UnrunnableProfile;
-		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
-	}
-
-	/// Without an offer the server chooses, and the client floor still bounds
-	/// that choice.
-	#[test]
-	fn a_dealers_choice_client_refuses_a_profile_below_its_floor() {
-		let policy = DefaultPolicy::with_floor(Arc::new(RefuseAll));
-		let accept = SecurityAccept::new(native_profile());
-
-		let refusal = policy.admit(None, Some(&accept));
-		let expected = NegotiationError::BelowStrengthFloor;
-		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
+	// Without an offer the server chooses, and the client still refuses a
+	// selection its policy refuses: (the policy, the selection, the refusal).
+	crate::tb_cases! {
+		fn a_dealers_choice_client_refuses_an_ineligible_profile(
+			(policy, selected, refusal): (DefaultPolicy, SecurityProfileDesc, NegotiationError)
+		) {
+			let accept = SecurityAccept::new(selected);
+			let admitted = policy.admit(None, Some(&accept));
+			assert!(matches!(admitted, Err(HandshakeError::NegotiationError(error)) if error == refusal));
+		}
+		cases {
+			/// The client refuses a selection that names an algorithm its
+			/// provider does not run, so a session runs only under the
+			/// algorithms of its provider.
+			unrunnable => (DefaultPolicy::new(), foreign_profile(), NegotiationError::UnrunnableProfile),
+			/// The client floor bounds the choice of the server.
+			below_its_floor => (
+				DefaultPolicy::with_floor(Arc::new(RefuseAll)),
+				create_default_test_profile(),
+				NegotiationError::BelowStrengthFloor,
+			),
+		}
 	}
 }

@@ -251,75 +251,26 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::cluster::{
-		AdmittedDial, CertificateSpec, ClusterConfig, ClusterTlsConfig, PeerRoute, ServletEntry,
-		DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
-	};
+	use crate::colony::cluster::runtime::bounds::fixtures::Audited;
+	use crate::colony::cluster::{ClusterConfig, ServletEntry};
 	use crate::colony::urn::ColonyNamespace;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::testing::{TestCertificate, TestKey};
-	use crate::transport::TokioListener;
+	use crate::testing::TestResult;
 
 	fn stream_type() -> Urn<'static> {
-		ColonyNamespace::default()
-			.servlet("stream-echo")
-			.expect("test names satisfy the mint grammar")
+		ColonyNamespace::servlet_fixture("stream-echo")
 	}
 
-	// A missing decrement in `HopBudget::relayed_route` fails here even when
-	// integration topologies mask it with a clamp. The mux handle tests pin
-	// the stamp of the route on the Open.
+	/// A gateway with no peer pool dials its peers on its hive pool, so a peer
+	/// route plans a relayed splice and refuses nothing before the dial.
 	#[test]
-	fn relayed_route_stamps_a_decremented_budget() {
-		let route = HopBudget::for_test(2).relayed_route(&stream_type());
-		assert_eq!(route.hops_remaining(), 1);
-	}
+	fn a_peer_route_on_a_gateway_with_no_peer_pool_hops_on_the_hive_pool() -> TestResult {
+		let audited = Audited::of(ClusterConfig::fixture());
+		let route = ServletEntry::peer_fixture(stream_type().canonical_bytes(), b"first", "192.0.2.1:9001");
 
-	#[test]
-	fn relayed_route_saturates_a_spent_budget_at_zero() {
-		let route = HopBudget::for_test(0).relayed_route(&stream_type());
-		assert_eq!(route.hops_remaining(), 0);
-	}
+		audited.gateway.servlet_registry.add(route)?;
 
-	#[test]
-	fn relayed_route_keeps_the_target() {
-		let route = HopBudget::for_test(2).relayed_route(&stream_type());
-		assert_eq!(route.target(), Some(&stream_type()));
-	}
-
-	/// The route of [`stream_type`] through the peer gateway `first`.
-	fn peer_route() -> ServletEntry {
-		let servlet_type = stream_type().canonical_bytes();
-		let route = PeerRoute {
-			peer_id: Arc::from(b"first".as_slice()),
-			servlet_type: Arc::from(servlet_type.as_slice()),
-			dial: AdmittedDial::fixture("192.0.2.1:9001"),
-		};
-
-		ServletEntry::peer(route, DEFAULT_INITIAL_PHEROMONE, DEFAULT_ABANDONMENT_LIMIT)
-	}
-
-	/// The request context of a gateway that configures no peer trust, so it
-	/// holds no peer pool.
-	fn gateway_with_no_peer_pool(trace: &Arc<TraceCollector>) -> GatewayRuntimeCtx<TokioListener> {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let spec = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-		let config = ClusterConfig::new(tls.expect("the fixture certificate decodes"));
-
-		GatewayRuntimeCtx::for_test(config, trace, &Arc::new(TraceCollector::new()))
-	}
-
-	// A gateway with no peer pool dials its peers on its hive pool, so a peer
-	// route plans a relayed splice and refuses nothing before the dial.
-	#[test]
-	fn a_peer_route_on_a_gateway_with_no_peer_pool_hops_on_the_hive_pool() -> Result<(), Box<dyn core::error::Error>> {
-		let trace = Arc::new(TraceCollector::new());
-		let gateway = gateway_with_no_peer_pool(&trace);
-		gateway.servlet_registry.add(peer_route())?;
-
-		let planned = gateway.plan_splice(&stream_type(), HopBudget::for_test(2), None, &trace)?;
+		let budget = HopBudget::for_test(2);
+		let planned = audited.gateway.plan_splice(&stream_type(), budget, None, &audited.trace)?;
 
 		let route = planned.map(|plan| plan.route);
 		let read = route.as_ref().map(|route| (route.hops_remaining(), route.target()));

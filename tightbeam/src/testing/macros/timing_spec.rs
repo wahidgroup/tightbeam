@@ -137,35 +137,33 @@ mod tests {
 
 	use crate::testing::timing::{DefaultStatisticalAnalyzer, Percentile, TimingGuard};
 
+	/// A range guard takes identifiers as its bounds.
 	#[test]
-	fn a_range_guard_takes_identifier_bounds() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_range_guard_takes_identifier_bounds() {
 		let lower = Duration::from_millis(5);
 		let upper = Duration::from_millis(10);
 
 		let guard = crate::guard!(lower <= clock <= upper);
 		assert_eq!(guard, TimingGuard::ClockInRange("clock".to_string(), lower, upper));
-		Ok(())
 	}
 
+	/// A WCET holds its analyzer under the percentile it names.
 	#[test]
-	fn a_wcet_holds_its_analyzer_under_its_percentile() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_wcet_holds_its_analyzer_under_its_percentile() {
 		let duration = Duration::from_millis(10);
 		let wcet = crate::wcet!(duration, analyzer: DefaultStatisticalAnalyzer, percentile: Percentile::P99);
 
-		let percentile = wcet.percentile.ok_or("the bound holds a percentile")?;
-		assert_eq!(percentile.percentile, Percentile::P99);
-		assert!(percentile.analyzer.is_some());
-		Ok(())
+		let percentile = wcet.percentile.map(|bound| (bound.percentile, bound.analyzer.is_some()));
+		assert_eq!(percentile, Some((Percentile::P99, true)));
 	}
 
+	/// A deadline in braces keeps its duration and its slack.
 	#[test]
-	fn a_deadline_in_braces_keeps_its_slack() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_deadline_in_braces_keeps_its_slack() {
 		let duration = Duration::from_millis(100);
 		let slack = Duration::from_millis(5);
 
 		let params = crate::deadline! { duration: duration, slack: slack };
-		assert_eq!(params.duration, duration);
-		assert_eq!(params.min_slack, Some(slack));
-		Ok(())
+		assert_eq!((params.duration, params.min_slack), (duration, Some(slack)));
 	}
 }

@@ -445,22 +445,25 @@ mod tests {
 	use futures::lock::Mutex as FuturesMutex;
 	use tokio::time;
 
-	use super::super::testing::{client_shared, noop_cx};
+	use super::super::fixtures::{noop_cx, FIXTURE_PEER_CAP};
 	use super::super::transport::MuxTransport;
 	use super::*;
-	use crate::clock::ManualClock;
+	use crate::clock::{ManualClock, SystemClock};
 	use crate::marker::MaybeSendFuture;
 	use crate::transport::envelopes::{
 		MuxPingPackage, MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage,
 	};
 	use crate::transport::handshake::HandshakeError;
 	use crate::transport::multiplex::{MuxRekeyContext, MuxRole, MuxSettings};
-	use crate::transport::rekey::tests::{rekey_pair, run_exchange};
-	use crate::transport::rekey::{EpochInstall, RekeyDriver};
+	use crate::transport::rekey::{ClientRekey, EpochInstall, RekeyDriver};
 	use crate::transport::{EnvelopeSource, TransportError};
 
-	/// A sink that accepts every envelope and every send cipher, and reports
-	/// unlimited records.
+	/// A sink that accepts every envelope and every send cipher, reports
+	/// unlimited records, and hands out the clock of the trait default.
+	///
+	/// The writer driver under test reads its deadlines on the clock of its
+	/// sink and writes no byte that a test reads, so the double stands in for
+	/// the write half of a connection.
 	struct OpenSink;
 
 	impl EnvelopeSink for OpenSink {
@@ -477,16 +480,23 @@ mod tests {
 		}
 	}
 
-	/// A sink split from a connection that reads the manual clock `self.0`.
+	/// The [`OpenSink`] on the manual clock it holds.
+	///
+	/// The deadline cases move the clock of the link by hand, which the
+	/// default clock of a sink leaves to the host.
 	struct ClockedSink(Arc<ManualClock>);
 
 	impl EnvelopeSink for ClockedSink {
-		async fn write_envelope(&mut self, _envelope: TransportEnvelope) -> TransportResult<()> {
-			Ok(())
+		async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+			OpenSink.write_envelope(envelope).await
 		}
 
 		fn remaining_records(&self) -> u64 {
-			u64::MAX
+			OpenSink.remaining_records()
+		}
+
+		fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
+			OpenSink.install_send_cipher(cipher)
 		}
 
 		fn clock(&self) -> Arc<dyn Clock> {
@@ -496,6 +506,9 @@ mod tests {
 
 	/// A client exchange that refuses every leg, in place of the handle whose
 	/// presence the deadline checks.
+	///
+	/// The deadline under test reads that an exchange is present and never
+	/// drives it, so a real exchange would add keys that no case reads.
 	struct StalledExchange;
 
 	impl ClientRekeyExchange for StalledExchange {
@@ -513,6 +526,9 @@ mod tests {
 
 	/// A source for a transport whose reader stays undriven in every test. A
 	/// read on it reports a closed connection.
+	///
+	/// No case drives the reader, so the double stands in for the read half
+	/// of a connection that no case opens.
 	struct IdleSource;
 
 	impl EnvelopeSource for IdleSource {
@@ -525,7 +541,7 @@ mod tests {
 	/// renewal budget of `deadline`, beside the queue's sender, which keeps the
 	/// queue open. The driver reads the clock its sink carries.
 	fn stalled_driver<W: EnvelopeSink>(sink: W, deadline: Duration) -> (MuxWriterDriver<W>, mpsc::Sender<Outbound>) {
-		let shared = client_shared();
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
 		shared.enter_renewal(|| Some(())).expect("an idle connection enters renewal");
 
 		let (sender, commands) = mpsc::channel(1);
@@ -583,6 +599,16 @@ mod tests {
 		assert_eq!(writer.clock.monotonic(), link_clock.monotonic());
 	}
 
+	/// A transport over a link that names no clock of its own runs the
+	/// system clock, the default of every link. `Clock` has no `PartialEq`, so
+	/// the case reads the `Debug` of the clock, which names its type.
+	#[test]
+	fn a_transport_over_a_link_of_no_clock_runs_the_system_clock() {
+		let mux = MuxTransport::new(IdleSource, OpenSink, MuxRole::Client, MuxSettings::symmetric(4));
+		let (_handle, _reader, writer, _responder) = mux.into_parts();
+		assert_eq!(format!("{:?}", writer.clock), format!("{SystemClock:?}"));
+	}
+
 	/// Whether the writer of a transport that `with_rekey` assembles from
 	/// `driver` holds its key-switch marker after `install`, the install of
 	/// the half `driver` holds at the end of one exchange.
@@ -598,25 +624,29 @@ mod tests {
 		writer.pending_ack.is_some()
 	}
 
-	/// A transport assembled from a client's rekey context holds its
-	/// key-switch marker until its owed chunks quiesce, as the client role
-	/// does, because the context alone decides the role.
-	#[tokio::test]
-	async fn a_client_rekey_context_assembles_a_client_transport() -> Result<(), Box<dyn std::error::Error>> {
-		let (mut client, mut server) = rekey_pair()?;
-		let (install, _) = run_exchange(&mut client, &mut server).await?;
-		assert!(holds_key_switch(RekeyDriver::client(client), install).await);
-		Ok(())
-	}
-
-	/// A transport assembled from a server's rekey context writes its
-	/// key-switch marker at once, as the server role does.
-	#[tokio::test]
-	async fn a_server_rekey_context_assembles_a_server_transport() -> Result<(), Box<dyn std::error::Error>> {
-		let (mut client, mut server) = rekey_pair()?;
-		let (_, install) = run_exchange(&mut client, &mut server).await?;
-		assert!(!holds_key_switch(RekeyDriver::server(server), install).await);
-		Ok(())
+	// A transport that `with_rekey` assembles takes its role from the rekey
+	// context alone: a client transport holds its key-switch marker until its
+	// owed chunks quiesce, and a server transport writes its marker at once.
+	// Each case is (the driver of one half after one exchange, the install of
+	// that half, whether the writer holds the marker).
+	crate::tb_cases! {
+		async fn a_rekey_context_assembles_a_transport_of_its_role(
+			(driver, install, holds): (RekeyDriver, EpochInstall, bool)
+		) {
+			assert_eq!(holds_key_switch(driver, install).await, holds);
+		}
+		cases {
+			client => {
+				let (mut client, mut server) = ClientRekey::fixture_pair();
+				let (install, _) = client.exchange_with(&mut server).await;
+				(RekeyDriver::client(client), install, true)
+			},
+			server => {
+				let (mut client, mut server) = ClientRekey::fixture_pair();
+				let (_, outcome) = client.exchange_with(&mut server).await;
+				(RekeyDriver::server(server), outcome.install, false)
+			},
+		}
 	}
 
 	/// A stalled exchange waits while the clock of the link stays short of

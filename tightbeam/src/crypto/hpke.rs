@@ -1371,12 +1371,12 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::aead::Key;
+	use crate::crypto::aead::{AeadInPlace, Error as AeadError, Key, Tag};
 	use crate::crypto::common::typenum::U48;
 	use crate::crypto::k256::sha2::Sha512;
 	use crate::crypto::secret::ToInsecure;
-	use crate::testing::{unhex, SeededStream};
-	use aead::{AeadInPlace, Tag};
+	use crate::testing::vectors::rfc5869::{HkdfVector, RFC_5869_A_1, RFC_5869_A_2, RFC_5869_A_3};
+	use crate::testing::{unhex, SeededStream, TestResult};
 
 	/// The house suite.
 	type Suite = HpkeSecp256k1Sha256Aes256Gcm;
@@ -1416,6 +1416,9 @@ mod tests {
 
 	/// HKDF-SHA256 that answers a 12-byte request `LEN_SHIFT` bytes away from
 	/// it, as a faulty provider KDF does.
+	///
+	/// Every KDF a provider ships answers the length it is asked, so a faulty
+	/// one runs only as this double.
 	struct AlteredKdf<const LEN_SHIFT: i8>;
 
 	impl<const LEN_SHIFT: i8> HpkeKdf for AlteredKdf<LEN_SHIFT> {
@@ -1437,6 +1440,9 @@ mod tests {
 
 	/// A KDF with no bound on its output, so the two-byte length frame of
 	/// `LabeledExpand` is the one refusal a long request meets.
+	///
+	/// Every registered HPKE KDF bounds its output below that frame, so a KDF
+	/// that reaches it runs only as this double.
 	struct UnboundedKdf;
 
 	impl HpkeKdf for UnboundedKdf {
@@ -1622,102 +1628,97 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn the_sender_matches_the_published_vector_under_aes_128_gcm() -> Result<()> {
-		let derived = Derived::by_sender::<RegisteredAes128>(&AES_128_GCM_VECTOR)?;
-		assert_eq!(derived, Derived::published(&AES_128_GCM_VECTOR));
-		Ok(())
+	/// The side of a vector that a row derives, under one suite.
+	type DeriveOf = fn(&Vector) -> Result<Derived>;
+
+	// Each side of each published vector derives the shared secret, the key,
+	// and the base nonce that vector publishes: the sender from its ephemeral
+	// secret and the recipient public key, and the recipient from its secret
+	// key and the encapsulated key.
+	crate::tb_cases! {
+		fn the_published_vector_holds_for_the((derive, vector): (DeriveOf, Vector)) -> TestResult {
+			let derived = derive(&vector)?;
+			assert_eq!(derived, Derived::published(&vector));
+			Ok(())
+		}
+		cases {
+			sender_under_aes_128_gcm => (Derived::by_sender::<RegisteredAes128>, AES_128_GCM_VECTOR),
+			sender_under_aes_256_gcm => (Derived::by_sender::<RegisteredAes256>, AES_256_GCM_VECTOR),
+			recipient_under_aes_128_gcm => (Derived::by_recipient::<RegisteredAes128>, AES_128_GCM_VECTOR),
+			recipient_under_aes_256_gcm => (Derived::by_recipient::<RegisteredAes256>, AES_256_GCM_VECTOR),
+		}
 	}
 
-	#[test]
-	fn the_sender_matches_the_published_vector_under_aes_256_gcm() -> Result<()> {
-		let derived = Derived::by_sender::<RegisteredAes256>(&AES_256_GCM_VECTOR)?;
-		assert_eq!(derived, Derived::published(&AES_256_GCM_VECTOR));
-		Ok(())
+	// The KEM alone, under the ephemeral of each vector, yields the shared
+	// secret and the encapsulated key that vector publishes.
+	crate::tb_cases! {
+		fn the_dhkem_encapsulates_to_the_published(vector: Vector) -> TestResult {
+			let encapsulated = vector.encapsulated()?;
+			assert_eq!(encapsulated, vector.published_encapsulation());
+			Ok(())
+		}
+		cases {
+			b_1_1_vector => AES_128_GCM_VECTOR,
+			b_2_1_vector => AES_256_GCM_VECTOR,
+		}
 	}
 
-	#[test]
-	fn the_recipient_matches_the_published_vectors() -> Result<()> {
-		let with_aes_128 = Derived::by_recipient::<RegisteredAes128>(&AES_128_GCM_VECTOR)?;
-		let with_aes_256 = Derived::by_recipient::<RegisteredAes256>(&AES_256_GCM_VECTOR)?;
-		assert_eq!(with_aes_128, Derived::published(&AES_128_GCM_VECTOR));
-		assert_eq!(with_aes_256, Derived::published(&AES_256_GCM_VECTOR));
-		Ok(())
+	// The KEM alone, from the DH output of the recipient key and the
+	// encapsulated key of each vector, yields its shared secret.
+	crate::tb_cases! {
+		fn the_dhkem_decapsulates_the_published(vector: Vector) -> TestResult {
+			let decapsulated = vector.decapsulated()?;
+			assert_eq!(decapsulated, unhex(vector.shared_secret));
+			Ok(())
+		}
+		cases {
+			b_1_1_vector => AES_128_GCM_VECTOR,
+			b_2_1_vector => AES_256_GCM_VECTOR,
+		}
 	}
 
-	/// The KEM alone, under the ephemeral of the B.1.1 vector, yields the
-	/// shared secret and the encapsulated key that vector publishes.
-	#[test]
-	fn the_dhkem_encapsulates_to_the_published_b_1_1_vector() -> Result<()> {
-		let encapsulated = AES_128_GCM_VECTOR.encapsulated()?;
-		assert_eq!(encapsulated, AES_128_GCM_VECTOR.published_encapsulation());
-		Ok(())
+	// The KEM and the KDF carry the identifiers the registry assigns them,
+	// and the house suite is the registered one, so it runs under the three
+	// identifiers the registry assigns: KEM `0x0016`, KDF `0x0001`, and AEAD
+	// `0x0002`.
+	crate::tb_cases! {
+		fn a_registry_identifier_holds_for_the((actual, expected): (u16, u16)) {
+			assert_eq!(actual, expected);
+		}
+		cases {
+			registered_kem => (DhKemSecp256k1::KEM_ID, 0x0016),
+			registered_kdf => (<HkdfSha256 as HpkeKdf>::KDF_ID, 0x0001),
+			house_kem => (<Suite as HpkeSuite>::KEM_ID, 0x0016),
+			house_kdf => (<<Suite as HpkeSuite>::Kdf as HpkeKdf>::KDF_ID, 0x0001),
+			house_aead => (<<Suite as HpkeSuite>::Aead as HpkeAead>::AEAD_ID, 0x0002),
+		}
 	}
 
-	/// The KEM alone, under the ephemeral of the B.2.1 vector, yields the
-	/// shared secret and the encapsulated key that vector publishes.
-	#[test]
-	fn the_dhkem_encapsulates_to_the_published_b_2_1_vector() -> Result<()> {
-		let encapsulated = AES_256_GCM_VECTOR.encapsulated()?;
-		assert_eq!(encapsulated, AES_256_GCM_VECTOR.published_encapsulation());
-		Ok(())
-	}
-
-	/// The KEM alone, from the DH output of the recipient key and the
-	/// encapsulated key of the B.1.1 vector, yields its shared secret.
-	#[test]
-	fn the_dhkem_decapsulates_the_published_b_1_1_vector() -> Result<()> {
-		let decapsulated = AES_128_GCM_VECTOR.decapsulated()?;
-		assert_eq!(decapsulated, unhex(AES_128_GCM_VECTOR.shared_secret));
-		Ok(())
-	}
-
-	/// The KEM alone, from the DH output of the recipient key and the
-	/// encapsulated key of the B.2.1 vector, yields its shared secret.
-	#[test]
-	fn the_dhkem_decapsulates_the_published_b_2_1_vector() -> Result<()> {
-		let decapsulated = AES_256_GCM_VECTOR.decapsulated()?;
-		assert_eq!(decapsulated, unhex(AES_256_GCM_VECTOR.shared_secret));
-		Ok(())
-	}
-
-	/// The KEM carries the identifier the registry assigns it.
-	#[test]
-	fn the_registered_dhkem_carries_its_registry_identifiers() {
-		assert_eq!(DhKemSecp256k1::KEM_ID, 0x0016);
-		assert_eq!(<HkdfSha256 as HpkeKdf>::KDF_ID, 0x0001);
-	}
-
-	/// The house suite is the registered one, so it runs under the three
-	/// identifiers the registry assigns: KEM `0x0016`, KDF `0x0001`, and AEAD
-	/// `0x0002`.
-	#[test]
-	fn the_house_suite_carries_the_registered_identifiers() {
-		assert_eq!(<Suite as HpkeSuite>::KEM_ID, 0x0016);
-		assert_eq!(<<Suite as HpkeSuite>::Kdf as HpkeKdf>::KDF_ID, 0x0001);
-		assert_eq!(<<Suite as HpkeSuite>::Aead as HpkeAead>::AEAD_ID, 0x0002);
+	/// The encoding of the known answer: the encapsulated key that
+	/// [`AES_256_GCM_VECTOR`] publishes, then [`REGISTERED_CIPHERTEXT`].
+	fn known_answer_wire() -> Vec<u8> {
+		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
+		[enc, unhex(REGISTERED_CIPHERTEXT)].concat()
 	}
 
 	/// The sealed bytes are the encapsulated key the vector publishes and the
 	/// ciphertext an independent AES-GCM produces under the derived key and
 	/// nonce, so the cipher runs on the key and the nonce the schedule derives.
 	#[test]
-	fn a_sealed_message_matches_its_known_answer() -> Result<()> {
+	fn a_sealed_message_matches_its_known_answer() -> TestResult {
 		let registered = AES_256_GCM_VECTOR.sealed::<RegisteredAes256>()?.to_bytes();
-		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
-		assert_eq!(registered, [enc.as_slice(), &unhex(REGISTERED_CIPHERTEXT)].concat());
+		assert_eq!(registered, known_answer_wire());
 		Ok(())
 	}
 
+	/// The recipient of the B.2.1 vector opens the known answer to its
+	/// plaintext.
 	#[test]
-	fn the_recipient_opens_the_known_answer() -> Result<()> {
-		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
-		let wire = [enc.as_slice(), &unhex(REGISTERED_CIPHERTEXT)].concat();
-		let message = HpkeMessage::<Suite>::from_bytes(wire)?;
+	fn the_recipient_opens_the_known_answer() -> TestResult {
+		let message = HpkeMessage::<Suite>::from_bytes(known_answer_wire())?;
+		let recipient = AES_256_GCM_VECTOR.recipient();
 
-		let opened = AES_256_GCM_VECTOR
-			.recipient()
-			.open(&message, unhex(AES_256_GCM_VECTOR.info), KNOWN_AAD)?;
+		let opened = recipient.open(&message, unhex(AES_256_GCM_VECTOR.info), KNOWN_AAD)?;
 		assert_eq!(&opened.to_insecure()[..], KNOWN_PLAINTEXT);
 		Ok(())
 	}
@@ -1861,172 +1862,121 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn the_key_schedule_and_the_seal_match_rfc_9180_a_1() -> Result<()> {
-		let scheduled = Scheduled::by_suite::<RfcA1>(&RFC_A_1_1)?;
-		assert_eq!(scheduled, Scheduled::published(&RFC_A_1_1));
-		Ok(())
-	}
+	/// What a row's suite makes of the shared secret of a schedule vector.
+	type ScheduleOf = fn(&ScheduleVector) -> Result<Scheduled>;
 
-	#[test]
-	fn the_key_schedule_and_the_seal_match_rfc_9180_a_3() -> Result<()> {
-		let scheduled = Scheduled::by_suite::<RfcA3>(&RFC_A_3_1)?;
-		assert_eq!(scheduled, Scheduled::published(&RFC_A_3_1));
-		Ok(())
-	}
-
-	/// The KDF of the key schedule differs from the KDF of the KEM here.
-	#[test]
-	fn the_key_schedule_and_the_seal_match_rfc_9180_a_4() -> Result<()> {
-		let scheduled = Scheduled::by_suite::<RfcA4>(&RFC_A_4_1)?;
-		assert_eq!(scheduled, Scheduled::published(&RFC_A_4_1));
-		Ok(())
-	}
-
-	/// The shared secret is 64 bytes wide here, and the key is 32.
-	#[test]
-	fn the_key_schedule_and_the_seal_match_rfc_9180_a_6() -> Result<()> {
-		let scheduled = Scheduled::by_suite::<RfcA6>(&RFC_A_6_1)?;
-		assert_eq!(scheduled, Scheduled::published(&RFC_A_6_1));
-		Ok(())
-	}
-
-	/// One HKDF-SHA256 vector of RFC 5869 Appendix A.
-	struct HkdfVector {
-		ikm: &'static str,
-		salt: &'static str,
-		info: &'static str,
-		length: usize,
-		prk: &'static str,
-		okm: &'static str,
-	}
-
-	/// RFC 5869 A.1, the basic test case.
-	const RFC_5869_A_1: HkdfVector = HkdfVector {
-		ikm: "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-		salt: "000102030405060708090a0b0c",
-		info: "f0f1f2f3f4f5f6f7f8f9",
-		length: 42,
-		prk: "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
-		okm: "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
-	};
-
-	/// RFC 5869 A.2, longer inputs and outputs.
-	const RFC_5869_A_2: HkdfVector = HkdfVector {
-		ikm: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
-			202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
-		salt: "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f\
-			808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
-		info: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf\
-			d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
-		length: 82,
-		prk: "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244",
-		okm: "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c\
-			59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87",
-	};
-
-	/// RFC 5869 A.3, a zero-length salt and info.
-	const RFC_5869_A_3: HkdfVector = HkdfVector {
-		ikm: "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-		salt: "",
-		info: "",
-		length: 42,
-		prk: "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04",
-		okm: "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
-	};
-
-	impl HkdfVector {
-		/// What [`HkdfSha256`] derives from this vector: the PRK and the OKM.
-		fn derived(&self) -> core::result::Result<(Vec<u8>, Vec<u8>), KdfError> {
-			let prk = HkdfSha256::extract(&unhex(self.salt), &unhex(self.ikm));
-			let okm = HkdfSha256::expand(&prk, &unhex(self.info), self.length)?;
-			Ok((prk.to_vec(), okm.to_vec()))
+	// The key schedule of each Appendix A suite derives the published key and
+	// base nonce from the published shared secret, seals the plaintext to the
+	// published ciphertext, and opens that ciphertext back.
+	crate::tb_cases! {
+		fn the_key_schedule_and_the_seal_match_rfc_9180(
+			(schedule, vector): (ScheduleOf, ScheduleVector)
+		) -> TestResult {
+			let scheduled = schedule(&vector)?;
+			assert_eq!(scheduled, Scheduled::published(&vector));
+			Ok(())
 		}
-
-		/// The PRK and the OKM this vector publishes.
-		fn published(&self) -> (Vec<u8>, Vec<u8>) {
-			(unhex(self.prk), unhex(self.okm))
+		cases {
+			a_1 => (Scheduled::by_suite::<RfcA1>, RFC_A_1_1),
+			a_3 => (Scheduled::by_suite::<RfcA3>, RFC_A_3_1),
+			/// The KDF of the key schedule differs from that of the KEM here.
+			a_4 => (Scheduled::by_suite::<RfcA4>, RFC_A_4_1),
+			/// The shared secret is 64 bytes wide here, and the key is 32.
+			a_6 => (Scheduled::by_suite::<RfcA6>, RFC_A_6_1),
 		}
 	}
 
-	#[test]
-	fn hkdf_sha256_matches_rfc_5869_a_1() -> core::result::Result<(), KdfError> {
-		let derived = RFC_5869_A_1.derived()?;
-		assert_eq!(derived, RFC_5869_A_1.published());
-		Ok(())
+	// HKDF-SHA256 derives the PRK and the OKM of each case of RFC 5869
+	// Appendix A.
+	crate::tb_cases! {
+		fn hkdf_sha256_matches_rfc_5869(vector: HkdfVector) -> TestResult {
+			let prk = HkdfSha256::extract(&unhex(vector.salt), &unhex(vector.ikm));
+
+			let okm = HkdfSha256::expand(&prk, &unhex(vector.info), vector.length)?;
+			assert_eq!((prk.to_vec(), okm.to_vec()), (unhex(vector.prk), unhex(vector.okm)));
+			Ok(())
+		}
+		cases {
+			a_1 => RFC_5869_A_1,
+			a_2 => RFC_5869_A_2,
+			a_3 => RFC_5869_A_3,
+		}
 	}
 
-	#[test]
-	fn hkdf_sha256_matches_rfc_5869_a_2() -> core::result::Result<(), KdfError> {
-		let derived = RFC_5869_A_2.derived()?;
-		assert_eq!(derived, RFC_5869_A_2.published());
-		Ok(())
-	}
+	/// The seed of the key of the recipient the round-trip tests seal to.
+	const RECIPIENT: u8 = 0x31;
 
-	#[test]
-	fn hkdf_sha256_matches_rfc_5869_a_3() -> core::result::Result<(), KdfError> {
-		let derived = RFC_5869_A_3.derived()?;
-		assert_eq!(derived, RFC_5869_A_3.published());
-		Ok(())
-	}
+	/// The seed of the key of a recipient other than [`RECIPIENT`].
+	const OTHER_RECIPIENT: u8 = 0x32;
 
-	fn keypair() -> (SecretKey<Secp256k1>, PublicKey<Secp256k1>) {
-		let secret = SecretKey::<Secp256k1>::random(&mut OsRng);
+	/// The secret key whose 32 octets each hold `seed`, beside its public key.
+	fn keypair(seed: u8) -> (SecretKey<Secp256k1>, PublicKey<Secp256k1>) {
+		let secret = SecretKey::<Secp256k1>::from_bytes(&[seed; 32].into());
+		let secret = secret.expect("a seed from 0x01 to 0xfe names a scalar");
 		let public = secret.public_key();
 		(secret, public)
 	}
 
-	fn roundtrip(plaintext: impl AsRef<[u8]>, aad: impl AsRef<[u8]>) -> Result<()> {
-		let plaintext = plaintext.as_ref();
-		let (secret, public) = keypair();
-		let sealed = public.seal::<Suite>(INFO, &aad, plaintext, None)?;
-
-		let opened = secret.open(&sealed, INFO, &aad)?;
-		assert_eq!(plaintext, &opened.to_insecure()[..]);
-		Ok(())
+	/// `plaintext` sealed under [`Suite`] to `public` in the context [`INFO`],
+	/// with `aad`.
+	fn sealed_to(public: &PublicKey<Secp256k1>, aad: &[u8], plaintext: &[u8]) -> HpkeMessage<Suite> {
+		let sealed = public.seal::<Suite>(INFO, aad, plaintext, None);
+		sealed.expect("a seal to a curve point succeeds")
 	}
 
-	#[test]
-	fn a_sealed_message_opens_to_its_plaintext() -> Result<()> {
-		roundtrip(b"Hello, HPKE!", b"")?;
-		roundtrip(b"Secret message", b"authenticated data")?;
-		roundtrip(b"", b"")?;
-		roundtrip([0x5Au8; 4096], b"")?;
-		roundtrip(b"\x00\x01\x02\x03\xFF\xFE\xFD\xFC", b"version:1|timestamp:12345")?;
-		Ok(())
+	/// What the holder of the key of [`RECIPIENT`] opens from `plaintext`
+	/// sealed to it under `aad`.
+	fn round_tripped(plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+		let (secret, public) = keypair(RECIPIENT);
+		let sealed = sealed_to(&public, aad, plaintext);
+		let opened = secret.open(&sealed, INFO, aad).expect("a message opens under its own context");
+		opened.to_insecure().to_vec()
 	}
 
-	#[test]
-	fn a_message_opens_under_its_aad_alone() -> Result<()> {
-		let (secret, public) = keypair();
-		let sealed = public.seal::<Suite>(INFO, b"authenticated data", b"Secret message", None)?;
-
-		let opened = secret.open(&sealed, INFO, b"authenticated data")?;
-		assert_eq!(&opened.to_insecure()[..], b"Secret message");
-		assert!(secret.open(&sealed, INFO, b"wrong data").is_err());
-		assert!(secret.open(&sealed, INFO, b"").is_err());
-		Ok(())
+	// A sealed message opens to its plaintext under the context and the
+	// associated data it was sealed with.
+	crate::tb_cases! {
+		fn a_sealed_message_opens_to_its_plaintext((plaintext, aad): (Vec<u8>, &[u8])) {
+			let opened = round_tripped(&plaintext, aad);
+			assert_eq!(opened, plaintext);
+		}
+		cases {
+			with_no_aad => (b"Hello, HPKE!".to_vec(), b""),
+			with_aad => (b"Secret message".to_vec(), b"authenticated data"),
+			empty => (Vec::new(), b""),
+			of_4096_octets => (vec![0x5A; 4096], b""),
+			of_binary_octets => (b"\x00\x01\x02\x03\xFF\xFE\xFD\xFC".to_vec(), b"version:1|timestamp:12345"),
+		}
 	}
 
-	/// The key schedule binds `info`, so a message opens under the context the
-	/// sender sealed it in.
-	#[test]
-	fn a_message_opens_under_its_info_alone() -> Result<()> {
-		let (secret, public) = keypair();
-		let sealed = public.seal::<Suite>(INFO, b"", b"Secret message", None)?;
+	// A message sealed to the key of [`RECIPIENT`] under [`INFO`] and
+	// `authenticated data` fails to open under the key of another recipient.
+	// The key schedule binds `info` and the AEAD binds the associated data,
+	// so it also fails under another context or none, and under other
+	// associated data or none.
+	crate::tb_cases! {
+		fn a_message_does_not_open_under((secret, info, aad): (SecretKey<Secp256k1>, &[u8], &[u8])) {
+			let (_, public) = keypair(RECIPIENT);
+			let sealed = sealed_to(&public, b"authenticated data", b"Secret message");
 
-		assert!(secret.open(&sealed, INFO, b"").is_ok());
-		assert!(secret.open(&sealed, b"another context", b"").is_err());
-		assert!(secret.open(&sealed, b"", b"").is_err());
-		Ok(())
+			let opened = secret.open(&sealed, info, aad);
+			assert!(matches!(opened, Err(HpkeError::DecryptionFailed(_))));
+		}
+		cases {
+			another_recipient => (keypair(OTHER_RECIPIENT).0, INFO, b"authenticated data"),
+			another_info => (keypair(RECIPIENT).0, b"another context", b"authenticated data"),
+			no_info => (keypair(RECIPIENT).0, b"", b"authenticated data"),
+			another_aad => (keypair(RECIPIENT).0, INFO, b"wrong data"),
+			no_aad => (keypair(RECIPIENT).0, INFO, b""),
+		}
 	}
 
 	/// The labels bind the identifiers, so the same algorithms under another
 	/// KEM identifier derive another key.
 	#[test]
-	fn a_message_opens_under_its_suite_alone() -> Result<()> {
-		let (secret, public) = keypair();
-		let sealed = public.seal::<Suite>(INFO, b"", b"Secret message", None)?;
+	fn a_message_opens_under_its_suite_alone() -> TestResult {
+		let (secret, public) = keypair(RECIPIENT);
+		let sealed = sealed_to(&public, b"", b"Secret message");
 		let relabeled = HpkeMessage::<Relabeled>::from_bytes(sealed.to_bytes())?;
 
 		let opened = secret.open(&relabeled, INFO, b"");
@@ -2034,58 +1984,71 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn another_recipient_fails_to_open() -> Result<()> {
-		let (_, public) = keypair();
-		let (other_secret, _) = keypair();
-		let sealed = public.seal::<Suite>(INFO, b"", b"Sensitive data", None)?;
-
-		let opened = other_secret.open(&sealed, INFO, b"");
-		assert!(matches!(opened, Err(HpkeError::DecryptionFailed(_))));
-		Ok(())
-	}
-
 	/// The KEM context binds the recipient key, so the right DH output opens
-	/// the message under that key alone.
+	/// the message under that key.
 	#[test]
-	fn a_dh_output_opens_under_its_recipient_key_alone() -> Result<()> {
-		let (secret, public) = keypair();
-		let (_, other_public) = keypair();
-		let sealed = public.seal::<Suite>(INFO, b"", b"Sensitive data", None)?;
+	fn a_dh_output_opens_under_its_recipient_key() -> TestResult {
+		let (secret, public) = keypair(RECIPIENT);
+		let sealed = sealed_to(&public, b"", b"Sensitive data");
 		let ephemeral = sealed.encapsulated_key();
 
 		let opened = EcdhSecret::agree(&secret, ephemeral).open(&public, &sealed, INFO, b"")?;
-		let rebound = EcdhSecret::agree(&secret, ephemeral).open(&other_public, &sealed, INFO, b"");
 		assert_eq!(&opened.to_insecure()[..], b"Sensitive data");
-		assert!(matches!(rebound, Err(HpkeError::DecryptionFailed(_))));
 		Ok(())
 	}
 
+	/// The KEM context binds the recipient key, so the right DH output fails
+	/// to open the message under another recipient key.
+	#[test]
+	fn a_dh_output_does_not_open_under_another_recipient_key() {
+		let (secret, public) = keypair(RECIPIENT);
+		let (_, other_public) = keypair(OTHER_RECIPIENT);
+		let sealed = sealed_to(&public, b"", b"Sensitive data");
+		let ephemeral = sealed.encapsulated_key();
+
+		let rebound = EcdhSecret::agree(&secret, ephemeral).open(&other_public, &sealed, INFO, b"");
+		assert!(matches!(rebound, Err(HpkeError::DecryptionFailed(_))));
+	}
+
 	/// What a recipient reads from a sealed message after `tamper` changes its
-	/// encoding.
+	/// encoding: the parse, then the open.
 	fn opened_after(tamper: fn(&mut Vec<u8>)) -> Result<SecretSlice<u8>> {
-		let (secret, public) = keypair();
-		let mut wire = public.seal::<Suite>(INFO, b"", b"Sensitive data", None)?.to_bytes();
+		let (secret, public) = keypair(RECIPIENT);
+		let mut wire = sealed_to(&public, b"", b"Sensitive data").to_bytes();
 		tamper(&mut wire);
 
 		let message = HpkeMessage::<Suite>::from_bytes(wire)?;
 		secret.open(&message, INFO, b"")
 	}
 
+	/// A message whose encoding no one changed opens to its plaintext.
 	#[test]
-	fn a_tampered_message_fails_to_open() -> Result<()> {
-		let untouched = opened_after(|_| ())?;
-		let last_byte_flipped = opened_after(|wire| wire[HOUSE_NENC + 29] ^= 0xFF);
-		let first_byte_flipped = opened_after(|wire| wire[HOUSE_NENC] ^= 0xFF);
-		let one_byte_short = opened_after(|wire| wire.truncate(HOUSE_NENC + 29));
-		let key_tag_flipped = opened_after(|wire| wire[0] ^= 0xFF);
-
-		assert_eq!(&untouched.to_insecure()[..], b"Sensitive data");
-		assert!(matches!(last_byte_flipped, Err(HpkeError::DecryptionFailed(_))));
-		assert!(matches!(first_byte_flipped, Err(HpkeError::DecryptionFailed(_))));
-		assert!(matches!(one_byte_short, Err(HpkeError::DecryptionFailed(_))));
-		assert!(matches!(key_tag_flipped, Err(HpkeError::InvalidPublicKey(_))));
+	fn an_untouched_message_opens() -> TestResult {
+		let opened = opened_after(|_| ())?;
+		assert_eq!(&opened.to_insecure()[..], b"Sensitive data");
 		Ok(())
+	}
+
+	// A change to the ciphertext of a message, to its last octet, its first
+	// octet, or its length, fails the open.
+	crate::tb_cases! {
+		fn a_tampered_message_fails_to_open(tamper: fn(&mut Vec<u8>)) {
+			let opened = opened_after(tamper);
+			assert!(matches!(opened, Err(HpkeError::DecryptionFailed(_))));
+		}
+		cases {
+			last_byte => |wire| wire[HOUSE_NENC + 29] ^= 0xFF,
+			first_byte => |wire| wire[HOUSE_NENC] ^= 0xFF,
+			one_byte_short => |wire| wire.truncate(HOUSE_NENC + 29),
+		}
+	}
+
+	/// A flipped tag on the encapsulated key names no point, so the parse
+	/// refuses the message.
+	#[test]
+	fn a_message_with_a_flipped_key_tag_is_refused() {
+		let opened = opened_after(|wire| wire[0] ^= 0xFF);
+		assert!(matches!(opened, Err(HpkeError::InvalidPublicKey(_))));
 	}
 
 	/// The encoding of a message under `enc`, with a ciphertext of `tag`
@@ -2094,40 +2057,55 @@ mod tests {
 		[enc.as_ref(), &vec![0xEEu8; tag]].concat()
 	}
 
-	/// The parse refuses a message that cannot carry an encapsulated key and
-	/// a tag, ahead of any DH.
-	#[test]
-	fn a_message_too_short_for_a_key_and_a_tag_is_refused() -> Result<()> {
-		let enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
+	/// The encapsulated key of [`AES_256_GCM_VECTOR`] after `edit`.
+	fn enc_edited(edit: fn(&mut Vec<u8>)) -> Vec<u8> {
+		let mut enc = unhex(AES_256_GCM_VECTOR.ephemeral_public);
+		edit(&mut enc);
+		enc
+	}
 
-		let short_key = HpkeMessage::<Suite>::from_bytes(&enc[..HOUSE_NENC - 1]);
-		let short_tag = HpkeMessage::<Suite>::from_bytes(wire_of(&enc, 15));
-		let bare_tag = HpkeMessage::<Suite>::from_bytes(wire_of(&enc, 16))?;
-		assert!(matches!(short_key, Err(HpkeError::InvalidCiphertext)));
-		assert!(matches!(short_tag, Err(HpkeError::InvalidCiphertext)));
-		assert_eq!(bare_tag.ciphertext(), &[0xEE; 16]);
+	// The parse refuses a message that cannot carry an encapsulated key and a
+	// tag, ahead of any DH.
+	crate::tb_cases! {
+		fn a_message_too_short_for_a_key_and_a_tag_is_refused(wire: Vec<u8>) {
+			let parsed = HpkeMessage::<Suite>::from_bytes(wire);
+			assert!(matches!(parsed, Err(HpkeError::InvalidCiphertext)));
+		}
+		cases {
+			short_key => enc_edited(|enc| enc.truncate(HOUSE_NENC - 1)),
+			short_tag => wire_of(enc_edited(|_| ()), 15),
+		}
+	}
+
+	/// A message of an encapsulated key and a bare 16-byte tag parses, with
+	/// the tag as its ciphertext.
+	#[test]
+	fn a_message_of_a_key_and_a_bare_tag_parses() -> TestResult {
+		let wire = wire_of(enc_edited(|_| ()), 16);
+		let parsed = HpkeMessage::<Suite>::from_bytes(wire)?;
+		assert_eq!(parsed.ciphertext(), &[0xEE; 16]);
 		Ok(())
 	}
 
-	/// The parse validates the encapsulated key, so it refuses a point off the
-	/// curve and a compressed encoding at the uncompressed width.
-	#[test]
-	fn an_encapsulated_key_that_is_no_point_is_refused() {
-		let mut off_curve = unhex(AES_256_GCM_VECTOR.ephemeral_public);
-		off_curve[HOUSE_NENC - 1] ^= 0x01;
-		let mut compressed_tag = unhex(AES_256_GCM_VECTOR.ephemeral_public);
-		compressed_tag[0] = 0x02;
-
-		let off_curve = HpkeMessage::<Suite>::from_bytes(wire_of(off_curve, 16));
-		let compressed_tag = HpkeMessage::<Suite>::from_bytes(wire_of(compressed_tag, 16));
-		assert!(matches!(off_curve, Err(HpkeError::InvalidPublicKey(_))));
-		assert!(matches!(compressed_tag, Err(HpkeError::InvalidPublicKey(_))));
+	// The parse validates the encapsulated key, so it refuses a point off the
+	// curve and a compressed encoding at the uncompressed width.
+	crate::tb_cases! {
+		fn an_encapsulated_key_that_is_no_point_is_refused(enc: Vec<u8>) {
+			let parsed = HpkeMessage::<Suite>::from_bytes(wire_of(enc, 16));
+			assert!(matches!(parsed, Err(HpkeError::InvalidPublicKey(_))));
+		}
+		cases {
+			off_curve => enc_edited(|enc| enc[HOUSE_NENC - 1] ^= 0x01),
+			compressed_tag => enc_edited(|enc| enc[0] = 0x02),
+		}
 	}
 
+	/// A message parses back from its encoding to its encapsulated key and its
+	/// ciphertext, and opens.
 	#[test]
-	fn a_message_survives_its_encoding() -> Result<()> {
-		let (secret, public) = keypair();
-		let sealed = public.seal::<Suite>(INFO, b"", b"Test serialization", None)?;
+	fn a_message_survives_its_encoding() -> TestResult {
+		let (secret, public) = keypair(RECIPIENT);
+		let sealed = sealed_to(&public, b"", b"Test serialization");
 		let parsed = HpkeMessage::<Suite>::from_bytes(sealed.to_bytes())?;
 
 		let opened = secret.open(&parsed, INFO, b"")?;
@@ -2137,19 +2115,29 @@ mod tests {
 		Ok(())
 	}
 
+	/// A secret key restores from its byte form to the same key.
 	#[test]
-	fn a_secret_key_survives_its_byte_form() -> Result<()> {
-		let (secret, public) = keypair();
+	fn a_secret_key_survives_its_byte_form() -> TestResult {
+		let (secret, public) = keypair(RECIPIENT);
 		let secret_bytes: SecretSlice<u8> = (&secret).into();
 
 		let restored = crate::crypto::k256::SecretKey::try_from(secret_bytes)?;
-		let zero = crate::crypto::k256::SecretKey::try_from(Secret::from(vec![0x00u8; 32]));
+
 		assert_eq!(restored.public_key(), public);
-		assert!(matches!(zero, Err(HpkeError::InvalidSecretKey(_))));
 		Ok(())
 	}
 
+	/// Thirty-two zero octets name no scalar, so they restore no secret key.
+	#[test]
+	fn a_secret_key_of_zeros_is_refused() {
+		let zero = crate::crypto::k256::SecretKey::try_from(Secret::from(vec![0x00u8; 32]));
+		assert!(matches!(zero, Err(HpkeError::InvalidSecretKey(_))));
+	}
+
 	/// AES-256-GCM behind a 48-byte key, wider than one 32-byte KDF block.
+	///
+	/// No registered HPKE AEAD takes a key wider than 32 bytes, so a cipher of
+	/// that width runs only as this double.
 	struct WideKeyCipher(Aes256Gcm);
 
 	impl KeySizeUser for WideKeyCipher {
@@ -2175,7 +2163,7 @@ mod tests {
 			nonce: &Nonce<Self>,
 			associated_data: &[u8],
 			buffer: &mut [u8],
-		) -> aead::Result<Tag<Self>> {
+		) -> core::result::Result<Tag<Self>, AeadError> {
 			self.0.encrypt_in_place_detached(nonce, associated_data, buffer)
 		}
 
@@ -2185,7 +2173,7 @@ mod tests {
 			associated_data: &[u8],
 			buffer: &mut [u8],
 			tag: &Tag<Self>,
-		) -> aead::Result<()> {
+		) -> core::result::Result<(), AeadError> {
 			self.0.decrypt_in_place_detached(nonce, associated_data, buffer, tag)
 		}
 	}
@@ -2197,9 +2185,9 @@ mod tests {
 	/// A cipher whose key is wider than one KDF block keys and round-trips,
 	/// because the key schedule derives the key at the cipher's own size.
 	#[test]
-	fn a_key_wider_than_32_bytes_round_trips() -> Result<()> {
+	fn a_key_wider_than_32_bytes_round_trips() -> TestResult {
 		type Wide = DhKemSuite<Secp256k1, HkdfSha256, WideKeyCipher, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
-		let (secret, public) = keypair();
+		let (secret, public) = keypair(RECIPIENT);
 		let sealed = public.seal::<Wide>(INFO, b"", b"wide", None)?;
 
 		let opened = secret.open(&sealed, INFO, b"")?;
@@ -2207,19 +2195,37 @@ mod tests {
 		Ok(())
 	}
 
-	/// A KDF that answers another length than the one asked fails the
-	/// derivation on either side of it, so the cipher runs on its own geometry
-	/// alone.
-	#[test]
-	fn a_kdf_output_of_another_length_is_refused() {
-		type Overlong = DhKemSuite<Secp256k1, AlteredKdf<1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
-		type Short = DhKemSuite<Secp256k1, AlteredKdf<-1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
-		let (_, public) = keypair();
+	/// The house algorithms under a KDF that answers a 12-byte request one
+	/// byte long.
+	type Overlong = DhKemSuite<Secp256k1, AlteredKdf<1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
 
-		let overlong = public.seal::<Overlong>(INFO, b"", b"plaintext", None);
-		let short = public.seal::<Short>(INFO, b"", b"plaintext", None);
-		assert!(matches!(overlong, Err(HpkeError::Kdf(_))));
-		assert!(matches!(short, Err(HpkeError::Kdf(_))));
+	/// The house algorithms under a KDF that answers a 12-byte request one
+	/// byte short.
+	type Short = DhKemSuite<Secp256k1, AlteredKdf<-1>, Aes256Gcm, KEM_DHKEM_SECP256K1_HKDF_SHA256>;
+
+	// A KDF that answers another length than the one asked fails the
+	// derivation on either side of it, so the cipher runs on its own geometry
+	// alone.
+	crate::tb_cases! {
+		fn a_kdf_output_of_another_length_is_refused(refused: Option<HpkeError>) {
+			assert!(matches!(refused, Some(HpkeError::Kdf(_))));
+		}
+		cases {
+			overlong => keypair(RECIPIENT).1.seal::<Overlong>(INFO, b"", b"plaintext", None).err(),
+			short => keypair(RECIPIENT).1.seal::<Short>(INFO, b"", b"plaintext", None).err(),
+		}
+	}
+
+	/// The algorithms of [`Suite`] under [`UnboundedKdf`].
+	type Unbounded = DhKemSuite<Secp256k1, UnboundedKdf, Aes256Gcm, 0xFFFD>;
+
+	/// `LabeledExpand` frames its length in two bytes, so it derives the
+	/// widest length the frame holds.
+	#[test]
+	fn a_labeled_expand_of_the_widest_framed_length_derives() {
+		let labeled = Labeled::<UnboundedKdf>::schedule::<Unbounded>();
+		let widest = labeled.expand(&[0x11u8; 32], b"key", b"", usize::from(u16::MAX));
+		assert!(matches!(widest, Ok(okm) if okm.len() == usize::from(u16::MAX)));
 	}
 
 	/// `LabeledExpand` frames its length in two bytes, so it refuses a longer
@@ -2228,36 +2234,37 @@ mod tests {
 	/// frame.
 	#[test]
 	fn a_labeled_expand_past_two_length_bytes_is_refused() {
-		type Unbounded = DhKemSuite<Secp256k1, UnboundedKdf, Aes256Gcm, 0xFFFD>;
 		let labeled = Labeled::<UnboundedKdf>::schedule::<Unbounded>();
-		let prk = [0x11u8; 32];
-
-		let widest = labeled.expand(&prk, b"key", b"", usize::from(u16::MAX));
-		let past_the_frame = labeled.expand(&prk, b"key", b"", usize::from(u16::MAX) + 1);
-		assert!(widest.is_ok());
+		let past_the_frame = labeled.expand(&[0x11u8; 32], b"key", b"", usize::from(u16::MAX) + 1);
 		assert!(matches!(past_the_frame, Err(HpkeError::Kdf(_))));
 	}
 
-	/// Seals a fixed plaintext to `public` with the ephemeral drawn from
-	/// `stream`.
-	fn sealed_from(public: &PublicKey<Secp256k1>, mut stream: SeededStream) -> Result<Vec<u8>> {
-		let sealed = public.seal::<Suite>(INFO, b"", b"seeded", Some(&mut stream))?;
-		Ok(sealed.to_bytes())
+	/// Seals a fixed plaintext to the key of [`RECIPIENT`] with the ephemeral
+	/// drawn from `stream`.
+	fn sealed_from(mut stream: SeededStream) -> Vec<u8> {
+		let (_, public) = keypair(RECIPIENT);
+		let sealed = public.seal::<Suite>(INFO, b"", b"seeded", Some(&mut stream));
+		sealed.expect("a seal to a curve point succeeds").to_bytes()
 	}
 
 	/// The ephemeral key comes from the caller's RNG and the nonce from the
 	/// key schedule, so two streams of one seed seal one plaintext to the same
 	/// bytes.
 	#[test]
-	fn seal_draws_from_the_callers_rng() -> Result<()> {
-		let (_, public) = keypair();
+	fn seal_draws_from_the_callers_rng() {
+		let first = sealed_from(SeededStream(0));
 
-		let first = sealed_from(&public, SeededStream(0))?;
-		let second = sealed_from(&public, SeededStream(0))?;
-		let other_seed = sealed_from(&public, SeededStream(7))?;
+		let second = sealed_from(SeededStream(0));
 		assert_eq!(first, second);
+	}
+
+	/// The ephemeral key comes from the caller's RNG, so streams of two seeds
+	/// seal one plaintext to other bytes.
+	#[test]
+	fn seals_from_streams_of_two_seeds_differ() {
+		let first = sealed_from(SeededStream(0));
+		let other_seed = sealed_from(SeededStream(7));
 		assert_ne!(first, other_seed);
-		Ok(())
 	}
 
 	/// The frame KEM recipients of the house provider.
@@ -2267,13 +2274,13 @@ mod tests {
 		use crate::asn1::WireDer;
 		use crate::cms::enveloped_data::RecipientInfo;
 		use crate::crypto::aead::{DecryptContent, Encryptor};
-		use crate::crypto::cms::{BareKemKey, KemRecipientInfo, KeyAgreementIdentity};
-		use crate::crypto::key::{DiffieHellman, KeyBackend, Secp256k1KeyProvider};
+		use crate::crypto::cms::{KemKeyHolder, KemRecipientInfo};
 		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::der::{Decode, Encode};
 		use crate::oids::{AES_256_GCM, AES_256_WRAP, HKDF_SHA3_256, ORI_KEM};
-		use crate::testing::{TestAttributes, TestCertificate};
+		use crate::runtime::rt;
+		use crate::testing::fixtures::TestAgreement;
+		use crate::testing::{TestAttributes, TestKey};
 		use crate::ZeroizingBytes;
 
 		type House = DefaultCryptoProvider;
@@ -2289,19 +2296,6 @@ mod tests {
 		const ID_SIGNED_DATA: crate::der::asn1::ObjectIdentifier =
 			crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 
-		/// The public point and the house backend of a fresh secp256k1 key.
-		fn key_with_backend() -> (PublicKey<Secp256k1>, Arc<dyn DiffieHellman<Secp256k1>>) {
-			let key = Secp256k1SigningKey::random(&mut OsRng);
-			let public = PublicKey::from(key.verifying_key());
-			(public, Arc::new(Secp256k1KeyProvider::from(key)))
-		}
-
-		/// The bare recipient of `backend`'s key, from its SPKI.
-		fn bare_recipient(backend: &Arc<dyn DiffieHellman<Secp256k1>>) -> KemRecipient<DhKemSecp256k1> {
-			let spki = backend.to_public_key_bytes().expect("the backend encodes its key");
-			KemRecipient::bare(spki).expect("the key is a secp256k1 key")
-		}
-
 		/// [`FRAMED`] sealed to `recipient` by the house frame encryptor,
 		/// beside the DER it arrives as.
 		fn sealed_to(recipient: KemRecipient<DhKemSecp256k1>) -> (AuthEnvelopedData, Vec<u8>) {
@@ -2309,6 +2303,21 @@ mod tests {
 			let sealed = encryptor.encrypt_content(FRAMED, None, None).expect("the frame seals");
 			let arrived = sealed.to_der().expect("the frame encodes");
 			(sealed, arrived)
+		}
+
+		/// [`FRAMED`] sealed to the bare recipient of [`TestKey::fixed`]
+		/// `seed`.
+		fn sealed_to_bare(seed: u8) -> AuthEnvelopedData {
+			let (sealed, _) = sealed_to(TestAgreement::recipient(&TestKey::fixed(seed)));
+			sealed
+		}
+
+		/// [`FRAMED`] sealed as `id-signedData` by the house frame encryptor to
+		/// the bare recipient of [`TestKey::fixed`] [`RECIPIENT`].
+		fn signed_data_sealed() -> AuthEnvelopedData {
+			let encryptor = HpkeEncryptor::<House>::new(TestAgreement::recipient(&TestKey::fixed(RECIPIENT)));
+			let sealed = encryptor.encrypt_content(FRAMED, Some(ID_SIGNED_DATA), None);
+			sealed.expect("the frame seals")
 		}
 
 		/// `sealed` as a frame carries it: the envelope with its content
@@ -2319,7 +2328,24 @@ mod tests {
 			(envelope, content)
 		}
 
+		/// The content that the house frame decryptor of `holder` opens from
+		/// `sealed`, detached as a frame carries it. The decryption runs no
+		/// timer and no socket, so it blocks in place.
+		fn opened_by(
+			holder: impl KemKeyHolder<DhKemSecp256k1> + 'static,
+			sealed: AuthEnvelopedData,
+		) -> crate::error::Result<ZeroizingBytes> {
+			let (envelope, mut content) = detached(sealed);
+			let decryptor = HpkeDecryptor::<House>::new(holder);
+			rt::block_on(decryptor.decrypt_content(&envelope, &mut content))?;
+			Ok(content)
+		}
+
 		/// The `KEMRecipientInfo` of `sealed`.
+		///
+		/// The house reader `EnvelopeRecipient` decodes the `ori` of any type,
+		/// and these tests also hold the `ori` to `id-ori-kem`, so they read
+		/// it here.
 		fn kem_recipient_of(sealed: &AuthEnvelopedData) -> KemRecipientInfo {
 			let recipient = sealed.recipient_infos.0.as_slice().first().cloned();
 			let other = match recipient {
@@ -2331,60 +2357,55 @@ mod tests {
 			other.ori_value.decode_as().expect("the value is a KEMRecipientInfo")
 		}
 
-		#[tokio::test]
-		async fn a_frame_sealed_to_a_bare_key_opens_through_its_bare_kem_key() -> crate::error::Result<()> {
-			let (public, backend) = key_with_backend();
-			let (sealed, _) = sealed_to(bare_recipient(&backend));
-			let (envelope, mut content) = detached(sealed);
+		/// The `ukm` of the `KEMRecipientInfo` of `sealed`.
+		fn ukm_of(sealed: &AuthEnvelopedData) -> Vec<u8> {
+			let ukm = kem_recipient_of(sealed).ukm.expect("a frame seal carries a ukm");
+			ukm.as_bytes().to_vec()
+		}
 
-			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			decryptor.decrypt_content(&envelope, &mut content).await?;
+		/// A frame sealed to the bare recipient of a key opens through the bare
+		/// key that holds it.
+		#[test]
+		fn a_frame_sealed_to_a_bare_key_opens_through_its_bare_kem_key() -> TestResult {
+			let sealed = sealed_to_bare(RECIPIENT);
+			let content = opened_by(TestAgreement::bare(&TestKey::fixed(RECIPIENT)), sealed)?;
 			assert_eq!(&content[..], FRAMED);
 			Ok(())
 		}
 
-		#[tokio::test]
-		async fn a_frame_sealed_to_a_certificate_key_opens_through_its_identity() -> crate::error::Result<()> {
-			let key = Secp256k1SigningKey::random(&mut OsRng);
-			let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(Secp256k1KeyProvider::from(key.to_owned()));
-			let identity = KeyAgreementIdentity::<DhKemSecp256k1>::new(TestCertificate::self_signed(&key), backend)?;
+		/// A frame sealed to the recipient of a certificate opens through the
+		/// key-agreement identity of that certificate.
+		#[test]
+		fn a_frame_sealed_to_a_certificate_key_opens_through_its_identity() -> TestResult {
+			let identity = TestAgreement::identity(&TestKey::fixed(RECIPIENT));
 			let (sealed, _) = sealed_to(identity.recipient().clone());
-			let (envelope, mut content) = detached(sealed);
 
-			let decryptor = HpkeDecryptor::<House>::new(identity);
-			decryptor.decrypt_content(&envelope, &mut content).await?;
+			let content = opened_by(identity, sealed)?;
 			assert_eq!(&content[..], FRAMED);
 			Ok(())
 		}
 
-		#[tokio::test]
-		async fn a_frame_whose_rid_names_another_key_is_refused() -> crate::error::Result<()> {
-			let (_, sealed_backend) = key_with_backend();
-			let (public, backend) = key_with_backend();
-			let (sealed, _) = sealed_to(bare_recipient(&sealed_backend));
-			let (envelope, mut content) = detached(sealed);
-
-			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			let refused = decryptor.decrypt_content(&envelope, &mut content).await;
+		/// A frame whose `rid` names another key is refused.
+		#[test]
+		fn a_frame_whose_rid_names_another_key_is_refused() {
+			let sealed = sealed_to_bare(OTHER_RECIPIENT);
+			let refused = opened_by(TestAgreement::bare(&TestKey::fixed(RECIPIENT)), sealed);
 			assert!(matches!(
 				refused,
 				Err(crate::TightBeamError::EnvelopeError(EnvelopeError::RecipientIdentifier))
 			));
-			Ok(())
 		}
 
 		/// A KEM seal of another purpose carries another `ukm`, so the frame
 		/// decryptor refuses it.
-		#[tokio::test]
-		async fn a_kem_seal_of_another_purpose_does_not_open_as_a_frame() -> crate::error::Result<()> {
-			let (public, backend) = key_with_backend();
-			let recipient = bare_recipient(&backend);
+		#[test]
+		fn a_kem_seal_of_another_purpose_does_not_open_as_a_frame() -> TestResult {
+			let key = TestKey::fixed(RECIPIENT);
+			let recipient = TestAgreement::recipient(&key);
 			let opening = Recipient::Kem { recipient: &recipient, ukm_label: b"tb/handshake/opening/ukm/v1" };
 			let sealed = AuthEnvelopedData::seal::<House>(opening, DATA, FRAMED, [], None)?;
-			let (envelope, mut content) = detached(sealed);
 
-			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			let refused = decryptor.decrypt_content(&envelope, &mut content).await;
+			let refused = opened_by(TestAgreement::bare(&key), sealed);
 			assert!(matches!(refused, Err(crate::TightBeamError::EnvelopeError(EnvelopeError::Ukm))));
 			Ok(())
 		}
@@ -2393,54 +2414,40 @@ mod tests {
 		/// each by its registered identifier.
 		#[test]
 		fn a_frame_seal_names_the_algorithms_of_its_provider() {
-			let (_, backend) = key_with_backend();
-			let (sealed, _) = sealed_to(bare_recipient(&backend));
+			let sealed = sealed_to_bare(RECIPIENT);
 
 			let recipient = kem_recipient_of(&sealed);
-			assert_eq!(recipient.kem.oid, DHKEM_SECP256K1);
-			assert_eq!(recipient.kdf.oid, HKDF_SHA3_256);
-			assert_eq!(recipient.wrap.oid, AES_256_WRAP);
-			assert_eq!(sealed.auth_encrypted_content_info.content_enc_alg.oid, AES_256_GCM);
+			let content_algorithm = sealed.auth_encrypted_content_info.content_enc_alg.oid;
+			let algorithms = (recipient.kem.oid, recipient.kdf.oid, recipient.wrap.oid, content_algorithm);
+			assert_eq!(algorithms, (DHKEM_SECP256K1, HKDF_SHA3_256, AES_256_WRAP, AES_256_GCM));
 		}
 
 		/// The `ukm` of a frame seal is the frame purpose label, then the 32
 		/// octets the seal draws.
 		#[test]
-		fn a_frame_seal_leads_its_ukm_with_the_frame_label() -> crate::error::Result<()> {
-			let (_, backend) = key_with_backend();
-			let (sealed, _) = sealed_to(bare_recipient(&backend));
+		fn a_frame_seal_leads_its_ukm_with_the_frame_label() {
+			let sealed = sealed_to_bare(RECIPIENT);
 
-			let ukm = kem_recipient_of(&sealed).ukm.ok_or(EnvelopeError::Ukm)?;
-			let (label, random) = ukm.as_bytes().split_at(FRAME_UKM_LABEL.len());
-			assert_eq!(label, FRAME_UKM_LABEL);
-			assert_eq!(random.len(), 32);
-			Ok(())
+			let ukm = ukm_of(&sealed);
+			let (label, random) = ukm.split_at(FRAME_UKM_LABEL.len());
+			assert_eq!((label, random.len()), (FRAME_UKM_LABEL, 32));
 		}
 
 		/// A frame sealed as another content type declares that type, in its
 		/// content type and in its content-type attribute.
 		#[test]
-		fn a_frame_seal_declares_the_content_type_it_is_given() -> crate::error::Result<()> {
-			let (_, backend) = key_with_backend();
-			let encryptor = HpkeEncryptor::<House>::new(bare_recipient(&backend));
-			let sealed = encryptor.encrypt_content(FRAMED, Some(ID_SIGNED_DATA), None)?;
-
+		fn a_frame_seal_declares_the_content_type_it_is_given() {
+			let sealed = signed_data_sealed();
 			let declared = TestAttributes::declared_content_types(&sealed);
 			assert_eq!(declared, (ID_SIGNED_DATA, ID_SIGNED_DATA));
-			Ok(())
 		}
 
 		/// A frame sealed as another content type opens as that type, the type
 		/// its attributes authenticate.
-		#[tokio::test]
-		async fn a_frame_of_another_content_type_opens_as_that_type() -> crate::error::Result<()> {
-			let (public, backend) = key_with_backend();
-			let encryptor = HpkeEncryptor::<House>::new(bare_recipient(&backend));
-			let sealed = encryptor.encrypt_content(FRAMED, Some(ID_SIGNED_DATA), None)?;
-			let (envelope, mut content) = detached(sealed);
-
-			let decryptor = HpkeDecryptor::<House>::new(BareKemKey::new(public, backend)?);
-			decryptor.decrypt_content(&envelope, &mut content).await?;
+		#[test]
+		fn a_frame_of_another_content_type_opens_as_that_type() -> TestResult {
+			let sealed = signed_data_sealed();
+			let content = opened_by(TestAgreement::bare(&TestKey::fixed(RECIPIENT)), sealed)?;
 			assert_eq!(&content[..], FRAMED);
 			Ok(())
 		}
@@ -2449,19 +2456,15 @@ mod tests {
 		/// recipient carry two `kemct` values.
 		#[test]
 		fn each_frame_seal_encapsulates_afresh() {
-			let (_, backend) = key_with_backend();
-			let recipient = bare_recipient(&backend);
-			let (first, _) = sealed_to(recipient.clone());
-			let (second, _) = sealed_to(recipient);
-
+			let first = sealed_to_bare(RECIPIENT);
+			let second = sealed_to_bare(RECIPIENT);
 			assert_ne!(kem_recipient_of(&first).kemct, kem_recipient_of(&second).kemct);
 		}
 
 		/// A frame decodes back from the DER its seal encodes.
 		#[test]
-		fn a_frame_seal_decodes_back_from_its_encoding() -> crate::error::Result<()> {
-			let (_, backend) = key_with_backend();
-			let (sealed, arrived) = sealed_to(bare_recipient(&backend));
+		fn a_frame_seal_decodes_back_from_its_encoding() -> TestResult {
+			let (sealed, arrived) = sealed_to(TestAgreement::recipient(&TestKey::fixed(RECIPIENT)));
 			assert_eq!(AuthEnvelopedData::from_der(&arrived)?, sealed);
 			Ok(())
 		}
@@ -2473,47 +2476,22 @@ mod tests {
 	mod kem_traits {
 		use super::*;
 		use crate::crypto::cms::{ProviderKem, RecipientKem};
+		use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator};
 		use crate::crypto::key::Secp256k1KeyProvider;
 		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::x509::ext::pkix::KeyUsages;
+		use crate::runtime::rt;
+		use crate::testing::PublishedDraw;
 		use crate::SigningKey;
-		use kem::{Decapsulator, EncappedKey, Encapsulator};
 
 		/// The KEM of the house provider role.
 		type HouseKem = ProviderKem<DefaultCryptoProvider>;
 
-		/// The outcome of a test.
-		type Outcome = core::result::Result<(), Box<dyn std::error::Error>>;
-
-		/// A random source that repeats the octets of one draw, so an
-		/// encapsulation draws the ephemeral secret that a vector names.
-		struct Replay(Vec<u8>);
-
-		impl RngCore for Replay {
-			fn next_u32(&mut self) -> u32 {
-				rand_core::impls::next_u32_via_fill(self)
-			}
-
-			fn next_u64(&mut self) -> u64 {
-				rand_core::impls::next_u64_via_fill(self)
-			}
-
-			fn fill_bytes(&mut self, dest: &mut [u8]) {
-				let draw = dest.iter_mut().zip(self.0.iter().cycle());
-				draw.for_each(|(slot, octet)| *slot = *octet);
-			}
-
-			fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand_core::Error> {
-				self.fill_bytes(dest);
-				Ok(())
-			}
-		}
-
-		impl CryptoRng for Replay {}
-
 		impl Vector {
-			/// A random source that draws the ephemeral secret of this vector.
-			fn replay(&self) -> Replay {
-				Replay(unhex(self.ephemeral_secret))
+			/// A random source that draws the ephemeral secret of this vector,
+			/// the one 32-octet scalar an encapsulation draws.
+			fn draw(&self) -> PublishedDraw {
+				PublishedDraw(unhex(self.ephemeral_secret))
 			}
 
 			/// The recipient key of this vector, as the house backend holds it.
@@ -2538,10 +2516,10 @@ mod tests {
 		/// The `kem` traits, under the ephemeral of the B.2.1 vector, yield the
 		/// encapsulated key and the shared secret that vector publishes.
 		#[test]
-		fn the_kem_traits_encapsulate_to_the_published_vector() -> Outcome {
+		fn the_kem_traits_encapsulate_to_the_published_vector() -> TestResult {
 			let vector = &AES_256_GCM_VECTOR;
 			let recipient = vector.recipient_public();
-			let encapsulated = DhKemSecp256k1::default().try_encap(&mut vector.replay(), &recipient)?;
+			let encapsulated = DhKemSecp256k1::default().try_encap(&mut vector.draw(), &recipient)?;
 
 			let (encapped_key, shared_secret) = encapsulated;
 			let sent = (*encapped_key.public_key(), shared_secret.as_bytes().to_vec());
@@ -2550,24 +2528,27 @@ mod tests {
 			Ok(())
 		}
 
-		/// The house recipient key decapsulates the encapsulated key of each
-		/// vector to the shared secret it publishes.
-		#[test]
-		fn the_kem_traits_decapsulate_the_published_vectors() -> Outcome {
-			let with_aes_128 = AES_128_GCM_VECTOR.decapsulated_by_trait()?;
-			let with_aes_256 = AES_256_GCM_VECTOR.decapsulated_by_trait()?;
-			assert_eq!(with_aes_128, unhex(AES_128_GCM_VECTOR.shared_secret));
-			assert_eq!(with_aes_256, unhex(AES_256_GCM_VECTOR.shared_secret));
-			Ok(())
+		// The house recipient key decapsulates the encapsulated key of each
+		// vector to the shared secret it publishes.
+		crate::tb_cases! {
+			fn the_kem_traits_decapsulate_the_published(vector: Vector) -> TestResult {
+				let decapsulated = vector.decapsulated_by_trait()?;
+				assert_eq!(decapsulated, unhex(vector.shared_secret));
+				Ok(())
+			}
+			cases {
+				b_1_1_vector => AES_128_GCM_VECTOR,
+				b_2_1_vector => AES_256_GCM_VECTOR,
+			}
 		}
 
 		/// The provider KEM, under the ephemeral of the B.2.1 vector, carries
 		/// the published encapsulated key as its `kemct` beside the published
 		/// shared secret.
 		#[test]
-		fn the_provider_kem_encapsulates_to_the_published_vector() -> Outcome {
+		fn the_provider_kem_encapsulates_to_the_published_vector() -> TestResult {
 			let vector = &AES_256_GCM_VECTOR;
-			let sent = HouseKem::encapsulate(&vector.recipient_public(), &mut vector.replay())?;
+			let sent = HouseKem::encapsulate(&vector.recipient_public(), &mut vector.draw())?;
 
 			let published = (unhex(vector.ephemeral_public), unhex(vector.shared_secret));
 			assert_eq!((sent.kemct, sent.shared_secret.to_vec()), published);
@@ -2576,46 +2557,44 @@ mod tests {
 
 		/// The provider KEM decapsulates the `kemct` of the B.1.1 vector
 		/// through the house recipient key to the shared secret that vector
-		/// publishes.
-		#[tokio::test]
-		async fn the_provider_kem_decapsulates_the_published_vector() -> Outcome {
+		/// publishes. The decapsulation runs no timer and no socket, so it
+		/// blocks in place.
+		#[test]
+		fn the_provider_kem_decapsulates_the_published_vector() -> TestResult {
 			let vector = &AES_128_GCM_VECTOR;
 			let (key, recipient) = (vector.recipient_key(), vector.recipient_public());
 			let kemct = unhex(vector.ephemeral_public);
 
-			let received = HouseKem::decapsulate(&key, &recipient, &kemct).await?;
+			let received = rt::block_on(HouseKem::decapsulate(&key, &recipient, &kemct))?;
 			assert_eq!(received.to_vec(), unhex(vector.shared_secret));
 			Ok(())
 		}
 
 		/// The house role runs DHKEM(secp256k1), so its recipient certificate
-		/// asserts the `keyAgreement` that the house KEM asserts (RFC 5480 §3).
+		/// asserts `keyAgreement` (RFC 5480 §3).
 		#[test]
-		fn the_provider_kem_asserts_the_usage_of_the_house_kem() -> Outcome {
-			assert_eq!(HouseKem::USAGE, DhKemSecp256k1::USAGE);
-			Ok(())
+		fn the_provider_kem_asserts_the_usage_of_the_house_kem() {
+			assert_eq!(HouseKem::USAGE, KeyUsages::KeyAgreement);
 		}
 
 		/// The `enc` of an ephemeral key is its uncompressed SEC 1 encoding,
 		/// `Nenc` octets (RFC 9180 §4.1).
 		#[test]
-		fn an_ephemeral_key_encapsulates_as_its_uncompressed_point() -> Outcome {
+		fn an_ephemeral_key_encapsulates_as_its_uncompressed_point() -> TestResult {
 			let vector = &AES_256_GCM_VECTOR;
 			let encapped_key = DhKemSecp256k1Enc::try_from(vector.encapsulated_key())?;
-
 			assert_eq!(encapped_key.as_ref(), unhex(vector.ephemeral_public));
 			Ok(())
 		}
 
 		/// A `kemct` that is no uncompressed point on secp256k1 is refused.
-		#[tokio::test]
-		async fn the_provider_kem_refuses_a_kemct_off_the_curve() -> Outcome {
+		#[test]
+		fn the_provider_kem_refuses_a_kemct_off_the_curve() {
 			let vector = &AES_128_GCM_VECTOR;
 			let (key, recipient) = (vector.recipient_key(), vector.recipient_public());
 
-			let refused = HouseKem::decapsulate(&key, &recipient, &[0x04; 65]).await;
+			let refused = rt::block_on(HouseKem::decapsulate(&key, &recipient, &[0x04; 65]));
 			assert!(matches!(refused, Err(EnvelopeError::KemRefused)));
-			Ok(())
 		}
 	}
 }

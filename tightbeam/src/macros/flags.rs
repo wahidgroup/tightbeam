@@ -282,49 +282,31 @@ macro_rules! flagset {
 mod tests {
 	use crate::flags::FlagSet;
 	use crate::matrix::{MatrixDyn, MatrixError};
+	use crate::testing::TestResult;
+	use crate::Flaggable;
 
-	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Flaggable)]
+	#[repr(u8)]
 	enum Status {
 		#[default]
 		Inactive = 0,
 		Enabled = 1,
 	}
 
-	impl From<Status> for u8 {
-		fn from(flag: Status) -> u8 {
-			flag as u8
-		}
-	}
-
-	impl PartialEq<u8> for Status {
-		fn eq(&self, other: &u8) -> bool {
-			(*self as u8) == *other
-		}
-	}
-
 	// `SubStatus` deliberately ends with `Status`: any name-suffix-based
 	// slot dispatch aliases the two types.
-	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Flaggable)]
+	#[repr(u8)]
 	enum SubStatus {
 		#[default]
 		None = 0,
 		Active = 2,
 	}
 
-	impl From<SubStatus> for u8 {
-		fn from(flag: SubStatus) -> u8 {
-			flag as u8
-		}
-	}
-
-	impl PartialEq<u8> for SubStatus {
-		fn eq(&self, other: &u8) -> bool {
-			(*self as u8) == *other
-		}
-	}
-
 	crate::flagset!(SuffixFlags: Status, SubStatus);
 
+	/// Each registered type takes the slot of its position, so a type whose
+	/// name ends with the name of another keeps a slot of its own.
 	#[test]
 	fn suffix_named_types_use_distinct_slots() {
 		let mut set = SuffixFlags::default();
@@ -339,13 +321,15 @@ mod tests {
 	/// Each flag is positional, so a matrix of another dimension is refused
 	/// rather than clamped.
 	#[test]
-	fn a_flagset_refuses_a_matrix_of_another_dimension() -> Result<(), MatrixError> {
+	fn a_flagset_refuses_a_matrix_of_another_dimension() -> TestResult {
 		let four_by_four = MatrixDyn::try_from(4u8)?;
 		let refused = SuffixFlags::try_from(&four_by_four);
 		assert!(matches!(refused, Err(MatrixError::DimensionMismatch { expected: 2, n: 4 })));
 		Ok(())
 	}
 
+	/// An unset writes the default of its own type into its own slot, so the
+	/// flag of the other type stays set.
 	#[test]
 	fn unset_clears_only_its_own_slot() {
 		let mut set = SuffixFlags::default();
@@ -360,35 +344,27 @@ mod tests {
 	}
 
 	/// A flag type whose default is the variant with the non-zero value.
-	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Flaggable)]
+	#[repr(u8)]
 	enum Mode {
 		Zero = 0,
 		#[default]
 		One = 1,
 	}
 
-	impl From<Mode> for u8 {
-		fn from(flag: Mode) -> u8 {
-			flag as u8
-		}
-	}
-
 	crate::flagset!(ModeFlags: Mode);
 
-	#[test]
-	fn a_never_set_slot_holds_the_default_variant_alone() {
-		let flags = ModeFlags::default();
-		let held = [Mode::Zero, Mode::One].map(|mode| FlagSet::contains(&flags, mode));
-		assert_eq!(held, [false, true]);
-	}
-
-	/// A slot set to the variant whose value is zero holds that variant alone.
-	#[test]
-	fn a_slot_set_to_the_zero_variant_holds_it_alone() {
-		let mut flags = ModeFlags::default();
-		FlagSet::set(&mut flags, Mode::Zero);
-
-		let held = [Mode::Zero, Mode::One].map(|mode| FlagSet::contains(&flags, mode));
-		assert_eq!(held, [true, false]);
+	// A slot holds one variant at a time. A never-set slot holds the default
+	// variant, and a slot set to the variant whose value is zero holds that
+	// variant.
+	crate::tb_cases! {
+		fn a_slot_holds_one_variant_alone((flags, held): (ModeFlags, (bool, bool))) {
+			let zero_and_one = (FlagSet::contains(&flags, Mode::Zero), FlagSet::contains(&flags, Mode::One));
+			assert_eq!(zero_and_one, held);
+		}
+		cases {
+			never_set => (ModeFlags::default(), (false, true)),
+			set_to_the_zero_variant => (crate::flags!(ModeFlags: Mode::Zero), (true, false)),
+		}
 	}
 }

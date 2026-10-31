@@ -669,19 +669,18 @@ macro_rules! tb_process_spec {
 
 #[cfg(all(test, feature = "testing-csp"))]
 mod tests {
-	use core::error::Error;
-
 	#[cfg(feature = "testing-timing")]
 	use core::time::Duration;
 	#[cfg(feature = "testing-timing")]
 	use std::collections::HashMap;
 
 	use crate::testing::specs::csp::ProcessSpec;
-	use crate::trace::{ConsumedTrace, TraceCollector};
+	use crate::testing::TestResult;
+	use crate::trace::ConsumedTrace;
 	use crate::urn::Urn;
 
 	#[cfg(feature = "testing-timing")]
-	use crate::testing::specs::csp::{Event, ProcessBuildError, State, Successor};
+	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State, Successor};
 	#[cfg(feature = "testing-timing")]
 	use crate::testing::timing::{TimedTransition, TimingGuard};
 
@@ -780,14 +779,10 @@ mod tests {
 		}
 	}
 
-	/// A trace that records each of `events` once, in order.
-	fn trace_of(events: &[Urn<'static>]) -> ConsumedTrace {
-		let collector = TraceCollector::new();
-		for event in events {
-			collector.event(event).expect("the run injects no fault").emit();
-		}
-
-		ConsumedTrace::drained_from(&collector)
+	/// The process of the guarded form.
+	#[cfg(feature = "testing-timing")]
+	fn guarded() -> Process {
+		GuardedProcess::process().expect("the guarded form builds")
 	}
 
 	/// The timed transition that `event` labels from `from`.
@@ -795,12 +790,12 @@ mod tests {
 	/// The plain arm records no timed transition, so the lookup fails where a
 	/// guarded form falls through to it.
 	#[cfg(feature = "testing-timing")]
-	fn timed_transition(from: &'static str, event: Urn<'static>) -> Result<TimedTransition, Box<dyn Error>> {
+	fn timed_transition(from: &'static str, event: Urn<'static>) -> TimedTransition {
 		let key = (State(from), Event::from(event));
-		let mut table = GuardedProcess::process()?.timed_transitions.unwrap_or_default();
+		let mut table = guarded().timed_transitions.unwrap_or_default();
 
 		let transition = table.remove(&key).and_then(|transitions| transitions.into_iter().next());
-		transition.ok_or_else(|| "the guarded form recorded no timed transition".into())
+		transition.expect("the guarded form records a timed transition")
 	}
 
 	/// The clock readings once `clk` has run `span`.
@@ -809,35 +804,49 @@ mod tests {
 		HashMap::from([("clk".to_string(), span)])
 	}
 
-	#[test]
-	fn a_spec_accepts_a_trace_that_its_process_allows() -> Result<(), Box<dyn Error>> {
-		let trace = trace_of(&[ARM, FIRE]);
-		let result = PlainProcess.validate_trace(&PlainProcess::process()?, &trace);
-		assert!(result.valid, "{:?}", result.violations);
-		Ok(())
+	// A spec decides the validity of a trace by the events that the states of
+	// its process enable.
+	crate::tb_cases! {
+		fn a_spec_decides_the_validity_of((events, valid): (&[Urn<'static>], bool)) -> TestResult {
+			let trace = ConsumedTrace::recording(events);
+			let result = PlainProcess.validate_trace(&PlainProcess::process()?, &trace);
+			assert_eq!(result.valid, valid);
+			Ok(())
+		}
+
+		cases {
+			a_trace_that_its_process_allows => (&[ARM, FIRE], true),
+			an_event_that_its_state_does_not_enable => (&[FIRE], false),
+		}
 	}
 
+	// A timing block that contradicts itself does not build, and the refusal
+	// names the events it contradicts on.
 	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_spec_that_bounds_an_event_twice_does_not_build() -> Result<(), Box<dyn Error>> {
-		let refused = BoundsArmTwice::process();
-		let conflict = ProcessBuildError::ConflictingTiming { event: Event::from(ARM) };
-		assert_eq!(refused.err(), Some(conflict));
-		Ok(())
+	crate::tb_cases! {
+		fn a_spec_does_not_build_with(
+			(build, refused): (fn() -> Result<Process, ProcessBuildError>, ProcessBuildError)
+		) {
+			let built = build();
+			assert_eq!(built.err(), Some(refused));
+		}
+
+		cases {
+			an_event_bounded_twice => (
+				BoundsArmTwice::process,
+				ProcessBuildError::ConflictingTiming { event: Event::from(ARM) },
+			),
+			a_deadline_slack_past_its_duration => (
+				SlackPastItsDeadline::process,
+				ProcessBuildError::InvalidDeadline { start: Event::from(ARM), end: Event::from(FIRE) },
+			),
+		}
 	}
 
+	/// A timing block that holds a deadline alone builds the deadline.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_spec_whose_deadline_slack_passes_its_duration_does_not_build() -> Result<(), Box<dyn Error>> {
-		let refused = SlackPastItsDeadline::process();
-		let invalid = ProcessBuildError::InvalidDeadline { start: Event::from(ARM), end: Event::from(FIRE) };
-		assert_eq!(refused.err(), Some(invalid));
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_timing_block_that_holds_a_deadline_alone_builds_the_deadline() -> Result<(), Box<dyn Error>> {
+	fn a_timing_block_that_holds_a_deadline_alone_builds_the_deadline() -> TestResult {
 		let process = DeadlineAlone::process()?;
 		let constraints = process.timing_constraints.unwrap_or_default();
 
@@ -847,79 +856,57 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn a_spec_rejects_an_event_that_its_state_does_not_enable() -> Result<(), Box<dyn Error>> {
-		let trace = trace_of(&[FIRE]);
-		let result = PlainProcess.validate_trace(&PlainProcess::process()?, &trace);
-		assert!(!result.valid);
-		Ok(())
-	}
-
+	/// A guarded event expands to a timed transition under its guard.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_guarded_event_expands_to_a_timed_transition() -> Result<(), Box<dyn Error>> {
-		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-		let transition = timed_transition("S0", ARM)?;
-		assert_eq!(transition.guard, Some(bound));
-		assert_eq!(transition.to, State("S1"));
-		Ok(())
+	fn a_guarded_event_expands_to_a_timed_transition() {
+		let transition = timed_transition("S0", ARM);
+		assert_eq!(
+			(transition.guard, transition.to),
+			(Some(TimingGuard::clk_within(5)), State("S1"))
+		);
 	}
 
+	/// A guard with resets names the clocks it resets.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_guard_allows_its_edge_at_its_bound() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process()?;
-		let readings = readings_after(Duration::from_millis(5));
-
-		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
-		assert_eq!(successors, [Successor { to: State("S1"), resets: &[] }]);
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_guard_refuses_its_edge_past_its_bound() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process()?;
-		let readings = readings_after(Duration::from_micros(5_001));
-
-		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
-		assert!(successors.is_empty());
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_guard_with_resets_names_its_clocks() -> Result<(), Box<dyn Error>> {
-		let transition = timed_transition("S1", FIRE)?;
+	fn a_guard_with_resets_names_its_clocks() {
+		let transition = timed_transition("S1", FIRE);
 		assert_eq!(transition.reset_clocks, ["clk"]);
-		Ok(())
 	}
 
+	/// A guarded transition is an edge of the process.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_guarded_transition_is_an_edge_of_the_process() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process()?;
-		assert_eq!(process.step(State("S0"), &Event::from(ARM)), [State("S1")]);
-		Ok(())
+	fn a_guarded_transition_is_an_edge_of_the_process() {
+		let process = guarded();
+		let reached = process.step(State("S0"), &Event::from(ARM));
+		assert_eq!(reached, [State("S1")]);
 	}
 
+	/// A declared clock starts at zero.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_declared_clock_starts_at_zero() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process()?;
+	fn a_declared_clock_starts_at_zero() {
+		let process = guarded();
 		let clocks = process.initial_clocks();
 		assert_eq!(clocks, HashMap::from([("clk".to_string(), Duration::ZERO)]));
-		Ok(())
 	}
 
+	// The guard `clk <= 5 ms` on `ARM` allows the edge to `S1` while the clock
+	// reads at most 5 ms, and refuses it past that.
 	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_guard_allows_its_edge_when_a_run_starts() -> Result<(), Box<dyn Error>> {
-		let process = GuardedProcess::process()?;
-		let readings = process.initial_clocks();
+	crate::tb_cases! {
+		fn a_guard_on_arm_decides_its_edge((readings, successors): (HashMap<String, Duration>, &[Successor])) {
+			let process = guarded();
+			let found: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
+			assert_eq!(found, successors);
+		}
 
-		let successors: Vec<Successor> = process.successors(State("S0"), &Event::from(ARM), &readings).collect();
-		assert_eq!(successors, [Successor { to: State("S1"), resets: &[] }]);
-		Ok(())
+		cases {
+			at_its_bound => (readings_after(Duration::from_millis(5)), &[Successor { to: State("S1"), resets: &[] }]),
+			past_its_bound => (readings_after(Duration::from_micros(5_001)), &[]),
+			when_a_run_starts => (guarded().initial_clocks(), &[Successor { to: State("S1"), resets: &[] }]),
+		}
 	}
 }

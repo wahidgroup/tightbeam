@@ -1273,24 +1273,25 @@ macro_rules! server {
 mod tests {
 	use core::future::ready;
 	use core::sync::atomic::{AtomicBool, Ordering};
-	#[cfg(feature = "instrument")]
-	use std::borrow::Cow;
 	#[cfg(feature = "tcp")]
 	use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 
-	use tokio::net::{TcpListener, TcpStream};
+	use tokio::net::TcpStream;
 
 	use super::*;
+	use crate::testing::fixtures::TestLoopback;
 	use crate::testing::TestFrame;
 	use crate::transport::tcp::r#async::{TcpTransport, TokioStream};
-	use crate::transport::{EndpointConfig, TransportResult};
+	use crate::transport::EndpointConfig;
 
 	#[cfg(feature = "tcp")]
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	#[cfg(feature = "instrument")]
 	use crate::instrumentation::events;
-	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
-	use crate::testing::fdr::FaultModel;
+	#[cfg(feature = "instrument")]
+	use crate::testing::fixtures::TestTrace;
+	#[cfg(any(feature = "instrument", feature = "tcp"))]
+	use crate::testing::TestResult;
 	#[cfg(feature = "instrument")]
 	use crate::trace::TraceCollector;
 	#[cfg(feature = "tcp")]
@@ -1301,30 +1302,33 @@ mod tests {
 	use crate::transport::MessageEmitter;
 	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
 	use crate::transport::TransportError;
+
+	/// A cleartext transport over a loopback connection, beside the accepted
+	/// end that holds the connection open.
+	async fn loopback_transport() -> (TcpStream, TcpTransport<TokioStream>) {
+		let (accepted, dialing) = TestLoopback::tokio_pair().await;
+		let transport = TcpTransport::new(TokioStream::from(dialing), EndpointConfig::cleartext());
+		(accepted, transport)
+	}
+
+	/// A handler that answers each frame with itself.
 	#[cfg(feature = "instrument")]
-	use crate::urn::Urn;
-
-	/// A cleartext transport over a loopback connection, beside the listener
-	/// that holds the other end open.
-	async fn loopback_transport() -> TransportResult<(TcpListener, TcpTransport<TokioStream>)> {
-		let listener = TcpListener::bind("127.0.0.1:0").await?;
-		let stream = TcpStream::connect(listener.local_addr()?).await?;
-		let transport = TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext());
-
-		Ok((listener, transport))
+	fn echo_handler() -> SharedHandler {
+		SharedHandler::from_context_blind(|frame| ready(Ok::<_, TightBeamError>(Some(frame))))
 	}
 
 	/// Runs one turn over `transport` on a frame collected under `status` with
-	/// a handler that fails, and returns the turn's answer and whether the
-	/// handler ran.
+	/// a handler that fails with `failure`, and returns the turn's answer and
+	/// whether the handler ran.
 	async fn failing_turn_over(
 		mut transport: TcpTransport<TokioStream>,
 		status: TransitStatus,
+		failure: TightBeamError,
 	) -> (SingleFlightAnswer, bool) {
 		let ran = AtomicBool::new(false);
 		let failing = |_frame, _session| {
 			ran.store(true, Ordering::SeqCst);
-			ready(Err::<Option<Frame>, _>(TightBeamError::MissingResponse))
+			ready(Err::<Option<Frame>, _>(failure))
 		};
 
 		let collected = (Arc::new(TestFrame::v0(None, None)), status);
@@ -1335,40 +1339,35 @@ mod tests {
 	/// Runs one turn on a frame collected under `status` with a handler that
 	/// fails, and returns the status the turn answers with and whether the
 	/// handler ran.
-	async fn failing_turn(status: TransitStatus) -> TransportResult<(TransitStatus, bool)> {
-		let (_listener, transport) = loopback_transport().await?;
-		let (answer, ran) = failing_turn_over(transport, status).await;
-		Ok((answer.status, ran))
+	async fn failing_turn(status: TransitStatus) -> (TransitStatus, bool) {
+		let (_accepted, transport) = loopback_transport().await;
+		let (answer, ran) = failing_turn_over(transport, status, TightBeamError::MissingResponse).await;
+		(answer.status, ran)
 	}
 
 	/// A turn answers a refused frame with the status that refused it, before
 	/// any handler runs.
 	#[tokio::test]
-	async fn a_turn_answers_a_refused_frame_with_its_status() -> TransportResult<()> {
+	async fn a_turn_answers_a_refused_frame_with_its_status() {
 		let refused = TransitStatus::PermissionDenied;
-		assert_eq!(failing_turn(refused).await?, (refused, false));
-		Ok(())
+		assert_eq!(failing_turn(refused).await, (refused, false));
 	}
 
 	/// A turn answers an admitted frame whose handler fails with `Internal`,
 	/// so the peer can tell it apart from an accepted empty reply.
 	#[tokio::test]
-	async fn a_turn_answers_a_failed_handler_with_internal() -> TransportResult<()> {
-		assert_eq!(failing_turn(TransitStatus::Ok).await?, (TransitStatus::Internal, true));
-		Ok(())
+	async fn a_turn_answers_a_failed_handler_with_internal() {
+		assert_eq!(failing_turn(TransitStatus::Ok).await, (TransitStatus::Internal, true));
 	}
 
 	/// A turn answers a service default that refuses the unary kind with
 	/// `Unimplemented`, and keeps no error of a failed handler.
 	#[tokio::test]
-	async fn a_turn_answers_a_refused_kind_with_unimplemented() -> TransportResult<()> {
-		let (_listener, mut transport) = loopback_transport().await?;
-		let refusing = |_frame, _session| ready(Err::<Option<Frame>, _>(TightBeamError::unimplemented()));
-		let collected = (Arc::new(TestFrame::v0(None, None)), TransitStatus::Ok);
+	async fn a_turn_answers_a_refused_kind_with_unimplemented() {
+		let (_accepted, transport) = loopback_transport().await;
 
-		let answer = SingleFlightAnswer::of(&mut transport, &mut None, collected, refusing).await;
-		assert_eq!((answer.status, answer.failure.is_none()), (TransitStatus::Unimplemented, true));
-		Ok(())
+		let (answer, _ran) = failing_turn_over(transport, TransitStatus::Ok, TightBeamError::unimplemented()).await;
+		assert!(matches!((answer.status, answer.failure), (TransitStatus::Unimplemented, None)));
 	}
 
 	/// A service default that refuses its kind is no handler failure, so the
@@ -1382,90 +1381,73 @@ mod tests {
 		assert!(reports.try_recv().is_err());
 	}
 
-	/// The labels of the `event` records that `trace` holds, in the order it
-	/// recorded them.
-	#[cfg(feature = "instrument")]
-	fn labels(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<Cow<'static, str>>> {
-		let records = trace.drain_events();
-		records
-			.into_iter()
-			.filter(|record| record.urn == event)
-			.map(|record| record.label)
-			.collect()
-	}
-
 	/// A turn records its handler's failure on its connection's audit trail,
 	/// labelled with the `Internal` answer.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
-	async fn a_turn_records_the_failure_of_its_handler() -> TransportResult<()> {
-		let (_listener, transport) = loopback_transport().await?;
+	async fn a_turn_records_the_failure_of_its_handler() {
+		let (_accepted, transport) = loopback_transport().await;
 		let trace = TraceCollector::new();
-		failing_turn_over(transport.with_trace(trace.share()), TransitStatus::Ok).await;
-		assert_eq!(labels(&trace, events::HANDLER_FAILED), [Some("Internal".into())]);
-		Ok(())
+
+		let turn = transport.with_trace(trace.share());
+		failing_turn_over(turn, TransitStatus::Ok, TightBeamError::MissingResponse).await;
+
+		let labels = TestTrace::labels(&trace, events::HANDLER_FAILED);
+		assert_eq!(labels, [Some(String::from("Internal"))]);
 	}
 
 	/// A fault the trace injects at the record of a failed handler replaces the
 	/// handler's error, so the turn reports the fault.
 	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
 	#[tokio::test]
-	async fn a_fault_at_the_record_of_a_failed_handler_takes_its_place() -> TransportResult<()> {
-		let (_listener, transport) = loopback_transport().await?;
+	async fn a_fault_at_the_record_of_a_failed_handler_takes_its_place() {
+		let (_accepted, transport) = loopback_transport().await;
 		let fault = || TightBeamError::ChannelClosed;
-		let model = FaultModel::default().with_event_fault(events::HANDLER_FAILED, fault, crate::bps!(10000));
-		let trace = TraceCollector::new().with_fault_model(model);
+		let trace = TestTrace::faulting(events::HANDLER_FAILED, fault, crate::bps!(10000));
 
-		let (answer, _ran) = failing_turn_over(transport.with_trace(trace), TransitStatus::Ok).await;
+		let turn = transport.with_trace(trace);
+		let (answer, _ran) = failing_turn_over(turn, TransitStatus::Ok, TightBeamError::MissingResponse).await;
 		assert!(matches!(answer.failure, Some(TightBeamError::ChannelClosed)));
-		Ok(())
 	}
 
 	/// The service of an accepted connection records the acceptance on the
 	/// audit trail of the connection, once.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
-	async fn a_served_connection_records_its_acceptance() -> TransportResult<()> {
-		let (listener, transport) = loopback_transport().await?;
+	async fn a_served_connection_records_its_acceptance() {
+		let (accepted, transport) = loopback_transport().await;
 		let trace = TraceCollector::new();
-		let handler = SharedHandler::from_context_blind(|frame| ready(Ok::<_, TightBeamError>(Some(frame))));
-		drop(listener);
+		drop(accepted);
 
-		serve_connection(transport.with_trace(trace.share()), handler, None, None).await;
+		serve_connection(transport.with_trace(trace.share()), echo_handler(), None, None).await;
 
 		assert_eq!(trace.recorded(events::CONNECTION_ACCEPTED), 1);
-		Ok(())
 	}
 
 	/// A fault that the trace injects at the record of an acceptance goes to
 	/// the error channel, and ends the connection before it serves a frame.
 	#[cfg(all(feature = "instrument", feature = "testing-fault"))]
 	#[tokio::test]
-	async fn a_fault_at_the_record_of_an_acceptance_ends_the_connection() -> TransportResult<()> {
-		let (listener, transport) = loopback_transport().await?;
+	async fn a_fault_at_the_record_of_an_acceptance_ends_the_connection() {
+		let (accepted, transport) = loopback_transport().await;
 		let fault = || TransportError::InvalidAddress;
-		let model = FaultModel::default().with_event_fault(events::CONNECTION_ACCEPTED, fault, crate::bps!(10000));
-		let trace = TraceCollector::new().with_fault_model(model);
-		let handler = SharedHandler::from_context_blind(|frame| ready(Ok::<_, TightBeamError>(Some(frame))));
+		let trace = TestTrace::faulting(events::CONNECTION_ACCEPTED, fault, crate::bps!(10000));
 		let (errors, mut reported) = server_runtime::rt::channel(2);
-		drop(listener);
+		drop(accepted);
 
-		serve_connection(transport.with_trace(trace.share()), handler, Some(errors), None).await;
+		serve_connection(transport.with_trace(trace.share()), echo_handler(), Some(errors), None).await;
 
 		assert!(matches!(reported.try_recv(), Ok(TransportError::InvalidAddress)));
 		assert!(reported.try_recv().is_err());
-		Ok(())
 	}
 
 	/// The payload of an acceptance record names the peer by the address the
 	/// listener accepted the connection from.
 	#[cfg(feature = "instrument")]
 	#[tokio::test]
-	async fn a_served_connection_names_the_peer_it_accepted() -> TransportResult<()> {
+	async fn a_served_connection_names_the_peer_it_accepted() -> TestResult {
 		use crate::crypto::hash::{Digest, Sha3_256};
 		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::instrumentation::TbInstrumentationConfig;
-		use crate::trace::TraceConfig;
 		use crate::transport::tcp::r#async::TokioListener;
 
 		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
@@ -1474,20 +1456,20 @@ mod tests {
 		let expected: [u8; 32] = Sha3_256::digest(client.local_addr()?.to_string()).into();
 		drop(client);
 
-		let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-		let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
-		let handler = SharedHandler::from_context_blind(|frame| ready(Ok::<_, TightBeamError>(Some(frame))));
-		serve_connection(transport.with_trace(trace.share()), handler, None, None).await;
-
-		let recorded = trace.drain_events();
-		let accepted = recorded.into_iter().filter(|event| event.urn == events::CONNECTION_ACCEPTED);
-		let evidence: Vec<_> = accepted.map(|event| event.payload_hash).collect();
-		assert_eq!(evidence, [Some(expected)]);
+		let trace = TestTrace::with_payloads();
+		serve_connection(transport.with_trace(trace.share()), echo_handler(), None, None).await;
+		assert_eq!(TestTrace::payloads(&trace, events::CONNECTION_ACCEPTED), [Some(expected)]);
 		Ok(())
 	}
 
 	/// Serves `listener` with the blocking `server!` form on a std thread
 	/// outside a tokio runtime, and answers each frame with itself.
+	///
+	/// The thread runs until the test process exits, because
+	/// [`BlockingAcceptPlane::accept_on`] accepts for as long as its thread
+	/// runs.
+	///
+	/// [`BlockingAcceptPlane::accept_on`]: crate::transport::accept::BlockingAcceptPlane::accept_on
 	#[cfg(feature = "tcp")]
 	fn serve_blocking<P: HandshakeProvider>(listener: BlockingListener<NetTcpListener, P>) {
 		std::thread::spawn(move || {
@@ -1510,7 +1492,7 @@ mod tests {
 	/// of its accept plane, which run outside a tokio runtime.
 	#[cfg(feature = "tcp")]
 	#[tokio::test]
-	async fn a_blocking_server_serves_in_the_clear_with_no_runtime() -> TransportResult<()> {
+	async fn a_blocking_server_serves_in_the_clear_with_no_runtime() -> TestResult {
 		let (socket, addr) = loopback_socket();
 		serve_blocking(BlockingListener::<_, DefaultCryptoProvider>::from_listener_cleartext(socket));
 
@@ -1528,18 +1510,15 @@ mod tests {
 	/// serves the frame that follows it.
 	#[cfg(all(feature = "tcp", feature = "transport-hpke"))]
 	#[tokio::test]
-	async fn a_blocking_server_runs_the_handshake_with_no_runtime() -> Result<(), Box<dyn core::error::Error>> {
-		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-		use crate::crypto::x509::KeyCurves;
+	async fn a_blocking_server_runs_the_handshake_with_no_runtime() -> TestResult {
+		use crate::testing::fixtures::TestStore;
 		use crate::testing::TestIdentity;
 		use crate::transport::client::ClientBuilder;
 		use crate::transport::TransportEncryptionConfig;
 
 		let (socket, addr) = loopback_socket();
 		let identity = TestIdentity::insecure_fixed();
-		let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let trust = trust.with_certificate(identity.certificate().to_owned())?.build();
+		let trust = TestStore::holding([identity.certificate().to_owned()]);
 		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity);
 
 		serve_blocking(BlockingListener::from_listener_with(socket, config)?);

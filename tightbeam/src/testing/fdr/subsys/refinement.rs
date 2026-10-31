@@ -477,176 +477,108 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::DefaultRefinementChecker;
+	use crate::testing::fdr::verdict::{Failure, Trace};
 	use crate::testing::fdr::{DefaultCache, FdrConfig, RefinementChecker, RefinementOutcome};
-	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+	use crate::testing::fixtures::TestProcess;
+	use crate::testing::specs::csp::{Event, Process, State};
 
-	/// A process that can stop at `Idle`, which also offers `a`, and at
-	/// `Done`, which `a` leads to.
-	fn accepting() -> Result<Process, ProcessBuildError> {
-		Process::builder("Accepting")
-			.initial_state(State("Idle"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("Idle"), Event("a"), State("Done"))
-			.add_terminal(State("Idle"))
-			.add_terminal(State("Done"))
-			.build()
-	}
+	/// A fixture that builds the process of a row.
+	type Fixture = fn() -> Process;
 
-	/// The process of [`accepting`] with `Done` its one accepting state, so
-	/// `Idle` refuses `b` alone.
-	fn idling() -> Result<Process, ProcessBuildError> {
-		Process::builder("Idling")
-			.initial_state(State("Idle"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("Idle"), Event("a"), State("Done"))
-			.add_terminal(State("Done"))
-			.build()
-	}
-
-	/// A process whose hidden `t` and `u` take `S1` to `S2` and back, with the
-	/// observable exit `b` at `S2`, so it can diverge after `a`.
-	fn spinning() -> Result<Process, ProcessBuildError> {
-		Process::builder("Spinning")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("u"), State("S1"))
-			.add_transition(State("S2"), Event("b"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
-	}
-
-	/// A process that takes `a`, then spins on the hidden `t` at `S1`, so it
-	/// can diverge after one event.
-	fn spinning_after_a() -> Result<Process, ProcessBuildError> {
-		Process::builder("SpinningAfterA")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S1"))
-			.build()
+	/// The process of [`TestProcess::accepting`] with `Done` its one accepting
+	/// state, so `Idle` refuses `b` alone.
+	fn idling() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			transitions: &[("Idle", "a", "Done")],
+			terminal: &["Done"],
+			..TestProcess::of("Idling", "Idle")
+		}
+		.build()
 	}
 
 	/// A process that takes `a`, then `b`, then spins on the hidden `t` at
 	/// `S2`, so it can diverge after two events.
-	fn spinning_after_a_b() -> Result<Process, ProcessBuildError> {
-		Process::builder("SpinningAfterAB")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("b"), State("S2"))
-			.add_transition(State("S2"), Event("t"), State("S2"))
-			.build()
+	fn spinning_after_a_b() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S1", "b", "S2"), ("S2", "t", "S2")],
+			..TestProcess::of("SpinningAfterAB", "S0")
+		}
+		.build()
 	}
 
 	/// A process that takes `a`, then stops at the accepting `S1`.
-	fn stopping_after_a() -> Result<Process, ProcessBuildError> {
-		Process::builder("StoppingAfterA")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()
+	fn stopping_after_a() -> Process {
+		TestProcess::chain("StoppingAfterA", &["S0", "S1"], &["a"])
 	}
 
 	/// A process that takes `a`, then the hidden `t` to the accepting `S2`.
-	fn settling_after_a() -> Result<Process, ProcessBuildError> {
-		Process::builder("SettlingAfterA")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_terminal(State("S2"))
-			.build()
+	fn settling_after_a() -> Process {
+		TestProcess {
+			observable: &["a"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S1", "t", "S2")],
+			terminal: &["S2"],
+			..TestProcess::of("SettlingAfterA", "S0")
+		}
+		.build()
 	}
 
 	/// A process that takes `a` or `b` at `S0` and comes back, so its traces
 	/// of at most 14 events number 32,767, past `MAX_VISITED`.
-	fn looping_on_a_and_b() -> Result<Process, ProcessBuildError> {
-		Process::builder("LoopingOnAAndB")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("S0"), Event("a"), State("S0"))
-			.add_transition(State("S0"), Event("b"), State("S0"))
-			.build()
+	fn looping_on_a_and_b() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			transitions: &[("S0", "a", "S0"), ("S0", "b", "S0")],
+			..TestProcess::of("LoopingOnAAndB", "S0")
+		}
+		.build()
 	}
 
 	/// A process over `a` and `b` that stops at its accepting initial state.
-	fn stopped() -> Result<Process, ProcessBuildError> {
-		Process::builder("Stopped")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_terminal(State("S0"))
-			.build()
+	fn stopped() -> Process {
+		TestProcess { observable: &["a", "b"], terminal: &["S0"], ..TestProcess::of("Stopped", "S0") }.build()
 	}
 
 	/// A process over `a` and `b` that takes `event` once, then stops at the
-	/// accepting `S1`.
-	fn once(event: Event) -> Result<Process, ProcessBuildError> {
+	/// accepting `S1`. The event varies, so the process takes the builder that
+	/// [`TestProcess`] wraps.
+	fn once(event: &'static str) -> Process {
 		Process::builder("Once")
 			.initial_state(State("S0"))
 			.add_observable(Event("a"))
 			.add_observable(Event("b"))
-			.add_transition(State("S0"), event, State("S1"))
+			.add_transition(State("S0"), Event(event), State("S1"))
 			.add_terminal(State("S1"))
 			.build()
+			.expect("a process with an initial state builds")
 	}
 
 	/// A process whose `S0` offers `a` beside the hidden `t`, which leads to
 	/// `b`.
-	fn hidden_beside_a() -> Result<Process, ProcessBuildError> {
-		Process::builder("HiddenBesideA")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S0"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("b"), State("S3"))
-			.add_terminal(State("S1"))
-			.add_terminal(State("S3"))
-			.build()
+	fn hidden_beside_a() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S0", "t", "S2"), ("S2", "b", "S3")],
+			terminal: &["S1", "S3"],
+			..TestProcess::of("HiddenBesideA", "S0")
+		}
+		.build()
 	}
 
 	/// A process whose hidden `t` and `u` branch at `S0`, to `a` and to `b`.
-	fn two_hidden_branches() -> Result<Process, ProcessBuildError> {
-		Process::builder("TwoHiddenBranches")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("t"), State("S1"))
-			.add_transition(State("S0"), Event("u"), State("S2"))
-			.add_transition(State("S1"), Event("a"), State("S3"))
-			.add_transition(State("S2"), Event("b"), State("S4"))
-			.add_terminal(State("S3"))
-			.add_terminal(State("S4"))
-			.build()
-	}
-
-	/// A process whose `e`, in the observable and in the hidden alphabet,
-	/// takes `S0` to the accepting `S1`.
-	fn e_in_both_alphabets() -> Result<Process, ProcessBuildError> {
-		Process::builder("EInBothAlphabets")
-			.initial_state(State("S0"))
-			.add_observable(Event("e"))
-			.add_hidden(Event("e"))
-			.add_transition(State("S0"), Event("e"), State("S1"))
-			.add_terminal(State("S1"))
-			.build()
+	fn two_hidden_branches() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["t", "u"],
+			transitions: &[("S0", "t", "S1"), ("S0", "u", "S2"), ("S1", "a", "S3"), ("S2", "b", "S4")],
+			terminal: &["S3", "S4"],
+			..TestProcess::of("TwoHiddenBranches", "S0")
+		}
+		.build()
 	}
 
 	/// The checker of `process` under the default configuration.
@@ -660,233 +592,212 @@ mod tests {
 		DefaultRefinementChecker::new(process, Arc::new(config), cache)
 	}
 
-	#[test]
-	fn a_reachable_hidden_cycle_makes_its_trace_a_divergence() -> Result<(), ProcessBuildError> {
-		let process = spinning()?;
-		let mut checker = checker_of(&process);
-
-		let (divergences, _complete) = checker.compute_divergences(&process, 8);
-		let after_a = HashSet::from([vec![Event("a")]]);
-		assert_eq!(divergences, after_a, "`S1` and `S2` can spin after `a`");
-		Ok(())
+	/// The divergences of `process` within `depth` observable events.
+	fn divergences_of(process: &Process, depth: usize) -> HashSet<Trace> {
+		let (divergences, _complete) = checker_of(process).compute_divergences(process, depth);
+		divergences
 	}
 
-	#[test]
-	fn an_accepting_state_fails_with_every_observable_event() -> Result<(), ProcessBuildError> {
-		let process = accepting()?;
-		let mut checker = checker_of(&process);
-
-		let (failures, _complete) = checker.compute_failures(&process, 8);
-		let refused_at_idle = (vec![], HashSet::from([Event("a"), Event("b")]));
-		assert!(failures.contains(&refused_at_idle), "the failures were {failures:?}");
-		Ok(())
+	/// The failures of `process` within `depth` observable events.
+	fn failures_of(process: &Process, depth: usize) -> Vec<Failure> {
+		let (failures, _complete) = checker_of(process).compute_failures(process, depth);
+		failures
 	}
 
-	#[test]
-	fn a_divergence_after_max_depth_events_is_a_divergence() -> Result<(), ProcessBuildError> {
-		let process = spinning_after_a()?;
-		let mut checker = checker_of(&process);
-
-		let (divergences, _complete) = checker.compute_divergences(&process, 1);
-		let after_a = HashSet::from([vec![Event("a")]]);
-		assert_eq!(divergences, after_a, "`S1` spins after one event, the bound");
-		Ok(())
+	/// The traces of `process` within `depth` observable events.
+	fn traces_of(process: &Process, depth: usize) -> HashSet<Trace> {
+		let (traces, _complete) = checker_of(process).compute_traces(process, depth);
+		traces
 	}
 
-	#[test]
-	fn a_failure_after_max_depth_events_is_a_failure() -> Result<(), ProcessBuildError> {
-		let process = spinning()?;
-		let mut checker = checker_of(&process);
+	// The divergences of a process are the traces after which it can spin on
+	// hidden events, within the depth bound.
+	crate::tb_cases! {
+		fn the_divergence_search_finds((process, depth, divergences): (Fixture, usize, HashSet<Trace>)) {
+			let found = divergences_of(&process(), depth);
+			assert_eq!(found, divergences);
+		}
 
-		let (failures, _complete) = checker.compute_failures(&process, 2);
-		let refused_at_s3 = (vec![Event("a"), Event("b")], HashSet::from([Event("a"), Event("b")]));
-		assert!(failures.contains(&refused_at_s3), "the failures were {failures:?}");
-		Ok(())
+		cases {
+			/// `S1` and `S2` can spin after `a`.
+			the_trace_of_a_reachable_hidden_cycle => (TestProcess::spinning, 8, HashSet::from([vec![Event("a")]])),
+			/// `S1` spins after one event, the bound.
+			a_divergence_after_max_depth_events => (
+				TestProcess::spinning_after_a,
+				1,
+				HashSet::from([vec![Event("a")]]),
+			),
+			/// `S2` lies two events deep, past the bound of one.
+			no_divergence_past_max_depth => (spinning_after_a_b, 1, HashSet::new()),
+		}
 	}
 
-	#[test]
-	fn the_search_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
-		let process = spinning_after_a_b()?;
-		let mut checker = checker_of(&process);
+	// The failures of a process hold the refusal of each stable state it
+	// reaches, within the depth bound.
+	crate::tb_cases! {
+		fn the_failures_include((process, depth, failure): (Fixture, usize, Failure)) {
+			let found = failures_of(&process(), depth);
+			assert!(found.contains(&failure));
+		}
 
-		let (divergences, _complete) = checker.compute_divergences(&process, 1);
-		assert!(divergences.is_empty(), "`S2` lies two events deep, past the bound of one");
-		Ok(())
+		cases {
+			every_observable_event_at_an_accepting_state => (
+				TestProcess::accepting,
+				8,
+				(vec![], HashSet::from([Event("a"), Event("b")])),
+			),
+			a_failure_after_max_depth_events => (
+				TestProcess::spinning,
+				2,
+				(vec![Event("a"), Event("b")], HashSet::from([Event("a"), Event("b")])),
+			),
+			a_failure_behind_a_hidden_step_at_max_depth => (
+				settling_after_a,
+				1,
+				(vec![Event("a")], HashSet::from([Event("a")])),
+			),
+		}
 	}
 
-	#[test]
-	fn the_trace_search_takes_no_observable_step_past_max_depth() -> Result<(), ProcessBuildError> {
-		let process = spinning_after_a_b()?;
-		let mut checker = checker_of(&process);
+	// A divergence search that runs out of time or past `MAX_VISITED` claims no
+	// completeness.
+	crate::tb_cases! {
+		fn a_divergence_search_is_incomplete((process, config, depth): (Fixture, FdrConfig, usize)) {
+			let process = process();
+			let mut checker = checker_under(&process, config);
 
-		let (traces, _complete) = checker.compute_traces(&process, 1);
-		let up_to_one_event = HashSet::from([vec![], vec![Event("a")]]);
-		assert_eq!(traces, up_to_one_event, "`b` lies two events deep, past the bound of one");
-		Ok(())
+			let (_divergences, complete) = checker.compute_divergences(&process, depth);
+			assert!(!complete);
+		}
+
+		cases {
+			past_its_timeout => (TestProcess::spinning, FdrConfig { timeout_ms: 0, ..Default::default() }, 8),
+			/// 32,767 pairs of state and trace pass the visited limit.
+			past_the_visited_limit => (looping_on_a_and_b, FdrConfig::default(), 14),
+		}
 	}
 
+	// Trace refinement refutes the first event of the subject that the spec
+	// cannot follow, and names it as the witness.
+	crate::tb_cases! {
+		fn trace_refinement_refutes((spec, subject, witness): (Fixture, Fixture, Trace)) {
+			let (spec, subject) = (spec(), subject());
+			let mut checker = checker_of(&subject);
+
+			let outcome = checker.check_trace_refinement(&spec, &subject);
+			assert_eq!(outcome, RefinementOutcome::Violated(witness));
+		}
+
+		cases {
+			an_event_after_an_accepting_state => (stopped, TestProcess::accepting, vec![Event("a")]),
+			an_event_beside_a_hidden_step => (|| once("b"), hidden_beside_a, vec![Event("a")]),
+			an_event_after_a_second_hidden_branch => (|| once("a"), two_hidden_branches, vec![Event("b")]),
+		}
+	}
+
+	/// A trace search stops at the depth bound, so `b`, two events deep, lies
+	/// past the bound of one.
 	#[test]
-	fn divergence_refinement_refutes_a_divergence_at_the_depth_bound() -> Result<(), ProcessBuildError> {
-		let spec = stopping_after_a()?;
-		let subject = spinning_after_a()?;
+	fn the_trace_search_takes_no_observable_step_past_max_depth() {
+		let traces = traces_of(&spinning_after_a_b(), 1);
+		assert_eq!(traces, HashSet::from([vec![], vec![Event("a")]]));
+	}
+
+	/// Divergence refinement refutes a subject that diverges at the depth
+	/// bound where the spec stops.
+	#[test]
+	fn divergence_refinement_refutes_a_divergence_at_the_depth_bound() {
+		let (spec, subject) = (stopping_after_a(), TestProcess::spinning_after_a());
 		let mut checker = checker_under(&spec, FdrConfig { max_depth: 1, ..Default::default() });
 
 		let outcome = checker.check_divergence_refinement(&spec, &subject);
 		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("a")]));
-		Ok(())
 	}
 
+	/// The cache keeps the incompleteness of a divergence search that ran out
+	/// of time, so its second answer claims no completeness either.
 	#[test]
-	fn a_divergence_search_past_its_timeout_is_incomplete() -> Result<(), ProcessBuildError> {
-		let process = spinning()?;
-		let mut checker = checker_under(&process, FdrConfig { timeout_ms: 0, ..Default::default() });
-
-		let (_divergences, complete) = checker.compute_divergences(&process, 8);
-		assert!(!complete, "a search that ran out of time claims no completeness");
-		Ok(())
-	}
-
-	#[test]
-	fn a_failure_behind_a_hidden_step_at_max_depth_is_a_failure() -> Result<(), ProcessBuildError> {
-		let process = settling_after_a()?;
-		let mut checker = checker_of(&process);
-
-		let (failures, _complete) = checker.compute_failures(&process, 1);
-		let refused_at_s2 = (vec![Event("a")], HashSet::from([Event("a")]));
-		assert!(failures.contains(&refused_at_s2), "the failures were {failures:?}");
-		Ok(())
-	}
-
-	#[test]
-	fn a_divergence_search_past_its_timeout_caches_its_incompleteness() -> Result<(), ProcessBuildError> {
-		let process = spinning()?;
+	fn a_divergence_search_past_its_timeout_caches_its_incompleteness() {
+		let process = TestProcess::spinning();
 		let mut checker = checker_under(&process, FdrConfig { timeout_ms: 0, ..Default::default() });
 		let (_divergences, _complete) = checker.compute_divergences(&process, 8);
 
 		let (_cached, complete) = checker.compute_divergences(&process, 8);
-		assert!(!complete, "the cache keeps the incompleteness of the first search");
-		Ok(())
+		assert!(!complete);
 	}
 
+	/// Divergence refinement holds for a subject whose divergences extend a
+	/// divergence of the spec.
 	#[test]
-	fn a_divergence_search_past_its_limits_is_incomplete() -> Result<(), ProcessBuildError> {
-		let process = looping_on_a_and_b()?;
-		let mut checker = checker_of(&process);
-
-		let (_divergences, complete) = checker.compute_divergences(&process, 14);
-		assert!(!complete, "32,767 pairs of state and trace pass the visited limit");
-		Ok(())
-	}
-
-	#[test]
-	fn trace_refinement_refutes_an_event_after_an_accepting_state() -> Result<(), ProcessBuildError> {
-		let spec = stopped()?;
-		let subject = accepting()?;
-		let mut checker = checker_of(&subject);
-
-		let outcome = checker.check_trace_refinement(&spec, &subject);
-		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("a")]));
-		Ok(())
-	}
-
-	#[test]
-	fn trace_refinement_refutes_an_event_beside_a_hidden_step() -> Result<(), ProcessBuildError> {
-		let spec = once(Event("b"))?;
-		let subject = hidden_beside_a()?;
-		let mut checker = checker_of(&subject);
-
-		let outcome = checker.check_trace_refinement(&spec, &subject);
-		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("a")]));
-		Ok(())
-	}
-
-	#[test]
-	fn trace_refinement_refutes_an_event_after_a_second_hidden_branch() -> Result<(), ProcessBuildError> {
-		let spec = once(Event("a"))?;
-		let subject = two_hidden_branches()?;
-		let mut checker = checker_of(&subject);
-
-		let outcome = checker.check_trace_refinement(&spec, &subject);
-		assert_eq!(outcome, RefinementOutcome::Violated(vec![Event("b")]));
-		Ok(())
-	}
-
-	#[test]
-	fn divergence_refinement_holds_for_an_extension_of_a_spec_divergence() -> Result<(), ProcessBuildError> {
-		let spec = spinning_after_a()?;
-		let subject = spinning_after_a_b()?;
+	fn divergence_refinement_holds_for_an_extension_of_a_spec_divergence() {
+		let (spec, subject) = (TestProcess::spinning_after_a(), spinning_after_a_b());
 		let mut checker = checker_of(&spec);
 
 		let outcome = checker.check_divergence_refinement(&spec, &subject);
 		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
-		Ok(())
 	}
 
+	/// The observable action of an event in both alphabets extends the trace.
 	#[test]
-	fn the_observable_action_of_an_event_in_both_alphabets_extends_the_trace() -> Result<(), ProcessBuildError> {
-		let process = e_in_both_alphabets()?;
-		let mut checker = checker_of(&process);
-
-		let (traces, _complete) = checker.compute_traces(&process, 8);
-		assert!(traces.contains(&vec![Event("e")]), "the traces were {traces:?}");
-		Ok(())
+	fn the_observable_action_of_an_event_in_both_alphabets_extends_the_trace() {
+		let traces = traces_of(&TestProcess::e_in_both_alphabets(), 8);
+		assert!(traces.contains(&vec![Event("e")]));
 	}
 
+	/// The search of a spec matches the observable action of an event in both
+	/// alphabets, so the process refines itself.
 	#[test]
-	fn the_spec_search_matches_the_observable_action_of_an_event_in_both_alphabets() -> Result<(), ProcessBuildError> {
-		let process = e_in_both_alphabets()?;
+	fn the_spec_search_matches_the_observable_action_of_an_event_in_both_alphabets() {
+		let process = TestProcess::e_in_both_alphabets();
 		let mut checker = checker_of(&process);
 
 		let outcome = checker.check_trace_refinement(&process, &process);
 		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
-		Ok(())
 	}
 
+	/// Failures refinement refutes the refusal of `a` and `b` at the accepting
+	/// `Idle`, which the spec lacks.
 	#[test]
-	fn failures_refinement_refutes_a_refusal_that_the_spec_lacks() -> Result<(), ProcessBuildError> {
-		let spec = idling()?;
-		let subject = accepting()?;
+	fn failures_refinement_refutes_a_refusal_that_the_spec_lacks() {
+		let (spec, subject) = (idling(), TestProcess::accepting());
 		let mut checker = checker_of(&subject);
 
 		let outcome = checker.check_failures_refinement(&spec, &subject);
 		let refused_at_idle = (vec![], HashSet::from([Event("a"), Event("b")]));
 		assert_eq!(outcome, RefinementOutcome::Violated(refused_at_idle));
-		Ok(())
 	}
 
+	/// Failures refinement holds for a refusal that the spec allows.
 	#[test]
-	fn failures_refinement_holds_for_a_refusal_that_the_spec_allows() -> Result<(), ProcessBuildError> {
-		let spec = accepting()?;
-		let subject = idling()?;
+	fn failures_refinement_holds_for_a_refusal_that_the_spec_allows() {
+		let (spec, subject) = (TestProcess::accepting(), idling());
 		let mut checker = checker_of(&subject);
 
 		let outcome = checker.check_failures_refinement(&spec, &subject);
 		assert_eq!(outcome, RefinementOutcome::Holds { complete: true });
-		Ok(())
 	}
 
+	/// A set cached at one depth answers no search at another, so `S2`, two
+	/// events deep, lies within a bound of eight.
 	#[test]
-	fn a_set_cached_at_one_depth_answers_no_search_at_another() -> Result<(), ProcessBuildError> {
-		let process = spinning_after_a_b()?;
+	fn a_set_cached_at_one_depth_answers_no_search_at_another() {
+		let process = spinning_after_a_b();
 		let mut checker = checker_of(&process);
 		let (_within_one, _complete) = checker.compute_divergences(&process, 1);
 
 		let (within_eight, _complete) = checker.compute_divergences(&process, 8);
-		let after_a_b = HashSet::from([vec![Event("a"), Event("b")]]);
-		assert_eq!(within_eight, after_a_b, "`S2` lies two events deep, within a bound of eight");
-		Ok(())
+		assert_eq!(within_eight, HashSet::from([vec![Event("a"), Event("b")]]));
 	}
 
+	/// A cache serves each process its own set, though the two processes share
+	/// their name.
 	#[test]
-	fn a_cache_serves_each_process_its_own_set() -> Result<(), ProcessBuildError> {
-		let first = once(Event("a"))?;
-		let second = once(Event("b"))?;
+	fn a_cache_serves_each_process_its_own_set() {
+		let (first, second) = (once("a"), once("b"));
 		let mut checker = checker_of(&first);
 		let (_first_traces, _complete) = checker.compute_traces(&first, 8);
 
 		let (traces, _complete) = checker.compute_traces(&second, 8);
-		let empty_and_b = HashSet::from([vec![], vec![Event("b")]]);
-		assert_eq!(traces, empty_and_b, "the two processes share a name alone");
-		Ok(())
+		assert_eq!(traces, HashSet::from([vec![], vec![Event("b")]]));
 	}
 }
