@@ -431,9 +431,12 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::aead::SessionKeys;
 	use crate::testing::TestFrame;
 	use crate::transport::error::TransportFailure;
-	use std::error::Error;
+
+	#[cfg(feature = "tokio")]
+	use crate::testing::TestResult;
 
 	/// An empty validator set demands nothing, so it leaves an endpoint that
 	/// already demands mutual authentication as it is.
@@ -496,7 +499,6 @@ mod tests {
 		use crate::crypto::profiles::DefaultCryptoProvider;
 
 		let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext();
-
 		let refused = endpoint.with_operation_timeout(Some(Duration::ZERO));
 		assert!(matches!(
 			refused,
@@ -508,12 +510,11 @@ mod tests {
 	/// runtime, with policies and with none.
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn the_bind_cleartext_arms_of_the_server_macro_bind() -> TransportResult<()> {
+	async fn the_bind_cleartext_arms_of_the_server_macro_bind() -> TestResult {
 		use crate::asn1::Frame;
 		use crate::transport::tcp::r#async::TokioListener;
 
 		let addr = <TokioListener as Protocol>::default_bind_address()?;
-
 		let plain = crate::server! {
 			protocol TokioListener: bind_cleartext addr,
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
@@ -529,12 +530,11 @@ mod tests {
 		Ok(())
 	}
 
+	/// The server and client macros carry a frame from the client to the
+	/// handler of the server.
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn test_server_and_client_macros() -> TransportResult<()> {
-		use core::time::Duration;
-		use std::sync::{mpsc, Arc};
-
+	async fn the_server_and_client_macros_carry_a_frame() -> TestResult {
 		use crate::asn1::Frame;
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::transport::policy::RestartLinearBackoff;
@@ -543,14 +543,11 @@ mod tests {
 
 		let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
 		let addr = TightBeamSocketAddr(listener.local_addr()?);
-
-		let (tx, rx) = mpsc::channel();
-		let tx = Arc::new(tx);
-
+		let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 		let server_handle = crate::server! {
 			protocol TokioListener: listener,
 			handle: move |message: Frame| {
-				let tx = Arc::clone(&tx);
+				let tx = tx.clone();
 				async move {
 					// The receiver lives for the whole test, so a refused send
 					// surfaces as a missing message at the assertion.
@@ -569,14 +566,10 @@ mod tests {
 		};
 
 		let message = TestFrame::v0(None, None);
-		let result = client.emit(message.clone(), None).await;
-		result?;
 
-		let received = rx
-			.recv_timeout(Duration::from_secs(1))
-			.map_err(|_| TransportError::OperationFailed(error::TransportFailure::DeadlineExceeded))?;
-		assert_eq!(message, received);
+		client.emit(message.clone(), None).await?;
 
+		assert_eq!(rx.recv().await, Some(message));
 		server_handle.abort();
 
 		Ok(())
@@ -584,7 +577,8 @@ mod tests {
 
 	/// The handler events that one call to a cleartext server records on the
 	/// trail of its connection, in order, under a trace whose config sets
-	/// `enable_internal_detail` to `detail`.
+	/// `enable_internal_detail` to `detail`. The `client!` macro raises its
+	/// dial error with `?`, so the span comes back as a result.
 	#[cfg(all(feature = "tokio", feature = "instrument"))]
 	async fn single_flight_handler_span(detail: bool) -> TransportResult<Vec<crate::urn::Urn<'static>>> {
 		use crate::asn1::Frame;
@@ -605,7 +599,6 @@ mod tests {
 			policies: { with_trace: [ served.share() ] },
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
 		};
-
 		let mut client = crate::client! {
 			connect TokioListener: addr,
 			cleartext,
@@ -622,32 +615,34 @@ mod tests {
 		Ok(TestTrace::trail(&trace, &[events::HANDLER_ENTER, events::HANDLER_EXIT]))
 	}
 
-	/// A single-flight call records the span of its handler when, and only
-	/// when, the trace config sets the detail flag.
+	// A single-flight call records the span of its handler when, and only
+	// when, the trace config sets the detail flag.
 	#[cfg(all(feature = "tokio", feature = "instrument"))]
-	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn a_single_flight_call_records_its_handler_span_under_the_detail_flag_alone() -> TransportResult<()> {
-		use crate::instrumentation::events;
-
-		let detailed = single_flight_handler_span(true).await?;
-		let plain = single_flight_handler_span(false).await?;
-		assert_eq!([detailed, plain], [vec![events::HANDLER_ENTER, events::HANDLER_EXIT], vec![]]);
-		Ok(())
+	crate::tb_cases! {
+		#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+		async fn a_single_flight_call_records_its_handler_span_under_the_detail_flag_alone(
+			(detail, expected): (bool, Vec<crate::urn::Urn<'static>>)
+		) -> TestResult {
+			let span = single_flight_handler_span(detail).await?;
+			assert_eq!(span, expected);
+			Ok(())
+		}
+		cases {
+			detailed => (
+				true,
+				vec![crate::instrumentation::events::HANDLER_ENTER, crate::instrumentation::events::HANDLER_EXIT],
+			),
+			plain => (false, vec![]),
+		}
 	}
 
-	/// A builder with no configured limits enforces the defaults.
-	///
-	/// A default endpoint reads cleartext under a bound. Every other limit test
-	/// sets a ceiling explicitly, so only this test covers the default.
+	/// A builder with no configured limits refuses a payload past the
+	/// default cleartext ceiling, though the caller configured nothing. Every
+	/// other limit test sets a ceiling explicitly, so only this test covers
+	/// the default.
 	#[test]
 	fn default_limits_bound_a_cleartext_envelope() {
 		let limits = TransportLimits::default();
-		assert!(limits.cleartext_envelope > 0);
-		assert!(limits.encrypted_envelope > 0);
-		assert!(limits.handshake_wire > 0);
-
-		// The builder refuses a payload past the default ceiling, though the
-		// caller configured nothing.
 		let oversized = "a".repeat(limits.cleartext_envelope + 1);
 		let frame = TestFrame::v0(Some(&oversized), None);
 		let result = builders::EnvelopeBuilder::request(frame).finish();
@@ -657,69 +652,57 @@ mod tests {
 		));
 	}
 
-	/// The encrypted ceiling measures the sealed wire form, not the plaintext.
-	///
-	/// The builder refuses a payload under a ceiling of exactly the plaintext
-	/// length. The AEAD tag, the nonce, and the `WireEnvelope` wrapper come
-	/// after the encode, so a measurement before them would let an oversized
-	/// envelope reach the peer as a connection reset.
-	#[test]
-	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
-		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};
-		use crate::crypto::profiles::DefaultCryptoProvider;
+	/// The length of the DER of a request envelope of `frame`, before a seal.
+	fn plaintext_length(frame: &crate::asn1::Frame) -> usize {
 		use crate::der::Encode;
 
-		let frame = TestFrame::v0(None, None);
-		let plaintext_len = TransportEnvelope::from(frame.clone()).to_der()?.len();
-		let cipher = RuntimeAead::new::<DefaultCryptoProvider>(vec![0u8; 32])?;
-
-		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
-		let result = builders::EnvelopeBuilder::request(frame)
-			.sealed_by(&encryptor)
-			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() }.checked()?)
-			.finish();
-		assert!(matches!(
-			result,
-			Err(TransportError::MessageNotSent(_, TransportFailure::SizeExceeded))
-		));
-
-		Ok(())
+		let encoded = TransportEnvelope::from(frame.clone()).to_der();
+		encoded.expect("a request envelope encodes").len()
 	}
 
-	#[test]
-	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn Error>> {
-		use crate::crypto::aead::{RecordDirection, RuntimeAead, SendCipher};
-		use crate::crypto::profiles::DefaultCryptoProvider;
-
-		let frame = TestFrame::v0(None, None);
-		let cipher = RuntimeAead::new::<DefaultCryptoProvider>(vec![0u8; 32])?;
-
-		let encryptor = SendCipher::new(cipher, 0, RecordDirection::ClientToServer);
-		let result = builders::EnvelopeBuilder::request(frame.clone())
-			.sealed_by(&encryptor)
-			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() }.checked()?)
-			.finish();
-		assert!(matches!(
-			result,
-			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
-		));
-
-		Ok(())
+	/// The outcome of a build of a request envelope of `frame` under
+	/// `limits`, sealed by the send half of [`SessionKeys::insecure_client`]
+	/// when `sealed` is set.
+	fn built(frame: &crate::asn1::Frame, sealed: bool, limits: TransportLimits) -> TransportResult<WireEnvelope> {
+		let (sender, _receiver) = SessionKeys::insecure_client().into_parts();
+		let limits = limits.checked().expect("the case limits agree");
+		let builder = builders::EnvelopeBuilder::request(frame.clone());
+		if sealed {
+			builder.sealed_by(&sender).with_limits(limits).finish()
+		} else {
+			builder.with_limits(limits).finish()
+		}
 	}
 
-	#[test]
-	fn test_envelope_builder_cleartext_limit_returns_message() -> Result<(), Box<dyn Error>> {
-		let frame = TestFrame::v0(None, None);
-		// A handshake message of one octet takes three on the wire, so a
-		// cleartext ceiling of four admits the set and refuses the frame.
-		let limits = TransportLimits { handshake_wire: 1, cleartext_envelope: 4, ..TransportLimits::default() };
-		let result = builders::EnvelopeBuilder::request(frame.clone())
-			.with_limits(limits.checked()?)
-			.finish();
-		assert!(matches!(
-			result,
-			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
-		));
-		Ok(())
+	// A builder past its ceiling refuses the envelope and returns the frame.
+	// The encrypted ceiling measures the sealed wire form, so a ceiling of
+	// exactly the plaintext length refuses: the AEAD tag, the nonce, and the
+	// `WireEnvelope` wrapper come after the encode, and a measurement before
+	// them would let an oversized envelope reach the peer as a connection
+	// reset. A handshake message of one octet takes three on the wire, so a
+	// cleartext ceiling of four admits the set and refuses the frame.
+	crate::tb_cases! {
+		fn a_builder_past_its_ceiling_returns_the_frame((sealed, limits): (bool, TransportLimits)) {
+			let frame = TestFrame::v1(None, Some("ceiling"));
+			let result = built(&frame, sealed, limits);
+			assert!(matches!(
+				result,
+				Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
+			));
+		}
+		cases {
+			sealed_at_the_plaintext_length => (
+				true,
+				TransportLimits {
+					encrypted_envelope: plaintext_length(&TestFrame::v1(None, Some("ceiling"))),
+					..TransportLimits::default()
+				},
+			),
+			sealed_at_one_octet => (true, TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() }),
+			cleartext_at_four_octets => (
+				false,
+				TransportLimits { handshake_wire: 1, cleartext_envelope: 4, ..TransportLimits::default() },
+			),
+		}
 	}
 }

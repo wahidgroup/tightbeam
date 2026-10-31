@@ -102,28 +102,36 @@ impl<S: Zeroize> ToInsecure for Secret<S> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 
+	/// A secret string parses from a `str` and holds the text it parsed.
 	#[test]
-	fn test_secret_string_from_str() -> Result<(), core::convert::Infallible> {
-		let s = SecretString::from_str("test")?;
-		assert_eq!(s.to_insecure().as_str(), "test");
+	fn a_secret_string_parses_from_a_str() -> TestResult {
+		let secret = SecretString::from_str("test")?;
+		assert_eq!(secret.to_insecure().as_str(), "test");
 		Ok(())
 	}
 
+	/// An exposed sized secret hands back the value it wrapped.
 	#[test]
-	fn test_to_insecure_sized() {
-		let s: Secret<[u8; 2]> = Secret::from([1u8, 2u8]);
-		let raw = s.to_insecure();
+	fn an_exposed_sized_secret_hands_back_its_value() {
+		let secret: Secret<[u8; 2]> = Secret::from([1u8, 2u8]);
+		let raw = secret.to_insecure();
 		assert_eq!(*raw, [1, 2]);
 	}
 
+	/// An exposed secret string hands back the text it wrapped.
 	#[test]
-	fn test_to_insecure_buffers() {
-		let s: SecretString = SecretString::from("abc");
-		assert_eq!(s.to_insecure().as_str(), "abc");
+	fn an_exposed_secret_string_hands_back_its_text() {
+		let secret = SecretString::from("abc");
+		assert_eq!(secret.to_insecure().as_str(), "abc");
+	}
 
-		let s2: SecretSlice<u8> = Vec::from([9u8, 8u8, 7u8]).into();
-		assert_eq!(s2.to_insecure().as_slice(), &[9, 8, 7]);
+	/// An exposed secret slice hands back the octets it wrapped.
+	#[test]
+	fn an_exposed_secret_slice_hands_back_its_octets() {
+		let secret: SecretSlice<u8> = Vec::from([9u8, 8u8, 7u8]).into();
+		assert_eq!(secret.to_insecure().as_slice(), &[9, 8, 7]);
 	}
 
 	/// Wrapping a buffer keeps its allocation, so the bytes that arrived are
@@ -142,8 +150,8 @@ mod tests {
 	/// Compiles only for a type whose values wipe when they drop.
 	fn assert_wipes_on_drop<T: ZeroizeOnDrop>() {}
 
-	// An exposed secret still owns key material, so the value it hands back
-	// wipes when it drops.
+	/// An exposed secret still owns key material, so the value it hands back
+	/// wipes when it drops.
 	#[test]
 	fn an_exposed_secret_wipes_on_drop() {
 		assert_wipes_on_drop::<<Secret<[u8; 2]> as ToInsecure>::Raw>();
@@ -151,10 +159,18 @@ mod tests {
 		assert_wipes_on_drop::<<SecretString as ToInsecure>::Raw>();
 	}
 
+	/// `with` lends the wrapped value to its closure.
 	#[test]
-	fn test_with_immutable_access() {
-		let s: SecretString = SecretString::from("abcdef");
-		assert_eq!(s.with(String::len), 6);
-		assert_eq!(s.to_insecure().as_str(), "abcdef");
+	fn a_secret_lends_its_value_to_a_closure() {
+		let secret = SecretString::from("abcdef");
+		assert_eq!(secret.with(String::len), 6);
+	}
+
+	/// A loan through `with` leaves the wrapped value in place.
+	#[test]
+	fn a_lent_secret_keeps_its_value() {
+		let secret = SecretString::from("abcdef");
+		secret.with(String::len);
+		assert_eq!(secret.to_insecure().as_str(), "abcdef");
 	}
 }

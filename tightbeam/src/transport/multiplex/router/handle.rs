@@ -524,218 +524,210 @@ mod tests {
 
 	use futures::channel::mpsc;
 
-	use super::super::body::BodyEvent;
-	use super::super::testing::{client_shared, poll_now};
+	use super::super::body::{BodyEvent, DrainNote};
+	use super::super::fixtures::{next_mux, poll_now, FIXTURE_PEER_CAP};
 	use super::*;
+	use crate::testing::TestResult;
 	use crate::transport::envelopes::MuxEnvelope;
+	use crate::transport::multiplex::{MuxRole, MuxSettings};
 
-	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>) {
-		let (outbound, sent) = mpsc::channel(8);
-		let (link, _) = MuxLink::new(client_shared(), outbound);
-		let handle = MuxHandle { link };
-		(handle, sent)
+	/// A client handle over a fresh link, beside the receiver of its outbound
+	/// queue and the receiver of its drain notes.
+	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>, mpsc::Receiver<DrainNote>) {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
+		let (link, sent, notes) = MuxLink::over(shared, 8);
+		(MuxHandle { link }, sent, notes)
 	}
 
-	// Abandoning a duplex reply after the sink closed must reclaim
-	// the stream: without the body's drop guard the cap slot and
-	// the duplex forwarder stay pinned until the peer's trailer.
+	/// Receives the peer's GoAway above stream 0 on `shared`, whose trace
+	/// injects no fault.
+	fn receive_goaway(shared: &MuxShared) {
+		let received = shared.fail_pending_above(0, GoAwayReason::Shutdown);
+		received.expect("a state with no fault model records the GoAway");
+	}
+
+	/// Abandoning a duplex reply after the sink closed must reclaim the
+	/// stream: without the body's drop guard the cap slot and the duplex
+	/// forwarder stay pinned until the peer's trailer.
 	#[test]
-	fn test_stream_body_drop_cancels_abandoned_duplex_reply() {
-		let (handle, mut sent) = duplex_handle();
-		let (sink, body) = handle.open_duplex().expect("fresh connection has stream slots");
+	fn a_dropped_body_cancels_its_abandoned_duplex_reply() -> TestResult {
+		let (handle, mut sent, _notes) = duplex_handle();
+		let (sink, body) = handle.open_duplex()?;
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 
 		drop(body);
 
-		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(_))))
-		));
-		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package))))
-				if package.stream_id() == 1
-		));
+		assert!(matches!(next_mux(&mut sent), Some(MuxEnvelope::Open(_))));
+		assert!(matches!(next_mux(&mut sent), Some(MuxEnvelope::Cancel(package)) if package.stream_id() == 1));
 		assert!(handle.link.shared().take_duplex(1).is_none());
 		assert!(!handle.link.shared().is_pending(1));
-	}
-
-	// open_stream_to stamps the grpc-style route on the stream's
-	// Open record so a gateway responder can dispatch or splice by
-	// target. The origin open carries the default relay budget.
-	#[test]
-	fn test_open_stream_to_stamps_route_on_open() -> TransportResult<()> {
-		let (handle, mut sent) = duplex_handle();
-		let target = crate::urn!("tb", "servlet:ledger");
-		let (sink, _response) = handle.open_stream_to(target.clone())?;
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
-		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.target() == Some(&target) && package.hops_remaining() == DEFAULT_HOP_BUDGET
-		));
-
 		Ok(())
 	}
 
-	// An explicit spent budget reaches the Open, so a peer gateway serves
-	// the stream locally and never re-forwards it.
-	#[test]
-	fn test_open_stream_with_relayed_route_stamps_budget() -> TransportResult<()> {
-		let (handle, mut sent) = duplex_handle();
-		let target = crate::urn!("tb", "servlet:ledger");
-		let (sink, _response) = handle.open_stream_with_route(StreamRoute::from_parts(Some(target.clone()), 0))?;
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
-		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.target() == Some(&target) && package.hops_remaining() == 0
-		));
+	/// An open, the target its Open record names, and the relay budget it
+	/// stamps.
+	type RouteCase = (fn(&MuxHandle) -> TransportResult<RequestSink>, Option<Urn<'static>>, u8);
 
-		Ok(())
+	// An open stamps its route on the Open record of its stream: a routed
+	// open names its target so a gateway responder can dispatch or splice by
+	// it, an explicit spent budget reaches the Open so a peer gateway serves
+	// the stream locally and never forwards it again, and the unrouted open
+	// carries no target. An origin open carries the default relay budget.
+	crate::tb_cases! {
+		fn an_open_stamps_its_route_on_the_open_record((open, target, hops): RouteCase) -> TestResult {
+			let (handle, mut sent, _notes) = duplex_handle();
+			let sink = open(&handle)?;
+
+			let closed = poll_now(sink.close());
+			assert!(matches!(closed, Poll::Ready(Ok(()))));
+			assert!(matches!(
+				next_mux(&mut sent),
+				Some(MuxEnvelope::Open(package))
+					if package.target() == target.as_ref() && package.hops_remaining() == hops
+			));
+			Ok(())
+		}
+		cases {
+			to_a_target => (
+				|handle| handle.open_stream_to(crate::urn!("tb", "servlet:ledger")).map(|(sink, _response)| sink),
+				Some(crate::urn!("tb", "servlet:ledger")),
+				DEFAULT_HOP_BUDGET,
+			),
+			with_a_spent_relay_budget => (
+				|handle| {
+					let route = StreamRoute::from_parts(Some(crate::urn!("tb", "servlet:ledger")), 0);
+					handle.open_stream_with_route(route).map(|(sink, _response)| sink)
+				},
+				Some(crate::urn!("tb", "servlet:ledger")),
+				0,
+			),
+			local => (|handle| handle.open_stream().map(|(sink, _response)| sink), None, DEFAULT_HOP_BUDGET),
+		}
 	}
 
-	// The unrouted open path carries no route: open_stream emits an
-	// Open with no target and the default relay budget.
+	/// A failed connection refuses the first push, and the body has ended
+	/// with it.
 	#[test]
-	fn test_open_stream_local_open_has_no_route() -> TransportResult<()> {
-		let (handle, mut sent) = duplex_handle();
-		let (sink, _response) = handle.open_stream()?;
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
-		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.target().is_none() && package.hops_remaining() == DEFAULT_HOP_BUDGET
-		));
-
-		Ok(())
-	}
-
-	// A failed connection refuses the first push, and the body has ended with
-	// it.
-	#[test]
-	fn test_duplex_body_ends_when_the_open_meets_a_failed_connection() -> TransportResult<()> {
-		let (handle, _sent) = duplex_handle();
+	fn a_duplex_body_ends_when_its_open_meets_a_failed_connection() -> TestResult {
+		let (handle, _sent, _notes) = duplex_handle();
 		let (mut sink, mut body) = handle.open_duplex()?;
 		handle.link.shared().fail_all_pending();
 
 		let pushed = poll_now(sink.push([1u8]));
 		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
-
-		let ended = body.poll_chunk_now();
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		assert!(matches!(
+			body.poll_chunk_now(),
+			Poll::Ready(Err(TransportError::ConnectionClosed))
+		));
 		Ok(())
 	}
 
-	// The body reports what it drained under its stream ID, and it learns that
-	// ID from the slot it shares with the reservation.
+	/// The body reports what it drained under its stream ID, and it learns
+	/// that ID from the slot it shares with the reservation.
 	#[test]
-	fn test_duplex_body_reports_drains_under_the_opened_id() -> TransportResult<()> {
-		let (outbound, _sent) = mpsc::channel(8);
-		let (link, mut notes) = MuxLink::new(client_shared(), outbound);
-		let handle = MuxHandle { link };
+	fn a_duplex_body_reports_drains_under_the_opened_id() -> TestResult {
+		let (handle, _sent, mut notes) = duplex_handle();
 		let (mut sink, mut body) = handle.open_duplex()?;
 		assert!(matches!(poll_now(sink.push([1u8])), Poll::Ready(Ok(()))));
 
-		let mut forwarder = handle.link.shared().take_duplex(1).expect("the open registered the forwarder");
+		let mut forwarder = handle.link.shared().take_duplex(1).ok_or("the open registered the forwarder")?;
 		assert!(forwarder.accept_and_forward([7u8]));
-		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(Some(_)))));
 
-		let note = notes.try_recv();
-		assert!(matches!(note, Ok(note) if note.stream_id == 1 && note.consumed == 1));
+		let chunk = body.poll_chunk_now();
+		assert!(matches!(chunk, Poll::Ready(Ok(Some(_)))));
+		assert!(matches!(notes.try_recv(), Ok(note) if note.stream_id == 1 && note.consumed == 1));
 		Ok(())
 	}
 
-	// A stream that is reserved and not yet opened has to end with its
-	// connection, even while its sink is alive and has pushed nothing.
-	#[test]
-	fn test_unopened_stream_response_ends_on_connection_failure() -> TransportResult<()> {
-		let (handle, _sent) = duplex_handle();
-		let (_sink, response) = handle.open_stream()?;
-		handle.link.shared().fail_all_pending();
+	/// An end of a link and the test of the error it ends an unopened stream
+	/// with.
+	type LinkEndCase = (fn(&MuxShared), fn(&TransportError) -> bool);
 
-		let ended = poll_now(response);
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
-		Ok(())
+	// A stream that is reserved and not yet opened ends with its link, even
+	// while its sink is alive and has pushed nothing: a failed connection
+	// ends it as closed, and a GoAway in either direction ends admission, so
+	// it ends as draining.
+	crate::tb_cases! {
+		fn an_unopened_response_ends_with_its_link((end, ended_as): LinkEndCase) -> TestResult {
+			let (handle, _sent, _notes) = duplex_handle();
+			let (_sink, response) = handle.open_stream()?;
+			end(handle.link.shared());
+
+			let ended = poll_now(response);
+			assert!(matches!(&ended, Poll::Ready(Err(error)) if ended_as(error)));
+			Ok(())
+		}
+		cases {
+			on_a_connection_failure => (
+				MuxShared::fail_all_pending,
+				|error| matches!(error, TransportError::ConnectionClosed),
+			),
+			on_a_local_shutdown => (
+				|shared| {
+					shared.begin_shutdown();
+				},
+				|error| matches!(error, TransportError::Draining),
+			),
+		}
 	}
 
-	#[test]
-	fn test_unopened_duplex_body_ends_on_connection_failure() -> TransportResult<()> {
-		let (handle, _sent) = duplex_handle();
-		let (_sink, mut body) = handle.open_duplex()?;
-		handle.link.shared().fail_all_pending();
+	// An unopened duplex body ends with its link as an unopened response
+	// does.
+	crate::tb_cases! {
+		fn an_unopened_duplex_body_ends_with_its_link((end, ended_as): LinkEndCase) -> TestResult {
+			let (handle, _sent, _notes) = duplex_handle();
+			let (_sink, mut body) = handle.open_duplex()?;
+			end(handle.link.shared());
 
-		let ended = body.poll_chunk_now();
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
-		Ok(())
+			let ended = body.poll_chunk_now();
+			assert!(matches!(&ended, Poll::Ready(Err(error)) if ended_as(error)));
+			Ok(())
+		}
+		cases {
+			on_a_connection_failure => (
+				MuxShared::fail_all_pending,
+				|error| matches!(error, TransportError::ConnectionClosed),
+			),
+			on_a_peer_goaway => (receive_goaway, |error| matches!(error, TransportError::Draining)),
+		}
 	}
 
-	// A sink dropped before its first push cancels a stream that never opened,
-	// and its body reads that as a cancel on a connection that still runs.
+	/// A sink dropped before its first push cancels a stream that never
+	/// opened, and its body reads that as a cancel on a connection that still
+	/// runs.
 	#[test]
-	fn test_unopened_duplex_body_ends_cancelled_when_its_sink_drops() -> TransportResult<()> {
-		let (handle, _sent) = duplex_handle();
+	fn an_unopened_duplex_body_ends_cancelled_when_its_sink_drops() -> TestResult {
+		let (handle, _sent, _notes) = duplex_handle();
 		let (sink, mut body) = handle.open_duplex()?;
 		drop(sink);
 
-		let ended = body.poll_chunk_now();
 		assert!(matches!(
-			ended,
+			body.poll_chunk_now(),
 			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
 		));
 		Ok(())
 	}
 
-	// A GoAway in either direction ends admission, so a stream that has not
-	// opened never will.
+	/// A resolved reply disarms the guard: dropping the body after its
+	/// terminal event sends no cancel.
 	#[test]
-	fn test_unopened_stream_response_ends_on_local_shutdown() -> TransportResult<()> {
-		let (handle, _sent) = duplex_handle();
-		let (_sink, response) = handle.open_stream()?;
-		handle.link.shared().begin_shutdown();
-
-		let ended = poll_now(response);
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
-		Ok(())
-	}
-
-	#[test]
-	fn test_unopened_duplex_body_ends_on_peer_goaway() -> TransportResult<()> {
-		let (handle, _sent) = duplex_handle();
-		let (_sink, mut body) = handle.open_duplex()?;
-		handle.link.shared().fail_pending_above(0, GoAwayReason::Shutdown)?;
-
-		let ended = body.poll_chunk_now();
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::Draining))));
-		Ok(())
-	}
-
-	// A resolved reply disarms the guard: dropping the body after
-	// its terminal event sends no cancel.
-	#[test]
-	fn test_stream_body_terminal_disarms_drop_cancel() {
-		let (handle, mut sent) = duplex_handle();
-		let (sink, mut body) = handle.open_duplex().expect("fresh connection has stream slots");
+	fn a_terminal_body_disarms_its_drop_cancel() -> TestResult {
+		let (handle, mut sent, _notes) = duplex_handle();
+		let (sink, mut body) = handle.open_duplex()?;
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 
-		let mut forwarder = handle
-			.link
-			.shared()
-			.take_duplex(1)
-			.expect("open_duplex registered the forwarder");
-
+		let shared = handle.link.shared();
+		let mut forwarder = shared.take_duplex(1).ok_or("open_duplex registered the forwarder")?;
 		// The reply ledger entry is dropped so the terminal event alone, and
 		// no pending reply, decides what the drop guard sees.
-		let _ = handle.link.shared().remove_pending(1);
+		let _ = shared.remove_pending(1);
 		assert!(forwarder.forward(BodyEvent::End));
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 
 		drop(body);
 
-		assert!(matches!(
-			sent.try_recv(),
-			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(_))))
-		));
+		assert!(matches!(next_mux(&mut sent), Some(MuxEnvelope::Open(_))));
 		assert!(sent.try_recv().is_err());
+		Ok(())
 	}
 }

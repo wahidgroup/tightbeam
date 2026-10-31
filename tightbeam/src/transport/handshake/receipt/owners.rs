@@ -355,21 +355,13 @@ impl CountersignedReceipt {
 
 #[cfg(all(test, feature = "transport-hpke"))]
 mod tests {
-	use std::error::Error;
-
 	use super::*;
-	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::x509::KeyPurposes;
+	use crate::testing::{TestIdentity, TestKey, TestResult};
 	use crate::transport::handshake::tests::{
-		budget_offer, create_test_certificate, fixture_handshake_secret, fixture_transcript, signing_identity,
-		TestCertificate, TEST_BUDGETS,
+		budget_offer, fixture_handshake_secret, fixture_transcript_hash, TEST_BUDGETS,
 	};
-
-	/// The transcript hash the test receipts bind.
-	fn transcript() -> TranscriptHash {
-		fixture_transcript::<Sha3_256>([7u8; 32])
-	}
 
 	/// An accept that grants the test budgets.
 	fn budget_accept() -> TransportAccept {
@@ -386,10 +378,9 @@ mod tests {
 
 	/// The artifact a server holding `server` issues for the budget accept
 	/// over the test transcript.
-	async fn issued_by(server: &TestCertificate) -> Signed<SignedData> {
-		let identity = signing_identity(server);
+	async fn issued_by(server: &SigningIdentity) -> Signed<SignedData> {
 		let accept = budget_accept();
-		let issuing = IssuedReceipt::issue(transcript(), Some(&accept), None, true, &identity);
+		let issuing = IssuedReceipt::issue(fixture_transcript_hash(), Some(&accept), None, true, server);
 
 		let issued = issuing.await.expect("the test key signs the receipt");
 		let issued = issued.expect("a budget-bearing accept issues a receipt");
@@ -400,23 +391,27 @@ mod tests {
 	/// server Finished.
 	fn verified_under(
 		artifact: Signed<SignedData>,
-		server: &TestCertificate,
+		server: &SigningIdentity,
 	) -> Result<Option<PendingReceipt>, HandshakeError> {
 		let accept = budget_accept();
-		let identity = PeerCertificate::parse(server.certificate.clone(), KeyPurposes::HOUSE.server);
+		let identity = PeerCertificate::parse(server.certificate_arc(), KeyPurposes::HOUSE.server);
 		let identity = identity.expect("the test certificate holds a point");
 		let confirmed = ServerConfirmed::assumed(fixture_handshake_secret(0x42));
 		let artifact = Some(artifact);
-		PendingReceipt::verify::<DefaultCryptoProvider>(&confirmed, artifact, Some(&accept), &transcript(), &identity)
+		let transcript = fixture_transcript_hash();
+
+		PendingReceipt::verify::<DefaultCryptoProvider>(&confirmed, artifact, Some(&accept), &transcript, &identity)
 	}
 
+	/// A receipt the admitted server signed verifies, and the client keeps it
+	/// with the budgets it grants.
 	#[tokio::test]
-	async fn a_receipt_the_admitted_server_signed_is_kept() -> Result<(), Box<dyn Error>> {
-		let server = create_test_certificate();
+	async fn a_receipt_the_admitted_server_signed_is_kept() -> TestResult {
+		let server = TestIdentity::insecure_fixed();
 		let artifact = issued_by(&server).await;
 
 		let pending = verified_under(artifact, &server)?;
-		assert!(pending.is_some());
+		assert!(matches!(pending, Some(PendingReceipt { receipt, .. }) if receipt.budgets == TEST_BUDGETS));
 		Ok(())
 	}
 
@@ -424,8 +419,8 @@ mod tests {
 	/// the client admitted, so it is refused.
 	#[tokio::test]
 	async fn a_receipt_another_key_signed_is_refused() {
-		let server = create_test_certificate();
-		let artifact = issued_by(&create_test_certificate()).await;
+		let server = TestIdentity::insecure_fixed();
+		let artifact = issued_by(&TestIdentity::of(&TestKey::fixed(0x02))).await;
 
 		let refusal = verified_under(artifact, &server);
 		assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
@@ -435,21 +430,20 @@ mod tests {
 	/// verify, so it refuses to issue a budget-bearing receipt.
 	#[tokio::test]
 	async fn budgets_with_no_client_certificate_issue_no_receipt() {
-		let identity = signing_identity(&create_test_certificate());
+		let identity = TestIdentity::insecure_fixed();
 		let accept = budget_accept();
 
-		let issuing = IssuedReceipt::issue(transcript(), Some(&accept), None, false, &identity);
+		let issuing = IssuedReceipt::issue(fixture_transcript_hash(), Some(&accept), None, false, &identity);
 		assert!(matches!(issuing.await, Err(HandshakeError::MutualAuthRequired)));
 	}
 
 	/// An unmetered session issues no receipt.
 	#[tokio::test]
-	async fn an_accept_with_no_budgets_issues_no_receipt() -> Result<(), Box<dyn Error>> {
-		let identity = signing_identity(&create_test_certificate());
+	async fn an_accept_with_no_budgets_issues_no_receipt() {
+		let identity = TestIdentity::insecure_fixed();
 		let accept = TransportAccept { granted_budgets: None, ..budget_accept() };
 
-		let issued = IssuedReceipt::issue(transcript(), Some(&accept), None, true, &identity).await?;
-		assert!(issued.is_none());
-		Ok(())
+		let issuing = IssuedReceipt::issue(fixture_transcript_hash(), Some(&accept), None, true, &identity);
+		assert!(matches!(issuing.await, Ok(None)));
 	}
 }

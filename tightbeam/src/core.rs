@@ -663,7 +663,12 @@ mod tests {
 	};
 
 	use crate::asn1::AuthEnvelopedData;
-	use crate::testing::{TestIdentity, TestKey, TestMessage};
+	use crate::cms::signed_data::SignerIdentifier;
+	use crate::crypto::sign::Signed;
+	use crate::der::{ErrorKind, Tag};
+	use crate::oids::AES_256_GCM;
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage};
 	use crate::Beamable;
 	use crate::MessagePriority;
 	use crate::SignerInfo;
@@ -683,311 +688,187 @@ mod tests {
 		flag: bool,
 	}
 
-	/// Pin `decoded` to the type of `original`. With reduced feature sets the
-	/// `serde_json` dev-dependency's `PartialEq<Value>` impls for integers make
-	/// a bare `assert_eq!` on `decode`'s inferred output ambiguous.
-	fn assert_round_trip<T: PartialEq + core::fmt::Debug>(original: &T, decoded: &T) {
-		assert_eq!(original, decoded);
+	// A simple message decodes again from its DER to the value that wrote it.
+	crate::tb_cases! {
+		fn a_simple_message_round_trips(original: SimpleMessage) {
+			assert_eq!(der_round_trip(&original), original);
+		}
+		cases {
+			with_a_short_name => SimpleMessage { id: 42, name: "test".to_string() },
+			with_zero_fields => SimpleMessage { id: 0, name: String::new() },
+			with_the_largest_id => SimpleMessage {
+				id: u64::MAX,
+				name: "a very long name with many characters".to_string(),
+			},
+		}
 	}
 
-	/// Macro to generate encode/decode round-trip tests.
-	macro_rules! test_encode_decode {
-		($($name:ident: $value:expr,)*) => {
-			$(
-				#[test]
-				fn $name() -> Result<()> {
-					let original = $value;
-
-					let encoded = crate::encode(&original)?;
-					assert!(!encoded.is_empty());
-
-					let decoded = crate::decode(&encoded)?;
-					assert_round_trip(&original, &decoded);
-
-					// A second encode proves the decoded value is valid DER.
-					let re_encoded = crate::encode(&decoded)?;
-					assert_eq!(encoded, re_encoded);
-
-					Ok(())
-				}
-			)*
-		};
+	// A nested message decodes again from its DER to the value that wrote it.
+	crate::tb_cases! {
+		fn a_nested_message_round_trips(original: NestedMessage) {
+			assert_eq!(der_round_trip(&original), original);
+		}
+		cases {
+			with_its_flag_set => NestedMessage { value: 12345, data: vec![1, 2, 3, 4, 5], flag: true },
+			with_zero_fields => NestedMessage { value: 0, data: Vec::new(), flag: false },
+		}
 	}
 
-	test_encode_decode! {
-		encode_decode_simple_message: SimpleMessage {
-			id: 42,
-			name: "test".to_string(),
-		},
-		encode_decode_simple_message_zero: SimpleMessage {
-			id: 0,
-			name: String::new(),
-		},
-		encode_decode_simple_message_large: SimpleMessage {
-			id: u64::MAX,
-			name: "a very long name with many characters".to_string(),
-		},
-		encode_decode_nested_message: NestedMessage {
-			value: 12345,
-			data: vec![1, 2, 3, 4, 5],
-			flag: true,
-		},
-		encode_decode_nested_message_false: NestedMessage {
-			value: 0,
-			data: Vec::new(),
-			flag: false,
-		},
-		encode_decode_u32: 42u32,
-		encode_decode_u64: 9876543210u64,
-		encode_decode_bool_true: true,
-		encode_decode_bool_false: false,
+	// A boolean decodes again from its DER to the value that wrote it.
+	crate::tb_cases! {
+		fn a_bool_round_trips(original: bool) {
+			assert_eq!(der_round_trip(&original), original);
+		}
+		cases {
+			when_true => true,
+			when_false => false,
+		}
 	}
 
-	/// Macro to generate decode failure tests.
-	macro_rules! test_decode_failure {
-		($($name:ident: $data:expr => $type:ty,)*) => {
-			$(
-				#[test]
-				fn $name() {
-					let result: Result<$type> = crate::decode($data);
-					assert!(result.is_err());
-				}
-			)*
-		};
-	}
-
-	test_decode_failure! {
-		decode_invalid_der_should_fail: &vec![0xFF, 0xFF, 0xFF] => u32,
-		decode_empty_should_fail: &vec![] => u32,
-		decode_invalid_sequence: &vec![0x30, 0xFF] => SimpleMessage,
-		decode_wrong_type: &vec![0x02, 0x01, 0x2A] => SimpleMessage, // INTEGER instead of SEQUENCE
-	}
-
+	/// A `u32` decodes again from its DER to the value that wrote it.
 	#[test]
-	fn decode_truncated_should_fail() -> Result<()> {
-		let original = SimpleMessage { id: 100, name: "test".to_string() };
-		let mut encoded = crate::encode(&original)?;
-		encoded.truncate(5);
-
-		let result: Result<SimpleMessage> = crate::decode(&encoded);
-		assert!(result.is_err());
-
-		Ok(())
+	fn a_u32_round_trips() {
+		let original = 42u32;
+		assert_eq!(der_round_trip(&original), original);
 	}
 
-	/// Macro to generate TightBeam encode/decode round-trip tests.
-	macro_rules! test_tightbeam_roundtrip {
-		($($name:ident: $tightbeam:expr,)*) => {
-			$(
-				#[test]
-				fn $name() -> Result<()> {
-					let original = $tightbeam;
+	/// A `u64` past the range of a `u32` decodes again from its DER to the
+	/// value that wrote it.
+	#[test]
+	fn a_u64_round_trips() {
+		let original = 9_876_543_210u64;
+		assert_eq!(der_round_trip(&original), original);
+	}
 
-					let encoded = crate::encode(&original)?;
-					assert!(!encoded.is_empty());
+	// The decode of a `u32` refuses octets that hold no DER INTEGER, with the
+	// kind of the refusal.
+	crate::tb_cases! {
+		fn a_u32_decode_refuses((der, kind): (&[u8], ErrorKind)) {
+			let refused = crate::decode::<u32>(der);
+			assert!(matches!(refused, Err(TightBeamError::SerializationError(error)) if error.kind() == kind));
+		}
+		cases {
+			invalid_der => (&[0xFF, 0xFF, 0xFF], ErrorKind::TagNumberInvalid),
+			empty_input => (&[], ErrorKind::Incomplete { expected_len: 1u8.into(), actual_len: 0u8.into() }),
+		}
+	}
 
-					let decoded: Frame = crate::decode(&encoded)?;
-					assert_eq!(original, decoded);
+	// The decode of a simple message refuses octets that hold no DER encoding
+	// of one, with the kind of the refusal.
+	crate::tb_cases! {
+		fn a_simple_message_decode_refuses((der, kind): (&[u8], ErrorKind)) {
+			let refused = crate::decode::<SimpleMessage>(der);
+			assert!(matches!(refused, Err(TightBeamError::SerializationError(error)) if error.kind() == kind));
+		}
+		cases {
+			a_sequence_of_invalid_length => (&[0x30, 0xFF], ErrorKind::Length { tag: Tag::Sequence }),
+			an_integer_in_place_of_a_sequence => (
+				&[0x02, 0x01, 0x2A],
+				ErrorKind::TagUnexpected { expected: Some(Tag::Sequence), actual: Tag::Integer }
+			),
+			/// The first five octets of the DER of
+			/// `SimpleMessage { id: 100, name: "test" }`.
+			a_truncated_encoding => (
+				&[0x30, 0x09, 0x02, 0x01, 0x64],
+				ErrorKind::Length { tag: Tag::Sequence }
+			),
+		}
+	}
 
-					// A second encode proves the decoded value is valid DER.
-					let re_encoded = crate::encode(&decoded)?;
-					assert_eq!(encoded, re_encoded);
+	/// A V2 frame of [`TestMessage::sample`] under `id` that carries a seal, a
+	/// signature, a message digest, a priority, and a lifetime.
+	fn full_v2(id: &str) -> Frame {
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-					Ok(())
-				}
-			)*
+		let (_, cipher) = TestKey::insecure_fixed_cipher();
+		let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+		let built = compose! {
+			V2: id: id,
+				order: TestFrame::ORDER,
+				message: TestMessage::sample(None),
+				confidentiality: cipher,
+				nonrepudiation<Secp256k1Signature, _>: signer,
+				message_integrity<Sha3_256>: [],
+				priority: MessagePriority::HighThroughput,
+				lifetime: 3600
 		};
+		built.expect("a V2 frame carries each of its fields")
 	}
 
-	test_tightbeam_roundtrip! {
-		tightbeam_v0_minimal: {
-			let message = TestMessage::sample(None);
-			compose! {
-				V0:
-					id: "test-001",
-					order: 1696521600,
-					message: message,
-			}?
-		},
-		tightbeam_v0_large_value: {
-			let message = TestMessage::sample(Some(&("A".repeat(1000))));
-			compose! {
-				V0:
-					id: "test-002",
-					order: 1696521700,
-					message: message
-			}?
-		},
-		tightbeam_v1_encrypted: {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-
-			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-			compose! {
-				V1: id: "test-003",
-					order: 1696521800,
-					message: message,
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
-			}?
-		},
-		tightbeam_v2_full: {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-			use crate::crypto::hash::Sha3_256;
-
-			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-			compose! {
-				V2: id: "test-004",
-					order: 1696521900,
-					message: message,
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					message_integrity<Sha3_256>: [],
-					priority: MessagePriority::HighThroughput,
-					lifetime: 3600
-			}?
-		},
+	// A frame of each version decodes again from its DER to the frame that
+	// wrote it.
+	crate::tb_cases! {
+		fn a_frame_round_trips(original: Frame) {
+			assert_eq!(der_round_trip(&original), original);
+		}
+		cases {
+			v0_minimal => TestFrame::v0(None, Some("test-001")),
+			v0_large_value => TestFrame::v0(Some(&"A".repeat(1000)), Some("test-002")),
+			v1_sealed_signed => TestFrame::sealed_signed(Version::V1, "test-003"),
+			v2_full => full_v2("test-004"),
+		}
 	}
 
-	/// Macro to test TightBeam conversions.
-	macro_rules! test_tightbeam_conversions {
-		($($name:ident: $tightbeam:expr => $target:ty,)*) => {
-			$(
-				#[test]
-				fn $name() -> Result<()> {
-					let tightbeam = $tightbeam;
-					let _converted: $target = tightbeam.clone().into();
-
-					Ok(())
-				}
-			)*
-		};
+	/// A frame converts into its metadata, which keeps the id of the frame.
+	#[test]
+	fn a_frame_converts_into_its_metadata() {
+		let frame = TestFrame::v0(None, Some("meta-001"));
+		let metadata = Metadata::from(frame);
+		assert_eq!(metadata.id(), "meta-001".as_bytes());
 	}
 
-	test_tightbeam_conversions! {
-		tightbeam_to_metadata_v0: {
-			let message = TestMessage::sample(None);
-			compose! {
-				V0:
-					id: "meta-001",
-					order: 1000,
-					message: message
-			}?
-		} => Metadata,
-		tightbeam_to_protocol_version: {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-			use crate::crypto::hash::Sha3_256;
-
-			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-			compose! {
-				V2:
-					id: "ver-001",
-					order: 2000,
-					message: message,
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					message_integrity<Sha3_256>: [],
-					priority: MessagePriority::Expedited,
-					lifetime: 60
-			}?
-		} => Version,
+	/// A frame converts into the version it was built at.
+	#[test]
+	fn a_frame_converts_into_its_version() {
+		let frame = TestFrame::sealed_signed(Version::V2, "ver-001");
+		let version = Version::from(frame);
+		assert_eq!(version, Version::V2);
 	}
 
-	/// Macro to test TightBeam TryFrom conversions (owned only).
-	macro_rules! test_tightbeam_try_conversions {
-		(success: $($name:ident: $tightbeam:expr => $target:ty,)*) => {
-			$(
-				#[test]
-				fn $name() -> Result<()> {
-					let tightbeam = $tightbeam;
-					let result: Result<$target> = tightbeam.try_into();
-					assert!(result.is_ok());
+	/// A check that the outcome of a conversion of a frame is the one its row
+	/// names.
+	type Verdict<T> = fn(Result<T>) -> bool;
 
-					Ok(())
-				}
-			)*
-		};
-		(failure: $($name:ident: $tightbeam:expr => $target:ty,)*) => {
-			$(
-				#[test]
-				fn $name() -> Result<()> {
-					let tightbeam = $tightbeam;
-					let result: Result<$target> = tightbeam.try_into();
-					assert!(result.is_err());
-
-					Ok(())
-				}
-			)*
-		};
+	// A frame yields the signer info it carries, here the one that names the
+	// fixed signing key, and a V0 frame, which carries none, yields
+	// `MissingSignature`.
+	crate::tb_cases! {
+		fn a_frame_yields_its_signer_info((frame, verdict): (Frame, Verdict<Signed<SignerInfo>>)) {
+			let signer_info = Signed::<SignerInfo>::try_from(frame);
+			assert!(verdict(signer_info));
+		}
+		cases {
+			v1_sealed_signed => (TestFrame::sealed_signed(Version::V1, "sig-001"), |converted| {
+				let signer = converted.map(|signed| signed.into_inner().sid);
+				let fixed = TestKey::INSECURE_FIXED_KEY_IDENTIFIER;
+				matches!(signer, Ok(SignerIdentifier::SubjectKeyIdentifier(key)) if key.0.as_bytes() == fixed)
+			}),
+			v0 => (TestFrame::v0(None, Some("fail-001")), |converted| {
+				matches!(converted, Err(TightBeamError::MissingSignature))
+			}),
+		}
 	}
 
-	test_tightbeam_try_conversions! {
-		success:
-		tightbeam_v1_to_signature_info: {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-
-			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-			compose! {
-				V1: id: "sig-001",
-					order: 3000,
-					message: message,
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
-			}?
-		} => crate::crypto::sign::Signed<SignerInfo>,
-		tightbeam_v2_to_encryption_info: {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-			use crate::crypto::hash::Sha3_256;
-
-			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-			compose! {
-				V2:
-					id: "enc-001",
-					order: 4000,
-					message: message,
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					message_integrity<Sha3_256>: [],
-					priority: MessagePriority::LowLatency,
-					lifetime: 120
-			}?
-		} => AuthEnvelopedData,
-	}
-
-	test_tightbeam_try_conversions! {
-		failure: // These conversions should fail due to missing fields.
-		tightbeam_v0_to_signature_info_fails: {
-			let message = TestMessage::sample(None);
-			compose! {
-				V0:
-					id: "fail-001",
-					order: 5000,
-					message: message
-			}?
-		} => crate::crypto::sign::Signed<SignerInfo>,
-		tightbeam_v0_to_encryption_info_fails: {
-			let message = TestMessage::sample(None);
-			compose! {
-				V0:
-					id: "fail-002",
-					order: 6000,
-					message: message
-			}?
-		} => AuthEnvelopedData,
+	// A frame yields the envelope that seals its body, here one under
+	// AES-256-GCM, and a V0 frame, which carries none, yields
+	// `MissingEncryptionInfo`.
+	crate::tb_cases! {
+		fn a_frame_yields_its_envelope((frame, verdict): (Frame, Verdict<AuthEnvelopedData>)) {
+			let envelope = AuthEnvelopedData::try_from(frame);
+			assert!(verdict(envelope));
+		}
+		cases {
+			v2_sealed_signed => (TestFrame::sealed_signed(Version::V2, "enc-001"), |converted| {
+				matches!(
+					converted,
+					Ok(envelope) if envelope.auth_encrypted_content_info.content_enc_alg.oid == AES_256_GCM
+				)
+			}),
+			v0 => (TestFrame::v0(None, Some("fail-002")), |converted| {
+				matches!(converted, Err(TightBeamError::MissingEncryptionInfo))
+			}),
+		}
 	}
 
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
@@ -1010,26 +891,36 @@ mod tests {
 		data: String,
 	}
 
+	/// Every message type names a profile type that implements
+	/// `SecurityProfile`, whether it declares a numeric level, a type path, or
+	/// no profile. A type that names another type fails to compile.
 	#[test]
-	#[allow(clippy::assertions_on_constants)]
-	fn test_profile_types() {
-		// Every message type must expose a Profile type that implements
-		// SecurityProfile.
+	fn every_message_type_names_a_security_profile() {
 		fn assert_security_profile<P: crate::crypto::profiles::SecurityProfile>() {}
-
 		assert_security_profile::<<NumericProfileMessage as crate::Message>::Profile>();
 		assert_security_profile::<<TypeProfileMessage as crate::Message>::Profile>();
 		assert_security_profile::<<NoProfileMessage as crate::Message>::Profile>();
+	}
 
-		// A type-based profile resolves to the named profile type.
-		assert_eq!(
-			core::any::TypeId::of::<<TypeProfileMessage as crate::Message>::Profile>(),
-			core::any::TypeId::of::<crate::crypto::profiles::TightbeamProfile>()
-		);
+	/// A type-based profile resolves to the profile type that the path names.
+	#[test]
+	fn a_type_path_profile_resolves_to_its_type() {
+		let resolved = core::any::TypeId::of::<<TypeProfileMessage as crate::Message>::Profile>();
+		let named = core::any::TypeId::of::<crate::crypto::profiles::TightbeamProfile>();
+		assert_eq!(resolved, named);
+	}
 
-		assert!(!NumericProfileMessage::HAS_PROFILE);
-		assert!(TypeProfileMessage::HAS_PROFILE);
-		assert!(!NoProfileMessage::HAS_PROFILE);
+	// A message type declares a profile of its own through a type path alone,
+	// so a numeric level and no profile both leave `HAS_PROFILE` unset.
+	crate::tb_cases! {
+		fn only_a_type_path_declares_a_profile((declared, expected): (bool, bool)) {
+			assert_eq!(declared, expected);
+		}
+		cases {
+			numeric_level => (NumericProfileMessage::HAS_PROFILE, false),
+			type_path => (TypeProfileMessage::HAS_PROFILE, true),
+			no_profile => (NoProfileMessage::HAS_PROFILE, false),
+		}
 	}
 
 	/// A level-1 message that also declares a minimum version above the V1 of
@@ -1040,14 +931,6 @@ mod tests {
 		id: u64,
 	}
 
-	/// A numeric level and a `min_version` combine to the stricter of the two,
-	/// as the level's flags combine with the declared ones.
-	#[test]
-	fn a_numeric_level_keeps_a_higher_declared_minimum_version() -> Result<()> {
-		assert_eq!(LeveledRecentMessage::MIN_VERSION, Version::V2);
-		Ok(())
-	}
-
 	/// A level-1 message that also declares a minimum version below the V1 of
 	/// the level.
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
@@ -1056,97 +939,79 @@ mod tests {
 		id: u64,
 	}
 
-	/// A numeric level keeps its own minimum version above a lower declared
-	/// one.
-	#[test]
-	fn a_numeric_level_keeps_its_minimum_above_a_lower_declared_version() -> Result<()> {
-		assert_eq!(LeveledEarlyMessage::MIN_VERSION, Version::V1);
-		Ok(())
+	// A numeric level and a `min_version` combine to the stricter of the two,
+	// as the flags of the level combine with the declared ones.
+	crate::tb_cases! {
+		fn a_numeric_level_keeps_the_stricter_minimum_version((declared, expected): (Version, Version)) {
+			assert_eq!(declared, expected);
+		}
+		cases {
+			/// The declared V2 is above the V1 of level 1.
+			higher_declared => (LeveledRecentMessage::MIN_VERSION, Version::V2),
+			/// The V1 of level 1 is above the declared V0.
+			lower_declared => (LeveledEarlyMessage::MIN_VERSION, Version::V1),
+		}
 	}
 
 	/// The typed decodes outside the router, each held to the requirements of
 	/// its message type.
 	mod typed_decode {
-		use super::*;
 		use crate::core::{Requirement, RequirementError};
 		use crate::frame::BodyTransform;
+		use crate::testing::fixtures::{RecentNote, SignedNote};
 		use crate::TightBeamError;
 
-		/// A note whose type requires a signature. Its DER is the DER of
-		/// [`TestMessage`].
-		#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
-		#[beam(nonrepudiable)]
-		struct SignedNote {
-			content: String,
-		}
-
-		/// A note whose type requires V2 or later. Its DER is the DER of
-		/// [`TestMessage`].
-		#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
-		#[beam(min_version = "V2")]
-		struct RecentNote {
-			content: String,
-		}
+		use super::*;
 
 		/// An encrypted frame that carries no signature is no carrier of a type
 		/// that requires one, so the typed decrypt refuses it before the open.
 		#[tokio::test]
-		async fn a_typed_decrypt_refuses_a_frame_without_the_signature_its_type_requires() -> Result<()> {
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let message = TestMessage::sample(None);
-			let frame = compose! { V1: id: "unsigned", order: 1u64, message: message, confidentiality: cipher }?;
+		async fn a_typed_decrypt_refuses_a_frame_without_the_signature_its_type_requires() {
+			let frame = TestFrame::sealed("unsigned");
 
 			let (_, key) = TestKey::insecure_fixed_cipher();
 			let refused = frame.decrypt::<SignedNote>(&key, None).await;
 			let unprotected = RequirementError::Unprotected(Requirement::NonRepudiation);
 			assert!(matches!(refused, Err(TightBeamError::Requirement(error)) if error == unprotected));
-			Ok(())
 		}
 
 		/// The borrowed decode holds a V0 frame to the V2 minimum of its type.
 		#[test]
-		fn a_borrowed_decode_refuses_a_frame_below_its_minimum_version() -> Result<()> {
-			let message = TestMessage::sample(None);
-			let frame = compose! { V0: id: "recent", order: 1u64, message: message }?;
+		fn a_borrowed_decode_refuses_a_frame_below_its_minimum_version() {
+			let frame = TestFrame::v0(None, Some("recent"));
 
 			let refused = frame.decode_message::<RecentNote>();
 			let below = RequirementError::Version((Version::V0, Version::V2).into());
 			assert!(matches!(refused, Err(TightBeamError::Requirement(error)) if error == below));
-			Ok(())
 		}
 
 		/// An encrypted body is opaque, so the borrowed decode refuses it
 		/// before it reads the body.
 		#[test]
-		fn a_borrowed_decode_refuses_an_encrypted_body() -> Result<()> {
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let message = TestMessage::sample(None);
-			let frame = compose! { V1: id: "sealed", order: 1u64, message: message, confidentiality: cipher }?;
+		fn a_borrowed_decode_refuses_an_encrypted_body() {
+			let frame = TestFrame::sealed("sealed");
 
 			let refused = frame.decode_message::<TestMessage>();
 			assert!(matches!(refused, Err(TightBeamError::OpaqueBody(BodyTransform::Decrypt))));
-			Ok(())
 		}
 
 		/// A V0 frame is below the V2 minimum of its type, so the typed
 		/// delivery of a servlet refuses it before the handler runs.
 		#[cfg(all(feature = "colony", feature = "instrument"))]
 		#[tokio::test]
-		async fn a_typed_servlet_delivery_refuses_a_frame_below_the_minimum_of_its_type() -> Result<()> {
+		async fn a_typed_servlet_delivery_refuses_a_frame_below_the_minimum_of_its_type() {
 			use std::sync::Arc;
 
 			use crate::colony::servlet::ServletContext;
 			use crate::testing::fixtures::TestTrace;
 
 			let ctx = ServletContext::new(Arc::new(TestTrace::with_detail(false)), Arc::new(()), [], None);
-			let message = TestMessage::sample(None);
-			let frame = compose! { V0: id: "recent", order: 1u64, message: message }?;
+			let frame = TestFrame::v0(None, Some("recent"));
 
 			let handler = |_: RecentNote, _: Frame, _: &ServletContext| async { Ok(None) };
 			let refused = frame.dispatch_typed_unary(&ctx, handler).await;
 			let below = RequirementError::Version((Version::V0, Version::V2).into());
 			assert!(matches!(refused, Err(TightBeamError::Requirement(error)) if error == below));
-			Ok(())
 		}
 	}
 }

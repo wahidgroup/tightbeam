@@ -85,6 +85,11 @@ pub use fixtures::{Aes256Sha3_512Profile, Aes256Sha3_512Provider};
 #[cfg(feature = "testing-fmea")]
 pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 
+/// The return type of a fallible unit test, into which `?` converts each
+/// error.
+#[cfg(test)]
+pub(crate) type TestResult = Result<(), Box<dyn core::error::Error>>;
+
 #[cfg(test)]
 mod tests {
 	use crate::exactly;
@@ -103,9 +108,11 @@ mod tests {
 		}
 	}
 
+	/// The spec macro registers each version it declares under the name of
+	/// the spec.
 	#[test]
-	fn build_demo_spec() {
-		let s = DemoSpec::get(1, 0, 0).expect("version exists");
-		assert_eq!(s.id(), "DemoSpec");
+	fn a_declared_version_resolves_under_the_spec_name() {
+		let resolved = DemoSpec::get(1, 0, 0).map(|spec| spec.id());
+		assert_eq!(resolved, Some("DemoSpec"));
 	}
 }

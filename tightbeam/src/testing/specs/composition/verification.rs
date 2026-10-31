@@ -193,62 +193,25 @@ impl From<NonDeterminismError> for CompositionError {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+	use crate::testing::fixtures::TestProcess;
 
-	fn deadlock_process() -> Process {
-		Process::builder("Deadlock")
-			.initial_state(State("s0"))
-			.add_state(State("s0"))
-			.add_state(State("s1"))
-			.add_observable(Event("a"))
-			.add_transition(State("s0"), Event("a"), State("s1"))
-			.build()
-			.expect("Failed to build process")
+	/// One property check over a process, as whether the process passes it.
+	type Check = fn(&Process) -> bool;
+
+	/// A process in which `a` takes `s0` to `s1`, which is not terminal and
+	/// enables nothing.
+	fn stuck_after_a() -> Process {
+		TestProcess {
+			observable: &["a"],
+			transitions: &[("s0", "a", "s1")],
+			..TestProcess::of("Deadlock", "s0")
+		}
+		.build()
 	}
 
-	fn non_deadlock_process() -> Process {
-		Process::builder("NonDeadlock")
-			.initial_state(State("s0"))
-			.add_state(State("s0"))
-			.add_state(State("s1"))
-			.add_observable(Event("a"))
-			.add_transition(State("s0"), Event("a"), State("s1"))
-			.add_terminal(State("s1"))
-			.build()
-			.expect("Failed to build process")
-	}
-
-	fn deterministic_process() -> Process {
-		Process::builder("Det")
-			.initial_state(State("s0"))
-			.add_state(State("s0"))
-			.add_state(State("s1"))
-			.add_observable(Event("a"))
-			.add_transition(State("s0"), Event("a"), State("s1"))
-			.add_terminal(State("s1"))
-			.build()
-			.expect("Failed to build process")
-	}
-
-	#[test]
-	fn test_deadlock_detection_finds_deadlock() {
-		let p = deadlock_process();
-		let result = DeadlockChecker::check(&p);
-		assert!(result.is_err());
-	}
-
-	#[test]
-	fn test_deadlock_detection_no_deadlock() {
-		let p = non_deadlock_process();
-		let result = DeadlockChecker::check(&p);
-		assert!(result.is_ok());
-	}
-
-	#[test]
-	fn test_determinism_check_deterministic() {
-		let p = deterministic_process();
-		let result = DeterminismChecker::check(&p);
-		assert!(result.is_ok());
+	/// A process in which `a` takes `s0` to the terminal `s1`.
+	fn a_once() -> Process {
+		TestProcess::chain("Det", &["s0", "s1"], &["a"])
 	}
 
 	/// A process where `x` and `y` each lead from every state of `a` to `l`
@@ -272,6 +235,32 @@ mod tests {
 		builder.build().expect("a process with an initial state builds")
 	}
 
+	/// A deadlock names the first state that enables nothing and is not
+	/// terminal.
+	#[test]
+	fn a_state_that_enables_nothing_and_is_not_terminal_is_a_deadlock() {
+		let process = stuck_after_a();
+		let checked = DeadlockChecker::check(&process);
+		assert_eq!(checked.err().map(|error| error.state), Some(State("s1")));
+	}
+
+	// Each check passes a chain that ends in a terminal state.
+	crate::tb_cases! {
+		fn a_chain_to_a_terminal_state_passes_the_check(check: Check) {
+			let process = a_once();
+			let passed = check(&process);
+			assert!(passed);
+		}
+
+		cases {
+			of_deadlock => |process| DeadlockChecker::check(process).is_ok(),
+			of_determinism => |process| DeterminismChecker::check(process).is_ok(),
+			of_livelock => |process| LivelockChecker::check(process).is_ok(),
+		}
+	}
+
+	/// The witness of nondeterminism names the first state and event by name,
+	/// with the targets sorted.
 	#[test]
 	fn the_witness_names_the_first_state_and_event_by_name_with_sorted_targets() {
 		let process = nondeterministic_everywhere();
@@ -282,38 +271,15 @@ mod tests {
 		assert_eq!(witness, Some((State("a"), Event("x"), targets)));
 	}
 
+	/// A hidden cycle with an observable exit is a livelock, and the error
+	/// names the states of the cycle.
 	#[test]
-	fn test_livelock_detection_no_livelock() {
-		let p = deterministic_process();
-		let result = LivelockChecker::check(&p);
-		assert!(result.is_ok());
-	}
-
-	/// A process whose hidden `t` and `u` take `s1` to `s2` and back, with the
-	/// observable exit `b` at `s2`.
-	fn spinning() -> Result<Process, ProcessBuildError> {
-		Process::builder("Spinning")
-			.initial_state(State("s0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("s0"), Event("a"), State("s1"))
-			.add_transition(State("s1"), Event("t"), State("s2"))
-			.add_transition(State("s2"), Event("u"), State("s1"))
-			.add_transition(State("s2"), Event("b"), State("s3"))
-			.add_terminal(State("s3"))
-			.build()
-	}
-
-	#[test]
-	fn a_hidden_cycle_with_an_observable_exit_is_a_livelock() -> Result<(), ProcessBuildError> {
-		let process = spinning()?;
+	fn a_hidden_cycle_with_an_observable_exit_is_a_livelock() {
+		let process = TestProcess::spinning();
 		let checked = LivelockChecker::check(&process);
 
 		let cycle = checked.err().map(|error| error.cycle);
-		let spin = vec![State("s1"), State("s2")];
-		assert_eq!(cycle, Some(spin), "the run of `t` and `u` can go on forever");
-		Ok(())
+		let spin = vec![State("S1"), State("S2")];
+		assert_eq!(cycle, Some(spin));
 	}
 }

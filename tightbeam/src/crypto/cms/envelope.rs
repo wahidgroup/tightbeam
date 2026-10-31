@@ -570,7 +570,6 @@ impl AuthEnvelopedData {
 	) -> Result<(Self, Vec<u8>, Range<usize>), EnvelopeError> {
 		DerAdmission::Cms.admit(arrived)?;
 		let decoded = ArrivedEnvelope::read(arrived)?;
-
 		let ArrivedContentInfo { content_type: encrypted_type, content_enc_alg, encrypted_content } =
 			decoded.auth_encrypted_content_info;
 
@@ -757,6 +756,7 @@ impl<A: ContentEncryption> Draw<A> {
 		let content_enc_alg = AlgorithmIdentifierOwned { oid, parameters };
 		let auth_encrypted_content_info =
 			EncryptedContentInfo { content_type, content_enc_alg, encrypted_content: None };
+
 		let mut sealed = AuthEnvelopedData {
 			version: CmsVersion::V0,
 			originator_info: None,
@@ -991,6 +991,7 @@ fn authenticated_attributes(
 	let attributes = attributes.into_iter();
 	let mut set = Vec::with_capacity(attributes.size_hint().0.saturating_add(1));
 	set.push(Attribute { oid: ATTR_CONTENT_TYPE, values });
+
 	for attribute in attributes {
 		if attribute.oid == ATTR_CONTENT_TYPE {
 			return Err(EnvelopeError::ContentTypeAttribute);
@@ -1020,15 +1021,15 @@ fn content_type_of(attributes: &Attributes) -> Result<ObjectIdentifier, Envelope
 
 #[cfg(test)]
 mod tests {
-	use aead::{AeadCore, Nonce};
-
 	use super::gcm_parameters;
+	use crate::crypto::aead::{AeadCore, Nonce};
 	use crate::crypto::cms::EnvelopeError;
 	use crate::crypto::common::typenum::{U0, U12, U32, U8};
 	use crate::error::ReceivedExpectedError;
 
 	/// An AEAD with an 8-octet tag, shorter than any tag `aes-ICVlen` names
-	/// (RFC 5084 §3.2).
+	/// (RFC 5084 §3.2). Every house cipher takes a 16-octet tag, so a shorter
+	/// tag runs only as this type.
 	struct ShortTagCipher;
 
 	impl AeadCore for ShortTagCipher {
@@ -1038,7 +1039,8 @@ mod tests {
 	}
 
 	/// An AEAD with a 32-octet tag, longer than any tag `aes-ICVlen` names
-	/// (RFC 5084 §3.2).
+	/// (RFC 5084 §3.2). Every house cipher takes a 16-octet tag, so a longer
+	/// tag runs only as this type.
 	struct LongTagCipher;
 
 	impl AeadCore for LongTagCipher {
@@ -1047,21 +1049,23 @@ mod tests {
 		type CiphertextOverhead = U0;
 	}
 
-	/// A tag shorter than any `aes-ICVlen` refuses the parameters, and the
-	/// error expects 12, the nearest length the field names.
-	#[test]
-	fn a_tag_shorter_than_any_icv_length_expects_the_nearest_one() {
-		let refused = gcm_parameters::<ShortTagCipher>(&Nonce::<ShortTagCipher>::default());
-		let expected = ReceivedExpectedError { received: 8, expected: 12 };
-		assert!(matches!(refused, Err(EnvelopeError::TagLength(found)) if found == expected));
+	/// The refusal of the GCM parameters of cipher `A`, if any.
+	fn refusal_of<A: AeadCore>() -> Option<EnvelopeError> {
+		gcm_parameters::<A>(&Nonce::<A>::default()).err()
 	}
 
-	/// A tag longer than any `aes-ICVlen` refuses the parameters, and the
-	/// error expects 16, the nearest length the field names.
-	#[test]
-	fn a_tag_longer_than_any_icv_length_expects_the_nearest_one() {
-		let refused = gcm_parameters::<LongTagCipher>(&Nonce::<LongTagCipher>::default());
-		let expected = ReceivedExpectedError { received: 32, expected: 16 };
-		assert!(matches!(refused, Err(EnvelopeError::TagLength(found)) if found == expected));
+	// A tag outside every `aes-ICVlen` refuses the parameters, and the error
+	// expects the nearest length the field names: 12 below the range, 16
+	// above it.
+	crate::tb_cases! {
+		fn a_tag_outside_the_icv_lengths_expects_the_nearest_one(
+			(refused, expected): (Option<EnvelopeError>, ReceivedExpectedError<usize, usize>)
+		) {
+			assert!(matches!(refused, Some(EnvelopeError::TagLength(found)) if found == expected));
+		}
+		cases {
+			shorter => (refusal_of::<ShortTagCipher>(), ReceivedExpectedError { received: 8, expected: 12 }),
+			longer => (refusal_of::<LongTagCipher>(), ReceivedExpectedError { received: 32, expected: 16 }),
+		}
 	}
 }

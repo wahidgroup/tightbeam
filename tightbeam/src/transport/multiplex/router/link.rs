@@ -402,14 +402,28 @@ impl MuxLink {
 	}
 }
 
+#[cfg(test)]
+impl MuxLink {
+	/// A link over `shared` whose outbound queue holds `queue` commands,
+	/// beside the receiver of that queue and the receiver of its drain notes.
+	pub(crate) fn over(
+		shared: Arc<MuxShared>,
+		queue: usize,
+	) -> (MuxLink, mpsc::Receiver<Outbound>, mpsc::Receiver<DrainNote>) {
+		let (outbound, wire) = mpsc::channel(queue);
+		let (link, notes) = MuxLink::new(shared, outbound);
+		(link, wire, notes)
+	}
+}
+
 #[cfg(all(test, feature = "testing-fault", feature = "instrument"))]
 mod tests {
 	use core::task::Poll;
 
-	use super::super::testing::poll_now;
+	use super::super::fixtures::poll_now;
 	use super::*;
-	use crate::testing::{FaultModel, TestFrame};
-	use crate::trace::TraceCollector;
+	use crate::testing::fixtures::TestTrace;
+	use crate::testing::TestFrame;
 	use crate::transport::envelopes::MuxEnvelope;
 	use crate::transport::handshake::negotiation::MuxSettings;
 	use crate::transport::multiplex::MuxRole;
@@ -418,26 +432,10 @@ mod tests {
 	/// [`TransportError::InvalidAddress`] at every record of `MUX_GOAWAY_SENT`,
 	/// beside the receiver of its outbound queue.
 	fn goaway_faulting_link(settings: &MuxSettings) -> (MuxLink, mpsc::Receiver<Outbound>) {
-		let injected = || TransportError::InvalidAddress;
-		let model = FaultModel::default().with_event_fault(events::MUX_GOAWAY_SENT, injected, crate::bps!(10000));
-		let mut shared = MuxShared::new(MuxRole::Server, settings);
-		shared.trace = Some(TraceCollector::new().with_fault_model(model));
-
-		let (outbound, wire) = mpsc::channel(4);
-		let (link, _drained) = MuxLink::new(Arc::new(shared), outbound);
+		let trace = TestTrace::faulting(events::MUX_GOAWAY_SENT, || TransportError::InvalidAddress, crate::bps!(10000));
+		let shared = MuxShared::traced(MuxRole::Server, settings, trace);
+		let (link, wire, _drained) = MuxLink::over(Arc::new(shared), 4);
 		(link, wire)
-	}
-
-	/// Settings whose budget holds `credits`, above a drain reserve of five
-	/// records at one credit each.
-	fn budget_settings(credits: u64) -> MuxSettings {
-		let settings = MuxSettings::symmetric(1).with_chunk_size(1024);
-		settings.with_send_budget(Some(credits))
-	}
-
-	/// Whether `command` carries a GoAway.
-	fn is_goaway(command: &Outbound) -> bool {
-		matches!(command, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::GoAway(_))))
 	}
 
 	/// The link records the GoAway once it queues it, so a fault the trace
@@ -448,8 +446,9 @@ mod tests {
 		let (link, mut wire) = goaway_faulting_link(&MuxSettings::symmetric(4));
 
 		let announced = poll_now(link.announce_goaway(GoAwayReason::Shutdown));
+		let queued = wire.try_recv().ok();
 		assert!(matches!(announced, Poll::Ready(Err(TransportError::InvalidAddress))));
-		assert!(wire.try_recv().is_ok_and(|command| is_goaway(&command)));
+		assert!(matches!(queued.as_ref().and_then(Outbound::mux), Some(MuxEnvelope::GoAway(_))));
 	}
 
 	/// A response whose debit reaches the drain reserve, and whose drain
@@ -457,7 +456,7 @@ mod tests {
 	/// not leave.
 	#[test]
 	fn a_failed_drain_returns_its_debit() {
-		let (link, _wire) = goaway_faulting_link(&budget_settings(6));
+		let (link, _wire) = goaway_faulting_link(&MuxSettings::budgeted(6));
 		let response = ResponsePackage::new(TransitStatus::Ok, Some(TestFrame::v0(None, None)));
 
 		let sent = poll_now(link.send_response(1, response));

@@ -350,31 +350,30 @@ pub mod rt {
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
-	use core::error::Error;
 	use core::time::Duration;
 	use std::sync::mpsc;
+
+	use crate::testing::TestResult;
 
 	use super::{rt, ChannelClosed};
 
 	/// A thread outside any runtime blocks on a future to its output.
 	#[test]
-	fn a_thread_outside_a_runtime_blocks_on_a_future() -> Result<(), Box<dyn Error>> {
+	fn a_thread_outside_a_runtime_blocks_on_a_future() {
 		let output = rt::block_on(async { 7 });
 		assert_eq!(output, 7);
-		Ok(())
 	}
 
 	/// The thread of a current-thread runtime blocks on a future to its output.
 	#[tokio::test]
-	async fn the_thread_of_a_current_thread_runtime_blocks_on_a_future() -> Result<(), Box<dyn Error>> {
+	async fn the_thread_of_a_current_thread_runtime_blocks_on_a_future() {
 		let output = rt::block_on(async { 7 });
 		assert_eq!(output, 7);
-		Ok(())
 	}
 
 	/// A lone worker of a multi-thread runtime blocks on a tokio timer.
 	#[test]
-	fn a_worker_of_a_multi_thread_runtime_blocks_on_a_tokio_timer() -> Result<(), Box<dyn Error>> {
+	fn a_worker_of_a_multi_thread_runtime_blocks_on_a_tokio_timer() -> TestResult {
 		let mut builder = tokio::runtime::Builder::new_multi_thread();
 		let runtime = builder.worker_threads(1).enable_time().build()?;
 		let (sender, receiver) = mpsc::channel();
@@ -395,19 +394,17 @@ mod tests {
 
 	/// A send to a channel whose receiver is gone fails as closed.
 	#[tokio::test]
-	async fn a_send_to_a_dropped_receiver_fails_as_closed() -> Result<(), Box<dyn Error>> {
+	async fn a_send_to_a_dropped_receiver_fails_as_closed() {
 		let (sender, receiver) = rt::channel::<u8>(1);
 		drop(receiver);
 		assert_eq!(rt::send(&sender, 7).await, Err(ChannelClosed));
-		Ok(())
 	}
 
 	/// A wait on a oneshot whose sender dropped unsent fails as closed.
 	#[tokio::test]
-	async fn a_wait_on_a_dropped_sender_fails_as_closed() -> Result<(), Box<dyn Error>> {
+	async fn a_wait_on_a_dropped_sender_fails_as_closed() {
 		let (sender, receiver) = rt::oneshot::<u8>();
 		drop(sender);
 		assert_eq!(rt::wait_response(receiver).await, Err(ChannelClosed));
-		Ok(())
 	}
 }

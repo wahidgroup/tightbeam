@@ -243,10 +243,11 @@ mod tests {
 
 	use super::*;
 	use crate::tb_cases;
+	use crate::testing::TestResult;
 
 	/// The admitted form of a fixture spelling, for a case that expects
 	/// admission.
-	fn admitted(spelling: &str) -> Result<PeerAddress, DialRefusal> {
+	fn admits_as(spelling: &str) -> Result<PeerAddress, DialRefusal> {
 		Ok(PeerAddress::fixture(spelling))
 	}
 
@@ -255,7 +256,6 @@ mod tests {
 	tb_cases! {
 		fn admit_dial_applies_the_fixed_classes_then_the_allowlist((plane, claimed, expected): (PeerConfig, &str, Result<PeerAddress, DialRefusal>)) {
 			let verdict = plane.admit_dial(PeerAddress::fixture(claimed));
-
 			assert_eq!(verdict.map(|dial| dial.address()), expected);
 		}
 		cases {
@@ -268,38 +268,45 @@ mod tests {
 			default_refuses_the_reserved_block => (PeerConfig::default(), "240.0.0.1:9000", Err(DialRefusal::NotUnicast)),
 			default_refuses_this_network => (PeerConfig::default(), "0.0.0.1:9000", Err(DialRefusal::NotUnicast)),
 			allowlist_naming_multicast_still_refuses_it => (PeerConfig::allowing(["224.0.0.1:9000"]), "224.0.0.1:9000", Err(DialRefusal::NotUnicast)),
-			default_admits_a_routable_address => (PeerConfig::default(), "192.0.2.1:9000", admitted("192.0.2.1:9000")),
-			default_admits_a_routable_ipv6_address => (PeerConfig::default(), "[2001:db8::1]:9000", admitted("[2001:db8::1]:9000")),
-			default_admits_loopback => (PeerConfig::default(), "127.0.0.1:9000", admitted("127.0.0.1:9000")),
-			allowlist_compares_sockets_not_spellings => (PeerConfig::allowing(["[::1]:9000"]), "[0:0:0:0:0:0:0:1]:9000", admitted("[::1]:9000")),
+			default_admits_a_routable_address => (PeerConfig::default(), "192.0.2.1:9000", admits_as("192.0.2.1:9000")),
+			default_admits_a_routable_ipv6_address => (
+				PeerConfig::default(),
+				"[2001:db8::1]:9000",
+				admits_as("[2001:db8::1]:9000"),
+			),
+			default_admits_loopback => (PeerConfig::default(), "127.0.0.1:9000", admits_as("127.0.0.1:9000")),
+			allowlist_compares_sockets_not_spellings => (
+				PeerConfig::allowing(["[::1]:9000"]),
+				"[0:0:0:0:0:0:0:1]:9000",
+				admits_as("[::1]:9000"),
+			),
 			allowlist_refuses_a_routable_address_it_omits => (PeerConfig::allowing(["10.0.0.1:9000"]), "192.0.2.1:9000", Err(DialRefusal::OffAllowlist)),
 		}
 	}
 
 	// The one parse decides which bytes spell a socket, and its refusal
 	// arrives here as the claim's refusal.
-	#[test]
-	fn admit_claim_refuses_bytes_that_name_no_socket() {
-		let verdict = PeerConfig::default().admit_claim(b"not-a-socket");
-		assert_eq!(verdict, Err(DialRefusal::NotASocket));
-	}
-
-	#[test]
-	fn admit_claim_admits_a_socket_spelling() -> Result<(), DialRefusal> {
-		let admitted = PeerConfig::default().admit_claim(b"192.0.2.1:9000")?;
-		assert_eq!(admitted.address(), PeerAddress::fixture("192.0.2.1:9000"));
-		Ok(())
+	tb_cases! {
+		fn admit_claim_admits_only_a_socket_spelling((claimed, expected): (&[u8], Result<PeerAddress, DialRefusal>)) {
+			let verdict = PeerConfig::default().admit_claim(claimed);
+			assert_eq!(verdict.map(|dial| dial.address()), expected);
+		}
+		cases {
+			not_a_socket => (b"not-a-socket", Err(DialRefusal::NotASocket)),
+			a_socket_spelling => (b"192.0.2.1:9000", admits_as("192.0.2.1:9000")),
+		}
 	}
 
 	// A wire entry becomes a hint through the same decider a claimed
 	// advertisement passes, so a peer cannot pass one gate and fail the
 	// other with one address.
 	tb_cases! {
-		fn admit_hint_carries_the_fingerprint_when_one_was_sent((wire_id, hint_id): (Vec<u8>, Option<Vec<u8>>)) -> Result<(), DialRefusal> {
+		fn admit_hint_carries_the_fingerprint_when_one_was_sent(
+			(wire_id, hint_id): (Vec<u8>, Option<Vec<u8>>)
+		) -> TestResult {
 			let entry = PeerGossip { peer_id: wire_id, gateway_addr: b"10.0.0.1:9000".to_vec() };
 			let hint = PeerConfig::default().admit_hint(entry)?;
-			assert_eq!(hint.dial.to_string(), "10.0.0.1:9000");
-			assert_eq!(hint.peer_id, hint_id);
+			assert_eq!((hint.dial, hint.peer_id), (AdmittedDial::fixture("10.0.0.1:9000"), hint_id));
 			Ok(())
 		}
 		cases {

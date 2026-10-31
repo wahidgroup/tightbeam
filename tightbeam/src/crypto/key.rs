@@ -756,115 +756,109 @@ pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<crate::crypto::pro
 
 #[cfg(test)]
 mod tests {
-	use rand_core::OsRng;
-
 	use super::*;
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::crypto::secret::ToInsecure;
-	use crate::crypto::sign::ecdsa::k256::ecdsa::SigningKey;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::PrehashVerifier;
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	use crate::testing::unhex;
+	use crate::runtime::rt;
+	use crate::testing::{TestKey, TestResult};
 
-	fn prehash(data: impl AsRef<[u8]>) -> Vec<u8> {
-		let data = data.as_ref();
-		let mut hasher = Sha3_256::new();
-		hasher.update(data);
-		hasher.finalize().to_vec()
+	/// The SHA3-256 digest of the content every signing test signs.
+	fn digest() -> Vec<u8> {
+		Sha3_256::digest(TestKey::HIGH_S_CONTENT).to_vec()
 	}
 
-	#[test]
-	fn test_secp256k1_provider_public_key() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key = SigningKey::random(&mut OsRng);
-		let provider = Secp256k1KeyProvider::from(signing_key);
-
-		let public_key_bytes = provider.to_public_key_bytes()?;
-		// A DER-encoded secp256k1 SPKI is 88 bytes.
-		assert_eq!(public_key_bytes.len(), 88);
-		Ok(())
+	/// The house provider of the fixed test key.
+	fn provider() -> Secp256k1KeyProvider {
+		Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing())
 	}
 
-	#[tokio::test]
-	async fn test_secp256k1_provider_sign() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key = SigningKey::random(&mut OsRng);
-		let provider = Secp256k1KeyProvider::from(signing_key.clone());
+	/// The length of the SPKI that `provider` presents.
+	fn spki_len_of(provider: &impl KeyBackend) -> usize {
+		let spki = provider.to_public_key_bytes().expect("the house provider encodes its key");
+		spki.len()
+	}
 
-		let digest = prehash(b"test data to sign");
-		let signature_bytes = provider.sign_prehash(&digest).await?;
+	/// The signature that `provider` makes over [`digest`], parsed from its
+	/// DER.
+	fn signature_of(provider: &impl SigningKeyProvider) -> Secp256k1Signature {
+		let der = rt::block_on(provider.sign_prehash(&digest())).expect("the house provider signs");
+		Secp256k1Signature::from_bytes(&der).expect("the house provider signs in DER")
+	}
 
-		let signature = Secp256k1Signature::from_bytes(&signature_bytes)?;
-		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
-		Ok(())
+	/// The secret that the house provider of [`TestKey::fixed`] `own` agrees
+	/// with the point of [`TestKey::fixed`] `peer`.
+	#[cfg(feature = "ecdh")]
+	fn agreed(own: u8, peer: u8) -> Vec<u8> {
+		let provider = Secp256k1KeyProvider::from(TestKey::fixed(own));
+		let peer = PublicKey::from(TestKey::fixed(peer).verifying_key());
+		let agreed = rt::block_on(provider.agree(&peer)).expect("the house provider agrees on a curve point");
+		agreed.to_insecure().to_vec()
+	}
+
+	// The house provider presents its key as a DER SPKI of 88 octets, the
+	// size of a secp256k1 SPKI, owned, shared, or shared as a trait object.
+	crate::tb_cases! {
+		fn a_provider_presents_an_spki_of_88_octets(len: usize) {
+			assert_eq!(len, 88);
+		}
+		cases {
+			owned => spki_len_of(&provider()),
+			shared => spki_len_of(&Arc::new(provider())),
+			shared_as_a_trait_object => spki_len_of(&(Arc::new(provider()) as Arc<dyn SigningKeyProvider>)),
+		}
+	}
+
+	// The house provider signs a prehash that its key verifies, owned,
+	// shared, or shared as a trait object.
+	crate::tb_cases! {
+		fn a_provider_signs_verifiably(signature: Secp256k1Signature) {
+			let verifying_key = *TestKey::insecure_fixed_signing().verifying_key();
+			let verified = verifying_key.verify_prehash(&digest(), &signature);
+			assert!(matches!(verified, Ok(())));
+		}
+		cases {
+			owned => signature_of(&provider()),
+			shared => signature_of(&Arc::new(provider())),
+			shared_as_a_trait_object => signature_of(&(Arc::new(provider()) as Arc<dyn SigningKeyProvider>)),
+		}
 	}
 
 	/// The provider signs with `s` in the low half of the curve order, so its
 	/// DER value is the canonical form a verifier keys on. The raw `s` of this
 	/// key over this content lies in the high half, by an independent RFC
 	/// 6979 computation, so the test fails for a provider that skips the rule.
-	#[tokio::test]
-	async fn the_provider_signs_low_s() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key = crate::testing::TestKey::insecure_fixed_signing();
-		let provider = Secp256k1KeyProvider::from(signing_key);
-		let digest = prehash(b"cms signer content");
-		let signature_bytes = provider.sign_prehash(&digest).await?;
-
-		let parsed = Secp256k1Signature::from_bytes(&signature_bytes)?;
-		let scalars = crate::crypto::sign::ecdsa::Signature::<Secp256k1>::try_from(parsed)?;
+	#[test]
+	fn the_provider_signs_low_s() -> TestResult {
+		let signature = signature_of(&provider());
+		let scalars = crate::crypto::sign::ecdsa::Signature::<Secp256k1>::try_from(signature)?;
 		assert!(scalars.normalize_s().is_none());
 		Ok(())
 	}
 
+	/// Both sides of an agreement compute the same shared secret.
 	#[cfg(feature = "ecdh")]
-	#[tokio::test]
-	async fn test_secp256k1_provider_key_agreement() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key1 = SigningKey::random(&mut OsRng);
-		let signing_key2 = SigningKey::random(&mut OsRng);
-
-		let provider1 = Secp256k1KeyProvider::from(signing_key1.clone());
-		let provider2 = Secp256k1KeyProvider::from(signing_key2.clone());
-
-		let public1 = PublicKey::from(signing_key1.verifying_key());
-		let public2 = PublicKey::from(signing_key2.verifying_key());
-
-		// Both sides must compute the same shared secret.
-		let shared1 = provider1.agree(&public2).await?.to_insecure();
-		let shared2 = provider2.agree(&public1).await?.to_insecure();
-		assert_eq!(shared1, shared2);
-		assert_eq!(shared1.len(), 32); // A secp256k1 shared secret is 32 bytes.
-		Ok(())
+	#[test]
+	fn both_providers_agree_on_one_secret() {
+		let initiator = agreed(0x11, 0x22);
+		let responder = agreed(0x22, 0x11);
+		assert_eq!(initiator, responder);
 	}
 
-	#[tokio::test]
-	async fn test_arc_secp256k1_provider() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key = SigningKey::random(&mut OsRng);
-		let provider = Arc::new(Secp256k1KeyProvider::from(signing_key.clone()));
-
-		// `Arc<Secp256k1KeyProvider>` implements `SigningKeyProvider`.
-		let public_key_bytes = provider.to_public_key_bytes()?;
-		// A DER-encoded secp256k1 SPKI is 88 bytes.
-		assert_eq!(public_key_bytes.len(), 88);
-
-		let digest = prehash(b"test");
-		let signature_bytes = provider.sign_prehash(&digest).await?;
-
-		let signature = Secp256k1Signature::from_bytes(&signature_bytes)?;
-		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
-
-		// The one blanket impl serves a shared trait object as well.
-		let shared: Arc<dyn SigningKeyProvider> = provider;
-		assert_eq!(shared.to_public_key_bytes()?, public_key_bytes);
-		Ok(())
+	/// A secp256k1 shared secret is 32 bytes, the width of the field.
+	#[cfg(feature = "ecdh")]
+	#[test]
+	fn an_agreed_secret_is_as_wide_as_the_field() {
+		let secret = agreed(0x11, 0x22);
+		assert_eq!(secret.len(), 32);
 	}
 
-	#[tokio::test]
-	async fn test_algorithm_identifier() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key = SigningKey::random(&mut OsRng);
-		let provider = Secp256k1KeyProvider::from(signing_key);
-
-		let alg = provider.algorithm();
-		assert_eq!(alg.oid, Secp256k1Signature::ALGORITHM_OID);
-		Ok(())
+	/// The house provider names the algorithm of the signatures it makes.
+	#[test]
+	fn a_provider_names_the_algorithm_of_its_signatures() {
+		let algorithm = provider().algorithm();
+		assert_eq!(algorithm.oid, Secp256k1Signature::ALGORITHM_OID);
 	}
 
 	/// Short key material reaches a typed refusal ahead of the
@@ -873,7 +867,7 @@ mod tests {
 	fn short_signing_key_bytes_are_refused() {
 		let spec = SigningKeySpec::Bytes(&[0u8; 5]);
 		let refused = spec.to_provider::<crate::crypto::sign::ecdsa::k256::Secp256k1>();
-		assert!(matches!(refused, Err(KeyError::KeyLengthError(_))));
+		assert!(matches!(refused, Err(KeyError::KeyLengthError(sizes)) if (sizes.received, sizes.expected) == (5, 32)));
 	}
 
 	/// The `Debug` of a raw key spec prints its length only, so a caller that
@@ -886,126 +880,102 @@ mod tests {
 		assert!(rendered.contains("32"));
 	}
 
-	/// The content key the house provider wraps in its `decrypt_into` tests.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	const CONTENT_KEY: [u8; 32] = [0xC3u8; 32];
+	/// The house in-memory provider, which wraps a content key under the key
+	/// it holds.
+	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+	mod house_wrap {
+		use core::convert::identity;
 
-	/// The house in-memory provider of the default profile, under a fixed KEK.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	fn house_holder() -> Aes256GcmKeyProvider {
-		let holder = Aes256GcmKeyProvider::new(vec![0x5Au8; 32], b"tb/test/kek/v1".to_vec());
-		holder.expect("a 32-octet KEK is the size of the house wrap's key")
-	}
+		use super::*;
+		use crate::testing::fixtures::flip_last;
+		use crate::testing::unhex;
+		use crate::testing::vectors::rfc3394::RFC_3394_4_6;
 
-	/// The RFC 3394 §4.6 key-encryption key, `000102...1f`.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	const RFC_3394_KEK: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+		/// The content key the house provider wraps in its `decrypt_into`
+		/// tests.
+		const CONTENT_KEY: [u8; 32] = [0xC3u8; 32];
 
-	/// The RFC 3394 §4.6 key data, 256 bits.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	const RFC_3394_KEY_DATA: &str = "00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f";
+		/// The house provider of the fixed test key-encryption key.
+		fn house() -> Aes256GcmKeyProvider {
+			let (_kek, holder) = TestKey::insecure_fixed_cipher();
+			holder
+		}
 
-	/// The RFC 3394 §4.6 ciphertext: the key data under the KEK.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	const RFC_3394_4_6: &str = "28c9f404c4b810f4cbccb35cfb87f8263f5786e2d80ed326cbc7f0e71a99f43bfb988b9b7a02dd21";
+		/// The house provider of the RFC 3394 §4.6 key-encryption key.
+		fn rfc_3394_holder() -> Aes256GcmKeyProvider {
+			let holder = Aes256GcmKeyProvider::new(unhex(RFC_3394_4_6.kek), b"tb/test/kek/v1".to_vec());
+			holder.expect("the RFC 3394 §4.6 KEK is the size of the house wrap's key")
+		}
 
-	/// The house provider of the RFC 3394 §4.6 key-encryption key.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	fn rfc_3394_holder() -> Aes256GcmKeyProvider {
-		let holder = Aes256GcmKeyProvider::new(unhex(RFC_3394_KEK), b"tb/test/kek/v1".to_vec());
-		holder.expect("the RFC 3394 §4.6 KEK is the size of the house wrap's key")
-	}
+		/// [`CONTENT_KEY`] as `holder` wraps it.
+		fn wrapped_by(holder: &impl EncryptingKeyProvider) -> Vec<u8> {
+			let wrapped = rt::block_on(holder.encrypt(&CONTENT_KEY));
+			wrapped.expect("the house wrap takes a 32-octet key")
+		}
 
-	/// The house provider wraps under the key it holds as RFC 3394 §4.6 wraps
-	/// 256 bits of key data under a 256-bit KEK.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	#[tokio::test]
-	async fn the_house_provider_wraps_as_rfc_3394_4_6() -> Result<(), KeyError> {
-		let key_data = unhex(RFC_3394_KEY_DATA);
-		let wrapped = rfc_3394_holder().encrypt(&key_data).await?;
-		assert_eq!(wrapped, unhex(RFC_3394_4_6));
-		Ok(())
-	}
+		/// The refusal of `holder` to unwrap its own wrap of [`CONTENT_KEY`],
+		/// after `alter`, into a buffer of 16 octets.
+		fn short_unwrap(holder: &impl EncryptingKeyProvider, alter: fn(Vec<u8>) -> Vec<u8>) -> Option<KeyError> {
+			let wrapped = alter(wrapped_by(holder));
+			let mut short = [0u8; 16];
+			rt::block_on(holder.decrypt_into(&wrapped, &mut short)).err()
+		}
 
-	/// The house provider unwraps under the key it holds as RFC 3394 §4.6
-	/// unwraps 256 bits of key data under a 256-bit KEK.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	#[tokio::test]
-	async fn the_house_provider_unwraps_rfc_3394_4_6() -> Result<(), KeyError> {
-		let wrapped = unhex(RFC_3394_4_6);
-		let mut key = [0u8; 32];
+		/// The house provider wraps under the key it holds as RFC 3394 §4.6
+		/// wraps 256 bits of key data under a 256-bit KEK.
+		#[test]
+		fn the_house_provider_wraps_as_rfc_3394_4_6() -> TestResult {
+			let key_data = unhex(RFC_3394_4_6.key_data);
+			let wrapped = rt::block_on(rfc_3394_holder().encrypt(&key_data))?;
+			assert_eq!(wrapped, unhex(RFC_3394_4_6.ciphertext));
+			Ok(())
+		}
 
-		rfc_3394_holder().decrypt_into(&wrapped, &mut key).await?;
-		assert_eq!(key.as_slice(), unhex(RFC_3394_KEY_DATA).as_slice());
-		Ok(())
-	}
+		/// The house provider unwraps under the key it holds as RFC 3394 §4.6
+		/// unwraps 256 bits of key data under a 256-bit KEK.
+		#[test]
+		fn the_house_provider_unwraps_rfc_3394_4_6() -> TestResult {
+			let wrapped = unhex(RFC_3394_4_6.ciphertext);
+			let mut key = [0u8; 32];
 
-	/// The house provider unwraps into the caller's buffer the content key it
-	/// wrapped.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	#[tokio::test]
-	async fn the_house_provider_decrypts_into_the_callers_buffer() -> Result<(), KeyError> {
-		let holder = house_holder();
-		let wrapped = holder.encrypt(&CONTENT_KEY).await?;
-		let mut content_key = [0u8; 32];
+			rt::block_on(rfc_3394_holder().decrypt_into(&wrapped, &mut key))?;
 
-		holder.decrypt_into(&wrapped, &mut content_key).await?;
+			assert_eq!(key.as_slice(), unhex(RFC_3394_4_6.key_data).as_slice());
+			Ok(())
+		}
 
-		assert_eq!(content_key, CONTENT_KEY);
-		Ok(())
-	}
+		/// The house provider unwraps into the caller's buffer the content key
+		/// it wrapped.
+		#[test]
+		fn the_house_provider_decrypts_into_the_callers_buffer() -> TestResult {
+			let holder = house();
+			let wrapped = wrapped_by(&holder);
+			let mut content_key = [0u8; 32];
 
-	/// `wrapped` with its last octet altered, as a wrapped key the integrity
-	/// check of the wrap refuses (RFC 3394 §2.2.3).
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	fn altered(mut wrapped: Vec<u8>) -> Vec<u8> {
-		let last = wrapped.last_mut().expect("a wrapped key holds octets");
-		*last ^= 0x01;
-		wrapped
-	}
+			rt::block_on(holder.decrypt_into(&wrapped, &mut content_key))?;
 
-	/// The house provider hands the caller's buffer to the key wrap itself,
-	/// so the wrap refuses a buffer of another size and names the 32 octets
-	/// a wrapped key of 40 octets holds (RFC 3394 §2.2.2).
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	#[tokio::test]
-	async fn the_house_wrap_refuses_a_buffer_of_another_size() -> Result<(), KeyError> {
-		let holder = house_holder();
-		let wrapped = holder.encrypt(&CONTENT_KEY).await?;
-		let mut short = [0u8; 16];
+			assert_eq!(content_key, CONTENT_KEY);
+			Ok(())
+		}
 
-		let refused = holder.decrypt_into(&wrapped, &mut short).await;
-		assert!(matches!(refused, Err(KeyError::WrapLength(sizes)) if (sizes.received, sizes.expected) == (16, 32)));
-		Ok(())
-	}
-
-	/// The house wrap checks the size of the caller's buffer before it
-	/// unwraps, so it refuses an altered wrapped key into a buffer of another
-	/// size for the size of the buffer.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	#[tokio::test]
-	async fn the_house_provider_checks_the_buffer_before_it_unwraps() -> Result<(), KeyError> {
-		let holder = house_holder();
-		let wrapped = altered(holder.encrypt(&CONTENT_KEY).await?);
-		let mut short = [0u8; 16];
-
-		let refused = holder.decrypt_into(&wrapped, &mut short).await;
-		assert!(matches!(refused, Err(KeyError::WrapLength(_))));
-		Ok(())
-	}
-
-	/// A shared house provider reaches the same override, so it refuses an
-	/// altered wrapped key into a buffer of another size for the size of the
-	/// buffer.
-	#[cfg(all(feature = "aead", feature = "kdf", feature = "ecdh", feature = "aes-gcm"))]
-	#[tokio::test]
-	async fn a_shared_house_provider_refuses_through_its_override() -> Result<(), KeyError> {
-		let holder = Arc::new(house_holder());
-		let wrapped = altered(holder.encrypt(&CONTENT_KEY).await?);
-		let mut short = [0u8; 16];
-
-		let refused = holder.decrypt_into(&wrapped, &mut short).await;
-		assert!(matches!(refused, Err(KeyError::WrapLength(_))));
-		Ok(())
+		// The house provider hands the caller's buffer to the key wrap itself,
+		// so the wrap refuses a buffer of another size and names the 32 octets
+		// a wrapped key of 40 octets holds (RFC 3394 §2.2.2). It checks the
+		// size before it unwraps, so a wrapped key whose integrity check fails
+		// (RFC 3394 §2.2.3) meets the same refusal, through a shared house
+		// provider too.
+		crate::tb_cases! {
+			fn the_house_provider_checks_the_buffer_before_it_unwraps(refused: Option<KeyError>) {
+				assert!(matches!(
+					refused,
+					Some(KeyError::WrapLength(sizes)) if (sizes.received, sizes.expected) == (16, 32)
+				));
+			}
+			cases {
+				an_intact_wrap => short_unwrap(&house(), identity),
+				a_failed_wrap => short_unwrap(&house(), flip_last),
+				a_failed_wrap_of_a_shared_provider => short_unwrap(&Arc::new(house()), flip_last),
+			}
+		}
 	}
 }

@@ -775,13 +775,14 @@ impl KeyList {
 
 #[cfg(all(test, feature = "std", feature = "signature"))]
 mod tests {
-	use super::*;
-
 	use crate::der::asn1::{BitString, ObjectIdentifier};
 	use crate::der::oid::db::rfc8410::{ID_ED_25519, ID_X_25519};
-	use crate::der::{Any, Error};
 	use crate::oids::{CURVE_NIST_P256, CURVE_NIST_P384, CURVE_NIST_P521, CURVE_SECP256K1};
 	use crate::testing::fixtures::{TestCertificate, TestKey, TestP256Points};
+	use crate::testing::TestResult;
+	use crate::x509::Certificate;
+
+	use super::*;
 
 	/// `sect233k1`, a SEC 2 curve over a binary field.
 	const SECT233K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.26");
@@ -793,6 +794,9 @@ mod tests {
 	/// contract of [`CurvePoints`] on an off-curve encoding, the one input on
 	/// which two decoders of one curve can disagree, so it shows which of two
 	/// decoders decides.
+	///
+	/// No runnable decoder breaks that contract, because [`Sec1Curve`] and
+	/// [`TestP256Points`] each refuse an off-curve encoding.
 	#[derive(Debug)]
 	struct PermissiveSecp256k1;
 
@@ -815,338 +819,365 @@ mod tests {
 	/// The set that holds no decoder.
 	const NO_DECODER: KeyCurves = KeyCurves::new(&[]);
 
-	/// The SubjectPublicKeyInfo of the fixed test key, in the uncompressed
-	/// form the test certificate carries.
-	fn uncompressed() -> SubjectPublicKeyInfoOwned {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		certificate.tbs_certificate.subject_public_key_info
+	/// An entry that reads the canonical form of the key of a
+	/// SubjectPublicKeyInfo.
+	type Canonical = fn(&SubjectPublicKeyInfoOwned) -> crate::der::Result<CanonicalKey>;
+
+	/// The canonical form of the key of `spki`, read through its
+	/// [`KeyIdentity`] under [`KeyCurves::HOUSE`].
+	fn house_identity(spki: &SubjectPublicKeyInfoOwned) -> crate::der::Result<CanonicalKey> {
+		KeyIdentity::of(spki, KeyCurves::HOUSE).to_canonical()
 	}
 
-	/// The SubjectPublicKeyInfo of the fixed test key in its compressed form.
-	fn compressed() -> SubjectPublicKeyInfoOwned {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let certificate = TestCertificate::with_compressed_key(certificate);
-		certificate.tbs_certificate.subject_public_key_info
+	/// The fixed test certificate with its key in the compressed SEC 1 form.
+	fn compressed() -> Certificate {
+		TestCertificate::with_compressed_key(TestCertificate::insecure_fixed())
 	}
 
-	/// The SubjectPublicKeyInfo of the negation of the fixed test key, whose
-	/// point shares the x-coordinate of that key.
-	fn negated() -> SubjectPublicKeyInfoOwned {
-		let negation = TestKey::negation_of(&TestKey::insecure_fixed_signing());
-		let certificate = TestCertificate::self_signed(&negation);
-		certificate.tbs_certificate.subject_public_key_info
-	}
-
-	/// The DER of `spki`, the form a list names a key in.
-	fn der_of(spki: &SubjectPublicKeyInfoOwned) -> Vec<u8> {
-		spki.to_der().expect("a test SubjectPublicKeyInfo encodes")
-	}
-
-	/// [`uncompressed`] under the named curve `curve`.
-	fn on_curve(curve: ObjectIdentifier) -> SubjectPublicKeyInfoOwned {
-		let mut spki = uncompressed();
-		let named_curve = Any::encode_from(&curve).expect("a curve OID encodes");
-		spki.algorithm.parameters = Some(named_curve);
-		spki
-	}
-
-	/// [`uncompressed`] with its y-coordinate changed off the curve, so the
-	/// encoding keeps the x-coordinate and the y parity of the fixed key.
-	fn off_curve_alias() -> SubjectPublicKeyInfoOwned {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let certificate = TestCertificate::with_off_curve_key(certificate);
-		certificate.tbs_certificate.subject_public_key_info
-	}
-
-	/// [`uncompressed`] under `oid` with no parameters, so its algorithm OID
-	/// alone names its kind.
-	fn under(oid: ObjectIdentifier) -> SubjectPublicKeyInfoOwned {
-		let mut spki = uncompressed();
-		spki.algorithm.oid = oid;
-		spki.algorithm.parameters = None;
-		spki
-	}
-
-	/// `point` as the key of an `id-ecPublicKey` SubjectPublicKeyInfo on the
-	/// named curve `curve`.
-	fn with_point(curve: ObjectIdentifier, point: &[u8]) -> SubjectPublicKeyInfoOwned {
-		let mut spki = on_curve(curve);
-		spki.subject_public_key = BitString::from_bytes(point).expect("a point is a BIT STRING");
-		spki
-	}
-
-	/// The P-256 key of RFC 6979 §A.2.5 in the uncompressed SEC 1 form.
-	fn p256_uncompressed() -> SubjectPublicKeyInfoOwned {
-		with_point(CURVE_NIST_P256, &TestKey::RFC6979_P256_UNCOMPRESSED)
-	}
-
-	/// The P-256 key of RFC 6979 §A.2.5 in the compressed SEC 1 form.
-	fn p256_compressed() -> SubjectPublicKeyInfoOwned {
-		with_point(CURVE_NIST_P256, &TestKey::RFC6979_P256_COMPRESSED)
-	}
-
-	/// [`under`] Ed25519 with a key of 300 octets, whose canonical form exceeds
-	/// the inline bound.
-	fn long_key() -> SubjectPublicKeyInfoOwned {
-		let mut spki = under(ID_ED_25519);
-		let bits = BitString::from_bytes(&[0x2a; 300]).expect("300 octets are a BIT STRING");
-		spki.subject_public_key = bits;
-		spki
-	}
-
-	/// [`under`] Ed25519 with a key of 178 octets, whose canonical form fills
-	/// the inline bound to its last octet.
-	fn edge_key() -> SubjectPublicKeyInfoOwned {
-		let mut spki = under(ID_ED_25519);
-		let bits = BitString::from_bytes(&[0x2a; 178]).expect("178 octets are a BIT STRING");
-		spki.subject_public_key = bits;
-		spki
-	}
-
-	/// The octets of the uncompressed point of the fixed key with `form` as
-	/// its first octet.
-	fn in_form(form: u8) -> Vec<u8> {
-		let spki = uncompressed();
-		let point = spki.subject_public_key.raw_bytes();
-		let (_, coordinates) = point.split_first().expect("the point names its form");
-		[&[form][..], coordinates].concat()
-	}
-
-	/// The SubjectPublicKeyInfo of the fixed key with its point in the compact
-	/// form, the octet `0x05` before the x-coordinate alone.
-	fn compact() -> SubjectPublicKeyInfoOwned {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let certificate = TestCertificate::with_compact_key(certificate);
-		certificate.tbs_certificate.subject_public_key_info
-	}
-
-	/// One secp256k1 point in its compressed and its uncompressed form is one
+	/// The fixed test certificate with its y-coordinate changed off the curve,
+	/// so the encoding keeps the x-coordinate and the y parity of the fixed
 	/// key.
-	#[test]
-	fn one_point_in_both_forms_is_one_key() -> Result<(), Error> {
-		let compressed = compressed();
-		let uncompressed = uncompressed();
-
-		let compressed = KeyIdentity::of(&compressed, KeyCurves::HOUSE).to_canonical()?;
-		assert_eq!(compressed, KeyIdentity::of(&uncompressed, KeyCurves::HOUSE).to_canonical()?);
-		Ok(())
+	fn off_curve_alias() -> Certificate {
+		TestCertificate::with_off_curve_key(TestCertificate::insecure_fixed())
 	}
 
-	/// The canonical form of the uncompressed fixed key is the DER of its
-	/// compressed SubjectPublicKeyInfo, which k256 compresses and the DER
-	/// encoder writes outside the code under test.
-	#[test]
-	fn the_canonical_form_of_an_uncompressed_point_is_its_compressed_der() -> Result<(), Error> {
-		let expected = compressed().to_der()?;
-		let canonical = CanonicalKey::of(&uncompressed())?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	/// The fixed test certificate with `point` as its key on the named curve
+	/// `curve`.
+	fn point_on(curve: ObjectIdentifier, point: &[u8]) -> Certificate {
+		TestCertificate::with_curve_point(TestCertificate::insecure_fixed(), curve, point)
 	}
 
-	/// A key that reads as its bits keeps its DER as its canonical form.
-	#[test]
-	fn a_key_read_as_its_bits_keeps_its_der() -> Result<(), Error> {
-		let ed25519 = under(ID_ED_25519);
-		let expected = ed25519.to_der()?;
-
-		let canonical = CanonicalKey::of(&ed25519)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	/// The fixed test certificate with its key under `oid` and no parameters,
+	/// so its algorithm OID alone names its kind.
+	fn under(oid: ObjectIdentifier) -> Certificate {
+		let mut certificate = TestCertificate::insecure_fixed();
+		let algorithm = &mut certificate.tbs_certificate.subject_public_key_info.algorithm;
+		algorithm.oid = oid;
+		algorithm.parameters = None;
+		certificate
 	}
 
-	/// The P-256 key of RFC 6979 §A.2.5 in its two SEC 1 forms is one key,
-	/// read by its form with no decoder of P-256.
-	#[test]
-	fn one_point_of_a_curve_without_a_decoder_in_both_forms_is_one_key() -> Result<(), Error> {
-		let compressed = CanonicalKey::of(&p256_compressed())?;
-		assert_eq!(compressed, CanonicalKey::of(&p256_uncompressed())?);
-		Ok(())
+	/// The fixed test certificate with its key under `oid` and the named
+	/// curve it held, so its BIT STRING keeps the octets of the point.
+	fn with_algorithm(oid: ObjectIdentifier) -> Certificate {
+		let mut certificate = TestCertificate::insecure_fixed();
+		certificate.tbs_certificate.subject_public_key_info.algorithm.oid = oid;
+		certificate
 	}
 
-	/// An encoding that the decoder of its curve refuses reads as its bits,
-	/// so it keeps its DER (SEC 1 v2.0 §2.3.4).
-	#[test]
-	fn a_point_its_decoder_refuses_keeps_its_der() -> Result<(), Error> {
-		let alias = off_curve_alias();
-		let expected = alias.to_der()?;
-
-		let canonical = KeyCurves::HOUSE.canonical(&alias)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	/// [`under`] Ed25519 with a key of `len` octets.
+	fn ed25519_of_len(len: usize) -> Certificate {
+		let mut certificate = under(ID_ED_25519);
+		let bits = BitString::from_bytes(&vec![0x2a; len]).expect("a key of whole octets is a BIT STRING");
+		certificate.tbs_certificate.subject_public_key_info.subject_public_key = bits;
+		certificate
 	}
 
-	/// The first decoder of a curve decides, so the real decoder ahead of a
-	/// permissive one reads an off-curve alias as its bits.
-	#[test]
-	fn a_strict_first_decoder_reads_an_alias_as_its_bits() -> Result<(), Error> {
-		let alias = off_curve_alias();
-		let expected = alias.to_der()?;
-
-		let canonical = STRICT_FIRST.canonical(&alias)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	/// The SEC 1 point that `certificate` holds as its key.
+	fn point_of(certificate: &Certificate) -> Vec<u8> {
+		let spki = &certificate.tbs_certificate.subject_public_key_info;
+		spki.subject_public_key.raw_bytes().to_vec()
 	}
 
-	/// The first decoder of a curve decides, so a permissive decoder ahead of
-	/// the real one reads an off-curve alias as the point it names.
-	#[test]
-	fn a_permissive_first_decoder_reads_an_alias_as_its_point() -> Result<(), Error> {
-		let expected = compressed().to_der()?;
-		let canonical = PERMISSIVE_FIRST.canonical(&off_curve_alias())?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
-	}
-
-	/// The decoder of secp256k1 accepts its generator in the uncompressed
-	/// form that SEC 2 v2.0 §2.4.1 publishes.
-	#[test]
-	fn the_secp256k1_decoder_accepts_the_published_uncompressed_generator() {
-		let decoder = Sec1Curve::<Secp256k1>::new();
-		assert!(decoder.decodes(&TestKey::SEC2_SECP256K1_G_UNCOMPRESSED));
-	}
-
-	/// The decoder of secp256k1 accepts its generator in the compressed form
-	/// that SEC 2 v2.0 §2.4.1 publishes.
-	#[test]
-	fn the_secp256k1_decoder_accepts_the_published_compressed_generator() {
-		let decoder = Sec1Curve::<Secp256k1>::new();
-		assert!(decoder.decodes(&TestKey::SEC2_SECP256K1_G_COMPRESSED));
-	}
-
-	/// The test decoder of P-256 accepts the key of RFC 6979 §A.2.5 in the
-	/// uncompressed form, whose coordinates solve the curve equation.
-	#[test]
-	fn the_test_p256_decoder_accepts_the_rfc6979_key_uncompressed() {
-		assert!(TestP256Points.decodes(&TestKey::RFC6979_P256_UNCOMPRESSED));
-	}
-
-	/// The test decoder of P-256 accepts the key of RFC 6979 §A.2.5 in the
-	/// compressed form, whose x-coordinate gives a square.
-	#[test]
-	fn the_test_p256_decoder_accepts_the_rfc6979_key_compressed() {
-		assert!(TestP256Points.decodes(&TestKey::RFC6979_P256_COMPRESSED));
-	}
-
-	/// The test decoder of P-256 refuses the RFC 6979 key with the
+	/// The P-256 key of RFC 6979 §A.2.5 in the uncompressed form with the
 	/// second-lowest bit of y flipped, which solves no curve equation.
-	#[test]
-	fn the_test_p256_decoder_refuses_an_off_curve_alias() {
+	fn p256_off_curve_alias() -> Vec<u8> {
 		let mut alias = TestKey::RFC6979_P256_UNCOMPRESSED;
-		alias[64] ^= 0b10;
-		assert!(!TestP256Points.decodes(&alias));
+		let low = alias.last_mut().expect("the point ends in its y-coordinate");
+		*low ^= 0b10;
+		alias.to_vec()
 	}
 
-	/// The test decoder of P-256 refuses a compressed point whose x-coordinate,
-	/// the one of the RFC 6979 key plus one, gives no square.
-	#[test]
-	fn the_test_p256_decoder_refuses_an_x_of_no_point() {
+	/// The P-256 key of RFC 6979 §A.2.5 in the compressed form with one added
+	/// to its x-coordinate, which gives no square.
+	fn p256_x_of_no_point() -> Vec<u8> {
 		let mut point = TestKey::RFC6979_P256_COMPRESSED;
-		point[32] += 1;
-		assert!(!TestP256Points.decodes(&point));
+		let low = point.last_mut().expect("the point ends in its x-coordinate");
+		*low += 1;
+		point.to_vec()
 	}
 
-	/// The canonical form of the published uncompressed generator holds the
-	/// compressed generator that SEC 2 v2.0 §2.4.1 publishes.
-	#[test]
-	fn the_canonical_form_of_the_generator_is_its_published_compressed_form() -> Result<(), Error> {
-		let expected = with_point(CURVE_SECP256K1, &TestKey::SEC2_SECP256K1_G_COMPRESSED).to_der()?;
-
-		let uncompressed = with_point(CURVE_SECP256K1, &TestKey::SEC2_SECP256K1_G_UNCOMPRESSED);
-		let canonical = CanonicalKey::of(&uncompressed)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	/// `index`, an empty index, once it holds the key of `held` with `value`.
+	fn index_of<V>(mut index: KeyIndex<V>, held: &Certificate, value: V) -> KeyIndex<V> {
+		let held = &held.tbs_certificate.subject_public_key_info;
+		// An empty index replaces no value, so the insert returns `None`.
+		index.insert(held, value).expect("a test key has a canonical form");
+		index
 	}
 
-	/// The canonical form of the P-521 key of RFC 6979 §A.2.7 holds its
-	/// compressed form, read with no decoder of P-521.
-	#[test]
-	fn the_canonical_form_of_the_rfc6979_p521_key_is_its_compressed_form() -> Result<(), Error> {
-		let expected = with_point(CURVE_NIST_P521, &TestKey::RFC6979_P521_COMPRESSED).to_der()?;
-		let canonical = CanonicalKey::of(&with_point(CURVE_NIST_P521, &TestKey::RFC6979_P521_UNCOMPRESSED))?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	// The canonical form of a key is the DER of its SubjectPublicKeyInfo, with
+	// a point its decoder reads in the compressed form. Each row reads it
+	// through the entry it names, and the DER encoder writes the expected form
+	// outside the code under test.
+	crate::tb_cases! {
+		fn the_canonical_form_of((canonical, presented, expected): (Canonical, Certificate, Certificate))
+			-> TestResult
+		{
+			let expected = TestCertificate::spki_der(&expected);
+			let canonical = canonical(&presented.tbs_certificate.subject_public_key_info)?;
+			assert_eq!(canonical.as_der(), expected.as_slice());
+			Ok(())
+		}
+		cases {
+			/// The canonical form of the uncompressed fixed key is the DER of
+			/// its compressed SubjectPublicKeyInfo, which k256 compresses
+			/// outside the code under test.
+			an_uncompressed_point_is_its_compressed_der => (
+				CanonicalKey::of,
+				TestCertificate::insecure_fixed(),
+				compressed(),
+			),
+			/// A key that reads as its bits keeps its DER as its canonical
+			/// form.
+			a_key_read_as_its_bits_is_its_der => (CanonicalKey::of, under(ID_ED_25519), under(ID_ED_25519)),
+			/// An encoding that the decoder of its curve refuses reads as its
+			/// bits, so it keeps its DER (SEC 1 v2.0 §2.3.4).
+			a_point_its_decoder_refuses_is_its_der => (
+				|spki| KeyCurves::HOUSE.canonical(spki),
+				off_curve_alias(),
+				off_curve_alias(),
+			),
+			/// The first decoder of a curve decides, so the real decoder ahead
+			/// of a permissive one reads an off-curve alias as its bits.
+			an_alias_read_by_a_strict_first_decoder_is_its_der => (
+				|spki| STRICT_FIRST.canonical(spki),
+				off_curve_alias(),
+				off_curve_alias(),
+			),
+			/// The first decoder of a curve decides, so a permissive decoder
+			/// ahead of the real one reads an off-curve alias as the point it
+			/// names.
+			an_alias_read_by_a_permissive_first_decoder_is_the_point_it_names => (
+				|spki| PERMISSIVE_FIRST.canonical(spki),
+				off_curve_alias(),
+				compressed(),
+			),
+			/// The canonical form of the published uncompressed generator holds
+			/// the compressed generator that SEC 2 v2.0 §2.4.1 publishes.
+			the_generator_is_its_published_compressed_form => (
+				CanonicalKey::of,
+				point_on(CURVE_SECP256K1, &TestKey::SEC2_SECP256K1_G_UNCOMPRESSED),
+				point_on(CURVE_SECP256K1, &TestKey::SEC2_SECP256K1_G_COMPRESSED),
+			),
+			/// The canonical form of the P-521 key of RFC 6979 §A.2.7 holds its
+			/// compressed form, read with no decoder of P-521.
+			the_rfc6979_p521_key_is_its_compressed_form => (
+				CanonicalKey::of,
+				point_on(CURVE_NIST_P521, &TestKey::RFC6979_P521_UNCOMPRESSED),
+				point_on(CURVE_NIST_P521, &TestKey::RFC6979_P521_COMPRESSED),
+			),
+			/// A key of 178 octets, whose canonical form fills the inline bound
+			/// to its last octet, keeps its whole DER.
+			a_key_at_the_inline_bound_is_its_der => (CanonicalKey::of, ed25519_of_len(178), ed25519_of_len(178)),
+			/// A key of 300 octets, whose canonical form exceeds the inline
+			/// bound, keeps its whole DER.
+			a_key_past_the_inline_bound_is_its_der => (CanonicalKey::of, ed25519_of_len(300), ed25519_of_len(300)),
+			/// RFC 5480 §2.2 refuses the compact form, the octet `0x05` before
+			/// the x-coordinate alone, so a key in it reads as its bits and
+			/// keeps its DER.
+			a_compact_point_is_its_der => (
+				CanonicalKey::of,
+				TestCertificate::with_compact_key(TestCertificate::insecure_fixed()),
+				TestCertificate::with_compact_key(TestCertificate::insecure_fixed()),
+			),
+		}
 	}
 
-	/// A key on a SEC 2 binary-field curve reads as its bits, so its two forms
-	/// are two keys (SEC 1 v2.0 §2.3.3).
-	#[test]
-	fn a_key_on_a_sec2_binary_curve_in_two_forms_is_two_keys() -> Result<(), Error> {
-		let uncompressed = with_point(SECT233K1, &in_form(0x04));
-		let compressed = with_point(SECT233K1, compressed().subject_public_key.raw_bytes());
-
-		let uncompressed = CanonicalKey::of(&uncompressed)?;
-		assert_ne!(uncompressed, CanonicalKey::of(&compressed)?);
-		Ok(())
+	// One point in its two SEC 1 forms is one key, read through the entry each
+	// row names.
+	crate::tb_cases! {
+		fn one_point((canonical, left, right): (Canonical, Certificate, Certificate)) -> TestResult {
+			let left = canonical(&left.tbs_certificate.subject_public_key_info)?;
+			let right = canonical(&right.tbs_certificate.subject_public_key_info)?;
+			assert_eq!(left, right);
+			Ok(())
+		}
+		cases {
+			/// One secp256k1 point in its compressed and its uncompressed form
+			/// is one key.
+			in_both_forms_is_one_key => (house_identity, compressed(), TestCertificate::insecure_fixed()),
+			/// The P-256 key of RFC 6979 §A.2.5 in its two SEC 1 forms is one
+			/// key, read by its form with no decoder of P-256.
+			of_a_curve_without_a_decoder_in_both_forms_is_one_key => (
+				CanonicalKey::of,
+				point_on(CURVE_NIST_P256, &TestKey::RFC6979_P256_COMPRESSED),
+				point_on(CURVE_NIST_P256, &TestKey::RFC6979_P256_UNCOMPRESSED),
+			),
+		}
 	}
 
-	/// A key on an X9.62 binary-field curve reads as its bits, so its two
-	/// forms are two keys.
-	#[test]
-	fn a_key_on_an_x962_binary_curve_in_two_forms_is_two_keys() -> Result<(), Error> {
-		let uncompressed = with_point(C2PNB163V1, &in_form(0x04));
-		let compressed = with_point(C2PNB163V1, compressed().subject_public_key.raw_bytes());
-
-		let uncompressed = CanonicalKey::of(&uncompressed)?;
-		assert_ne!(uncompressed, CanonicalKey::of(&compressed)?);
-		Ok(())
+	// Two keys keep two canonical forms, read through the entry each row names.
+	crate::tb_cases! {
+		fn two_keys_are((canonical, left, right): (Canonical, Certificate, Certificate)) -> TestResult {
+			let left = canonical(&left.tbs_certificate.subject_public_key_info)?;
+			let right = canonical(&right.tbs_certificate.subject_public_key_info)?;
+			assert_ne!(left, right);
+			Ok(())
+		}
+		cases {
+			/// A key on a SEC 2 binary-field curve reads as its bits, so its
+			/// two forms are two keys (SEC 1 v2.0 §2.3.3).
+			the_two_forms_of_a_key_on_a_sec2_binary_curve => (
+				CanonicalKey::of,
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), SECT233K1),
+				TestCertificate::with_named_curve(compressed(), SECT233K1),
+			),
+			/// A key on an X9.62 binary-field curve reads as its bits, so its
+			/// two forms are two keys.
+			the_two_forms_of_a_key_on_an_x962_binary_curve => (
+				CanonicalKey::of,
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), C2PNB163V1),
+				TestCertificate::with_named_curve(compressed(), C2PNB163V1),
+			),
+			/// A point and its negation share an x-coordinate and are two keys.
+			a_point_and_its_negation => (
+				house_identity,
+				TestCertificate::insecure_fixed_negation(),
+				TestCertificate::insecure_fixed(),
+			),
+			/// One point encoding under P-256 and under P-384 reads by its form
+			/// under each, so the named curve alone separates the two keys.
+			one_encoding_on_two_curves => (
+				house_identity,
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), CURVE_NIST_P256),
+				TestCertificate::with_named_curve(TestCertificate::insecure_fixed(), CURVE_NIST_P384),
+			),
+			/// An encoding of the x-coordinate and the y parity of the fixed
+			/// key that is no point of its curve reads as its bits, so it is
+			/// another key (SEC 1 v2.0 §2.3.4).
+			an_off_curve_alias_and_its_point => (house_identity, off_curve_alias(), TestCertificate::insecure_fixed()),
+			/// One bit string under Ed25519 and under X25519 is two keys, which
+			/// the algorithm OID alone separates (RFC 8410 §3).
+			one_bit_string_under_two_algorithms => (house_identity, under(ID_ED_25519), under(ID_X_25519)),
+		}
 	}
 
-	/// A key whose canonical form fills the inline bound keeps its whole DER.
-	#[test]
-	fn a_key_at_the_inline_bound_keeps_its_der() -> Result<(), Error> {
-		let edge = edge_key();
-		let expected = edge.to_der()?;
-
-		let canonical = CanonicalKey::of(&edge)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	// A decoder of a curve accepts each encoding of a point of its curve and
+	// refuses each encoding of none.
+	crate::tb_cases! {
+		fn a_decoder((decoder, point, decodes): (&dyn CurvePoints, Vec<u8>, bool)) {
+			let decoded = decoder.decodes(&point);
+			assert_eq!(decoded, decodes);
+		}
+		cases {
+			/// The decoder of secp256k1 accepts its generator in the
+			/// uncompressed form that SEC 2 v2.0 §2.4.1 publishes.
+			of_secp256k1_accepts_the_published_uncompressed_generator => (
+				&Sec1Curve::<Secp256k1>::new(),
+				TestKey::SEC2_SECP256K1_G_UNCOMPRESSED.to_vec(),
+				true,
+			),
+			/// The decoder of secp256k1 accepts its generator in the compressed
+			/// form that SEC 2 v2.0 §2.4.1 publishes.
+			of_secp256k1_accepts_the_published_compressed_generator => (
+				&Sec1Curve::<Secp256k1>::new(),
+				TestKey::SEC2_SECP256K1_G_COMPRESSED.to_vec(),
+				true,
+			),
+			/// The test decoder of P-256 accepts the key of RFC 6979 §A.2.5 in
+			/// the uncompressed form, whose coordinates solve the curve
+			/// equation.
+			of_p256_accepts_the_rfc6979_key_uncompressed => (
+				&TestP256Points,
+				TestKey::RFC6979_P256_UNCOMPRESSED.to_vec(),
+				true,
+			),
+			/// The test decoder of P-256 accepts the key of RFC 6979 §A.2.5 in
+			/// the compressed form, whose x-coordinate gives a square.
+			of_p256_accepts_the_rfc6979_key_compressed => (
+				&TestP256Points,
+				TestKey::RFC6979_P256_COMPRESSED.to_vec(),
+				true,
+			),
+			/// The test decoder of P-256 refuses the RFC 6979 key with the
+			/// second-lowest bit of y flipped, which solves no curve equation.
+			of_p256_refuses_an_off_curve_alias => (&TestP256Points, p256_off_curve_alias(), false),
+			/// The test decoder of P-256 refuses a compressed point whose
+			/// x-coordinate, the one of the RFC 6979 key plus one, gives no
+			/// square.
+			of_p256_refuses_an_x_of_no_point => (&TestP256Points, p256_x_of_no_point(), false),
+		}
 	}
 
-	/// A key whose canonical form exceeds the inline bound keeps its whole DER.
-	#[test]
-	fn a_key_past_the_inline_bound_keeps_its_der() -> Result<(), Error> {
-		let long = long_key();
-		let expected = long.to_der()?;
-
-		let canonical = CanonicalKey::of(&long)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	// A SEC 1 read names no point in an encoding of uneven halves, or in a
+	// form that RFC 5480 §2.2 refuses.
+	crate::tb_cases! {
+		fn no_point_is_read_from(point: Vec<u8>) {
+			let read = Sec1Point::read(&point);
+			assert_eq!(read, None);
+		}
+		cases {
+			/// An uncompressed point whose two halves differ in length holds no
+			/// x and y of one field, so it is no point.
+			an_uncompressed_encoding_of_uneven_halves => {
+				[point_of(&TestCertificate::insecure_fixed()), vec![0]].concat()
+			},
+			/// RFC 5480 §2.2 refuses the hybrid form, so its octet `0x06` names
+			/// no point.
+			a_hybrid_encoding_of_even_y => {
+				point_of(&TestCertificate::with_key_form(TestCertificate::insecure_fixed(), 0x06))
+			},
+			/// RFC 5480 §2.2 refuses the hybrid form, so its octet `0x07` names
+			/// no point.
+			a_hybrid_encoding_of_odd_y => {
+				point_of(&TestCertificate::with_key_form(TestCertificate::insecure_fixed(), 0x07))
+			},
+		}
 	}
 
-	/// A key index finds the key it holds by the point in its other SEC 1 form.
-	#[test]
-	fn an_index_finds_a_key_by_its_point_in_the_other_form() -> Result<(), Error> {
-		let compressed = compressed();
-		let uncompressed = uncompressed();
-		let mut index = KeyIndex::default();
-		index.insert(&compressed, ())?;
-
-		let found = index.find(&uncompressed);
-		assert_eq!(found, Some(&()));
-		Ok(())
-	}
-
-	/// A key index finds no key by the negation of the point it holds.
-	#[test]
-	fn an_index_finds_no_key_by_the_negation_of_its_point() -> Result<(), Error> {
-		let negated = negated();
-		let uncompressed = uncompressed();
-		let mut index = KeyIndex::default();
-		index.insert(&uncompressed, ())?;
-
-		let found = index.find(&negated);
-		assert_eq!(found, None);
-		Ok(())
+	// A key index finds the key it holds by the point in either SEC 1 form,
+	// read under its own curves, and by no other point.
+	crate::tb_cases! {
+		fn an_index_finds((empty, held, probe, expected): (KeyIndex<()>, Certificate, Certificate, Option<()>)) {
+			let index = index_of(empty, &held, ());
+			let found = index.find(&probe.tbs_certificate.subject_public_key_info).copied();
+			assert_eq!(found, expected);
+		}
+		cases {
+			/// A key index finds the key it holds by the point in its other
+			/// SEC 1 form.
+			a_key_by_its_point_in_the_other_form => (
+				KeyIndex::default(),
+				compressed(),
+				TestCertificate::insecure_fixed(),
+				Some(()),
+			),
+			/// A key index finds no key by the negation of the point it holds.
+			no_key_by_the_negation_of_its_point => (
+				KeyIndex::default(),
+				TestCertificate::insecure_fixed(),
+				TestCertificate::insecure_fixed_negation(),
+				None,
+			),
+			/// A key index reads the key it inserts under its own curves, so an
+			/// index with no decoder of secp256k1 reads an off-curve alias as
+			/// the point it names, and finds that point by it.
+			the_point_an_alias_names_under_its_own_curves => (
+				KeyIndex::new(NO_DECODER),
+				off_curve_alias(),
+				TestCertificate::insecure_fixed(),
+				Some(()),
+			),
+			/// The default index reads each key under [`KeyCurves::HOUSE`],
+			/// whose decoder of secp256k1 refuses an off-curve alias, so the
+			/// alias reads as its bits and names no point.
+			no_key_by_the_point_an_alias_names_under_the_house_curves => (
+				KeyIndex::default(),
+				off_curve_alias(),
+				TestCertificate::insecure_fixed(),
+				None,
+			),
+		}
 	}
 
 	/// A key index that indexes a key again, in its other SEC 1 form, returns
 	/// the value that the key held before.
 	#[test]
-	fn an_index_returns_the_value_it_replaces() -> Result<(), Error> {
-		let mut index = KeyIndex::default();
-		index.insert(&uncompressed(), "first")?;
+	fn an_index_returns_the_value_it_replaces() -> TestResult {
+		let mut index = index_of(KeyIndex::default(), &TestCertificate::insecure_fixed(), "first");
+		let compressed = compressed();
 
-		let replaced = index.insert(&compressed(), "second")?;
+		let replaced = index.insert(&compressed.tbs_certificate.subject_public_key_info, "second")?;
 		assert_eq!(replaced, Some("first"));
 		Ok(())
 	}
@@ -1154,164 +1185,70 @@ mod tests {
 	/// A key index removes the key it holds by the point in its other SEC 1
 	/// form, and returns its value.
 	#[test]
-	fn an_index_removes_a_key_by_its_point_in_the_other_form() -> Result<(), Error> {
-		let mut index = KeyIndex::default();
-		index.insert(&uncompressed(), "enrolled")?;
+	fn an_index_removes_a_key_by_its_point_in_the_other_form() {
+		let mut index = index_of(KeyIndex::default(), &TestCertificate::insecure_fixed(), "enrolled");
+		let compressed = compressed();
 
-		let removed = index.remove(&compressed());
+		let removed = index.remove(&compressed.tbs_certificate.subject_public_key_info);
 		assert_eq!(removed, Some("enrolled"));
-		Ok(())
 	}
 
-	/// A key index reads the key it inserts under its own curves, so an index
-	/// with no decoder of secp256k1 reads an off-curve alias as the point it
-	/// names, and finds that point by it.
-	#[test]
-	fn an_index_reads_the_key_it_inserts_under_its_own_curves() -> Result<(), Error> {
-		let mut index = KeyIndex::new(NO_DECODER);
-		index.insert(&off_curve_alias(), ())?;
+	// A key list holds a key by the point in either SEC 1 form, under its
+	// algorithm and its curve.
+	crate::tb_cases! {
+		fn a_list((listed, probe, held): (Certificate, Certificate, bool)) -> TestResult {
+			let list = KeyList::read(KeyCurves::HOUSE, [TestCertificate::spki_der(&listed)])?;
 
-		let found = index.find(&uncompressed());
-		assert_eq!(found, Some(&()));
-		Ok(())
+			let holds = list.holds(&probe.tbs_certificate.subject_public_key_info);
+			assert_eq!(holds, held);
+			Ok(())
+		}
+		cases {
+			/// A list of the negation of a key holds no point of that key,
+			/// whose x-coordinate the negation shares.
+			of_the_negation_holds_no_point_of_the_key => (
+				TestCertificate::insecure_fixed_negation(),
+				TestCertificate::insecure_fixed(),
+				false,
+			),
+			/// A list of the compressed form of a point holds the point in its
+			/// uncompressed form.
+			holds_its_point_in_the_other_form => (compressed(), TestCertificate::insecure_fixed(), true),
+			/// A key of another algorithm is another key, though its BIT STRING
+			/// holds the octets of a listed point.
+			holds_no_key_of_another_algorithm => (
+				TestCertificate::insecure_fixed(),
+				with_algorithm(ID_ED_25519),
+				false,
+			),
+			/// A list of a key of another algorithm holds that key by its bits.
+			holds_a_key_of_another_algorithm_by_its_bits => (under(ID_ED_25519), under(ID_ED_25519), true),
+		}
 	}
 
-	/// A point and its negation share an x-coordinate and are two keys.
-	#[test]
-	fn a_point_and_its_negation_are_two_keys() -> Result<(), Error> {
-		let negated = negated();
-		let uncompressed = uncompressed();
-
-		let negated = KeyIdentity::of(&negated, KeyCurves::HOUSE).to_canonical()?;
-		assert_ne!(negated, KeyIdentity::of(&uncompressed, KeyCurves::HOUSE).to_canonical()?);
-		Ok(())
-	}
-
-	/// One point encoding under P-256 and under P-384 reads by its form under
-	/// each, so the named curve alone separates the two keys.
-	#[test]
-	fn one_encoding_on_two_curves_is_two_keys() -> Result<(), Error> {
-		let p256 = on_curve(CURVE_NIST_P256);
-		let p384 = on_curve(CURVE_NIST_P384);
-
-		let p256 = KeyIdentity::of(&p256, KeyCurves::HOUSE).to_canonical()?;
-		assert_ne!(p256, KeyIdentity::of(&p384, KeyCurves::HOUSE).to_canonical()?);
-		Ok(())
-	}
-
-	/// A list of the negation of a key holds no point of that key, whose
-	/// x-coordinate the negation shares.
-	#[test]
-	fn a_list_of_the_negation_holds_no_point_of_the_key() -> Result<(), KeyListError> {
-		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&negated())])?;
-		assert!(!list.holds(&uncompressed()));
-		Ok(())
-	}
-
-	/// A list of the compressed form of a point holds the point in its
-	/// uncompressed form.
-	#[test]
-	fn a_list_holds_its_point_in_the_other_form() -> Result<(), KeyListError> {
-		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&compressed())])?;
-		assert!(list.holds(&uncompressed()));
-		Ok(())
-	}
-
-	/// A list read with no decoder of secp256k1 cannot tell a point of that
-	/// curve from an off-curve alias, so it refuses the entry with its index.
-	#[test]
-	fn a_list_with_no_decoder_of_a_curve_refuses_its_point() {
-		let refused = KeyList::read(NO_DECODER, [der_of(&uncompressed())]);
-		assert_eq!(refused.err(), Some(KeyListError::NoDecoder { index: 0 }));
-	}
-
-	/// A key of another algorithm is another key, though its BIT STRING
-	/// holds the octets of a listed point.
-	#[test]
-	fn a_list_holds_no_key_of_another_algorithm() -> Result<(), KeyListError> {
-		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&uncompressed())])?;
-		let mut other = uncompressed();
-		other.algorithm.oid = ID_ED_25519;
-
-		assert!(!list.holds(&other));
-		Ok(())
-	}
-
-	/// A list of a key of another algorithm holds that key by its bits.
-	#[test]
-	fn a_list_holds_a_key_of_another_algorithm_by_its_bits() -> Result<(), KeyListError> {
-		let ed25519 = under(ID_ED_25519);
-		let list = KeyList::read(KeyCurves::HOUSE, [der_of(&ed25519)])?;
-		assert!(list.holds(&ed25519));
-		Ok(())
-	}
-
-	/// An entry that is no SubjectPublicKeyInfo refuses the list with its
-	/// index.
-	#[test]
-	fn a_list_refuses_an_unreadable_entry_with_its_index() {
-		let refused = KeyList::read(KeyCurves::HOUSE, [der_of(&uncompressed()), b"no key".to_vec()]);
-		assert_eq!(refused.err(), Some(KeyListError::Unreadable { index: 1 }));
-	}
-
-	/// An encoding of the x-coordinate and the y parity of the fixed key that
-	/// is no point of its curve reads as its bits, so it is another key
-	/// (SEC 1 v2.0 §2.3.4).
-	#[test]
-	fn an_off_curve_alias_of_a_point_is_another_key() -> Result<(), Error> {
-		let alias = off_curve_alias();
-		let uncompressed = uncompressed();
-
-		let alias = KeyIdentity::of(&alias, KeyCurves::HOUSE).to_canonical()?;
-		assert_ne!(alias, KeyIdentity::of(&uncompressed, KeyCurves::HOUSE).to_canonical()?);
-		Ok(())
-	}
-
-	/// One bit string under Ed25519 and under X25519 is two keys, which the
-	/// algorithm OID alone separates (RFC 8410 §3).
-	#[test]
-	fn one_bit_string_under_two_algorithms_is_two_keys() -> Result<(), Error> {
-		let signing = under(ID_ED_25519);
-		let agreement = under(ID_X_25519);
-
-		let signing = KeyIdentity::of(&signing, KeyCurves::HOUSE).to_canonical()?;
-		assert_ne!(signing, KeyIdentity::of(&agreement, KeyCurves::HOUSE).to_canonical()?);
-		Ok(())
-	}
-
-	/// An uncompressed point whose two halves differ in length holds no x and
-	/// y of one field, so it is no point.
-	#[test]
-	fn an_uncompressed_point_of_uneven_halves_is_no_point() {
-		let uneven = [in_form(0x04), vec![0]].concat();
-		assert_eq!(Sec1Point::read(&uneven), None);
-	}
-
-	/// RFC 5480 §2.2 refuses the hybrid form, so its octet `0x06` names no
-	/// point.
-	#[test]
-	fn a_hybrid_point_of_even_y_is_no_point() {
-		let hybrid = in_form(0x06);
-		assert_eq!(Sec1Point::read(&hybrid), None);
-	}
-
-	/// RFC 5480 §2.2 refuses the hybrid form, so its octet `0x07` names no
-	/// point.
-	#[test]
-	fn a_hybrid_point_of_odd_y_is_no_point() {
-		let hybrid = in_form(0x07);
-		assert_eq!(Sec1Point::read(&hybrid), None);
-	}
-
-	/// RFC 5480 §2.2 refuses the compact form, so a key in it reads as its
-	/// bits and keeps its DER.
-	#[test]
-	fn a_compact_point_keeps_its_der() -> Result<(), Error> {
-		let compact = compact();
-		let expected = compact.to_der()?;
-
-		let canonical = CanonicalKey::of(&compact)?;
-		assert_eq!(canonical.as_der(), expected.as_slice());
-		Ok(())
+	// A key list refuses the whole list for an entry it cannot read, and names
+	// that entry by its index.
+	crate::tb_cases! {
+		fn a_list_refuses((curves, entries, refusal): (KeyCurves, Vec<Vec<u8>>, KeyListError)) {
+			let refused = KeyList::read(curves, entries);
+			assert_eq!(refused.err(), Some(refusal));
+		}
+		cases {
+			/// A list read with no decoder of secp256k1 cannot tell a point of
+			/// that curve from an off-curve alias, so it refuses the entry with
+			/// its index.
+			a_point_of_a_curve_it_holds_no_decoder_for => (
+				NO_DECODER,
+				vec![TestCertificate::spki_der(&TestCertificate::insecure_fixed())],
+				KeyListError::NoDecoder { index: 0 },
+			),
+			/// An entry that is no SubjectPublicKeyInfo refuses the list with
+			/// its index.
+			an_unreadable_entry_with_its_index => (
+				KeyCurves::HOUSE,
+				vec![TestCertificate::spki_der(&TestCertificate::insecure_fixed()), b"no key".to_vec()],
+				KeyListError::Unreadable { index: 1 },
+			),
+		}
 	}
 }

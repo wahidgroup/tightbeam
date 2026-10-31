@@ -867,17 +867,28 @@ pub mod active {
 mod tests {
 	use core::time::Duration;
 	use std::borrow::Cow;
-	use std::panic::{catch_unwind, AssertUnwindSafe};
 	use std::sync::Arc;
 
 	use super::active::{tagged, tb_event_tags};
 	use super::*;
-	use crate::clock::{Clock, ManualClock};
-	use crate::crypto::hash::{Digest, Sha3_256};
+	use crate::asn1::admission::fixtures::der_refusal;
+	use crate::clock::ManualClock;
 	use crate::der::asn1::{Any, OctetString};
-	use crate::der::{Decode, Encode, ErrorKind, Tag};
-	use crate::error::Result;
-	use crate::trace::{ConsumedTrace, TraceCollector, TraceConfig};
+	use crate::der::{Decode, Encode, ErrorKind, Length, Tag};
+	use crate::hex;
+	use crate::testing::fixtures::{der_round_trip, poison, TestClock, TestTrace};
+	use crate::trace::{ConsumedTrace, TraceCollector};
+
+	/// The trace hash of [`artifact_of_one_event`], which Python's `hashlib`
+	/// computed over the DER of its event, written by hand from the `TbEvent`
+	/// module of the README.
+	const ONE_EVENT_TRACE_HASH: [u8; 32] = hex!("c3c796ba389a4d648c87e3c8acb8d07118637b0e163daf130bd2ad511d260c23");
+
+	/// The evidence hash of [`artifact_of_an_overflowed_trace`], which Python's
+	/// `hashlib` computed over 32 zero octets, the trace hash, and `01 01 FF`,
+	/// with the DER of the two events written by hand from the `TbEvent` module
+	/// of the README.
+	const OVERFLOWED_EVIDENCE_HASH: [u8; 32] = hex!("7b28dfd077f95e098705f8b97b01c5168b3a52297baa022a19a2d143439573d1");
 
 	/// One `TbEvent` SEQUENCE that carries `hash` as its payload-hash field.
 	///
@@ -901,6 +912,8 @@ mod tests {
 			.expect("a SEQUENCE re-encodes")
 	}
 
+	/// An event decodes from its DER as the event that wrote it, each optional
+	/// field and the URN included.
 	#[test]
 	fn an_event_survives_a_der_round_trip() {
 		let event = TbEvent {
@@ -914,59 +927,53 @@ mod tests {
 			extras: Some(vec![1, 2, 3]),
 		};
 
-		let encoded = event.to_der().expect("an event built from valid parts encodes");
-		let decoded = TbEvent::from_der(&encoded).expect("what the encoder wrote, the decoder reads");
-		assert_eq!(decoded.seq, event.seq);
-		assert_eq!(decoded.label, event.label);
-		assert_eq!(decoded.payload_hash, event.payload_hash);
-		assert_eq!(decoded.duration_ns, event.duration_ns);
-		assert_eq!(decoded.timestamp_ns, event.timestamp_ns);
-		assert_eq!(decoded.flags, event.flags);
-		assert_eq!(decoded.extras, event.extras);
+		let decoded = der_round_trip(&event);
+		assert_eq!(decoded, event);
 	}
 
-	/// The same fields under a SEQUENCE header that declares `declared` bytes
-	/// of body, whatever the real length of the body.
-	fn event_with_declared_length(declared: usize) -> Vec<u8> {
+	/// The fields of [`event_with_payload_hash`] under a SEQUENCE header whose
+	/// short-form length misses the body by `offset` octets.
+	fn event_with_length_off_by(offset: i8) -> Vec<u8> {
 		let honest = event_with_payload_hash([7u8; 32]);
-		let body = &honest[2..];
-		assert!(
-			honest[0] == 0x30 && honest[1] < 128,
-			"the helper above writes a short-form SEQUENCE"
-		);
+		let [0x30, length @ 0..=0x7f, body @ ..] = honest.as_slice() else {
+			panic!("the payload-hash event is a short-form SEQUENCE");
+		};
 
-		let mut der = vec![0x30, declared as u8];
-		der.extend_from_slice(body);
-		der
+		let declared = length.checked_add_signed(offset).expect("the declared length fits one octet");
+		[&[0x30, declared][..], body].concat()
 	}
 
 	// `decode_value` gets an unbounded reader, so a decoder that ignores
-	// `header.length` reads past its own event when events are nested.
-	#[test]
-	fn a_declared_length_shorter_than_the_body_is_refused() {
-		let honest_len = event_with_payload_hash([7u8; 32])[1] as usize;
-		let refused = TbEvent::from_der(&event_with_declared_length(honest_len - 4));
-		assert!(refused.is_err(), "a SEQUENCE length that undercuts its body must not decode");
+	// `header.length` reads past its own event when events are nested. A
+	// declared length that undercuts or overruns the body is refused.
+	crate::tb_cases! {
+		fn a_declared_length_that_misses_the_body_is_refused((offset, refusal): (i8, ErrorKind)) {
+			let decoded = TbEvent::from_der(&event_with_length_off_by(offset));
+			assert_eq!(der_refusal(decoded), Some(refusal));
+		}
+		cases {
+			/// The declared body ends at octet 72, before the payload-hash
+			/// field inside it ends at octet 73.
+			shorter => (-4, ErrorKind::Incomplete { expected_len: Length::new(73), actual_len: Length::new(72) }),
+			/// The header declares a body that ends at octet 80, past the 76
+			/// octets of the input.
+			longer => (4, ErrorKind::Incomplete { expected_len: Length::new(80), actual_len: Length::new(76) }),
+		}
 	}
 
-	#[test]
-	fn a_declared_length_longer_than_the_body_is_refused() {
-		let honest_len = event_with_payload_hash([7u8; 32])[1] as usize;
-		let refused = TbEvent::from_der(&event_with_declared_length(honest_len + 4));
-		assert!(refused.is_err(), "a SEQUENCE length that overruns its body must not decode");
-	}
-
-	// A truncated hash must not read as an absent one.
-	#[test]
-	fn a_payload_hash_of_the_wrong_length_is_refused() {
-		let refused = TbEvent::from_der(&event_with_payload_hash([0u8; 16]));
-		assert!(refused.is_err(), "a 16-byte payload hash must not decode as an absent one");
-	}
-
-	#[test]
-	fn a_payload_hash_of_the_right_length_decodes() {
-		let accepted = TbEvent::from_der(&event_with_payload_hash([7u8; 32])).expect("a 32-byte hash decodes");
-		assert_eq!(accepted.payload_hash, Some([7u8; 32]));
+	// A payload hash decodes at 32 octets alone, so a truncated hash is a
+	// length error and never reads as an absent one.
+	crate::tb_cases! {
+		fn a_payload_hash_decodes_only_at_32_octets(
+			(hash, decoded): (Vec<u8>, Result<Option<[u8; 32]>, ErrorKind>)
+		) {
+			let event = TbEvent::from_der(&event_with_payload_hash(hash));
+			assert_eq!(event.map(|event| event.payload_hash).map_err(|error| error.kind()), decoded);
+		}
+		cases {
+			short => (vec![0; 16], Err(ErrorKind::Length { tag: Tag::OctetString })),
+			full => (vec![7; 32], Ok(Some([7; 32]))),
+		}
 	}
 
 	/// An event of sequence number `seq` with no optional field.
@@ -983,24 +990,25 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn bounded_sink_retains_up_to_cap() {
-		let sink = BoundedMemorySink::new(2);
-		sink.emit(sample_event(0));
-		sink.emit(sample_event(1));
-		assert!(!sink.overflowed());
-		assert_eq!(sink.drain().len(), 2);
+	/// A sink that holds `cap` events, after it receives the events of the
+	/// sequence numbers below `count`.
+	fn filled(cap: u32, count: u64) -> BoundedMemorySink {
+		let sink = BoundedMemorySink::new(cap);
+		(0..count).for_each(|seq| sink.emit(sample_event(seq)));
+		sink
 	}
 
-	#[test]
-	fn bounded_sink_drops_past_cap_and_latches() {
-		let sink = BoundedMemorySink::new(1);
-		sink.emit(sample_event(0));
-		sink.emit(sample_event(1));
-		sink.emit(sample_event(2));
-
-		assert!(sink.overflowed());
-		assert_eq!(sink.drain().len(), 2);
+	// A bounded sink within its cap keeps every event, and a sink past its cap
+	// latches the overflow and keeps one warning past the cap.
+	crate::tb_cases! {
+		fn a_bounded_sink_latches_past_its_cap((cap, emits, overflowed, drained): (u32, u64, bool, usize)) {
+			let sink = filled(cap, emits);
+			assert_eq!((sink.overflowed(), sink.drain().len()), (overflowed, drained));
+		}
+		cases {
+			within_cap => (2, 2, false, 2),
+			past_cap => (1, 3, true, 2),
+		}
 	}
 
 	/// The warning of an event takes its sequence number and its clock stamp,
@@ -1018,7 +1026,6 @@ mod tests {
 		};
 
 		let warning = dropped.into_overflow_warning();
-
 		let expected = TbEvent {
 			urn: events::WARN,
 			label: Some(Cow::Borrowed("urn:tightbeam:event:core/start")),
@@ -1032,27 +1039,26 @@ mod tests {
 	/// so the collector builds the event that the warning replaces.
 	#[test]
 	fn a_full_bounded_sink_retains_the_event_its_warning_replaces() {
-		let sink = BoundedMemorySink::new(1);
-		sink.emit(sample_event(0));
-
+		let sink = filled(1, 1);
 		assert_eq!([sink.retains(), sink.overflowed()], [true, false]);
 	}
 
+	/// A drain frees the capacity of a bounded sink, so it keeps the next
+	/// event with its latch clear.
 	#[test]
 	fn bounded_sink_drain_rearms_capacity() {
-		let sink = BoundedMemorySink::new(1);
-		sink.emit(sample_event(0));
+		let sink = filled(1, 1);
 		sink.drain();
 		sink.emit(sample_event(1));
 		assert!(!sink.overflowed());
 		assert_eq!(sink.drain().len(), 1);
 	}
 
+	/// The overflow latch of a bounded sink stays set across a drain, so the
+	/// sink keeps one warning.
 	#[test]
 	fn bounded_sink_overflow_latch_survives_drain() {
-		let sink = BoundedMemorySink::new(1);
-		sink.emit(sample_event(0));
-		sink.emit(sample_event(1));
+		let sink = filled(1, 2);
 		sink.drain();
 		assert!(sink.overflowed());
 	}
@@ -1068,42 +1074,34 @@ mod tests {
 		assert_eq!([first, sink.retains(), sink.overflowed()], [true, false, true]);
 	}
 
-	/// Poisons the event lock of `sink`, as a panic while an emit holds the
-	/// lock would.
-	fn poison_events(sink: &BoundedMemorySink) {
-		let events = sink.events_lock();
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = events.lock();
-			panic!("poison the event lock");
-		}));
-
-		assert!(panicked.is_err());
-		assert!(events.is_poisoned());
-	}
-
 	/// A poisoned sink keeps the events it holds, and the warning in place of
 	/// the first event past its bound sets the latch, as an unpoisoned sink
 	/// does.
 	#[test]
 	fn a_poisoned_sink_keeps_its_events_and_latches_a_drop() {
-		let sink = BoundedMemorySink::new(1);
-		sink.emit(sample_event(0));
-		poison_events(&sink);
+		let sink = filled(1, 1);
+		poison(sink.events_lock());
 
 		sink.emit(sample_event(1));
 
 		assert_eq!((sink.overflowed(), sink.drain().len()), (true, 2));
 	}
 
+	/// The artifact of the trace that drains `collector`, against the zero
+	/// spec hash.
+	fn artifact_of(collector: &TraceCollector) -> EvidenceArtifact {
+		let artifact = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(collector));
+		artifact.expect("the events of a test trace encode as DER")
+	}
+
 	/// The trace hash of the artifact of a trace whose one event `record`
 	/// writes, under a config that keeps durations.
 	fn trace_hash_of(record: impl FnOnce(&TraceCollector)) -> OctetString {
-		let config = TbInstrumentationConfig { record_durations: true, ..TbInstrumentationConfig::default() };
-		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+		let collector =
+			TestTrace::with_config(TbInstrumentationConfig { record_durations: true, ..Default::default() });
 		record(&collector);
 
-		let artifact = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(&collector));
-		artifact.expect("one event encodes as DER").trace_hash().clone()
+		artifact_of(&collector).trace_hash().clone()
 	}
 
 	/// An event that records a zero span and one that records no span hash
@@ -1111,33 +1109,29 @@ mod tests {
 	#[test]
 	fn two_events_that_differ_in_an_absent_field_hash_apart() {
 		let timed = trace_hash_of(|collector| collector.emit_with_timing(events::START, "x", Duration::ZERO));
-
 		let untimed = trace_hash_of(|collector| collector.emit(events::START, "x"));
-
 		assert_ne!(timed, untimed);
 	}
 
 	/// A trace that another reader drained first leaves the drop latch clear,
 	/// and its artifact still reports that it misses events.
 	#[test]
-	fn an_artifact_of_a_truncated_trace_reports_overflow() -> Result<()> {
+	fn an_artifact_of_a_truncated_trace_reports_overflow() {
 		let collector = TraceCollector::new();
 		collector.emit(events::START, "taken");
 		let _taken = collector.drain_events();
 		collector.emit(events::END, "left");
 
-		let artifact = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(&collector))?;
-
+		let artifact = artifact_of(&collector);
 		assert!(artifact.overflow());
-		Ok(())
 	}
 
 	/// The artifact of a complete trace of one event.
-	fn artifact_of_one_event() -> Result<EvidenceArtifact> {
+	fn artifact_of_one_event() -> EvidenceArtifact {
 		let collector = TraceCollector::new();
 		collector.emit(events::START, "covered");
 
-		EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(&collector))
+		artifact_of(&collector)
 	}
 
 	/// The DER of an `EvidenceArtifact` SEQUENCE of `spec_hash`, the two hashes
@@ -1145,44 +1139,40 @@ mod tests {
 	/// them.
 	fn forged_der(
 		artifact: &EvidenceArtifact,
-		spec_hash: &OctetString,
+		spec_hash: impl AsRef<[u8]>,
 		events: Vec<TbEvent>,
 		overflow: bool,
-	) -> Result<Vec<u8>> {
+	) -> Vec<u8> {
+		let spec_hash = OctetString::new(spec_hash.as_ref()).expect("a test spec hash wraps in an OctetString");
 		let fields = [
-			spec_hash.to_der()?,
-			artifact.trace_hash().to_der()?,
-			artifact.evidence_hash().to_der()?,
-			events.to_der()?,
-			overflow.to_der()?,
+			spec_hash.to_der().expect("an octet string encodes"),
+			artifact.trace_hash().to_der().expect("an octet string encodes"),
+			artifact.evidence_hash().to_der().expect("an octet string encodes"),
+			events.to_der().expect("the events of a test trace encode"),
+			overflow.to_der().expect("a boolean encodes"),
 		];
 
-		Ok(Any::new(Tag::Sequence, fields.concat())?.to_der()?)
+		let sequence = Any::new(Tag::Sequence, fields.concat()).expect("the fields are a SEQUENCE body");
+		sequence.to_der().expect("a SEQUENCE re-encodes")
 	}
 
 	/// The artifact of a trace whose sink holds one of the two events it is
 	/// offered, so the trace misses an event.
-	fn artifact_of_an_overflowed_trace() -> Result<EvidenceArtifact> {
-		let config = TbInstrumentationConfig { max_events: 1, ..TbInstrumentationConfig::default() };
-		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+	fn artifact_of_an_overflowed_trace() -> EvidenceArtifact {
+		let collector = TestTrace::with_config(TbInstrumentationConfig { max_events: 1, ..Default::default() });
 		collector.emit(events::START, "kept");
 		collector.emit(events::END, "dropped");
 
-		EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(&collector))
+		artifact_of(&collector)
 	}
 
 	// Each case is (the artifact of a trace, whether the trace overflowed). An
 	// artifact decodes as the artifact that `of` built, `overflow` included.
 	crate::tb_cases! {
-		fn an_artifact_survives_a_der_round_trip(
-			(artifact_of, overflow): (fn() -> Result<EvidenceArtifact>, bool)
-		) -> Result<()> {
-			let artifact = artifact_of()?;
-
-			let decoded = EvidenceArtifact::from_der(&artifact.to_der()?)?;
-
+		fn an_artifact_survives_a_der_round_trip((build, overflow): (fn() -> EvidenceArtifact, bool)) {
+			let artifact = build();
+			let decoded = der_round_trip(&artifact);
 			assert_eq!((decoded.overflow(), decoded), (overflow, artifact));
-			Ok(())
 		}
 		cases {
 			complete => (artifact_of_one_event, false),
@@ -1193,115 +1183,92 @@ mod tests {
 	/// The events of an overflowed trace hold the warning of the first event
 	/// that its sink dropped, so the trace hash covers the truncation.
 	#[test]
-	fn the_artifact_of_an_overflowed_trace_covers_its_warning() -> Result<()> {
-		let artifact = artifact_of_an_overflowed_trace()?;
-
-		let urns: Vec<_> = artifact.events().iter().map(|event| event.urn.clone()).collect();
-
-		assert_eq!(urns, [events::START, events::WARN]);
-		Ok(())
+	fn the_artifact_of_an_overflowed_trace_covers_its_warning() {
+		let artifact = artifact_of_an_overflowed_trace();
+		let urns: Vec<_> = artifact.events().iter().map(|event| &event.urn).collect();
+		assert_eq!(urns, [&events::START, &events::WARN]);
 	}
 
 	/// The trace hash is the SHA3-256 of the DER of the events, a SEQUENCE OF
 	/// `TbEvent`.
 	#[test]
-	fn the_trace_hash_is_the_sha3_of_the_der_of_the_events() -> Result<()> {
-		let artifact = artifact_of_one_event()?;
-
-		let expected = Sha3_256::digest(artifact.events().to_vec().to_der()?);
-
-		assert_eq!(artifact.trace_hash().as_bytes(), expected.as_slice());
-		Ok(())
+	fn the_trace_hash_is_the_sha3_of_the_der_of_the_events() {
+		let artifact = artifact_of_one_event();
+		assert_eq!(artifact.trace_hash().as_bytes(), ONE_EVENT_TRACE_HASH);
 	}
 
-	/// The decode recomputes the trace hash from the events it read, so an
-	/// artifact whose hashes do not cover its events is refused.
-	#[test]
-	fn an_artifact_whose_hashes_do_not_cover_its_events_is_refused() -> Result<()> {
-		let artifact = artifact_of_one_event()?;
-		let forged = forged_der(&artifact, artifact.spec_hash(), Vec::new(), artifact.overflow())?;
+	/// The DER that one forgery writes of an artifact.
+	type Forgery = fn(&EvidenceArtifact) -> Vec<u8>;
 
-		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
-
-		assert_eq!(refused, Err(ErrorKind::Value { tag: Tag::OctetString }));
-		Ok(())
-	}
-
-	/// The evidence hash covers the spec hash, so an artifact under another
-	/// spec hash with the same trace hash is refused.
-	#[test]
-	fn an_artifact_whose_evidence_hash_does_not_cover_its_spec_hash_is_refused() -> Result<()> {
-		let artifact = artifact_of_one_event()?;
-		let other_spec = OctetString::new([1u8; 32])?;
-		let forged = forged_der(&artifact, &other_spec, artifact.events().to_vec(), artifact.overflow())?;
-
-		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
-
-		assert_eq!(refused, Err(ErrorKind::Value { tag: Tag::OctetString }));
-		Ok(())
-	}
-
-	/// `of` takes a spec hash of 32 octets, so the decode refuses a spec hash
-	/// of another width.
-	#[test]
-	fn an_artifact_whose_spec_hash_is_not_32_octets_is_refused() -> Result<()> {
-		let artifact = artifact_of_one_event()?;
-		let short_spec = OctetString::new([0u8; 16])?;
-		let forged = forged_der(&artifact, &short_spec, artifact.events().to_vec(), artifact.overflow())?;
-
-		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
-
-		assert_eq!(refused, Err(ErrorKind::Length { tag: Tag::OctetString }));
-		Ok(())
-	}
-
-	/// The evidence hash covers `overflow`, so the decode refuses the artifact
-	/// of a truncated trace whose `overflow` reads `false`.
-	#[test]
-	fn an_artifact_whose_evidence_hash_does_not_cover_its_overflow_is_refused() -> Result<()> {
-		let artifact = artifact_of_an_overflowed_trace()?;
-		let forged = forged_der(&artifact, artifact.spec_hash(), artifact.events().to_vec(), false)?;
-
-		let refused = EvidenceArtifact::from_der(&forged).map_err(|error| error.kind());
-
-		assert_eq!(refused, Err(ErrorKind::Value { tag: Tag::OctetString }));
-		Ok(())
+	// The decode recomputes both hashes from the fields it read and takes a
+	// spec hash of 32 octets, so it refuses an artifact whose hashes miss a
+	// field, and a spec hash of another width.
+	crate::tb_cases! {
+		fn a_forged_artifact_is_refused(
+			(build, forge, refusal): (fn() -> EvidenceArtifact, Forgery, ErrorKind)
+		) {
+			let artifact = build();
+			let decoded = EvidenceArtifact::from_der(&forge(&artifact));
+			assert_eq!(der_refusal(decoded), Some(refusal));
+		}
+		cases {
+			/// The trace hash covers the events, so an artifact whose hashes do
+			/// not cover its events is refused.
+			events_not_covered => (
+				artifact_of_one_event,
+				|artifact| forged_der(artifact, artifact.spec_hash().as_bytes(), Vec::new(), artifact.overflow()),
+				ErrorKind::Value { tag: Tag::OctetString },
+			),
+			/// The evidence hash covers the spec hash, so an artifact under
+			/// another spec hash with the same trace hash is refused.
+			spec_hash_not_covered => (
+				artifact_of_one_event,
+				|artifact| forged_der(artifact, [1u8; 32], artifact.events().to_vec(), artifact.overflow()),
+				ErrorKind::Value { tag: Tag::OctetString },
+			),
+			/// `of` takes a spec hash of 32 octets, so the decode refuses a
+			/// spec hash of another width.
+			spec_hash_not_32_octets => (
+				artifact_of_one_event,
+				|artifact| forged_der(artifact, [0u8; 16], artifact.events().to_vec(), artifact.overflow()),
+				ErrorKind::Length { tag: Tag::OctetString },
+			),
+			/// The evidence hash covers `overflow`, so the decode refuses the
+			/// artifact of a truncated trace whose `overflow` reads `false`.
+			overflow_not_covered => (
+				artifact_of_an_overflowed_trace,
+				|artifact| forged_der(artifact, artifact.spec_hash().as_bytes(), artifact.events().to_vec(), false),
+				ErrorKind::Value { tag: Tag::OctetString },
+			),
+		}
 	}
 
 	/// The evidence hash of a run on `clock`: three events through the event
 	/// API, so each event carries a stamp of the clock.
-	fn evidence_hash_on(clock: &Arc<ManualClock>) -> Result<OctetString> {
-		let trace = TraceCollector::new().with_clock(Arc::clone(clock) as Arc<dyn Clock>);
-		trace.emit_event(events::START)?;
-		trace.emit_event_with_evidence(events::GATE_REJECT, "PermissionDenied", Some(b"peer key"))?;
-		trace.emit_event(events::END)?;
+	fn evidence_hash_on(clock: &Arc<ManualClock>) -> OctetString {
+		let trace = TestTrace::on(clock);
+		let start = trace.emit_event(events::START);
+		let reject = trace.emit_event_with_evidence(events::GATE_REJECT, "PermissionDenied", Some(b"peer key"));
+		let end = trace.emit_event(events::END);
+		start.and(reject).and(end).expect("the trace injects no fault");
 
-		let artifact = EvidenceArtifact::of([0u8; 32], &ConsumedTrace::drained_from(&trace))?;
-		Ok(artifact.evidence_hash().clone())
+		artifact_of(&trace).evidence_hash().clone()
 	}
 
 	/// Two runs of the same events on a clock that gives each of them the
 	/// same readings give one evidence hash.
 	#[test]
-	fn two_runs_of_one_clock_reading_give_one_evidence_hash() -> Result<()> {
-		let clock = Arc::new(ManualClock::default());
-
-		let (first, second) = (evidence_hash_on(&clock)?, evidence_hash_on(&clock)?);
-
+	fn two_runs_of_one_clock_reading_give_one_evidence_hash() {
+		let clock = TestClock::manual();
+		let (first, second) = (evidence_hash_on(&clock), evidence_hash_on(&clock));
 		assert_eq!(first, second);
-		Ok(())
 	}
 
 	/// The evidence hash of an overflowed trace covers the DER of its
 	/// `overflow`, the BOOLEAN TRUE of X.690 § 11.1.
 	#[test]
-	fn the_evidence_hash_covers_the_der_of_overflow() -> Result<()> {
-		let artifact = artifact_of_an_overflowed_trace()?;
-
-		let der_true: &[u8] = &[0x01, 0x01, 0xFF];
-		let covered = [artifact.spec_hash().as_bytes(), artifact.trace_hash().as_bytes(), der_true].concat();
-
-		assert_eq!(artifact.evidence_hash().as_bytes(), Sha3_256::digest(covered).as_slice());
-		Ok(())
+	fn the_evidence_hash_covers_the_der_of_overflow() {
+		let artifact = artifact_of_an_overflowed_trace();
+		assert_eq!(artifact.evidence_hash().as_bytes(), OVERFLOWED_EVIDENCE_HASH);
 	}
 }

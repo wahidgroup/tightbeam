@@ -598,23 +598,16 @@ impl ClusterConfigBuilder {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::x509::CertificateSpec;
-	use crate::testing::{TestCertificate, TestKey};
-	use crate::TightBeamError;
-
-	/// The TLS material of a gateway under the fixed test key.
-	fn tls() -> Result<ClusterTlsConfig, TightBeamError> {
-		let key = TestKey::insecure_fixed_signing();
-		let certificate = CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key)));
-		ClusterTlsConfig::new(certificate, Arc::new(Secp256k1KeyProvider::from(key)))
-	}
+	use crate::colony::urn::ServletTypeKey;
+	use crate::testing::TestResult;
 
 	/// The gossip ingress set before the gossip section survives the section.
 	#[test]
-	fn a_gossip_field_set_before_its_section_survives_it() -> Result<(), Box<dyn std::error::Error>> {
-		let ingress = ColonyNamespace::default().servlet("feed")?;
-		let builder = ClusterConfig::builder(tls()?).with_gossip_ingress(ingress.clone())?;
+	fn a_gossip_field_set_before_its_section_survives_it() -> TestResult {
+		let ingress = ColonyNamespace::servlet_fixture("feed");
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let builder = builder.with_gossip_ingress(ingress.clone())?;
+
 		let config = builder.with_gossip_config(GossipConfig::default()).build();
 		assert_eq!(config.gossip.ingress, Some(ingress));
 		Ok(())
@@ -622,22 +615,25 @@ mod tests {
 
 	/// The gossip ingress set before its namespace keys under that namespace.
 	#[test]
-	fn a_gossip_ingress_set_before_its_namespace_keys_under_it() -> Result<(), Box<dyn std::error::Error>> {
+	fn a_gossip_ingress_set_before_its_namespace_keys_under_it() -> TestResult {
 		let acme = ColonyNamespace::new("acme", "prod")?;
-		let ingress = acme.servlet("feed")?;
-		let expected = acme.servlet_type_key(&ingress);
-
-		let builder = ClusterConfig::builder(tls()?).with_gossip_ingress(ingress)?;
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let builder = builder.with_gossip_ingress(acme.servlet("feed")?)?;
 		let config = builder.with_namespace(acme).build();
-		assert_eq!(config.gossip_ingress_key()?, expected);
+
+		let key = config.gossip_ingress_key()?;
+		let named = key.as_ref().map(ServletTypeKey::as_bytes);
+		assert_eq!(named, Some(b"urn:acme:prod:servlet:feed".as_slice()));
 		Ok(())
 	}
 
 	/// The dial list and the relay cap set before the peer section survive
 	/// the section.
 	#[test]
-	fn a_peer_field_set_before_its_section_survives_it() -> Result<(), Box<dyn std::error::Error>> {
-		let builder = ClusterConfig::builder(tls()?).with_peers(["127.0.0.1:9000"])?.with_max_hops(2);
+	fn a_peer_field_set_before_its_section_survives_it() -> TestResult {
+		let builder = ClusterConfig::builder(ClusterTlsConfig::fixture());
+		let builder = builder.with_peers(["127.0.0.1:9000"])?.with_max_hops(2);
+
 		let config = builder.with_peer_config(PeerConfig::default()).build();
 		assert_eq!((config.peer.peers().len(), config.peer.max_hops), (1, 2));
 		Ok(())

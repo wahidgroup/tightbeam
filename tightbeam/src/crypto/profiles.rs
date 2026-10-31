@@ -11,6 +11,7 @@ use core::fmt;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::TagNumber;
 use crate::wire::wire_sequence;
+use crate::Beamable;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::AeadAlgorithm;
@@ -78,7 +79,6 @@ use crate::der::oid::AssociatedOid;
 use crate::oids::{AES_128_WRAP, AES_192_WRAP, AES_256_WRAP};
 #[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
 use crate::spki::AlgorithmIdentifierOwned;
-use crate::Beamable;
 #[cfg(feature = "kem")]
 use kem::{Decapsulator, EncappedKey, Encapsulator};
 /// A one-shot closure that verifies a signature over the given bytes against
@@ -1008,33 +1008,35 @@ mod tests {
 		TIGHTBEAM_HYBRID_EXCHANGE_LABEL, TIGHTBEAM_OPENING_UKM_LABEL, TIGHTBEAM_RECORD_KEY_ID_DOMAIN,
 		TIGHTBEAM_SERVER_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_KEY_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 	};
+	use crate::testing::fixtures::der_round_trip;
 
-	/// Guard the domain constants against accidental change.
-	///
-	/// A failure means that a domain constant changed, which invalidates every
-	/// key and signature derived under the old value.
-	#[test]
-	fn test_domain_constants_stable() {
-		assert_eq!(TIGHTBEAM_OPENING_UKM_LABEL, b"tb/handshake/opening/ukm/v1");
-		assert_eq!(TIGHTBEAM_SESSION_KDF_INFO, b"tb/session/kdf/v1");
-		assert_eq!(TIGHTBEAM_SERVER_FINISHED_DOMAIN, b"tb/handshake/finished/server/v1");
-		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1");
-		assert_eq!(TIGHTBEAM_ACK_KEY_ID_DOMAIN, b"tb/handshake/ack/kekid/v1");
-		assert_eq!(TIGHTBEAM_FRAME_UKM_LABEL, b"tb/frame/ukm/v1");
-		assert_eq!(TIGHTBEAM_RECORD_KEY_ID_DOMAIN, b"tb/session/record/kekid/v1");
-		assert_eq!(TIGHTBEAM_CLOSING_KDF_INFO, b"tb/session/kdf/closing/v1");
-		assert_eq!(TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1");
-		assert_eq!(TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1");
-		assert_eq!(TIGHTBEAM_SERVER_FINISHED_KEY_INFO, b"tb/handshake/finished/server/mac/v1");
-		assert_eq!(TIGHTBEAM_HYBRID_EXCHANGE_LABEL, b"tb/exchange/hybrid/v1");
+	// Guard the domain constants against accidental change. A failure means
+	// that a domain constant changed, which invalidates every key and
+	// signature derived under the old value.
+	crate::tb_cases! {
+		fn a_domain_constant_keeps_its_value((constant, expected): (&[u8], &[u8])) {
+			assert_eq!(constant, expected);
+		}
+		cases {
+			opening_ukm_label => (TIGHTBEAM_OPENING_UKM_LABEL, b"tb/handshake/opening/ukm/v1"),
+			session_kdf_info => (TIGHTBEAM_SESSION_KDF_INFO, b"tb/session/kdf/v1"),
+			server_finished_domain => (TIGHTBEAM_SERVER_FINISHED_DOMAIN, b"tb/handshake/finished/server/v1"),
+			client_finished_domain => (TIGHTBEAM_CLIENT_FINISHED_DOMAIN, b"tb/handshake/finished/client/v1"),
+			ack_key_id_domain => (TIGHTBEAM_ACK_KEY_ID_DOMAIN, b"tb/handshake/ack/kekid/v1"),
+			frame_ukm_label => (TIGHTBEAM_FRAME_UKM_LABEL, b"tb/frame/ukm/v1"),
+			record_key_id_domain => (TIGHTBEAM_RECORD_KEY_ID_DOMAIN, b"tb/session/record/kekid/v1"),
+			closing_kdf_info => (TIGHTBEAM_CLOSING_KDF_INFO, b"tb/session/kdf/closing/v1"),
+			closing_key_id_domain => (TIGHTBEAM_CLOSING_KEY_ID_DOMAIN, b"tb/handshake/closing/kekid/v1"),
+			client_finished_key_info => (TIGHTBEAM_CLIENT_FINISHED_KEY_INFO, b"tb/handshake/finished/client/mac/v1"),
+			server_finished_key_info => (TIGHTBEAM_SERVER_FINISHED_KEY_INFO, b"tb/handshake/finished/server/mac/v1"),
+			hybrid_exchange_label => (TIGHTBEAM_HYBRID_EXCHANGE_LABEL, b"tb/exchange/hybrid/v1"),
+		}
 	}
 
 	/// Each optional field carries its own tag, so every OID decodes into its
 	/// own field when an algorithm before it is absent.
 	#[test]
-	fn a_profile_with_absent_algorithms_round_trips() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::der::{Decode, Encode};
-
+	fn a_profile_with_absent_algorithms_round_trips() {
 		let desc = SecurityProfileDesc {
 			digest: None,
 			aead: Some(crate::oids::AES_256_GCM),
@@ -1044,11 +1046,11 @@ mod tests {
 			key_wrap: Some(AES_256_WRAP),
 		};
 
-		let decoded = SecurityProfileDesc::from_der(&desc.to_der()?)?;
+		let decoded = der_round_trip(&desc);
 		assert_eq!(decoded, desc);
-		Ok(())
 	}
 
+	/// The descriptor of a profile names the AEAD identifier of its cipher.
 	#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 	#[test]
 	fn a_profile_descriptor_names_its_aead() {
@@ -1060,7 +1062,7 @@ mod tests {
 			type AeadOid = crate::crypto::aead::Aes128GcmOid;
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
 			type Kdf = crate::crypto::kdf::HkdfSha3_256;
-			type KeyExchange = Ecdhe<k256::Secp256k1>;
+			type KeyExchange = Ecdhe<crate::crypto::k256::Secp256k1>;
 			type KeyWrapOid = Aes256Wrap;
 		}
 
@@ -1071,114 +1073,121 @@ mod tests {
 	// The KDF and key-exchange types carry the identifiers that peers
 	// negotiate, so the default descriptor names `HKDF_SHA3_256` and
 	// `CURVE_SECP256K1`.
-	#[cfg(all(feature = "kdf", feature = "ecdh"))]
-	#[test]
-	fn the_default_profile_negotiates_its_kdf_and_key_exchange_identifiers() {
-		let desc = SecurityProfileDesc::from(&TightbeamProfile);
-		assert_eq!(desc.kdf, Some(crate::oids::HKDF_SHA3_256));
-		assert_eq!(desc.key_exchange, Some(crate::oids::CURVE_SECP256K1));
+	crate::tb_cases! {
+		fn the_default_profile_negotiates_its_identifier(
+			(negotiated, expected): (Option<ObjectIdentifier>, ObjectIdentifier)
+		) {
+			assert_eq!(negotiated, Some(expected));
+		}
+		cases {
+			#[cfg(all(feature = "kdf", feature = "ecdh"))]
+			kdf => (SecurityProfileDesc::from(&TightbeamProfile).kdf, crate::oids::HKDF_SHA3_256),
+			#[cfg(all(feature = "kdf", feature = "ecdh"))]
+			key_exchange => (SecurityProfileDesc::from(&TightbeamProfile).key_exchange, crate::oids::CURVE_SECP256K1),
+		}
 	}
 
-	/// The DER of the descriptor of [`TightbeamProfile`].
-	#[cfg(all(feature = "testing", any(feature = "transport-cms", feature = "transport-hpke")))]
-	const TIGHTBEAM_DESCRIPTOR: &str = "304ca00b0609608648016503040208a10b0609608648016503\
-		04012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40706052b8104000a\
-		a50b060960864801650304012d";
+	// Each ECC order rates as its row of NIST SP 800-57 Part 1 Rev. 5 Table 2:
+	// the first order of each row, and the last order of the row below it.
+	crate::tb_cases! {
+		fn an_ecc_order_rates_as_its_row_of_table_2((order_bits, strength): (usize, SecurityStrength)) {
+			assert_eq!(SecurityStrength::of_ecc_order(order_bits), strength);
+		}
+		cases {
+			bits_160 => (160, SecurityStrength::BITS_80),
+			bits_223 => (223, SecurityStrength::BITS_80),
+			bits_224 => (224, SecurityStrength::BITS_112),
+			bits_255 => (255, SecurityStrength::BITS_112),
+			bits_256 => (256, SecurityStrength::BITS_128),
+			bits_383 => (383, SecurityStrength::BITS_128),
+			bits_384 => (384, SecurityStrength::BITS_192),
+			bits_511 => (511, SecurityStrength::BITS_192),
+			bits_512 => (512, SecurityStrength::BITS_256),
+		}
+	}
 
-	/// The DER of the descriptor of the SHA3-512 profile of the test fixtures.
+	/// The house descriptors as they cross the wire.
 	#[cfg(all(feature = "testing", any(feature = "transport-cms", feature = "transport-hpke")))]
-	const SHA3_512_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b0609608648016503\
-		04012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40706052b8104000a\
-		a50b060960864801650304012d";
-
-	/// The house descriptors encode as their known DER, so a peer of another
-	/// release reads the same profile from them.
-	#[cfg(all(feature = "testing", any(feature = "transport-cms", feature = "transport-hpke")))]
-	#[test]
-	fn the_house_descriptors_encode_as_their_known_der() -> Result<(), Box<dyn std::error::Error>> {
+	mod descriptors {
+		use super::*;
 		use crate::der::Encode;
 		use crate::testing::fixtures::Aes256Sha3_512Profile;
-		use crate::testing::unhex;
+		use crate::testing::{unhex, TestResult};
 
-		let house = SecurityProfileDesc::from(&TightbeamProfile).to_der()?;
-		let fixture = SecurityProfileDesc::from(&Aes256Sha3_512Profile).to_der()?;
-		assert_eq!((house, fixture), (unhex(TIGHTBEAM_DESCRIPTOR), unhex(SHA3_512_DESCRIPTOR)));
-		Ok(())
-	}
+		/// The DER of the descriptor of [`TightbeamProfile`].
+		const TIGHTBEAM_DESCRIPTOR: &str = "304ca00b0609608648016503040208a10b0609608648016503\
+			04012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40706052b8104000a\
+			a50b060960864801650304012d";
 
-	/// The DER of the descriptor of [`PreviewPqcProfile`]: the house
-	/// descriptor, with the hybrid of ML-KEM-768 and ECDH over secp256k1 as
-	/// its key exchange.
-	#[cfg(all(
-		feature = "preview-pqc",
-		feature = "testing",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	const PREVIEW_PQC_DESCRIPTOR: &str = "3051a00b0609608648016503040208a10b060960864801650304\
-		012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40c060a2b0601040183\
-		f84a0204a50b060960864801650304012d";
+		/// The DER of the descriptor of the SHA3-512 profile of the test
+		/// fixtures.
+		const SHA3_512_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b0609608648016503\
+			04012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40706052b8104000a\
+			a50b060960864801650304012d";
 
-	/// The preview profile negotiates the hybrid under its own identifier,
-	/// encodes as its known DER, and its 192-bit exchange meets the default
-	/// floor.
-	#[cfg(all(
-		feature = "preview-pqc",
-		feature = "testing",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	#[test]
-	fn the_preview_profile_negotiates_the_hybrid() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::der::Encode;
-		use crate::oids::KEM_SECP256K1_ML_KEM_768;
-		use crate::testing::unhex;
-		use crate::transport::handshake::negotiation::RunnableProfile;
+		// The house descriptors encode as their known DER, so a peer of
+		// another release reads the same profile from them.
+		crate::tb_cases! {
+			fn a_house_descriptor_encodes_as_its_known_der(
+				(descriptor, der): (SecurityProfileDesc, &str)
+			) -> TestResult {
+				let encoded = descriptor.to_der()?;
+				assert_eq!(encoded, unhex(der));
+				Ok(())
+			}
+			cases {
+				tightbeam => (SecurityProfileDesc::from(&TightbeamProfile), TIGHTBEAM_DESCRIPTOR),
+				aes_256_sha3_512 => (SecurityProfileDesc::from(&Aes256Sha3_512Profile), SHA3_512_DESCRIPTOR),
+				#[cfg(feature = "preview-pqc")]
+				preview_pqc => (SecurityProfileDesc::from(&PreviewPqcProfile), preview::PREVIEW_PQC_DESCRIPTOR),
+			}
+		}
 
-		let descriptor = SecurityProfileDesc::from(&PreviewPqcProfile);
-		let strength = RunnableProfile::<PreviewPqcProvider>::native().strength();
+		/// The preview profile, which negotiates the hybrid of ML-KEM-768 and
+		/// ECDH over secp256k1.
+		#[cfg(feature = "preview-pqc")]
+		mod preview {
+			use super::*;
+			use crate::oids::KEM_SECP256K1_ML_KEM_768;
+			use crate::transport::handshake::negotiation::{NegotiationError, RunnableProfile, SecurityOffer};
 
-		let negotiated = (descriptor.key_exchange, strength.key_exchange);
-		let expected = (Some(KEM_SECP256K1_ML_KEM_768), SecurityStrength::BITS_192);
-		assert_eq!(negotiated, expected);
-		assert!(PreviewPqcProvider::strength_floor().meets_floor(&strength));
-		assert_eq!(descriptor.to_der()?, unhex(PREVIEW_PQC_DESCRIPTOR));
-		Ok(())
-	}
+			/// The DER of the descriptor of [`PreviewPqcProfile`]: the house
+			/// descriptor, with the hybrid of ML-KEM-768 and ECDH over
+			/// secp256k1 as its key exchange.
+			pub(super) const PREVIEW_PQC_DESCRIPTOR: &str = "3051a00b0609608648016503040208a10b060960864801650304\
+				012ea20b060960864801650304030aa30d060b2a864886f70d0109100321a40c060a2b0601040183\
+				f84a0204a50b060960864801650304012d";
 
-	/// A server that supports the preview profile alone finds no profile in an
-	/// offer of the house profile alone, since the two name other exchanges.
-	#[cfg(all(
-		feature = "preview-pqc",
-		feature = "testing",
-		any(feature = "transport-cms", feature = "transport-hpke")
-	))]
-	#[test]
-	fn a_house_offer_finds_no_profile_on_a_preview_server() {
-		use crate::transport::handshake::negotiation::{NegotiationError, SecurityOffer};
+			/// The preview profile negotiates the hybrid under its own
+			/// identifier, at 192 bits.
+			#[test]
+			fn the_preview_profile_negotiates_the_hybrid() {
+				let descriptor = SecurityProfileDesc::from(&PreviewPqcProfile);
 
-		let offer = SecurityOffer::new(Vec::from([SecurityProfileDesc::from(&TightbeamProfile)]));
-		let supported = [SecurityProfileDesc::from(&PreviewPqcProfile)];
+				let strength = RunnableProfile::<PreviewPqcProvider>::native().strength();
+				let negotiated = (descriptor.key_exchange, strength.key_exchange);
+				assert_eq!(negotiated, (Some(KEM_SECP256K1_ML_KEM_768), SecurityStrength::BITS_192));
+			}
 
-		let selected = offer.select_profile(supported);
-		assert!(matches!(selected, Err(NegotiationError::NoMutualProfile)));
-	}
+			/// The 192-bit exchange of the preview profile meets the default
+			/// floor.
+			#[test]
+			fn the_preview_profile_meets_the_default_floor() {
+				let strength = RunnableProfile::<PreviewPqcProvider>::native().strength();
+				assert!(PreviewPqcProvider::strength_floor().meets_floor(&strength));
+			}
 
-	/// Each ECC order rates as its row of NIST SP 800-57 Part 1 Rev. 5 Table 2:
-	/// the first order of each row, and the last order of the row below it.
-	#[test]
-	fn each_ecc_order_rates_as_its_row_of_table_2() {
-		let rows = [
-			(160, SecurityStrength::BITS_80),
-			(223, SecurityStrength::BITS_80),
-			(224, SecurityStrength::BITS_112),
-			(255, SecurityStrength::BITS_112),
-			(256, SecurityStrength::BITS_128),
-			(383, SecurityStrength::BITS_128),
-			(384, SecurityStrength::BITS_192),
-			(511, SecurityStrength::BITS_192),
-			(512, SecurityStrength::BITS_256),
-		];
+			/// A server that supports the preview profile alone finds no
+			/// profile in an offer of the house profile alone, since the two
+			/// name other exchanges.
+			#[test]
+			fn a_house_offer_finds_no_profile_on_a_preview_server() {
+				let offer = SecurityOffer::new(Vec::from([SecurityProfileDesc::from(&TightbeamProfile)]));
+				let supported = [SecurityProfileDesc::from(&PreviewPqcProfile)];
 
-		let rated = rows.map(|(order_bits, _)| (order_bits, SecurityStrength::of_ecc_order(order_bits)));
-		assert_eq!(rated, rows);
+				let selected = offer.select_profile(supported);
+				assert!(matches!(selected, Err(NegotiationError::NoMutualProfile)));
+			}
+		}
 	}
 }

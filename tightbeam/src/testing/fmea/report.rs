@@ -260,10 +260,25 @@ impl InjectedFaultRecord {
 }
 
 #[cfg(test)]
+impl InjectedFaultRecord {
+	/// A fault of `event` at `state`, which a run injects at a probability of
+	/// 5,000 basis points.
+	pub(crate) fn at(state: impl AsRef<str>, event: impl AsRef<str>) -> Self {
+		InjectedFaultRecord {
+			csp_state: state.as_ref().to_string(),
+			event_label: event.as_ref().to_string(),
+			error_message: "Test fault".to_string(),
+			probability_bps: 5000,
+		}
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::fdr::{DefaultFdrExplorer, FaultModel, FdrConfig};
-	use crate::testing::specs::csp::{Event, Process, State};
+	use crate::testing::fdr::{FaultModel, FdrConfig};
+	use crate::testing::fixtures::TestProcess;
+	use crate::testing::fmea::DEADLOCK;
 	use crate::urn::Urn;
 
 	const SEND: Urn<'static> = crate::urn!("test", "event:fmea-report/send");
@@ -285,182 +300,159 @@ mod tests {
 	// that state alone.
 	crate::tb_gen_process_types!(Link, Ready);
 
-	// Test fixtures and helpers
-	fn create_fault(state: impl AsRef<str>, event: impl AsRef<str>) -> InjectedFaultRecord {
-		let state = state.as_ref();
-		let event = event.as_ref();
-		InjectedFaultRecord {
-			csp_state: state.to_string(),
-			event_label: event.to_string(),
-			error_message: "Test fault".to_string(),
-			probability_bps: 5000,
-		}
-	}
+	/// A process whose `start` takes `Init` to `Running`, and whose `finish`
+	/// takes `Running` to the terminal `Success`.
+	const FINISHING: TestProcess = TestProcess {
+		observable: &["start", "finish"],
+		transitions: &[("Init", "start", "Running"), ("Running", "finish", "Success")],
+		terminal: &["Success"],
+		..TestProcess::of("TestProcess", "Init")
+	};
 
-	fn assert_effect_contains(effects: impl AsRef<[String]>, expected: impl AsRef<str>, context: impl AsRef<str>) {
-		let effects = effects.as_ref();
-		let expected = expected.as_ref();
-		let context = context.as_ref();
-		assert!(!effects.is_empty(), "{}: Should identify effects", context);
-		assert!(
-			effects.iter().any(|e| e.contains(expected)),
-			"{}: Expected '{}' in effects: {:?}",
-			context,
-			expected,
-			effects
-		);
-	}
+	/// A process of four states in a line from `Init` to `C`, which is not
+	/// terminal and offers no event.
+	const RESTRICTED: TestProcess = TestProcess {
+		observable: &["to_a", "to_b", "to_c"],
+		transitions: &[("Init", "to_a", "A"), ("A", "to_b", "B"), ("B", "to_c", "C")],
+		..TestProcess::of("RestrictedProcess", "Init")
+	};
 
-	// Configuration and type tests
-	#[test]
-	fn test_severity_scale_default() {
-		assert_eq!(SeverityScale::default(), SeverityScale::MilStd1629);
-	}
+	/// A process whose three states lie on one cycle, with no terminal state.
+	const CYCLE: TestProcess = TestProcess {
+		observable: &["event1", "event2"],
+		transitions: &[("S1", "event1", "S2"), ("S2", "event2", "S3"), ("S3", "event1", "S1")],
+		..TestProcess::of("NormalProcess", "S1")
+	};
 
-	#[test]
-	fn test_fmea_config_default() {
-		let config = FmeaConfig::default();
-		assert_eq!(config.severity_scale, SeverityScale::MilStd1629);
-		assert_eq!(config.rpn_critical_threshold, 100);
-		assert!(config.auto_generate);
-	}
-
-	#[test]
-	fn test_failure_mode_rpn_calculation() {
-		let fm = FailureMode::new(
-			"Test.State".to_string(),
-			"event".to_string(),
-			vec!["Effect".to_string()],
-			8,
-			50,
-			6,
-		);
-		assert_eq!(fm.rpn, 8 * 50 * 6);
-	}
-
-	#[test]
-	fn test_fmea_report_critical_identification() {
-		let modes = vec![
-			FailureMode::new("S1".to_string(), "e1".to_string(), vec![], 8, 50, 6),
-			FailureMode::new("S2".to_string(), "e2".to_string(), vec![], 4, 20, 3),
+	/// The report of two failure modes of RPN 2,400 and 240, past a critical
+	/// threshold of 1,000.
+	fn two_modes() -> FmeaReport {
+		let modes = [
+			FailureMode::new("S1", "e1", Vec::new(), 8, 50, 6),
+			FailureMode::new("S2", "e2", Vec::new(), 4, 20, 3),
 		];
 
-		let report = FmeaReport::new(modes, SeverityScale::MilStd1629, 1000);
-		assert_eq!(report.total_rpn, 2400 + 240);
-		assert_eq!(report.critical_failures, vec![0]);
-	}
-
-	// CSP reachability analysis tests
-	#[test]
-	fn test_analyze_effects_terminal_state_reachable() -> Result<(), Box<dyn core::error::Error>> {
-		let process = Process::builder("TestProcess")
-			.add_observable(Event("start"))
-			.add_observable(Event("finish"))
-			.initial_state(State("Init"))
-			.add_terminal(State("Success"))
-			.add_transition(State("Init"), Event("start"), State("Running"))
-			.add_transition(State("Running"), Event("finish"), State("Success"))
-			.build()?;
-
-		let effects = create_fault("TestProcess.Init", "start").effects(&[&process]);
-		assert_effect_contains(&effects, "terminal state", "Terminal state detection");
-		Ok(())
-	}
-
-	#[test]
-	fn test_analyze_effects_deadlock_detection() -> Result<(), Box<dyn core::error::Error>> {
-		let process = Process::builder("DeadlockProcess")
-			.add_observable(Event("start"))
-			.initial_state(State("Init"))
-			.add_transition(State("Init"), Event("start"), State("Blocked"))
-			.build()?;
-
-		let effects = create_fault("DeadlockProcess.Init", "start").effects(&[&process]);
-		assert_effect_contains(&effects, "deadlock", "Deadlock detection");
-		Ok(())
-	}
-
-	#[test]
-	fn test_analyze_effects_state_space_restriction() -> Result<(), Box<dyn core::error::Error>> {
-		let process = Process::builder("RestrictedProcess")
-			.add_observable(Event("to_a"))
-			.add_observable(Event("to_b"))
-			.add_observable(Event("to_c"))
-			.initial_state(State("Init"))
-			.add_transition(State("Init"), Event("to_a"), State("A"))
-			.add_transition(State("A"), Event("to_b"), State("B"))
-			.add_transition(State("B"), Event("to_c"), State("C"))
-			.build()?;
-
-		let effects = create_fault("RestrictedProcess.A", "to_b").effects(&[&process]);
-		assert_effect_contains(&effects, "Restricts reachable states", "State space restriction");
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_analyze_effects_unknown_state() -> Result<(), Box<dyn core::error::Error>> {
-		let process = Process::builder("SimpleProcess")
-			.add_observable(Event("event"))
-			.initial_state(State("Known"))
-			.build()?;
-
-		let effects = create_fault("SimpleProcess.UnknownState", "event").effects(&[&process]);
-		assert_eq!(effects.len(), 1);
-		assert!(effects[0].contains("unknown state"));
-		Ok(())
-	}
-
-	#[test]
-	fn test_analyze_effects_default_message() -> Result<(), Box<dyn core::error::Error>> {
-		let process = Process::builder("NormalProcess")
-			.add_observable(Event("event1"))
-			.add_observable(Event("event2"))
-			.initial_state(State("S1"))
-			.add_transition(State("S1"), Event("event1"), State("S2"))
-			.add_transition(State("S2"), Event("event2"), State("S3"))
-			.add_transition(State("S3"), Event("event1"), State("S1"))
-			.build()?;
-
-		let effects = create_fault("NormalProcess.S1", "event1").effects(&[&process]);
-		assert_effect_contains(&effects, "state transition failure", "Default message");
-		Ok(())
+		FmeaReport::new(modes, SeverityScale::MilStd1629, 1000)
 	}
 
 	/// The failure modes of the report that a run of `seeds` seeds generates,
 	/// where every send in `Ready` fails.
-	fn generated_modes(seeds: u32) -> Result<Vec<FailureMode>, Box<dyn core::error::Error>> {
+	fn generated_modes(seeds: u32) -> Vec<FailureMode> {
 		let fault = || TightBeamError::ChannelClosed;
 		let event = link::Event(SEND);
 		let fault_model = FaultModel::default().with_fault(link::States::Ready, event, fault, crate::bps!(10000));
+		let link = Link::process().expect("the link spec builds");
 		let config = FdrConfig {
 			seeds,
-			specs: vec![Link::process()?],
+			specs: vec![link.clone()],
 			fault_model: Some(fault_model),
 			fmea_config: Some(FmeaConfig::default()),
 			..FdrConfig::default()
 		};
 
-		let process = Link::process()?;
-		let verdict = DefaultFdrExplorer::with_defaults(&process, config).explore()?;
-		let modes = verdict.fmea_report.map(|report| report.failure_modes).unwrap_or_default();
-
-		Ok(modes)
+		let verdict = link.verdict_under(config);
+		verdict.fmea_report.map(|report| report.failure_modes).unwrap_or_default()
 	}
 
-	#[test]
-	fn a_generated_report_traces_the_effects_from_the_fault_state() -> Result<(), Box<dyn core::error::Error>> {
-		let modes = generated_modes(1)?;
+	// These tests cover the defaults and the RPN arithmetic.
 
+	/// A report rates on the MIL-STD-1629 scale by default.
+	#[test]
+	fn the_default_severity_scale_is_mil_std_1629() {
+		assert_eq!(SeverityScale::default(), SeverityScale::MilStd1629);
+	}
+
+	/// The default config generates a report on the MIL-STD-1629 scale, with
+	/// a critical RPN of 100.
+	#[test]
+	fn the_default_config_generates_a_mil_std_1629_report_with_a_critical_rpn_of_100() {
+		let config = FmeaConfig::default();
+		let settings = (config.severity_scale, config.rpn_critical_threshold, config.auto_generate);
+		assert_eq!(settings, (SeverityScale::MilStd1629, 100, true));
+	}
+
+	/// The RPN of a failure mode is the product of its severity, occurrence,
+	/// and detection ratings.
+	#[test]
+	fn a_failure_mode_rates_its_rpn_as_the_product_of_its_ratings() {
+		let mode = FailureMode::new("Test.State", "event", ["Effect".to_string()], 8, 50, 6);
+		assert_eq!(mode.rpn, 2_400);
+	}
+
+	/// The total RPN of a report is the sum of the RPN of its modes.
+	#[test]
+	fn a_report_sums_the_rpn_of_its_modes() {
+		let report = two_modes();
+		assert_eq!(report.total_rpn, 2_640);
+	}
+
+	/// A report flags each mode whose RPN passes its critical threshold, by
+	/// its place in the report.
+	#[test]
+	fn a_report_flags_each_mode_past_its_critical_threshold() {
+		let report = two_modes();
+		assert_eq!(report.critical_failures, [0]);
+	}
+
+	// The CSP reachability analysis names each effect that the state of a fault
+	// reaches: a terminal state, a deadlock, and a restricted reach. A fault at
+	// a state the process lacks names that state, and a fault with no other
+	// effect names a transition failure.
+	crate::tb_cases! {
+		fn a_fault_has_the_effects((process, state, event, effects): (Process, &str, &str, &[&str])) {
+			let fault = InjectedFaultRecord::at(state, event);
+			let found = fault.effects(&[&process]);
+			assert_eq!(found, effects);
+		}
+
+		cases {
+			of_a_reachable_terminal_state => (
+				FINISHING.build(),
+				"TestProcess.Init",
+				"start",
+				&["Can reach terminal state(s): Success"],
+			),
+			of_a_reachable_deadlock => (
+				DEADLOCK.build(),
+				"DeadlockProcess.Init",
+				"start",
+				&["Potential deadlock in state(s): Blocked"],
+			),
+			of_a_deadlock_and_a_restricted_reach => (
+				RESTRICTED.build(),
+				"RestrictedProcess.A",
+				"to_b",
+				&["Potential deadlock in state(s): C", "Restricts reachable states to 3 of 4 total states"],
+			),
+			of_an_unknown_state => (
+				TestProcess { observable: &["event"], ..TestProcess::of("SimpleProcess", "Known") }.build(),
+				"SimpleProcess.UnknownState",
+				"event",
+				&["Fault occurs in unknown state: SimpleProcess.UnknownState"],
+			),
+			of_a_transition_failure_where_no_other_effect_holds => (
+				CYCLE.build(),
+				"NormalProcess.S1",
+				"event1",
+				&["Fault during event1 may cause state transition failure"],
+			),
+		}
+	}
+
+	/// A generated report traces the effects of a fault from the state where
+	/// it fires.
+	#[test]
+	fn a_generated_report_traces_the_effects_from_the_fault_state() {
+		let modes = generated_modes(1);
 		let effects: Vec<Vec<String>> = modes.into_iter().map(|mode| mode.effects).collect();
 		assert_eq!(effects, [["Can reach terminal state(s): Done"]]);
-		Ok(())
 	}
 
+	/// A fault point that injects on every seed of a run is one failure mode
+	/// of its report.
 	#[test]
-	fn a_fault_point_that_injects_on_every_seed_is_one_failure_mode() -> Result<(), Box<dyn core::error::Error>> {
-		let modes = generated_modes(4)?;
+	fn a_fault_point_that_injects_on_every_seed_is_one_failure_mode() {
+		let modes = generated_modes(4);
 		assert_eq!(modes.len(), 1);
-		Ok(())
 	}
 }

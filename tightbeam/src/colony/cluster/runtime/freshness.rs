@@ -176,7 +176,7 @@ mod tests {
 	use super::*;
 	use crate::clock::ManualClock;
 	use crate::tb_cases;
-	use crate::testing::fixtures::{TestIdentity, TestRumor};
+	use crate::testing::fixtures::{TestClock, TestIdentity, TestRumor};
 
 	/// The window every case judges against.
 	const WINDOW: FreshnessWindow = FreshnessWindow::new(Duration::from_millis(30_000));
@@ -225,32 +225,37 @@ mod tests {
 		(frame, signature.expect("the fixed test key signed the frame"))
 	}
 
+	/// A replay guard of a 60 s window on `clock`.
+	fn guard_on(clock: &Arc<ManualClock>) -> GatewayReplayGuard {
+		GatewayReplayGuard::new(Duration::from_millis(60_000), TestClock::erased(clock))
+	}
+
 	/// A control frame whose order leads the gateway clock by 59 s, inside a
 	/// 60 s window, is still fresh 61 s after its admission, so the ledger
 	/// refuses its replay (CWE-294).
 	#[test]
 	fn a_future_dated_control_frame_is_a_replay_while_it_is_fresh() {
-		let clock = Arc::new(ManualClock::default());
-		let guard = GatewayReplayGuard::new(Duration::from_millis(60_000), Arc::clone(&clock) as Arc<dyn Clock>);
+		let clock = TestClock::manual();
+		let guard = guard_on(&clock);
 		let (frame, signature) = signed_at(clock.unix().saturating_add(Duration::from_millis(59_000)));
-
 		let first = guard.admits(&frame, &signature);
-		clock.advance(Duration::from_millis(61_000));
-		let replayed = guard.admits(&frame, &signature);
 
-		assert_eq!(first, TransitStatus::Ok);
-		assert_eq!(replayed, TransitStatus::PermissionDenied);
+		clock.advance(Duration::from_millis(61_000));
+
+		let replayed = guard.admits(&frame, &signature);
+		assert_eq!((first, replayed), (TransitStatus::Ok, TransitStatus::PermissionDenied));
 	}
 
 	/// A control frame whose order lies past the window is stale, so the
 	/// ledger refuses it (CWE-294).
 	#[test]
 	fn a_control_frame_past_the_window_is_refused() {
-		let clock = Arc::new(ManualClock::default());
-		let guard = GatewayReplayGuard::new(Duration::from_millis(60_000), Arc::clone(&clock) as Arc<dyn Clock>);
+		let clock = TestClock::manual();
+		let guard = guard_on(&clock);
 		let (frame, signature) = signed_at(clock.unix());
 
 		clock.advance(Duration::from_millis(60_001));
+
 		assert_eq!(guard.admits(&frame, &signature), TransitStatus::PermissionDenied);
 	}
 
@@ -258,8 +263,8 @@ mod tests {
 	/// is a duplicate (README §5.7.1), though its signature is new.
 	#[test]
 	fn a_second_control_frame_at_an_admitted_order_is_refused() {
-		let clock = Arc::new(ManualClock::default());
-		let guard = GatewayReplayGuard::new(Duration::from_millis(60_000), Arc::clone(&clock) as Arc<dyn Clock>);
+		let clock = TestClock::manual();
+		let guard = guard_on(&clock);
 		let (first, first_signature) = signed_carrying(clock.unix(), [1]);
 		let (second, second_signature) = signed_carrying(clock.unix(), [2]);
 

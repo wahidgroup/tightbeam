@@ -77,6 +77,15 @@ impl TimingGuard {
 	}
 }
 
+#[cfg(test)]
+impl TimingGuard {
+	/// The guard that holds while the clock `clk` reads at most `millis`
+	/// milliseconds.
+	pub(crate) fn clk_within(millis: u64) -> Self {
+		TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(millis))
+	}
+}
+
 /// A CSP transition that may carry a timing guard and the clocks it resets.
 #[derive(Debug, Clone)]
 pub struct TimedTransition {

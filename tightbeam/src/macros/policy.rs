@@ -136,18 +136,11 @@ macro_rules! policy {
 
 #[cfg(test)]
 mod tests {
-	#![allow(unused_variables)]
-
-	use crate::der::Sequence;
 	use crate::policy::{GatePolicy, ReceptorPolicy, SessionContext, TransitStatus};
+	use crate::testing::{TestFrame, TestMessage};
 	use crate::transport::error::TransportFailure;
 	use crate::transport::policy::{RestartPolicy, RetryAction};
-	use crate::Beamable;
-
-	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-	struct DummyMessage {
-		value: u64,
-	}
+	use crate::Frame;
 
 	// Every public arm expands here, so a broken arm fails `cargo test`.
 	policy! {
@@ -177,14 +170,14 @@ mod tests {
 		GatePolicy: pub TestGatePublic {
 			TransitStatus::Ok
 		}
-		ReceptorPolicy<DummyMessage>: TestReceptorReject |message| {
-			if message.value == 0 {
+		ReceptorPolicy<TestMessage>: TestReceptorReject |message| {
+			if message.content.is_empty() {
 				TransitStatus::PermissionDenied
 			} else {
 				TransitStatus::Ok
 			}
 		}
-		ReceptorPolicy<DummyMessage>: TestReceptorImplicitArg {
+		ReceptorPolicy<TestMessage>: TestReceptorImplicitArg {
 			TransitStatus::Ok
 		}
 		RestartPolicy: pub(crate) TestRestart |frame, _failure, attempt| {
@@ -195,74 +188,53 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_gate_policy() -> Result<(), crate::TightBeamError> {
-		let frame = compose! {
-			V0: id: b"test", message: DummyMessage { value: 42 }
-		}?;
-		assert_eq!(
-			TestGateBusy.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::ResourceExhausted
-		);
-		assert_eq!(
-			TestGateAccept.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::Ok
-		);
-
-		Ok(())
+	// A declared gate answers with the status its body names, with a frame or
+	// with none.
+	crate::tb_cases! {
+		fn a_declared_gate_answers_its_body((gate, frame, expected): (&dyn GatePolicy, Option<Frame>, TransitStatus)) {
+			assert_eq!(gate.evaluate(frame.as_ref(), &SessionContext::default()), expected);
+		}
+		cases {
+			busy => (&TestGateBusy, Some(TestFrame::v0(None, Some("test"))), TransitStatus::ResourceExhausted),
+			accepting => (&TestGateAccept, Some(TestFrame::v0(None, Some("test"))), TransitStatus::Ok),
+			/// A session with no authenticated peer is refused.
+			session_aware_without_a_peer => (
+				&TestGateSessionAware,
+				Some(TestFrame::v0(None, Some("test"))),
+				TransitStatus::Unauthenticated,
+			),
+			implicit_argument => (&TestGateImplicitArg, Some(TestFrame::v0(None, Some("test"))), TransitStatus::Ok),
+			crate_visible => (&TestGateCrateVisible, None, TransitStatus::Ok),
+			public => (&TestGatePublic, None, TransitStatus::Ok),
+		}
 	}
 
-	#[test]
-	fn test_session_aware_gate_arm() -> Result<(), crate::TightBeamError> {
-		let frame = compose! {
-			V0: id: b"test", message: DummyMessage { value: 42 }
-		}?;
-		assert_eq!(
-			TestGateSessionAware.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::Unauthenticated
-		);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_receptor_policy() {
-		let receptor = TestReceptorReject;
-		assert_eq!(receptor.evaluate(&DummyMessage { value: 1 }), TransitStatus::Ok);
-		assert_eq!(receptor.evaluate(&DummyMessage { value: 0 }), TransitStatus::PermissionDenied);
-	}
-
-	#[test]
-	fn test_implicit_argument_arms() -> Result<(), crate::TightBeamError> {
-		let frame = compose! {
-			V0: id: b"test", message: DummyMessage { value: 42 }
-		}?;
-		assert_eq!(
-			TestGateImplicitArg.evaluate(Some(&frame), &SessionContext::default()),
-			TransitStatus::Ok
-		);
-		assert_eq!(TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }), TransitStatus::Ok);
-
-		let session = SessionContext::default();
-		assert_eq!(TestGateCrateVisible.evaluate(None, &session), TransitStatus::Ok);
-		assert_eq!(TestGatePublic.evaluate(None, &session), TransitStatus::Ok);
-
-		Ok(())
+	// A declared receptor answers with the status its body names for the
+	// message it reads.
+	crate::tb_cases! {
+		fn a_declared_receptor_answers_its_body(
+			(receptor, content, expected): (&dyn ReceptorPolicy<TestMessage>, &str, TransitStatus)
+		) {
+			let message = TestMessage { content: content.to_string() };
+			assert_eq!(receptor.evaluate(&message), expected);
+		}
+		cases {
+			a_message_with_content => (&TestReceptorReject, "content", TransitStatus::Ok),
+			an_empty_message => (&TestReceptorReject, "", TransitStatus::PermissionDenied),
+			implicit_argument => (&TestReceptorImplicitArg, "content", TransitStatus::Ok),
+		}
 	}
 
 	/// The restart arm evaluates its body with the attempt the transport
 	/// passes, so the second attempt stops where the first retries.
 	#[test]
-	fn test_restart_policy_evaluates_its_body() -> Result<(), crate::TightBeamError> {
-		let frame = compose! {
-			V0: id: b"test", message: DummyMessage { value: 42 }
-		}?;
+	fn a_restart_arm_retries_the_first_attempt_alone() {
+		let frame = TestFrame::v0(None, Some("test"));
 		let failure = TransportFailure::Unavailable;
 
 		let first = TestRestart.evaluate(Box::new(frame.clone()), &failure, 0);
 		let second = TestRestart.evaluate(Box::new(frame.clone()), &failure, 1);
 		let retried = RetryAction::Retry { frame: Box::new(frame), delay: core::time::Duration::ZERO };
 		assert_eq!((first, second), (retried, RetryAction::NoRetry));
-		Ok(())
 	}
 }

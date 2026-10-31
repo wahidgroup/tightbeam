@@ -230,62 +230,65 @@ impl From<ZstdCompression> for AlgorithmIdentifierOwned {
 
 #[cfg(all(test, feature = "zstd"))]
 mod tests {
-	use super::*;
-	use crate::error::Result;
 	use crate::tb_cases;
+	use crate::testing::vectors::patterned;
+	use crate::testing::TestResult;
 
-	fn compress_zeros(len: usize) -> Result<Vec<u8>> {
+	use super::*;
+
+	/// The zstd frame of `len` zero octets.
+	fn compress_zeros(len: usize) -> Vec<u8> {
 		let data = vec![0u8; len];
-		let (compressed, _) = ZstdCompression::default().compress(&data, None)?;
-		Ok(compressed)
+		let (compressed, _) = ZstdCompression::default().compress(&data, None).expect("zeros compress");
+		compressed
 	}
 
-	/// The frame body is opaque data, so its `CompressedData` names `id-data`,
-	/// `1.2.840.113549.1.7.1` (RFC 5652 §4), as the type of the content it
-	/// compresses (RFC 3274 §1.1).
+	/// `id-data`, the content type of opaque data (RFC 5652 §4).
+	const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+
+	/// The frame body is opaque data, so its `CompressedData` names
+	/// [`ID_DATA`] as the type of the content it compresses (RFC 3274 §1.1).
 	#[test]
-	fn a_compressed_body_declares_id_data() -> Result<()> {
+	fn a_compressed_body_declares_id_data() -> TestResult {
 		let (_, compressed_data) = ZstdCompression::default().compress(b"frame body", None)?;
 		let declared = compressed_data.encap_content_info.econtent_type;
-		assert_eq!(declared, crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1"));
+		assert_eq!(declared, ID_DATA);
 		Ok(())
 	}
 
-	#[test]
-	fn compress_then_decompress_round_trips() -> Result<()> {
-		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
-		let big_repeat = vec![b'a'; 16 * 1024];
-		let cases: Vec<&[u8]> = vec![
-			b"",
-			b"a",
-			b"hello world",
-			b"The quick brown fox jumps over the lazy dog",
-			&patterned,
-			&big_repeat,
-		];
+	// A body of any size and pattern decompresses to the octets it compressed.
+	tb_cases! {
+		fn a_body_round_trips_through_compression(data: Vec<u8>) -> TestResult {
+			let compressor = ZstdCompression::default();
 
-		let compressor = ZstdCompression::default();
-		for &data in &cases {
-			let (compressed, _info) = compressor.compress(data, None)?;
+			let (compressed, _info) = compressor.compress(&data, None)?;
 			let decompressed = compressor.decompress(&compressed)?;
 			assert_eq!(decompressed, data);
+			Ok(())
 		}
-
-		Ok(())
+		cases {
+			empty => Vec::new(),
+			one_octet => b"a".to_vec(),
+			two_words => b"hello world".to_vec(),
+			a_pangram => b"The quick brown fox jumps over the lazy dog".to_vec(),
+			patterned => patterned(2048),
+			repeated => vec![b'a'; 16 * 1024],
+		}
 	}
 
+	/// A stream that lands exactly on the output cap decompresses whole.
 	#[test]
-	fn decompress_within_limit_round_trips() -> Result<()> {
-		let compressed = compress_zeros(4096)?;
+	fn decompress_within_limit_round_trips() -> TestResult {
+		let compressed = compress_zeros(4096);
 		let out = ZstdCompression::with_max_output(4096).decompress(&compressed)?;
 		assert_eq!(out, vec![0u8; 4096]);
-
 		Ok(())
 	}
 
+	/// A stream one octet past the output cap is refused with that cap.
 	#[test]
-	fn decompress_over_limit_rejected() -> Result<()> {
-		let compressed = compress_zeros(4096)?;
+	fn decompress_over_limit_rejected() {
+		let compressed = compress_zeros(4096);
 		let result = ZstdCompression::with_max_output(4095).decompress(&compressed);
 		assert!(matches!(
 			result,
@@ -293,8 +296,6 @@ mod tests {
 				4095
 			)))
 		));
-
-		Ok(())
 	}
 
 	/// One zstd frame followed by a skippable frame whose payload ends in
@@ -312,25 +313,26 @@ mod tests {
 	/// The skippable frame alone, taken from the octet stream above.
 	const SKIPPABLE_TAIL: &[u8] = TRAILING_SEEK_TABLE.split_at(44).1;
 
+	/// A stream with a seek table after its frame ends in a compression error,
+	/// so the decode of a hostile footer terminates.
 	#[test]
-	fn seekable_footer_input_terminates() -> Result<()> {
+	fn seekable_footer_input_terminates() {
 		let result = ZstdCompression::with_max_output(65536).decompress(TRAILING_SEEK_TABLE);
 		assert!(matches!(result, Err(crate::TightBeamError::CompressionError(_))));
-		Ok(())
 	}
 
+	/// The octets after the one frame of a stream are refused as trailing.
 	#[test]
-	fn octets_after_the_frame_are_rejected() -> Result<()> {
-		let mut framed = compress_zeros(4096)?;
+	fn octets_after_the_frame_are_rejected() {
+		let mut framed = compress_zeros(4096);
 		framed.extend_from_slice(SKIPPABLE_TAIL);
 
 		let result = ZstdCompression::with_max_output(65536).decompress(&framed);
+		let trailing = SKIPPABLE_TAIL.len();
 		assert!(matches!(
 			result,
-			Err(crate::TightBeamError::CompressionError(CompressionError::TrailingBytes(_)))
+			Err(crate::TightBeamError::CompressionError(CompressionError::TrailingBytes(count))) if count == trailing
 		));
-
-		Ok(())
 	}
 
 	/// A frame whose header declares a window of `2^window_log` octets and
@@ -348,7 +350,7 @@ mod tests {
 	// A frame may declare a window up to the output ceiling rounded up to a
 	// power of two, which a cap between two powers exercises.
 	tb_cases! {
-		fn a_window_within_the_rounded_output_ceiling_decodes((max_output, window_log): (usize, u8)) -> Result<()> {
+		fn a_window_within_the_rounded_output_ceiling_decodes((max_output, window_log): (usize, u8)) -> TestResult {
 			let frame = frame_declaring_window(window_log);
 			let out = ZstdCompression::with_max_output(max_output).decompress(&frame)?;
 			assert_eq!(out, vec![0x41]);
@@ -380,17 +382,16 @@ mod tests {
 		}
 	}
 
+	/// The default cap refuses a stream that decompresses one octet past it,
+	/// so a decompression bomb fails before it fills memory (CWE-409).
 	#[test]
-	fn decompression_bomb_rejected_by_default_cap() -> Result<()> {
-		let compressed = compress_zeros(DEFAULT_MAX_DECOMPRESSED_LEN + 1)?;
+	fn decompression_bomb_rejected_by_default_cap() {
+		let compressed = compress_zeros(DEFAULT_MAX_DECOMPRESSED_LEN + 1);
 		let result = ZstdCompression::default().decompress(&compressed);
+		let cap = DEFAULT_MAX_DECOMPRESSED_LEN;
 		assert!(matches!(
 			result,
-			Err(crate::TightBeamError::CompressionError(CompressionError::OutputLimitExceeded(
-				_
-			)))
+			Err(crate::TightBeamError::CompressionError(CompressionError::OutputLimitExceeded(limit))) if limit == cap
 		));
-
-		Ok(())
 	}
 }

@@ -320,37 +320,62 @@ impl<P: ColonyDialProtocol> ColonyConfig<P> {
 pub(crate) mod fixtures {
 	use std::sync::Arc;
 
-	use super::{ColonyConfig, GatewayRuntimeCtx};
+	use super::{ColonyConfig, ColonyDigest, GatewayRuntimeCtx};
+	use crate::builder::frame::{CheckDigestOid, FrameBuilder};
+	use crate::builder::TypeBuilder;
 	use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 	use crate::colony::cluster::runtime::hop::HivePlane;
-	use crate::colony::cluster::{CertificateSpec, ClusterConfig, ClusterTlsConfig, HiveRegistry, ServletRegistry};
-	use crate::colony::urn::ColonyNamespace;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::KeyCurves;
+	use crate::colony::cluster::{Cluster, ClusterConfig, ClusterGateway, HiveRegistry, ServletRegistry};
 	use crate::runtime::TaskGroup;
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::TestFrame;
 	use crate::trace::TraceCollector;
 	use crate::transport::TokioListener;
+	use crate::urn::Urn;
+	use crate::{Frame, Message, Version};
 
-	/// A colony member whose peer trust enrolls its own certificate, so it
-	/// admits a peer advertisement that it signs itself.
-	pub(crate) fn self_peering_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let colony = ColonyNamespace::default().colony("main").expect("a literal colony name");
-		let certificate = TestCertificate::with_uri_sans(&key, &[&colony.to_string()]);
-		let enrolled = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let enrolled = enrolled.with_certificate(certificate.clone());
-		let peer_trust: Arc<dyn CertificateTrust> = Arc::new(enrolled.expect("the member enrolls").build());
-		let spec = CertificateSpec::Built(Box::new(certificate));
-		let tls = ClusterTlsConfig::new(spec, Arc::new(Secp256k1KeyProvider::from(key)));
-		let tls = tls.expect("the member certificate must decode").with_peer_trust(peer_trust);
+	/// A gateway request context beside the trace and the connection trace
+	/// that it records on.
+	pub(crate) struct Audited {
+		/// The request context, which binds no listener.
+		pub(crate) gateway: GatewayRuntimeCtx<TokioListener>,
+		/// The trace that records the events of a proven peer.
+		pub(crate) trace: Arc<TraceCollector>,
+		/// The trace that records the events of an anonymous connection.
+		pub(crate) connections: Arc<TraceCollector>,
+	}
 
-		let mut config = ClusterConfig::new(tls);
-		config.bind_colony_membership();
-		config
+	impl Audited {
+		/// A gateway under `config`, with two traces of its own.
+		pub(crate) fn of(config: ClusterConfig) -> Self {
+			let (trace, connections) = (Arc::new(TraceCollector::new()), Arc::new(TraceCollector::new()));
+			let gateway = GatewayRuntimeCtx::for_test(config, &trace, &connections);
+			Self { gateway, trace, connections }
+		}
+
+		/// The count of `event` on the trace, then on the connection trace.
+		pub(crate) fn counts(&self, event: Urn<'static>) -> (usize, usize) {
+			(self.trace.recorded(&event), self.connections.recorded(&event))
+		}
+	}
+
+	impl ColonyConfig<TokioListener> {
+		/// `config` as the configuration of a house gateway, whose colony
+		/// digest is SHA3-256.
+		pub(crate) fn house(config: ClusterConfig) -> Self {
+			ColonyConfig::new(config).expect("a test configuration mints its gossip ingress key")
+		}
+
+		/// `message` in the V2 frame `id`, issued at the reading of this
+		/// gateway's clock, witnessed under its colony digest, and signed by
+		/// its own identity.
+		pub(crate) fn self_signed<T>(&self, id: impl AsRef<[u8]>, message: T) -> Frame
+		where
+			T: Message + CheckDigestOid<ColonyDigest<TokioListener>>,
+		{
+			let issued = FrameBuilder::from(Version::V2).with_id(id).with_order(self.clock.unix().get());
+			let built = self.witnessed(issued.with_message(message)).build();
+			TestFrame::signed_by(built.expect("a witnessed frame builds"), self.tls.identity())
+		}
 	}
 
 	impl GatewayRuntimeCtx<TokioListener> {
@@ -361,12 +386,12 @@ pub(crate) mod fixtures {
 			trace: &Arc<TraceCollector>,
 			connections: &Arc<TraceCollector>,
 		) -> Self {
-			let minted = ColonyConfig::<TokioListener>::new(config);
-			let config = minted.expect("a test configuration mints its gossip ingress key");
+			let config = ColonyConfig::house(config);
 			let pools = config.tls.pools::<TokioListener>(&config.pool_config, &config.clock, trace);
 			let clock = Arc::clone(&config.clock);
 			let registry = HiveRegistry::new(config.heartbeat.timeout, Arc::clone(&clock));
-			let servlet_registry = ServletRegistry::new(config.pheromone.clone(), Arc::clone(&clock));
+			let servlet_registry = ServletRegistry::new(config.pheromone.clone(), Arc::clone(&clock))
+				.with_ad_tombstone_window(config.control_freshness_window);
 			let hive_plane = HivePlane::new(pools.hive, Arc::clone(trace));
 			let peer_plane = hive_plane.peers(pools.peer, config.clone());
 
@@ -383,6 +408,15 @@ pub(crate) mod fixtures {
 				ledgers: Arc::default(),
 				config,
 			}
+		}
+	}
+
+	impl ClusterGateway<TokioListener> {
+		/// A live gateway under `config` on a loopback port, which records on
+		/// `trace`.
+		pub(crate) async fn started(config: ClusterConfig, trace: Arc<TraceCollector>) -> Self {
+			let started = ClusterGateway::start(trace, config).await;
+			started.expect("a gateway binds a loopback port")
 		}
 	}
 }

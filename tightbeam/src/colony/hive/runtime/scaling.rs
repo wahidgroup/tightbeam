@@ -506,25 +506,20 @@ mod tests {
 	use super::*;
 	use crate::bps;
 	use crate::clock::ManualClock;
-	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::hive::{HashMapRegistry, ServletBox};
-	use crate::colony::urn::ColonyNamespace;
+	use crate::colony::hive::fixtures::{echo_type, Probe, Report};
+	use crate::colony::hive::HashMapRegistry;
 	use crate::tb_cases;
+	use crate::testing::fixtures::TestClock;
 	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
 	use crate::transport::TokioListener;
 
 	/// The cooldown every stamp in this module holds for.
 	const COOLDOWN: Duration = Duration::from_secs(30);
 
-	/// A clock that moves only when the test advances it.
-	fn manual_clock() -> Arc<ManualClock> {
-		Arc::new(ManualClock::default())
-	}
-
 	/// Cooldowns on `clock`, with the `echo` type stamped at its current
 	/// instant.
 	fn stamped_cooldowns(clock: &Arc<ManualClock>) -> Cooldowns {
-		let mut cooldowns = Cooldowns::new(Arc::clone(clock) as Arc<dyn Clock>);
+		let mut cooldowns = Cooldowns::new(TestClock::erased(clock));
 		cooldowns.stamp(b"echo".as_slice());
 		cooldowns
 	}
@@ -533,7 +528,7 @@ mod tests {
 	// type frees the moment that clock reaches the cooldown.
 	tb_cases! {
 		fn a_cooldown_runs_on_the_hive_clock((advance, active): (Duration, bool)) {
-			let clock = manual_clock();
+			let clock = TestClock::manual();
 			let cooldowns = stamped_cooldowns(&clock);
 			clock.advance(advance);
 			assert_eq!(cooldowns.active(b"echo", COOLDOWN), active);
@@ -545,8 +540,8 @@ mod tests {
 		}
 	}
 
-	// A load reads as the mean of its instances' basis points. Each case is
-	// an `(instances, utilization_sum, expected_bps)` row.
+	// A load reads as the mean of its instances' basis points, and a mean
+	// past the `u16` range reads as saturation.
 	tb_cases! {
 		fn aggregate_utilization_means_across_all_instances((instances, utilization_sum, expected): (usize, u64, u16)) {
 			let load = TypeLoad { instances, utilization_sum };
@@ -559,60 +554,18 @@ mod tests {
 			with_one_uniform_mean => (4, 20_000, 5_000),
 			with_one_loaded_type_and_one_idle => (2, 10_000, 5_000),
 			with_every_instance_fully_loaded => (4, 40_000, 10_000),
+			/// A mean of 65,536 basis points is past the `u16` range.
+			past_the_u16_range_saturates => (2, 131_072, 10_000),
 		}
 	}
 
-	// A mean of 65,536 basis points is past the `u16` range, and it reads as
-	// saturation.
-	#[test]
-	fn a_mean_past_the_u16_range_reads_as_saturation() {
-		let load = TypeLoad { instances: 2, utilization_sum: 131_072 };
-		assert_eq!(load.utilization(), BasisPoints::MAX);
-	}
-
-	/// The utilization a servlet reports in the tick a test runs: `Some`
-	/// basis points, or `None` for a tick in which it reports nothing.
-	type Report = Arc<Mutex<Option<BasisPoints>>>;
-
-	/// A servlet whose utilization report the test sets for each tick.
-	struct ReportingProbe {
-		report: Report,
-	}
-
-	impl ServletBox for ReportingProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7010".as_slice())
-		}
-
-		fn stop_boxed(self: Box<Self>) {}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			None
-		}
-
-		fn utilization(&self) -> Option<BasisPoints> {
-			*self.report.lock().unwrap_or_else(PoisonError::into_inner)
-		}
-	}
-
-	/// The servlet type of the probe.
-	fn echo_type() -> Urn<'static> {
-		let namespace = ColonyNamespace::default();
-		namespace.servlet("echo").expect("test names satisfy the mint grammar")
-	}
-
-	/// A scaling task over a registry that holds one [`ReportingProbe`] of
-	/// [`echo_type`], which reports what `report` holds.
+	/// A scaling task over a registry that holds one probe of the `echo`
+	/// type, which reports what `report` holds.
 	fn reporting_task(report: &Report) -> ScalingTask<TokioListener, HashMapRegistry> {
-		let servlet_type = echo_type();
-		let key = servlet_type.instance_urn(b"127.0.0.1:7010");
+		let key = echo_type().instance_urn(b"127.0.0.1:7010");
 		let key = key.expect("the probe locator names an instance");
-		let probe = ReportingProbe { report: Arc::clone(report) };
-		let spawner: SpawnerFn = Arc::new(|_| Box::pin(async { Err(TightBeamError::NotEstablished) }));
-		let registration = ServletRegistration { servlet: Box::new(probe), spawner, servlet_type };
-		let servlets = HashMapRegistry::default();
-		let inserted = servlets.insert(key.canonical_bytes(), registration);
-		assert!(inserted.is_ok(), "the map registry takes every registration");
+		let probe = Probe::at(b"127.0.0.1:7010").reporting(report);
+		let servlets = HashMapRegistry::holding(key.canonical_bytes(), probe.registration(echo_type()));
 
 		let pool = Arc::new(ConnectionPool::<TokioListener>::builder().build());
 		ScalingTask {
@@ -654,21 +607,27 @@ mod tests {
 	/// The key of the one instance the sample tests read.
 	const INSTANCE: &[u8] = b"urn:tightbeam:servlet:echo/127.0.0.1:7010";
 
-	/// An instance with no report and no sample counts at the unknown figure.
-	#[test]
-	fn an_instance_with_no_sample_counts_as_unknown() {
-		let mut samples = LastSamples::default();
-		assert_eq!(samples.resolve(INSTANCE, None), u64::from(UNKNOWN_SERVLET_UTILIZATION_BPS));
-	}
+	/// A history of the samples of the instance before the tick a test reads.
+	type Prepare = fn(&mut LastSamples);
 
-	/// A tick that skips an instance drops its sample, so the samples hold the
-	/// registered instances alone.
-	#[test]
-	fn a_sample_drops_after_a_tick_that_skips_its_instance() {
-		let mut samples = LastSamples::default();
-		samples.resolve(INSTANCE, Some(bps!(9000)));
-		samples.close_tick();
-		samples.close_tick();
-		assert_eq!(samples.resolve(INSTANCE, None), u64::from(UNKNOWN_SERVLET_UTILIZATION_BPS));
+	// An instance with no report and no live sample counts at the unknown
+	// figure, whether it never reported or a tick that skipped it dropped
+	// its sample, so the samples hold the registered instances alone.
+	tb_cases! {
+		fn an_instance_without_a_live_sample_counts_as_unknown(prepare: Prepare) {
+			let mut samples = LastSamples::default();
+			prepare(&mut samples);
+
+			let resolved = samples.resolve(INSTANCE, None);
+			assert_eq!(resolved, u64::from(UNKNOWN_SERVLET_UTILIZATION_BPS));
+		}
+		cases {
+			never_sampled => |_| {},
+			skipped_a_tick => |samples| {
+				samples.resolve(INSTANCE, Some(bps!(9000)));
+				samples.close_tick();
+				samples.close_tick();
+			},
+		}
 	}
 }

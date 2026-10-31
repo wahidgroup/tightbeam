@@ -507,12 +507,12 @@ impl MuxResponder {
 mod tests {
 	use core::future::pending;
 
+	use super::super::fixtures::poll_times;
 	use super::super::outbound::Outbound;
 	use super::super::shared::MuxShared;
-	use super::super::testing::poll_times;
 	use super::*;
 	use crate::testing::TestFrame;
-	use crate::transport::envelopes::{MuxEnvelope, TransportEnvelope};
+	use crate::transport::envelopes::MuxEnvelope;
 	use crate::transport::handshake::negotiation::MuxSettings;
 	use crate::transport::multiplex::MuxRole;
 
@@ -533,7 +533,7 @@ mod tests {
 		let mut filler = outbound.clone();
 		assert!(filler.try_send(Outbound::Close).is_ok());
 
-		let shared = Arc::new(MuxShared::new(MuxRole::Server, &settings));
+		let shared = MuxShared::fixture(MuxRole::Server, &settings);
 		let (link, _drained) = MuxLink::new(shared, outbound);
 		let (inbound, inbound_receiver) = mpsc::channel(16);
 		let responder = MuxResponder::new(inbound_receiver, link, peer_cap);
@@ -558,104 +558,70 @@ mod tests {
 	/// the gated service of a connection.
 	#[cfg(all(pooled_mux, feature = "testing-fault", feature = "instrument"))]
 	mod gate_fault {
-		use futures::future::ready;
-
+		use super::super::super::fixtures::drained;
+		use super::internal_detail::{echo, gated, responder_with};
 		use super::*;
-		use crate::policy::{AcceptAllGate, SessionContext};
-		use crate::testing::FaultModel;
+		use crate::testing::fixtures::TestTrace;
 		use crate::trace::TraceCollector;
-		use crate::transport::multiplex::service::GatedService;
-		use crate::transport::multiplex::{MuxHandle, MuxService};
-		use crate::TightBeamError;
 
-		/// The peer streams of [`gate_faulting_responder`], in the order the
-		/// gate reads them.
+		/// The peer streams of a gate fault case, in the order the gate reads
+		/// them.
 		const STREAMS: [u32; 3] = [1, 3, 5];
-
-		/// A server-role responder whose trace injects
-		/// [`TransportError::InvalidAddress`] at every second gate acceptance,
-		/// the gated echo service of its connection, and the receiver of its
-		/// outbound queue. A unary request on each of [`STREAMS`] waits on the
-		/// inbound queue, which then closes.
-		fn gate_faulting_responder() -> (MuxResponder, GatedService<impl MuxService>, mpsc::Receiver<Outbound>) {
-			// The deterministic strategy injects at 5,000 bps on the second
-			// record of the event, then the fourth.
-			let injected = || TransportError::InvalidAddress;
-			let model = FaultModel::default().with_event_fault(events::GATE_ACCEPT, injected, crate::bps!(5000));
-			let mut shared = MuxShared::new(MuxRole::Server, &MuxSettings::symmetric(4));
-			shared.trace = Some(TraceCollector::new().with_fault_model(model));
-
-			let (outbound, wire) = mpsc::channel(4);
-			let (link, _drained) = MuxLink::new(Arc::new(shared), outbound);
-			let (mut inbound, inbound_receiver) = mpsc::channel(STREAMS.len());
-			let frame = Arc::new(TestFrame::v0(None, None));
-			for stream_id in STREAMS {
-				let request = InboundEvent::Request(stream_id, Arc::clone(&frame));
-				inbound
-					.try_send(request)
-					.expect("the inbound channel has room for every request");
-			}
-
-			let echo = |frame: Frame, _session: SessionContext| ready(Ok::<_, TightBeamError>(Some(frame)));
-			let handle = MuxHandle::new(link.clone());
-			let service = GatedService::new(echo, Box::new(AcceptAllGate), SessionContext::default(), handle);
-			(MuxResponder::new(inbound_receiver, link, 4), service, wire)
-		}
 
 		/// The status that answers each stream on `wire`, by stream ID.
 		fn answered(wire: &mut mpsc::Receiver<Outbound>) -> Vec<(u32, TransitStatus)> {
-			let mut answered = Vec::new();
-			while let Ok(command) = wire.try_recv() {
-				if let Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::End(package))) = command {
-					answered.push((package.stream_id(), package.status()));
-				}
-			}
+			let commands = drained(wire);
+			let ends = commands.iter().filter_map(Outbound::mux).filter_map(|envelope| match envelope {
+				MuxEnvelope::End(package) => Some((package.stream_id(), package.status())),
+				_ => None,
+			});
+			ends.collect()
+		}
 
-			answered
+		/// What a gated echo service over a responder whose connection records
+		/// into `trace` answers on its wire, once it serves a unary request on
+		/// each of `streams` and the inbound queue closes.
+		async fn served_through_the_gate(trace: &TraceCollector, streams: &[u32]) -> Vec<(u32, TransitStatus)> {
+			let frame = Arc::new(TestFrame::v0(None, None));
+			let requests = streams
+				.iter()
+				.map(|stream_id| InboundEvent::Request(*stream_id, Arc::clone(&frame)));
+
+			let (responder, link, mut wire) = responder_with(trace, requests.collect());
+			let served = responder.serve_with(gated(echo(), link)).await;
+			served.expect("the responder serves until the inbound queue closes");
+			answered(&mut wire)
 		}
 
 		/// A fault the trace injects at the gate verdict of one stream refuses
 		/// that stream alone: it reads `Internal`, and the responder serves the
-		/// stream after it.
+		/// stream after it. The deterministic strategy injects at 5,000 bps on
+		/// the second record of the event, then the fourth.
 		#[tokio::test]
-		async fn a_fault_at_the_gate_verdict_refuses_its_stream_alone() -> TransportResult<()> {
-			let (responder, service, mut wire) = gate_faulting_responder();
-			let expected = [(1, TransitStatus::Ok), (3, TransitStatus::Internal), (5, TransitStatus::Ok)];
-
-			responder.serve_with(service).await?;
-			assert_eq!(answered(&mut wire), expected);
-			Ok(())
+		async fn a_fault_at_the_gate_verdict_refuses_its_stream_alone() {
+			let trace = TestTrace::faulting(events::GATE_ACCEPT, || TransportError::InvalidAddress, crate::bps!(5000));
+			let answers = served_through_the_gate(&trace, &STREAMS).await;
+			assert_eq!(
+				answers,
+				[(1, TransitStatus::Ok), (3, TransitStatus::Internal), (5, TransitStatus::Ok)]
+			);
 		}
 
 		/// A fault the trace injects at the entry of a handler stops the
 		/// handler before it runs, so its stream reads `Internal` and the trail
 		/// records no failed handler.
 		#[tokio::test]
-		async fn a_fault_at_the_entry_of_a_handler_files_no_handler_failure() -> TransportResult<()> {
-			let injected = || TransportError::InvalidAddress;
-			let model = FaultModel::default().with_event_fault(events::HANDLER_ENTER, injected, crate::bps!(10000));
-			let trace = crate::testing::fixtures::TestTrace::with_detail(true).with_fault_model(model);
-			let mut shared = MuxShared::new(MuxRole::Server, &MuxSettings::symmetric(4));
-			shared.trace = Some(trace.share());
-			let (outbound, mut wire) = mpsc::channel(4);
-			let (link, _drained) = MuxLink::new(Arc::new(shared), outbound);
-			let (mut inbound, inbound_receiver) = mpsc::channel(1);
-			let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
-			assert!(inbound.try_send(request).is_ok());
-			drop(inbound);
-
-			let echo = |frame: Frame, _session: SessionContext| ready(Ok::<_, TightBeamError>(Some(frame)));
-			let service = GatedService::new(
-				echo,
-				Box::new(AcceptAllGate),
-				SessionContext::default(),
-				MuxHandle::new(link.clone()),
+		async fn a_fault_at_the_entry_of_a_handler_files_no_handler_failure() {
+			let model = crate::testing::FaultModel::default().with_event_fault(
+				events::HANDLER_ENTER,
+				|| TransportError::InvalidAddress,
+				crate::bps!(10000),
 			);
-			MuxResponder::new(inbound_receiver, link, 4).serve_with(service).await?;
 
-			assert_eq!(answered(&mut wire), [(1, TransitStatus::Internal)]);
+			let trace = TestTrace::with_detail(true).with_fault_model(model);
+			let answers = served_through_the_gate(&trace, &STREAMS[..1]).await;
+			assert_eq!(answers, [(1, TransitStatus::Internal)]);
 			assert_eq!(trace.recorded(events::HANDLER_FAILED), 0);
-			Ok(())
 		}
 	}
 
@@ -671,7 +637,7 @@ mod tests {
 		use crate::urn::Urn;
 
 		#[cfg(pooled_mux)]
-		use super::super::super::testing::body_fixture;
+		use super::super::super::body::StreamBody;
 		#[cfg(pooled_mux)]
 		use crate::policy::{AcceptAllGate, SessionContext};
 		#[cfg(pooled_mux)]
@@ -688,11 +654,9 @@ mod tests {
 			trace: &TraceCollector,
 			inbound: Vec<InboundEvent>,
 		) -> (MuxResponder, MuxLink, mpsc::Receiver<Outbound>) {
-			let mut shared = MuxShared::new(MuxRole::Server, &MuxSettings::symmetric(4));
-			shared.trace = Some(trace.share());
+			let shared = MuxShared::traced(MuxRole::Server, &MuxSettings::symmetric(4), trace.share());
 
-			let (outbound, wire) = mpsc::channel(4);
-			let (link, _drained) = MuxLink::new(Arc::new(shared), outbound);
+			let (link, wire, _drained) = MuxLink::over(Arc::new(shared), 4);
 			let (mut sender, inbound_receiver) = mpsc::channel(inbound.len());
 			for event in inbound {
 				sender.try_send(event).expect("the inbound channel has room for every event");
@@ -720,13 +684,21 @@ mod tests {
 			Ok(TestTrace::trail(&trace, &[events::ROUTE_STEP]))
 		}
 
-		/// A responder records the route step of a peer stream when, and only
-		/// when, the trace config sets the detail flag.
-		#[tokio::test]
-		async fn a_peer_stream_records_its_route_step_under_the_detail_flag_alone() -> TransportResult<()> {
-			let trails = [route_trail(true).await?, route_trail(false).await?];
-			assert_eq!(trails, [vec![events::ROUTE_STEP], vec![]]);
-			Ok(())
+		// A responder records the route step of a peer stream when, and only
+		// when, the trace config sets the detail flag.
+		crate::tb_cases! {
+			async fn a_peer_stream_records_its_route_step_under_the_detail_flag_alone(
+				(detail, expected): (bool, Vec<Urn<'static>>)
+			) -> crate::testing::TestResult {
+				let trail = route_trail(detail).await?;
+
+				assert_eq!(trail, expected);
+				Ok(())
+			}
+			cases {
+				detailed => (true, vec![events::ROUTE_STEP]),
+				plain => (false, vec![]),
+			}
 		}
 
 		/// The steps of one gated request, with its verdict, in the order the
@@ -770,15 +742,23 @@ mod tests {
 			Ok(TestTrace::trail(&trace, &GATED_STEPS))
 		}
 
-		/// Under the detail flag, a gated request records its route step,
-		/// policy step, verdict, and handler span, in that order. With the flag
-		/// clear, it records its verdict alone.
+		// Under the detail flag, a gated request records its route step, policy
+		// step, verdict, and handler span, in that order. With the flag clear,
+		// it records its verdict alone.
 		#[cfg(pooled_mux)]
-		#[tokio::test]
-		async fn a_gated_request_records_its_steps_in_order_under_the_detail_flag_alone() -> TransportResult<()> {
-			let trails = [gated_trail(true).await?, gated_trail(false).await?];
-			assert_eq!(trails, [GATED_STEPS.to_vec(), vec![events::GATE_ACCEPT]]);
-			Ok(())
+		crate::tb_cases! {
+			async fn a_gated_request_records_its_steps_in_order_under_the_detail_flag_alone(
+				(detail, expected): (bool, Vec<Urn<'static>>)
+			) -> crate::testing::TestResult {
+				let trail = gated_trail(detail).await?;
+
+				assert_eq!(trail, expected);
+				Ok(())
+			}
+			cases {
+				detailed => (true, GATED_STEPS.to_vec()),
+				plain => (false, vec![events::GATE_ACCEPT]),
+			}
 		}
 
 		/// A gated streaming call runs its handler inside the span of the
@@ -786,15 +766,14 @@ mod tests {
 		/// refusal runs inside the span too.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_streaming_call_records_its_handler_span() -> TransportResult<()> {
+		async fn a_streaming_call_records_its_handler_span() {
 			let trace = TestTrace::with_detail(true);
 			let (_responder, link, _wire) = responder_with(&trace, Vec::new());
-			let (body, _forwarder, _notes) = body_fixture(1, 4);
-			let refused = MuxDispatch::streaming(&gated(echo(), link), body, StreamRoute::local()).await;
+			let (body, _forwarder, _notes) = StreamBody::fixture(1, 4);
 
+			let refused = MuxDispatch::streaming(&gated(echo(), link), body, StreamRoute::local()).await;
 			assert!(matches!(refused, Err(TransportError::NotServed)));
 			assert_eq!(TestTrace::trail(&trace, &HANDLER_SPAN), HANDLER_SPAN);
-			Ok(())
 		}
 
 		/// A gated duplex call runs its handler inside the span of the handler.
@@ -802,23 +781,22 @@ mod tests {
 		/// inside the span too.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_duplex_call_records_its_handler_span() -> TransportResult<()> {
+		async fn a_duplex_call_records_its_handler_span() {
 			let trace = TestTrace::with_detail(true);
 			let (_responder, link, _wire) = responder_with(&trace, Vec::new());
-			let (body, _forwarder, _notes) = body_fixture(1, 4);
+			let (body, _forwarder, _notes) = StreamBody::fixture(1, 4);
 
 			let reply = ReplySink::new(1, link.clone());
 			let refused = MuxDispatch::duplex(&gated(echo(), link), body, reply, StreamRoute::local()).await;
 			assert!(matches!(refused, Err(TransportError::NotServed)));
 			assert_eq!(TestTrace::trail(&trace, &HANDLER_SPAN), HANDLER_SPAN);
-			Ok(())
 		}
 
 		/// A peer cancel of a stream whose handler runs closes the span of that
 		/// handler with the record of the cancel.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_peer_cancel_closes_the_handler_span_with_its_record() -> TransportResult<()> {
+		async fn a_peer_cancel_closes_the_handler_span_with_its_record() -> crate::testing::TestResult {
 			let trace = TestTrace::with_detail(true);
 			let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
 			let (responder, link, _wire) = responder_with(&trace, vec![request, InboundEvent::Cancel(1)]);
@@ -840,28 +818,17 @@ mod tests {
 
 		use super::internal_detail::{responder_with, responder_with_one_request};
 		use super::*;
+		use crate::testing::fixtures::TestTrace;
 		use crate::trace::TraceCollector;
-		use crate::urn::Urn;
 
 		#[cfg(pooled_mux)]
-		use super::super::super::testing::body_fixture;
+		use super::super::super::body::StreamBody;
 		#[cfg(pooled_mux)]
 		use super::internal_detail::{echo, gated};
 		#[cfg(pooled_mux)]
 		use crate::transport::multiplex::{CallContext, MuxDispatch, MuxService};
 		#[cfg(pooled_mux)]
 		use crate::TightBeamError;
-
-		/// The labels of the records of `event` that `trace` holds, in the
-		/// order it recorded them.
-		fn labels(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<String>> {
-			let records = trace.drain_events();
-			records
-				.into_iter()
-				.filter(|record| record.urn == event)
-				.map(|record| record.label.map(String::from))
-				.collect()
-		}
 
 		/// A label that names `status`.
 		fn label(status: TransitStatus) -> Option<String> {
@@ -871,14 +838,14 @@ mod tests {
 		/// A unary stream that reaches a dispatch with no unary method answers
 		/// `Unimplemented`, and the responder records the refused kind.
 		#[tokio::test]
-		async fn a_stream_of_a_kind_the_dispatch_leaves_out_records_its_refusal() -> TransportResult<()> {
+		async fn a_stream_of_a_kind_the_dispatch_leaves_out_records_its_refusal() -> crate::testing::TestResult {
 			let trace = TraceCollector::new();
 			let (responder, _link, _wire) = responder_with_one_request(&trace);
 			let streaming = |_body: StreamBody| ready(ResponsePackage::new(TransitStatus::Ok, None));
 			responder.serve_streaming(streaming).await?;
 
 			let refused = label(TransitStatus::Unimplemented);
-			assert_eq!(labels(&trace, events::MUX_STREAM_REFUSED), [refused]);
+			assert_eq!(TestTrace::labels(&trace, events::MUX_STREAM_REFUSED), [refused]);
 			Ok(())
 		}
 
@@ -895,7 +862,7 @@ mod tests {
 			poll_times(&mut serve, 8);
 
 			let refused = label(TransitStatus::ResourceExhausted);
-			assert_eq!(labels(&trace, events::MUX_STREAM_REFUSED), [refused]);
+			assert_eq!(TestTrace::labels(&trace, events::MUX_STREAM_REFUSED), [refused]);
 		}
 
 		/// The refusal of every handler of [`Denying`].
@@ -940,13 +907,13 @@ mod tests {
 		/// the status that the call answers.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_unary_call_whose_handler_fails_records_the_failure() -> TransportResult<()> {
+		async fn a_unary_call_whose_handler_fails_records_the_failure() -> crate::testing::TestResult {
 			let trace = TraceCollector::new();
 			let (responder, link, _wire) = responder_with_one_request(&trace);
 			responder.serve_with(gated(Denying, link)).await?;
 
 			let failed = label(TransitStatus::PermissionDenied);
-			assert_eq!(labels(&trace, events::HANDLER_FAILED), [failed]);
+			assert_eq!(TestTrace::labels(&trace, events::HANDLER_FAILED), [failed]);
 			Ok(())
 		}
 
@@ -954,14 +921,14 @@ mod tests {
 		/// with the status that the call answers.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_streaming_call_whose_handler_fails_records_the_failure() -> TransportResult<()> {
+		async fn a_streaming_call_whose_handler_fails_records_the_failure() -> crate::testing::TestResult {
 			let trace = TraceCollector::new();
 			let (_responder, link, _wire) = responder_with(&trace, Vec::new());
-			let (body, _forwarder, _notes) = body_fixture(1, 4);
+			let (body, _forwarder, _notes) = StreamBody::fixture(1, 4);
 			MuxDispatch::streaming(&gated(Denying, link), body, StreamRoute::local()).await?;
 
 			let failed = label(TransitStatus::PermissionDenied);
-			assert_eq!(labels(&trace, events::HANDLER_FAILED), [failed]);
+			assert_eq!(TestTrace::labels(&trace, events::HANDLER_FAILED), [failed]);
 			Ok(())
 		}
 
@@ -969,15 +936,15 @@ mod tests {
 		/// the status that the call answers.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_duplex_call_whose_handler_fails_records_the_failure() -> TransportResult<()> {
+		async fn a_duplex_call_whose_handler_fails_records_the_failure() -> crate::testing::TestResult {
 			let trace = TraceCollector::new();
 			let (_responder, link, _wire) = responder_with(&trace, Vec::new());
-			let (body, _forwarder, _notes) = body_fixture(1, 4);
+			let (body, _forwarder, _notes) = StreamBody::fixture(1, 4);
 			let reply = ReplySink::new(1, link.clone());
 			MuxDispatch::duplex(&gated(Denying, link), body, reply, StreamRoute::local()).await?;
 
 			let failed = label(TransitStatus::PermissionDenied);
-			assert_eq!(labels(&trace, events::HANDLER_FAILED), [failed]);
+			assert_eq!(TestTrace::labels(&trace, events::HANDLER_FAILED), [failed]);
 			Ok(())
 		}
 
@@ -985,15 +952,15 @@ mod tests {
 		/// kind: the responder records the refusal, and no handler failure.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_service_default_records_a_refused_kind_and_no_failure() -> TransportResult<()> {
+		async fn a_service_default_records_a_refused_kind_and_no_failure() -> crate::testing::TestResult {
 			let trace = TraceCollector::new();
-			let (body, _forwarder, _notes) = body_fixture(1, 4);
+			let (body, _forwarder, _notes) = StreamBody::fixture(1, 4);
 			let open = InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, Box::new(body), StreamRoute::local());
 			let (responder, link, _wire) = responder_with(&trace, vec![open]);
 			responder.serve_with(gated(echo(), link)).await?;
 
 			let refused = label(TransitStatus::Unimplemented);
-			assert_eq!(labels(&trace, events::MUX_STREAM_REFUSED), [refused]);
+			assert_eq!(TestTrace::labels(&trace, events::MUX_STREAM_REFUSED), [refused]);
 			assert_eq!(trace.recorded(events::HANDLER_FAILED), 0);
 			Ok(())
 		}
@@ -1018,24 +985,22 @@ mod tests {
 		/// failure and no refused kind.
 		#[cfg(pooled_mux)]
 		#[tokio::test]
-		async fn a_handler_that_answers_unimplemented_records_its_failure() -> TransportResult<()> {
+		async fn a_handler_that_answers_unimplemented_records_its_failure() -> crate::testing::TestResult {
 			let trace = TraceCollector::new();
 			let (responder, link, _wire) = responder_with_one_request(&trace);
 			responder.serve_with(gated(Unimplementing, link)).await?;
 
 			let failed = label(TransitStatus::Unimplemented);
-			assert_eq!(labels(&trace, events::HANDLER_FAILED), [failed]);
+			assert_eq!(TestTrace::labels(&trace, events::HANDLER_FAILED), [failed]);
 			assert_eq!(trace.recorded(events::MUX_STREAM_REFUSED), 0);
 			Ok(())
 		}
 	}
 
+	/// Whether `command` ends a stream as refused at the cap.
 	fn is_cap_refusal(command: &Outbound) -> bool {
-		matches!(
-			command,
-			Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::End(package)))
-				if package.status() == TransitStatus::ResourceExhausted
-		)
+		let envelope = command.mux();
+		matches!(envelope, Some(MuxEnvelope::End(package)) if package.status() == TransitStatus::ResourceExhausted)
 	}
 
 	/// A peer past the cap that this endpoint advertised opens streams at zero
@@ -1043,7 +1008,7 @@ mod tests {
 	/// let a stalled writer hold one trailer per open (CWE-770). Refusals share
 	/// the responder link's one slot, and the responder drops the rest.
 	#[test]
-	fn test_refusals_at_cap_stop_at_the_link_slot() {
+	fn refusals_at_the_cap_stop_at_the_link_slot() {
 		let mut fixture = responder_with_full_queue(1);
 		fixture.flood(&[1, 3, 5, 7, 9, 11]);
 

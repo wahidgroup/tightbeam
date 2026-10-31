@@ -189,13 +189,23 @@ impl Deref for CheckedLimits {
 mod tests {
 	use super::*;
 
-	/// The defaults pass the check, so an endpoint that configures no limits
-	/// holds a set whose ceilings agree.
-	#[test]
-	fn the_default_limits_pass_the_check() -> TransportResult<()> {
-		let limits = TransportLimits::default();
-		assert_eq!(*limits.checked()?, limits);
-		Ok(())
+	// A set whose ceilings agree passes the check whole: the defaults, so an
+	// endpoint that configures no limits holds an agreeing set, and a
+	// handshake ceiling whose wire form meets the cleartext ceiling exactly.
+	crate::tb_cases! {
+		fn an_agreeing_set_passes_the_check(limits: TransportLimits) -> crate::testing::TestResult {
+			let checked = limits.checked()?;
+			assert_eq!(*checked, limits);
+			Ok(())
+		}
+		cases {
+			the_defaults => TransportLimits::default(),
+			a_handshake_wire_form_at_the_cleartext_ceiling => TransportLimits {
+				handshake_wire: 16_384,
+				cleartext_envelope: 16_388,
+				..TransportLimits::default()
+			},
+		}
 	}
 
 	// Each case is a set with one ceiling at zero, which refuses every
@@ -222,7 +232,6 @@ mod tests {
 			(handshake_wire, cleartext_envelope): (usize, usize)
 		) {
 			let limits = TransportLimits { handshake_wire, cleartext_envelope, ..TransportLimits::default() };
-
 			let refused = limits.checked();
 			assert!(matches!(refused, Err(TransportError::InvalidLimits(LimitsRefusal::HandshakePastCleartext))));
 		}
@@ -232,15 +241,5 @@ mod tests {
 			inverted => (1 << 20, 128 * 1024),
 			past_the_der_length_range => (usize::MAX, usize::MAX),
 		}
-	}
-
-	/// A handshake ceiling whose wire form meets the cleartext ceiling exactly
-	/// passes the check.
-	#[test]
-	fn a_handshake_ceiling_whose_wire_form_meets_the_cleartext_ceiling_passes() -> TransportResult<()> {
-		let limits =
-			TransportLimits { handshake_wire: 16_384, cleartext_envelope: 16_388, ..TransportLimits::default() };
-		assert_eq!(*limits.checked()?, limits);
-		Ok(())
 	}
 }

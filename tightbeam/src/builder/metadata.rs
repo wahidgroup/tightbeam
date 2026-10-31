@@ -152,160 +152,129 @@ impl MetadataBuilder {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use crate::asn1::GatedField;
 	use crate::builder::error::MetadataError;
-	use crate::testing::TestDigest;
+	use crate::testing::{TestDigest, TestFrame, TestResult};
+
+	use super::*;
+
+	/// The optional fields a metadata build carries: its integrity, priority,
+	/// lifetime, previous frame, and matrix.
+	type Carried = (
+		Option<DigestInfo>,
+		Option<MessagePriority>,
+		Option<u64>,
+		Option<DigestInfo>,
+		Option<MatrixDyn>,
+	);
 
 	/// A 2x2 zero matrix, the fixture of the builder chains.
 	fn fixture_matrix() -> MatrixDyn {
 		MatrixDyn::try_from(2u8).expect("2 is a valid matrix dimension")
 	}
 
-	macro_rules! test_metadata_builder {
-		($test_name:ident, $version:expr, $builder:expr) => {
-			#[test]
-			fn $test_name() {
-				let metadata = $builder
-					.build()
-					.expect(concat!("Failed to build ", stringify!($version), " metadata"));
-
-				// One structure serves every version, as in X.509, so the
-				// assertions branch on the version.
-				match $version {
-					Version::V0 => {
-						assert!(metadata.priority().is_none());
-						assert!(metadata.lifetime().is_none());
-						assert!(metadata.previous_frame().is_none());
-						assert!(metadata.matrix().is_none());
-					}
-					Version::V1 => {
-						assert!(metadata.priority().is_none());
-						assert!(metadata.lifetime().is_none());
-						assert!(metadata.previous_frame().is_none());
-						assert!(metadata.matrix().is_none());
-					}
-					Version::V2 => {
-						assert!(metadata.priority().is_some());
-						assert!(metadata.matrix().is_none());
-					}
-					Version::V3 => {
-						assert!(metadata.priority().is_some());
-						assert!(metadata.matrix().is_some());
-					}
-				}
-			}
-		};
+	/// Returns a builder of `version` that holds the id `test-id` and the
+	/// order [`TestFrame::ORDER`].
+	fn ordered(version: Version) -> MetadataBuilder {
+		MetadataBuilder::from(version).with_id("test-id").with_order(TestFrame::ORDER)
 	}
 
-	// V0 permits no integrity info. The rejection tests below cover a V0
-	// builder that sets one.
-	test_metadata_builder!(
-		test_metadata_builder_v0,
-		Version::V0,
-		MetadataBuilder::from(Version::V0)
-			.with_id("test-id-v0")
-			.with_order(1696521600u64)
-	);
-
-	test_metadata_builder!(
-		test_metadata_builder_v1,
-		Version::V1,
-		MetadataBuilder::from(Version::V1)
-			.with_id("test-id-v1")
-			.with_order(1696521600u64)
-			.with_integrity_info(TestDigest::info())
-	);
-
-	test_metadata_builder!(
-		test_metadata_builder_v2,
-		Version::V2,
-		MetadataBuilder::from(Version::V2)
-			.with_id("test-id-v2")
-			.with_order(1696521600u64)
-			.with_integrity_info(TestDigest::info())
-			.with_priority(MessagePriority::LowLatency)
-			.with_lifetime(3600)
-	);
-
-	test_metadata_builder!(
-		test_metadata_builder_v3,
-		Version::V3,
-		MetadataBuilder::from(Version::V3)
-			.with_id("test-id-v3")
-			.with_order(1696521600u64)
-			.with_integrity_info(TestDigest::info())
-			.with_priority(MessagePriority::LowLatency)
-			.with_lifetime(3600)
-			.with_matrix(fixture_matrix())
-	);
-
-	#[test]
-	fn test_metadata_builder_missing_required_fields() {
-		let result = MetadataBuilder::from(Version::V0).with_id("test-id").build();
-		assert!(matches!(result, Err(BuildError::InvalidMetadata(MetadataError::MissingOrder))));
+	/// Returns the optional fields that `metadata` carries.
+	fn carried(metadata: &Metadata) -> Carried {
+		let integrity = metadata.integrity().cloned();
+		let previous_frame = metadata.previous_frame().cloned();
+		let matrix = metadata.matrix().cloned();
+		(integrity, metadata.priority(), metadata.lifetime(), previous_frame, matrix)
 	}
 
-	mod errors {
-		use super::*;
+	// One structure serves every version, as in X.509. Each case is a builder
+	// of one version with fields that the version admits, beside the fields
+	// its build carries. V0 admits no integrity, so its case sets none.
+	crate::tb_cases! {
+		fn a_metadata_build_carries_the_fields_its_version_admits((builder, expected): (MetadataBuilder, Carried))
+			-> TestResult
+		{
+			let metadata = builder.build()?;
+			assert_eq!(carried(&metadata), expected);
+			Ok(())
+		}
+		cases {
+			v0 => (ordered(Version::V0), (None, None, None, None, None)),
+			v1 => (
+				ordered(Version::V1).with_integrity_info(TestDigest::info()),
+				(Some(TestDigest::info()), None, None, None, None),
+			),
+			v2 => (
+				ordered(Version::V2)
+					.with_integrity_info(TestDigest::info())
+					.with_priority(MessagePriority::LowLatency)
+					.with_lifetime(3600),
+				(Some(TestDigest::info()), Some(MessagePriority::LowLatency), Some(3600), None, None),
+			),
+			v3 => (
+				ordered(Version::V3)
+					.with_integrity_info(TestDigest::info())
+					.with_priority(MessagePriority::LowLatency)
+					.with_lifetime(3600)
+					.with_matrix(fixture_matrix()),
+				(Some(TestDigest::info()), Some(MessagePriority::LowLatency), Some(3600), None, Some(fixture_matrix())),
+			),
+		}
+	}
 
-		/// The builder of one case, and the error that its build returns.
-		type ErrorCase = (MetadataBuilder, MetadataError);
+	// Each case is a builder short of a required field or holding a field
+	// that its version forbids, beside the metadata error of its build.
+	crate::tb_cases! {
+		fn an_incomplete_or_gated_metadata_build_is_refused((builder, expected): (MetadataBuilder, MetadataError)) {
+			let result = builder.build();
 
-		crate::tb_cases! {
-			fn test_metadata_validation_errors((builder, expected): ErrorCase) {
-				let result = builder.build();
-				assert!(matches!(result, Err(BuildError::InvalidMetadata(ref err)) if *err == expected));
-			}
-			cases {
-				v0_missing_id => (MetadataBuilder::from(Version::V0).with_order(1696521600), MetadataError::MissingId),
-				v0_missing_order => (
-					MetadataBuilder::from(Version::V0).with_id("test-id"),
-					MetadataError::MissingOrder,
-				),
-				v1_missing_id => (MetadataBuilder::from(Version::V1).with_order(1696521600), MetadataError::MissingId),
-				v1_missing_order => (
-					MetadataBuilder::from(Version::V1).with_id("test-id"),
-					MetadataError::MissingOrder,
-				),
-				v2_missing_id => (MetadataBuilder::from(Version::V2).with_order(1696521600), MetadataError::MissingId),
-				v2_missing_order => (
-					MetadataBuilder::from(Version::V2).with_id("test-id"),
-					MetadataError::MissingOrder,
-				),
-				v0_rejects_integrity => (
-					MetadataBuilder::from(Version::V0)
-						.with_id("test-id")
-						.with_order(1696521600)
-						.with_integrity_info(TestDigest::info()),
-					MetadataError::UnsupportedField { field: GatedField::MessageIntegrity, version: Version::V0 },
-				),
-				v0_rejects_priority => (
-					MetadataBuilder::from(Version::V0)
-						.with_id("test-id")
-						.with_order(1696521600)
-						.with_priority(MessagePriority::LowLatency),
-					MetadataError::UnsupportedField { field: GatedField::Priority, version: Version::V0 },
-				),
-				v1_rejects_lifetime => (
-					MetadataBuilder::from(Version::V1).with_id("test-id").with_order(1696521600).with_lifetime(3600),
-					MetadataError::UnsupportedField { field: GatedField::Lifetime, version: Version::V1 },
-				),
-				v0_rejects_previous_frame => (
-					MetadataBuilder::from(Version::V0)
-						.with_id("test-id")
-						.with_order(1696521600)
-						.previous_frame(TestDigest::info()),
-					MetadataError::UnsupportedField { field: GatedField::PreviousFrame, version: Version::V0 },
-				),
-				v2_rejects_matrix => (
-					MetadataBuilder::from(Version::V2)
-						.with_id("test-id")
-						.with_order(1696521600)
-						.with_matrix(MatrixDyn::default()),
-					MetadataError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 },
-				),
-			}
+			assert!(matches!(result, Err(BuildError::InvalidMetadata(ref err)) if *err == expected));
+		}
+		cases {
+			v0_missing_id => (
+				MetadataBuilder::from(Version::V0).with_order(TestFrame::ORDER),
+				MetadataError::MissingId,
+			),
+			v0_missing_order => (
+				MetadataBuilder::from(Version::V0).with_id("test-id"),
+				MetadataError::MissingOrder,
+			),
+			v1_missing_id => (
+				MetadataBuilder::from(Version::V1).with_order(TestFrame::ORDER),
+				MetadataError::MissingId,
+			),
+			v1_missing_order => (
+				MetadataBuilder::from(Version::V1).with_id("test-id"),
+				MetadataError::MissingOrder,
+			),
+			v2_missing_id => (
+				MetadataBuilder::from(Version::V2).with_order(TestFrame::ORDER),
+				MetadataError::MissingId,
+			),
+			v2_missing_order => (
+				MetadataBuilder::from(Version::V2).with_id("test-id"),
+				MetadataError::MissingOrder,
+			),
+			v0_rejects_integrity => (
+				ordered(Version::V0).with_integrity_info(TestDigest::info()),
+				MetadataError::UnsupportedField { field: GatedField::MessageIntegrity, version: Version::V0 },
+			),
+			v0_rejects_priority => (
+				ordered(Version::V0).with_priority(MessagePriority::LowLatency),
+				MetadataError::UnsupportedField { field: GatedField::Priority, version: Version::V0 },
+			),
+			v1_rejects_lifetime => (
+				ordered(Version::V1).with_lifetime(3600),
+				MetadataError::UnsupportedField { field: GatedField::Lifetime, version: Version::V1 },
+			),
+			v0_rejects_previous_frame => (
+				ordered(Version::V0).previous_frame(TestDigest::info()),
+				MetadataError::UnsupportedField { field: GatedField::PreviousFrame, version: Version::V0 },
+			),
+			v2_rejects_matrix => (
+				ordered(Version::V2).with_matrix(MatrixDyn::default()),
+				MetadataError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 },
+			),
 		}
 	}
 }

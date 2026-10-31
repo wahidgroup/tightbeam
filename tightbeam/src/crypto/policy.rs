@@ -262,53 +262,39 @@ where
 	feature = "sha3"
 ))]
 mod tests {
-	use signature::DigestSigner;
-
 	use super::{CanonicalForm, Secp256k1Policy, VerificationPolicy, VerifiedSignature};
 	use crate::crypto::hash::{Digest, Sha3_256};
-	use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey, Signature};
-	use crate::crypto::sign::CanonicalSigner;
+	use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Signature};
+	use crate::crypto::sign::{CanonicalSigner, PrehashSigner};
 	use crate::crypto::x509::error::CertificateValidationError;
+	use crate::der::asn1::ObjectIdentifier;
 	use crate::oids::{HASH_SHA3_256, HASH_SHA3_512, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::spki::EncodePublicKey;
-	use crate::testing::TestKey;
+	use crate::testing::{TestKey, TestResult};
 
-	/// Content whose raw `s` under the fixed test key lies in the high half,
-	/// so a signer that skips the low-s rule fails the tests that sign it.
-	const CONTENT: &[u8] = b"cms signer content";
-
-	/// The low-s signature the fixed test key makes over [`CONTENT`], with the
-	/// `(r, n - s)` twin that an external signer may emit for it.
-	fn low_and_high() -> (Signature<Secp256k1>, Signature<Secp256k1>) {
-		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let low: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(CONTENT).expect("the test key signs");
-		let low = Signature::<Secp256k1>::try_from(low).expect("a DER signature holds two scalars");
-		let (r, s) = low.split_scalars();
-		let high = Signature::<Secp256k1>::from_scalars(r, -s).expect("n - s is a scalar");
-
-		(low, high)
+	/// The low-s signature the fixed test key makes over
+	/// [`TestKey::HIGH_S_CONTENT`].
+	fn low() -> Signature<Secp256k1> {
+		let signing_key = TestKey::insecure_fixed_signing();
+		let low: Secp256k1Signature = signing_key
+			.sign_canonical::<Sha3_256>(TestKey::HIGH_S_CONTENT)
+			.expect("the test key signs");
+		Signature::<Secp256k1>::try_from(low).expect("a DER signature holds two scalars")
 	}
 
-	/// Interop: a signature produced by the `ecdsa` crate's own
-	/// `DigestSigner<Sha3_256>` path -- independent of this crate's
-	/// `sign_canonical` -- must verify under the advertised
-	/// ecdsa-with-SHA3-256 OID.
+	/// Interop: a signature from the `ecdsa` crate's own prehash signer over
+	/// the SHA3-256 digest, apart from this crate's `sign_canonical`,
+	/// verifies under the advertised ecdsa-with-SHA3-256 OID.
 	#[test]
-	fn verifies_independent_sha3_ecdsa_signature() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
+	fn verifies_independent_sha3_ecdsa_signature() -> TestResult {
+		let signing_key = TestKey::insecure_fixed_signing();
 		let message = b"independent sha3-ecdsa interop";
-
-		let mut digest = Sha3_256::default();
-		digest::Digest::update(&mut digest, message);
-
-		let signature: Signature<Secp256k1> = signing_key.try_sign_digest(digest)?;
+		let signature: Signature<Secp256k1> = signing_key.sign_prehash(&Sha3_256::digest(message))?;
 		let public_key_der = signing_key.verifying_key().to_public_key_der()?;
-		Secp256k1Policy::default().verify_signature(
-			&SIGNER_ECDSA_WITH_SHA3_256,
-			public_key_der.as_bytes(),
-			message,
-			signature.to_der().as_bytes(),
-		)?;
+		let (key, signature) = (public_key_der.as_bytes(), signature.to_der());
+		let policy = Secp256k1Policy::default();
+
+		policy.verify_signature(&SIGNER_ECDSA_WITH_SHA3_256, key, message, signature.as_bytes())?;
 
 		Ok(())
 	}
@@ -316,59 +302,56 @@ mod tests {
 	/// The crate signs with `s` in the low half of the curve order.
 	#[test]
 	fn the_crate_signs_low_s() {
-		let (low, _) = low_and_high();
-		assert!(low.normalize_s().is_none());
+		assert!(low().normalize_s().is_none());
 	}
 
 	/// A high-s value from an external signer verifies (SEC 1 v2.0 §4.1.4).
 	#[test]
-	fn a_high_s_signature_verifies() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let (_, high) = low_and_high();
-
-		let prehash = Sha3_256::digest(CONTENT);
-		let encoded = high.to_der();
+	fn a_high_s_signature_verifies() -> TestResult {
+		let signing_key = TestKey::insecure_fixed_signing();
+		let prehash = Sha3_256::digest(TestKey::HIGH_S_CONTENT);
+		let encoded = TestKey::high_s_twin(low()).to_der();
 		VerifiedSignature::verify::<Secp256k1Signature, _>(signing_key.verifying_key(), prehash, encoded)?;
-
 		Ok(())
 	}
 
 	/// A signature and its `(r, n - s)` twin verify to one canonical value, so
 	/// a ledger that keys on it keys the two as one.
 	#[test]
-	fn a_signature_and_its_high_s_twin_verify_to_one_value() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let (low, high) = low_and_high();
-		let prehash = Sha3_256::digest(CONTENT);
+	fn a_signature_and_its_high_s_twin_verify_to_one_value() -> TestResult {
+		let signing_key = TestKey::insecure_fixed_signing();
+		let high = TestKey::high_s_twin(low());
+		let prehash = Sha3_256::digest(TestKey::HIGH_S_CONTENT);
 		let verifier = signing_key.verifying_key();
 
-		let from_low = VerifiedSignature::verify::<Secp256k1Signature, _>(verifier, prehash, low.to_der())?;
+		let from_low = VerifiedSignature::verify::<Secp256k1Signature, _>(verifier, prehash, low().to_der())?;
 		let from_high = VerifiedSignature::verify::<Secp256k1Signature, _>(verifier, prehash, high.to_der())?;
 		assert_eq!(from_low, from_high);
 		Ok(())
 	}
 
 	/// A raw `r || s` value is no ECDSA-Sig-Value, so the parse refuses it.
+	/// The error of the `signature` crate is opaque, so the refusal is the
+	/// whole contract.
 	#[test]
 	fn a_raw_r_s_value_is_refused() {
-		let (low, _) = low_and_high();
-		let raw = low.to_bytes();
-
+		let raw = low().to_bytes();
 		let parsed = Secp256k1Signature::canonical(&raw);
 		assert!(parsed.is_err());
 	}
 
 	/// The DER of a high-s value comes back as the DER of its low-s twin.
 	#[test]
-	fn the_canonical_form_of_a_high_s_value_is_its_low_s_twin() -> Result<(), Box<dyn std::error::Error>> {
-		let (low, high) = low_and_high();
+	fn the_canonical_form_of_a_high_s_value_is_its_low_s_twin() -> TestResult {
+		let high = TestKey::high_s_twin(low());
 		let canonical = Secp256k1Signature::canonical(high.to_der().as_bytes())?;
-		assert_eq!(canonical.as_bytes(), low.to_der().as_bytes());
+		assert_eq!(canonical.as_bytes(), low().to_der().as_bytes());
 		Ok(())
 	}
 
-	/// RFC 6979 known answer: the fixed test key signs [`CONTENT`] under the
-	/// SHA3-256 prehash to one DER value with a low `s`.
+	/// RFC 6979 known answer: the fixed test key signs
+	/// [`TestKey::HIGH_S_CONTENT`] under the SHA3-256 prehash to one DER value
+	/// with a low `s`.
 	///
 	/// NIST CAVP publishes no secp256k1 vector, and RFC 6979 Appendix A holds
 	/// none for this curve. An independent computation gives the value, and
@@ -378,7 +361,7 @@ mod tests {
 	/// - The ECDSA equations of SEC 1 v2.0 §4.1.3, and the low-s rule.
 	/// - The DER of RFC 3279 §2.2.3.
 	#[test]
-	fn the_signature_matches_its_rfc_6979_known_answer() -> Result<(), Box<dyn std::error::Error>> {
+	fn the_signature_matches_its_rfc_6979_known_answer() -> TestResult {
 		const EXPECTED: [u8; 71] = [
 			0x30, 0x45, 0x02, 0x21, 0x00, 0xf5, 0x73, 0x23, 0xf4, 0x99, 0xab, 0x6c, 0xc6, 0x03, 0x60, 0x2a, 0x78, 0x93,
 			0x5d, 0x50, 0x54, 0x2c, 0xa8, 0x73, 0xdf, 0x00, 0x8b, 0xd7, 0xd6, 0x87, 0x08, 0x0d, 0xe7, 0x25, 0xb9, 0x6a,
@@ -386,29 +369,26 @@ mod tests {
 			0x12, 0x30, 0x08, 0xad, 0xbd, 0x2b, 0x66, 0x97, 0xba, 0xdf, 0x78, 0x72, 0xc2, 0xd6, 0xac, 0x1b, 0x61,
 		];
 
-		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let signature: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(CONTENT)?;
+		let signing_key = TestKey::insecure_fixed_signing();
+		let signature: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(TestKey::HIGH_S_CONTENT)?;
 		assert_eq!(signature.as_bytes(), EXPECTED.as_slice());
 		Ok(())
 	}
 
-	/// The policy refuses a digest its signature algorithm does not name (RFC
-	/// 5753 §2.1.1).
-	#[test]
-	fn the_policy_refuses_a_digest_its_signature_algorithm_does_not_name() {
-		let refused = Secp256k1Policy::default().digest(&SIGNER_ECDSA_WITH_SHA3_256, &HASH_SHA3_512, CONTENT);
-		assert!(matches!(refused, Err(CertificateValidationError::UnsupportedAlgorithm(oid)) if oid == HASH_SHA3_512));
-	}
-
-	/// The policy refuses a signature algorithm other than its own, even
-	/// beside the digest it implements.
-	#[test]
-	fn the_policy_refuses_a_signature_algorithm_it_does_not_hold() {
-		let refused = Secp256k1Policy::default().digest(&SIGNER_ECDSA_WITH_SHA256, &HASH_SHA3_256, CONTENT);
-		let unsupported = matches!(
-			refused,
-			Err(CertificateValidationError::UnsupportedAlgorithm(oid)) if oid == SIGNER_ECDSA_WITH_SHA256
-		);
-		assert!(unsupported);
+	// The policy refuses a pair it does not hold and names the identifier it
+	// refused: a digest its signature algorithm does not name (RFC 5753
+	// §2.1.1), or a signature algorithm other than its own, even beside the
+	// digest it implements.
+	crate::tb_cases! {
+		fn the_policy_refuses_an_algorithm_pair(
+			(signature, digest, refused): (ObjectIdentifier, ObjectIdentifier, ObjectIdentifier)
+		) {
+			let digested = Secp256k1Policy::default().digest(&signature, &digest, TestKey::HIGH_S_CONTENT);
+			assert!(matches!(digested, Err(CertificateValidationError::UnsupportedAlgorithm(oid)) if oid == refused));
+		}
+		cases {
+			digest_not_named => (SIGNER_ECDSA_WITH_SHA3_256, HASH_SHA3_512, HASH_SHA3_512),
+			signature_not_held => (SIGNER_ECDSA_WITH_SHA256, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256),
+		}
 	}
 }

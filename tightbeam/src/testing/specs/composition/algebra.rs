@@ -397,6 +397,7 @@ impl Process {
 		let builder = Process::builder(name)
 			.initial_state(self.initial)
 			.copy_states(self, |state| *state);
+
 		let builder = builder.copy_terminals(self, |state| *state);
 		let builder = builder.copy_choices(self, |state| *state);
 		let observable_events: Vec<Event> = self.observable.iter().map(|event| rename_event(*event)).collect();
@@ -543,135 +544,61 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(feature = "testing-timing")]
-	use core::time::Duration;
-
 	use super::*;
-	use crate::testing::specs::csp::{Event, Process, State};
-	use crate::trace::{ConsumedTrace, TraceCollector};
-	use crate::urn::Urn;
+	use crate::testing::fixtures::TestProcess;
+	use crate::testing::specs::lts::CspValidationResult;
+	use crate::testing::TestResult;
+	use crate::trace::ConsumedTrace;
 
 	#[cfg(feature = "testing-timing")]
-	use crate::builder::TypeBuilder;
+	use crate::testing::timing::TimingGuard;
+
+	/// One composition operator over two processes.
+	type Compose = fn(&Process, &Process) -> Result<Process, CompositionError>;
+
+	/// One operator over a single process.
 	#[cfg(feature = "testing-timing")]
-	use crate::testing::specs::csp::ProcessBuildError;
-	#[cfg(feature = "testing-timing")]
-	use crate::testing::timing::{TimingConstraint, TimingConstraints, TimingGuard, WcetConfigBuilder};
+	type Transform = fn(&Process) -> Result<Process, CompositionError>;
 
-	const A: Urn<'static> = crate::urn!("test", "event:algebra/a");
-	const B: Urn<'static> = crate::urn!("test", "event:algebra/b");
-
-	/// The trace of a run that records each of `labels` once, in order.
-	fn trace_of(labels: &[Urn<'static>]) -> ConsumedTrace {
-		let collector = TraceCollector::new();
-		for label in labels {
-			collector.event(label).expect("the run injects no fault").emit();
-		}
-
-		ConsumedTrace::drained_from(&collector)
-	}
-
+	/// A process `P` in which `a` takes `s0` to `s1`, and `b` takes `s1` to
+	/// the terminal `s2`.
 	fn simple_process() -> Process {
-		Process::builder("P")
-			.initial_state(State("s0"))
-			.add_state(State("s0"))
-			.add_state(State("s1"))
-			.add_state(State("s2"))
-			.add_observable(A)
-			.add_observable(B)
-			.add_transition(State("s0"), A, State("s1"))
-			.add_transition(State("s1"), B, State("s2"))
-			.add_terminal(State("s2"))
-			.build()
-			.expect("Failed to build process")
+		TestProcess::chain("P", &["s0", "s1", "s2"], &["a", "b"])
 	}
 
-	#[test]
-	fn test_hiding_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let hidden_events = [Event::from(A)].iter().copied().collect();
-
-		let result = p.hide(hidden_events);
-		assert!(result.hidden.contains(&Event::from(A)));
-		assert!(!result.observable.contains(&Event::from(A)));
-		assert!(result.observable.contains(&Event::from(B)));
-		Ok(())
+	/// The composition of two copies of [`simple_process`] under `compose`.
+	fn composed(compose: Compose) -> Process {
+		let built = compose(&simple_process(), &simple_process());
+		built.expect("two copies of one untimed process compose")
 	}
 
-	#[test]
-	fn test_renaming_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let mut mapping = HashMap::new();
-		mapping.insert(Event::from(A), Event("x"));
-
-		let result = p.rename(mapping)?;
-		assert!(result.observable.contains(&Event("x")));
-		assert!(!result.observable.contains(&Event::from(A)));
-
-		Ok(())
+	/// The states of `names`.
+	fn states_named(names: &[&'static str]) -> HashSet<State> {
+		names.iter().copied().map(State).collect()
 	}
 
-	#[test]
-	fn test_sequential_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let q = simple_process();
-
-		let result = Process::sequential(&p, &q)?;
-		assert!(result.name.contains(";"));
-		assert!(result.states.len() >= p.states.len() + q.states.len());
-
-		Ok(())
+	/// A process in which `a` takes `s0` to `s1` through the hidden `t`, and
+	/// `s1` to the terminal `s2`.
+	fn hidden_start() -> Process {
+		TestProcess {
+			observable: &["a"],
+			hidden: &["t"],
+			transitions: &[("s0", "t", "s1"), ("s1", "a", "s2")],
+			terminal: &["s2"],
+			..TestProcess::of("H", "s0")
+		}
+		.build()
 	}
 
-	#[test]
-	fn test_external_choice_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let q = simple_process();
-
-		let result = Process::external_choice(&p, &q)?;
-		assert!(result.name.contains("[]"));
-		assert!(result.states.len() >= 3);
-		Ok(())
-	}
-
-	#[test]
-	fn test_internal_choice_basic() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let q = simple_process();
-
-		let result = Process::internal_choice(&p, &q)?;
-		assert!(result.name.contains("|~|"));
-		assert!(result.states.len() >= 3);
-
-		Ok(())
-	}
-
-	#[test]
-	fn internal_choice_trace_validates_through_tau() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let q = simple_process();
-		let composed = Process::internal_choice(&p, &q)?;
-
-		let result = composed.validate_trace(&trace_of(&[A, B]));
-		assert!(result.valid);
-		Ok(())
-	}
-
-	#[test]
-	fn sequential_trace_validates_across_tau_bridge() -> Result<(), Box<dyn core::error::Error>> {
-		let p = simple_process();
-		let q = simple_process();
-		let composed = Process::sequential(&p, &q)?;
-
-		let result = composed.validate_trace(&trace_of(&[A, B, A, B]));
-		assert!(result.valid);
-		Ok(())
+	/// A process in which `c` takes `q0` to the terminal `q1`.
+	fn c_once() -> Process {
+		TestProcess::chain("C", &["q0", "q1"], &["c"])
 	}
 
 	/// A process in which `a` takes `s0` to the terminal `s1` where the
 	/// clocks satisfy `guard`.
 	#[cfg(feature = "testing-timing")]
-	fn guarded_process(guard: TimingGuard) -> Result<Process, ProcessBuildError> {
+	fn guarded_process(guard: TimingGuard) -> Process {
 		Process::builder("G")
 			.initial_state(State("s0"))
 			.clock(guard.clock())
@@ -679,6 +606,7 @@ mod tests {
 			.add_timed_transition(State("s0"), Event("a"), State("s1"), Some(guard), Vec::new())
 			.add_terminal(State("s1"))
 			.build()
+			.expect("a guard on a declared clock builds")
 	}
 
 	/// The guards of the timed edges that `a` labels at `state`.
@@ -686,97 +614,6 @@ mod tests {
 	fn guards_of(process: &Process, state: State) -> Vec<Option<TimingGuard>> {
 		let edges = process.timed_edges(state, &Event("a"));
 		edges.iter().map(|edge| edge.guard.clone()).collect()
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn hiding_keeps_the_guard_of_a_timed_transition() -> Result<(), Box<dyn core::error::Error>> {
-		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-		let guarded = guarded_process(bound.clone())?;
-
-		let copy = guarded.hide(HashSet::new());
-		assert_eq!(guards_of(&copy, State("s0")), [Some(bound)]);
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn an_external_choice_keeps_the_guard_of_a_first_event() -> Result<(), Box<dyn core::error::Error>> {
-		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-		let guarded = guarded_process(bound.clone())?;
-
-		let choice = Process::external_choice(&guarded, &simple_process())?;
-		assert_eq!(guards_of(&choice, choice.initial), [Some(bound)]);
-		Ok(())
-	}
-
-	/// A process in which `a` takes `s0` to `s1` through the hidden `t`, and
-	/// `s1` to the terminal `s2`.
-	fn hidden_start() -> Process {
-		Process::builder("H")
-			.initial_state(State("s0"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("t"))
-			.add_transition(State("s0"), Event("t"), State("s1"))
-			.add_transition(State("s1"), Event("a"), State("s2"))
-			.add_terminal(State("s2"))
-			.build()
-			.expect("a process with an initial state builds")
-	}
-
-	/// A process in which `c` takes `q0` to the terminal `q1`.
-	fn c_once() -> Process {
-		Process::builder("C")
-			.initial_state(State("q0"))
-			.add_observable(Event("c"))
-			.add_transition(State("q0"), Event("c"), State("q1"))
-			.add_terminal(State("q1"))
-			.build()
-			.expect("a process with an initial state builds")
-	}
-
-	/// A process in which `a` takes `s0` to `s1` or to `s2`, and `s0` is a
-	/// declared choice point.
-	fn branching() -> Process {
-		Process::builder("B")
-			.initial_state(State("s0"))
-			.add_observable(Event("a"))
-			.add_transition(State("s0"), Event("a"), State("s1"))
-			.add_transition(State("s0"), Event("a"), State("s2"))
-			.add_choice(State("s0"))
-			.add_terminal(State("s1"))
-			.add_terminal(State("s2"))
-			.build()
-			.expect("a process with an initial state builds")
-	}
-
-	/// A process in which each event of `wcets` takes `s0` to the terminal
-	/// `s1`, and the WCET of each is its milliseconds.
-	#[cfg(feature = "testing-timing")]
-	fn timed(
-		name: &'static str,
-		wcets: &[(&'static str, u64)],
-	) -> Result<Process, crate::testing::error::TestingError> {
-		let mut constraints = TimingConstraints::default();
-		let builder = Process::builder(name).initial_state(State("s0")).add_terminal(State("s1"));
-		let builder = wcets.iter().try_fold(builder, |builder, &(event, millis)| {
-			let duration = Duration::from_millis(millis);
-			let wcet = WcetConfigBuilder::default()
-				.with_duration(duration)
-				.build()
-				.expect("a WCET with a duration builds");
-			constraints.add(Event(event), TimingConstraint::Wcet(wcet))?;
-			let builder = builder
-				.add_observable(Event(event))
-				.add_transition(State("s0"), Event(event), State("s1"));
-			Ok::<_, crate::testing::error::TestingError>(builder)
-		})?;
-
-		let process = builder
-			.timing_constraints(constraints)
-			.build()
-			.expect("a process with an initial state builds");
-		Ok(process)
 	}
 
 	/// Whether `process` holds a timing constraint on `event`.
@@ -801,73 +638,147 @@ mod tests {
 			.expect("a process with an initial state builds")
 	}
 
+	/// Hiding moves an event from the observable to the hidden alphabet.
 	#[test]
-	fn a_hidden_first_move_keeps_the_choice_open() -> Result<(), Box<dyn core::error::Error>> {
-		let choice = Process::external_choice(&hidden_start(), &c_once())?;
+	fn hiding_moves_an_event_to_the_hidden_alphabet() {
+		let process = simple_process();
+		let hidden = process.hide(HashSet::from([Event("a")]));
 
-		let after_hidden = choice.step(choice.initial, &Event("t"));
-		let offered: Vec<HashSet<Event>> = after_hidden.iter().map(|state| choice.offers(*state)).collect();
-		assert_eq!(offered, [HashSet::from([Event("a"), Event("c")])]);
+		let alphabets = (hidden.observable, hidden.hidden);
+		assert_eq!(alphabets, (HashSet::from([Event("b")]), HashSet::from([Event("a")])));
+	}
+
+	/// Renaming replaces an event of the observable alphabet with its new
+	/// name.
+	#[test]
+	fn renaming_replaces_an_event_of_the_alphabet() -> TestResult {
+		let process = simple_process();
+		let renamed = process.rename(HashMap::from([(Event("a"), Event("x"))]))?;
+		assert_eq!(renamed.observable, HashSet::from([Event("x"), Event("b")]));
 		Ok(())
 	}
 
-	#[test]
-	fn an_observable_first_event_commits_the_choice() -> Result<(), Box<dyn core::error::Error>> {
-		let choice = Process::external_choice(&simple_process(), &c_once())?;
+	// Each operator names its composition in CSP notation, over the states of
+	// both operands and the states it adds.
+	crate::tb_cases! {
+		fn an_operator_names_its_composition((compose, name, states): (Compose, &str, HashSet<State>)) {
+			let process = composed(compose);
+			assert_eq!((process.name, process.states), (name, states));
+		}
 
-		let after_a = choice.step(choice.initial, &Event::from(A));
-		let offered: Vec<HashSet<Event>> = after_a.iter().map(|state| choice.offers(*state)).collect();
-		assert_eq!(offered, [HashSet::from([Event::from(B)])]);
-		Ok(())
+		cases {
+			sequential => (
+				Process::sequential,
+				"(P ; P)",
+				states_named(&["s0", "s1", "s2", "Q_s0", "Q_s1", "Q_s2"]),
+			),
+			external_choice => (
+				Process::external_choice,
+				"(P [] P)",
+				states_named(&["ExternalChoice_(s0,s0)", "P_s0", "P_s1", "P_s2", "Q_s0", "Q_s1", "Q_s2"]),
+			),
+			internal_choice => (
+				Process::internal_choice,
+				"(P |~| P)",
+				states_named(&["InternalChoice_Initial", "P_s0", "P_s1", "P_s2", "Q_s0", "Q_s1", "Q_s2"]),
+			),
+		}
 	}
 
+	// A composition takes its hidden step silently, so a trace of the events
+	// of its operands validates.
+	crate::tb_cases! {
+		fn a_trace_validates_across_the_hidden_step_of((compose, trace): (Compose, ConsumedTrace)) {
+			let process = composed(compose);
+			let result = process.validate_trace(&trace);
+			assert_eq!(result, CspValidationResult { valid: true, violations: Vec::new() });
+		}
+
+		cases {
+			an_internal_choice => (Process::internal_choice, ConsumedTrace::recording([Event("a"), Event("b")])),
+			a_sequential_composition => (
+				Process::sequential,
+				ConsumedTrace::recording([Event("a"), Event("b"), Event("a"), Event("b")]),
+			),
+		}
+	}
+
+	// Each operator keeps the guard of the first event of an operand, so the
+	// copy also declares the clock that the guard reads.
+	#[cfg(feature = "testing-timing")]
+	crate::tb_cases! {
+		fn the_guard_of_a_first_event_survives(transform: Transform) -> TestResult {
+			let guarded = guarded_process(TimingGuard::clk_within(5));
+			let copy = transform(&guarded)?;
+			assert_eq!(guards_of(&copy, copy.initial), [Some(TimingGuard::clk_within(5))]);
+			Ok(())
+		}
+
+		cases {
+			hiding => |guarded| Ok(guarded.hide(HashSet::new())),
+			an_external_choice => |guarded| Process::external_choice(guarded, &simple_process()),
+			a_sequential_composition => |guarded| Process::sequential(guarded, &simple_process()),
+		}
+	}
+
+	// The first move of an external choice keeps the choice open when it is
+	// hidden, and commits the choice when it is observable.
+	crate::tb_cases! {
+		fn an_external_choice_after_one_move((left, first, offered): (Process, &str, HashSet<Event>)) -> TestResult {
+			let choice = Process::external_choice(&left, &c_once())?;
+
+			let after = choice.step(choice.initial, &Event(first));
+			let offers: Vec<HashSet<Event>> = after.iter().map(|state| choice.offers(*state)).collect();
+			assert_eq!(offers, [offered]);
+			Ok(())
+		}
+
+		cases {
+			that_is_hidden_stays_open => (hidden_start(), "t", HashSet::from([Event("a"), Event("c")])),
+			on_an_observable_event_commits => (simple_process(), "a", HashSet::from([Event("b")])),
+		}
+	}
+
+	/// An external choice whose operands share a first event is a choice
+	/// point at its initial state.
 	#[test]
-	fn a_first_event_of_both_operands_makes_a_choice_point() -> Result<(), Box<dyn core::error::Error>> {
-		let choice = Process::external_choice(&simple_process(), &simple_process())?;
+	fn a_first_event_of_both_operands_makes_a_choice_point() {
+		let choice = composed(Process::external_choice);
 		assert!(choice.is_choice(choice.initial));
-		Ok(())
 	}
 
+	/// Renaming keeps a declared choice point.
 	#[test]
-	fn renaming_keeps_a_choice_point() -> Result<(), Box<dyn core::error::Error>> {
-		let renamed = branching().rename(HashMap::from([(Event("a"), Event("x"))]))?;
+	fn renaming_keeps_a_choice_point() -> TestResult {
+		let branching = TestProcess::choosing("B", "s0", "a", &["s1", "s2"]);
+		let renamed = branching.rename(HashMap::from([(Event("a"), Event("x"))]))?;
 		assert!(renamed.is_choice(State("s0")));
 		Ok(())
 	}
 
+	// Hiding and renaming keep the timing constraint of an event, under its
+	// new name where the operator renames it.
 	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_sequential_composition_declares_the_clocks_it_copies() -> Result<(), Box<dyn core::error::Error>> {
-		let bound = TimingGuard::ClockLessEqual("clk".to_string(), Duration::from_millis(5));
-		let guarded = guarded_process(bound.clone())?;
+	crate::tb_cases! {
+		fn the_constraint_of_an_event_survives((transform, event): (Transform, &'static str)) -> TestResult {
+			let process = TestProcess::timed("T", &[("a", 10)]);
+			let copy = transform(&process)?;
+			assert!(constrains(&copy, event));
+			Ok(())
+		}
 
-		let composed = Process::sequential(&guarded, &simple_process())?;
-		assert_eq!(guards_of(&composed, State("s0")), [Some(bound)]);
-		Ok(())
+		cases {
+			hiding => (|process| Ok(process.hide(HashSet::from([Event("a")]))), "a"),
+			renaming => (|process| process.rename(HashMap::from([(Event("a"), Event("x"))])), "x"),
+		}
 	}
 
+	/// Renaming two events that hold different constraints to one name is
+	/// refused.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn hiding_keeps_the_timing_constraints() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("T", &[("a", 10)])?;
-		let copy = process.hide(HashSet::from([Event("a")]));
-		assert!(constrains(&copy, "a"));
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn renaming_moves_a_constraint_to_the_new_event() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("T", &[("a", 10)])?;
-		let renamed = process.rename(HashMap::from([(Event("a"), Event("x"))]))?;
-		assert!(constrains(&renamed, "x"));
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn renaming_two_differently_constrained_events_to_one_is_refused() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("T", &[("a", 10), ("b", 20)])?;
+	fn renaming_two_differently_constrained_events_to_one_is_refused() {
+		let process = TestProcess::timed("T", &[("a", 10), ("b", 20)]);
 		let mapping = HashMap::from([(Event("a"), Event("x")), (Event("b"), Event("x"))]);
 
 		let refused = process.rename(mapping);
@@ -875,76 +786,71 @@ mod tests {
 			refused,
 			Err(CompositionError::ConflictingTiming { event: Event("x") })
 		));
-		Ok(())
 	}
 
+	// Each operator holds the timing constraints of both operands.
 	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_sequential_composition_holds_the_timing_of_both() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::sequential(&timed("P", &[("a", 10)])?, &timed("Q", &[("b", 20)])?)?;
-		assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
-		Ok(())
+	crate::tb_cases! {
+		fn the_timing_of_both_operands_survives(compose: Compose) -> TestResult {
+			let composed = compose(&TestProcess::timed("P", &[("a", 10)]), &TestProcess::timed("Q", &[("b", 20)]))?;
+			assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
+			Ok(())
+		}
+
+		cases {
+			a_sequential_composition => Process::sequential,
+			an_external_choice => Process::external_choice,
+			an_internal_choice => Process::internal_choice,
+		}
 	}
 
+	/// A composition of two operands that agree on a constraint keeps one
+	/// copy of it.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn an_external_choice_holds_the_timing_of_both() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::external_choice(&timed("P", &[("a", 10)])?, &timed("Q", &[("b", 20)])?)?;
-		assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn an_internal_choice_holds_the_timing_of_both() -> Result<(), Box<dyn core::error::Error>> {
-		let composed = Process::internal_choice(&timed("P", &[("a", 10)])?, &timed("Q", &[("b", 20)])?)?;
-		assert_eq!([constrains(&composed, "a"), constrains(&composed, "b")], [true, true]);
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-timing")]
-	#[test]
-	fn a_composition_keeps_one_copy_of_an_agreeing_constraint() -> Result<(), Box<dyn core::error::Error>> {
-		let process = timed("P", &[("a", 10)])?;
+	fn a_composition_keeps_one_copy_of_an_agreeing_constraint() -> TestResult {
+		let process = TestProcess::timed("P", &[("a", 10)]);
 		let composed = Process::sequential(&process, &process)?;
 		assert!(constrains(&composed, "a"));
 		Ok(())
 	}
 
+	/// A composition refuses two constraints on one event that disagree.
 	#[cfg(feature = "testing-timing")]
 	#[test]
-	fn a_composition_refuses_constraints_that_do_not_agree() -> Result<(), Box<dyn core::error::Error>> {
-		let refused = Process::sequential(&timed("P", &[("a", 10)])?, &timed("Q", &[("a", 20)])?);
+	fn a_composition_refuses_constraints_that_do_not_agree() {
+		let (first, second) = (TestProcess::timed("P", &[("a", 10)]), TestProcess::timed("Q", &[("a", 20)]));
+		let refused = Process::sequential(&first, &second);
 		assert!(matches!(
 			refused,
 			Err(CompositionError::ConflictingTiming { event: Event("a") })
 		));
-		Ok(())
 	}
 
+	/// Hiding keeps the schedulability periods.
 	#[cfg(feature = "testing-schedulability")]
 	#[test]
-	fn hiding_keeps_the_schedulability_periods() -> Result<(), Box<dyn core::error::Error>> {
+	fn hiding_keeps_the_schedulability_periods() {
 		let process = scheduled(SchedulerType::RateMonotonic, 50);
 		let copy = process.hide(HashSet::new());
 		assert_eq!(copy.schedulability_periods, process.schedulability_periods);
-		Ok(())
 	}
 
+	/// A composition refuses two operands that name different schedulers.
 	#[cfg(feature = "testing-schedulability")]
 	#[test]
-	fn a_composition_refuses_two_schedulers() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_composition_refuses_two_schedulers() {
 		let rate_monotonic = scheduled(SchedulerType::RateMonotonic, 50);
 		let deadline_first = scheduled(SchedulerType::EarliestDeadlineFirst, 50);
 
 		let refused = Process::internal_choice(&rate_monotonic, &deadline_first);
 		assert!(matches!(refused, Err(CompositionError::ConflictingScheduler)));
-		Ok(())
 	}
 
+	/// A composition refuses two periods for one event.
 	#[cfg(feature = "testing-schedulability")]
 	#[test]
-	fn a_composition_refuses_two_periods_for_one_event() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_composition_refuses_two_periods_for_one_event() {
 		let fast = scheduled(SchedulerType::RateMonotonic, 50);
 		let slow = scheduled(SchedulerType::RateMonotonic, 100);
 
@@ -953,6 +859,5 @@ mod tests {
 			refused,
 			Err(CompositionError::ConflictingTiming { event: Event("a") })
 		));
-		Ok(())
 	}
 }

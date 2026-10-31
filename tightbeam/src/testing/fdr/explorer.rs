@@ -794,44 +794,55 @@ mod tests {
 	mod seeded_rng {
 		use super::*;
 
-		#[test]
-		fn deterministic_sequences() {
-			let mut rng1 = SeededRng::new(42);
-			let mut rng2 = SeededRng::new(42);
+		/// The first `count` draws of a generator that starts from `seed`.
+		fn draws(seed: u64, count: usize) -> Vec<u64> {
+			let mut rng = SeededRng::new(seed);
+			(0..count).map(|_| rng.get_next()).collect()
+		}
 
-			let first: Vec<_> = (0..10).map(|_| rng1.get_next()).collect();
-			let second: Vec<_> = (0..10).map(|_| rng2.get_next()).collect();
+		/// Two generators that start from one seed draw one sequence.
+		#[test]
+		fn one_seed_repeats_its_draws() {
+			let first = draws(42, 10);
+			let second = draws(42, 10);
 			assert_eq!(first, second);
 		}
 
+		/// Two generators that start from two seeds draw two sequences.
 		#[test]
-		fn different_seeds_produce_different_sequences() {
-			let mut rng1 = SeededRng::new(42);
-			let mut rng2 = SeededRng::new(43);
-
-			let same_count = (0..10).filter(|_| rng1.get_next() == rng2.get_next()).count();
-			assert!(same_count < 10, "All values should not be identical");
+		fn two_seeds_draw_two_sequences() {
+			let first = draws(42, 10);
+			let second = draws(43, 10);
+			assert_ne!(first, second);
 		}
 
-		#[test]
-		fn choose_from_items() {
-			let mut rng = SeededRng::new(42);
-			let items = vec![1, 2, 3, 4, 5];
+		// Seed 42 picks the item at the high 32 bits of its first draw modulo
+		// the length, and picks nothing from no item. The first draw is
+		// 43 * 6364136223846793005 + 1442695040888963407 modulo 2^64, whose
+		// high bits 3922296602 pick index 2 of 5.
+		crate::tb_cases! {
+			fn a_choice_under_seed_42_picks((items, picked): (&'static [i32], Option<&'static i32>)) {
+				let mut rng = SeededRng::new(42);
+				let chosen = rng.choose(items);
+				assert_eq!(chosen, picked);
+			}
 
-			assert!(rng.choose(&items).is_some());
-			assert!(rng.choose(&Vec::<i32>::new()).is_none());
+			cases {
+				the_third_of_five_items => (&[1, 2, 3, 4, 5], Some(&3)),
+				nothing_from_no_item => (&[], None),
+			}
 		}
 
+		/// The high bits of seed 7 pick one side of a two-way choice twice,
+		/// where the alternating low bit would pick each side once.
 		#[test]
-		fn a_two_way_choice_can_pick_one_item_twice() -> Result<(), Box<dyn core::error::Error>> {
+		fn a_two_way_choice_can_pick_one_item_twice() {
 			let mut rng = SeededRng::new(7);
 			let sides = [0, 1];
 
 			let first = rng.choose(&sides);
 			let second = rng.choose(&sides);
-
-			assert_eq!(first, second, "the high bits of seed 7 pick one side twice");
-			Ok(())
+			assert_eq!(first, second);
 		}
 	}
 
@@ -840,97 +851,124 @@ mod tests {
 		use super::*;
 		use crate::testing::specs::csp::{Event, State};
 
-		#[test]
-		fn initial_state() {
-			let state = State("Start");
-			let exp_state = ExplorationState::initial(state);
-			assert_eq!(exp_state.process_state, state);
-			assert!(exp_state.trace.is_empty());
-			assert_eq!(exp_state.internal_run, 0);
-			assert_eq!(exp_state.state_path.len(), 1);
-			assert!(exp_state.hidden_events.is_empty());
+		/// The branch at `state` after `laps` hidden `event` loops back to it.
+		fn after_hidden_laps(state: State, event: Event, laps: usize) -> ExplorationState {
+			let mut branch = ExplorationState::initial(state);
+			for _ in 0..laps {
+				branch.record_hidden(event, state);
+			}
+
+			branch
 		}
 
+		/// A branch starts at its state, with no event and a path of that state
+		/// alone.
 		#[test]
-		fn record_observable_event() {
+		fn a_branch_starts_at_its_state_with_no_event() {
+			let state = State("Start");
+			let branch = ExplorationState::initial(state);
+
+			let place = (branch.process_state, branch.state_path);
+			let counts = (branch.trace.len(), branch.internal_run, branch.hidden_events.len());
+			assert_eq!((place, counts), ((state, vec![state]), (0, 0, 0)));
+		}
+
+		/// An observable event extends the trace and the path to its target,
+		/// and leaves the hidden run at zero.
+		#[test]
+		fn an_observable_event_extends_the_trace_and_the_path() {
 			let (state1, state2) = (State("S1"), State("S2"));
 			let event = Event("evt");
 
-			let mut exp_state = ExplorationState::initial(state1);
-			exp_state.record_observable(event, state2);
-			assert_eq!(exp_state.process_state, state2);
-			assert_eq!(exp_state.trace, vec![event]);
-			assert_eq!(exp_state.internal_run, 0); // An observable event ends the run.
-			assert_eq!(exp_state.state_path.len(), 2);
+			let mut branch = ExplorationState::initial(state1);
+			branch.record_observable(event, state2);
+
+			let place = (branch.process_state, branch.state_path);
+			let events = (branch.trace, branch.internal_run);
+			assert_eq!((place, events), ((state2, vec![state1, state2]), (vec![event], 0)));
 		}
 
+		/// A hidden event extends the hidden run and the path to its target,
+		/// and leaves the observable trace empty.
 		#[test]
-		fn record_hidden_event() {
+		fn a_hidden_event_extends_the_hidden_run_and_the_path() {
 			let (state1, state2) = (State("S1"), State("S2"));
 			let event = Event("tau");
 
-			let mut exp_state = ExplorationState::initial(state1);
-			exp_state.record_hidden(event, state2);
-			assert_eq!(exp_state.process_state, state2);
-			assert!(exp_state.trace.is_empty()); // The trace holds observable events alone.
-			assert_eq!(exp_state.internal_run, 1); // The hidden event extends the run.
-			assert_eq!(exp_state.hidden_events, vec![event]);
-			assert_eq!(exp_state.state_path.len(), 2);
+			let mut branch = ExplorationState::initial(state1);
+			branch.record_hidden(event, state2);
+
+			let place = (branch.process_state, branch.state_path);
+			let events = (branch.trace.len(), branch.internal_run, branch.hidden_events);
+			assert_eq!((place, events), ((state2, vec![state1, state2]), (0, 1, vec![event])));
 		}
 
+		/// An observable event ends the hidden run, so the current run holds
+		/// the hidden events after it alone.
 		#[test]
 		fn an_observable_event_starts_a_new_hidden_run() {
 			let (state1, state2) = (State("S1"), State("S2"));
 			let (tau, evt, tick) = (Event("tau"), Event("evt"), Event("tick"));
 
-			let mut exp_state = ExplorationState::initial(state1);
-			exp_state.record_hidden(tau, state2);
-			exp_state.record_observable(evt, state1);
-			exp_state.record_hidden(tick, state2);
+			let mut branch = ExplorationState::initial(state1);
+			branch.record_hidden(tau, state2);
+			branch.record_observable(evt, state1);
+			branch.record_hidden(tick, state2);
 
-			assert_eq!(exp_state.current_run(), [tick]);
-			assert_eq!(exp_state.hidden_events, vec![tau, tick]);
+			let runs = (branch.current_run(), branch.hidden_events.as_slice());
+			assert_eq!(runs, (&[tick][..], &[tau, tick][..]));
 		}
 
+		/// A hidden loop counts each of its laps into one hidden run, past the
+		/// default `max_internal_run` of 32, with no observable event.
 		#[test]
-		fn divergence_detection_via_internal_run_counter() {
-			let state = State("S1");
-			let tau = Event("tau");
-			let mut exp_state = ExplorationState::initial(state);
+		fn a_hidden_loop_counts_each_lap_into_one_run() {
+			let branch = after_hidden_laps(State("S1"), Event("tau"), 35);
+			let counted = (branch.internal_run, branch.current_run().len(), branch.trace.len());
+			assert_eq!(counted, (35, 35, 0));
+		}
 
-			// A τ-loop takes the same hidden event 35 times, past the default
-			// `max_internal_run` of 32.
-			for _ in 0..35 {
-				exp_state.record_hidden(tau, state);
+		/// The WCET in milliseconds of each event that a branch takes, in
+		/// order.
+		#[cfg(feature = "testing-timing")]
+		type Wcets = &'static [(&'static str, u64)];
+
+		/// The branch at `S1` after it takes each event of `wcets` back to `S1`
+		/// and charges its WCET in milliseconds.
+		#[cfg(feature = "testing-timing")]
+		fn timed_after(wcets: &[(&'static str, u64)]) -> ExplorationState {
+			let mut branch = ExplorationState::initial(State("S1"));
+			for &(event, millis) in wcets {
+				branch.record_observable(Event(event), State("S1"));
+				branch.update_timing(&Event(event), Duration::from_millis(millis));
 			}
 
-			assert!(exp_state.internal_run > 32);
-			assert_eq!(exp_state.hidden_events.len(), 35);
-			assert!(exp_state.trace.is_empty()); // The observable trace stays empty.
+			branch
 		}
 
+		// The elapsed time sums the WCET of each event, and each event records
+		// the elapsed time after it.
 		#[cfg(feature = "testing-timing")]
-		#[test]
-		fn update_timing() {
-			let state = State("S1");
-			let event = Event("evt");
-			let mut exp_state = ExplorationState::initial(state);
+		crate::tb_cases! {
+			fn the_elapsed_time_sums_the_wcet_of_each_event(
+				(wcets, elapsed, times): (Wcets, Duration, Vec<(Event, Duration)>)
+			) {
+				let branch = timed_after(wcets);
+				assert_eq!((branch.elapsed_time, branch.event_times), (elapsed, times));
+			}
 
-			exp_state.record_observable(event, state);
-			exp_state.update_timing(&event, Duration::from_millis(10));
-			assert_eq!(exp_state.elapsed_time, Duration::from_millis(10));
-			assert_eq!(exp_state.event_times.len(), 1);
-			assert_eq!(exp_state.event_times[0].0, event);
-			assert_eq!(exp_state.event_times[0].1, Duration::from_millis(10));
-
-			// A second event adds its WCET to the elapsed time of the first.
-			let event2 = Event("evt2");
-			exp_state.record_observable(event2, state);
-			exp_state.update_timing(&event2, Duration::from_millis(5));
-			assert_eq!(exp_state.elapsed_time, Duration::from_millis(15));
-			assert_eq!(exp_state.event_times.len(), 2);
-			assert_eq!(exp_state.event_times[1].0, event2);
-			assert_eq!(exp_state.event_times[1].1, Duration::from_millis(15));
+			cases {
+				after_one_event => (
+					&[("evt", 10)],
+					Duration::from_millis(10),
+					vec![(Event("evt"), Duration::from_millis(10))],
+				),
+				after_two_events => (
+					&[("evt", 10), ("evt2", 5)],
+					Duration::from_millis(15),
+					vec![(Event("evt"), Duration::from_millis(10)), (Event("evt2"), Duration::from_millis(15))],
+				),
+			}
 		}
 	}
 
@@ -938,10 +976,12 @@ mod tests {
 	#[cfg(feature = "testing-timing")]
 	mod cache_key {
 		use super::*;
-		use crate::testing::specs::csp::ProcessBuildError;
+		use crate::testing::TestResult;
 
+		/// A timed transition is part of the key, so two processes that differ
+		/// in it alone key apart.
 		#[test]
-		fn a_timed_transition_is_part_of_the_key() -> Result<(), ProcessBuildError> {
+		fn a_timed_transition_is_part_of_the_key() -> TestResult {
 			let without = Process::builder("Keyed")
 				.initial_state(State("S0"))
 				.add_state(State("S1"))

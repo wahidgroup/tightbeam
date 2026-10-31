@@ -573,17 +573,20 @@ impl<P: Protocol, R: ServletRegistry> Drop for HiveRuntime<P, R> {
 mod tests {
 	use super::*;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::hive::{ScaleConfigRefusal, ServletScaleConfig};
+	use crate::colony::hive::fixtures::{echo_type, Probe};
+	use crate::colony::hive::ServletScaleConfig;
 	use crate::colony::protocol::ServletInfo;
-	use crate::colony::urn::ColonyNamespace;
 	use crate::tb_cases;
+	use crate::testing::TestResult;
 	use crate::transport::TokioListener;
 
+	/// A fresh runtime has begun no drain.
 	#[test]
 	fn a_fresh_runtime_is_not_draining() {
 		assert!(!DrainMode::default().is_draining());
 	}
 
+	/// Each holder of the drain handle sees a drain that one holder began.
 	#[test]
 	fn every_holder_of_the_handle_sees_the_drain() {
 		let mode = DrainMode::default();
@@ -592,40 +595,15 @@ mod tests {
 		assert!(reader.is_draining());
 	}
 
-	/// A servlet at a fixed locator that names `signer` as the identity it
-	/// answers under.
-	struct SignerProbe {
-		signer: Option<SignerIdentifier>,
-	}
-
-	impl ServletBox for SignerProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7005".as_slice())
-		}
-
-		fn stop_boxed(self: Box<Self>) {}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			self.signer.as_ref()
-		}
-	}
-
-	/// The type every probe registers under.
-	fn echo_type() -> Urn<'static> {
-		let namespace = ColonyNamespace::default();
-		namespace.servlet("echo").expect("test names satisfy the mint grammar")
-	}
-
 	// A sibling's dial admits a servlet's answer by its signer alone, so a
 	// registration routes a servlet that names its signer and leaves out one
 	// that names none.
 	tb_cases! {
-		fn register_routes_a_servlet_by_its_signer(
-			(signer, routed): (Option<SignerIdentifier>, bool)
-		) -> Result<(), TightBeamError> {
+		fn register_routes_a_servlet_by_its_signer((signer, routed): (Option<SignerIdentifier>, bool)) -> TestResult {
 			let mut hive = HiveRuntime::<TokioListener>::new(None)?;
+			let probe = Probe::at(b"127.0.0.1:7005").signed(signer);
 
-			hive.register(echo_type(), SignerProbe { signer }, |_| async { Ok(SignerProbe { signer: None }) })?;
+			hive.register(echo_type(), probe, |_| async { Ok(Probe::at(b"127.0.0.1:7005")) })?;
 
 			assert_eq!(hive.hive_context.resolves(&echo_type()), routed);
 			Ok(())
@@ -636,44 +614,28 @@ mod tests {
 		}
 	}
 
-	/// A servlet at `addr` that names no signer.
-	struct AddressProbe {
-		addr: &'static [u8],
-	}
-
-	impl ServletBox for AddressProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(self.addr)
-		}
-
-		fn stop_boxed(self: Box<Self>) {}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			None
-		}
-	}
-
 	/// The configuration of a hive whose `echo` type holds one instance at
 	/// most.
-	fn single_instance_config() -> Result<HiveConfig, ScaleConfigRefusal> {
-		let bounds = ServletScaleConfig::new(1, 1, crate::bps!(8000), crate::bps!(2000))?;
+	fn single_instance_config() -> HiveConfig {
 		let mut config = HiveConfig::default();
+		let bounds = ServletScaleConfig::single_instance();
 		config.scaling.overrides.insert(echo_type(), bounds);
-
-		Ok(config)
+		config
 	}
 
 	/// A type at its bound refuses a registration at a second address, so a
 	/// registration keeps the bound that a spawn keeps (CWE-770).
 	#[test]
-	fn a_registration_past_the_bound_of_its_type_is_refused() -> Result<(), Box<dyn core::error::Error>> {
-		let mut hive = HiveRuntime::<TokioListener>::new(Some(single_instance_config()?))?;
-		let spawner = |_| async { Ok(AddressProbe { addr: b"127.0.0.1:7005" }) };
-		hive.register(echo_type(), AddressProbe { addr: b"127.0.0.1:7005" }, spawner)?;
+	fn a_registration_past_the_bound_of_its_type_is_refused() -> TestResult {
+		let mut hive = HiveRuntime::<TokioListener>::new(Some(single_instance_config()))?;
+		let spawner = |_| async { Ok(Probe::at(b"127.0.0.1:7005")) };
+		hive.register(echo_type(), Probe::at(b"127.0.0.1:7005"), spawner)?;
 
-		let refused = hive.register(echo_type(), AddressProbe { addr: b"127.0.0.1:7006" }, spawner);
-		let exhausted = matches!(refused, Err(TightBeamError::WorkRefused(TransitStatus::ResourceExhausted)));
-		assert!(exhausted);
+		let refused = hive.register(echo_type(), Probe::at(b"127.0.0.1:7006"), spawner);
+		assert!(matches!(
+			refused,
+			Err(TightBeamError::WorkRefused(TransitStatus::ResourceExhausted))
+		));
 		Ok(())
 	}
 }

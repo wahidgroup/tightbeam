@@ -335,8 +335,6 @@ impl Display for ScenarioResult {
 
 #[cfg(test)]
 mod tests {
-	use core::error::Error;
-
 	use super::ScenarioVerdict;
 	use crate::testing::config::Expect;
 	use crate::testing::specs::{Layer, SpecViolation};
@@ -349,33 +347,32 @@ mod tests {
 		found.unwrap_or_default()
 	}
 
-	#[test]
-	fn an_expected_assertion_rejection_passes() -> Result<(), Box<dyn Error>> {
-		let verdict = ScenarioVerdict::from_layers(Err(SpecViolation::ResponseValidationFailed), None, None);
-		let found = rejections(&verdict, Expect::Violation(Layer::Assertion));
-		assert!(found.is_empty(), "{found:?}");
-		Ok(())
-	}
+	// A rejection from the assertion layer passes a scenario that expects it,
+	// and fails with an unmet expectation a scenario that names another layer.
+	crate::tb_cases! {
+		fn an_assertion_rejection_leaves((expect, rejected): (Expect, Vec<SpecViolation>)) {
+			let verdict = ScenarioVerdict::from_layers(Err(SpecViolation::ResponseValidationFailed), None, None);
+			let found = rejections(&verdict, expect);
+			assert_eq!(found, rejected);
+		}
 
-	#[test]
-	fn a_rejection_from_a_layer_the_scenario_did_not_name_fails() -> Result<(), Box<dyn Error>> {
-		let verdict = ScenarioVerdict::from_layers(Err(SpecViolation::ResponseValidationFailed), None, None);
-
-		let found = rejections(&verdict, Expect::Violation(Layer::Csp));
-		let unmet = SpecViolation::ExpectationUnmet(Layer::Csp);
-		assert_eq!(found, [SpecViolation::ResponseValidationFailed, unmet]);
-		Ok(())
+		cases {
+			no_rejection_when_the_scenario_expects_it => (Expect::Violation(Layer::Assertion), Vec::new()),
+			itself_and_an_unmet_expectation_when_the_scenario_names_another_layer => (
+				Expect::Violation(Layer::Csp),
+				vec![SpecViolation::ResponseValidationFailed, SpecViolation::ExpectationUnmet(Layer::Csp)],
+			),
+		}
 	}
 
 	/// A result that [`ScenarioResult::graded`] builds answers from the
 	/// configuration that graded it.
 	mod graded {
-		use core::error::Error;
-
 		use crate::testing::config::{Expect, ScenarioConfig};
 		use crate::testing::macros::BuiltAssertSpec;
 		use crate::testing::result::ScenarioResult;
 		use crate::testing::specs::Layer;
+		use crate::testing::TestResult;
 		use crate::trace::ConsumedTrace;
 		use crate::urn::Urn;
 
@@ -403,8 +400,10 @@ mod tests {
 			specs.into_iter().map(|spec| core::ptr::from_ref(*spec)).collect()
 		}
 
+		/// A graded result names the first spec of its configuration as its
+		/// assertion spec.
 		#[test]
-		fn a_graded_result_names_the_first_spec_of_its_configuration() -> Result<(), Box<dyn Error>> {
+		fn a_graded_result_names_the_first_spec_of_its_configuration() -> TestResult {
 			let specs = [StepSpec::latest(), ReplySpec::latest()];
 			let config = ScenarioConfig::builder().with_specs(specs).build()?;
 
@@ -414,8 +413,9 @@ mod tests {
 			Ok(())
 		}
 
+		/// A graded result holds every spec of its configuration, in order.
 		#[test]
-		fn a_graded_result_holds_every_spec_of_its_configuration() -> Result<(), Box<dyn Error>> {
+		fn a_graded_result_holds_every_spec_of_its_configuration() -> TestResult {
 			let specs = [StepSpec::latest(), ReplySpec::latest()];
 			let config = ScenarioConfig::builder().with_specs(specs).build()?;
 
@@ -424,14 +424,16 @@ mod tests {
 			Ok(())
 		}
 
+		/// A graded result passes when the spec rejects a trace with no step
+		/// and its configuration expects an assertion rejection.
 		#[test]
-		fn a_graded_result_meets_the_expectation_of_its_configuration() -> Result<(), Box<dyn Error>> {
+		fn a_graded_result_meets_the_expectation_of_its_configuration() -> TestResult {
 			let expect = Expect::Violation(Layer::Assertion);
 			let builder = ScenarioConfig::builder().with_spec(StepSpec::latest());
 			let config = builder.with_expect(expect).build()?;
 
 			let result = ScenarioResult::graded(&config, ConsumedTrace::new(), Ok(()))?;
-			assert_eq!(result.outcome(), Ok(()), "the spec rejects the trace with no step");
+			assert_eq!(result.outcome(), Ok(()));
 			Ok(())
 		}
 	}

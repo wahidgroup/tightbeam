@@ -917,36 +917,13 @@ mod tests {
 	/// A refusal status and the failure it surfaces as.
 	type StatusMappingCase = (TransitStatus, TransportFailure);
 
-	// Each refusal status surfaces as its failure.
+	// Each refusal status surfaces as its failure, and that failure relays as
+	// the same status.
 	crate::tb_cases! {
-		fn a_refusal_status_surfaces_as_its_failure((status, expected): StatusMappingCase) {
-			let error = TransportError::from(status);
-			assert!(matches!(error, TransportError::OperationFailed(failure) if failure == expected));
-		}
-		cases {
-			cancelled => (TransitStatus::Cancelled, TransportFailure::Cancelled),
-			unknown => (TransitStatus::Unknown, TransportFailure::Unknown),
-			invalid_argument => (TransitStatus::InvalidArgument, TransportFailure::InvalidArgument),
-			deadline_exceeded => (TransitStatus::DeadlineExceeded, TransportFailure::DeadlineExceeded),
-			not_found => (TransitStatus::NotFound, TransportFailure::NotFound),
-			already_exists => (TransitStatus::AlreadyExists, TransportFailure::AlreadyExists),
-			permission_denied => (TransitStatus::PermissionDenied, TransportFailure::PermissionDenied),
-			resource_exhausted => (TransitStatus::ResourceExhausted, TransportFailure::ResourceExhausted),
-			failed_precondition => (TransitStatus::FailedPrecondition, TransportFailure::FailedPrecondition),
-			aborted => (TransitStatus::Aborted, TransportFailure::Aborted),
-			out_of_range => (TransitStatus::OutOfRange, TransportFailure::OutOfRange),
-			unimplemented => (TransitStatus::Unimplemented, TransportFailure::Unimplemented),
-			internal => (TransitStatus::Internal, TransportFailure::Internal),
-			unavailable => (TransitStatus::Unavailable, TransportFailure::Unavailable),
-			data_loss => (TransitStatus::DataLoss, TransportFailure::DataLoss),
-			unauthenticated => (TransitStatus::Unauthenticated, TransportFailure::Unauthenticated),
-		}
-	}
-
-	// Each failure of a refusal status relays as that status.
-	crate::tb_cases! {
-		fn a_refusal_failure_relays_as_its_status((status, failure): StatusMappingCase) {
+		fn a_refusal_status_and_its_failure_map_both_ways((status, failure): StatusMappingCase) {
+			let surfaced = TransportError::from(status);
 			let relayed = TransitStatus::try_from(failure);
+			assert!(matches!(surfaced, TransportError::OperationFailed(surfaced) if surfaced == failure));
 			assert!(matches!(relayed, Ok(relayed) if relayed == status));
 		}
 		cases {
@@ -969,9 +946,9 @@ mod tests {
 		}
 	}
 
-	// An error reaches consumer logs through `Display` or `Debug`, so the
-	// frame body, which is application plaintext, stays out of both, as text
-	// and as the byte list a derived `Debug` would print (CWE-532).
+	/// An error reaches consumer logs through `Display` or `Debug`, so the
+	/// frame body, which is application plaintext, stays out of both, as text
+	/// and as the byte list a derived `Debug` would print (CWE-532).
 	#[test]
 	fn message_not_sent_names_the_frame_without_its_body() {
 		use crate::testing::TestFrame;
@@ -996,9 +973,8 @@ mod tests {
 	// An error of one exchange ends the stream unless it proves the frame never
 	// left, so a decode or size refusal of an answer ends it too.
 	crate::tb_cases! {
-		fn is_connection_error_of((error, expected): (TransportError, bool)) -> Result<()> {
+		fn an_error_ends_the_stream_unless_the_frame_never_left((error, expected): (TransportError, bool)) {
 			assert_eq!(error.is_connection_error(), expected);
-			Ok(())
 		}
 		cases {
 			a_close_ends_the_stream => (TransportError::ConnectionClosed, true),
@@ -1030,6 +1006,7 @@ mod tests {
 		}
 	}
 
+	/// A failure local to this endpoint has no status on the wire.
 	#[test]
 	fn local_failures_have_no_wire_status() {
 		let relayed = TransitStatus::try_from(TransportFailure::EncodingFailed);
@@ -1056,9 +1033,8 @@ mod tests {
 		any(feature = "tokio", feature = "async-transport")
 	))]
 	crate::tb_cases! {
-		fn failure_status_of((failure, expected): (TransportError, TransitStatus)) {
+		fn a_handler_failure_answers_with_its_status((failure, expected): (TransportError, TransitStatus)) {
 			let status = failure.failure_status();
-
 			assert_eq!(status, expected);
 		}
 

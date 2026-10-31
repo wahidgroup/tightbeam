@@ -212,6 +212,15 @@ impl Default for ServletScaleConfig {
 	}
 }
 
+#[cfg(test)]
+impl ServletScaleConfig {
+	/// The bounds of a type that holds one instance at most.
+	pub(crate) fn single_instance() -> Self {
+		let bounds = Self::new(1, 1, crate::bps!(8000), crate::bps!(2000));
+		bounds.expect("one instance is a legal range")
+	}
+}
+
 /// One reading of a servlet type that the hive scaling loop decides on.
 #[derive(Debug, Clone)]
 pub struct ScalingMetrics {
@@ -260,64 +269,59 @@ impl ScalingMetrics {
 mod tests {
 	use super::*;
 	use crate::tb_cases;
+	use crate::testing::TestResult;
 
-	#[test]
-	fn an_inverted_instance_range_is_refused() {
-		let refusal = ServletScaleConfig::new(4, 2, crate::bps!(8000), crate::bps!(2000));
-		assert!(matches!(refusal, Err(ScaleConfigRefusal::InstanceBounds)));
+	/// The instance bounds and the scale-up and scale-down thresholds in basis
+	/// points of a scale config, and the refusal they meet.
+	type Refused = (usize, usize, u16, u16, ScaleConfigRefusal);
+
+	// A scale config refuses an inverted instance range and a floor of zero
+	// instances, and a scale-down threshold at or above the scale-up one. The
+	// refusal is `down >= up`, so equal thresholds are the boundary case: one
+	// utilization reading would both scale up and scale down.
+	tb_cases! {
+		fn a_scale_config_refuses((min, max, up, down, refusal): Refused) {
+			let thresholds = (BasisPoints::new_saturating(up), BasisPoints::new_saturating(down));
+			let refused = ServletScaleConfig::new(min, max, thresholds.0, thresholds.1);
+			assert_eq!(refused.err(), Some(refusal));
+		}
+		cases {
+			an_inverted_instance_range => (4, 2, 8_000, 2_000, ScaleConfigRefusal::InstanceBounds),
+			a_floor_of_zero_instances => (0, 2, 8_000, 2_000, ScaleConfigRefusal::InstanceBounds),
+			overlapping_thresholds => (1, 4, 2_000, 8_000, ScaleConfigRefusal::OverlappingThresholds),
+			equal_thresholds => (1, 4, 5_000, 5_000, ScaleConfigRefusal::OverlappingThresholds),
+		}
 	}
 
-	#[test]
-	fn a_floor_of_zero_instances_is_refused() {
-		let refusal = ServletScaleConfig::new(0, 2, crate::bps!(8000), crate::bps!(2000));
-		assert!(matches!(refusal, Err(ScaleConfigRefusal::InstanceBounds)));
-	}
-
-	#[test]
-	fn overlapping_thresholds_are_refused() {
-		let refusal = ServletScaleConfig::new(1, 4, crate::bps!(2000), crate::bps!(8000));
-		assert!(matches!(refusal, Err(ScaleConfigRefusal::OverlappingThresholds)));
-	}
-
-	/// The refusal is `down >= up`, so equal thresholds are the boundary
-	/// case: one utilization reading would both scale up and scale down.
-	#[test]
-	fn equal_thresholds_are_refused() {
-		let refusal = ServletScaleConfig::new(1, 4, crate::bps!(5000), crate::bps!(5000));
-		assert!(matches!(refusal, Err(ScaleConfigRefusal::OverlappingThresholds)));
-	}
-
-	/// The bound is `min > max`, so a range that holds one instance count is
-	/// admitted: a servlet with a fixed instance count is a legal
-	/// configuration.
-	#[test]
-	fn a_single_instance_range_is_admitted() -> Result<(), ScaleConfigRefusal> {
-		let config = ServletScaleConfig::new(2, 2, crate::bps!(8000), crate::bps!(2000))?;
-		assert_eq!(config.min_instances(), 2);
-		assert_eq!(config.max_instances(), 2);
-		Ok(())
+	// A scale config admits an instance range under separated thresholds. The
+	// bound is `min > max`, so a range that holds one instance count is
+	// admitted: a servlet with a fixed instance count is a legal
+	// configuration.
+	tb_cases! {
+		fn a_scale_config_admits((min, max): (usize, usize)) -> TestResult {
+			let config = ServletScaleConfig::new(min, max, crate::bps!(8000), crate::bps!(2000))?;
+			assert_eq!((config.min_instances(), config.max_instances()), (min, max));
+			Ok(())
+		}
+		cases {
+			a_single_instance_range => (2, 2),
+			a_separated_pair_of_thresholds => (1, 4),
+		}
 	}
 
 	/// Cooldowns arrive as a named pair, so each duration lands on the
 	/// cooldown that the call site names.
 	#[test]
-	fn cooldowns_land_where_they_are_named() -> Result<(), ScaleConfigRefusal> {
-		let config =
-			ServletScaleConfig::new(1, 4, crate::bps!(8000), crate::bps!(2000))?.with_cooldowns(ScaleCooldowns {
-				after_scale_up: Duration::from_secs(5),
-				after_scale_down: Duration::from_secs(90),
-			});
-
-		assert_eq!(config.scale_up_cooldown(), Duration::from_secs(5));
-		assert_eq!(config.scale_down_cooldown(), Duration::from_secs(90));
-		Ok(())
-	}
-
-	#[test]
-	fn a_separated_pair_of_thresholds_is_admitted() -> Result<(), ScaleConfigRefusal> {
+	fn cooldowns_land_where_they_are_named() -> TestResult {
 		let config = ServletScaleConfig::new(1, 4, crate::bps!(8000), crate::bps!(2000))?;
-		assert_eq!(config.min_instances(), 1);
-		assert_eq!(config.max_instances(), 4);
+		let cooldowns = ScaleCooldowns {
+			after_scale_up: Duration::from_secs(5),
+			after_scale_down: Duration::from_secs(90),
+		};
+
+		let config = config.with_cooldowns(cooldowns);
+		let read = (config.scale_up_cooldown(), config.scale_down_cooldown());
+		assert_eq!(read, (Duration::from_secs(5), Duration::from_secs(90)));
 		Ok(())
 	}
 

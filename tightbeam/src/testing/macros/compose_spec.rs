@@ -283,7 +283,7 @@ mod tests {
 
 	use crate::testing::specs::composition::{CompositionError, CompositionProperty, CompositionSpec};
 	use crate::testing::specs::csp::Event;
-	use crate::testing::{ScenarioConfig, ScenarioConfigError};
+	use crate::testing::{ScenarioConfig, ScenarioConfigError, TestResult};
 	use crate::urn::Urn;
 
 	const PING: Urn<'static> = crate::urn!("test", "event:compose/ping");
@@ -350,31 +350,38 @@ mod tests {
 		composition: Interleaved
 	}
 
+	/// A synchronized spec states the events its operands share as its sync
+	/// alphabet.
 	#[test]
-	fn a_synchronized_spec_states_the_shared_events_as_its_sync_alphabet() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_synchronized_spec_states_the_shared_events_as_its_sync_alphabet() -> TestResult {
 		let sync_alphabet = ClaimsCrossedOrderDeadlocks::metadata()?.sync_alphabet;
 		assert_eq!(sync_alphabet, HashSet::from([Event::from(PING), Event::from(PONG)]));
 		Ok(())
 	}
 
+	/// A false claim of deadlock is refused when the process is free of
+	/// deadlock.
 	#[test]
-	fn a_false_claim_is_refused_when_the_process_holds_the_property() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_false_claim_is_refused_when_the_process_holds_the_property() {
 		let verified = ClaimsInterleavingDeadlocks::verify_properties();
-		let holds = CompositionProperty::DeadlockFree;
-		assert!(matches!(verified, Err(CompositionError::PropertyHolds { property }) if property == holds));
-		Ok(())
+		let holds = CompositionError::PropertyHolds { property: CompositionProperty::DeadlockFree };
+		assert_eq!(verified, Err(holds));
 	}
 
+	/// A claim of deadlock holds when the checker finds a deadlock.
 	#[test]
-	fn a_false_claim_holds_when_the_checker_finds_a_witness() -> Result<(), Box<dyn core::error::Error>> {
-		ClaimsCrossedOrderDeadlocks::verify_properties()?;
-		Ok(())
+	fn a_false_claim_holds_when_the_checker_finds_a_witness() {
+		let verified = ClaimsCrossedOrderDeadlocks::verify_properties();
+		assert_eq!(verified, Ok(()));
 	}
 
+	/// A claim of deadlock freedom is refused with the deadlock that the
+	/// checker finds at the initial state.
 	#[test]
-	fn a_true_claim_is_refused_when_the_checker_finds_a_witness() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_true_claim_is_refused_when_the_checker_finds_a_witness() -> TestResult {
+		let initial = ClaimsCrossedOrderIsDeadlockFree::process()?.initial;
 		let verified = ClaimsCrossedOrderIsDeadlockFree::verify_properties();
-		assert!(matches!(verified, Err(CompositionError::DeadlockDetected { .. })));
+		assert_eq!(verified, Err(CompositionError::DeadlockDetected { state: initial }));
 		Ok(())
 	}
 
@@ -385,18 +392,20 @@ mod tests {
 		composition: Interface { events: ["pnig"] }
 	}
 
+	/// An interface that names an event outside its operands refuses the
+	/// composition.
 	#[test]
-	fn an_interface_outside_its_operands_refuses_the_composition() -> Result<(), Box<dyn core::error::Error>> {
+	fn an_interface_outside_its_operands_refuses_the_composition() {
 		let refused = MisspellsItsInterface::process();
 		assert!(matches!(refused, Err(CompositionError::AlphabetMismatch { .. })));
-		Ok(())
 	}
 
+	/// A false claim of an operand composition refuses the scenario that
+	/// names the outer composition.
 	#[test]
-	fn a_false_claim_of_an_operand_composition_fails_a_scenario() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_false_claim_of_an_operand_composition_fails_a_scenario() {
 		let refused = ScenarioConfig::builder().with_csp(NestsAFalseClaim).build();
 		let holds = CompositionError::PropertyHolds { property: CompositionProperty::DeadlockFree };
 		assert_eq!(refused.err(), Some(ScenarioConfigError::CspRefused(holds)));
-		Ok(())
 	}
 }

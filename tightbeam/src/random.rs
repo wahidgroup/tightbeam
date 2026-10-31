@@ -137,55 +137,71 @@ pub fn generate_random_bytes(bytes: &mut [u8], rng: Option<&mut dyn CryptoRngCor
 
 #[cfg(test)]
 mod tests {
+	use crate::testing::{SeededStream, TestResult};
+
 	use super::*;
 
-	/// A generator that draws once from the supplied RNG and once from the
-	/// default source.
-	type DrawPair = fn(&mut rand_core::OsRng) -> Result<(Vec<u8>, Vec<u8>)>;
+	/// A generator that draws from the source it is handed and yields the draw
+	/// as octets.
+	type Draw = fn(Option<&mut dyn CryptoRngCore>) -> Result<Vec<u8>>;
 
-	// Each case pairs a byte size with the generator of one draw function.
+	/// The eight octets of [`generate_random_number`], least significant
+	/// first.
+	fn number(rng: Option<&mut dyn CryptoRngCore>) -> Result<Vec<u8>> {
+		Ok(generate_random_number::<8>(rng)?.to_le_bytes().to_vec())
+	}
+
+	/// The sixteen octets of [`generate_nonce`].
+	fn nonce(rng: Option<&mut dyn CryptoRngCore>) -> Result<Vec<u8>> {
+		Ok(generate_nonce::<16>(rng)?.to_vec())
+	}
+
+	/// Twenty-four octets of [`generate_random_bytes`].
+	fn bytes(rng: Option<&mut dyn CryptoRngCore>) -> Result<Vec<u8>> {
+		let mut drawn = vec![0u8; 24];
+		generate_random_bytes(&mut drawn, rng)?;
+		Ok(drawn)
+	}
+
+	// Each generator fills its draw from the source it is handed. The seeded
+	// source fills its first draw with `0x01`, so a generator that drew from
+	// the OS in its place fails.
 	crate::tb_cases! {
-		fn test_random((size, draw): (usize, DrawPair)) -> Result<()> {
-			let mut rng = rand_core::OsRng;
-			let (nonce1, nonce2) = draw(&mut rng)?;
-
-			assert_eq!(nonce1.len(), size);
-			assert_eq!(nonce2.len(), size);
-
-			// Two draws are equal with negligible probability.
-			assert_ne!(nonce1, nonce2);
-
-			assert_ne!(nonce1, vec![0u8; size]);
-			assert_ne!(nonce2, vec![0u8; size]);
-
+		fn a_supplied_source_fills_the_draw((draw, expected): (Draw, Vec<u8>)) -> TestResult {
+			let mut source = SeededStream(0);
+			let drawn = draw(Some(&mut source))?;
+			assert_eq!(drawn, expected);
 			Ok(())
 		}
-
 		cases {
-			number => (8, |rng| {
-				let n1 = generate_random_number::<8>(Some(rng))?;
-				let n2 = generate_random_number::<8>(None)?;
-				Ok((n1.to_be_bytes().to_vec(), n2.to_be_bytes().to_vec()))
-			}),
-			nonce => (16, |rng| {
-				let n1 = generate_nonce::<16>(Some(rng))?;
-				let n2 = generate_nonce::<16>(None)?;
-				Ok((n1.to_vec(), n2.to_vec()))
-			}),
-			bytes => (24, |rng| {
-				let mut n1 = [0u8; 24];
-				generate_random_bytes(&mut n1, Some(rng))?;
-
-				let mut n2 = [0u8; 24];
-				generate_random_bytes(&mut n2, None)?;
-
-				Ok((n1.to_vec(), n2.to_vec()))
-			}),
+			number => (number, vec![0x01; 8]),
+			nonce => (nonce, vec![0x01; 16]),
+			bytes => (bytes, vec![0x01; 24]),
 		}
 	}
 
-	// The balancers of a gateway seed by XOR with the placement, which keeps
-	// their seeds distinct only while it holds one value in a process.
+	// Each generator with no source fills its whole draw from the OS source,
+	// which draws afresh each time. Two draws are equal, or all zeros, with
+	// negligible probability.
+	crate::tb_cases! {
+		fn the_os_source_fills_a_fresh_draw((draw, size): (Draw, usize)) -> TestResult {
+			let first = draw(None)?;
+			let second = draw(None)?;
+			assert_eq!((first.len(), second.len()), (size, size));
+			assert_ne!(first, second);
+			assert_ne!(first, vec![0u8; size]);
+			assert_ne!(second, vec![0u8; size]);
+			Ok(())
+		}
+		cases {
+			number => (number, 8),
+			nonce => (nonce, 16),
+			bytes => (bytes, 24),
+		}
+	}
+
+	/// The balancers of a gateway seed by XOR with the placement, which keeps
+	/// their seeds distinct only while it holds one value in a process.
 	#[cfg(all(feature = "std", feature = "transport"))]
 	#[test]
 	fn the_placement_entropy_holds_one_value_per_process() {
@@ -203,8 +219,8 @@ mod tests {
 		hasher.finish()
 	}
 
-	// A retry delay reveals the placement, so the placement holds more than
-	// the hash of an address that the layout of the process names.
+	/// A retry delay reveals the placement, so the placement holds more than
+	/// the hash of an address that the layout of the process names.
 	#[cfg(all(feature = "std", feature = "transport"))]
 	#[test]
 	fn the_placement_entropy_is_more_than_the_hash_of_an_address() {
@@ -227,25 +243,26 @@ mod tests {
 
 	/// The placement that the child half prints in a process of its own.
 	#[cfg(all(feature = "std", feature = "transport"))]
-	fn placement_of_a_child_process() -> core::result::Result<u64, Box<dyn std::error::Error>> {
-		let exe = std::env::current_exe()?;
+	fn placement_of_a_child_process() -> u64 {
+		let exe = std::env::current_exe().expect("the test binary has a path");
 		let args = ["--ignored", "--exact", PLACEMENT_PRINTER, "--nocapture", "--test-threads=1"];
-		let output = std::process::Command::new(exe).args(args).output()?;
-		let stdout = String::from_utf8(output.stdout)?;
+		let output = std::process::Command::new(exe).args(args).output();
+		let output = output.expect("the test binary runs as a child process");
+		let stdout = String::from_utf8(output.stdout).expect("the child prints UTF-8");
 		let printed = stdout
 			.lines()
 			.find_map(|line| line.split_once("placement=").map(|(_, placement)| placement));
 
-		Ok(printed.ok_or("the child prints its placement")?.trim().parse()?)
+		let printed = printed.expect("the child prints its placement");
+		printed.trim().parse().expect("the child prints its placement as a number")
 	}
 
-	// Peers that lose the random source together seed apart only while each
-	// process takes a placement of its own.
+	/// Peers that lose the random source together seed apart only while each
+	/// process takes a placement of its own.
 	#[cfg(all(feature = "std", feature = "transport"))]
 	#[test]
-	fn two_processes_take_two_placements() -> core::result::Result<(), Box<dyn std::error::Error>> {
-		let child = placement_of_a_child_process()?;
+	fn two_processes_take_two_placements() {
+		let child = placement_of_a_child_process();
 		assert_ne!(child, placement_entropy());
-		Ok(())
 	}
 }

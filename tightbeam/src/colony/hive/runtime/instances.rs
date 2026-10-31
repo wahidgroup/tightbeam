@@ -353,95 +353,18 @@ impl<'a, R: ServletRegistry, P: Protocol> HiveInstances<'a, R, P> {
 
 #[cfg(test)]
 mod tests {
-	use core::error::Error;
 	use core::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::colony::hive::{HashMapRegistry, HiveContext, ReplacedServlet, ServletScaleConfig, SpawnerFn};
+	use crate::colony::hive::fixtures::{echo_type, Probe};
+	use crate::colony::hive::{HashMapRegistry, HiveContext, ReplacedServlet, ServletScaleConfig};
 	use crate::colony::protocol::ServletInfo;
-	use crate::colony::urn::ColonyNamespace;
 	use crate::router::RouterError;
-	use crate::testing::TestMessage;
+	use crate::testing::{TestMessage, TestResult};
 	use crate::transport::client::{ConnectionBuilder, ConnectionPool};
 	use crate::transport::TokioListener;
 	use crate::{encode, Frame};
-
-	/// A [`ServletBox`] whose stop is observable.
-	///
-	/// The shipped servlet runtime stops by aborting its accept task, which
-	/// leaves a test nothing to read, so this probe records the call.
-	struct StopProbe {
-		stopped: Arc<AtomicBool>,
-		signer: Option<SignerIdentifier>,
-	}
-
-	impl ServletBox for StopProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7001".as_slice())
-		}
-
-		fn stop_boxed(self: Box<Self>) {
-			self.stopped.store(true, Ordering::SeqCst);
-		}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			self.signer.as_ref()
-		}
-	}
-
-	/// A [`ServletBox`] that reads the hive's routes for its own type at the
-	/// instant the hive stops it.
-	///
-	/// The order of a removal is observable only from inside the stop, so
-	/// this probe records whether a route names its type at that instant.
-	struct RouteProbe {
-		routes: Arc<HiveContextImpl<TokioListener>>,
-		servlet_type: Urn<'static>,
-		routed_at_stop: Arc<AtomicBool>,
-		signer: SignerIdentifier,
-	}
-
-	impl ServletBox for RouteProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7002".as_slice())
-		}
-
-		fn stop_boxed(self: Box<Self>) {
-			let routed = self.routes.resolves(&self.servlet_type);
-			self.routed_at_stop.store(routed, Ordering::SeqCst);
-		}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			Some(&self.signer)
-		}
-	}
-
-	/// A [`ServletBox`] that reads, at the instant the hive stops it, whether
-	/// the admission lock is free.
-	///
-	/// A stop is code an outside crate writes, and every move of the hive
-	/// waits on that lock, so this probe records whether its stop ran with
-	/// the lock free.
-	struct LockProbe {
-		admission: Arc<Mutex<()>>,
-		free_at_stop: Arc<AtomicBool>,
-	}
-
-	impl ServletBox for LockProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7003".as_slice())
-		}
-
-		fn stop_boxed(self: Box<Self>) {
-			let free = self.admission.try_lock().is_ok();
-			self.free_at_stop.store(free, Ordering::SeqCst);
-		}
-
-		fn signer(&self) -> Option<&SignerIdentifier> {
-			None
-		}
-	}
 
 	/// A [`ServletRegistry`] that refuses every insert.
 	///
@@ -501,175 +424,148 @@ mod tests {
 		}
 	}
 
-	/// Returns the spawner every probe registration carries. The insert under
-	/// test reads no spawner, so this one spawns a plain [`StopProbe`].
-	fn probe_spawner() -> SpawnerFn {
-		Arc::new(|_| {
-			let probe = StopProbe { stopped: Arc::default(), signer: None };
-			Box::pin(async move { Ok(Box::new(probe) as Box<dyn ServletBox>) })
-		})
+	/// The address of the probe that each instance test registers.
+	const PROBE: &[u8] = b"127.0.0.1:7001";
+
+	/// A registration of the probe under the `echo` type, which sets
+	/// `stopped` as it stops and names `signer`.
+	fn probe(stopped: &Arc<AtomicBool>, signer: Option<SignerIdentifier>) -> ServletRegistration {
+		Probe::at(PROBE).flagging(stopped).signed(signer).registration(echo_type())
 	}
 
-	/// Builds a registration of one [`StopProbe`] under `servlet_type` that
-	/// names `signer`.
-	fn probe_registration(
-		servlet_type: Urn<'static>,
-		stopped: &Arc<AtomicBool>,
-		signer: Option<SignerIdentifier>,
-	) -> ServletRegistration {
-		let probe = StopProbe { stopped: Arc::clone(stopped), signer };
-		ServletRegistration { servlet: Box::new(probe), spawner: probe_spawner(), servlet_type }
+	/// A registration of the probe under the `echo` type, which names no
+	/// signer and runs no step as it stops.
+	fn idle() -> ServletRegistration {
+		Probe::at(PROBE).registration(echo_type())
 	}
 
-	/// Builds a registration of one [`RouteProbe`] under `servlet_type`. The
-	/// probe reads `routes` for that type when it stops.
-	fn route_probe_registration(
-		routes: &Arc<HiveContextImpl<TokioListener>>,
-		servlet_type: &Urn<'static>,
-		routed_at_stop: &Arc<AtomicBool>,
-	) -> ServletRegistration {
-		let probe = RouteProbe {
-			routes: Arc::clone(routes),
-			servlet_type: servlet_type.clone(),
-			routed_at_stop: Arc::clone(routed_at_stop),
-			signer: ServletInfo::fixture_signer(),
-		};
-		let spawner = probe_spawner();
-
-		ServletRegistration { servlet: Box::new(probe), spawner, servlet_type: servlet_type.clone() }
-	}
-
-	/// Builds empty routes over a fresh pool, which the tests leave idle.
-	fn routes() -> HiveContextImpl<TokioListener> {
-		HiveContextImpl::new(Arc::new(ConnectionPool::<TokioListener>::builder().build()))
-	}
-
-	/// The admission lock, the drain state, and the type bounds that the
-	/// instance set of a test reads.
-	#[derive(Default)]
-	struct Admission {
+	/// A hive's registry and its routes over an idle pool, with the admission
+	/// lock, the drain state, and the type bounds that its instance set reads.
+	struct Hive<R = HashMapRegistry> {
+		servlets: R,
+		routes: Arc<HiveContextImpl<TokioListener>>,
 		hold: Arc<Mutex<()>>,
 		drain: DrainMode,
 		scaling: HiveScalingConfig,
 	}
 
-	impl Admission {
-		/// An admission that bounds the `echo` type to one instance.
-		fn single_instance() -> Self {
-			let bounds = ServletScaleConfig::new(1, 1, crate::bps!(8000), crate::bps!(2000));
-			let bounds = bounds.expect("one instance is a legal range");
-			let mut admission = Self::default();
-			admission.scaling.overrides.insert(echo_type(), bounds);
-			admission
-		}
-
-		/// Views `servlets` and `routes` as one instance set.
-		fn instances<'a, R: ServletRegistry>(
-			&'a self,
-			servlets: &'a R,
-			routes: &'a HiveContextImpl<TokioListener>,
-		) -> HiveInstances<'a, R, TokioListener> {
-			HiveInstances::new(servlets, routes, &self.hold, &self.drain, &self.scaling)
-		}
-
-		/// Builds a registration of one [`LockProbe`] under the `echo` type,
-		/// which reads this admission's lock as it stops and sets
-		/// `free_at_stop` to what it found.
-		fn lock_probe(&self, free_at_stop: &Arc<AtomicBool>) -> ServletRegistration {
-			let probe = LockProbe { admission: Arc::clone(&self.hold), free_at_stop: Arc::clone(free_at_stop) };
-			let spawner = probe_spawner();
-
-			ServletRegistration { servlet: Box::new(probe), spawner, servlet_type: echo_type() }
+	impl<R: ServletRegistry + Default> Default for Hive<R> {
+		fn default() -> Self {
+			let pool = Arc::new(ConnectionPool::<TokioListener>::builder().build());
+			let routes = Arc::new(HiveContextImpl::new(pool));
+			let (hold, drain, scaling) = Default::default();
+			Self { servlets: R::default(), routes, hold, drain, scaling }
 		}
 	}
 
-	/// The servlet type of every probe.
-	fn echo_type() -> Urn<'static> {
-		let servlet_type = ColonyNamespace::default().servlet("echo");
-		servlet_type.expect("test names satisfy the mint grammar")
+	impl Hive {
+		/// A hive over a map registry that holds no instance, has begun no
+		/// drain, and bounds no type.
+		fn new() -> Self {
+			Self::default()
+		}
+
+		/// A hive that bounds the `echo` type to one instance.
+		fn single_instance() -> Self {
+			let mut hive = Self::default();
+			let bounds = ServletScaleConfig::single_instance();
+			hive.scaling.overrides.insert(echo_type(), bounds);
+			hive
+		}
+
+		/// A hive whose drain has begun.
+		fn draining() -> Self {
+			let hive = Self::default();
+			hive.drain.begin();
+			hive
+		}
+	}
+
+	impl<R: ServletRegistry> Hive<R> {
+		/// The registry and the routes of this hive as one instance set.
+		fn instances(&self) -> HiveInstances<'_, R, TokioListener> {
+			HiveInstances::new(&self.servlets, &self.routes, &self.hold, &self.drain, &self.scaling)
+		}
+
+		/// A registration of the probe under the `echo` type, which reads the
+		/// admission lock of this hive as it stops and sets `free_at_stop` to
+		/// what it found.
+		fn lock_probe(&self, free_at_stop: &Arc<AtomicBool>) -> ServletRegistration {
+			let (hold, free) = (Arc::clone(&self.hold), Arc::clone(free_at_stop));
+			let read = move || free.store(hold.try_lock().is_ok(), Ordering::SeqCst);
+
+			Probe::at(b"127.0.0.1:7003").on_stop(read).registration(echo_type())
+		}
+
+		/// A registration of the probe under the `echo` type, which reads the
+		/// routes of this hive for that type as it stops and sets
+		/// `routed_at_stop` to what it found.
+		fn route_probe(&self, routed_at_stop: &Arc<AtomicBool>) -> ServletRegistration {
+			let (routes, routed) = (Arc::clone(&self.routes), Arc::clone(routed_at_stop));
+			let read = move || routed.store(routes.resolves(&echo_type()), Ordering::SeqCst);
+			let probe = Probe::at(b"127.0.0.1:7002").signed(ServletInfo::fixture_signer());
+			probe.on_stop(read).registration(echo_type())
+		}
 	}
 
 	/// Builds a frame to call a sibling with.
 	fn call_frame() -> Frame {
 		let message = encode(&TestMessage { content: "ping".into() }).expect("a test message encodes");
-
 		Frame::v0(b"call", message)
 	}
 
 	/// A refused registry insert adds no route and stops the servlet the one
 	/// way the trait names.
 	#[tokio::test]
-	async fn a_refused_registry_insert_leaves_no_route() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = RefusingRegistry;
-		let routes = routes();
+	async fn a_refused_registry_insert_leaves_no_route() {
+		let hive = Hive::<RefusingRegistry>::default();
 		let stopped = Arc::new(AtomicBool::new(false));
-		let registration = probe_registration(servlet_type.clone(), &stopped, Some(ServletInfo::fixture_signer()));
 
-		let admission = Admission::default();
-		let inserted = admission.instances(&servlets, &routes).insert(registration);
+		let inserted = hive.instances().insert(probe(&stopped, Some(ServletInfo::fixture_signer())));
+		let unrouted = hive.routes.call(&echo_type(), call_frame()).await;
 		assert!(matches!(inserted, Err(InsertRefusal::Registry(TightBeamError::NonceExhausted))));
-
-		let unrouted = routes.call(&servlet_type, call_frame()).await;
 		assert!(matches!(unrouted, Err(TightBeamError::RouterError(RouterError::UnknownRoute))));
 		assert!(stopped.load(Ordering::SeqCst));
-		Ok(())
 	}
 
 	/// The map registry hands back the registration it replaces as a value
 	/// whose drop stops the servlet, so a caller that drops it leaves no
 	/// servlet running.
 	#[test]
-	fn a_replaced_registration_that_its_caller_drops_stops_its_servlet() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = HashMapRegistry::default();
+	fn a_replaced_registration_that_its_caller_drops_stops_its_servlet() {
 		let replaced = Arc::new(AtomicBool::new(false));
-		let first = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type.clone(), &replaced, None));
-		first.map_err(|refused| refused.stop_servlet())?;
+		let servlets = HashMapRegistry::holding(b"echo".to_vec(), probe(&replaced, None));
 
-		let second = servlets.insert(b"echo".to_vec(), probe_registration(servlet_type, &Arc::default(), None));
-		drop(second.map_err(|refused| refused.stop_servlet())?);
+		let second = servlets.insert(b"echo".to_vec(), idle());
+		drop(second);
 
 		assert!(replaced.load(Ordering::SeqCst));
-		Ok(())
 	}
 
 	/// A registration of an instance the hive holds replaces it, and the
 	/// replaced servlet stops the one way the trait names.
 	#[test]
-	fn a_replaced_registration_stops_its_servlet() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		let instances = admission.instances(&servlets, &routes);
-		let replaced = Arc::new(AtomicBool::new(false));
-		let replacing = Arc::new(AtomicBool::new(false));
+	fn a_replaced_registration_stops_its_servlet() -> TestResult {
+		let hive = Hive::new();
+		let (replaced, replacing) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+		hive.instances().insert(probe(&replaced, None))?;
+		hive.instances().insert(probe(&replacing, None))?;
 
-		instances.insert(probe_registration(servlet_type.clone(), &replaced, None))?;
-		instances.insert(probe_registration(servlet_type, &replacing, None))?;
-
-		assert!(replaced.load(Ordering::SeqCst));
-		assert!(!replacing.load(Ordering::SeqCst));
-		assert_eq!(servlets.count(), 1);
+		let stops = (replaced.load(Ordering::SeqCst), replacing.load(Ordering::SeqCst));
+		assert_eq!((stops, hive.servlets.count()), ((true, false), 1));
 		Ok(())
 	}
 
 	/// A removal drops the route before it stops the servlet, so no call in
 	/// the removal window resolves a stopped instance.
-	#[tokio::test]
-	async fn a_removed_instance_loses_its_route_before_it_stops() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = HashMapRegistry::default();
-		let routes = Arc::new(routes());
+	#[test]
+	fn a_removed_instance_loses_its_route_before_it_stops() -> TestResult {
+		let hive = Hive::new();
 		let routed_at_stop = Arc::new(AtomicBool::new(true));
-		let registration = route_probe_registration(&routes, &servlet_type, &routed_at_stop);
-		let admission = Admission::default();
-		let instances = admission.instances(&servlets, &routes);
-		let placed = instances.insert(registration)?;
+		let placed = hive.instances().insert(hive.route_probe(&routed_at_stop))?;
 
-		instances.insert(probe_registration(servlet_type, &Arc::default(), None))?;
-		instances.remove(placed.instance.canonical_bytes())?;
+		hive.instances().insert(idle())?;
+		hive.instances().remove(placed.instance.canonical_bytes())?;
 
 		assert!(!routed_at_stop.load(Ordering::SeqCst));
 		Ok(())
@@ -679,16 +575,12 @@ mod tests {
 	/// sibling's dial admits a servlet's answer by that signer alone
 	/// (CWE-346).
 	#[tokio::test]
-	async fn an_unsigned_servlet_registers_with_no_route() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let registration = probe_registration(servlet_type.clone(), &Arc::default(), None);
+	async fn an_unsigned_servlet_registers_with_no_route() -> TestResult {
+		let hive = Hive::new();
+		hive.instances().insert(idle())?;
 
-		Admission::default().instances(&servlets, &routes).insert(registration)?;
-
-		let unrouted = routes.call(&servlet_type, call_frame()).await;
-		assert_eq!(servlets.count(), 1);
+		let unrouted = hive.routes.call(&echo_type(), call_frame()).await;
+		assert_eq!(hive.servlets.count(), 1);
 		assert!(matches!(unrouted, Err(TightBeamError::RouterError(RouterError::UnknownRoute))));
 		Ok(())
 	}
@@ -697,15 +589,10 @@ mod tests {
 	/// so a spawn that outlived the drain leaves nothing running.
 	#[test]
 	fn a_draining_hive_refuses_an_insert_and_stops_its_servlet() {
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		admission.drain.begin();
-
+		let hive = Hive::draining();
 		let stopped = Arc::new(AtomicBool::new(false));
-		let registration = probe_registration(echo_type(), &stopped, None);
 
-		let inserted = admission.instances(&servlets, &routes).insert(registration);
+		let inserted = hive.instances().insert(probe(&stopped, None));
 		assert!(matches!(inserted, Err(InsertRefusal::Draining)));
 		assert!(stopped.load(Ordering::SeqCst));
 	}
@@ -713,32 +600,25 @@ mod tests {
 	/// A replacement that names no signer has no route, so the route of the
 	/// signed instance it replaces leaves with it (CWE-346).
 	#[test]
-	fn an_unsigned_replacement_takes_the_route_of_the_instance_it_replaces_away() -> Result<(), Box<dyn Error>> {
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		let instances = admission.instances(&servlets, &routes);
-		let signed = probe_registration(echo_type(), &Arc::default(), Some(ServletInfo::fixture_signer()));
-		instances.insert(signed)?;
+	fn an_unsigned_replacement_takes_the_route_of_the_instance_it_replaces_away() -> TestResult {
+		let hive = Hive::new();
+		let signed = probe(&Arc::default(), Some(ServletInfo::fixture_signer()));
 
-		instances.insert(probe_registration(echo_type(), &Arc::default(), None))?;
+		hive.instances().insert(signed)?;
+		hive.instances().insert(idle())?;
 
-		assert!(!routes.resolves(&echo_type()));
+		assert!(!hive.routes.resolves(&echo_type()));
 		Ok(())
 	}
 
 	/// A registration that replaces the instance at its own address takes no
 	/// place of its own, so a type at its bound admits it.
 	#[test]
-	fn a_replacement_at_the_bound_is_admitted() -> Result<(), Box<dyn Error>> {
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::single_instance();
-		let instances = admission.instances(&servlets, &routes);
-		instances.insert(probe_registration(echo_type(), &Arc::default(), None))?;
-		instances.insert(probe_registration(echo_type(), &Arc::default(), None))?;
-
-		assert_eq!(servlets.count(), 1);
+	fn a_replacement_at_the_bound_is_admitted() -> TestResult {
+		let hive = Hive::single_instance();
+		hive.instances().insert(idle())?;
+		hive.instances().insert(idle())?;
+		assert_eq!(hive.servlets.count(), 1);
 		Ok(())
 	}
 
@@ -746,33 +626,24 @@ mod tests {
 	/// an insert that lands after it adds no instance, whichever path drained
 	/// the hive (CWE-362).
 	#[test]
-	fn a_drained_instance_set_refuses_a_later_insert() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		let instances = admission.instances(&servlets, &routes);
-		instances.drain_all();
+	fn a_drained_instance_set_refuses_a_later_insert() {
+		let hive = Hive::new();
+		hive.instances().drain_all();
 
-		let inserted = instances.insert(probe_registration(servlet_type, &Arc::default(), None));
+		let inserted = hive.instances().insert(idle());
 		assert!(matches!(inserted, Err(InsertRefusal::Draining)));
-		Ok(())
 	}
 
 	/// A removed servlet stops once the admission lock drops, so a stop that
 	/// blocks holds up no other move of the hive.
 	#[test]
-	fn a_removed_servlet_stops_once_the_admission_lock_drops() -> Result<(), Box<dyn Error>> {
-		let servlet_type = ColonyNamespace::default().servlet("echo")?;
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		let instances = admission.instances(&servlets, &routes);
+	fn a_removed_servlet_stops_once_the_admission_lock_drops() -> TestResult {
+		let hive = Hive::new();
 		let free_at_stop = Arc::new(AtomicBool::new(false));
-		let placed = instances.insert(admission.lock_probe(&free_at_stop))?;
+		let placed = hive.instances().insert(hive.lock_probe(&free_at_stop))?;
 
-		instances.insert(probe_registration(servlet_type, &Arc::default(), None))?;
-		instances.remove(placed.instance.canonical_bytes())?;
+		hive.instances().insert(probe(&Arc::default(), None))?;
+		hive.instances().remove(placed.instance.canonical_bytes())?;
 
 		assert!(free_at_stop.load(Ordering::SeqCst));
 		Ok(())
@@ -780,32 +651,24 @@ mod tests {
 
 	/// A servlet that the hive refuses stops once the admission lock drops.
 	#[test]
-	fn a_refused_servlet_stops_once_the_admission_lock_drops() -> Result<(), Box<dyn Error>> {
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		admission.drain.begin();
-
-		let instances = admission.instances(&servlets, &routes);
+	fn a_refused_servlet_stops_once_the_admission_lock_drops() {
+		let hive = Hive::draining();
 		let free_at_stop = Arc::new(AtomicBool::new(false));
 
-		let refused = instances.insert(admission.lock_probe(&free_at_stop)).is_err();
-		assert_eq!((refused, free_at_stop.load(Ordering::SeqCst)), (true, true));
-		Ok(())
+		let refused = hive.instances().insert(hive.lock_probe(&free_at_stop));
+		assert!(matches!(refused, Err(InsertRefusal::Draining)));
+		assert!(free_at_stop.load(Ordering::SeqCst));
 	}
 
 	/// A servlet that a registration at its own address replaces stops once
 	/// the admission lock drops.
 	#[test]
-	fn a_replaced_servlet_stops_once_the_admission_lock_drops() -> Result<(), Box<dyn Error>> {
-		let servlets = HashMapRegistry::default();
-		let routes = routes();
-		let admission = Admission::default();
-		let instances = admission.instances(&servlets, &routes);
+	fn a_replaced_servlet_stops_once_the_admission_lock_drops() -> TestResult {
+		let hive = Hive::new();
 		let free_at_stop = Arc::new(AtomicBool::new(false));
 
-		instances.insert(admission.lock_probe(&free_at_stop))?;
-		instances.insert(admission.lock_probe(&Arc::default()))?;
+		hive.instances().insert(hive.lock_probe(&free_at_stop))?;
+		hive.instances().insert(hive.lock_probe(&Arc::default()))?;
 
 		assert!(free_at_stop.load(Ordering::SeqCst));
 		Ok(())

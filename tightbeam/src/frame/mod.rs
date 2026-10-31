@@ -600,9 +600,10 @@ fn first_forbidden<const N: usize>(version: Version, present: [(GatedField, bool
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::der::{Decode, Encode};
-	use crate::testing::{TestDigest, TestMessage, TestSigner};
-	use crate::TightBeamError;
+	use crate::asn1::admission::fixtures::der_refusal;
+	use crate::der::{Decode, Encode, ErrorKind};
+	use crate::testing::fixtures::TestEnvelope;
+	use crate::testing::{TestDigest, TestResult, TestSigner};
 
 	/// A frame at `version` that carries `field`, built without the
 	/// constructor's check.
@@ -630,60 +631,53 @@ mod tests {
 	}
 
 	fn sealed_content() -> WireDer<AuthEnvelopedData> {
-		use crate::cms::content_info::CmsVersion;
-		use crate::cms::enveloped_data::{EncryptedContentInfo, RecipientInfos};
-
-		let content_enc_alg = crate::spki::AlgorithmIdentifierOwned { oid: crate::oids::DATA, parameters: None };
-		let info = EncryptedContentInfo { content_type: crate::oids::DATA, content_enc_alg, encrypted_content: None };
-		let mac = crate::der::asn1::OctetString::new([0u8; 16]).expect("16 octets fit an OCTET STRING");
-		let envelope = AuthEnvelopedData {
-			version: CmsVersion::V0,
-			originator_info: None,
-			recipient_infos: RecipientInfos::default(),
-			auth_encrypted_content_info: info,
-			auth_attrs: None,
-			mac,
-			unauth_attrs: None,
-		};
-		WireDer::new(envelope).expect("the envelope encodes")
+		WireDer::new(TestEnvelope::empty_auth_enveloped(crate::oids::DATA)).expect("the envelope encodes")
 	}
 
-	macro_rules! gate_tests {
-		($($name:ident: $field:expr, forbidden at $forbidding:expr,)*) => {
-			$(
-				mod $name {
-					use super::*;
-
-					#[test]
-					fn the_decoder_refuses_it_below_its_version() -> crate::error::Result<()> {
-						let encoded = carrying($forbidding, $field).to_der()?;
-						assert!(Frame::from_der(&encoded).is_err());
-						Ok(())
-					}
-
-					#[test]
-					fn the_decoder_accepts_it_at_its_version() -> crate::error::Result<()> {
-						let frame = carrying($field.since(), $field);
-						let decoded = Frame::from_der(&frame.to_der()?)?;
-						assert_eq!(decoded, frame);
-						Ok(())
-					}
-				}
-			)*
-		};
+	// The decoder refuses a frame that carries a field below the version
+	// that introduced it. Each case is (the field, a version below its own).
+	crate::tb_cases! {
+		fn the_decoder_refuses_a_field_below_its_version((field, forbidding): (GatedField, Version)) -> TestResult {
+			let encoded = carrying(forbidding, field).to_der()?;
+			let refused = der_refusal(Frame::from_der(&encoded));
+			assert_eq!(refused, Some(ErrorKind::Value { tag: Tag::Sequence }));
+			Ok(())
+		}
+		cases {
+			message_integrity => (GatedField::MessageIntegrity, Version::V0),
+			confidentiality => (GatedField::Confidentiality, Version::V0),
+			frame_integrity => (GatedField::FrameIntegrity, Version::V0),
+			nonrepudiation => (GatedField::Nonrepudiation, Version::V0),
+			priority => (GatedField::Priority, Version::V1),
+			lifetime => (GatedField::Lifetime, Version::V1),
+			previous_frame => (GatedField::PreviousFrame, Version::V1),
+			matrix => (GatedField::Matrix, Version::V2),
+		}
 	}
 
-	gate_tests! {
-		message_integrity: GatedField::MessageIntegrity, forbidden at Version::V0,
-		confidentiality: GatedField::Confidentiality, forbidden at Version::V0,
-		frame_integrity: GatedField::FrameIntegrity, forbidden at Version::V0,
-		nonrepudiation: GatedField::Nonrepudiation, forbidden at Version::V0,
-		priority: GatedField::Priority, forbidden at Version::V1,
-		lifetime: GatedField::Lifetime, forbidden at Version::V1,
-		previous_frame: GatedField::PreviousFrame, forbidden at Version::V1,
-		matrix: GatedField::Matrix, forbidden at Version::V2,
+	// The decoder accepts a frame that carries a field at the version that
+	// introduced it, and decodes it whole.
+	crate::tb_cases! {
+		fn the_decoder_accepts_a_field_at_its_version(field: GatedField) -> TestResult {
+			let frame = carrying(field.since(), field);
+			let decoded = Frame::from_der(&frame.to_der()?)?;
+			assert_eq!(decoded, frame);
+			Ok(())
+		}
+		cases {
+			message_integrity => GatedField::MessageIntegrity,
+			confidentiality => GatedField::Confidentiality,
+			frame_integrity => GatedField::FrameIntegrity,
+			nonrepudiation => GatedField::Nonrepudiation,
+			priority => GatedField::Priority,
+			lifetime => GatedField::Lifetime,
+			previous_frame => GatedField::PreviousFrame,
+			matrix => GatedField::Matrix,
+		}
 	}
 
+	/// The frame assembly refuses a frame field below its version with the
+	/// error that names the field and the frame version.
 	#[cfg(feature = "builder")]
 	#[test]
 	fn assembly_refuses_a_field_below_its_version() {
@@ -706,18 +700,5 @@ mod tests {
 			result,
 			Err(crate::TightBeamError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 })
 		));
-	}
-
-	/// The one §5.6 rule refuses a metadata field that the builder sets and a
-	/// frame field that the assembly adds with one error.
-	#[cfg(feature = "builder")]
-	#[test]
-	fn a_metadata_field_and_a_frame_field_below_their_versions_refuse_alike() {
-		let message = TestMessage::sample(None);
-		let metadata_field = compose! { V2: id: "grid", order: 1u64, message: message, matrix: MatrixDyn::default() };
-		let frame_field = Frame::assemble(Version::V0, Metadata::empty(), Vec::new(), Some(TestDigest::info()));
-
-		assert!(matches!(metadata_field, Err(TightBeamError::UnsupportedField { .. })));
-		assert!(matches!(frame_field, Err(TightBeamError::UnsupportedField { .. })));
 	}
 }

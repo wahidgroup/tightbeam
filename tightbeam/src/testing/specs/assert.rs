@@ -601,23 +601,21 @@ impl EventCountContract {
 
 #[cfg(test)]
 mod tests {
-	use core::error::Error;
-
 	use super::TBSpec;
-	use crate::error::TightBeamError;
+	use crate::error::{ReceivedExpectedError, TightBeamError};
 	use crate::testing::macros::{AssertSpecBuilder, BuiltAssertSpec};
-	use crate::testing::specs::{EventOrderViolationDetail, SpecViolation};
+	use crate::testing::specs::{AssertionViolationDetail, EventOrderViolationDetail, SpecViolation};
 	use crate::testing::TestFrame;
-	use crate::trace::{ConsumedTrace, ExecutionMode, TraceCollector};
+	use crate::trace::{ConsumedTrace, ExecutionMode};
 	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec};
 
 	#[cfg(feature = "instrument")]
 	use crate::instrumentation::{events, TbInstrumentationConfig};
 	#[cfg(feature = "instrument")]
-	use crate::testing::specs::EventCountMismatchDetail;
+	use crate::testing::fixtures::TestTrace;
 	#[cfg(feature = "instrument")]
-	use crate::trace::TraceConfig;
+	use crate::testing::specs::EventCountMismatchDetail;
 
 	const STEP: Urn<'static> = crate::urn!("test", "event:assert/step");
 	const FIRST: Urn<'static> = crate::urn!("test", "event:assert/first");
@@ -675,18 +673,7 @@ mod tests {
 
 	/// A trace that records `STEP` `count` times.
 	fn steps(count: usize) -> ConsumedTrace {
-		let labels = vec![STEP; count];
-		recorded(&labels)
-	}
-
-	/// A trace that records each label of `labels` once, in that order.
-	fn recorded(labels: &[Urn<'static>]) -> ConsumedTrace {
-		let collector = TraceCollector::new();
-		for label in labels {
-			collector.event(label).expect("the run injects no fault").emit();
-		}
-
-		ConsumedTrace::drained_from(&collector)
+		ConsumedTrace::recording(vec![STEP; count])
 	}
 
 	/// A spec that requires `FIRST` and then `SECOND`, once each.
@@ -714,147 +701,125 @@ mod tests {
 	/// drained from a sink that holds `max_events` events.
 	#[cfg(feature = "instrument")]
 	fn accepted(count: usize, max_events: u32) -> ConsumedTrace {
-		let config = TbInstrumentationConfig { max_events, ..Default::default() };
-		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
+		let collector = TestTrace::with_config(TbInstrumentationConfig { max_events, ..Default::default() });
 		for _ in 0..count {
 			collector.emit(events::GATE_ACCEPT, "Ok");
 		}
 
-		let mut trace = ConsumedTrace::new();
-		trace.populate_from_collector(&collector);
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
-	#[test]
-	fn a_run_that_meets_its_spec_verifies() -> Result<(), Box<dyn Error>> {
-		let trace = steps(1);
-		let verdict = OneStepSpec::latest().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Ok(()));
-		Ok(())
+	// A spec judges a run by its assertions, their order, its response, and
+	// its instrumentation events.
+	crate::tb_cases! {
+		fn a_spec_judges_a_run((spec, trace, verdict): (&BuiltAssertSpec, ConsumedTrace, Result<(), SpecViolation>)) {
+			let judged = spec.verify(&trace, &Ok(()));
+			assert_eq!(judged, verdict);
+		}
+
+		cases {
+			that_meets_its_assertions => (OneStepSpec::latest(), steps(1), Ok(())),
+			that_records_its_ordered_labels_in_order => (
+				&first_then_second(),
+				ConsumedTrace::recording([FIRST, SECOND]),
+				Ok(()),
+			),
+			that_records_its_ordered_labels_out_of_order => (
+				&first_then_second(),
+				ConsumedTrace::recording([SECOND, FIRST]),
+				Err(SpecViolation::AssertionOrderViolation(EventOrderViolationDetail {
+					expected_kind: SECOND,
+					position: 1,
+				})),
+			),
+			with_the_response_its_spec_requires => (RepliesSpec::latest(), exchanged(true), Ok(())),
+			without_the_response_its_spec_requires => (
+				RepliesSpec::latest(),
+				exchanged(false),
+				Err(SpecViolation::ResponseUnexpectedAbsence),
+			),
+			with_a_response_its_spec_forbids => (
+				SilentSpec::latest(),
+				exchanged(true),
+				Err(SpecViolation::ResponseUnexpectedPresence),
+			),
+			/// A run that reports no exchange meets no spec that forbids a
+			/// response.
+			that_reports_no_exchange_to_a_spec_that_forbids_a_response => (
+				SilentSpec::latest(),
+				ConsumedTrace::new(),
+				Err(SpecViolation::ResponseUnreported),
+			),
+			/// A run that reports no exchange meets no spec that requires a
+			/// response.
+			that_reports_no_exchange_to_a_spec_that_requires_a_response => (
+				RepliesSpec::latest(),
+				ConsumedTrace::new(),
+				Err(SpecViolation::ResponseUnreported),
+			),
+			#[cfg(feature = "instrument")]
+			that_meets_its_event_count => (AcceptsOnceSpec::latest(), accepted(1, 1024), Ok(())),
+			#[cfg(feature = "instrument")]
+			whose_event_count_breaks_its_spec => (
+				AcceptsOnceSpec::latest(),
+				accepted(2, 1024),
+				Err(SpecViolation::EventCountMismatch(EventCountMismatchDetail {
+					kind: events::GATE_ACCEPT,
+					expected: exactly!(1),
+					actual: 2,
+				})),
+			),
+			/// A truncated record decides no event count.
+			#[cfg(feature = "instrument")]
+			whose_record_is_truncated => (
+				AcceptsOnceSpec::latest(),
+				accepted(2, 1),
+				Err(SpecViolation::EventRecordTruncated),
+			),
+			#[cfg(feature = "instrument")]
+			that_lacks_a_required_event_in_order => (
+				RejectsAfterAcceptSpec::latest(),
+				accepted(1, 1024),
+				Err(SpecViolation::EventOrderViolation(EventOrderViolationDetail {
+					expected_kind: events::GATE_REJECT,
+					position: 1,
+				})),
+			),
+		}
 	}
 
+	/// A run in another mode than the spec expects is refused.
 	#[test]
-	fn a_run_in_another_mode_is_refused() -> Result<(), Box<dyn Error>> {
+	fn a_run_in_another_mode_is_refused() {
 		let trace = steps(1);
 		let verdict = OneStepSpec::latest().verify(&trace, &Err(TightBeamError::RecvTimeoutError));
-		assert!(matches!(verdict, Err(SpecViolation::ModeMismatch(_))));
-		Ok(())
+		let modes = ReceivedExpectedError { received: ExecutionMode::Error, expected: ExecutionMode::Accept };
+		assert_eq!(verdict, Err(SpecViolation::ModeMismatch(modes)));
 	}
 
+	/// A run that misses an assertion of its spec is refused.
 	#[test]
-	fn a_run_that_misses_an_assertion_is_refused() -> Result<(), Box<dyn Error>> {
+	fn a_run_that_misses_an_assertion_is_refused() {
 		let trace = steps(0);
 		let verdict = OneStepSpec::latest().verify(&trace, &Ok(()));
-		assert!(matches!(verdict, Err(SpecViolation::AssertionViolation(_))));
-		Ok(())
+		assert!(matches!(
+			verdict,
+			Err(SpecViolation::AssertionViolation(AssertionViolationDetail { actual: 0, .. }))
+		));
 	}
 
-	#[test]
-	fn a_run_that_records_its_ordered_labels_in_order_verifies() -> Result<(), Box<dyn Error>> {
-		let trace = recorded(&[FIRST, SECOND]);
-		let verdict = first_then_second().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Ok(()));
-		Ok(())
-	}
+	// A spec can reject a run when it counts an event, and it cannot when it
+	// constrains the response alone.
+	crate::tb_cases! {
+		fn whether_a_spec_can_reject((spec, can_reject): (&BuiltAssertSpec, bool)) {
+			let decided = spec.can_reject();
+			assert_eq!(decided, can_reject);
+		}
 
-	#[test]
-	fn a_run_that_records_its_ordered_labels_out_of_order_is_refused() -> Result<(), Box<dyn Error>> {
-		let trace = recorded(&[SECOND, FIRST]);
-		let verdict = first_then_second().verify(&trace, &Ok(()));
-
-		let detail = EventOrderViolationDetail { expected_kind: SECOND, position: 1 };
-		assert_eq!(verdict, Err(SpecViolation::AssertionOrderViolation(detail)));
-		Ok(())
-	}
-
-	#[test]
-	fn a_run_with_the_response_its_spec_requires_verifies() -> Result<(), Box<dyn Error>> {
-		let trace = exchanged(true);
-		let verdict = RepliesSpec::latest().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Ok(()));
-		Ok(())
-	}
-
-	#[test]
-	fn a_run_without_the_response_its_spec_requires_is_refused() -> Result<(), Box<dyn Error>> {
-		let trace = exchanged(false);
-		let verdict = RepliesSpec::latest().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Err(SpecViolation::ResponseUnexpectedAbsence));
-		Ok(())
-	}
-
-	#[test]
-	fn a_run_with_a_response_its_spec_forbids_is_refused() -> Result<(), Box<dyn Error>> {
-		let trace = exchanged(true);
-		let verdict = SilentSpec::latest().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Err(SpecViolation::ResponseUnexpectedPresence));
-		Ok(())
-	}
-
-	#[test]
-	fn a_run_that_reports_no_exchange_meets_no_spec_that_forbids_a_response() -> Result<(), Box<dyn Error>> {
-		let verdict = SilentSpec::latest().verify(&ConsumedTrace::new(), &Ok(()));
-		assert_eq!(verdict, Err(SpecViolation::ResponseUnreported));
-		Ok(())
-	}
-
-	#[test]
-	fn a_run_that_reports_no_exchange_meets_no_spec_that_requires_a_response() -> Result<(), Box<dyn Error>> {
-		let verdict = RepliesSpec::latest().verify(&ConsumedTrace::new(), &Ok(()));
-		assert_eq!(verdict, Err(SpecViolation::ResponseUnreported));
-		Ok(())
-	}
-
-	#[test]
-	fn a_spec_that_constrains_only_the_response_cannot_reject() -> Result<(), Box<dyn Error>> {
-		assert!(!SilentSpec::latest().can_reject());
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_run_that_meets_its_event_count_verifies() -> Result<(), Box<dyn Error>> {
-		let trace = accepted(1, 1024);
-		let verdict = AcceptsOnceSpec::latest().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Ok(()));
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_run_whose_event_count_breaks_its_spec_is_refused() -> Result<(), Box<dyn Error>> {
-		let trace = accepted(2, 1024);
-		let verdict = AcceptsOnceSpec::latest().verify(&trace, &Ok(()));
-
-		let detail = EventCountMismatchDetail { kind: events::GATE_ACCEPT, expected: exactly!(1), actual: 2 };
-		assert_eq!(verdict, Err(SpecViolation::EventCountMismatch(detail)));
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_truncated_record_decides_no_event_count() -> Result<(), Box<dyn Error>> {
-		let trace = accepted(2, 1);
-		let verdict = AcceptsOnceSpec::latest().verify(&trace, &Ok(()));
-		assert_eq!(verdict, Err(SpecViolation::EventRecordTruncated));
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_run_that_lacks_a_required_event_in_order_is_refused() -> Result<(), Box<dyn Error>> {
-		let trace = accepted(1, 1024);
-		let verdict = RejectsAfterAcceptSpec::latest().verify(&trace, &Ok(()));
-
-		let detail = EventOrderViolationDetail { expected_kind: events::GATE_REJECT, position: 1 };
-		assert_eq!(verdict, Err(SpecViolation::EventOrderViolation(detail)));
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_spec_that_counts_only_an_event_can_reject() -> Result<(), Box<dyn Error>> {
-		assert!(AcceptsOnceSpec::latest().can_reject());
-		Ok(())
+		cases {
+			that_constrains_only_the_response => (SilentSpec::latest(), false),
+			#[cfg(feature = "instrument")]
+			that_counts_only_an_event => (AcceptsOnceSpec::latest(), true),
+		}
 	}
 }

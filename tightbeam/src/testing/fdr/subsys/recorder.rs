@@ -183,33 +183,26 @@ mod tests {
 	use super::*;
 	use crate::instrumentation::TbInstrumentationConfig;
 	use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
-	use crate::testing::specs::csp::ProcessBuildError;
-	use crate::trace::TraceConfig;
+	use crate::testing::fixtures::{TestProcess, TestTrace};
 	use crate::urn::Urn;
 
 	#[cfg(feature = "testing-fault")]
+	#[cfg(feature = "testing-fault")]
 	use crate::testing::fdr::FaultModel;
-
-	/// The error type of these tests, which build processes and explore them.
-	type TestResult = Result<(), Box<dyn core::error::Error>>;
 
 	/// A process with stable states, an unstable state, and a terminal state.
 	///
 	/// `S0` offers `a` and `b`, and each leads to `S1`. The hidden `t` takes
 	/// `S1` to `S2`, which offers `c`, and `c` leads to the terminal `S3`.
-	fn offering() -> Result<Process, ProcessBuildError> {
-		Process::builder("Offering")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_observable(Event("c"))
-			.add_hidden(Event("t"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S0"), Event("b"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("c"), State("S3"))
-			.add_terminal(State("S3"))
-			.build()
+	fn offering() -> Process {
+		TestProcess {
+			observable: &["a", "b", "c"],
+			hidden: &["t"],
+			transitions: &[("S0", "a", "S1"), ("S0", "b", "S1"), ("S1", "t", "S2"), ("S2", "c", "S3")],
+			terminal: &["S3"],
+			..TestProcess::of("Offering", "S0")
+		}
+		.build()
 	}
 
 	/// A process with a hidden diamond and a hidden cycle.
@@ -219,267 +212,215 @@ mod tests {
 	/// `v` takes each of them to `S7`, so two hidden runs meet at `S7` and
 	/// close no cycle. The hidden `t` and `u` take `S1` to `S2` and back, so
 	/// each seed diverges at `S1`.
-	fn diverging() -> Result<Process, ProcessBuildError> {
-		Process::builder("Diverging")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_hidden(Event("v"))
-			.add_transition(State("S0"), Event("a"), State("S3"))
-			.add_transition(State("S0"), Event("a"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.add_transition(State("S2"), Event("u"), State("S1"))
-			.add_transition(State("S2"), Event("b"), State("S5"))
-			.add_transition(State("S3"), Event("t"), State("S4"))
-			.add_transition(State("S3"), Event("t"), State("S6"))
-			.add_transition(State("S4"), Event("v"), State("S7"))
-			.add_transition(State("S6"), Event("v"), State("S7"))
-			.add_transition(State("S7"), Event("b"), State("S5"))
-			.add_terminal(State("S5"))
-			.build()
+	fn diverging() -> Process {
+		TestProcess {
+			observable: &["a", "b"],
+			hidden: &["t", "u", "v"],
+			transitions: &[
+				("S0", "a", "S3"),
+				("S0", "a", "S1"),
+				("S1", "t", "S2"),
+				("S2", "u", "S1"),
+				("S2", "b", "S5"),
+				("S3", "t", "S4"),
+				("S3", "t", "S6"),
+				("S4", "v", "S7"),
+				("S6", "v", "S7"),
+				("S7", "b", "S5"),
+			],
+			terminal: &["S5"],
+			..TestProcess::of("Diverging", "S0")
+		}
+		.build()
 	}
 
 	/// A process whose `a` leads to `S2`, where the hidden `u` and `t` take it
 	/// to `S1` and back, so the run of its divergence takes `u` before `t`.
-	fn turning() -> Result<Process, ProcessBuildError> {
-		Process::builder("Turning")
-			.initial_state(State("S0"))
-			.add_observable(Event("a"))
-			.add_hidden(Event("t"))
-			.add_hidden(Event("u"))
-			.add_transition(State("S0"), Event("a"), State("S2"))
-			.add_transition(State("S2"), Event("u"), State("S1"))
-			.add_transition(State("S1"), Event("t"), State("S2"))
-			.build()
+	fn turning() -> Process {
+		TestProcess {
+			observable: &["a"],
+			hidden: &["t", "u"],
+			transitions: &[("S0", "a", "S2"), ("S2", "u", "S1"), ("S1", "t", "S2")],
+			..TestProcess::of("Turning", "S0")
+		}
+		.build()
 	}
 
 	/// A specification that offers `send` at `Idle` and stops at `Sent`.
 	#[cfg(feature = "testing-fault")]
-	fn sending() -> Result<Process, ProcessBuildError> {
-		Process::builder("Sending")
-			.initial_state(State("Idle"))
-			.add_observable(Event("send"))
-			.add_transition(State("Idle"), Event("send"), State("Sent"))
-			.add_terminal(State("Sent"))
-			.build()
-	}
-
-	/// A process that can stop at `Idle`, which offers `a` as well, and at
-	/// `Done`, which `a` leads to.
-	fn accepting() -> Result<Process, ProcessBuildError> {
-		Process::builder("Accepting")
-			.initial_state(State("Idle"))
-			.add_observable(Event("a"))
-			.add_observable(Event("b"))
-			.add_transition(State("Idle"), Event("a"), State("Done"))
-			.add_terminal(State("Idle"))
-			.add_terminal(State("Done"))
-			.build()
+	fn sending() -> Process {
+		TestProcess::chain("Sending", &["Idle", "Sent"], &["send"])
 	}
 
 	/// A specification that offers `recv` at `Idle` and stops at `Sent`, so its
 	/// states share their names with those of [`sending`].
 	#[cfg(feature = "testing-fault")]
-	fn receiving() -> Result<Process, ProcessBuildError> {
-		Process::builder("Receiving")
-			.initial_state(State("Idle"))
-			.add_observable(Event("recv"))
-			.add_transition(State("Idle"), Event("recv"), State("Sent"))
-			.add_terminal(State("Sent"))
-			.build()
+	fn receiving() -> Process {
+		TestProcess::chain("Receiving", &["Idle", "Sent"], &["recv"])
 	}
 
-	/// Instrumentation settings that ask for every exploration event.
-	fn every_flag() -> TbInstrumentationConfig {
-		TbInstrumentationConfig {
-			sample_enabled_sets: true,
-			sample_refusals: true,
-			divergence_heuristics: true,
-			..Default::default()
-		}
+	/// The settings that ask for the enabled sets alone.
+	fn enabled_sets() -> TbInstrumentationConfig {
+		TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() }
 	}
 
-	/// A trace with the instrumentation `settings`.
-	fn trace_with(settings: TbInstrumentationConfig) -> TraceCollector {
-		TraceCollector::from(TraceConfig::with_instrumentation(settings))
+	/// The settings that ask for the refusal sets alone.
+	fn refusals() -> TbInstrumentationConfig {
+		TbInstrumentationConfig { sample_refusals: true, ..Default::default() }
+	}
+
+	/// The settings that ask for the divergences alone.
+	fn divergences() -> TbInstrumentationConfig {
+		TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() }
 	}
 
 	/// The labels of the `urn` events that exploring `process` under `config`
-	/// records into a trace with `settings`.
+	/// records into a trace with `settings`. The labels are the subject, so
+	/// the verdict of the exploration goes unread.
 	fn recorded(
 		process: &Process,
 		config: FdrConfig,
 		settings: TbInstrumentationConfig,
 		urn: Urn<'static>,
-	) -> Result<Vec<String>, TightBeamError> {
-		let trace = trace_with(settings);
+	) -> Vec<String> {
+		let trace = TestTrace::with_config(settings);
 		let mut explorer = DefaultFdrExplorer::with_defaults(process, config);
-		explorer.explore_into(&trace)?;
+		explorer.explore_into(&trace).expect("the trace takes each exploration event");
 
-		let events = trace.drain_events();
-		let named = events.into_iter().filter(|event| event.urn == urn);
-		let labels = named.filter_map(|event| event.label.map(String::from)).collect();
-		Ok(labels)
+		TestTrace::labels(&trace, urn).into_iter().flatten().collect()
 	}
 
-	#[test]
-	fn a_visited_state_records_the_observable_events_it_offers() -> TestResult {
-		let process = offering()?;
-		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
+	// An exploration records the events its trace asks for: the offers of each
+	// visited state, the refusals of each stable state, and the hidden run of
+	// each divergence. A fault run records the states of the specs it
+	// explores.
+	crate::tb_cases! {
+		fn an_exploration_records(
+			(process, config, settings, urn, labels): (
+				Process,
+				FdrConfig,
+				TbInstrumentationConfig,
+				Urn<'static>,
+				&[&str],
+			)
+		) {
+			let recorded = recorded(&process, config, settings, urn);
+			assert_eq!(recorded, labels);
+		}
 
-		let labels = recorded(&process, FdrConfig::default(), settings, ENABLED_SET_SAMPLE)?;
-		let offers = ["Offering.S0: {a, b}", "Offering.S1: {}", "Offering.S2: {c}", "Offering.S3: {}"];
-		assert_eq!(labels, offers);
-		Ok(())
+		cases {
+			the_observable_events_each_visited_state_offers => (
+				offering(),
+				FdrConfig::default(),
+				enabled_sets(),
+				ENABLED_SET_SAMPLE,
+				&["Offering.S0: {a, b}", "Offering.S1: {}", "Offering.S2: {c}", "Offering.S3: {}"],
+			),
+			/// `S1` enables the hidden `t`, so it is not stable.
+			the_refusal_set_of_each_stable_state => (
+				offering(),
+				FdrConfig::default(),
+				refusals(),
+				REFUSAL_SNAPSHOT,
+				&["Offering.S0: {c}", "Offering.S2: {a, b}", "Offering.S3: {a, b, c}"],
+			),
+			/// The process can stop at `Idle` and at `Done`.
+			every_observable_event_as_refused_at_an_accepting_state => (
+				TestProcess::accepting(),
+				FdrConfig::default(),
+				refusals(),
+				REFUSAL_SNAPSHOT,
+				&["Accepting.Done: {a, b}", "Accepting.Idle: {a, b}"],
+			),
+			/// The diamond at `S3` closes no cycle.
+			the_divergence_of_the_state_where_a_seed_diverged => (
+				diverging(),
+				FdrConfig::default(),
+				divergences(),
+				DIVERGENCE_DETECT,
+				&["Diverging.S1: <t, u>"],
+			),
+			/// The run takes `u` first.
+			a_divergence_in_the_order_of_its_run => (
+				turning(),
+				FdrConfig::default(),
+				divergences(),
+				DIVERGENCE_DETECT,
+				&["Turning.S2: <u, t>"],
+			),
+			/// The cycle of two hidden events needs no bound.
+			the_divergence_of_a_cycle_longer_than_the_hidden_run_bound => (
+				diverging(),
+				FdrConfig { max_internal_run: 1, ..Default::default() },
+				divergences(),
+				DIVERGENCE_DETECT,
+				&["Diverging.S1: <t, u>"],
+			),
+			#[cfg(feature = "testing-fault")]
+			the_states_of_the_spec_a_fault_run_explores => (
+				offering(),
+				FdrConfig::under_faults([sending()]),
+				enabled_sets(),
+				ENABLED_SET_SAMPLE,
+				&["Sending.Idle: {send}", "Sending.Sent: {}"],
+			),
+			/// The two specs share the names of their states.
+			#[cfg(feature = "testing-fault")]
+			the_spec_of_each_state_a_fault_run_explores => (
+				offering(),
+				FdrConfig::under_faults([sending(), receiving()]),
+				enabled_sets(),
+				ENABLED_SET_SAMPLE,
+				&["Sending.Idle: {send}", "Sending.Sent: {}", "Receiving.Idle: {recv}", "Receiving.Sent: {}"],
+			),
+		}
 	}
 
-	#[test]
-	fn a_trace_that_asks_for_no_enabled_set_records_none() -> TestResult {
-		let process = offering()?;
-		let settings = TbInstrumentationConfig { sample_enabled_sets: false, ..every_flag() };
+	// A trace that asks for every exploration event but one records none of
+	// that one.
+	crate::tb_cases! {
+		fn a_trace_that_asks_for_no((process, settings, urn): (Process, TbInstrumentationConfig, Urn<'static>)) {
+			let recorded = recorded(&process, FdrConfig::default(), settings, urn);
+			assert!(recorded.is_empty());
+		}
 
-		let labels = recorded(&process, FdrConfig::default(), settings, ENABLED_SET_SAMPLE)?;
-		assert!(labels.is_empty(), "the trace asked for no enabled set, and recorded {labels:?}");
-		Ok(())
+		cases {
+			enabled_set_records_none => (
+				offering(),
+				TbInstrumentationConfig { sample_enabled_sets: false, ..TestTrace::every_flag() },
+				ENABLED_SET_SAMPLE,
+			),
+			refusals_records_none => (
+				offering(),
+				TbInstrumentationConfig { sample_refusals: false, ..TestTrace::every_flag() },
+				REFUSAL_SNAPSHOT,
+			),
+			divergence_records_none => (
+				diverging(),
+				TbInstrumentationConfig { divergence_heuristics: false, ..TestTrace::every_flag() },
+				DIVERGENCE_DETECT,
+			),
+		}
 	}
 
-	#[test]
-	fn a_visited_stable_state_records_its_refusal_set() -> TestResult {
-		let process = offering()?;
-		let settings = TbInstrumentationConfig { sample_refusals: true, ..Default::default() };
-
-		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
-		let stable = ["Offering.S0: {c}", "Offering.S2: {a, b}", "Offering.S3: {a, b, c}"];
-		assert_eq!(labels, stable, "`S1` enables the hidden `t`");
-		Ok(())
-	}
-
-	#[test]
-	fn an_accepting_state_records_every_observable_event_as_refused() -> TestResult {
-		let process = accepting()?;
-		let settings = TbInstrumentationConfig { sample_refusals: true, ..Default::default() };
-
-		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
-		let refused = ["Accepting.Done: {a, b}", "Accepting.Idle: {a, b}"];
-		assert_eq!(labels, refused, "the process can stop at `Idle` and at `Done`");
-		Ok(())
-	}
-
-	#[test]
-	fn a_trace_that_asks_for_no_refusals_records_none() -> TestResult {
-		let process = offering()?;
-		let settings = TbInstrumentationConfig { sample_refusals: false, ..every_flag() };
-
-		let labels = recorded(&process, FdrConfig::default(), settings, REFUSAL_SNAPSHOT)?;
-		assert!(labels.is_empty(), "the trace asked for no refusals, and recorded {labels:?}");
-		Ok(())
-	}
-
-	#[test]
-	fn a_state_where_a_seed_diverged_records_its_divergence() -> TestResult {
-		let process = diverging()?;
-		let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
-
-		let labels = recorded(&process, FdrConfig::default(), settings, DIVERGENCE_DETECT)?;
-		assert_eq!(labels, ["Diverging.S1: <t, u>"], "the diamond at `S3` closes no cycle");
-		Ok(())
-	}
-
-	#[test]
-	fn a_divergence_label_keeps_the_order_of_its_run() -> TestResult {
-		let process = turning()?;
-		let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
-
-		let labels = recorded(&process, FdrConfig::default(), settings, DIVERGENCE_DETECT)?;
-		assert_eq!(labels, ["Turning.S2: <u, t>"], "the run takes `u` first");
-		Ok(())
-	}
-
-	#[test]
-	fn a_trace_that_asks_for_no_divergence_records_none() -> TestResult {
-		let process = diverging()?;
-		let settings = TbInstrumentationConfig { divergence_heuristics: false, ..every_flag() };
-
-		let labels = recorded(&process, FdrConfig::default(), settings, DIVERGENCE_DETECT)?;
-		assert!(labels.is_empty(), "the trace asked for no divergence, and recorded {labels:?}");
-		Ok(())
-	}
-
-	#[test]
-	fn a_cycle_longer_than_the_hidden_run_bound_records_its_divergence() -> TestResult {
-		let process = diverging()?;
-		let config = FdrConfig { max_internal_run: 1, ..Default::default() };
-		let settings = TbInstrumentationConfig { divergence_heuristics: true, ..Default::default() };
-
-		let labels = recorded(&process, config, settings, DIVERGENCE_DETECT)?;
-		let divergence = ["Diverging.S1: <t, u>"];
-		assert_eq!(labels, divergence, "the cycle of two hidden events needs no bound");
-		Ok(())
-	}
-
+	// An exploration event that the trace refuses fails the exploration with
+	// the error of the refusal, in a plain exploration and in a fault run.
 	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn a_fault_run_records_the_states_of_the_spec_it_explores() -> TestResult {
-		let subject = offering()?;
-		let specs = vec![sending()?];
-		let fault_model = Some(FaultModel::default());
-		let config = FdrConfig { specs, fault_model, ..Default::default() };
-		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
+	crate::tb_cases! {
+		fn an_exploration_event_the_trace_refuses_fails(config: FdrConfig) {
+			let refuse = || TightBeamError::ChannelClosed;
+			let model = FaultModel::default().with_event_fault(ENABLED_SET_SAMPLE, refuse, crate::bps!(10000));
+			let trace = TestTrace::with_config(enabled_sets()).with_fault_model(model);
+			let process = offering();
+			let mut explorer = DefaultFdrExplorer::with_defaults(&process, config);
 
-		let labels = recorded(&subject, config, settings, ENABLED_SET_SAMPLE)?;
-		assert_eq!(labels, ["Sending.Idle: {send}", "Sending.Sent: {}"]);
-		Ok(())
-	}
+			let explored = explorer.explore_into(&trace);
+			assert!(matches!(explored, Err(TightBeamError::ChannelClosed)));
+		}
 
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn a_fault_run_names_the_spec_of_each_state() -> TestResult {
-		let subject = offering()?;
-		let specs = vec![sending()?, receiving()?];
-		let fault_model = Some(FaultModel::default());
-		let config = FdrConfig { specs, fault_model, ..Default::default() };
-		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
-		let sending = ["Sending.Idle: {send}", "Sending.Sent: {}"];
-		let receiving = ["Receiving.Idle: {recv}", "Receiving.Sent: {}"];
-
-		let labels = recorded(&subject, config, settings, ENABLED_SET_SAMPLE)?;
-		let named = [sending, receiving].concat();
-		assert_eq!(labels, named, "the two specs share the names of their states");
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn an_exploration_event_the_trace_refuses_fails_the_exploration() -> TestResult {
-		let process = offering()?;
-		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
-		let refuse = || TightBeamError::ChannelClosed;
-		let model = FaultModel::default().with_event_fault(ENABLED_SET_SAMPLE, refuse, crate::bps!(10000));
-		let trace = trace_with(settings).with_fault_model(model);
-		let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
-
-		let explored = explorer.explore_into(&trace);
-		assert!(matches!(explored, Err(TightBeamError::ChannelClosed)));
-		Ok(())
-	}
-
-	#[cfg(feature = "testing-fault")]
-	#[test]
-	fn a_fault_run_returns_the_error_of_a_refused_event() -> TestResult {
-		let subject = offering()?;
-		let specs = vec![sending()?];
-		let fault_model = Some(FaultModel::default());
-		let config = FdrConfig { specs, fault_model, ..Default::default() };
-		let settings = TbInstrumentationConfig { sample_enabled_sets: true, ..Default::default() };
-		let refuse = || TightBeamError::ChannelClosed;
-		let model = FaultModel::default().with_event_fault(ENABLED_SET_SAMPLE, refuse, crate::bps!(10000));
-		let trace = trace_with(settings).with_fault_model(model);
-		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
-
-		let explored = explorer.explore_into(&trace);
-		assert!(matches!(explored, Err(TightBeamError::ChannelClosed)));
-		Ok(())
+		cases {
+			the_exploration => FdrConfig::default(),
+			a_fault_run => FdrConfig::under_faults([sending()]),
+		}
 	}
 }

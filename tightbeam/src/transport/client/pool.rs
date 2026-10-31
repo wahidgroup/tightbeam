@@ -1567,28 +1567,52 @@ where
 mod tests {
 	use super::*;
 
+	#[cfg(all(pooled_mux, feature = "transport-cms", feature = "testing"))]
+	use crate::transport::tcp::TightBeamSocketAddr;
+
+	/// The default pool config keeps an idle connection with no timeout.
 	#[test]
-	fn test_pool_config_default() {
+	fn the_default_pool_config_sets_no_idle_timeout() {
 		let config = PoolConfig::default();
 		assert!(config.idle_timeout.is_none());
 	}
 
+	/// The default pool caps each destination at the named constant.
 	#[test]
 	fn the_default_pool_cap_is_the_named_constant() {
 		let config = PoolConfig::default();
 		assert_eq!(config.max_connections, DEFAULT_MAX_POOL_CONNECTIONS);
 	}
 
-	#[test]
-	fn test_pool_config_with_timeout() {
-		let config = PoolConfig { idle_timeout: Some(Duration::from_secs(30)), ..PoolConfig::default() };
-		assert_eq!(config.idle_timeout, Some(Duration::from_secs(30)));
-	}
+	/// The address of a test server that negotiates a mux connection on each
+	/// dial, beside a store that trusts the server. The server holds each
+	/// connection open when `hold` is set, as a peer that never closes after
+	/// its GoAway, and hangs up on it otherwise.
+	#[cfg(all(pooled_mux, feature = "transport-cms", feature = "testing"))]
+	async fn mux_server(hold: bool) -> (TightBeamSocketAddr, Arc<dyn CertificateTrust>) {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::testing::TestCmsServer;
+		use crate::transport::multiplex::MuxAcceptor;
+		use crate::transport::{EncryptedProtocol, TokioListener, TransportEncryptionConfig};
 
-	#[test]
-	fn test_pool_config_with_max_connections() {
-		let config = PoolConfig { max_connections: NonZeroUsize::MIN, ..PoolConfig::default() };
-		assert_eq!(config.max_connections, NonZeroUsize::MIN);
+		let server = TestCmsServer::generate("Mux Server");
+		let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
+		let bind = <TokioListener as Protocol>::default_bind_address().expect("the loopback address parses");
+		let (listener, addr) = TokioListener::bind_with(bind, config).await.expect("the test server binds");
+		tokio::spawn(async move {
+			let mut held = Vec::new();
+			while let Ok((transport, _)) = listener.accept().await {
+				let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(4)));
+				// The connection ends or stays whatever the negotiation
+				// answered, which is what each case waits on.
+				let _negotiated = transport.negotiate_mux().await;
+				if hold {
+					held.push(transport);
+				}
+			}
+		});
+
+		(addr, Arc::new(server.store()))
 	}
 
 	/// A fault the trace injects where a connection leaves the pool reaches the
@@ -1602,19 +1626,13 @@ mod tests {
 	))]
 	mod eviction_faults {
 		use super::*;
-		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::testing::{FaultModel, TestCmsServer, TestFrame};
-		use crate::transport::multiplex::MuxAcceptor;
-		use crate::transport::tcp::TightBeamSocketAddr;
-		use crate::transport::{EncryptedProtocol, TokioListener, TransportEncryptionConfig};
+		use crate::testing::fixtures::TestTrace;
+		use crate::testing::{TestFrame, TestResult};
+		use crate::transport::TokioListener;
 		use tokio::net::TcpListener;
 
-		/// The number of reads that a wait on the pool state takes, one every
-		/// [`SETTLE_INTERVAL`] for 2 s.
-		const SETTLE_ATTEMPTS: u32 = 400;
-
-		/// The interval between the reads of a wait on the pool state.
-		const SETTLE_INTERVAL: Duration = Duration::from_millis(5);
+		/// The span of paused time a wait on the pool state lets pass.
+		const SETTLE: Duration = Duration::from_secs(2);
 
 		/// The fault the trace injects at each eviction, an error distinct from
 		/// every answer of the eviction paths.
@@ -1624,8 +1642,7 @@ mod tests {
 
 		/// A collector whose trace injects [`injected`] at every eviction.
 		fn faulting_trace() -> TraceCollector {
-			let model = FaultModel::default().with_event_fault(events::POOL_EVICTED, injected, crate::bps!(10000));
-			TraceCollector::new().with_fault_model(model)
+			TestTrace::faulting(events::POOL_EVICTED, injected, crate::bps!(10000))
 		}
 
 		/// A pool of one connection from `builder`, which multiplexes under
@@ -1655,20 +1672,7 @@ mod tests {
 		/// A multiplexed pool of one connection, beside the address of a test
 		/// server that hangs up on each dial once its mux negotiation ends.
 		async fn mux_pool(trace: &TraceCollector) -> (Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr) {
-			let server = TestCmsServer::generate("Pool Server");
-			let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
-			let bind = TightBeamSocketAddr("127.0.0.1:0".parse().expect("a loopback address parses"));
-			let (listener, addr) = TokioListener::bind_with(bind, config).await.expect("the test server binds");
-			tokio::spawn(async move {
-				while let Ok((transport, _)) = listener.accept().await {
-					let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(4)));
-					// The connection ends here whatever the negotiation
-					// answered, which is the hang-up the cases wait for.
-					let _ = transport.negotiate_mux().await;
-				}
-			});
-
-			let store: Arc<dyn CertificateTrust> = Arc::new(server.store());
+			let (addr, store) = mux_server(false).await;
 			let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
 			(pool_of_one(builder, Some(TransportOffer::mux(4)), trace), addr)
 		}
@@ -1678,17 +1682,13 @@ mod tests {
 			TightBeamSocketAddr(listener.local_addr().expect("a bound listener has an address"))
 		}
 
-		/// Polls `settled` every [`SETTLE_INTERVAL`] for up to
-		/// [`SETTLE_ATTEMPTS`] reads, and asserts that it held. The socket work
-		/// it waits on runs on other tasks.
-		async fn await_settled(mut settled: impl FnMut() -> bool) {
-			let mut attempts = 0;
-			while !settled() && attempts < SETTLE_ATTEMPTS {
-				tokio::time::sleep(SETTLE_INTERVAL).await;
-				attempts += 1;
-			}
-
-			assert!(settled(), "the pool state settles");
+		/// Lets every task run until each one waits, and asserts that
+		/// `settled` then holds. The clock of the test is paused, so the sleep
+		/// ends only once no task can run and no socket event waits, and it
+		/// spends no wall time.
+		async fn await_settled(settled: impl FnOnce() -> bool) {
+			tokio::time::sleep(SETTLE).await;
+			assert!(settled());
 		}
 
 		/// Whether the pool holds idle connections to `addr` and each one has
@@ -1735,8 +1735,8 @@ mod tests {
 		/// An idle exclusive connection whose peer reset it leaves the pool
 		/// when a connect finds it, before the fault at its eviction reaches
 		/// that connect.
-		#[tokio::test]
-		async fn a_fault_at_evicting_a_dead_idle_lease_reaches_the_connect() -> TransportResult<()> {
+		#[tokio::test(start_paused = true)]
+		async fn a_fault_at_evicting_a_dead_idle_lease_reaches_the_connect() -> TestResult {
 			let trace = faulting_trace();
 			let (pool, listener) = exclusive_pool(&trace).await;
 			let addr = address_of(&listener);
@@ -1755,8 +1755,8 @@ mod tests {
 
 		/// A mux connection whose reader ended leaves the pool when a connect
 		/// finds it, before the fault at its eviction reaches that connect.
-		#[tokio::test]
-		async fn a_fault_at_evicting_an_ended_mux_connection_reaches_the_connect() -> TransportResult<()> {
+		#[tokio::test(start_paused = true)]
+		async fn a_fault_at_evicting_an_ended_mux_connection_reaches_the_connect() -> TestResult {
 			let trace = faulting_trace();
 			let (pool, addr) = mux_pool(&trace).await;
 			drop(pool.connect(addr).await?);
@@ -1770,8 +1770,8 @@ mod tests {
 
 		/// An emit that meets a closed mux connection evicts it, and the fault
 		/// at the eviction reaches the emit after the connection left the pool.
-		#[tokio::test]
-		async fn a_fault_at_evicting_after_a_closed_emit_reaches_the_emit() -> TransportResult<()> {
+		#[tokio::test(start_paused = true)]
+		async fn a_fault_at_evicting_after_a_closed_emit_reaches_the_emit() -> TestResult {
 			let trace = faulting_trace();
 			let (pool, addr) = mux_pool(&trace).await;
 			let mut lease = pool.connect(addr).await?;
@@ -1786,7 +1786,7 @@ mod tests {
 		/// A discarded mux lease evicts its connection, and the fault at the
 		/// eviction reaches the discard after the connection left the pool.
 		#[tokio::test]
-		async fn a_fault_at_discarding_a_mux_lease_reaches_the_discard() -> TransportResult<()> {
+		async fn a_fault_at_discarding_a_mux_lease_reaches_the_discard() -> TestResult {
 			let trace = faulting_trace();
 			let (pool, addr) = mux_pool(&trace).await;
 			let lease = pool.connect(addr).await?;
@@ -1800,7 +1800,7 @@ mod tests {
 		/// A discarded exclusive lease closes its connection, and the fault at
 		/// the eviction reaches the discard after the connection left the pool.
 		#[tokio::test]
-		async fn a_fault_at_discarding_an_exclusive_lease_reaches_the_discard() -> TransportResult<()> {
+		async fn a_fault_at_discarding_an_exclusive_lease_reaches_the_discard() -> TestResult {
 			let trace = faulting_trace();
 			let (pool, listener) = exclusive_pool(&trace).await;
 			let addr = address_of(&listener);
@@ -1820,11 +1820,8 @@ mod tests {
 	mod draining {
 		use super::*;
 		use crate::clock::ManualClock;
-		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::testing::TestCmsServer;
-		use crate::transport::multiplex::MuxAcceptor;
-		use crate::transport::tcp::TightBeamSocketAddr;
-		use crate::transport::{EncryptedProtocol, TokioListener, TransportEncryptionConfig};
+		use crate::testing::TestResult;
+		use crate::transport::TokioListener;
 
 		/// The idle timeout of the pool, which the test clock passes at once.
 		const IDLE: Duration = Duration::from_secs(1);
@@ -1833,22 +1830,7 @@ mod tests {
 		/// connections leave at [`IDLE`], beside the address of a test server
 		/// that holds each connection open once its mux negotiation ends.
 		async fn holding_pool(clock: &Arc<ManualClock>) -> (Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr) {
-			let server = TestCmsServer::generate("Holding Server");
-			let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(server.signing_identity());
-			let bind = TightBeamSocketAddr("127.0.0.1:0".parse().expect("a loopback address parses"));
-			let (listener, addr) = TokioListener::bind_with(bind, config).await.expect("the test server binds");
-			tokio::spawn(async move {
-				let mut held = Vec::new();
-				while let Ok((transport, _)) = listener.accept().await {
-					let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(4)));
-					// The connection stays open whatever the negotiation
-					// answered, as a peer that never closes after its GoAway.
-					let _negotiated = transport.negotiate_mux().await;
-					held.push(transport);
-				}
-			});
-
-			let store: Arc<dyn CertificateTrust> = Arc::new(server.store());
+			let (addr, store) = mux_server(true).await;
 			let offer = Some(Arc::new(TransportOffer::mux(4)));
 			let config = PoolConfig { idle_timeout: Some(IDLE), max_connections: NonZeroUsize::MIN, mux_offer: offer };
 			let builder = ConnectionPool::<TokioListener>::builder().with_trust_store(store);
@@ -1861,14 +1843,9 @@ mod tests {
 
 		/// Leases a connection to `addr` and idles it past [`IDLE`], so the
 		/// next lease prunes it onto the shelf.
-		async fn idle_one(
-			pool: &Arc<ConnectionPool<TokioListener>>,
-			addr: TightBeamSocketAddr,
-			clock: &ManualClock,
-		) -> TransportResult<()> {
-			drop(pool.connect(addr).await?);
+		async fn idle_one(pool: &Arc<ConnectionPool<TokioListener>>, addr: TightBeamSocketAddr, clock: &ManualClock) {
+			drop(pool.connect(addr).await.expect("the holding server takes the dial"));
 			clock.advance(IDLE);
-			Ok(())
 		}
 
 		/// The drivers the draining shelf of `addr` holds.
@@ -1877,13 +1854,15 @@ mod tests {
 			pools.get(addr).map_or(0, |dest_pool| dest_pool.draining.drivers.len())
 		}
 
+		/// The draining shelf keeps at most the connection cap of drivers,
+		/// however many idle connections the pool prunes onto it.
 		#[tokio::test]
-		async fn the_draining_shelf_holds_no_more_than_the_connection_cap() -> TransportResult<()> {
+		async fn the_draining_shelf_holds_no_more_than_the_connection_cap() -> TestResult {
 			let clock = Arc::new(ManualClock::default());
 			let (pool, addr) = holding_pool(&clock).await;
-			idle_one(&pool, addr, &clock).await?;
-			idle_one(&pool, addr, &clock).await?;
-			idle_one(&pool, addr, &clock).await?;
+			idle_one(&pool, addr, &clock).await;
+			idle_one(&pool, addr, &clock).await;
+			idle_one(&pool, addr, &clock).await;
 
 			let _live = pool.connect(addr).await?;
 			assert_eq!(shelved(&pool, &addr), 1);

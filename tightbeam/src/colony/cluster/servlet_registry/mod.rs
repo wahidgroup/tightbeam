@@ -619,12 +619,13 @@ impl ServletRegistry {
 	/// Poisons the route lock, as a thread that panicked under the guard
 	/// leaves it.
 	pub(crate) fn poison_routes(&self) {
-		let poisoner = || {
-			let _held = self.routes.write();
-			panic!("a thread panicked under the route lock");
-		};
+		crate::testing::fixtures::poison_write(&self.routes);
+	}
 
-		// The panic is the point, so the joined result carries nothing to read.
-		let _panicked = std::thread::scope(|scope| scope.spawn(poisoner).join());
+	/// A registry on the default pheromone settings and a manual clock, which
+	/// holds no route.
+	pub(crate) fn fixture() -> Self {
+		let clock = crate::testing::fixtures::TestClock::manual();
+		ServletRegistry::new(PheromoneConfig::default(), clock)
 	}
 }

@@ -475,13 +475,15 @@ impl ConsumedTrace {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::fdr::{Decision, DefaultFdrExplorer, FdrConfig};
-	use crate::trace::TraceCollector;
+	use crate::testing::fdr::{Decision, FdrConfig};
 	use crate::urn::Urn;
-	use crate::TightBeamError;
 
 	#[cfg(feature = "instrument")]
 	use crate::instrumentation::events::GATE_ACCEPT;
+	#[cfg(feature = "instrument")]
+	use crate::trace::TraceCollector;
+	#[cfg(feature = "instrument")]
+	use crate::TightBeamError;
 
 	/// An assertion that a run records first.
 	const FIRST: Urn<'static> = crate::urn!("test", "event:extensions/first");
@@ -490,13 +492,17 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	const AFTER: Urn<'static> = crate::urn!("test", "event:extensions/after");
 
-	/// The trace that `collector` recorded, with `gate` as its gate decision.
-	fn consumed(collector: &TraceCollector, gate: Option<TransitStatus>) -> ConsumedTrace {
-		let mut trace = ConsumedTrace::new();
-		trace.populate_from_collector(collector);
-		trace.gate_decision = gate;
+	/// The trace of a run that records each of `urns` and whose gate decided
+	/// `gate`.
+	fn decided(urns: &[Urn<'static>], gate: TransitStatus) -> ConsumedTrace {
+		let mut trace = ConsumedTrace::recording(urns);
+		trace.gate_decision = Some(gate);
 		trace
 	}
+
+	/// A run that writes its records into a collector.
+	#[cfg(feature = "instrument")]
+	type Record = fn(&TraceCollector) -> Result<(), TightBeamError>;
 
 	/// The events along the one chain of `process`, from its initial state.
 	#[cfg(feature = "instrument")]
@@ -515,118 +521,105 @@ mod tests {
 		chain
 	}
 
-	#[test]
-	fn a_run_whose_gate_accepted_with_no_assertion_and_no_response_is_invalid() {
-		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::Ok));
-		assert!(!trace.csp_valid(), "an accepted run shows neither an assertion nor a response");
-	}
-
-	#[test]
-	fn a_run_whose_gate_accepted_with_an_assertion_is_valid() -> Result<(), TightBeamError> {
+	/// The chain of the process that a trace converts to with its observable
+	/// instrumentation, after `record` writes the run into its collector.
+	#[cfg(feature = "instrument")]
+	fn instrumented_chain(record: Record) -> Vec<&'static str> {
 		let collector = TraceCollector::new();
-		collector.event(FIRST)?.emit();
+		record(&collector).expect("the run records each event");
 
-		let trace = consumed(&collector, Some(TransitStatus::Ok));
-		assert!(trace.csp_valid(), "the accepted run recorded an assertion");
-		Ok(())
+		let trace = ConsumedTrace::drained_from(&collector);
+		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
+		chain_of(&process)
 	}
 
-	#[test]
-	fn a_gate_that_reached_no_decision_ends_in_an_invalid_state() {
-		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::Unknown));
-		assert!(!trace.terminated_in_valid_state(), "an undecided gate did not terminate");
+	// A run whose gate accepted is valid when it recorded an assertion, and
+	// invalid when it shows neither an assertion nor a response.
+	crate::tb_cases! {
+		fn a_run_whose_gate_accepted((recorded, valid): (&[Urn<'static>], bool)) {
+			let trace = decided(recorded, TransitStatus::Ok);
+			assert_eq!(trace.csp_valid(), valid);
+		}
+
+		cases {
+			with_no_assertion_and_no_response_is_invalid => (&[], false),
+			with_an_assertion_is_valid => (&[FIRST], true),
+		}
 	}
 
-	#[test]
-	fn a_rejected_run_ends_in_a_valid_state() {
-		let trace = consumed(&TraceCollector::new(), Some(TransitStatus::PermissionDenied));
-		assert!(trace.terminated_in_valid_state(), "a rejection is terminal");
+	// A run whose gate rejected it ends in a valid state, because a rejection
+	// is terminal. A gate that reached no decision did not terminate.
+	crate::tb_cases! {
+		fn a_run_whose_gate((gate, valid): (TransitStatus, bool)) {
+			let trace = decided(&[], gate);
+			assert_eq!(trace.terminated_in_valid_state(), valid);
+		}
+
+		cases {
+			reached_no_decision_ends_in_an_invalid_state => (TransitStatus::Unknown, false),
+			rejected_it_ends_in_a_valid_state => (TransitStatus::PermissionDenied, true),
+		}
 	}
 
+	/// A trace with no event converts to a process that ends where it starts,
+	/// which holds deadlock freedom.
 	#[test]
-	fn a_trace_with_no_event_converts_to_a_process_free_of_deadlock() -> Result<(), TightBeamError> {
+	fn a_trace_with_no_event_converts_to_a_process_free_of_deadlock() {
 		let process = ConsumedTrace::new().to_process();
-		let mut explorer = DefaultFdrExplorer::with_defaults(&process, FdrConfig::default());
-
-		let verdict = explorer.explore()?;
-		assert_eq!(verdict.deadlock_free, Decision::Holds, "the run ended where it started");
-		Ok(())
+		let verdict = process.verdict_under(FdrConfig::default());
+		assert_eq!(verdict.deadlock_free, Decision::Holds);
 	}
 
+	// The process of a trace with its observable instrumentation holds each
+	// assertion once, in the order of the run, under the URN of its assertion,
+	// and an instrumentation event in its place by its label. A record that the
+	// event API did not write stays out of it.
 	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_valueless_assertion_enters_the_chain_once() -> Result<(), TightBeamError> {
-		let collector = TraceCollector::new();
-		collector.event(FIRST)?.emit();
-		let trace = consumed(&collector, None);
+	crate::tb_cases! {
+		fn the_instrumented_chain((record, chain): (Record, &[&str])) {
+			let converted = instrumented_chain(record);
+			assert_eq!(converted, chain);
+		}
 
-		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
-		let first = FIRST.to_string();
-		assert_eq!(chain_of(&process), [first.as_str()]);
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn an_instrumentation_event_keeps_its_place_among_the_assertions() -> Result<(), TightBeamError> {
-		let collector = TraceCollector::new();
-		collector.emit_event_with_evidence(GATE_ACCEPT, "Ok", None)?;
-		collector.event(AFTER)?.emit();
-
-		let trace = consumed(&collector, None);
-
-		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
-		let after = AFTER.to_string();
-		assert_eq!(chain_of(&process), ["Ok", after.as_str()]);
-		Ok(())
-	}
-
-	/// A dual-written event outside the observable kinds enters the chain once,
-	/// under the URN that its assertion names.
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_dual_written_event_enters_the_chain_under_its_urn() -> Result<(), TightBeamError> {
-		let collector = TraceCollector::new();
-		collector.emit_event_with_evidence(FIRST, "why", None)?;
-
-		let trace = consumed(&collector, None);
-
-		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
-		let first = FIRST.to_string();
-		assert_eq!(chain_of(&process), [first.as_str()]);
-		Ok(())
-	}
-
-	/// A record of another kind that the event API did not write stays out of
-	/// the chain, though the event API wrote a record of the same URN.
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn a_plain_record_of_a_written_event_stays_out_of_the_chain() -> Result<(), TightBeamError> {
-		let collector = TraceCollector::new();
-		collector.emit_event(FIRST)?;
-		collector.emit(FIRST, "plain");
-
-		let trace = consumed(&collector, None);
-
-		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
-		let first = FIRST.to_string();
-		assert_eq!(chain_of(&process), [first.as_str()]);
-		Ok(())
-	}
-
-	/// An observable record that the event API wrote with no label enters the
-	/// chain under its URN.
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn an_unlabelled_written_record_enters_the_chain_under_its_urn() -> Result<(), TightBeamError> {
-		let collector = TraceCollector::new();
-		collector.emit_event(GATE_ACCEPT)?;
-
-		let trace = consumed(&collector, None);
-
-		let process = trace.to_process_with_mode(TraceProcessMode::WithObservableInstrumentation);
-		let accept = GATE_ACCEPT.to_string();
-		assert_eq!(chain_of(&process), [accept.as_str()]);
-		Ok(())
+		cases {
+			holds_a_valueless_assertion_once => (
+				|collector| {
+					collector.event(FIRST)?.emit();
+					Ok(())
+				},
+				&["urn:test:event:extensions/first"],
+			),
+			keeps_the_place_of_an_instrumentation_event => (
+				|collector| {
+					collector.emit_event_with_evidence(GATE_ACCEPT, "Ok", None)?;
+					collector.event(AFTER)?.emit();
+					Ok(())
+				},
+				&["Ok", "urn:test:event:extensions/after"],
+			),
+			/// A dual-written event outside the observable kinds enters the
+			/// chain once, under the URN that its assertion names.
+			names_a_dual_written_event_by_its_urn => (
+				|collector| collector.emit_event_with_evidence(FIRST, "why", None),
+				&["urn:test:event:extensions/first"],
+			),
+			/// A record of another kind that the event API did not write stays
+			/// out of the chain, though the event API wrote a record of the
+			/// same URN.
+			leaves_out_a_plain_record_of_a_written_event => (
+				|collector| {
+					collector.emit_event(FIRST)?;
+					collector.emit(FIRST, "plain");
+					Ok(())
+				},
+				&["urn:test:event:extensions/first"],
+			),
+			/// An observable record that the event API wrote with no label
+			/// enters the chain under its URN.
+			names_an_unlabelled_written_record_by_its_urn => (
+				|collector| collector.emit_event(GATE_ACCEPT),
+				&["urn:tightbeam:event:gate/accept"],
+			),
+		}
 	}
 }

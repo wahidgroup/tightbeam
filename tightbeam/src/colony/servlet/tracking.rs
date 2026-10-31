@@ -378,6 +378,7 @@ impl<G: UtilizationGauge + ?Sized> UtilizationGauge for SharedGauge<G> {
 mod tests {
 	use super::*;
 
+	/// A queue slot releases its count when it drops.
 	#[test]
 	fn a_queue_slot_releases_its_count_when_it_drops() {
 		let metrics = Arc::new(ServletMetrics::new());
@@ -391,16 +392,17 @@ mod tests {
 		assert_eq!(metrics.queue_depth(), 0);
 	}
 
+	/// A handler that takes a queue slot and returns before it does any work.
+	fn refuse(metrics: &Arc<ServletMetrics>) {
+		let _slot = metrics.enqueue();
+	}
+
+	/// A handler that returns before it does any work releases the slot it
+	/// took.
 	#[test]
 	fn a_handler_that_returns_early_still_releases_its_slot() {
 		let metrics = Arc::new(ServletMetrics::new());
-
-		fn refuse(metrics: &Arc<ServletMetrics>) -> Option<u32> {
-			let _slot = metrics.enqueue();
-			None
-		}
-
-		assert_eq!(refuse(&metrics), None);
+		refuse(&metrics);
 		assert_eq!(metrics.queue_depth(), 0);
 	}
 }

@@ -375,7 +375,6 @@ impl ConnectionTerms {
 		let transport = transport.with_mux_offer(self.mux_offer.clone());
 		#[cfg(feature = "instrument")]
 		let transport = transport.with_trace(self.trace.current().share());
-
 		transport
 	}
 }
@@ -392,15 +391,13 @@ mod tests {
 	use crate::clock::ManualClock;
 
 	#[cfg(all(pooled_mux, feature = "tcp"))]
-	use crate::crypto::profiles::DefaultCryptoProvider;
-	#[cfg(all(pooled_mux, feature = "tcp"))]
 	use crate::transport::handshake::negotiation::MuxSettings;
 	#[cfg(all(pooled_mux, feature = "tcp"))]
 	use crate::transport::multiplex::{MuxAcceptor, MuxRole, MuxService, MuxTransport};
 	#[cfg(all(pooled_mux, feature = "tcp"))]
-	use crate::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
+	use crate::transport::tcp::r#async::{TcpTransport, TokioStream};
 	#[cfg(all(pooled_mux, feature = "tcp"))]
-	use crate::transport::{EndpointConfig, TransportResult};
+	use crate::transport::{EndpointConfig, TransportError};
 
 	/// How long the peer of an ended connection has to read its close.
 	#[cfg(all(pooled_mux, feature = "tcp"))]
@@ -431,6 +428,7 @@ mod tests {
 		assert!(wait.as_mut().poll(&mut context).is_ready());
 	}
 
+	/// A plane with every slot held admits no further connection.
 	#[tokio::test(start_paused = true)]
 	async fn a_full_plane_admits_no_further_connection() {
 		let mut plane = plane();
@@ -439,6 +437,7 @@ mod tests {
 		assert!(blocked.is_err());
 	}
 
+	/// A connection that finished returns its slot to the plane.
 	#[tokio::test(start_paused = true)]
 	async fn a_finished_connection_returns_its_slot() {
 		let mut plane = plane();
@@ -446,17 +445,20 @@ mod tests {
 		tokio::task::yield_now().await;
 
 		let reserved = tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await;
-		assert!(reserved.is_ok());
+		assert!(matches!(reserved, Ok(Some(_))));
 	}
 
+	/// The drop of a plane aborts the connections it serves, so a handler that
+	/// waits past the drop never finishes. The plane spawns through its own
+	/// `serve`, so the case paces the paused clock inline.
 	#[tokio::test(start_paused = true)]
 	async fn dropping_the_plane_aborts_its_connections() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
+		let finished = Arc::new(AtomicBool::new(false));
+		let flag = Arc::clone(&finished);
 		let mut plane = plane();
-		serve_on_free_slot(&mut plane, async {
+		serve_on_free_slot(&mut plane, async move {
 			tokio::time::sleep(Duration::from_secs(30)).await;
-			FINISHED.store(true, Ordering::SeqCst);
+			flag.store(true, Ordering::SeqCst);
 		})
 		.await;
 
@@ -464,11 +466,14 @@ mod tests {
 		drop(plane);
 		tokio::time::advance(Duration::from_secs(60)).await;
 		tokio::task::yield_now().await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
+		assert!(!finished.load(Ordering::SeqCst));
 	}
 
 	/// A service that refuses every kind of stream through the defaults of its
 	/// trait.
+	///
+	/// The case serves no request, so the trait defaults stand in for a
+	/// service.
 	#[cfg(all(pooled_mux, feature = "tcp"))]
 	struct Refusing;
 
@@ -479,14 +484,9 @@ mod tests {
 	/// connection.
 	#[cfg(all(pooled_mux, feature = "tcp"))]
 	async fn cleartext_pair() -> (TcpTransport<TokioStream>, TcpTransport<TokioStream>) {
-		let bound = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await;
-		let listener = bound.expect("a loopback port binds");
-		let addr = listener.local_addr().expect("a bound listener has an address");
-		let connected = tokio::net::TcpStream::connect(addr).await;
-		let stream = connected.expect("the client reaches the listener");
-		let (server, _) = listener.accept().await.expect("the listener accepts the client");
-
-		let client = TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext());
+		let (accepted, dialing) = crate::testing::fixtures::TestLoopback::tokio_pair().await;
+		let server = TcpTransport::new(TokioStream::from(accepted), EndpointConfig::cleartext());
+		let client = TcpTransport::new(TokioStream::from(dialing), EndpointConfig::cleartext());
 		(client, server)
 	}
 
@@ -495,7 +495,7 @@ mod tests {
 	/// reads the close (CWE-772).
 	#[cfg(all(pooled_mux, feature = "tcp"))]
 	#[tokio::test]
-	async fn dropping_the_plane_ends_a_multiplexed_connection() -> TransportResult<()> {
+	async fn dropping_the_plane_ends_a_multiplexed_connection() -> crate::testing::TestResult {
 		let (client, server) = cleartext_pair().await;
 		let settings = MuxSettings::symmetric(4);
 
@@ -515,7 +515,7 @@ mod tests {
 		drop(plane);
 
 		let closed = tokio::time::timeout(CLOSE_GUARD, client_reader.drive()).await;
-		assert!(closed.is_ok());
+		assert!(matches!(closed, Ok(Err(TransportError::ConnectionClosed))));
 		Ok(())
 	}
 }

@@ -492,31 +492,14 @@ impl ServletRegistry {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::cluster::peer::WireHopBudget;
-	use crate::colony::cluster::{
-		AdmittedDial, PeerRoute, RelayRoute, ServletEntry, SharedId, DEFAULT_ABANDONMENT_LIMIT,
-		DEFAULT_INITIAL_PHEROMONE,
-	};
-	use crate::colony::cluster::{InstanceMetrics, LoadBalancer};
+	use crate::colony::cluster::{InstanceMetrics, LoadBalancer, RoundRobin, SharedId};
 	use crate::colony::protocol::ServletInfo;
 	use crate::colony::urn::ColonyNamespace;
-	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
-
-	use crate::clock::ManualClock;
-	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PheromoneConfig};
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::testing::{TestCertificate, TestKey};
-
-	/// A registry on a clock only the test moves.
-	fn registry() -> ServletRegistry {
-		ServletRegistry::new(PheromoneConfig::default(), Arc::new(ManualClock::default()))
-	}
+	use crate::tb_cases;
+	use crate::testing::TestResult;
 
 	fn ping_type() -> Urn<'static> {
-		ColonyNamespace::default()
-			.servlet("ping")
-			.expect("test names satisfy the mint grammar")
+		ColonyNamespace::servlet_fixture("ping")
 	}
 
 	/// The route key for the fixture servlet type, created as production
@@ -527,34 +510,21 @@ mod tests {
 			.expect("the fixture type is bare in the default namespace")
 	}
 
-	fn peer_entry(peer: impl AsRef<[u8]>, dial: impl AsRef<str>) -> ServletEntry {
-		let peer = peer.as_ref();
-		let servlet_type = ping_type().canonical_bytes();
-		ServletEntry::peer(
-			PeerRoute {
-				peer_id: Arc::from(peer),
-				servlet_type: Arc::from(servlet_type.as_slice()),
-				dial: AdmittedDial::fixture(dial),
-			},
-			DEFAULT_INITIAL_PHEROMONE,
-			DEFAULT_ABANDONMENT_LIMIT,
-		)
+	/// The route of `ping` through the peer gateway `peer` at the fixture
+	/// socket `dial`.
+	fn peer_entry(peer: &[u8], dial: &str) -> ServletEntry {
+		ServletEntry::peer_fixture(ping_type().canonical_bytes(), peer, dial)
 	}
 
-	fn relay_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>, dial: impl AsRef<str>) -> ServletEntry {
-		let origin = origin.as_ref();
-		let relay = relay.as_ref();
-		let servlet_type = ping_type().canonical_bytes();
-		ServletEntry::peer_relay(
-			RelayRoute {
-				origin_id: Arc::from(origin),
-				relay_id: Arc::from(relay),
-				servlet_type: Arc::from(servlet_type.as_slice()),
-				dial: AdmittedDial::fixture(dial),
-			},
-			DEFAULT_INITIAL_PHEROMONE,
-			DEFAULT_ABANDONMENT_LIMIT,
-		)
+	/// The route of `ping` through the peer gateway `first`.
+	fn first_peer() -> ServletEntry {
+		peer_entry(b"first", "192.0.2.1:9001")
+	}
+
+	/// The route of `ping` from the gateway `origin` through the relay
+	/// `relay`, at the fixture socket `192.0.2.3:9001`.
+	fn relay_entry() -> ServletEntry {
+		ServletEntry::relay_fixture(b"origin", b"relay", ping_type().canonical_bytes(), "192.0.2.3:9001")
 	}
 
 	/// The reply frame of a gateway that answers with `response`.
@@ -570,18 +540,18 @@ mod tests {
 
 	/// The plane of a direct peer route.
 	fn peer_plane() -> RoutePlane {
-		peer_entry(b"first", "192.0.2.1:9001").plane()
+		first_peer().plane()
 	}
 
 	/// The plane of a relay trail, which names its relay.
 	fn relay_plane() -> RoutePlane {
-		relay_entry(b"origin", b"relay", "192.0.2.3:9001").plane()
+		relay_entry().plane()
 	}
 
 	/// A local servlet's reply returns encoded whole, so the client verifies
 	/// the servlet's envelope.
 	#[test]
-	fn forward_outcome_local_reply_never_fails_over() -> Result<(), ClusterError> {
+	fn forward_outcome_local_reply_never_fails_over() -> TestResult {
 		let reply = Frame::v0(b"pong", b"pong".to_vec());
 		let encoded = encode(&reply)?;
 
@@ -591,83 +561,42 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn forward_outcome_peer_unavailable_reply_fails_over() -> Result<(), ClusterError> {
-		let reply = work_reply(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(peer_plane().classify(reply)?.proves_undelivered());
-		Ok(())
+	// A reply of a peer or a relay proves the frame undelivered when it
+	// answers `Unavailable`, and it settles when it answers `Ok` or relays a
+	// refusal of the far end unchanged.
+	tb_cases! {
+		fn a_forwarded_reply_proves_undelivered_by_plane_and_status(
+			(plane, status, undelivered): (RoutePlane, TransitStatus, bool)
+		) -> TestResult {
+			let reply = work_reply(&ClusterWorkResponse { status, payload: None });
+
+			let outcome = plane.classify(reply)?;
+			assert_eq!(outcome.proves_undelivered(), undelivered);
+			Ok(())
+		}
+		cases {
+			peer_unavailable => (peer_plane(), TransitStatus::Unavailable, true),
+			relay_unavailable => (relay_plane(), TransitStatus::Unavailable, true),
+			peer_ok => (peer_plane(), TransitStatus::Ok, false),
+			peer_refusal => (peer_plane(), TransitStatus::PermissionDenied, false),
+		}
 	}
 
+	/// A garbled reply follows a frame the peer read, so it proves nothing, and
+	/// the frame stays with its first route.
 	#[test]
-	fn forward_outcome_relay_unavailable_reply_fails_over() -> Result<(), ClusterError> {
-		let reply = work_reply(&ClusterWorkResponse::err(TransitStatus::Unavailable));
-		assert!(relay_plane().classify(reply)?.proves_undelivered());
-		Ok(())
-	}
-
-	#[test]
-	fn forward_outcome_peer_ok_reply_settles() -> Result<(), ClusterError> {
-		let reply = work_reply(&ClusterWorkResponse::ok(b"pong".to_vec()));
-		assert!(!peer_plane().classify(reply)?.proves_undelivered());
-		Ok(())
-	}
-
-	#[test]
-	fn forward_outcome_peer_refusal_relays_unchanged() -> Result<(), ClusterError> {
-		let reply = work_reply(&ClusterWorkResponse::err(TransitStatus::PermissionDenied));
-		assert!(!peer_plane().classify(reply)?.proves_undelivered());
-		Ok(())
-	}
-
-	// A garbled reply follows a frame the peer read, so it proves nothing, and
-	// the frame stays with its first route.
-	#[test]
-	fn forward_outcome_garbled_peer_reply_never_fails_over() -> Result<(), ClusterError> {
+	fn forward_outcome_garbled_peer_reply_never_fails_over() -> TestResult {
 		let reply = Frame::v0(b"work-forward", b"not-a-response".to_vec());
-
 		let outcome = peer_plane().classify(reply)?;
 		assert!(matches!(outcome, ForwardOutcome::PeerGarbled));
 		assert!(!outcome.proves_undelivered());
 		Ok(())
 	}
 
-	fn test_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		ClusterConfig::new(
-			ClusterTlsConfig::new(
-				CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
-				Arc::new(Secp256k1KeyProvider::from(key)),
-			)
-			.expect("the test certificate must decode"),
-		)
-	}
-
-	#[test]
-	fn relayed_work_stamps_a_decremented_budget() {
-		let work = HopBudget::for_test(2).relayed_work(ping_type(), vec![1]);
-		assert_eq!(work.hops_remaining, 1);
-	}
-
-	#[test]
-	fn relayed_work_saturates_a_spent_budget_at_zero() {
-		let work = HopBudget::for_test(0).relayed_work(ping_type(), vec![1]);
-		assert_eq!(work.hops_remaining, 0);
-	}
-
-	// It pins the on-wire budget, so a skipped decrement in
-	// `HopBudget::relayed_work` fails here even when an integration clamp
-	// masks it.
-	#[test]
-	fn relayed_envelope_carries_the_decremented_budget_on_the_wire() -> Result<(), TightBeamError> {
-		let relayed = HopBudget::for_test(2).relayed_work(ping_type(), vec![7]);
-		let envelope = encode(&ClusterRequest::Work(relayed))?;
-
-		let decoded = decode::<ClusterRequest>(&envelope)?;
-		assert!(matches!(decoded, ClusterRequest::Work(work) if work.hops_remaining == 1));
-		Ok(())
-	}
-
-	/// A balancer double that answers with an out-of-range index.
+	/// A balancer that answers with an index past the pool.
+	///
+	/// Each house balancer picks inside the pool, so an implementor's own
+	/// balancer is the one source of an index past it.
 	struct RogueBalancer;
 
 	impl LoadBalancer for RogueBalancer {
@@ -676,98 +605,49 @@ mod tests {
 		}
 	}
 
-	/// A balancer double that always picks the first candidate.
-	struct FirstBalancer;
-
-	impl LoadBalancer for FirstBalancer {
-		fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
-			candidates.first().map(|_| 0)
-		}
-	}
-
+	/// A config whose draws go through `balancer`.
 	fn config_balancing_with(balancer: Arc<dyn LoadBalancer>) -> ClusterConfig {
-		let mut config = test_config();
+		let mut config = ClusterConfig::fixture();
 		config.load_balancer = balancer;
 		config
 	}
 
-	#[test]
-	fn a_draw_refuses_an_out_of_range_index() {
-		let entries = vec![Arc::new(peer_entry(b"first", "192.0.2.1:9001"))];
-		let config = config_balancing_with(Arc::new(RogueBalancer));
-		assert!(config.pick_instance(&entries).is_none());
+	// A draw refuses an index past the pool, and returns the entry the
+	// balancer selects. A fresh round robin selects the first entry.
+	tb_cases! {
+		fn a_draw_returns_what_the_balancer_selects((balancer, dialed): (Arc<dyn LoadBalancer>, Option<&[u8]>)) {
+			let entries = vec![Arc::new(first_peer())];
+			let picked = config_balancing_with(balancer).pick_instance(&entries);
+			assert_eq!(picked.map(|entry| entry.dial_target().as_bytes()), dialed);
+		}
+		cases {
+			out_of_range_refused => (Arc::new(RogueBalancer), None),
+			first_selected => (Arc::new(RoundRobin::default()), Some(b"192.0.2.1:9001".as_slice())),
+		}
 	}
 
-	// A local splice opens a local route on the hive plane.
+	/// A local splice opens a local route on the hive plane.
 	#[test]
 	fn a_local_splice_opens_a_local_route() {
 		let route = local_plane().stream_route(&ping_type(), HopBudget::for_test(2));
 		assert_eq!(route, StreamRoute::local());
 	}
 
-	// A peer splice relays its route to the same target with one forward
-	// spent.
+	/// A peer splice relays its route to the same target with one forward
+	/// spent.
 	#[test]
-	fn a_peer_splice_relays_its_route_with_one_forward_spent() -> Result<(), ClusterError> {
+	fn a_peer_splice_relays_its_route_with_one_forward_spent() {
 		let route = peer_plane().stream_route(&ping_type(), HopBudget::for_test(2));
 		assert_eq!((route.hops_remaining(), route.target()), (1, Some(&ping_type())));
-		Ok(())
 	}
 
+	/// A route selection withholds a relay trail from a budget below two hops,
+	/// and offers it at two.
 	#[test]
-	fn a_draw_returns_the_selected_entry() {
-		let entries = vec![Arc::new(peer_entry(b"first", "192.0.2.1:9001"))];
-		let config = config_balancing_with(Arc::new(FirstBalancer));
-		let picked = config.pick_instance(&entries);
-		assert!(matches!(picked, Some(entry) if entry.dial_target().as_bytes() == b"192.0.2.1:9001"));
-	}
-
-	#[test]
-	fn hop_budget_clamps_the_origin_sentinel_to_policy() {
-		assert_eq!(HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), 1).wire(), 1);
-	}
-
-	#[test]
-	fn hop_budget_honors_a_relayed_value_below_policy() {
-		assert_eq!(HopBudget::from_wire(WireHopBudget::new(1), 3).wire(), 1);
-	}
-
-	#[test]
-	fn hop_budget_zero_policy_disables_forwarding() {
-		let budget = HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), 0);
-		assert_eq!(budget.wire(), 0);
-		assert!(!budget.allows_forward());
-	}
-
-	/// An origin request carries the sentinel, so anything below it
-	/// reached this gateway through a relay.
-	#[test]
-	fn an_origin_budget_reads_as_direct() {
-		assert!(!HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), DEFAULT_HOP_BUDGET).is_relayed());
-		assert!(HopBudget::from_wire(WireHopBudget::new(2), 4).is_relayed());
-	}
-
-	// The relayed fact reads the wire count, because the clamped count under a
-	// cap below the origin sentinel would mark every direct caller relayed and
-	// refuse it at the export boundary.
-	#[test]
-	fn a_clamped_origin_budget_still_reads_as_direct() {
-		assert!(!HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), DEFAULT_MAX_HOPS).is_relayed());
-	}
-
-	/// A relay trail spends one hop at the relay, so a shorter budget
-	/// could never select it.
-	#[test]
-	fn a_relay_trail_needs_two_forwards() {
-		assert!(!HopBudget::from_wire(WireHopBudget::new(1), 4).allows_relay_trail());
-		assert!(HopBudget::from_wire(WireHopBudget::new(2), 4).allows_relay_trail());
-	}
-
-	#[test]
-	fn select_route_withholds_relay_trails_below_two_hops() -> Result<(), ClusterError> {
-		let config = test_config();
-		let registry = registry();
-		registry.add(relay_entry(b"origin", b"relay", "192.0.2.3:9001"))?;
+	fn select_route_withholds_relay_trails_below_two_hops() -> TestResult {
+		let config = ClusterConfig::fixture();
+		let registry = ServletRegistry::fixture();
+		registry.add(relay_entry())?;
 
 		let type_key = ping_key();
 		let below = registry.select_route(&config, &type_key, HopBudget::for_test(1), None);
@@ -779,11 +659,12 @@ mod tests {
 		Ok(())
 	}
 
+	/// A retry of a route selection excludes the route key that failed.
 	#[test]
-	fn select_route_excludes_the_failed_route_key() -> Result<(), ClusterError> {
-		let config = test_config();
-		let registry = registry();
-		registry.add(peer_entry(b"first", "192.0.2.1:9001"))?;
+	fn select_route_excludes_the_failed_route_key() -> TestResult {
+		let config = ClusterConfig::fixture();
+		let registry = ServletRegistry::fixture();
+		registry.add(first_peer())?;
 		registry.add(peer_entry(b"second", "192.0.2.2:9001"))?;
 
 		let type_key = ping_key();

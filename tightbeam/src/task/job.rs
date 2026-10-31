@@ -336,59 +336,55 @@ mod tests {
 			.expect("a servlet type URN yields an instance URN")
 	}
 
+	// A sync job with a tuple input composes the spawn request of that input
+	// under the id of its frame.
 	#[cfg(feature = "colony")]
 	test_job! {
-		name: test_spawn_servlet_job,
+		name: a_spawn_job_composes_a_spawn_request,
 		job: SpawnServletJob::run((worker_type(), None)),
 		assertions: |frame| {
-			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata().id(), b"spawn-req");
-
+			let frame = frame?;
 			let request: HiveManagement = frame.decode_message()?;
-			let HiveManagement::Spawn(spawn) = request else {
-				return Err(crate::testing::error::TestingError::InvariantViolated.into());
-			};
-			assert_eq!(spawn.servlet_type, worker_type());
+			let expected = HiveManagement::Spawn(SpawnServletParams { servlet_type: worker_type(), config: None });
+			assert_eq!(frame.metadata().id(), b"spawn-req");
+			assert_eq!(request, expected);
 			Ok(())
 		}
 	}
 
+	// A sync job with no parameters composes the list request with no filter.
 	#[cfg(feature = "colony")]
 	test_job! {
-		name: test_list_servlets_job,
+		name: a_list_job_composes_a_list_request,
 		job: ListServletsJob::run(),
 		assertions: |frame| {
-			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata().id(), b"list-req");
-
+			let frame = frame?;
 			let request: HiveManagement = frame.decode_message()?;
-			if !matches!(request, HiveManagement::List(_)) {
-				return Err(crate::testing::error::TestingError::InvariantViolated.into());
-			}
+			assert_eq!(frame.metadata().id(), b"list-req");
+			assert_eq!(request, HiveManagement::List(ListServletsParams { filter: None }));
 			Ok(())
 		}
 	}
 
+	// A sync job with a one-element tuple input composes the stop request of
+	// that instance.
 	#[cfg(feature = "colony")]
 	test_job! {
-		name: test_stop_servlet_job,
+		name: a_stop_job_composes_a_stop_request,
 		job: StopServletJob::run((worker_instance(),)),
 		assertions: |frame| {
-			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata().id(), b"stop-req");
-
+			let frame = frame?;
 			let request: HiveManagement = frame.decode_message()?;
-			let HiveManagement::Stop(stop) = request else {
-				return Err(crate::testing::error::TestingError::InvariantViolated.into());
-			};
-			assert_eq!(stop.servlet_id, worker_instance());
+			assert_eq!(frame.metadata().id(), b"stop-req");
+			assert_eq!(request, HiveManagement::Stop(StopServletParams { servlet_id: worker_instance() }));
 			Ok(())
 		}
 	}
 
+	// An async job with a tuple input composes the sum of its input.
 	#[cfg(all(feature = "tokio", feature = "router"))]
 	test_job! {
-		name: test_async_job,
+		name: an_async_job_composes_the_sum_of_its_input,
 		job: AsyncCalculationJob::run((10, 32)),
 		assertions: |frame| async move {
 			let frame = frame.await?;
@@ -400,9 +396,10 @@ mod tests {
 		}
 	}
 
+	// An async job with no parameters composes its fixed reply.
 	#[cfg(all(feature = "tokio", feature = "router"))]
 	test_job! {
-		name: test_async_job_with_no_parameters,
+		name: an_async_job_with_no_parameters_composes_its_reply,
 		job: AsyncPingJob::run(),
 		assertions: |frame| async move {
 			let frame = frame.await?;

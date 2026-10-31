@@ -582,29 +582,29 @@ impl<'a> ColonyMembership<'a> {
 
 #[cfg(test)]
 mod tests {
+	use core::mem::discriminant;
 	use core::str::from_utf8;
 
 	use super::*;
 	use crate::clock::ManualClock;
-	use crate::colony::cluster::servlet_registry::PheromoneConfig;
-	use crate::colony::cluster::{CertificateSpec, ClusterConfig, ClusterTlsConfig};
+	use crate::colony::cluster::ClusterConfig;
 	use crate::colony::protocol::ServletInfo;
 	use crate::colony::urn::ColonyNamespace;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::der::asn1::OctetString;
 	use crate::tb_cases;
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::fixtures::TestClock;
+	use crate::testing::TestResult;
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
-	/// A clock that moves only when the test advances it.
-	fn manual_clock() -> Arc<dyn Clock> {
-		Arc::new(ManualClock::default())
+	/// A hive registry whose lease is `ttl`, beside the manual clock it reads.
+	fn hive_registry_on(ttl: Duration) -> (HiveRegistry, Arc<ManualClock>) {
+		let clock = TestClock::manual();
+		(HiveRegistry::new(ttl, TestClock::erased(&clock)), clock)
 	}
 
 	/// A hive registry with the default fixture lease, on a manual clock.
 	fn hive_registry() -> HiveRegistry {
-		HiveRegistry::new(Duration::from_secs(15), manual_clock())
+		hive_registry_on(Duration::from_secs(15)).0
 	}
 
 	/// A signer named by the subject key identifier `id`.
@@ -619,65 +619,47 @@ mod tests {
 		signer_named(b"test-signer")
 	}
 
-	/// A config with every default, which the fixtures build their slates
-	/// through.
-	fn test_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let tls = ClusterTlsConfig::new(
-			CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
-			Arc::new(Secp256k1KeyProvider::from(key)),
-		)
-		.expect("the test certificate must decode");
-
-		ClusterConfig::new(tls)
-	}
-
 	/// A registration of `servlets` at `addr`, whose locators each name that
 	/// same address, as a hive advertises its own instances.
 	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
 		let addr = addr.as_ref();
 		let locator = from_utf8(addr).expect("fixture addresses are UTF-8");
-		let namespace = ColonyNamespace::default();
-		RegisterHiveRequest {
-			hive_addr: addr.to_vec(),
-			metadata: None,
-			servlet_addresses: servlets
-				.iter()
-				.map(|s| ServletInfo {
-					servlet_id: namespace
-						.servlet(s)
-						.and_then(|servlet_type| servlet_type.servlet_instance(locator))
-						.expect("test names satisfy the mint grammar"),
-					address: addr.to_vec(),
-					signer: ServletInfo::fixture_signer(),
-				})
-				.collect(),
-		}
+		let servlet_at = |servlet: &&str| ServletInfo {
+			servlet_id: ColonyNamespace::instance_fixture(servlet, locator),
+			address: addr.to_vec(),
+			signer: ServletInfo::fixture_signer(),
+		};
+
+		let servlet_addresses = servlets.iter().map(servlet_at).collect();
+		RegisterHiveRequest { hive_addr: addr.to_vec(), metadata: None, servlet_addresses }
 	}
 
 	/// One local route for `hive_addr`, the shape a registration installs.
 	fn slate(hive_addr: &SharedId, servlet: &str) -> HiveSlate {
 		let servlets = request(hive_addr, &[servlet]).servlet_addresses;
-		test_config()
-			.servlet_slate(&servlets, hive_addr)
-			.expect("fixture locators name their own address")
+		let slate = ClusterConfig::fixture().servlet_slate(&servlets, hive_addr);
+		slate.expect("fixture locators name their own address")
 	}
 
 	/// The pair of registries one gateway serves, with the admission lock
-	/// that binds them.
+	/// that binds them, and the manual clock of its hive lease.
 	struct Colony {
 		hives: HiveRegistry,
 		servlets: ServletRegistry,
 		admission: Mutex<()>,
+		clock: Arc<ManualClock>,
 	}
 
 	impl Colony {
+		/// The registries of a gateway under the default fixture lease.
 		fn new() -> Self {
-			Self {
-				hives: hive_registry(),
-				servlets: ServletRegistry::new(PheromoneConfig::default(), manual_clock()),
-				admission: Mutex::new(()),
-			}
+			Self::with_lease(Duration::from_secs(15))
+		}
+
+		/// The registries of a gateway whose hive lease is `ttl`.
+		fn with_lease(ttl: Duration) -> Self {
+			let (hives, clock) = hive_registry_on(ttl);
+			Self { hives, servlets: ServletRegistry::fixture(), admission: Mutex::new(()), clock }
 		}
 
 		fn membership(&self) -> ColonyMembership<'_> {
@@ -685,14 +667,18 @@ mod tests {
 		}
 	}
 
+	/// Admits the hive at `addr` into `colony` with one route of `servlet`.
+	fn admit(colony: &Colony, addr: &[u8], servlet: &str) -> Result<(), ClusterError> {
+		let hive_addr: SharedId = Arc::from(addr);
+		let membership = colony.membership();
+		let admitted = membership.admit(request(addr, &[servlet]), test_signer(), slate(&hive_addr, servlet));
+		admitted.map(drop)
+	}
+
 	/// Admits a hive at each of `addrs` into `colony`, each with one route.
-	fn admit_hives(colony: &Colony, addrs: &[&[u8]]) -> Result<(), ClusterError> {
-		addrs.iter().try_for_each(|addr| {
-			let hive_addr: SharedId = Arc::from(*addr);
-			let membership = colony.membership();
-			let admitted = membership.admit(request(addr, &["ping"]), test_signer(), slate(&hive_addr, "ping"));
-			admitted.map(drop)
-		})
+	fn admit_hives(colony: &Colony, addrs: &[&[u8]]) {
+		let admitted = addrs.iter().try_for_each(|addr| admit(colony, addr, "ping"));
+		admitted.expect("a fresh colony admits each fixture hive");
 	}
 
 	/// The status of a beat that the hive refused.
@@ -706,53 +692,45 @@ mod tests {
 	/// A hive whose beats fail `max_failures` times in a row leaves the
 	/// registry with every route it owned.
 	#[test]
-	fn a_hive_whose_beats_fail_max_failures_times_leaves_with_its_routes() -> Result<(), ClusterError> {
+	fn a_hive_whose_beats_fail_max_failures_times_leaves_with_its_routes() -> TestResult {
 		let colony = Colony::new();
-		admit_hives(&colony, &[b"hive1"])?;
+		admit_hives(&colony, &[b"hive1"]);
 
 		let membership = colony.membership();
 		membership.settle_beat(b"hive1", Err(REFUSED), 2)?;
 		membership.settle_beat(b"hive1", Err(REFUSED), 2)?;
 
-		assert_eq!(colony.hives.len()?, 0);
-		assert_eq!(colony.servlets.len()?, 0);
+		assert_eq!((colony.hives.len()?, colony.servlets.len()?), (0, 0));
 		Ok(())
 	}
 
 	// A failure below the bound counts and keeps the hive. The failure that
 	// reaches it retires the hive, and names the hives that the retire left.
+	// A failure of a hive the registry does not hold retires none.
 	tb_cases! {
-		fn a_counted_failure((max_failures, expected, hives_after): (u32, FailureCount, usize)) -> Result<(), ClusterError> {
+		fn a_counted_failure(
+			(beaten, max_failures, expected, hives_after): (&[u8], u32, FailureCount, usize)
+		) -> TestResult {
 			let colony = Colony::new();
-			admit_hives(&colony, &[b"hive1", b"hive2"])?;
+			admit_hives(&colony, &[b"hive1", b"hive2"]);
 
-			let settled = colony.membership().settle_beat(b"hive1", Err(REFUSED), max_failures)?;
-			assert_eq!(settled, refused_beat(expected));
-			assert_eq!(colony.hives.len()?, hives_after);
+			let settled = colony.membership().settle_beat(beaten, Err(REFUSED), max_failures)?;
+
+			assert_eq!((settled, colony.hives.len()?), (refused_beat(expected), hives_after));
 			Ok(())
 		}
 		cases {
-			below_the_bound_counts => (2, FailureCount::Counted(1), 2),
-			at_the_bound_retires => (1, FailureCount::Retired { remaining: 1 }, 1),
+			below_the_bound_counts => (b"hive1", 2, FailureCount::Counted(1), 2),
+			at_the_bound_retires => (b"hive1", 1, FailureCount::Retired { remaining: 1 }, 1),
+			of_an_unregistered_hive_retires_none => (b"hive9", 0, FailureCount::Unregistered, 2),
 		}
-	}
-
-	#[test]
-	fn a_failure_of_an_unregistered_hive_retires_none() -> Result<(), ClusterError> {
-		let colony = Colony::new();
-		admit_hives(&colony, &[b"hive1"])?;
-
-		let settled = colony.membership().settle_beat(b"hive9", Err(REFUSED), 0)?;
-		assert_eq!(settled, refused_beat(FailureCount::Unregistered));
-		assert_eq!(colony.hives.len()?, 1);
-		Ok(())
 	}
 
 	/// A live beat stores the utilization that the hive reported.
 	#[test]
-	fn a_live_beat_records_the_utilization_it_reported() -> Result<(), ClusterError> {
+	fn a_live_beat_records_the_utilization_it_reported() -> TestResult {
 		let colony = Colony::new();
-		admit_hives(&colony, &[b"hive1"])?;
+		admit_hives(&colony, &[b"hive1"]);
 
 		colony.membership().settle_beat(b"hive1", Ok(crate::bps!(5000)), 2)?;
 
@@ -765,9 +743,9 @@ mod tests {
 	/// A live beat clears the failures counted before it, so the next refused
 	/// beat counts from one.
 	#[test]
-	fn a_live_beat_clears_the_failures_counted_before_it() -> Result<(), ClusterError> {
+	fn a_live_beat_clears_the_failures_counted_before_it() -> TestResult {
 		let colony = Colony::new();
-		admit_hives(&colony, &[b"hive1"])?;
+		admit_hives(&colony, &[b"hive1"]);
 
 		let membership = colony.membership();
 		membership.settle_beat(b"hive1", Err(REFUSED), 3)?;
@@ -778,8 +756,9 @@ mod tests {
 		Ok(())
 	}
 
+	/// A registered hive lists at the address it registered from.
 	#[test]
-	fn registry_register_and_lookup() -> Result<(), ClusterError> {
+	fn a_registered_hive_lists_at_its_address() -> TestResult {
 		let registry = hive_registry();
 		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]), test_signer())?;
 
@@ -789,50 +768,52 @@ mod tests {
 		Ok(())
 	}
 
+	/// An unregistered hive leaves the registry, and the call returns the
+	/// entry it removed.
 	#[test]
-	fn registry_unregister() -> Result<(), ClusterError> {
+	fn an_unregistered_hive_leaves_the_registry() -> TestResult {
 		let registry = hive_registry();
 		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
-		assert_eq!(registry.len()?, 1);
-		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
-		assert_eq!(registry.len()?, 0);
+
+		let removed = registry.unregister(b"127.0.0.1:8080")?.map(|hive| hive.address);
+
+		let left = SharedId::from(b"127.0.0.1:8080".as_slice());
+		assert_eq!((removed, registry.len()?), (Some(left), 0));
 		Ok(())
 	}
 
+	/// `all_hives` lists every registered hive with the metadata it
+	/// registered, in address order.
 	#[test]
-	fn registry_all_hives() -> Result<(), ClusterError> {
+	fn all_hives_lists_every_registered_hive() -> TestResult {
 		let registry = hive_registry();
 		let mut described = request(b"hive2", &["calc"]);
 		described.metadata = Some(b"metadata".to_vec());
 		registry.register(request(b"hive1", &["ping"]), test_signer())?;
 		registry.register(described, test_signer())?;
 
-		let all = registry.all_hives()?;
-		assert_eq!(all.len(), 2);
+		let hives = registry.all_hives()?.into_iter();
+		let mut listed: Vec<(SharedId, Option<Arc<[u8]>>)> = hives.map(|hive| (hive.address, hive.metadata)).collect();
+		listed.sort();
 
-		let addrs: Vec<_> = all.iter().map(|e| e.address.as_ref()).collect();
-		assert!(addrs.contains(&b"hive1".as_slice()));
-		assert!(addrs.contains(&b"hive2".as_slice()));
-
+		let expected = [
+			(SharedId::from(b"hive1".as_slice()), None),
+			(SharedId::from(b"hive2".as_slice()), Some(Arc::from(b"metadata".as_slice()))),
+		];
+		assert_eq!(listed, expected);
 		Ok(())
 	}
 
 	/// The hives that one lease sweep retired, in the sweep's order, each
 	/// with the count that its retire left.
 	#[test]
-	fn a_lease_sweep_counts_down_the_hives_each_retire_leaves() -> Result<(), ClusterError> {
-		let clock = Arc::new(ManualClock::default());
-		let hives = HiveRegistry::new(Duration::from_millis(10), Arc::clone(&clock) as Arc<dyn Clock>);
-		let servlets = ServletRegistry::new(PheromoneConfig::default(), manual_clock());
-		let admission = Mutex::new(());
-		let membership = ColonyMembership::new(&hives, &servlets, &admission);
+	fn a_lease_sweep_counts_down_the_hives_each_retire_leaves() -> TestResult {
+		let colony = Colony::with_lease(Duration::from_millis(10));
+		colony.hives.register(request(b"hive1", &["ping"]), test_signer())?;
+		colony.hives.register(request(b"hive2", &["ping"]), test_signer())?;
+		colony.clock.advance(Duration::from_secs(1));
 
-		hives.register(request(b"hive1", &["ping"]), test_signer())?;
-		hives.register(request(b"hive2", &["ping"]), test_signer())?;
-
-		clock.advance(Duration::from_secs(1));
-
-		let retired = membership.retire_stale()?;
+		let retired = colony.membership().retire_stale()?;
 		let remaining: Vec<usize> = retired.iter().map(|hive| hive.remaining).collect();
 		assert_eq!(remaining, [1, 0]);
 		Ok(())
@@ -842,17 +823,14 @@ mod tests {
 	// registry's clock, rather than after it waits. A lease exactly at the ttl
 	// stays live, so the boundary row pins `>` against `>=`.
 	tb_cases! {
-		fn evict_stale((ttl, evicted_len, remaining_len): (Duration, usize, usize)) -> Result<(), ClusterError> {
-			let clock = Arc::new(ManualClock::default());
-			let registry = HiveRegistry::new(ttl, Arc::clone(&clock) as Arc<dyn Clock>);
+		fn a_lease_evicts_only_past_its_ttl((ttl, evicted_len, remaining_len): (Duration, usize, usize)) -> TestResult {
+			let (registry, clock) = hive_registry_on(ttl);
 			registry.register(request(b"hive1", &["ping"]), test_signer())?;
 
 			clock.advance(Duration::from_secs(1));
 
 			let evicted = registry.evict_stale()?;
-			assert_eq!(evicted.len(), evicted_len);
-			assert_eq!(registry.len()?, remaining_len);
-
+			assert_eq!((evicted.len(), registry.len()?), (evicted_len, remaining_len));
 			Ok(())
 		}
 		cases {
@@ -862,35 +840,28 @@ mod tests {
 		}
 	}
 
-	struct SignerRebindCase {
-		first: &'static [u8],
-		second: &'static [u8],
-		expect_ok: bool,
-	}
+	/// A second claim to one hive id: the signer that claims it first, the
+	/// signer that claims it second, and the refusal of the second claim.
+	type Rebind = (&'static [u8], &'static [u8], Option<ClusterError>);
 
-	// A hive id stays bound to the signer that first claimed it. The type
-	// requires a signer on every registration, so the rows cover a bound hive
-	// alone.
+	// A hive id stays bound to the signer that first claimed it, and the
+	// signer bound first survives the attempt. The type requires a signer on
+	// every registration, so the rows cover a bound hive alone.
 	tb_cases! {
-		fn register_signer_rebind(case: SignerRebindCase) -> Result<(), ClusterError> {
-			let registry = HiveRegistry::new(Duration::from_secs(3600), manual_clock());
-			registry.register(request(b"hive1", &["ping"]), signer_named(case.first))?;
+		fn a_hive_id_stays_bound_to_its_first_signer((first, second, refusal): Rebind) -> TestResult {
+			let registry = hive_registry();
+			registry.register(request(b"hive1", &["ping"]), signer_named(first))?;
 
-			let result = registry.register(request(b"hive1", &["ping"]), signer_named(case.second));
-			assert_eq!(result.is_ok(), case.expect_ok);
-			if !case.expect_ok {
-				assert!(matches!(result, Err(ClusterError::SignerMismatch)));
-			}
+			let result = registry.register(request(b"hive1", &["ping"]), signer_named(second));
 
-			// The signer bound first always survives the attempt.
 			let bound = registry.signer_for(b"hive1")?;
-			assert_eq!(bound, Some(signer_named(case.first)));
-
+			let expected = (refusal.as_ref().map(discriminant), Some(signer_named(first)));
+			assert_eq!((ClusterError::variant_of(&result), bound), expected);
 			Ok(())
 		}
 		cases {
-			refuses_a_different_signer => SignerRebindCase { first: b"sid-a", second: b"sid-b", expect_ok: false },
-			admits_the_bound_signer => SignerRebindCase { first: b"sid-a", second: b"sid-a", expect_ok: true },
+			refuses_a_different_signer => (b"sid-a", b"sid-b", Some(ClusterError::SignerMismatch)),
+			admits_the_bound_signer => (b"sid-a", b"sid-a", None),
 		}
 	}
 
@@ -955,45 +926,33 @@ mod tests {
 	/// rollback.
 	fn poison_routes(servlets: &ServletRegistry) {
 		servlets.poison_routes();
-		assert!(servlets.local_servlets().is_err());
+		servlets.local_servlets().expect_err("a poisoned route lock refuses each read");
 	}
 
 	/// A re-registration whose slate will not install must leave the
 	/// registration it displaced in service.
 	#[test]
-	fn a_refused_reregistration_restores_the_hive_it_displaced() -> Result<(), ClusterError> {
+	fn a_refused_reregistration_restores_the_hive_it_displaced() -> TestResult {
 		let colony = Colony::new();
-		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
-
-		colony
-			.membership()
-			.admit(request(b"hive-a", &["echo"]), test_signer(), slate(&hive_addr, "echo"))?;
+		admit_hives(&colony, &[b"hive-a"]);
 		poison_routes(&colony.servlets);
 
-		let refused =
-			colony
-				.membership()
-				.admit(request(b"hive-a", &["ping"]), test_signer(), slate(&hive_addr, "ping"));
-		assert!(refused.is_err());
-		assert_eq!(colony.hives.len()?, 1);
-		assert_eq!(colony.hives.signer_for(&hive_addr)?, Some(test_signer()));
+		let refused = admit(&colony, b"hive-a", "echo");
+		let bound = colony.hives.signer_for(b"hive-a")?;
+		assert!(matches!(refused, Err(ClusterError::LockPoisoned)));
+		assert_eq!((colony.hives.len()?, bound), (1, Some(test_signer())));
 		Ok(())
 	}
 
 	/// A first registration whose slate will not install must leave no half
 	/// of it in either registry.
 	#[test]
-	fn a_refused_first_registration_leaves_no_half() -> Result<(), ClusterError> {
+	fn a_refused_first_registration_leaves_no_half() -> TestResult {
 		let colony = Colony::new();
-		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
-
 		poison_routes(&colony.servlets);
 
-		let refused =
-			colony
-				.membership()
-				.admit(request(b"hive-a", &["echo"]), test_signer(), slate(&hive_addr, "echo"));
-		assert!(refused.is_err());
+		let refused = admit(&colony, b"hive-a", "echo");
+		assert!(matches!(refused, Err(ClusterError::LockPoisoned)));
 		assert_eq!(colony.hives.len()?, 0);
 		Ok(())
 	}

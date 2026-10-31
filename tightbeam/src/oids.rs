@@ -514,105 +514,102 @@ const RESERVED_ARCS: [ObjectIdentifier; 9] = [
 mod tests {
 	use super::*;
 
-	/// The test pins each OID constant of its table to its dotted-decimal
-	/// value, so an accidental edit cannot silently change an identifier that
-	/// peers exchange.
-	#[test]
-	fn oid_values_are_pinned() {
-		let pinned: &[(ObjectIdentifier, &str)] = &[
-			(DATA, "1.2.840.113549.1.7.1"),
-			(SIGNED_DATA, "1.2.840.113549.1.7.2"),
-			(ENVELOPED_DATA, "1.2.840.113549.1.7.3"),
-			(AUTH_ENVELOPED_DATA, "1.2.840.113549.1.9.16.1.23"),
-			(ORI_KEM, "1.2.840.113549.1.9.16.13.3"),
-			(COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
-			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
-			(HKDF_SHA3_256, "1.2.840.113549.1.9.16.3.33"),
-			(COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
-			(DHKEM_SECP256K1, "1.3.6.1.4.1.64586.2.3"),
-			(KEM_SECP256K1_ML_KEM_768, "1.3.6.1.4.1.64586.2.4"),
-			(KEY_PURPOSE_SIGNER, "1.3.6.1.4.1.64586.3.1"),
-			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
-			(HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
-			(HASH_SHA3_384, "2.16.840.1.101.3.4.2.9"),
-			(HASH_SHA3_512, "2.16.840.1.101.3.4.2.10"),
-			(SIGNER_ECDSA_WITH_SHA256, "1.2.840.10045.4.3.2"),
-			(SIGNER_ECDSA_WITH_SHA3_256, "2.16.840.1.101.3.4.3.10"),
-			(SIGNER_ECDSA_WITH_SHA3_512, "2.16.840.1.101.3.4.3.12"),
-			(AES_128_GCM, "2.16.840.1.101.3.4.1.6"),
-			(AES_256_GCM, "2.16.840.1.101.3.4.1.46"),
-			(AES_128_WRAP, "2.16.840.1.101.3.4.1.5"),
-			(AES_192_WRAP, "2.16.840.1.101.3.4.1.25"),
-			(AES_256_WRAP, "2.16.840.1.101.3.4.1.45"),
-			(CURVE_SECP256K1, "1.3.132.0.10"),
-			(CURVE_NIST_P256, "1.2.840.10045.3.1.7"),
-			(CURVE_NIST_P384, "1.3.132.0.34"),
-			(CURVE_NIST_P521, "1.3.132.0.35"),
-			(CURVE_X962_C_TWO, "1.2.840.10045.3.0"),
-			(CURVE_X25519, "1.3.101.110"),
-			(KEM_ML_KEM_768, "2.16.840.1.101.3.4.4.2"),
-			(KEM_ML_KEM_1024, "2.16.840.1.101.3.4.4.3"),
-			(HANDSHAKE_PROTOCOL_VERSION, "1.3.6.1.4.1.64586.1.1"),
-			(HANDSHAKE_ALGORITHM_PROFILE, "1.3.6.1.4.1.64586.1.2"),
-			(HANDSHAKE_SELECT_VERSION, "1.3.6.1.4.1.64586.1.4"),
-			(HANDSHAKE_SELECT_ALGORITHM, "1.3.6.1.4.1.64586.1.5"),
-			(HANDSHAKE_ABORT_ALERT, "1.3.6.1.4.1.64586.1.7"),
-			(HANDSHAKE_TRANSCRIPT_HASH, "1.3.6.1.4.1.64586.1.8"),
-			(HANDSHAKE_SECURITY_OFFER, "1.3.6.1.4.1.64586.1.11"),
-			(HANDSHAKE_SECURITY_ACCEPT, "1.3.6.1.4.1.64586.1.12"),
-			(HANDSHAKE_PROFILE_HPKE_GCM, "1.3.6.1.4.1.64586.1.101"),
-			(HANDSHAKE_TRANSPORT_OFFER, "1.3.6.1.4.1.64586.1.15"),
-			(HANDSHAKE_TRANSPORT_ACCEPT, "1.3.6.1.4.1.64586.1.16"),
-			(RECEIPT_ACK, "1.3.6.1.4.1.64586.1.18"),
-			(SESSION_RECEIPT, "1.3.6.1.4.1.64586.1.19"),
-			(SESSION_RECEIPT_CONTENT, "1.3.6.1.4.1.64586.1.20"),
-			(RECEIPT_ROLE, "1.3.6.1.4.1.64586.1.21"),
-			(RECEIPT_ANSWER, "1.3.6.1.4.1.64586.1.22"),
-			(HANDSHAKE_SERVER_EPHEMERAL, "1.3.6.1.4.1.64586.1.23"),
-			(HANDSHAKE_KEY_CONFIRMATION, "1.3.6.1.4.1.64586.1.24"),
-			(HANDSHAKE_OPENING_CONTENT, "1.3.6.1.4.1.64586.1.25"),
-			(HANDSHAKE_REPLY_CONTENT, "1.3.6.1.4.1.64586.1.26"),
-			(RECORD_SEQUENCE, "1.3.6.1.4.1.64586.1.27"),
-			(HANDSHAKE_SERVER_KEM_CIPHERTEXT, "1.3.6.1.4.1.64586.1.28"),
-			(ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
-			(ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
-			(ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),
-		];
+	/// The 18 SEC 2 curves over a binary field (SEC 2 v1.0 Appendix A).
+	const SEC2_BINARY_FIELD_CURVES: [ObjectIdentifier; 18] = [
+		ObjectIdentifier::new_unwrap("1.3.132.0.1"),  // sect163k1
+		ObjectIdentifier::new_unwrap("1.3.132.0.2"),  // sect163r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.3"),  // sect239k1
+		ObjectIdentifier::new_unwrap("1.3.132.0.4"),  // sect113r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.5"),  // sect113r2
+		ObjectIdentifier::new_unwrap("1.3.132.0.15"), // sect163r2
+		ObjectIdentifier::new_unwrap("1.3.132.0.16"), // sect283k1
+		ObjectIdentifier::new_unwrap("1.3.132.0.17"), // sect283r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.22"), // sect131r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.23"), // sect131r2
+		ObjectIdentifier::new_unwrap("1.3.132.0.24"), // sect193r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.25"), // sect193r2
+		ObjectIdentifier::new_unwrap("1.3.132.0.26"), // sect233k1
+		ObjectIdentifier::new_unwrap("1.3.132.0.27"), // sect233r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.36"), // sect409k1
+		ObjectIdentifier::new_unwrap("1.3.132.0.37"), // sect409r1
+		ObjectIdentifier::new_unwrap("1.3.132.0.38"), // sect571k1
+		ObjectIdentifier::new_unwrap("1.3.132.0.39"), // sect571r1
+	];
 
-		let values: Vec<String> = pinned.iter().map(|(oid, _)| oid.to_string()).collect();
-		let expected: Vec<&str> = pinned.iter().map(|(_, dotted)| *dotted).collect();
-		assert_eq!(values, expected);
-		// Each reserved arc stays apart from the constants, so each arc keeps
-		// one meaning.
-		let reused = pinned.iter().filter(|(oid, _)| RESERVED_ARCS.contains(oid)).count();
-		assert_eq!(reused, 0);
+	// Each OID constant holds its dotted-decimal value, so an edit that changes
+	// an identifier that peers exchange fails the row of that constant. Each
+	// reserved arc stays apart from the constants, so each arc keeps one
+	// meaning.
+	crate::tb_cases! {
+		fn each_oid_constant_holds_its_dotted_value((oid, dotted): (ObjectIdentifier, &str)) {
+			assert_eq!(ObjectIdentifier::new(dotted), Ok(oid));
+			assert!(!RESERVED_ARCS.contains(&oid));
+		}
+		cases {
+			data => (DATA, "1.2.840.113549.1.7.1"),
+			signed_data => (SIGNED_DATA, "1.2.840.113549.1.7.2"),
+			enveloped_data => (ENVELOPED_DATA, "1.2.840.113549.1.7.3"),
+			auth_enveloped_data => (AUTH_ENVELOPED_DATA, "1.2.840.113549.1.9.16.1.23"),
+			ori_kem => (ORI_KEM, "1.2.840.113549.1.9.16.13.3"),
+			compression_content => (COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
+			compression_zlib => (COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
+			hkdf_sha3_256 => (HKDF_SHA3_256, "1.2.840.113549.1.9.16.3.33"),
+			compression_zstd => (COMPRESSION_ZSTD, "1.3.6.1.4.1.64586.2.1"),
+			dhkem_secp256k1 => (DHKEM_SECP256K1, "1.3.6.1.4.1.64586.2.3"),
+			kem_secp256k1_ml_kem_768 => (KEM_SECP256K1_ML_KEM_768, "1.3.6.1.4.1.64586.2.4"),
+			key_purpose_signer => (KEY_PURPOSE_SIGNER, "1.3.6.1.4.1.64586.3.1"),
+			hash_sha256 => (HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
+			hash_sha3_256 => (HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
+			hash_sha3_384 => (HASH_SHA3_384, "2.16.840.1.101.3.4.2.9"),
+			hash_sha3_512 => (HASH_SHA3_512, "2.16.840.1.101.3.4.2.10"),
+			signer_ecdsa_with_sha256 => (SIGNER_ECDSA_WITH_SHA256, "1.2.840.10045.4.3.2"),
+			signer_ecdsa_with_sha3_256 => (SIGNER_ECDSA_WITH_SHA3_256, "2.16.840.1.101.3.4.3.10"),
+			signer_ecdsa_with_sha3_512 => (SIGNER_ECDSA_WITH_SHA3_512, "2.16.840.1.101.3.4.3.12"),
+			aes_128_gcm => (AES_128_GCM, "2.16.840.1.101.3.4.1.6"),
+			aes_256_gcm => (AES_256_GCM, "2.16.840.1.101.3.4.1.46"),
+			aes_128_wrap => (AES_128_WRAP, "2.16.840.1.101.3.4.1.5"),
+			aes_192_wrap => (AES_192_WRAP, "2.16.840.1.101.3.4.1.25"),
+			aes_256_wrap => (AES_256_WRAP, "2.16.840.1.101.3.4.1.45"),
+			curve_secp256k1 => (CURVE_SECP256K1, "1.3.132.0.10"),
+			curve_nist_p256 => (CURVE_NIST_P256, "1.2.840.10045.3.1.7"),
+			curve_nist_p384 => (CURVE_NIST_P384, "1.3.132.0.34"),
+			curve_nist_p521 => (CURVE_NIST_P521, "1.3.132.0.35"),
+			curve_x962_c_two => (CURVE_X962_C_TWO, "1.2.840.10045.3.0"),
+			curve_x25519 => (CURVE_X25519, "1.3.101.110"),
+			kem_ml_kem_768 => (KEM_ML_KEM_768, "2.16.840.1.101.3.4.4.2"),
+			kem_ml_kem_1024 => (KEM_ML_KEM_1024, "2.16.840.1.101.3.4.4.3"),
+			handshake_protocol_version => (HANDSHAKE_PROTOCOL_VERSION, "1.3.6.1.4.1.64586.1.1"),
+			handshake_algorithm_profile => (HANDSHAKE_ALGORITHM_PROFILE, "1.3.6.1.4.1.64586.1.2"),
+			handshake_select_version => (HANDSHAKE_SELECT_VERSION, "1.3.6.1.4.1.64586.1.4"),
+			handshake_select_algorithm => (HANDSHAKE_SELECT_ALGORITHM, "1.3.6.1.4.1.64586.1.5"),
+			handshake_abort_alert => (HANDSHAKE_ABORT_ALERT, "1.3.6.1.4.1.64586.1.7"),
+			handshake_transcript_hash => (HANDSHAKE_TRANSCRIPT_HASH, "1.3.6.1.4.1.64586.1.8"),
+			handshake_security_offer => (HANDSHAKE_SECURITY_OFFER, "1.3.6.1.4.1.64586.1.11"),
+			handshake_security_accept => (HANDSHAKE_SECURITY_ACCEPT, "1.3.6.1.4.1.64586.1.12"),
+			handshake_profile_hpke_gcm => (HANDSHAKE_PROFILE_HPKE_GCM, "1.3.6.1.4.1.64586.1.101"),
+			handshake_transport_offer => (HANDSHAKE_TRANSPORT_OFFER, "1.3.6.1.4.1.64586.1.15"),
+			handshake_transport_accept => (HANDSHAKE_TRANSPORT_ACCEPT, "1.3.6.1.4.1.64586.1.16"),
+			receipt_ack => (RECEIPT_ACK, "1.3.6.1.4.1.64586.1.18"),
+			session_receipt => (SESSION_RECEIPT, "1.3.6.1.4.1.64586.1.19"),
+			session_receipt_content => (SESSION_RECEIPT_CONTENT, "1.3.6.1.4.1.64586.1.20"),
+			receipt_role => (RECEIPT_ROLE, "1.3.6.1.4.1.64586.1.21"),
+			receipt_answer => (RECEIPT_ANSWER, "1.3.6.1.4.1.64586.1.22"),
+			handshake_server_ephemeral => (HANDSHAKE_SERVER_EPHEMERAL, "1.3.6.1.4.1.64586.1.23"),
+			handshake_key_confirmation => (HANDSHAKE_KEY_CONFIRMATION, "1.3.6.1.4.1.64586.1.24"),
+			handshake_opening_content => (HANDSHAKE_OPENING_CONTENT, "1.3.6.1.4.1.64586.1.25"),
+			handshake_reply_content => (HANDSHAKE_REPLY_CONTENT, "1.3.6.1.4.1.64586.1.26"),
+			record_sequence => (RECORD_SEQUENCE, "1.3.6.1.4.1.64586.1.27"),
+			handshake_server_kem_ciphertext => (HANDSHAKE_SERVER_KEM_CIPHERTEXT, "1.3.6.1.4.1.64586.1.28"),
+			attr_content_type => (ATTR_CONTENT_TYPE, "1.2.840.113549.1.9.3"),
+			attr_message_digest => (ATTR_MESSAGE_DIGEST, "1.2.840.113549.1.9.4"),
+			attr_cms_algorithm_protection => (ATTR_CMS_ALGORITHM_PROTECTION, "1.2.840.113549.1.9.52"),
+		}
 	}
 
 	/// The test pins the 18 SEC 2 curves over a binary field, which a key
 	/// refuses, to their dotted-decimal values (SEC 2 v1.0 Appendix A).
 	#[test]
 	fn binary_field_curves_are_pinned() {
-		let values = BINARY_FIELD_CURVES.map(|oid| oid.to_string());
-		let sec2 = [
-			"1.3.132.0.1",  // sect163k1
-			"1.3.132.0.2",  // sect163r1
-			"1.3.132.0.3",  // sect239k1
-			"1.3.132.0.4",  // sect113r1
-			"1.3.132.0.5",  // sect113r2
-			"1.3.132.0.15", // sect163r2
-			"1.3.132.0.16", // sect283k1
-			"1.3.132.0.17", // sect283r1
-			"1.3.132.0.22", // sect131r1
-			"1.3.132.0.23", // sect131r2
-			"1.3.132.0.24", // sect193r1
-			"1.3.132.0.25", // sect193r2
-			"1.3.132.0.26", // sect233k1
-			"1.3.132.0.27", // sect233r1
-			"1.3.132.0.36", // sect409k1
-			"1.3.132.0.37", // sect409r1
-			"1.3.132.0.38", // sect571k1
-			"1.3.132.0.39", // sect571r1
-		];
-		assert_eq!(values, sec2);
+		assert_eq!(BINARY_FIELD_CURVES, SEC2_BINARY_FIELD_CURVES);
 	}
 }

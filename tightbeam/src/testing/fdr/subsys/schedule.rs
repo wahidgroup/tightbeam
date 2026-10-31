@@ -183,43 +183,38 @@ impl Process {
 
 #[cfg(test)]
 mod tests {
-	use core::error::Error;
 	use core::num::NonZeroU32;
 	use std::collections::{HashMap, HashSet};
 
 	use crate::testing::fdr::{SchedulerConstraint, SchedulerCounts, SchedulerModel};
+	use crate::testing::fixtures::TestProcess;
 	use crate::testing::specs::composition::CompositionOperator;
-	use crate::testing::specs::csp::{Event, Process, State};
+	use crate::testing::specs::csp::{Event, Process};
+	use crate::testing::TestResult;
 
-	/// A process named `name` that takes the events of `events` in turn,
-	/// through the states of `states`, to its accepting last state.
-	fn chain(name: &'static str, states: &[&'static str], events: &[&'static str]) -> Process {
-		let first = states.first().copied().expect("a chain has a first state");
-		let last = states.last().copied().expect("a chain has a last state");
-		let builder = Process::builder(name).initial_state(State(first));
-		let steps = states.iter().zip(states.iter().skip(1)).zip(events);
-		let builder = steps.fold(builder, |builder, ((from, to), event)| {
-			let builder = builder.add_observable(Event(event));
-			builder.add_transition(State(from), Event(event), State(to))
-		});
-
-		builder.add_terminal(State(last)).build().expect("a chain of events builds")
-	}
+	/// A fixture that builds the process of a row.
+	type Fixture = fn() -> Process;
 
 	/// The interleaving of `a1` then `a2` with `b1` then `b2`.
 	fn interleaved() -> Process {
-		let a = chain("A", &["A0", "A1", "A2"], &["a1", "a2"]);
-		let b = chain("B", &["B0", "B1", "B2"], &["b1", "b2"]);
+		let a = TestProcess::chain("A", &["A0", "A1", "A2"], &["a1", "a2"]);
+		let b = TestProcess::chain("B", &["B0", "B1", "B2"], &["b1", "b2"]);
 		let composed = CompositionOperator::Interleaved.compose(&a, &b);
 		composed.expect("an interleaving builds")
+	}
+
+	/// The interleaving of [`interleaved`] with `a1` renamed to `z`.
+	fn renamed_interleaving() -> Process {
+		let renamed = interleaved().rename(HashMap::from([(Event("a1"), Event("z"))]));
+		renamed.expect("a renaming of one event builds")
 	}
 
 	/// `A` (`a1`, the shared `x`, `a2`) beside `B` (`x`, `b2`), synchronized on
 	/// `x`, and interleaved with `C` (`c`).
 	fn shared_beside_a_third() -> Process {
-		let a = chain("A", &["A0", "A1", "A2", "A3"], &["a1", "x", "a2"]);
-		let b = chain("B", &["B0", "B1", "B2"], &["x", "b2"]);
-		let c = chain("C", &["C0", "C1"], &["c"]);
+		let a = TestProcess::chain("A", &["A0", "A1", "A2", "A3"], &["a1", "x", "a2"]);
+		let b = TestProcess::chain("B", &["B0", "B1", "B2"], &["x", "b2"]);
+		let c = TestProcess::chain("C", &["C0", "C1"], &["c"]);
 
 		let interface = CompositionOperator::Interface { events: HashSet::from([Event("x")]) };
 		let ab = interface.compose(&a, &b).expect("the interface parallel builds");
@@ -246,35 +241,34 @@ mod tests {
 		process.offers(state)
 	}
 
-	#[test]
-	fn a_running_process_holds_the_one_cooperative_scheduler() -> Result<(), Box<dyn Error>> {
-		let scheduled = one_scheduler(SchedulerModel::Cooperative, 2).schedule(&interleaved())?;
-		assert_eq!(offers_after(&scheduled, &["a1"]), HashSet::from([Event("a2")]));
-		Ok(())
-	}
+	// One cooperative scheduler runs a process until it blocks or takes a
+	// shared event, so the composition offers the events of the process that
+	// holds the scheduler, or of each process once a holder yields.
+	crate::tb_cases! {
+		fn a_cooperative_scheduler_offers(
+			(process, processes, trace, offered): (Fixture, u32, &'static [&'static str], HashSet<Event>)
+		) -> TestResult {
+			let scheduled = one_scheduler(SchedulerModel::Cooperative, processes).schedule(&process())?;
+			let offers = offers_after(&scheduled, trace);
+			assert_eq!(offers, offered);
+			Ok(())
+		}
 
-	#[test]
-	fn a_blocked_process_yields_its_scheduler() -> Result<(), Box<dyn Error>> {
-		let scheduled = one_scheduler(SchedulerModel::Cooperative, 2).schedule(&interleaved())?;
-		assert_eq!(offers_after(&scheduled, &["a1", "a2"]), HashSet::from([Event("b1")]));
-		Ok(())
-	}
-
-	#[test]
-	fn a_shared_event_yields_the_schedulers_of_its_movers() -> Result<(), Box<dyn Error>> {
-		let scheduled = one_scheduler(SchedulerModel::Cooperative, 3).schedule(&shared_beside_a_third())?;
-
-		let offered = offers_after(&scheduled, &["a1", "x"]);
-		assert_eq!(offered, HashSet::from([Event("a2"), Event("b2"), Event("c")]));
-		Ok(())
-	}
-
-	#[test]
-	fn a_renamed_interleaving_keeps_the_components_of_its_edges() -> Result<(), Box<dyn Error>> {
-		let renamed = interleaved().rename(HashMap::from([(Event("a1"), Event("z"))]))?;
-
-		let scheduled = one_scheduler(SchedulerModel::Cooperative, 2).schedule(&renamed)?;
-		assert_eq!(offers_after(&scheduled, &["z"]), HashSet::from([Event("a2")]));
-		Ok(())
+		cases {
+			the_next_event_of_the_running_process => (interleaved, 2, &["a1"], HashSet::from([Event("a2")])),
+			the_events_of_another_process_once_one_blocks => (
+				interleaved,
+				2,
+				&["a1", "a2"],
+				HashSet::from([Event("b1")]),
+			),
+			the_events_of_each_mover_after_a_shared_event => (
+				shared_beside_a_third,
+				3,
+				&["a1", "x"],
+				HashSet::from([Event("a2"), Event("b2"), Event("c")]),
+			),
+			the_components_of_a_renamed_edge => (renamed_interleaving, 2, &["z"], HashSet::from([Event("a2")])),
+		}
 	}
 }

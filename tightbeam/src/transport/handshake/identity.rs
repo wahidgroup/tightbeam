@@ -198,73 +198,62 @@ impl<K: RecipientKem<PrivateKey: 'static> + 'static> ServerIdentity for CmsIdent
 
 #[cfg(all(test, feature = "transport-cms"))]
 mod tests {
-	use std::error::Error;
-
 	use super::*;
-	use crate::crypto::hpke::DhKemSecp256k1;
-	use crate::crypto::key::{DiffieHellman, Secp256k1KeyProvider};
-	use crate::crypto::sign::ecdsa::k256::Secp256k1;
-	use crate::crypto::sign::ecdsa::SigningKey;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::x509::KeyPurposes;
 	use crate::der::asn1::Ia5String;
-	use crate::random::OsRng;
-	use crate::testing::{TestCertificate, TestCmsServer, TestIdentity};
-	use crate::transport::handshake::Arc;
+	use crate::testing::{TestCertificate, TestCmsServer, TestKey, TestResult};
 	use crate::x509::ext::pkix::name::GeneralName;
-	use crate::x509::ext::pkix::{KeyUsage, KeyUsages};
 	use crate::x509::ext::Extension;
 	use crate::x509::name::RdnSequence;
 
+	/// A signing certificate and a key-agreement certificate of one subject
+	/// and two keys build a pair that holds both.
 	#[test]
-	fn a_pair_of_one_subject_with_two_keys_is_built() {
+	fn a_pair_of_one_subject_with_two_keys_is_built() -> TestResult {
 		let server = TestCmsServer::generate("tightbeam pair");
-		let pair = CmsIdentityPair::new(server.signing_identity(), server.key_agreement_identity());
-		assert!(pair.is_ok());
+
+		let pair = CmsIdentityPair::new(server.signing_identity(), server.key_agreement_identity())?;
+		let held = (pair.signing().certificate(), pair.key_agreement().certificate());
+		assert_eq!(held, (&server.signing, &server.key_agreement));
+		Ok(())
 	}
 
-	/// One key in both identities would serve two purposes, so the pair is
-	/// refused (NIST SP 800-57 Part 1 Rev. 5 §5.2).
-	#[test]
-	fn a_pair_of_one_key_is_refused() {
-		let server = TestCmsServer::generate("tightbeam pair");
-		let usage = KeyUsage(KeyUsages::DigitalSignature.into());
-		let signing = TestCertificate::with_key_usage(server.key_agreement.to_owned(), usage);
-		let signing = TestIdentity::presenting(signing, &server.key_agreement_key);
+	// One key in both identities would serve two purposes, so the pair is
+	// refused (NIST SP 800-57 Part 1 Rev. 5 §5.2), in each form whose
+	// agreement collapses into the signing key.
+	crate::tb_cases! {
+		fn a_pair_of_one_key_is_refused((signing_key, key_agreement_key): (Secp256k1SigningKey, Secp256k1SigningKey)) {
+			let server = TestCmsServer::of("tightbeam pair", signing_key, key_agreement_key);
 
-		let refused = CmsIdentityPair::new(signing, server.key_agreement_identity());
-		assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
-	}
-
-	/// A key and its negation agree alike (SEC 1 v2.0 §3.3.1), so a pair of
-	/// the two is refused as one key.
-	#[test]
-	fn a_pair_of_a_key_and_its_negation_is_refused() {
-		let signing_key = SigningKey::random(&mut OsRng);
-		let negated_key = SigningKey::from(-*signing_key.as_nonzero_scalar());
-		let server = TestCmsServer::of("tightbeam pair", signing_key, negated_key);
-
-		let refused = CmsIdentityPair::new(server.signing_identity(), server.key_agreement_identity());
-		assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
+			let refused = CmsIdentityPair::new(server.signing_identity(), server.key_agreement_identity());
+			assert!(matches!(refused, Err(HandshakeError::KeyReuse)));
+		}
+		cases {
+			same_key => (TestKey::fixed(0x31), TestKey::fixed(0x31)),
+			/// A key and its negation agree alike (SEC 1 v2.0 §3.3.1).
+			negation => (TestKey::fixed(0x32), TestKey::negation_of(&TestKey::fixed(0x32))),
+		}
 	}
 
 	/// The server role checks the purpose of each certificate of the pair,
 	/// so a pair whose key-agreement certificate names the client's purpose
 	/// alone is refused for the server role.
 	#[test]
-	fn a_pair_of_a_client_key_agreement_certificate_is_refused_for_the_server_role() -> Result<(), Box<dyn Error>> {
+	fn a_pair_of_a_client_key_agreement_certificate_is_refused_for_the_server_role() -> TestResult {
 		let server = TestCmsServer::generate("tightbeam pair");
 		let certificate = server.key_agreement.to_owned();
-		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.client]);
-		let provider = Secp256k1KeyProvider::from(server.key_agreement_key.to_owned());
-		let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(provider);
-		let key_agreement = KeyAgreementIdentity::<DhKemSecp256k1>::new(certificate, backend)?;
-		let pair = CmsIdentityPair::new(server.signing_identity(), key_agreement)?;
+		let key_agreement = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.client]);
+		let server = TestCmsServer { key_agreement, ..server };
+		let pair = CmsIdentityPair::new(server.signing_identity(), server.key_agreement_identity())?;
 
 		let refused = pair.require_purpose(KeyPurposes::HOUSE.server);
 		assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
 		Ok(())
 	}
 
+	/// The two certificates of a pair name one subject, so a pair of two
+	/// subjects is refused.
 	#[test]
 	fn a_pair_of_two_subjects_is_refused() {
 		let server = TestCmsServer::generate("tightbeam pair");
@@ -281,40 +270,44 @@ mod tests {
 		TestCertificate::extension(&names, true)
 	}
 
-	/// The signing and key-agreement certificates of a server of an empty
-	/// subject, whose `subjectAltName` names the URI `signing` and the URI
-	/// `key_agreement`, in that order.
-	fn unnamed_pair(signing: &str, key_agreement: &str) -> (Certificate, Certificate) {
-		let server = TestCmsServer::named(RdnSequence::default());
-		let signing = TestCertificate::with_extension(server.signing, naming(signing));
-		let key_agreement = TestCertificate::with_extension(server.key_agreement, naming(key_agreement));
-		(signing, key_agreement)
+	/// `certificate` with the critical `subjectAltName` that names `uri`, where
+	/// `uri` is given.
+	fn named_by(certificate: Certificate, uri: Option<&str>) -> Certificate {
+		uri.map(naming).into_iter().fold(certificate, TestCertificate::with_extension)
 	}
 
-	/// An empty subject names its holder by its `subjectAltName`, so two
-	/// certificates of an empty subject that name two holders are two
-	/// subjects (RFC 5280 §4.1.2.6).
-	#[test]
-	fn two_certificates_of_an_empty_subject_that_name_two_holders_are_refused() {
-		let (signing, key_agreement) = unnamed_pair("urn:tightbeam:signer", "urn:tightbeam:other");
-		let refused = signing.pairs_with(&key_agreement);
-		assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
+	/// The signing and key-agreement certificates of a server of an empty
+	/// subject, [`named_by`] the URI `signing` and the URI `key_agreement`, in
+	/// that order.
+	fn unnamed_pair(signing: Option<&str>, key_agreement: Option<&str>) -> (Certificate, Certificate) {
+		let server = TestCmsServer::named(RdnSequence::default());
+		(named_by(server.signing, signing), named_by(server.key_agreement, key_agreement))
+	}
+
+	// An empty subject names its holder by its `subjectAltName`, so two
+	// certificates of an empty subject are two subjects unless both name one
+	// holder (RFC 5280 §4.1.2.6).
+	crate::tb_cases! {
+		fn two_certificates_of_an_empty_subject_are_refused((signing, key_agreement): (Option<&str>, Option<&str>)) {
+			let (signing, key_agreement) = unnamed_pair(signing, key_agreement);
+			let refused = signing.pairs_with(&key_agreement);
+			assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
+		}
+		cases {
+			/// Two certificates that name two holders name two subjects.
+			two_holders => (Some("urn:tightbeam:signer"), Some("urn:tightbeam:other")),
+			/// A certificate of an empty subject and no `subjectAltName` names
+			/// no holder.
+			no_name => (None, None),
+		}
 	}
 
 	/// Two certificates of an empty subject that name one holder by their
 	/// `subjectAltName` are one subject.
 	#[test]
-	fn two_certificates_of_an_empty_subject_that_name_one_holder_pair() -> Result<(), HandshakeError> {
-		let (signing, key_agreement) = unnamed_pair("urn:tightbeam:signer", "urn:tightbeam:signer");
-		signing.pairs_with(&key_agreement)
-	}
-
-	/// An empty subject with no `subjectAltName` names no holder, so two such
-	/// certificates are refused as two subjects.
-	#[test]
-	fn two_certificates_of_an_empty_subject_and_no_name_are_refused() {
-		let server = TestCmsServer::named(RdnSequence::default());
-		let refused = server.signing.pairs_with(&server.key_agreement);
-		assert!(matches!(refused, Err(HandshakeError::SubjectMismatch)));
+	fn two_certificates_of_an_empty_subject_that_name_one_holder_pair() -> TestResult {
+		let (signing, key_agreement) = unnamed_pair(Some("urn:tightbeam:signer"), Some("urn:tightbeam:signer"));
+		signing.pairs_with(&key_agreement)?;
+		Ok(())
 	}
 }

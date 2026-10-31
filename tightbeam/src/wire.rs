@@ -291,13 +291,19 @@ pub(crate) use wire_sequence;
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use crate::der::Encode;
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::TestResult;
 
+	#[cfg(feature = "colony")]
+	use crate::asn1::admission::fixtures::der_refusal;
 	#[cfg(feature = "colony")]
 	use crate::der::TagNumber;
 	#[cfg(feature = "colony")]
 	use crate::DigestInfo;
+
+	#[cfg(feature = "colony")]
+	use super::*;
 
 	#[derive(Debug, Clone, PartialEq, Eq)]
 	struct Probe {
@@ -311,22 +317,21 @@ mod tests {
 		Probe { count: 7, body: Vec::from([0x78; 4]) }
 	}
 
+	/// A plain field and an octet field decode again to the value that wrote
+	/// them.
 	#[test]
-	fn round_trips_plain_and_octet_fields() -> Result<()> {
-		let original = probe();
-		let encoded = original.to_der()?;
-		let decoded = Probe::from_der(&encoded)?;
-		assert_eq!(original, decoded);
-		Ok(())
+	fn round_trips_plain_and_octet_fields() {
+		assert_eq!(der_round_trip(&probe()), probe());
 	}
 
+	/// An owned byte field costs one wire byte per payload byte plus the
+	/// two-byte OCTET STRING header, which is less than the SEQUENCE OF
+	/// INTEGER form costs.
 	#[test]
-	fn encodes_bytes_as_octet_string() -> Result<()> {
+	fn encodes_bytes_as_octet_string() -> TestResult {
 		let encoded = probe().to_der()?;
-		// The body must cost one wire byte per payload byte plus the two-byte
-		// OCTET STRING header, never the SEQUENCE OF INTEGER form.
-		let body = [0x04, 0x04, 0x78, 0x78, 0x78, 0x78];
-		assert!(encoded.windows(body.len()).any(|window| window == body));
+		// SEQUENCE { INTEGER 7, OCTET STRING 78 78 78 78 }.
+		assert_eq!(encoded, [0x30, 0x09, 0x02, 0x01, 0x07, 0x04, 0x04, 0x78, 0x78, 0x78, 0x78]);
 		Ok(())
 	}
 
@@ -354,24 +359,17 @@ mod tests {
 		}
 	}
 
+	// Each field kind decodes again to the value that wrote it, with its
+	// optionals present or absent.
 	#[cfg(feature = "colony")]
-	#[test]
-	fn round_trips_all_field_kinds() -> Result<()> {
-		let original = colony_probe();
-		let encoded = original.to_der()?;
-		let decoded = ColonyProbe::from_der(&encoded)?;
-		assert_eq!(original, decoded);
-		Ok(())
-	}
-
-	#[cfg(feature = "colony")]
-	#[test]
-	fn round_trips_absent_optionals() -> Result<()> {
-		let original = ColonyProbe { note: None, digests: Vec::new(), ..colony_probe() };
-		let encoded = original.to_der()?;
-		let decoded = ColonyProbe::from_der(&encoded)?;
-		assert_eq!(original, decoded);
-		Ok(())
+	crate::tb_cases! {
+		fn round_trips(original: ColonyProbe) {
+			assert_eq!(der_round_trip(&original), original);
+		}
+		cases {
+			all_field_kinds => colony_probe(),
+			absent_optionals => ColonyProbe { note: None, digests: Vec::new(), ..colony_probe() },
+		}
 	}
 
 	#[cfg(feature = "colony")]
@@ -386,24 +384,29 @@ mod tests {
 	#[cfg(feature = "colony")]
 	wire_sequence!(BudgetProbe { budget: default(BUDGET_DEFAULT) });
 
+	/// A field equal to its default is omitted from the wire, and the decode
+	/// restores the default.
 	#[cfg(feature = "colony")]
 	#[test]
-	fn default_field_is_omitted_on_the_wire() -> Result<()> {
+	fn default_field_is_omitted_on_the_wire() -> TestResult {
 		let encoded = BudgetProbe { budget: BUDGET_DEFAULT }.to_der()?;
 		let decoded = BudgetProbe::from_der(&encoded)?;
 		assert_eq!(encoded, [0x30, 0x00]);
-		assert_eq!(decoded.budget, BUDGET_DEFAULT);
+		assert_eq!(decoded, BudgetProbe { budget: BUDGET_DEFAULT });
 		Ok(())
 	}
 
+	/// A field that differs from its default travels on the wire and decodes
+	/// back.
 	#[cfg(feature = "colony")]
 	#[test]
-	fn non_default_field_round_trips() -> Result<()> {
-		let decoded = BudgetProbe::from_der(&BudgetProbe { budget: 5 }.to_der()?)?;
-		assert_eq!(decoded.budget, 5);
-		Ok(())
+	fn non_default_field_round_trips() {
+		let original = BudgetProbe { budget: 5 };
+		assert_eq!(der_round_trip(&original), original);
 	}
 
+	/// A field present with the value of its default is refused as
+	/// non-canonical.
 	#[cfg(feature = "colony")]
 	#[test]
 	fn present_default_value_is_refused_as_noncanonical() {
@@ -411,6 +414,7 @@ mod tests {
 		// writes the schema default in place of an omitted field. The module
 		// `# Sources` links the recommendation.
 		let encoded = [0x30, 0x03, 0x02, 0x01, 0x07];
-		assert!(BudgetProbe::from_der(&encoded).is_err());
+		let refused = BudgetProbe::from_der(&encoded);
+		assert_eq!(der_refusal(refused), Some(ErrorKind::Noncanonical { tag: Tag::Integer }));
 	}
 }

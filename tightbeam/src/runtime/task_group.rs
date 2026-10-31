@@ -4,6 +4,11 @@ use core::future::Future;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+#[cfg(test)]
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use core::time::Duration;
+
 use crate::runtime::rt;
 
 /// The background tasks one runtime started.
@@ -90,39 +95,41 @@ impl TaskGroup {
 }
 
 #[cfg(test)]
+impl TaskGroup {
+	/// Spawns onto this group a task that sleeps out `span` and then raises
+	/// the flag this returns, and yields once, so the task starts its sleep
+	/// before the call returns.
+	///
+	/// The sleep runs on the tokio clock. Under `start_paused`, the flag rises
+	/// only after the test moves the clock past `span`. A group that refuses
+	/// the task leaves the flag down.
+	async fn spawn_flagged(&self, span: Duration) -> Arc<AtomicBool> {
+		let flag = Arc::new(AtomicBool::new(false));
+		let raised = Arc::clone(&flag);
+		self.spawn(async move {
+			tokio::time::sleep(span).await;
+			raised.store(true, Ordering::SeqCst);
+		});
+
+		tokio::task::yield_now().await;
+		flag
+	}
+}
+
+#[cfg(test)]
 mod tests {
-	use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	use core::sync::atomic::{AtomicUsize, Ordering};
 	use core::time::Duration;
 
-	use std::panic::{catch_unwind, AssertUnwindSafe};
-	use std::sync::mpsc;
-	use std::thread;
+	use std::sync::mpsc::{self, TryRecvError};
 
 	use super::TaskGroup;
+	use crate::testing::fixtures::poison;
 
 	/// Counts the handles the group still holds.
 	fn owned(group: &TaskGroup) -> usize {
-		group.0.lock().expect("task group lock").running.len()
+		group.state().running.len()
 	}
-
-	/// Poisons the group lock, as a task that panics while it holds the
-	/// guard would.
-	fn poison(group: &TaskGroup) {
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = group.0.lock().expect("the lock is live until this panic");
-			panic!("poison the task group lock");
-		}));
-
-		assert!(panicked.is_err());
-		assert!(group.0.is_poisoned());
-	}
-
-	/// A span longer than any test moves its clock. A task that sleeps it out
-	/// and then finishes shows that the stop missed it.
-	const LONG_RUN: Duration = Duration::from_secs(30);
-
-	/// The pause between two beats of the task under test.
-	const BEAT: Duration = Duration::from_millis(5);
 
 	/// Moves the paused test clock forward by `span` and lets every task it
 	/// woke run.
@@ -134,20 +141,31 @@ mod tests {
 		tokio::task::yield_now().await;
 	}
 
-	#[tokio::test(start_paused = true)]
-	async fn stopping_a_group_aborts_the_work_it_owns() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
+	/// A span longer than any test moves its clock. A task that sleeps it out
+	/// and then finishes shows that the stop missed it.
+	const LONG_RUN: Duration = Duration::from_secs(30);
 
-		let group = TaskGroup::default();
-		group.spawn(async {
-			tokio::time::sleep(LONG_RUN).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
+	/// The pause between two beats of the task under test.
+	const BEAT: Duration = Duration::from_millis(5);
 
-		tokio::task::yield_now().await;
-		group.abort_all();
-		advance_past(LONG_RUN * 2).await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
+	// A stop aborts every task the group owns. A poisoned lock still holds
+	// every handle the group adopted, so the stop reaches them all (CWE-772).
+	crate::tb_cases! {
+		#[tokio::test(start_paused = true)]
+		async fn stopping_a_group_aborts_the_work_it_owns(prepare: fn(&TaskGroup)) {
+			let group = TaskGroup::default();
+			let finished = group.spawn_flagged(LONG_RUN).await;
+			prepare(&group);
+
+			group.abort_all();
+			advance_past(LONG_RUN * 2).await;
+
+			assert!(!finished.load(Ordering::SeqCst));
+		}
+		cases {
+			under_a_live_lock => |_| {},
+			under_a_poisoned_lock => |group| poison(&group.0),
+		}
 	}
 
 	/// The group that owns a beat ends it even past the beat's own checks,
@@ -173,99 +191,49 @@ mod tests {
 		assert_eq!(BEATS.load(Ordering::SeqCst), settled);
 	}
 
-	/// A poisoned lock still holds every handle the group adopted, so the stop
-	/// reaches them all (CWE-772).
-	#[tokio::test(start_paused = true)]
-	async fn stopping_a_poisoned_group_aborts_the_work_it_owns() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
-		let group = TaskGroup::default();
-		group.spawn(async {
-			tokio::time::sleep(LONG_RUN).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
-		tokio::task::yield_now().await;
-		poison(&group);
-
-		group.abort_all();
-		advance_past(LONG_RUN * 2).await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
-	}
-
 	/// The state under a poisoned lock is whole, so a live group still runs
 	/// the work it adopts.
 	#[tokio::test(start_paused = true)]
 	async fn a_poisoned_group_runs_the_work_it_adopts() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
 		let group = TaskGroup::default();
-		poison(&group);
+		poison(&group.0);
 
-		group.spawn(async {
-			tokio::time::sleep(BEAT).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
-		tokio::task::yield_now().await;
-
+		let finished = group.spawn_flagged(BEAT).await;
 		advance_past(BEAT * 8).await;
-		assert!(FINISHED.load(Ordering::SeqCst));
+		assert!(finished.load(Ordering::SeqCst));
 	}
 
+	/// A stopped group refuses the work that starts after the stop, so the
+	/// work stays unfinished and the group holds no handle of it (CWE-772).
 	#[tokio::test(start_paused = true)]
 	async fn work_started_after_the_stop_does_not_outlive_it() {
-		static FINISHED: AtomicBool = AtomicBool::new(false);
-
 		let group = TaskGroup::default();
 		group.abort_all();
-		group.spawn(async {
-			tokio::time::sleep(BEAT).await;
-			FINISHED.store(true, Ordering::SeqCst);
-		});
 
+		let finished = group.spawn_flagged(BEAT).await;
 		advance_past(BEAT * 8).await;
-		assert!(!FINISHED.load(Ordering::SeqCst));
-		assert_eq!(owned(&group), 0);
+		assert_eq!((finished.load(Ordering::SeqCst), owned(&group)), (false, 0));
 	}
 
-	/// The longest wait of [`hold_lock`] for a task to report that it ran.
-	const HOLD: Duration = Duration::from_millis(200);
-
-	/// Holds the lock of `group` on a thread of its own until `ran` reports
-	/// that a task ran, or until [`HOLD`] passes, and returns once that thread
-	/// holds the lock. The thread answers whether the report came.
-	fn hold_lock(group: &TaskGroup, ran: mpsc::Receiver<()>) -> thread::JoinHandle<bool> {
-		let group = group.clone();
-		let (held, holding) = mpsc::channel();
-		let holder = thread::spawn(move || {
-			let _guard = group.state();
-			held.send(()).expect("the test waits for the hold");
-			ran.recv_timeout(HOLD).is_ok()
-		});
-
-		holding.recv().expect("the holder takes the lock");
-		holder
-	}
-
-	/// A stopped group runs none of the body of a task it refuses, so the work
-	/// before the task's first await never happens (CWE-367). The group lock is
-	/// held while the spawn runs, so a task that starts before the group reads
-	/// its stop runs on the second worker and reports it.
-	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn a_task_spawned_after_the_stop_does_no_work_before_its_first_await() -> Result<(), &'static str> {
+	/// A stopped group reads its stop before it starts a task, so the task it
+	/// refuses drops unstarted before the spawn returns, and the work before
+	/// its first await never happens (CWE-367). A group that starts the task
+	/// and then aborts it leaves the drop to the runtime, so the report
+	/// channel of the task is still open at the check.
+	#[tokio::test]
+	async fn a_task_spawned_after_the_stop_does_no_work_before_its_first_await() {
 		let group = TaskGroup::default();
 		group.abort_all();
+
 		let (report, ran) = mpsc::channel();
-		let holder = hold_lock(&group, ran);
 
 		group.spawn(async move {
-			// The holder may have ended its wait, and then no one reads the
-			// report.
+			// The test reads the channel itself, so the result of the send
+			// carries nothing more.
 			let _reported = report.send(());
 		});
 
-		let task_ran = holder.join().map_err(|_| "the lock holder panicked")?;
-		assert!(!task_ran);
-		Ok(())
+		assert_eq!(ran.try_recv(), Err(TryRecvError::Disconnected));
 	}
 
 	/// The test runtime runs on one thread, so the yield runs the empty task

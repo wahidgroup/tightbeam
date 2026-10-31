@@ -5,18 +5,13 @@
 //! it once per protocol. A test of the messages of one protocol sits beside
 //! that flow.
 
-use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::cms::cert::IssuerAndSerialNumber;
-use crate::cms::signed_data::{SignerInfo, SignerInfos};
 use crate::crypto::cms::EnvelopeError;
-use crate::crypto::hash::Sha3_256;
 use crate::crypto::key::SigningKeyProvider;
-use crate::crypto::policy::Secp256k1Policy;
-use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::Secp256k1;
 use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::elliptic_curve::PublicKey;
@@ -24,25 +19,18 @@ use crate::crypto::sign::SignedDataSigners;
 use crate::crypto::x509::error::CertificateValidationError::{
 	AmbiguousIssuer, CertificateNotPinned, CertificateNotTrusted, Expired, PathCycle, PathLenExceeded,
 };
-use crate::crypto::x509::policy::{
-	CertificateValidation, DirectTrustValidator, ExpiryValidator, RuntimeCertificatePinning,
-};
-use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use crate::crypto::x509::utils::Skid;
-use crate::crypto::x509::KeyCurves;
-use crate::der::asn1::SetOfVec;
 use crate::der::Encode;
 use crate::marker::MaybeSendFuture;
-use crate::oids::{AES_128_GCM, SESSION_RECEIPT};
-use crate::testing::TestIdentity;
+use crate::oids::{HANDSHAKE_KEY_CONFIRMATION, SESSION_RECEIPT};
+use crate::testing::fixtures::TestStore;
+use crate::testing::{TestCmsServer, TestIdentity, TestKey, TestResult};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{MuxSettings, NegotiationError, SecurityOffer, TransportOffer};
 use crate::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
 use crate::transport::handshake::tests::*;
-use crate::transport::handshake::{
-	Handshake, HandshakeAttribute, HandshakeMessage, HandshakePhase, PeerAuthentication,
-};
-use crate::x509::attr::{Attribute, Attributes};
+use crate::transport::handshake::{Handshake, HandshakeMessage, HandshakePhase, PeerAuthentication};
 use crate::x509::Certificate;
 use crate::TightBeamError;
 
@@ -67,13 +55,10 @@ async fn stray_reply<F: TestFlow>() -> HandshakeMessage {
 	server.reply(opening).await.expect("the server admits the opening")
 }
 
-/// A descriptor that names an AEAD the default provider does not run.
-fn foreign_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc { aead: Some(AES_128_GCM), ..create_default_test_profile() }
-}
-
-async fn the_phase_follows_the_steps<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (mut client, mut server) = pair::<F>(mutual_with(ExpiryValidator::default()));
+/// Each endpoint moves from `Idle` through `Exchanging` to `Agreed` as its
+/// steps run, and both endpoints complete once both agreed.
+async fn the_phase_follows_the_steps<F: TestFlow>() -> TestResult {
+	let (mut client, mut server) = pair::<F>(PeerAuthentication::mutual_by_expiry());
 	assert_eq!(client.phase(), HandshakePhase::Idle);
 	assert_eq!(server.phase(), HandshakePhase::Idle);
 
@@ -96,7 +81,9 @@ async fn the_phase_follows_the_steps<F: TestFlow>() -> Result<(), Box<dyn Error>
 	Ok(())
 }
 
-async fn an_illegal_client_step_leaves_the_phase_unchanged<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+/// A client refuses each step out of its order and keeps its phase, so the
+/// handshake still runs to its end.
+async fn an_illegal_client_step_leaves_the_phase_unchanged<F: TestFlow>() -> TestResult {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 
 	// Only the opening runs on an idle client.
@@ -118,7 +105,9 @@ async fn an_illegal_client_step_leaves_the_phase_unchanged<F: TestFlow>() -> Res
 	Ok(())
 }
 
-async fn an_illegal_server_step_leaves_the_phase_unchanged<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+/// A server refuses each step out of its order and keeps its phase, so the
+/// handshake still runs to its end.
+async fn an_illegal_server_step_leaves_the_phase_unchanged<F: TestFlow>() -> TestResult {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let opening = client.start()?;
 
@@ -142,21 +131,35 @@ async fn an_illegal_server_step_leaves_the_phase_unchanged<F: TestFlow>() -> Res
 	Ok(())
 }
 
-/// A handshake that agreed refuses every further step that reads or builds a
-/// leg, and each refusal leaves what it agreed in place.
-async fn a_step_after_the_agreement_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
-	let Run { opening, reply, closing, mut client, mut server, .. } = run(client, server).await;
-
+/// Whether each step that reads or builds a leg is refused as
+/// [`HandshakeError::InvalidState`] when it runs again on the endpoints of
+/// `run`, beside those endpoints. The client answers and opens, then the
+/// server replies and reads the closing, in that order.
+async fn steps_after_the_legs<F: TestFlow>(run: Run<F>) -> ([bool; 4], TestClient<F>, TestServer<F>) {
+	let Run { opening, reply, closing, mut client, mut server, .. } = run;
 	let answered = client.respond(reply).await;
-	assert!(matches!(client.start(), Err(HandshakeError::InvalidState)));
-	assert!(matches!(answered, Err(HandshakeError::InvalidState)));
-	assert_eq!(client.phase(), HandshakePhase::Agreed);
-
+	let started = client.start();
 	let reopened = server.reply(opening).await;
 	let reclosed = server.finish(closing).await;
-	assert!(matches!(reopened, Err(HandshakeError::InvalidState)));
-	assert!(matches!(reclosed, Err(HandshakeError::InvalidState)));
+
+	let refused = [
+		matches!(answered, Err(HandshakeError::InvalidState)),
+		matches!(started, Err(HandshakeError::InvalidState)),
+		matches!(reopened, Err(HandshakeError::InvalidState)),
+		matches!(reclosed, Err(HandshakeError::InvalidState)),
+	];
+	(refused, client, server)
+}
+
+/// A handshake that agreed refuses every further step that reads or builds a
+/// leg, and each refusal leaves what it agreed in place.
+async fn a_step_after_the_agreement_is_refused<F: TestFlow>() -> TestResult {
+	let Parties { client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
+	let run = run(client, server).await;
+
+	let (refused, mut client, mut server) = steps_after_the_legs(run).await;
+	assert_eq!(refused, [true; 4]);
+	assert_eq!(client.phase(), HandshakePhase::Agreed);
 	assert_eq!(server.phase(), HandshakePhase::Agreed);
 
 	// Both sides still complete.
@@ -167,51 +170,44 @@ async fn a_step_after_the_agreement_is_refused<F: TestFlow>() -> Result<(), Box<
 
 /// A completed handshake is terminal: it refuses every step that reads or
 /// builds a leg, and each refusal leaves it completed.
-async fn a_step_after_completion_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_step_after_completion_is_refused<F: TestFlow>() -> TestResult {
 	let Established { run, .. } = established::<F>(PeerAuthentication::Anonymous).await;
-	let Run { opening, reply, closing, mut client, mut server, .. } = run;
-
-	let answered = client.respond(reply).await;
-	assert!(matches!(client.start(), Err(HandshakeError::InvalidState)));
-	assert!(matches!(answered, Err(HandshakeError::InvalidState)));
+	let (refused, client, server) = steps_after_the_legs(run).await;
+	assert_eq!(refused, [true; 4]);
 	assert_eq!(client.phase(), HandshakePhase::Completed);
-
-	let reopened = server.reply(opening).await;
-	let reclosed = server.finish(closing).await;
-	assert!(matches!(reopened, Err(HandshakeError::InvalidState)));
-	assert!(matches!(reclosed, Err(HandshakeError::InvalidState)));
 	assert_eq!(server.phase(), HandshakePhase::Completed);
 	Ok(())
 }
 
 /// Completion moves the handshake secret out, so a second completion has
 /// nothing to derive from and each accessor answers `None`.
-async fn completion_takes_what_the_handshake_agreed<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
+async fn completion_takes_what_the_handshake_agreed<F: TestFlow>() -> TestResult {
+	let mutual = PeerAuthentication::mutual_by_expiry();
+	let Parties { server_identity, client_identity, client, server } = parties::<F>(mutual);
 	let mut run = run(client, server).await;
-	assert!(run.client.selected_profile().is_some());
-	assert!(run.client.peer_certificate().is_some());
-	assert!(run.server.transcript_hash().is_some());
-	assert!(run.server.peer_certificate().is_some());
+	assert_eq!(run.client.selected_profile(), Some(create_default_test_profile()));
+	assert_eq!(run.client.peer_certificate(), Some(&server_identity.signing));
+	assert_eq!(run.server.transcript_hash(), Some(run.transcript_hash));
+	assert_eq!(run.server.peer_certificate(), Some(&client_identity.certificate));
 
 	run.client.complete()?;
 	run.server.complete()?;
 	assert!(matches!(run.client.complete(), Err(HandshakeError::InvalidState)));
 	assert!(matches!(run.server.complete(), Err(HandshakeError::InvalidState)));
-	assert!(run.client.selected_profile().is_none());
-	assert!(run.client.peer_certificate().is_none());
-	assert!(run.server.transcript_hash().is_none());
-	assert!(run.server.peer_certificate().is_none());
+	assert_eq!(run.client.selected_profile(), None);
+	assert_eq!(run.client.peer_certificate(), None);
+	assert_eq!(run.server.transcript_hash(), None);
+	assert_eq!(run.server.peer_certificate(), None);
 	Ok(())
 }
 
 /// A reply the same server signed for another handshake fails its signature
 /// over this transcript, and the client admits no step after the refusal.
-async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> TestResult {
 	let Parties { server_identity, client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	let mut client = Handshake::client(client);
 	let mut server = Handshake::server(server);
-	let mut other = Handshake::client(F::client(&server_identity, &create_test_certificate()));
+	let mut other = Handshake::client(F::client(&server_identity, &create_test_certificate(0xe0)));
 	let stray = server.reply(other.start()?).await?;
 
 	client.start()?;
@@ -229,7 +225,7 @@ async fn a_refused_reply_leaves_the_client_spent<F: TestFlow>() -> Result<(), Bo
 
 /// The server refuses a closing that another handshake secret sealed, and it
 /// admits no step after the refusal.
-async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> TestResult {
 	let (mut client, mut server) = pair::<F>(PeerAuthentication::Anonymous);
 	let other = established::<F>(PeerAuthentication::Anonymous).await;
 
@@ -247,11 +243,11 @@ async fn a_refused_closing_leaves_the_server_spent<F: TestFlow>() -> Result<(), 
 
 /// Both sides of a handshake with an anonymous-client server derive one key
 /// schedule: a frame the server seals opens on the client.
-async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> TestResult {
 	let Established { client_session, server_session, .. } = established::<F>(PeerAuthentication::Anonymous).await;
-
 	let record = server_session.keys().send().encrypt_next(b"server to client".to_vec())?;
 	let mut to_client = record.to_der()?;
+
 	let opened = client_session.into_keys().recv_mut().open(&mut to_client)?;
 	assert_eq!(opened, b"server to client");
 	Ok(())
@@ -259,11 +255,11 @@ async fn both_sides_derive_the_same_keys_anonymously<F: TestFlow>() -> Result<()
 
 /// Both sides of a mutually authenticated handshake derive one key schedule:
 /// a frame the client seals opens on the server.
-async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Established { client_session, server_session, .. } =
-		established::<F>(mutual_with(ExpiryValidator::default())).await;
+async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow>() -> TestResult {
+	let mutual = PeerAuthentication::mutual_by_expiry();
+	let Established { client_session, server_session, .. } = established::<F>(mutual).await;
 
-	let mut record = sealed_record(&client_session)?;
+	let mut record = sealed_record(&client_session);
 	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
 	assert_eq!(opened, RECORD_PLAINTEXT);
 	Ok(())
@@ -273,25 +269,26 @@ async fn both_sides_derive_the_same_keys_under_mutual_authentication<F: TestFlow
 /// server's static key recovers the CMS base secret, and the HPKE flow seals
 /// nothing to that key. No traffic key the observer derives from what it
 /// holds and the recording opens a recorded frame.
-async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_recorded_session_does_not_open_under_the_server_static_key<F: TestFlow>() -> TestResult {
 	let established = established::<F>(PeerAuthentication::Anonymous).await;
 	let Established { server_identity, run, client_session, .. } = established;
-
-	let record = sealed_record(&client_session)?;
+	let record = sealed_record(&client_session);
 	let Recovered { observer, .. } = F::recover(&run, &server_identity).await;
 
-	let attempts = observer.record_attempts(&record)?;
-	let mut outcomes = attempts.iter();
-	assert_eq!(attempts.len(), F::RECORD_ATTEMPTS);
-	assert!(outcomes.all(|attempt| matches!(attempt, Err(TightBeamError::EnvelopeError(EnvelopeError::KeyUnwrap)))));
+	let attempts = observer.record_attempts(&record);
+	let refused: Vec<bool> = attempts
+		.iter()
+		.map(|attempt| matches!(attempt, Err(TightBeamError::EnvelopeError(EnvelopeError::KeyUnwrap))))
+		.collect();
+	assert_eq!(refused, vec![true; F::RECORD_ATTEMPTS]);
 	Ok(())
 }
 
 /// A mutual handshake carries no byte of the client identity in the clear.
 /// The wire holds no byte of its certificate, its key identifier, its issuer
 /// and serial number, its key, or the signature of its client Finished.
-async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let client_identity = create_issued_test_certificate([0x5a; 16]);
+async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>() -> TestResult {
+	let client_identity = create_issued_test_certificate(0xe1, [0x5a; 16]);
 	let recorder = Arc::new(RecordingProvider::new(client_identity.signing_key.to_owned()));
 	let run = mutual_run::<F>(&client_identity, Arc::clone(&recorder) as Arc<dyn SigningKeyProvider>).await;
 	let certificate = &client_identity.certificate;
@@ -320,11 +317,11 @@ async fn a_mutual_handshake_carries_no_byte_of_the_client_identity<F: TestFlow>(
 
 /// The identity seals padded, so two certificates whose lengths differ within
 /// one padding block close with one length.
-async fn two_identities_of_different_lengths_close_with_one_length<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let short = create_issued_test_certificate([0x5a]);
-	let long = create_issued_test_certificate([0x5a; 20]);
-	let short_run = mutual_run::<F>(&short, into_provider(short.signing_key.to_owned())).await;
-	let long_run = mutual_run::<F>(&long, into_provider(long.signing_key.to_owned())).await;
+async fn two_identities_of_different_lengths_close_with_one_length<F: TestFlow>() -> TestResult {
+	let short = create_issued_test_certificate(0xe2, [0x5a]);
+	let long = create_issued_test_certificate(0xe3, [0x5a; 20]);
+	let short_run = mutual_run::<F>(&short, TestKey::provider(short.signing_key.to_owned())).await;
+	let long_run = mutual_run::<F>(&long, TestKey::provider(long.signing_key.to_owned())).await;
 
 	let short_closing = short_run.closing.der();
 	let long_closing = long_run.closing.der();
@@ -344,8 +341,8 @@ fn sealed_length<F: TestFlow>(run: &Run<F>) -> usize {
 
 /// The client Finished adds about 440 bytes to the 285-byte test
 /// certificate, so an identified closing pads to the 1024-byte floor.
-async fn an_identified_closing_pads_to_the_floor<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { client, server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
+async fn an_identified_closing_pads_to_the_floor<F: TestFlow>() -> TestResult {
+	let Parties { client, server, .. } = parties::<F>(PeerAuthentication::mutual_by_expiry());
 	let run = run(client, server).await;
 	assert_eq!(sealed_length(&run), 1024);
 	Ok(())
@@ -353,13 +350,8 @@ async fn an_identified_closing_pads_to_the_floor<F: TestFlow>() -> Result<(), Bo
 
 /// A receipt countersignature adds about 620 bytes more, so a budget-bearing
 /// identified closing pads past the floor to 1536 bytes.
-async fn a_budget_bearing_identified_closing_pads_past_the_floor<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
-	client.transport_offer = Some(budget_offer());
-	client.receipt_approver = Some(Arc::new(PayingApprover));
-	server.transport = Some(budget_offer());
-	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
-
+async fn a_budget_bearing_identified_closing_pads_past_the_floor<F: TestFlow>() -> TestResult {
+	let Parties { client, server, .. } = budget_bearing::<F>(ChallengingAuthorizer);
 	let run = run(client, server).await;
 	assert_eq!(sealed_length(&run), 1536);
 	Ok(())
@@ -369,42 +361,56 @@ async fn a_budget_bearing_identified_closing_pads_past_the_floor<F: TestFlow>() 
 /// key: the closing holds no byte of the certificate, and no closing key the
 /// recorder derives opens it. The session is budget-bearing, so the client
 /// Finished carries the countersignature inside that seal.
-async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let mutual = mutual_with(ExpiryValidator::default());
-	let Parties { server_identity, client_identity, mut client, mut server } = parties::<F>(mutual);
-	client.transport_offer = Some(budget_offer());
-	client.receipt_approver = Some(Arc::new(PayingApprover));
-	server.transport = Some(budget_offer());
-	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
+async fn the_client_identity_is_sealed_from_the_server_static_key<F: TestFlow>() -> TestResult {
+	let Parties { server_identity, client_identity, client, server } = budget_bearing::<F>(ChallengingAuthorizer);
 
 	let run = run(client, server).await;
 	let Recovered { observer, .. } = F::recover(&run, &server_identity).await;
 	let sealed = run.closing.der();
 	let certificate_der = client_identity.certificate.to_der()?;
 
-	let attempts = observer.closing_attempts(&run.transcript_hash, sealed).await?;
-	let mut outcomes = attempts.iter();
+	let attempts = observer.closing_attempts(&run.transcript_hash, sealed).await;
+	let refused: Vec<bool> = attempts
+		.iter()
+		.map(|attempt| matches!(attempt, Err(HandshakeError::SealedClosing(_))))
+		.collect();
 	assert!(!contains_window(sealed, &certificate_der));
-	assert_eq!(attempts.len(), F::CLOSING_ATTEMPTS);
-	assert!(outcomes.all(|attempt| matches!(attempt, Err(HandshakeError::SealedClosing(_)))));
+	assert_eq!(refused, vec![true; F::CLOSING_ATTEMPTS]);
 	Ok(())
+}
+
+/// The server of `server` once it replied, beside the closing that a client
+/// of `client` answered that reply with.
+async fn server_and_closing<F: TestFlow>(
+	client: TestClientConfig<F>,
+	server: TestServerConfig<F>,
+) -> (TestServer<F>, HandshakeMessage) {
+	let mut client = Handshake::client(client);
+	let mut server = Handshake::server(server);
+	let opening = client.start().expect("a fresh client builds its opening");
+	let reply = server.reply(opening).await.expect("the server admits the opening");
+	let closing = client.respond(reply).await.expect("the client admits the reply");
+
+	(server, closing)
+}
+
+/// What the server of `server` answers to the closing of a client of
+/// `client`.
+async fn closing_outcome<F: TestFlow>(
+	client: TestClientConfig<F>,
+	server: TestServerConfig<F>,
+) -> Result<(), HandshakeError> {
+	let (mut server, closing) = server_and_closing::<F>(client, server).await;
+	server.finish(closing).await
 }
 
 /// Settlement is the last gate of the closing, so a refused settlement drops
 /// the handshake secret with the step and leaves nothing to complete or to
 /// replay with.
-async fn a_refused_settlement_leaves_the_server_spent<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
-	client.transport_offer = Some(budget_offer());
-	client.receipt_approver = Some(Arc::new(PayingApprover));
-	server.transport = Some(budget_offer());
-	server.transport_authorizer = Some(Arc::new(RefusingAuthorizer));
+async fn a_refused_settlement_leaves_the_server_spent<F: TestFlow>() -> TestResult {
+	let Parties { client, server, .. } = budget_bearing::<F>(RefusingAuthorizer);
+	let (mut server, closing) = server_and_closing::<F>(client, server).await;
 
-	let mut client = Handshake::client(client);
-	let mut server = Handshake::server(server);
-
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
 	let refused = server.finish(closing.to_owned()).await;
 	assert!(matches!(refused, Err(HandshakeError::SettlementRejected { .. })));
 	assert_eq!(server.phase(), HandshakePhase::Spent);
@@ -417,6 +423,9 @@ async fn a_refused_settlement_leaves_the_server_spent<F: TestFlow>() -> Result<(
 
 /// An approver that pays each receipt, as [`PayingApprover`] does, and
 /// counts its calls.
+///
+/// Each embedder supplies its own approver as its payment policy, so a test
+/// of when the client consults the approver holds this double.
 #[derive(Default)]
 struct CountingApprover(AtomicUsize);
 
@@ -441,9 +450,8 @@ impl ReceiptApprover for CountingApprover {
 /// as an on-path party would forge it. The signature covers no unsigned
 /// attribute, so it still verifies.
 fn with_forged_server_finished(reply: HandshakeMessage) -> HandshakeMessage {
-	let forged = HandshakeAttribute::encode(&fixture_confirmation()).expect("a tag encodes as an attribute");
-	let forged = Attribute::try_from(forged).expect("the attribute encodes");
-	with_unsigned_attribute(reply, forged)
+	let forged = finished_attribute(&fixture_confirmation());
+	reply.with_unsigned(|carried| [without_attribute(carried, HANDSHAKE_KEY_CONFIRMATION), vec![forged]].concat())
 }
 
 /// `reply` with the session receipt of `other`, the reply of another
@@ -454,34 +462,17 @@ fn with_receipt_of(reply: HandshakeMessage, other: HandshakeMessage) -> Handshak
 	let signer = other.sole_signer().expect("a reply has one signer");
 	let mut carried = signer.unsigned_attrs.iter().flat_map(|attributes| attributes.iter());
 	let receipt = carried.find(|attribute| attribute.oid == SESSION_RECEIPT);
-	let receipt = receipt.expect("a budget-bearing reply carries its receipt");
-	with_unsigned_attribute(reply, receipt.to_owned())
-}
+	let receipt = receipt.expect("a budget-bearing reply carries its receipt").to_owned();
 
-/// `reply` with `attribute` in place of the unsigned attribute of its OID.
-fn with_unsigned_attribute(reply: HandshakeMessage, attribute: Attribute) -> HandshakeMessage {
-	let mut signed_data = reply.signed().expect("a reply is a SignedData").into_value();
-	let signers = core::mem::take(&mut signed_data.signer_infos.0).into_vec();
-	let [signer] = <[SignerInfo; 1]>::try_from(signers).expect("a reply has one signer");
-	let carried = signer.unsigned_attrs.to_owned().map(SetOfVec::into_vec).unwrap_or_default();
-	let oid = attribute.oid;
-	let kept = carried.into_iter().filter(|carried| carried.oid != oid);
-
-	let unsigned = Attributes::try_from(kept.chain([attribute]).collect::<Vec<_>>()).expect("the attributes are a SET");
-	let signer = SignerInfo { unsigned_attrs: Some(unsigned), ..signer };
-	signed_data.signer_infos = SignerInfos(SetOfVec::try_from(vec![signer]).expect("one signer is a SET"));
-
-	HandshakeMessage::try_from(signed_data).expect("the reply encodes")
+	reply.with_unsigned(|carried| [without_attribute(carried, SESSION_RECEIPT), vec![receipt]].concat())
 }
 
 /// A budget-bearing client of flow `F` whose approver is `approver`, and the
 /// server it opened to, with that server's reply.
 async fn budget_bearing_reply<F: TestFlow>(approver: &Arc<CountingApprover>) -> (TestClient<F>, HandshakeMessage) {
-	let Parties { mut client, mut server, .. } = parties::<F>(mutual_with(ExpiryValidator::default()));
-	client.transport_offer = Some(budget_offer());
-	client.receipt_approver = Some(approver.to_owned());
-	server.transport = Some(budget_offer());
-	server.transport_authorizer = Some(Arc::new(ChallengingAuthorizer));
+	let authorizer = Arc::new(ChallengingAuthorizer);
+	let parties = parties::<F>(PeerAuthentication::mutual_by_expiry());
+	let Parties { client, server, .. } = parties.budget_bearing(approver.to_owned(), authorizer);
 
 	let mut client = Handshake::client(client);
 	let mut server = Handshake::server(server);
@@ -494,7 +485,7 @@ async fn budget_bearing_reply<F: TestFlow>(approver: &Arc<CountingApprover>) -> 
 /// The client confirms the server Finished before it reads the receipt, so
 /// it refuses a reply whose Finished fails before the approver runs, and the
 /// approver sees no call.
-async fn a_reply_whose_server_finished_fails_never_reaches_the_approver<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_reply_whose_server_finished_fails_never_reaches_the_approver<F: TestFlow>() -> TestResult {
 	let approver = Arc::new(CountingApprover::default());
 	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
 
@@ -506,7 +497,7 @@ async fn a_reply_whose_server_finished_fails_never_reaches_the_approver<F: TestF
 
 /// A control of the test above: the honest reply of the same session reaches
 /// the approver once.
-async fn an_honest_budget_bearing_reply_reaches_the_approver_once<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn an_honest_budget_bearing_reply_reaches_the_approver_once<F: TestFlow>() -> TestResult {
 	let approver = Arc::new(CountingApprover::default());
 	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
 
@@ -518,7 +509,7 @@ async fn an_honest_budget_bearing_reply_reaches_the_approver_once<F: TestFlow>()
 /// The client confirms the server Finished before it verifies the receipt, so
 /// when a reply's Finished fails beside the receipt of another session, the
 /// client refuses the reply for its Finished.
-async fn a_forged_server_finished_is_refused_before_the_receipt_is_read<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_forged_server_finished_is_refused_before_the_receipt_is_read<F: TestFlow>() -> TestResult {
 	let approver = Arc::new(CountingApprover::default());
 	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
 	let (_, other) = budget_bearing_reply::<F>(&approver).await;
@@ -532,7 +523,7 @@ async fn a_forged_server_finished_is_refused_before_the_receipt_is_read<F: TestF
 
 /// A control of the test above: the receipt check refuses the receipt of
 /// another session beside an honest server Finished.
-async fn a_reply_beside_the_receipt_of_another_session_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_reply_beside_the_receipt_of_another_session_is_refused<F: TestFlow>() -> TestResult {
 	let approver = Arc::new(CountingApprover::default());
 	let (mut client, reply) = budget_bearing_reply::<F>(&approver).await;
 	let (_, other) = budget_bearing_reply::<F>(&approver).await;
@@ -544,17 +535,17 @@ async fn a_reply_beside_the_receipt_of_another_session_is_refused<F: TestFlow>()
 
 /// A server that demands no client certificate verifies the proof of an
 /// offered one and records no peer.
-async fn an_anonymous_server_records_no_peer<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn an_anonymous_server_records_no_peer<F: TestFlow>() -> TestResult {
 	let Established { server_session, .. } = established::<F>(PeerAuthentication::Anonymous).await;
-	assert!(server_session.peer().is_none());
+	assert_eq!(server_session.peer(), None);
 	Ok(())
 }
 
 /// A mutual server records the certificate every validator accepted.
-async fn a_mutual_server_records_the_accepted_peer<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_mutual_server_records_the_accepted_peer<F: TestFlow>() -> TestResult {
 	let Parties { client_identity, client, mut server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	let pinned = DirectTrustValidator::default().with_trust_chain([client_identity.certificate.to_owned()])?;
-	server.peer_authentication = mutual_with(pinned);
+	server.peer_authentication = PeerAuthentication::mutual_with(pinned);
 
 	let mut run = run(client, server).await;
 	let session = run.server.complete()?;
@@ -564,32 +555,43 @@ async fn a_mutual_server_records_the_accepted_peer<F: TestFlow>() -> Result<(), 
 
 /// A mutual server refuses a closing whose certificate a validator refuses.
 /// A direct-trust validator with no anchor refuses every certificate.
-async fn a_mutual_server_refuses_a_refused_certificate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (mut client, mut server) = pair::<F>(mutual_with(DirectTrustValidator::default()));
+async fn a_mutual_server_refuses_a_refused_certificate<F: TestFlow>() -> TestResult {
+	let Parties { client, server, .. } = parties::<F>(PeerAuthentication::mutual_with(DirectTrustValidator::default()));
 
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
-	let refusal = server.finish(closing).await;
+	let refusal = closing_outcome::<F>(client, server).await;
 	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 	Ok(())
 }
 
+/// The configuration of a server of flow `F` that holds `identity` and
+/// demands a client certificate that `validator` accepts.
+fn mutual_server<F: TestFlow>(
+	identity: &TestCmsServer,
+	validator: Arc<dyn CertificateValidation>,
+) -> TestServerConfig<F> {
+	let mut server = F::server(identity);
+	server.peer_authentication = PeerAuthentication::Anonymous.and(validator);
+	server
+}
+
+/// A client of flow `F` that presents `client`, beside a mutual server whose
+/// one client validator pins `pinned` alone.
+fn pinning_mutual<F: TestFlow>(
+	client: &HandshakeCertificate,
+	pinned: &Certificate,
+) -> (TestClientConfig<F>, TestServerConfig<F>) {
+	let server_identity = create_test_server();
+	let server = mutual_server::<F>(&server_identity, pin_of(pinned));
+	(F::client(&server_identity, client), server)
+}
+
 /// A pin reads no validity period, so a mutual server reads it itself and
 /// refuses an expired certificate that its pin accepts.
-async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let server_identity = create_test_server();
-	let client_identity = create_expired_test_certificate();
-	let pinned = [client_identity.certificate.to_owned()];
-	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
-	let mut server_config = F::server(&server_identity);
-	server_config.peer_authentication = mutual_with(pin);
+async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestFlow>() -> TestResult {
+	let client_identity = create_expired_test_certificate(0xe4);
+	let (client, server) = pinning_mutual::<F>(&client_identity, &client_identity.certificate);
 
-	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
-	let mut server = Handshake::server(server_config);
-
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
-	let refusal = server.finish(closing).await;
+	let refusal = closing_outcome::<F>(client, server).await;
 	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 	Ok(())
 }
@@ -597,46 +599,30 @@ async fn a_mutual_server_refuses_an_expired_certificate_its_pin_accepts<F: TestF
 /// A mutual server reads the validity period of a client certificate on its
 /// own clock, so a clock past the end of the period refuses a client that the
 /// host clock reads as current.
-async fn a_mutual_server_reads_the_validity_period_on_its_own_clock<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let server_identity = create_test_server();
-	let client_identity = create_windowed_test_certificate();
-	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates([client_identity.certificate.to_owned()])?;
-	let mut server_config = F::server(&server_identity).with_clock(CertificateFixtures::clock_past_validity());
-	server_config.peer_authentication = mutual_with(pin);
+async fn a_mutual_server_reads_the_validity_period_on_its_own_clock<F: TestFlow>() -> TestResult {
+	let client_identity = create_windowed_test_certificate(0xe5);
+	let (client, server) = pinning_mutual::<F>(&client_identity, &client_identity.certificate);
+	let server = server.with_clock(TestCertificate::clock_past_validity());
 
-	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
-	let mut server = Handshake::server(server_config);
-
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
-	let refusal = server.finish(closing).await;
+	let refusal = closing_outcome::<F>(client, server).await;
 	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 	Ok(())
 }
 
 /// A mutual server reads the validity period before its validators, so it
 /// refuses an expired certificate that its pin also refuses as [`Expired`].
-async fn a_mutual_server_reads_the_validity_period_before_its_validators<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let server_identity = create_test_server();
-	let client_identity = create_expired_test_certificate();
-	let pinned = [create_test_certificate().certificate];
-	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates(pinned)?;
-	let mut server_config = F::server(&server_identity);
-	server_config.peer_authentication = mutual_with(pin);
+async fn a_mutual_server_reads_the_validity_period_before_its_validators<F: TestFlow>() -> TestResult {
+	let client_identity = create_expired_test_certificate(0xe6);
+	let (client, server) = pinning_mutual::<F>(&client_identity, &create_test_certificate(0xe7).certificate);
 
-	let mut client = Handshake::client(F::client(&server_identity, &client_identity));
-	let mut server = Handshake::server(server_config);
-
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
-	let refusal = server.finish(closing).await;
+	let refusal = closing_outcome::<F>(client, server).await;
 	assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
 	Ok(())
 }
 
 /// A server takes the first profile it runs that the client also offered,
 /// and both sides fix that profile.
-async fn both_sides_fix_the_offered_profile_the_server_runs<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn both_sides_fix_the_offered_profile_the_server_runs<F: TestFlow>() -> TestResult {
 	let Parties { mut client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	client.security_offer = Some(SecurityOffer::new(vec![foreign_profile(), create_default_test_profile()]));
 
@@ -649,7 +635,7 @@ async fn both_sides_fix_the_offered_profile_the_server_runs<F: TestFlow>() -> Re
 /// A server refuses an offer that names no profile it runs, so it never
 /// falls back to its own choice past an offer. The refused opening spends the
 /// server.
-async fn a_server_refuses_an_offer_that_names_no_profile_it_runs<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+async fn a_server_refuses_an_offer_that_names_no_profile_it_runs<F: TestFlow>() -> TestResult {
 	let Parties { mut client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
 	client.security_offer = Some(SecurityOffer::new(vec![foreign_profile()]));
 
@@ -663,122 +649,135 @@ async fn a_server_refuses_an_offer_that_names_no_profile_it_runs<F: TestFlow>() 
 	Ok(())
 }
 
-/// Multiplexing negotiates when the client offers it and the server enables
-/// it, and the cap each side advertises bounds the streams its peer initiates.
-async fn multiplexing_negotiates_when_offered_and_enabled<F: TestFlow>() -> Result<(), Box<dyn Error>> {
+/// The multiplexing settings that the client and the server of an anonymous
+/// handshake of flow `F` fix, in that order, once the client offers
+/// `client_offer` and the server advertises `server_offer`.
+async fn negotiated_mux<F: TestFlow>(
+	client_offer: Option<TransportOffer>,
+	server_offer: Option<TransportOffer>,
+) -> (Option<MuxSettings>, Option<MuxSettings>) {
 	let Parties { mut client, mut server, .. } = parties::<F>(PeerAuthentication::Anonymous);
-	client.transport_offer = Some(TransportOffer::mux(8));
-	server.transport = Some(TransportOffer::mux(4));
+	client.transport_offer = client_offer;
+	server.transport = server_offer;
 
 	let run = run(client, server).await;
+	(run.client.negotiated_mux(), run.server.negotiated_mux())
+}
+
+/// Multiplexing negotiates when the client offers it and the server enables
+/// it, and the cap each side advertises bounds the streams its peer initiates.
+async fn multiplexing_negotiates_when_offered_and_enabled<F: TestFlow>() -> TestResult {
+	let (offer, advertisement) = (TransportOffer::mux(8), TransportOffer::mux(4));
+	let (client, server) = negotiated_mux::<F>(Some(offer), Some(advertisement)).await;
 
 	let caps = |mux: MuxSettings| (mux.local_initiated_cap(), mux.peer_initiated_cap());
-	let server_caps = run.server.negotiated_mux().map(caps);
-	assert_eq!(server_caps, Some((8, 4)));
-
-	let client_caps = run.client.negotiated_mux().map(caps);
-	assert_eq!(client_caps, Some((4, 8)));
+	assert_eq!(server.map(caps), Some((8, 4)));
+	assert_eq!(client.map(caps), Some((4, 8)));
 	Ok(())
 }
 
 /// A session stays single-flight when the client offers multiplexing and the
 /// server leaves it disabled.
-async fn an_offer_alone_stays_single_flight<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { mut client, server, .. } = parties::<F>(PeerAuthentication::Anonymous);
-	client.transport_offer = Some(TransportOffer::mux(8));
-
-	let run = run(client, server).await;
-	assert_eq!(run.server.negotiated_mux(), None);
-	assert_eq!(run.client.negotiated_mux(), None);
+async fn an_offer_alone_stays_single_flight<F: TestFlow>() -> TestResult {
+	let negotiated = negotiated_mux::<F>(Some(TransportOffer::mux(8)), None).await;
+	assert_eq!(negotiated, (None, None));
 	Ok(())
 }
 
 /// A session stays single-flight when the server enables multiplexing and
 /// the client leaves it out of its offer.
-async fn a_local_advertisement_alone_stays_single_flight<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let Parties { client, mut server, .. } = parties::<F>(PeerAuthentication::Anonymous);
-	server.transport = Some(TransportOffer::mux(4));
-
-	let run = run(client, server).await;
-	assert_eq!(run.server.negotiated_mux(), None);
-	assert_eq!(run.client.negotiated_mux(), None);
+async fn a_local_advertisement_alone_stays_single_flight<F: TestFlow>() -> TestResult {
+	let negotiated = negotiated_mux::<F>(None, Some(TransportOffer::mux(4))).await;
+	assert_eq!(negotiated, (None, None));
 	Ok(())
 }
 
-/// A server of the fixed test chain, which presents its intermediate, beside a
-/// client of flow `F` that admits it. The CMS client's store holds the root
-/// alone.
-fn chained_pair<F: TestFlow>() -> (ChainedTestServer, TestClient<F>, TestServer<F>) {
-	let chained = ChainedTestServer::fixed();
-	let client = F::client(&chained.identity, &create_test_certificate());
+/// A client of flow `F` that admits the server of `chained`, beside that
+/// server, which presents its intermediate. The CMS client's store holds the
+/// root alone.
+fn chained_pair<F: TestFlow>(chained: &ChainedTestServer) -> (TestClient<F>, TestServer<F>) {
+	let client = F::client(&chained.identity, &create_test_certificate(0xe8));
 	let server = F::server_presenting(&chained.identity, chained.signing_identity());
-	(chained, Handshake::client(client), Handshake::server(server))
+	(Handshake::client(client), Handshake::server(server))
 }
 
 /// A reply carries the intermediate its server presents beside the signing
 /// certificate (RFC 5652 §5.1).
-async fn a_reply_carries_the_intermediate_its_server_presents<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (chained, mut client, mut server) = chained_pair::<F>();
+async fn a_reply_carries_the_intermediate_its_server_presents<F: TestFlow>() -> TestResult {
+	let chained = ChainedTestServer::fixed();
+	let (mut client, mut server) = chained_pair::<F>(&chained);
 	let reply = server.reply(client.start()?).await?;
-	assert!(presented_certificates(&reply).contains(&chained.intermediate));
+	assert!(reply.presented_certificates().contains(&chained.intermediate));
 	Ok(())
+}
+
+/// What a client of flow `F` answers to the reply of the server of `chained`
+/// once that reply presents `issuers` above the signing certificate, in place
+/// of the path the server sent.
+async fn answer_presenting<F: TestFlow>(
+	chained: &ChainedTestServer,
+	issuers: impl IntoIterator<Item = Certificate>,
+) -> Result<HandshakeMessage, HandshakeError> {
+	let (mut client, mut server) = chained_pair::<F>(chained);
+	let opening = client.start().expect("a fresh client builds its opening");
+	let reply = server.reply(opening).await.expect("the server admits the opening");
+	let leaf = chained.identity.signing.to_owned();
+
+	client.respond(reply.with_presented([leaf].into_iter().chain(issuers))).await
 }
 
 /// A reply whose intermediate was swapped for its twin of one subject and one
 /// key still holds a valid path, and the transcript binds the `certificates`
 /// field the server sent, so the reply's signature fails.
-async fn a_reply_whose_intermediate_was_swapped_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (chained, mut client, mut server) = chained_pair::<F>();
-	let reply = server.reply(client.start()?).await?;
-	let leaf = chained.identity.signing.certificate.to_owned();
-	let swapped = with_presented(&reply, [leaf, chained.intermediate_twin()]);
+async fn a_reply_whose_intermediate_was_swapped_is_refused<F: TestFlow>() -> TestResult {
+	let chained = ChainedTestServer::fixed();
+	let issuers = [chained.intermediate_twin()];
 
-	let refused = client.respond(swapped).await;
+	let refused = answer_presenting::<F>(&chained, issuers).await;
 	assert!(matches!(refused, Err(HandshakeError::SignatureVerificationFailed)));
 	Ok(())
 }
 
 /// The client refuses a reply of nine certificates before it reads any
 /// certificate of the reply or checks any signature (CWE-770).
-async fn a_reply_of_nine_certificates_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (chained, mut client, mut server) = chained_pair::<F>();
-	let reply = server.reply(client.start()?).await?;
-	let path = [chained.identity.signing.certificate.to_owned(), chained.intermediate.to_owned()];
-	let crowded = with_presented(&reply, path.into_iter().chain(CertificateFixtures::strangers(7)));
+async fn a_reply_of_nine_certificates_is_refused<F: TestFlow>() -> TestResult {
+	let chained = ChainedTestServer::fixed();
+	let issuers = [vec![chained.intermediate.to_owned()], TestCertificate::strangers(7)].concat();
 
-	let refused = client.respond(crowded).await;
-	let capped = matches!(refused, Err(HandshakeError::CertificateValidationError(PathLenExceeded)));
-	assert!(capped);
+	let refused = answer_presenting::<F>(&chained, issuers).await;
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(PathLenExceeded))
+	));
 	Ok(())
 }
 
 /// The client refuses a reply whose issuers lead the walk back to a
 /// certificate of its path, before it reads the reply's signature.
-async fn a_reply_whose_path_returns_to_itself_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (chained, mut client, mut server) = chained_pair::<F>();
-	let reply = server.reply(client.start()?).await?;
-	let leaf = chained.identity.signing.certificate.to_owned();
-	let [first, second] = CertificateFixtures::looping_issuers(&chained.intermediate);
-	let looping = with_presented(&reply, [leaf, first, second]);
+async fn a_reply_whose_path_returns_to_itself_is_refused<F: TestFlow>() -> TestResult {
+	let chained = ChainedTestServer::fixed();
+	let issuers = TestCertificate::looping_issuers(&chained.intermediate);
 
-	let refused = client.respond(looping).await;
-	let cycled = matches!(refused, Err(HandshakeError::CertificateValidationError(PathCycle { .. })));
-	assert!(cycled);
+	let refused = answer_presenting::<F>(&chained, issuers).await;
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(PathCycle { .. }))
+	));
 	Ok(())
 }
 
 /// The client refuses a reply that carries two certificates of the subject
 /// of the signing certificate's issuer, because the walk cannot tell which
 /// one issued it.
-async fn a_reply_with_two_issuers_of_one_subject_is_refused<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let (chained, mut client, mut server) = chained_pair::<F>();
-	let reply = server.reply(client.start()?).await?;
-	let leaf = chained.identity.signing.certificate.to_owned();
-	let repeated = with_presented(&reply, [leaf, chained.intermediate.to_owned(), chained.intermediate_twin()]);
+async fn a_reply_with_two_issuers_of_one_subject_is_refused<F: TestFlow>() -> TestResult {
+	let chained = ChainedTestServer::fixed();
+	let issuers = [chained.intermediate.to_owned(), chained.intermediate_twin()];
 
-	let refused = client.respond(repeated).await;
-	let ambiguous = matches!(refused, Err(HandshakeError::CertificateValidationError(AmbiguousIssuer { .. })));
-	assert!(ambiguous);
+	let refused = answer_presenting::<F>(&chained, issuers).await;
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(AmbiguousIssuer { .. }))
+	));
 	Ok(())
 }
 
@@ -794,11 +793,8 @@ fn root_anchored_mutual<F: TestFlow>(
 	let server_identity = create_test_server();
 	let client = F::client_presenting(&server_identity, identity);
 
-	let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-	let store = store.with_certificate(chain.root.to_owned());
-	let store = store.expect("the root is within its validity period").build();
-	let mut server = F::server(&server_identity);
-	server.peer_authentication = mutual_with(store);
+	let store = TestStore::holding([chain.root.to_owned()]);
+	let server = mutual_server::<F>(&server_identity, Arc::new(store));
 	(client, server)
 }
 
@@ -806,8 +802,8 @@ fn root_anchored_mutual<F: TestFlow>(
 /// certificate an intermediate issued, because the client Finished presents
 /// the intermediate and the server validates that path to the root
 /// (RFC 5280 §6.1).
-async fn a_root_only_server_admits_a_presented_intermediate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let chain = CertificateFixtures::insecure_fixed_chain()?;
+async fn a_root_only_server_admits_a_presented_intermediate<F: TestFlow>() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
 	let (client, server) = root_anchored_mutual::<F>(&chain, [chain.intermediate.to_owned()]);
 
 	let mut run = run(client, server).await;
@@ -819,47 +815,17 @@ async fn a_root_only_server_admits_a_presented_intermediate<F: TestFlow>() -> Re
 /// A mutual server whose store holds the root alone refuses a client whose
 /// Finished presents another authority of the intermediate's name in its
 /// place, because that path reaches no anchor of the store.
-async fn a_root_only_server_refuses_a_swapped_intermediate<F: TestFlow>() -> Result<(), Box<dyn Error>> {
-	let chain = CertificateFixtures::insecure_fixed_chain()?;
-	let impostor = CertificateFixtures::authority(&create_test_signing_key(), "Intermediate")?;
+async fn a_root_only_server_refuses_a_swapped_intermediate<F: TestFlow>() -> TestResult {
+	let chain = TestCertificate::insecure_fixed_chain()?;
+	let impostor = TestCertificate::authority(&TestKey::fixed(0x24), "Intermediate")?;
 	let (client, server) = root_anchored_mutual::<F>(&chain, [impostor]);
-	let (mut client, mut server) = (Handshake::client(client), Handshake::server(server));
 
-	let reply = server.reply(client.start()?).await?;
-	let closing = client.respond(reply).await?;
-	let refused = server.finish(closing).await;
-	let untrusted = matches!(refused, Err(HandshakeError::CertificateValidationError(CertificateNotTrusted)));
-	assert!(untrusted);
+	let refused = closing_outcome::<F>(client, server).await;
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(CertificateNotTrusted))
+	));
 	Ok(())
-}
-
-/// Run each named test body once per protocol.
-macro_rules! over_each_flow {
-	($($test:ident),* $(,)?) => {
-		#[cfg(feature = "transport-hpke")]
-		mod hpke {
-			use super::*;
-
-			$(
-				#[tokio::test]
-				async fn $test() -> Result<(), Box<dyn Error>> {
-					super::$test::<Hpke>().await
-				}
-			)*
-		}
-
-		#[cfg(feature = "transport-cms")]
-		mod cms {
-			use super::*;
-
-			$(
-				#[tokio::test]
-				async fn $test() -> Result<(), Box<dyn Error>> {
-					super::$test::<Cms>().await
-				}
-			)*
-		}
-	};
 }
 
 over_each_flow! {
@@ -909,12 +875,13 @@ over_each_flow! {
 /// presented path to that root (RFC 5280 §6.1).
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
-async fn a_cms_client_of_the_root_alone_admits_a_presented_intermediate() -> Result<(), Box<dyn Error>> {
-	let (chained, mut client, mut server) = chained_pair::<Cms>();
+async fn a_cms_client_of_the_root_alone_admits_a_presented_intermediate() -> TestResult {
+	let chained = ChainedTestServer::fixed();
+	let (mut client, mut server) = chained_pair::<Cms>(&chained);
 
 	let reply = server.reply(client.start()?).await?;
 	client.respond(reply).await?;
-	assert_eq!(client.peer_certificate(), Some(&chained.identity.signing.certificate));
+	assert_eq!(client.peer_certificate(), Some(&chained.identity.signing));
 	Ok(())
 }
 
@@ -932,7 +899,7 @@ fn root_anchored_hpke_client(chained: &ChainedTestServer) -> TestClient<Hpke> {
 /// validates the path the reply presents to that root (RFC 5280 §6.1).
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
-async fn an_hpke_client_of_the_root_alone_completes_under_a_presented_intermediate() -> Result<(), Box<dyn Error>> {
+async fn an_hpke_client_of_the_root_alone_completes_under_a_presented_intermediate() -> TestResult {
 	let chained = ChainedTestServer::fixed();
 	let mut client = root_anchored_hpke_client(&chained);
 	let mut server = Handshake::server(Hpke::server_presenting(&chained.identity, chained.signing_identity()));
@@ -943,7 +910,7 @@ async fn an_hpke_client_of_the_root_alone_completes_under_a_presented_intermedia
 	server.finish(closing).await?;
 	client.complete()?;
 	server.complete()?;
-	assert_eq!(admitted.as_ref(), Some(&chained.identity.signing.certificate));
+	assert_eq!(admitted.as_ref(), Some(&chained.identity.signing));
 	Ok(())
 }
 
@@ -952,15 +919,17 @@ async fn an_hpke_client_of_the_root_alone_completes_under_a_presented_intermedia
 /// path stops below its anchor.
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
-async fn an_hpke_client_of_the_root_alone_refuses_a_path_short_of_its_anchor() -> Result<(), Box<dyn Error>> {
+async fn an_hpke_client_of_the_root_alone_refuses_a_path_short_of_its_anchor() -> TestResult {
 	let chained = ChainedTestServer::fixed();
 	let mut client = root_anchored_hpke_client(&chained);
 	let mut server = Handshake::server(Hpke::server(&chained.identity));
 
 	let reply = server.reply(client.start()?).await?;
 	let refused = client.respond(reply).await;
-	let short = matches!(refused, Err(HandshakeError::CertificateValidationError(CertificateNotTrusted)));
-	assert!(short);
+	assert!(matches!(
+		refused,
+		Err(HandshakeError::CertificateValidationError(CertificateNotTrusted))
+	));
 	Ok(())
 }
 
@@ -972,14 +941,14 @@ async fn a_cms_client_session_keeps_the_key_agreement_certificate() {
 	let established = established::<Cms>(PeerAuthentication::Anonymous).await;
 	let session_peer = established.client_session.session_peer();
 	let kept = session_peer.map(Arc::as_ref).and_then(SessionPeer::key_agreement);
-	assert_eq!(kept, Some(&established.server_identity.key_agreement.certificate));
+	assert_eq!(kept, Some(&established.server_identity.key_agreement));
 }
 
 /// The base secret of the CMS opening crosses the wire only sealed, so no
 /// leg carries its bytes in the clear (CWE-311).
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
-async fn the_base_secret_crosses_the_wire_only_sealed() -> Result<(), Box<dyn Error>> {
+async fn the_base_secret_crosses_the_wire_only_sealed() -> TestResult {
 	let Parties { server_identity, client, server, .. } = parties::<Cms>(PeerAuthentication::Anonymous);
 	let run = run(client, server).await;
 
@@ -1002,18 +971,12 @@ async fn two_handshakes_draw_different_base_secrets() {
 	assert_ne!(first.base, second.base);
 }
 
-/// The server policy that pins `certificate` alone, by its fingerprint.
-fn pin_of(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
-	let pin = RuntimeCertificatePinning::<Sha3_256>::from_certificates([certificate.to_owned()]);
-	Arc::new(pin.expect("the test certificate has a fingerprint"))
-}
-
 /// The configuration of the CMS server of `server_identity` after its
 /// authority issued its signing certificate again, to the same subject, for a
 /// fresh key, beside that certificate.
 #[cfg(feature = "transport-cms")]
-fn rotated_cms_server(server_identity: &TestServerIdentity) -> (TestServerConfig<Cms>, Certificate) {
-	let (pair, rotated) = server_identity.fixture().rotated_pair();
+fn rotated_cms_server(server_identity: &TestCmsServer) -> (TestServerConfig<Cms>, Certificate) {
+	let (pair, rotated) = server_identity.rotated_pair();
 	let profiles = SupportedProfiles::from(create_default_test_profile());
 	let config = ServerConfig::new(CmsServerSettings, pair, profiles, KeyPurposes::HOUSE);
 	(config.expect("a rotated test server pair serves the server role"), rotated)
@@ -1023,10 +986,10 @@ fn rotated_cms_server(server_identity: &TestServerIdentity) -> (TestServerConfig
 /// of it admits the server after the server rotates its signing certificate.
 #[cfg(feature = "transport-cms")]
 #[tokio::test]
-async fn a_cms_key_agreement_pin_admits_a_rotated_signing_certificate() -> Result<(), Box<dyn Error>> {
+async fn a_cms_key_agreement_pin_admits_a_rotated_signing_certificate() -> TestResult {
 	let server_identity = create_test_server();
-	let pin = pin_of(&server_identity.key_agreement.certificate);
-	let client = Cms::client(&server_identity, &create_test_certificate()).with_server_policy([pin]);
+	let pin = pin_of(&server_identity.key_agreement);
+	let client = Cms::client(&server_identity, &create_test_certificate(0xe9)).with_server_policy([pin]);
 	let (server, rotated) = rotated_cms_server(&server_identity);
 
 	let mut client = Handshake::client(client);
@@ -1043,7 +1006,7 @@ async fn a_cms_key_agreement_pin_admits_a_rotated_signing_certificate() -> Resul
 #[test]
 fn a_cms_policy_that_refuses_the_pinned_certificate_builds_no_opening() {
 	let Parties { server_identity, client, .. } = parties::<Cms>(PeerAuthentication::Anonymous);
-	let pin = pin_of(&server_identity.signing.certificate);
+	let pin = pin_of(&server_identity.signing);
 	let mut client = Handshake::client(client.with_server_policy([pin]));
 
 	let refused = client.start();
@@ -1057,9 +1020,9 @@ fn a_cms_policy_that_refuses_the_pinned_certificate_builds_no_opening() {
 /// reply names, though the client's trust admits it.
 #[cfg(feature = "transport-hpke")]
 #[tokio::test]
-async fn an_hpke_pin_refuses_another_server() -> Result<(), Box<dyn Error>> {
+async fn an_hpke_pin_refuses_another_server() -> TestResult {
 	let Parties { client, server, .. } = parties::<Hpke>(PeerAuthentication::Anonymous);
-	let pin = pin_of(&create_test_certificate().certificate);
+	let pin = pin_of(&create_test_certificate(0xea).certificate);
 	let mut client = Handshake::client(client.with_server_policy([pin]));
 	let mut server = Handshake::server(server);
 

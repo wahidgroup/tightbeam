@@ -241,7 +241,7 @@ mod tests {
 		spec: GossipAndPeerAdRefusalSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let frame = TestRumor::application(1_000, [1, 2, 3]);
+				let frame = TestRumor::fixed();
 				let audit = RequestAudit::proven(&Arc::new(trace));
 				Refusal::to(&frame, &audit).gossip(TransitStatus::ResourceExhausted)?;
 				Refusal::to(&frame, &audit).peer_ad(TransitStatus::PermissionDenied)?;
@@ -267,7 +267,7 @@ mod tests {
 		spec: ReconcileRefusalSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				let frame = TestRumor::application(1_000, [1, 2, 3]);
+				let frame = TestRumor::fixed();
 				let audit = RequestAudit::proven(&Arc::new(trace));
 				Refusal::to(&frame, &audit).reconcile(TransitStatus::InvalidArgument)?;
 				Ok(())
@@ -280,67 +280,46 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	mod audit {
 		use super::*;
-		use crate::instrumentation::TbInstrumentationConfig;
-		use crate::trace::TraceConfig;
+		use crate::tb_cases;
+		use crate::testing::fixtures::TestTrace;
+		use crate::testing::TestResult;
 
-		/// A trace whose sink keeps the digest of each payload.
-		fn payload_trace() -> TraceCollector {
-			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-			TraceCollector::from(TraceConfig::with_instrumentation(config))
-		}
-
-		/// The digest of the payload of each [`CLUSTER_GOSSIP_REFUSED`] that
-		/// `trace` holds.
-		fn refused_payloads(trace: &TraceCollector) -> Vec<Option<[u8; 32]>> {
-			let recorded = trace.drain_events().into_iter();
-			let refused = recorded.filter(|record| record.urn == CLUSTER_GOSSIP_REFUSED);
-			refused.map(|record| record.payload_hash).collect()
-		}
-
-		// A refusal of a frame whose signature has not verified names no
-		// signer, though the frame names one, so the trail never names a
-		// party that the frame only claims (CWE-345).
+		/// A refusal of a frame whose signature has not verified names no
+		/// signer, though the frame names one, so the trail never names a
+		/// party that the frame only claims (CWE-345).
 		#[test]
-		fn an_unverified_refusal_names_no_signer() -> Result<(), TightBeamError> {
-			let trace = Arc::new(payload_trace());
-			let frame = TestRumor::application(1_000, [1, 2, 3]);
+		fn an_unverified_refusal_names_no_signer() -> TestResult {
+			let trace = Arc::new(TestTrace::with_payloads());
+			let frame = TestRumor::fixed();
 			Refusal::to(&frame, &RequestAudit::proven(&trace)).gossip(TransitStatus::PermissionDenied)?;
-			assert_eq!(refused_payloads(&trace), [None]);
+			assert_eq!(TestTrace::payloads(&trace, CLUSTER_GOSSIP_REFUSED), [None]);
 			Ok(())
 		}
 
-		/// The label of each [`CLUSTER_GOSSIP_REFUSED`] that `trace` holds.
-		fn refused_labels(trace: &TraceCollector) -> Vec<Option<String>> {
-			let recorded = trace.drain_events().into_iter();
-			let refused = recorded.filter(|record| record.urn == CLUSTER_GOSSIP_REFUSED);
-			refused.map(|record| record.label.as_deref().map(String::from)).collect()
-		}
+		/// One refusal of a fault of the gateway's own.
+		type Refuse = fn(Refusal<'_>) -> Result<Option<Frame>, TightBeamError>;
 
-		// The gateway refuses a rumor that meets a fault of its own and names
-		// the fault in the record, so the trail tells a failed journal from a
-		// failed rate admission (CWE-778).
-		#[test]
-		fn a_gossip_refusal_of_a_fault_names_the_fault() -> Result<(), TightBeamError> {
-			let trace = Arc::new(TraceCollector::default());
-			let frame = TestRumor::application(1_000, [1, 2, 3]);
-			let fault = LoopFault::Registry(ClusterError::GossipJournalUnavailable);
-
-			Refusal::to(&frame, &RequestAudit::proven(&trace)).gossip_fault(fault)?;
-
-			let expected = [Some(String::from("Unavailable/gossip-journal-unavailable"))];
-			assert_eq!(refused_labels(&trace), expected);
-			Ok(())
-		}
-
-		// The gateway refuses a reconcile round that meets a fault of its own
-		// and names the fault in the record.
-		#[test]
-		fn a_reconcile_refusal_of_a_fault_names_the_fault() -> Result<(), TightBeamError> {
-			let trace = Arc::new(TraceCollector::default());
-			let frame = TestRumor::application(1_000, [1, 2, 3]);
-			Refusal::to(&frame, &RequestAudit::proven(&trace)).reconcile_fault(&ClusterError::LockPoisoned)?;
-			assert_eq!(refused_labels(&trace), [Some(String::from("Unavailable/lock-poisoned"))]);
-			Ok(())
+		// The gateway refuses a rumor or a reconcile round that meets a fault
+		// of its own and names the fault in the record, so the trail tells a
+		// failed journal from a failed rate admission (CWE-778).
+		tb_cases! {
+			fn a_fault_refusal_names_the_fault((refuse, label): (Refuse, &str)) -> TestResult {
+				let trace = Arc::new(TraceCollector::default());
+				let frame = TestRumor::fixed();
+				refuse(Refusal::to(&frame, &RequestAudit::proven(&trace)))?;
+				assert_eq!(TestTrace::labels(&trace, CLUSTER_GOSSIP_REFUSED), [Some(String::from(label))]);
+				Ok(())
+			}
+			cases {
+				gossip_journal => (
+					|refusal| refusal.gossip_fault(LoopFault::Registry(ClusterError::GossipJournalUnavailable)),
+					"Unavailable/gossip-journal-unavailable",
+				),
+				reconcile_lock => (
+					|refusal| refusal.reconcile_fault(&ClusterError::LockPoisoned),
+					"Unavailable/lock-poisoned",
+				),
+			}
 		}
 	}
 }

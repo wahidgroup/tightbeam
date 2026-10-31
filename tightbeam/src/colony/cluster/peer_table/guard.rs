@@ -501,13 +501,7 @@ impl GuardedTable {
 	/// leaves it.
 	#[cfg(test)]
 	pub fn poison(&self) {
-		let poisoner = || {
-			let _guard = self.state.lock();
-			panic!("a thread panicked under the table guard");
-		};
-
-		// The panic is the point, so the joined result carries nothing to read.
-		let _panicked = std::thread::scope(|scope| scope.spawn(poisoner).join());
+		crate::testing::fixtures::poison(&self.state);
 	}
 
 	/// Reads the table under the guard.

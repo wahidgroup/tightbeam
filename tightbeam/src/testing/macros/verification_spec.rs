@@ -1286,6 +1286,8 @@ mod tests {
 	use std::borrow::Cow;
 
 	use super::*;
+	use crate::testing::specs::AssertionViolationDetail;
+	use crate::testing::TestResult;
 	use crate::trace::TraceCollector;
 
 	const OLDER_KEY: Urn<'static> = crate::urn!("test", "event:spec/older-key");
@@ -1294,6 +1296,12 @@ mod tests {
 	const ACCEPTED: Urn<'static> = crate::urn!("test", "event:spec/accepted");
 	#[cfg(feature = "instrument")]
 	const REJECTED: Urn<'static> = crate::urn!("test", "event:spec/rejected");
+
+	/// The shorter label of the joined-order specs.
+	const JOINED_SHORT: Urn<'static> = crate::urn!("aa", "b");
+	/// The longer label, whose rendering is the rendering of `JOINED_SHORT`
+	/// twice in a row.
+	const JOINED_LONG: Urn<'static> = crate::urn!("aa", "burn:aa:b");
 
 	crate::tb_assert_spec! {
 		pub VersionedKeySpec,
@@ -1311,155 +1319,148 @@ mod tests {
 		}
 	}
 
+	/// Two spec builders that the hash tests compare.
+	type SpecPair = (AssertSpecBuilder, AssertSpecBuilder);
+
+	/// The builder of the spec `Spec` in `Accept` mode, which each hash test
+	/// starts from.
+	fn spec() -> AssertSpecBuilder {
+		AssertSpecBuilder::new("Spec", ExecutionMode::Accept)
+	}
+
+	/// `builder` with an assertion that `label` occurs once under `tags`.
+	fn asserting(builder: AssertSpecBuilder, label: Urn<'static>, tags: Vec<&'static str>) -> AssertSpecBuilder {
+		let asserted = builder.assertion(label, tags, exactly!(1));
+		asserted.expect("a new label with a count asserts")
+	}
+
+	/// The spec that asserts `first` and `second` once each, ordered as
+	/// `first` then `second`, and as `second` then `first`.
+	fn both_orders(first: Urn<'static>, second: Urn<'static>) -> SpecPair {
+		let builder = asserting(asserting(spec(), first.clone(), Vec::new()), second.clone(), Vec::new());
+		let forward = builder.clone().ordering([first.clone(), second.clone()]);
+		let reverse = builder.ordering([second, first]);
+		let ordered = "an order of asserted labels builds";
+		(forward.expect(ordered), reverse.expect(ordered))
+	}
+
+	/// The spec that asserts `OLDER_KEY` once with the value `value`.
+	fn valued(value: u8) -> AssertSpecBuilder {
+		let asserted = spec().assertion_with_value(OLDER_KEY, Vec::new(), exactly!(1), crate::equals!(value));
+		asserted.expect("a new label with a count and a value asserts")
+	}
+
+	/// The latest spec is the block of the highest version.
 	#[test]
 	fn latest_selects_highest_version_block() {
 		let latest = VersionedKeySpec::latest();
+
+		let labels: Vec<_> = latest.required_assertions().iter().map(|contract| &contract.label).collect();
 		let generated = AssertionLabel::Custom(Cow::Owned(NEWER_KEY.to_string()));
-		assert_eq!(latest.version(), (2, 0, 0));
-		assert!(latest
-			.required_assertions()
-			.iter()
-			.any(|contract| contract.label.matches(&generated)));
+		assert_eq!((latest.version(), labels), ((2, 0, 0), vec![&generated]));
 	}
 
-	#[test]
-	fn version_ascent_check_accepts_and_rejects() {
-		assert!(versions_strictly_ascending(&[(1, 0, 0), (1, 1, 0), (2, 0, 0)]));
-		assert!(!versions_strictly_ascending(&[(2, 0, 0), (1, 0, 0)]));
-		assert!(!versions_strictly_ascending(&[(1, 0, 0), (1, 0, 0)]));
+	// The check of a version list holds only when each version is greater
+	// than the one before it.
+	crate::tb_cases! {
+		fn versions_ascend((versions, ascending): (&[(u16, u16, u16)], bool)) {
+			let checked = versions_strictly_ascending(versions);
+			assert_eq!(checked, ascending);
+		}
+
+		cases {
+			when_each_is_greater => (&[(1, 0, 0), (1, 1, 0), (2, 0, 0)], true),
+			not_when_one_is_smaller => (&[(2, 0, 0), (1, 0, 0)], false),
+			not_when_one_repeats => (&[(1, 0, 0), (1, 0, 0)], false),
+		}
 	}
 
+	/// A count past `u32::MAX` exceeds every maximum a spec can state.
 	#[cfg(target_pointer_width = "64")]
 	#[test]
-	fn a_count_past_u32_max_exceeds_every_maximum() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_count_past_u32_max_exceeds_every_maximum() -> TestResult {
 		let beyond = usize::try_from(u64::from(u32::MAX) + 1)?;
 		assert!(!Cardinality::at_most(u32::MAX).is_satisfied_by(beyond));
 		Ok(())
 	}
 
-	#[test]
-	fn specs_that_differ_in_their_response_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let requires = AssertSpecBuilder::new("Spec", ExecutionMode::Accept).expected_response(Some(Presence::Present));
-		let forbids = AssertSpecBuilder::new("Spec", ExecutionMode::Accept).expected_response(Some(Presence::Absent));
-		assert_ne!(requires.build().spec_hash(), forbids.build().spec_hash());
-		Ok(())
+	// Two specs that differ in one part hash apart. Each label of an order
+	// takes its length first, so two orders whose labels join to one string
+	// hash apart too. A trace records the required events in order, so two
+	// orders of one set hash apart.
+	crate::tb_cases! {
+		fn specs_hash_apart_when_they_differ(pair: fn() -> SpecPair) {
+			let (one, other) = pair();
+
+			let hashes = (one.build().spec_hash(), other.build().spec_hash());
+			assert_ne!(hashes.0, hashes.1);
+		}
+
+		cases {
+			in_their_response => || {
+				let requires = spec().expected_response(Some(Presence::Present));
+				(requires, spec().expected_response(Some(Presence::Absent)))
+			},
+			in_their_assertion_order => || both_orders(OLDER_KEY, NEWER_KEY),
+			in_an_equals_value => || (valued(1), valued(2)),
+			in_the_tags_of_an_assertion => || {
+				(asserting(spec(), OLDER_KEY, vec!["hot"]), asserting(spec(), OLDER_KEY, vec!["cold"]))
+			},
+			in_orders_whose_labels_join_to_one_string => || both_orders(JOINED_SHORT, JOINED_LONG),
+			#[cfg(feature = "instrument")]
+			in_an_event_count => || {
+				(spec().event_count(ACCEPTED, exactly!(1)), spec().event_count(ACCEPTED, exactly!(2)))
+			},
+			#[cfg(feature = "instrument")]
+			in_the_order_of_their_required_events => || {
+				(spec().required_events([ACCEPTED, REJECTED]), spec().required_events([REJECTED, ACCEPTED]))
+			},
+		}
 	}
 
-	#[test]
-	fn specs_that_differ_in_their_assertion_order_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let builder = builder.assertion(OLDER_KEY, Vec::new(), exactly!(1))?;
-		let builder = builder.assertion(NEWER_KEY, Vec::new(), exactly!(1))?;
-		let forward = builder.clone().ordering([OLDER_KEY, NEWER_KEY])?;
-		let reverse = builder.ordering([NEWER_KEY, OLDER_KEY])?;
-		assert_ne!(forward.build().spec_hash(), reverse.build().spec_hash());
-		Ok(())
+	// Two specs that state one set of tags or event counts in two orders
+	// hash the same.
+	crate::tb_cases! {
+		fn specs_hash_the_same_with(pair: fn() -> SpecPair) {
+			let (one, other) = pair();
+			let hashes = (one.build().spec_hash(), other.build().spec_hash());
+			assert_eq!(hashes.0, hashes.1);
+		}
+
+		cases {
+			tags_in_another_order => || {
+				let forward = asserting(spec().tag_filter(vec!["hot", "fresh"]), OLDER_KEY, vec!["south", "north"]);
+				(forward, asserting(spec().tag_filter(vec!["fresh", "hot"]), OLDER_KEY, vec!["north", "south"]))
+			},
+			#[cfg(feature = "instrument")]
+			event_counts_in_another_order => || {
+				let forward = spec().event_count(ACCEPTED, exactly!(1)).event_count(REJECTED, absent!());
+				(forward, spec().event_count(REJECTED, absent!()).event_count(ACCEPTED, exactly!(1)))
+			},
+		}
 	}
 
+	/// An assertion counts only the records that carry its own tags.
 	#[test]
-	fn specs_that_differ_in_an_equals_value_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let (one, two) = (builder.clone(), builder);
-		let one = one.assertion_with_value(OLDER_KEY, Vec::new(), exactly!(1), crate::equals!(1u8))?;
-		let two = two.assertion_with_value(OLDER_KEY, Vec::new(), exactly!(1), crate::equals!(2u8))?;
-		assert_ne!(one.build().spec_hash(), two.build().spec_hash());
-		Ok(())
-	}
-
-	#[test]
-	fn specs_that_differ_in_the_tags_of_an_assertion_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let hot = builder.clone().assertion(OLDER_KEY, vec!["hot"], exactly!(1))?;
-		let cold = builder.assertion(OLDER_KEY, vec!["cold"], exactly!(1))?;
-		assert_ne!(hot.build().spec_hash(), cold.build().spec_hash());
-		Ok(())
-	}
-
-	#[test]
-	fn an_assertion_counts_only_the_records_that_carry_its_own_tags() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let spec = builder.assertion(OLDER_KEY, vec!["hot"], exactly!(1))?.build();
-
+	fn an_assertion_counts_only_the_records_that_carry_its_own_tags() -> TestResult {
+		let hot_once = asserting(spec(), OLDER_KEY, vec!["hot"]).build();
 		let collector = TraceCollector::new();
 		collector.event_with(OLDER_KEY, &["cold"], ())?.emit();
+
 		let trace = ConsumedTrace::drained_from(&collector);
-
-		let verdict = spec.verify(&trace, &Ok(()));
-		assert!(matches!(verdict, Err(SpecViolation::AssertionViolation(_))));
+		let verdict = hot_once.verify(&trace, &Ok(()));
+		assert!(matches!(
+			verdict,
+			Err(SpecViolation::AssertionViolation(AssertionViolationDetail { actual: 0, .. }))
+		));
 		Ok(())
 	}
 
+	/// A spec states the description its builder gave it.
 	#[test]
-	fn a_spec_states_its_description() -> Result<(), Box<dyn core::error::Error>> {
-		let spec = AssertSpecBuilder::new("Described", ExecutionMode::Accept)
-			.description("one ping")
-			.build();
+	fn a_spec_states_its_description() {
+		let builder = AssertSpecBuilder::new("Described", ExecutionMode::Accept);
+		let spec = builder.description("one ping").build();
 		assert_eq!(spec.description(), Some("one ping"));
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn specs_that_differ_in_an_event_count_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let once = AssertSpecBuilder::new("Spec", ExecutionMode::Accept).event_count(ACCEPTED, exactly!(1));
-		let twice = AssertSpecBuilder::new("Spec", ExecutionMode::Accept).event_count(ACCEPTED, exactly!(2));
-		assert_ne!(once.build().spec_hash(), twice.build().spec_hash());
-		Ok(())
-	}
-
-	/// The shorter label of the joined-order specs.
-	const JOINED_SHORT: Urn<'static> = crate::urn!("aa", "b");
-	/// The longer label, whose rendering is the rendering of `JOINED_SHORT`
-	/// twice in a row.
-	const JOINED_LONG: Urn<'static> = crate::urn!("aa", "burn:aa:b");
-
-	/// Two orders whose labels join to one byte string hash apart, because
-	/// each label takes its length first.
-	#[test]
-	fn orders_whose_labels_join_to_one_string_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let builder = builder.assertion(JOINED_SHORT, Vec::new(), exactly!(1))?;
-		let builder = builder.assertion(JOINED_LONG, Vec::new(), exactly!(1))?;
-		let forward = builder.clone().ordering([JOINED_SHORT, JOINED_LONG])?;
-		let reverse = builder.ordering([JOINED_LONG, JOINED_SHORT])?;
-		assert_ne!(forward.build().spec_hash(), reverse.build().spec_hash());
-		Ok(())
-	}
-
-	/// The trace must record the required events in order, so two orders of
-	/// one set hash apart.
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn specs_that_differ_in_the_order_of_their_required_events_hash_apart() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let forward = builder.clone().required_events([ACCEPTED, REJECTED]);
-		let reverse = builder.required_events([REJECTED, ACCEPTED]);
-		assert_ne!(forward.build().spec_hash(), reverse.build().spec_hash());
-		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn event_counts_in_another_order_hash_the_same() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let forward = builder
-			.clone()
-			.event_count(ACCEPTED, exactly!(1))
-			.event_count(REJECTED, absent!());
-
-		let reverse = builder.event_count(REJECTED, absent!()).event_count(ACCEPTED, exactly!(1));
-		assert_eq!(forward.build().spec_hash(), reverse.build().spec_hash());
-		Ok(())
-	}
-
-	#[test]
-	fn tags_in_another_order_hash_the_same() -> Result<(), Box<dyn core::error::Error>> {
-		let builder = AssertSpecBuilder::new("Spec", ExecutionMode::Accept);
-		let forward = builder.clone().tag_filter(vec!["hot", "fresh"]);
-		let forward = forward.assertion(OLDER_KEY, vec!["south", "north"], exactly!(1))?;
-		let reverse = builder.tag_filter(vec!["fresh", "hot"]);
-		let reverse = reverse.assertion(OLDER_KEY, vec!["north", "south"], exactly!(1))?;
-		assert_eq!(forward.build().spec_hash(), reverse.build().spec_hash());
-		Ok(())
 	}
 }

@@ -739,22 +739,30 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use crate::core::RequirementError;
 	use crate::test_builder;
-	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage};
+	use crate::testing::{TestFrame, TestIdentity, TestKey, TestMessage, TestResult};
 	use crate::Beamable;
 
 	#[cfg(feature = "zstd")]
 	use crate::compress::ZstdCompression;
-	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
+	#[cfg(feature = "sha3")]
 	use crate::crypto::hash::Sha3_256;
+
+	use super::*;
+
+	/// Returns a builder of `version` that holds [`TestMessage::sample`] under
+	/// the id `sample` at [`TestFrame::ORDER`].
+	fn sample_builder(version: Version) -> FrameBuilder<TestMessage> {
+		let builder = FrameBuilder::<TestMessage>::from(version).with_message(TestMessage::sample(None));
+		builder.with_id("sample").with_order(TestFrame::ORDER)
+	}
 
 	/// A frame built without an order takes the [`UnixMillis::now`] reading in
 	/// seconds, so its order agrees with every other clock value.
 	#[cfg(host_clock)]
 	#[test]
-	fn an_omitted_order_defaults_to_the_clocks_seconds() -> Result<()> {
+	fn an_omitted_order_defaults_to_the_clocks_seconds() -> TestResult {
 		let before = Duration::from_millis(UnixMillis::now().get()).as_secs();
 		let frame = FrameBuilder::<TestMessage>::from(Version::V0)
 			.with_message(TestMessage::sample(None))
@@ -766,194 +774,19 @@ mod tests {
 		Ok(())
 	}
 
+	// A V0 build carries the version and the id its builder names.
 	#[cfg(feature = "sha3")]
 	test_builder! {
-		name: test_v0_basic,
+		name: a_v0_build_carries_its_version_and_id,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V0,
 		message: TestMessage::sample(None),
 		setup: |builder, msg| {
-			builder
-				.with_message(msg)
-				.with_id("test_v0_basic")
-				.with_order(1696521600)
-				.build()
+			builder.with_message(msg).with_id("v0-build").with_order(TestFrame::ORDER).build()
 		},
 		assertions: |_msg, result| {
-			let tightbeam  = result?;
-			assert_eq!(tightbeam.version(), Version::V0);
-			assert_eq!(str::from_utf8(tightbeam.metadata().id()), Ok("test_v0_basic"));
-			Ok(())
-		}
-	}
-
-	#[cfg(all(feature = "aes-gcm", feature = "sha3", feature = "secp256k1"))]
-	test_builder! {
-		name: test_v1_with_encryption,
-		builder_type: FrameBuilder<TestMessage>,
-		version: Version::V1,
-		message: TestMessage::sample(None),
-		setup: |builder, msg| {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-		builder
-			.with_message(msg)
-			.with_id("test_v1_with_encryption")
-			.with_order(1696521600)
-			.with_encryptor(cipher)
-			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
-			.build()
-		},
-		assertions: |message, result| {
-			let tightbeam  = result?;
-			assert_eq!(tightbeam.version(), Version::V1);
-			assert!(tightbeam.metadata().confidentiality().is_some());
-			assert!(tightbeam.nonrepudiation().is_some());
-
-			// The body is encrypted, so it does not decode as the message.
-			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
-			assert!(decode_result.is_err(), "Body should be encrypted");
-
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let decrypted = TestFrame::decrypted::<TestMessage>(tightbeam, &cipher, None)?;
-			assert_eq!(decrypted, message);
-
-			Ok(())
-		}
-	}
-
-	#[cfg(all(feature = "zstd", feature = "aes-gcm", feature = "sha3", feature = "secp256k1"))]
-	test_builder! {
-		name: test_v1_with_compression,
-		builder_type: FrameBuilder<TestMessage>,
-		version: Version::V1,
-		message: TestMessage::sample(None),
-		setup: |builder, msg| {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-			use crate::compress::ZstdCompression;
-
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-		builder
-			.with_message(msg)
-			.with_id("test_v1_with_compression")
-			.with_order(1696521600)
-			.with_compression(ZstdCompression::default())
-			.with_encryptor(cipher)
-			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
-			.build()
-		},
-		assertions: |message, result| {
-			let tightbeam = result?;
-			assert_eq!(tightbeam.version(), Version::V1);
-			assert!(tightbeam.metadata().compactness().is_some());
-			assert!(tightbeam.metadata().confidentiality().is_some());
-
-			// The body is compressed and encrypted, so it does not decode as
-			// the message.
-			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
-			assert!(decode_result.is_err(), "Body should be encrypted/compressed");
-
-			// The decryption also decompresses the body.
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let decrypted = TestFrame::decrypted::<TestMessage>(tightbeam, &cipher, Some(&ZstdCompression::default()))?;
-			assert_eq!(decrypted, message);
-
-			Ok(())
-		}
-	}
-
-	#[cfg(all(
-		feature = "zstd",
-		feature = "aes-gcm",
-		feature = "sha3",
-		feature = "secp256k1",
-		feature = "random"
-	))]
-	test_builder! {
-		name: test_v2_full,
-		builder_type: FrameBuilder<TestMessage>,
-		version: Version::V2,
-		message: || {
-			TestMessage::sample(None)
-		},
-		setup: |builder, msg| {
-			use crate::crypto::sign::ecdsa::Secp256k1Signature;
-
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let signing_key = TestKey::insecure_fixed_signing();
-
-			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
-			let rng = rand_core::OsRng;
-
-			builder
-				.with_message(msg)
-				.with_id("test_v2_full")
-				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>([])
-				.with_witness_hasher::<Sha3_256>()
-				.with_compression(ZstdCompression::default())
-				.with_rng(rng)
-				.with_encryptor(cipher)
-				.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key))
-				.with_priority(crate::MessagePriority::LowLatency)
-				.with_lifetime(3600)
-				.with_previous_hash(previous_hash)
-				// The matrix requires V3 or later, so this V2 frame omits it.
-				.build()
-		},
-		assertions: |message, result| {
-			use crate::crypto::profiles::DefaultCryptoProvider;
-			use crate::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
-			use crate::testing::TestCertificate;
-
-			let tightbeam = result?;
-			assert_eq!(tightbeam.version(), Version::V2);
-			assert_eq!(tightbeam.metadata().id(), b"test_v2_full");
-			assert_eq!(tightbeam.metadata().priority(), Some(crate::MessagePriority::LowLatency));
-			assert_eq!(tightbeam.metadata().lifetime(), Some(3600));
-			assert!(tightbeam.metadata().confidentiality().is_some());
-			assert!(tightbeam.metadata().compactness().is_some());
-			assert!(tightbeam.metadata().previous_frame().is_some());
-			assert!(tightbeam.metadata().matrix().is_none()); // The matrix needs V3 or later.
-			assert!(tightbeam.integrity().is_some());
-			assert!(tightbeam.nonrepudiation().is_some());
-			// Verify Message Integrity (MI): re-prove the commitment over the
-			// original message and compare.
-			assert!(tightbeam.verify_commitment_of::<Sha3_256, _>(&message, [])?);
-
-			// Verify Frame Integrity (FI): hash the envelope (version and
-			// metadata) and compare.
-			let scaffold = crate::frame::FrameIntegrityScaffold {
-				version: &tightbeam.version(),
-				metadata: tightbeam.metadata(),
-			};
-
-			let scaffold_der = crate::encode(&scaffold)?;
-			let expected_fi = crate::utils::digest::<Sha3_256>(&scaffold_der)?;
-			let actual_fi = tightbeam.integrity().ok_or(TightBeamError::MissingDigestInfo)?;
-			assert_eq!(actual_fi.digest.as_bytes(), expected_fi.digest.as_bytes());
-
-			// The body is compressed and encrypted, so it does not decode as
-			// the message.
-			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
-			assert!(decode_result.is_err());
-
-			// Verify the signature first, because decryption consumes the
-			// frame.
-			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-			let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer)?;
-			assert!(tightbeam.verify(&signer).is_ok());
-
-			// The decryption also decompresses the body.
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let decrypted = TestFrame::decrypted::<TestMessage>(tightbeam, &cipher, Some(&ZstdCompression::default()))?;
-			assert_eq!(decrypted, message);
-
+			let frame = result?;
+			assert_eq!((frame.version(), frame.metadata().id()), (Version::V0, b"v0-build".as_slice()));
 			Ok(())
 		}
 	}
@@ -962,9 +795,7 @@ mod tests {
 	/// after the hasher is the one it commits to.
 	#[test]
 	#[cfg(feature = "sha3")]
-	fn a_frame_commits_to_the_body_it_carries() -> Result<()> {
-		use crate::crypto::hash::Sha3_256;
-
+	fn a_frame_commits_to_the_body_it_carries() -> TestResult {
 		let carried = TestMessage::sample(Some("carried"));
 		let frame = FrameBuilder::<TestMessage>::from(Version::V1)
 			.with_id("commitment")
@@ -977,65 +808,76 @@ mod tests {
 		Ok(())
 	}
 
+	/// A build with no message is refused for its missing body.
 	#[test]
 	#[cfg(feature = "sha3")]
-	fn test_missing_message() {
-		let result = FrameBuilder::<TestMessage>::from(Version::V0)
-			.with_id("no-message")
-			.with_order(1696521600)
-			.with_message_hasher::<Sha3_256>([])
-			.build();
-		assert!(result.is_err());
+	fn a_build_without_a_message_is_refused() {
+		let builder = FrameBuilder::<TestMessage>::from(Version::V0).with_id("no-message");
+		let builder = builder.with_order(TestFrame::ORDER).with_message_hasher::<Sha3_256>([]);
+
+		let result = builder.build();
+		assert!(matches!(result, Err(TightBeamError::InvalidBody)));
 	}
 
 	/// A salt too short to hide the body, which a hash call defers as an
 	/// `InvalidSaltLength` error.
 	const SHORT_SALT: [u8; 1] = [0x5a];
 
-	// A single deferred error surfaces bare, outside a one-element `Sequence`.
-	#[test]
+	/// Whether `error` refuses [`SHORT_SALT`], one octet against the least
+	/// salt of 16.
 	#[cfg(feature = "sha3")]
-	fn test_single_deferred_error_surfaces_bare() {
-		let message = TestMessage::sample(None);
-		let result = FrameBuilder::from(Version::V0)
-			.with_id("error-test")
-			.with_order(1696521600)
-			.with_message(message)
-			.with_message_hasher::<Sha3_256>(SHORT_SALT)
-			.build();
-		assert!(matches!(result, Err(TightBeamError::InvalidSaltLength(_))));
+	fn refuses_the_short_salt(error: &TightBeamError) -> bool {
+		let short = ReceivedExpectedError { received: 1, expected: 16 };
+		matches!(error, TightBeamError::InvalidSaltLength(refusal) if *refusal == short)
 	}
 
+	/// A single deferred error surfaces bare, outside a one-element `Sequence`.
 	#[test]
 	#[cfg(feature = "sha3")]
-	fn test_multiple_deferred_errors_surface_as_sequence() {
-		let message = TestMessage::sample(None);
-		let result = FrameBuilder::from(Version::V0)
-			.with_id("error-test")
-			.with_order(1696521600)
-			.with_message(message)
-			.with_message_hasher::<Sha3_256>(SHORT_SALT)
-			.with_message_hasher::<Sha3_256>(SHORT_SALT)
-			.build();
-		assert!(matches!(result, Err(TightBeamError::Sequence(ref errors)) if errors.len() == 2));
+	fn a_single_deferred_error_surfaces_bare() {
+		let builder = sample_builder(Version::V0).with_message_hasher::<Sha3_256>(SHORT_SALT);
+		let result = builder.build();
+		assert!(matches!(result, Err(error) if refuses_the_short_salt(&error)));
 	}
 
-	// V1 is the first version whose metadata carries integrity info.
-	// `MetadataBuilder::build` rejects V0 with `message_integrity`.
+	/// Two deferred errors surface together, as one `Sequence` of both.
 	#[test]
-	fn test_compose_macro() -> Result<()> {
+	#[cfg(feature = "sha3")]
+	fn deferred_errors_surface_as_one_sequence() {
+		let builder = sample_builder(Version::V0).with_message_hasher::<Sha3_256>(SHORT_SALT);
+		let result = builder.with_message_hasher::<Sha3_256>(SHORT_SALT).build();
+
+		let short = refuses_the_short_salt;
+		let both_short = |errors: &[TightBeamError]| matches!(errors, [first, second] if short(first) && short(second));
+		assert!(matches!(result, Err(TightBeamError::Sequence(errors)) if both_short(errors.as_slice())));
+	}
+
+	/// `compose!` builds a frame of the version, the id, the order, and the
+	/// message integrity it names. V1 is the first version whose metadata
+	/// carries integrity info, and `MetadataBuilder::build` rejects V0 with
+	/// `message_integrity`.
+	#[test]
+	#[cfg(feature = "sha3")]
+	fn compose_builds_the_frame_it_names() -> TestResult {
 		let message = TestMessage::sample(None);
 		let frame = compose! {
 			V1:
 				id: "test-id",
-				order: 1696521600,
+				order: TestFrame::ORDER,
 				message: message,
 				message_integrity<Sha3_256>: [] // The salt is empty.
 		}?;
-		assert_eq!(frame.version(), Version::V1);
-		assert_eq!(frame.metadata().id(), b"test-id");
-		assert_eq!(frame.metadata().order(), 1696521600);
-		assert!(frame.metadata().integrity().is_some());
+
+		let metadata = frame.metadata();
+		let digest = metadata.integrity().map(|integrity| integrity.algorithm.oid);
+		let named = (frame.version(), metadata.id(), metadata.order(), digest);
+		let expected = (
+			Version::V1,
+			b"test-id".as_slice(),
+			TestFrame::ORDER,
+			Some(crate::oids::HASH_SHA3_256),
+		);
+		assert_eq!(named, expected);
 		Ok(())
 	}
 
@@ -1056,10 +898,10 @@ mod tests {
 	#[cfg(all(feature = "aead", feature = "digest", feature = "signature"))]
 	crate::tb_cases! {
 		fn a_marker_refusal_names_its_call((refusal, marker, call): (TightBeamError, &str, &str)) {
-			assert!(
-				matches!(&refusal, TightBeamError::MissingProtection { marker: m, call: c } if *m == marker && *c == call),
-				"expected {marker} / {call}, got {refusal:?}"
-			);
+			assert!(matches!(
+				&refusal,
+				TightBeamError::MissingProtection { marker: m, call: c } if *m == marker && *c == call
+			));
 		}
 		cases {
 			confidential => (
@@ -1075,40 +917,31 @@ mod tests {
 		}
 	}
 
-	/// A note whose type requires V2 or later.
-	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
-	#[beam(min_version = "V2")]
-	struct RecentNote {
-		content: String,
-	}
-
-	/// A build below the minimum version of its type refuses with the error
-	/// that every typed decode of a frame of the type returns.
-	#[test]
-	fn a_build_below_the_minimum_version_refuses_as_a_typed_decode_does() -> Result<()> {
-		let message = RecentNote { content: "recent".into() };
-		let refused = compose! { V1: id: "recent", order: 1u64, message: message };
-
-		let below = RequirementError::Version((Version::V1, Version::V2).into());
-		assert!(matches!(refused, Err(TightBeamError::Requirement(error)) if error == below));
-		Ok(())
-	}
-
 	#[cfg(all(feature = "aes-gcm", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	mod seals {
-		use super::*;
 		use crate::asn1::GcmParameters;
+		use crate::core::Inflator;
 		use crate::crypto::aead::{Aes128GcmOid, Aes256GcmOid};
 		use crate::crypto::exchange::Ecdhe;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::k256::Secp256k1;
 		use crate::crypto::kdf::HkdfSha3_256;
-		use crate::crypto::profiles::{Aes128Wrap, TightbeamProfile};
+		use crate::crypto::profiles::{Aes128Wrap, Aes256Wrap};
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
 		use crate::der::asn1::OctetString;
 		use crate::oids::{AES_128_WRAP, AES_256_WRAP};
-		use crate::random::CryptoRngCore;
 		use crate::testing::{SeededStream, TestAttributes};
+
+		#[cfg(feature = "zstd")]
+		use crate::asn1::admission::fixtures::{elements_of, tlv};
+		#[cfg(feature = "zstd")]
+		use crate::der::Tag;
+		#[cfg(feature = "zstd")]
+		use crate::testing::TestDigest;
+		#[cfg(feature = "zstd")]
+		use crate::MessagePriority;
+
+		use super::*;
 
 		/// The `id-signedData` content type, `1.2.840.113549.1.7.2` (RFC 5652
 		/// §5.1), a type other than the default.
@@ -1120,13 +953,10 @@ mod tests {
 		/// The AES-256-GCM algorithm, `2.16.840.1.101.3.4.1.46` (RFC 5084).
 		const AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
 
-		/// A V1 builder of a sample message, ready for its seal.
-		fn builder() -> FrameBuilder<TestMessage> {
-			FrameBuilder::<TestMessage>::from(Version::V1)
-				.with_message(TestMessage::sample(None))
-				.with_id("seal")
-				.with_order(1)
-		}
+		/// The refusal of a seal under AES-256 key wrap as a carrier of a type
+		/// whose profile names AES-128 key wrap.
+		const WRAP_OUTSIDE_THE_PROFILE: RequirementError =
+			RequirementError::Algorithm(ReceivedExpectedError { received: AES_256_WRAP, expected: AES_128_WRAP });
 
 		/// The nonce the `GCMParameters` of the seal of `frame` name.
 		fn sealed_nonce(frame: &Frame) -> Vec<u8> {
@@ -1137,55 +967,247 @@ mod tests {
 			parameters.aes_nonce.as_bytes().to_vec()
 		}
 
-		/// `SeededStream(0)` draws the content key `0x01` repeated 32 times,
-		/// then the nonce `0x02` repeated 12 times, so the seal's nonce shows
-		/// the builder's rng drew it.
-		#[test]
-		fn the_builders_rng_draws_the_seal() -> Result<()> {
+		/// Returns a V1 frame of [`TestMessage::sample`] that declares the
+		/// content type `id-signedData`, sealed to
+		/// [`TestKey::insecure_fixed_cipher`].
+		fn signed_data_frame() -> Frame {
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let frame = builder().with_rng(SeededStream(0)).with_encryptor(cipher).build()?;
-			assert_eq!(sealed_nonce(&frame), [0x02; 12]);
-			Ok(())
+			let builder = sample_builder(Version::V1).with_content_oid(ID_SIGNED_DATA);
+			let built = builder.with_encryptor(cipher).build();
+			built.expect("a V1 frame seals under another content type")
 		}
 
-		/// The rng binds at the build, so it draws the seal when it follows
-		/// the encryptor.
-		#[test]
-		fn an_rng_set_after_the_encryptor_draws_the_seal() -> Result<()> {
+		/// Returns a V1 frame of [`TestMessage::sample`] that zstd compresses
+		/// and the fixed keys of [`TestKey`] seal and sign.
+		#[cfg(feature = "zstd")]
+		fn compressed_v1_frame() -> Frame {
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let frame = builder().with_encryptor(cipher).with_rng(SeededStream(0)).build()?;
-			assert_eq!(sealed_nonce(&frame), [0x02; 12]);
-			Ok(())
+			let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+			sample_builder(Version::V1)
+				.with_compression(ZstdCompression::default())
+				.with_rng(SeededStream(0))
+				.with_encryptor(cipher)
+				.with_signer::<Secp256k1Signature, _>(signer)
+				.build()
+				.expect("a V1 frame carries a compression, a seal, and a signature")
+		}
+
+		/// Returns a V2 frame of [`TestMessage::sample`] under the id `full-v2`
+		/// that carries each field V2 admits: a commitment to its message, a
+		/// frame integrity digest, a compression, a seal, a signature, a
+		/// priority, a lifetime, and the [`TestDigest::info`] of a previous
+		/// frame.
+		#[cfg(feature = "zstd")]
+		fn full_v2_frame() -> Frame {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signer = TestIdentity::certified(TestKey::insecure_fixed_signing());
+			sample_builder(Version::V2)
+				.with_id("full-v2")
+				.with_message_hasher::<Sha3_256>([])
+				.with_witness_hasher::<Sha3_256>()
+				.with_compression(ZstdCompression::default())
+				.with_rng(SeededStream(0))
+				.with_encryptor(cipher)
+				.with_signer::<Secp256k1Signature, _>(signer)
+				.with_priority(MessagePriority::LowLatency)
+				.with_lifetime(3600)
+				.with_previous_hash(TestDigest::info())
+				// The matrix requires V3 or later, so this V2 frame omits it.
+				.build()
+				.expect("a V2 frame carries each field it admits")
+		}
+
+		/// Returns the SEQUENCE of the version and the metadata of `frame`,
+		/// which are the first two elements of its DER.
+		#[cfg(feature = "zstd")]
+		fn wire_envelope(frame: &Frame) -> Vec<u8> {
+			let der = crate::der::Encode::to_der(frame).expect("the frame encodes");
+			let envelope: Vec<u8> = elements_of(der).into_iter().take(2).flatten().collect();
+			tlv(Tag::Sequence, &envelope)
+		}
+
+		// `SeededStream(0)` draws the content key `0x01` repeated 32 times,
+		// then the nonce `0x02` repeated 12 times, so the nonce of the seal
+		// shows that the builder's rng drew it. The rng binds at the build, so
+		// it draws the seal on either side of the encryptor. Each case is a
+		// builder with its rng and its encryptor in one order.
+		crate::tb_cases! {
+			fn the_builders_rng_draws_the_seal(builder: FrameBuilder<TestMessage>) -> TestResult {
+				let frame = builder.build()?;
+
+				assert_eq!(sealed_nonce(&frame), [0x02; 12]);
+				Ok(())
+			}
+			cases {
+				rng_before_the_encryptor => sample_builder(Version::V1)
+					.with_rng(SeededStream(0))
+					.with_encryptor(TestKey::insecure_fixed_cipher().1),
+				rng_after_the_encryptor => sample_builder(Version::V1)
+					.with_encryptor(TestKey::insecure_fixed_cipher().1)
+					.with_rng(SeededStream(0)),
+			}
 		}
 
 		/// The content type the builder names is the type the frame's envelope
 		/// declares, in its content type and in its content-type attribute.
 		#[test]
-		fn a_frame_declares_the_content_type_its_builder_names() -> Result<()> {
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let frame = builder().with_content_oid(ID_SIGNED_DATA).with_encryptor(cipher).build()?;
+		fn a_frame_declares_the_content_type_its_builder_names() {
+			let frame = signed_data_frame();
+
+			let envelope = frame.metadata().confidentiality();
+			let declared = envelope.map(TestAttributes::declared_content_types);
+			assert_eq!(declared, Some((ID_SIGNED_DATA, ID_SIGNED_DATA)));
+		}
+
+		// A seal carries its ciphertext in place of the body, so the body of
+		// a sealed frame decodes as no message. Each case is a sealed frame.
+		crate::tb_cases! {
+			fn a_sealed_frame_hides_its_message(frame: Frame) {
+				let decoded: Result<TestMessage> = crate::decode(frame.message());
+				assert!(matches!(decoded, Err(TightBeamError::SerializationError(_))));
+			}
+			cases {
+				signed_v1 => TestFrame::sealed_signed(Version::V1, "signed-v1"),
+				#[cfg(feature = "zstd")]
+				compressed_v1 => compressed_v1_frame(),
+				#[cfg(feature = "zstd")]
+				full_v2 => full_v2_frame(),
+			}
+		}
+
+		// Each case is a sealed frame beside the inflator of its body. The
+		// frame opens to the sample message under the key that sealed it.
+		crate::tb_cases! {
+			fn a_sealed_frame_opens_to_its_message((frame, inflator): (Frame, Option<&(dyn Inflator + Sync)>))
+				-> TestResult
+			{
+				let (_, cipher) = TestKey::insecure_fixed_cipher();
+				let opened = TestFrame::decrypted::<TestMessage>(frame, &cipher, inflator)?;
+				assert_eq!(opened, TestMessage::sample(None));
+				Ok(())
+			}
+			cases {
+				/// A frame of the content type the builder names opens as that
+				/// type.
+				another_content_type => (signed_data_frame(), None),
+				signed_v1 => (TestFrame::sealed_signed(Version::V1, "signed-v1"), None),
+				/// The open also inflates a compressed body.
+				#[cfg(feature = "zstd")]
+				compressed_v1 => (compressed_v1_frame(), Some(&ZstdCompression::default())),
+				#[cfg(feature = "zstd")]
+				full_v2 => (full_v2_frame(), Some(&ZstdCompression::default())),
+			}
+		}
+
+		// Each case is a sealed frame, beside its version and whether it
+		// carries a compression, a seal, a signature, and a frame integrity
+		// digest, in that order.
+		crate::tb_cases! {
+			fn a_sealed_frame_carries_the_protections_its_builder_set(
+				(frame, expected): (Frame, (Version, bool, bool, bool, bool))
+			) {
+				let metadata = frame.metadata();
+
+				let (compressed, sealed) = (metadata.compactness().is_some(), metadata.confidentiality().is_some());
+				let (signed, digested) = (frame.nonrepudiation().is_some(), frame.integrity().is_some());
+				assert_eq!((frame.version(), compressed, sealed, signed, digested), expected);
+			}
+			cases {
+				signed_v1 => (
+					TestFrame::sealed_signed(Version::V1, "signed-v1"),
+					(Version::V1, false, true, true, false),
+				),
+				#[cfg(feature = "zstd")]
+				compressed_v1 => (compressed_v1_frame(), (Version::V1, true, true, true, false)),
+				#[cfg(feature = "zstd")]
+				full_v2 => (full_v2_frame(), (Version::V2, true, true, true, true)),
+			}
+		}
+
+		/// A full V2 frame carries the id, the priority, the lifetime, and the
+		/// previous frame its builder set, and no matrix, which V2 forbids.
+		#[cfg(feature = "zstd")]
+		#[test]
+		fn a_full_v2_frame_carries_its_metadata() {
+			let frame = full_v2_frame();
 
 			let metadata = frame.metadata();
-			let envelope = metadata.confidentiality().ok_or(TightBeamError::MissingEncryptionInfo)?;
-			let declared = TestAttributes::declared_content_types(envelope);
-			assert_eq!(declared, (ID_SIGNED_DATA, ID_SIGNED_DATA));
-			Ok(())
+			let carried = (
+				metadata.id(),
+				metadata.priority(),
+				metadata.lifetime(),
+				metadata.previous_frame(),
+				metadata.matrix(),
+			);
+
+			let previous = TestDigest::info();
+			let expected = (
+				b"full-v2".as_slice(),
+				Some(MessagePriority::LowLatency),
+				Some(3600),
+				Some(&previous),
+				None,
+			);
+			assert_eq!(carried, expected);
 		}
 
-		/// A frame of the content type the builder names opens as that type
-		/// under the key that sealed it.
+		/// A full V2 frame commits to the message it seals.
+		#[cfg(feature = "zstd")]
 		#[test]
-		fn a_frame_of_another_content_type_opens_under_its_key() -> Result<()> {
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let frame = builder().with_content_oid(ID_SIGNED_DATA).with_encryptor(cipher).build()?;
-
-			let (_, key) = TestKey::insecure_fixed_cipher();
-			let opened = TestFrame::decrypted::<TestMessage>(frame, &key, None)?;
-			assert_eq!(opened, TestMessage::sample(None));
+		fn a_full_v2_frame_commits_to_its_message() -> TestResult {
+			let frame = full_v2_frame();
+			let committed = frame.verify_commitment_of::<Sha3_256, _>(&TestMessage::sample(None), [])?;
+			assert!(committed);
 			Ok(())
 		}
 
-		/// A message of the house profile whose manual checker admits every
+		/// The frame integrity digest of a full V2 frame is SHA3-256 over its
+		/// version and its metadata, as its own DER carries them.
+		#[cfg(feature = "zstd")]
+		#[test]
+		fn a_full_v2_frame_digests_its_envelope() {
+			let frame = full_v2_frame();
+			let digest = frame.integrity().map(|integrity| integrity.digest.as_bytes());
+
+			// The oracle hashes the version and the metadata as a receiver
+			// reads them off the wire.
+			let oracle = Sha3_256::digest(wire_envelope(&frame));
+			assert_eq!(digest, Some(oracle.as_slice()));
+		}
+
+		/// A full V2 frame verifies under the certificate of the key that
+		/// signed it.
+		#[cfg(feature = "zstd")]
+		#[test]
+		fn a_full_v2_frame_verifies_under_its_signer() -> TestResult {
+			use crate::crypto::profiles::DefaultCryptoProvider;
+			use crate::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
+			use crate::testing::TestCertificate;
+
+			let frame = full_v2_frame();
+			let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+			let purpose = KeyPurposes::HOUSE.signer;
+			let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, purpose)?;
+
+			frame.verify(&signer)?;
+			Ok(())
+		}
+
+		/// The house profile under AES-128-GCM, so the house encryptor of
+		/// AES-256-GCM seals outside it.
+		#[derive(Debug, Default, Clone, Copy)]
+		struct Aes128GcmProfile;
+
+		impl SecurityProfile for Aes128GcmProfile {
+			type Digest = Sha3_256;
+			type AeadOid = Aes128GcmOid;
+			type SignatureAlg = Secp256k1Signature;
+			type Kdf = HkdfSha3_256;
+			type KeyExchange = Ecdhe<Secp256k1>;
+			type KeyWrapOid = Aes256Wrap;
+		}
+
+		/// A message of [`Aes128GcmProfile`] whose manual checker admits every
 		/// AEAD, so the builder's run-time comparison is its one guard.
 		#[derive(Clone, Debug, PartialEq, crate::der::Sequence)]
 		struct LaxMessage {
@@ -1194,38 +1216,25 @@ mod tests {
 
 		impl Message for LaxMessage {
 			const HAS_PROFILE: bool = true;
-			type Profile = TightbeamProfile;
+			type Profile = Aes128GcmProfile;
 		}
 
 		impl<C: AssociatedOid> CheckAeadOid<C> for LaxMessage {}
 
-		/// An encryptor that names AES-128-GCM, outside the house profile.
-		struct Aes128Encryptor;
-
-		impl Encryptor<Aes128GcmOid> for Aes128Encryptor {
-			fn encrypt_content(
-				&self,
-				_content: impl Into<Vec<u8>>,
-				_content_type: Option<ObjectIdentifier>,
-				_rng: Option<&mut dyn CryptoRngCore>,
-			) -> Result<AuthEnvelopedData> {
-				Err(TightBeamError::MissingEncryptionInfo)
-			}
-		}
-
 		/// A checker that admits any algorithm leaves the profile to the
 		/// builder, which refuses an encryptor outside it.
 		#[test]
-		fn an_encryptor_outside_the_profile_is_refused() -> Result<()> {
+		fn an_encryptor_outside_the_profile_is_refused() -> TestResult {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let message = LaxMessage { content: OctetString::new(b"lax".as_slice())? };
 			let built = FrameBuilder::<LaxMessage>::from(Version::V1)
 				.with_message(message)
 				.with_id("lax")
 				.with_order(1)
-				.with_encryptor(Aes128Encryptor)
+				.with_encryptor(cipher)
 				.build();
 
-			let expected = ReceivedExpectedError { received: AES_128_GCM, expected: AES_256_GCM };
+			let expected = ReceivedExpectedError { received: AES_256_GCM, expected: AES_128_GCM };
 			assert!(matches!(built, Err(TightBeamError::UnexpectedAlgorithm(found)) if found == expected));
 			Ok(())
 		}
@@ -1254,7 +1263,7 @@ mod tests {
 		/// outside a profile that names AES-128 key wrap, so the builder
 		/// refuses it.
 		#[test]
-		fn an_encryptor_whose_key_wrap_is_outside_the_profile_is_refused() -> Result<()> {
+		fn an_encryptor_whose_key_wrap_is_outside_the_profile_is_refused() -> TestResult {
 			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let message = WrappedNote { content: OctetString::new(b"wrapped".as_slice())? };
 			let built = FrameBuilder::<WrappedNote>::from(Version::V1)
@@ -1264,8 +1273,7 @@ mod tests {
 				.with_encryptor(cipher)
 				.build();
 
-			let outside = RequirementError::Algorithm((AES_256_WRAP, AES_128_WRAP).into());
-			assert!(matches!(built, Err(TightBeamError::Requirement(error)) if error == outside));
+			assert!(matches!(built, Err(TightBeamError::Requirement(error)) if error == WRAP_OUTSIDE_THE_PROFILE));
 			Ok(())
 		}
 
@@ -1273,13 +1281,10 @@ mod tests {
 		/// a receiver refuses a frame sealed under AES-256 key wrap as a
 		/// carrier of a type whose profile names AES-128 key wrap.
 		#[test]
-		fn a_receiver_refuses_a_kek_recipient_whose_wrap_is_outside_the_profile() -> Result<()> {
-			let (_, cipher) = TestKey::insecure_fixed_cipher();
-			let frame = builder().with_encryptor(cipher).build()?;
-
-			let outside = RequirementError::Algorithm((AES_256_WRAP, AES_128_WRAP).into());
-			assert_eq!(frame.validate_for::<WrappedNote>(), Err(outside));
-			Ok(())
+		fn a_receiver_refuses_a_kek_recipient_whose_wrap_is_outside_the_profile() {
+			let frame = TestFrame::sealed("sealed");
+			let validated = frame.validate_for::<WrappedNote>();
+			assert_eq!(validated, Err(WRAP_OUTSIDE_THE_PROFILE));
 		}
 
 		/// A `KEMRecipientInfo` names its wrap in `wrap`, so a receiver
@@ -1287,32 +1292,31 @@ mod tests {
 		/// a carrier of a type whose profile names AES-128 key wrap.
 		#[cfg(feature = "hpke")]
 		#[test]
-		fn a_receiver_refuses_a_kem_recipient_whose_wrap_is_outside_the_profile() -> Result<()> {
-			use crate::crypto::cms::KemRecipient;
+		fn a_receiver_refuses_a_kem_recipient_whose_wrap_is_outside_the_profile() -> TestResult {
 			use crate::crypto::hpke::HpkeEncryptor;
-			use crate::crypto::key::{KeyBackend, Secp256k1KeyProvider};
 			use crate::crypto::profiles::DefaultCryptoProvider;
+			use crate::testing::fixtures::TestAgreement;
 
-			let backend = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
-			let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
+			let recipient = TestAgreement::recipient(&TestKey::insecure_fixed_signing());
 			let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
-			let frame = builder().with_encryptor(encryptor).build()?;
+			let builder = sample_builder(Version::V1).with_rng(SeededStream(0));
+			let frame = builder.with_encryptor(encryptor).build()?;
 
-			let outside = RequirementError::Algorithm((AES_256_WRAP, AES_128_WRAP).into());
-			assert_eq!(frame.validate_for::<WrappedNote>(), Err(outside));
+			let validated = frame.validate_for::<WrappedNote>();
+			assert_eq!(validated, Err(WRAP_OUTSIDE_THE_PROFILE));
 			Ok(())
 		}
 	}
 
 	#[cfg(all(feature = "zstd", any(feature = "transport-cms", feature = "transport-hpke")))]
 	mod interop {
-		use super::*;
-		use crate::crypto::cms::KemRecipient;
 		use crate::crypto::hpke::HpkeEncryptor;
-		use crate::crypto::key::{KeyBackend, Secp256k1KeyProvider};
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::oids::{AUTH_ENVELOPED_DATA, COMPRESSION_CONTENT};
-		use crate::transport::handshake::tests::{content_info, write_interop_samples};
+		use crate::testing::fixtures::{write_interop_samples, TestAgreement, TestEnvelope};
+		use crate::testing::SeededStream;
+
+		use super::*;
 
 		/// The `ContentInfo` of the envelope of `frame`, a compressed and
 		/// sealed frame, and of its `CompressedData`.
@@ -1320,8 +1324,8 @@ mod tests {
 			let envelope = frame.metadata().confidentiality().expect("the frame is sealed");
 			let compressed = frame.metadata().compactness().expect("the frame is compressed");
 			[
-				("frame-kem", content_info(AUTH_ENVELOPED_DATA, envelope)),
-				("compressed-data", content_info(COMPRESSION_CONTENT, compressed)),
+				("frame-kem", TestEnvelope::content_info(AUTH_ENVELOPED_DATA, envelope)),
+				("compressed-data", TestEnvelope::content_info(COMPRESSION_CONTENT, compressed)),
 			]
 		}
 
@@ -1330,261 +1334,192 @@ mod tests {
 		/// `TIGHTBEAM_CMS_SAMPLES`. `scripts/cms-interop.sh` parses both with
 		/// OpenSSL and checks that the `CompressedData` declares `id-data`.
 		#[test]
-		fn the_emitted_structures_write_their_interop_samples() -> Result<()> {
-			let backend = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
-			let recipient = KemRecipient::bare(backend.to_public_key_bytes()?)?;
+		fn the_emitted_structures_write_their_interop_samples() -> TestResult {
+			let recipient = TestAgreement::recipient(&TestKey::insecure_fixed_signing());
 			let encryptor = HpkeEncryptor::<DefaultCryptoProvider>::new(recipient);
-			let frame = FrameBuilder::<TestMessage>::from(Version::V1)
-				.with_message(TestMessage::sample(None))
+			let frame = sample_builder(Version::V1)
 				.with_id("interop")
-				.with_order(1696521600)
 				.with_compression(ZstdCompression::default())
+				.with_rng(SeededStream(0))
 				.with_encryptor(encryptor)
 				.build()?;
 
-			write_interop_samples(&samples_of(&frame), &[], &[])?;
+			write_interop_samples(&samples_of(&frame), &[], &[]);
 			Ok(())
 		}
 	}
 
 	mod validation {
-		use super::*;
-		use crate::crypto::aead::Aes256GcmOid;
 		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::key::Aes256GcmKeyProvider;
-		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-		use crate::testing::{TestIdentity, TestKey};
-		use crate::Version;
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::testing::fixtures::RecentNote;
 
-		// Run the shared assertions after the struct definition.
-		macro_rules! run_tests {
-			($name:expr, $confidential:expr, $nonrepudiable:expr, $message_integrity:expr, $frame_integrity:expr, $min_version:expr, $signing_key:expr) => {
-				let message = TestMsg { content: format!("test {}", $name) };
+		use super::*;
 
-				// Test 1: Verify that the constants match the derive macro
-				// attributes.
-				assert_eq!(TestMsg::MUST_BE_CONFIDENTIAL, $confidential);
-				assert_eq!(TestMsg::MUST_BE_NON_REPUDIABLE, $nonrepudiable);
-				assert_eq!(TestMsg::MUST_HAVE_MESSAGE_INTEGRITY, $message_integrity);
-				assert_eq!(TestMsg::MUST_HAVE_FRAME_INTEGRITY, $frame_integrity);
-				assert_eq!(TestMsg::MIN_VERSION, $min_version);
+		/// The requirement constants of a message type: whether it requires a
+		/// seal, a signature, a message integrity commitment, and a frame
+		/// integrity digest, then its minimum version.
+		type Requirements = (bool, bool, bool, bool, Version);
 
-				// Test 2: Verify the frame composition.
-				let result = compose_frame(
-					$name,
-					message.clone(),
-					TestKey::insecure_fixed_cipher().1,
-					$signing_key.clone(),
-					$confidential,
-					$nonrepudiable,
-					$message_integrity,
-					$frame_integrity,
-				);
-				let frame = result?;
+		/// Whether a frame carries a seal, a signature, a message integrity
+		/// commitment, and a frame integrity digest, in that order.
+		type Protections = (bool, bool, bool, bool);
 
-				// Test 3: Verify the README "Security Requirement Semantics".
-				// Each MUST flag requires the matching frame field.
-
-				// MUST_BE_NON_REPUDIABLE=true requires the nonrepudiation
-				// field.
-				assert_eq!(frame.nonrepudiation().is_some(), $nonrepudiable);
-				// MUST_BE_CONFIDENTIAL=true requires the confidentiality field.
-				assert_eq!(frame.metadata().confidentiality().is_some(), $confidential);
-				// MUST_HAVE_MESSAGE_INTEGRITY=true requires the metadata
-				// integrity field.
-				assert_eq!(frame.metadata().integrity().is_some(), $message_integrity);
-				// MUST_HAVE_FRAME_INTEGRITY=true requires the frame integrity
-				// field.
-				assert_eq!(frame.integrity().is_some(), $frame_integrity);
-
-				// Test 4: Verify the version enforcement.
-				if $min_version > Version::V0 {
-					let result_v0 = compose! {
-						V0: id: $name, order: 1u64, message: message.clone()
-					};
-					assert!(result_v0.is_err());
-				}
-			};
+		/// A note whose type requires no protection.
+		#[derive(Beamable, Clone, Debug, PartialEq, crate::der::Sequence)]
+		#[beam(min_version = "V0")]
+		struct BasicNote {
+			content: String,
 		}
 
-		// Generate the test message struct with the attributes of one case. The
-		// macro matches only the four cases that the test uses.
-		macro_rules! test_msg_struct {
-			// BasicMessage: (false, false, false, false, V0)
-			(false, false, false, false, V0) => {
-				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
-				#[beam(min_version = "V0")]
-				struct TestMsg {
-					content: String,
-				}
-			};
-			// ConfidentialMessage: (true, false, false, false, V1)
-			(true, false, false, false, V1) => {
-				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
-				#[beam(confidential, min_version = "V1")]
-				struct TestMsg {
-					content: String,
-				}
-			};
-			// NonrepudiableMessage: (false, true, false, false, V1)
-			(false, true, false, false, V1) => {
-				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
-				#[beam(nonrepudiable, min_version = "V1")]
-				struct TestMsg {
-					content: String,
-				}
-			};
-			// FullSecurityMessage: (true, true, true, true, V2)
-			(true, true, true, true, V2) => {
-				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
-				#[beam(
-					confidential,
-					nonrepudiable,
-					message_integrity,
-					frame_integrity,
-					min_version = "V2"
-				)]
-				struct TestMsg {
-					content: String,
-				}
-			};
+		/// A note whose type requires a confidential frame of V1 or later.
+		#[derive(Beamable, Clone, Debug, PartialEq, crate::der::Sequence)]
+		#[beam(confidential, min_version = "V1")]
+		struct ConfidentialV1Note {
+			content: String,
 		}
 
-		// Compose a frame that satisfies the given security requirements.
-		// The requirement tuple selects the matching `compose!` invocation.
-		#[allow(clippy::too_many_arguments)]
-		fn compose_frame<T>(
-			test_name: impl AsRef<str>,
-			message: T,
-			cipher: Aes256GcmKeyProvider,
-			signing_key: Secp256k1SigningKey,
-			confidential: bool,
-			nonrepudiable: bool,
-			message_integrity: bool,
-			frame_integrity: bool,
-		) -> crate::error::Result<crate::Frame>
-		where
-			T: crate::Message
-				+ crate::builder::CheckAeadOid<Aes256GcmOid>
-				+ crate::builder::CheckSignatureOid<Secp256k1Signature>
-				+ crate::builder::CheckDigestOid<Sha3_256>
-				+ Clone,
-		{
-			let test_name = test_name.as_ref();
-			match (confidential, nonrepudiable, message_integrity, frame_integrity) {
-				(true, true, true, true) => compose! {
-					V2: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					message_integrity<Sha3_256>: [],
-					frame_integrity: type Sha3_256
-				},
-				(true, false, true, _) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality: cipher,
-					message_integrity<Sha3_256>: []
-				},
-				(true, false, false, _) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality: cipher
-				},
-				(false, true, true, _) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					message_integrity<Sha3_256>: []
-				},
-				(false, true, false, _) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
-				},
-				(false, false, true, true) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					message_integrity<Sha3_256>: [],
-					frame_integrity: type Sha3_256
-				},
-				(false, false, true, false) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					message_integrity<Sha3_256>: []
-				},
-				(false, false, false, true) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					frame_integrity: type Sha3_256
-				},
-				(false, false, false, false) => compose! {
-					V0: id: test_name, order: 1u64, message: message.clone()
-				},
-				(true, true, true, false) => compose! {
-					V2: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					message_integrity<Sha3_256>: []
-				},
-				(true, true, false, true) => compose! {
-					V2: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key),
-					frame_integrity: type Sha3_256
-				},
-				(true, true, false, false) => compose! {
-					V1: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality: cipher,
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signing_key)
-				},
+		/// A note whose type requires a non-repudiable frame of V1 or later.
+		#[derive(Beamable, Clone, Debug, PartialEq, crate::der::Sequence)]
+		#[beam(nonrepudiable, min_version = "V1")]
+		struct NonrepudiableV1Note {
+			content: String,
+		}
+
+		/// A note whose type requires each protection in a frame of V2 or
+		/// later.
+		#[derive(Beamable, Clone, Debug, PartialEq, crate::der::Sequence)]
+		#[beam(
+			confidential,
+			nonrepudiable,
+			message_integrity,
+			frame_integrity,
+			min_version = "V2"
+		)]
+		struct FullV2Note {
+			content: String,
+		}
+
+		/// Returns the requirement constants of `T`.
+		fn requirements_of<T: Message>() -> Requirements {
+			(
+				T::MUST_BE_CONFIDENTIAL,
+				T::MUST_BE_NON_REPUDIABLE,
+				T::MUST_HAVE_MESSAGE_INTEGRITY,
+				T::MUST_HAVE_FRAME_INTEGRITY,
+				T::MIN_VERSION,
+			)
+		}
+
+		/// Returns the protections that `frame` carries.
+		fn protections_of(frame: &Frame) -> Protections {
+			let metadata = frame.metadata();
+			let sealed = metadata.confidentiality().is_some();
+			let committed = metadata.integrity().is_some();
+			(sealed, frame.nonrepudiation().is_some(), committed, frame.integrity().is_some())
+		}
+
+		// The derive sets each constant of a type from its `#[beam]`
+		// attributes. Each case is a type beside the constants it declares.
+		crate::tb_cases! {
+			fn the_derive_sets_the_requirement_constants(
+				(requirements, expected): (fn() -> Requirements, Requirements)
+			) {
+				assert_eq!(requirements(), expected);
+			}
+			cases {
+				basic => (requirements_of::<BasicNote>, (false, false, false, false, Version::V0)),
+				confidential => (requirements_of::<ConfidentialV1Note>, (true, false, false, false, Version::V1)),
+				nonrepudiable => (requirements_of::<NonrepudiableV1Note>, (false, true, false, false, Version::V1)),
+				full => (requirements_of::<FullV2Note>, (true, true, true, true, Version::V2)),
 			}
 		}
 
-		// Each requirement combination gets one named test. The same flag tuple
-		// drives the struct definition and the shared assertions, so each test
-		// body stays free of dispatch logic.
-		macro_rules! message_trait_test {
-			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
-				#[test]
-				fn $test() -> Result<()> {
-					let signing_key = TestKey::insecure_fixed_signing();
+		// A frame composed with the protections its type requires carries
+		// each of them, as the README section "Security Requirement Semantics"
+		// states. Each case composes a frame of one type, beside the
+		// protections the frame carries.
+		crate::tb_cases! {
+			fn a_composed_frame_carries_the_protections_its_type_requires(
+				(compose, expected): (fn() -> Result<Frame>, Protections)
+			) -> TestResult {
+				let frame = compose()?;
 
-					test_msg_struct!($confidential, $nonrepudiable, $message_integrity, $frame_integrity, $version);
-					run_tests!(
-						$name,
-						$confidential,
-						$nonrepudiable,
-						$message_integrity,
-						$frame_integrity,
-						Version::$version,
-						&signing_key
-					);
-
-					Ok(())
-				}
-			};
+				assert_eq!(protections_of(&frame), expected);
+				Ok(())
+			}
+			cases {
+				basic => (
+					|| compose! { V0: id: "basic", order: 1u64, message: BasicNote { content: "basic".into() } },
+					(false, false, false, false),
+				),
+				confidential => (
+					|| compose! {
+						V1: id: "confidential", order: 1u64,
+						message: ConfidentialV1Note { content: "confidential".into() },
+						confidentiality: TestKey::insecure_fixed_cipher().1
+					},
+					(true, false, false, false),
+				),
+				nonrepudiable => (
+					|| compose! {
+						V1: id: "nonrepudiable", order: 1u64,
+						message: NonrepudiableV1Note { content: "nonrepudiable".into() },
+						nonrepudiation<Secp256k1Signature, _>:
+							TestIdentity::certified(TestKey::insecure_fixed_signing())
+					},
+					(false, true, false, false),
+				),
+				full => (
+					|| compose! {
+						V2: id: "full", order: 1u64,
+						message: FullV2Note { content: "full".into() },
+						confidentiality: TestKey::insecure_fixed_cipher().1,
+						nonrepudiation<Secp256k1Signature, _>:
+							TestIdentity::certified(TestKey::insecure_fixed_signing()),
+						message_integrity<Sha3_256>: [],
+						frame_integrity: type Sha3_256
+					},
+					(true, true, true, true),
+				),
+			}
 		}
 
-		message_trait_test!(test_basic_message_traits, "BasicMessage", false, false, false, false, V0);
-		message_trait_test!(
-			test_confidential_message_traits,
-			"ConfidentialMessage",
-			true,
-			false,
-			false,
-			false,
-			V1
-		);
-		message_trait_test!(
-			test_nonrepudiable_message_traits,
-			"NonrepudiableMessage",
-			false,
-			true,
-			false,
-			false,
-			V1
-		);
-		message_trait_test!(
-			test_full_security_message_traits,
-			"FullSecurityMessage",
-			true,
-			true,
-			true,
-			true,
-			V2
-		);
+		// A build below the minimum version of its type refuses with the error
+		// that every typed decode of a frame of the type returns. Each case
+		// composes a frame of one type below its minimum version, beside the
+		// refusal.
+		crate::tb_cases! {
+			fn a_build_below_the_minimum_version_of_its_type_is_refused(
+				(compose, below): (fn() -> Result<Frame>, RequirementError)
+			) {
+				let refused = compose();
+				assert!(matches!(refused, Err(TightBeamError::Requirement(error)) if error == below));
+			}
+			cases {
+				confidential_at_v0 => (
+					|| compose! {
+						V0: id: "confidential", order: 1u64,
+						message: ConfidentialV1Note { content: "confidential".into() }
+					},
+					RequirementError::Version((Version::V0, Version::V1).into()),
+				),
+				nonrepudiable_at_v0 => (
+					|| compose! {
+						V0: id: "nonrepudiable", order: 1u64,
+						message: NonrepudiableV1Note { content: "nonrepudiable".into() }
+					},
+					RequirementError::Version((Version::V0, Version::V1).into()),
+				),
+				full_at_v0 => (
+					|| compose! { V0: id: "full", order: 1u64, message: FullV2Note { content: "full".into() } },
+					RequirementError::Version((Version::V0, Version::V2).into()),
+				),
+				recent_at_v1 => (
+					|| compose! { V1: id: "recent", order: 1u64, message: RecentNote { content: "recent".into() } },
+					RequirementError::Version((Version::V1, Version::V2).into()),
+				),
+			}
+		}
 	}
 }

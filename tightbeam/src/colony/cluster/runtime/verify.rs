@@ -504,66 +504,62 @@ mod tests {
 	use super::*;
 	use crate::builder::frame::FrameBuilder;
 	use crate::builder::TypeBuilder;
-	use crate::colony::cluster::{
-		CertificateSpec, ClusterTlsConfig, ExportGate, ExportGrant, StaticExportList, TrustPlanes,
-	};
+	use crate::colony::cluster::{ExportGate, ExportGrant, StaticExportList, TrustPlanes};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::crypto::sign::PrehashSigner;
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::utils::Fingerprint;
-	use crate::crypto::x509::{Certificate, KeyCurves};
+	use crate::crypto::x509::store::CertificateTrust;
+	use crate::crypto::x509::Certificate;
 	use crate::tb_cases;
-	use crate::testing::{TestCertificate, TestKey, TestMessage};
+	use crate::testing::fixtures::{TestGate, TestStore};
+	use crate::testing::{TestCertificate, TestKey, TestMessage, TestResult};
 	use crate::transport::TokioListener;
 	use crate::Version;
 
-	fn servlet(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
-		let name = name.as_ref();
-		ColonyNamespace::default()
-			.servlet(name)
-			.expect("test names satisfy the mint grammar")
+	fn servlet(name: &str) -> Urn<'static> {
+		ColonyNamespace::servlet_fixture(name)
 	}
 
 	/// A config that exports only "ping", so "ledger" needs a grant.
 	fn exporting_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let mut config = ClusterConfig::new(
-			ClusterTlsConfig::new(
-				CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
-				Arc::new(Secp256k1KeyProvider::from(key)),
-			)
-			.expect("the test certificate must decode"),
-		);
-		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("ping")])));
+		let mut config = ClusterConfig::fixture();
+		config.peer.exported_types = Some(Arc::new(StaticExportList::new([servlet("ping")])));
 		config
 	}
 
 	/// A peer gateway key, distinct from the fixed key the config presents.
 	fn peer_key() -> Secp256k1SigningKey {
-		Secp256k1SigningKey::from_bytes(&[2u8; 32].into()).expect("the fixture scalar is a valid key")
+		TestKey::fixed(0x02)
 	}
 
-	/// A config whose peer plane enrolls `enrolled` alone.
-	fn config_enrolling(enrolled: &Certificate) -> ClusterConfig {
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let builder = builder.with_certificate(enrolled.clone());
-		let store = builder.expect("the test certificate satisfies the trust builder").build();
+	/// The certificate of [`peer_key`].
+	fn peer_certificate() -> Certificate {
+		TestCertificate::self_signed(&peer_key())
+	}
 
+	/// A house store that holds `certificate` alone.
+	fn trust_of(certificate: &Certificate) -> Arc<dyn CertificateTrust> {
+		Arc::new(TestStore::holding([certificate.clone()]))
+	}
+
+	/// A house gateway of [`exporting_config`] whose hive plane anchors `hive`
+	/// and whose peer plane anchors `peer`, each plane empty for `None`.
+	fn anchored(hive: Option<&Certificate>, peer: Option<&Certificate>) -> ColonyConfig<TokioListener> {
 		let mut config = exporting_config();
-		config.tls.peer_trust = Some(Arc::new(store));
-		config
+		config.tls.hive_trust = hive.map(trust_of);
+		config.tls.peer_trust = peer.map(trust_of);
+		ColonyConfig::house(config)
 	}
 
-	/// `config` as the configuration of a house gateway, whose colony digest
-	/// is SHA3-256.
-	fn house(config: ClusterConfig) -> ColonyConfig<TokioListener> {
-		ColonyConfig::new(config).expect("the test configuration names no gossip ingress")
+	/// A house gateway whose peer plane enrolls [`peer_certificate`] alone.
+	fn peer_enrolling() -> ColonyConfig<TokioListener> {
+		anchored(None, Some(&peer_certificate()))
 	}
 
+	/// A grant of every target.
+	///
+	/// The crate holds no house grant, so a grant is an implementor's own.
 	struct GrantAll;
 
 	impl ExportGrant for GrantAll {
@@ -572,6 +568,9 @@ mod tests {
 		}
 	}
 
+	/// A grant of each origin request.
+	///
+	/// The crate holds no house grant, so a grant is an implementor's own.
 	struct OriginOnlyGrant;
 
 	impl ExportGrant for OriginOnlyGrant {
@@ -580,6 +579,9 @@ mod tests {
 		}
 	}
 
+	/// A grant of each session that proved a key.
+	///
+	/// The crate holds no house grant, so a grant is an implementor's own.
 	struct IdentityGrant;
 
 	impl ExportGrant for IdentityGrant {
@@ -588,9 +590,13 @@ mod tests {
 		}
 	}
 
-	struct DenyAllGate;
+	/// An export gate that answers every target with the status it holds.
+	///
+	/// The crate holds no house export gate, so a gate is an implementor's
+	/// own.
+	struct GateAnswering(TransitStatus);
 
-	impl ExportGate for DenyAllGate {
+	impl ExportGate for GateAnswering {
 		fn evaluate(
 			&self,
 			_target: &Urn<'_>,
@@ -598,38 +604,18 @@ mod tests {
 			_planes: &TrustPlanes<'_>,
 			_relayed: bool,
 		) -> TransitStatus {
-			TransitStatus::PermissionDenied
+			self.0
 		}
 	}
 
-	struct UnknownGate;
-
-	impl ExportGate for UnknownGate {
-		fn evaluate(
-			&self,
-			_target: &Urn<'_>,
-			_session: &SessionContext,
-			_planes: &TrustPlanes<'_>,
-			_relayed: bool,
-		) -> TransitStatus {
-			TransitStatus::Unknown
-		}
-	}
-
-	struct UnknownPolicy;
-
-	impl GatePolicy for UnknownPolicy {
-		fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-			TransitStatus::Unknown
-		}
-	}
-
-	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-			.with_certificate(cert.clone())
-			.expect("test certificates satisfy the trust builder")
+	/// A frame of the control shape that carries no signature.
+	fn unsigned_control_frame() -> Frame {
+		let frame = FrameBuilder::from(Version::V1)
+			.with_id("verify-origin")
+			.with_order(1)
+			.with_message(TestMessage::sample(None))
 			.build();
-		Arc::new(store)
+		frame.expect("test frame builds")
 	}
 
 	/// A control frame signed by `key` under the canonical convention.
@@ -639,13 +625,7 @@ mod tests {
 
 	/// A control frame signed with `signer` that names `claimed` as its signer.
 	fn control_frame_claiming(signer: &Secp256k1SigningKey, claimed: &Secp256k1SigningKey) -> Frame {
-		let mut frame = FrameBuilder::from(Version::V1)
-			.with_id("verify-origin")
-			.with_order(1)
-			.with_message(TestMessage::sample(None))
-			.build()
-			.expect("test frame builds");
-
+		let mut frame = unsigned_control_frame();
 		let claimed_certificate = TestCertificate::self_signed(claimed);
 		let draft = frame.signing_draft::<Secp256k1Signature>(&claimed_certificate);
 		let draft = draft.expect("test frame drafts its signature");
@@ -656,6 +636,22 @@ mod tests {
 		frame
 	}
 
+	/// The certificate of the fixed test key that names `cn`, under the colony
+	/// URN `urn:tightbeam:colony:test`.
+	fn named(cn: &str) -> Certificate {
+		let key = TestKey::insecure_fixed_signing();
+		TestCertificate::with_cn_and_uri_sans(&key, cn, &["urn:tightbeam:colony:test"])
+	}
+
+	/// A control frame that the fixed test key signs, beside the certificate
+	/// of that key.
+	fn fixed_signed() -> (Frame, Certificate) {
+		(
+			signed_control_frame(&TestKey::insecure_fixed_signing()),
+			TestCertificate::insecure_fixed(),
+		)
+	}
+
 	/// A gateway that rotated its certificate under one key keeps the slate
 	/// key of the certificate the peer plane enrolled.
 	#[test]
@@ -663,7 +659,7 @@ mod tests {
 		let key = peer_key();
 		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
 		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
-		let config = house(config_enrolling(&enrolled));
+		let config = anchored(None, Some(&enrolled));
 
 		let named = config.peer_identity(&rotated);
 		assert_eq!(named, enrolled.fingerprint_id::<Sha3_256>());
@@ -674,116 +670,97 @@ mod tests {
 	/// so a bound hop it answers fails closed.
 	#[test]
 	fn peer_identity_names_no_gateway_for_an_unenrolled_key() {
-		let enrolled = TestCertificate::self_signed(&peer_key());
-		let stranger = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let config = house(config_enrolling(&enrolled));
-
-		let named = config.peer_identity(&stranger);
+		let config = peer_enrolling();
+		let named = config.peer_identity(&TestCertificate::insecure_fixed());
 		assert_eq!(named, None);
 	}
 
-	#[test]
-	fn grant_widens_unexported_target() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.export_grants.push(Arc::new(GrantAll));
+	/// The grants and the export gates of a gateway that exports "ping"
+	/// alone, the target of a request, whether a relay carried it, and the
+	/// verdict on it.
+	type Judged = (
+		Vec<Arc<dyn ExportGrant>>,
+		Vec<Arc<dyn ExportGate>>,
+		&'static str,
+		bool,
+		TransitStatus,
+	);
 
-		let verdict = house(config).evaluate_export_gates(
-			&servlet("ledger"),
-			&SessionContext::default(),
-			false,
-			&TraceCollector::default(),
-		);
-		assert_eq!(verdict?, TransitStatus::Ok);
+	// A grant widens the export list to an unexported target, a gate that
+	// denies overrides a grant, and an unknown gate verdict normalizes to
+	// `Internal`. An identity grant matches no anonymous session, and an
+	// origin-only grant passes an origin request alone.
+	tb_cases! {
+		fn export_gates_judge_a_target((grants, gates, target, relayed, verdict): Judged) -> TestResult {
+			let mut config = exporting_config();
+			config.export_grants = grants;
+			config.export_gates = gates;
+			let (session, trace) = (SessionContext::default(), TraceCollector::default());
+			let gateway = ColonyConfig::house(config);
+
+			let judged = gateway.evaluate_export_gates(&servlet(target), &session, relayed, &trace)?;
+
+			assert_eq!(judged, verdict);
+			Ok(())
+		}
+		cases {
+			a_grant_widens_an_unexported_target => (
+				vec![Arc::new(GrantAll)],
+				Vec::new(),
+				"ledger",
+				false,
+				TransitStatus::Ok,
+			),
+			a_deny_gate_overrides_a_grant => (
+				vec![Arc::new(GrantAll)],
+				vec![Arc::new(GateAnswering(TransitStatus::PermissionDenied))],
+				"ledger",
+				false,
+				TransitStatus::PermissionDenied,
+			),
+			an_anonymous_session_matches_no_identity_grant => (
+				vec![Arc::new(IdentityGrant)],
+				Vec::new(),
+				"ledger",
+				false,
+				TransitStatus::PermissionDenied,
+			),
+			an_origin_only_grant_refuses_a_relayed_request => (
+				vec![Arc::new(OriginOnlyGrant)],
+				Vec::new(),
+				"ledger",
+				true,
+				TransitStatus::PermissionDenied,
+			),
+			an_origin_only_grant_passes_an_origin_request => (
+				vec![Arc::new(OriginOnlyGrant)],
+				Vec::new(),
+				"ledger",
+				false,
+				TransitStatus::Ok,
+			),
+			an_unknown_gate_verdict_normalizes_to_internal => (
+				Vec::new(),
+				vec![Arc::new(GateAnswering(TransitStatus::Unknown))],
+				"ping",
+				false,
+				TransitStatus::Internal,
+			),
+		}
+	}
+
+	/// An unknown verdict of a gate policy normalizes to `Internal`.
+	#[test]
+	fn unknown_gate_policy_verdict_normalizes_to_internal() -> TestResult {
+		let mut config = exporting_config();
+		config.policies.push(Arc::new(TestGate(TransitStatus::Unknown)));
+
+		let verdict = config.evaluate_gates(None, &SessionContext::default(), &TraceCollector::default())?;
+		assert_eq!(verdict, TransitStatus::Internal);
 		Ok(())
 	}
 
-	#[test]
-	fn deny_gate_overrides_grant() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.export_grants.push(Arc::new(GrantAll));
-		config.export_gates.push(Arc::new(DenyAllGate));
-
-		let verdict = house(config).evaluate_export_gates(
-			&servlet("ledger"),
-			&SessionContext::default(),
-			false,
-			&TraceCollector::default(),
-		);
-		assert_eq!(verdict?, TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	#[test]
-	fn anonymous_session_matches_no_identity_grant() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.export_grants.push(Arc::new(IdentityGrant));
-
-		let verdict = house(config).evaluate_export_gates(
-			&servlet("ledger"),
-			&SessionContext::default(),
-			false,
-			&TraceCollector::default(),
-		);
-		assert_eq!(verdict?, TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	#[test]
-	fn origin_only_grant_refuses_relayed_request() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.export_grants.push(Arc::new(OriginOnlyGrant));
-
-		let verdict = house(config).evaluate_export_gates(
-			&servlet("ledger"),
-			&SessionContext::default(),
-			true,
-			&TraceCollector::default(),
-		);
-		assert_eq!(verdict?, TransitStatus::PermissionDenied);
-		Ok(())
-	}
-
-	#[test]
-	fn origin_only_grant_passes_origin_request() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.export_grants.push(Arc::new(OriginOnlyGrant));
-
-		let verdict = house(config).evaluate_export_gates(
-			&servlet("ledger"),
-			&SessionContext::default(),
-			false,
-			&TraceCollector::default(),
-		);
-		assert_eq!(verdict?, TransitStatus::Ok);
-		Ok(())
-	}
-
-	#[test]
-	fn unknown_export_gate_verdict_normalizes_to_internal() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.export_gates.push(Arc::new(UnknownGate));
-
-		let verdict = house(config).evaluate_export_gates(
-			&servlet("ping"),
-			&SessionContext::default(),
-			false,
-			&TraceCollector::default(),
-		);
-		assert_eq!(verdict?, TransitStatus::Internal);
-		Ok(())
-	}
-
-	#[test]
-	fn unknown_gate_policy_verdict_normalizes_to_internal() -> Result<(), TightBeamError> {
-		let mut config = exporting_config();
-		config.policies.push(Arc::new(UnknownPolicy));
-
-		let verdict = config.evaluate_gates(None, &SessionContext::default(), &TraceCollector::default());
-		assert_eq!(verdict?, TransitStatus::Internal);
-
-		Ok(())
-	}
-
+	// Each refusal answers its frame with the status of its cause.
 	tb_cases! {
 		fn a_refusal_maps_to_the_status_its_frame_is_answered_with((refusal, status): (VerifyRefusal, TransitStatus)) {
 			assert_eq!(TransitStatus::from(refusal), status);
@@ -798,114 +775,88 @@ mod tests {
 		}
 	}
 
-	/// A frame of the control shape that carries no signature.
-	fn unsigned_control_frame() -> Frame {
-		let frame = FrameBuilder::from(Version::V1)
-			.with_id("verify-origin")
-			.with_order(1)
-			.with_message(TestMessage::sample(None))
-			.build();
-		frame.expect("test frame builds")
+	// The peer plane names why it refuses a frame: a signer it does not hold,
+	// a forged signature under a signer it holds, a frame with no signature,
+	// and a plane with no store.
+	tb_cases! {
+		fn verify_peer_names_its_refusal(
+			(frame, config, refusal): (Frame, ColonyConfig<TokioListener>, VerifyRefusal)
+		) {
+			let verified = config.verify_peer(&frame);
+
+			assert_eq!(verified.err(), Some(refusal));
+		}
+		cases {
+			unknown_signer => (
+				signed_control_frame(&peer_key()),
+				anchored(None, Some(&TestCertificate::insecure_fixed())),
+				VerifyRefusal::UnknownSigner,
+			),
+			forged => (
+				control_frame_claiming(&TestKey::insecure_fixed_signing(), &peer_key()),
+				peer_enrolling(),
+				VerifyRefusal::Forged,
+			),
+			unsigned => (unsigned_control_frame(), peer_enrolling(), VerifyRefusal::Unsigned),
+			no_store => (
+				signed_control_frame(&peer_key()),
+				ColonyConfig::house(exporting_config()),
+				VerifyRefusal::NoStore,
+			),
+		}
 	}
 
-	#[test]
-	fn peer_origin_names_a_signer_the_store_does_not_hold() {
-		let frame = signed_control_frame(&peer_key());
-		let enrolled_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-
-		let config = house(config_enrolling(&TestCertificate::self_signed(&enrolled_key)));
-		let verified = config.verify_peer(&frame);
-		assert!(matches!(verified, Err(VerifyRefusal::UnknownSigner)));
-	}
-
-	#[test]
-	fn peer_origin_names_a_forged_signature_under_a_held_signer() {
-		let forger: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let frame = control_frame_claiming(&forger, &peer_key());
-
-		let config = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
-		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::Forged)));
-	}
-
-	#[test]
-	fn peer_origin_names_a_frame_with_no_signature() {
-		let frame = unsigned_control_frame();
-		let config = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
-		assert!(matches!(config.verify_peer(&frame), Err(VerifyRefusal::Unsigned)));
-	}
-
-	#[test]
-	fn peer_origin_names_a_plane_with_no_store() {
-		let frame = signed_control_frame(&peer_key());
-		let config = house(exporting_config());
-
-		let verified = config.verify_peer(&frame);
-		assert!(matches!(verified, Err(VerifyRefusal::NoStore)));
-	}
-
+	/// A gateway with no colony URN is in no flood.
 	#[test]
 	fn a_gateway_with_no_colony_is_in_no_flood() {
 		assert!(exporting_config().flood().is_none());
 	}
 
+	/// The hive plane passes a frame of a signer that it alone anchors, as the
+	/// first party, and names the frame and the certificate of its signer.
 	#[test]
 	fn hive_origin_passes_hive_only_signer() {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let frame = signed_control_frame(&key);
-		let cert = TestCertificate::self_signed(&key);
-
-		let mut config = exporting_config();
-		config.tls.hive_trust = Some(trust_of(&cert));
-
-		let config = house(config);
+		let (frame, cert) = fixed_signed();
+		let config = anchored(Some(&cert), None);
 		let verified = config.verify_hive(&frame);
-		assert!(matches!(
-			verified,
-			Ok(ref proof)
-				if proof.party() == Party::FirstParty
-					&& proof.frame().metadata().id() == frame.metadata().id()
-					&& Fingerprint::<Sha3_256>::from_certificate(proof.signer_cert()).ok()
-						== Fingerprint::<Sha3_256>::from_certificate(&cert).ok()
-		));
+
+		let read = verified.map(|proof| {
+			let signer = proof.signer_cert().fingerprint_id::<Sha3_256>();
+			(proof.party(), proof.frame().metadata().id().to_vec(), signer)
+		});
+		let expected = (
+			Party::FirstParty,
+			frame.metadata().id().to_vec(),
+			cert.fingerprint_id::<Sha3_256>(),
+		);
+		assert_eq!(read, Ok(expected));
 	}
 
-	#[test]
-	fn hive_origin_refuses_dual_anchored_signer() {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let frame = signed_control_frame(&key);
-		let cert = TestCertificate::self_signed(&key);
+	// The hive plane refuses a key that the peer plane holds too, under the
+	// one certificate or under a rotated certificate of that key.
+	tb_cases! {
+		fn verify_hive_refuses_a_key_the_peer_plane_holds((hive, peer): (Certificate, Certificate)) {
+			let (frame, _) = fixed_signed();
+			let config = anchored(Some(&hive), Some(&peer));
 
-		let mut config = exporting_config();
-		config.tls.hive_trust = Some(trust_of(&cert));
-		config.tls.peer_trust = Some(trust_of(&cert));
-		assert!(matches!(house(config).verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
+			let verified = config.verify_hive(&frame);
+			assert_eq!(verified.err(), Some(VerifyRefusal::WrongPlane));
+		}
+		cases {
+			dual_anchored => (TestCertificate::insecure_fixed(), TestCertificate::insecure_fixed()),
+			rotated_peer_certificate => (named("hive"), named("peer")),
+		}
 	}
 
-	#[test]
-	fn hive_origin_refuses_peer_key_under_rotated_certificate() {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let frame = signed_control_frame(&key);
-		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
-		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
-
-		let mut config = exporting_config();
-		config.tls.hive_trust = Some(trust_of(&hive_cert));
-		config.tls.peer_trust = Some(trust_of(&peer_cert));
-		assert!(matches!(house(config).verify_hive(&frame), Err(VerifyRefusal::WrongPlane)));
-	}
-
+	/// The peer plane passes a signer that both planes anchor, as a peer.
 	#[test]
 	fn peer_origin_accepts_dual_anchored_signer() {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let frame = signed_control_frame(&key);
-		let cert = TestCertificate::self_signed(&key);
+		let (frame, cert) = fixed_signed();
+		let config = anchored(Some(&cert), Some(&cert));
 
-		let mut config = exporting_config();
-		config.tls.hive_trust = Some(trust_of(&cert));
-		config.tls.peer_trust = Some(trust_of(&cert));
+		let verified = config.verify_peer(&frame);
 
-		let config = house(config);
-		assert!(matches!(config.verify_peer(&frame), Ok(verified) if verified.party() == Party::Peer));
+		assert!(matches!(verified, Ok(verified) if verified.party() == Party::Peer));
 	}
 
 	/// The instrument records of an export refusal, read from a collector that
@@ -915,8 +866,9 @@ mod tests {
 		use core::cell::Cell;
 
 		use super::*;
-		use crate::instrumentation::{TbEvent, TbInstrumentationConfig};
-		use crate::trace::TraceConfig;
+		use crate::crypto::x509::utils::Fingerprint;
+		use crate::instrumentation::TbInstrumentationConfig;
+		use crate::testing::fixtures::TestTrace;
 
 		std::thread_local! {
 			/// The digests that [`CountingDigest`] starts on this thread.
@@ -924,6 +876,10 @@ mod tests {
 		}
 
 		/// A SHA3-256 that counts each digest it starts.
+		///
+		/// The count of fingerprints a record computes is the behavior under
+		/// test, and the house digest keeps no count, so this wrapper of the
+		/// house digest counts its starts.
 		#[derive(Clone)]
 		struct CountingDigest(Sha3_256);
 
@@ -954,89 +910,85 @@ mod tests {
 
 		/// The count of digests that one export refusal of a certified caller
 		/// starts on a trace that holds `max_events` events.
-		fn fingerprints_of_a_refusal(max_events: u32) -> Result<usize, TightBeamError> {
+		fn fingerprints_of_a_refusal(max_events: u32) -> usize {
 			let config = TbInstrumentationConfig { enable_payloads: true, max_events, ..Default::default() };
-			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+			let trace = TestTrace::with_config(config);
 			// A full sink keeps its overflow warning in place of the first
 			// record past its bound, so this record takes that place.
 			trace.emit(CLUSTER_EXPORT_REFUSED, "warning");
-			let session = SessionContext::for_peer(Arc::new(TestCertificate::self_signed(&peer_key())));
+			let session = SessionContext::for_peer(Arc::new(peer_certificate()));
 			let audit = ExportAudit { trace: &trace, session: &session, relayed: false };
 			let before = DIGESTS.with(Cell::get);
 
-			audit.record::<CountingDigest>(CLUSTER_EXPORT_REFUSED, TransitStatus::PermissionDenied)?;
+			let recorded = audit.record::<CountingDigest>(CLUSTER_EXPORT_REFUSED, TransitStatus::PermissionDenied);
+			recorded.expect("the trace takes the record");
 
-			Ok(DIGESTS.with(Cell::get).saturating_sub(before))
+			DIGESTS.with(Cell::get).saturating_sub(before)
 		}
 
-		/// A record that the sink drops computes no fingerprint of its caller.
-		#[test]
-		fn a_dropped_export_record_computes_no_fingerprint() -> Result<(), TightBeamError> {
-			assert_eq!(fingerprints_of_a_refusal(0)?, 0);
-			Ok(())
-		}
-
-		/// A kept record computes the fingerprint of its caller once.
-		#[test]
-		fn a_kept_export_record_computes_one_fingerprint() -> Result<(), TightBeamError> {
-			assert_eq!(fingerprints_of_a_refusal(u32::MAX)?, 1);
-			Ok(())
-		}
-
-		// An export label names its status as `TransitStatus::as_str` names it.
+		// A record that the sink drops computes no fingerprint of its caller,
+		// and a kept record computes it once.
 		tb_cases! {
-			fn an_export_label_names_its_status_as_the_status_does(status: TransitStatus) {
-				let (trace, session) = (TraceCollector::default(), SessionContext::default());
-				let audit = ExportAudit { trace: &trace, session: &session, relayed: true };
-				assert_eq!(audit.label(status), format!("{}/relayed", status.as_str()));
+			fn an_export_record_computes_fingerprints_as_its_sink_keeps_it((max_events, fingerprints): (u32, usize)) {
+				assert_eq!(fingerprints_of_a_refusal(max_events), fingerprints);
 			}
 			cases {
-				ok => TransitStatus::Ok,
-				cancelled => TransitStatus::Cancelled,
-				unknown => TransitStatus::Unknown,
-				invalid_argument => TransitStatus::InvalidArgument,
-				deadline_exceeded => TransitStatus::DeadlineExceeded,
-				not_found => TransitStatus::NotFound,
-				already_exists => TransitStatus::AlreadyExists,
-				permission_denied => TransitStatus::PermissionDenied,
-				resource_exhausted => TransitStatus::ResourceExhausted,
-				failed_precondition => TransitStatus::FailedPrecondition,
-				aborted => TransitStatus::Aborted,
-				out_of_range => TransitStatus::OutOfRange,
-				unimplemented => TransitStatus::Unimplemented,
-				internal => TransitStatus::Internal,
-				unavailable => TransitStatus::Unavailable,
-				data_loss => TransitStatus::DataLoss,
-				unauthenticated => TransitStatus::Unauthenticated,
+				dropped => (0, 0),
+				kept => (u32::MAX, 1),
 			}
 		}
 
-		/// The records of [`CLUSTER_EXPORT_REFUSED`] that a house gateway
-		/// leaves when it refuses "ledger" to `session`.
-		fn refusal_records(session: &SessionContext, relayed: bool) -> Result<Vec<TbEvent>, TightBeamError> {
-			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-			let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
-			let gateway = house(exporting_config());
-			let verdict = gateway.evaluate_export_gates(&servlet("ledger"), session, relayed, &trace)?;
-			assert_eq!(verdict, TransitStatus::PermissionDenied);
+		// An export label names its status by its variant, then the route of
+		// the request.
+		tb_cases! {
+			fn an_export_label_names_its_status_as_the_status_does((status, label): (TransitStatus, &str)) {
+				let (trace, session) = (TraceCollector::default(), SessionContext::default());
+				let audit = ExportAudit { trace: &trace, session: &session, relayed: true };
+				assert_eq!(audit.label(status), label);
+			}
+			cases {
+				ok => (TransitStatus::Ok, "Ok/relayed"),
+				cancelled => (TransitStatus::Cancelled, "Cancelled/relayed"),
+				unknown => (TransitStatus::Unknown, "Unknown/relayed"),
+				invalid_argument => (TransitStatus::InvalidArgument, "InvalidArgument/relayed"),
+				deadline_exceeded => (TransitStatus::DeadlineExceeded, "DeadlineExceeded/relayed"),
+				not_found => (TransitStatus::NotFound, "NotFound/relayed"),
+				already_exists => (TransitStatus::AlreadyExists, "AlreadyExists/relayed"),
+				permission_denied => (TransitStatus::PermissionDenied, "PermissionDenied/relayed"),
+				resource_exhausted => (TransitStatus::ResourceExhausted, "ResourceExhausted/relayed"),
+				failed_precondition => (TransitStatus::FailedPrecondition, "FailedPrecondition/relayed"),
+				aborted => (TransitStatus::Aborted, "Aborted/relayed"),
+				out_of_range => (TransitStatus::OutOfRange, "OutOfRange/relayed"),
+				unimplemented => (TransitStatus::Unimplemented, "Unimplemented/relayed"),
+				internal => (TransitStatus::Internal, "Internal/relayed"),
+				unavailable => (TransitStatus::Unavailable, "Unavailable/relayed"),
+				data_loss => (TransitStatus::DataLoss, "DataLoss/relayed"),
+				unauthenticated => (TransitStatus::Unauthenticated, "Unauthenticated/relayed"),
+			}
+		}
 
-			let recorded = trace.drain_events();
-			let refusal = |event: &TbEvent| event.urn == CLUSTER_EXPORT_REFUSED;
-			Ok(recorded.into_iter().filter(refusal).collect())
+		/// The verdict of a house gateway on "ledger" for `session`, beside the
+		/// trace that holds the records the verdict leaves.
+		fn refusal_trace(session: &SessionContext, relayed: bool) -> (TransitStatus, TraceCollector) {
+			let trace = TestTrace::with_payloads();
+			let gateway = ColonyConfig::house(exporting_config());
+			let verdict = gateway.evaluate_export_gates(&servlet("ledger"), session, relayed, &trace);
+			let verdict = verdict.expect("the trace takes the export record");
+
+			(verdict, trace)
 		}
 
 		/// A refusal of a certified caller records the caller's fingerprint
 		/// under the colony digest as its payload.
 		#[test]
-		fn a_refusal_records_the_fingerprint_of_its_caller() -> Result<(), TightBeamError> {
-			let certificate = TestCertificate::self_signed(&peer_key());
-			let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
-			let session = SessionContext::for_peer(Arc::new(certificate));
+		fn a_refusal_records_the_fingerprint_of_its_caller() -> TestResult {
+			let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&peer_certificate())?;
+			let session = SessionContext::for_peer(Arc::new(peer_certificate()));
+			let (verdict, trace) = refusal_trace(&session, false);
 
 			let expected: [u8; 32] = Sha3_256::digest(fingerprint.as_slice()).into();
-			let records = refusal_records(&session, false)?;
-			let evidence: Vec<Option<[u8; 32]>> = records.iter().map(|record| record.payload_hash).collect();
-			assert_eq!(evidence, [Some(expected)]);
+			let evidence = TestTrace::payloads(&trace, CLUSTER_EXPORT_REFUSED);
+			assert_eq!((verdict, evidence), (TransitStatus::PermissionDenied, vec![Some(expected)]));
 			Ok(())
 		}
 
@@ -1044,11 +996,10 @@ mod tests {
 		// sink keeps the label and drops the value that carries the relayed
 		// flag.
 		tb_cases! {
-			fn a_refusal_names_its_status_and_route((relayed, expected): (bool, &str)) -> Result<(), TightBeamError> {
-				let records = refusal_records(&SessionContext::default(), relayed)?;
-				let labels: Vec<Option<String>> = records.into_iter().map(|record| record.label.map(String::from)).collect();
-				assert_eq!(labels, [Some(String::from(expected))]);
-				Ok(())
+			fn a_refusal_names_its_status_and_route((relayed, expected): (bool, &str)) {
+				let (verdict, trace) = refusal_trace(&SessionContext::default(), relayed);
+				let labels = TestTrace::labels(&trace, CLUSTER_EXPORT_REFUSED);
+				assert_eq!((verdict, labels), (TransitStatus::PermissionDenied, vec![Some(String::from(expected))]));
 			}
 			cases {
 				direct => (false, "PermissionDenied/direct"),
@@ -1056,30 +1007,29 @@ mod tests {
 			}
 		}
 
-		// A refusal after the frame verified on its plane names the
-		// fingerprint of the signer that the verification proved.
+		/// The fingerprint of the signer that `gateway` proves on its peer
+		/// plane for `frame`.
+		fn verified_signer(gateway: &ColonyConfig<TokioListener>, frame: &Frame) -> VerifiedSignerId {
+			let verified = gateway.verify_peer(frame).map(|verified| verified.fingerprint());
+			verified.expect("the peer plane enrolls the signer of the frame")
+		}
+
+		/// A refusal after the frame verified on its plane names the
+		/// fingerprint of the signer that the verification proved.
 		#[test]
-		fn a_verified_refusal_names_its_signer() -> Result<(), TightBeamError> {
+		fn a_verified_refusal_names_its_signer() -> TestResult {
 			use crate::colony::cluster::runtime::refuse::Refusal;
 			use crate::instrumentation::events::CLUSTER_GOSSIP_REFUSED;
 
-			let config = TbInstrumentationConfig { enable_payloads: true, ..TbInstrumentationConfig::default() };
-			let trace = Arc::new(TraceCollector::from(TraceConfig::with_instrumentation(config)));
-			let connections = Arc::new(TraceCollector::new());
+			let (trace, connections) = (Arc::new(TestTrace::with_payloads()), Arc::new(TraceCollector::new()));
 			let frame = signed_control_frame(&peer_key());
-			let gateway = house(config_enrolling(&TestCertificate::self_signed(&peer_key())));
-			let signer = gateway.verify_peer(&frame).map(|verified| verified.fingerprint());
-			let signer = signer.map_err(|_| TightBeamError::MissingSignature)?;
-
+			let signer = verified_signer(&peer_enrolling(), &frame);
 			let audit = RequestAudit::of(&trace, &connections, &SessionContext::default());
 			let refusal = Refusal::to(&frame, &audit).by(&signer);
 			refusal.gossip(TransitStatus::PermissionDenied)?;
 
 			let expected: [u8; 32] = Sha3_256::digest(signer.as_shared().as_ref()).into();
-			let drained = trace.drain_events().into_iter();
-			let recorded = drained.filter(|event| event.urn == CLUSTER_GOSSIP_REFUSED);
-			let evidence: Vec<Option<[u8; 32]>> = recorded.map(|event| event.payload_hash).collect();
-			assert_eq!(evidence, [Some(expected)]);
+			assert_eq!(TestTrace::payloads(&trace, CLUSTER_GOSSIP_REFUSED), [Some(expected)]);
 			Ok(())
 		}
 	}

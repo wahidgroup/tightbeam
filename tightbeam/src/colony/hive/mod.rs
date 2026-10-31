@@ -307,6 +307,18 @@ impl RefusedRegistration {
 	}
 }
 
+// A refusal prints its error and the type of its servlet, which names the
+// servlet in the message of a failed test.
+#[cfg(test)]
+impl core::fmt::Debug for RefusedRegistration {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("RefusedRegistration")
+			.field("error", &self.error)
+			.field("servlet_type", &self.registration.servlet_type)
+			.finish_non_exhaustive()
+	}
+}
+
 /// A registration that a [`ServletRegistry`] gave up for a newer one under
 /// its key.
 ///
@@ -543,6 +555,17 @@ impl HashMapRegistry {
 	/// Locks the map, and recovers a poisoned lock.
 	fn map(&self) -> MutexGuard<'_, HashMap<Vec<u8>, ServletRegistration>> {
 		self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+}
+
+#[cfg(test)]
+impl HashMapRegistry {
+	/// A map registry that holds `registration` under `key`.
+	pub(crate) fn holding(key: impl Into<Vec<u8>>, registration: ServletRegistration) -> Self {
+		let registry = HashMapRegistry::default();
+		let inserted = registry.insert(key, registration);
+		inserted.expect("the map registry takes every registration");
+		registry
 	}
 }
 
@@ -1322,126 +1345,119 @@ impl Default for HiveConfig {
 #[path = "macros.rs"]
 mod macros_impl;
 
+/// The probe servlets that the hive tests register, and the registry and
+/// bounds that hold them.
 #[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::error::CertificateValidationError::ExcludedKeyPurpose;
-	use crate::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-	use crate::crypto::x509::{CertificateSpec, KeyCurves};
-	use crate::der::asn1::ObjectIdentifier;
-	use crate::der::oid::db::rfc5280::ANY_EXTENDED_KEY_USAGE;
-	use crate::tb_cases;
-	use crate::testing::{TestCertificate, TestKey};
+pub(crate) mod fixtures {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::{Arc, Mutex, PoisonError};
 
-	/// A signer purpose of an implementor's own, outside the house purposes.
-	const OWN_SIGNER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.12");
+	use super::{ServletBox, ServletRegistration, SpawnerFn};
+	use crate::basis_points::BasisPoints;
+	use crate::cms::signed_data::SignerIdentifier;
+	use crate::colony::urn::ColonyNamespace;
+	use crate::urn::Urn;
 
-	/// Builds an identity on the fixed test key whose certificate names
-	/// `purpose` as its one key purpose, or carries no `extendedKeyUsage` for
-	/// `None`.
-	fn identity_naming(purpose: Option<ObjectIdentifier>) -> SigningIdentity {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let certificate = match purpose {
-			Some(purpose) => TestCertificate::with_key_purposes(certificate, [purpose]),
-			None => certificate,
-		};
+	/// The utilization a probe reports in the tick a test runs: `Some` basis
+	/// points, or `None` for a tick in which it reports nothing.
+	pub(crate) type Report = Arc<Mutex<Option<BasisPoints>>>;
 
-		let provider = Arc::new(Secp256k1KeyProvider::from(key));
-		SigningIdentity::new(certificate, provider).expect("the fixture key proves its certificate")
-	}
-
-	// `from_identity` installs a certificate that names the signer purpose,
-	// any purpose, or none (RFC 5280 §4.2.1.12).
-	tb_cases! {
-		fn from_identity_admits_an_identity_for_the_signer(
-			purpose: Option<ObjectIdentifier>
-		) -> Result<(), TightBeamError> {
-			HiveTlsConfig::from_identity(identity_naming(purpose), PeerAuthentication::Anonymous, KeyPurposes::HOUSE)?;
-
-			Ok(())
-		}
-		cases {
-			an_identity_for_the_signer => Some(KeyPurposes::HOUSE.signer),
-			an_identity_for_any_purpose => Some(ANY_EXTENDED_KEY_USAGE),
-			an_identity_with_no_key_purpose => None,
-		}
-	}
-
-	// The install refuses a certificate whose key purposes omit the signer.
-	tb_cases! {
-		fn from_identity_refuses_an_identity_outside_the_signer(purpose: ObjectIdentifier) {
-			let identity = identity_naming(Some(purpose));
-			let installed = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
-
-			let excluded = matches!(installed, Err(ExcludedKeyPurpose));
-			assert!(excluded);
-		}
-		cases {
-			an_identity_for_servers_alone => KeyPurposes::HOUSE.server,
-			an_identity_for_clients_alone => KeyPurposes::HOUSE.client,
-		}
-	}
-
-	// An identity that names an implementor's own signer purpose alone
-	// installs under the purposes that name it.
-	#[test]
-	fn from_identity_installs_an_own_signer_purpose_under_the_purposes_that_name_it() -> Result<(), TightBeamError> {
-		let key_purposes = KeyPurposes { signer: OWN_SIGNER, ..KeyPurposes::HOUSE };
-		HiveTlsConfig::from_identity(identity_naming(Some(OWN_SIGNER)), PeerAuthentication::Anonymous, key_purposes)?;
-		Ok(())
-	}
-
-	// The house purposes refuse an identity that names an implementor's own
-	// signer purpose alone.
-	#[test]
-	fn from_identity_refuses_an_own_signer_purpose_under_the_house_purposes() {
-		let identity = identity_naming(Some(OWN_SIGNER));
-		let installed = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
-
-		let excluded = matches!(installed, Err(ExcludedKeyPurpose));
-		assert!(excluded);
-	}
-
-	/// A servlet at a fixed locator that names `signer` as the identity it
-	/// answers under.
-	struct SignerProbe {
+	/// A servlet at a fixed address that runs no handler, and names the
+	/// signer, the stop step, and the report that its test sets.
+	///
+	/// The shipped servlet runtime stops by aborting its accept task, which
+	/// leaves a test nothing to read, so the probe runs the step its test
+	/// names as it stops.
+	pub(crate) struct Probe {
+		addr: &'static [u8],
 		signer: Option<SignerIdentifier>,
+		on_stop: Option<Box<dyn FnOnce() + Send + Sync>>,
+		report: Option<Report>,
 	}
 
-	impl ServletBox for SignerProbe {
-		fn addr_bytes(&self) -> Arc<[u8]> {
-			Arc::from(b"127.0.0.1:7003".as_slice())
+	impl Probe {
+		/// A probe at `addr` that names no signer, runs no step as it stops,
+		/// and reports no utilization.
+		pub(crate) fn at(addr: &'static [u8]) -> Self {
+			Probe { addr, signer: None, on_stop: None, report: None }
 		}
 
-		fn stop_boxed(self: Box<Self>) {}
+		/// This probe, under `signer` as the identity it answers under.
+		pub(crate) fn signed(self, signer: impl Into<Option<SignerIdentifier>>) -> Self {
+			Probe { signer: signer.into(), ..self }
+		}
+
+		/// This probe, which runs `step` as it stops.
+		pub(crate) fn on_stop(self, step: impl FnOnce() + Send + Sync + 'static) -> Self {
+			Probe { on_stop: Some(Box::new(step)), ..self }
+		}
+
+		/// This probe, which sets `stopped` as it stops.
+		pub(crate) fn flagging(self, stopped: &Arc<AtomicBool>) -> Self {
+			let stopped = Arc::clone(stopped);
+			self.on_stop(move || stopped.store(true, Ordering::SeqCst))
+		}
+
+		/// This probe, which reports what `report` holds in each tick.
+		pub(crate) fn reporting(self, report: &Report) -> Self {
+			Probe { report: Some(Arc::clone(report)), ..self }
+		}
+
+		/// The spawner of a plain probe, for a registration whose test spawns
+		/// no instance.
+		pub(crate) fn spawner() -> SpawnerFn {
+			Arc::new(|_| Box::pin(async { Ok(Box::new(Probe::at(b"127.0.0.1:7001")) as Box<dyn ServletBox>) }))
+		}
+
+		/// The registration of this probe under `servlet_type`, with the
+		/// spawner of a plain probe.
+		pub(crate) fn registration(self, servlet_type: Urn<'static>) -> ServletRegistration {
+			ServletRegistration { servlet: Box::new(self), spawner: Probe::spawner(), servlet_type }
+		}
+	}
+
+	impl ServletBox for Probe {
+		fn addr_bytes(&self) -> Arc<[u8]> {
+			Arc::from(self.addr)
+		}
+
+		fn stop_boxed(self: Box<Self>) {
+			if let Some(step) = self.on_stop {
+				step();
+			}
+		}
 
 		fn signer(&self) -> Option<&SignerIdentifier> {
 			self.signer.as_ref()
 		}
+
+		fn utilization(&self) -> Option<BasisPoints> {
+			let report = self.report.as_ref()?;
+			*report.lock().unwrap_or_else(PoisonError::into_inner)
+		}
 	}
 
-	/// Returns the spawner of a [`SignerProbe`] that names no signer.
-	fn probe_spawner() -> SpawnerFn {
-		Arc::new(|_| Box::pin(async { Ok(Box::new(SignerProbe { signer: None }) as Box<dyn ServletBox>) }))
+	/// The servlet type `echo` of the default namespace, which each probe
+	/// registers under.
+	pub(crate) fn echo_type() -> Urn<'static> {
+		ColonyNamespace::servlet_fixture("echo")
 	}
+}
 
-	/// Builds a registry with one [`SignerProbe`] that names `signer`.
+#[cfg(test)]
+mod tests {
+	use super::fixtures::{echo_type, Probe};
+	use super::*;
+	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::x509::store::TrustBuilder;
+	use crate::tb_cases;
+	use crate::testing::fixtures::{TestIdentity, TestStore};
+
+	/// A registry that holds one probe at a fixed locator, which names
+	/// `signer` as the identity it answers under.
 	fn registry_holding(signer: Option<SignerIdentifier>) -> HashMapRegistry {
-		let registry = HashMapRegistry::default();
-		let namespace = ColonyNamespace::default();
-		let servlet_type = namespace.servlet("echo").expect("test names satisfy the mint grammar");
-		let spawner = probe_spawner();
-		let registration = ServletRegistration { servlet: Box::new(SignerProbe { signer }), spawner, servlet_type };
-
-		let inserted = registry.insert(b"echo".to_vec(), registration);
-		assert!(inserted.is_ok(), "the map registry takes every registration");
-
-		registry
+		let probe = Probe::at(b"127.0.0.1:7003").signed(signer);
+		HashMapRegistry::holding(b"echo".to_vec(), probe.registration(echo_type()))
 	}
 
 	// The slate carries the signer each servlet names, and leaves out a
@@ -1465,59 +1481,45 @@ mod tests {
 	/// The key purposes that put the house client purpose in the server role.
 	const SWAPPED_SERVER: KeyPurposes = KeyPurposes { server: KeyPurposes::HOUSE.client, ..KeyPurposes::HOUSE };
 
-	// A hive with a trust store authenticates each command against the peer
-	// its handshake proves, so its control plane demands a client
-	// certificate when its TLS config names anonymous clients.
+	/// The TLS of a hive on the fixed test key, whose certificate names no key
+	/// purpose, under `key_purposes` and anonymous clients.
+	fn anonymous_tls(key_purposes: KeyPurposes) -> HiveTlsConfig {
+		let identity = TestIdentity::naming(None);
+		let installed = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, key_purposes);
+		installed.expect("an identity with no key purpose installs under any purposes")
+	}
+
+	/// A hive with a trust store authenticates each command against the peer
+	/// its handshake proves, so its control plane demands a client
+	/// certificate when its TLS config names anonymous clients.
 	#[test]
-	fn a_hive_with_no_client_validators_and_a_command_trust_demands_a_client_certificate() -> Result<(), TightBeamError>
-	{
-		let identity = identity_naming(None);
-		let tls = HiveTlsConfig::from_identity(identity, PeerAuthentication::Anonymous, KeyPurposes::HOUSE)?;
-		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-		let store: Arc<dyn CertificateTrust> = Arc::new(builder.build());
+	fn a_hive_with_no_client_validators_and_a_command_trust_demands_a_client_certificate() {
+		let tls = anonymous_tls(KeyPurposes::HOUSE);
+		let store: Arc<dyn CertificateTrust> = Arc::new(TestStore::empty().build());
 		let config = HiveConfig { trust_store: Some(store), hive_tls: Some(Arc::new(tls)), ..Default::default() };
 
 		let accept = config.control_encryption::<DefaultCryptoProvider>();
 		assert!(accept.is_some_and(|accept| accept.peer_authentication.requires_certificate()));
-		Ok(())
 	}
 
-	// The control plane holds the hive's identity to the purposes its TLS
-	// config names, so the transport and the hive read one purpose set.
+	/// The control plane holds the hive's identity to the purposes its TLS
+	/// config names, so the transport and the hive read one purpose set.
 	#[test]
-	fn the_control_plane_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
-		let tls = HiveTlsConfig::from_identity(identity_naming(None), PeerAuthentication::Anonymous, SWAPPED_SERVER)?;
+	fn the_control_plane_takes_the_configured_key_purposes() {
+		let tls = anonymous_tls(SWAPPED_SERVER);
 		let accept = tls.accept_encryption::<DefaultCryptoProvider>(None);
 		assert_eq!(accept.key_purposes, SWAPPED_SERVER);
-		Ok(())
 	}
 
-	// A gateway dial presents the hive's identity under the purposes its TLS
-	// config names.
+	/// A gateway dial presents the hive's identity under the purposes its TLS
+	/// config names.
 	#[test]
-	fn a_gateway_dial_takes_the_configured_key_purposes() -> Result<(), TightBeamError> {
-		let tls = HiveTlsConfig::from_identity(identity_naming(None), PeerAuthentication::Anonymous, SWAPPED_SERVER)?;
+	fn a_gateway_dial_takes_the_configured_key_purposes() {
+		let tls = anonymous_tls(SWAPPED_SERVER);
 		let mut encryption = EncryptionConfig::<DefaultCryptoProvider>::unconfigured();
 
 		tls.outbound(&mut encryption);
 
 		assert_eq!(encryption.key_purposes, SWAPPED_SERVER);
-		Ok(())
-	}
-
-	// `new` installs through `from_identity`, so it refuses the same identity
-	// in its own error.
-	#[test]
-	fn new_refuses_an_identity_for_servers_alone() -> Result<(), TightBeamError> {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-		let certificate = TestCertificate::with_key_purposes(certificate, [KeyPurposes::HOUSE.server]);
-		let spec = CertificateSpec::Built(Box::new(certificate));
-
-		let provider = Arc::new(Secp256k1KeyProvider::from(key));
-		let refused = HiveTlsConfig::new(spec, provider, PeerAuthentication::Anonymous);
-		let excluded = matches!(refused, Err(TightBeamError::CertificateValidationError(ExcludedKeyPurpose)));
-		assert!(excluded);
-		Ok(())
 	}
 }

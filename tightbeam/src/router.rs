@@ -308,13 +308,16 @@ macro_rules! routes {
 #[cfg(all(test, feature = "builder"))]
 mod tests {
 	use std::sync::{mpsc, Arc};
-	use std::time::Duration;
 
 	use crate::core::{Requirement, RequirementError};
 	use crate::der::asn1::SetOfVec;
-	use crate::der::{Decode, Encode, ErrorKind, Sequence};
+	use crate::der::{ErrorKind, Sequence};
 	use crate::router::{CleartextFrame, RouterError, RouterPolicy};
-	use crate::{Beamable, Frame, TightBeamError, Version};
+	use crate::testing::{TestFrame, TestResult};
+	use crate::{Beamable, Frame, Version};
+
+	#[cfg(all(feature = "aead", feature = "zstd"))]
+	use crate::TightBeamError;
 
 	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 	pub struct HealthCheck {
@@ -346,9 +349,13 @@ mod tests {
 			health_tx: mpsc::Sender<Delivery<HealthCheck>>,
 		}:
 			Payment |router, frame, msg| {
+				// The test reads its receiver, so a failed send shows there as
+				// a missing delivery.
 				let _ = router.payment_tx.send((frame, msg));
 			}
 			HealthCheck |router, frame, msg| {
+				// The test reads its receiver, so a failed send shows there as
+				// a missing delivery.
 				let _ = router.health_tx.send((frame, msg));
 			}
 	}
@@ -358,6 +365,7 @@ mod tests {
 			tally_tx: mpsc::Sender<Tally>,
 		}:
 			Tally |router, _frame, msg| {
+				// The test reads the refusal alone, so a failed send is moot.
 				let _ = router.tally_tx.send(msg);
 			}
 	}
@@ -371,18 +379,11 @@ mod tests {
 
 	/// A frame whose `Tally` body holds its counts in descending order, as a
 	/// peer that skips DER order sends it.
-	fn descending_tally() -> Result<Frame, Box<dyn std::error::Error>> {
-		let counts = SetOfVec::try_from(vec![1u8, 2])?;
-		let frame = compose! { V0: id: "tally", order: 1u64, message: Tally { counts } }?;
-		let mut der = frame.to_der()?;
-		let at = der
-			.windows(ASCENDING_COUNTS.len())
-			.position(|window| window == ASCENDING_COUNTS);
-
-		let at = at.ok_or("the encoded frame carries the counts in DER order")?;
-		der[at..at + DESCENDING_COUNTS.len()].copy_from_slice(&DESCENDING_COUNTS);
-
-		Ok(Frame::from_der(&der)?)
+	fn descending_tally() -> Frame {
+		let counts = SetOfVec::try_from(vec![1u8, 2]).expect("two distinct counts form a set");
+		let frame = compose! { V0: id: "tally", order: 1u64, message: Tally { counts } };
+		let frame = frame.expect("a V0 frame carries a tally");
+		TestFrame::tamper(&frame, ASCENDING_COUNTS, DESCENDING_COUNTS)
 	}
 
 	fn build_router() -> (
@@ -395,7 +396,8 @@ mod tests {
 		(ChannelRouter { payment_tx, health_tx }, payment_rx, health_rx)
 	}
 
-	fn compose_payment(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
+	/// The V0 frame `p-<index>` of a payment of `index` from alice.
+	fn compose_payment(index: u64) -> Frame {
 		let frame = compose! {
 			V0: id: format!("p-{index}"),
 				order: 1u64,
@@ -403,66 +405,86 @@ mod tests {
 					from: "alice".into(),
 					amount: index
 				}
-		}?;
-		Ok(frame)
+		};
+		frame.expect("a V0 frame carries a payment")
 	}
 
-	fn compose_health(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
+	/// The V0 frame `h-<index>` of a health check of an uptime of `index`.
+	fn compose_health(index: u64) -> Frame {
 		let frame = compose! {
 			V0: id: format!("h-{index}"),
 				order: 1u64,
 				message: HealthCheck { uptime: index }
-		}?;
-		Ok(frame)
+		};
+		frame.expect("a V0 frame carries a health check")
 	}
 
+	/// Dispatches the payment and then the health check of each index below
+	/// `count` through `router`, in order of index.
+	fn dispatch_in_turn(router: &ChannelRouter, count: u64) {
+		for index in 0..count {
+			let payment = router.dispatch::<Payment>(Arc::new(compose_payment(index)));
+			payment.expect("a payment routes");
+
+			let health = router.dispatch::<HealthCheck>(Arc::new(compose_health(index)));
+			health.expect("a health check routes");
+		}
+	}
+
+	/// The id and the message of each delivery that waits on `deliveries`, in
+	/// the order they arrived.
+	fn delivered<T>(deliveries: &mpsc::Receiver<Delivery<T>>) -> Vec<(Vec<u8>, T)> {
+		let waiting = deliveries.try_iter();
+		waiting
+			.map(|(frame, message)| (frame.metadata().id().to_vec(), message))
+			.collect()
+	}
+
+	/// Each route delivers the frames of its own type, decoded, in the order
+	/// of their dispatch.
 	#[test]
-	fn dispatch_delivers_decoded_message_per_route() -> Result<(), Box<dyn std::error::Error>> {
+	fn dispatch_delivers_decoded_message_per_route() {
 		let (router, payment_rx, health_rx) = build_router();
 
-		let n = 5u64;
-		for i in 0..n {
-			router.dispatch::<Payment>(Arc::new(compose_payment(i)?))?;
-			router.dispatch::<HealthCheck>(Arc::new(compose_health(i)?))?;
-		}
+		dispatch_in_turn(&router, 5);
 
-		let timeout = Duration::from_millis(200);
-		for i in 0..n {
-			let (payment_frame, payment) = payment_rx.recv_timeout(timeout)?;
-			assert_eq!(payment_frame.metadata().id(), format!("p-{i}").as_bytes());
-			assert_eq!(payment, Payment { from: "alice".into(), amount: i });
-
-			let (health_frame, health) = health_rx.recv_timeout(timeout)?;
-			assert_eq!(health_frame.metadata().id(), format!("h-{i}").as_bytes());
-			assert_eq!(health, HealthCheck { uptime: i });
-		}
-
-		Ok(())
+		let payments = [
+			(b"p-0".to_vec(), Payment { from: "alice".into(), amount: 0 }),
+			(b"p-1".to_vec(), Payment { from: "alice".into(), amount: 1 }),
+			(b"p-2".to_vec(), Payment { from: "alice".into(), amount: 2 }),
+			(b"p-3".to_vec(), Payment { from: "alice".into(), amount: 3 }),
+			(b"p-4".to_vec(), Payment { from: "alice".into(), amount: 4 }),
+		];
+		let health_checks = [
+			(b"h-0".to_vec(), HealthCheck { uptime: 0 }),
+			(b"h-1".to_vec(), HealthCheck { uptime: 1 }),
+			(b"h-2".to_vec(), HealthCheck { uptime: 2 }),
+			(b"h-3".to_vec(), HealthCheck { uptime: 3 }),
+			(b"h-4".to_vec(), HealthCheck { uptime: 4 }),
+		];
+		assert_eq!(delivered(&payment_rx), payments);
+		assert_eq!(delivered(&health_rx), health_checks);
 	}
 
+	/// A frame whose body decodes as no `Payment` is refused, and the payment
+	/// route delivers nothing.
 	#[test]
-	fn dispatch_rejects_misdelivered_type() -> Result<(), Box<dyn std::error::Error>> {
+	fn dispatch_rejects_misdelivered_type() {
 		let (router, payment_rx, _health_rx) = build_router();
-
-		let result = router.dispatch::<Payment>(Arc::new(compose_health(0)?));
+		let result = router.dispatch::<Payment>(Arc::new(compose_health(0)));
 		assert!(matches!(result, Err(RouterError::DecodeFailed(_))));
-		assert!(matches!(
-			payment_rx.recv_timeout(Duration::from_millis(50)),
-			Err(mpsc::RecvTimeoutError::Timeout)
-		));
-		Ok(())
+		assert!(matches!(payment_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 	}
 
 	/// A routed body arrives from a peer, so a SET in it out of DER order is
 	/// refused before the decode sorts it (X.690 § 11.6, CWE-407).
 	#[test]
-	fn dispatch_refuses_a_body_whose_set_is_out_of_der_order() -> Result<(), Box<dyn std::error::Error>> {
+	fn dispatch_refuses_a_body_whose_set_is_out_of_der_order() {
 		let (tally_tx, _tally_rx) = mpsc::channel();
 		let router = TallyRouter { tally_tx };
 
-		let refused = router.dispatch::<Tally>(Arc::new(descending_tally()?));
+		let refused = router.dispatch::<Tally>(Arc::new(descending_tally()));
 		assert!(matches!(refused, Err(RouterError::DecodeFailed(error)) if error.kind() == ErrorKind::SetOrdering));
-		Ok(())
 	}
 
 	/// A payment whose type requires confidentiality. Its DER is the DER of
@@ -504,46 +526,49 @@ mod tests {
 			}
 	}
 
+	/// A router of sealed payments, beside the receiver of its deliveries.
+	#[cfg(feature = "aead")]
+	fn sealed_router() -> (SealedRouter, mpsc::Receiver<SealedPayment>) {
+		let (sealed_tx, sealed_rx) = mpsc::channel();
+		(SealedRouter { sealed_tx }, sealed_rx)
+	}
+
 	/// A cleartext frame carries no `confidentiality`, so the router refuses it
 	/// as a carrier of a type that requires confidentiality.
 	#[cfg(feature = "aead")]
 	#[test]
-	fn a_cleartext_frame_of_a_confidential_type_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-		let (sealed_tx, _sealed_rx) = mpsc::channel();
-		let router = SealedRouter { sealed_tx };
+	fn a_cleartext_frame_of_a_confidential_type_is_refused() {
+		let (router, _sealed_rx) = sealed_router();
 
-		let refused = router.dispatch::<SealedPayment>(Arc::new(compose_payment(0)?));
+		let refused = router.dispatch::<SealedPayment>(Arc::new(compose_payment(0)));
 		let unprotected = RequirementError::Unprotected(Requirement::Confidentiality);
 		assert!(matches!(refused, Err(RouterError::Requirement(error)) if error == unprotected));
-		Ok(())
 	}
 
 	/// A V0 frame is below the V2 minimum of its type, so the router
 	/// refuses it.
 	#[test]
-	fn a_frame_below_the_minimum_version_of_its_type_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+	fn a_frame_below_the_minimum_version_of_its_type_is_refused() {
 		let (recent_tx, _recent_rx) = mpsc::channel();
 		let router = RecentRouter { recent_tx };
 
-		let refused = router.dispatch::<RecentHealthCheck>(Arc::new(compose_health(0)?));
+		let refused = router.dispatch::<RecentHealthCheck>(Arc::new(compose_health(0)));
 		let below = RequirementError::Version((Version::V0, Version::V2).into());
 		assert!(matches!(refused, Err(RouterError::Requirement(error)) if error == below));
-		Ok(())
 	}
 
 	/// A frame that arrived encrypted keeps that shape across its decrypt, so a
 	/// type that requires confidentiality routes.
 	#[cfg(feature = "aead")]
 	#[tokio::test]
-	async fn a_decrypted_frame_of_a_confidential_type_routes() -> Result<(), Box<dyn std::error::Error>> {
-		let (sealed_tx, sealed_rx) = mpsc::channel();
-		let router = SealedRouter { sealed_tx };
+	async fn a_decrypted_frame_of_a_confidential_type_routes() -> TestResult {
+		let (router, sealed_rx) = sealed_router();
 
 		let (_, key) = crate::testing::TestKey::insecure_fixed_cipher();
-		let opened = CleartextFrame::decrypt(confidential_payment(3)?, &key, None).await?;
+		let opened = CleartextFrame::decrypt(confidential_payment(3), &key, None).await?;
 		router.dispatch_cleartext::<SealedPayment>(opened)?;
 
-		let delivered = sealed_rx.recv_timeout(Duration::from_millis(200))?;
+		let delivered = sealed_rx.try_recv()?;
 		assert_eq!(delivered, SealedPayment { from: "alice".into(), amount: 3 });
 		Ok(())
 	}
@@ -552,12 +577,11 @@ mod tests {
 	/// the frame, so the router refuses the frame it then admits.
 	#[cfg(feature = "aead")]
 	#[tokio::test]
-	async fn a_frame_decrypted_before_admission_loses_its_confidentiality() -> Result<(), Box<dyn std::error::Error>> {
-		let (sealed_tx, _sealed_rx) = mpsc::channel();
-		let router = SealedRouter { sealed_tx };
+	async fn a_frame_decrypted_before_admission_loses_its_confidentiality() -> TestResult {
+		let (router, _sealed_rx) = sealed_router();
 
 		let (_, key) = crate::testing::TestKey::insecure_fixed_cipher();
-		let mut frame = confidential_payment(3)?;
+		let mut frame = confidential_payment(3);
 		let _opened = frame.decrypt_in_place(&key, None).await?;
 
 		let refused = router.dispatch::<SealedPayment>(Arc::new(frame));
@@ -568,45 +592,31 @@ mod tests {
 
 	/// An encrypted body needs a decrypt before an inflate, so the inflate
 	/// refuses it.
-	#[cfg(feature = "aead")]
+	#[cfg(all(feature = "aead", feature = "zstd"))]
 	#[test]
-	fn an_inflate_refuses_an_encrypted_body() -> Result<(), Box<dyn std::error::Error>> {
-		let inflated = CleartextFrame::inflate(confidential_payment(3)?, &Unused);
+	fn an_inflate_refuses_an_encrypted_body() {
+		use crate::compress::ZstdCompression;
+
+		let inflated = CleartextFrame::inflate(confidential_payment(3), &ZstdCompression::default());
 		let refused = matches!(inflated, Err(TightBeamError::RouterError(RouterError::ConfidentialFrame)));
 		assert!(refused);
-		Ok(())
 	}
 
-	/// An inflator that the refused inflate never reaches.
-	#[cfg(feature = "aead")]
-	struct Unused;
-
-	#[cfg(feature = "aead")]
-	impl crate::core::Inflator for Unused {
-		fn algorithm_oid(&self) -> crate::der::asn1::ObjectIdentifier {
-			crate::oids::COMPRESSION_ZSTD
-		}
-
-		fn decompress(&self, _data: &[u8]) -> crate::error::Result<Vec<u8>> {
-			Err(crate::TightBeamError::MissingInflator)
-		}
-	}
-
+	/// A frame of a type that no route names is refused as an unknown route.
 	#[test]
-	fn dispatch_rejects_unregistered_type() -> Result<(), Box<dyn std::error::Error>> {
+	fn dispatch_rejects_unregistered_type() {
 		let (router, _payment_rx, _health_rx) = build_router();
-		let result = router.dispatch::<Unrouted>(Arc::new(compose_payment(0)?));
+		let result = router.dispatch::<Unrouted>(Arc::new(compose_payment(0)));
 		assert!(matches!(result, Err(RouterError::UnknownRoute)));
-		Ok(())
 	}
 
-	/// A policy that counts every frame it is handed, with no guard of its own.
+	/// A policy whose `dispatch_cleartext` records each frame it is handed.
 	///
 	/// It stands in for a consumer that implements [`RouterPolicy`] by hand, so
 	/// the guard must come from the provided `dispatch`, not from this
 	/// implementation.
 	struct NaiveRouter {
-		seen: std::sync::Mutex<usize>,
+		seen: std::sync::Mutex<Vec<Arc<Frame>>>,
 	}
 
 	impl RouterPolicy for NaiveRouter {
@@ -614,9 +624,8 @@ mod tests {
 			&self,
 			frame: crate::router::CleartextFrame,
 		) -> crate::router::Result<()> {
-			let _ = frame.into_shared();
 			let mut seen = self.seen.lock().unwrap_or_else(|err| err.into_inner());
-			*seen += 1;
+			seen.push(frame.into_shared());
 			Ok(())
 		}
 	}
@@ -624,61 +633,50 @@ mod tests {
 	/// A V1 payment whose body is encrypted, so it still needs a decrypt before
 	/// a decode.
 	#[cfg(feature = "aead")]
-	fn confidential_payment(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
-		use crate::testing::TestKey;
-
-		let (_, cipher) = TestKey::insecure_fixed_cipher();
-		let frame = compose! {
-			V1: id: format!("p-{index}"),
-				order: 1u64,
-				message: Payment {
-					from: "alice".into(),
-					amount: index
-				},
-				confidentiality: cipher
-		}?;
-		Ok(frame)
+	fn confidential_payment(index: u64) -> Frame {
+		let payment = Payment { from: "alice".into(), amount: index };
+		TestFrame::sealed_with(payment, format!("p-{index}"))
 	}
 
+	/// The provided `dispatch` refuses a confidential frame before a policy
+	/// written by hand is handed it.
 	#[cfg(feature = "aead")]
 	#[test]
-	fn hand_written_policy_never_sees_a_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
-		let router = NaiveRouter { seen: std::sync::Mutex::new(0) };
-		let opaque = router.dispatch::<Payment>(Arc::new(confidential_payment(0)?));
+	fn hand_written_policy_never_sees_a_confidential_frame() -> TestResult {
+		let router = NaiveRouter { seen: std::sync::Mutex::new(Vec::new()) };
+		let opaque = router.dispatch::<Payment>(Arc::new(confidential_payment(0)));
 		assert!(matches!(opaque, Err(RouterError::ConfidentialFrame)));
-		assert_eq!(*router.seen.lock().unwrap_or_else(|err| err.into_inner()), 0);
+		assert!(router.seen.into_inner()?.is_empty());
 		Ok(())
 	}
 
+	/// The admission of a frame refuses a body that still needs a decrypt.
 	#[cfg(feature = "aead")]
 	#[test]
-	fn admit_refuses_a_confidential_body() -> Result<(), Box<dyn std::error::Error>> {
-		let frame = Arc::new(confidential_payment(0)?);
-		assert!(matches!(
-			crate::router::CleartextFrame::admit(frame),
-			Err(RouterError::ConfidentialFrame)
-		));
-		Ok(())
+	fn admit_refuses_a_confidential_body() {
+		let frame = Arc::new(confidential_payment(0));
+		let refused = CleartextFrame::admit(frame);
+		assert!(matches!(refused, Err(RouterError::ConfidentialFrame)));
 	}
 
+	/// The router refuses a confidential frame before its route, which
+	/// delivers nothing.
 	#[cfg(feature = "aead")]
 	#[test]
-	fn dispatch_rejects_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
+	fn dispatch_rejects_confidential_frame() {
 		let (router, payment_rx, _health_rx) = build_router();
 
-		let frame = confidential_payment(0)?;
+		let frame = confidential_payment(0);
 		let result = router.dispatch::<Payment>(Arc::new(frame));
 		assert!(matches!(result, Err(RouterError::ConfidentialFrame)));
-		assert!(matches!(
-			payment_rx.recv_timeout(Duration::from_millis(50)),
-			Err(mpsc::RecvTimeoutError::Timeout)
-		));
-		Ok(())
+		assert!(matches!(payment_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 	}
 
+	/// The router refuses a compressed frame, whose body still needs an
+	/// inflate before a decode.
 	#[cfg(feature = "zstd")]
 	#[test]
-	fn dispatch_rejects_compressed_frame() -> Result<(), Box<dyn std::error::Error>> {
+	fn dispatch_rejects_compressed_frame() -> TestResult {
 		use crate::compress::ZstdCompression;
 
 		let (router, _payment_rx, _health_rx) = build_router();

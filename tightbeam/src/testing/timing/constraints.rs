@@ -309,18 +309,9 @@ impl TimingConstraints {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::builder::TypeBuilder;
-	use crate::testing::schedulability::ResponseTime;
-	use crate::testing::timing::{
-		DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer, WcetConfigBuilder, WcetPercentile,
-	};
-
-	/// A WCET bound of `millis` milliseconds.
-	fn wcet_of(millis: u64) -> WcetConfig {
-		let duration = Duration::from_millis(millis);
-		let wcet = WcetConfigBuilder::default().with_duration(duration).build();
-		wcet.expect("a WCET with a duration builds")
-	}
+	use crate::testing::schedulability::{ResponseTime, TaskResponseTime};
+	use crate::testing::timing::{DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer, WcetPercentile};
+	use crate::testing::TestResult;
 
 	/// A P99 WCET bound of 10 ms under an analyzer of its own.
 	fn p99_wcet_under_its_own_analyzer() -> TimingConstraint {
@@ -329,45 +320,44 @@ mod tests {
 		TimingConstraint::Wcet(WcetConfig { duration: Duration::from_millis(10), percentile })
 	}
 
-	#[test]
-	fn two_wcet_bounds_under_two_analyzers_disagree() -> Result<(), Box<dyn core::error::Error>> {
-		let mut constraints = TimingConstraints::default();
-		constraints.add(Event("process"), p99_wcet_under_its_own_analyzer())?;
+	// A second constraint on `process` that disagrees with the one it holds is
+	// refused: two bounds under two analyzers, and two bounds of two kinds.
+	crate::tb_cases! {
+		fn add_refuses_a_disagreeing_constraint((held, added): (TimingConstraint, TimingConstraint)) -> TestResult {
+			let mut constraints = TimingConstraints::default();
+			constraints.add(Event("process"), held)?;
 
-		let refused = constraints.add(Event("process"), p99_wcet_under_its_own_analyzer());
-		let disagrees = matches!(refused, Err(TestingError::ConflictingTimingConstraint(Event("process"))));
-		assert!(disagrees);
-		Ok(())
+			let refused = constraints.add(Event("process"), added);
+			assert!(matches!(refused, Err(TestingError::ConflictingTimingConstraint(Event("process")))));
+			Ok(())
+		}
+
+		cases {
+			under_another_analyzer => (p99_wcet_under_its_own_analyzer(), p99_wcet_under_its_own_analyzer()),
+			of_another_kind => (
+				TimingConstraint::Wcet(WcetConfig::of_millis(10)),
+				TimingConstraint::Jitter(Duration::from_millis(5), None),
+			),
+		}
 	}
 
+	/// A task set keeps the rate order of periods past four seconds. The task
+	/// of the 4 s period runs first: R = 1 s, and the other task takes
+	/// R = 2 + ⌈3/4⌉ * 1 = 3 s. The order of the 5 s period first gives 2 s and
+	/// 3 s.
 	#[test]
-	fn add_refuses_a_constraint_that_disagrees_with_the_one_held() -> Result<(), Box<dyn core::error::Error>> {
+	fn a_task_set_keeps_the_rate_order_of_periods_past_four_seconds() -> TestResult {
 		let mut constraints = TimingConstraints::default();
-		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_of(10)))?;
-
-		let refused = constraints.add(Event("process"), TimingConstraint::Jitter(Duration::from_millis(5), None));
-		let disagrees = matches!(refused, Err(TestingError::ConflictingTimingConstraint(Event("process"))));
-		assert!(disagrees);
-		Ok(())
-	}
-
-	// The task of the 4 s period runs first: R = 1 s, and the other task
-	// takes R = 2 + ⌈3/4⌉ * 1 = 3 s. The order of the 5 s period first gives
-	// 2 s and 3 s.
-	#[test]
-	fn a_task_set_keeps_the_rate_order_of_periods_past_four_seconds() -> Result<(), Box<dyn core::error::Error>> {
-		let mut constraints = TimingConstraints::default();
-		constraints.add(Event("fast"), TimingConstraint::Wcet(wcet_of(1_000)))?;
-		constraints.add(Event("slow"), TimingConstraint::Wcet(wcet_of(2_000)))?;
+		constraints.add(Event("fast"), TimingConstraint::Wcet(WcetConfig::of_millis(1_000)))?;
+		constraints.add(Event("slow"), TimingConstraint::Wcet(WcetConfig::of_millis(2_000)))?;
 
 		let periods = HashMap::from([(Event("fast"), Duration::from_secs(4)), (Event("slow"), Duration::from_secs(5))]);
 		let task_set = constraints.to_task_set(&periods, SchedulerType::RateMonotonic)?;
 		let response_times = task_set.response_time_analysis()?;
 
-		let named = response_times.iter().map(|time| (time.task.id.as_str(), time.response_time));
-		let named: Vec<_> = named.collect();
 		let one_second = ResponseTime::Converged(Duration::from_secs(1));
 		let three_seconds = ResponseTime::Converged(Duration::from_secs(3));
+		let named = TaskResponseTime::named(&response_times);
 		assert_eq!(named, [("fast", one_second), ("slow", three_seconds)]);
 		Ok(())
 	}

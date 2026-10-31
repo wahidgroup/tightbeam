@@ -283,18 +283,52 @@ impl core::fmt::Display for BasisPoints {
 
 #[cfg(test)]
 mod tests {
+	use core::cmp::Ordering;
+
+	use crate::asn1::admission::fixtures::der_refusal;
+	use crate::testing::fixtures::der_round_trip;
+	use crate::testing::TestResult;
+
 	use super::*;
 
-	#[test]
-	fn new_validates_range() {
-		assert_eq!(crate::bps!(0).get(), 0);
-		assert_eq!(crate::bps!(5000).get(), 5000);
-		assert_eq!(crate::bps!(10000).get(), 10000);
+	/// No basis points, built in the initializer of a constant.
+	const ZERO: BasisPoints = crate::bps!(0);
+
+	/// The full 10000 basis points, built in the initializer of a constant.
+	const WHOLE: BasisPoints = crate::bps!(10000);
+
+	/// The outcome of a conversion into basis points.
+	type Converted = Result<BasisPoints, BasisPointsOutOfRange>;
+
+	// A value reads back the count of basis points it was built with, whether
+	// the macro, a constant, the bounds, or the default built it.
+	crate::tb_cases! {
+		fn a_value_reads_its_count((bps, count): (BasisPoints, u16)) {
+			assert_eq!(bps.get(), count);
+		}
+		cases {
+			macro_zero => (crate::bps!(0), 0),
+			macro_half => (crate::bps!(5000), 5000),
+			macro_whole => (crate::bps!(10000), 10000),
+			const_zero => (ZERO, 0),
+			const_whole => (WHOLE, 10000),
+			max => (BasisPoints::MAX, 10000),
+			min => (BasisPoints::MIN, 0),
+			default => (BasisPoints::default(), 0),
+		}
 	}
 
-	#[test]
-	fn try_from_refuses_above_max() {
-		assert_eq!(BasisPoints::try_from(10001u16), Err(BasisPointsOutOfRange));
+	// A count converts into basis points up to 10000 and is refused above it.
+	crate::tb_cases! {
+		fn a_count_converts_within_the_range((count, expected): (u16, Converted)) {
+			assert_eq!(BasisPoints::try_from(count), expected);
+		}
+		cases {
+			zero => (0, Ok(BasisPoints::MIN)),
+			half => (5000, Ok(crate::bps!(5000))),
+			max => (10000, Ok(BasisPoints::MAX)),
+			above_max => (10001, Err(BasisPointsOutOfRange)),
+		}
 	}
 
 	/// 65,537 narrows to 1 in a `u16`, so a clamp after the narrowing would
@@ -307,121 +341,115 @@ mod tests {
 	/// The decode refuses what the conversion refuses, so INTEGER 65535 is
 	/// refused rather than read as 10000.
 	#[test]
-	fn decode_refuses_above_max() -> crate::der::Result<()> {
+	fn decode_refuses_above_max() -> TestResult {
 		let encoded = u16::MAX.to_der()?;
-
 		let refused = BasisPoints::from_der(&encoded);
-		let out_of_range = crate::der::ErrorKind::Value { tag: Tag::Integer };
-		assert_eq!(refused.map_err(|error| error.kind()), Err(out_of_range));
+		assert_eq!(der_refusal(refused), Some(crate::der::ErrorKind::Value { tag: Tag::Integer }));
 		Ok(())
 	}
 
-	#[test]
-	fn const_validation_works() {
-		const ZERO: BasisPoints = crate::bps!(0);
-		const MAX: BasisPoints = crate::bps!(10000);
-		assert_eq!(ZERO.get(), 0);
-		assert_eq!(MAX.get(), 10000);
+	// A value reads as a percentage, one hundredth of its count.
+	crate::tb_cases! {
+		fn a_value_reads_as_a_percentage((bps, percentage): (BasisPoints, f64)) {
+			assert_eq!(bps.as_percentage(), percentage);
+		}
+		cases {
+			zero => (crate::bps!(0), 0.0),
+			half => (crate::bps!(5000), 50.0),
+			whole => (crate::bps!(10000), 100.0),
+			fractional => (crate::bps!(7550), 75.5),
+		}
 	}
 
-	#[test]
-	fn percentage_conversion() {
-		assert_eq!(crate::bps!(0).as_percentage(), 0.0);
-		assert_eq!(crate::bps!(5000).as_percentage(), 50.0);
-		assert_eq!(crate::bps!(10000).as_percentage(), 100.0);
-		assert_eq!(crate::bps!(7550).as_percentage(), 75.5);
+	// A value reads as a fraction, one ten-thousandth of its count.
+	crate::tb_cases! {
+		fn a_value_reads_as_a_fraction((bps, fraction): (BasisPoints, f64)) {
+			assert_eq!(bps.as_fraction(), fraction);
+		}
+		cases {
+			zero => (crate::bps!(0), 0.0),
+			half => (crate::bps!(5000), 0.5),
+			whole => (crate::bps!(10000), 1.0),
+			quarter => (crate::bps!(2500), 0.25),
+		}
 	}
 
-	#[test]
-	fn fraction_conversion() {
-		assert_eq!(crate::bps!(0).as_fraction(), 0.0);
-		assert_eq!(crate::bps!(5000).as_fraction(), 0.5);
-		assert_eq!(crate::bps!(10000).as_fraction(), 1.0);
-		assert_eq!(crate::bps!(2500).as_fraction(), 0.25);
+	// A percentage from 0 to 100 converts into basis points, and a percentage
+	// outside that range, or not a number, is refused.
+	crate::tb_cases! {
+		fn a_percentage_converts_within_the_range((percentage, expected): (f64, Converted)) {
+			assert_eq!(BasisPoints::from_percentage(percentage), expected);
+		}
+		cases {
+			zero => (0.0, Ok(crate::bps!(0))),
+			half => (50.0, Ok(crate::bps!(5000))),
+			whole => (100.0, Ok(crate::bps!(10000))),
+			fractional => (75.5, Ok(crate::bps!(7550))),
+			below_zero => (-0.1, Err(BasisPointsOutOfRange)),
+			above_whole => (100.1, Err(BasisPointsOutOfRange)),
+			not_a_number => (f64::NAN, Err(BasisPointsOutOfRange)),
+		}
 	}
 
-	#[test]
-	fn from_percentage() {
-		assert_eq!(BasisPoints::from_percentage(0.0), Ok(crate::bps!(0)));
-		assert_eq!(BasisPoints::from_percentage(50.0), Ok(crate::bps!(5000)));
-		assert_eq!(BasisPoints::from_percentage(100.0), Ok(crate::bps!(10000)));
-		assert_eq!(BasisPoints::from_percentage(75.5), Ok(crate::bps!(7550)));
+	// A fraction from 0 to 1 converts into basis points, and a fraction
+	// outside that range, or not a number, is refused.
+	crate::tb_cases! {
+		fn a_fraction_converts_within_the_range((fraction, expected): (f64, Converted)) {
+			assert_eq!(BasisPoints::from_fraction(fraction), expected);
+		}
+		cases {
+			zero => (0.0, Ok(crate::bps!(0))),
+			half => (0.5, Ok(crate::bps!(5000))),
+			whole => (1.0, Ok(crate::bps!(10000))),
+			quarter => (0.25, Ok(crate::bps!(2500))),
+			below_zero => (-0.1, Err(BasisPointsOutOfRange)),
+			above_whole => (1.1, Err(BasisPointsOutOfRange)),
+			not_a_number => (f64::NAN, Err(BasisPointsOutOfRange)),
+		}
 	}
 
-	#[test]
-	fn from_percentage_rejects_out_of_range() {
-		assert_eq!(BasisPoints::from_percentage(-0.1), Err(BasisPointsOutOfRange));
-		assert_eq!(BasisPoints::from_percentage(100.1), Err(BasisPointsOutOfRange));
-		assert_eq!(BasisPoints::from_percentage(f64::NAN), Err(BasisPointsOutOfRange));
+	// A value displays its count and its percentage.
+	crate::tb_cases! {
+		fn a_value_displays_its_count_and_percentage((bps, text): (BasisPoints, &str)) {
+			assert_eq!(bps.to_string(), text);
+		}
+		cases {
+			half => (crate::bps!(5000), "5000bps (50%)"),
+			fractional => (crate::bps!(7550), "7550bps (75.5%)"),
+		}
 	}
 
-	#[test]
-	fn from_fraction() {
-		assert_eq!(BasisPoints::from_fraction(0.0), Ok(crate::bps!(0)));
-		assert_eq!(BasisPoints::from_fraction(0.5), Ok(crate::bps!(5000)));
-		assert_eq!(BasisPoints::from_fraction(1.0), Ok(crate::bps!(10000)));
-		assert_eq!(BasisPoints::from_fraction(0.25), Ok(crate::bps!(2500)));
+	// Values order by their count.
+	crate::tb_cases! {
+		fn values_order_by_their_count((first, second, order): (BasisPoints, BasisPoints, Ordering)) {
+			assert_eq!(first.cmp(&second), order);
+		}
+		cases {
+			less => (crate::bps!(1000), crate::bps!(5000), Ordering::Less),
+			greater => (crate::bps!(10000), crate::bps!(0), Ordering::Greater),
+			equal => (crate::bps!(5000), crate::bps!(5000), Ordering::Equal),
+		}
 	}
 
-	#[test]
-	fn from_fraction_rejects_out_of_range() {
-		assert_eq!(BasisPoints::from_fraction(-0.1), Err(BasisPointsOutOfRange));
-		assert_eq!(BasisPoints::from_fraction(1.1), Err(BasisPointsOutOfRange));
-		assert_eq!(BasisPoints::from_fraction(f64::NAN), Err(BasisPointsOutOfRange));
+	// A count above 10000 saturates at 10000, and a count within the range
+	// stays as it is.
+	crate::tb_cases! {
+		fn a_saturating_count_clamps_to_the_range((count, clamped): (u16, u16)) {
+			assert_eq!(BasisPoints::new_saturating(count).get(), clamped);
+		}
+		cases {
+			zero => (0, 0),
+			half => (5000, 5000),
+			whole => (10000, 10000),
+			just_above_whole => (10001, 10000),
+			largest_count => (u16::MAX, 10000),
+		}
 	}
 
+	/// A value decodes again from its DER to the value that wrote it.
 	#[test]
-	fn try_from_validates_range() {
-		assert_eq!(BasisPoints::try_from(0u16), Ok(BasisPoints::MIN));
-		assert_eq!(BasisPoints::try_from(5000u16), Ok(crate::bps!(5000)));
-		assert_eq!(BasisPoints::try_from(10000u16), Ok(BasisPoints::MAX));
-		assert_eq!(BasisPoints::try_from(10001u16), Err(BasisPointsOutOfRange));
-	}
-
-	#[test]
-	fn display_format() {
-		assert_eq!(format!("{}", crate::bps!(5000)), "5000bps (50%)");
-		assert_eq!(format!("{}", crate::bps!(7550)), "7550bps (75.5%)");
-	}
-
-	#[test]
-	fn constants() {
-		assert_eq!(BasisPoints::MAX.get(), 10000);
-		assert_eq!(BasisPoints::MIN.get(), 0);
-	}
-
-	#[test]
-	fn default_is_zero() {
-		assert_eq!(BasisPoints::default().get(), 0);
-	}
-
-	#[test]
-	fn ordering() {
-		assert!(crate::bps!(1000) < crate::bps!(5000));
-		assert!(crate::bps!(10000) > crate::bps!(0));
-		assert_eq!(crate::bps!(5000), crate::bps!(5000));
-	}
-
-	#[test]
-	fn new_saturating_clamps() {
-		assert_eq!(BasisPoints::new_saturating(0).get(), 0);
-		assert_eq!(BasisPoints::new_saturating(5000).get(), 5000);
-		assert_eq!(BasisPoints::new_saturating(10000).get(), 10000);
-		assert_eq!(BasisPoints::new_saturating(10001).get(), 10000);
-		assert_eq!(BasisPoints::new_saturating(u16::MAX).get(), 10000);
-	}
-
-	#[test]
-	fn der_roundtrip() {
-		use crate::der::{Decode, Encode};
-
+	fn a_value_round_trips_through_der() {
 		let original = crate::bps!(7500);
-		let mut buf = [0u8; 16];
-		let encoded = original.encode_to_slice(&mut buf);
-		assert!(encoded.is_ok());
-
-		let decoded = BasisPoints::from_der(encoded.as_ref().map(|s| *s).unwrap_or(&[]));
-		assert!(decoded.is_ok());
-		assert_eq!(decoded.ok(), Some(original));
+		assert_eq!(der_round_trip(&original), original);
 	}
 }

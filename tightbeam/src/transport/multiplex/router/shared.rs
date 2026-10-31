@@ -1628,29 +1628,43 @@ impl CancelReason {
 }
 
 #[cfg(test)]
+impl MuxShared {
+	/// Connection state of `role` under `settings`, shared.
+	pub(crate) fn fixture(role: MuxRole, settings: &MuxSettings) -> Arc<Self> {
+		Arc::new(MuxShared::new(role, settings))
+	}
+
+	/// Connection state of `role` under `settings` that records into `trace`.
+	#[cfg(feature = "instrument")]
+	pub(crate) fn traced(role: MuxRole, settings: &MuxSettings, trace: TraceCollector) -> Self {
+		let mut shared = MuxShared::new(role, settings);
+		shared.trace = Some(trace);
+		shared
+	}
+}
+
+#[cfg(test)]
 mod tests {
+	use super::super::fixtures::{drained, noop_cx, FlagWake};
 	use super::super::link::MuxLink;
-	use super::super::testing::{noop_cx, FlagWake};
 	use super::*;
 
 	use crate::constants::DEFAULT_HOP_BUDGET;
+	use crate::testing::TestResult;
 	use crate::transport::envelopes::MuxEnvelope;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::envelopes::MuxPingPackage;
 
 	#[cfg(feature = "instrument")]
-	use super::super::testing::poll_now;
+	use super::super::fixtures::poll_now;
+	#[cfg(feature = "instrument")]
+	use crate::testing::fixtures::TestTrace;
 	#[cfg(feature = "instrument")]
 	use crate::trace::AssertionValue;
 
-	fn shared(role: MuxRole, local_cap: u32) -> Arc<MuxShared> {
-		Arc::new(MuxShared::new(role, &MuxSettings::symmetric(local_cap)))
-	}
-
-	fn shared_with_settings(role: MuxRole, settings: MuxSettings) -> Arc<MuxShared> {
-		Arc::new(MuxShared::new(role, &settings))
-	}
+	/// The stream cap of a [`link_in`] link.
+	const LINK_CAP: u32 = 2;
 
 	/// Receives the peer's GoAway of `reason` above `last_stream_id` on
 	/// `shared`, whose trace injects no fault.
@@ -1674,24 +1688,39 @@ mod tests {
 		oneshot::channel().0
 	}
 
-	/// Opens one stream through the production path. It reserves a slot, then
-	/// atomically assigns the ID and enqueues the Open record.
-	fn open_one(shared: &Arc<MuxShared>) -> TransportResult<u32> {
-		let mut reservation = shared.reserve_stream_slot(slot())?;
-		let (mut outbound, _wire) = mpsc::channel(4);
-		let mut request = OpenRequest {
+	/// An Open of a unary request that closes its send half and carries no
+	/// payload.
+	fn unary_request() -> OpenRequest<'static> {
+		OpenRequest {
 			kind: MuxStreamKind::Unary,
 			last: true,
 			payload: &[],
 			records: 1,
 			target: None,
 			hops_remaining: DEFAULT_HOP_BUDGET,
-		};
+		}
+	}
 
-		let mut cx = noop_cx();
-		match shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx) {
+	/// Polls the Open of a unary request under `reservation` once, with a
+	/// writer queue that has room.
+	fn enqueue(shared: &MuxShared, reservation: &mut StreamReservation) -> Poll<TransportResult<u32>> {
+		let (mut outbound, _wire) = mpsc::channel(4);
+		let mut request = unary_request();
+
+		shared.poll_open_enqueue(reservation, &mut request, &mut outbound, &mut noop_cx())
+	}
+
+	/// Opens one stream through the production path. It reserves a slot, then
+	/// atomically assigns the ID and enqueues the Open record.
+	///
+	/// # Panics
+	///
+	/// - The Open parks, which a writer queue with room never makes it do.
+	fn open_one(shared: &Arc<MuxShared>) -> TransportResult<u32> {
+		let mut reservation = shared.reserve_stream_slot(slot())?;
+		match enqueue(shared, &mut reservation) {
 			Poll::Ready(result) => result,
-			Poll::Pending => Err(TransportError::ConnectionClosed),
+			Poll::Pending => panic!("a writer queue with room takes the Open at once"),
 		}
 	}
 
@@ -1716,91 +1745,64 @@ mod tests {
 		shared.poll_stream_slot(&mut cx)
 	}
 
-	fn assert_slot_poll(shared: &MuxShared, expect: SlotExpect) {
-		let polled = poll_slot(shared);
-		match expect {
-			SlotExpect::ReadyOk => assert!(matches!(polled, Poll::Ready(Ok(())))),
-			SlotExpect::Pending => assert!(matches!(polled, Poll::Pending)),
-			SlotExpect::Draining => {
-				assert!(matches!(polled, Poll::Ready(Err(TransportError::Draining))))
-			}
-		}
-	}
-
-	enum HeadroomSetup {
-		Fresh { cap: u32 },
-		AtCap { cap: u32 },
-		LocalShutdown { cap: u32 },
-	}
-
-	fn prepare_headroom(setup: HeadroomSetup) -> Arc<MuxShared> {
-		match setup {
-			HeadroomSetup::Fresh { cap } => shared(MuxRole::Client, cap),
-			HeadroomSetup::AtCap { cap } => {
-				let shared = shared(MuxRole::Client, cap);
-				open_streams(&shared, 1);
-				shared
-			}
-			HeadroomSetup::LocalShutdown { cap } => {
-				let shared = shared(MuxRole::Client, cap);
-				shared.begin_shutdown();
-				shared
-			}
-		}
-	}
-
-	enum GoAwaySetup {
-		Live,
-		PeerEnhanceYourCalm,
+	/// A state that a test brings a client link to before it asks the link a
+	/// question.
+	#[derive(Clone, Copy, Debug)]
+	enum LinkState {
+		/// A link with every slot of its cap free.
+		Fresh,
+		/// A link with every slot of its cap open.
+		AtCap,
+		/// A link whose local side began its shutdown.
 		LocalShutdown,
+		/// A link that received the peer's GoAway of the reason it holds.
+		PeerGoAway(GoAwayReason),
+		/// A link whose reader ended on a failure.
+		Failed,
+		/// A link whose local side began its shutdown before its reader failed.
+		FailedWhileDraining,
+		/// A link that opened the last stream ID of its space.
+		IdSpaceSpent,
 	}
 
-	fn prepare_goaway(setup: GoAwaySetup) -> Arc<MuxShared> {
-		let shared = shared(MuxRole::Client, 2);
-		match setup {
-			GoAwaySetup::Live => {}
-			GoAwaySetup::PeerEnhanceYourCalm => {
-				receive_goaway(&shared, 0, GoAwayReason::EnhanceYourCalm);
+	/// A client link of [`LINK_CAP`] streams in `state`.
+	fn link_in(state: LinkState) -> Arc<MuxShared> {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(LINK_CAP));
+		match state {
+			LinkState::Fresh => {}
+			LinkState::AtCap => {
+				open_streams(&shared, LINK_CAP as usize);
 			}
-			GoAwaySetup::LocalShutdown => {
+			LinkState::LocalShutdown => {
 				shared.begin_shutdown();
 			}
-		}
-		shared
-	}
-
-	enum SlotSetup {
-		ReadyWithHeadroom,
-		PendingAtCap,
-		DrainingLocal,
-		DrainingPeer,
-	}
-
-	enum SlotExpect {
-		ReadyOk,
-		Pending,
-		Draining,
-	}
-
-	fn prepare_slot(setup: SlotSetup) -> Arc<MuxShared> {
-		let shared = shared(MuxRole::Client, 1);
-		match setup {
-			SlotSetup::ReadyWithHeadroom => {}
-			SlotSetup::PendingAtCap => {
+			LinkState::PeerGoAway(reason) => receive_goaway(&shared, 0, reason),
+			LinkState::Failed => shared.fail_all_pending(),
+			LinkState::FailedWhileDraining => {
+				shared.begin_shutdown();
+				shared.fail_all_pending();
+			}
+			LinkState::IdSpaceSpent => {
+				shared.lock().next_stream_id = Some(u32::MAX);
 				open_streams(&shared, 1);
 			}
-			SlotSetup::DrainingLocal => {
-				shared.begin_shutdown();
-			}
-			SlotSetup::DrainingPeer => {
-				receive_goaway(&shared, 0, GoAwayReason::Shutdown);
-			}
 		}
 		shared
 	}
 
+	/// Whether `answer` refuses as [`TransportError::Draining`].
+	fn is_draining<T>(answer: &TransportResult<T>) -> bool {
+		matches!(answer, Err(TransportError::Draining))
+	}
+
+	/// Whether `answer` refuses as [`TransportError::ConnectionClosed`].
+	fn is_closed<T>(answer: &TransportResult<T>) -> bool {
+		matches!(answer, Err(TransportError::ConnectionClosed))
+	}
+
+	// A cancel reason maps to the failure its stream ends with.
 	crate::tb_cases! {
-		fn test_cancel_reason_error_mapping((reason, failure): (CancelReason, TransportFailure)) {
+		fn a_cancel_reason_maps_to_its_failure((reason, failure): (CancelReason, TransportFailure)) {
 			let error = reason.cancel_error();
 			assert!(matches!(
 				error,
@@ -1815,9 +1817,10 @@ mod tests {
 		}
 	}
 
+	// Each role opens increasing stream IDs of its own parity.
 	crate::tb_cases! {
-		fn test_role_allocates_monotonic_ids((role, ids): (MuxRole, &[u32])) {
-			let shared = shared(role, 8);
+		fn each_role_opens_increasing_ids_of_its_parity((role, ids): (MuxRole, &[u32])) {
+			let shared = MuxShared::fixture(role, &MuxSettings::symmetric(8));
 			assert_eq!(open_streams(&shared, ids.len()), ids);
 		}
 		cases {
@@ -1826,143 +1829,143 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_cap_exhaustion_reports_busy() {
-		let shared = shared(MuxRole::Client, 2);
-		open_streams(&shared, 2);
-		assert!(matches!(
-			open_one(&shared),
-			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
-		));
+	// A link at its cap refuses an open as exhausted, and a link that drains
+	// or failed refuses it by its end.
+	crate::tb_cases! {
+		fn a_link_that_cannot_open_refuses_the_open((state, refused): (LinkState, fn(&TransportResult<u32>) -> bool)) {
+			let shared = link_in(state);
+			let opened = open_one(&shared);
+			assert!(refused(&opened));
+		}
+		cases {
+			at_cap => (
+				LinkState::AtCap,
+				|opened| matches!(opened, Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))),
+			),
+			local_shutdown => (LinkState::LocalShutdown, is_draining),
+			peer_goaway => (LinkState::PeerGoAway(GoAwayReason::Shutdown), is_draining),
+			id_space_spent => (LinkState::IdSpaceSpent, is_draining),
+			failed => (LinkState::Failed, is_closed),
+		}
 	}
 
+	/// The first shutdown names the highest peer stream it admits, and a
+	/// second shutdown names none.
 	#[test]
-	fn test_completed_stream_frees_cap_slot() {
-		let shared = shared(MuxRole::Client, 1);
+	fn a_shutdown_names_its_watermark_once() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
+
+		let first = shared.begin_shutdown();
+		let second = shared.begin_shutdown();
+		assert_eq!((first, second), (Some(0), None));
+	}
+
+	/// A completed stream frees its cap slot for the next open.
+	#[test]
+	fn a_completed_stream_frees_its_cap_slot() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(1));
 		open_streams(&shared, 1);
-		assert!(shared.remove_pending(1).is_some());
-		assert_eq!(open_streams(&shared, 1), [3]);
+
+		let removed = shared.remove_pending(1);
+		let reopened = open_streams(&shared, 1);
+		assert!(removed.is_some());
+		assert_eq!(reopened, [3]);
 	}
 
-	// The atomic open gives the lower ID to whichever initiation sends its
-	// Open first, whatever the reservation order, so Opens reach the peer in
-	// strictly increasing ID order.
+	/// The atomic open gives the lower ID to whichever initiation sends its
+	/// Open first, whatever the reservation order, so Opens reach the peer in
+	/// strictly increasing ID order.
 	#[test]
-	fn test_ids_follow_open_order_not_reservation_order() {
-		let shared = shared(MuxRole::Client, 4);
-		let early = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
-		assert!(matches!(open_one(&shared), Ok(1)));
+	fn ids_follow_the_open_order_and_not_the_reservation_order() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(4));
+		let early = shared.reserve_stream_slot(slot())?;
+		let first = open_one(&shared);
 
 		drop(early);
 
+		assert!(matches!(first, Ok(1)));
 		assert!(matches!(open_one(&shared), Ok(3)));
+		Ok(())
 	}
 
+	/// A reservation holds its cap slot until it drops.
 	#[test]
-	fn test_reservation_holds_cap_slot_until_dropped() {
-		let shared = shared(MuxRole::Client, 1);
-		let held = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
-
-		assert!(matches!(
-			open_one(&shared),
-			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
-		));
+	fn a_reservation_holds_its_cap_slot_until_it_drops() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(1));
+		let held = shared.reserve_stream_slot(slot())?;
+		let refused = open_one(&shared);
 
 		drop(held);
+
+		assert!(matches!(
+			refused,
+			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
+		));
 		assert!(matches!(open_one(&shared), Ok(1)));
+		Ok(())
 	}
 
-	// An open parked on the rekey hard floor holds its reservation, so the
-	// same reservation opens once the floor lifts.
+	/// An open parked on the rekey hard floor holds its reservation, so the
+	/// same reservation opens once the floor lifts.
 	#[test]
-	fn test_open_parked_on_rekey_floor_keeps_reservation() {
-		let shared = shared(MuxRole::Client, 4);
-		let mut reservation = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
-		let (mut outbound, _wire) = mpsc::channel(4);
-		let mut request = OpenRequest {
-			kind: MuxStreamKind::Unary,
-			last: true,
-			payload: &[],
-			records: 1,
-			target: None,
-			hops_remaining: DEFAULT_HOP_BUDGET,
-		};
-
-		let mut cx = noop_cx();
+	fn an_open_parked_on_the_rekey_floor_keeps_its_reservation() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(4));
+		let mut reservation = shared.reserve_stream_slot(slot())?;
 
 		shared.lock().rekey_hard_floor = true;
-
-		let parked = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
-		assert!(matches!(parked, Poll::Pending));
-
+		let parked = enqueue(&shared, &mut reservation);
 		shared.lock().rekey_hard_floor = false;
 
-		let opened = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
+		let opened = enqueue(&shared, &mut reservation);
+		assert!(matches!(parked, Poll::Pending));
 		assert!(matches!(opened, Poll::Ready(Ok(1))));
+		Ok(())
 	}
 
-	#[test]
-	fn test_allocation_halts_after_shutdown() {
-		let shared = shared(MuxRole::Client, 8);
-		assert!(matches!(shared.begin_shutdown(), Some(0)));
-		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
-		assert!(shared.begin_shutdown().is_none());
+	/// An end of the link and the test of the open it leaves.
+	type ReserveGapCase = (fn(&MuxShared), fn(&TransportResult<u32>) -> bool);
+
+	// An end that lands between reservation and enqueue stops the Open. The
+	// reservation succeeds while admission is open, so this is the window the
+	// enqueue itself has to close (CWE-362).
+	crate::tb_cases! {
+		fn an_end_between_reserve_and_enqueue_refuses_the_open(
+			(end, refused): ReserveGapCase
+		) -> TestResult {
+			let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
+			let mut reservation = shared.reserve_stream_slot(slot())?;
+			end(&shared);
+
+			let enqueued = enqueue(&shared, &mut reservation);
+			assert!(matches!(&enqueued, Poll::Ready(answer) if refused(answer)));
+			Ok(())
+		}
+		cases {
+			goaway => (|shared| receive_goaway(shared, 0, GoAwayReason::Shutdown), is_draining),
+			failure => (MuxShared::fail_all_pending, is_closed),
+		}
 	}
 
-	#[test]
-	fn test_allocation_halts_after_peer_goaway() {
-		let shared = shared(MuxRole::Client, 8);
-		receive_goaway(&shared, 0, GoAwayReason::Shutdown);
-		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
-	}
-
-	#[test]
-	fn test_id_space_exhaustion_reports_draining() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.lock().next_stream_id = Some(u32::MAX);
-		open_streams(&shared, 1);
-		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
-	}
-
-	/// A GoAway that lands between reservation and enqueue stops the Open.
-	///
-	/// The reservation succeeds while admission is open, so this is the
-	/// window the enqueue itself has to close (CWE-362).
-	#[test]
-	fn test_goaway_after_reservation_refuses_the_open() {
-		let shared = shared(MuxRole::Client, 8);
-		let mut reservation = shared.reserve_stream_slot(slot()).expect("admission is open");
-
-		receive_goaway(&shared, 0, GoAwayReason::Shutdown);
-
-		let (mut outbound, _wire) = mpsc::channel(4);
-		let mut request = OpenRequest {
-			kind: MuxStreamKind::Unary,
-			last: true,
-			payload: &[],
-			records: 1,
-			target: None,
-			hops_remaining: DEFAULT_HOP_BUDGET,
-		};
-
-		let mut cx = noop_cx();
-		let enqueued = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
-		assert!(matches!(enqueued, Poll::Ready(Err(TransportError::Draining))));
-	}
-
-	#[test]
-	fn test_goaway_refuses_a_new_ping() {
-		let shared = shared(MuxRole::Client, 8);
-		receive_goaway(&shared, 0, GoAwayReason::Shutdown);
-
-		let (sender, _receiver) = oneshot::channel();
-		assert!(matches!(shared.allocate_ping(sender), Err(TransportError::Draining)));
+	// A link that drains refuses a new ping as draining, and a failed link
+	// refuses it as closed, even one that began a drain first.
+	crate::tb_cases! {
+		fn a_link_that_ended_refuses_a_ping((state, refused): (LinkState, fn(&TransportResult<u64>) -> bool)) {
+			let shared = link_in(state);
+			let pinged = shared.allocate_ping(ping_slot());
+			assert!(refused(&pinged));
+		}
+		cases {
+			local_shutdown => (LinkState::LocalShutdown, is_draining),
+			peer_goaway => (LinkState::PeerGoAway(GoAwayReason::Shutdown), is_draining),
+			failed => (LinkState::Failed, is_closed),
+			failed_while_draining => (LinkState::FailedWhileDraining, is_closed),
+		}
 	}
 
 	// A peer of a server opens odd IDs alone, and ID 0 is reserved.
 	crate::tb_cases! {
-		fn test_peer_stream_rejects_invalid_ids(id: u32) {
-			let server = shared(MuxRole::Server, 8);
+		fn an_invalid_peer_stream_id_is_refused(id: u32) {
+			let server = MuxShared::fixture(MuxRole::Server, &MuxSettings::symmetric(8));
 			assert!(matches!(server.register_peer_stream(id), Err(TransportError::InvalidMessage)));
 		}
 		cases {
@@ -1971,26 +1974,30 @@ mod tests {
 		}
 	}
 
+	/// A peer stream ID at or below the last one the peer opened is refused.
 	#[test]
-	fn test_peer_stream_rejects_non_increasing() {
-		let server = shared(MuxRole::Server, 8);
+	fn a_peer_stream_id_at_or_below_the_last_is_refused() {
+		let server = MuxShared::fixture(MuxRole::Server, &MuxSettings::symmetric(8));
 		assert!(matches!(server.register_peer_stream(5), Ok(PeerStream::Accept)));
 		assert!(matches!(server.register_peer_stream(3), Err(TransportError::InvalidMessage)));
 		assert!(matches!(server.register_peer_stream(5), Err(TransportError::InvalidMessage)));
 		assert!(matches!(server.register_peer_stream(7), Ok(PeerStream::Accept)));
 	}
 
+	/// A peer stream above the watermark of a local GoAway is rejected as
+	/// draining.
 	#[test]
-	fn test_peer_stream_above_goaway_watermark_refused() {
-		let server = shared(MuxRole::Server, 8);
+	fn a_peer_stream_above_the_goaway_watermark_is_rejected_as_draining() {
+		let server = MuxShared::fixture(MuxRole::Server, &MuxSettings::symmetric(8));
 		assert!(matches!(server.register_peer_stream(1), Ok(PeerStream::Accept)));
 		assert!(matches!(server.begin_shutdown(), Some(1)));
 		assert!(matches!(server.register_peer_stream(3), Ok(PeerStream::RejectDraining)));
 	}
 
+	/// A received GoAway fails the pending streams above its watermark alone.
 	#[test]
-	fn test_goaway_fails_pending_above_watermark_only() {
-		let shared = shared(MuxRole::Client, 8);
+	fn a_goaway_fails_the_pending_streams_above_its_watermark_alone() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
 		let (sender_low, mut receiver_low) = oneshot::channel();
 		let (sender_high, mut receiver_high) = oneshot::channel();
 
@@ -2002,215 +2009,135 @@ mod tests {
 		assert!(matches!(receiver_high.try_recv(), Ok(Some(StreamOutcome::Draining))));
 	}
 
+	/// Pings take increasing correlation values from zero.
 	#[test]
-	fn test_ping_allocates_monotonic_opaque() {
-		let shared = shared(MuxRole::Client, 8);
+	fn pings_allocate_increasing_opaque_values() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
 		assert_eq!(allocate_pings(&shared, 3), [0, 1, 2]);
 	}
 
-	#[test]
-	fn test_ping_ack_resolves_pending() {
-		let shared = shared(MuxRole::Client, 8);
-		let (sender, mut receiver) = oneshot::channel();
-		assert!(matches!(shared.allocate_ping(sender), Ok(0)));
+	/// An event on a link whose ping 0 is pending, and the test of what the
+	/// receiver of that ping then reads.
+	type PingEndCase = (fn(&MuxShared), fn(&Result<Option<()>, oneshot::Canceled>) -> bool);
 
-		shared.resolve_ping(0);
-		assert!(matches!(receiver.try_recv(), Ok(Some(()))));
+	// A pending ping ends by the event that answers it: its ack resolves it,
+	// an ack of a ping that left the pending table resolves nothing, so the
+	// ping reads as cancelled, and a connection failure fails it.
+	crate::tb_cases! {
+		fn a_pending_ping_ends_by_the_event_that_answers_it((event, received): PingEndCase) {
+			let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
+			let (sender, mut receiver) = oneshot::channel();
+			let allocated = shared.allocate_ping(sender);
+
+			event(&shared);
+
+			assert!(matches!(allocated, Ok(0)));
+			assert!(received(&receiver.try_recv()));
+		}
+		cases {
+			an_ack => (|shared| shared.resolve_ping(0), |read| matches!(read, Ok(Some(())))),
+			a_stale_ack => (
+				|shared| {
+					shared.remove_pending_ping(0);
+					shared.resolve_ping(0);
+				},
+				|read| matches!(read, Err(oneshot::Canceled)),
+			),
+			a_connection_failure => (MuxShared::fail_all_pending, |read| matches!(read, Err(oneshot::Canceled))),
+		}
 	}
 
-	#[test]
-	fn test_stale_ping_ack_discarded() {
-		let shared = shared(MuxRole::Client, 8);
-		let (sender, mut receiver) = oneshot::channel();
-		assert!(matches!(shared.allocate_ping(sender), Ok(0)));
-
-		shared.remove_pending_ping(0);
-		shared.resolve_ping(0);
-		assert!(receiver.try_recv().is_err());
-	}
-
-	#[test]
-	fn test_ping_refused_while_draining() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.begin_shutdown();
-		assert!(matches!(shared.allocate_ping(ping_slot()), Err(TransportError::Draining)));
-	}
-
-	#[test]
-	fn test_connection_failure_fails_pending_pings() {
-		let shared = shared(MuxRole::Client, 8);
-		let (sender, mut receiver) = oneshot::channel();
-		assert!(matches!(shared.allocate_ping(sender), Ok(0)));
-
-		shared.fail_all_pending();
-		assert!(receiver.try_recv().is_err());
-	}
-
-	// The reader has ended, so no ack can arrive for a ping registered later.
-	#[test]
-	fn test_ping_refused_after_connection_failure() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.fail_all_pending();
-		assert!(matches!(
-			shared.allocate_ping(ping_slot()),
-			Err(TransportError::ConnectionClosed)
-		));
-	}
-
-	/// A failure that lands between reservation and enqueue stops the Open.
-	///
-	/// The reservation succeeds while the reader runs, so this is the window
-	/// the enqueue itself has to close (CWE-362).
-	#[test]
-	fn test_failure_after_reservation_refuses_the_open() {
-		let shared = shared(MuxRole::Client, 8);
-		let mut reservation = shared.reserve_stream_slot(slot()).expect("admission is open");
-
-		shared.fail_all_pending();
-
-		let (mut outbound, _wire) = mpsc::channel(4);
-		let mut request = OpenRequest {
-			kind: MuxStreamKind::Unary,
-			last: true,
-			payload: &[],
-			records: 1,
-			target: None,
-			hops_remaining: DEFAULT_HOP_BUDGET,
-		};
-
-		let mut cx = noop_cx();
-		let enqueued = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
-		assert!(matches!(enqueued, Poll::Ready(Err(TransportError::ConnectionClosed))));
-	}
-
-	#[test]
-	fn test_no_stream_headroom_after_connection_failure() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.fail_all_pending();
-		assert!(!shared.has_stream_headroom());
-	}
-
+	/// A failed connection is not ready to renew, even with its rekey
+	/// materials attached.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn test_no_renewal_after_connection_failure() {
-		let shared = shared(MuxRole::Client, 8);
+	fn a_failed_connection_is_not_ready_to_renew() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
 		shared.mark_rekey_attached();
 		shared.fail_all_pending();
 		assert!(!shared.renewal_ready());
 	}
 
-	// A server holds its rekey materials to answer renewals, so its budget
-	// reserve takes the GoAway drain.
+	/// A server answers renewals and opens none, so its budget reserve takes
+	/// the GoAway drain.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn test_renewal_readiness_takes_the_client_role() {
-		let shared = shared(MuxRole::Server, 8);
+	fn a_server_is_not_ready_to_renew() {
+		let shared = MuxShared::fixture(MuxRole::Server, &MuxSettings::symmetric(8));
 		shared.mark_rekey_attached();
 		assert!(!shared.renewal_ready());
 	}
 
-	// The sweep returns the phase to `Idle`, so the phase alone would let a
-	// renewal open on a connection that cannot answer it.
+	/// A failed connection enters no renewal. The sweep returns the phase to
+	/// `Idle`, so the phase alone would let a renewal open on a connection that
+	/// cannot answer it.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn test_renewal_not_entered_after_connection_failure() {
-		let shared = shared(MuxRole::Client, 8);
+	fn a_failed_connection_enters_no_renewal() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
 		shared.fail_all_pending();
 		assert!(shared.enter_renewal(|| Some(())).is_none());
 	}
 
+	/// A failed link refuses a reservation as closed.
 	#[test]
-	fn test_reservation_refused_after_connection_failure() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.fail_all_pending();
-
+	fn a_failed_link_refuses_a_reservation() {
+		let shared = link_in(LinkState::Failed);
 		let reserved = shared.reserve_stream_slot(slot());
 		assert!(matches!(reserved, Err(TransportError::ConnectionClosed)));
-	}
-
-	#[test]
-	fn test_stream_slot_refused_after_connection_failure() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.fail_all_pending();
-		assert!(matches!(poll_slot(&shared), Poll::Ready(Err(TransportError::ConnectionClosed))));
-	}
-
-	#[test]
-	fn test_stream_slot_wakes_on_connection_failure() {
-		let shared = shared(MuxRole::Client, 1);
-		open_streams(&shared, 1);
-
-		let (flag, waker) = FlagWake::pair();
-		let mut cx = Context::from_waker(&waker);
-		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
-
-		shared.fail_all_pending();
-
-		assert!(flag.woken());
-		let woken = shared.poll_stream_slot(&mut cx);
-		assert!(matches!(woken, Poll::Ready(Err(TransportError::ConnectionClosed))));
-	}
-
-	// An orderly shutdown ends with the reader, and the later fact wins: the
-	// drain could finish, and a failed connection cannot.
-	#[test]
-	fn test_connection_failure_outranks_a_drain() {
-		let shared = shared(MuxRole::Client, 8);
-		shared.begin_shutdown();
-		shared.fail_all_pending();
-
-		let pinged = shared.allocate_ping(ping_slot());
-		assert!(matches!(pinged, Err(TransportError::ConnectionClosed)));
 	}
 
 	/// Counts the `MUX_EMIT_DRAINING` events one refused ping leaves, on a
 	/// connection that `end` has brought to its end.
 	#[cfg(feature = "instrument")]
-	fn drain_events_of_a_refused_ping(end: impl FnOnce(&MuxShared)) -> usize {
+	fn drain_events_of_a_refused_ping(end: fn(&MuxShared)) -> usize {
 		let trace = TraceCollector::new();
-		let mut shared = MuxShared::new(MuxRole::Client, &MuxSettings::symmetric(8));
-		shared.trace = Some(trace.share());
+		let shared = MuxShared::traced(MuxRole::Client, &MuxSettings::symmetric(8), trace.share());
 		end(&shared);
 
 		let refused = shared.allocate_ping(ping_slot());
 		refused.expect_err("an ended connection refuses a ping");
 
-		let traced = trace.drain_events();
-		traced.iter().filter(|event| event.urn == events::MUX_EMIT_DRAINING).count()
+		TestTrace::records(&trace, events::MUX_EMIT_DRAINING).len()
 	}
 
+	// A refused ping traces a drain on a link that drains, and none on a
+	// failed link, because the event names a drain.
 	#[cfg(feature = "instrument")]
-	#[test]
-	fn test_drain_refusal_traces_a_drain() {
-		let drains = drain_events_of_a_refused_ping(|shared| {
-			shared.begin_shutdown();
-		});
-		assert_eq!(drains, 1);
-	}
-
-	// The event names a drain, and a failed connection is none.
-	#[cfg(feature = "instrument")]
-	#[test]
-	fn test_connection_failure_refusal_traces_no_drain() {
-		let drains = drain_events_of_a_refused_ping(MuxShared::fail_all_pending);
-		assert_eq!(drains, 0);
-	}
-
 	crate::tb_cases! {
-		fn test_stream_headroom((setup, expect): (HeadroomSetup, bool)) {
-			let shared = prepare_headroom(setup);
-			assert_eq!(shared.has_stream_headroom(), expect);
+		fn a_refused_ping_traces_a_drain_by_its_end((end, drains): (fn(&MuxShared), usize)) {
+			assert_eq!(drain_events_of_a_refused_ping(end), drains);
 		}
 		cases {
-			fresh => (HeadroomSetup::Fresh { cap: 2 }, true),
-			at_cap => (HeadroomSetup::AtCap { cap: 1 }, false),
-			local_shutdown => (HeadroomSetup::LocalShutdown { cap: 2 }, false),
+			local_shutdown => (
+				|shared| {
+					shared.begin_shutdown();
+				},
+				1,
+			),
+			failure => (MuxShared::fail_all_pending, 0),
 		}
 	}
 
+	// A link has stream headroom while its cap has a free slot and it neither
+	// drains nor failed.
+	crate::tb_cases! {
+		fn a_link_reports_its_stream_headroom((state, expected): (LinkState, bool)) {
+			let shared = link_in(state);
+			assert_eq!(shared.has_stream_headroom(), expected);
+		}
+		cases {
+			fresh => (LinkState::Fresh, true),
+			at_cap => (LinkState::AtCap, false),
+			local_shutdown => (LinkState::LocalShutdown, false),
+			failed => (LinkState::Failed, false),
+		}
+	}
+
+	/// The pending streams track the streams in flight.
 	#[test]
-	fn test_pending_streams_track_in_flight() {
-		let shared = shared(MuxRole::Client, 8);
+	fn pending_streams_track_the_streams_in_flight() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
 		assert!(!shared.has_pending_streams());
 
 		open_streams(&shared, 1);
@@ -2220,101 +2147,132 @@ mod tests {
 		assert!(!shared.has_pending_streams());
 	}
 
-	// A reserved slot (`open_stream` before the first push) must pin the
-	// connection against the idle prune as a pending ID does.
+	/// A reserved slot (`open_stream` before the first push) must pin the
+	/// connection against the idle prune as a pending ID does.
 	#[test]
-	fn test_reserved_slot_counts_as_pending() {
-		let shared = shared(MuxRole::Client, 8);
-		assert!(!shared.has_pending_streams());
-
-		let reservation = shared.reserve_stream_slot(slot());
-		assert!(reservation.is_ok());
-		assert!(shared.has_pending_streams());
+	fn a_reserved_slot_counts_as_pending() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
+		let before = shared.has_pending_streams();
+		let reservation = shared.reserve_stream_slot(slot())?;
+		let held = shared.has_pending_streams();
 
 		drop(reservation);
-		assert!(!shared.has_pending_streams());
+
+		assert_eq!((before, held, shared.has_pending_streams()), (false, true, false));
+		Ok(())
 	}
 
+	// The GoAway reason a link reports comes from the peer alone, so a local
+	// shutdown reports none.
 	crate::tb_cases! {
-		fn test_goaway_reason_from_peer_only((setup, expected): (GoAwaySetup, Option<GoAwayReason>)) {
-			let shared = prepare_goaway(setup);
+		fn the_goaway_reason_comes_from_the_peer_alone((state, expected): (LinkState, Option<GoAwayReason>)) {
+			let shared = link_in(state);
+
 			assert_eq!(shared.goaway_reason(), expected);
 		}
 		cases {
-			live => (GoAwaySetup::Live, None),
-			peer_enhance_your_calm => (GoAwaySetup::PeerEnhanceYourCalm, Some(GoAwayReason::EnhanceYourCalm)),
-			local_shutdown => (GoAwaySetup::LocalShutdown, None),
+			live => (LinkState::Fresh, None),
+			peer_enhance_your_calm => (
+				LinkState::PeerGoAway(GoAwayReason::EnhanceYourCalm),
+				Some(GoAwayReason::EnhanceYourCalm),
+			),
+			local_shutdown => (LinkState::LocalShutdown, None),
 		}
 	}
 
+	/// A state of the link and the test of its slot poll.
+	type SlotPollCase = (LinkState, fn(&Poll<TransportResult<()>>) -> bool);
+
+	// A slot poll is ready while the cap has room, pends at the cap, and
+	// refuses by the end of a link that drains or failed.
 	crate::tb_cases! {
-		fn test_stream_slot_poll_outcomes((setup, expect): (SlotSetup, SlotExpect)) {
-			let shared = prepare_slot(setup);
-			assert_slot_poll(&shared, expect);
+		fn a_slot_poll_answers_by_link_state((state, answered): SlotPollCase) {
+			let shared = link_in(state);
+			assert!(answered(&poll_slot(&shared)));
 		}
 		cases {
-			ready_with_headroom => (SlotSetup::ReadyWithHeadroom, SlotExpect::ReadyOk),
-			pending_at_cap => (SlotSetup::PendingAtCap, SlotExpect::Pending),
-			draining_local => (SlotSetup::DrainingLocal, SlotExpect::Draining),
-			draining_peer => (SlotSetup::DrainingPeer, SlotExpect::Draining),
+			ready_with_headroom => (LinkState::Fresh, |polled| matches!(polled, Poll::Ready(Ok(())))),
+			pending_at_cap => (LinkState::AtCap, |polled| matches!(polled, Poll::Pending)),
+			draining_local => (
+				LinkState::LocalShutdown,
+				|polled| matches!(polled, Poll::Ready(Err(TransportError::Draining))),
+			),
+			draining_peer => (
+				LinkState::PeerGoAway(GoAwayReason::Shutdown),
+				|polled| matches!(polled, Poll::Ready(Err(TransportError::Draining))),
+			),
+			failed => (
+				LinkState::Failed,
+				|polled| matches!(polled, Poll::Ready(Err(TransportError::ConnectionClosed))),
+			),
 		}
 	}
 
-	#[test]
-	fn test_stream_slot_wakes_when_slot_frees() {
-		let shared = shared(MuxRole::Client, 1);
-		open_streams(&shared, 1);
+	/// An event on the link and the test of the slot poll it wakes.
+	type WakeCase = (fn(&MuxShared), fn(&Poll<TransportResult<()>>) -> bool);
 
-		let (flag, waker) = FlagWake::pair();
-		let mut cx = Context::from_waker(&waker);
-		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
-		assert!(shared.remove_pending(1).is_some());
+	// A slot poll parked at the cap wakes on the event that answers it: a
+	// freed slot, a shutdown, or a failure.
+	crate::tb_cases! {
+		fn a_parked_slot_poll_wakes_on_the_event_that_answers_it(
+			(event, answered): WakeCase
+		) {
+			let shared = link_in(LinkState::AtCap);
+			let parked = FlagWake::parked();
+			let pending = shared.poll_stream_slot(&mut parked.cx());
 
-		assert!(flag.woken());
-		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Ready(Ok(()))));
+			event(&shared);
+
+			let woken = shared.poll_stream_slot(&mut parked.cx());
+			assert!(matches!(pending, Poll::Pending));
+			assert!(parked.woken());
+			assert!(answered(&woken));
+		}
+		cases {
+			slot_frees => (
+				|shared| {
+					shared.remove_pending(1).expect("stream 1 is pending");
+				},
+				|polled| matches!(polled, Poll::Ready(Ok(()))),
+			),
+			shutdown => (
+				|shared| {
+					shared.begin_shutdown();
+				},
+				|polled| matches!(polled, Poll::Ready(Err(TransportError::Draining))),
+			),
+			failure => (
+				MuxShared::fail_all_pending,
+				|polled| matches!(polled, Poll::Ready(Err(TransportError::ConnectionClosed))),
+			),
+		}
 	}
 
-	// A reserved stream holds a cap slot before it has an ID, so each
-	// question about room counts it.
+	/// A reserved stream holds a cap slot before it has an ID, so each
+	/// question about room counts it.
 	#[test]
-	fn test_reserved_slot_counts_against_headroom() {
-		let shared = shared(MuxRole::Client, 1);
-		let _held = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
+	fn a_reserved_slot_counts_against_the_headroom() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(1));
+		let _held = shared.reserve_stream_slot(slot())?;
 		assert!(!shared.has_stream_headroom());
 		assert!(matches!(poll_slot(&shared), Poll::Pending));
+		Ok(())
 	}
 
+	/// A slot poll parked on a reservation wakes when the reservation drops.
 	#[test]
-	fn test_stream_slot_wakes_when_a_reservation_drops() {
-		let shared = shared(MuxRole::Client, 1);
-		let held = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
-
-		let (flag, waker) = FlagWake::pair();
-		let mut cx = Context::from_waker(&waker);
-		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
+	fn a_parked_slot_poll_wakes_when_a_reservation_drops() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(1));
+		let held = shared.reserve_stream_slot(slot())?;
+		let parked = FlagWake::parked();
+		let pending = shared.poll_stream_slot(&mut parked.cx());
 
 		drop(held);
 
-		assert!(flag.woken());
-		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Ready(Ok(()))));
-	}
-
-	#[test]
-	fn test_stream_slot_wakes_on_shutdown() {
-		let shared = shared(MuxRole::Client, 1);
-		open_streams(&shared, 1);
-
-		let (flag, waker) = FlagWake::pair();
-		let mut cx = Context::from_waker(&waker);
-		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
-
-		shared.begin_shutdown();
-
-		assert!(flag.woken());
-		assert!(matches!(
-			shared.poll_stream_slot(&mut cx),
-			Poll::Ready(Err(TransportError::Draining))
-		));
+		assert!(matches!(pending, Poll::Pending));
+		assert!(parked.woken());
+		assert!(matches!(shared.poll_stream_slot(&mut parked.cx()), Poll::Ready(Ok(()))));
+		Ok(())
 	}
 
 	fn metered_settings(initial_send_credit: u64, send_budget: Option<u64>) -> MuxSettings {
@@ -2322,118 +2280,104 @@ mod tests {
 		settings.with_send_budget(send_budget)
 	}
 
-	/// Caps of 1 and 1, a chunk of 1024, and the default unit of 1024 give a
-	/// drain headroom of 5 records at 1 credit each.
-	fn budget_settings(send_budget: u64) -> MuxSettings {
-		let settings = MuxSettings::symmetric(1).with_chunk_size(1024);
-		settings.with_send_budget(Some(send_budget))
-	}
-
+	/// A chunk parks at the credit limit of its stream and resumes on a
+	/// grant.
 	#[test]
-	fn test_send_chunk_parks_at_limit_and_resumes_on_grant() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(1, None));
+	fn a_chunk_parks_at_its_credit_limit_and_resumes_on_a_grant() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(1, None));
 		shared.register_send_stream(1, 2);
 
-		let mut cx = noop_cx();
-		assert!(matches!(shared.poll_send_chunk(1, &mut cx), Poll::Ready(Ok(()))));
-
-		let (flag, waker) = FlagWake::pair();
-		let mut parked_cx = Context::from_waker(&waker);
-		assert!(matches!(shared.poll_send_chunk(1, &mut parked_cx), Poll::Pending));
+		let first = shared.poll_send_chunk(1, &mut noop_cx());
+		let parked = FlagWake::parked();
+		let pending = shared.poll_send_chunk(1, &mut parked.cx());
 
 		shared.apply_credit_grant(1, 2);
-		assert!(flag.woken());
-		assert!(matches!(shared.poll_send_chunk(1, &mut cx), Poll::Ready(Ok(()))));
+
+		assert!(matches!(first, Poll::Ready(Ok(()))));
+		assert!(matches!(pending, Poll::Pending));
+		assert!(parked.woken());
+		assert!(matches!(shared.poll_send_chunk(1, &mut noop_cx()), Poll::Ready(Ok(()))));
 	}
 
-	// Only the reader applies a grant, so a ledger registered after it ended
-	// has nothing to wait for at its limit.
+	/// Only the reader applies a grant, so a ledger registered after it ended
+	/// fails at its limit, with nothing to wait for.
 	#[test]
-	fn test_send_chunk_fails_at_limit_after_connection_failure() {
-		let shared = shared_with_settings(MuxRole::Server, metered_settings(1, None));
+	fn a_chunk_at_its_limit_fails_after_a_connection_failure() {
+		let shared = MuxShared::fixture(MuxRole::Server, &metered_settings(1, None));
 		shared.fail_all_pending();
 		shared.register_send_stream(2, 2);
 
-		let mut cx = noop_cx();
-		assert!(matches!(shared.poll_send_chunk(2, &mut cx), Poll::Ready(Ok(()))));
-		let at_limit = shared.poll_send_chunk(2, &mut cx);
+		let first = shared.poll_send_chunk(2, &mut noop_cx());
+		let at_limit = shared.poll_send_chunk(2, &mut noop_cx());
+		assert!(matches!(first, Poll::Ready(Ok(()))));
 		assert!(matches!(at_limit, Poll::Ready(Err(TransportError::ConnectionClosed))));
 	}
 
-	// The peer's credit for a stream its GoAway disowned has ended, so a
-	// producer parked on that stream has to wake with the sweep.
+	/// The peer's credit for a stream its GoAway disowned has ended, so a
+	/// producer parked on that stream has to wake with the sweep.
 	#[test]
-	fn test_goaway_wakes_a_producer_parked_above_the_watermark() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(1, None));
+	fn a_goaway_wakes_a_producer_parked_above_its_watermark() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(1, None));
 		open_streams(&shared, 1);
 
-		let (flag, waker) = FlagWake::pair();
-		let mut cx = Context::from_waker(&waker);
-		assert!(matches!(shared.poll_send_chunk(1, &mut cx), Poll::Pending));
+		let parked = FlagWake::parked();
+		let pending = shared.poll_send_chunk(1, &mut parked.cx());
 
 		receive_goaway(&shared, 0, GoAwayReason::Shutdown);
 
-		assert!(flag.woken());
-
-		let resumed = shared.poll_send_chunk(1, &mut cx);
+		let resumed = shared.poll_send_chunk(1, &mut parked.cx());
+		assert!(matches!(pending, Poll::Pending));
+		assert!(parked.woken());
 		assert!(matches!(
 			resumed,
 			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
 		));
 	}
 
-	// An Open that the writer queue refuses stays off the queue, so the
-	// stream, the ledger, and the reply forwarder that wait on it all drop.
+	/// An Open that the writer queue refuses stays off the queue, so the
+	/// stream, the ledger, and the reply forwarder that wait on it all drop.
 	#[test]
-	fn test_open_that_does_not_enqueue_registers_nothing() {
-		let shared = shared(MuxRole::Client, 8);
+	fn an_open_that_does_not_enqueue_registers_nothing() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(8));
 		let (drained, _notes) = mpsc::channel(1);
-		let (mut reservation, mut body) = shared.reserve_duplex_slot(drained).expect("admission is open");
+		let (mut reservation, mut body) = shared.reserve_duplex_slot(drained)?;
 		let (mut outbound, wire) = mpsc::channel(4);
+
 		drop(wire);
 
-		let mut request = OpenRequest {
-			kind: MuxStreamKind::Duplex,
-			last: true,
-			payload: &[],
-			records: 1,
-			target: None,
-			hops_remaining: DEFAULT_HOP_BUDGET,
-		};
-
-		let mut cx = noop_cx();
-		let enqueued = reservation.poll_open(&mut request, &mut outbound, &mut cx);
+		let mut request = OpenRequest { kind: MuxStreamKind::Duplex, ..unary_request() };
+		let enqueued = reservation.poll_open(&mut request, &mut outbound, &mut noop_cx());
 		assert!(matches!(enqueued, Poll::Ready(Err(TransportError::ConnectionClosed))));
 		assert!(!shared.has_pending_streams());
-
-		let ledger = shared.poll_send_chunk(1, &mut cx);
 		assert!(matches!(
-			ledger,
+			shared.poll_send_chunk(1, &mut noop_cx()),
 			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
 		));
-
-		let ended = body.poll_chunk_now();
-		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		assert!(matches!(
+			body.poll_chunk_now(),
+			Poll::Ready(Err(TransportError::ConnectionClosed))
+		));
+		Ok(())
 	}
 
+	/// A chunk fails as cancelled once its ledger drops.
 	#[test]
-	fn test_send_chunk_fails_after_ledger_drop() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(1, None));
+	fn a_chunk_fails_after_its_ledger_drops() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(1, None));
 		shared.register_send_stream(1, 1);
 		shared.finish_send_stream(1);
-
-		let mut cx = noop_cx();
 		assert!(matches!(
-			shared.poll_send_chunk(1, &mut cx),
+			shared.poll_send_chunk(1, &mut noop_cx()),
 			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)))
 		));
 	}
 
+	/// A grant at or below the current credit limit leaves the limit as it
+	/// is.
 	#[test]
-	fn test_credit_grants_are_monotonic() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
+	fn a_grant_below_the_limit_leaves_the_limit() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(2, None));
 		shared.register_send_stream(1, 4);
-		// A grant at or below the current limit leaves the limit as it is.
 		shared.apply_credit_grant(1, 1);
 
 		let mut cx = noop_cx();
@@ -2442,9 +2386,10 @@ mod tests {
 		assert!(matches!(shared.poll_send_chunk(1, &mut cx), Poll::Pending));
 	}
 
+	/// The unsent chunks fall with each sent chunk and each finished stream.
 	#[test]
-	fn test_unsent_chunks_track_flush_and_drop() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(8, None));
+	fn unsent_chunks_track_each_send_and_each_finished_stream() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(8, None));
 		shared.register_send_stream(1, 3);
 		shared.register_send_stream(3, 2);
 		assert_eq!(shared.unsent_chunks(), 5);
@@ -2460,10 +2405,11 @@ mod tests {
 		assert_eq!(shared.unsent_chunks(), 0);
 	}
 
+	/// A send budget fails a debit past its spendable credits fast, and lets
+	/// owed traffic alone spend its drain reserve.
 	#[test]
-	fn test_budget_debit_fail_fast_and_reserve() {
-		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
-
+	fn a_budget_fails_fast_and_spends_its_reserve_on_owed_traffic_alone() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::budgeted(10));
 		// Of 10 credits, 5 are reserved, so a debit of 4 stays `Healthy`.
 		assert!(matches!(shared.debit_send_budget(4, false), Ok(BudgetStanding::Healthy)));
 		// With 6 credits left and 1 spendable, a debit of 6 must fail fast
@@ -2489,8 +2435,7 @@ mod tests {
 	#[cfg(feature = "instrument")]
 	fn refusal_records(credits: u64, reserved: bool) -> (bool, Vec<Option<String>>, Vec<Option<AssertionValue>>) {
 		let trace = TraceCollector::new();
-		let mut shared = MuxShared::new(MuxRole::Client, &budget_settings(10));
-		shared.trace = Some(trace.share());
+		let shared = MuxShared::traced(MuxRole::Client, &MuxSettings::budgeted(10), trace.share());
 
 		let refused = poll_now(shared.admit_debit(credits, reserved));
 		let exhausted = matches!(
@@ -2498,12 +2443,7 @@ mod tests {
 			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted)))
 		);
 
-		let records = trace.drain_events();
-		let labels = records
-			.into_iter()
-			.filter(|record| record.urn == events::MUX_BUDGET_REFUSED)
-			.map(|record| record.label.map(String::from))
-			.collect();
+		let labels = TestTrace::labels(&trace, events::MUX_BUDGET_REFUSED);
 		let values = trace.drain_assertions().into_iter().map(|record| record.value).collect();
 		(exhausted, labels, values)
 	}
@@ -2526,19 +2466,19 @@ mod tests {
 	/// terms of the epoch.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_refund_after_a_renewal_stays_within_the_terms() -> TransportResult<()> {
-		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
+	fn a_refund_after_a_renewal_stays_within_the_terms() -> TestResult {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::budgeted(10));
 		shared.debit_send_budget(4, false)?;
 		shared.reset_send_budget();
-
 		shared.refund_budget(4);
 		assert_eq!(shared.send_budget(), Some(10));
 		Ok(())
 	}
 
+	/// An unmetered budget stays healthy under any debit.
 	#[test]
-	fn test_unmetered_budget_never_exhausts() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(1, None));
+	fn an_unmetered_budget_stays_healthy() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(1, None));
 		assert!(matches!(shared.debit_send_budget(u64::MAX, false), Ok(BudgetStanding::Healthy)));
 	}
 
@@ -2550,22 +2490,21 @@ mod tests {
 		state.rekey = RekeyPhase::AwaitingResponse;
 	}
 
+	/// An admission parks across a renewal and resumes when it finishes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn test_admissions_park_across_renewal_and_resume() {
-		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
+	fn an_admission_parks_across_a_renewal_and_resumes() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::budgeted(10));
 		begin_client_renewal(&shared);
 
-		let (flag, waker) = FlagWake::pair();
-		let mut parked_cx = Context::from_waker(&waker);
-		let parked = shared.poll_admit_debit(1, false, &mut parked_cx);
-		assert!(matches!(parked, Poll::Pending));
+		let parked = FlagWake::parked();
+		let pending = shared.poll_admit_debit(1, false, &mut parked.cx());
 
 		shared.finish_renewal();
-		assert!(flag.woken());
 
-		let mut cx = noop_cx();
-		let admitted = shared.poll_admit_debit(1, false, &mut cx);
+		let admitted = shared.poll_admit_debit(1, false, &mut noop_cx());
+		assert!(matches!(pending, Poll::Pending));
+		assert!(parked.woken());
 		assert!(matches!(admitted, Poll::Ready(Ok(BudgetStanding::Healthy))));
 	}
 
@@ -2586,14 +2525,13 @@ mod tests {
 	/// An admission released by a completed renewal debits the new epoch, so
 	/// it must find the new epoch's receipt already in place when it wakes.
 	#[tokio::test]
-	async fn test_a_released_admission_reads_the_new_epoch_receipt(
-	) -> Result<(), crate::transport::handshake::HandshakeError> {
-		use crate::transport::rekey::tests::{rekey_pair, run_exchange};
+	async fn a_released_admission_reads_the_new_epoch_receipt() {
+		use crate::transport::rekey::ClientRekey;
 
-		let (mut client, mut server) = rekey_pair()?;
-		let (client_install, _) = run_exchange(&mut client, &mut server).await?;
+		let (mut client, mut server) = ClientRekey::fixture_pair();
+		let (client_install, _) = client.exchange_with(&mut server).await;
 
-		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::budgeted(10));
 		begin_client_renewal(&shared);
 		assert!(shared.admit_rekey_response());
 
@@ -2606,13 +2544,13 @@ mod tests {
 
 		assert!(shared.complete_renewal(client_install.receipt));
 		assert!(witness.rotated.load(core::sync::atomic::Ordering::SeqCst));
-		Ok(())
 	}
 
+	/// The hard floor parks a chunk until the Ack of the renewal writes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn test_hard_floor_parks_chunks_until_ack_writes() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
+	fn the_hard_floor_parks_chunks_until_the_ack_writes() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(2, None));
 		shared.register_send_stream(1, 1);
 		begin_client_renewal(&shared);
 		assert!(shared.park_hard_floor());
@@ -2620,19 +2558,17 @@ mod tests {
 		let (mut outbound, _outbound_rx) = mpsc::channel(4);
 		let ping = MuxPingPackage::new(false, 0);
 		let mut slot = Some(TransportEnvelope::from(ping));
-		let (flag, waker) = FlagWake::pair();
-		let mut parked_cx = Context::from_waker(&waker);
-		let parked = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut parked_cx);
-		assert!(matches!(parked, Poll::Pending));
+		let parked = FlagWake::parked();
+		let pending = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut parked.cx());
+		assert!(matches!(pending, Poll::Pending));
 
 		// The renewal reaches the Ack write through the flush phase, the same
 		// order the reader and writer drive it in.
 		assert!(shared.admit_rekey_response());
 		shared.mark_ack_written();
-		assert!(flag.woken());
+		assert!(parked.woken());
 
-		let mut cx = noop_cx();
-		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut cx);
+		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut noop_cx());
 		assert!(matches!(enqueued, Poll::Ready(Ok(()))));
 	}
 
@@ -2642,8 +2578,8 @@ mod tests {
 	/// with the renewal gone it leaves the floor down and chunks pass.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn test_park_hard_floor_refuses_once_the_renewal_closed() {
-		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
+	fn the_hard_floor_stays_down_once_the_renewal_closed() {
+		let shared = MuxShared::fixture(MuxRole::Client, &metered_settings(2, None));
 		shared.register_send_stream(1, 1);
 		begin_client_renewal(&shared);
 
@@ -2655,45 +2591,42 @@ mod tests {
 		let (mut outbound, _outbound_rx) = mpsc::channel(4);
 		let ping = MuxPingPackage::new(false, 0);
 		let mut slot = Some(TransportEnvelope::from(ping));
-		let mut cx = noop_cx();
 
-		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut cx);
+		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut noop_cx());
 		assert!(matches!(enqueued, Poll::Ready(Ok(()))));
 	}
 
-	// A cancel enqueued while the queue is saturated travels, because the
-	// teardown clone's guaranteed slot admits it past a full buffer. The
-	// channel capacity is the buffer plus the senders.
+	/// Fills the queue of `outbound` through a clone of it, until the queue
+	/// refuses a command.
+	fn saturate(outbound: &mpsc::Sender<Outbound>) {
+		let mut filler = outbound.clone();
+		while filler.try_send(Outbound::Close).is_ok() {}
+	}
+
+	/// A cancel enqueued while the queue is saturated travels, because the
+	/// teardown clone's guaranteed slot admits it past a full buffer. The
+	/// channel capacity is the buffer plus the senders.
 	#[test]
-	fn test_stream_cancel_survives_saturated_queue() {
-		let shared = shared(MuxRole::Client, 2);
+	fn a_stream_cancel_passes_a_saturated_queue() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(2));
 		open_streams(&shared, 1);
 
 		let (outbound, mut wire) = mpsc::channel(0);
-		let mut filler = outbound.clone();
-		while filler.try_send(Outbound::Close).is_ok() {}
+		saturate(&outbound);
 
 		let (link, _) = MuxLink::new(shared, outbound);
 		link.enqueue_stream_cancel(1);
 
-		let mut saw_cancel = false;
-		while let Ok(command) = wire.try_recv() {
-			if matches!(
-				&command,
-				Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package)))
-					if package.stream_id() == 1
-			) {
-				saw_cancel = true;
-			}
-		}
-		assert!(saw_cancel);
+		let queued = drained(&mut wire);
+		let last = queued.last().and_then(Outbound::mux);
+		assert!(matches!(last, Some(MuxEnvelope::Cancel(package)) if package.stream_id() == 1));
 	}
 
-	// A peer GoAway disowns duplex replies above its watermark, so those
-	// bodies fail with Draining and the rest stay live.
+	/// A peer GoAway disowns duplex replies above its watermark, so those
+	/// bodies fail with Draining and the rest stay live.
 	#[test]
-	fn test_fail_duplex_above_fails_disowned_replies() {
-		let shared = shared(MuxRole::Client, 4);
+	fn a_goaway_fails_the_duplex_replies_it_disowns() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(4));
 		let (feedback, _notes) = mpsc::channel(0);
 		let budget = shared.reassembly_budget();
 		let (mut kept, below) = StreamBody::pair(OpenSlot::assigned(1), 4, feedback.clone(), Arc::clone(&budget));

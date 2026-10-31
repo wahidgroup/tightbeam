@@ -271,29 +271,19 @@ impl<T> From<std::sync::PoisonError<T>> for TestingError {
 
 #[cfg(test)]
 mod tests {
-	use std::panic::{catch_unwind, AssertUnwindSafe};
 	use std::sync::Mutex;
 
 	use super::TestingError;
+	use crate::testing::fixtures::poison;
 
-	/// A lock that a panic poisoned while it held the guard.
-	fn poisoned() -> Mutex<u8> {
-		let lock = Mutex::new(0);
-		let panicked = catch_unwind(AssertUnwindSafe(|| {
-			let _held = lock.lock();
-			panic!("poison the lock");
-		}));
-
-		assert!(panicked.is_err());
-		lock
-	}
-
+	/// A lock that a panic poisoned outside the fuzz cursor reads as
+	/// `LockPoisoned`.
 	#[test]
 	fn a_poisoned_lock_outside_the_fuzz_cursor_reads_as_lock_poisoned() {
-		let lock = poisoned();
+		let lock = Mutex::new(0u8);
+		poison(&lock);
 
 		let refused = lock.lock().map(|_| ()).map_err(TestingError::from);
-
 		assert!(matches!(refused, Err(TestingError::LockPoisoned)));
 	}
 }

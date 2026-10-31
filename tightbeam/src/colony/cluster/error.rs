@@ -294,6 +294,15 @@ impl<T> From<std::sync::PoisonError<T>> for ClusterError {
 }
 
 #[cfg(test)]
+impl ClusterError {
+	/// The variant of the error that `result` holds, or [`None`] for an `Ok`,
+	/// for a test whose refusal carries a payload that is not its behavior.
+	pub(crate) fn variant_of<T>(result: &Result<T, ClusterError>) -> Option<core::mem::Discriminant<ClusterError>> {
+		result.as_ref().err().map(core::mem::discriminant)
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::tb_cases;

@@ -8,12 +8,10 @@ use std::thread;
 
 use super::entry::LocalRoute;
 use super::{
-	ClusterError, DialTarget, HiveSlate, KindCaps, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind,
-	RoutePlane, Routes, ServletEntry, ServletRegistry, SharedId, SlateChange, DEFAULT_ABANDONMENT_LIMIT,
-	DEFAULT_INITIAL_PHEROMONE,
+	ClusterError, DialTarget, HiveSlate, KindCaps, PeerCaps, PeerRoute, PheromoneConfig, RouteKind, RoutePlane, Routes,
+	ServletEntry, ServletRegistry, SharedId, SlateChange, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::basis_points::BasisPoints;
-use crate::basis_points::BasisPointsOutOfRange;
 use crate::clock::{Clock, ManualClock, UnixMillis};
 use crate::cms::signed_data::SignerIdentifier;
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
@@ -23,28 +21,22 @@ use crate::colony::protocol::ServletInfo;
 use crate::colony::urn::ColonyNamespace;
 use crate::colony::urn::ServletTypeKey;
 use crate::tb_cases;
-use crate::urn::Urn;
+use crate::testing::fixtures::TestClock;
+use crate::testing::TestResult;
 
-/// A clock only the test moves.
-fn manual_clock() -> Arc<ManualClock> {
-	Arc::new(ManualClock::default())
-}
-
-/// A registry on the default pheromone configuration and a manual clock.
-fn registry() -> ServletRegistry {
-	registry_on(&manual_clock())
-}
+/// The abandonment limit of the tests that drive a route to it.
+const LIMIT: u32 = 2;
 
 /// A registry on `clock`, for tests that advance it.
 fn registry_on(clock: &Arc<ManualClock>) -> ServletRegistry {
-	ServletRegistry::new(PheromoneConfig::default(), Arc::clone(clock) as Arc<dyn Clock>)
+	ServletRegistry::new(PheromoneConfig::default(), TestClock::erased(clock))
 }
 
 /// A registry whose routes abandon after `limit` failures.
 fn registry_abandoning_after(limit: u32) -> ServletRegistry {
 	let abandonment_limit = NonZeroU32::new(limit).expect("a test limit is at least one");
 	let config = PheromoneConfig { abandonment_limit, ..Default::default() };
-	ServletRegistry::new(config, manual_clock())
+	ServletRegistry::new(config, TestClock::manual())
 }
 
 /// The read guard over the registry's routes, where the admission logic lives.
@@ -56,6 +48,31 @@ fn routes(registry: &ServletRegistry) -> RwLockReadGuard<'_, Routes> {
 fn owner_of(registry: &ServletRegistry, key: impl AsRef<[u8]>) -> Option<SharedId> {
 	let key = key.as_ref();
 	routes(registry).get(key).map(|entry| Arc::clone(entry.owner_id()))
+}
+
+/// A registry that holds each of `entries`.
+fn registry_holding(entries: impl IntoIterator<Item = ServletEntry>) -> ServletRegistry {
+	let registry = ServletRegistry::fixture();
+	for entry in entries {
+		registry.add(entry).expect("a fresh registry takes each fixture route");
+	}
+
+	registry
+}
+
+/// The route key of each of `entries`, in order.
+fn route_keys(entries: &[Arc<ServletEntry>]) -> Vec<SharedId> {
+	entries.iter().map(|entry| Arc::clone(entry.route_key())).collect()
+}
+
+/// The owner of each of `entries`, in order.
+fn owners(entries: &[Arc<ServletEntry>]) -> Vec<SharedId> {
+	entries.iter().map(|entry| Arc::clone(entry.owner_id())).collect()
+}
+
+/// The route kind of each of `entries`, in order.
+fn kinds(entries: &[Arc<ServletEntry>]) -> Vec<RouteKind> {
+	entries.iter().map(|entry| entry.route_kind()).collect()
 }
 
 /// The type key the registry indexes `servlet_type` under.
@@ -71,46 +88,35 @@ fn admitted_dial(dial: impl AsRef<[u8]>) -> AdmittedDial {
 	AdmittedDial::fixture(from_utf8(dial).expect("fixture dial addresses are UTF-8"))
 }
 
+/// A local entry at `addr` that serves `servlet_type` for `hive`, under the
+/// fixture servlet's signer, at `pheromone` and the abandonment limit
+/// `limit`.
+fn local_entry(addr: &[u8], servlet_type: &[u8], hive: &[u8], pheromone: u64, limit: NonZeroU32) -> ServletEntry {
+	let route = LocalRoute {
+		address: Arc::from(addr),
+		servlet_type: Arc::from(servlet_type),
+		hive_id: Arc::from(hive),
+		signer: ServletInfo::fixture_signer(),
+	};
+
+	ServletEntry::local(route, pheromone, limit)
+}
+
 /// One local entry with the given pheromone and abandonment limit.
 fn test_entry(pheromone: u64, abandonment_limit: u32) -> ServletEntry {
 	let abandonment_limit = NonZeroU32::new(abandonment_limit).expect("a test limit is at least one");
-	ServletEntry::local(
-		LocalRoute {
-			address: Arc::from(b"addr".as_slice()),
-			servlet_type: Arc::from(b"type".as_slice()),
-			hive_id: Arc::from(b"hive".as_slice()),
-			signer: ServletInfo::fixture_signer(),
-		},
-		pheromone,
-		abandonment_limit,
-	)
+	local_entry(b"addr", b"type", b"hive", pheromone, abandonment_limit)
 }
 
 /// A local entry at `addr` that serves `servlet_type` for `hive`.
 fn named_entry(addr: impl AsRef<[u8]>, servlet_type: impl AsRef<[u8]>, hive: impl AsRef<[u8]>) -> ServletEntry {
-	let addr = addr.as_ref();
-	let servlet_type = servlet_type.as_ref();
-	let hive = hive.as_ref();
-	ServletEntry::local(
-		LocalRoute {
-			address: Arc::from(addr),
-			servlet_type: Arc::from(servlet_type),
-			hive_id: Arc::from(hive),
-			signer: ServletInfo::fixture_signer(),
-		},
-		DEFAULT_INITIAL_PHEROMONE,
-		DEFAULT_ABANDONMENT_LIMIT,
-	)
+	let (addr, servlet_type, hive) = (addr.as_ref(), servlet_type.as_ref(), hive.as_ref());
+	local_entry(addr, servlet_type, hive, DEFAULT_INITIAL_PHEROMONE, DEFAULT_ABANDONMENT_LIMIT)
 }
 
 /// The signer of a fixture servlet's registration.
 fn servlet_signer() -> Arc<SignerIdentifier> {
 	Arc::new(ServletInfo::fixture_signer())
-}
-
-/// The slate `hive` registers, which holds `entries`.
-fn hive_slate(hive: impl AsRef<[u8]>, entries: impl IntoIterator<Item = ServletEntry>) -> HiveSlate {
-	HiveSlate::of(hive, entries)
 }
 
 /// A peer entry for `servlet_type` advertised by `peer_id`, which dials the
@@ -119,34 +125,17 @@ fn peer_entry(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>) -> Serv
 	peer_entry_dial(servlet_type, peer_id, b"127.0.0.1:9000")
 }
 
+/// A peer entry for `servlet_type` advertised by `peer_id`, which dials the
+/// fixture socket `dial`.
 fn peer_entry_dial(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
-	let servlet_type = servlet_type.as_ref();
-	let peer_id = peer_id.as_ref();
-	ServletEntry::peer(
-		PeerRoute {
-			peer_id: Arc::from(peer_id),
-			servlet_type: Arc::from(servlet_type),
-			dial: admitted_dial(dial),
-		},
-		DEFAULT_INITIAL_PHEROMONE,
-		DEFAULT_ABANDONMENT_LIMIT,
-	)
+	let dial = from_utf8(dial.as_ref()).expect("fixture dial addresses are UTF-8");
+	ServletEntry::peer_fixture(servlet_type, peer_id, dial)
 }
 
 /// A peer entry with a specific abandonment limit.
 fn peer_entry_limit(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, limit: u32) -> ServletEntry {
-	let servlet_type = servlet_type.as_ref();
-	let peer_id = peer_id.as_ref();
 	let limit = NonZeroU32::new(limit).expect("a test limit is at least one");
-	ServletEntry::peer(
-		PeerRoute {
-			peer_id: Arc::from(peer_id),
-			servlet_type: Arc::from(servlet_type),
-			dial: admitted_dial(b"127.0.0.1:9000"),
-		},
-		DEFAULT_INITIAL_PHEROMONE,
-		limit,
-	)
+	peer_entry(servlet_type, peer_id).with_abandonment_limit(limit)
 }
 
 /// An admitted advertisement from `hive` at `dial` that carries `slate`, at
@@ -162,16 +151,28 @@ fn admitted(
 	admitted_with_order(hive, dial, slate, 0)
 }
 
+/// An admitted advertisement from `hive` at `dial` that carries `slate`,
+/// issued at `order`.
 fn admitted_with_order(
 	hive: impl AsRef<[u8]>,
 	dial: impl AsRef<[u8]>,
 	slate: impl IntoIterator<Item = ServletEntry>,
 	order: u64,
 ) -> AdmittedPeerAd {
-	let hive = hive.as_ref();
-	let dial = admitted_dial(dial);
-	let slate: Vec<ServletEntry> = slate.into_iter().collect();
-	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order: UnixMillis::new(order) }
+	let dial = from_utf8(dial.as_ref()).expect("fixture dial addresses are UTF-8");
+	AdmittedPeerAd::fixture(hive, dial, slate, order)
+}
+
+/// The advertisement of `calc` by `origin` at the fixture socket, issued at
+/// `order`.
+fn origin_ad(order: u64) -> AdmittedPeerAd {
+	admitted_with_order(b"origin", b"127.0.0.1:9000", [peer_entry(b"calc", b"origin")], order)
+}
+
+/// The advertisement of `origin` at the fixture socket that names no route,
+/// issued at `order`.
+fn origin_withdrawal(order: u64) -> AdmittedPeerAd {
+	admitted_with_order(b"origin", b"127.0.0.1:9000", Vec::new(), order)
 }
 
 /// Installs one direct peer slate for `peer` that dials the fixture socket,
@@ -183,6 +184,11 @@ fn install_peer_slate(
 ) -> Result<SlateChange, ClusterError> {
 	let peer = peer.as_ref();
 	registry.reconcile_peer_slate(admitted(peer, b"127.0.0.1:9000", slate), PeerCaps::default())
+}
+
+/// Installs `trail` with the default caps, and returns what it changed.
+fn install_relay_trail(registry: &ServletRegistry, trail: RelayTrail) -> Result<SlateChange, ClusterError> {
+	registry.reconcile_relay_trail(trail, PeerCaps::default())
 }
 
 /// The installed and the withdrawn counts of `change`, with 0 for none.
@@ -201,17 +207,8 @@ fn relay_trail(
 ) -> RelayTrail {
 	let origin = origin.as_ref();
 	let relay = relay.as_ref();
-	let servlet_type = servlet_type.as_ref();
-	let slate = vec![ServletEntry::peer_relay(
-		RelayRoute {
-			origin_id: Arc::from(origin),
-			relay_id: Arc::from(relay),
-			servlet_type: Arc::from(servlet_type),
-			dial: admitted_dial(dial),
-		},
-		DEFAULT_INITIAL_PHEROMONE,
-		DEFAULT_ABANDONMENT_LIMIT,
-	)];
+	let dial = from_utf8(dial.as_ref()).expect("fixture dial addresses are UTF-8");
+	let slate = vec![ServletEntry::relay_fixture(origin, relay, servlet_type, dial)];
 
 	RelayTrail {
 		bucket: ServletEntry::relay_bucket(origin, relay),
@@ -224,8 +221,7 @@ fn relay_trail(
 /// The one entry of a relay trail for `origin` through `relay`, which dials
 /// the relay at the fixture socket.
 fn relay_trail_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>) -> ServletEntry {
-	let mut slate = relay_trail(origin, relay, b"ping", b"127.0.0.1:9001").slate;
-	slate.pop().expect("the fixture trail holds one entry")
+	ServletEntry::relay_fixture(origin, relay, b"ping", "127.0.0.1:9001")
 }
 
 /// The peer plane bound to the gateway whose slate key is `gateway_id`.
@@ -239,23 +235,19 @@ fn hive_plane(signer: Arc<SignerIdentifier>) -> RoutePlane {
 }
 
 /// Counts `times` failures against the route at `key`.
-fn weaken_times(registry: &ServletRegistry, key: impl AsRef<[u8]>, times: u32) -> Result<(), ClusterError> {
+fn weaken_times(registry: &ServletRegistry, key: impl AsRef<[u8]>, times: u32) {
 	let key = key.as_ref();
 	for _ in 0..times {
-		registry.weaken(key)?;
+		registry.weaken(key).expect("a live route lock takes a failure");
 	}
-
-	Ok(())
 }
 
 /// Counts `times` failures against every route attributed to `peer`.
-fn weaken_peer_times(registry: &ServletRegistry, peer: impl AsRef<[u8]>, times: u32) -> Result<(), ClusterError> {
+fn weaken_peer_times(registry: &ServletRegistry, peer: impl AsRef<[u8]>, times: u32) {
 	let peer = peer.as_ref();
 	for _ in 0..times {
-		registry.weaken_peer(peer)?;
+		registry.weaken_peer(peer).expect("a live route lock takes a failure");
 	}
-
-	Ok(())
 }
 
 // Reinforcement adds to the level and stops at the ceiling.
@@ -275,7 +267,7 @@ tb_cases! {
 
 // Evaporation removes the configured share of the level.
 tb_cases! {
-	fn entry_evaporate_pheromone((initial, rate, expected): (u64, u16, u64)) -> Result<(), BasisPointsOutOfRange> {
+	fn entry_evaporate_pheromone((initial, rate, expected): (u64, u16, u64)) -> TestResult {
 		let entry = test_entry(initial, 5);
 		entry.evaporate(BasisPoints::try_from(rate)?);
 
@@ -314,12 +306,18 @@ tb_cases! {
 	}
 }
 
-// Only the failure that reaches the limit reports it, and a failure past the
-// limit reports nothing.
+/// Counts `failures` failures on one entry, and answers whether each one
+/// reached the limit.
+fn limit_reports(entry: &ServletEntry, failures: usize) -> Vec<bool> {
+	(0..failures).map(|_| entry.weaken_to_limit()).collect()
+}
+
+/// Only the failure that reaches the limit reports it, and a failure past the
+/// limit reports nothing.
 #[test]
 fn entry_reports_the_failure_that_reaches_its_limit() {
 	let entry = test_entry(5000, 3);
-	let reached: Vec<bool> = (0..4).map(|_| entry.weaken_to_limit()).collect();
+	let reached = limit_reports(&entry, 4);
 	assert_eq!(reached, vec![false, false, true, false]);
 	assert!(entry.is_abandoned());
 }
@@ -327,7 +325,7 @@ fn entry_reports_the_failure_that_reaches_its_limit() {
 /// An entry at the least abandonment limit, one, is live at its creation, so
 /// no limit abandons a route before its first failure.
 #[test]
-fn an_entry_at_the_least_limit_is_live_at_creation() -> Result<(), Box<dyn core::error::Error>> {
+fn an_entry_at_the_least_limit_is_live_at_creation() -> TestResult {
 	let entry = test_entry(5000, 1);
 	assert!(entry.is_live());
 	Ok(())
@@ -336,25 +334,25 @@ fn an_entry_at_the_least_limit_is_live_at_creation() -> Result<(), Box<dyn core:
 /// A failure against a count at `u32::MAX` leaves the count there, so an
 /// abandoned route stays abandoned whatever failures follow.
 #[test]
-fn a_saturated_trial_count_keeps_its_route_abandoned() -> Result<(), Box<dyn core::error::Error>> {
+fn a_saturated_trial_count_keeps_its_route_abandoned() -> TestResult {
 	let entry = test_entry(5000, 3).with_trials(u32::MAX);
 	entry.weaken();
 	assert!(entry.is_abandoned());
 	Ok(())
 }
 
+/// A reinforcement resets the trial count of its entry.
 #[test]
 fn entry_reinforce_resets_trials() {
 	let entry = test_entry(5000, 5);
 	weaken_entry_times(&entry, 2);
-
 	entry.reinforce(100);
-
 	assert_eq!(entry.trial_count(), 0);
 }
 
+/// A local entry routes as a local route.
 #[test]
-fn entry_route_kind_defaults_local() {
+fn a_local_entry_routes_as_local() {
 	let entry = named_entry(b"addr1", b"calculator", b"hive1");
 	assert_eq!(entry.route_kind(), RouteKind::Local);
 }
@@ -390,6 +388,8 @@ tb_cases! {
 	}
 }
 
+/// A peer entry dials the gateway socket of its peer, and its route key names
+/// the peer and the type.
 #[test]
 fn entry_peer_dials_gateway_not_route_key() {
 	let entry = peer_entry(b"calc", b"fp");
@@ -399,9 +399,10 @@ fn entry_peer_dials_gateway_not_route_key() {
 	assert_eq!(entry.route_key().get(2), Some(&0));
 }
 
+/// The peer entries hold the peer routes alone.
 #[test]
-fn peer_entries_filters_by_route_kind() -> Result<(), ClusterError> {
-	let registry = registry();
+fn peer_entries_filters_by_route_kind() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"local", b"calc", b"hive1"))?;
 
 	let peer = peer_entry(b"calc", b"peer-colony");
@@ -410,46 +411,46 @@ fn peer_entries_filters_by_route_kind() -> Result<(), ClusterError> {
 	registry.add(peer)?;
 
 	let peers = registry.peer_entries()?;
-	let keys: Vec<SharedId> = peers.iter().map(|entry| Arc::clone(entry.route_key())).collect();
-	assert_eq!(keys, vec![route_key]);
+	assert_eq!(route_keys(&peers), vec![route_key]);
 	Ok(())
 }
 
+/// The peer entries leave out a route at its abandonment limit.
 #[test]
-fn peer_entries_excludes_abandoned() -> Result<(), ClusterError> {
-	let limit = 2;
-	let registry = registry_abandoning_after(limit);
-	let peer = peer_entry_limit(b"calc", b"peer-colony", limit);
+fn peer_entries_excludes_abandoned() -> TestResult {
+	let registry = registry_abandoning_after(LIMIT);
+	let peer = peer_entry_limit(b"calc", b"peer-colony", LIMIT);
 	let route_key = Arc::clone(peer.route_key());
 	registry.add(peer)?;
 
-	weaken_times(&registry, &route_key, limit)?;
+	weaken_times(&registry, &route_key, LIMIT);
 
 	let peers = registry.peer_entries()?;
 	assert!(peers.is_empty());
 	Ok(())
 }
 
-#[test]
-fn local_entries_for_type_excludes_peer_routes() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(named_entry(b"local", b"calc", b"hive1"))?;
-	registry.add(peer_entry(b"calc", b"peer-colony"))?;
-
-	let local = registry.local_entries_for_type(&type_key(b"calc"))?;
-	let keys: Vec<SharedId> = local.iter().map(|entry| Arc::clone(entry.route_key())).collect();
-	assert_eq!(keys, vec![SharedId::from(b"local".as_slice())]);
-	Ok(())
+/// A route of `calc` that a peer advertises.
+fn calc_peer_route() -> ServletEntry {
+	peer_entry(b"calc", b"peer-colony")
 }
 
-#[test]
-fn local_entries_for_type_empty_when_only_peer_routes() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(peer_entry(b"calc", b"peer-colony"))?;
-
-	let local = registry.local_entries_for_type(&type_key(b"calc"))?;
-	assert!(local.is_empty());
-	Ok(())
+// The local entries of a type hold its local routes alone, beside a peer
+// route of the type or with none but peer routes.
+tb_cases! {
+	fn local_entries_for_type_holds_only_local_routes((seed, local): (Vec<ServletEntry>, Vec<SharedId>)) -> TestResult {
+		let registry = registry_holding(seed);
+		let entries = registry.local_entries_for_type(&type_key(b"calc"))?;
+		assert_eq!(route_keys(&entries), local);
+		Ok(())
+	}
+	cases {
+		beside_a_peer_route => (
+			vec![named_entry(b"local", b"calc", b"hive1"), calc_peer_route()],
+			vec![SharedId::from(b"local".as_slice())],
+		),
+		with_only_peer_routes => (vec![calc_peer_route()], Vec::new()),
+	}
 }
 
 /// Races two slates for one peer bucket against a reader, and answers
@@ -484,9 +485,11 @@ fn race_peer_slates(registry: &ServletRegistry) -> bool {
 	saw_empty.load(Ordering::Relaxed)
 }
 
+/// Two slates for one bucket reconcile one at a time, so a reader sees the
+/// bucket held.
 #[test]
-fn reconcile_peer_slate_serializes_concurrent_slates() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_serializes_concurrent_slates() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	install_peer_slate(&registry, b"gw", vec![peer_entry(b"urn:t:a", b"gw")])?;
 
 	let saw_empty = race_peer_slates(&registry);
@@ -495,9 +498,11 @@ fn reconcile_peer_slate_serializes_concurrent_slates() -> Result<(), ClusterErro
 	Ok(())
 }
 
+/// The local servlets name each type of a local route once, and leave out a
+/// type that a peer route alone serves.
 #[test]
-fn local_servlets_dedups_and_excludes_peer_routes() -> Result<(), ClusterError> {
-	let registry = registry();
+fn local_servlets_dedups_and_excludes_peer_routes() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"a1", b"calc", b"hive1"))?;
 	registry.add(named_entry(b"a2", b"calc", b"hive1"))?;
 	registry.add(named_entry(b"a3", b"echo", b"hive1"))?;
@@ -512,8 +517,8 @@ fn local_servlets_dedups_and_excludes_peer_routes() -> Result<(), ClusterError> 
 /// names the type once. The type index lives in this registry alone, so it
 /// answers the fan-out the balancer picks from.
 #[test]
-fn two_hives_serving_one_type_both_yield_routes() -> Result<(), ClusterError> {
-	let registry = registry();
+fn two_hives_serving_one_type_both_yield_routes() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"a1", b"calc", b"hive1"))?;
 	registry.add(named_entry(b"a2", b"calc", b"hive2"))?;
 
@@ -523,9 +528,10 @@ fn two_hives_serving_one_type_both_yield_routes() -> Result<(), ClusterError> {
 	Ok(())
 }
 
+/// The local servlets follow each add and each removal of a local route.
 #[test]
-fn local_servlets_tracks_adds_and_removes() -> Result<(), ClusterError> {
-	let registry = registry();
+fn local_servlets_tracks_adds_and_removes() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"a1", b"calc", b"hive1"))?;
 	registry.add(named_entry(b"a2", b"echo", b"hive1"))?;
 	registry.remove(b"a2")?;
@@ -535,18 +541,20 @@ fn local_servlets_tracks_adds_and_removes() -> Result<(), ClusterError> {
 	Ok(())
 }
 
+/// A peer slate installs a route for each type it names.
 #[test]
-fn reconcile_peer_slate_installs_multi_type_slate() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_installs_multi_type_slate() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let slate = vec![peer_entry(b"urn:t:a", b"gw"), peer_entry(b"urn:t:b", b"gw")];
 	install_peer_slate(&registry, b"gw", slate)?;
 	assert_eq!(registry.peer_entries()?.len(), 2);
 	Ok(())
 }
 
+/// A peer slate prunes each route of its bucket that it leaves out.
 #[test]
-fn reconcile_peer_slate_prunes_stale_routes() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_prunes_stale_routes() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let full = vec![peer_entry(b"urn:t:a", b"gw"), peer_entry(b"urn:t:b", b"gw")];
 
 	install_peer_slate(&registry, b"gw", full)?;
@@ -564,8 +572,10 @@ type SlateTypes = &'static [&'static [u8]];
 // A second slate for one bucket counts the routes it adds and the routes it
 // leaves out, and a route both slates name counts as neither.
 tb_cases! {
-	fn reconcile_peer_slate_counts_what_the_slate_changed((first, second, expected): (SlateTypes, SlateTypes, (usize, usize))) -> Result<(), ClusterError> {
-		let registry = registry();
+	fn reconcile_peer_slate_counts_what_the_slate_changed(
+		(first, second, expected): (SlateTypes, SlateTypes, (usize, usize))
+	) -> TestResult {
+		let registry = ServletRegistry::fixture();
 		let slate = |types: SlateTypes| types.iter().map(|servlet| peer_entry(servlet, b"gw")).collect::<Vec<_>>();
 		install_peer_slate(&registry, b"gw", slate(first))?;
 
@@ -582,9 +592,10 @@ tb_cases! {
 	}
 }
 
+/// A first slate for a bucket counts each of its routes as installed.
 #[test]
-fn reconcile_peer_slate_counts_a_first_slate_as_installed() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_counts_a_first_slate_as_installed() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let slate = vec![peer_entry(b"urn:t:a", b"gw"), peer_entry(b"urn:t:b", b"gw")];
 
 	let change = install_peer_slate(&registry, b"gw", slate)?;
@@ -593,9 +604,10 @@ fn reconcile_peer_slate_counts_a_first_slate_as_installed() -> Result<(), Cluste
 	Ok(())
 }
 
+/// A peer slate and its withdrawal leave the local routes of a type in place.
 #[test]
-fn reconcile_peer_slate_leaves_local_routes_untouched() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_leaves_local_routes_untouched() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"local", b"urn:t:a", b"hive1"))?;
 
 	install_peer_slate(&registry, b"gw", vec![peer_entry(b"urn:t:a", b"gw")])?;
@@ -606,9 +618,11 @@ fn reconcile_peer_slate_leaves_local_routes_untouched() -> Result<(), ClusterErr
 	Ok(())
 }
 
+/// A refreshed slate keeps the pheromone and the trials of each route it
+/// carries over, and takes the dial it names.
 #[test]
-fn reconcile_peer_slate_preserves_peer_trail_state() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_preserves_peer_trail_state() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let first = peer_entry(b"urn:t:a", b"fp");
 	let route = Arc::clone(first.route_key());
 
@@ -641,43 +655,13 @@ fn reconcile_peer_slate_preserves_peer_trail_state() -> Result<(), ClusterError>
 	Ok(())
 }
 
-/// The slate `hive1` registers at the fixture gateway socket.
-fn local_at_the_gateway_socket() -> HiveSlate {
-	hive_slate(b"hive1", vec![named_entry(b"127.0.0.1:9000", b"calc", b"hive1")])
-}
-
-/// The advertisement `gw` sends from the fixture gateway socket.
-fn peer_at_the_gateway_socket() -> AdmittedPeerAd {
-	admitted(b"gw", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"gw")])
-}
-
-// A peer may not advertise a socket at which the gateway dials a local servlet.
-#[test]
-fn a_peer_cannot_dial_a_local_servlets_socket() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.reconcile_by_hive(local_at_the_gateway_socket())?;
-
-	let refused = registry.reconcile_peer_slate(peer_at_the_gateway_socket(), PeerCaps::default());
-	assert!(matches!(refused, Err(ClusterError::PeerSlateConflict)));
-	assert_eq!(registry.len()?, 1);
-	Ok(())
-}
-
-// A hive may not register a servlet at a socket where the gateway dials a peer
-// gateway. The one decider on the dial axis judges this reverse collision too.
-#[test]
-fn a_hive_cannot_register_a_peer_gateways_socket() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.reconcile_peer_slate(peer_at_the_gateway_socket(), PeerCaps::default())?;
-
-	let refused = registry.reconcile_by_hive(local_at_the_gateway_socket());
-	assert!(matches!(refused, Err(ClusterError::ServletNotOwned)));
-	assert_eq!(registry.len()?, 1);
-	Ok(())
-}
-
-/// A second owner's claim on `claimed`, placed against the registry.
+/// One owner's claim on `claimed`, placed against the registry.
 type Claim = fn(&ServletRegistry, &[u8]) -> Result<(), ClusterError>;
+
+/// The hive `hive1` that registers a servlet at `claimed`.
+fn claimed_by_the_hive(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
+	registry.reconcile_by_hive(HiveSlate::of(b"hive1", vec![named_entry(claimed, b"calc", b"hive1")]))
+}
 
 /// A peer `gw` that claims `claimed` as its gateway socket.
 fn claimed_by_a_peer(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
@@ -688,34 +672,89 @@ fn claimed_by_a_peer(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), C
 
 /// A second hive that registers a servlet at `claimed`.
 fn claimed_by_another_hive(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
-	registry.reconcile_by_hive(hive_slate(b"hive2", vec![named_entry(claimed, b"calc", b"hive2")]))
+	registry.reconcile_by_hive(HiveSlate::of(b"hive2", vec![named_entry(claimed, b"calc", b"hive2")]))
 }
 
-// The registry refuses another owner's socket under any spelling, to a second
-// hive as to a peer, because a dual-stack host, a scope id, and a wildcard
-// listener each reach one socket by more than one spelling (CWE-706, CWE-639).
+/// The first owner's claim and its socket, the second owner's claim and its
+/// spelling of the socket, and the refusal of the second claim.
+type Collision = (Claim, &'static [u8], Claim, &'static [u8], ClusterError);
+
+// The registry refuses a socket that another owner holds, under any
+// spelling, to a second hive as to a peer, because a dual-stack host, a
+// scope id, and a wildcard listener each reach one socket by more than one
+// spelling (CWE-706, CWE-639). A peer may not advertise a socket at which
+// the gateway dials a local servlet, and the one decider on the dial axis
+// judges the reverse collision too: a hive may not register a servlet at a
+// socket where the gateway dials a peer gateway.
 tb_cases! {
-	fn a_socket_another_owner_holds_is_refused_under_any_spelling((local, claimed, claim, expected): (&[u8], &[u8], Claim, ClusterError)) -> Result<(), ClusterError> {
-		let registry = registry();
-		registry.reconcile_by_hive(hive_slate(b"hive1", vec![named_entry(local, b"calc", b"hive1")]))?;
+	fn a_socket_another_owner_holds_is_refused_under_any_spelling(
+		(held, socket, claim, claimed, expected): Collision
+	) -> TestResult {
+		let registry = ServletRegistry::fixture();
+		held(&registry, socket)?;
 
 		let refused = claim(&registry, claimed);
-		assert_eq!(refused.map_err(|error| discriminant(&error)), Err(discriminant(&expected)));
+		assert_eq!(ClusterError::variant_of(&refused), Some(discriminant(&expected)));
 		assert_eq!(registry.len()?, 1);
 		Ok(())
 	}
 	cases {
-		peer_by_the_mapped_spelling => (b"127.0.0.1:9000", b"[::ffff:127.0.0.1]:9000", claimed_by_a_peer, ClusterError::PeerSlateConflict),
-		peer_by_a_scoped_spelling => (b"[::1]:9000", b"[::1%7]:9000", claimed_by_a_peer, ClusterError::PeerSlateConflict),
-		peer_at_the_loopback_of_a_wildcard_servlet => (b"0.0.0.0:9000", b"127.0.0.1:9000", claimed_by_a_peer, ClusterError::PeerSlateConflict),
-		hive_by_the_mapped_spelling => (b"127.0.0.1:9000", b"[::ffff:127.0.0.1]:9000", claimed_by_another_hive, ClusterError::ServletNotOwned),
-		hive_by_a_scoped_spelling => (b"[::1]:9000", b"[::1%7]:9000", claimed_by_another_hive, ClusterError::ServletNotOwned),
+		peer_by_the_same_spelling => (
+			claimed_by_the_hive,
+			b"127.0.0.1:9000",
+			claimed_by_a_peer,
+			b"127.0.0.1:9000",
+			ClusterError::PeerSlateConflict,
+		),
+		hive_after_a_peer_holds_it => (
+			claimed_by_a_peer,
+			b"127.0.0.1:9000",
+			claimed_by_another_hive,
+			b"127.0.0.1:9000",
+			ClusterError::ServletNotOwned,
+		),
+		peer_by_the_mapped_spelling => (
+			claimed_by_the_hive,
+			b"127.0.0.1:9000",
+			claimed_by_a_peer,
+			b"[::ffff:127.0.0.1]:9000",
+			ClusterError::PeerSlateConflict,
+		),
+		peer_by_a_scoped_spelling => (
+			claimed_by_the_hive,
+			b"[::1]:9000",
+			claimed_by_a_peer,
+			b"[::1%7]:9000",
+			ClusterError::PeerSlateConflict,
+		),
+		peer_at_the_loopback_of_a_wildcard_servlet => (
+			claimed_by_the_hive,
+			b"0.0.0.0:9000",
+			claimed_by_a_peer,
+			b"127.0.0.1:9000",
+			ClusterError::PeerSlateConflict,
+		),
+		hive_by_the_mapped_spelling => (
+			claimed_by_the_hive,
+			b"127.0.0.1:9000",
+			claimed_by_another_hive,
+			b"[::ffff:127.0.0.1]:9000",
+			ClusterError::ServletNotOwned,
+		),
+		hive_by_a_scoped_spelling => (
+			claimed_by_the_hive,
+			b"[::1]:9000",
+			claimed_by_another_hive,
+			b"[::1%7]:9000",
+			ClusterError::ServletNotOwned,
+		),
 	}
 }
 
+/// A peer may claim a socket at which no local route dials.
 #[test]
-fn a_peer_may_dial_a_socket_no_local_route_holds() -> Result<(), ClusterError> {
-	let registry = registry();
+fn a_peer_may_dial_a_socket_no_local_route_holds() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"127.0.0.1:9000", b"calc", b"hive1"))?;
 
 	let admitted_ad = admitted(
@@ -730,35 +769,27 @@ fn a_peer_may_dial_a_socket_no_local_route_holds() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-#[test]
-fn slate_exceeds_caps_counts_gateways_and_routes() -> Result<(), ClusterError> {
-	let registry = registry();
-	install_peer_slate(&registry, b"fp1", vec![peer_entry(b"a", b"fp1")])?;
-	install_peer_slate(&registry, b"fp2", vec![peer_entry(b"a", b"fp2")])?;
+/// The caps of the peer plane at `max_identities` gateways and
+/// `max_routes` routes.
+fn peer_caps(max_identities: usize, max_routes: usize) -> KindCaps {
+	KindCaps { kind: RouteKind::Peer, max_identities, max_routes }
+}
 
-	assert!(routes(&registry).slate_exceeds_caps(
-		b"fp3",
-		1,
-		KindCaps { kind: RouteKind::Peer, max_identities: 2, max_routes: 1024 }
-	));
-	assert!(!routes(&registry).slate_exceeds_caps(
-		b"fp1",
-		1,
-		KindCaps { kind: RouteKind::Peer, max_identities: 2, max_routes: 1024 }
-	));
-	// fp1 and fp2 hold one route each, so a five-route slate for fp1 leaves
-	// six routes, one over the cap of five.
-	assert!(routes(&registry).slate_exceeds_caps(
-		b"fp1",
-		5,
-		KindCaps { kind: RouteKind::Peer, max_identities: 64, max_routes: 5 }
-	));
-	assert!(!routes(&registry).slate_exceeds_caps(
-		b"fp1",
-		0,
-		KindCaps { kind: RouteKind::Peer, max_identities: 1, max_routes: 1 }
-	));
-	Ok(())
+// A slate past the cap of gateways or of routes exceeds the caps, and a
+// slate of a known gateway inside them does not. The gateways `fp1` and
+// `fp2` hold one route each, so a five-route slate for `fp1` leaves six
+// routes, one over a cap of five.
+tb_cases! {
+	fn slate_exceeds_caps((bucket, routes_after, caps, exceeds): (&[u8], usize, KindCaps, bool)) {
+		let registry = registry_holding([peer_entry(b"a", b"fp1"), peer_entry(b"a", b"fp2")]);
+		assert_eq!(routes(&registry).slate_exceeds_caps(bucket, routes_after, caps), exceeds);
+	}
+	cases {
+		a_new_gateway_past_the_identity_cap => (b"fp3", 1, peer_caps(2, 1024), true),
+		a_known_gateway_inside_the_identity_cap => (b"fp1", 1, peer_caps(2, 1024), false),
+		a_slate_past_the_route_cap => (b"fp1", 5, peer_caps(64, 5), true),
+		an_empty_slate_inside_any_cap => (b"fp1", 0, peer_caps(1, 1), false),
+	}
 }
 
 /// Races an older and a newer advertisement for one bucket and answers the
@@ -787,31 +818,28 @@ fn race_ad_orders(registry: &Arc<ServletRegistry>) -> Vec<SharedId> {
 		.collect()
 }
 
-// The order ledger and the installed slate are one decision, so after the last
-// ad applies, the ledger names the installed slate. A ledger below the
-// installed order would admit a replay older than that slate (CWE-294).
+/// The order ledger and the installed slate are one decision, so after the last
+/// ad applies, the ledger names the installed slate. A ledger below the
+/// installed order would admit a replay older than that slate (CWE-294).
 #[test]
 fn racing_ads_leave_the_ledger_naming_the_installed_slate() {
-	let registry = Arc::new(registry());
+	let registry = Arc::new(ServletRegistry::fixture());
 	let installed = race_ad_orders(&registry);
 	assert_eq!(installed, vec![SharedId::from(b"calc".as_slice())]);
 }
 
-// A fresh direct advertisement reconciles only the origin bucket, so the
-// fallback trail through the relay survives it.
+/// A fresh direct advertisement reconciles only the origin bucket, so the
+/// fallback trail through the relay survives it.
 #[test]
-fn direct_reconcile_preserves_relay_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
-	install_peer_slate(&registry, b"origin", vec![peer_entry(b"calc", b"origin")])?;
-
-	let trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
-	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
+fn direct_reconcile_preserves_relay_bucket() -> TestResult {
+	let registry = registry_with_a_relay_trail();
 
 	install_peer_slate(&registry, b"origin", vec![peer_entry(b"calc", b"origin")])?;
 
 	let entries = registry.peer_entries()?;
-	assert_eq!(entries.len(), 2);
-	assert!(entries.iter().any(|entry| entry.route_kind() == RouteKind::PeerRelay));
+	let calc = SharedId::from(b"calc".as_slice());
+	let expected = vec![(RouteKind::Peer, calc.clone()), (RouteKind::PeerRelay, calc)];
+	assert_eq!(kinds_and_types(&entries), expected);
 	Ok(())
 }
 
@@ -819,8 +847,8 @@ fn direct_reconcile_preserves_relay_bucket() -> Result<(), ClusterError> {
 /// of the peer that advertised it and the relay trail through it. Another
 /// peer's direct route stays.
 #[test]
-fn withdraw_peer_by_dial_drops_the_routes_that_dial_the_socket() -> Result<(), ClusterError> {
-	let registry = registry();
+fn withdraw_peer_by_dial_drops_the_routes_that_dial_the_socket() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
 
 	let through = relay_trail(b"peer-c", b"peer-a", b"echo", b"127.0.0.1:9000");
@@ -828,23 +856,22 @@ fn withdraw_peer_by_dial_drops_the_routes_that_dial_the_socket() -> Result<(), C
 
 	let other_slate = vec![peer_entry_dial(b"pong", b"peer-b", b"127.0.0.1:9001")];
 	let other = admitted(b"peer-b", b"127.0.0.1:9001", other_slate);
-	registry.reconcile_peer_slate(other, PeerCaps::default())?;
-	let withdrawn = registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 
+	registry.reconcile_peer_slate(other, PeerCaps::default())?;
+
+	let withdrawn = registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 	let live = registry.peer_entries()?;
-	let owners: Vec<SharedId> = live.iter().map(|entry| Arc::clone(entry.owner_id())).collect();
-	let kinds: Vec<RouteKind> = live.iter().map(|entry| entry.route_kind()).collect();
 	assert_eq!(withdrawn, NonZeroUsize::new(2));
-	assert_eq!(owners, vec![SharedId::from(b"peer-b".as_slice())]);
-	assert_eq!(kinds, vec![RouteKind::Peer]);
+	assert_eq!(owners(&live), vec![SharedId::from(b"peer-b".as_slice())]);
+	assert_eq!(kinds(&live), vec![RouteKind::Peer]);
 	Ok(())
 }
 
 /// The peer whose socket is withdrawn stays reachable through its fallback
 /// trail, because that trail dials the relay.
 #[test]
-fn withdraw_peer_by_dial_keeps_the_fallback_trail_through_another_relay() -> Result<(), ClusterError> {
-	let registry = registry();
+fn withdraw_peer_by_dial_keeps_the_fallback_trail_through_another_relay() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	install_peer_slate(&registry, b"peer-a", vec![peer_entry(b"ping", b"peer-a")])?;
 
 	let fallback = relay_trail(b"peer-a", b"peer-b", b"ping", b"127.0.0.1:9001");
@@ -860,8 +887,8 @@ fn withdraw_peer_by_dial_keeps_the_fallback_trail_through_another_relay() -> Res
 /// A hive route whose address spells the withdrawn socket stays, because the
 /// withdrawal acts on the peer plane alone.
 #[test]
-fn withdraw_peer_by_dial_keeps_a_local_route_at_the_socket() -> Result<(), ClusterError> {
-	let registry = registry();
+fn withdraw_peer_by_dial_keeps_a_local_route_at_the_socket() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"127.0.0.1:9000", b"calc", b"hive1"))?;
 
 	let withdrawn = registry.withdraw_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
@@ -871,34 +898,28 @@ fn withdraw_peer_by_dial_keeps_a_local_route_at_the_socket() -> Result<(), Clust
 	Ok(())
 }
 
+/// A relay trail replaces the routes of its own bucket alone, so the direct
+/// route of its origin stays.
 #[test]
-fn relay_reconcile_replaces_only_its_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
-	install_peer_slate(&registry, b"origin", vec![peer_entry(b"calc", b"origin")])?;
-	registry.reconcile_relay_trail(
-		relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"),
-		PeerCaps::default(),
-	)?;
+fn relay_reconcile_replaces_only_its_bucket() -> TestResult {
+	let registry = registry_with_a_relay_trail();
 
-	let replaced = relay_trail(b"origin", b"relay", b"sum", b"127.0.0.1:9001");
-	registry.reconcile_relay_trail(replaced, PeerCaps::default())?;
+	install_relay_trail(&registry, relay_trail(b"origin", b"relay", b"sum", b"127.0.0.1:9001"))?;
 
 	let entries = registry.peer_entries()?;
-	assert_eq!(entries.len(), 2);
-	assert!(entries.iter().any(|entry| entry.route_kind() == RouteKind::Peer));
-	assert!(entries
-		.iter()
-		.any(|entry| entry.route_kind() == RouteKind::PeerRelay && entry.servlet_type().as_ref() == b"sum"));
+	let (calc, sum) = (SharedId::from(b"calc".as_slice()), SharedId::from(b"sum".as_slice()));
+	let expected = vec![(RouteKind::Peer, calc), (RouteKind::PeerRelay, sum)];
+	assert_eq!(kinds_and_types(&entries), expected);
 	Ok(())
 }
 
-// A gateway at its direct cap admits a relay trail, because relay buckets
-// spend their own budget.
+/// A gateway at its direct cap admits a relay trail, because relay buckets
+/// spend their own budget.
 #[test]
-fn relay_buckets_do_not_spend_the_direct_gateway_cap() -> Result<(), ClusterError> {
-	let registry = registry();
+fn relay_buckets_do_not_spend_the_direct_gateway_cap() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let caps = PeerCaps { max_gateways: 1, max_relay_buckets: 1, ..Default::default() };
-	let ad = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	let ad = origin_ad(0);
 
 	registry.reconcile_peer_slate(ad, caps)?;
 	registry.reconcile_relay_trail(relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"), caps)?;
@@ -907,11 +928,11 @@ fn relay_buckets_do_not_spend_the_direct_gateway_cap() -> Result<(), ClusterErro
 	Ok(())
 }
 
-// A member that relays many origins creates one bucket per (origin, relay)
-// pair, so the relay-bucket cap bounds how far relay spam inflates buckets.
+/// A member that relays many origins creates one bucket per (origin, relay)
+/// pair, so the relay-bucket cap bounds how far relay spam inflates buckets.
 #[test]
-fn relay_bucket_cap_refuses_extra_buckets() -> Result<(), ClusterError> {
-	let registry = registry();
+fn relay_bucket_cap_refuses_extra_buckets() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let caps = PeerCaps { max_relay_buckets: 1, ..Default::default() };
 
 	registry.reconcile_relay_trail(relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"), caps)?;
@@ -921,43 +942,31 @@ fn relay_bucket_cap_refuses_extra_buckets() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// An origin that withdraws its whole direct slate withdraws its relay
-// fallbacks with it: a relay trail lasts as long as a direct claim.
+/// An origin that withdraws its whole direct slate withdraws its relay
+/// fallbacks with it: a relay trail lasts as long as a direct claim.
 #[test]
-fn empty_direct_slate_clears_relay_trails_for_origin() -> Result<(), ClusterError> {
-	let registry = registry();
-	install_peer_slate(&registry, b"origin", vec![peer_entry(b"calc", b"origin")])?;
-	registry.reconcile_relay_trail(
-		relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"),
-		PeerCaps::default(),
-	)?;
-
+fn empty_direct_slate_clears_relay_trails_for_origin() -> TestResult {
+	let registry = registry_with_a_relay_trail();
 	install_peer_slate(&registry, b"origin", Vec::new())?;
-
 	assert!(registry.peer_entries()?.is_empty());
 	Ok(())
 }
 
-// An emptied direct slate counts the relay trails it withdraws with the
-// direct routes, because both leave in the one step.
+/// An emptied direct slate counts the relay trails it withdraws with the
+/// direct routes, because both leave in the one step.
 #[test]
-fn empty_direct_slate_counts_the_relay_trails_it_withdraws() -> Result<(), ClusterError> {
-	let registry = registry();
-	install_peer_slate(&registry, b"origin", vec![peer_entry(b"calc", b"origin")])?;
-
-	let trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
-	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
-
+fn empty_direct_slate_counts_the_relay_trails_it_withdraws() -> TestResult {
+	let registry = registry_with_a_relay_trail();
 	let change = install_peer_slate(&registry, b"origin", Vec::new())?;
 	assert_eq!(counts(change), (0, 2));
 	Ok(())
 }
 
-// A relay trail is new when its bucket held no route. A refresh of the
-// trail, or a trail that replaces its type, finds the bucket held.
+/// A relay trail is new when its bucket held no route. A refresh of the
+/// trail, or a trail that replaces its type, finds the bucket held.
 #[test]
-fn a_relay_trail_opens_its_bucket_once() -> Result<(), ClusterError> {
-	let registry = registry();
+fn a_relay_trail_opens_its_bucket_once() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let trail = |servlet_type: &[u8]| relay_trail(b"origin", b"relay", servlet_type, b"127.0.0.1:9001");
 	let first = registry.reconcile_relay_trail(trail(b"calc"), PeerCaps::default())?;
 	let refreshed = registry.reconcile_relay_trail(trail(b"calc"), PeerCaps::default())?;
@@ -968,47 +977,49 @@ fn a_relay_trail_opens_its_bucket_once() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// A replayed advertisement older than the newest applied one must not
-// regress a direct bucket.
-#[test]
-fn stale_ad_order_is_refused_for_a_direct_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
-	let fresh = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20);
+/// An install of the route of `calc` that `origin` dials at `dial`, issued
+/// at `order`, on one plane.
+type Install = fn(&ServletRegistry, &[u8], u64) -> Result<(), ClusterError>;
 
-	registry.reconcile_peer_slate(fresh, PeerCaps::default())?;
-
-	let replayed = admitted_with_order(b"origin", b"127.0.0.1:9666", vec![peer_entry(b"calc", b"origin")], 10);
-	let refused = registry.reconcile_peer_slate(replayed, PeerCaps::default());
-	assert!(matches!(refused, Err(ClusterError::StalePeerAd)));
-	Ok(())
+/// Installs the direct slate of `origin` at `dial`, issued at `order`.
+fn direct_at(registry: &ServletRegistry, dial: &[u8], order: u64) -> Result<(), ClusterError> {
+	let ad = admitted_with_order(b"origin", dial, vec![peer_entry_dial(b"calc", b"origin", dial)], order);
+	registry.reconcile_peer_slate(ad, PeerCaps::default()).map(drop)
 }
 
-// A replayed advertisement older than the newest applied one must not
-// regress a relay bucket either.
-#[test]
-fn stale_ad_order_is_refused_for_a_relay_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
-	let trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
-
-	registry.reconcile_relay_trail(RelayTrail { order: UnixMillis::new(20), ..trail }, PeerCaps::default())?;
-
-	let replayed = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9666");
-	let refused =
-		registry.reconcile_relay_trail(RelayTrail { order: UnixMillis::new(10), ..replayed }, PeerCaps::default());
-
-	assert!(matches!(refused, Err(ClusterError::StalePeerAd)));
-	Ok(())
+/// Installs the relay trail of `origin` through `relay` at `dial`, issued at
+/// `order`.
+fn relay_at(registry: &ServletRegistry, dial: &[u8], order: u64) -> Result<(), ClusterError> {
+	let trail = RelayTrail { order: UnixMillis::new(order), ..relay_trail(b"origin", b"relay", b"calc", dial) };
+	registry.reconcile_relay_trail(trail, PeerCaps::default()).map(drop)
 }
 
-// The order ledger keys per bucket: an equal-order refresh reconciles,
-// and each bucket's order gates that bucket alone.
+// A replayed advertisement older than the newest applied one regresses no
+// bucket, direct or relay.
+tb_cases! {
+	fn a_stale_ad_order_is_refused(install: Install) -> TestResult {
+		let registry = ServletRegistry::fixture();
+		install(&registry, b"127.0.0.1:9001", 20)?;
+
+		let refused = install(&registry, b"127.0.0.1:9666", 10);
+		assert!(matches!(refused, Err(ClusterError::StalePeerAd)));
+		Ok(())
+	}
+	cases {
+		for_a_direct_bucket => direct_at,
+		for_a_relay_bucket => relay_at,
+	}
+}
+
+/// The order ledger keys per bucket: an equal-order refresh reconciles,
+/// and each bucket's order gates that bucket alone.
 #[test]
-fn equal_ad_order_reconciles_idempotently() -> Result<(), ClusterError> {
-	let registry = registry();
-	let first = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20);
+fn equal_ad_order_reconciles_idempotently() -> TestResult {
+	let registry = ServletRegistry::fixture();
+	let first = origin_ad(20);
 	registry.reconcile_peer_slate(first, PeerCaps::default())?;
 
-	let refresh = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20);
+	let refresh = origin_ad(20);
 	registry.reconcile_peer_slate(refresh, PeerCaps::default())?;
 	registry.reconcile_relay_trail(
 		relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"),
@@ -1019,40 +1030,40 @@ fn equal_ad_order_reconciles_idempotently() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// A withdrawal leaves a tombstone in the order ledger, so the registry
-// refuses a replayed older advertisement inside the freshness window, and the
-// routes the origin withdrew stay withdrawn.
+/// A withdrawal leaves a tombstone in the order ledger, so the registry
+/// refuses a replayed older advertisement inside the freshness window, and the
+/// routes the origin withdrew stay withdrawn.
 #[test]
-fn withdrawal_tombstone_refuses_older_ad_reinstall() -> Result<(), ClusterError> {
+fn withdrawal_tombstone_refuses_older_ad_reinstall() -> TestResult {
 	// The unbounded window pins the retain rule itself: the outcome
 	// must not depend on how much time elapses between statements.
-	let clock = manual_clock();
+	let clock = TestClock::manual();
 	let registry = registry_on(&clock).with_ad_tombstone_window(Duration::MAX);
 	let issued = clock.unix().get();
-	let install = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
+	let install = origin_ad(issued);
 	registry.reconcile_peer_slate(install, PeerCaps::default())?;
 
-	let withdrawal = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![], issued + 1);
+	let withdrawal = origin_withdrawal(issued + 1);
 	registry.reconcile_peer_slate(withdrawal, PeerCaps::default())?;
 
-	let replayed = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
+	let replayed = origin_ad(issued);
 	let result = registry.reconcile_peer_slate(replayed, PeerCaps::default());
 	assert!(matches!(result, Err(ClusterError::StalePeerAd)));
 	Ok(())
 }
 
-// Past the window the freshness gate refuses the replayed frame
-// itself, so the ledger prunes the dead bucket's tombstone and stays
-// bounded.
+/// Past the window the freshness gate refuses the replayed frame
+/// itself, so the ledger prunes the dead bucket's tombstone and stays
+/// bounded.
 #[test]
-fn expired_tombstone_prunes_from_the_ledger() -> Result<(), ClusterError> {
-	let clock = manual_clock();
+fn expired_tombstone_prunes_from_the_ledger() -> TestResult {
+	let clock = TestClock::manual();
 	let registry = registry_on(&clock).with_ad_tombstone_window(Duration::ZERO);
 	let issued = clock.unix().get().saturating_sub(10);
-	let install = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
+	let install = origin_ad(issued);
 	registry.reconcile_peer_slate(install, PeerCaps::default())?;
 
-	let withdrawal = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![], issued + 1);
+	let withdrawal = origin_withdrawal(issued + 1);
 	registry.reconcile_peer_slate(withdrawal, PeerCaps::default())?;
 
 	assert_eq!(routes(&registry).ad_order_rows(), 0);
@@ -1063,7 +1074,7 @@ fn expired_tombstone_prunes_from_the_ledger() -> Result<(), ClusterError> {
 /// for `origin`, both installed at the clock's start.
 fn registry_with_relay_trail(clock: &Arc<ManualClock>) -> ServletRegistry {
 	let registry = registry_on(clock);
-	let ad = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	let ad = origin_ad(0);
 	registry
 		.reconcile_peer_slate(ad, PeerCaps::default())
 		.expect("the direct slate installs");
@@ -1075,16 +1086,39 @@ fn registry_with_relay_trail(clock: &Arc<ManualClock>) -> ServletRegistry {
 	registry
 }
 
+/// The registry of [`registry_with_relay_trail`] on a clock that the test
+/// leaves still.
+fn registry_with_a_relay_trail() -> ServletRegistry {
+	registry_with_relay_trail(&TestClock::manual())
+}
+
+/// The rank of `kind` in the order local, peer, relay, which sorts the
+/// route kinds a test reads.
+fn rank(kind: RouteKind) -> u8 {
+	match kind {
+		RouteKind::Local => 0,
+		RouteKind::Peer => 1,
+		RouteKind::PeerRelay => 2,
+	}
+}
+
+/// The route kind and the servlet type of each of `entries`, sorted by
+/// kind.
+fn kinds_and_types(entries: &[Arc<ServletEntry>]) -> Vec<(RouteKind, SharedId)> {
+	let mut read: Vec<(RouteKind, SharedId)> = entries
+		.iter()
+		.map(|entry| (entry.route_kind(), Arc::clone(entry.servlet_type())))
+		.collect();
+	read.sort_by_key(|(kind, _)| rank(*kind));
+	read
+}
+
 /// The route kinds left in a registry after a prune at `max_age`, and how
 /// many routes that prune dropped.
 fn kinds_after_prune(registry: &ServletRegistry, max_age: Duration) -> Result<(usize, Vec<RouteKind>), ClusterError> {
 	let pruned = registry.prune_stale_relay_trails(max_age)?.map_or(0, NonZeroUsize::get);
-	let mut kinds: Vec<RouteKind> = registry.peer_entries()?.iter().map(|entry| entry.route_kind()).collect();
-	kinds.sort_by_key(|kind| match kind {
-		RouteKind::Local => 0,
-		RouteKind::Peer => 1,
-		RouteKind::PeerRelay => 2,
-	});
+	let mut kinds = kinds(&registry.peer_entries()?);
+	kinds.sort_by_key(|kind| rank(*kind));
 
 	Ok((pruned, kinds))
 }
@@ -1093,8 +1127,8 @@ fn kinds_after_prune(registry: &ServletRegistry, max_age: Duration) -> Result<(u
 // the retirement signal. A trail exactly at the age stays, so the boundary
 // row pins `>` against `>=`. The prune leaves direct trails in place.
 tb_cases! {
-	fn prune_stale_relay_trails_judges_age((elapsed, pruned, kinds): (Duration, usize, Vec<RouteKind>)) -> Result<(), ClusterError> {
-		let clock = manual_clock();
+	fn prune_stale_relay_trails_judges_age((elapsed, pruned, kinds): (Duration, usize, Vec<RouteKind>)) -> TestResult {
+		let clock = TestClock::manual();
 		let registry = registry_with_relay_trail(&clock);
 
 		clock.advance(elapsed);
@@ -1114,8 +1148,8 @@ tb_cases! {
 /// A trail that a reconcile refreshes ages from the refresh, on the
 /// registry's clock, so the prune keeps it.
 #[test]
-fn a_refreshed_relay_trail_survives_the_prune() -> Result<(), ClusterError> {
-	let clock = manual_clock();
+fn a_refreshed_relay_trail_survives_the_prune() -> TestResult {
+	let clock = TestClock::manual();
 	let registry = registry_with_relay_trail(&clock);
 
 	clock.advance(Duration::from_secs(601));
@@ -1131,22 +1165,26 @@ fn a_refreshed_relay_trail_survives_the_prune() -> Result<(), ClusterError> {
 // `weaken_peer` weakens every trail attributed to an identity: its own
 // direct routes, the relay trails learned for it, and every relay trail
 // that forwards through it.
-#[test]
-fn weaken_peer_scores_relay_trails_through_the_peer() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(peer_entry(b"urn:t:a", b"relay"))?;
+tb_cases! {
+	fn weaken_peer_scores_every_trail_of_the_identity((peer, weakened): (&[u8], usize)) -> TestResult {
+		let registry = registry_holding([peer_entry(b"urn:t:a", b"relay")]);
+		install_relay_trail(&registry, relay_trail(b"origin", b"relay", b"urn:t:a", b"127.0.0.1:9001"))?;
 
-	let trail = relay_trail(b"origin", b"relay", b"urn:t:a", b"127.0.0.1:9001");
-	registry.reconcile_relay_trail(trail, PeerCaps::default())?;
-
-	assert_eq!(registry.weaken_peer(b"relay")?.count(), 2);
-	assert_eq!(registry.weaken_peer(b"origin")?.count(), 1);
-	Ok(())
+		let reached = registry.weaken_peer(peer)?;
+		assert_eq!(reached.count(), weakened);
+		Ok(())
+	}
+	cases {
+		through_the_relay => (b"relay", 2),
+		learned_for_the_origin => (b"origin", 1),
+	}
 }
 
+/// A slate of a new gateway past the cap of gateways is refused, and the routes
+/// held stay.
 #[test]
-fn reconcile_peer_slate_refuses_over_gateway_cap() -> Result<(), ClusterError> {
-	let registry = registry();
+fn reconcile_peer_slate_refuses_over_gateway_cap() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	let caps = PeerCaps { max_gateways: 1, ..Default::default() };
 	let first_ad = admitted(b"fp1", b"127.0.0.1:9000", vec![peer_entry(b"a", b"fp1")]);
 
@@ -1171,12 +1209,12 @@ fn reconcile_peer_slate_refuses_over_gateway_cap() -> Result<(), ClusterError> {
 fn rounds_with_one_plane_holding_the_bucket(rounds: usize) -> usize {
 	(0..rounds)
 		.filter(|_| {
-			let registry = registry();
+			let registry = ServletRegistry::fixture();
 			// Either racer may be the one refused, so the test discards both
 			// outcomes and reads what the bucket holds afterwards.
 			thread::scope(|scope| {
 				scope.spawn(|| {
-					let slate = hive_slate(b"gw", vec![named_entry(b"gw", b"calc", b"gw")]);
+					let slate = HiveSlate::of(b"gw", vec![named_entry(b"gw", b"calc", b"gw")]);
 					let _outcome = registry.reconcile_by_hive(slate);
 				});
 				scope.spawn(|| {
@@ -1195,6 +1233,8 @@ fn rounds_with_one_plane_holding_the_bucket(rounds: usize) -> usize {
 		.count()
 }
 
+/// A local install and a peer slate that race for one bucket leave it to one
+/// plane.
 #[test]
 fn racing_slates_for_one_bucket_leave_it_to_one_plane() {
 	let rounds = 500;
@@ -1202,13 +1242,13 @@ fn racing_slates_for_one_bucket_leave_it_to_one_plane() {
 	assert_eq!(settled, rounds);
 }
 
-// The registry refuses a peer advertisement whose bucket bytes equal a hive
-// id once that hive's routes sit under the bucket, because the hive and the
-// peer are different owners even when their bytes agree (CWE-639).
+/// The registry refuses a peer advertisement whose bucket bytes equal a hive
+/// id once that hive's routes sit under the bucket, because the hive and the
+/// peer are different owners even when their bytes agree (CWE-639).
 #[test]
-fn a_peer_cannot_advertise_under_a_hives_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.reconcile_by_hive(hive_slate(b"gw", vec![named_entry(b"addr1", b"calc", b"gw")]))?;
+fn a_peer_cannot_advertise_under_a_hives_bucket() -> TestResult {
+	let registry = ServletRegistry::fixture();
+	registry.reconcile_by_hive(HiveSlate::of(b"gw", vec![named_entry(b"addr1", b"calc", b"gw")]))?;
 
 	let refused = install_peer_slate(&registry, b"gw", vec![peer_entry(b"calc", b"gw")]);
 	assert!(matches!(refused, Err(ClusterError::PeerSlateConflict)));
@@ -1217,26 +1257,27 @@ fn a_peer_cannot_advertise_under_a_hives_bucket() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-// A hive whose id equals a peer's fingerprint bytes may not register
-// under that bucket: the slate swap would sweep the peer's routes, so the
-// one decider refuses the sweep before anything moves (CWE-639).
+/// A hive whose id equals a peer's fingerprint bytes may not register
+/// under that bucket: the slate swap would sweep the peer's routes, so the
+/// one decider refuses the sweep before anything moves (CWE-639).
 #[test]
-fn a_hive_cannot_sweep_a_peers_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
+fn a_hive_cannot_sweep_a_peers_bucket() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	install_peer_slate(&registry, b"peer", vec![peer_entry(b"calc", b"peer")])?;
 
-	let refused = registry.reconcile_by_hive(hive_slate(b"peer", vec![named_entry(b"local-addr", b"calc", b"peer")]));
+	let refused =
+		registry.reconcile_by_hive(HiveSlate::of(b"peer", vec![named_entry(b"local-addr", b"calc", b"peer")]));
 	assert!(matches!(refused, Err(ClusterError::ServletNotOwned)));
 	assert!(routes(&registry).get(b"local-addr").is_none());
 	assert_eq!(registry.peer_entries()?.len(), 1);
 	Ok(())
 }
 
-// The retirement of a hive takes only the routes it owns, so a peer's routes
-// under the same bucket bytes survive it.
+/// The retirement of a hive takes only the routes it owns, so a peer's routes
+/// under the same bucket bytes survive it.
 #[test]
-fn removing_a_hive_leaves_a_peers_routes_under_the_same_bucket() -> Result<(), ClusterError> {
-	let registry = registry();
+fn removing_a_hive_leaves_a_peers_routes_under_the_same_bucket() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	install_peer_slate(&registry, b"shared", vec![peer_entry(b"calc", b"shared")])?;
 
 	let removed = registry.remove_by_hive(b"shared")?;
@@ -1245,48 +1286,49 @@ fn removing_a_hive_leaves_a_peers_routes_under_the_same_bucket() -> Result<(), C
 	Ok(())
 }
 
-// The registry admits a peer advertisement when a local servlet shares its
-// bucket bytes as an address: the keys and sockets differ, so both routes
-// stay.
+/// The registry admits a peer advertisement when a local servlet shares its
+/// bucket bytes as an address: the keys and sockets differ, so both routes
+/// stay.
 #[test]
-fn a_peer_may_share_bytes_with_a_local_address() -> Result<(), ClusterError> {
-	let registry = registry();
+fn a_peer_may_share_bytes_with_a_local_address() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"gw", b"calc", b"hive1"))?;
 	install_peer_slate(&registry, b"gw", vec![peer_entry(b"calc", b"gw")])?;
 	assert_eq!(registry.len()?, 2);
 	Ok(())
 }
 
+/// An added route resolves by its servlet type.
 #[test]
-fn registry_add_and_lookup() -> Result<(), ClusterError> {
-	let registry = registry();
+fn an_added_route_resolves_by_its_type() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"addr1", b"calculator", b"hive1"))?;
 
 	let found = registry.entries_for_type(&type_key(b"calculator"))?;
-	let keys: Vec<SharedId> = found.iter().map(|entry| Arc::clone(entry.route_key())).collect();
-	assert_eq!(keys, vec![SharedId::from(b"addr1".as_slice())]);
+	assert_eq!(route_keys(&found), vec![SharedId::from(b"addr1".as_slice())]);
 	Ok(())
 }
 
-fn seed_reregistered_registry() -> Result<ServletRegistry, ClusterError> {
-	let registry = registry();
-	registry.add(named_entry(b"addr1", b"calculator", b"hive1"))?;
-	registry.add(named_entry(b"addr1", b"calculator", b"hive1"))?;
-	Ok(registry)
+/// A registry that registered one route twice at one address.
+fn seed_reregistered_registry() -> ServletRegistry {
+	let route = || named_entry(b"addr1", b"calculator", b"hive1");
+	registry_holding([route(), route()])
 }
 
+/// A route registered twice at one address keeps one row in the type index.
 #[test]
-fn registry_reregistration_does_not_duplicate_indices() -> Result<(), ClusterError> {
-	let registry = seed_reregistered_registry()?;
+fn a_reregistration_keeps_one_index_row() -> TestResult {
+	let registry = seed_reregistered_registry();
 	let found = registry.entries_for_type(&type_key(b"calculator"))?;
 	assert_eq!(found.len(), 1);
 	assert_eq!(registry.len()?, 1);
 	Ok(())
 }
 
+/// A route registered again under another type moves to that type.
 #[test]
-fn registry_reregistration_moves_entry_across_types() -> Result<(), ClusterError> {
-	let registry = registry();
+fn a_reregistration_moves_the_route_to_its_new_type() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(named_entry(b"addr1", b"calculator", b"hive1"))?;
 	registry.add(named_entry(b"addr1", b"auth", b"hive1"))?;
 
@@ -1300,10 +1342,10 @@ fn registry_reregistration_moves_entry_across_types() -> Result<(), ClusterError
 /// One hive cannot take over an address another hive registered. The
 /// registry refuses the slate whole, and the first hive keeps its route.
 #[test]
-fn a_hive_cannot_take_over_another_hives_address() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.reconcile_by_hive(hive_slate(b"hive-b", vec![named_entry(b"addr-b", b"calc", b"hive-b")]))?;
-	let slate = hive_slate(
+fn a_hive_cannot_take_over_another_hives_address() -> TestResult {
+	let registry = ServletRegistry::fixture();
+	registry.reconcile_by_hive(HiveSlate::of(b"hive-b", vec![named_entry(b"addr-b", b"calc", b"hive-b")]))?;
+	let slate = HiveSlate::of(
 		b"hive-a",
 		vec![
 			named_entry(b"addr-a", b"calc", b"hive-a"),
@@ -1318,9 +1360,10 @@ fn a_hive_cannot_take_over_another_hives_address() -> Result<(), ClusterError> {
 	Ok(())
 }
 
+/// A removal of a route registered twice clears it from its type.
 #[test]
-fn registry_remove_after_reregistration_clears_entry() -> Result<(), ClusterError> {
-	let registry = seed_reregistered_registry()?;
+fn a_removal_after_a_reregistration_clears_the_route() -> TestResult {
+	let registry = seed_reregistered_registry();
 	registry.remove(b"addr1")?;
 
 	let found = registry.entries_for_type(&type_key(b"calculator"))?;
@@ -1328,19 +1371,18 @@ fn registry_remove_after_reregistration_clears_entry() -> Result<(), ClusterErro
 	Ok(())
 }
 
-// The sweep drops a local route and a peer route at their limit, and counts
-// the peer route alone.
+/// The sweep drops a local route and a peer route at their limit, and counts
+/// the peer route alone.
 #[test]
-fn registry_remove_abandoned_prunes_entries() -> Result<(), ClusterError> {
-	let limit = 2;
-	let registry = registry_abandoning_after(limit);
-	registry.add(test_entry(5000, limit))?;
-	let peer = peer_entry_limit(b"urn:t:a", b"fp-a", limit);
+fn remove_abandoned_drops_routes_at_their_limit() -> TestResult {
+	let registry = registry_abandoning_after(LIMIT);
+	registry.add(test_entry(5000, LIMIT))?;
+	let peer = peer_entry_limit(b"urn:t:a", b"fp-a", LIMIT);
 	let peer_key = Arc::clone(peer.route_key());
 	registry.add(peer)?;
 
-	weaken_times(&registry, b"addr", limit)?;
-	weaken_times(&registry, &peer_key, limit)?;
+	weaken_times(&registry, b"addr", LIMIT);
+	weaken_times(&registry, &peer_key, LIMIT);
 
 	let removed = registry.remove_abandoned()?;
 	assert_eq!(removed, NonZeroUsize::new(1));
@@ -1348,105 +1390,117 @@ fn registry_remove_abandoned_prunes_entries() -> Result<(), ClusterError> {
 	Ok(())
 }
 
-#[test]
-fn weaken_peer_targets_all_routes_of_one_peer() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(peer_entry(b"urn:t:a", b"fp-a"))?;
-	registry.add(peer_entry(b"urn:t:b", b"fp-a"))?;
-	registry.add(peer_entry(b"urn:t:a", b"fp-b"))?;
+// A weakening of a peer reaches every route that peer advertised and no
+// route of another peer, and no local route of a hive of the same name.
+tb_cases! {
+	fn weaken_peer_reaches_the_routes_of_one_peer(
+		(seed, peer, weakened): (Vec<ServletEntry>, &[u8], usize)
+	) -> TestResult {
+		let registry = registry_holding(seed);
 
-	let weakened = registry.weaken_peer(b"fp-a")?;
-	assert_eq!(weakened.count(), 2);
-	Ok(())
+		let reached = registry.weaken_peer(peer)?;
+		assert_eq!(reached.count(), weakened);
+		Ok(())
+	}
+	cases {
+		all_routes_of_one_peer => (
+			vec![peer_entry(b"urn:t:a", b"fp-a"), peer_entry(b"urn:t:b", b"fp-a"), peer_entry(b"urn:t:a", b"fp-b")],
+			b"fp-a",
+			2,
+		),
+		no_local_route => (vec![named_entry(b"addr", b"urn:t:a", b"hive-a")], b"hive-a", 0),
+	}
 }
 
+/// A peer weakened to its limit abandons its routes, and the routes of another
+/// peer stay live.
 #[test]
-fn weaken_peer_skips_local_routes() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(named_entry(b"addr", b"urn:t:a", b"hive-a"))?;
+fn weaken_peer_abandons_after_limit_leaving_others_live() -> TestResult {
+	let registry = ServletRegistry::fixture();
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", LIMIT))?;
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-b", LIMIT))?;
 
-	let weakened = registry.weaken_peer(b"hive-a")?;
-	assert_eq!(weakened.count(), 0);
-	Ok(())
-}
-
-#[test]
-fn weaken_peer_abandons_after_limit_leaving_others_live() -> Result<(), ClusterError> {
-	let limit = 2;
-	let registry = registry();
-	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", limit))?;
-	registry.add(peer_entry_limit(b"urn:t:a", b"fp-b", limit))?;
-
-	weaken_peer_times(&registry, b"fp-a", limit)?;
+	weaken_peer_times(&registry, b"fp-a", LIMIT);
 
 	let live = registry.peer_entries()?;
-	let owners: Vec<SharedId> = live.iter().map(|entry| Arc::clone(entry.owner_id())).collect();
-	assert_eq!(owners, vec![SharedId::from(b"fp-b".as_slice())]);
+	assert_eq!(owners(&live), vec![SharedId::from(b"fp-b".as_slice())]);
 	Ok(())
 }
 
+/// A weakening of a peer reaches none of its routes that are already abandoned.
 #[test]
-fn weaken_peer_skips_already_abandoned_routes() -> Result<(), ClusterError> {
-	let limit = 2;
-	let registry = registry();
-	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", limit))?;
-	weaken_peer_times(&registry, b"fp-a", limit)?;
+fn weaken_peer_skips_already_abandoned_routes() -> TestResult {
+	let registry = ServletRegistry::fixture();
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", LIMIT))?;
+	weaken_peer_times(&registry, b"fp-a", LIMIT);
 
 	let weakened = registry.weaken_peer(b"fp-a")?;
 	assert_eq!(weakened.count(), 0);
 	Ok(())
 }
 
-#[test]
-fn weaken_peer_by_dial_targets_matching_gateway() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"))?;
-	registry.add(peer_entry_dial(b"urn:t:b", b"fp-a", b"127.0.0.1:9100"))?;
-	registry.add(peer_entry_dial(b"urn:t:a", b"fp-b", b"127.0.0.1:9200"))?;
+/// The three peer routes of the weakening by socket: two of `fp-a` at
+/// `127.0.0.1:9100` and one of `fp-b` at `127.0.0.1:9200`.
+fn routes_at_two_sockets() -> Vec<ServletEntry> {
+	vec![
+		peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"),
+		peer_entry_dial(b"urn:t:b", b"fp-a", b"127.0.0.1:9100"),
+		peer_entry_dial(b"urn:t:a", b"fp-b", b"127.0.0.1:9200"),
+	]
+}
 
-	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9100"))?;
-	assert_eq!(weakened.count(), 2);
+// A weakening by socket reaches the routes that dial the matching gateway
+// alone, and none for a gateway the registry does not know.
+tb_cases! {
+	fn weaken_peer_by_dial_reaches_the_routes_at_the_socket((dial, weakened): (&str, usize)) -> TestResult {
+		let registry = registry_holding(routes_at_two_sockets());
+		let reached = registry.weaken_peer_by_dial(PeerAddress::fixture(dial))?;
+		assert_eq!(reached.count(), weakened);
+		Ok(())
+	}
+	cases {
+		a_matching_gateway => ("127.0.0.1:9100", 2),
+		an_unknown_gateway => ("127.0.0.1:9999", 0),
+	}
+}
+
+/// The count of routes that one weakening of `peer` reaches, beside the
+/// count it abandons.
+fn weakening(registry: &ServletRegistry, peer: &[u8]) -> (usize, usize) {
+	let weakened = registry.weaken_peer(peer).expect("a live route lock takes a weakening");
+	(weakened.count(), weakened.abandoned().map_or(0, NonZeroUsize::get))
+}
+
+/// Each weakening counts the routes it reached, and the one that drives them
+/// to their limit counts them as abandoned. A weakening past the limit
+/// reaches no live route.
+#[test]
+fn weaken_peer_counts_the_routes_it_abandons() -> TestResult {
+	let registry = ServletRegistry::fixture();
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", LIMIT))?;
+	registry.add(peer_entry_limit(b"urn:t:b", b"fp-a", LIMIT))?;
+	registry.add(peer_entry_limit(b"urn:t:a", b"fp-b", LIMIT))?;
+
+	let rounds = [
+		weakening(&registry, b"fp-a"),
+		weakening(&registry, b"fp-a"),
+		weakening(&registry, b"fp-a"),
+	];
+	assert_eq!(rounds, [(2, 0), (2, 2), (0, 0)]);
 	Ok(())
 }
 
-// Each weakening counts the routes it reached, and the one that drives them
-// to their limit counts them as abandoned. A weakening past the limit
-// reaches no live route.
+/// A weakening by socket counts the routes it reached and the routes it
+/// abandoned.
 #[test]
-fn weaken_peer_counts_the_routes_it_abandons() -> Result<(), ClusterError> {
-	let limit = 2;
-	let registry = registry();
-	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", limit))?;
-	registry.add(peer_entry_limit(b"urn:t:b", b"fp-a", limit))?;
-	registry.add(peer_entry_limit(b"urn:t:a", b"fp-b", limit))?;
-
-	let rounds: Vec<(usize, usize)> = (0..3)
-		.map(|_| registry.weaken_peer(b"fp-a"))
-		.map(|weakened| weakened.map(|weakened| (weakened.count(), weakened.abandoned().map_or(0, NonZeroUsize::get))))
-		.collect::<Result<_, _>>()?;
-	assert_eq!(rounds, vec![(2, 0), (2, 2), (0, 0)]);
-	Ok(())
-}
-
-#[test]
-fn weaken_peer_by_dial_counts_the_routes_it_abandons() -> Result<(), ClusterError> {
-	let registry = registry();
+fn weaken_peer_by_dial_counts_the_routes_it_abandons() -> TestResult {
+	let registry = ServletRegistry::fixture();
 	registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", 1))?;
 	registry.add(peer_entry(b"urn:t:b", b"fp-a"))?;
 
 	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9000"))?;
 	assert_eq!(weakened.count(), 2);
 	assert_eq!(weakened.abandoned().map(NonZeroUsize::get), Some(1));
-	Ok(())
-}
-
-#[test]
-fn weaken_peer_by_dial_ignores_unknown_gateway() -> Result<(), ClusterError> {
-	let registry = registry();
-	registry.add(peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"))?;
-
-	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9999"))?;
-	assert_eq!(weakened.count(), 0);
 	Ok(())
 }
 
@@ -1468,35 +1522,30 @@ struct ApplyAddressUpdateCase {
 }
 
 /// The `calc` routes a registry holds, as (address, owner), sorted by address.
-fn calc_routes(registry: &ServletRegistry) -> Result<Vec<(SharedId, SharedId)>, ClusterError> {
-	let mut found: Vec<(SharedId, SharedId)> = registry
-		.entries_for_type(&type_key(b"calc"))?
-		.iter()
-		.map(|entry| (Arc::clone(entry.route_key()), Arc::clone(entry.owner_id())))
-		.collect();
+fn calc_routes(registry: &ServletRegistry) -> Vec<(SharedId, SharedId)> {
+	let entries = registry.entries_for_type(&type_key(b"calc")).expect("a live route lock reads");
+	let mut found: Vec<(SharedId, SharedId)> = route_keys(&entries).into_iter().zip(owners(&entries)).collect();
 	found.sort();
-
-	Ok(found)
+	found
 }
 
 // The registry checks every entry before any map moves, so a refused update
 // leaves the registry as seeded, and an accepted one lands whole.
 tb_cases! {
-	fn apply_address_update_ownership_and_atomicity(case: ApplyAddressUpdateCase) -> Result<(), ClusterError> {
-		let registry = registry();
+	fn apply_address_update_ownership_and_atomicity(case: ApplyAddressUpdateCase) -> TestResult {
+		let registry = ServletRegistry::fixture();
 		registry.add(named_entry(case.seed.0, case.seed.1, case.seed.2))?;
 
-		let added = hive_slate(case.caller_hive, case.add.map(|(a, t, h)| named_entry(a, t, h)));
+		let added = HiveSlate::of(case.caller_hive, case.add.map(|(a, t, h)| named_entry(a, t, h)));
 		let result = registry.apply_address_update(added, case.remove);
-		let outcome = result.as_ref().err().map(core::mem::discriminant);
-		assert_eq!(outcome, case.expected.as_ref().map(core::mem::discriminant));
+		assert_eq!(ClusterError::variant_of(&result), case.expected.as_ref().map(discriminant));
 
 		let expected_routes: Vec<(SharedId, SharedId)> = case
 			.expected_routes
 			.iter()
 			.map(|(address, owner)| (SharedId::from(*address), SharedId::from(*owner)))
 			.collect();
-		assert_eq!(calc_routes(&registry)?, expected_routes);
+		assert_eq!(calc_routes(&registry), expected_routes);
 		Ok(())
 	}
 	cases {
@@ -1558,17 +1607,26 @@ fn dial_rendering(entry: Option<&ServletEntry>) -> SharedId {
 	info.expect("a slate entry is peer-routed").dial_addr
 }
 
-/// A servlet type of the default namespace named `name`.
-fn servlet_type_urn(name: &str) -> Urn<'static> {
-	let urn = ColonyNamespace::default().servlet(name);
-	urn.expect("test names satisfy the mint grammar")
+/// The slate of the trail of `advertisement` through `relay`, which dials
+/// the relay at the fixture socket `127.0.0.1:9001`.
+fn relay_slate_of(advertisement: &AdmittedPeerAd, relay: &[u8]) -> Vec<ServletEntry> {
+	let trail = advertisement.relay_trail(
+		&SharedId::from(relay),
+		admitted_dial(b"127.0.0.1:9001"),
+		&PheromoneConfig::default(),
+	);
+	trail.expect("a relay other than the origin yields a trail").slate
 }
 
 /// The entries of one peer slate dial one socket, so they share one rendering
 /// of it.
 #[test]
 fn a_peer_slate_shares_one_rendering_of_its_socket() {
-	let types = [servlet_type_urn("ping"), servlet_type_urn("echo")];
+	let types = [
+		ColonyNamespace::servlet_fixture("ping"),
+		ColonyNamespace::servlet_fixture("echo"),
+	];
+
 	let peer_id = SharedId::from(&b"gw"[..]);
 	let slate = PheromoneConfig::default().peer_slate(&peer_id, admitted_dial(b"127.0.0.1:9000"), types);
 
@@ -1580,18 +1638,13 @@ fn a_peer_slate_shares_one_rendering_of_its_socket() {
 /// The trails through one relay dial one relay socket, so they share one
 /// rendering of it.
 #[test]
-fn a_relay_trail_shares_one_rendering_of_its_relay_socket() -> Result<(), &'static str> {
+fn a_relay_trail_shares_one_rendering_of_its_relay_socket() {
 	let slate = [peer_entry(b"ping", b"origin"), peer_entry(b"echo", b"origin")];
 	let advertisement = admitted(b"origin", b"127.0.0.1:9000", slate);
-	let relay_id = SharedId::from(&b"relay"[..]);
 
-	let trail = advertisement.relay_trail(&relay_id, admitted_dial(b"127.0.0.1:9001"), &PheromoneConfig::default());
-	let trail = trail.ok_or("a relay other than the origin yields a trail")?;
-
-	let first = dial_rendering(trail.slate.first());
-	let last = dial_rendering(trail.slate.last());
+	let slate = relay_slate_of(&advertisement, b"relay");
+	let (first, last) = (dial_rendering(slate.first()), dial_rendering(slate.last()));
 	assert!(Arc::ptr_eq(&first, &last));
-	Ok(())
 }
 
 /// A shared target of another socket leaves each entry on the socket its own

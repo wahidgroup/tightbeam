@@ -250,15 +250,15 @@ impl<P: HybridPair> Hybrid<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::exchange::tests::{fresh_point, octets_of};
+	use crate::crypto::exchange::tests::{kem_ciphertext_of, octets_of, point_of, secrets_of_both_ends};
 	use crate::crypto::exchange::{EcdheShare, KemCiphertext, ReplyAttribute};
 	use crate::crypto::hash::Digest;
 	use crate::der::asn1::OctetString;
 	use crate::der::referenced::OwnedToRef;
-	use crate::random::OsRng;
-	use crate::spki::{AlgorithmIdentifierOwned, Error as SpkiError, SubjectPublicKeyInfoOwned};
+	use crate::spki::SubjectPublicKeyInfoOwned;
+	use crate::testing::fixtures::TestAlgorithm;
 	use crate::testing::vectors::ml_kem::ML_KEM_768;
-	use crate::testing::{unhex, PublishedDraw};
+	use crate::testing::{unhex, PublishedDraw, SeededStream, TestResult};
 
 	/// The house hybrid.
 	type HouseHybrid = Hybrid<Secp256k1MlKem768>;
@@ -266,8 +266,23 @@ mod tests {
 	/// The offer of the house hybrid.
 	type HouseOffer = <HouseHybrid as KeyExchange>::Offer;
 
+	/// The reply of the house hybrid.
+	type HouseReply = <HouseHybrid as KeyExchange>::Reply;
+
 	/// The secret of [`the_house_hybrid_derives_its_known_secret`].
 	const KNOWN_HOUSE_HYBRID_SECRET: &str = "b4fe42825fe5f6710bd2a7f5550419b856c00a2201b45ad68b98eebf4410d7ca";
+
+	/// The octet of the scalar of a static key that no seeded draw of these
+	/// tests makes.
+	const STATIC: u8 = 0x77;
+
+	/// The offer that the combiner tests bind, as wide as an offer of the
+	/// house hybrid.
+	const OFFER: [u8; 1217] = [0x33; 1217];
+
+	/// The reply that the combiner tests bind, as wide as a reply of the
+	/// house hybrid.
+	const REPLY: [u8; 1121] = [0x44; 1121];
 
 	/// A pairing of the parts of the house pairing, under another identifier.
 	struct Renamed;
@@ -281,50 +296,78 @@ mod tests {
 		type Classical = Ecdhe<Secp256k1>;
 	}
 
-	#[test]
-	fn both_ends_of_a_hybrid_derive_one_secret() -> Result<(), KeyExchangeError> {
-		let (pending, offer) = HouseHybrid::offer(&mut OsRng);
-		let (reply, responder) = HouseHybrid::respond(&offer, &mut OsRng)?;
-		let initiator = HouseHybrid::complete(&pending, &reply)?;
+	/// An offer of the house hybrid from a seeded draw.
+	fn offered() -> HouseOffer {
+		let (_pending, offer) = HouseHybrid::offer(&mut SeededStream(0x10));
+		offer
+	}
 
-		let equal = initiator.with(|secret| responder.with(|other| secret == other));
-		assert!(equal);
-		Ok(())
+	/// The reply of the house hybrid to `offer`, from a seeded draw.
+	fn replied(offer: &HouseOffer) -> HouseReply {
+		let responded = HouseHybrid::respond(offer, &mut SeededStream(0x20));
+		let (reply, _secret) = responded.expect("the hybrid answers its own offer");
+		reply
+	}
+
+	/// The octets of [`offered`] after `edit`.
+	fn offer_edited(edit: fn(&mut Vec<u8>)) -> Vec<u8> {
+		let mut octets = offered().to_octets();
+		edit(&mut octets);
+		octets
+	}
+
+	/// The secret the combiner of pairing `P` derives from secrets of
+	/// `post_quantum` and `classical` octets over `offer` and `reply`.
+	fn combined<P: HybridPair>(post_quantum: u8, classical: u8, offer: &[u8], reply: &[u8]) -> Vec<u8> {
+		let secret = |octet| SecretSlice::from(vec![octet; 32]);
+		let combined = Hybrid::<P>::combine(&secret(post_quantum), &secret(classical), offer, reply);
+		octets_of(&combined.expect("the pairing identifier encodes"))
+	}
+
+	/// Both ends of a hybrid exchange derive one secret.
+	#[test]
+	fn both_ends_of_a_hybrid_derive_one_secret() {
+		let (initiator, responder) = secrets_of_both_ends::<HouseHybrid>();
+		assert_eq!(initiator, responder);
 	}
 
 	/// Each share is the ML-KEM-768 share, then the compressed secp256k1
 	/// point: 1184 and 33 octets in the offer, 1088 and 33 in the reply.
 	#[test]
-	fn a_share_is_the_post_quantum_share_then_the_classical_share() -> Result<(), KeyExchangeError> {
-		let (_pending, offer) = HouseHybrid::offer(&mut OsRng);
-		let (reply, _secret) = HouseHybrid::respond(&offer, &mut OsRng)?;
+	fn a_share_is_the_post_quantum_share_then_the_classical_share() {
+		let offer = offered();
+		let reply = replied(&offer);
 		let parts = [offer.post_quantum.to_octets(), offer.classical.to_octets()].concat();
 
 		let widths = (offer.to_octets().len(), reply.to_octets().len());
 		assert_eq!((offer.to_octets(), widths), (parts, (1217, 1121)));
-		Ok(())
 	}
 
-	/// A share of another width is refused at the width of both parts, and a
-	/// share with a malformed part is refused by that part: an ML-KEM key
-	/// whose first coefficient is at or above the modulus (FIPS 203 §7.2), and
-	/// a point in the compact form.
-	#[test]
-	fn a_share_of_another_width_or_a_malformed_part_is_refused() {
-		let (_pending, offer) = HouseHybrid::offer(&mut OsRng);
-		let octets = offer.to_octets();
-		let short = octets.get(1..).unwrap_or_default().to_vec();
-		let mut above_modulus = octets.clone();
-		above_modulus[0] = 0xff;
-		above_modulus[1] |= 0x0f;
-
-		let mut compact = octets;
-		compact[1184] = 0x05;
-
-		let refused = [&short, &above_modulus, &compact].map(|octets| HouseOffer::from_octets(octets).err());
-		let width = KeyExchangeError::Width { expected: 1217, actual: 1216 };
-		let malformed = Some(KeyExchangeError::Malformed);
-		assert_eq!(refused, [Some(width), malformed, malformed]);
+	// A share of another width is refused at the width of both parts, and a
+	// share with a malformed part is refused by that part: an ML-KEM key
+	// whose first coefficient is at or above the modulus (FIPS 203 §7.2), and
+	// a point in the compact form.
+	crate::tb_cases! {
+		fn a_share_of_another_width_or_a_malformed_part_is_refused(
+			(octets, expected): (Vec<u8>, KeyExchangeError)
+		) {
+			let refused = HouseOffer::from_octets(&octets);
+			assert!(matches!(refused, Err(error) if error == expected));
+		}
+		cases {
+			short => (
+				offer_edited(|octets| octets.truncate(1216)),
+				KeyExchangeError::Width { expected: 1217, actual: 1216 },
+			),
+			above_modulus => (
+				offer_edited(|octets| {
+					octets[0] = 0xff;
+					octets[1] |= 0x0f;
+				}),
+				KeyExchangeError::Malformed,
+			),
+			compact_point => (offer_edited(|octets| octets[1184] = 0x05), KeyExchangeError::Malformed),
+		}
 	}
 
 	/// The combiner binds both shares of both parts, so the house hybrid rates
@@ -337,39 +380,31 @@ mod tests {
 	/// The combiner hashes the counter, both secrets, the label, the pairing,
 	/// and both shares under SHA3-256, in that order.
 	#[test]
-	fn the_combiner_hashes_its_inputs_in_order() -> Result<(), Box<dyn std::error::Error>> {
-		let post_quantum = SecretSlice::from(vec![0x11; 32]);
-		let classical = SecretSlice::from(vec![0x22; 32]);
-		let (offer, reply) = ([0x33; 1217], [0x44; 1121]);
+	fn the_combiner_hashes_its_inputs_in_order() -> TestResult {
 		let pairing = KEM_SECP256K1_ML_KEM_768.to_der()?;
 		let label = TIGHTBEAM_HYBRID_EXCHANGE_LABEL;
 
-		let combined = HouseHybrid::combine(&post_quantum, &classical, &offer, &reply)?;
-		let input = [&[0, 0, 0, 1][..], &[0x11; 32], &[0x22; 32], label, &pairing, &offer, &reply].concat();
-		assert_eq!(octets_of(&combined), Sha3_256::digest(&input).to_vec());
+		let combined = combined::<Secp256k1MlKem768>(0x11, 0x22, &OFFER, &REPLY);
+		let input = [&[0, 0, 0, 1][..], &[0x11; 32], &[0x22; 32], label, &pairing, &OFFER, &REPLY].concat();
+		assert_eq!(combined, Sha3_256::digest(&input).to_vec());
 		Ok(())
 	}
 
-	/// A change to any one input of the combiner, the pairing among them,
-	/// changes the secret.
-	#[test]
-	fn the_combiner_binds_each_input() -> Result<(), KeyExchangeError> {
-		let secret = |octet| SecretSlice::from(vec![octet; 32]);
-		let (offer, reply) = ([0x33; 1217], [0x44; 1121]);
-		let (other_offer, other_reply) = ([0x55; 1217], [0x66; 1121]);
-		let base = octets_of(&HouseHybrid::combine(&secret(0x11), &secret(0x22), &offer, &reply)?);
-
-		let post_quantum = octets_of(&HouseHybrid::combine(&secret(0x77), &secret(0x22), &offer, &reply)?);
-		let classical = octets_of(&HouseHybrid::combine(&secret(0x11), &secret(0x77), &offer, &reply)?);
-		let offered = octets_of(&HouseHybrid::combine(&secret(0x11), &secret(0x22), &other_offer, &reply)?);
-		let replied = octets_of(&HouseHybrid::combine(&secret(0x11), &secret(0x22), &offer, &other_reply)?);
-		let pairing = octets_of(&Hybrid::<Renamed>::combine(&secret(0x11), &secret(0x22), &offer, &reply)?);
-		assert_ne!(post_quantum, base);
-		assert_ne!(classical, base);
-		assert_ne!(offered, base);
-		assert_ne!(replied, base);
-		assert_ne!(pairing, base);
-		Ok(())
+	// A change to any one input of the combiner, the pairing among them,
+	// changes the secret it derives from secrets of `0x11` and `0x22` octets
+	// over `OFFER` and `REPLY`.
+	crate::tb_cases! {
+		fn the_combiner_binds_the(changed: Vec<u8>) {
+			let base = combined::<Secp256k1MlKem768>(0x11, 0x22, &OFFER, &REPLY);
+			assert_ne!(changed, base);
+		}
+		cases {
+			post_quantum_secret => combined::<Secp256k1MlKem768>(0x77, 0x22, &OFFER, &REPLY),
+			classical_secret => combined::<Secp256k1MlKem768>(0x11, 0x77, &OFFER, &REPLY),
+			offer => combined::<Secp256k1MlKem768>(0x11, 0x22, &[0x55; 1217], &REPLY),
+			reply => combined::<Secp256k1MlKem768>(0x11, 0x22, &OFFER, &[0x66; 1121]),
+			pairing => combined::<Renamed>(0x11, 0x22, &OFFER, &REPLY),
+		}
 	}
 
 	/// The secret of fixed draws, so a change to the shares or the combiner
@@ -377,7 +412,7 @@ mod tests {
 	/// generation vector and the secp256k1 scalar `0x11..11`, and the responder
 	/// draws `m` of its encapsulation vector and the scalar `0x22..22`.
 	#[test]
-	fn the_house_hybrid_derives_its_known_secret() -> Result<(), KeyExchangeError> {
+	fn the_house_hybrid_derives_its_known_secret() -> TestResult {
 		let offer_draw = [unhex(ML_KEM_768.keygen_d), unhex(ML_KEM_768.keygen_z), vec![0x11; 32]].concat();
 		let reply_draw = [unhex(ML_KEM_768.encap_m), vec![0x22; 32]].concat();
 		let (pending, offer) = HouseHybrid::offer(&mut PublishedDraw(offer_draw));
@@ -389,49 +424,55 @@ mod tests {
 		Ok(())
 	}
 
-	/// The classical part alone collapses into a static key: a share whose
-	/// point is the sender's key collapses, and a fresh share does not.
-	#[test]
-	fn a_share_collapses_into_a_static_key_of_its_classical_part() -> Result<(), KeyExchangeError> {
-		let key = fresh_point();
-		let (_pending, offer) = HouseHybrid::offer(&mut OsRng);
-		let collapsing = [offer.post_quantum.to_octets(), EcdheShare::from(key).to_octets()].concat();
-		let collapsing = HouseOffer::from_octets(&collapsing)?;
+	/// The offer whose classical part is the point of the static key.
+	fn offer_of_the_static_key() -> HouseOffer {
+		let post_quantum = offered().post_quantum.to_octets();
+		let classical = EcdheShare::from(point_of(STATIC)).to_octets();
+		let offer = HouseOffer::from_octets(&[post_quantum, classical].concat());
+		offer.expect("the parts of a test offer are well formed")
+	}
 
-		let collapses = (collapsing.collapses_into(&key), offer.collapses_into(&key));
-		assert_eq!(collapses, (true, false));
-		Ok(())
+	// The classical part alone collapses into a static key: a share whose
+	// point is the sender's key collapses, and a fresh share does not.
+	crate::tb_cases! {
+		fn a_share_collapses_into_a_static_key_of_its_classical_part((offer, collapses): (HouseOffer, bool)) {
+			assert_eq!(offer.collapses_into(&point_of(STATIC)), collapses);
+		}
+		cases {
+			own_key => (offer_of_the_static_key(), true),
+			fresh_share => (offered(), false),
+		}
 	}
 
 	/// The hybrid reads a secp256k1 key as its static key, as its classical
 	/// part does.
 	#[test]
-	fn the_hybrid_reads_the_static_keys_of_its_classical_part() -> Result<(), SpkiError> {
-		let key = fresh_point();
-		let spki = SubjectPublicKeyInfoOwned::from_key(key)?;
-		assert_eq!(HouseHybrid::static_key(spki.owned_to_ref()), Some(key));
+	fn the_hybrid_reads_the_static_keys_of_its_classical_part() -> TestResult {
+		let spki = SubjectPublicKeyInfoOwned::from_key(point_of(STATIC))?;
+		let read = HouseHybrid::static_key(spki.owned_to_ref());
+		assert_eq!(read, Some(point_of(STATIC)));
 		Ok(())
 	}
 
 	/// The reply travels in the CMS Finished as a `KemCiphertext` under the
-	/// identifier of the pairing, and a reply under the identifier of its
-	/// post-quantum part names another algorithm.
+	/// identifier of the pairing.
 	#[test]
-	fn a_reply_travels_as_a_kem_ciphertext_under_the_pairing() -> Result<(), Box<dyn std::error::Error>> {
-		let (_pending, offer) = HouseHybrid::offer(&mut OsRng);
-		let (reply, _secret) = HouseHybrid::respond(&offer, &mut OsRng)?;
+	fn a_reply_travels_as_a_kem_ciphertext_under_the_pairing() -> TestResult {
+		let reply = replied(&offered());
 
 		let attribute = ReplyAttribute::of::<HouseHybrid>(&reply)?;
-		let ReplyAttribute::KemCiphertext(KemCiphertext { kem, kemct }) = attribute else {
-			return Err("a hybrid reply travels as a KEM ciphertext".into());
-		};
+		let expected = Some((KEM_SECP256K1_ML_KEM_768, reply.to_octets()));
+		assert_eq!(kem_ciphertext_of(attribute), expected);
+		Ok(())
+	}
 
-		let carried = (kem.oid, kemct.as_bytes());
-		let reply_octets = reply.to_octets();
-		assert_eq!(carried, (KEM_SECP256K1_ML_KEM_768, reply_octets.as_slice()));
+	/// A reply under the identifier of the post-quantum part of the pairing
+	/// names another algorithm.
+	#[test]
+	fn a_reply_under_its_post_quantum_identifier_is_refused() -> TestResult {
+		let kem = TestAlgorithm::of(MlKem768::OID);
+		let kemct = OctetString::new(replied(&offered()).to_octets())?;
 
-		let kem = AlgorithmIdentifierOwned { oid: MlKem768::OID, parameters: None };
-		let kemct = OctetString::new(reply.to_octets())?;
 		let refused = ReplyAttribute::KemCiphertext(KemCiphertext { kem, kemct }).reply::<HouseHybrid>();
 		assert!(matches!(refused, Err(KeyExchangeError::Algorithm)));
 		Ok(())

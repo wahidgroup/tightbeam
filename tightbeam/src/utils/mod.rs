@@ -99,38 +99,41 @@ pub(crate) fn digest_info<D: digest::Digest + crate::der::oid::AssociatedOid>(
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-
 	use crate::asn1::admission::fixtures::descending_attribute;
 	use crate::cms::cert::x509::attr::Attribute;
 	use crate::der::asn1::OctetStringRef;
+	use crate::der::oid::db::{rfc4519, rfc5280, rfc5912};
 	use crate::der::oid::ObjectIdentifier;
 	use crate::der::ErrorKind;
 	use crate::error::TightBeamError::SerializationError;
+	use crate::testing::vectors::patterned;
+	use crate::testing::TestResult;
 
+	use super::*;
+
+	// An OID encodes under its universal tag and decodes back to itself.
 	crate::tb_cases! {
-		fn data_driven_der_round_trip_of_an_oid(oid: ObjectIdentifier) -> Result<(), TightBeamError> {
+		fn an_oid_survives_a_der_round_trip(oid: ObjectIdentifier) -> TestResult {
 			let enc = encode(&oid)?;
-			assert!(!enc.is_empty());
-			assert_eq!(enc[0], 0x06);
+			assert_eq!(enc.first(), Some(&0x06));
 
 			let dec: ObjectIdentifier = decode(&enc)?;
 			assert_eq!(dec, oid);
 			Ok(())
 		}
 		cases {
-			rsa_encryption => ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1"),
-			server_auth => ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1"),
-			common_name => ObjectIdentifier::new_unwrap("2.5.4.3"),
+			rsa_encryption => rfc5912::RSA_ENCRYPTION,
+			server_auth => rfc5280::ID_KP_SERVER_AUTH,
+			common_name => rfc4519::COMMON_NAME,
 		}
 	}
 
 	// The octet string cases vary in size and pattern.
 	crate::tb_cases! {
-		fn data_driven_der_round_trip_of_an_octet_string(data: Vec<u8>) -> Result<(), TightBeamError> {
+		fn an_octet_string_survives_a_der_round_trip(data: Vec<u8>) -> TestResult {
 			let oct = OctetStringRef::new(&data)?;
 			let enc = encode(&oct)?;
-			assert_eq!(enc[0], 0x04);
+			assert_eq!(enc.first(), Some(&0x04));
 
 			let dec: OctetStringRef<'_> = decode(&enc)?;
 			assert_eq!(dec.as_bytes(), data);
@@ -141,10 +144,12 @@ mod tests {
 			one_octet => b"a".to_vec(),
 			word => b"hello".to_vec(),
 			sentence => b"The quick brown fox jumps over the lazy dog".to_vec(),
-			counting => (0u16..64).map(|v| (v % 251) as u8).collect(),
+			counting => patterned(64),
 		}
 	}
 
+	/// The decode checks the order of each SET before it sorts one, so a
+	/// descending set is refused as a SET ordering error.
 	#[test]
 	fn a_descending_set_is_refused() {
 		let refused = decode::<Attribute>(&descending_attribute());

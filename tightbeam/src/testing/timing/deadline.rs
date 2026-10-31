@@ -50,6 +50,16 @@ impl Deadline {
 	}
 }
 
+#[cfg(test)]
+impl Deadline {
+	/// A deadline of `millis` milliseconds from `start` to `end`, with no
+	/// minimum slack.
+	pub(crate) fn of_millis(millis: u64, start: &'static str, end: &'static str) -> Self {
+		let (start_event, end_event) = (Event(start), Event(end));
+		Deadline { duration: Duration::from_millis(millis), start_event, end_event, min_slack: None }
+	}
+}
+
 /// The builder of a [`Deadline`].
 #[derive(Debug, Default, Clone)]
 pub struct DeadlineBuilder {

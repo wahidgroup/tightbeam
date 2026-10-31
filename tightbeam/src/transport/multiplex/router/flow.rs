@@ -127,9 +127,10 @@ mod tests {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	use crate::transport::handshake::negotiation::MuxSettings;
 
-	// Each case is (payload length, chunk size, records).
+	// A payload takes one record per chunk it starts. Each case is (payload
+	// length, chunk size, records).
 	crate::tb_cases! {
-		fn test_chunk_records_boundaries((len, chunk, expect): (usize, usize, u64)) {
+		fn a_payload_takes_one_record_per_chunk_it_starts((len, chunk, expect): (usize, usize, u64)) {
 			assert_eq!(ChunkSize::new(chunk).records(len), expect);
 		}
 		cases {
@@ -151,7 +152,9 @@ mod tests {
 	// sender's whole-frame debit equals the receiver's per-chunk sum, and not
 	// the naive whole-frame ceil (3 for the last case).
 	crate::tb_cases! {
-		fn test_payload_credits_match_per_chunk_sum((len, chunk, unit, expect): (usize, usize, NonZeroU32, u64)) {
+		fn the_credits_of_a_payload_match_its_per_chunk_sum(
+			(len, chunk, unit, expect): (usize, usize, NonZeroU32, u64)
+		) {
 			assert_eq!(ChunkSize::new(chunk).credits(len, unit), expect);
 		}
 		cases {
@@ -163,36 +166,41 @@ mod tests {
 		}
 	}
 
+	// The renewal floor adds the exchange allowance to the drain floor, and
+	// saturates at the top of the range. Each case is (drain floor, renewal
+	// floor).
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[test]
-	fn test_renewal_floor_adds_exchange_allowance() {
-		use crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE;
-
-		assert_eq!(renewal_floor(0), DEFAULT_REKEY_RENEWAL_ALLOWANCE);
-
-		let drain_floor = MuxSettings::symmetric(4).drain_reserve_records();
-		assert_eq!(renewal_floor(drain_floor), drain_floor + DEFAULT_REKEY_RENEWAL_ALLOWANCE);
-		assert_eq!(renewal_floor(u64::MAX), u64::MAX);
+	crate::tb_cases! {
+		fn the_renewal_floor_adds_the_exchange_allowance((drain_floor, expected): (u64, u64)) {
+			assert_eq!(renewal_floor(drain_floor), expected);
+		}
+		cases {
+			zero => (0, crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE),
+			the_drain_floor => (
+				MuxSettings::symmetric(4).drain_reserve_records(),
+				MuxSettings::symmetric(4).drain_reserve_records() + crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE,
+			),
+			saturates => (u64::MAX, u64::MAX),
+		}
 	}
 
-	#[test]
-	fn test_buffered_grantor_batches_at_low_water() {
-		let grantor = BufferedGrantor::new(4);
-		// Above the half-window low-water mark, no grant fires.
-		assert_eq!(grantor.replenish(StreamId::new(1), 0, 4), None);
-		assert_eq!(grantor.replenish(StreamId::new(1), 1, 4), None);
-		assert_eq!(grantor.replenish(StreamId::new(1), 3, 8), None);
-		// At the low-water mark, the grant tops back up to a full window ahead.
-		assert_eq!(grantor.replenish(StreamId::new(1), 2, 4), Some(6));
-		assert_eq!(grantor.replenish(StreamId::new(1), 6, 8), Some(10));
-	}
-
-	#[test]
-	fn test_buffered_grantor_single_chunk_window() {
-		let grantor = BufferedGrantor::new(1);
-		// A grant to the limit itself would not raise it, so none fires.
-		assert_eq!(grantor.replenish(StreamId::new(1), 3, 4), None);
-		// A fully consumed window opens the next chunk.
-		assert_eq!(grantor.replenish(StreamId::new(1), 4, 4), Some(5));
+	// A buffered grantor grants at its half-window low-water mark, topping
+	// back up to a full window ahead, and fires no grant above the mark or at
+	// a grant that would not raise the limit. Each case is (window, consumed,
+	// limit, grant).
+	crate::tb_cases! {
+		fn a_buffered_grantor_grants_at_low_water((window, consumed, limit, expected): (u64, u64, u64, Option<u64>)) {
+			let grantor = BufferedGrantor::new(window);
+			assert_eq!(grantor.replenish(StreamId::new(1), consumed, limit), expected);
+		}
+		cases {
+			nothing_consumed => (4, 0, 4, None),
+			above_the_mark => (4, 1, 4, None),
+			above_the_mark_of_a_raised_limit => (4, 3, 8, None),
+			at_the_mark => (4, 2, 4, Some(6)),
+			at_the_mark_of_a_raised_limit => (4, 6, 8, Some(10)),
+			a_one_chunk_window_short_of_its_limit => (1, 3, 4, None),
+			a_one_chunk_window_fully_consumed => (1, 4, 4, Some(5)),
+		}
 	}
 }

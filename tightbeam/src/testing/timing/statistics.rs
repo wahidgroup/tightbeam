@@ -230,163 +230,112 @@ impl StatisticalAnalyzer for DefaultStatisticalAnalyzer {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::TestResult;
 
-	#[test]
-	fn test_percentile_as_float() {
-		assert_eq!(Percentile::P50.as_float(), 0.50);
-		assert_eq!(Percentile::P90.as_float(), 0.90);
-		assert_eq!(Percentile::P95.as_float(), 0.95);
-		assert_eq!(Percentile::P99.as_float(), 0.99);
-		assert_eq!(Percentile::P99_9.as_float(), 0.999);
-		assert_eq!(Percentile::P99_99.as_float(), 0.9999);
+	/// The percentile levels of the house analyzer, in the order it reports
+	/// them.
+	const LEVELS: [Percentile; 6] = [
+		Percentile::P50,
+		Percentile::P90,
+		Percentile::P95,
+		Percentile::P99,
+		Percentile::P99_9,
+		Percentile::P99_99,
+	];
+
+	/// The samples of 1 ms, 2 ms, and so on up to `count` ms, in nanoseconds.
+	fn ascending_millis(count: u64) -> Vec<u64> {
+		(1..=count).map(|millis| millis * 1_000_000).collect()
 	}
 
-	#[test]
-	fn test_percentile_as_fixed_point() {
-		assert_eq!(Percentile::P50.as_fixed_point(), 5000);
-		assert_eq!(Percentile::P90.as_fixed_point(), 9000);
-		assert_eq!(Percentile::P95.as_fixed_point(), 9500);
-		assert_eq!(Percentile::P99.as_fixed_point(), 9900);
-		assert_eq!(Percentile::P99_9.as_fixed_point(), 9990);
-		assert_eq!(Percentile::P99_99.as_fixed_point(), 9999);
+	/// Each level of [`LEVELS`] with its value in `values`, in order.
+	fn percentiles(values: [u64; 6]) -> Vec<PercentileValue> {
+		let levels = LEVELS.into_iter().zip(values);
+		let paired = levels.map(|(percentile, value)| PercentileValue { percentile, value });
+		paired.collect()
 	}
 
-	#[test]
-	fn test_basic_analyzer_empty() {
-		let analyzer = DefaultStatisticalAnalyzer;
-		let result = analyzer.analyze(&[]);
-		assert!(matches!(result, Err(TightBeamError::InvalidMetadata)));
+	/// The measures of `count` samples of mean `mean`, with the percentile
+	/// values `values` and no confidence interval. The median is the value of
+	/// P50.
+	fn measures(count: u64, mean: u64, values: [u64; 6]) -> StatisticalMeasures {
+		let [median, ..] = values;
+		let percentiles = percentiles(values);
+		StatisticalMeasures { count, mean, median, percentiles, confidence_intervals: None, custom: Vec::new() }
 	}
 
+	// Each percentile reads as its fraction and as its fixed-point integer
+	// scaled by 10,000.
+	crate::tb_cases! {
+		fn a_percentile_reads_as_its_fraction_and_its_fixed_point(
+			(percentile, fraction, fixed_point): (Percentile, f64, u32)
+		) {
+			let forms = (percentile.as_float(), percentile.as_fixed_point());
+			assert_eq!(forms, (fraction, fixed_point));
+		}
+
+		cases {
+			p50 => (Percentile::P50, 0.50, 5000),
+			p90 => (Percentile::P90, 0.90, 9000),
+			p95 => (Percentile::P95, 0.95, 9500),
+			p99 => (Percentile::P99, 0.99, 9900),
+			p99_9 => (Percentile::P99_9, 0.999, 9990),
+			p99_99 => (Percentile::P99_99, 0.9999, 9999),
+		}
+	}
+
+	/// The house analyzer refuses a sample set with no sample.
 	#[test]
-	fn test_basic_analyzer_single_value() -> Result<(), Box<dyn core::error::Error>> {
-		let analyzer = DefaultStatisticalAnalyzer;
-		let durations = vec![100_000_000]; // 100ms
+	fn the_analysis_refuses_an_empty_sample() {
+		let analyzed = DefaultStatisticalAnalyzer.analyze(&[]);
+		assert!(matches!(analyzed, Err(TightBeamError::InvalidMetadata)));
+	}
 
-		let result = analyzer.analyze(&durations)?;
-		assert_eq!(result.count, 1);
-		assert_eq!(result.mean, 100_000_000);
-		assert_eq!(result.median, 100_000_000);
-		assert_eq!(
-			result
-				.percentiles
-				.iter()
-				.find(|pv| pv.percentile == Percentile::P50)
-				.map(|pv| pv.value),
-			Some(100_000_000)
-		);
+	// A sample of fewer than 30 values has its count, its mean, its median,
+	// and its percentiles, and no confidence interval. The rank of each
+	// percentile rounds to the nearest index.
+	crate::tb_cases! {
+		fn the_measures_of_a_small_sample((durations, measured): (&[u64], StatisticalMeasures)) -> TestResult {
+			let analyzed = DefaultStatisticalAnalyzer.analyze(durations)?;
+			assert_eq!(analyzed, measured);
+			Ok(())
+		}
 
+		cases {
+			one_value => (&[100_000_000], measures(1, 100_000_000, [100_000_000; 6])),
+			/// P90 and each level above it round to the index of the largest
+			/// sample, 50 ms.
+			five_values => (
+				&[10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000],
+				measures(5, 30_000_000, [30_000_000, 50_000_000, 50_000_000, 50_000_000, 50_000_000, 50_000_000]),
+			),
+		}
+	}
+
+	/// A sample of 30 values or more has a 95% confidence interval of its
+	/// mean. The 50 samples of 1 ms to 50 ms have a mean of 25.5 ms and a
+	/// standard deviation of 14,430,869 ns, so the margin of 1.96 deviations
+	/// over 7, the integer square root of 50, is 4,040,643 ns.
+	#[test]
+	fn a_sample_of_thirty_values_or_more_has_a_confidence_interval_of_its_mean() -> TestResult {
+		let durations = ascending_millis(50);
+		let analyzed = DefaultStatisticalAnalyzer.analyze(&durations)?;
+
+		let interval = ConfidenceIntervals { level: 9500, lower: 21_459_357, upper: 29_540_643 };
+		assert_eq!(analyzed.confidence_intervals, Some(interval));
 		Ok(())
 	}
 
+	/// Each percentile of the 100 samples of 1 ms to 100 ms reads the sample
+	/// at its rank, rounded to the nearest index. The median of an even count
+	/// is the mean of its two middle samples.
 	#[test]
-	fn test_basic_analyzer_multiple_values() -> Result<(), Box<dyn core::error::Error>> {
-		let analyzer = DefaultStatisticalAnalyzer;
-		// The durations are 10ms, 20ms, 30ms, 40ms, and 50ms.
-		let durations = vec![10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000];
+	fn each_percentile_reads_the_sample_at_its_rank() -> TestResult {
+		let durations = ascending_millis(100);
+		let analyzed = DefaultStatisticalAnalyzer.analyze(&durations)?;
 
-		let result = analyzer.analyze(&durations)?;
-		assert_eq!(result.count, 5);
-		assert_eq!(result.mean, 30_000_000);
-		assert_eq!(result.median, 30_000_000); // P50
-		assert_eq!(
-			result
-				.percentiles
-				.iter()
-				.find(|pv| pv.percentile == Percentile::P50)
-				.map(|pv| pv.value),
-			Some(30_000_000)
-		);
-		assert_eq!(
-			result
-				.percentiles
-				.iter()
-				.find(|pv| pv.percentile == Percentile::P95)
-				.map(|pv| pv.value),
-			Some(50_000_000)
-		);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_basic_analyzer_confidence_intervals() -> Result<(), Box<dyn core::error::Error>> {
-		let analyzer = DefaultStatisticalAnalyzer;
-		// A confidence interval needs 30 or more values, so the test uses 50.
-		let durations: Vec<u64> = (1..=50).map(|i| i * 1_000_000).collect();
-
-		let result = analyzer.analyze(&durations)?;
-		let Some(ci) = result.confidence_intervals else {
-			return Err(crate::testing::error::TestingError::InvariantViolated.into());
-		};
-		assert_eq!(ci.level, 9500);
-		assert!(ci.lower < ci.upper);
-		assert!(ci.lower <= result.mean);
-		assert!(ci.upper >= result.mean);
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_basic_analyzer_percentiles() -> Result<(), Box<dyn core::error::Error>> {
-		let analyzer = DefaultStatisticalAnalyzer;
-		// The input holds 100 values from 1ms to 100ms.
-		let durations: Vec<u64> = (1..=100).map(|i| i * 1_000_000).collect();
-
-		// Every percentile level is present.
-		let result = analyzer.analyze(&durations)?;
-		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P50));
-		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P90));
-		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P95));
-		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99));
-		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99_9));
-		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99_99));
-
-		// The percentiles are monotonic: P50 <= P90 <= P95 <= P99 <= P99.9 <=
-		// P99.99.
-		let p50 = result
-			.percentiles
-			.iter()
-			.find(|pv| pv.percentile == Percentile::P50)
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
-			.value;
-		let p90 = result
-			.percentiles
-			.iter()
-			.find(|pv| pv.percentile == Percentile::P90)
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
-			.value;
-		let p95 = result
-			.percentiles
-			.iter()
-			.find(|pv| pv.percentile == Percentile::P95)
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
-			.value;
-		let p99 = result
-			.percentiles
-			.iter()
-			.find(|pv| pv.percentile == Percentile::P99)
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
-			.value;
-		let p99_9 = result
-			.percentiles
-			.iter()
-			.find(|pv| pv.percentile == Percentile::P99_9)
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
-			.value;
-		let p99_99 = result
-			.percentiles
-			.iter()
-			.find(|pv| pv.percentile == Percentile::P99_99)
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
-			.value;
-
-		assert!(p50 <= p90);
-		assert!(p90 <= p95);
-		assert!(p95 <= p99);
-		assert!(p99 <= p99_9);
-		assert!(p99_9 <= p99_99);
-
+		let values = [50_500_000, 90_000_000, 95_000_000, 99_000_000, 100_000_000, 100_000_000];
+		assert_eq!(analyzed.percentiles, percentiles(values));
 		Ok(())
 	}
 }

@@ -176,152 +176,86 @@ impl SeverityScale {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Event, Process, State};
+	use crate::testing::fixtures::TestProcess;
+	use crate::testing::fmea::DEADLOCK;
 
-	fn create_fault(state: impl AsRef<str>) -> InjectedFaultRecord {
-		let state = state.as_ref();
-		InjectedFaultRecord {
-			csp_state: state.to_string(),
-			event_label: "test_event".to_string(),
-			error_message: "Test fault".to_string(),
-			probability_bps: 5000,
+	/// A process whose `start` takes `Init` to the loop at `Loop`, so no run
+	/// reaches its terminal `Success`.
+	const NO_TERMINAL: TestProcess = TestProcess {
+		observable: &["start", "loop_back"],
+		transitions: &[("Init", "start", "Loop"), ("Loop", "loop_back", "Loop")],
+		terminal: &["Success"],
+		..TestProcess::of("NoTerminalProcess", "Init")
+	};
+
+	/// A process of six states, where `A` reaches `A` and the terminal `Done`
+	/// alone.
+	const RESTRICTED: TestProcess = TestProcess {
+		observable: &["to_a", "done", "to_b", "to_c", "to_d"],
+		transitions: &[
+			("Init", "to_a", "A"),
+			("A", "done", "Done"),
+			("Init", "to_b", "B"),
+			("B", "to_c", "C"),
+			("C", "to_d", "D"),
+			("D", "done", "Done"),
+		],
+		terminal: &["Done"],
+		..TestProcess::of("RestrictedProcess", "Init")
+	};
+
+	/// A process of five states, where `A` reaches `A`, `B`, and the terminal
+	/// `Done`.
+	const MODERATE: TestProcess = TestProcess {
+		observable: &["to_a", "to_alt", "to_b", "done"],
+		transitions: &[
+			("Init", "to_a", "A"),
+			("Init", "to_alt", "Alt"),
+			("A", "to_b", "B"),
+			("B", "done", "Done"),
+			("Alt", "done", "Done"),
+		],
+		terminal: &["Done"],
+		..TestProcess::of("ModerateProcess", "Init")
+	};
+
+	/// A process whose `event` takes `S1` to `S2` and back, with no terminal
+	/// state.
+	const MINOR: TestProcess = TestProcess {
+		observable: &["event"],
+		transitions: &[("S1", "event", "S2"), ("S2", "event", "S1")],
+		..TestProcess::of("MinorProcess", "S1")
+	};
+
+	// A fault rates its severity on both scales from what its state reaches:
+	// a deadlock, no terminal state, under half the states, under four fifths
+	// of them, or the rest. A fault at a state the process lacks rates
+	// mid-scale.
+	crate::tb_cases! {
+		fn a_fault_rates_its_severity((process, state, ratings): (Process, &str, (u8, u8))) {
+			let fault = InjectedFaultRecord::at(state, "test_event");
+
+			let mil = fault.severity(&process, SeverityScale::MilStd1629);
+			let iso = fault.severity(&process, SeverityScale::Iso26262);
+			assert_eq!((mil, iso), ratings);
+		}
+
+		cases {
+			at_a_state_that_reaches_a_deadlock => (DEADLOCK.build(), "DeadlockProcess.Init", (10, 4)),
+			at_a_state_that_cannot_reach_a_terminal_state => (NO_TERMINAL.build(), "NoTerminalProcess.Init", (9, 4)),
+			at_a_state_that_reaches_under_half_the_states => (RESTRICTED.build(), "RestrictedProcess.A", (7, 3)),
+			at_a_state_that_reaches_under_four_fifths_of_the_states => (MODERATE.build(), "ModerateProcess.A", (5, 2)),
+			at_a_state_that_reaches_every_state => (MINOR.build(), "MinorProcess.S1", (3, 1)),
+			at_a_bare_state_name => (TestProcess { name: "BareProcess", ..DEADLOCK }.build(), "Init", (10, 4)),
+			at_mid_scale_for_a_state_the_process_lacks => (
+				TestProcess { observable: &["event"], ..TestProcess::of("SimpleProcess", "Known") }.build(),
+				"SimpleProcess.UnknownState",
+				(5, 2),
+			),
 		}
 	}
 
-	fn assert_severity_both_scales(fault: &InjectedFaultRecord, process: &Process, expected_mil: u8, expected_iso: u8) {
-		let severity_mil = fault.severity(process, SeverityScale::MilStd1629);
-		let severity_iso = fault.severity(process, SeverityScale::Iso26262);
-		assert_eq!(severity_mil, expected_mil);
-		assert_eq!(severity_iso, expected_iso);
-	}
-
-	macro_rules! process_spec {
-		(
-			$name:expr,
-			initial: $initial:expr,
-			terminals: [$($terminal:expr),* $(,)?],
-			transitions: [$(($from:expr, $event:expr, $to:expr)),* $(,)?]
-		) => {{
-			let mut builder = Process::builder($name).initial_state(State($initial));
-
-			let mut observables = std::collections::HashSet::new();
-			$(
-				observables.insert(Event($event));
-			)*
-
-			for observable in observables {
-				builder = builder.add_observable(observable);
-			}
-
-			$(
-				builder = builder.add_terminal(State($terminal));
-			)*
-
-			$(
-				builder = builder.add_transition(State($from), Event($event), State($to));
-			)*
-
-			builder.build().expect("fixture state machine builds")
-		}};
-	}
-
-	#[test]
-	fn test_severity_deadlock_catastrophic() {
-		let process = process_spec!(
-			"DeadlockProcess",
-			initial: "Init",
-			terminals: [],
-			transitions: [("Init", "start", "Blocked")]
-		);
-		assert_severity_both_scales(&create_fault("DeadlockProcess.Init"), &process, 10, 4);
-	}
-
-	#[test]
-	fn test_severity_cannot_reach_terminal() {
-		let process = process_spec!(
-			"NoTerminalProcess",
-			initial: "Init",
-			terminals: ["Success"],
-			transitions: [
-				("Init", "start", "Loop"),
-				("Loop", "loop_back", "Loop")
-			]
-		);
-		assert_severity_both_scales(&create_fault("NoTerminalProcess.Init"), &process, 9, 4);
-	}
-
-	#[test]
-	fn test_severity_severe_restriction() {
-		let process = process_spec!(
-			"RestrictedProcess",
-			initial: "Init",
-			terminals: ["Done"],
-			transitions: [
-				("Init", "to_a", "A"),
-				("A", "done", "Done"),
-				("Init", "to_b", "B"),
-				("B", "to_c", "C"),
-				("C", "to_d", "D"),
-				("D", "done", "Done")
-			]
-		);
-		assert_severity_both_scales(&create_fault("RestrictedProcess.A"), &process, 7, 3);
-	}
-
-	#[test]
-	fn test_severity_moderate_restriction() {
-		let process = process_spec!(
-			"ModerateProcess",
-			initial: "Init",
-			terminals: ["Done"],
-			transitions: [
-				("Init", "to_a", "A"),
-				("Init", "to_alt", "Alt"),
-				("A", "to_b", "B"),
-				("B", "done", "Done"),
-				("Alt", "done", "Done")
-			]
-		);
-		assert_severity_both_scales(&create_fault("ModerateProcess.A"), &process, 5, 2);
-	}
-
-	#[test]
-	fn test_severity_minor_impact() {
-		let process = process_spec!(
-			"MinorProcess",
-			initial: "S1",
-			terminals: [],
-			transitions: [
-				("S1", "event", "S2"),
-				("S2", "event", "S1")
-			]
-		);
-		assert_severity_both_scales(&create_fault("MinorProcess.S1"), &process, 3, 1);
-	}
-
-	#[test]
-	fn test_severity_bare_state_name_accepted() {
-		let process = process_spec!(
-			"BareProcess",
-			initial: "Init",
-			terminals: [],
-			transitions: [("Init", "start", "Blocked")]
-		);
-		assert_severity_both_scales(&create_fault("Init"), &process, 10, 4);
-	}
-
-	#[test]
-	fn test_severity_unknown_state() -> Result<(), Box<dyn core::error::Error>> {
-		let process = Process::builder("SimpleProcess")
-			.add_observable(Event("event"))
-			.initial_state(State("Known"))
-			.build()?;
-
-		assert_severity_both_scales(&create_fault("SimpleProcess.UnknownState"), &process, 5, 2);
-
-		Ok(())
-	}
-
+	// The occurrence rating maps a probability in basis points onto the scale.
 	// Each row is (basis points, scale, expected occurrence rating).
 	crate::tb_cases! {
 		fn occurrence_boundary((bps, scale, expected): (u16, SeverityScale, u16)) {
@@ -338,6 +272,7 @@ mod tests {
 		}
 	}
 
+	// The detection rating falls as the share of successful recoveries rises.
 	// Each row is (recoveries successful, recoveries failed, scale, expected
 	// detection rating).
 	crate::tb_cases! {

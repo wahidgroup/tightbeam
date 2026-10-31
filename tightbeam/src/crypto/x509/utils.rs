@@ -683,30 +683,26 @@ pub(crate) fn recipient_identifier_of(sid: &SignerIdentifier) -> RecipientIdenti
 
 #[cfg(test)]
 mod tests {
-	use super::{CertificateExt, Fingerprint, Skid};
 	use crate::asn1::admission::fixtures::{tlv, DESCENDING_LEN};
 	use crate::crypto::hash::{Digest, Sha3_256};
-	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::error::CertificateValidationError::EncodingError;
-	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::crypto::x509::Certificate;
 	use crate::der::asn1::OctetString;
 	use crate::der::oid::AssociatedOid;
 	use crate::der::{Encode, ErrorKind, Tag, TagNumber};
-	use crate::testing::{TestCertificate, TestKey};
+	use crate::testing::{TestCertificate, TestResult};
 	use crate::x509::ext::pkix::{IssuerAltName, SubjectKeyIdentifier};
 	use crate::x509::ext::Extension;
 
-	/// The self-signed test certificate with an `issuerAltName` extension
-	/// around `value`. The lookup of an extension reads the extensions alone,
-	/// so the stale signature leaves the lookup as it is.
-	fn with_issuer_alt_name(value: Vec<u8>) -> Certificate {
-		let mut certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	use super::{CertificateExt, Fingerprint, Skid};
+
+	/// The fixed test certificate with an `issuerAltName` extension around
+	/// `value`. The lookup of an extension reads the extensions alone, so the
+	/// stale signature leaves the lookup as it is.
+	fn with_issuer_alt_name(value: impl Into<Vec<u8>>) -> Certificate {
 		let extn_value = OctetString::new(value).expect("a test value fits an OCTET STRING");
 		let extension = Extension { extn_id: IssuerAltName::OID, critical: false, extn_value };
-		let extensions = certificate.tbs_certificate.extensions.get_or_insert_with(Vec::new);
-		extensions.push(extension);
-		certificate
+		TestCertificate::with_extension(TestCertificate::insecure_fixed(), extension)
 	}
 
 	/// The `GeneralNames` of one `directoryName` whose one RDN holds
@@ -718,6 +714,7 @@ mod tests {
 			let value = tlv(Tag::OctetString, &value.to_be_bytes());
 			tlv(Tag::Sequence, &[common_name.as_slice(), &value].concat())
 		});
+
 		let rdn = tlv(Tag::Set, &entries.collect::<Vec<_>>().concat());
 		let directory_name = Tag::ContextSpecific { constructed: true, number: TagNumber::N4 };
 		tlv(Tag::Sequence, &tlv(directory_name, &tlv(Tag::Sequence, &rdn)))
@@ -739,8 +736,8 @@ mod tests {
 	/// digest of the whole DER, which the encoder writes outside the code
 	/// under test.
 	#[test]
-	fn a_fingerprint_is_the_digest_of_the_certificate_der() -> Result<(), CertificateValidationError> {
-		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	fn a_fingerprint_is_the_digest_of_the_certificate_der() -> TestResult {
+		let certificate = TestCertificate::insecure_fixed();
 		let expected = Sha3_256::digest(certificate.to_der()?);
 
 		let fingerprint = Fingerprint::<Sha3_256>::from_certificate(&certificate)?;
@@ -751,16 +748,19 @@ mod tests {
 	/// The extension value a SKID converts to carries the SKID bytes whole,
 	/// so a certificate the crate creates holds the 20 bytes its key names.
 	#[test]
-	fn a_skid_converts_to_the_extension_value_that_carries_it() -> Result<(), crate::der::Error> {
+	fn a_skid_converts_to_the_extension_value_that_carries_it() -> TestResult {
 		let skid = Skid::parse([0x5au8; 20]).ok_or(crate::der::Tag::OctetString.value_error())?;
 		let identifier = SubjectKeyIdentifier::try_from(skid)?;
 		assert_eq!(identifier.0.as_bytes(), skid.as_bytes());
 		Ok(())
 	}
 
+	/// The `pem!` macro trims the indent of each line of an inline PEM block,
+	/// so it parses the ssl.com certificate whose serial number
+	/// `openssl x509 -serial` reads as `799DEE3BAA70B56D0184D20EB0CC4BD3`.
 	#[test]
-	fn test_pem_macro() {
-		let cert = pem! {"
+	fn the_pem_macro_parses_a_certificate() -> TestResult {
+		let certificate = pem! {"
 			-----BEGIN CERTIFICATE-----
 			MIIH/zCCBeegAwIBAgIQeZ3uO6pwtW0BhNIOsMxL0zANBgkqhkiG9w0BAQsFADBy
 			MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24x
@@ -806,111 +806,116 @@ mod tests {
 			z6ZMFc1D521/AoM4rmZI6S31X5nrRGw8OsIYFQfpkvZRpQBYYTioWYbxrzeziaES
 			quB/qaj1ZWmsSd2LrJ+4S9roN+RR9xZYSu11p8fAWQvlbqk=
 			-----END CERTIFICATE-----
-		"};
-		assert!(cert.is_ok());
-	}
+		"}?;
 
-	#[test]
-	fn test_expiry_validator_rejects_expired_cert() {
-		let expired_cert = TestCertificate::expired();
-		let validator = ExpiryValidator::default();
-
-		// This certificate expired on August 17, 2019, so the validator rejects
-		// it.
-		let result = validator.evaluate(&expired_cert);
-		assert!(result.is_err(), "Expired certificate should be rejected");
-
-		match result {
-			Err(CertificateValidationError::Expired) => {
-				// This arm is the expected error.
-			}
-			other => panic!("Expected Expired error, got: {other:?}"),
-		}
+		let serial = [
+			0x79, 0x9d, 0xee, 0x3b, 0xaa, 0x70, 0xb5, 0x6d, 0x01, 0x84, 0xd2, 0x0e, 0xb0, 0xcc, 0x4b, 0xd3,
+		];
+		assert_eq!(certificate.tbs_certificate.serial_number.as_bytes(), serial);
+		Ok(())
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
 	mod certificate_extension {
 		use crate::crypto::x509::error::CertificateValidationError;
+		use crate::crypto::x509::error::CertificateValidationError::{
+			DuplicateExtension, UnprocessedCriticalExtension,
+		};
 		use crate::crypto::x509::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
-		use crate::crypto::x509::utils::CertificateExt;
-		use crate::der::oid::db::rfc5280::{ANY_EXTENDED_KEY_USAGE, ID_KP_CLIENT_AUTH, ID_KP_TIME_STAMPING};
-		use crate::der::oid::AssociatedOid;
-		use crate::testing::fixtures::TestCertificate;
-		use crate::testing::TestKey;
-		use crate::x509::Certificate;
+		use crate::crypto::x509::fixtures::Verdict;
+		use crate::der::asn1::ObjectIdentifier;
+		use crate::der::flagset::FlagSet;
+		use crate::der::oid::db::rfc5280::{
+			ANY_EXTENDED_KEY_USAGE, ID_CE_KEY_USAGE, ID_CE_NAME_CONSTRAINTS, ID_KP_CLIENT_AUTH, ID_KP_TIME_STAMPING,
+		};
+		use crate::testing::fixtures::TestCertificateChain;
 
-		/// A self-signed certificate of the fixed test key, whose `keyUsage`
-		/// carries `digitalSignature` and `keyAgreement`.
-		fn both_uses() -> Certificate {
-			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
+		use super::*;
+
+		/// The fixed test certificate with `extensions` in place of the
+		/// extensions it carries.
+		fn carrying(extensions: impl IntoIterator<Item = Extension>) -> Certificate {
+			let mut certificate = TestCertificate::insecure_fixed();
+			certificate.tbs_certificate.extensions = Some(extensions.into_iter().collect());
+			certificate
 		}
 
-		/// [`both_uses`] with an `extendedKeyUsage` of `purposes` alone.
-		fn with_purposes(purposes: Vec<crate::der::asn1::ObjectIdentifier>) -> Certificate {
-			TestCertificate::with_key_purposes(both_uses(), purposes)
+		/// The fixed test certificate with `usages` as the bits of its
+		/// `keyUsage`.
+		fn with_usages(usages: impl Into<FlagSet<KeyUsages>>) -> Certificate {
+			TestCertificate::with_key_usage(TestCertificate::insecure_fixed(), KeyUsage(usages.into()))
 		}
 
-		#[test]
-		fn rejects_unknown_critical_extension() {
-			// nameConstraints (2.5.29.30) sits outside the processed set.
-			let mut cert = both_uses();
-			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.30", true)]);
-			assert!(matches!(
-				cert.ensure_critical_extensions_processed(),
-				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-			));
+		/// The fixed test certificate with an `extendedKeyUsage` of `purposes`
+		/// alone.
+		fn with_purposes(purposes: impl IntoIterator<Item = ObjectIdentifier>) -> Certificate {
+			TestCertificate::with_key_purposes(TestCertificate::insecure_fixed(), purposes)
 		}
 
-		#[test]
-		fn accepts_unknown_noncritical_extension() {
-			let mut cert = both_uses();
-			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.30", false)]);
-			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		/// The fixed test chain, in which a root signs an intermediate and the
+		/// intermediate signs a leaf.
+		fn chain() -> TestCertificateChain {
+			TestCertificate::insecure_fixed_chain().expect("the fixed test chain builds")
 		}
 
-		#[test]
-		fn accepts_processed_critical_extensions() {
-			let mut cert = both_uses();
-			cert.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, None));
-			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		// The critical-extension check refuses a critical extension that the
+		// crate does not process, and admits a processed or a noncritical one
+		// (RFC 5280 §4.2).
+		crate::tb_cases! {
+			fn the_critical_extension_check((certificate, verdict): (Certificate, Verdict)) {
+				let checked = certificate.ensure_critical_extensions_processed();
+				assert!(verdict(&checked));
+			}
+			cases {
+				/// `nameConstraints` (2.5.29.30) sits outside the processed
+				/// set.
+				refuses_an_unknown_critical_extension => (
+					carrying([TestCertificate::opaque_extension("2.5.29.30", true)]),
+					|r| matches!(r, Err(UnprocessedCriticalExtension(oid)) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+				admits_an_unknown_noncritical_extension => (
+					carrying([TestCertificate::opaque_extension("2.5.29.30", false)]),
+					Result::is_ok,
+				),
+				admits_processed_critical_extensions => (
+					carrying(TestCertificate::ca_extensions(true, true, None)),
+					Result::is_ok,
+				),
+				/// The crate processes `extendedKeyUsage`, so it admits a
+				/// critical one (RFC 5280 §4.2.1.12).
+				admits_a_critical_extended_key_usage => (
+					TestCertificate::with_extension(
+						TestCertificate::insecure_fixed(),
+						TestCertificate::extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]), true),
+					),
+					Result::is_ok,
+				),
+				/// Colony membership reads subjectAltName (2.5.29.17), which
+				/// RFC 5280 §4.1.2.6 marks critical when the subject DN is
+				/// empty.
+				admits_a_critical_subject_alt_name => (
+					carrying([TestCertificate::opaque_extension("2.5.29.17", true)]),
+					Result::is_ok,
+				),
+			}
 		}
 
-		/// The crate processes `extendedKeyUsage`, so it admits a critical one
-		/// (RFC 5280 §4.2.1.12).
-		#[test]
-		fn accepts_a_critical_extended_key_usage() {
-			let extension = TestCertificate::extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]), true);
-			let cert = TestCertificate::with_extension(both_uses(), extension);
-			assert!(cert.ensure_critical_extensions_processed().is_ok());
-		}
-
-		/// The uniqueness check refuses a certificate with two `keyUsage`
-		/// extensions (RFC 5280 §4.2).
-		#[test]
-		fn rejects_a_repeated_extension() {
-			let mut cert = both_uses();
-			let key_usage = TestCertificate::opaque_extension("2.5.29.15", true);
-			let repeated = vec![key_usage.clone(), key_usage];
-
-			cert.tbs_certificate.extensions = Some(repeated);
-
-			let refused = cert.ensure_unique_extensions();
-			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-		}
-
-		#[test]
-		fn accepts_one_instance_of_each_extension() {
-			let cert = both_uses();
-			assert!(cert.ensure_unique_extensions().is_ok());
-		}
-
-		#[test]
-		fn accepts_critical_subject_alt_name() {
-			// Colony membership reads subjectAltName (2.5.29.17), which
-			// RFC 5280 §4.1.2.6 marks critical when the subject DN is empty.
-			let mut cert = both_uses();
-			cert.tbs_certificate.extensions = Some(vec![TestCertificate::opaque_extension("2.5.29.17", true)]);
-			assert!(cert.ensure_critical_extensions_processed().is_ok());
+		// The uniqueness check refuses a certificate that carries one extension
+		// twice (RFC 5280 §4.2).
+		crate::tb_cases! {
+			fn the_uniqueness_check((certificate, verdict): (Certificate, Verdict)) {
+				let checked = certificate.ensure_unique_extensions();
+				assert!(verdict(&checked));
+			}
+			cases {
+				/// The check refuses a certificate with two `keyUsage`
+				/// extensions.
+				refuses_a_repeated_extension => (
+					carrying(vec![TestCertificate::opaque_extension("2.5.29.15", true); 2]),
+					|r| matches!(r, Err(DuplicateExtension(oid)) if *oid == ID_CE_KEY_USAGE),
+				),
+				admits_one_instance_of_each_extension => (TestCertificate::insecure_fixed(), Result::is_ok),
+			}
 		}
 
 		/// The read of one extension refuses a certificate that carries it
@@ -918,121 +923,114 @@ mod tests {
 		#[test]
 		fn reading_an_extension_carried_twice_is_refused() {
 			let key_usage = KeyUsage(KeyUsages::DigitalSignature.into());
-			let cert = TestCertificate::with_extension(both_uses(), TestCertificate::extension(&key_usage, true));
+			let extension = TestCertificate::extension(&key_usage, true);
+			let cert = TestCertificate::with_extension(TestCertificate::insecure_fixed(), extension);
 
 			let refused = cert.extension::<KeyUsage>();
-			assert!(
-				matches!(refused, Err(CertificateValidationError::DuplicateExtension(oid)) if oid == KeyUsage::OID)
-			);
+			assert!(matches!(refused, Err(DuplicateExtension(oid)) if oid == KeyUsage::OID));
 		}
 
-		/// Each use admits a certificate whose `keyUsage` carries both bits.
-		#[test]
-		fn a_certificate_with_both_bits_is_admitted_for_signing() {
-			assert!(both_uses().require_use(KeyUsages::DigitalSignature).is_ok());
+		// A use admits a certificate whose `keyUsage` carries its bit, after
+		// the extension rules of RFC 5280 §4.2 pass.
+		crate::tb_cases! {
+			fn the_use_check((certificate, usage, verdict): (Certificate, KeyUsages, Verdict)) {
+				let checked = certificate.require_use(usage);
+				assert!(verdict(&checked));
+			}
+			cases {
+				/// Each use admits a certificate whose `keyUsage` carries both
+				/// bits.
+				admits_both_bits_for_signing => (
+					TestCertificate::insecure_fixed(),
+					KeyUsages::DigitalSignature,
+					Result::is_ok,
+				),
+				admits_both_bits_for_key_agreement => (
+					TestCertificate::insecure_fixed(),
+					KeyUsages::KeyAgreement,
+					Result::is_ok,
+				),
+				/// The signing use refuses a certificate whose `keyUsage`
+				/// carries `keyAgreement` alone.
+				refuses_a_key_agreement_certificate_for_signing => (
+					with_usages(KeyUsages::KeyAgreement),
+					KeyUsages::DigitalSignature,
+					|r| matches!(r, Err(CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature))),
+				),
+				/// The key-agreement use refuses a certificate whose `keyUsage`
+				/// carries `digitalSignature` alone.
+				refuses_a_signing_certificate_for_key_agreement => (
+					with_usages(KeyUsages::DigitalSignature),
+					KeyUsages::KeyAgreement,
+					|r| matches!(r, Err(CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement))),
+				),
+				/// The use refuses a repeated extension before it reads
+				/// `keyUsage`, so it refuses a certificate with no `keyUsage`
+				/// for the repeat.
+				refuses_a_repeated_extension => (
+					TestCertificate::with_repeated_extension(
+						TestCertificate::without_extension(TestCertificate::insecure_fixed(), KeyUsage::OID),
+						"2.5.29.30",
+					),
+					KeyUsages::DigitalSignature,
+					|r| matches!(r, Err(DuplicateExtension(oid)) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+				/// The use refuses a critical extension the crate does not
+				/// process.
+				refuses_an_unknown_critical_extension => (
+					TestCertificate::with_unknown_critical_extension(TestCertificate::insecure_fixed()),
+					KeyUsages::KeyAgreement,
+					|r| matches!(r, Err(UnprocessedCriticalExtension(oid)) if *oid == ID_CE_NAME_CONSTRAINTS),
+				),
+			}
 		}
 
-		#[test]
-		fn a_certificate_with_both_bits_is_admitted_for_key_agreement() {
-			assert!(both_uses().require_use(KeyUsages::KeyAgreement).is_ok());
+		// The client role admits a certificate whose `extendedKeyUsage` names
+		// its purpose or `anyExtendedKeyUsage`, and a certificate with no
+		// `extendedKeyUsage` (RFC 5280 §4.2.1.12).
+		crate::tb_cases! {
+			fn the_client_purpose_check((certificate, verdict): (Certificate, Verdict)) {
+				let checked = certificate.require_purpose(ID_KP_CLIENT_AUTH);
+				assert!(verdict(&checked));
+			}
+			cases {
+				/// An `extendedKeyUsage` that omits a purpose refuses its role
+				/// (RFC 5280 §4.2.1.12).
+				refuses_a_certificate_that_omits_it => (
+					with_purposes([ID_KP_TIME_STAMPING]),
+					|r| matches!(r, Err(CertificateValidationError::ExcludedKeyPurpose)),
+				),
+				/// An `extendedKeyUsage` that names a purpose among others
+				/// admits its role.
+				admits_a_certificate_that_names_it_among_others => (
+					with_purposes([ID_KP_TIME_STAMPING, ID_KP_CLIENT_AUTH]),
+					Result::is_ok,
+				),
+				/// `anyExtendedKeyUsage` admits every role (RFC 5280
+				/// §4.2.1.12).
+				admits_any_extended_key_usage => (with_purposes([ANY_EXTENDED_KEY_USAGE]), Result::is_ok),
+				/// A certificate with no `extendedKeyUsage` serves every role.
+				admits_a_certificate_with_no_extended_key_usage => (TestCertificate::insecure_fixed(), Result::is_ok),
+			}
 		}
 
-		/// The signing use refuses a certificate whose `keyUsage` carries
-		/// `keyAgreement` alone.
-		#[test]
-		fn a_key_agreement_certificate_is_refused_for_signing() {
-			let cert = TestCertificate::with_key_usage(both_uses(), KeyUsage(KeyUsages::KeyAgreement.into()));
-			let refused = cert.require_use(KeyUsages::DigitalSignature);
-			assert!(matches!(
-				refused,
-				Err(CertificateValidationError::MissingKeyUsage(KeyUsages::DigitalSignature))
-			));
-		}
-
-		/// The key-agreement use refuses a certificate whose `keyUsage`
-		/// carries `digitalSignature` alone.
-		#[test]
-		fn a_signing_certificate_is_refused_for_key_agreement() {
-			let cert = TestCertificate::with_key_usage(both_uses(), KeyUsage(KeyUsages::DigitalSignature.into()));
-			let refused = cert.require_use(KeyUsages::KeyAgreement);
-			assert!(matches!(
-				refused,
-				Err(CertificateValidationError::MissingKeyUsage(KeyUsages::KeyAgreement))
-			));
-		}
-
-		/// An `extendedKeyUsage` that omits a purpose refuses its role
-		/// (RFC 5280 §4.2.1.12).
-		#[test]
-		fn a_purpose_the_extended_key_usage_omits_is_refused() {
-			let cert = with_purposes(vec![ID_KP_TIME_STAMPING]);
-			let refused = cert.require_purpose(ID_KP_CLIENT_AUTH);
-			assert!(matches!(refused, Err(CertificateValidationError::ExcludedKeyPurpose)));
-		}
-
-		/// An `extendedKeyUsage` that names a purpose among others admits its
-		/// role.
-		#[test]
-		fn a_purpose_the_extended_key_usage_names_is_admitted() {
-			let cert = with_purposes(vec![ID_KP_TIME_STAMPING, ID_KP_CLIENT_AUTH]);
-			assert!(cert.require_purpose(ID_KP_CLIENT_AUTH).is_ok());
-		}
-
-		/// `anyExtendedKeyUsage` admits every role (RFC 5280 §4.2.1.12).
-		#[test]
-		fn any_extended_key_usage_admits_the_role() {
-			let cert = with_purposes(vec![ANY_EXTENDED_KEY_USAGE]);
-			assert!(cert.require_purpose(ID_KP_CLIENT_AUTH).is_ok());
-		}
-
-		/// A certificate with no `extendedKeyUsage` serves every role.
-		#[test]
-		fn a_certificate_without_extended_key_usage_admits_the_role() {
-			assert!(both_uses().require_purpose(ID_KP_CLIENT_AUTH).is_ok());
-		}
-
-		/// The use refuses a repeated extension before it reads `keyUsage`,
-		/// so it refuses a certificate with no `keyUsage` for the repeat.
-		#[test]
-		fn a_use_refuses_a_repeated_extension() {
-			let extension = TestCertificate::opaque_extension("2.5.29.30", false);
-			let cert = TestCertificate::without_extension(both_uses(), KeyUsage::OID);
-			let cert = TestCertificate::with_extension(cert, extension.clone());
-			let cert = TestCertificate::with_extension(cert, extension);
-
-			let refused = cert.require_use(KeyUsages::DigitalSignature);
-			assert!(matches!(refused, Err(CertificateValidationError::DuplicateExtension(_))));
-		}
-
-		/// The use refuses a critical extension the crate does not process.
-		#[test]
-		fn a_use_refuses_an_unknown_critical_extension() {
-			let extension = TestCertificate::opaque_extension("2.5.29.30", true);
-			let cert = TestCertificate::with_extension(both_uses(), extension);
-
-			let refused = cert.require_use(KeyUsages::KeyAgreement);
-			assert!(matches!(
-				refused,
-				Err(CertificateValidationError::UnprocessedCriticalExtension(_))
-			));
-		}
-
-		#[test]
-		fn reads_basic_constraints() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = TestCertificate::insecure_fixed_chain()?;
-			let basic_constraints = &chain
-				.root
-				.extension::<BasicConstraints>()?
-				.ok_or(crate::testing::error::TestingError::InvariantViolated)?;
-			assert!(basic_constraints.ca);
-			Ok(())
-		}
-
-		#[test]
-		fn absent_returns_none() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = TestCertificate::insecure_fixed_chain()?;
-			assert!(&chain.leaf.extension::<BasicConstraints>()?.is_none());
-			Ok(())
+		// The read of `basicConstraints` returns the extension a certificate
+		// carries, and `None` for a certificate that carries none.
+		crate::tb_cases! {
+			fn the_basic_constraints_of((certificate, expected): (Certificate, Option<BasicConstraints>))
+				-> TestResult
+			{
+				let constraints = certificate.extension::<BasicConstraints>()?;
+				assert_eq!(constraints, expected);
+				Ok(())
+			}
+			cases {
+				/// The fixed test chain names its root a CA with no path
+				/// length.
+				a_root_name_a_ca => (chain().root, Some(BasicConstraints { ca: true, path_len_constraint: None })),
+				/// The fixed test chain gives its leaf no `basicConstraints`.
+				a_leaf_are_absent => (chain().leaf, None),
+			}
 		}
 	}
 }

@@ -164,9 +164,12 @@ pub enum RFC5424Error {
 
 #[cfg(test)]
 mod tests {
-	use super::{RFC5424Error, SyslogSeverity};
 	use crate::der::{Decode, Encode};
+	use crate::testing::TestResult;
 
+	use super::{RFC5424Error, SyslogSeverity};
+
+	/// The severities run from 0 to 7, so the value 8 is refused.
 	#[test]
 	fn a_severity_value_past_seven_is_refused() {
 		assert_eq!(SyslogSeverity::try_from(8), Err(RFC5424Error::InvalidSeverityValue(8)));
@@ -174,25 +177,24 @@ mod tests {
 
 	/// A severity encodes as an ENUMERATED of its number, and decodes back.
 	#[test]
-	fn a_severity_survives_a_der_round_trip() -> Result<(), crate::der::Error> {
+	fn a_severity_survives_a_der_round_trip() -> TestResult {
 		let encoded = SyslogSeverity::Notice.to_der()?;
-
 		let decoded = SyslogSeverity::from_der(&encoded)?;
-
 		assert_eq!((encoded, decoded), (vec![0x0A, 0x01, 0x05], SyslogSeverity::Notice));
 		Ok(())
 	}
 
-	/// A number names the severity of that number.
-	#[test]
-	fn a_number_parses_as_the_severity_of_that_number() {
-		assert_eq!("6".parse::<SyslogSeverity>(), Ok(SyslogSeverity::Informational));
-	}
-
-	/// The parse of a number goes through the numeric table, so a number past
-	/// 7 is refused as a value, as `TryFrom<u8>` refuses it.
-	#[test]
-	fn a_number_past_seven_is_refused_as_a_severity_value() {
-		assert_eq!("8".parse::<SyslogSeverity>(), Err(RFC5424Error::InvalidSeverityValue(8)));
+	// The parse of a number goes through the numeric table of `TryFrom<u8>`.
+	crate::tb_cases! {
+		fn a_number_parses_through_the_numeric_table((text, expected): (&str, Result<SyslogSeverity, RFC5424Error>)) {
+			assert_eq!(text.parse::<SyslogSeverity>(), expected);
+		}
+		cases {
+			/// A number names the severity of that number.
+			within_it => ("6", Ok(SyslogSeverity::Informational)),
+			/// A number past 7 is refused as a value, as `TryFrom<u8>` refuses
+			/// it.
+			past_seven => ("8", Err(RFC5424Error::InvalidSeverityValue(8))),
+		}
 	}
 }

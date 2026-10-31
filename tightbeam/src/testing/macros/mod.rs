@@ -1134,101 +1134,94 @@ macro_rules! tb_scenario {
 crate::__tb_if_test! {
 	crate::__tb_if_testing_csp! {
 		mod tests {
-			use std::borrow::Cow;
 			use std::panic::{catch_unwind, AssertUnwindSafe};
 			use std::sync::atomic::{AtomicBool, Ordering};
 			use std::sync::Arc;
 
-			use crate::testing::specs::composition::CompositionError;
-			use crate::testing::specs::csp::{CspValidationResult, CspViolation, Event, Process, ProcessSpec, State};
+			use crate::testing::fixtures::TestProcess;
+			use crate::testing::specs::csp::ProcessSpec;
 			use crate::testing::{HookContext, ScenarioConfig, TestHooks};
-			use crate::trace::ConsumedTrace;
 
-			struct AlwaysInvalidSpec;
-
-			impl ProcessSpec for AlwaysInvalidSpec {
-				fn validate_trace(&self, _process: &Process, _trace: &ConsumedTrace) -> CspValidationResult {
-					CspValidationResult {
-						valid: false,
-						violations: vec![CspViolation::Deadlock { event: Event("noop"), state: State("start") }],
-					}
-				}
-
-				fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
-					let process = Process::builder("always_invalid").initial_state(State("start")).build()?;
-					Ok(Cow::Owned(process))
-				}
-			}
-
-			// Layer 2 CSP failures must travel the same failure path as Layer 1
-			// assertion failures: `on_fail` runs before the panic, so logging
-			// and cleanup hooks observe the regression.
-			#[test]
-			fn csp_failure_invokes_on_fail_before_panicking() -> Result<(), crate::TightBeamError> {
-				let failed = Arc::new(AtomicBool::new(false));
-				let observed = Arc::clone(&failed);
-				let hooks = TestHooks::on_fail(move |_context, _violations| {
-						observed.store(true, Ordering::SeqCst);
-					});
-
-				let config = crate::__tb_accept_config!(
-					ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build()
-				);
+			/// Whether grading a run with no event under `spec` and `hooks`
+			/// panicked.
+			fn grading_panics(spec: impl ProcessSpec + Send + Sync + 'static, hooks: TestHooks) -> bool {
+				let built = ScenarioConfig::builder().with_csp(spec).with_hooks(hooks).build();
+				let config = crate::__tb_accept_config!(built);
 				let trace = config.trace();
-				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()))?;
+				let built = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()));
+				let hook_ctx = built.expect("a run with no event grades");
 				let outcome = catch_unwind(AssertUnwindSafe(|| {
 					crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx);
 				}));
 
-				assert!(outcome.is_err());
-				assert!(failed.load(Ordering::SeqCst));
-				Ok(())
+				outcome.is_err()
 			}
 
-			struct AlwaysValidSpec;
+			/// Hooks whose failure observer raises the flag they take.
+			type FailureHooks = fn(Arc<AtomicBool>) -> TestHooks;
 
-			impl ProcessSpec for AlwaysValidSpec {
-				fn validate_trace(&self, _process: &Process, _trace: &ConsumedTrace) -> CspValidationResult {
-					CspValidationResult { valid: true, violations: Vec::new() }
+			// Layer 2 CSP failures travel the failure path of Layer 1
+			// assertion failures: `on_fail` runs before the panic, so logging
+			// and cleanup hooks observe the regression. A failure observer runs
+			// alone, and beside a pass observer when `with_on_fail` adds it.
+			crate::tb_cases! {
+				fn csp_failure_invokes_on_fail_before_panicking(hooks: FailureHooks) {
+					let failed = Arc::new(AtomicBool::new(false));
+					let observed = hooks(Arc::clone(&failed));
+
+					let panicked = grading_panics(TestProcess::of("Refusing", "S0").build(), observed);
+
+					assert_eq!((panicked, failed.load(Ordering::SeqCst)), (true, true));
 				}
 
-				fn to_process_cow(&self) -> Result<Cow<'_, Process>, CompositionError> {
-					let process = Process::builder("always_valid").initial_state(State("start")).build()?;
-					Ok(Cow::Owned(process))
+				cases {
+					alone => |failed| {
+						TestHooks::on_fail(move |_context, _violations| failed.store(true, Ordering::SeqCst))
+					},
+					beside_a_pass_observer => |failed| {
+						let passing = TestHooks::on_pass(|_context| {});
+						passing.with_on_fail(move |_context, _violations| failed.store(true, Ordering::SeqCst))
+					},
 				}
 			}
 
-			// A scenario that every layer accepts returns, and `on_pass` runs.
+			/// A scenario that every layer accepts returns, and `on_pass` runs.
 			#[test]
-			fn a_passing_scenario_invokes_on_pass_and_returns() -> Result<(), crate::TightBeamError> {
+			fn a_passing_scenario_invokes_on_pass_and_returns() {
 				let passed = Arc::new(AtomicBool::new(false));
 				let observed = Arc::clone(&passed);
 				let hooks = TestHooks::on_pass(move |_context| {
-						observed.store(true, Ordering::SeqCst);
-					});
+					observed.store(true, Ordering::SeqCst);
+				});
 
-				let config = crate::__tb_accept_config!(
-					ScenarioConfig::builder().with_csp(AlwaysValidSpec).with_hooks(hooks).build()
-				);
+				let panicked = grading_panics(TestProcess::idle(), hooks);
 
-				let trace = config.trace();
-				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()))?;
-				let outcome = catch_unwind(AssertUnwindSafe(|| {
-					crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx);
-				}));
-
-				assert!(outcome.is_ok());
-				assert!(passed.load(Ordering::SeqCst));
-				Ok(())
+				assert_eq!((panicked, passed.load(Ordering::SeqCst)), (false, true));
 			}
 		}
 	}
 }
 
+/// The one-request client that the scenario tests of the macros and of the
+/// CSP specs share.
+#[cfg(all(test, feature = "tcp", feature = "tokio"))]
+pub(crate) mod fixtures {
+	use crate::transport::tcp::r#async::TokioListener;
+	use crate::transport::tcp::TightBeamSocketAddr;
+	use crate::transport::{EndpointConfig, MessageEmitter, Protocol};
+	use crate::{Frame, TightBeamError};
+
+	/// Sends `request` to the server at `addr` over a cleartext connection,
+	/// and returns the answer of the server.
+	pub(crate) async fn send_one(addr: TightBeamSocketAddr, request: Frame) -> Result<Option<Frame>, TightBeamError> {
+		let stream = <TokioListener as Protocol>::connect(addr).await?;
+		let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
+		Ok(client.emit(request, None).await?)
+	}
+}
+
 #[cfg(test)]
 mod outcome_tests {
-	use core::error::Error;
-
 	use crate::testing::TestFrame;
 	use crate::trace::{ConsumedTrace, Exchange, Presence, TraceCollector};
 	use crate::Frame;
@@ -1238,91 +1231,87 @@ mod outcome_tests {
 		(TestFrame::v0(None, Some("request")), TestFrame::v0(None, Some("response")))
 	}
 
+	/// The exchange in which `response` answered `request`.
+	fn answered(request: &Frame, response: &Frame) -> Exchange {
+		Exchange::Accepted { request: request.clone(), response: Some(Box::new(response.clone())) }
+	}
+
 	/// The trace of a run whose client recorded `exchanges` in order.
 	fn traced(exchanges: Vec<Exchange>) -> ConsumedTrace {
 		let collector = TraceCollector::new();
 		exchanges.into_iter().for_each(|exchange| collector.record_exchange(exchange));
-
-		let mut trace = ConsumedTrace::new();
-		trace.populate_from_collector(&collector);
-		trace
+		ConsumedTrace::drained_from(&collector)
 	}
 
+	/// An accepted exchange records its request and its response.
 	#[test]
-	fn an_accepted_exchange_records_its_request_and_its_response() -> Result<(), Box<dyn Error>> {
+	fn an_accepted_exchange_records_its_request_and_its_response() {
 		let (request, response) = frames();
-		let exchange = Exchange::Accepted { request: request.clone(), response: Some(Box::new(response.clone())) };
-
-		let trace = traced(vec![exchange]);
+		let trace = traced(vec![answered(&request, &response)]);
 		assert_eq!((trace.accepted_frame(), trace.response()), (Some(&request), Some(&response)));
-		Ok(())
 	}
 
+	/// A rejected exchange records its request as the rejected frame alone.
 	#[test]
-	fn a_rejected_exchange_records_its_request() -> Result<(), Box<dyn Error>> {
+	fn a_rejected_exchange_records_its_request() {
 		let (request, _) = frames();
 		let trace = traced(vec![Exchange::Rejected { request: request.clone() }]);
 		assert_eq!((trace.rejected_frame(), trace.accepted_frame()), (Some(&request), None));
-		Ok(())
 	}
 
+	/// The response of a run is the first response that arrived.
 	#[test]
-	fn the_response_of_a_run_is_the_first_that_arrived() -> Result<(), Box<dyn Error>> {
+	fn the_response_of_a_run_is_the_first_that_arrived() {
 		let (request, response) = frames();
-		let first = Exchange::Accepted { request: request.clone(), response: Some(Box::new(response.clone())) };
-		let second = Exchange::Accepted { request: request.clone(), response: Some(Box::new(request)) };
-
-		let trace = traced(vec![first, second]);
+		let trace = traced(vec![answered(&request, &response), answered(&request, &request)]);
 		assert_eq!(trace.response(), Some(&response));
-		Ok(())
 	}
 
 	/// A trace that already holds a response keeps it over the response of the
 	/// collector it drains.
 	#[test]
-	fn a_trace_keeps_its_own_response_over_a_drained_one() -> Result<(), Box<dyn Error>> {
+	fn a_trace_keeps_its_own_response_over_a_drained_one() {
 		let (request, response) = frames();
 		let collector = TraceCollector::new();
-		collector.record_exchange(Exchange::Accepted { request: request.clone(), response: Some(Box::new(request)) });
+		collector.record_exchange(answered(&request, &request));
 
 		let mut trace = ConsumedTrace::new();
 		trace.record_accepted(response.clone(), Some(response.clone()));
 		trace.populate_from_collector(&collector);
 		assert_eq!(trace.response(), Some(&response));
-		Ok(())
 	}
 
-	#[test]
-	fn a_run_that_reports_no_exchange_reports_no_response() -> Result<(), Box<dyn Error>> {
-		let trace = traced(Vec::new());
-		assert_eq!(trace.response_presence(), None);
-		Ok(())
-	}
+	// A run reports whether a response arrived from the exchanges that its
+	// client recorded.
+	crate::tb_cases! {
+		fn a_run_reports_the_presence_of_its_response((exchanges, presence): (Vec<Exchange>, Option<Presence>)) {
+			let trace = traced(exchanges);
+			let reported = trace.response_presence();
+			assert_eq!(reported, presence);
+		}
 
-	#[test]
-	fn a_refused_request_reports_an_absent_response() -> Result<(), Box<dyn Error>> {
-		let (request, _) = frames();
-		let trace = traced(vec![Exchange::Rejected { request }]);
-		assert_eq!(trace.response_presence(), Some(Presence::Absent));
-		Ok(())
+		cases {
+			with_no_exchange => (Vec::new(), None),
+			after_a_refused_request => (vec![Exchange::Rejected { request: frames().0 }], Some(Presence::Absent)),
+		}
 	}
 }
 
 #[cfg(all(test, feature = "tcp", feature = "tokio"))]
 mod scenario_outcome_tests {
-	use core::error::Error;
 	use core::future::Future;
 	use std::sync::Arc;
 
 	use tokio::sync::Notify;
 
+	use super::fixtures::send_one;
 	use super::ServerOutcome;
 	use crate::runtime::rt::JoinHandle;
 	use crate::testing::{ClientEnv, Expect, Layer, ScenarioConfig, SetupEnv, TestFrame};
 	use crate::trace::{Exchange, TraceCollector};
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
-	use crate::transport::{EndpointConfig, MessageEmitter, Protocol};
+	use crate::transport::Protocol;
 	use crate::urn::Urn;
 	use crate::{exactly, tb_assert_spec, Frame, TightBeamError};
 
@@ -1360,14 +1349,10 @@ mod scenario_outcome_tests {
 		}
 	}
 
-	/// A loopback address on a port that the system picks.
-	fn loopback() -> TightBeamSocketAddr {
-		TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-	}
-
 	/// Starts a server that answers each request with the request itself.
 	async fn echo_server() -> Result<(JoinHandle, TightBeamSocketAddr), TightBeamError> {
-		let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback()).await?;
+		let loopback = <TokioListener as Protocol>::default_bind_address()?;
+		let (listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback).await?;
 		let handle = crate::server! {
 			protocol TokioListener: listener,
 			handle: |frame: Frame| async move { Ok(Some(frame)) }
@@ -1379,11 +1364,8 @@ mod scenario_outcome_tests {
 	/// Sends one request to the server at `addr`, records `STEP`, and records
 	/// into `trace` how the server answered.
 	async fn echo_exchange(trace: TraceCollector, addr: TightBeamSocketAddr) -> Result<(), TightBeamError> {
-		let stream = <TokioListener as Protocol>::connect(addr).await?;
-		let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
-
 		let request = TestFrame::v0(None, Some("request"));
-		let response = client.emit(request.clone(), None).await?;
+		let response = send_one(addr, request.clone()).await?;
 
 		trace.event(STEP)?;
 		trace.record_exchange(Exchange::Accepted { request, response: response.map(Box::new) });
@@ -1391,10 +1373,14 @@ mod scenario_outcome_tests {
 	}
 
 	/// Starts a server task that signals `ended` and then fails.
+	///
+	/// A house server fails only on a fault of its transport, which a test
+	/// cannot raise on demand, so this stand-in fails at once.
 	async fn failed_server(
 		ended: Arc<Notify>,
 	) -> Result<(tokio::task::JoinHandle<Result<(), TightBeamError>>, TightBeamSocketAddr), TightBeamError> {
-		let (_listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback()).await?;
+		let loopback = <TokioListener as Protocol>::default_bind_address()?;
+		let (_listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback).await?;
 		let handle = tokio::spawn(async move {
 			ended.notify_one();
 			Err(TightBeamError::MissingConfiguration)
@@ -1404,8 +1390,12 @@ mod scenario_outcome_tests {
 	}
 
 	/// Starts a server task that signals `ended` and then panics.
+	///
+	/// A house server panics only on a defect of its own, so this stand-in
+	/// panics at once.
 	async fn panicked_server(ended: Arc<Notify>) -> Result<(JoinHandle, TightBeamSocketAddr), TightBeamError> {
-		let (_listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback()).await?;
+		let loopback = <TokioListener as Protocol>::default_bind_address()?;
+		let (_listener, addr) = <TokioListener as Protocol>::bind_cleartext(loopback).await?;
 		let handle = tokio::spawn(async move {
 			ended.notify_one();
 			panic!("the scenario server broke");
@@ -1421,6 +1411,7 @@ mod scenario_outcome_tests {
 		Ok(())
 	}
 
+	// A response that arrives breaks a spec that forbids one.
 	tb_scenario! {
 		name: a_response_that_arrives_breaks_a_spec_that_forbids_one,
 		config: ScenarioConfig::builder()
@@ -1433,6 +1424,7 @@ mod scenario_outcome_tests {
 		}
 	}
 
+	// A response that arrives meets a spec that requires one.
 	tb_scenario! {
 		name: a_response_that_arrives_meets_a_spec_that_requires_one,
 		config: ScenarioConfig::builder().with_spec(AnsweredSpec::latest()).build(),
@@ -1444,7 +1436,7 @@ mod scenario_outcome_tests {
 
 	/// The text that a ServiceClient scenario panics with over the server
 	/// that `server` starts.
-	async fn panic_of<S, F, T>(server: S) -> Result<String, Box<dyn Error>>
+	async fn panic_of<S, F, T>(server: S) -> String
 	where
 		S: FnOnce(Arc<Notify>) -> F + Send + 'static,
 		F: Future<Output = Result<(tokio::task::JoinHandle<T>, TightBeamSocketAddr), TightBeamError>> + Send,
@@ -1459,26 +1451,25 @@ mod scenario_outcome_tests {
 			)
 		});
 
-		let joined = run.await.err().ok_or("the scenario ended with no panic")?;
-		let payload = joined
-			.try_into_panic()
-			.map_err(|_cancelled| "the scenario task was cancelled")?;
+		let joined = run.await.expect_err("the scenario ends in a panic");
+		let payload = joined.try_into_panic().expect("the scenario task runs to its panic");
 		let borrowed = payload.downcast_ref::<&str>().map(|text| text.to_string());
+
 		let text = borrowed.or_else(|| payload.downcast_ref::<String>().cloned());
-		Ok(text.ok_or("the panic payload holds no text")?)
+		text.expect("the panic payload holds text")
 	}
 
+	/// A server that failed fails the scenario with its failure.
 	#[tokio::test]
-	async fn a_server_that_failed_fails_the_scenario_with_its_failure() -> Result<(), Box<dyn Error>> {
-		let payload = panic_of(failed_server).await?;
+	async fn a_server_that_failed_fails_the_scenario_with_its_failure() {
+		let payload = panic_of(failed_server).await;
 		assert_eq!(payload, "the server of the scenario failed: MissingConfiguration");
-		Ok(())
 	}
 
+	/// A server that panicked fails the scenario with its own panic.
 	#[tokio::test]
-	async fn a_server_that_panicked_fails_the_scenario_with_its_own_panic() -> Result<(), Box<dyn Error>> {
-		let payload = panic_of(panicked_server).await?;
+	async fn a_server_that_panicked_fails_the_scenario_with_its_own_panic() {
+		let payload = panic_of(panicked_server).await;
 		assert_eq!(payload, "the scenario server broke");
-		Ok(())
 	}
 }

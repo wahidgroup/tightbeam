@@ -493,93 +493,103 @@ mod tests {
 	use crate::crypto::sign::{elliptic_curve, SignerError};
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::error::ReceivedExpectedError;
+	use crate::testing::fixtures::TestTrace;
+	use crate::testing::TestResult;
 	use crate::TightBeamError;
 
-	#[test]
-	fn a_missing_client_certificate_is_a_certificate_rejection() {
-		let audit = HandshakeError::MissingClientCertificate.audit();
-		let expected = HandshakeAudit::IdentityRefused("missing-client-certificate");
-		assert_eq!(audit, Some(expected));
-	}
-
-	/// A closing that fails to open names no certificate the server could
-	/// check, so it records the refusal of an unproven identity.
-	#[test]
-	fn a_sealed_identity_that_fails_to_open_is_a_certificate_rejection() {
-		let audit = HandshakeError::SealedClosing(EnvelopeError::Authentication).audit();
-		let expected = HandshakeAudit::IdentityRefused("sealed-closing/authentication");
-		assert_eq!(audit, Some(expected));
-	}
-
-	#[test]
-	fn a_refused_approval_is_a_receipt_refusal() {
-		let audit = HandshakeError::ApprovalRefused { code: 7 }.audit();
-		let expected = HandshakeAudit::ReceiptRefused { reason: "approval-refused", code: Some(7) };
-		assert_eq!(audit, Some(expected));
-	}
-
 	// Each refusal files the reason it names, and the code of a refusal that
-	// carries one, so a spec tells one refusal from another.
+	// carries one, so a spec tells one refusal from another. A local fault
+	// files no record.
 	crate::tb_cases! {
-		fn a_refusal_files_its_reason((error, expected): (HandshakeError, HandshakeAudit)) {
-			assert_eq!(error.audit(), Some(expected));
+		fn a_refusal_files_its_reason((error, expected): (HandshakeError, Option<HandshakeAudit>)) {
+			assert_eq!(error.audit(), expected);
 		}
 		cases {
+			/// A missing client certificate is the refusal of an identity.
+			missing_client_certificate => (
+				HandshakeError::MissingClientCertificate,
+				Some(HandshakeAudit::IdentityRefused("missing-client-certificate")),
+			),
+			/// A closing that fails to open names no certificate the server
+			/// could check, so it records the refusal of an unproven identity.
+			sealed_closing_authentication => (
+				HandshakeError::SealedClosing(EnvelopeError::Authentication),
+				Some(HandshakeAudit::IdentityRefused("sealed-closing/authentication")),
+			),
+			/// A refused approval is the refusal of a receipt.
+			approval_refused => (
+				HandshakeError::ApprovalRefused { code: 7 },
+				Some(HandshakeAudit::ReceiptRefused { reason: "approval-refused", code: Some(7) }),
+			),
 			settlement_rejected => (
 				HandshakeError::SettlementRejected { code: 9 },
-				HandshakeAudit::ReceiptRefused { reason: "settlement-rejected", code: Some(9) },
+				Some(HandshakeAudit::ReceiptRefused { reason: "settlement-rejected", code: Some(9) }),
 			),
 			receipt_missing => (
 				HandshakeError::ReceiptMissing,
-				HandshakeAudit::ReceiptRefused { reason: "receipt-missing", code: None },
+				Some(HandshakeAudit::ReceiptRefused { reason: "receipt-missing", code: None }),
 			),
 			receipt_mismatch => (
 				HandshakeError::ReceiptMismatch,
-				HandshakeAudit::ReceiptRefused { reason: "receipt-mismatch", code: None },
+				Some(HandshakeAudit::ReceiptRefused { reason: "receipt-mismatch", code: None }),
 			),
 			countersignature_missing => (
 				HandshakeError::CountersignatureMissing,
-				HandshakeAudit::ReceiptRefused { reason: "countersignature-missing", code: None },
+				Some(HandshakeAudit::ReceiptRefused { reason: "countersignature-missing", code: None }),
 			),
 			certificate_cause => (
 				HandshakeError::CertificateValidationError(CertificateValidationError::CertificateDenied),
-				HandshakeAudit::IdentityRefused("certificate/certificate-denied"),
+				Some(HandshakeAudit::IdentityRefused("certificate/certificate-denied")),
 			),
 			signature => (
 				HandshakeError::SignatureVerificationFailed,
-				HandshakeAudit::IdentityRefused("signature"),
+				Some(HandshakeAudit::IdentityRefused("signature")),
 			),
 			mutual_auth_required => (
 				HandshakeError::MutualAuthRequired,
-				HandshakeAudit::IdentityRefused("mutual-auth-required"),
+				Some(HandshakeAudit::IdentityRefused("mutual-auth-required")),
 			),
-			sealed_frame => (HandshakeError::SealedFrame, HandshakeAudit::IdentityRefused("sealed-frame")),
+			sealed_frame => (HandshakeError::SealedFrame, Some(HandshakeAudit::IdentityRefused("sealed-frame"))),
 			authorization_refused => (
 				HandshakeError::NegotiationError(NegotiationError::AuthorizationRefused { code: 11 }),
-				HandshakeAudit::AuthorizationRefused(11),
+				Some(HandshakeAudit::AuthorizationRefused(11)),
 			),
 			key_confirmation_failed => (
 				HandshakeError::KeyConfirmationFailed,
-				HandshakeAudit::IdentityRefused("key-confirmation"),
+				Some(HandshakeAudit::IdentityRefused("key-confirmation")),
 			),
-			subject_mismatch => (HandshakeError::SubjectMismatch, HandshakeAudit::IdentityRefused("subject-mismatch")),
-			anchor_mismatch => (HandshakeError::AnchorMismatch, HandshakeAudit::IdentityRefused("anchor-mismatch")),
-			key_reuse => (HandshakeError::KeyReuse, HandshakeAudit::IdentityRefused("key-reuse")),
+			subject_mismatch => (
+				HandshakeError::SubjectMismatch,
+				Some(HandshakeAudit::IdentityRefused("subject-mismatch")),
+			),
+			anchor_mismatch => (
+				HandshakeError::AnchorMismatch,
+				Some(HandshakeAudit::IdentityRefused("anchor-mismatch")),
+			),
+			key_reuse => (HandshakeError::KeyReuse, Some(HandshakeAudit::IdentityRefused("key-reuse"))),
 			missing_server_certificate => (
 				HandshakeError::MissingServerCertificate,
-				HandshakeAudit::IdentityRefused("missing-server-certificate"),
+				Some(HandshakeAudit::IdentityRefused("missing-server-certificate")),
 			),
 			server_ephemeral_is_static => (
 				HandshakeError::ServerEphemeralIsStatic,
-				HandshakeAudit::IdentityRefused("server-ephemeral-is-static"),
+				Some(HandshakeAudit::IdentityRefused("server-ephemeral-is-static")),
 			),
 			client_ephemeral_is_static => (
 				HandshakeError::ClientEphemeralIsStatic,
-				HandshakeAudit::IdentityRefused("client-ephemeral-is-static"),
+				Some(HandshakeAudit::IdentityRefused("client-ephemeral-is-static")),
 			),
 			signature_error => (
 				HandshakeError::SignatureError(crate::crypto::sign::Error::new()),
-				HandshakeAudit::IdentityRefused("signature"),
+				Some(HandshakeAudit::IdentityRefused("signature")),
+			),
+			/// A local fault files no record.
+			invalid_state => (HandshakeError::InvalidState, None),
+			/// A crate error with no handshake counterpart files the generic
+			/// failure.
+			unmapped_crate_error => (
+				HandshakeError::from(TightBeamError::MissingEncryptionInfo),
+				Some(HandshakeAudit::Failed),
 			),
 		}
 	}
@@ -587,13 +597,11 @@ mod tests {
 	// The label of a refused authorization holds the decimal digits of its
 	// code, from one digit to the ten of `u32::MAX`.
 	crate::tb_cases! {
-		fn a_refusal_code_labels_its_record_in_decimal((code, label): (u32, &str)) -> Result<(), TightBeamError> {
+		fn a_refusal_code_labels_its_record_in_decimal((code, label): (u32, &str)) -> TestResult {
 			let trace = TraceCollector::new();
 			HandshakeAudit::AuthorizationRefused(code).file(&trace)?;
 
-			let recorded = trace.drain_events();
-			let refusals = recorded.into_iter().filter(|event| event.urn == events::SESSION_AUTHORIZATION_REFUSED);
-			let labels: Vec<Option<String>> = refusals.map(|event| event.label.map(String::from)).collect();
+			let labels = TestTrace::labels(&trace, events::SESSION_AUTHORIZATION_REFUSED);
 			assert_eq!(labels, [Some(label.to_owned())]);
 			Ok(())
 		}
@@ -604,15 +612,10 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn a_state_error_records_no_audit_event() {
-		assert_eq!(HandshakeError::InvalidState.audit(), None);
-	}
-
 	/// A crate error with no handshake counterpart keeps its cause, so the
 	/// conversion reports no state fault.
 	#[test]
-	fn an_unmapped_crate_error_reads_back_through_its_source() -> Result<(), Box<dyn core::error::Error>> {
+	fn an_unmapped_crate_error_reads_back_through_its_source() -> TestResult {
 		let error = HandshakeError::from(TightBeamError::MissingEncryptionInfo);
 		let source = core::error::Error::source(&error).ok_or("the conversion keeps the cause")?;
 
@@ -622,38 +625,31 @@ mod tests {
 		Ok(())
 	}
 
-	/// The widths that a shared-secret length error of the KDF holds, or
-	/// `None` for every other error.
-	fn held_width(error: HandshakeError) -> Option<ReceivedExpectedError<usize, usize>> {
-		match error {
-			HandshakeError::KdfError(KdfError::InvalidSharedSecretLength(held)) => Some(held),
-			_ => None,
-		}
-	}
-
 	/// A key derivation failure has a handshake counterpart, so it keeps its
-	/// kind.
+	/// kind and the widths it holds.
 	#[test]
 	fn a_key_derivation_failure_converts_to_its_counterpart() {
 		let width = ReceivedExpectedError { received: 16, expected: 32 };
 		let failure = KdfError::InvalidSharedSecretLength(width.clone());
 		let error = HandshakeError::from(TightBeamError::KeyDerivationError(failure));
-		assert_eq!(held_width(error), Some(width));
+		assert!(matches!(error, HandshakeError::KdfError(KdfError::InvalidSharedSecretLength(held)) if held == width));
 	}
 
-	/// A signature that fails to encode is a signature the handshake refuses.
-	#[test]
-	fn a_signature_encoding_failure_is_a_failed_verification() {
-		let error = HandshakeError::from(TightBeamError::SignatureEncodingError);
-		assert!(matches!(error, HandshakeError::SignatureVerificationFailed));
-	}
-
-	/// A signer error that the crate error carries whole converts as the
-	/// signer conversion converts it.
-	#[test]
-	fn a_carried_signer_error_converts_as_a_signer_refusal() {
-		let error = HandshakeError::from(TightBeamError::Signer(SignerError::SignerIdentifier));
-		assert!(matches!(error, HandshakeError::SignatureVerificationFailed));
+	// A crate error whose cause is a signature the handshake cannot read
+	// converts to a failed verification.
+	crate::tb_cases! {
+		fn a_crate_error_converts_to_a_failed_verification(error: TightBeamError) {
+			let converted = HandshakeError::from(error);
+			assert!(matches!(converted, HandshakeError::SignatureVerificationFailed));
+		}
+		cases {
+			/// A signature that fails to encode is a signature the handshake
+			/// refuses.
+			signature_encoding => TightBeamError::SignatureEncodingError,
+			/// A signer error that the crate error carries whole converts as
+			/// the signer conversion converts it.
+			carried_signer => TightBeamError::Signer(SignerError::SignerIdentifier),
+		}
 	}
 
 	/// A curve failure is an invalid public key.
@@ -668,11 +664,5 @@ mod tests {
 	fn an_invalid_key_length_converts_to_its_counterpart() {
 		let error = HandshakeError::from(TightBeamError::InvalidKeyLength(crypto_common::InvalidLength));
 		assert!(matches!(error, HandshakeError::InvalidKeyMaterialLength(_)));
-	}
-
-	#[test]
-	fn an_unmapped_crate_error_records_the_generic_failure() {
-		let audit = HandshakeError::from(TightBeamError::MissingEncryptionInfo).audit();
-		assert_eq!(audit, Some(HandshakeAudit::Failed));
 	}
 }

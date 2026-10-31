@@ -281,26 +281,33 @@ mod tests {
 		tag.as_slice().to_vec()
 	}
 
-	/// NIST HMAC-SHA3-256 Sample #1, a key shorter than the 136-octet block.
-	#[test]
-	fn hmac_sha3_256_matches_nist_sample_1() {
-		let tag = hmac_sha3_256(&sample_key(32), b"Sample message for keylen<blocklen");
-		assert_eq!(tag, hex!("4fe8e202c4f058e8dddc23d8c34e467343e23555e24fc2f025d598f558f67205"));
-	}
-
-	/// NIST HMAC-SHA3-256 Sample #2, a key as wide as the block.
-	#[test]
-	fn hmac_sha3_256_matches_nist_sample_2() {
-		let tag = hmac_sha3_256(&sample_key(136), b"Sample message for keylen=blocklen");
-		assert_eq!(tag, hex!("68b94e2e538a9be4103bebb5aa016d47961d4d1aa906061313b557f8af2c3faa"));
-	}
-
-	/// NIST HMAC-SHA3-256 Sample #3, a key wider than the block, which HMAC
-	/// hashes first.
-	#[test]
-	fn hmac_sha3_256_matches_nist_sample_3() {
-		let tag = hmac_sha3_256(&sample_key(168), b"Sample message for keylen>blocklen");
-		assert_eq!(tag, hex!("9bcf2c238e235c3ce88404e813bd2f3a97185ac6f238c63d6229a00b07974258"));
+	// Each NIST HMAC-SHA3-256 sample keys the MAC with the octets from 0
+	// counting up, as many as the sample names, and pins the tag of its text.
+	crate::tb_cases! {
+		fn hmac_sha3_256_matches_nist((key_len, text, expected): (usize, &[u8], [u8; 32])) {
+			let tag = hmac_sha3_256(&sample_key(key_len), text);
+			assert_eq!(tag, expected);
+		}
+		cases {
+			/// Sample #1, a key shorter than the 136-octet block.
+			sample_1 => (
+				32,
+				b"Sample message for keylen<blocklen",
+				hex!("4fe8e202c4f058e8dddc23d8c34e467343e23555e24fc2f025d598f558f67205"),
+			),
+			/// Sample #2, a key as wide as the block.
+			sample_2 => (
+				136,
+				b"Sample message for keylen=blocklen",
+				hex!("68b94e2e538a9be4103bebb5aa016d47961d4d1aa906061313b557f8af2c3faa"),
+			),
+			/// Sample #3, a key wider than the block, which HMAC hashes first.
+			sample_3 => (
+				168,
+				b"Sample message for keylen>blocklen",
+				hex!("9bcf2c238e235c3ce88404e813bd2f3a97185ac6f238c63d6229a00b07974258"),
+			),
+		}
 	}
 
 	/// The expansion refuses an output past 255 output blocks (RFC 5869 § 2.3).
@@ -327,55 +334,35 @@ mod tests {
 	mod rfc5869 {
 		use super::*;
 		use crate::crypto::k256::sha2::Sha256;
+		use crate::testing::unhex;
+		use crate::testing::vectors::rfc5869::{HkdfVector, RFC_5869_A_1, RFC_5869_A_2, RFC_5869_A_3};
 
-		/// The output of HKDF-SHA-256 of `ikm` under `salt` and `info`, `len`
-		/// octets of it.
-		fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, InvalidLength> {
-			let mut okm = vec![0u8; len];
-			ZeroizingHkdf::<Sha256>::new(salt, ikm).expand(info, &mut okm)?;
-			Ok(okm)
+		/// The output of HKDF-SHA-256 over the inputs of `vector`, as many
+		/// octets as it names.
+		fn hkdf_sha256(vector: &HkdfVector) -> Vec<u8> {
+			let mut okm = vec![0u8; vector.length];
+			let hkdf = ZeroizingHkdf::<Sha256>::new(&unhex(vector.salt), &unhex(vector.ikm));
+			let expanded = hkdf.expand(&unhex(vector.info), &mut okm);
+			expanded.expect("a published length lies within 255 blocks");
+			okm
 		}
 
-		/// A.1, the basic case: two output blocks, the second cut short.
-		#[test]
-		fn hkdf_sha256_matches_test_case_1() -> Result<(), InvalidLength> {
-			let ikm = [0x0b; 22];
-			let salt = hex!("000102030405060708090a0b0c");
-			let info = hex!("f0f1f2f3f4f5f6f7f8f9");
-
-			let okm = hkdf_sha256(&salt, &ikm, &info, 42)?;
-			let expected = hex!("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
-			assert_eq!(okm, expected);
-			Ok(())
-		}
-
-		/// A.2, longer inputs and outputs: three output blocks, each chained
-		/// on the block before.
-		#[test]
-		fn hkdf_sha256_matches_test_case_2() -> Result<(), InvalidLength> {
-			let ikm: Vec<u8> = (0x00..=0x4f).collect();
-			let salt: Vec<u8> = (0x60..=0xaf).collect();
-			let info: Vec<u8> = (0xb0..=0xff).collect();
-
-			let okm = hkdf_sha256(&salt, &ikm, &info, 82)?;
-			let expected = hex!(
-				"b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c"
-				"59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71"
-				"cc30c58179ec3e87c14c01d5c1f3434f1d87"
-			);
-			assert_eq!(okm, expected);
-			Ok(())
-		}
-
-		/// A.3, an empty salt and an empty info.
-		#[test]
-		fn hkdf_sha256_matches_test_case_3() -> Result<(), InvalidLength> {
-			let ikm = [0x0b; 22];
-
-			let okm = hkdf_sha256(&[], &ikm, &[], 42)?;
-			let expected = hex!("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
-			assert_eq!(okm, expected);
-			Ok(())
+		// The zeroizing HKDF over SHA-256 expands each published case to its
+		// output keying material.
+		crate::tb_cases! {
+			fn hkdf_sha256_matches_test(vector: HkdfVector) {
+				let okm = hkdf_sha256(&vector);
+				assert_eq!(okm, unhex(vector.okm));
+			}
+			cases {
+				/// A.1, the basic case: two output blocks, the last cut short.
+				case_1 => RFC_5869_A_1,
+				/// A.2, longer inputs and outputs: three output blocks, each
+				/// chained on the block before.
+				case_2 => RFC_5869_A_2,
+				/// A.3, an empty salt and an empty info.
+				case_3 => RFC_5869_A_3,
+			}
 		}
 	}
 }

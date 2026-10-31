@@ -123,44 +123,26 @@ impl<'a, P> BoundDial<'a, P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::crypto::x509::error::CertificateValidationError;
+	use crate::colony::protocol::ServletInfo;
+	use crate::tb_cases;
 	use crate::testing::{TestCertificate, TestKey};
 	use crate::transport::TokioListener;
 
-	/// A hive identity's certificate on a key of its own.
-	fn other_certificate() -> Certificate {
-		let key = Secp256k1SigningKey::from_bytes(&[2u8; 32].into()).expect("the fixture scalar is a valid key");
-		TestCertificate::self_signed(&key)
-	}
-
-	/// The certificate on the fixed test key, whose signer a hive registered.
-	fn registered_certificate() -> Certificate {
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		TestCertificate::self_signed(&key)
-	}
-
 	// The control plane answers under the identity that signed the hive's
-	// registration, so the dial admits that certificate.
-	#[test]
-	fn a_hive_dial_admits_the_registered_signer() -> Result<(), CertificateValidationError> {
-		let registered = registered_certificate();
-		let expected = ExpectedSigner::<TokioListener>::Hive(Arc::new(registered.signer_identifier()?));
+	// registration, so the dial admits that certificate, and it refuses
+	// another identity at the hive's address before any frame leaves toward
+	// it (CWE-346).
+	tb_cases! {
+		fn a_hive_dial_admits_only_the_registered_signer((presented, admitted): (Certificate, bool)) {
+			let registered = ServletInfo::fixture_signer();
+			let expected = ExpectedSigner::<TokioListener>::Hive(Arc::new(registered));
 
-		let admitted = expected.admits(&registered);
-		assert!(admitted);
-		Ok(())
-	}
-
-	// The dial refuses another identity at the hive's address before any
-	// frame leaves toward it (CWE-346).
-	#[test]
-	fn a_hive_dial_refuses_another_identity() -> Result<(), CertificateValidationError> {
-		let registered = registered_certificate();
-		let expected = ExpectedSigner::<TokioListener>::Hive(Arc::new(registered.signer_identifier()?));
-
-		let admitted = expected.admits(&other_certificate());
-		assert!(!admitted);
-		Ok(())
+			let verdict = expected.admits(&presented);
+			assert_eq!(verdict, admitted);
+		}
+		cases {
+			the_registered_signer => (TestCertificate::insecure_fixed(), true),
+			another_identity => (TestCertificate::self_signed(&TestKey::fixed(0x02)), false),
+		}
 	}
 }

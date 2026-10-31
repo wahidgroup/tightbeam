@@ -494,224 +494,188 @@ impl<C: Curve> EcdhSecret<C> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::crypto::k256::Secp256k1;
 	use p521::NistP521;
 
-	#[track_caller]
-	fn assert_key_length(key: &[u8], expected_len: usize) {
-		assert_eq!(key.len(), expected_len, "Key length mismatch");
-	}
-
-	#[track_caller]
-	fn assert_keys_equal(key1: &[u8], key2: &[u8]) {
-		assert_eq!(key1[..], key2[..], "Keys should be equal");
-	}
-
-	#[track_caller]
-	fn assert_keys_different(key1: &[u8], key2: &[u8]) {
-		assert_ne!(key1[..], key2[..], "Keys should be different");
-	}
-
-	macro_rules! assert_key_pair_lengths {
-		($enc:expr, $mac:expr, $size:expr) => {
-			assert_eq!($enc.len(), $size, "Encryption key length mismatch");
-			assert_eq!($mac.len(), $size, "MAC key length mismatch");
-		};
-	}
-
-	macro_rules! assert_keys_different {
-		($key1:expr, $key2:expr) => {
-			assert_ne!($key1[..], $key2[..], "Keys should be different");
-		};
-	}
-
-	macro_rules! assert_key_length {
-		($key:expr, $size:expr) => {
-			assert_eq!($key.len(), $size, "Key length mismatch");
-		};
-	}
+	use super::*;
+	use crate::crypto::k256::Secp256k1;
 
 	const SHARED_SECRET: &[u8] = b"shared_secret_32_bytes__________";
 	const INFO_V1: &[u8] = b"tightbeam-ecies-v1";
 	const INFO_V2: &[u8] = b"protocol-v2";
 	const SALT: &[u8] = b"random_salt_value";
 
+	/// A SharedInfo longer than 256 octets.
+	const LARGE_INFO: [u8; 300] = [0xAB; 300];
+
 	/// [`SALT`] as the salt of one derivation.
 	fn salt() -> KdfSalt<'static> {
 		KdfSalt::try_from(SALT).expect("the test salt meets the floor")
 	}
 
+	/// The unsalted HKDF key of `length` octets from `ikm` under [`INFO_V1`].
+	fn hkdf_key(ikm: &[u8], length: usize) -> ZeroizingBytes {
+		let key = HkdfSha3_256::derive_dynamic_key(ikm, INFO_V1, None, length);
+		key.expect("the test length lies within the HKDF bounds")
+	}
+
+	/// The 32-octet X9.63 key of [`SHARED_SECRET`] under `info` and `salt`.
+	fn x963_key(info: &[u8], salt: Option<KdfSalt<'_>>) -> ZeroizingBytes {
+		let key = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, info, salt, 32);
+		key.expect("32 octets lies within the X9.63 bounds")
+	}
+
+	/// The two halves of the X9.63 dual-key pair of `N` octets each, from
+	/// [`SHARED_SECRET`] under `info`, joined in order.
+	fn x963_pair<const N: usize>(info: &[u8]) -> Vec<u8> {
+		let pair = X963Sha3_256::derive_dual_keys::<N>(SHARED_SECRET, info, None);
+		let (k_enc, k_mac) = pair.expect("the test size lies within the X9.63 bounds");
+		[k_enc.as_slice(), k_mac.as_slice()].concat()
+	}
+
+	/// The two halves of the HKDF dual-key pair of `N` octets each, from `ikm`
+	/// under [`INFO_V1`] and `salt`, joined in order.
+	fn hkdf_pair<const N: usize>(ikm: &[u8], salt: Option<KdfSalt<'_>>) -> Vec<u8> {
+		let pair = HkdfSha3_256::derive_dual_keys::<N>(ikm, INFO_V1, salt);
+		let (k_enc, k_mac) = pair.expect("the test size lies within the HKDF bounds");
+		[k_enc.as_slice(), k_mac.as_slice()].concat()
+	}
+
+	/// The first `N` octets of the RFC 5869 expansion of `ikm` under
+	/// [`INFO_V1`] and `salt`, read from `hkdf` directly.
+	fn hkdf_expansion<const N: usize>(salt: Option<&[u8]>, ikm: &[u8]) -> Vec<u8> {
+		let mut expansion = [0u8; N];
+		let expanded = Hkdf::<Sha3_256>::new(salt, ikm).expand(INFO_V1, &mut expansion);
+		expanded.expect("the test length lies within 255 blocks");
+		expansion.to_vec()
+	}
+
+	/// The X9.63 block of `counter` over [`SHARED_SECRET`] and `info`, built
+	/// from SHA3-256 as SEC 1 v2.0 §3.6.1 states it: the hash of the secret,
+	/// the big-endian counter, and the SharedInfo, in that order.
+	fn x963_block(counter: u32, info: &[u8]) -> Vec<u8> {
+		Sha3_256::digest([SHARED_SECRET, &counter.to_be_bytes(), info].concat()).to_vec()
+	}
+
 	// `EcdhSecret` refuses a shared secret of another width than the field of
 	// its curve, so every derivation runs on exactly that width: 32 bytes on
 	// secp256k1, and 66 on P-521.
-	#[test]
-	fn a_shared_secret_of_the_wrong_length_is_refused() {
-		let short = EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(b"short".to_vec()));
-		let long = EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(b"shared_secret_that_is_too_long____".to_vec()));
-		let narrow = EcdhSecret::<NistP521>::try_from(SecretSlice::from(vec![0x11; 32]));
-		let short_width = ReceivedExpectedError { received: 5, expected: 32 };
-		let long_width = ReceivedExpectedError { received: 34, expected: 32 };
-		let narrow_width = ReceivedExpectedError { received: 32, expected: 66 };
-		assert!(matches!(short, Err(KdfError::InvalidSharedSecretLength(width)) if width == short_width));
-		assert!(matches!(long, Err(KdfError::InvalidSharedSecretLength(width)) if width == long_width));
-		assert!(matches!(narrow, Err(KdfError::InvalidSharedSecretLength(width)) if width == narrow_width));
+	crate::tb_cases! {
+		fn a_shared_secret_of_the_wrong_length_is_refused(
+			(refused, width): (Option<KdfError>, ReceivedExpectedError<usize, usize>)
+		) {
+			assert!(matches!(refused, Some(KdfError::InvalidSharedSecretLength(found)) if found == width));
+		}
+		cases {
+			short => (
+				EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(b"short".to_vec())).err(),
+				ReceivedExpectedError { received: 5, expected: 32 },
+			),
+			long => (
+				EcdhSecret::<Secp256k1>::try_from(SecretSlice::from(vec![0x11; 34])).err(),
+				ReceivedExpectedError { received: 34, expected: 32 },
+			),
+			narrow_on_p521 => (
+				EcdhSecret::<NistP521>::try_from(SecretSlice::from(vec![0x11; 32])).err(),
+				ReceivedExpectedError { received: 32, expected: 66 },
+			),
+		}
 	}
 
-	// General-purpose HKDF derives 16, 32, and 64-byte keys. The same inputs
-	// derive the same key, and a different IKM derives a different key.
-	#[test]
-	fn test_hkdf_sha3_256_basic() -> crate::error::Result<()> {
-		let ikm = b"input_key_material";
-		let info = b"test_info";
-
-		let key_16 = HkdfSha3_256::derive_dynamic_key(ikm, info, None, 16)?;
-		let key_32 = HkdfSha3_256::derive_dynamic_key(ikm, info, None, 32)?;
-		let key_64 = HkdfSha3_256::derive_dynamic_key(ikm, info, None, 64)?;
-
-		let key_32_again = HkdfSha3_256::derive_dynamic_key(ikm, info, None, 32)?;
-		let key_different = HkdfSha3_256::derive_dynamic_key(b"different_ikm", info, None, 32)?;
-
-		assert_key_length!(key_16, 16);
-		assert_key_length!(key_32, 32);
-		assert_key_length!(key_64, 64);
-		assert_eq!(key_32[..], key_32_again[..]);
-		assert_keys_different!(key_32, key_different);
-
-		Ok(())
+	// A provider derives a key of the length it is asked for. General-purpose
+	// HKDF derives 16, 32, and 64-byte keys.
+	crate::tb_cases! {
+		fn a_dynamic_key_takes_its_length((key, length): (ZeroizingBytes, usize)) {
+			assert_eq!(key.len(), length);
+		}
+		cases {
+			hkdf_of_16_octets => (hkdf_key(SHARED_SECRET, 16), 16),
+			hkdf_of_32_octets => (hkdf_key(SHARED_SECRET, 32), 32),
+			hkdf_of_64_octets => (hkdf_key(SHARED_SECRET, 64), 64),
+			x963_of_32_octets => (x963_key(INFO_V1, None), 32),
+		}
 	}
 
-	// A dual-key size of 64 bytes expands to 128 bytes, which equals
-	// `MAX_HKDF_OUTPUT_SIZE`, so it derives. A size of 65 bytes expands to 130
-	// bytes, which is past the cap, so it fails with `DerivationFailed`.
-	#[test]
-	fn test_hkdf_dual_keys_bounds_checking() -> crate::error::Result<()> {
-		let max_size_result = HkdfSha3_256::derive_dual_keys::<64>(SHARED_SECRET, INFO_V1, None);
-		let oversized_result = HkdfSha3_256::derive_dual_keys::<65>(SHARED_SECRET, INFO_V1, None);
-		assert!(max_size_result.is_ok());
-
-		let (k_enc, k_mac) = max_size_result?;
-		assert_key_pair_lengths!(k_enc, k_mac, 64);
-
-		assert!(oversized_result.is_err());
-		assert!(matches!(oversized_result, Err(KdfError::DerivationFailed(_))));
-
-		Ok(())
+	// The same inputs derive the same key under HKDF and under X9.63, and
+	// X9.63 ignores the salt, so a salted key equals the unsalted key.
+	crate::tb_cases! {
+		fn two_derivations_give_one_key((first, second): (ZeroizingBytes, ZeroizingBytes)) {
+			assert_eq!(first, second);
+		}
+		cases {
+			hkdf_of_the_same_inputs => (hkdf_key(SHARED_SECRET, 32), hkdf_key(SHARED_SECRET, 32)),
+			x963_of_the_same_inputs => (x963_key(INFO_V1, None), x963_key(INFO_V1, None)),
+			x963_with_and_without_a_salt => (x963_key(INFO_V1, None), x963_key(INFO_V1, Some(salt()))),
+		}
 	}
 
-	// The ANSI X9.63 provider over SHA3-256 is deterministic and binds the
-	// info.
-	#[test]
-	fn test_x963_kdf_basic() -> crate::error::Result<()> {
-		let key1 = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, None, 32)?;
-		let key1_again = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, None, 32)?;
-		let key_diff_info = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V2, None, 32)?;
-		// X9.63 ignores the salt, so a salted key equals the unsalted key.
-		let key_with_salt = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, Some(salt()), 32)?;
-		assert_key_length(&key1, 32);
-		assert_keys_equal(&key1, &key1_again);
-		assert_keys_different(&key1, &key_diff_info);
-		assert_keys_equal(&key1, &key_with_salt);
-		Ok(())
+	// HKDF binds its IKM and X9.63 binds its info, so another input derives
+	// another key.
+	crate::tb_cases! {
+		fn a_changed_input_gives_another_key((key, changed): (ZeroizingBytes, ZeroizingBytes)) {
+			assert_ne!(key, changed);
+		}
+		cases {
+			hkdf_ikm => (hkdf_key(SHARED_SECRET, 32), hkdf_key(b"different_ikm", 32)),
+			x963_info => (x963_key(INFO_V1, None), x963_key(INFO_V2, None)),
+		}
 	}
 
-	#[test]
-	fn test_x963_dual_key_size_variations() -> crate::error::Result<()> {
-		let keys_16 = X963Sha3_256::derive_dual_keys::<16>(SHARED_SECRET, INFO_V1, None)?;
-		let keys_32 = X963Sha3_256::derive_dual_keys::<32>(SHARED_SECRET, INFO_V1, None)?;
-
-		let (k_enc_16, k_mac_16) = keys_16;
-		let (k_enc_32, k_mac_32) = keys_32;
-		assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
-		assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
-		assert_keys_different!(k_enc_32, k_mac_32);
-		Ok(())
+	// Each provider refuses an output below `MIN_KEY_SIZE`, and the HKDF
+	// provider also refuses an output past `MAX_HKDF_OUTPUT_SIZE`. A dual-key
+	// size of 65 bytes expands to 130, past the cap, and one of 8 bytes is
+	// below the floor.
+	crate::tb_cases! {
+		fn a_key_outside_the_bounds_is_refused(refused: Option<KdfError>) {
+			assert!(matches!(refused, Some(KdfError::DerivationFailed(_))));
+		}
+		cases {
+			hkdf_below_min => HkdfSha3_256::derive_dynamic_key(b"ikm", b"info", None, 8).err(),
+			hkdf_above_max => HkdfSha3_256::derive_dynamic_key(b"ikm", b"info", None, 129).err(),
+			x963_below_min => X963Sha3_256::derive_dynamic_key(b"ikm", b"info", None, 8).err(),
+			hkdf_dual_past_the_cap => HkdfSha3_256::derive_dual_keys::<65>(SHARED_SECRET, INFO_V1, None).err(),
+			x963_dual_below_min => X963Sha3_256::derive_dual_keys::<8>(b"ikm", INFO_V1, None).err(),
+		}
 	}
 
-	// Both providers reject an output below `MIN_KEY_SIZE`, and the HKDF
-	// provider also rejects an output past `MAX_HKDF_OUTPUT_SIZE`.
-	#[test]
-	fn test_derive_dynamic_key_bounds() {
-		let hkdf_below_min = HkdfSha3_256::derive_dynamic_key(b"ikm", b"info", None, 8);
-		let hkdf_above_max = HkdfSha3_256::derive_dynamic_key(b"ikm", b"info", None, 129);
-		let x963_below_min = X963Sha3_256::derive_dynamic_key(b"ikm", b"info", None, 8);
-		assert!(matches!(hkdf_below_min, Err(KdfError::DerivationFailed(_))));
-		assert!(matches!(hkdf_above_max, Err(KdfError::DerivationFailed(_))));
-		assert!(matches!(x963_below_min, Err(KdfError::DerivationFailed(_))));
+	// Each derivation matches its reference, built outside the provider. A
+	// dual-key pair is one expansion split in half, the encryption key first.
+	crate::tb_cases! {
+		fn a_derivation_matches_its_reference((derived, reference): (Vec<u8>, Vec<u8>)) {
+			assert_eq!(derived, reference);
+		}
+		cases {
+			/// An unsalted key is the RFC 5869 expansion under a salt of zeros
+			/// as long as the hash, which `hkdf` 0.12 takes for an absent salt.
+			unsalted_hkdf_key => (hkdf_key(b"ikm", 32).to_vec(), hkdf_expansion::<32>(None, b"ikm")),
+			/// The HKDF pair is the interoperable ECIES key schedule.
+			hkdf_pair_under_a_salt => (hkdf_pair::<32>(b"ikm", Some(salt())), hkdf_expansion::<64>(Some(SALT), b"ikm")),
+			/// A dual-key size of 64 bytes expands to 128 bytes, which equals
+			/// `MAX_HKDF_OUTPUT_SIZE`.
+			hkdf_pair_at_the_cap => (hkdf_pair::<64>(SHARED_SECRET, None), hkdf_expansion::<128>(None, SHARED_SECRET)),
+			/// Each X9.63 block is the hash of the secret, the counter, and the
+			/// SharedInfo, in that order.
+			x963_key_of_one_block => (x963_key(INFO_V1, None).to_vec(), x963_block(1, INFO_V1)),
+			/// A pair of 16 octets each splits the first block.
+			x963_pair_of_16_octets => (x963_pair::<16>(INFO_V1), x963_block(1, INFO_V1)),
+			/// A pair of 32 octets each spans two blocks.
+			x963_pair_of_32_octets => (
+				x963_pair::<32>(INFO_V1),
+				[x963_block(1, INFO_V1), x963_block(2, INFO_V1)].concat(),
+			),
+			/// A SharedInfo longer than 256 octets derives too, so no fixed
+			/// 256-octet buffer bounds the info.
+			x963_pair_under_a_large_shared_info => (
+				x963_pair::<32>(&LARGE_INFO),
+				[x963_block(1, &LARGE_INFO), x963_block(2, &LARGE_INFO)].concat(),
+			),
+		}
 	}
 
-	// A SharedInfo longer than 256 bytes must derive a key pair without a
-	// panic, so no fixed 256-byte buffer bounds the info.
-	#[test]
-	fn test_x963_dual_keys_large_shared_info() -> crate::error::Result<()> {
-		let large_info = vec![0xABu8; 300];
-		let (k_enc, k_mac) = X963Sha3_256::derive_dual_keys::<32>(SHARED_SECRET, &large_info, None)?;
-
-		assert_key_pair_lengths!(k_enc, k_mac, 32);
-		assert_keys_different!(k_enc, k_mac);
-		Ok(())
-	}
-
-	// The HKDF dual-key output is the interoperable ECIES key schedule, which
-	// is the two halves of one RFC 5869 expansion.
-	#[test]
-	fn an_hkdf_dual_key_pair_is_one_expansion_split_in_half() -> crate::error::Result<()> {
-		let mut expected = [0u8; 64];
-		Hkdf::<Sha3_256>::new(Some(SALT), b"ikm")
-			.expand(INFO_V1, &mut expected)
-			.map_err(KdfError::DerivationFailed)?;
-
-		let (k_enc, k_mac) = HkdfSha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, Some(salt()))?;
-		assert_eq!(k_enc[..], expected[..32]);
-		assert_eq!(k_mac[..], expected[32..]);
-		Ok(())
-	}
-
-	// An unsalted derivation is the RFC 5869 derivation under a salt of
-	// zeros as long as the hash, which `hkdf` 0.12 takes for an absent salt.
-	#[test]
-	fn an_unsalted_hkdf_key_is_the_expansion_under_a_salt_of_zeros() -> crate::error::Result<()> {
-		let mut expected = [0u8; 32];
-		let reference = Hkdf::<Sha3_256>::new(None, b"ikm").expand(INFO_V1, &mut expected);
-		reference.map_err(KdfError::DerivationFailed)?;
-
-		let key = HkdfSha3_256::derive_dynamic_key(b"ikm", INFO_V1, None, 32)?;
-		assert_eq!(key[..], expected[..]);
-		Ok(())
-	}
-
-	// Each X9.63 block is the hash of the secret, the counter, and the
-	// SharedInfo, in that order.
-	#[test]
-	fn an_x963_block_is_the_hash_of_the_secret_the_counter_and_the_info() -> crate::error::Result<()> {
-		let expected = Sha3_256::digest([SHARED_SECRET, &1u32.to_be_bytes(), INFO_V1].concat());
-
-		let key = X963Sha3_256::derive_dynamic_key(SHARED_SECRET, INFO_V1, None, 32)?;
-		assert_eq!(key[..], expected[..]);
-		Ok(())
-	}
-
-	// X9.63 dual keys split one expansion the same way.
-	#[test]
-	fn an_x963_dual_key_pair_is_one_expansion_split_in_half() -> crate::error::Result<()> {
-		let expected = X963Sha3_256::derive_dynamic_key(b"ikm", INFO_V1, None, 64)?;
-		let (k_enc, k_mac) = X963Sha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, None)?;
-		assert_eq!(k_enc[..], expected[..32]);
-		assert_eq!(k_mac[..], expected[32..]);
-		Ok(())
-	}
-
-	// A salt below `MIN_SALT_ENTROPY_BYTES` is refused where its `KdfSalt` is
-	// built, before any KDF reads it, and the refusal names both lengths.
+	/// A salt below `MIN_SALT_ENTROPY_BYTES` is refused where its `KdfSalt` is
+	/// built, before any KDF reads it, and the refusal names both lengths.
 	#[test]
 	fn a_salt_below_the_floor_is_refused_at_kdf_salt() {
 		let refused = KdfSalt::try_from(b"ab".as_slice());
 		assert!(matches!(refused, Err(KdfError::SaltTooShort { actual: 2, minimum: 16 })));
-	}
-
-	#[test]
-	fn a_dual_key_below_the_minimum_size_is_refused() {
-		let result = X963Sha3_256::derive_dual_keys::<8>(b"ikm", INFO_V1, None);
-		assert!(matches!(result, Err(KdfError::DerivationFailed(_))));
 	}
 }

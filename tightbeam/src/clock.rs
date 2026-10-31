@@ -245,6 +245,12 @@ struct ManualState {
 
 #[cfg(all(host_clock, any(test, feature = "testing")))]
 impl ManualClock {
+	/// A clock whose unix reading starts at `unix` in place of the system
+	/// clock's, so a test that names an instant reads it on every run.
+	pub(crate) fn at(unix: UnixMillis) -> Self {
+		Self { unix_start: unix, ..Self::default() }
+	}
+
 	/// Move both readings forward by `span`, and wake every sleep it ends.
 	pub fn advance(&self, span: Duration) {
 		let sleepers = {
@@ -328,6 +334,8 @@ fn saturating_millis(span: Duration) -> u64 {
 mod tests {
 	use super::*;
 
+	/// The span to an earlier instant is zero, so a clock that steps back
+	/// yields no span that wraps.
 	#[test]
 	fn a_span_between_instants_never_wraps_on_a_backward_clock() {
 		let earlier = UnixMillis::new(1_000);
@@ -335,14 +343,20 @@ mod tests {
 		assert_eq!(later.saturating_since(earlier), Duration::ZERO);
 	}
 
-	// The arm that reads the `time` crate runs on no host, so this test pins
-	// its one conversion.
-	#[test]
-	fn a_reading_in_nanoseconds_becomes_whole_milliseconds() {
-		assert_eq!(UnixMillis::from_unix_nanos(1_500_000), UnixMillis::new(1));
-		assert_eq!(UnixMillis::from_unix_nanos(-1_500_000), UnixMillis::new(0));
+	// The arm that reads the `time` crate runs on no host, so this table pins
+	// its one conversion: whole milliseconds, with a reading before the epoch
+	// clamped to zero.
+	crate::tb_cases! {
+		fn a_reading_in_nanoseconds_becomes_whole_milliseconds((nanos, millis): (i128, u64)) {
+			assert_eq!(UnixMillis::from_unix_nanos(nanos), UnixMillis::new(millis));
+		}
+		cases {
+			positive => (1_500_000, 1),
+			negative_clamps_to_zero => (-1_500_000, 0),
+		}
 	}
 
+	/// An instant advanced past the end of the range saturates at the end.
 	#[test]
 	fn an_instant_advanced_past_the_range_saturates() {
 		let near_end = UnixMillis::new(u64::MAX - 1);
@@ -350,6 +364,8 @@ mod tests {
 		assert_eq!(advanced, UnixMillis::new(u64::MAX));
 	}
 
+	/// An advance of a manual clock moves its unix and monotonic readings by
+	/// the same span.
 	#[test]
 	fn a_manual_clock_moves_both_readings_together() {
 		let clock = ManualClock::default();
@@ -358,11 +374,9 @@ mod tests {
 
 		clock.advance(Duration::from_secs(2));
 
-		assert_eq!(clock.unix().saturating_since(unix_before), Duration::from_secs(2));
-		assert_eq!(
-			clock.monotonic().saturating_duration_since(monotonic_before),
-			Duration::from_secs(2)
-		);
+		let unix_moved = clock.unix().saturating_since(unix_before);
+		let monotonic_moved = clock.monotonic().saturating_duration_since(monotonic_before);
+		assert_eq!((unix_moved, monotonic_moved), (Duration::from_secs(2), Duration::from_secs(2)));
 	}
 
 	/// A sleep on a manual clock waits for the test and resolves once an
@@ -381,16 +395,25 @@ mod tests {
 		assert!(wait.as_mut().poll(&mut context).is_ready());
 	}
 
+	/// A deadline past the representable range of the monotonic clock is
+	/// absent.
 	#[test]
 	fn a_deadline_past_the_representable_range_is_absent() {
 		let clock = ManualClock::default();
 		assert!(clock.monotonic().checked_add(Duration::MAX).is_none());
 	}
 
-	#[test]
-	fn skew_reads_the_same_in_either_direction() {
-		let early = UnixMillis::new(1_000);
-		let late = UnixMillis::new(1_250);
-		assert_eq!(early.abs_diff(late), late.abs_diff(early));
+	// The skew between two instants is the span between them, whichever of
+	// the two comes first.
+	crate::tb_cases! {
+		fn skew_reads_the_same_in_either_direction((from, to): (u64, u64)) {
+			let skew = UnixMillis::new(from).abs_diff(UnixMillis::new(to));
+
+			assert_eq!(skew, Duration::from_millis(250));
+		}
+		cases {
+			forward => (1_000, 1_250),
+			backward => (1_250, 1_000),
+		}
 	}
 }

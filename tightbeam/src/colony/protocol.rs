@@ -515,14 +515,20 @@ impl ServletInfo {
 	/// The signer of the certificate on the fixed test key, which a fixture
 	/// servlet that serves under that key presents.
 	pub(crate) fn fixture_signer() -> SignerIdentifier {
-		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::crypto::x509::utils::CertificateExt;
-		use crate::testing::{TestCertificate, TestKey};
+		use crate::testing::TestCertificate;
 
-		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
-		let certificate = TestCertificate::self_signed(&key);
-
+		let certificate = TestCertificate::insecure_fixed();
 		certificate.signer_identifier().expect("the fixture certificate names its key")
+	}
+
+	/// The servlet `ping` at `addr`, whose locator names that same address and
+	/// whose signer is [`Self::fixture_signer`].
+	pub(crate) fn fixture(addr: impl AsRef<str>) -> Self {
+		let addr = addr.as_ref();
+		let servlet_id = crate::colony::urn::ColonyNamespace::instance_fixture("ping", addr);
+		let address = addr.as_bytes().to_vec();
+		ServletInfo { servlet_id, address, signer: ServletInfo::fixture_signer() }
 	}
 }
 
@@ -1223,20 +1229,21 @@ impl IssuedOrder {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::asn1::admission::fixtures::der_refusal;
 	use crate::asn1::Version;
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::clock::ManualClock;
 	use crate::colony::urn::ColonyNamespace;
 	use crate::crypto::hash::Sha3_256;
-	use crate::der::{Decode, ErrorKind, Tag, TagNumber};
-	use crate::error::Result;
+	use crate::der::{DecodeOwned, Encode, ErrorKind, Tag, TagNumber};
 	use crate::tb_cases;
+	use crate::testing::fixtures::{der_round_trip, TestClock};
+	use crate::testing::TestResult;
 
 	/// An issue clock over a manual clock, beside that clock.
 	fn issue_clock() -> (IssueClock, Arc<ManualClock>) {
-		let clock = Arc::new(ManualClock::default());
-		let erased: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
-		(IssueClock::new(erased), clock)
+		let clock = TestClock::manual();
+		(IssueClock::new(TestClock::erased(&clock)), clock)
 	}
 
 	/// Two control frames issued at one clock reading take two orders, one
@@ -1258,33 +1265,25 @@ mod tests {
 		assert_eq!(issue.issue().instant(), clock.unix());
 	}
 
-	fn round_trip(original: ClusterRequest) -> Result<()> {
-		let encoded = crate::encode(&original)?;
-		let decoded: ClusterRequest = crate::decode(&encoded)?;
-		assert_eq!(original, decoded);
-		Ok(())
-	}
-
-	fn ping_type() -> crate::urn::Urn<'static> {
-		ColonyNamespace::default()
-			.servlet("ping")
-			.expect("test names satisfy the mint grammar")
-	}
-
-	fn ping_instance() -> Urn<'static> {
-		ping_type()
-			.servlet_instance("127.0.0.1:9001")
-			.expect("a servlet type URN yields an instance URN")
-	}
-
-	fn hive_id() -> crate::urn::Urn<'static> {
-		ColonyNamespace::default()
-			.hive("127.0.0.1:9000")
-			.expect("test locators satisfy the mint grammar")
-	}
-
 	fn work_frame() -> Frame {
 		Frame::v0(b"work-1", vec![0x02, 0x01, 0x2A])
+	}
+
+	/// The work request of `ping` that carries [`work_frame`].
+	fn work_request() -> ClusterWorkRequest {
+		let request = ClusterWorkRequest::new(ColonyNamespace::servlet_fixture("ping"), &work_frame());
+		request.expect("the fixture frame encodes")
+	}
+
+	/// The DER of [`work_request`], with no envelope tag around it.
+	fn work_request_der() -> Vec<u8> {
+		encode(&work_request()).expect("the fixture request encodes")
+	}
+
+	/// The `Ok` work response whose payload is the encoding of
+	/// [`work_frame`].
+	fn ok_response() -> ClusterWorkResponse {
+		ClusterWorkResponse::ok(encode(&work_frame()).expect("the fixture frame encodes"))
 	}
 
 	/// A V1 frame whose body is `body`, beside the frame integrity digest that
@@ -1307,7 +1306,6 @@ mod tests {
 	/// A frame whose body is the DER encoding of `command`.
 	fn command_frame(command: &ClusterCommand) -> Frame {
 		let body = encode(command).expect("a cluster command encodes");
-
 		witnessed_frame(body)
 	}
 
@@ -1328,6 +1326,7 @@ mod tests {
 	/// `StopServletResult`, a SEQUENCE of one ENUMERATED 0.
 	const STOP_OUTCOME: [u8; 7] = [0xa2, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x00];
 
+	/// A frame that carries one command reads as that command.
 	#[test]
 	fn choice_of_reads_the_one_command_a_frame_carries() {
 		let frame = command_frame(&ClusterCommand::Heartbeat(healthy()));
@@ -1335,200 +1334,202 @@ mod tests {
 		assert_eq!(choice, Some(ClusterCommand::Heartbeat(healthy())));
 	}
 
-	/// A CHOICE value is one alternative, so a body that spells a second
-	/// alternative after the first holds trailing data and names no command.
-	#[test]
-	fn choice_of_refuses_a_body_that_names_two_commands() {
-		let two = [HEARTBEAT_COMMAND.as_slice(), [0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
-		let frame = witnessed_frame(two);
+	// A frame carries a command only when its body is one command and the
+	// frame carries the integrity digest that `ClusterCommand` requires.
+	tb_cases! {
+		fn choice_of_finds_no_command(frame: Frame) {
+			let choice = ClusterCommand::choice_of(&frame);
 
-		let choice = ClusterCommand::choice_of(&frame);
-		assert_eq!(choice, None);
+			assert_eq!(choice, None);
+		}
+		cases {
+			/// A CHOICE value is one alternative, so a body that spells a
+			/// second alternative after the first holds trailing data.
+			in_a_body_that_names_two_commands => witnessed_frame(
+				[HEARTBEAT_COMMAND.as_slice(), [0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat(),
+			),
+			in_a_body_that_is_no_command => witnessed_frame(work_frame().message()),
+			/// A frame without frame integrity carries no command, whatever
+			/// its body holds.
+			in_a_command_frame_without_frame_integrity => Frame::v0(b"command-1", HEARTBEAT_COMMAND),
+		}
 	}
 
-	#[test]
-	fn choice_of_refuses_a_body_that_is_no_command() {
-		let frame = witnessed_frame(work_frame().message());
-		let choice = ClusterCommand::choice_of(&frame);
-		assert_eq!(choice, None);
+	/// The rumor frame of an application payload, issued at order 1,000.
+	fn gossip_frame() -> Frame {
+		let rumor_body = GossipRumor::application(vec![0x02, 0x01, 0x2A]);
+		let rumor = FrameBuilder::from(Version::V0)
+			.with_id("rumor-1")
+			.with_order(1_000)
+			.with_message(rumor_body)
+			.build();
+
+		rumor.expect("an unsigned rumor builds")
 	}
 
-	/// `ClusterCommand` requires frame integrity, so a frame without it
-	/// carries no command, whatever its body holds.
-	#[test]
-	fn choice_of_refuses_a_command_frame_without_frame_integrity() {
-		let frame = Frame::v0(b"command-1", HEARTBEAT_COMMAND);
-		let choice = ClusterCommand::choice_of(&frame);
-		assert_eq!(choice, None);
+	// Each request alternative decodes to the request it encodes.
+	tb_cases! {
+		fn a_cluster_request_round_trips(request: ClusterRequest) {
+			assert_eq!(der_round_trip(&request), request);
+		}
+		cases {
+			register_hive => ClusterRequest::RegisterHive(RegisterHiveRequest {
+				hive_addr: b"127.0.0.1:9000".to_vec(),
+				servlet_addresses: vec![ServletInfo::fixture("127.0.0.1:9001")],
+				metadata: None,
+			}),
+			servlet_address_update => ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
+				hive_id: ColonyNamespace::hive_fixture("127.0.0.1:9000"),
+				added: vec![],
+				removed: vec![ColonyNamespace::instance_fixture("ping", "127.0.0.1:9100")],
+			}),
+			work => ClusterRequest::Work(work_request()),
+			advertise_peer => ClusterRequest::AdvertisePeer(PeerAdvertisement {
+				gateway_addr: b"127.0.0.1:9000".to_vec(),
+				advertised_types: vec![ColonyNamespace::servlet_fixture("ping")],
+			}),
+			gossip => ClusterRequest::Gossip(Box::new(gossip_frame())),
+			publish_gossip => ClusterRequest::PublishGossip(GossipRumor::application(vec![0x02, 0x01, 0x2A])),
+			reconcile_gossip => ClusterRequest::ReconcileGossip(GossipReconciliation {
+				held: vec![vec![0xAAu8; 32], vec![0xBBu8; 32]],
+			}),
+			reconcile_gossip_empty => ClusterRequest::ReconcileGossip(GossipReconciliation { held: vec![] }),
+		}
 	}
 
-	#[test]
-	fn cluster_request_register_hive_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
-			hive_addr: b"127.0.0.1:9000".to_vec(),
-			servlet_addresses: vec![ServletInfo {
-				servlet_id: ping_type()
-					.servlet_instance("127.0.0.1:9001")
-					.expect("a servlet type URN yields an instance URN"),
-				address: b"127.0.0.1:9001".to_vec(),
-				signer: ServletInfo::fixture_signer(),
-			}],
-			metadata: None,
-		}))
+	// A want list decodes to the want list it encodes, with or without a
+	// peer exchange.
+	tb_cases! {
+		fn a_gossip_want_round_trips(want: GossipWant) {
+			assert_eq!(der_round_trip(&want), want);
+		}
+		cases {
+			with_pex => GossipWant {
+				want: vec![vec![0xAAu8; 32]],
+				pex: vec![PeerGossip { peer_id: vec![1, 2, 3], gateway_addr: b"127.0.0.1:9100".to_vec() }],
+			},
+			empty => GossipWant { want: vec![], pex: vec![] },
+		}
 	}
 
-	#[test]
-	fn cluster_request_servlet_address_update_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
-			hive_id: hive_id(),
-			added: vec![],
-			removed: vec![ping_type()
-				.servlet_instance("127.0.0.1:9100")
-				.expect("a servlet type URN yields an instance URN")],
-		}))
+	// The status and the payload of a work response are the ones its
+	// constructor names, from owned bytes or a byte slice.
+	tb_cases! {
+		fn a_work_response_carries((response, status, payload): (ClusterWorkResponse, TransitStatus, Option<Vec<u8>>)) {
+			assert_eq!((response.status, response.payload), (status, payload));
+		}
+		cases {
+			ok_of_owned_bytes => (ClusterWorkResponse::ok(b"test".to_vec()), TransitStatus::Ok, Some(b"test".to_vec())),
+			ok_of_a_byte_slice => (ClusterWorkResponse::ok(b"test"), TransitStatus::Ok, Some(b"test".to_vec())),
+			err => (ClusterWorkResponse::err(TransitStatus::PermissionDenied), TransitStatus::PermissionDenied, None),
+		}
 	}
 
-	#[test]
-	fn cluster_request_work_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::Work(ClusterWorkRequest::new(ping_type(), &work_frame())?))
+	// An `Ok` response yields the frame its payload encodes, and a refusal
+	// yields none.
+	tb_cases! {
+		fn a_work_response_into_frame_yields_its_payload((response, frame): (ClusterWorkResponse, Option<Frame>))
+			-> TestResult
+		{
+			let yielded = response.into_frame()?;
+
+			assert_eq!(yielded, frame);
+			Ok(())
+		}
+		cases {
+			ok => (ok_response(), Some(work_frame())),
+			err => (ClusterWorkResponse::err(TransitStatus::Unavailable), None),
+		}
 	}
 
+	/// An `Ok` work response serves the frame its payload encodes.
 	#[test]
-	fn work_response_into_frame_round_trips() -> Result<()> {
-		let frame = work_frame();
-		let response = ClusterWorkResponse::ok(encode(&frame)?);
-		assert_eq!(response.into_frame()?, Some(frame));
+	fn work_response_served_yields_frame() -> TestResult {
+		let served = ok_response().served()?;
+		assert_eq!(served, work_frame());
 		Ok(())
 	}
 
-	#[test]
-	fn work_response_err_into_frame_is_none() -> Result<()> {
-		assert_eq!(ClusterWorkResponse::err(TransitStatus::Unavailable).into_frame()?, None);
-		Ok(())
-	}
-
-	#[test]
-	fn work_response_served_yields_frame() -> Result<()> {
-		let frame = work_frame();
-		let response = ClusterWorkResponse::ok(encode(&frame)?);
-		assert_eq!(response.served()?, frame);
-		Ok(())
-	}
-
+	/// A refusal serves as a work refusal that names its status.
 	#[test]
 	fn work_response_served_maps_refusal_to_work_refused() {
 		let served = ClusterWorkResponse::err(TransitStatus::Unavailable).served();
 		assert!(matches!(served, Err(TightBeamError::WorkRefused(TransitStatus::Unavailable))));
 	}
 
+	/// An `Ok` work response with no payload serves no frame.
 	#[test]
 	fn work_response_served_rejects_ok_without_payload() {
 		let response = ClusterWorkResponse { status: TransitStatus::Ok, payload: None };
 		assert!(matches!(response.served(), Err(TightBeamError::MissingResponse)));
 	}
 
-	#[test]
-	fn cluster_request_advertise_peer_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::AdvertisePeer(PeerAdvertisement {
-			gateway_addr: b"127.0.0.1:9000".to_vec(),
-			advertised_types: vec![ping_type()],
-		}))
+	/// The DER of `value`, beside what that DER decodes to.
+	fn known_answer<T: Encode + DecodeOwned>(value: &T) -> (Vec<u8>, T) {
+		let encoded = encode(value).expect("the value encodes");
+		let decoded = decode(&encoded).expect("what the encoder wrote, the decoder reads");
+		(encoded, decoded)
 	}
 
-	#[test]
-	fn cluster_request_gossip_round_trips() -> Result<()> {
-		let rumor_body = GossipRumor::application(vec![0x02, 0x01, 0x2A]);
-		let rumor = FrameBuilder::from(Version::V0)
-			.with_id("rumor-1")
-			.with_order(1_000)
-			.with_message(rumor_body)
-			.build()?;
-
-		round_trip(ClusterRequest::Gossip(Box::new(rumor)))
+	// A command encodes as its chosen alternative, an EXPLICIT context tag
+	// around the alternative's own encoding (X.690 § 8.13, § 8.14). The
+	// management alternative tags the management CHOICE explicitly, so its
+	// encoding nests the request's own tag (X.680 § 31.2.9).
+	tb_cases! {
+		fn a_command_round_trips_through_its_known_answer((command, der): (ClusterCommand, Vec<u8>)) {
+			assert_eq!(known_answer(&command), (der, command));
+		}
+		cases {
+			heartbeat => (ClusterCommand::Heartbeat(healthy()), HEARTBEAT_COMMAND.to_vec()),
+			manage => (
+				ClusterCommand::Manage(HiveManagement::List(ListServletsParams { filter: None })),
+				[[0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat(),
+			),
+		}
 	}
 
+	/// A management request encodes to its known answer and decodes back.
 	#[test]
-	fn cluster_request_publish_gossip_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::PublishGossip(GossipRumor::application(vec![0x02, 0x01, 0x2A])))
-	}
-
-	/// A command encodes as its chosen alternative, an EXPLICIT context tag
-	/// around the alternative's own encoding (X.690 § 8.13, § 8.14).
-	#[test]
-	fn a_heartbeat_command_round_trips_through_its_known_answer() -> Result<()> {
-		let command = ClusterCommand::Heartbeat(healthy());
-
-		let encoded = encode(&command)?;
-		let decoded: ClusterCommand = decode(&encoded)?;
-		assert_eq!(encoded, HEARTBEAT_COMMAND);
-		assert_eq!(decoded, command);
-		Ok(())
-	}
-
-	/// The management alternative tags the management CHOICE explicitly, so
-	/// its encoding nests the request's own tag (X.680 § 31.2.9).
-	#[test]
-	fn a_manage_command_round_trips_through_its_known_answer() -> Result<()> {
-		let command = ClusterCommand::Manage(HiveManagement::List(ListServletsParams { filter: None }));
-
-		let encoded = encode(&command)?;
-		let decoded: ClusterCommand = decode(&encoded)?;
-		assert_eq!(encoded, [[0xa1, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat());
-		assert_eq!(decoded, command);
-		Ok(())
-	}
-
-	#[test]
-	fn a_management_request_round_trips_through_its_known_answer() -> Result<()> {
+	fn a_management_request_round_trips_through_its_known_answer() {
 		let request = HiveManagement::List(ListServletsParams { filter: None });
-
-		let encoded = encode(&request)?;
-		let decoded: HiveManagement = decode(&encoded)?;
-		assert_eq!(encoded, LIST_REQUEST);
-		assert_eq!(decoded, request);
-		Ok(())
+		assert_eq!(known_answer(&request), (LIST_REQUEST.to_vec(), request));
 	}
 
+	/// A management outcome encodes to its known answer and decodes back.
 	#[test]
-	fn a_management_outcome_round_trips_through_its_known_answer() -> Result<()> {
+	fn a_management_outcome_round_trips_through_its_known_answer() {
 		let outcome = HiveManagementOutcome::stop_ok();
-
-		let encoded = encode(&outcome)?;
-		let decoded: HiveManagementOutcome = decode(&encoded)?;
-		assert_eq!(encoded, STOP_OUTCOME);
-		assert_eq!(decoded, outcome);
-		Ok(())
+		assert_eq!(known_answer(&outcome), (STOP_OUTCOME.to_vec(), outcome));
 	}
 
-	/// `HeartbeatResult` is a SEQUENCE of an ENUMERATED status and two
-	/// INTEGER fields, the utilization and the servlet count.
-	#[test]
-	fn a_heartbeat_response_round_trips_through_its_known_answer() -> Result<()> {
-		let response = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0);
+	/// The DER of the `HeartbeatResult` of an `Ok` beat at zero utilization
+	/// and zero servlets: a SEQUENCE of an ENUMERATED status and two INTEGER
+	/// fields.
+	const HEARTBEAT_RESULT: [u8; 11] = [0x30, 0x09, 0x0a, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00];
 
-		let encoded = encode(&response)?;
-		let decoded: ClusterCommandResponse = decode(&encoded)?;
-
-		let result = [0x30, 0x09, 0x0a, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00];
-		assert_eq!(encoded, [[0xa0, 0x0b].as_slice(), result.as_slice()].concat());
-		assert_eq!(decoded, response);
-		Ok(())
-	}
-
-	#[test]
-	fn a_manage_response_round_trips_through_its_known_answer() -> Result<()> {
-		let response = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
-
-		let encoded = encode(&response)?;
-		let decoded: ClusterCommandResponse = decode(&encoded)?;
-		assert_eq!(encoded, [[0xa1, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat());
-		assert_eq!(decoded, response);
-		Ok(())
+	// A response encodes as its alternative, an EXPLICIT context tag around
+	// the result it carries.
+	tb_cases! {
+		fn a_command_response_round_trips_through_its_known_answer(
+			(response, der): (ClusterCommandResponse, Vec<u8>)
+		) {
+			assert_eq!(known_answer(&response), (der, response));
+		}
+		cases {
+			heartbeat => (
+				ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0),
+				[[0xa0, 0x0b].as_slice(), HEARTBEAT_RESULT.as_slice()].concat(),
+			),
+			manage => (
+				ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok()),
+				[[0xa1, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat(),
+			),
+		}
 	}
 
 	/// The kind of error a decode of `bytes` as `T` meets.
-	fn decode_refusal<'a, T: Decode<'a>>(bytes: &'a [u8]) -> Option<ErrorKind> {
-		T::from_der(bytes).err().map(|error| error.kind())
+	fn decode_refusal<T: DecodeOwned>(bytes: &[u8]) -> Option<ErrorKind> {
+		der_refusal(T::from_der(bytes))
 	}
 
 	/// The refusal a CHOICE decoder gives a SEQUENCE where it reads an
@@ -1537,58 +1538,54 @@ mod tests {
 		Some(ErrorKind::TagUnexpected { expected: None, actual: Tag::Sequence })
 	}
 
-	// A command spelled as a SEQUENCE of OPTIONAL `[0]` and `[1]` fields
-	// decodes as no command, whether it names none, one, or both of them.
+	/// A decode of bytes as one CHOICE type, which returns the kind of its
+	/// error.
+	type RefusalOf = fn(&[u8]) -> Option<ErrorKind>;
+
+	// A CHOICE spelled as a SEQUENCE of OPTIONAL fields decodes as no value,
+	// whether it names none, one, or each of its alternatives, at the top
+	// and inside an alternative. A bare request without the alternative tag
+	// of its envelope is the same SEQUENCE.
 	tb_cases! {
-		fn a_command_of_the_sequence_shape_fails_to_decode(sequence: Vec<u8>) {
-			assert_eq!(decode_refusal::<ClusterCommand>(&sequence), sequence_refused());
+		fn a_value_of_the_sequence_shape_fails_to_decode((refusal_of, sequence): (RefusalOf, Vec<u8>)) {
+			assert_eq!(refusal_of(&sequence), sequence_refused());
 		}
 		cases {
-			naming_none => vec![0x30, 0x00],
-			naming_the_heartbeat => [[0x30, 0x07].as_slice(), HEARTBEAT_COMMAND.as_slice()].concat(),
-			naming_both => [
-				[0x30, 0x0f].as_slice(),
-				HEARTBEAT_COMMAND.as_slice(),
-				[0xa1, 0x06, 0x30, 0x04].as_slice(),
-				LIST_REQUEST.as_slice(),
-			]
-			.concat(),
+			command_naming_none => (decode_refusal::<ClusterCommand>, vec![0x30, 0x00]),
+			command_naming_the_heartbeat => (
+				decode_refusal::<ClusterCommand>,
+				[[0x30, 0x07].as_slice(), HEARTBEAT_COMMAND.as_slice()].concat(),
+			),
+			command_naming_both => (
+				decode_refusal::<ClusterCommand>,
+				[
+					[0x30, 0x0f].as_slice(),
+					HEARTBEAT_COMMAND.as_slice(),
+					[0xa1, 0x06, 0x30, 0x04].as_slice(),
+					LIST_REQUEST.as_slice(),
+				]
+				.concat(),
+			),
+			/// The SEQUENCE fails inside the `[1]` alternative.
+			manage_command_around_a_management_sequence => (
+				decode_refusal::<ClusterCommand>,
+				[[0xa1, 0x06, 0x30, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat(),
+			),
+			management_request => (
+				decode_refusal::<HiveManagement>,
+				[[0x30, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat(),
+			),
+			management_outcome => (
+				decode_refusal::<HiveManagementOutcome>,
+				[[0x30, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat(),
+			),
+			/// A SEQUENCE around a management SEQUENCE.
+			response => (
+				decode_refusal::<ClusterCommandResponse>,
+				[[0x30, 0x0b, 0xa1, 0x09, 0x30, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat(),
+			),
+			bare_work_request_without_its_envelope_tag => (decode_refusal::<ClusterRequest>, work_request_der()),
 		}
-	}
-
-	/// A management request spelled as a SEQUENCE of OPTIONAL `[0]`, `[1]`,
-	/// and `[2]` fields decodes as no request.
-	#[test]
-	fn a_management_request_of_the_sequence_shape_fails_to_decode() {
-		let sequence = [[0x30, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
-		let refused = decode_refusal::<HiveManagement>(&sequence);
-		assert_eq!(refused, sequence_refused());
-	}
-
-	/// A manage command that wraps a management request spelled as a SEQUENCE
-	/// fails inside the `[1]` alternative.
-	#[test]
-	fn a_manage_command_around_the_sequence_shape_fails_to_decode() {
-		let sequence = [[0xa1, 0x06, 0x30, 0x04].as_slice(), LIST_REQUEST.as_slice()].concat();
-		let refused = decode_refusal::<ClusterCommand>(&sequence);
-		assert_eq!(refused, sequence_refused());
-	}
-
-	/// A management outcome spelled as a SEQUENCE decodes as no outcome.
-	#[test]
-	fn a_management_outcome_of_the_sequence_shape_fails_to_decode() {
-		let sequence = [[0x30, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat();
-		let refused = decode_refusal::<HiveManagementOutcome>(&sequence);
-		assert_eq!(refused, sequence_refused());
-	}
-
-	/// A response spelled as a SEQUENCE around a management SEQUENCE decodes
-	/// as no response.
-	#[test]
-	fn a_response_of_the_sequence_shape_fails_to_decode() {
-		let sequence = [[0x30, 0x0b, 0xa1, 0x09, 0x30, 0x07].as_slice(), STOP_OUTCOME.as_slice()].concat();
-		let refused = decode_refusal::<ClusterCommandResponse>(&sequence);
-		assert_eq!(refused, sequence_refused());
 	}
 
 	/// The refusal a CHOICE decoder gives the constructed context tag
@@ -1623,48 +1620,6 @@ mod tests {
 			inside_the_heartbeat_alternative => vec![0xa0, 0x07, 0x30, 0x03, 0x0a, 0x01, 0x00, 0x05, 0x00],
 			inside_the_heartbeat_parameters => vec![0xa0, 0x07, 0x30, 0x05, 0x0a, 0x01, 0x00, 0x05, 0x00],
 		}
-	}
-
-	#[test]
-	fn cluster_request_reconcile_gossip_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation {
-			held: vec![vec![0xAAu8; 32], vec![0xBBu8; 32]],
-		}))
-	}
-
-	#[test]
-	fn cluster_request_reconcile_gossip_empty_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation { held: vec![] }))
-	}
-
-	#[test]
-	fn gossip_want_round_trips_with_pex() -> Result<()> {
-		let original = GossipWant {
-			want: vec![vec![0xAAu8; 32]],
-			pex: vec![PeerGossip { peer_id: vec![1, 2, 3], gateway_addr: b"127.0.0.1:9100".to_vec() }],
-		};
-
-		let encoded = crate::encode(&original)?;
-		let decoded: GossipWant = crate::decode(&encoded)?;
-		assert_eq!(original, decoded);
-		Ok(())
-	}
-
-	#[test]
-	fn gossip_want_round_trips_empty() -> Result<()> {
-		let original = GossipWant { want: vec![], pex: vec![] };
-		let encoded = crate::encode(&original)?;
-		let decoded: GossipWant = crate::decode(&encoded)?;
-		assert_eq!(original, decoded);
-		Ok(())
-	}
-
-	#[test]
-	fn bare_inner_type_rejected_without_envelope_tag() -> Result<()> {
-		let bare = encode(&ClusterWorkRequest::new(ping_type(), &work_frame())?)?;
-		let decoded = decode::<ClusterRequest>(&bare);
-		assert!(decoded.is_err());
-		Ok(())
 	}
 
 	/// The shape a sender would read `response` in, with the status it
@@ -1723,7 +1678,7 @@ mod tests {
 			heartbeat => (ClusterCommand::Heartbeat(healthy()), ReplyShape::Heartbeat),
 			spawn => (
 				ClusterCommand::Manage(HiveManagement::Spawn(SpawnServletParams {
-					servlet_type: ping_type(),
+					servlet_type: ColonyNamespace::servlet_fixture("ping"),
 					config: None,
 				})),
 				ReplyShape::Manage(ManageShape::Spawn),
@@ -1733,7 +1688,9 @@ mod tests {
 				ReplyShape::Manage(ManageShape::List),
 			),
 			stop => (
-				ClusterCommand::Manage(HiveManagement::Stop(StopServletParams { servlet_id: ping_instance() })),
+				ClusterCommand::Manage(HiveManagement::Stop(StopServletParams {
+					servlet_id: ColonyNamespace::instance_fixture("ping", "127.0.0.1:9001"),
+				})),
 				ReplyShape::Manage(ManageShape::Stop),
 			),
 		}
@@ -1746,28 +1703,35 @@ mod tests {
 		assert_eq!(ReplyShape::of(None), ReplyShape::Manage(ManageShape::Stop));
 	}
 
-	/// A heartbeat reply travels on a V2 frame at network-control priority,
-	/// so a health check answered under load leads the queue.
-	#[test]
-	fn a_heartbeat_reply_travels_at_network_control_priority() -> Result<()> {
-		let response = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0);
-		let reply = ReplyShape::Heartbeat
-			.reply(b"hb", response)?
-			.ok_or(TightBeamError::MissingResponse)?;
-
-		assert_eq!(reply.metadata().priority(), Some(MessagePriority::NetworkControl));
-		Ok(())
+	/// The reply frame that `shape` builds around `response`.
+	fn reply_of(shape: ReplyShape, response: ClusterCommandResponse) -> Frame {
+		let reply = shape.reply(b"reply", response).expect("a reply frame builds");
+		reply.expect("a reply shape answers a response")
 	}
 
-	/// A management reply travels on a V0 frame, which has no priority field.
-	#[test]
-	fn a_manage_reply_travels_at_the_default_priority() -> Result<()> {
-		let response = ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok());
+	// A heartbeat reply travels on a V2 frame at network-control priority, so
+	// a health check answered under load leads the queue. A management reply
+	// travels on a V0 frame, which has no priority field.
+	tb_cases! {
+		fn a_reply_travels_at_its_shape_priority(
+			(shape, response, priority): (ReplyShape, ClusterCommandResponse, Option<MessagePriority>)
+		) {
+			let reply = reply_of(shape, response);
 
-		let reply = ReplyShape::Manage(ManageShape::Stop).reply(b"stop", response)?;
-		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-		assert_eq!(reply.metadata().priority(), None);
-		Ok(())
+			assert_eq!(reply.metadata().priority(), priority);
+		}
+		cases {
+			heartbeat => (
+				ReplyShape::Heartbeat,
+				ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0),
+				Some(MessagePriority::NetworkControl),
+			),
+			manage => (
+				ReplyShape::Manage(ManageShape::Stop),
+				ClusterCommandResponse::Manage(HiveManagementOutcome::stop_ok()),
+				None,
+			),
+		}
 	}
 
 	/// The utilization of a live hive, or the status of a failed beat.

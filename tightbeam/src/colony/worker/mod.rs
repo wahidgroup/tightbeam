@@ -210,23 +210,29 @@ impl<I: Message + Send> WorkerPolicyBuilder<I> {
 mod tests {
 	use std::sync::Arc;
 
-	use super::WorkerRelayError;
+	use super::{Worker, WorkerRelayError};
 	use crate::der::Sequence;
 	use crate::policy::{ReceptorPolicy, TransitStatus};
+	use crate::testing::TestResult;
 	use crate::worker;
 	use crate::Beamable;
 
+	/// A request that names its content and a lucky number.
 	#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 	pub struct RequestMessage {
 		content: String,
 		lucky_number: u32,
 	}
 
+	/// The answer of a worker that plays ping pong.
 	#[derive(Sequence, Beamable, Clone, Debug, PartialEq)]
 	pub struct PongMessage {
 		result: String,
 	}
 
+	/// A receptor gate that admits a `PING` alone.
+	///
+	/// A receptor gate is an implementor's own, so the test names one.
 	#[derive(Default)]
 	struct PingGate;
 
@@ -262,53 +268,66 @@ mod tests {
 		}
 	}
 
+	/// A request of `content` that names `lucky_number`.
+	fn request(content: &str, lucky_number: u32) -> Arc<RequestMessage> {
+		Arc::new(RequestMessage { content: content.to_string(), lucky_number })
+	}
+
+	/// A lotto worker whose winning number is 42.
+	fn lotto() -> LuckyNumberDeterminer {
+		LuckyNumberDeterminer::new(LuckyNumberDeterminerConfig { lotto_number: 42 })
+	}
+
+	/// Relays `number` to the lotto `worker`, and asserts that the worker
+	/// judges it a winner exactly when `wins` holds.
+	async fn judges(worker: &LuckyNumberDeterminer, number: u32, wins: bool) -> TestResult {
+		let verdict = worker.relay(request("PING", number)).await?;
+		assert_eq!(verdict, wins);
+		Ok(())
+	}
+
+	// A worker that names no queue bound queues 64 requests.
 	crate::test_worker! {
-		name: lucky_number_worker_checks_winner,
-		setup: || {
-			LuckyNumberDeterminer::new(LuckyNumberDeterminerConfig { lotto_number: 42 })
-		},
+		name: a_lucky_number_worker_queues_the_default_64_requests,
+		setup: || lotto(),
 		assertions: |worker| async move {
 			assert_eq!(worker.queue_capacity(), 64);
-
-			let winner = worker.relay(Arc::new(RequestMessage {
-				content: "PING".to_string(),
-				lucky_number: 42,
-			})).await?;
-			assert!(winner);
-
-			let loser = worker.relay(Arc::new(RequestMessage {
-				content: "PING".to_string(),
-				lucky_number: 7,
-			})).await?;
-			assert!(!loser);
-
 			Ok(())
 		}
 	}
 
+	// The lotto worker judges its winning number a winner.
 	crate::test_worker! {
-		name: test_ping_pong_worker,
-		setup: || {
-			PingPongWorker::new(())
-		},
+		name: a_lucky_number_worker_judges_the_winning_number_a_winner,
+		setup: || lotto(),
+		assertions: |worker| judges(worker, 42, true)
+	}
+
+	// The lotto worker judges another number a loser.
+	crate::test_worker! {
+		name: a_lucky_number_worker_judges_another_number_a_loser,
+		setup: || lotto(),
+		assertions: |worker| judges(worker, 7, false)
+	}
+
+	// The gate admits a PING, and the handler answers PONG.
+	crate::test_worker! {
+		name: a_ping_pong_worker_answers_a_ping,
+		setup: || PingPongWorker::new(()),
 		assertions: |worker| async move {
-			// The gate admits a PING, and the handler answers PONG.
-			let ping_msg = RequestMessage {
-				content: "PING".to_string(),
-				lucky_number: 42,
-			};
-			let response = worker.relay(Arc::new(ping_msg)).await?;
+			let response = worker.relay(request("PING", 42)).await?;
 			assert_eq!(response, PongMessage { result: "PONG".to_string() });
+			Ok(())
+		}
+	}
 
-			// The gate refuses other content, so the relay reads `Rejected`.
-			let pong_msg = RequestMessage {
-				content: "PONG".to_string(),
-				lucky_number: 42,
-			};
-
-			let result = worker.relay(Arc::new(pong_msg)).await;
-			assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
-
+	// The gate refuses other content, so the relay reads `Rejected`.
+	crate::test_worker! {
+		name: a_ping_pong_worker_refuses_other_content,
+		setup: || PingPongWorker::new(()),
+		assertions: |worker| async move {
+			let relayed = worker.relay(request("PONG", 42)).await;
+			assert!(matches!(relayed, Err(WorkerRelayError::Rejected(_))));
 			Ok(())
 		}
 	}
