@@ -3248,7 +3248,7 @@ mod tests {
 		fn a_timed_event_logs_the_unix_time_of_the_trace_clock() -> TestResult {
 			let backend = CaptureBackend::default();
 			let config = LoggerConfig::new(backend.clone(), LogFilter::new(LogLevel::Debug));
-			
+
 			// The clock reads 4,000,000,001 seconds past the epoch.
 			let trace = TestTrace::on(&TestClock::past(4_000_000_000));
 			let trace = trace.with_logger(config.with_default_level(LogLevel::Informational))?;
