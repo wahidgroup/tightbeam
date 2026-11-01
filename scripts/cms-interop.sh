@@ -232,7 +232,8 @@ decrypt() {
 
 # Check a sample under an OpenSSL that reads the RFC 5083 tags: it passes its
 # tag, and a copy with the last authAttrs octet flipped fails that tag. The flip
-# keeps the DER well formed, so the tag is the one check that meets it.
+# keeps the DER well formed, and OpenSSL names a failed tag `bad decrypt`, so a
+# copy that any other step refuses proves nothing and fails the check.
 authenticated() {
 	local sample="$1" name="$2" flipped="$scratch/$name.flipped" offset header length last octet
 	if [ "$(decrypt "$sample" "$name")" != "cms -decrypt ok" ]; then
@@ -241,7 +242,12 @@ authenticated() {
 	fi
 
 	read -r offset header length < <("$OPENSSL" asn1parse -inform DER -in "$sample" |
-		sed -nE '/:d=3 .*cont \[ 1 \]/s/^ *([0-9]+):d=3 +hl= *([0-9]+) +l= *([0-9]+) .*$/\1 \2 \3/p')
+		sed -nE '/:d=3 .*cont \[ 1 \]/s/^ *([0-9]+):d=3 +hl= *([0-9]+) +l= *([0-9]+) .*$/\1 \2 \3/p') || true
+	if [ -z "$offset" ] || [ "$length" -eq 0 ]; then
+		echo "asn1parse finds no authAttrs FAILED"
+		return
+	fi
+
 	last=$((offset + header + length - 1))
 	octet="$(od -An -tu1 -j "$last" -N 1 "$sample" | tr -d ' ')"
 	cp "$sample" "$flipped"
@@ -249,8 +255,10 @@ authenticated() {
 
 	if [ "$(decrypt "$flipped" "$name")" = "cms -decrypt ok" ]; then
 		echo "cms -decrypt accepts a flipped authAttrs octet FAILED"
-	else
+	elif grep -q ':bad decrypt:' "$scratch/$name.decrypt.log"; then
 		echo "cms -decrypt ok, the tag covers the authAttrs"
+	else
+		echo "cms -decrypt refuses a flipped authAttrs octet before the tag FAILED"
 	fi
 }
 
