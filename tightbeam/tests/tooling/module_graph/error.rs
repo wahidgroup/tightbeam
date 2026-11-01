@@ -14,6 +14,9 @@ pub(super) enum GraphError {
 	Syntax { file: String, line: usize, what: &'static str },
 	/// The sources hold no module at the path that the graph covers.
 	MissingScope(ItemPath),
+	/// The production edges hold a cycle in each component of `names`, and
+	/// `report` names the edges that close each cycle.
+	Cycles { names: Vec<Vec<String>>, report: String },
 }
 
 // The harness prints an `Err` through `Debug`, so `Debug` writes a sentence.
@@ -23,6 +26,7 @@ impl fmt::Debug for GraphError {
 			Self::Read { path, error } => write!(f, "{} is unreadable: {error}", path.display()),
 			Self::Syntax { file, line, what } => write!(f, "{file}:{line} holds {what}"),
 			Self::MissingScope(scope) => write!(f, "the sources hold no module `{scope}`"),
+			Self::Cycles { report, .. } => f.write_str(report),
 		}
 	}
 }

@@ -2,7 +2,6 @@
 
 #![cfg(all(
 	feature = "transport-hpke",
-	feature = "transport-policy",
 	feature = "transport-multiplex",
 	feature = "tcp",
 	feature = "tokio",
@@ -14,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tightbeam::asn1::Any;
+use tightbeam::cms::cert::CertificateChoices;
 use tightbeam::cms::signed_data::{SignedData, SignerInfo};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::Signed;
@@ -24,6 +24,7 @@ use tightbeam::exactly;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::RECEIPT_ANSWER;
 use tightbeam::tb_assert_spec;
+use tightbeam::tb_cases;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::trace::TraceCollector;
@@ -44,14 +45,16 @@ use tightbeam::TightBeamError;
 
 use tightbeam::instrumentation::events;
 
+use crate::common::result::TestResult;
 use crate::common::security::{
 	expectation_failure, ClientMaterials, GrantingAuthorizer, PayingApprover as AnsweringApprover, RecordingObserver,
 	ServerMaterials, SettleSpyAuthorizer,
 };
-use crate::transport::support::{
-	bind_encrypted_listener, bind_mutual_listener, connect_mutual_client, connect_pinned_client,
-	establish_mutual_transports, join_task, serve_one_handshake_message, MutualSessionHooks, MutualTransports,
+use crate::common::transport::{
+	bind_mutual_listener, establish_mutual_transports, establish_mutual_transports_of, serve_one_handshake_message,
+	MutualSessionHooks, MutualTransports,
 };
+use crate::transport::fixtures::{bind_encrypted_listener, connect_mutual_client, connect_pinned_client, join_task};
 
 /// The settlement challenge that the authorizer binds into every receipt.
 const CHALLENGE: &[u8] = b"receipt-invoice-42";
@@ -68,24 +71,31 @@ const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 8;
 /// The budgets that the client requests in every scenario.
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
+/// The offer of the server: multiplexing of four streams, with no budget.
 fn server_offer() -> TransportOffer {
 	TransportOffer::mux(4)
 }
 
+/// The offer of the client: [`server_offer`] with the [`REQUEST`] budgets.
 fn budget_offer() -> TransportOffer {
 	server_offer().with_budgets(REQUEST)
 }
 
+/// `client` with [`budget_offer`] as its multiplexing offer.
 fn with_budget_offer(client: TcpTransport<TokioStream>) -> TcpTransport<TokioStream> {
 	client.with_mux_offer(Some(budget_offer()))
 }
 
+/// `client` with [`budget_offer`] and `approver` as its receipt approver.
 fn with_budget_approver(client: TcpTransport<TokioStream>, approver: Arc<PayingApprover>) -> TcpTransport<TokioStream> {
 	with_budget_offer(client).with_receipt_approver(approver as Arc<dyn ReceiptApprover>)
 }
 
 /// An authorizer that binds `CHALLENGE` into every grant. Settlement succeeds
 /// only for the expected answer, and only when `accept_settlement` is set.
+///
+/// The crate leaves the authorization hook to the application and ships no
+/// authorizer, so no real instance runs.
 struct ChallengingAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -93,6 +103,8 @@ struct ChallengingAuthorizer {
 }
 
 impl ChallengingAuthorizer {
+	/// An authorizer that settles [`RESPONSE`] when `accept_settlement` is
+	/// set, and refuses every settlement otherwise.
 	fn new(accept_settlement: bool) -> Result<Self, TightBeamError> {
 		Ok(Self {
 			challenge: OctetString::new(CHALLENGE)?,
@@ -132,6 +144,9 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 
 /// An approver that pays with the settlement answer or refuses with its code.
 /// It counts its consultations, so a scenario can prove the hook never fired.
+///
+/// The crate leaves the approval hook to the application and ships no
+/// approver, so no real instance runs.
 struct PayingApprover {
 	response: OctetString,
 	refusal: Option<u32>,
@@ -139,6 +154,7 @@ struct PayingApprover {
 }
 
 impl PayingApprover {
+	/// An approver that answers every challenge with [`RESPONSE`].
 	fn paying() -> Result<Self, TightBeamError> {
 		Ok(Self {
 			response: OctetString::new(RESPONSE)?,
@@ -147,6 +163,7 @@ impl PayingApprover {
 		})
 	}
 
+	/// An approver that refuses every receipt with `code`.
 	fn refusing(code: u32) -> Result<Self, TightBeamError> {
 		Ok(Self {
 			response: OctetString::new(RESPONSE)?,
@@ -155,6 +172,7 @@ impl PayingApprover {
 		})
 	}
 
+	/// The number of receipts that this approver was consulted on.
 	fn approve_calls(&self) -> usize {
 		self.approve_calls.load(Ordering::SeqCst)
 	}
@@ -176,6 +194,9 @@ impl ReceiptApprover for PayingApprover {
 	}
 }
 
+/// Establishes a mutual session on `trace` whose receipt the client
+/// countersigns with [`RESPONSE`] and the server settles, and whose server
+/// reports each outcome to `observer` when one is set.
 async fn establish_settled_session_observed(
 	observer: Option<Arc<dyn SessionObserver>>,
 	trace: &TraceCollector,
@@ -190,6 +211,8 @@ async fn establish_settled_session_observed(
 	establish_mutual_transports(budget_offer(), server_offer(), hooks).await
 }
 
+/// Establishes a settled session on `trace`, as
+/// [`establish_settled_session_observed`] does with no observer.
 async fn establish_settled_session(trace: &TraceCollector) -> Result<MutualTransports, TightBeamError> {
 	establish_settled_session_observed(None, trace).await
 }
@@ -202,177 +225,176 @@ const CERTIFICATES: Tag = Tag::ContextSpecific { constructed: true, number: TagN
 /// `tightbeam::encode` puts each universal SET in DER order. The
 /// `certificates`, an IMPLICIT SET OF that only the schema names, go in DER
 /// order here, as the signers write them (X.690 § 11.6).
-fn stored_artifact(artifact: &SignedData) -> Result<Signed<SignedData>, TightBeamError> {
-	let encoded = tightbeam::encode(artifact)?;
-	let mut fields = SliceReader::new(AnyRef::from_der(&encoded)?.value())?;
+fn stored_artifact(artifact: &SignedData) -> Signed<SignedData> {
+	let encoded = tightbeam::encode(artifact).expect("an artifact encodes");
+	let outer = AnyRef::from_der(&encoded).expect("an encoded artifact is one TLV");
+	let mut fields = SliceReader::new(outer.value()).expect("an artifact holds its fields");
 	let mut arranged = Vec::new();
 	while !fields.is_finished() {
-		let field = AnyRef::from_der(fields.tlv_bytes()?)?;
-		arranged.push(in_der_order(field)?);
+		let field = fields.tlv_bytes().expect("each field of an artifact is one TLV");
+		arranged.push(in_der_order(AnyRef::from_der(field).expect("a field TLV decodes")));
 	}
 
-	let der = Any::new(Tag::Sequence, arranged.concat())?.to_der()?;
-	Ok(Signed::<SignedData>::from_der(&der)?)
+	let rearranged = Any::new(Tag::Sequence, arranged.concat()).expect("the fields fit a SEQUENCE");
+	let der = rearranged.to_der().expect("a SEQUENCE encodes");
+	Signed::<SignedData>::from_der(&der).expect("the arranged artifact is a SignedData")
 }
 
 /// The DER of `field`, with the elements of a `certificates` field in DER
 /// order.
-fn in_der_order(field: AnyRef<'_>) -> Result<Vec<u8>, TightBeamError> {
+fn in_der_order(field: AnyRef<'_>) -> Vec<u8> {
 	if field.tag() != CERTIFICATES {
-		return Ok(field.to_der()?);
+		return field.to_der().expect("a field encodes");
 	}
 
-	let mut reader = SliceReader::new(field.value())?;
+	let mut reader = SliceReader::new(field.value()).expect("the certificates hold their elements");
 	let mut elements = Vec::new();
 	while !reader.is_finished() {
-		elements.push(reader.tlv_bytes()?);
+		elements.push(reader.tlv_bytes().expect("each certificate is one TLV"));
 	}
 
 	elements.sort_unstable();
-	Ok(Any::new(CERTIFICATES, elements.concat())?.to_der()?)
+	let certificates = Any::new(CERTIFICATES, elements.concat()).expect("the certificates fit their tag");
+	certificates.to_der().expect("the certificates encode")
 }
 
-/// Whether a third party verifies `artifact` through [`StoredReceipt::verify`]
-/// under the server and client certificates.
+/// The verdict of a third party on `artifact`: the parse of
+/// [`StoredReceipt::try_from`], then [`StoredReceipt::verify`] under the
+/// server and client certificates.
+fn third_party_verdict(
+	artifact: &SignedData,
+	server_certificate: &Certificate,
+	client_certificate: &Certificate,
+) -> Result<(), HandshakeError> {
+	let stored = StoredReceipt::try_from(stored_artifact(artifact))?;
+
+	let server = server_certificate.to_owned();
+	let server = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(server, KeyPurposes::HOUSE.server);
+	let server = server.expect("the server certificate serves the server role");
+	let client = client_certificate.to_owned();
+	let client = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(client, KeyPurposes::HOUSE.client);
+	let client = client.expect("the client certificate serves the client role");
+	stored.verify(&server, &client)
+}
+
+/// Whether a third party verifies `artifact`, as [`third_party_verdict`]
+/// answers.
 fn third_party_verifies(
 	artifact: &SignedData,
 	server_certificate: &Certificate,
 	client_certificate: &Certificate,
 ) -> Result<bool, TightBeamError> {
-	let Ok(stored) = StoredReceipt::try_from(stored_artifact(artifact)?) else {
-		return Ok(false);
-	};
-
-	let server = server_certificate.to_owned();
-	let server = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(server, KeyPurposes::HOUSE.server)?;
-	let client = client_certificate.to_owned();
-	let client = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(client, KeyPurposes::HOUSE.client)?;
-	let verdict = stored.verify(&server, &client);
+	let verdict = third_party_verdict(artifact, server_certificate, client_certificate);
 	Ok(verdict.is_ok())
 }
 
-fn flipped(octets: &OctetString) -> Result<OctetString, TightBeamError> {
+/// `octets` with the first bit of its first octet flipped.
+fn flipped(octets: &OctetString) -> OctetString {
 	let mut bytes = octets.as_bytes().to_vec();
 	bytes[0] ^= 0x01;
-	Ok(OctetString::new(bytes)?)
+	OctetString::new(bytes).expect("the bytes of an OCTET STRING fit one")
 }
 
-fn tamper_body(
-	artifact: &mut SignedData,
-	mutate: fn(&mut SessionReceipt) -> Result<(), TightBeamError>,
-) -> Result<(), TightBeamError> {
-	let econtent = artifact
-		.encap_content_info
-		.econtent
-		.as_ref()
-		.ok_or_else(|| expectation_failure("receipt artifact must carry its body"))?;
+/// Applies `mutate` to the receipt that `artifact` signs as its body, and
+/// writes the changed body back, with every signature left as it was.
+fn tamper_body(artifact: &mut SignedData, mutate: fn(&mut SessionReceipt)) {
+	let econtent = artifact.encap_content_info.econtent.as_ref();
+	let econtent = econtent.expect("a receipt artifact carries its body");
 
-	let body: OctetString = econtent.decode_as()?;
-	let mut receipt = SessionReceipt::from_der(body.as_bytes())?;
-	mutate(&mut receipt)?;
+	let body: OctetString = econtent.decode_as().expect("the body is an OCTET STRING");
+	let mut receipt = SessionReceipt::from_der(body.as_bytes()).expect("the body is a receipt");
+	mutate(&mut receipt);
 
-	let body = OctetString::new(receipt.to_der()?)?;
-	let econtent = Any::from_der(&body.to_der()?)?;
+	let body = OctetString::new(receipt.to_der().expect("a receipt encodes")).expect("a receipt fits an OCTET STRING");
+	let econtent = Any::from_der(&body.to_der().expect("the body encodes")).expect("an encoded body decodes");
 
 	artifact.encap_content_info.econtent = Some(econtent);
-	Ok(())
 }
 
-fn tamper_signer(
-	artifact: &mut SignedData,
-	role: ReceiptRole,
-	mutate: fn(&mut SignerInfo) -> Result<(), TightBeamError>,
-) -> Result<(), TightBeamError> {
-	let stored = StoredReceipt::try_from(stored_artifact(artifact)?)?;
-	let target = stored.signer(role)?.to_owned();
+/// Applies `mutate` to the `SignerInfo` of `role` in `artifact`.
+fn tamper_signer(artifact: &mut SignedData, role: ReceiptRole, mutate: fn(&mut SignerInfo)) {
+	let stored = StoredReceipt::try_from(stored_artifact(artifact)).expect("a settled artifact parses");
+	let target = stored.signer(role).expect("a settled artifact holds a signer of each role");
+	let target = target.to_owned();
 
 	let mut rebuilt = Vec::new();
 	for signer in artifact.signer_infos.0.iter() {
 		let mut signer = signer.to_owned();
 		if signer == target {
-			mutate(&mut signer)?;
+			mutate(&mut signer);
 		}
 
 		rebuilt.push(signer);
 	}
 
-	artifact.signer_infos = rebuilt.try_into()?;
-	Ok(())
+	artifact.signer_infos = rebuilt.try_into().expect("the rebuilt signers keep their order");
 }
 
-fn flip_signature(signer: &mut SignerInfo) -> Result<(), TightBeamError> {
-	signer.signature = flipped(&signer.signature)?;
-	Ok(())
+/// Flips a bit of the signature of `signer`.
+fn flip_signature(signer: &mut SignerInfo) {
+	signer.signature = flipped(&signer.signature);
 }
 
-fn set_answer_attr(signer: &mut SignerInfo, answer: Option<&'static [u8]>) -> Result<(), TightBeamError> {
-	let attrs = signer
-		.signed_attrs
-		.take()
-		.ok_or_else(|| expectation_failure("client SignerInfo must carry signed attributes"))?;
+/// Sets the settlement answer that `signer` signs to `answer`, or strips it
+/// when `answer` is `None`.
+fn set_answer_attr(signer: &mut SignerInfo, answer: Option<&'static [u8]>) {
+	let attrs = signer.signed_attrs.take();
+	let attrs = attrs.expect("the client SignerInfo carries signed attributes");
 
-	let mut rebuilt: Vec<Attribute> = attrs
-		.iter()
-		.filter(|attribute| attribute.oid != RECEIPT_ANSWER)
-		.cloned()
-		.collect();
+	let kept = attrs.iter().filter(|attribute| attribute.oid != RECEIPT_ANSWER);
+	let mut rebuilt: Vec<Attribute> = kept.cloned().collect();
 	if let Some(answer) = answer {
-		let value = Any::encode_from(&OctetString::new(answer)?)?;
+		let answer = OctetString::new(answer).expect("an answer fits an OCTET STRING");
+		let value = Any::encode_from(&answer).expect("an OCTET STRING encodes");
 		let mut values = SetOfVec::new();
-		values.insert(value)?;
+		values.insert(value).expect("one value fits a SET OF");
 		rebuilt.push(Attribute { oid: RECEIPT_ANSWER, values });
 	}
 
-	signer.signed_attrs = Some(rebuilt.try_into()?);
-	Ok(())
+	signer.signed_attrs = Some(rebuilt.try_into().expect("the rebuilt attributes fit a SET OF"));
 }
 
-type Tamper = fn(&mut SignedData) -> Result<(), TightBeamError>;
+/// A change that a tamper row makes to a settled artifact.
+type Tamper = fn(&mut SignedData);
 
 /// Raises the client-to-server budget in the signed body.
-fn drift_budget(artifact: &mut SignedData) -> Result<(), TightBeamError> {
-	tamper_body(artifact, |receipt| {
-		receipt.budgets.client_to_server += 1;
-		Ok(())
-	})
+fn drift_budget(artifact: &mut SignedData) {
+	tamper_body(artifact, |receipt| receipt.budgets.client_to_server += 1);
 }
 
 /// Raises the credit unit in the signed body.
-fn drift_credit_unit(artifact: &mut SignedData) -> Result<(), TightBeamError> {
-	tamper_body(artifact, |receipt| {
-		receipt.credit_unit += 1;
-		Ok(())
-	})
+fn drift_credit_unit(artifact: &mut SignedData) {
+	tamper_body(artifact, |receipt| receipt.credit_unit += 1);
 }
 
 /// Swaps the settlement challenge in the signed body.
-fn swap_challenge(artifact: &mut SignedData) -> Result<(), TightBeamError> {
+fn swap_challenge(artifact: &mut SignedData) {
 	tamper_body(artifact, |receipt| {
-		receipt.ancillary = Some(OctetString::new(*b"receipt-invoice-43")?);
-		Ok(())
-	})
+		let challenge = OctetString::new(*b"receipt-invoice-43").expect("a challenge fits an OCTET STRING");
+		receipt.ancillary = Some(challenge);
+	});
 }
 
 /// Flips a bit of the server signature.
-fn flip_server_signature(artifact: &mut SignedData) -> Result<(), TightBeamError> {
-	tamper_signer(artifact, ReceiptRole::Server, flip_signature)
+fn flip_server_signature(artifact: &mut SignedData) {
+	tamper_signer(artifact, ReceiptRole::Server, flip_signature);
 }
 
 /// Flips a bit of the client countersignature.
-fn flip_client_countersignature(artifact: &mut SignedData) -> Result<(), TightBeamError> {
-	tamper_signer(artifact, ReceiptRole::Client, flip_signature)
+fn flip_client_countersignature(artifact: &mut SignedData) {
+	tamper_signer(artifact, ReceiptRole::Client, flip_signature);
 }
 
 /// Swaps the settlement answer that the client countersigned.
-fn swap_answer(artifact: &mut SignedData) -> Result<(), TightBeamError> {
+fn swap_answer(artifact: &mut SignedData) {
 	tamper_signer(artifact, ReceiptRole::Client, |signer| {
-		set_answer_attr(signer, Some(b"receipt-preimage-43"))
-	})
+		set_answer_attr(signer, Some(b"receipt-preimage-43"));
+	});
 }
 
 /// Strips the settlement answer that the client countersigned.
-fn strip_answer(artifact: &mut SignedData) -> Result<(), TightBeamError> {
-	tamper_signer(artifact, ReceiptRole::Client, |signer| set_answer_attr(signer, None))
+fn strip_answer(artifact: &mut SignedData) {
+	tamper_signer(artifact, ReceiptRole::Client, |signer| set_answer_attr(signer, None));
 }
 
 /// The artifact of the receipt that the client of a settled session retains,
@@ -386,19 +408,29 @@ struct SettledArtifact {
 	client_certificate: Arc<Certificate>,
 }
 
-/// The artifact of a session that settles on a runtime of its own, for a
-/// case-table test, which runs off the async runtime.
-fn settled_artifact() -> SettledArtifact {
-	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-	let runtime = runtime.expect("a current-thread runtime builds");
-	let settled = runtime.block_on(establish_settled_session(&TraceCollector::new()));
-	let session = settled.expect("a settled session establishes");
-	let stored = session.client.session_receipt().expect("the client retains the receipt");
+impl SettledArtifact {
+	/// The artifact that the client of `session` retains.
+	fn of(session: &MutualTransports) -> Self {
+		let stored = session.client.session_receipt();
+		let stored = stored.expect("the client of a settled session retains its receipt");
 
-	SettledArtifact {
-		artifact: SignedData::clone(stored.artifact()),
-		server_certificate: Arc::clone(&session.server_certificate),
-		client_certificate: Arc::clone(&session.client_certificate),
+		SettledArtifact {
+			artifact: SignedData::clone(stored.artifact()),
+			server_certificate: Arc::clone(&session.server_certificate),
+			client_certificate: Arc::clone(&session.client_certificate),
+		}
+	}
+
+	/// The artifact of a fresh settled session.
+	async fn fresh() -> Self {
+		let session = establish_settled_session(&TraceCollector::new()).await;
+		SettledArtifact::of(&session.expect("a settled session establishes"))
+	}
+
+	/// The verdict of a third party on `artifact` under the certificates of
+	/// this settlement.
+	fn verdict_on(&self, artifact: &SignedData) -> Result<(), HandshakeError> {
+		third_party_verdict(artifact, &self.server_certificate, &self.client_certificate)
 	}
 }
 
@@ -486,7 +518,7 @@ tb_scenario! {
 /// the receipt, so an authorizer can refuse a token that another client
 /// spends (CWE-294).
 #[tokio::test]
-async fn settle_receives_the_certificate_of_the_client_that_spends_the_token() -> Result<(), TightBeamError> {
+async fn settle_receives_the_certificate_of_the_client_that_spends_the_token() -> TestResult {
 	let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 	let hooks = MutualSessionHooks {
 		authorizer: Some(Arc::clone(&authorizer) as Arc<dyn TransportAuthorizer>),
@@ -501,29 +533,24 @@ async fn settle_receives_the_certificate_of_the_client_that_spends_the_token() -
 
 /// A third party verifies both signatures of a settled receipt offline.
 #[tokio::test]
-async fn receipt_third_party_verifiable() -> Result<(), TightBeamError> {
-	let session = establish_settled_session(&TraceCollector::new()).await?;
-	let stored = session
-		.client
-		.session_receipt()
-		.ok_or_else(|| expectation_failure("client must retain the receipt"))?;
+async fn a_third_party_verifies_a_settled_receipt_offline() {
+	let settled = SettledArtifact::fresh().await;
 
-	let verifies = third_party_verifies(stored.artifact(), &session.server_certificate, &session.client_certificate)?;
-	assert!(verifies, "a third party must verify both signatures offline");
-	Ok(())
+	let verdict = settled.verdict_on(&settled.artifact);
+	assert!(matches!(verdict, Ok(())));
 }
 
 // A third party refuses an artifact whose signed field, signature, or
-// countersigned answer a tamper altered.
-tightbeam::tb_cases! {
-	fn a_tampered_artifact_fails_offline_verification(tamper: Tamper) -> Result<(), TightBeamError> {
-		let settled = settled_artifact();
+// countersigned answer a tamper altered, because no signature verifies over
+// the altered bytes.
+tb_cases! {
+	async fn a_tampered_artifact_fails_offline_verification(tamper: Tamper) {
+		let settled = SettledArtifact::fresh().await;
 		let mut tampered = settled.artifact.clone();
-		tamper(&mut tampered)?;
+		tamper(&mut tampered);
 
-		let verifies = third_party_verifies(&tampered, &settled.server_certificate, &settled.client_certificate)?;
-		assert!(!verifies, "a tampered artifact must fail offline verification");
-		Ok(())
+		let verdict = settled.verdict_on(&tampered);
+		assert!(matches!(verdict, Err(HandshakeError::SignatureVerificationFailed)));
 	}
 	cases {
 		budget_drift_in_the_signed_body => drift_budget,
@@ -534,6 +561,44 @@ tightbeam::tb_cases! {
 		settlement_answer_swap => swap_answer,
 		settlement_answer_stripped => strip_answer,
 	}
+}
+
+/// Client materials that present the certificate and the key of the server of
+/// `materials`, so both signers of a receipt present one certificate.
+fn twin_client(materials: &ServerMaterials) -> ClientMaterials {
+	let certificate = Arc::clone(&materials.certificate);
+	let key_provider = Arc::clone(&materials.key_provider);
+	ClientMaterials { certificate, key_provider }
+}
+
+/// The count of the signers of `artifact`, beside the certificates that its
+/// certificate set holds.
+fn signers_and_certificates(artifact: &SignedData) -> (usize, Vec<Certificate>) {
+	let signers = artifact.signer_infos.0.len();
+	let choices = artifact.certificates.iter().flat_map(|set| set.0.iter());
+	let certificates = choices.filter_map(|choice| match choice {
+		CertificateChoices::Certificate(certificate) => Some(certificate.to_owned()),
+		CertificateChoices::Other(_) => None,
+	});
+	(signers, certificates.collect())
+}
+
+/// A countersignature adds the certificate of its signer to the receipt only
+/// when the certificate set lacks it, so a receipt whose two signers present
+/// one certificate holds that certificate once.
+#[tokio::test]
+async fn a_receipt_whose_signers_share_a_certificate_holds_it_once() -> TestResult {
+	let materials = ServerMaterials::fixed();
+	let twin = twin_client(&materials);
+	let hooks = MutualSessionHooks::default();
+	let purposes = KeyPurposes::HOUSE;
+
+	let session = establish_mutual_transports_of(budget_offer(), budget_offer(), hooks, &materials, &twin, purposes);
+	let session = session.await?;
+	let receipt = session.client.session_receipt();
+	let signed = receipt.map(|stored| signers_and_certificates(stored.artifact()));
+	assert_eq!(signed, Some((2, vec![Certificate::clone(&materials.certificate)])));
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -555,7 +620,7 @@ tb_scenario! {
 	spec: ReceiptSettleRejectionSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let client_materials = ClientMaterials::generate();
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 
@@ -613,7 +678,7 @@ tb_scenario! {
 	spec: ReceiptAbandonedSettlementSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let client_materials = ClientMaterials::generate();
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 
@@ -710,7 +775,7 @@ tb_scenario! {
 	spec: ReceiptOutcomeRefusedSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let client_materials = ClientMaterials::generate();
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 
@@ -781,7 +846,7 @@ tb_scenario! {
 	spec: ReceiptNoApproverSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let client_materials = ClientMaterials::generate();
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 
@@ -835,7 +900,7 @@ tb_scenario! {
 	spec: ReceiptMutualAuthSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let client_materials = ClientMaterials::generate();
 
 			// The first server has no client validators.

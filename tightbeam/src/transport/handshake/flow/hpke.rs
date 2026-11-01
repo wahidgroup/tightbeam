@@ -406,6 +406,7 @@ mod tests {
 	use crate::transport::envelopes::TransportEnvelope;
 	use crate::transport::handshake::flow::{ClosingDraft, ClosingParts};
 	use crate::transport::handshake::negotiation::{RunnableProfile, TransportOffer};
+	use crate::transport::handshake::receipt::SessionObserver;
 	use crate::transport::handshake::schedule::{KeyConfirmation, SecretSeal};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::{Handshake, HandshakePhase, PeerAuthentication, SupportedProfiles};
@@ -485,6 +486,31 @@ mod tests {
 	async fn identified_run() -> (HandshakeCertificate, Run<Hpke>) {
 		let Parties { client_identity, client, server, .. } = parties::<Hpke>(PeerAuthentication::mutual_by_expiry());
 		(client_identity, run(client, server).await)
+	}
+
+	/// Two budget-bearing endpoints of the HPKE flow, where
+	/// [`ChallengingAuthorizer`] grants the budgets and `observer` hears each
+	/// outcome the server reports.
+	fn observed_budget_bearing(observer: Arc<dyn SessionObserver>) -> Parties<Hpke> {
+		let mut parties = budget_bearing::<Hpke>(ChallengingAuthorizer);
+		parties.server.session_observer = Some(observer);
+		parties
+	}
+
+	/// A server that issued a receipt refuses a client Finished that carries
+	/// no countersignature, and its observer records the concluded exchange,
+	/// so a withheld countersignature leaves evidence (CWE-778).
+	#[tokio::test]
+	async fn a_withheld_countersignature_is_refused_and_recorded() {
+		let observer = Arc::new(CountingObserver::default());
+		let Parties { server, .. } = observed_budget_bearing(observer.to_owned());
+		let mut awaiting =
+			AwaitingClosing::<Hpke>::offering(server, fixture_ephemeral(0x6c), Some(budget_offer())).await;
+		let finished = awaiting.finished_of(&create_test_certificate(0xcd));
+
+		let refusal = awaiting.finish(&finished).await;
+		assert!(matches!(refusal, Err(HandshakeError::CountersignatureMissing)));
+		assert_eq!(observer.outcomes(), 1);
 	}
 
 	/// The hello is a `ContentInfo` of type `id-data` (RFC 5652 §4).

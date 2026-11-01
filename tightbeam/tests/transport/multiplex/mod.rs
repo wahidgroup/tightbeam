@@ -1,16 +1,15 @@
-//! Multiplexed transport integration tests over HPKE/TCP.
+//! The integration tests of the multiplexed transport.
 
 #![cfg(all(
 	feature = "transport-hpke",
-	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio",
-	feature = "testing",
 	feature = "testing-csp",
 	feature = "instrument"
 ))]
 
-/// Golden DER for `Mux(Open { stream_id: 1, last: true, kind: Unary, payload: [] })`.
+/// The golden DER of the envelope
+/// `Mux(Open { stream_id: 1, last: true, kind: Unary, payload: [] })`.
 const MUX_OPEN_WIRE_DER: [u8; 17] = [
 	0xA4, 0x0F, 0xA0, 0x0D, 0x30, 0x0B, 0x02, 0x01, 0x01, 0x01, 0x01, 0xFF, 0x0A, 0x01, 0x00, 0x04, 0x00,
 ];

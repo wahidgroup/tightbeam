@@ -16,6 +16,9 @@ use tightbeam::testing::{TestCertificate, TestKey};
 use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
 
+use crate::common::result::TestResult;
+use crate::common::trace::recorded_labels;
+
 /// The event that each test stamps.
 const SEND: Urn<'static> = tightbeam::urn!("outside", "event:clock/send");
 
@@ -78,24 +81,26 @@ fn stepped_trace() -> (TraceCollector, Arc<SteppedClock>) {
 	(trace, clock)
 }
 
+/// A trace on an outside clock records one origin, whose label is the Unix
+/// time of the clock at the origin in nanoseconds.
 #[test]
-fn a_trace_on_an_outside_clock_records_its_origin() -> Result<(), Box<dyn std::error::Error>> {
+fn a_trace_on_an_outside_clock_records_its_origin() -> TestResult {
 	let (trace, _clock) = stepped_trace();
 
 	trace.emit_event(SEND)?;
 
-	let recorded = trace.drain_events();
-	let origin = recorded.iter().find(|event| event.urn == TRACE_CLOCK_ORIGIN);
-	let label = origin.and_then(|event| event.label.as_deref());
-	assert_eq!(label, Some("1700000000000000000"));
+	let labels = recorded_labels(&trace, TRACE_CLOCK_ORIGIN);
+	assert_eq!(labels, [Some(String::from("1700000000000000000"))]);
 	Ok(())
 }
 
+/// A trace on an outside clock stamps an event with the span that the clock
+/// stepped through since its origin.
 #[test]
-fn a_trace_on_an_outside_clock_stamps_the_span_it_stepped() -> Result<(), Box<dyn std::error::Error>> {
+fn a_trace_on_an_outside_clock_stamps_the_span_it_stepped() -> TestResult {
 	let (trace, clock) = stepped_trace();
-	clock.step(Duration::from_millis(7));
 
+	clock.step(Duration::from_millis(7));
 	trace.emit_event(SEND)?;
 
 	let recorded = trace.drain_events();
@@ -112,6 +117,7 @@ fn a_validator_on_an_outside_clock_reads_validity_on_its_readings() {
 	let clock = Arc::new(SteppedClock::new());
 	let validator = ExpiryValidator::default().with_clock(Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>);
 	let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+
 	clock.step(Duration::from_secs(TestCertificate::END_OF_VALIDITY + 1).saturating_sub(ORIGIN));
 
 	let refused = validator.evaluate(&certificate);

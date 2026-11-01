@@ -1,6 +1,5 @@
 //! The fixtures of the multiplex transport tests.
 
-use core::error::Error;
 use core::future::{pending, poll_fn, ready, Future, Pending};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -9,7 +8,6 @@ use core::time::Duration;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::policy::{SessionContext, TransitStatus};
@@ -36,15 +34,16 @@ use tightbeam::transport::{
 	TransportFailure,
 };
 use tightbeam::{Frame, TightBeamError};
-use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::common::poll::{joined, within_hang_guard};
+use crate::common::result::TestResult;
 use crate::common::security::{expectation_failure, ServerMaterials};
-use crate::transport::support::{
-	await_ok, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
-	serve_one_handshake_message, HandlerSignal,
+use crate::common::transport::accept_handshaken;
+use crate::transport::fixtures::{
+	bind_encrypted_listener, connect_pinned_client, join_task, loopback_streams, mux_frame, mux_offer, HandlerSignal,
 };
 
 /// The receive half of a split TCP test transport.
@@ -71,7 +70,7 @@ pub fn large_mux_frame(label: impl AsRef<str>) -> Frame {
 
 /// A mux offer of `cap` streams with a chunk payload size of 1024 bytes.
 pub fn chunked_offer(cap: u32) -> TransportOffer {
-	mux_offer(cap).with_chunk_payload_size(1024)
+	TransportOffer::mux(cap).with_chunk_payload_size(1024)
 }
 
 /// The ID of the client-initiated stream at the zero-based `index`.
@@ -84,26 +83,22 @@ pub fn client_stream_id(index: u32) -> u32 {
 ///
 /// # Errors
 ///
-/// - [`TightBeamError`] -- the bind, connect, or handshake failure of either side, or a panicked server task.
+/// - [`TightBeamError`] -- the bind, connect, or handshake failure of either side.
+///
+/// # Panics
+///
+/// The call panics when the server task panics or outlasts the hang guard.
 pub async fn establish_transports(
 	client_offer: Option<TransportOffer>,
 	server_offer: Option<TransportOffer>,
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
-	let materials = ServerMaterials::generate();
+	let materials = ServerMaterials::fixed();
 	let (listener, addr) = bind_encrypted_listener(&materials).await?;
 
-	let server_task = tokio::spawn(async move {
-		let (mut transport, _) = listener.accept().await?;
-		if let Some(offer) = server_offer {
-			transport = transport.with_mux_offer(Some(offer));
-		}
-
-		// An HPKE handshake takes two client messages: the hello and the
-		// closing.
-		serve_one_handshake_message(&mut transport).await?;
-		serve_one_handshake_message(&mut transport).await?;
-		Ok::<_, TightBeamError>(transport)
-	});
+	let server_task = tokio::spawn(accept_handshaken(listener, |transport| match server_offer {
+		Some(offer) => transport.with_mux_offer(Some(offer)),
+		None => transport,
+	}));
 
 	let mut client = connect_pinned_client(addr, &materials.certificate).await?;
 	if let Some(offer) = client_offer {
@@ -112,7 +107,7 @@ pub async fn establish_transports(
 
 	client.perform_client_handshake().await?;
 
-	let server = await_ok(server_task, "server handshake task must not panic").await?;
+	let server = joined(server_task).await?;
 	Ok((client, server))
 }
 
@@ -169,9 +164,8 @@ pub fn spawn_mux_endpoint_with(
 	role: MuxRole,
 	config: MuxEndpointConfig,
 ) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
-	let settings = transport
-		.negotiated_mux()
-		.ok_or_else(|| expectation_failure("handshake must negotiate multiplexing"))?;
+	let negotiated = transport.negotiated_mux();
+	let settings = negotiated.ok_or_else(|| expectation_failure("handshake must negotiate multiplexing"))?;
 
 	let mut rekey = None;
 	if config.rekey {
@@ -232,28 +226,79 @@ pub fn spawn_cleartext_mux_endpoint(
 	Ok(endpoint_pair)
 }
 
-/// Connects a cleartext client to a cleartext listener and returns both
-/// transports.
+/// Connects a cleartext client to a cleartext server on a free loopback
+/// port and returns both transports.
 ///
-/// # Errors
+/// # Panics
 ///
-/// - [`TightBeamError`] -- the bind, connect, or accept failure, or a panicked accept task.
+/// The call panics when the loopback pair fails to connect, so it returns
+/// `Ok` for every pair.
 pub async fn establish_cleartext_transports(
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
-	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-	let addr = listener.local_addr()?;
-
-	let accept_task = tokio::spawn(async move {
-		let (transport, _) = listener.accept().await?;
-		Ok::<_, TightBeamError>(transport)
-	});
-
-	let stream = TcpStream::connect(addr).await?;
-	let client_stream = TokioStream::from(stream);
-	let client = TcpTransport::new(client_stream, EndpointConfig::cleartext());
-
-	let server = await_ok(accept_task, "cleartext accept task must not panic").await?;
+	let (client, server) = loopback_streams().await;
+	let client = TcpTransport::new(TokioStream::from(client), EndpointConfig::cleartext());
+	let server = TcpTransport::new(TokioStream::from(server), EndpointConfig::cleartext());
 	Ok((client, server))
+}
+
+/// The kind of link that a parity table runs a mux test on.
+#[derive(Clone, Copy)]
+pub enum Link {
+	/// Raw TCP with no handshake, under symmetric out-of-band settings.
+	Cleartext,
+	/// An HPKE session whose handshake negotiates the settings.
+	Encrypted,
+}
+
+impl Link {
+	/// The endpoints of a fresh link of this kind, each over 4 streams and
+	/// 1 KiB chunks.
+	pub async fn endpoints(self) -> MuxLink {
+		match self {
+			Link::Cleartext => MuxLink::cleartext().await,
+			Link::Encrypted => MuxLink::encrypted(chunked_offer(4), &TraceCollector::new()).await,
+		}
+	}
+}
+
+/// A client endpoint and a server endpoint on one link, beside the responder
+/// that serves the streams the client opens.
+pub struct MuxLink {
+	/// The client endpoint.
+	pub client: MuxEndpoint,
+	/// The server endpoint, whose drivers keep the connection running.
+	pub server: MuxEndpoint,
+	/// The responder of the server endpoint.
+	pub responder: MuxResponder,
+}
+
+impl MuxLink {
+	/// The endpoints of a cleartext link under symmetric settings of 4
+	/// streams and 1 KiB chunks.
+	pub async fn cleartext() -> Self {
+		let transports = establish_cleartext_transports().await;
+		let (client, server) = transports.expect("a loopback pair connects");
+		let settings = MuxSettings::symmetric(4).with_chunk_size(1024);
+
+		let client = spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, TraceCollector::new());
+		let (client, _client_responder) = client.expect("a cleartext transport splits");
+		let server = spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, TraceCollector::new());
+		let (server, responder) = server.expect("a cleartext transport splits");
+		MuxLink { client, server, responder }
+	}
+
+	/// The endpoints of an encrypted link on `trace`, whose client offers 4
+	/// streams of 1 KiB chunks and whose server offers `server_offer`.
+	pub async fn encrypted(server_offer: TransportOffer, trace: &TraceCollector) -> Self {
+		let transports = establish_transports(Some(chunked_offer(4)), Some(server_offer)).await;
+		let (client, server) = transports.expect("the pinned client completes its handshake");
+
+		let client = spawn_mux_endpoint(client.with_trace(trace.share()), MuxRole::Client);
+		let (client, _client_responder) = client.expect("the handshake negotiates multiplexing");
+		let server = spawn_mux_endpoint(server.with_trace(trace.share()), MuxRole::Server);
+		let (server, responder) = server.expect("the handshake negotiates multiplexing");
+		MuxLink { client, server, responder }
+	}
 }
 
 /// Accepts one encrypted mux server as the server-side trace entrypoint. The
@@ -268,13 +313,8 @@ pub async fn accept_mux_server(
 	offer: TransportOffer,
 	trace: TraceCollector,
 ) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
-	let (transport, _) = listener.accept().await?;
-	let mut transport = transport.with_mux_offer(Some(offer)).with_trace(trace);
-
-	// An HPKE handshake takes two client messages: the hello and the closing.
-	serve_one_handshake_message(&mut transport).await?;
-	serve_one_handshake_message(&mut transport).await?;
-
+	let transport = accept_handshaken(listener, |transport| transport.with_mux_offer(Some(offer)).with_trace(trace));
+	let transport = transport.await?;
 	spawn_mux_endpoint(transport, MuxRole::Server)
 }
 
@@ -338,12 +378,11 @@ pub async fn connect_mux_client(
 	trace: TraceCollector,
 ) -> Result<MuxClient, TightBeamError> {
 	let client = connect_pinned_client(addr, &materials.certificate).await?;
-	let mut client = client.with_mux_offer(Some(mux_offer(cap))).with_trace(trace);
+	let mut client = client.with_mux_offer(Some(TransportOffer::mux(cap))).with_trace(trace);
 	client.perform_client_handshake().await?;
 
-	let settings = client
-		.negotiated_mux()
-		.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
+	let negotiated = client.negotiated_mux();
+	let settings = negotiated.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
 
 	let (endpoint, responder) = spawn_mux_endpoint(client, MuxRole::Client)?;
 	Ok(MuxClient { endpoint, responder, settings })
@@ -386,22 +425,24 @@ pub async fn establish_client_mux_server_raw(
 	cap: u32,
 	trace: TraceCollector,
 ) -> Result<ClientMuxServerRaw, TightBeamError> {
-	establish_client_mux_server_raw_with(mux_offer(cap), mux_offer(cap), trace).await
+	establish_client_mux_server_raw_with(TransportOffer::mux(cap), TransportOffer::mux(cap), trace).await
 }
 
 /// Emits `frame` from the muxed client, echoes it from the raw server, and
-/// reports whether the echo matched.
+/// returns the frame that the emit resolves to.
 ///
-/// # Errors
+/// # Panics
 ///
-/// - [`TightBeamError`] -- the read or write failure of the raw server, or a panicked emit task.
-pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) -> Result<bool, TightBeamError> {
+/// The call panics when the raw server fails to read the request or to write
+/// its echo, or when the emit fails.
+pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) -> Option<Frame> {
 	let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
-	let (stream_id, message) = read_muxed_request(&mut link.server_reader).await?;
-	write_muxed_echo(&mut link.server_writer, stream_id, &message).await?;
+	let request = read_muxed_request(&mut link.server_reader).await;
+	let (stream_id, message) = request.expect("the raw server reads the muxed request");
+	let echo = write_muxed_echo(&mut link.server_writer, stream_id, &message).await;
+	echo.expect("the raw server writes its echo");
 
-	let echoed = await_ok(emit_task, "echo emit task must not panic").await?;
-	Ok(is_echo(echoed, frame))
+	joined(emit_task).await.expect("the emit resolves to the echo")
 }
 
 /// A muxed server against raw client halves, so the test drives requests on
@@ -459,7 +500,9 @@ pub async fn establish_server_mux_client_raw(
 	server_config: MuxEndpointConfig,
 	trace: TraceCollector,
 ) -> Result<ServerMuxClientRaw, TightBeamError> {
-	establish_server_mux_client_raw_with(mux_offer(client_cap), mux_offer(server_cap), server_config, trace).await
+	let client_offer = TransportOffer::mux(client_cap);
+	let server_offer = TransportOffer::mux(server_cap);
+	establish_server_mux_client_raw_with(client_offer, server_offer, server_config, trace).await
 }
 
 /// Two muxed endpoints with an echo responder that serves the server side.
@@ -485,10 +528,10 @@ pub fn spawn_echo_pair_with(
 	server_config: MuxEndpointConfig,
 	trace: TraceCollector,
 ) -> Result<MuxPair, TightBeamError> {
-	let (client_end, _client_responder) =
-		spawn_mux_endpoint_with(client.with_trace(trace.share()), MuxRole::Client, client_config)?;
-	let (server_end, server_responder) =
-		spawn_mux_endpoint_with(server.with_trace(trace), MuxRole::Server, server_config)?;
+	let client = client.with_trace(trace.share());
+	let (client_end, _client_responder) = spawn_mux_endpoint_with(client, MuxRole::Client, client_config)?;
+	let server = server.with_trace(trace);
+	let (server_end, server_responder) = spawn_mux_endpoint_with(server, MuxRole::Server, server_config)?;
 
 	Ok(MuxPair {
 		client: client_end,
@@ -555,11 +598,6 @@ pub async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 			Err(err) => return DrainedBody { bytes, chunks, failure: Some(err) },
 		}
 	}
-}
-
-/// Whether a handler that counts chunks observed a chunked (multi-record) body.
-pub fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
-	counter.load(Ordering::SeqCst) > 1
 }
 
 /// The echo of a body reassembled from streamed chunks.
@@ -667,7 +705,7 @@ impl GatedMuxContext {
 	/// notifier.
 	pub fn generate() -> Self {
 		Self {
-			materials: ServerMaterials::generate(),
+			materials: ServerMaterials::fixed(),
 			started: HandlerSignal::default(),
 			release: Notify::new(),
 		}
@@ -735,7 +773,7 @@ impl AbortContext {
 	/// notifier, and zeroed counters.
 	pub fn generate() -> Self {
 		Self {
-			materials: ServerMaterials::generate(),
+			materials: ServerMaterials::fixed(),
 			started: HandlerSignal::default(),
 			never: Notify::new(),
 			aborted: AtomicBool::new(false),
@@ -778,10 +816,7 @@ pub async fn abort_emit(task: EmitTask) {
 	task.abort();
 
 	let join = task.await;
-	assert!(
-		join.is_err_and(|error| error.is_cancelled()),
-		"aborted emit task must report cancellation"
-	);
+	assert!(join.is_err_and(|error| error.is_cancelled()));
 }
 
 /// Reads one single-chunk muxed open and decodes its frame.
@@ -953,14 +988,6 @@ pub fn is_streams_exhausted(result: &Result<Option<Frame>, TransportError>) -> b
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)))
 }
 
-/// Whether the peer refused the emit as resource exhausted.
-pub fn is_busy(result: &Result<Option<Frame>, TransportError>) -> bool {
-	matches!(
-		result,
-		Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
-	)
-}
-
 /// Whether the emit failed because the connection drains.
 pub fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::Draining))
@@ -969,11 +996,6 @@ pub fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
 /// Whether the emit failed on a closed connection.
 pub fn is_connection_closed(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::ConnectionClosed))
-}
-
-/// Whether the result failed as an invalid message.
-pub fn is_invalid_message<T>(result: &Result<T, TransportError>) -> bool {
-	matches!(result, Err(TransportError::InvalidMessage))
 }
 
 /// Whether the serve loop ended on a policy rejection.
@@ -1021,23 +1043,31 @@ pub async fn read_remaining_chunks(
 ///
 /// # Errors
 ///
-/// - [`TightBeamError`] -- an expectation failure when no GoAway arrives within
-///   two seconds, or the read failure.
+/// - [`TightBeamError`] -- the read failure.
+///
+/// # Panics
+///
+/// - No GoAway arrives within [`HANG_GUARD`].
+///
+/// [`HANG_GUARD`]: crate::common::poll::HANG_GUARD
 pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -> Result<bool, TightBeamError> {
-	timeout(Duration::from_secs(2), async {
+	let goaway = async {
 		loop {
 			let envelope = reader.read_envelope().await?;
 			if let TransportEnvelope::Mux(MuxEnvelope::GoAway(package)) = &envelope {
 				return Ok(package.reason() == reason);
 			}
 		}
-	})
-	.await
-	.map_err(|_| expectation_failure("GoAway must arrive before the read timeout"))?
+	};
+
+	within_hang_guard(goaway, "a GoAway arrives within the hang guard").await
 }
 
 /// A receiver policy that keeps every stream's limit at the initial credit
 /// window, which pins the sender there.
+///
+/// The crate's `BufferedGrantor` grants as its consumer drains, and the crate
+/// ships no grantor that withholds credit, so no real instance pins a sender.
 pub struct NeverGrant;
 
 impl CreditGrantor for NeverGrant {
@@ -1047,6 +1077,9 @@ impl CreditGrantor for NeverGrant {
 }
 
 /// An authorizer that grants half of each requested budget direction.
+///
+/// The crate leaves the authorization hook to the application and ships no
+/// authorizer, so no real instance runs.
 pub struct HalvingAuthorizer;
 
 impl TransportAuthorizer for HalvingAuthorizer {
@@ -1069,6 +1102,9 @@ impl TransportAuthorizer for HalvingAuthorizer {
 pub const REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR;
 
 /// An authorizer that refuses every offer with [`REFUSAL_CODE`].
+///
+/// The crate leaves the authorization hook to the application and ships no
+/// authorizer, so no real instance runs.
 pub struct RefusingAuthorizer;
 
 impl TransportAuthorizer for RefusingAuthorizer {
@@ -1082,6 +1118,9 @@ impl TransportAuthorizer for RefusingAuthorizer {
 
 /// An authorizer whose backend hangs forever, which simulates a hung
 /// authorization service on the unauthenticated handshake path.
+///
+/// The crate leaves the authorization hook to the application and ships no
+/// authorizer, so no real instance runs.
 pub struct HangingAuthorizer;
 
 impl TransportAuthorizer for HangingAuthorizer {
@@ -1120,8 +1159,10 @@ impl Drop for DropWitness {
 	}
 }
 
-/// One rekey headroom case, where
-/// `drain_headroom = 2 * (local_cap + peer_cap) + 1`.
+/// One rekey headroom case. The server holds back
+/// `2 * (local_cap + peer_cap) + 1` records of its rekey limit for the drain,
+/// so it answers the requests that the rest of the limit carries before its
+/// GoAway.
 pub struct RekeyCase {
 	/// The count of streams that the server may initiate.
 	pub server_local_cap: u32,
@@ -1129,27 +1170,16 @@ pub struct RekeyCase {
 	pub server_peer_cap: u32,
 	/// The rekey record limit of the send cipher under test.
 	pub rekey_limit: u64,
+	/// The client streams that the server answers before its GoAway, in the
+	/// order the raw client opens them.
+	pub answered: &'static [u32],
 }
 
 impl RekeyCase {
-	/// The drain headroom of this case, in records.
-	pub fn headroom(&self) -> u64 {
-		u64::from(self.server_local_cap)
-			.saturating_add(u64::from(self.server_peer_cap))
-			.saturating_mul(2)
-			.saturating_add(1)
-	}
-
-	/// The count of responses that the server sends before the drain floor
-	/// forces its GoAway.
-	///
-	/// # Panics
-	///
-	/// A debug build panics when `rekey_limit` does not exceed the headroom.
-	pub fn responses_before_goaway(&self) -> u32 {
-		let headroom = self.headroom();
-		debug_assert!(self.rekey_limit > headroom);
-		(self.rekey_limit - headroom) as u32
+	/// The watermark of the GoAway: the last stream that the server answers.
+	pub fn watermark(&self) -> u32 {
+		let last = self.answered.last();
+		*last.expect("a rekey case answers one stream or more")
 	}
 }
 
@@ -1242,38 +1272,36 @@ impl PingContext {
 	/// flag.
 	pub fn generate() -> Self {
 		Self {
-			materials: ServerMaterials::generate(),
+			materials: ServerMaterials::fixed(),
 			server_ping_done: HandlerSignal::default(),
 			server_ping_acked: AtomicBool::new(false),
 		}
 	}
 }
 
-/// Runs one case of a case table on its own runtime, and grades the trace of
-/// the case against `spec`, as `tb_scenario!` grades a scenario.
+/// Runs one case of a case table, and grades the trace of the case against
+/// `spec`, as `tb_scenario!` grades a scenario.
 ///
-/// `case` drives the endpoints with a share of the trace, and the grade takes
-/// the result of `case` beside the trace.
+/// `case` drives the endpoints with a share of the trace and asserts what
+/// they show, and the grade reads the trace once `case` ends.
 ///
 /// # Errors
 ///
 /// - [`ScenarioConfigError`] -- `spec` builds no configuration.
-/// - [`std::io::Error`] -- the runtime of the case fails to build.
 /// - [`TightBeamError`] -- the grade refuses an exploration event.
 /// - [`Violations`] -- the grade finds a violation.
 ///
 /// [`ScenarioConfigError`]: tightbeam::testing::ScenarioConfigError
-pub fn grade_case<F, Fut>(spec: &'static BuiltAssertSpec, case: F) -> Result<(), Box<dyn Error>>
+pub async fn grade_case<F, Fut>(spec: &'static BuiltAssertSpec, case: F) -> TestResult
 where
 	F: FnOnce(TraceCollector) -> Fut,
-	Fut: Future<Output = Result<(), TightBeamError>>,
+	Fut: Future<Output = ()>,
 {
 	let config = ScenarioConfig::builder().with_spec(spec).build()?;
 	let trace = config.trace();
-	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
-	let outcome = runtime.block_on(case(trace.share()));
-	let graded = HookContext::build(&config, &trace, outcome)?;
+	case(trace.share()).await;
+	let graded = HookContext::build(&config, &trace, Ok(()))?;
 	graded.outcome().map_err(Violations::clone)?;
 
 	Ok(())

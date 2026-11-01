@@ -1,7 +1,7 @@
 //! The message types of the DTN workers.
 //!
-//! Each worker takes a request and returns a result, for command execution,
-//! instrument selection, and telemetry building.
+//! Each worker takes a request and returns a result, for instrument selection
+//! and telemetry building.
 
 use tightbeam::{
 	der::{asn1::OctetString, Sequence},
@@ -10,37 +10,24 @@ use tightbeam::{
 
 use crate::dtn::messages::RoverInstrument;
 
-// The messages of command execution.
-
-/// A request to execute the rover command that `command_type` names.
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-pub struct CommandExecutionRequest {
-	pub command_type: u8,
-}
-
-/// The result of one command execution.
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-pub struct CommandExecutionResult {
-	pub success: bool,
-	pub instrument: RoverInstrument,
-	pub data_snippet: String,
-}
-
 // The messages of instrument selection.
 
 /// A request to select the instrument for a command.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[allow(dead_code)]
 pub struct InstrumentSelectionRequest {
+	/// The type of the command that needs an instrument.
 	pub command_type: u8,
 }
 
 /// The instrument that a selection picks, with its sample data.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub struct InstrumentSelection {
+	/// The instrument that the selection picks.
 	pub instrument: RoverInstrument,
+	/// The name of the instrument.
 	pub instrument_name: String,
+	/// The sample data that the instrument collected.
 	pub sample_data: OctetString,
 }
 
@@ -49,7 +36,11 @@ pub struct InstrumentSelection {
 /// A request to build a telemetry message.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct TelemetryBuildRequest {
+	/// The instrument that collected the data.
 	pub instrument: RoverInstrument,
+	/// The data payload, in the format of its instrument.
 	pub data: OctetString,
+	/// The mission elapsed time in milliseconds at which the instrument
+	/// collected the data.
 	pub mission_time_ms: u64,
 }

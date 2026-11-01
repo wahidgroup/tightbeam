@@ -50,7 +50,6 @@ use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::Encode;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{CURVE_NIST_P384, SIGNER_ECDSA_WITH_SHA3_512};
-use tightbeam::random::OsRng;
 use tightbeam::spki::{
 	AlgorithmIdentifierOwned, Document, EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoRef,
 };
@@ -59,9 +58,10 @@ use tightbeam::transport::handshake::HandshakeProvider;
 
 use super::{
 	carried_point, certificate_of, cms_pair, first_record_opened, hpke_pair, identity_of, outside_cms_server,
-	AgreementBackend, KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, P256Kem, CONTENT,
-	RFC_9180_PLAINTEXT,
+	AgreementBackend, KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, P256Kem, CLIENT_SEED,
+	CONTENT, RFC_9180_PLAINTEXT, SERVER_SEED,
 };
+use crate::common::result::TestResult;
 
 /// DHKEM(P-384, HKDF-SHA384) in the HPKE KEM registry (RFC 9180 §7.1).
 const KEM_DHKEM_P384_HKDF_SHA384: u16 = 0x0011;
@@ -305,9 +305,15 @@ impl SigningKeyProvider for P384KeyProvider {
 	}
 }
 
-/// An identity under [`P384Provider`], of a fresh key.
-pub(super) fn p384_identity() -> SigningIdentity {
-	p384_identity_of(SigningKey::random(&mut OsRng))
+/// The P-384 key whose scalar is thirty-two `seed` octets.
+fn p384_key(seed: u8) -> SigningKey {
+	let key = SigningKey::from_slice(&[seed; 32]);
+	key.expect("thirty-two octets name a scalar of P-384")
+}
+
+/// An identity under [`P384Provider`], of the key of [`p384_key`] of `seed`.
+pub(super) fn p384_identity(seed: u8) -> SigningIdentity {
+	p384_identity_of(p384_key(seed))
 }
 
 /// An identity under [`P384Provider`] of `key`.
@@ -317,14 +323,15 @@ pub(super) fn p384_identity_of(key: SigningKey) -> SigningIdentity {
 	identity_of::<P384Provider>(certificate, Arc::new(P384KeyProvider { key }))
 }
 
-/// A CMS server under `P` named `name`, which signs under a fresh P-384 key
-/// and agrees through `backend`, on `C`, the curve of the KEM of `P`.
+/// A CMS server under `P` named `name`, which signs under the P-384 key of
+/// [`p384_key`] of [`SERVER_SEED`] and agrees through `backend`, on `C`, the
+/// curve of the KEM of `P`.
 pub(super) fn p384_cms_server<P, C>(name: &str, backend: AgreementBackend<C>) -> OutsideCmsServer<P::Kem>
 where
 	P: HandshakeProvider<VerifyingKey: PartialEq, Kem: RecipientKem<PrivateKey = dyn DiffieHellman<C>>>,
 	C: HandshakeCurve,
 {
-	let key = SigningKey::random(&mut OsRng);
+	let key = p384_key(SERVER_SEED);
 	let point = PublicKey::from(key.verifying_key()).to_encoded_point(false);
 	let signer = Arc::new(P384KeyProvider { key });
 	outside_cms_server::<P, C>(name, signer, CURVE_NIST_P384, point.as_bytes(), backend)
@@ -334,7 +341,7 @@ where
 /// the known answer does: `enc` is the 97-octet `pkEm` of the scalar it
 /// draws, and the shared secret is the 48-octet one.
 #[test]
-fn the_p384_kem_encapsulates_its_known_answer() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p384_kem_encapsulates_its_known_answer() -> TestResult {
 	let encapsulated = KNOWN_ANSWER.encapsulated_by::<NistP384, P384Kem>()?;
 	assert_eq!(encapsulated, KNOWN_ANSWER.encapsulation());
 	Ok(())
@@ -344,7 +351,7 @@ fn the_p384_kem_encapsulates_its_known_answer() -> Result<(), Box<dyn std::error
 /// backend of the recipient scalar, whose agreement is 48 octets, to the
 /// known shared secret.
 #[tokio::test]
-async fn the_p384_kem_decapsulates_its_known_answer() -> Result<(), Box<dyn std::error::Error>> {
+async fn the_p384_kem_decapsulates_its_known_answer() -> TestResult {
 	let shared = KNOWN_ANSWER.decapsulated_by::<NistP384, P384Kem>().await?;
 	assert_eq!(shared, unhex(KNOWN_ANSWER.shared_secret));
 	Ok(())
@@ -353,7 +360,7 @@ async fn the_p384_kem_decapsulates_its_known_answer() -> Result<(), Box<dyn std:
 /// The HPKE suite of P-384 seals the plaintext at sequence number zero to
 /// `enc` and the known ciphertext.
 #[test]
-fn the_p384_hpke_suite_seals_its_known_answer() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p384_hpke_suite_seals_its_known_answer() -> TestResult {
 	let sealed = KNOWN_ANSWER.sealed_by::<P384Suite>()?;
 	assert_eq!(sealed, KNOWN_ANSWER.message());
 	Ok(())
@@ -362,7 +369,7 @@ fn the_p384_hpke_suite_seals_its_known_answer() -> Result<(), Box<dyn std::error
 /// The HPKE suite of P-384 parses the 97-octet `enc` of the known answer and
 /// opens its ciphertext under the recipient scalar.
 #[test]
-fn the_p384_hpke_suite_opens_its_known_answer() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p384_hpke_suite_opens_its_known_answer() -> TestResult {
 	let opened = KNOWN_ANSWER.opened_by::<P384Suite>()?;
 	assert_eq!(opened, unhex(RFC_9180_PLAINTEXT));
 	Ok(())
@@ -371,8 +378,10 @@ fn the_p384_hpke_suite_opens_its_known_answer() -> Result<(), Box<dyn std::error
 /// The HPKE flow runs under the P-384 provider, and the client's first
 /// record opens under the server's session keys.
 #[tokio::test]
-async fn a_p384_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let opened = first_record_opened(hpke_pair::<P384Provider>(p384_identity())).await?;
+async fn a_p384_provider_runs_the_hpke_flow() -> TestResult {
+	let pair = hpke_pair::<P384Provider>(p384_identity(SERVER_SEED));
+
+	let opened = first_record_opened(pair).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -380,8 +389,8 @@ async fn a_p384_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::
 /// The hello of a P-384 client carries `R` as a point of P-384 in the
 /// compressed form, 49 octets.
 #[test]
-fn a_p384_hello_carries_a_compressed_p384_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (carried, compressed) = carried_point::<P384Provider, _>(p384_identity())?;
+fn a_p384_hello_carries_a_compressed_p384_point() -> TestResult {
+	let (carried, compressed) = carried_point::<P384Provider, _>(p384_identity(SERVER_SEED))?;
 	assert_eq!(carried, compressed);
 	Ok(())
 }
@@ -390,9 +399,11 @@ fn a_p384_hello_carries_a_compressed_p384_point() -> Result<(), Box<dyn std::err
 /// on P-384 behind the outside KEM, and the client's first record opens
 /// under the server's session keys.
 #[tokio::test]
-async fn a_p384_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let server = p384_cms_server::<P384Provider, _>("p384 server", AgreementBackend::random());
-	let opened = first_record_opened(cms_pair::<P384Provider>(server, p384_identity())).await?;
+async fn a_p384_provider_runs_the_cms_flow() -> TestResult {
+	let server = p384_cms_server::<P384Provider, _>("p384 server", AgreementBackend::fixed());
+	let pair = cms_pair::<P384Provider>(server, p384_identity(CLIENT_SEED));
+
+	let opened = first_record_opened(pair).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -401,7 +412,7 @@ async fn a_p384_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::E
 /// client holds an epoch receipt other than the receipt of its handshake.
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 #[tokio::test]
-async fn a_p384_session_renews_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
+async fn a_p384_session_renews_its_epoch() -> TestResult {
 	let renewed = super::renewal::renews_its_epoch::<P384Provider>(p384_identity).await?;
 	assert!(renewed);
 	Ok(())
@@ -413,7 +424,7 @@ const P384_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b060960864801650
 
 /// The descriptor of [`P384Profile`] encodes as [`P384_DESCRIPTOR`].
 #[test]
-fn the_p384_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p384_descriptor_encodes_as_its_known_der() -> TestResult {
 	let der = SecurityProfileDesc::from(&P384Profile::default()).to_der()?;
 	assert_eq!(der, unhex(P384_DESCRIPTOR));
 	Ok(())

@@ -1,28 +1,24 @@
 //! The test scenarios of the payment gateway.
 //!
 //! One scenario sends a signed, hashed, and encrypted payment authorization
-//! through a cluster, a hive, and a servlet with bio-inspired ACO/ABC routing.
-//! A second scenario seals a card token to the key manager servlet, which
-//! opens it and refuses a tampered copy.
-
-#![cfg(all(
-	feature = "std",
-	feature = "tokio",
-	feature = "testing",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature"
-))]
+//! through a cluster to a servlet that a hive registered. A second scenario
+//! seals a card token to the key manager servlet, which opens it and refuses a
+//! tampered copy.
+//!
+//! The replay scenario is a self-check of the harness: the dedup book of
+//! `common::dedup` decides its verdict, and tightbeam carries its frames.
 
 use std::sync::Arc;
 
 use sha3::Sha3_256;
-use tightbeam::exactly;
+use tightbeam::{absent, exactly};
 use tightbeam::{
 	builder::TypeBuilder,
+	clock::UnixMillis,
 	colony::{
 		cluster::{Cluster, ClusterConfig, ClusterTlsConfig},
 		hive::{Hive, HiveConfig, HiveTlsConfig},
+		protocol::{ClusterCommand, ClusterCommandResponse, HiveManagement, HiveManagementOutcome, SpawnServletParams},
 		servlet::{ServletConfig, ServletFuture},
 		urn::ColonyNamespace,
 		SubmitWork,
@@ -38,7 +34,7 @@ use tightbeam::{
 				k256::{PublicKey, SecretKey},
 				Secp256k1Signature, Secp256k1SigningKey,
 			},
-			CertifiedKey,
+			CertifiedKey, SigningIdentity,
 		},
 		x509::{
 			store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
@@ -51,22 +47,32 @@ use tightbeam::{
 	policy::TransitStatus,
 	random::OsRng,
 	tb_assert_spec, tb_scenario,
-	testing::{ClientEnv, ServletEnv, SetupEnv},
+	testing::{ClientEnv, HiveEnv, ServletEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer,
 		handshake::PeerAuthentication,
 		tcp::{r#async::TokioListener, TightBeamSocketAddr},
-		ClientBuilder, ConnectionBuilder, GenericClient, TransportError,
+		ClientBuilder, ConnectionBuilder, GenericClient, TransportError, TransportFailure,
 	},
 	urn::Urn,
 	utils::digest,
 	Frame, Message, TightBeamError, Version,
 };
 
+#[cfg(feature = "instrument")]
+use core::time::Duration;
+
 use crate::common::hive::scenario_hive_config;
-use crate::common::security::expectation_failure;
-use crate::common::x509::create_test_cert_with_key;
+use crate::common::security::{expectation_failure, SignatureGate};
+use crate::common::x509::{create_test_cert_with_key, signing_identity};
+
+#[cfg(feature = "instrument")]
+use crate::common::poll::poll_until;
+#[cfg(feature = "instrument")]
+use crate::common::result::TestResult;
+#[cfg(feature = "instrument")]
+use crate::common::trace::recorded_labels;
 
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
@@ -74,7 +80,7 @@ use super::harness::{PaymentHarness, CHAIN_BROKEN, CHAIN_VALID, DEDUP_CACHE_HIT}
 use super::hives::PaymentProcessorHive;
 use super::messages::{
 	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
-	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
+	GetPublicKeyResponse, PaymentIdentification, PaymentStatusCode, TransactionStatus,
 };
 use super::servlets::{
 	AuthorizationServlet, CaptureServlet, KeyManagerRequest, KeyManagerServlet, AUTHORIZATION_APPROVED,
@@ -163,6 +169,9 @@ fn servlet_tls_config<M: Message>(
 		// forwards negotiate mux.
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_message_decryptor(shared_payment_cipher())
+		// The gate verifies each frame under the cluster certificate while its
+		// body is ciphertext, ahead of the decryptor.
+		.with_collector_gate(SignatureGate::of(certs.cluster_cert.to_owned()))
 		.with_config(Arc::clone(harness))
 		.build())
 }
@@ -202,11 +211,21 @@ fn create_auth_transaction(end_to_end_id: impl AsRef<[u8]>, amount: MonetaryAmou
 	transaction.expect("short references fit an OCTET STRING")
 }
 
-/// The frame that carries `transaction` to an authorization servlet: hashed,
-/// witnessed, sealed under the shared payment cipher, and signed by the
-/// cluster key.
+/// The frame that carries `transaction` to an authorization servlet, signed by
+/// the cluster key.
 fn authorization_frame(certs: &TestCerts, transaction: CreditTransferTransaction) -> Frame {
-	let signer = CertifiedKey::new(&certs.cluster_cert, certs.cluster_key.to_owned());
+	authorization_frame_under(&certs.cluster_cert, &certs.cluster_key, transaction)
+}
+
+/// The frame that carries `transaction` to an authorization servlet: hashed,
+/// witnessed, sealed under the shared payment cipher, and signed by `key`,
+/// the key of `certificate`.
+fn authorization_frame_under(
+	certificate: &Certificate,
+	key: &Secp256k1SigningKey,
+	transaction: CreditTransferTransaction,
+) -> Frame {
+	let signer = CertifiedKey::new(certificate, key.to_owned());
 	let frame = Version::V1
 		.compose()
 		.with_id(b"payment-auth-txn")
@@ -215,10 +234,20 @@ fn authorization_frame(certs: &TestCerts, transaction: CreditTransferTransaction
 		.with_message_hasher::<Sha3_256>([])
 		.with_witness_hasher::<Sha3_256>()
 		.with_encryptor(shared_payment_cipher())
-		.with_signer::<Secp256k1Signature, _>(signer.expect("the cluster key certifies"))
+		.with_signer::<Secp256k1Signature, _>(signer.expect("the key certifies"))
 		.build();
 
 	frame.expect("an authorization frame builds")
+}
+
+/// The status that `reply` carries.
+///
+/// # Errors
+///
+/// - [`TightBeamError::MissingResponse`] -- the reply holds no frame.
+/// - The errors of [`Frame::decode_message`].
+fn status_of(reply: Option<Frame>) -> Result<TransactionStatus, TightBeamError> {
+	reply.ok_or(TightBeamError::MissingResponse)?.decode_message()
 }
 
 /// The start of an authorization instance, which the hive calls for each
@@ -247,6 +276,75 @@ async fn hive_client(certs: &TestCerts, addr: TightBeamSocketAddr) -> GenericCli
 	builder.connect(addr).await.expect("a client of the hive certificate connects")
 }
 
+/// Starts an established hive on `trace` that registers one authorization
+/// instance of one payment flow.
+///
+/// The trust store of the hive holds the cluster certificate, so its control
+/// plane demands that certificate of each caller, and takes commands that the
+/// cluster key signs.
+async fn start_authorization_hive(
+	trace: &TraceCollector,
+	certs: &Arc<TestCerts>,
+) -> Result<PaymentProcessorHive, TightBeamError> {
+	let spawner = authorization_spawner(Arc::clone(certs), Arc::default());
+	let seed = spawner(Arc::new(trace.share())).await?;
+
+	let mut hive = PaymentProcessorHive::new(Some(hive_tls_config(certs)))?;
+	hive.register(authorization_urn(), seed, spawner)?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// Dials the control plane of `hive` under `identity`, sends one spawn of the
+/// authorization type that `identity` signs, and returns the answer.
+///
+/// # Errors
+///
+/// - [`TightBeamError::NotEstablished`] -- the hive holds no control plane.
+/// - [`TightBeamError`] -- the dial, the frame, or the exchange fails.
+async fn spawn_authorization(
+	hive: &PaymentProcessorHive,
+	certs: &TestCerts,
+	identity: SigningIdentity,
+) -> Result<ClusterCommandResponse, TightBeamError> {
+	let builder = ClientBuilder::<TokioListener>::builder()
+		.with_trust_store(Arc::clone(&certs.hive_trust))
+		.with_client_identity(identity.clone())
+		.build();
+
+	let addr = hive.addr().ok_or(TightBeamError::NotEstablished)?;
+	let mut client = builder.connect(addr.to_owned()).await?;
+
+	let spawn = SpawnServletParams { servlet_type: authorization_urn(), config: None };
+	let mut frame = Version::V1
+		.compose()
+		.with_id(b"spawn-authorization")
+		.with_order(UnixMillis::now().get())
+		.with_message(ClusterCommand::Manage(HiveManagement::Spawn(spawn)))
+		.with_witness_hasher::<Sha3_256>()
+		.build()?;
+	frame.sign_with_provider(&identity).await?;
+
+	let reply = client.emit(frame, None).await?;
+	reply.ok_or(TightBeamError::MissingResponse)?.decode_message()
+}
+
+/// The address of the instance that the answer to a spawn names.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the answer names no spawned instance.
+fn spawned_address(answer: ClusterCommandResponse) -> Result<TightBeamSocketAddr, TightBeamError> {
+	let ClusterCommandResponse::Manage(HiveManagementOutcome::Spawn(spawned)) = answer else {
+		return Err(expectation_failure("a spawn answers in the spawn alternative"));
+	};
+
+	let unnamed = expectation_failure("an accepted spawn names its address");
+	let address = spawned.servlet_address.ok_or(unnamed)?;
+	let address = String::from_utf8(address).expect("a socket address renders as UTF-8");
+	Ok(address.parse().expect("a spawned servlet reports a socket address"))
+}
+
 /// The frame that carries `capture`, linked to the authorization `authorized`
 /// through the digest of its body.
 fn capture_frame(certs: &TestCerts, capture: CaptureTransaction, authorized: &CreditTransferTransaction) -> Frame {
@@ -266,6 +364,40 @@ fn capture_frame(certs: &TestCerts, capture: CaptureTransaction, authorized: &Cr
 		.build();
 
 	frame.expect("a capture frame builds")
+}
+
+/// The two servlets of one payment flow, which share one harness, beside a
+/// client of each. The servlets serve while this value lives.
+struct PaymentFlow {
+	_authorizer: AuthorizationServlet,
+	_capturer: CaptureServlet,
+	authorization_client: GenericClient<TokioListener>,
+	capture_client: GenericClient<TokioListener>,
+}
+
+impl PaymentFlow {
+	/// Starts the servlets of one flow on `trace`, and connects a client to
+	/// each.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- a servlet fails to build or to start.
+	async fn start(trace: &TraceCollector, certs: &TestCerts) -> Result<Self, TightBeamError> {
+		let harness = Arc::default();
+		let config = servlet_tls_config(certs, &harness)?;
+		let authorizer = AuthorizationServlet::start(Arc::new(trace.share()), config).await?;
+		let config = servlet_tls_config(certs, &harness)?;
+		let capturer = CaptureServlet::start(Arc::new(trace.share()), config).await?;
+		let authorization_client = hive_client(certs, *authorizer.addr()).await;
+		let capture_client = hive_client(certs, *capturer.addr()).await;
+
+		Ok(Self {
+			_authorizer: authorizer,
+			_capturer: capturer,
+			authorization_client,
+			capture_client,
+		})
+	}
 }
 
 tb_assert_spec! {
@@ -444,31 +576,56 @@ tb_assert_spec! {
 	}
 }
 
-// An instance that the hive's spawner starts presents the hive certificate
-// and holds the payment decryptor, so it approves a confidential transfer as
-// the first instance does.
+// An instance that a hive spawns on a command of the cluster presents the hive
+// certificate and holds the payment decryptor, so it approves a confidential
+// transfer.
 tb_scenario! {
 	name: a_spawned_authorization_instance_opens_a_confidential_transfer,
 	spec: SpawnedAuthorizationSpec,
-	environment Servlet {
+	environment Hive {
 		context: TestCerts::generate(),
 		start: |SetupEnv { trace, context: certs }| async move {
-			let spawn = authorization_spawner(certs, Arc::default());
-			spawn(Arc::new(trace)).await
+			start_authorization_hive(&trace, &certs).await
 		},
-		setup: |ClientEnv { addr, context: certs, .. }| async move {
-			Ok(hive_client(&certs, addr).await)
-		},
-		client: |ServletEnv { mut client, context: certs, .. }| async move {
+		client: |HiveEnv { context: certs, hive, .. }| async move {
+			let cluster = signing_identity(certs.cluster_cert.to_owned(), certs.cluster_key.to_owned());
+			let spawned = spawn_authorization(&hive, &certs, cluster).await?;
+			let mut client = hive_client(&certs, spawned_address(spawned)?).await;
 			let transaction = create_auth_transaction(b"E2E-SPAWNED", MonetaryAmount::new(10000, *b"USD"));
-			let reply = client.emit(authorization_frame(&certs, transaction), None).await?;
-			let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-			let status: TransactionStatus = reply.decode_message()?;
-			assert!(status.status.is_success(), "the client decoded no approval from the servlet frame");
 
+			let reply = client.emit(authorization_frame(&certs, transaction), None).await?;
+			hive.stop();
+			assert_eq!(status_of(reply)?.status, PaymentStatusCode::AcceptedCustomerProfile);
 			Ok(())
 		}
 	}
+}
+
+/// The control plane of a payment hive authenticates each caller: a caller
+/// that presents a certificate outside the cluster trust fails its handshake,
+/// and the hive spawns no instance for it.
+#[cfg(feature = "instrument")]
+#[tokio::test]
+async fn a_hive_refuses_a_caller_outside_the_cluster_trust() -> TestResult {
+	let certs = Arc::new(TestCerts::generate());
+	let hive = start_authorization_hive(&TraceCollector::new(), &certs).await?;
+	let connections = hive.connection_trace().map(TraceCollector::share);
+	let connections = connections.ok_or(TightBeamError::NotEstablished)?;
+	let stranger = signing_identity(certs.hive_cert.to_owned(), certs.hive_key.to_owned());
+
+	// The refusal ends the exchange, so the test reads its reason from the
+	// connection trace. A wait that runs out leaves that trace short of the
+	// record, which the label then shows.
+	let _refused = spawn_authorization(&hive, &certs, stranger).await;
+	let rejected = || connections.recorded(events::SESSION_CERT_REJECTED) >= 1;
+	poll_until(50, Duration::from_millis(100), rejected).await;
+	let instances = hive.servlet_addresses().len();
+	hive.stop();
+
+	let reasons = recorded_labels(&connections, events::SESSION_CERT_REJECTED);
+	let refused = Some(String::from("certificate/certificate-not-trusted"));
+	assert_eq!((reasons, instances), (vec![refused], 1));
+	Ok(())
 }
 
 tb_assert_spec! {
@@ -482,8 +639,9 @@ tb_assert_spec! {
 	}
 }
 
-// The servlet answers a replayed authorization frame from its dedup cache, so
-// it approves the transfer once.
+// The harness answers a replayed authorization frame from its dedup cache, so
+// the servlet approves the transfer once and the client reads one approval on
+// both replies.
 tb_scenario! {
 	name: a_replayed_authorization_is_answered_from_the_dedup_cache,
 	spec: ReplaySpec,
@@ -498,9 +656,51 @@ tb_scenario! {
 		client: |ServletEnv { mut client, context: certs, .. }| async move {
 			let transaction = create_auth_transaction(b"E2E-REPLAY", MonetaryAmount::new(10000, *b"USD"));
 			let transfer = authorization_frame(&certs, transaction);
-			client.emit(transfer.to_owned(), None).await?;
-			client.emit(transfer, None).await?;
 
+			let first = status_of(client.emit(transfer.to_owned(), None).await?)?;
+			let replayed = status_of(client.emit(transfer, None).await?)?;
+			assert_eq!(first.status, PaymentStatusCode::AcceptedCustomerProfile);
+			assert_eq!(replayed, first);
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub UnknownSignerSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::GATE_REJECT, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(INTEGRITY_VERIFIED, absent!()),
+			(AUTHORIZATION_APPROVED, absent!())
+		]
+	}
+}
+
+// The collector gate of an authorization servlet verifies each frame under the
+// cluster certificate, so a transfer that another key signs stops ahead of the
+// decryptor and the handler.
+tb_scenario! {
+	name: a_transfer_that_the_cluster_did_not_sign_is_refused_ahead_of_its_handler,
+	spec: UnknownSignerSpec,
+	environment Servlet {
+		context: TestCerts::generate(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			AuthorizationServlet::start(Arc::new(trace), servlet_tls_config(&certs, &Arc::default())?).await
+		},
+		setup: |ClientEnv { addr, context: certs, .. }| async move {
+			Ok(hive_client(&certs, addr).await)
+		},
+		client: |ServletEnv { mut client, context: certs, .. }| async move {
+			let transaction = create_auth_transaction(b"E2E-UNKNOWN", MonetaryAmount::new(10000, *b"USD"));
+			let transfer = authorization_frame_under(&certs.hive_cert, &certs.hive_key, transaction);
+
+			let refused = client.emit(transfer, None).await;
+			assert!(matches!(
+				refused,
+				Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))
+			));
 			Ok(())
 		}
 	}
@@ -528,19 +728,56 @@ tb_scenario! {
 	environment Bare {
 		context: TestCerts::generate(),
 		exec: |SetupEnv { trace, context: certs }| async move {
-			let harness = Arc::default();
-			let authorizer = AuthorizationServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs, &harness)?).await?;
-			let capturer = CaptureServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs, &harness)?).await?;
+			let mut flow = PaymentFlow::start(&trace, &certs).await?;
 			let amount = MonetaryAmount::new(10000, *b"USD");
 			let authorized = create_auth_transaction(b"E2E-CAPTURE", amount.to_owned());
 			let capture = CaptureTransaction::new(b"E2E-CAPTURE", amount, authorized.creation_datetime)?;
 			let capture = capture_frame(&certs, capture, &authorized);
-			let mut authorization_client = hive_client(&certs, *authorizer.addr()).await;
-			let mut capture_client = hive_client(&certs, *capturer.addr()).await;
 
-			authorization_client.emit(authorization_frame(&certs, authorized), None).await?;
-			capture_client.emit(capture, None).await?;
+			flow.authorization_client.emit(authorization_frame(&certs, authorized), None).await?;
+			flow.capture_client.emit(capture, None).await?;
 
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub BrokenCaptureSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(AUTHORIZATION_APPROVED, exactly!(1)),
+			(CHAIN_VALID, exactly!(1)),
+			(CHAIN_BROKEN, exactly!(1)),
+			(CAPTURE_COMPLETED, absent!()),
+			(events::HANDLER_FAILED, exactly!(1), equals!(TransitStatus::Internal))
+		]
+	}
+}
+
+// A capture whose `previous_frame` crosses the wire with the digest of another
+// transfer misses the authorization at the tip of the chain, so the servlet
+// fails the request and settles nothing.
+tb_scenario! {
+	name: a_capture_linked_to_another_transfer_is_refused,
+	spec: BrokenCaptureSpec,
+	environment Bare {
+		context: TestCerts::generate(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let mut flow = PaymentFlow::start(&trace, &certs).await?;
+			let amount = MonetaryAmount::new(10000, *b"USD");
+			let authorized = create_auth_transaction(b"E2E-CAPTURE", amount.to_owned());
+			let another = create_auth_transaction(b"E2E-ANOTHER", amount.to_owned());
+			let capture = CaptureTransaction::new(b"E2E-CAPTURE", amount, authorized.creation_datetime)?;
+			let capture = capture_frame(&certs, capture, &another);
+			flow.authorization_client.emit(authorization_frame(&certs, authorized), None).await?;
+
+			let refused = flow.capture_client.emit(capture, None).await;
+			assert!(matches!(
+				refused,
+				Err(TransportError::OperationFailed(TransportFailure::Internal))
+			));
 			Ok(())
 		}
 	}

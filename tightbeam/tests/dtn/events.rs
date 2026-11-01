@@ -1,4 +1,4 @@
-//! DTN ultimate-scenario event URN inventory.
+//! The URNs of the events that the DTN nodes record in their trace.
 
 use tightbeam::urn::Urn;
 
@@ -69,6 +69,8 @@ pub(crate) const MISSION_CONTROL_RECEIVE_FRAME_REQUEST: Urn<'static> =
 	tightbeam::urn!("test", "event:ultimate/mission-control-receive-frame-request");
 pub(crate) const MISSION_CONTROL_RECEIVE_FRAME_RESPONSE: Urn<'static> =
 	tightbeam::urn!("test", "event:ultimate/mission-control-receive-frame-response");
+pub(crate) const MISSION_CONTROL_RECEIVE_LOW_POWER_FLAG: Urn<'static> =
+	tightbeam::urn!("test", "event:ultimate/mission-control-receive-low-power-flag");
 pub(crate) const MISSION_CONTROL_RECEIVE_TELEMETRY: Urn<'static> =
 	tightbeam::urn!("test", "event:ultimate/mission-control-receive-telemetry");
 pub(crate) const MISSION_CONTROL_SEND_COMMAND: Urn<'static> =

@@ -5,7 +5,7 @@
 //! by the SPKI DER of its validated certificate, so a refused frame stops
 //! ahead of the handler.
 
-#![cfg(all(feature = "tcp", feature = "testing", feature = "instrument"))]
+#![cfg(all(feature = "tcp", feature = "instrument"))]
 
 use core::num::NonZeroUsize;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use tightbeam::{Frame, TightBeamError};
 use tokio::task::JoinHandle;
 
 use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
-use crate::transport::support::bind_mutual_listener;
+use crate::common::transport::bind_mutual_listener;
 
 /// A mutual-auth doorman fixture: the server materials and the client
 /// identity the gate lists.
@@ -50,13 +50,19 @@ impl DoormanContext {
 		let signing_key = random_signing_key();
 		let client_certificate = Arc::new(test_certificate(&signing_key));
 		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		Self { materials: ServerMaterials::generate(), client_certificate, client_provider }
+		Self { materials: ServerMaterials::fixed(), client_certificate, client_provider }
 	}
 
 	/// The client's account key: the SPKI DER the peer-list gate
 	/// matches against.
 	fn client_key(&self) -> Result<Vec<u8>, TightBeamError> {
 		Ok(self.client_certificate.tbs_certificate.subject_public_key_info.to_der()?)
+	}
+
+	/// The SPKI DER of the server, a well-formed key that the client does not
+	/// hold.
+	fn unlisted_key(&self) -> Result<Vec<u8>, TightBeamError> {
+		Ok(self.materials.certificate.tbs_certificate.subject_public_key_info.to_der()?)
 	}
 }
 
@@ -117,11 +123,21 @@ async fn knock(lease: &mut PooledClient<TokioListener>) -> Result<bool, TightBea
 	Ok(reply == Some(frame))
 }
 
+/// Knocks once on the door, and reports whether the gate refused the knock
+/// with `PermissionDenied`.
+async fn barred(lease: &mut PooledClient<TokioListener>) -> bool {
+	let outcome = lease.emit(TestFrame::v0(Some("door-knock"), None), None).await;
+	matches!(
+		outcome,
+		Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))
+	)
+}
+
 // The trace sets the detail flag, so the one policy step of the gate shows
 // that the server records on the trace, and `absent!()` on the handler span
 // reads the refusal of the gate.
 tb_assert_spec! {
-	pub PeerDenyListSpec,
+	pub PeerBarredSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
@@ -139,7 +155,7 @@ tb_assert_spec! {
 tb_scenario! {
 	name: peer_deny_listed_client_is_barred,
 	config: ScenarioConfig::builder()
-		.with_spec(PeerDenyListSpec::latest())
+		.with_spec(PeerBarredSpec::latest())
 		.with_trace(TestTrace::with_detail(true))
 		.build(),
 	environment ServiceClient {
@@ -151,17 +167,37 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = doorman_pool(&ctx, &trace)?;
 			let mut lease = pool.connect(addr).await?;
+			assert!(barred(&mut lease).await, "the deny list bars the client");
+			Ok(())
+		}
+	}
+}
 
-			let outcome = lease.emit(TestFrame::v0(Some("door-knock"), None), None).await;
-			let barred = matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied)));
-			assert!(barred, "the deny list bars the client");
+// An allow list that omits the client's key bars the client past the same
+// mutual handshake, so the keys of the list decide the verdict of the gate.
+tb_scenario! {
+	name: peer_outside_the_allow_list_is_barred,
+	config: ScenarioConfig::builder()
+		.with_spec(PeerBarredSpec::latest())
+		.with_trace(TestTrace::with_detail(true))
+		.build(),
+	environment ServiceClient {
+		context: DoormanContext::generate(),
+		server: |SetupEnv { context: ctx, trace }| async move {
+			let gate = PeerListGate::allow([ctx.unlisted_key()?])?;
+			start_doorman_server(&ctx, gate, &trace).await
+		},
+		client: |ClientEnv { trace, context: ctx, addr }| async move {
+			let pool = doorman_pool(&ctx, &trace)?;
+			let mut lease = pool.connect(addr).await?;
+			assert!(barred(&mut lease).await);
 			Ok(())
 		}
 	}
 }
 
 tb_assert_spec! {
-	pub PeerAllowListSpec,
+	pub PeerAdmittedSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
@@ -175,7 +211,7 @@ tb_assert_spec! {
 // proves the gate keys on the session identity, not on frames.
 tb_scenario! {
 	name: peer_allow_listed_client_is_admitted,
-	spec: PeerAllowListSpec,
+	spec: PeerAdmittedSpec,
 	environment ServiceClient {
 		context: DoormanContext::generate(),
 		server: |SetupEnv { context: ctx, trace }| async move {
@@ -188,6 +224,28 @@ tb_scenario! {
 
 			let echoed = knock(&mut lease).await?;
 			assert!(echoed, "the allow-listed client's knock echoes");
+			Ok(())
+		}
+	}
+}
+
+// A deny list that omits the client's key admits the client, so a deny gate
+// bars the keys it lists and no other key.
+tb_scenario! {
+	name: peer_outside_the_deny_list_is_admitted,
+	spec: PeerAdmittedSpec,
+	environment ServiceClient {
+		context: DoormanContext::generate(),
+		server: |SetupEnv { context: ctx, trace }| async move {
+			let gate = PeerListGate::deny([ctx.unlisted_key()?])?;
+			start_doorman_server(&ctx, gate, &trace).await
+		},
+		client: |ClientEnv { trace, context: ctx, addr }| async move {
+			let pool = doorman_pool(&ctx, &trace)?;
+			let mut lease = pool.connect(addr).await?;
+
+			let echoed = knock(&mut lease).await?;
+			assert!(echoed);
 			Ok(())
 		}
 	}

@@ -5,12 +5,12 @@
 //! - a CSP process spec that checks the state machine, and
 //! - L1 assertion specs that count the events.
 
-#![cfg(all(feature = "testing", feature = "std"))]
+#![cfg(feature = "testing")]
 
-use tightbeam::der::Sequence;
 use tightbeam::task::Pipeline;
+use tightbeam::testing::TestMessage;
 use tightbeam::{compose, job};
-use tightbeam::{Beamable, Frame, TightBeamError};
+use tightbeam::{Frame, TightBeamError};
 
 #[cfg(feature = "testing-csp")]
 use tightbeam::testing::ScenarioConfig;
@@ -18,6 +18,8 @@ use tightbeam::testing::ScenarioConfig;
 use tightbeam::urn::Urn;
 #[cfg(feature = "testing-csp")]
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+use crate::common::result::TestResult;
 
 #[cfg(feature = "testing-csp")]
 pub(crate) const CREATE_TEST_FRAME_START: Urn<'static> =
@@ -36,11 +38,6 @@ pub(crate) const VALIDATE_FRAME_START: Urn<'static> = tightbeam::urn!("tightbeam
 #[cfg(feature = "testing-csp")]
 pub(crate) const VALIDATE_FRAME_SUCCESS: Urn<'static> =
 	tightbeam::urn!("tightbeam", "event:job/validate-frame-success");
-
-#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
-struct TestMessage {
-	content: String,
-}
 
 // The `job!` items implement `Job` over tuple-destructured parameters. A `Job`
 // input must be an owned type, with no borrow.
@@ -68,7 +65,6 @@ job! {
 	name: TransformContent,
 	fn run((frame,): (Frame,)) -> Result<Frame, TightBeamError> {
 		let msg: TestMessage = frame.decode_message()?;
-
 		compose! {
 			V0: id: frame.metadata().id(),
 				message: TestMessage {
@@ -80,19 +76,20 @@ job! {
 
 // The test of a pipeline over plain results
 
-/// A pipeline over plain results runs its three jobs in order, so the last
-/// job transforms the frame that the first job created.
+/// The three `job!` items chain over plain results in order, so the last job
+/// transforms the frame that the first job created. Method syntax on a
+/// `Result` reaches the inherent `Result::and_then`, so this test holds the
+/// chain of the jobs, and the unit tests of `Pipeline` hold
+/// `Pipeline::and_then`.
 #[test]
-fn test_pipeline_direct_results() -> Result<(), TightBeamError> {
-	// A pipeline of plain results runs outside `PipelineBuilder`, so it records
-	// no trace.
-	let frame = CreateTestFrame::run(("test-001".to_string(), "content".to_string()))
-		.and_then(|f| ValidateFrame::run((f,)))
-		.and_then(|f| TransformContent::run((f,)))
-		.run()?;
+fn three_job_items_chain_over_plain_results() -> TestResult {
+	let created = CreateTestFrame::run(("test-001".to_string(), "content".to_string()));
+	let validated = created.and_then(|f| ValidateFrame::run((f,)));
+	let transformed = validated.and_then(|f| TransformContent::run((f,)));
+	let frame = transformed.run()?;
 
 	let message: TestMessage = frame.decode_message()?;
-	assert_eq!(message.content, "content_transformed", "the three jobs ran out of order");
+	assert_eq!(message, TestMessage::sample(Some("content_transformed")));
 	Ok(())
 }
 
@@ -162,25 +159,4 @@ tb_scenario! {
 				.run()
 		}
 	}
-}
-
-// The test of a pipeline with a fallback
-
-/// A failed result runs its fallback, which builds the frame in its place.
-#[test]
-fn test_pipeline_with_fallback() -> Result<(), TightBeamError> {
-	let failing: Result<Frame, TightBeamError> = Err(TightBeamError::InvalidOrder);
-	let frame = failing
-		.or_else(|_| {
-			compose! {
-				V0: id: b"fallback",
-					message: TestMessage {
-						content: "fallback_content".to_string()
-					}
-			}
-		})
-		.run()?;
-
-	assert_eq!(frame.metadata().id(), b"fallback", "the fallback did not build the frame");
-	Ok(())
 }

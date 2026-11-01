@@ -3,10 +3,10 @@
 //! Each job is one unit of work with typed inputs and outputs, so a DTN node
 //! composes the jobs into pipelines.
 
-// Contexts
+// The shared state of the jobs.
 pub mod contexts;
 
-// Gap recovery jobs
+// The jobs of gap recovery.
 pub mod build_gap_recovery_frame;
 pub mod create_frame_request;
 pub mod emit_frame_to_network;

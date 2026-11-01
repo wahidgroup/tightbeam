@@ -2,9 +2,15 @@
 
 use std::net::{Ipv4Addr, TcpListener};
 
-use super::common::*;
 use tightbeam::colony::cluster::ClusterConfigBuilder;
 use tightbeam::transport::Protocol;
+
+#[cfg(feature = "instrument")]
+use crate::colony::trace::TraceWaiter;
+#[cfg(feature = "instrument")]
+use crate::common::result::TestResult;
+
+use super::common::*;
 
 tb_assert_spec! {
 	pub ClusterPeerAdvertisedSpec,
@@ -116,12 +122,14 @@ tb_scenario! {
 			// Exactly one learned route is keyed by the advertised type, and
 			// it exposes the claimed dial path and the signer fingerprint.
 			let ping_canonical = servlet_urn("ping").type_canonical_bytes();
+			let signer = gateway_fingerprint(&certs.cert);
 			let routes = cluster.peer_routes()?;
 			let exposed = routes.len() == 1
 				&& routes.first().is_some_and(|route| {
 					let servlet_type: &[u8] = route.servlet_type.as_ref();
 					let dial_addr: &[u8] = route.dial_addr.as_ref();
-					servlet_type == ping_canonical.as_slice() && dial_addr == PEER_GATEWAY_ADDR && !route.peer_id.is_empty()
+					let peer_id: &[u8] = route.peer_id.as_ref();
+					(servlet_type, dial_addr, peer_id) == (ping_canonical.as_slice(), PEER_GATEWAY_ADDR, signer.as_slice())
 				});
 
 			assert!(
@@ -474,8 +482,8 @@ tb_assert_spec! {
 }
 
 // Unary cross-cluster forward: ping lives only on the advertiser. The client
-// asks the receiver, the receiver re-emits Work with the budget spent, the
-// advertiser serves locally, and the echo returns.
+// asks the receiver, the receiver re-emits Work, the advertiser serves locally,
+// and the echo returns.
 tb_scenario! {
 	name: cluster_forwards_work_to_peer_gateway,
 	spec: ClusterPeerForwardEchoSpec,
@@ -995,9 +1003,21 @@ tb_assert_spec! {
 	}
 }
 
+/// The canonical keys of the slate that a beat advertises from one type past
+/// [`MAX_ADVERTISED_TYPES`]: the first keys of the sorted slate.
+fn capped_slate_keys() -> Vec<Arc<[u8]>> {
+	let types = (0..=MAX_ADVERTISED_TYPES).map(|i| servlet_urn(&format!("t{i}")));
+	let mut keys: Vec<Arc<[u8]>> = types.map(|urn| Arc::from(urn.type_canonical_bytes())).collect();
+	keys.sort_unstable();
+	keys.truncate(MAX_ADVERTISED_TYPES);
+
+	keys
+}
+
 // The beat honors the receiver's advertisement cap, so a colony past
-// MAX_ADVERTISED_TYPES advertises a deterministic capped subset. Every
-// receiver refuses an oversized slate, which would silently wedge federation.
+// MAX_ADVERTISED_TYPES advertises the first types of its sorted slate, a
+// deterministic subset. Every receiver refuses an oversized slate, which would
+// silently wedge federation.
 tb_scenario! {
 	name: cluster_beat_bounds_slate_to_advertised_cap,
 	spec: ClusterBeatCapSpec,
@@ -1028,8 +1048,9 @@ tb_scenario! {
 			)
 			.await?;
 
-			let learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
-			assert_eq!(learned.len(), MAX_ADVERTISED_TYPES, "the beat advertises the capped subset of the slate");
+			let mut learned = wait_for_peer_types(&trace, &receiver, 50, Duration::from_millis(100)).await;
+			learned.sort_unstable();
+			assert_eq!(learned, capped_slate_keys());
 
 			advertiser.stop();
 			receiver.stop();
@@ -1136,12 +1157,7 @@ tb_scenario! {
 /// Returns a federating builder bound to the IPv4 wildcard, which a scenario
 /// finishes with or without an advertise address.
 fn wildcard_advertising_builder(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfigBuilder {
-	let peer: String = peer.into();
-	ClusterConfig::builder(cluster_tls_config(certs))
-		.with_bind_addr("0.0.0.0:0")
-		.with_peers([peer])
-		.expect("fixture peers name sockets")
-		.with_advertise_interval(Duration::from_millis(100))
+	federating_builder(certs, "0.0.0.0:0", peer)
 }
 
 /// A port on the IPv4 wildcard that this value reserves for the scenario's
@@ -1176,30 +1192,46 @@ fn wildcard_port_is_free(port: u16) -> bool {
 	TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
-// A gateway bound to the wildcard address would advertise `0.0.0.0`, which
-// every peer refuses as unspecified. A federating gateway with no advertise
-// address therefore refuses to start, and releases the port it bound.
+/// The start of a federating gateway with no advertise address on a port of
+/// the IPv4 wildcard, beside the reservation that keeps the port from a
+/// concurrent test.
+struct WildcardStart {
+	/// The outcome of the start.
+	started: Result<ClusterGateway, TightBeamError>,
+	/// The reservation of the port that the start bound.
+	reserved: ReservedWildcardPort,
+}
+
+impl WildcardStart {
+	/// Starts a federating gateway on a reserved port of the IPv4 wildcard,
+	/// with no advertise address.
+	async fn run() -> Self {
+		let certs = cluster_certs();
+		let reserved = ReservedWildcardPort::hold();
+		let bind = format!("0.0.0.0:{}", reserved.port());
+		let conf = federating_builder(&certs, bind, "127.0.0.1:65210").build();
+
+		let started = start_cluster(&TraceCollector::new(), conf).await;
+		Self { started, reserved }
+	}
+}
+
+/// A gateway bound to the wildcard address would advertise `0.0.0.0`, which
+/// every peer refuses as unspecified. A federating gateway with no advertise
+/// address therefore refuses to start.
 #[tokio::test]
-async fn cluster_refuses_to_federate_from_a_wildcard_bind_without_an_advertise_address() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let reserved = ReservedWildcardPort::hold();
-	let port = reserved.port();
-	let conf = wildcard_advertising_builder(&certs, "127.0.0.1:65210")
-		.with_bind_addr(format!("0.0.0.0:{port}"))
-		.build();
+async fn a_wildcard_bind_without_an_advertise_address_refuses_to_start() {
+	let start = WildcardStart::run().await;
+	let refusal = cluster_refusal(&start.started);
+	assert!(matches!(refusal, Some(ClusterError::AdvertiseAddressRequired)));
+}
 
-	let refused = start_cluster(&TraceCollector::new(), conf).await;
-	let advertise_required = matches!(
-		refused,
-		Err(TightBeamError::ClusterError(error)) if matches!(*error, ClusterError::AdvertiseAddressRequired)
-	);
-
-	assert!(
-		advertise_required,
-		"a wildcard bind without an advertise address refuses to start"
-	);
-	assert!(wildcard_port_is_free(port), "a refused start releases the port it bound");
-	Ok(())
+/// A federating gateway that refuses its wildcard bind releases the port it
+/// bound.
+#[tokio::test]
+async fn a_refused_start_releases_its_port() {
+	let start = WildcardStart::run().await;
+	assert!(wildcard_port_is_free(start.reserved.port()));
 }
 
 tb_assert_spec! {
@@ -1258,18 +1290,18 @@ tb_scenario! {
 	}
 }
 
-// A peer that refuses a direct advertisement leaves a record on the gateway
-// that sent it, so the sender's trail shows each refusal (CWE-778). The
-// receiver holds no peer trust, so it refuses every advertisement.
+/// A peer that refuses a direct advertisement leaves a record on the gateway
+/// that sent it, so the sender's trail shows each refusal (CWE-778). The
+/// receiver holds no peer trust, so it refuses every advertisement.
+#[cfg(feature = "instrument")]
 #[tokio::test]
-async fn a_peer_that_refuses_a_direct_advertisement_leaves_a_record_on_the_sender() -> Result<(), TightBeamError> {
+async fn a_peer_that_refuses_a_direct_advertisement_leaves_a_record_on_the_sender() -> TestResult {
 	let certs = cluster_certs();
 	let receiver = start_cluster(&TraceCollector::new(), routing_cluster_conf(&certs, None)).await?;
-	let trace = TraceCollector::new();
+	let (trace, waiter) = TraceWaiter::trace();
 	let sender = start_cluster(&trace, advertising_cluster_conf(&certs, receiver.addr().to_string())).await?;
 
-	let refused = || trace.recorded(events::CLUSTER_PEER_AD_REFUSED_BY_PEER) > 0;
-	let recorded = poll_until(50, Duration::from_millis(100), refused).await;
+	let recorded = waiter.until(events::CLUSTER_PEER_AD_REFUSED_BY_PEER, 1).await;
 	sender.stop();
 	receiver.stop();
 

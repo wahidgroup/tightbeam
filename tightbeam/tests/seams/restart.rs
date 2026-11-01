@@ -3,20 +3,18 @@
 //! - An outside [`RestartPolicy`] decides whether [`MessageEmitter::emit`] sends a refused frame again.
 //! - An outside [`JitterStrategy`] spreads the delay of a house backoff policy.
 
-#![cfg(all(feature = "tcp", feature = "tokio"))]
-
 use core::time::Duration;
 use std::net::SocketAddr;
 
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::TestFrame;
 use tightbeam::transport::policy::{JitterStrategy, RestartConfig, RestartLinearBackoff, RestartPolicy, RetryAction};
-use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
-use tightbeam::transport::{EndpointConfig, MessageCollector, MessageEmitter, TransportFailure, TransportResult};
-use tightbeam::{Frame, TightBeamError};
-use tokio::net::TcpStream;
+use tightbeam::transport::{MessageCollector, MessageEmitter, TransportFailure, TransportResult};
+use tightbeam::Frame;
 use tokio::task::JoinHandle;
+
+use super::{cleartext_client, cleartext_listener};
+use crate::common::result::TestResult;
 
 /// A restart policy an outside crate writes: when the server refuses the first
 /// send as unavailable, it sends the frame again at once, and it stops on every
@@ -47,9 +45,7 @@ impl JitterStrategy for CappedJitter {
 /// A cleartext server on a loopback port that refuses the first frame it
 /// collects as unavailable and echoes the second, and the address it binds.
 async fn refuse_once_then_echo() -> (JoinHandle<TransportResult<()>>, SocketAddr) {
-	let bound = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await;
-	let listener = bound.expect("a loopback port binds");
-	let addr = listener.local_addr().expect("a bound listener has an address");
+	let (listener, addr) = cleartext_listener().await;
 
 	let serving = tokio::spawn(async move {
 		let (mut transport, _) = listener.accept().await?;
@@ -63,16 +59,10 @@ async fn refuse_once_then_echo() -> (JoinHandle<TransportResult<()>>, SocketAddr
 	(serving, addr)
 }
 
-/// A cleartext client transport connected to `addr`.
-async fn cleartext_client(addr: SocketAddr) -> TcpTransport<TokioStream, DefaultCryptoProvider> {
-	let stream = TcpStream::connect(addr).await.expect("the client reaches the listener");
-	TcpTransport::new(TokioStream::from(stream), EndpointConfig::<DefaultCryptoProvider>::cleartext())
-}
-
 /// A client under an outside restart policy sends again the frame the server
 /// refuses as unavailable, and reads the echo of the second send.
 #[tokio::test]
-async fn an_outside_restart_policy_resends_a_refused_frame() -> Result<(), TightBeamError> {
+async fn an_outside_restart_policy_resends_a_refused_frame() -> TestResult {
 	let (_serving, addr) = refuse_once_then_echo().await;
 	let mut client = cleartext_client(addr).await.with_restart(RetryUnavailable);
 	let frame = TestFrame::v0(Some("outside-restart"), None);

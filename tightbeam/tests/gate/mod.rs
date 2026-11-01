@@ -1,8 +1,8 @@
-//! What a trace with no gate decision is read as
+//! The reading of a trace with no gate decision.
 //!
 //! Nothing in the harness takes a gate, so a scenario records no decision.
 //! These tests hold the two halves of that: a spec may not require a decision
-//! that was never reached, and the absence of one is not read as a failure.
+//! that the run never reaches, and a run with no decision reads as accepted.
 
 use tightbeam::testing::{Expect, Layer, ScenarioConfig};
 use tightbeam::trace::{ConsumedTrace, ExecutionMode};
@@ -39,16 +39,15 @@ tb_scenario! {
 	}
 }
 
+/// A run that ends in `Ok` and records no gate decision reads as accepted.
 #[test]
-fn gateless_trace_is_mode_accept() {
+fn a_run_with_no_gate_decision_reads_as_accepted() {
 	let trace = ConsumedTrace::new();
-
 	assert_eq!(ExecutionMode::of(&Ok(()), &trace), ExecutionMode::Accept);
 }
 
 // Layer 1 must reject this: the run takes no gate, so `gate: Ok` names a
-// decision that was never reached. Restoring an unconditional gate write makes
-// Layer 1 accept, and the declared expectation then goes unmet.
+// decision that the run never reaches.
 tb_scenario! {
 	name: gate_ok_without_a_gate_is_rejected,
 	config: ScenarioConfig::builder()

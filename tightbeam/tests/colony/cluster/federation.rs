@@ -5,6 +5,7 @@
 //! - Rumors teach a gateway about origins it never dialed.
 //! - Relay trails carry work around a dead direct address.
 //! - The `max_hops` clamp bounds the origin's sentinel budget.
+//! - A forward spends one hop of its budget.
 //! - A forward reaches only the gateway that signed the advertisement.
 //! - A forward reaches a gateway that rotated its certificate under one key.
 
@@ -1000,5 +1001,168 @@ tb_scenario! {
 			hive.stop();
 			Ok(())
 		}
+	}
+}
+
+/// The builder of one gateway of a [`GatewayChain`], from its identity, its
+/// peer store, and its `max_hops`.
+type ChainConf = fn(&ClusterTestCerts, Arc<dyn CertificateTrust>, u8) -> ClusterConfig;
+
+/// A [`federation_conf`] with no anchors and no beat, so each route of the
+/// gateway comes from one injected advertisement.
+fn quiet_federation_conf(
+	certs: &ClusterTestCerts,
+	peer_trust: Arc<dyn CertificateTrust>,
+	max_hops: u8,
+) -> ClusterConfig {
+	let mut conf = federation_conf(certs, peer_trust, vec![], max_hops);
+	conf.peer.advertise_interval = None;
+	conf
+}
+
+/// A [`quiet_federation_conf`] with a mux offer, so the gateway serves routed
+/// streams and its pools open them.
+fn quiet_mux_federation_conf(
+	certs: &ClusterTestCerts,
+	peer_trust: Arc<dyn CertificateTrust>,
+	max_hops: u8,
+) -> ClusterConfig {
+	with_mux_offer(quiet_federation_conf(certs, peer_trust, max_hops))
+}
+
+/// Three gateways in a line, on the identities of [`federation_ctx`].
+///
+/// - A holds one route of the served type, which dials B.
+/// - B holds one route of the served type, which dials C, and no local servlet.
+/// - The hive of C serves the type.
+struct GatewayChain {
+	a: ClusterGateway,
+	b: ClusterGateway,
+	c: ClusterGateway,
+}
+
+impl GatewayChain {
+	/// Starts the chain on `trace`, registers `hive` with C, and injects one
+	/// advertisement of `servlet_type` at A and one at B.
+	///
+	/// - `conf` builds each gateway.
+	/// - B and C clamp a budget to one hop, and A clamps a budget to `hops_of_a`.
+	async fn start(
+		trace: &TraceCollector,
+		ctx: &FederationCtx,
+		hive: &ClusterTestHive,
+		conf: ChainConf,
+		servlet_type: &str,
+		hops_of_a: u8,
+	) -> Self {
+		let c = start_cluster(trace, conf(&ctx.c, Arc::clone(&ctx.peers_of_c), 1)).await;
+		let c = c.expect("a gateway starts on a free port");
+		let registered = hive.register_with_cluster(c.addr()).await;
+		registered.expect("the gateway answers the registration of its hive");
+
+		let b = start_cluster(trace, conf(&ctx.b, Arc::clone(&ctx.peers_of_b), 1)).await;
+		let b = b.expect("a gateway starts on a free port");
+		let a = start_cluster(trace, conf(&ctx.a, Arc::clone(&ctx.peers_of_a), hops_of_a)).await;
+		let a = a.expect("a gateway starts on a free port");
+
+		let slate = vec![servlet_urn(servlet_type)];
+		let at_b = advertise_peer_signed(&ctx.b, &ctx.c.key, &b, c.addr().to_string(), slate.clone()).await;
+		let at_a = advertise_peer_signed(&ctx.a, &ctx.b.key, &a, b.addr().to_string(), slate).await;
+		let at_b = at_b.expect("gateway B answers the advertisement of C");
+		let at_a = at_a.expect("gateway A answers the advertisement of B");
+		assert_eq!((at_b, at_a), (TransitStatus::Ok, TransitStatus::Ok));
+
+		Self { a, b, c }
+	}
+
+	/// Stops the three gateways.
+	fn stop(self) {
+		self.a.stop();
+		self.b.stop();
+		self.c.stop();
+	}
+}
+
+/// What one request does across a [`GatewayChain`]: its outcome at the client
+/// or the servlet, the selections that find no trail, and the settled
+/// forwards.
+type ChainOutcome<T> = (T, usize, usize);
+
+/// The counts of a [`ChainOutcome`] on `trace`.
+fn chain_outcome<T>(reached: T, trace: &TraceCollector) -> ChainOutcome<T> {
+	let unavailable = trace.recorded(events::CLUSTER_WORK_UNAVAILABLE);
+	(reached, unavailable, trace.recorded(events::CLUSTER_WORK_FORWARDED))
+}
+
+/// Sends one ping through a chain whose gateway A clamps a budget to
+/// `hops_of_a`. The first item of the outcome is the status of the refusal
+/// that the client reads, or `None` for a served ping.
+async fn ping_across_a_chain(hops_of_a: u8) -> ChainOutcome<Option<TransitStatus>> {
+	let ctx = federation_ctx();
+	let trace = TraceCollector::new();
+	let hive = start_ping_hive(trace.share(), Arc::clone(&ctx.c), None).await;
+	let hive = hive.expect("a ping hive establishes on a free port");
+	let chain = GatewayChain::start(&trace, &ctx, &hive, quiet_federation_conf, "ping", hops_of_a).await;
+	let client = connect_cluster(&ctx.a, chain.a.addr()).await;
+	let mut client = client.expect("a client connects to its gateway");
+
+	let served = emit_ping_work(&mut client, &ctx.a.key, b"chain-work").await;
+	chain.stop();
+	hive.stop();
+
+	chain_outcome(work_refusal_status(served).ok(), &trace)
+}
+
+/// Opens one stream through a chain whose gateway A clamps a budget to
+/// `hops_of_a`. The first item of the outcome is the count of streams that
+/// reach the servlet.
+async fn stream_across_a_chain(hops_of_a: u8) -> ChainOutcome<usize> {
+	let ctx = federation_ctx();
+	let trace = TraceCollector::new();
+	let hive = start_stream_hive(trace.share(), Arc::clone(&ctx.c)).await;
+	let hive = hive.expect("a stream hive establishes on a free port");
+	let chain = GatewayChain::start(&trace, &ctx, &hive, quiet_mux_federation_conf, "stream-echo", hops_of_a).await;
+	let client = pooled_cluster_client(&trace, &ctx.a, chain.a.addr()).await;
+	let client = client.expect("a client connects to its gateway");
+	let opened = client.open_stream_to(servlet_urn("stream-echo"));
+	let (sink, response) = opened.expect("a pooled client opens a stream");
+
+	// The counts are the observation, and a refused open fails the close or
+	// the reply, so both answers go unread.
+	let _closed = sink.close_with(b"chain-stream").await;
+	let _answered = response.await;
+	chain.stop();
+	hive.stop();
+
+	chain_outcome(trace.recorded(STREAM_SERVLET_HANDLED), &trace)
+}
+
+// A forward spends one hop of its budget, so the budget that reaches B decides
+// whether B may forward to C.
+tightbeam::tb_cases! {
+	async fn a_forward_of_unary_work_spends_one_hop((hops_of_a, outcome): (u8, ChainOutcome<Option<TransitStatus>>)) {
+		let recorded = ping_across_a_chain(hops_of_a).await;
+		assert_eq!(recorded, outcome);
+	}
+	cases {
+		/// A budget of one reaches B spent, so B selects among its local
+		/// routes, finds none, and answers `Unavailable`.
+		a_budget_of_one_ends_at_the_second_gateway => (1, (Some(TransitStatus::Unavailable), 1, 0)),
+		/// A budget of two leaves B one hop, so the ping crosses both hops.
+		a_budget_of_two_reaches_the_third_gateway => (2, (None, 0, 2)),
+	}
+}
+
+// A splice spends one hop of its budget, as unary work does.
+tightbeam::tb_cases! {
+	async fn a_splice_spends_one_hop((hops_of_a, outcome): (u8, ChainOutcome<usize>)) {
+		let recorded = stream_across_a_chain(hops_of_a).await;
+		assert_eq!(recorded, outcome);
+	}
+	cases {
+		/// A budget of one reaches B spent, so the stream ends at B.
+		a_budget_of_one_ends_at_the_second_gateway => (1, (0, 1, 0)),
+		/// A budget of two leaves B one hop, so the stream reaches the servlet.
+		a_budget_of_two_reaches_the_third_gateway => (2, (1, 0, 2)),
 	}
 }

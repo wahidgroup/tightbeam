@@ -1,10 +1,11 @@
-//! The one decider for a scenario's pass or fail
+//! The tests of the one decider for a scenario's pass or fail.
 //!
 //! Every layer reports into [`ScenarioVerdict`], and `outcome` grades what
 //! they reported against what the scenario expected. These tests drive that
 //! grading directly, one layer at a time, so a layer that stops reaching the
 //! decision fails here rather than leaving a scenario green.
 
+use tightbeam::tb_cases;
 use tightbeam::testing::fdr::{Decision, FdrVerdict};
 use tightbeam::testing::specs::{CspValidationResult, CspViolation, Event, State};
 use tightbeam::testing::{Expect, Layer, ScenarioResult, ScenarioVerdict, SpecViolation};
@@ -35,74 +36,84 @@ fn rejections(verdict: &ScenarioVerdict, expect: Expect) -> Vec<SpecViolation> {
 	}
 }
 
-#[test]
-fn every_layer_accepting_passes_the_scenario() {
-	let accepted_csp = CspValidationResult { valid: true, violations: Vec::new() };
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Some(accepted_csp), Some(FdrVerdict::default()));
+// The verdict grades what the layers reported against what the scenario
+// expected, and rejects the run with each violation in layer order.
+tb_cases! {
+	fn the_verdict_rejects(
+		(layer2, layer3, expect, rejected): (
+			Option<CspValidationResult>,
+			Option<FdrVerdict>,
+			Expect,
+			Vec<SpecViolation>,
+		)
+	) {
+		let verdict = ScenarioVerdict::from_layers(Ok(()), layer2, layer3);
 
-	let found = rejections(&verdict, Expect::Pass);
-
-	assert!(found.is_empty(), "every layer accepted the run: {found:?}");
+		let found = rejections(&verdict, expect);
+		assert_eq!(found, rejected);
+	}
+	cases {
+		/// Every layer accepted the run, so the scenario passes.
+		nothing_when_every_layer_accepts => (
+			Some(CspValidationResult { valid: true, violations: Vec::new() }),
+			Some(FdrVerdict::default()),
+			Expect::Pass,
+			vec![],
+		),
+		/// Layer 2 rejected the trace, so the scenario fails on the violations
+		/// of Layer 2.
+		a_layer2_violation => (
+			Some(refused_csp()),
+			None,
+			Expect::Pass,
+			vec![SpecViolation::CspProcessViolation(refused_csp().violations)],
+		),
+		/// Layer 3 rejected the exploration, so the scenario fails on it.
+		a_layer3_violation => (None, Some(refused_fdr()), Expect::Pass, vec![SpecViolation::RefinementViolation]),
+		/// Layer 3 rejected the run that the scenario expected it to reject, so
+		/// the scenario passes.
+		nothing_when_the_violation_was_expected => (
+			None,
+			Some(refused_fdr()),
+			Expect::Violation(Layer::Refinement),
+			vec![],
+		),
+		/// Layer 3 accepted a run that the scenario expected it to reject.
+		an_unmet_expectation => (
+			None,
+			Some(FdrVerdict::default()),
+			Expect::Violation(Layer::Refinement),
+			vec![SpecViolation::ExpectationUnmet(Layer::Refinement)],
+		),
+		/// An exploration of Layer 3 that never concluded is reported as
+		/// inconclusive.
+		an_undecided_layer3_as_inconclusive => (
+			None,
+			Some(undecided_fdr()),
+			Expect::Pass,
+			vec![SpecViolation::RefinementInconclusive],
+		),
+		/// An undecided Layer 3 leaves an expected violation of Layer 3 unmet
+		/// and is reported as inconclusive.
+		an_undecided_layer3_under_an_expected_violation => (
+			None,
+			Some(undecided_fdr()),
+			Expect::Violation(Layer::Refinement),
+			vec![SpecViolation::RefinementInconclusive],
+		),
+	}
 }
 
-#[test]
-fn layer2_violation_fails_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Some(refused_csp()), None);
-	let found = rejections(&verdict, Expect::Pass);
-	assert!(
-		matches!(found.as_slice(), [SpecViolation::CspProcessViolation(_)]),
-		"Layer 2 rejected the trace, so the scenario fails on it: {found:?}"
-	);
-}
-
-#[test]
-fn layer3_violation_fails_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(refused_fdr()));
-	let found = rejections(&verdict, Expect::Pass);
-	assert!(
-		matches!(found.as_slice(), [SpecViolation::RefinementViolation]),
-		"Layer 3 rejected the exploration, so the scenario fails on it: {found:?}"
-	);
-}
-
-#[test]
-fn an_expected_violation_passes_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(refused_fdr()));
-	let found = rejections(&verdict, Expect::Violation(Layer::Refinement));
-	assert!(
-		found.is_empty(),
-		"Layer 3 rejected the run the scenario expected it to reject: {found:?}"
-	);
-}
-
-#[test]
-fn an_unmet_expectation_fails_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(FdrVerdict::default()));
-	let found = rejections(&verdict, Expect::Violation(Layer::Refinement));
-	assert!(
-		matches!(found.as_slice(), [SpecViolation::ExpectationUnmet(Layer::Refinement)]),
-		"Layer 3 accepted a run the scenario expected it to reject: {found:?}"
-	);
-}
-
-#[test]
-fn a_result_derives_its_pass_from_the_verdict() {
-	let refused = ScenarioResult::from_spec_result(Err(SpecViolation::ResponseValidationFailed));
-	let accepted = ScenarioResult::from_spec_result(Ok(()));
-	assert!(!refused.passed(), "Layer 1 rejected the trace: {refused}");
-	assert!(accepted.passed(), "every layer accepted the run: {accepted}");
-}
-
-#[test]
-fn an_undecided_layer3_is_reported_as_inconclusive() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(undecided_fdr()));
-	let found = rejections(&verdict, Expect::Pass);
-	assert_eq!(found, vec![SpecViolation::RefinementInconclusive]);
-}
-
-#[test]
-fn an_undecided_layer3_does_not_satisfy_an_expected_violation() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(undecided_fdr()));
-	let found = rejections(&verdict, Expect::Violation(Layer::Refinement));
-	assert_eq!(found, vec![SpecViolation::RefinementInconclusive]);
+// A result passes when its verdict accepts the run.
+tb_cases! {
+	fn a_result_passes_as_its_verdict((spec_result, passed): (Result<(), SpecViolation>, bool)) {
+		let result = ScenarioResult::from_spec_result(spec_result);
+		assert_eq!(result.passed(), passed);
+	}
+	cases {
+		/// Layer 1 rejected the trace, so the result fails.
+		refused => (Err(SpecViolation::ResponseValidationFailed), false),
+		/// Every layer accepted the run, so the result passes.
+		accepted => (Ok(()), true),
+	}
 }

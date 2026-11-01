@@ -6,11 +6,11 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
 
 use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveRuntime};
 use tightbeam::colony::servlet::ServletConfig;
-use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::worker::Worker;
 use tightbeam::der::Sequence;
 use tightbeam::testing::{ScenarioConfig, WorkerEnv};
@@ -21,6 +21,10 @@ use tightbeam::transport::{ClientBuilder, ConnectionBuilder, TransportError, Tra
 use tightbeam::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{compose, exactly, servlet, tb_assert_spec, tb_scenario, worker, Frame, TightBeamError};
+
+use crate::common::hive::servlet_urn;
+use crate::common::poll::joined;
+use crate::common::result::TestResult;
 
 pub(crate) const RELAY_START: Urn<'static> = tightbeam::urn!("test", "event:worker/relay-start");
 pub(crate) const RELAY_SUCCESS: Urn<'static> = tightbeam::urn!("test", "event:worker/relay-success");
@@ -146,38 +150,53 @@ mod first {
 	}
 }
 
-/// A worker type under the same name as the one of [`first`].
+/// A worker type under the same name as the one of [`first`], which answers
+/// one past the length of the content, so each answer names its worker.
 mod second {
 	use super::PingMessage;
 
 	tightbeam::worker! {
 		name: Shared<PingMessage, usize>,
-		handle: |message, _trace| async move { message.content.len() }
+		handle: |message, _trace| async move { message.content.len() + 1 }
 	}
 }
 
-/// Two worker types under one name each resolve to their own worker, because
-/// a servlet keys its workers by their type.
-#[test]
-fn two_worker_types_under_one_name_both_resolve() -> Result<(), TightBeamError> {
+servlet! {
+	/// A servlet that relays each request to [`first::Shared`], then to
+	/// [`second::Shared`], and answers with the two results.
+	SharedNameServlet<PingMessage, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |request, frame, ctx| async move {
+		let request = Arc::new(request);
+		let by_first = ctx.relay::<first::Shared>(Arc::clone(&request)).await?;
+		let by_second = ctx.relay::<second::Shared>(request).await?;
+		Ok(Some(compose! {
+			V0: id: frame.metadata().id(),
+				message: PongMessage { result: format!("{by_first}/{by_second}") }
+		}?))
+	}
+}
+
+/// Two worker types under one name each resolve to their own worker in a
+/// running servlet, because a servlet keys its workers by their type.
+#[tokio::test]
+async fn two_worker_types_under_one_name_both_resolve() -> TestResult {
 	let config = ServletConfig::<TokioListener, PingMessage>::builder()
 		.with_worker(first::Shared::new(()))
 		.with_worker(second::Shared::new(()))
 		.allow_cleartext()
 		.build();
+	let servlet = SharedNameServlet::start(Arc::new(TraceCollector::new()), config).await?;
 
-	let resolved_first = config.worker::<first::Shared>().is_some();
-	let resolved_second = config.worker::<second::Shared>().is_some();
-	assert_eq!((resolved_first, resolved_second), (true, true));
+	let reply = ping(*servlet.addr()).await?;
+	servlet.stop();
+	let answer = reply.map(|frame| frame.decode_message::<PongMessage>()).transpose()?;
+	assert_eq!(answer, Some(PongMessage { result: "4/5".into() }));
 	Ok(())
 }
 
 /// The drain timeout of the gated hive, on its manual clock.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// A bound on a wait that the test expects to end. A wait that reaches it is
-/// a hang, which the test reports as a failure.
-const HANG_GUARD: Duration = Duration::from_secs(10);
 
 /// The signals of a worker that waits: the notice it gives as a message
 /// reaches its handler, the gate that handler waits on, and the mark it sets
@@ -239,64 +258,72 @@ servlet! {
 	}
 }
 
-/// The type the gated servlet registers under.
-fn gated_type() -> Urn<'static> {
-	let urn = ColonyNamespace::default().servlet("gated");
-	urn.expect("test names satisfy the mint grammar")
-}
-
 /// Starts a hive on `clock` with no control plane that holds one
 /// [`GatedServlet`], whose worker waits on `gate`, and returns it beside the
 /// servlet's address. The hive drains within [`DRAIN_TIMEOUT`].
 async fn start_gated_hive(
 	gate: &WorkerGate,
 	clock: &Arc<ManualClock>,
-) -> Result<(HiveRuntime<TokioListener>, TightBeamSocketAddr), TightBeamError> {
+) -> (HiveRuntime<TokioListener>, TightBeamSocketAddr) {
 	let worker = GatedWorker::new(GatedWorkerConfig { gate: gate.clone() });
 	let builder = ServletConfig::<TokioListener, PingMessage>::builder().with_worker(worker);
-	let servlet = GatedServlet::start(Arc::new(TraceCollector::new()), builder.allow_cleartext().build()).await?;
+	let servlet = GatedServlet::start(Arc::new(TraceCollector::new()), builder.allow_cleartext().build()).await;
+	let servlet = servlet.expect("a cleartext servlet starts on a free port");
 	let addr = *servlet.addr();
 
 	let mut conf = HiveConfig { clock: Arc::clone(clock) as Arc<dyn Clock>, ..Default::default() };
 	conf.control.drain_timeout = DRAIN_TIMEOUT;
 
-	let mut hive = HiveRuntime::<TokioListener>::new(Some(conf))?;
-	hive.register(gated_type(), servlet, |t| GatedServlet::start(t, ServletConfig::cleartext()))?;
-	Ok((hive, addr))
+	let mut hive = HiveRuntime::<TokioListener>::new(Some(conf)).expect("a hive with no control plane builds");
+	let registered = hive.register(servlet_urn("gated"), servlet, |t| {
+		GatedServlet::start(t, ServletConfig::cleartext())
+	});
+	registered.expect("a fresh hive registers its first servlet");
+	(hive, addr)
 }
 
-/// Sends one ping to the servlet at `addr`. The servlet's drain ends the
-/// connection, so the caller reads no reply.
-async fn ping(addr: TightBeamSocketAddr) -> Result<Option<Frame>, TightBeamError> {
+/// Sends one ping to the servlet at `addr`, and returns the outcome of the
+/// exchange.
+async fn ping(addr: TightBeamSocketAddr) -> Result<Option<Frame>, TransportError> {
 	let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
-	let mut client = builder.connect(addr).await?;
+	let mut client = builder.connect(addr).await.expect("a client connects to a started servlet");
 	let message = PingMessage { content: "PING".into(), lucky_number: 1 };
-	let request = compose! { V0: id: b"gated-ping", message: message }?;
-	Ok(client.emit(request, None).await?)
+	let request = compose! { V0: id: b"gated-ping", message: message }.expect("a V0 ping composes");
+
+	client.emit(request, None).await
 }
 
-/// A hive's drain ends each worker through its kill, so a message the worker
-/// holds completes before the drain returns. A stop aborts the worker and
-/// drops the message.
-#[tokio::test]
-async fn a_servlets_workers_drain_their_queue_at_drain() -> Result<(), TightBeamError> {
-	let gate = WorkerGate::default();
-	let clock = Arc::new(ManualClock::default());
-	let (hive, addr) = start_gated_hive(&gate, &clock).await?;
+/// Starts the drain of a gated hive on `clock` while its worker holds one
+/// message at `gate`, and returns the drain once it is under way.
+///
+/// The drain ends the accept loop before it kills the worker, and the end of
+/// the loop ends the client's exchange. So once the exchange ends, the drain
+/// is under way and its kill waits on the held message.
+async fn drain_with_a_held_message(
+	gate: &WorkerGate,
+	clock: &Arc<ManualClock>,
+) -> JoinHandle<Result<(), TightBeamError>> {
+	let (hive, addr) = start_gated_hive(gate, clock).await;
 	let client = tokio::spawn(ping(addr));
 	gate.entered.notified().await;
 
-	// The drain ends the accept loop before it kills the worker, and the end
-	// of the loop ends the client's exchange. So the gate opens while the
-	// kill waits on the message.
 	let drain = tokio::spawn(async move { hive.drain().await });
-	let exchanged = client.await.map_err(|_| TightBeamError::JoinError)?;
+	let exchanged = joined(client).await;
 	// The drain ended the connection before the servlet answered, so the
 	// exchange holds no reply for this test to read.
 	drop(exchanged);
-	gate.open();
+	drain
+}
 
-	drain.await.map_err(|_| TightBeamError::JoinError)??;
+/// A hive's drain ends each worker through its kill, so a message the worker
+/// holds completes before the drain returns.
+#[tokio::test]
+async fn a_servlets_workers_drain_their_queue_at_drain() -> TestResult {
+	let gate = WorkerGate::default();
+	let drain = drain_with_a_held_message(&gate, &Arc::new(ManualClock::default())).await;
+
+	gate.open();
+	joined(drain).await?;
 	assert!(gate.done());
 	Ok(())
 }
@@ -304,31 +331,18 @@ async fn a_servlets_workers_drain_their_queue_at_drain() -> Result<(), TightBeam
 /// A drain whose worker never answers ends once the hive clock passes the
 /// drain timeout, so the drain of a hive ends whatever one handler does.
 #[tokio::test]
-async fn a_drain_whose_worker_never_answers_ends_at_its_timeout() -> Result<(), TightBeamError> {
+async fn a_drain_whose_worker_never_answers_ends_at_its_timeout() {
 	let gate = WorkerGate::default();
 	let clock = Arc::new(ManualClock::default());
-	let (hive, addr) = start_gated_hive(&gate, &clock).await?;
-	let client = tokio::spawn(ping(addr));
-	gate.entered.notified().await;
+	let drain = drain_with_a_held_message(&gate, &clock).await;
 
-	// The client's exchange ends once the drain has begun, so the clock moves
-	// past the timeout of a drain that is under way.
-	let drain = tokio::spawn(async move { hive.drain().await });
-	let exchanged = client.await.map_err(|_| TightBeamError::JoinError)?;
-	// The drain ended the connection before the servlet answered, so the
-	// exchange holds no reply for this test to read.
-	drop(exchanged);
 	clock.advance(DRAIN_TIMEOUT);
 
-	let ended = tokio::time::timeout(HANG_GUARD, drain).await;
-	let drained = ended.map_err(|_| TightBeamError::RecvTimeoutError)?;
-	let drained = drained.map_err(|_| TightBeamError::JoinError)?;
-	let expired = matches!(
+	let drained = joined(drain).await;
+	assert!(matches!(
 		drained,
 		Err(TightBeamError::TransportError(TransportError::OperationFailed(
 			TransportFailure::DeadlineExceeded
 		)))
-	);
-	assert!(expired);
-	Ok(())
+	));
 }

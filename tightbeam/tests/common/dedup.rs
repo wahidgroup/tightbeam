@@ -1,13 +1,19 @@
 //! The dedup book and the chain state that the payment and queue harnesses
-//! share. Each harness names its events through [`HarnessEvents`].
+//! share. Each harness names its events through [`HarnessEvents`], and the
+//! tests of a harness build its frames through [`HarnessFrame`].
+//!
+//! The tests of this module are a self-check of the harness: their subject is
+//! the book and the chain of the test tree.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
-use tightbeam::asn1::DigestInfo;
+use tightbeam::asn1::{DigestInfo, Version};
+use tightbeam::builder::TypeBuilder;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::der::Encode;
+use tightbeam::testing::TestMessage;
 use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
 use tightbeam::{utils, Frame, TightBeamError};
@@ -204,17 +210,43 @@ impl<E: HarnessEvents> ChainState<E> {
 	}
 }
 
-#[cfg(test)]
+/// The V2 test frames of an id at an order, each of which carries a
+/// [`TestMessage`]. The tests of this harness, the DTN suite, and the payment
+/// suite build their frames with it.
+pub struct HarnessFrame;
+
+impl HarnessFrame {
+	/// A frame under `id` at `order` that carries `content` and links to no
+	/// frame.
+	pub fn at(id: impl AsRef<[u8]>, order: u64, content: impl Into<String>) -> Frame {
+		let message = TestMessage { content: content.into() };
+		let frame = Version::V2.compose().with_id(id).with_order(order).with_message(message);
+		frame.build().expect("a V2 frame with an id and an order builds")
+	}
+
+	/// A frame under `id` at `order` that carries `content` and links to the
+	/// frame that `previous` digests.
+	pub fn linked(id: impl AsRef<[u8]>, order: u64, content: impl Into<String>, previous: DigestInfo) -> Frame {
+		let message = TestMessage { content: content.into() };
+		let frame = Version::V2.compose().with_id(id).with_order(order);
+		let frame = frame.with_previous_hash(previous).with_message(message).build();
+		frame.expect("a V2 frame with a previous frame builds")
+	}
+
+	/// A frame under `id` at `order` that carries `content` and links to the
+	/// message digest of `previous`.
+	pub fn after(id: impl AsRef<[u8]>, order: u64, content: impl Into<String>, previous: &Frame) -> Frame {
+		let previous = utils::digest::<Sha3_256>(previous.message()).expect("SHA3-256 digests a message");
+		Self::linked(id, order, content, previous)
+	}
+}
+
 mod tests {
 	use std::cell::Cell;
 	use std::sync::TryLockError;
 
-	use tightbeam::asn1::Version;
-	use tightbeam::builder::TypeBuilder;
-	use tightbeam::der::Sequence;
-	use tightbeam::Beamable;
-
 	use super::*;
+	use crate::common::result::TestResult;
 
 	/// The events of these tests.
 	struct TestEvents;
@@ -228,84 +260,60 @@ mod tests {
 		const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:dedup-test/chain-broken");
 	}
 
-	/// The message of the test frames.
-	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-	struct Note {
-		#[beam(bytes)]
-		body: Vec<u8>,
-	}
-
-	/// A frame at `order` under `id` that carries `body`.
-	fn note(id: &[u8], order: u64, body: &[u8]) -> Frame {
-		let message = Note { body: body.to_vec() };
-		let frame = Version::V2.compose().with_id(id).with_order(order).with_message(message);
-		frame.build().expect("a V2 frame with an id and an order builds")
-	}
-
-	/// A frame at `order` that carries `body` and links to `previous`.
-	fn note_after(order: u64, body: &[u8], previous: &Frame) -> Frame {
-		let previous = utils::digest::<Sha3_256>(previous.message()).expect("SHA3-256 digests a message");
-		let message = Note { body: body.to_vec() };
-		let frame = Version::V2.compose().with_id(b"txn").with_order(order);
-		let frame = frame.with_previous_hash(previous).with_message(message).build();
-		frame.expect("a V2 frame with a previous frame builds")
-	}
-
+	/// A new frame gets the response that the book runs for it.
 	#[test]
-	fn dedup_first_frame_accepted() -> Result<(), TightBeamError> {
+	fn a_new_frame_gets_its_response() -> TestResult {
 		let trace = TraceCollector::default();
 		let dedup = DedupBook::<TestEvents, &str>::default();
-		let frame = note(b"txn1", 1, b"first");
+		let frame = HarnessFrame::at("txn1", 1, "first");
 
 		let response = dedup.answer(&frame, &trace, || Ok("AUTH1"))?;
 		assert_eq!(response, "AUTH1");
 		Ok(())
 	}
 
-	/// A duplicate gets the cached response of its original.
-	#[test]
-	fn a_duplicate_gets_the_response_of_its_original() -> Result<(), TightBeamError> {
-		let trace = TraceCollector::default();
-		let dedup = DedupBook::<TestEvents, &str>::default();
-		let frame = note(b"txn1", 1, b"first");
-		dedup.answer(&frame, &trace, || Ok("AUTH1"))?;
+	// The book answers a second frame after it answers `txn1` at order 1: a
+	// duplicate from its cache, and a frame at another order afresh.
+	tightbeam::tb_cases! {
+		fn the_book_answers((second, response): (Frame, &str)) -> TestResult {
+			let trace = TraceCollector::default();
+			let dedup = DedupBook::<TestEvents, &str>::default();
+			dedup.answer(&HarnessFrame::at("txn1", 1, "first"), &trace, || Ok("AUTH1"))?;
 
-		let duplicate = dedup.answer(&frame, &trace, || Ok("AUTH2"))?;
-		assert_eq!(duplicate, "AUTH1");
-		Ok(())
-	}
-
-	#[test]
-	fn dedup_different_order_accepted() -> Result<(), TightBeamError> {
-		let trace = TraceCollector::default();
-		let dedup = DedupBook::<TestEvents, &str>::default();
-		dedup.answer(&note(b"txn1", 1, b"first"), &trace, || Ok("AUTH1"))?;
-
-		let response = dedup.answer(&note(b"txn1", 2, b"second"), &trace, || Ok("AUTH2"))?;
-		assert_eq!(response, "AUTH2");
-		Ok(())
+			let answered = dedup.answer(&second, &trace, || Ok("AUTH2"))?;
+			assert_eq!(answered, response);
+			Ok(())
+		}
+		cases {
+			/// A duplicate gets the cached response of its original.
+			a_duplicate_with_the_response_of_its_original => (HarnessFrame::at("txn1", 1, "first"), "AUTH1"),
+			/// A frame at another order gets a response of its own.
+			another_order_with_a_response_of_its_own => (HarnessFrame::at("txn1", 2, "second"), "AUTH2"),
+		}
 	}
 
 	/// A changed frame that reuses a kept key is refused.
 	#[test]
-	fn an_altered_frame_that_reuses_a_key_is_refused() -> Result<(), TightBeamError> {
+	fn an_altered_frame_that_reuses_a_key_is_refused() -> TestResult {
 		let trace = TraceCollector::default();
 		let dedup = DedupBook::<TestEvents, &str>::default();
-		dedup.answer(&note(b"txn1", 1, b"the transfer"), &trace, || Ok("AUTH1"))?;
+		dedup.answer(&HarnessFrame::at("txn1", 1, "the transfer"), &trace, || Ok("AUTH1"))?;
 
-		let altered = dedup.answer(&note(b"txn1", 1, b"an altered transfer"), &trace, || Ok("AUTH2"));
+		let altered = dedup.answer(&HarnessFrame::at("txn1", 1, "an altered transfer"), &trace, || Ok("AUTH2"));
 		assert!(matches!(altered, Err(TightBeamError::InvalidMetadata)));
 		Ok(())
 	}
 
-	/// The book holds its lock while it answers a new frame.
+	/// The book holds its lock while it answers a new frame, so its check for
+	/// a kept answer and its insert of the new one are one step. The test reads
+	/// the private lock, because the lock is the behavior.
 	#[test]
-	fn the_book_answers_a_new_frame_under_its_lock() -> Result<(), TightBeamError> {
+	fn the_book_answers_a_new_frame_under_its_lock() -> TestResult {
 		let trace = TraceCollector::default();
 		let book = DedupBook::<TestEvents, &str>::default();
 		let locked = Cell::new(false);
 
-		book.answer(&note(b"txn1", 1, b"first"), &trace, || {
+		book.answer(&HarnessFrame::at("txn1", 1, "first"), &trace, || {
 			locked.set(matches!(book.answers.try_lock(), Err(TryLockError::WouldBlock)));
 			Ok("AUTH1")
 		})?;
@@ -314,28 +322,26 @@ mod tests {
 		Ok(())
 	}
 
-	/// The chain refuses a frame whose `previous_frame` misses its last frame.
-	#[test]
-	fn the_chain_refuses_a_frame_that_misses_its_last_frame() -> Result<(), TightBeamError> {
-		let trace = TraceCollector::default();
-		let chain = ChainState::<TestEvents>::default();
-		chain.record(&note(b"txn1", 1, b"first"), &trace, || Ok(()))?;
+	// The chain refuses a frame whose `previous_frame` misses the last frame
+	// of the chain.
+	tightbeam::tb_cases! {
+		fn the_chain_refuses_a_frame((first, second): (Frame, Frame)) -> TestResult {
+			let trace = TraceCollector::default();
+			let chain = ChainState::<TestEvents>::default();
+			chain.record(&first, &trace, || Ok(()))?;
 
-		let refusal = chain.record(&note(b"txn2", 2, b"second"), &trace, || Ok(()));
-		assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
-		Ok(())
-	}
-
-	/// The chain refuses a frame that links to another parent.
-	#[test]
-	fn a_frame_linked_to_another_parent_breaks_the_chain() -> Result<(), TightBeamError> {
-		let trace = TraceCollector::default();
-		let chain = ChainState::<TestEvents>::default();
-		let theirs = note(b"theirs", 1, b"their first");
-		chain.record(&note(b"ours", 1, b"our first"), &trace, || Ok(()))?;
-
-		let refusal = chain.record(&note_after(2, b"second", &theirs), &trace, || Ok(()));
-		assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
-		Ok(())
+			let refusal = chain.record(&second, &trace, || Ok(()));
+			assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
+			Ok(())
+		}
+		cases {
+			/// A frame that links to no frame misses the last frame.
+			that_misses_its_last_frame => (HarnessFrame::at("txn1", 1, "first"), HarnessFrame::at("txn2", 2, "second")),
+			/// A frame that links to another chain misses the last frame.
+			linked_to_another_parent => (
+				HarnessFrame::at("ours", 1, "our first"),
+				HarnessFrame::after("txn", 2, "second", &HarnessFrame::at("theirs", 1, "their first")),
+			),
+		}
 	}
 }

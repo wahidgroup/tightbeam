@@ -1,8 +1,7 @@
-//! Simulated mission clock for realistic DTN timing without actual delays
+//! The simulated Mission Elapsed Time (MET) clock of the DTN suite.
 //!
-//! This module provides a simulated Mission Elapsed Time (MET) clock that allows
-//! tests to simulate realistic Mars-Earth communication delays (8-20 minutes)
-//! without actually sleeping. The clock is advanced programmatically.
+//! A test advances the clock by the Mars-Earth delays of 8 to 20 minutes, and
+//! no real time passes.
 
 use std::sync::{OnceLock, RwLock};
 
@@ -51,7 +50,6 @@ pub mod delays {
 	// Light speed = 299,792 km/s
 
 	/// Minimum light-time delay (closest approach): ~3 minutes
-	/// NOTE: Available for scenarios testing minimum Mars-Earth distance
 	#[allow(dead_code)]
 	pub const MIN_LIGHT_TIME_MS: u64 = 3 * 60 * 1000;
 
@@ -59,24 +57,22 @@ pub mod delays {
 	pub const AVG_LIGHT_TIME_MS: u64 = 12 * 60 * 1000 + 30 * 1000;
 
 	/// Maximum light-time delay (farthest): ~22 minutes
-	/// NOTE: Available for scenarios testing maximum Mars-Earth distance
 	#[allow(dead_code)]
 	pub const MAX_LIGHT_TIME_MS: u64 = 22 * 60 * 1000;
 
-	/// Rover -> Relay delay (Mars orbit): ~1-2 seconds
+	/// The delay from the Rover to the relay in Mars orbit, 1.5 seconds.
 	pub const ROVER_TO_RELAY_MS: u64 = 1500;
 
-	/// Relay -> Earth delay (use average for test)
+	/// The delay from the relay to Earth, the average light time.
 	pub const RELAY_TO_EARTH_MS: u64 = AVG_LIGHT_TIME_MS;
 
-	/// Earth -> Relay delay
+	/// The delay from Earth to the relay, the average light time.
 	pub const EARTH_TO_RELAY_MS: u64 = AVG_LIGHT_TIME_MS;
 
-	/// Relay -> Rover delay
+	/// The delay from the relay to the Rover, 1.5 seconds.
 	pub const RELAY_TO_ROVER_MS: u64 = 1500;
 
-	/// Total round-trip time (Rover -> Earth -> Rover)
-	/// NOTE: Useful for calculating expected completion times in tests
+	/// The round trip from the Rover to Earth and back.
 	#[allow(dead_code)]
 	pub const ROUND_TRIP_MS: u64 = ROVER_TO_RELAY_MS + RELAY_TO_EARTH_MS + EARTH_TO_RELAY_MS + RELAY_TO_ROVER_MS;
 
@@ -84,11 +80,7 @@ pub mod delays {
 	pub const ROVER_RECHARGE_MS: u64 = 30 * 60 * 1000;
 }
 
-/// Track message transmission with delay
-///
-/// NOTE: This struct provides a wrapper for messages with simulated propagation delays.
-/// Currently unused as the test uses direct `advance_clock()` calls for timing simulation.
-/// Reserved for future use in more complex DTN scenarios with message queuing.
+/// A message beside the mission times of its send and of its arrival.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct DelayedMessage<T> {

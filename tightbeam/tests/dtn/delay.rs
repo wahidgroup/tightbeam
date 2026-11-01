@@ -1,8 +1,11 @@
 //! Delay simulation for the DTN tests.
+//!
+//! The simulator is test code over `HashMap` and the tokio clock, so the tests
+//! of this file are self-checks of the harness, and no tightbeam code runs in
+//! them.
 
 use std::collections::HashMap;
 use std::time::Duration;
-use tightbeam::TightBeamError;
 
 /// A simulator of the network delays between the nodes of a DTN network.
 ///
@@ -30,7 +33,7 @@ impl DelaySimulator {
 	///
 	/// The sleep stands for the signal propagation time of a real DTN path,
 	/// plus any store-and-forward delay.
-	pub async fn simulate_hop(&self, from: impl AsRef<str>, to: impl AsRef<str>) -> Result<(), TightBeamError> {
+	pub async fn simulate_hop(&self, from: impl AsRef<str>, to: impl AsRef<str>) {
 		let from = from.as_ref();
 		let to = to.as_ref();
 		let hop_key = format!("{}->{}", from, to);
@@ -38,8 +41,6 @@ impl DelaySimulator {
 		if let Some(delay) = self.delays.get(&hop_key) {
 			tokio::time::sleep(*delay).await;
 		}
-
-		Ok(())
 	}
 
 	/// The delay configured for the hop from `from` to `to`, if any.
@@ -57,48 +58,41 @@ impl Default for DelaySimulator {
 	}
 }
 
-#[cfg(test)]
 mod tests {
+	use tightbeam::tb_cases;
+
 	use super::*;
 
-	/// A configured hop sleeps for its delay, which the paused clock reads
-	/// exactly.
-	#[tokio::test(start_paused = true)]
-	async fn delay_simulator_basic() -> Result<(), TightBeamError> {
-		let mut sim = DelaySimulator::new();
+	// A hop sleeps for its configured delay, which the paused clock reads
+	// exactly, and a hop with no configured delay returns at once.
+	tb_cases! {
+		#[tokio::test(start_paused = true)]
+		async fn a_hop_sleeps_for_its_configured_delay((from, to, slept): (&str, &str, Duration)) {
+			let mut sim = DelaySimulator::new();
+			sim.configure_delay("Earth->Relay", Duration::from_millis(100));
 
-		sim.configure_delay("Earth->Relay", Duration::from_millis(100));
-
-		let start = tokio::time::Instant::now();
-		sim.simulate_hop("Earth", "Relay").await?;
-		let elapsed = start.elapsed();
-
-		assert_eq!(elapsed, Duration::from_millis(100));
-
-		Ok(())
+			let start = tokio::time::Instant::now();
+			sim.simulate_hop(from, to).await;
+			assert_eq!(start.elapsed(), slept);
+		}
+		cases {
+			configured_hop => ("Earth", "Relay", Duration::from_millis(100)),
+			unconfigured_hop => ("Node1", "Node2", Duration::ZERO),
+		}
 	}
 
-	/// A hop with no configured delay returns at once.
-	#[tokio::test(start_paused = true)]
-	async fn delay_simulator_unconfigured_hop() -> Result<(), TightBeamError> {
-		let sim = DelaySimulator::new();
+	// A configured delay belongs to its own direction of a hop.
+	tb_cases! {
+		fn a_delay_belongs_to_its_own_direction((from, to, delay): (&str, &str, Option<Duration>)) {
+			let mut sim = DelaySimulator::new();
+			sim.configure_delay("Earth->Mars", Duration::from_secs(1200));
 
-		let start = tokio::time::Instant::now();
-		sim.simulate_hop("Node1", "Node2").await?;
-		let elapsed = start.elapsed();
-
-		assert_eq!(elapsed, Duration::ZERO);
-
-		Ok(())
-	}
-
-	#[test]
-	fn delay_simulator_query() {
-		let mut sim = DelaySimulator::new();
-
-		sim.configure_delay("Earth->Mars", Duration::from_secs(1200)); // 20 minutes
-
-		assert_eq!(sim.delay_for("Earth", "Mars"), Some(Duration::from_secs(1200)));
-		assert_eq!(sim.delay_for("Mars", "Earth"), None);
+			let configured = sim.delay_for(from, to);
+			assert_eq!(configured, delay);
+		}
+		cases {
+			configured => ("Earth", "Mars", Some(Duration::from_secs(1200))),
+			reverse => ("Mars", "Earth", None),
+		}
 	}
 }

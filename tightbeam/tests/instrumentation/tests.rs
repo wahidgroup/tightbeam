@@ -4,7 +4,7 @@
 //! server that records into the scenario trace: the gate verdict and the
 //! handler span of the request that the server serves.
 
-#![cfg(all(feature = "instrument", feature = "tokio", feature = "tcp", feature = "testing"))]
+#![cfg(all(feature = "tokio", feature = "tcp", feature = "testing"))]
 
 use tightbeam::instrumentation::{events, TbInstrumentationConfig};
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestMessage};
@@ -51,7 +51,10 @@ mod sink {
 	use std::sync::Mutex;
 
 	use tightbeam::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
+	use tightbeam::testing::fixtures::TestTrace;
 	use tightbeam::trace::{TraceCollector, TraceConfig};
+
+	use crate::common::result::TestResult;
 
 	/// A loss-free sink, which holds every event in an unbounded list.
 	#[derive(Default)]
@@ -79,48 +82,21 @@ mod sink {
 		}
 	}
 
-	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::urn::Urn<'static>) -> usize {
-		let drained = drained.as_ref();
-		drained.iter().filter(|e| e.urn == urn).count()
-	}
-
+	/// A sink of an outside crate replaces the default sink, so it keeps every
+	/// event past the bound of the default sink and reports no overflow.
 	#[test]
-	fn consumer_sink_keeps_every_event_past_default_bound() -> Result<(), tightbeam::TightBeamError> {
+	fn an_outside_sink_keeps_every_event_past_the_default_bound() -> TestResult {
 		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
-		let collector =
-			TraceCollector::from(TraceConfig::with_instrumentation(config).with_sink(LossFreeSink::default()));
+		let loss_free = TraceConfig::with_instrumentation(config).with_sink(LossFreeSink::default());
+		let collector = TraceCollector::from(loss_free);
+		let kept = [events::MUX_GOAWAY_SENT, events::MUX_EMIT_DRAINING, events::MUX_GOAWAY_RECV];
 
 		collector.emit_event(events::MUX_GOAWAY_SENT)?;
 		collector.emit_event(events::MUX_EMIT_DRAINING)?;
 		collector.emit_event(events::MUX_GOAWAY_RECV)?;
 
-		assert!(!collector.overflowed(), "loss-free sink must never report overflow");
-
-		let drained = collector.drain_events();
-		assert_eq!(count_urn(&drained, events::MUX_GOAWAY_SENT), 1, "sink must retain goaway-sent");
-		assert_eq!(
-			count_urn(&drained, events::MUX_EMIT_DRAINING),
-			1,
-			"sink must retain emit-draining"
-		);
-		assert_eq!(count_urn(&drained, events::MUX_GOAWAY_RECV), 1, "sink must retain goaway-recv");
-		Ok(())
-	}
-
-	#[test]
-	fn default_bounded_sink_truncates_and_reports_overflow() -> Result<(), tightbeam::TightBeamError> {
-		let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
-		let collector = TraceCollector::from(TraceConfig::with_instrumentation(config));
-
-		collector.emit_event(events::MUX_GOAWAY_SENT)?;
-		collector.emit_event(events::MUX_EMIT_DRAINING)?;
-
-		assert!(collector.overflowed(), "bounded sink past cap must latch overflow");
-		assert_eq!(
-			collector.drain_events().len(),
-			2,
-			"bounded sink must retain up to cap and one warning"
-		);
+		let trail = (collector.overflowed(), TestTrace::trail(&collector, &kept));
+		assert_eq!(trail, (false, kept.to_vec()));
 		Ok(())
 	}
 

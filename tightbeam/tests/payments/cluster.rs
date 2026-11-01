@@ -1,6 +1,6 @@
 //! Payment Gateway Cluster
 //!
-//! Defines the payment gateway cluster with ACO/ABC bio-inspired routing.
+//! Defines the payment gateway cluster.
 
 use tightbeam::cluster;
 use tightbeam::transport::tcp::r#async::TokioListener;

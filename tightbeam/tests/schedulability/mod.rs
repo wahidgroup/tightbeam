@@ -1,12 +1,7 @@
-//! Schedulability integration tests
+//! The integration tests of schedulability analysis.
 //!
-//! Tests combining schedulability analysis with CSP processes and FDR verification.
-
-#![cfg(all(
-	feature = "testing-timing",
-	feature = "testing-schedulability",
-	feature = "testing-fdr"
-))]
+//! The tests combine schedulability analysis with CSP processes and FDR
+//! verification.
 
 mod edf_basic;
 mod rma_basic;

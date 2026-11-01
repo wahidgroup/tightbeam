@@ -1,30 +1,28 @@
-//! The shared fixtures of the security threat integration tests.
+//! The key materials, trust stores, handshake configs, and authorizers of the
+//! transport, security, colony, and seam suites.
 
-#![allow(dead_code)]
-
+use core::borrow::Borrow;
 use std::sync::Arc;
 
 use tightbeam::{
-	asn1::OctetString,
 	crypto::{
-		cms::AuthEnvelopedData,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
-		policy::Secp256k1Policy,
-		profiles::{SecurityProfileDesc, TightbeamProfile},
+		policy::{ProviderPolicy, VerificationPolicy},
+		profiles::{DefaultCryptoProvider, SecurityProfileDesc, TightbeamProfile},
 		sign::{ecdsa::Secp256k1SigningKey, SigningIdentity},
 		x509::policy::{CertificateValidation, DirectTrustValidator},
-		x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder},
-		x509::KeyCurves,
+		x509::store::{CertificateTrust, CertificateTrustBuilder, CertificateTrustStore, NoRevocation, TrustBuilder},
+		x509::{KeyCurves, KeyPurposes, PeerCertificate, Signing},
 	},
-	der::asn1::ObjectIdentifier,
 	oids::{AES_128_GCM, AES_128_WRAP},
+	policy::{GatePolicy, SessionContext, TransitStatus},
 	random::OsRng,
 	testing::{
 		error::TestingError,
 		fixtures::{TestCertificate, TestKey},
 	},
 	x509::Certificate,
-	TightBeamError,
+	Frame, TightBeamError,
 };
 
 #[cfg(feature = "transport-cms")]
@@ -34,22 +32,6 @@ use tightbeam::testing::TestCmsServer;
 /// outcome, which becomes a spec `ModeMismatch`.
 pub fn expectation_failure(reason: &'static str) -> TightBeamError {
 	TightBeamError::TestingError(TestingError::UnexpectedOutcome(reason))
-}
-
-/// The sealed closing with the middle byte of its encrypted content flipped.
-/// A flipped content byte is the one change on the wire that a MITM can make
-/// to what the closing seals: the client Finished or the anonymous
-/// attributes, and the acknowledgement inside either.
-pub fn flip_sealed_content(sealed_closing: &AuthEnvelopedData) -> Result<AuthEnvelopedData, TightBeamError> {
-	let mut tampered = sealed_closing.to_owned();
-	let content = tampered.auth_encrypted_content_info.encrypted_content.as_ref();
-	let content = content.ok_or_else(|| expectation_failure("a sealed closing carries content"))?;
-	let mut forged = content.as_bytes().to_vec();
-	let middle = forged.len() / 2;
-
-	forged[middle] ^= 0xFF;
-	tampered.auth_encrypted_content_info.encrypted_content = Some(OctetString::new(forged)?);
-	Ok(tampered)
 }
 
 /// The server credentials of a handshake fixture, over the fixed test key.
@@ -70,8 +52,23 @@ pub struct ServerMaterials {
 }
 
 impl ServerMaterials {
-	pub fn generate() -> Self {
-		let signing_key = TestKey::insecure_fixed_signing();
+	/// The fixed server credentials: a self-signed certificate over
+	/// [`TestKey::insecure_fixed_signing`], beside the CMS server of the name
+	/// `tightbeam test server`.
+	pub fn fixed() -> Self {
+		Self::of(TestKey::insecure_fixed_signing())
+	}
+
+	/// The credentials of `signing_key` under `certificate`, in place of its
+	/// self-signed certificate.
+	pub fn presenting(signing_key: Secp256k1SigningKey, certificate: Certificate) -> Self {
+		let certificate = Arc::new(certificate);
+		Self { certificate, ..Self::of(signing_key) }
+	}
+
+	/// A self-signed certificate over `signing_key`, beside the CMS server of
+	/// the name `tightbeam test server`.
+	fn of(signing_key: Secp256k1SigningKey) -> Self {
 		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
 
 		let secret_key_bytes = signing_key.to_bytes();
@@ -99,14 +96,6 @@ impl ServerMaterials {
 		let key_provider = Arc::clone(&self.key_provider);
 		SigningIdentity::new(certificate, key_provider).expect("the server key matches its certificate")
 	}
-
-	/// These materials with a certificate whose `extendedKeyUsage` names
-	/// `purpose` alone.
-	pub fn with_key_purpose(mut self, purpose: ObjectIdentifier) -> Self {
-		let certificate = self.certificate.as_ref().to_owned();
-		self.certificate = Arc::new(TestCertificate::with_key_purposes(certificate, [purpose]));
-		self
-	}
 }
 
 /// The client credentials of a mutual-authentication handshake fixture.
@@ -125,16 +114,26 @@ impl ClientMaterials {
 		Self::from_signing_key(signing_key)
 	}
 
-	/// A fixed-seed identity, for a scenario whose outcome names the client.
-	pub fn deterministic() -> Self {
-		let signing_key = deterministic_signing_key();
+	/// The fixed client identity, over the key of seed `0x0c` from
+	/// [`fixed_signing_key`]. This identity alone holds that key, so the pin of
+	/// another fixture refuses this client.
+	pub fn fixed() -> Self {
+		let signing_key = fixed_signing_key(0x0c);
 		Self::from_signing_key(signing_key)
+	}
+
+	/// The identity of `signing_key` under `certificate`, in place of its
+	/// self-signed certificate, for a client that presents a leaf of an
+	/// authority.
+	pub fn presenting(signing_key: Secp256k1SigningKey, certificate: Certificate) -> Self {
+		let certificate = Arc::new(certificate);
+		Self { certificate, ..Self::from_signing_key(signing_key) }
 	}
 
 	/// A self-signed certificate over `signing_key`, beside the provider that
 	/// proves it.
 	fn from_signing_key(signing_key: Secp256k1SigningKey) -> Self {
-		let certificate = Arc::new(test_certificate(&signing_key));
+		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
 		let key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
 		Self { certificate, key_provider }
 	}
@@ -144,14 +143,6 @@ impl ClientMaterials {
 		let certificate = Arc::clone(&self.certificate);
 		let key_provider = Arc::clone(&self.key_provider);
 		SigningIdentity::new(certificate, key_provider).expect("the client key matches its certificate")
-	}
-
-	/// These materials with a certificate whose `extendedKeyUsage` names
-	/// `purpose` alone.
-	pub fn with_key_purpose(mut self, purpose: ObjectIdentifier) -> Self {
-		let certificate = self.certificate.as_ref().to_owned();
-		self.certificate = Arc::new(TestCertificate::with_key_purposes(certificate, [purpose]));
-		self
 	}
 }
 
@@ -168,18 +159,68 @@ pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValida
 
 /// A trust store that pins the given server certificate, for a CMS client.
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let store = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
-		.with_certificate(certificate.to_owned())?
-		.build();
-	Ok(Arc::new(store))
+	Ok(combined_trust(&[certificate]))
 }
 
-/// The fixed-seed signing key, for a fixture that needs one stable identity.
-pub fn deterministic_signing_key() -> Secp256k1SigningKey {
-	TestKey::insecure_fixed_signing()
+/// A trust store under the policy of the provider `P` that anchors each of
+/// `certificates`.
+pub fn trust_under<P>(certificates: impl IntoIterator<Item = impl Borrow<Certificate>>) -> Arc<dyn CertificateTrust>
+where
+	ProviderPolicy<P>: VerificationPolicy + 'static,
+{
+	Arc::new(store_under::<P>(certificates))
+}
+
+/// A trust store under the house policy that anchors every certificate of
+/// `certs`.
+pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
+	trust_under::<DefaultCryptoProvider>(certs.iter().copied())
+}
+
+/// A client-certificate validator that anchors every certificate of `certs`.
+///
+/// It serves the inbound mutual-TLS accept plane
+/// (`ClusterTlsConfig::client_authentication`). Export scenarios turn it on
+/// so the gateway can recognize first-party origin sessions.
+pub fn combined_validator(certs: &[&Certificate]) -> Arc<dyn CertificateValidation> {
+	Arc::new(store_under::<DefaultCryptoProvider>(certs.iter().copied()))
+}
+
+/// The store under the policy of the provider `P` that anchors each of
+/// `certificates`.
+fn store_under<P>(certificates: impl IntoIterator<Item = impl Borrow<Certificate>>) -> CertificateTrustStore
+where
+	ProviderPolicy<P>: VerificationPolicy + 'static,
+{
+	let mut builder = CertificateTrustBuilder::new(ProviderPolicy::<P>::default(), KeyCurves::HOUSE, NoRevocation);
+	for certificate in certificates {
+		let certificate: &Certificate = certificate.borrow();
+		let anchored = builder.with_certificate(certificate.to_owned());
+		builder = anchored.expect("a test certificate anchors");
+	}
+
+	builder.build()
+}
+
+/// The secp256k1 signing key whose secret scalar is thirty-two `seed` octets.
+///
+/// The crate's `TestKey::fixed` builds the same key and is crate-private, so
+/// the integration suites hold this copy. Seed `0x01` gives the key of
+/// [`TestKey::insecure_fixed_signing`].
+///
+/// # Panics
+///
+/// - `seed` is `0x00` or `0xff`, whose octets name no scalar below the group order.
+pub fn fixed_signing_key(seed: u8) -> Secp256k1SigningKey {
+	let scalar = Secp256k1SigningKey::from_bytes(&[seed; 32].into());
+	scalar.expect("a seed from 0x01 to 0xfe names a scalar")
 }
 
 /// A fresh random signing key, for an identity unrelated to every other one.
+///
+/// Each call draws its own key, so a scenario that holds the identity trusts
+/// it alone, and a dial that a released port carries to the listener of
+/// another scenario fails its handshake.
 pub fn random_signing_key() -> Secp256k1SigningKey {
 	Secp256k1SigningKey::random(&mut OsRng)
 }
@@ -189,15 +230,38 @@ pub fn test_certificate(signing_key: &Secp256k1SigningKey) -> Certificate {
 	TestCertificate::self_signed(signing_key)
 }
 
+/// A collector gate that admits a frame whose signature verifies under one
+/// certificate, and refuses every other frame with `PermissionDenied`.
+///
+/// The gate reads a frame as it arrives, so it verifies the signature over a
+/// body that is ciphertext.
+pub struct SignatureGate {
+	/// The signer of each frame that the gate admits.
+	signer: PeerCertificate<Signing<DefaultCryptoProvider>>,
+}
+
+impl SignatureGate {
+	/// The gate of the signer that `certificate` names.
+	pub fn of(certificate: impl Into<Arc<Certificate>>) -> Self {
+		let signer = PeerCertificate::parse(certificate, KeyPurposes::HOUSE.signer);
+		Self { signer: signer.expect("a fixture certificate admits the house signer purpose") }
+	}
+}
+
+impl GatePolicy for SignatureGate {
+	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		let verified = frame.is_some_and(|frame| frame.verify(&self.signer).is_ok());
+		if verified {
+			TransitStatus::Ok
+		} else {
+			TransitStatus::PermissionDenied
+		}
+	}
+}
+
 /// The default profile descriptor, which every threat scenario shares.
 pub fn default_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc::from(&TightbeamProfile)
-}
-
-/// The strong profile (AES-256-GCM) of a downgrade test: the profile of the
-/// default provider.
-pub fn strong_security_profile() -> SecurityProfileDesc {
-	default_security_profile()
 }
 
 /// The weak profile (AES-128-GCM) of a downgrade test: the profile of the
@@ -217,7 +281,7 @@ pub fn weak_security_profile() -> SecurityProfileDesc {
 	feature = "transport-multiplex"
 ))]
 mod receipt_fixtures {
-	use std::sync::Mutex;
+	use std::sync::{Mutex, PoisonError};
 
 	use tightbeam::asn1::OctetString;
 	use tightbeam::marker::MaybeSendFuture;
@@ -230,18 +294,14 @@ mod receipt_fixtures {
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
-	/// Whether `needle` appears as a contiguous window inside `haystack`.
-	pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
-		let haystack = haystack.as_ref();
-		let needle = needle.as_ref();
-		haystack.windows(needle.len()).any(|window| window == needle)
-	}
-
 	/// An authorizer that grants the requested budgets, with an optional
 	/// settlement challenge, and keeps the default settlement.
 	///
 	/// The default settles a challenge-free receipt and refuses a challenged
 	/// one, so an authorizer from `challenging` refuses every settlement.
+	///
+	/// The crate leaves the authorization hook to the application and ships no
+	/// authorizer, so no real instance runs.
 	pub struct GrantingAuthorizer {
 		challenge: Option<OctetString>,
 	}
@@ -273,17 +333,34 @@ mod receipt_fixtures {
 
 	/// An authorizer that grants budgets with a settlement challenge and
 	/// records the client of every call to `settle`, so a scenario can prove
-	/// whether the hook fired, and for which client.
+	/// whether the hook fired, and for which client. A spy that expects an
+	/// answer refuses every other answer.
+	///
+	/// The crate leaves the authorization hook to the application and ships no
+	/// authorizer, so no real instance runs.
 	pub struct SettleSpyAuthorizer {
 		challenge: OctetString,
+		expected: Option<OctetString>,
 		settled_clients: Mutex<Vec<Certificate>>,
 	}
 
 	impl SettleSpyAuthorizer {
-		/// A spy that grants budgets with the given settlement challenge.
+		/// A spy that grants budgets with the given settlement challenge and
+		/// settles any answer.
 		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
 			let challenge = challenge.as_ref();
-			Ok(Self { challenge: OctetString::new(challenge)?, settled_clients: Mutex::default() })
+			Ok(Self {
+				challenge: OctetString::new(challenge)?,
+				expected: None,
+				settled_clients: Mutex::default(),
+			})
+		}
+
+		/// A spy that grants budgets with the settlement challenge `challenge`
+		/// and settles the answer `response` alone.
+		pub fn expecting(challenge: impl AsRef<[u8]>, response: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let expected = Some(OctetString::new(response.as_ref())?);
+			Ok(Self { expected, ..Self::challenging(challenge)? })
 		}
 
 		/// The number of calls that the `settle` hook received so far.
@@ -312,18 +389,24 @@ mod receipt_fixtures {
 		fn settle<'a>(
 			&'a self,
 			_receipt: &'a SessionReceipt,
-			_response: Option<&'a [u8]>,
+			response: Option<&'a [u8]>,
 			client: &'a Certificate,
 		) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 			let settled = self.settled_clients.lock();
 			let mut settled = settled.expect("no settlement panicked while holding the record");
 			settled.push(client.to_owned());
-			Box::pin(async move { Ok(()) })
+
+			let expected = self.expected.as_ref().map(OctetString::as_bytes);
+			let admitted = expected.is_none() || expected == response;
+			Box::pin(async move { admitted.then_some(()).ok_or(AuthorizationRefusal { code: u32::MAX }) })
 		}
 	}
 
 	/// An approver that approves every receipt and answers its challenge with
 	/// one fixed settlement answer.
+	///
+	/// The crate leaves the approval hook to the application and ships no
+	/// approver, so no real instance runs.
 	pub struct PayingApprover {
 		response: OctetString,
 	}
@@ -346,6 +429,9 @@ mod receipt_fixtures {
 	}
 
 	/// An observer that records every [`SessionOutcome`] the server hands it.
+	///
+	/// The crate leaves the outcome hook to the application and ships no
+	/// observer, so no real instance runs.
 	#[derive(Default)]
 	pub struct RecordingObserver {
 		outcomes: Mutex<Vec<SessionOutcome>>,
@@ -354,16 +440,15 @@ mod receipt_fixtures {
 	impl RecordingObserver {
 		/// A snapshot of the outcomes recorded so far.
 		pub fn recorded(&self) -> Vec<SessionOutcome> {
-			self.outcomes.lock().map(|outcomes| outcomes.to_owned()).unwrap_or_default()
+			self.outcomes.lock().unwrap_or_else(PoisonError::into_inner).to_owned()
 		}
 	}
 
 	impl SessionObserver for RecordingObserver {
 		fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()> {
 			Box::pin(async move {
-				if let Ok(mut outcomes) = self.outcomes.lock() {
-					outcomes.push(outcome.to_owned());
-				}
+				let mut outcomes = self.outcomes.lock().unwrap_or_else(PoisonError::into_inner);
+				outcomes.push(outcome.to_owned());
 			})
 		}
 	}
@@ -388,11 +473,11 @@ mod hpke_handshake {
 	use tightbeam::crypto::x509::policy::CertificateValidation;
 	use tightbeam::crypto::x509::KeyPurposes;
 	use tightbeam::der::asn1::OctetStringRef;
-	use tightbeam::der::{Any, Decode, Encode, Tag};
+	use tightbeam::der::{Any, Encode, Tag};
 	use tightbeam::oids::DATA;
 	use tightbeam::transport::handshake::{
 		ClientConfig, ClientHello, HandshakeMessage, HandshakeProvider, Hpke, HpkeClientSettings, HpkeServerSettings,
-		LearnedTrust, ServerConfig, ServerHandshake, SupportedProfiles,
+		LearnedTrust, ServerConfig, SupportedProfiles,
 	};
 
 	use super::ServerMaterials;
@@ -420,18 +505,20 @@ mod hpke_handshake {
 		config.expect("a test client identity serves the client role")
 	}
 
-	/// The configuration of an HPKE server that presents the certificate of
-	/// `materials`, runs `profiles` in preference order, and demands no client
-	/// certificate.
-	pub fn hpke_server_config<P: HandshakeProvider>(
-		materials: &ServerMaterials,
-		profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-	) -> ServerConfig<Hpke, P> {
-		let settings = HpkeServerSettings::new();
-		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
+	impl ServerMaterials {
+		/// The configuration of an HPKE server that presents the certificate
+		/// of these materials, runs `profiles` in preference order, and
+		/// demands no client certificate.
+		pub fn hpke_server_config<P: HandshakeProvider>(
+			&self,
+			profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		) -> ServerConfig<Hpke, P> {
+			let settings = HpkeServerSettings::new();
+			let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
 
-		let config = ServerConfig::new(settings, materials.identity(), profiles, KeyPurposes::HOUSE);
-		config.expect("a test server identity serves the server role")
+			let config = ServerConfig::new(settings, self.identity(), profiles, KeyPurposes::HOUSE);
+			config.expect("a test server identity serves the server role")
+		}
 	}
 
 	/// The DER of the `ClientHello` that `opening` carries as the OCTET
@@ -451,23 +538,6 @@ mod hpke_handshake {
 
 		let opening = HandshakeMessage::try_from(ContentInfo { content_type: DATA, content });
 		opening.expect("the opening encodes")
-	}
-
-	/// The `ServerHandshake` that `reply` signs as its content.
-	pub fn signed_handshake(reply: HandshakeMessage) -> ServerHandshake {
-		let signed = reply.signed().expect("an HPKE reply is a SignedData").into_value();
-		let econtent = signed.encap_content_info.econtent.expect("the reply carries its content");
-		ServerHandshake::from_der(econtent.value()).expect("the reply signs a ServerHandshake")
-	}
-
-	/// `reply` with `handshake` in place of the content it signs, as a MITM
-	/// rewrites it. The signature and every attribute stay as they were.
-	pub fn rewritten_reply(reply: HandshakeMessage, handshake: &ServerHandshake) -> HandshakeMessage {
-		let mut signed = reply.signed().expect("an HPKE reply is a SignedData").into_value();
-		let der = handshake.to_der().expect("a ServerHandshake encodes");
-		let content = Any::new(Tag::OctetString, der).expect("the content fits an OCTET STRING");
-		signed.encap_content_info.econtent = Some(content);
-		HandshakeMessage::try_from(signed).expect("the rewritten reply encodes")
 	}
 }
 
@@ -494,74 +564,77 @@ mod cms_pair {
 		SupportedProfiles,
 	};
 	use tightbeam::x509::Certificate;
-	use tightbeam::TightBeamError;
 
 	use super::{ClientMaterials, ServerMaterials};
 
-	/// The configuration of a CMS client that presents `identity` and seals
-	/// to the CMS server of `materials`. Their authority's store admits both
-	/// server certificates: the one the client pins and the one the reply
-	/// carries.
-	pub fn cms_client_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
-		materials: &ServerMaterials,
-		identity: SigningIdentity,
-	) -> ClientConfig<Cms, P> {
-		let trust = materials.cms.trust();
-		let config = ClientConfig::new(CmsClientSettings { trust, identity }, KeyPurposes::HOUSE);
-		config.expect("a test client identity serves the client role")
-	}
-
-	/// The configuration of a CMS server that holds the two identities of
-	/// `materials`, runs `profiles` in preference order, and records no client
-	/// as its peer.
-	pub fn cms_server_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
-		materials: &ServerMaterials,
-		profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-	) -> ServerConfig<Cms, P> {
-		let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
-		let config = ServerConfig::new(CmsServerSettings, materials.cms.pair(), profiles, KeyPurposes::HOUSE);
-		config.expect("a test server pair serves the server role")
-	}
-
 	/// A CMS client and server over the fixture server identity, beside the
-	/// certificate of the fresh identity that the client presents.
+	/// certificate of the fixed identity that the client presents.
 	///
 	/// Each endpoint is a configuration, so a suite sets its offers and hooks,
 	/// then creates the handshake.
 	pub struct CmsHandshakePair {
-		/// The client configuration, which presents the fresh identity.
+		/// The client configuration, which presents the fixed identity.
 		pub client: ClientConfig<Cms, DefaultCryptoProvider>,
 		/// The server configuration, which holds the fixture server identity.
 		pub server: ServerConfig<Cms, DefaultCryptoProvider>,
 		/// The certificate of the identity the client presents.
+		#[allow(dead_code)]
 		pub client_certificate: Arc<Certificate>,
 	}
 
-	/// Builds a [`CmsHandshakePair`] over `materials`.
-	///
-	/// - The client offers `client_profiles`, pins the server certificate, and presents a fresh identity.
-	/// - The server runs `server_profiles` and authenticates its client under `peer_authentication`.
-	pub fn cms_handshake_pair(
-		materials: &ServerMaterials,
-		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		peer_authentication: PeerAuthentication,
-	) -> Result<CmsHandshakePair, TightBeamError> {
-		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
-		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
-		let client_materials = ClientMaterials::generate();
-		let client_certificate = Arc::clone(&client_materials.certificate);
+	impl ServerMaterials {
+		/// The configuration of a CMS client that presents `identity` and
+		/// seals to the CMS server of these materials. Their authority's store
+		/// admits both server certificates: the one the client pins and the
+		/// one the reply carries.
+		pub fn cms_client_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
+			&self,
+			identity: SigningIdentity,
+		) -> ClientConfig<Cms, P> {
+			let trust = self.cms.trust();
+			let config = ClientConfig::new(CmsClientSettings { trust, identity }, KeyPurposes::HOUSE);
+			config.expect("a test client identity serves the client role")
+		}
 
-		let mut client = cms_client_config(materials, client_materials.identity());
-		client.security_offer = Some(SecurityOffer::new(client_profiles));
+		/// The configuration of a CMS server that holds the two identities of
+		/// these materials, runs `profiles` in preference order, and records
+		/// no client as its peer.
+		pub fn cms_server_config<P: HandshakeProvider<Kem = DhKemSecp256k1>>(
+			&self,
+			profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		) -> ServerConfig<Cms, P> {
+			let profiles = SupportedProfiles::new(profiles).expect("a server fixture runs at least one profile");
+			let config = ServerConfig::new(CmsServerSettings, self.cms.pair(), profiles, KeyPurposes::HOUSE);
+			config.expect("a test server pair serves the server role")
+		}
 
-		// The server learns the client certificate from the closing it opens,
-		// as in production. A seeded certificate would test a server that
-		// already knows what the handshake establishes.
-		let mut server = cms_server_config(materials, server_profiles);
-		server.peer_authentication = peer_authentication;
+		/// Builds a [`CmsHandshakePair`] over these materials.
+		///
+		/// - The client offers `client_profiles`, pins the server
+		///   certificate, and presents [`ClientMaterials::fixed`].
+		/// - The server runs `server_profiles` and authenticates its client under `peer_authentication`.
+		pub fn cms_pair(
+			&self,
+			client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+			server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+			peer_authentication: PeerAuthentication,
+		) -> CmsHandshakePair {
+			let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+			let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
+			let client_materials = ClientMaterials::fixed();
+			let client_certificate = Arc::clone(&client_materials.certificate);
 
-		Ok(CmsHandshakePair { client, server, client_certificate })
+			let mut client = self.cms_client_config(client_materials.identity());
+			client.security_offer = Some(SecurityOffer::new(client_profiles));
+
+			// The server learns the client certificate from the closing it
+			// opens, as in production. A seeded certificate would test a server
+			// that already knows what the handshake establishes.
+			let mut server = self.cms_server_config(server_profiles);
+			server.peer_authentication = peer_authentication;
+
+			CmsHandshakePair { client, server, client_certificate }
+		}
 	}
 }
 
@@ -571,70 +644,3 @@ mod cms_pair {
 #[allow(unused_imports)]
 #[cfg(feature = "transport-cms")]
 pub use cms_pair::*;
-
-/// A CMS client and server pair that a receipt scenario drives by hand.
-#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
-mod cms_fixtures {
-	use std::sync::Arc;
-
-	use tightbeam::crypto::profiles::DefaultCryptoProvider;
-	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthorizer, TransportOffer};
-	use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
-	use tightbeam::transport::handshake::{Client, Cms, Handshake, PeerAuthentication, Server};
-	use tightbeam::TightBeamError;
-
-	use super::{cms_handshake_pair, default_security_profile, ServerMaterials};
-
-	/// The hooks installed on a [`cms_mutual_budget_pair`] fixture.
-	#[derive(Default)]
-	pub struct CmsSessionHooks {
-		/// The budget-grant policy the server consults.
-		pub authorizer: Option<Arc<dyn TransportAuthorizer>>,
-		/// The approver the client consults before it countersigns.
-		pub approver: Option<Arc<dyn ReceiptApprover>>,
-		/// The observer the server reports each receipt outcome to.
-		pub observer: Option<Arc<dyn SessionObserver>>,
-	}
-
-	/// A mutually authenticated CMS client and server with a budget-bearing
-	/// transport offer, ready to drive by hand.
-	pub struct CmsSessionPair {
-		/// The client, before its opening.
-		pub client: Handshake<Client, Cms, DefaultCryptoProvider>,
-		/// The server, before the opening arrives.
-		pub server: Handshake<Server, Cms, DefaultCryptoProvider>,
-	}
-
-	/// Builds a [`CmsSessionPair`]. The client presents a fresh identity, pins
-	/// the server of `materials`, and requests the `request` budgets.
-	pub fn cms_mutual_budget_pair(
-		materials: &ServerMaterials,
-		request: MuxBudgets,
-		hooks: CmsSessionHooks,
-	) -> Result<CmsSessionPair, TightBeamError> {
-		let profile = default_security_profile();
-		let offer = TransportOffer::mux(4).with_budgets(request);
-		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
-		let pair = cms_handshake_pair(
-			materials,
-			vec![profile],
-			vec![profile],
-			PeerAuthentication::Anonymous.and(validator),
-		)?;
-
-		let mut config = pair.client;
-		config.transport_offer = Some(offer.to_owned());
-		config.receipt_approver = hooks.approver;
-
-		let mut server = pair.server;
-		server.transport = Some(offer);
-		server.transport_authorizer = hooks.authorizer;
-		server.session_observer = hooks.observer;
-
-		Ok(CmsSessionPair { client: Handshake::client(config), server: Handshake::server(server) })
-	}
-}
-
-#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
-pub use cms_fixtures::*;

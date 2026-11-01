@@ -4,39 +4,39 @@
 //! signer of a peer signs, and asks the hop that sent a frame for the frames
 //! missing before it.
 
-use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
-use tightbeam::asn1::{Frame, MessagePriority};
+use tightbeam::asn1::Frame;
 use tightbeam::builder::frame::FrameBuilder;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::compress::ZstdCompression;
 use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::der::Encode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::{TightBeamSocketAddr, Version};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::GenericClient;
-use tightbeam::utils::digest;
-use tightbeam::{servlet, TightBeamError};
+use tightbeam::urn::Urn;
+use tightbeam::{servlet, tb_cases, TightBeamError};
 
-use crate::common::security::expectation_failure;
+use crate::common::poll::within_hang_guard;
+use crate::common::result::TestResult;
+use crate::common::security::fixed_signing_key;
 use crate::dtn::certs::generate_shared_cipher;
 use crate::dtn::events::{
 	EARTH_RELAY_RECEIVE_FRAME_REQUEST, EARTH_RELAY_RECEIVE_FROM_MC, MARS_RELAY_RECEIVE_FRAME_REQUEST,
 	MISSION_CONTROL_RECEIVE_ACK, MISSION_CONTROL_RECEIVE_FRAME_REQUEST, ROVER_RECEIVE_COMMAND,
 };
 use crate::dtn::fault_manager::FaultManager;
-use crate::dtn::intake::{ChainFrame, SignedFrame};
-use crate::dtn::messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverCommand};
+use crate::dtn::messages::{EarthCommand, FrameResponse, RelayMessage};
 use crate::dtn::nodes::{DtnPath, DtnRole, NodeChain, PathSide, ORDER_BUFFER_FRAMES};
+use crate::dtn::ordering::orders_of;
 use crate::dtn::servlets::{
 	EarthRelaySatelliteServlet, LateAddr, MarsRelaySatelliteServlet, MissionControlServlet, MissionState, RoverServlet,
 };
 use crate::dtn::storage::StorageRoot;
+use crate::dtn::transit_status_of;
 
 /// Returns an address that no node serves, for a hop that a test leaves out.
 fn unserved() -> TightBeamSocketAddr {
@@ -88,7 +88,7 @@ struct MarsSide {
 	/// the Mars Relay cascades to it gets no answer.
 	_rover: RoverServlet,
 	/// The Mars Relay, whose servlet runs while this value holds it.
-	_mars_relay: MarsRelaySatelliteServlet,
+	mars_relay: MarsRelaySatelliteServlet,
 	/// The chain of the Mars Relay, which a test fills as the Mars Relay does.
 	mars_relay_chain: NodeChain,
 	/// Mission Control and the Earth Relay, which the Mars Relay sends on to.
@@ -123,6 +123,51 @@ impl GapAt {
 	}
 }
 
+/// A relay satellite of the path.
+#[derive(Clone, Copy)]
+enum Relay {
+	/// The relay in orbit around Earth.
+	Earth,
+	/// The relay in orbit around Mars.
+	Mars,
+}
+
+impl Relay {
+	/// The node that sends this relay the ACKs of the Rover, and the role of
+	/// this relay.
+	fn ack_link(self) -> (DtnRole, DtnRole) {
+		match self {
+			Self::Earth => (DtnRole::MarsRelay, DtnRole::EarthRelay),
+			Self::Mars => (DtnRole::Rover, DtnRole::MarsRelay),
+		}
+	}
+
+	/// The other relay, which cascades a frame request to this one, and the
+	/// role of this relay.
+	fn cascade_link(self) -> (DtnRole, DtnRole) {
+		match self {
+			Self::Earth => (DtnRole::MarsRelay, DtnRole::EarthRelay),
+			Self::Mars => (DtnRole::EarthRelay, DtnRole::MarsRelay),
+		}
+	}
+
+	/// The address of this relay on `side`.
+	fn addr(self, side: &MarsSide) -> TightBeamSocketAddr {
+		match self {
+			Self::Earth => side.ground.earth_relay_addr,
+			Self::Mars => *side.mars_relay.addr(),
+		}
+	}
+
+	/// The event that this relay records as it admits a frame request.
+	fn request_event(self) -> Urn<'static> {
+		match self {
+			Self::Earth => EARTH_RELAY_RECEIVE_FRAME_REQUEST,
+			Self::Mars => MARS_RELAY_RECEIVE_FRAME_REQUEST,
+		}
+	}
+}
+
 /// The configuration of a hop that answers each frame request with one
 /// fixed answer, whatever the request names.
 #[derive(Clone)]
@@ -135,7 +180,9 @@ struct FixedAnswerConfig {
 
 servlet! {
 	/// A hop in the place of the Mars Relay, which answers each frame request
-	/// with the answer of its configuration.
+	/// with the answer of its configuration. An honest Mars Relay answers
+	/// with the frames of the gap it holds, so no real node sends an answer
+	/// that leaves the gap open or carries a frame that no peer signs.
 	FixedAnswerHop<RelayMessage, EnvConfig = FixedAnswerConfig>,
 	protocol: TokioListener,
 	handle: raw |_frame, ctx| async move {
@@ -201,13 +248,12 @@ impl TestPath {
 		let mission_control_chain = self.chain(DtnRole::MissionControl.node_name());
 		let earth_relay_chain = self.chain(DtnRole::EarthRelay.node_name());
 		let mission_control_addr = LateAddr::default();
-		let earth_relay = self
-			.path
-			.start_earth_relay(&earth_relay_chain, mars_relay, &mission_control_addr);
+		let path = &self.path;
+		let earth_relay = path.start_earth_relay(&earth_relay_chain, mars_relay, &mission_control_addr);
 
 		let earth_relay = earth_relay.await.expect("the Earth Relay starts");
 		let earth_relay_addr = *earth_relay.addr();
-		let mission_control = self.path.start_mission_control(&mission_control_chain, earth_relay_addr);
+		let mission_control = path.start_mission_control(&mission_control_chain, earth_relay_addr);
 		let mission_control = mission_control.await.expect("Mission Control starts");
 
 		*mission_control_addr.write().expect("the address slot is sound") = Some(*mission_control.addr());
@@ -242,24 +288,23 @@ impl TestPath {
 		rover.await.expect("the Rover starts")
 	}
 
-	/// Builds the next ACK of the Rover, chained on `rover`.
-	fn rover_ack(&self, rover: &NodeChain) -> Frame {
-		let key = DtnRole::Rover.signing_key();
-		let (order, previous) = rover.processor.prepare_outgoing().expect("the Rover chain reads");
-		let ack = rover
-			.frame_builder
-			.build_relay_ack_frame(0, order, previous, &key, &self.path.cipher);
-		ack.expect("an ACK frame builds")
+	/// Builds the first command of a chain of Mission Control, which Mission
+	/// Control signs.
+	fn signed_command(&self) -> Frame {
+		self.chain(DtnRole::MissionControl.node_name()).command()
 	}
 
-	/// Builds the next command of Mission Control, chained on
-	/// `mission_control`.
-	fn command(&self, mission_control: &NodeChain) -> Frame {
-		let key = DtnRole::MissionControl.signing_key();
-		let (order, previous) = mission_control.processor.prepare_outgoing().expect("the chain reads");
-		let builder = &mission_control.frame_builder;
-		let command = builder.build_relay_command_frame(standby(), order, previous, &key, &self.path.cipher);
-		command.expect("a command frame builds")
+	/// Builds the first command of a chain, which the Mars Relay signs in the
+	/// place of Mission Control.
+	fn relay_signed_command(&self) -> Frame {
+		let chain = self.chain(DtnRole::MissionControl.node_name());
+		chain.command_signed_by(&DtnRole::MarsRelay.signing_key())
+	}
+
+	/// Builds the first command of a chain, which the key of no peer signs.
+	fn stranger_signed_command(&self) -> Frame {
+		let chain = self.chain(DtnRole::MissionControl.node_name());
+		chain.command_signed_by(&fixed_signing_key(0x55))
 	}
 
 	/// Builds the first command of a chain, sealed under the path's cipher and
@@ -268,7 +313,7 @@ impl TestPath {
 		let frame = FrameBuilder::from(Version::V3)
 			.with_id("relay-cmd-001")
 			.with_order(1)
-			.with_message(RelayMessage::Command(standby()))
+			.with_message(RelayMessage::Command(EarthCommand::standby()))
 			.with_message_hasher::<Sha3_256>([])
 			.with_witness_hasher::<Sha3_256>()
 			.with_compression(ZstdCompression::default())
@@ -278,25 +323,9 @@ impl TestPath {
 		frame.expect("an unsigned command frame builds")
 	}
 
-	/// Takes `frame` from the peer `role` on `side` into `chain`.
-	async fn take(&self, chain: &NodeChain, frame: Frame, role: DtnRole, side: PathSide) {
-		let signed = SignedFrame::from_peer(frame, role, side);
-		let signed = signed.expect("the signer of the role verifies the frame");
-		let entry = ChainFrame::open(signed, &self.path.cipher).await;
-		let entry = entry.expect("the frame opens as a frame of the chain");
-
-		let taken = chain.processor.process_incoming(entry);
-		taken.expect("the chain takes the frame");
-	}
-
-	/// Builds a frame request that `role` signs, for the frames between two
-	/// fixed test hashes.
+	/// Builds a frame request that `role` signs, over a chain of its own.
 	fn frame_request(&self, role: DtnRole) -> Frame {
-		let key = role.signing_key();
-		let chain = self.chain(role.node_name());
-		let request = FrameRequest::new([1; 32], [2; 32]).expect("two hashes fit an OCTET STRING");
-		let frame = chain.frame_builder.build_frame_request_frame(request, &key, &self.path.cipher);
-		frame.expect("a frame request builds")
+		self.chain(role.node_name()).frame_request(role)
 	}
 
 	/// Builds a frame response that `role` signs, which carries `frames`.
@@ -307,17 +336,6 @@ impl TestPath {
 		let builder = &chain.frame_builder;
 		let frame = builder.build_frame_response_frame(response, &key, &self.path.cipher);
 		frame.expect("a frame response builds")
-	}
-
-	/// Builds a command that Mission Control signs at order 2 over a
-	/// predecessor that no node holds.
-	fn stray_command(&self) -> Frame {
-		let key = DtnRole::MissionControl.signing_key();
-		let builder = self.chain("stray").frame_builder;
-		let unknown = digest::<Sha3_256>(b"a frame that no node holds").expect("SHA3-256 digests");
-
-		let frame = builder.build_relay_command_frame(standby(), 2, Some(unknown), &key, &self.path.cipher);
-		frame.expect("a stray command builds")
 	}
 
 	/// Starts the Rover and the Mars Relay, and sends the Rover two commands
@@ -331,15 +349,14 @@ impl TestPath {
 		let mars_relay_chain = self.chain(DtnRole::MarsRelay.node_name());
 		let mars_relay_addr = LateAddr::default();
 		let rover = self.start_rover(&rover_chain, &mars_relay_addr).await;
-		let mars_relay = self
-			.start_mars_relay(&mars_relay_chain, *rover.addr(), &LateAddr::default())
-			.await;
+		let earth_relay_addr = LateAddr::default();
+		let mars_relay = self.start_mars_relay(&mars_relay_chain, *rover.addr(), &earth_relay_addr).await;
 
 		*mars_relay_addr.write()? = Some(*mars_relay.addr());
 
 		let mission_control = self.chain(DtnRole::MissionControl.node_name());
-		let first = self.command(&mission_control);
-		let second = self.command(&mission_control);
+		let first = mission_control.command();
+		let second = mission_control.command();
 		let mut client = DtnRole::MarsRelay.connect(DtnRole::Rover, *rover.addr()).await?;
 		client.emit(second, None).await?;
 		client.emit(first, None).await?;
@@ -352,9 +369,9 @@ impl TestPath {
 	fn rover_acks_past_a_loss(&self) -> LostAck {
 		let rover = self.chain(DtnRole::Rover.node_name());
 
-		let lost = self.rover_ack(&rover);
-		let after = (0..ORDER_BUFFER_FRAMES).map(|_| self.rover_ack(&rover)).collect();
-		let next = self.rover_ack(&rover);
+		let lost = rover.rover_ack();
+		let after = (0..ORDER_BUFFER_FRAMES).map(|_| rover.rover_ack()).collect();
+		let next = rover.rover_ack();
 		LostAck { lost, after, next }
 	}
 
@@ -369,7 +386,7 @@ impl TestPath {
 		let ground = self.start_ground(*mars_relay.addr()).await;
 		*earth_relay_addr.write().expect("the address slot is sound") = Some(ground.earth_relay_addr);
 
-		MarsSide { _rover: rover, _mars_relay: mars_relay, mars_relay_chain, ground }
+		MarsSide { _rover: rover, mars_relay, mars_relay_chain, ground }
 	}
 
 	/// Starts a hop in the place of the Mars Relay, which answers each frame
@@ -378,9 +395,8 @@ impl TestPath {
 		let requests = Arc::new(AtomicUsize::new(0));
 		let answer = self.frame_response(DtnRole::MarsRelay, frames);
 		let config = FixedAnswerConfig { answer, requests: Arc::clone(&requests) };
-		let servlet_config = DtnRole::MarsRelay
-			.servlet_config(config)
-			.expect("the Mars Relay identity loads");
+		let servlet_config = DtnRole::MarsRelay.servlet_config(config);
+		let servlet_config = servlet_config.expect("the Mars Relay identity loads");
 
 		let servlet = FixedAnswerHop::start(Arc::clone(&self.path.trace), servlet_config.build()).await;
 		FixedHop { servlet: servlet.expect("the hop starts"), requests }
@@ -396,9 +412,8 @@ impl TestPath {
 	async fn fill_gap_at(&self, at: GapAt) -> Result<FilledGap, TightBeamError> {
 		let acks = self.rover_acks_past_a_loss();
 		let side = self.start_mars_side().await;
-		let lost = acks.lost.to_owned();
 
-		self.take(&side.mars_relay_chain, lost, DtnRole::Rover, PathSide::Mars).await;
+		side.mars_relay_chain.take(&acks.lost, DtnRole::Rover, PathSide::Mars)?;
 
 		let (sender, receiver) = at.link();
 		let mut client = sender.connect(receiver, at.addr(&side.ground)).await?;
@@ -406,39 +421,6 @@ impl TestPath {
 		let reply = send_in_turn(&mut client, acks.after).await?;
 		Ok(FilledGap { side, lost: acks.lost, reply })
 	}
-}
-
-/// Builds a standby command, which the Rover runs with no parameter.
-fn standby() -> EarthCommand {
-	let command = EarthCommand::new(RoverCommand::Standby, MessagePriority::Standard, 0);
-	command.expect("a standby command has no parameter")
-}
-
-/// Whether `holder` stores the frame at the head of `origin`.
-///
-/// # Errors
-///
-/// - [`TightBeamError`] -- the origin chain holds no frame, or a chain fails to read.
-fn holds_head_of(holder: &NodeChain, origin: &NodeChain) -> Result<bool, TightBeamError> {
-	let (_, head) = origin.processor.prepare_outgoing()?;
-	let head = head.ok_or_else(|| expectation_failure("the origin chain holds no frame"))?;
-
-	holder.processor.stores(head.digest.as_bytes())
-}
-
-/// The transit status that `refusal` carries, if it carries one.
-fn status_of(refusal: TightBeamError) -> Option<TransitStatus> {
-	let TightBeamError::TransportError(refusal) = refusal else {
-		return None;
-	};
-
-	refusal.transit_status()
-}
-
-/// Runs `future` to its end, which a test expects within 5 s.
-async fn within_seconds<T>(future: impl Future<Output = T>) -> T {
-	let settled = tokio::time::timeout(Duration::from_secs(5), future).await;
-	settled.expect("the node answers within 5 s")
 }
 
 /// Sends each frame of `frames` in turn over `client`, and returns the reply
@@ -459,65 +441,53 @@ async fn send_in_turn(
 	Ok(reply)
 }
 
-/// The Earth Relay buffers the second ACK until the first arrives, and then
-/// sends both on to Mission Control.
-#[tokio::test]
-async fn the_earth_relay_forwards_every_frame_its_chain_releases() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let ground = path.start_ground(unserved()).await;
-	let rover = path.chain(DtnRole::Rover.node_name());
-	let first = path.rover_ack(&rover);
-	let second = path.rover_ack(&rover);
-	let mut client = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, ground.earth_relay_addr).await?;
-	client.emit(second, None).await?;
-	client.emit(first, None).await?;
+// A relay buffers the second ACK until the first arrives, and then sends both
+// on toward Mission Control.
+tb_cases! {
+	async fn a_relay_forwards_every_frame_its_chain_releases(relay: Relay) -> TestResult {
+		let path = TestPath::new();
+		let side = path.start_mars_side().await;
+		let rover = path.chain(DtnRole::Rover.node_name());
+		let first = rover.rover_ack();
+		let second = rover.rover_ack();
+		let (sender, receiver) = relay.ack_link();
+		let mut client = sender.connect(receiver, relay.addr(&side)).await?;
+		client.emit(second, None).await?;
+		client.emit(first, None).await?;
 
-	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), 2);
-	Ok(())
+		assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), 2);
+		Ok(())
+	}
+	cases {
+		earth_relay => Relay::Earth,
+		mars_relay => Relay::Mars,
+	}
 }
 
-/// The Mars Relay buffers the second ACK until the first arrives, and then
-/// sends both on toward Mission Control.
-#[tokio::test]
-async fn the_mars_relay_forwards_every_frame_its_chain_releases() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let earth_relay_addr = LateAddr::default();
-	let mars_relay_chain = path.chain(DtnRole::MarsRelay.node_name());
-	let mars_relay = path.start_mars_relay(&mars_relay_chain, unserved(), &earth_relay_addr).await;
-	let ground = path.start_ground(*mars_relay.addr()).await;
+// A frame request that one relay cascades carries its own signature, which
+// the other relay admits.
+tb_cases! {
+	async fn a_relay_admits_a_request_the_other_relay_cascades(relay: Relay) -> TestResult {
+		let path = TestPath::new();
+		let side = path.start_mars_side().await;
+		let (sender, receiver) = relay.cascade_link();
+		let request = path.frame_request(sender);
+		let mut client = sender.connect(receiver, relay.addr(&side)).await?;
+		client.emit(request, None).await?;
 
-	*earth_relay_addr.write()? = Some(ground.earth_relay_addr);
-
-	let rover = path.chain(DtnRole::Rover.node_name());
-	let first = path.rover_ack(&rover);
-	let second = path.rover_ack(&rover);
-
-	let mut client = DtnRole::Rover.connect(DtnRole::MarsRelay, *mars_relay.addr()).await?;
-	client.emit(second, None).await?;
-	client.emit(first, None).await?;
-
-	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), 2);
-	Ok(())
-}
-
-/// A frame request that the Mars Relay cascades carries its own signature,
-/// which the Earth Relay admits.
-#[tokio::test]
-async fn the_earth_relay_admits_a_request_the_mars_relay_cascades() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let ground = path.start_ground(unserved()).await;
-	let request = path.frame_request(DtnRole::MarsRelay);
-	let mut client = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, ground.earth_relay_addr).await?;
-	client.emit(request, None).await?;
-
-	assert_eq!(path.trace().recorded(EARTH_RELAY_RECEIVE_FRAME_REQUEST), 1);
-	Ok(())
+		assert_eq!(path.trace().recorded(relay.request_event()), 1);
+		Ok(())
+	}
+	cases {
+		earth_relay => Relay::Earth,
+		mars_relay => Relay::Mars,
+	}
 }
 
 /// The Earth Relay admits a frame request of the Mars Relay once, so a replay
 /// of that request gets a refusal and no second answer.
 #[tokio::test]
-async fn the_earth_relay_answers_a_replayed_request_once() -> Result<(), TightBeamError> {
+async fn the_earth_relay_answers_a_replayed_request_once() -> TestResult {
 	let path = TestPath::new();
 	let ground = path.start_ground(unserved()).await;
 	let request = path.frame_request(DtnRole::MarsRelay);
@@ -525,72 +495,45 @@ async fn the_earth_relay_answers_a_replayed_request_once() -> Result<(), TightBe
 	client.emit(request.to_owned(), None).await?;
 
 	let replay = client.emit(request, None).await;
-	assert_eq!(
-		replay.err().and_then(|refusal| refusal.transit_status()),
-		Some(TransitStatus::Internal)
-	);
+	let status = replay.err().and_then(|refusal| refusal.transit_status());
+	assert_eq!(status, Some(TransitStatus::Internal));
 	assert_eq!(path.trace().recorded(EARTH_RELAY_RECEIVE_FRAME_REQUEST), 1);
 	Ok(())
 }
 
-/// A frame request that the Earth Relay cascades carries its own signature,
-/// which the Mars Relay admits.
-#[tokio::test]
-async fn the_mars_relay_admits_a_request_the_earth_relay_cascades() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let rover_chain = path.chain(DtnRole::Rover.node_name());
-	let mars_relay_chain = path.chain(DtnRole::MarsRelay.node_name());
-	let rover = path.start_rover(&rover_chain, &LateAddr::default()).await;
-	let mars_relay = path
-		.start_mars_relay(&mars_relay_chain, *rover.addr(), &LateAddr::default())
-		.await;
+// The Rover runs a command that Mission Control signs. It refuses a command
+// with no signature, the signature of a relay, or the signature of a stranger,
+// and that command never runs. The row `signed` is the control of the others.
+tb_cases! {
+	async fn the_rover_runs_only_a_command_that_mission_control_signs(
+		(build, refusal, runs): (fn(&TestPath) -> Frame, Option<TransitStatus>, usize)
+	) -> TestResult {
+		let path = TestPath::new();
+		let rover_chain = path.chain(DtnRole::Rover.node_name());
+		let rover = path.start_rover(&rover_chain, &LateAddr::default()).await;
 
-	let request = path.frame_request(DtnRole::EarthRelay);
-	let mut client = DtnRole::EarthRelay.connect(DtnRole::MarsRelay, *mars_relay.addr()).await?;
-	client.emit(request, None).await?;
+		let command = build(&path);
+		let mut client = DtnRole::MarsRelay.connect(DtnRole::Rover, *rover.addr()).await?;
 
-	assert_eq!(path.trace().recorded(MARS_RELAY_RECEIVE_FRAME_REQUEST), 1);
-	Ok(())
-}
-
-/// The Rover runs a command that Mission Control signs.
-#[tokio::test]
-async fn the_rover_runs_a_signed_command() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let rover = path
-		.start_rover(&path.chain(DtnRole::Rover.node_name()), &LateAddr::default())
-		.await;
-
-	let command = path.command(&path.chain(DtnRole::MissionControl.node_name()));
-	let mut client = DtnRole::MarsRelay.connect(DtnRole::Rover, *rover.addr()).await?;
-	client.emit(command, None).await?;
-
-	assert_eq!(path.trace().recorded(ROVER_RECEIVE_COMMAND), 1);
-	Ok(())
-}
-
-/// The Rover refuses a command that no node signs, so the command never
-/// runs.
-#[tokio::test]
-async fn the_rover_refuses_an_unsigned_command() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let rover = path
-		.start_rover(&path.chain(DtnRole::Rover.node_name()), &LateAddr::default())
-		.await;
-
-	let command = path.unsigned_command();
-	let mut client = DtnRole::MarsRelay.connect(DtnRole::Rover, *rover.addr()).await?;
-
-	let reply = client.emit(command, None).await;
-	assert!(reply.is_err());
-	assert_eq!(path.trace().recorded(ROVER_RECEIVE_COMMAND), 0);
-	Ok(())
+		let reply = client.emit(command, None).await;
+		assert_eq!(reply.err().and_then(|refused| refused.transit_status()), refusal);
+		assert_eq!(path.trace().recorded(ROVER_RECEIVE_COMMAND), runs);
+		Ok(())
+	}
+	cases {
+		signed => (TestPath::signed_command, None, 1),
+		unsigned => (TestPath::unsigned_command, Some(TransitStatus::Internal), 0),
+		/// The Mars Relay is a peer of the Rover, and it issues no command.
+		relay_signed => (TestPath::relay_signed_command, Some(TransitStatus::Internal), 0),
+		/// The signer of the command is no peer of the Rover.
+		stranger_signed => (TestPath::stranger_signed_command, Some(TransitStatus::Internal), 0),
+	}
 }
 
 /// The Rover buffers the second command until the first arrives, and then
 /// runs both.
 #[tokio::test]
-async fn the_rover_runs_every_command_its_chain_releases() -> Result<(), TightBeamError> {
+async fn the_rover_runs_every_command_its_chain_releases() -> TestResult {
 	let path = TestPath::new();
 	path.send_rover_two_reversed_commands().await?;
 	assert_eq!(path.trace().recorded(ROVER_RECEIVE_COMMAND), 2);
@@ -600,10 +543,11 @@ async fn the_rover_runs_every_command_its_chain_releases() -> Result<(), TightBe
 /// The second command waited in the buffer while its sender took `None`, so
 /// the Rover sends the ACK of that command to the Mars Relay.
 #[tokio::test]
-async fn the_rover_sends_the_ack_of_a_buffered_command_to_the_mars_relay() -> Result<(), TightBeamError> {
+async fn the_rover_sends_the_ack_of_a_buffered_command_to_the_mars_relay() -> TestResult {
 	let path = TestPath::new();
 	let reversed = path.send_rover_two_reversed_commands().await?;
-	assert!(holds_head_of(&reversed.mars_relay_chain, &reversed.rover_chain)?);
+	let rover_head = reversed.rover_chain.head();
+	assert!(reversed.mars_relay_chain.processor.stores(rover_head.digest.as_bytes())?);
 	Ok(())
 }
 
@@ -611,20 +555,21 @@ async fn the_rover_sends_the_ack_of_a_buffered_command_to_the_mars_relay() -> Re
 /// ACK before it. The command keeps the side its signer check found on arrival,
 /// so it goes on to the Mars Relay once the ACK from the Mars side releases it.
 #[tokio::test]
-async fn a_released_frame_routes_by_the_side_it_arrived_from() -> Result<(), TightBeamError> {
+async fn a_released_frame_routes_by_the_side_it_arrived_from() -> TestResult {
 	let path = TestPath::new();
 	let side = path.start_mars_side().await;
 	let earth_relay_addr = side.ground.earth_relay_addr;
 	let shared = path.chain("shared");
-	let ack = path.rover_ack(&shared);
-	let command = path.command(&shared);
+	let ack = shared.rover_ack();
+	let command = shared.command();
 	let mut mission_control = DtnRole::MissionControl.connect(DtnRole::EarthRelay, earth_relay_addr).await?;
 	let mut mars_relay = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, earth_relay_addr).await?;
 
-	mission_control.emit(command, None).await?;
+	mission_control.emit(command.to_owned(), None).await?;
 	mars_relay.emit(ack, None).await?;
 
 	assert_eq!(path.trace().recorded(EARTH_RELAY_RECEIVE_FROM_MC), 1);
+	assert!(side.mars_relay_chain.stores(&command));
 	Ok(())
 }
 
@@ -632,13 +577,13 @@ async fn a_released_frame_routes_by_the_side_it_arrived_from() -> Result<(), Tig
 /// Mission Control then sends outside a take. The ACK takes its turn at once,
 /// and Mission Control's next take routes it ahead of the arriving ACK.
 #[tokio::test]
-async fn a_frame_that_a_send_releases_routes_at_the_next_take() -> Result<(), TightBeamError> {
+async fn a_frame_that_a_send_releases_routes_at_the_next_take() -> TestResult {
 	let path = TestPath::new();
 	let ground = path.start_ground(unserved()).await;
 	let origin = path.chain("origin");
-	let command = path.command(&origin);
-	let first_ack = path.rover_ack(&origin);
-	let second_ack = path.rover_ack(&origin);
+	let command = origin.command();
+	let first_ack = origin.rover_ack();
+	let second_ack = origin.rover_ack();
 	let mission_control_addr = ground.mission_control_addr;
 	let connect = DtnRole::EarthRelay.connect(DtnRole::MissionControl, mission_control_addr);
 	let mut earth_relay = connect.await?;
@@ -653,18 +598,18 @@ async fn a_frame_that_a_send_releases_routes_at_the_next_take() -> Result<(), Ti
 
 /// A frame that a send releases still routes after a refused arrival.
 #[tokio::test]
-async fn a_frame_that_a_send_releases_routes_after_a_refused_arrival() -> Result<(), TightBeamError> {
+async fn a_frame_that_a_send_releases_routes_after_a_refused_arrival() -> TestResult {
 	let path = TestPath::new();
 	let ground = path.start_ground(unserved()).await;
 	let origin = path.chain("origin");
 	let other = path.chain("other");
-	let command = path.command(&origin);
-	let first_ack = path.rover_ack(&origin);
-	let second_ack = path.rover_ack(&origin);
+	let command = origin.command();
+	let first_ack = origin.rover_ack();
+	let second_ack = origin.rover_ack();
 
-	path.command(&other);
+	other.advance(1);
 
-	let fork = path.rover_ack(&other);
+	let fork = other.rover_ack();
 	let connect = DtnRole::EarthRelay.connect(DtnRole::MissionControl, ground.mission_control_addr);
 	let mut earth_relay = connect.await?;
 
@@ -674,93 +619,89 @@ async fn a_frame_that_a_send_releases_routes_after_a_refused_arrival() -> Result
 	let refusal = earth_relay.emit(fork, None).await;
 	earth_relay.emit(second_ack, None).await?;
 
-	assert!(refusal.is_err());
+	let status = refusal.err().and_then(|refused| refused.transit_status());
+	assert_eq!(status, Some(TransitStatus::Internal));
 	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), 2);
 	Ok(())
 }
 
 /// A failed route keeps the frames behind it for the next take.
 #[tokio::test]
-async fn a_failed_route_keeps_the_frames_behind_it() -> Result<(), TightBeamError> {
+async fn a_failed_route_keeps_the_frames_behind_it() -> TestResult {
 	let path = TestPath::new();
 	let ground = path.start_ground(unserved()).await;
 	let origin = path.chain("origin");
-	let first = path.command(&origin);
-	let second = path.command(&origin);
+	let first = origin.command();
+	let second = origin.command();
 	let connect = DtnRole::MissionControl.connect(DtnRole::EarthRelay, ground.earth_relay_addr);
 	let mut mission_control = connect.await?;
 	mission_control.emit(second, None).await?;
 
 	let failed = mission_control.emit(first, None).await;
 	let kept = ground.earth_relay_chain.processor.take_released()?;
-	assert!(failed.is_err());
-	assert!(matches!(kept.as_slice(), [frame] if frame.order() == 2));
+	let status = failed.err().and_then(|refused| refused.transit_status());
+	assert_eq!(status, Some(TransitStatus::Internal));
+	assert_eq!(orders_of(&kept), [2]);
 	Ok(())
 }
 
 /// A frame of Mission Control whose predecessor the Earth Relay lacks sends
 /// the Earth Relay's frame request to Mission Control, which holds it.
 #[tokio::test]
-async fn a_gap_in_a_mission_control_frame_asks_mission_control() -> Result<(), TightBeamError> {
+async fn a_gap_in_a_mission_control_frame_asks_mission_control() -> TestResult {
 	let path = TestPath::new();
 	let ground = path.start_ground(unserved()).await;
-	let first = path.command(&ground.mission_control_chain);
+	let first = ground.mission_control_chain.command();
 	let earth_relay = &ground.earth_relay_chain;
 
-	path.take(earth_relay, first, DtnRole::MissionControl, PathSide::Earth).await;
+	earth_relay.take(&first, DtnRole::MissionControl, PathSide::Earth)?;
 
-	let mut client = DtnRole::MissionControl
-		.connect(DtnRole::EarthRelay, ground.earth_relay_addr)
-		.await?;
-	client.emit(path.stray_command(), None).await?;
+	let connect = DtnRole::MissionControl.connect(DtnRole::EarthRelay, ground.earth_relay_addr);
+	let mut client = connect.await?;
+	client.emit(path.chain("stray").stray_command(), None).await?;
 
 	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_FRAME_REQUEST), 1);
 	Ok(())
 }
 
-/// The Earth Relay misses the Rover's first ACK, and the ACKs after it fill its
-/// order buffer. It asks the Mars Relay for the missing ACK, so Mission Control
-/// receives every ACK.
-#[tokio::test]
-async fn a_gap_at_the_earth_relay_fills_from_the_mars_relay() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let _filled = path.fill_gap_at(GapAt::EarthRelay).await?;
-	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), ORDER_BUFFER_FRAMES + 1);
-	Ok(())
-}
-
-/// Mission Control misses the Rover's first ACK, and the ACKs after it fill its
-/// order buffer. The Earth Relay lacks the missing ACK, so it cascades the
-/// frame request to the Mars Relay and brings the answer back. Mission Control
-/// receives every ACK.
-#[tokio::test]
-async fn a_gap_at_mission_control_fills_through_a_cascade() -> Result<(), TightBeamError> {
-	let path = TestPath::new();
-	let _filled = path.fill_gap_at(GapAt::MissionControl).await?;
-	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), ORDER_BUFFER_FRAMES + 1);
-	Ok(())
+// A node of the ground misses the Rover's first ACK, and the ACKs after it
+// fill its order buffer. The gap fills, so Mission Control receives every ACK.
+tb_cases! {
+	async fn a_gap_fills_so_mission_control_receives_every_ack(at: GapAt) -> TestResult {
+		let path = TestPath::new();
+		let _filled = path.fill_gap_at(at).await?;
+		assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), ORDER_BUFFER_FRAMES + 1);
+		Ok(())
+	}
+	cases {
+		/// The Earth Relay asks the Mars Relay for the missing ACK.
+		earth_relay => GapAt::EarthRelay,
+		/// The Earth Relay lacks the missing ACK, so it cascades the request of
+		/// Mission Control to the Mars Relay and brings the answer back.
+		mission_control => GapAt::MissionControl,
+	}
 }
 
 /// The lost ACK reaches the Earth Relay after the gap recovery filled its
 /// slot, so it passes as a duplicate, and the Mars Relay gets the receipt of
 /// its order.
 #[tokio::test]
-async fn a_frame_that_arrives_after_its_recovery_passes_as_a_duplicate() -> Result<(), TightBeamError> {
+async fn a_frame_that_arrives_after_its_recovery_passes_as_a_duplicate() -> TestResult {
 	let path = TestPath::new();
 	let filled = path.fill_gap_at(GapAt::EarthRelay).await?;
 	let earth_relay_addr = filled.side.ground.earth_relay_addr;
 	let mut client = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, earth_relay_addr).await?;
 
 	let reply = client.emit(filled.lost, None).await?;
-	let receipt = reply.ok_or(TightBeamError::MissingResponse)?;
-	assert_eq!(receipt.metadata().id(), b"stateless-ack-1");
+	let receipt = reply.as_ref().map(|receipt| receipt.metadata().id());
+	assert_eq!(receipt, Some(b"stateless-ack-1".as_slice()));
 	Ok(())
 }
 
 /// The Mars Relay answers the Earth Relay's frame request outside its chain,
 /// so its next frame takes the order after the lost ACK.
 #[tokio::test]
-async fn the_answer_to_a_gap_leaves_the_chain_of_its_holder() -> Result<(), TightBeamError> {
+async fn the_answer_to_a_gap_leaves_the_chain_of_its_holder() -> TestResult {
 	let path = TestPath::new();
 	let filled = path.fill_gap_at(GapAt::EarthRelay).await?;
 
@@ -772,13 +713,13 @@ async fn the_answer_to_a_gap_leaves_the_chain_of_its_holder() -> Result<(), Tigh
 /// The frame that shows the gap of Mission Control releases after the frames
 /// of the answer, and its own receipt is the reply to its sender.
 #[tokio::test]
-async fn mission_control_answers_the_frame_that_shows_a_gap_with_its_receipt() -> Result<(), TightBeamError> {
+async fn mission_control_answers_the_frame_that_shows_a_gap_with_its_receipt() -> TestResult {
 	let path = TestPath::new();
 	let filled = path.fill_gap_at(GapAt::MissionControl).await?;
 
-	let receipt = filled.reply.ok_or(TightBeamError::MissingResponse)?;
+	let receipt = filled.reply.as_ref().map(|receipt| receipt.metadata().id());
 	let receipt_of_arrival = format!("stateless-ack-{}", ORDER_BUFFER_FRAMES + 1);
-	assert_eq!(receipt.metadata().id(), receipt_of_arrival.as_bytes());
+	assert_eq!(receipt, Some(receipt_of_arrival.as_bytes()));
 	Ok(())
 }
 
@@ -787,18 +728,17 @@ async fn mission_control_answers_the_frame_that_shows_a_gap_with_its_receipt() -
 /// asks again once the Mars Relay holds the lost ACK, so Mission Control
 /// receives every ACK the Earth Relay's buffer held.
 #[tokio::test]
-async fn a_failed_recovery_asks_again_at_the_next_arrival() -> Result<(), TightBeamError> {
+async fn a_failed_recovery_asks_again_at_the_next_arrival() -> TestResult {
 	let path = TestPath::new();
 	let acks = path.rover_acks_past_a_loss();
 	let side = path.start_mars_side().await;
-	let mut client = DtnRole::MarsRelay
-		.connect(DtnRole::EarthRelay, side.ground.earth_relay_addr)
-		.await?;
+	let earth_relay_addr = side.ground.earth_relay_addr;
+	let mut client = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, earth_relay_addr).await?;
 
 	send_in_turn(&mut client, acks.after).await?;
 
 	let mars_relay = &side.mars_relay_chain;
-	path.take(mars_relay, acks.lost, DtnRole::Rover, PathSide::Mars).await;
+	mars_relay.take(&acks.lost, DtnRole::Rover, PathSide::Mars)?;
 	client.emit(acks.next, None).await?;
 
 	assert_eq!(path.trace().recorded(MISSION_CONTROL_RECEIVE_ACK), ORDER_BUFFER_FRAMES + 1);
@@ -808,14 +748,17 @@ async fn a_failed_recovery_asks_again_at_the_next_arrival() -> Result<(), TightB
 /// A hop whose answer leaves the gap open gets one frame request for that
 /// gap, and the take of the Earth Relay ends.
 #[tokio::test]
-async fn a_hop_whose_answer_leaves_the_gap_open_gets_one_request() -> Result<(), TightBeamError> {
+async fn a_hop_whose_answer_leaves_the_gap_open_gets_one_request() -> TestResult {
 	let path = TestPath::new();
 	let acks = path.rover_acks_past_a_loss();
 	let hop = path.start_fixed_hop(vec![acks.next]).await;
 	let ground = path.start_ground(*hop.servlet.addr()).await;
 	let mut client = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, ground.earth_relay_addr).await?;
 
-	within_seconds(send_in_turn(&mut client, acks.after)).await?;
+	// The reply to the last frame is the one event that marks the end of a
+	// take, so the bound only guards a hang.
+	let take = send_in_turn(&mut client, acks.after);
+	within_hang_guard(take, "the node answers within the hang guard").await?;
 
 	assert_eq!(hop.requests.load(Ordering::Relaxed), 1);
 	Ok(())
@@ -824,18 +767,17 @@ async fn a_hop_whose_answer_leaves_the_gap_open_gets_one_request() -> Result<(),
 /// An answer frame that no peer signs fails the arrival signer check, so the
 /// Earth Relay refuses the answer and stores none of it.
 #[tokio::test]
-async fn the_earth_relay_refuses_an_answer_whose_frame_no_peer_signs() -> Result<(), TightBeamError> {
+async fn the_earth_relay_refuses_an_answer_whose_frame_no_peer_signs() -> TestResult {
 	let path = TestPath::new();
 	let acks = path.rover_acks_past_a_loss();
 	let unsigned = path.unsigned_command();
-	let unsigned_digest = digest::<Sha3_256>(unsigned.to_der()?)?;
-	let hop = path.start_fixed_hop(vec![unsigned]).await;
+	let hop = path.start_fixed_hop(vec![unsigned.to_owned()]).await;
 	let ground = path.start_ground(*hop.servlet.addr()).await;
 	let mut client = DtnRole::MarsRelay.connect(DtnRole::EarthRelay, ground.earth_relay_addr).await?;
 
 	let refusal = send_in_turn(&mut client, acks.after).await;
-	let stored = ground.earth_relay_chain.processor.stores(unsigned_digest.digest.as_bytes())?;
-	assert_eq!(refusal.err().and_then(status_of), Some(TransitStatus::Internal));
+	let stored = ground.earth_relay_chain.stores(&unsigned);
+	assert_eq!(refusal.err().and_then(transit_status_of), Some(TransitStatus::Internal));
 	assert!(!stored);
 	Ok(())
 }
@@ -844,21 +786,18 @@ async fn the_earth_relay_refuses_an_answer_whose_frame_no_peer_signs() -> Result
 /// Earth Relay refuses one that arrives as a request, and its chain takes none
 /// of its frames.
 #[tokio::test]
-async fn the_earth_relay_refuses_a_frame_response_that_arrives_as_a_request() -> Result<(), TightBeamError> {
+async fn the_earth_relay_refuses_a_frame_response_that_arrives_as_a_request() -> TestResult {
 	let path = TestPath::new();
 	let ground = path.start_ground(unserved()).await;
-	let ack = path.rover_ack(&path.chain(DtnRole::Rover.node_name()));
+	let ack = path.chain(DtnRole::Rover.node_name()).rover_ack();
 	let response = path.frame_response(DtnRole::MissionControl, vec![ack]);
-	let mut client = DtnRole::MissionControl
-		.connect(DtnRole::EarthRelay, ground.earth_relay_addr)
-		.await?;
+	let connect = DtnRole::MissionControl.connect(DtnRole::EarthRelay, ground.earth_relay_addr);
+	let mut client = connect.await?;
 
 	let refusal = client.emit(response, None).await;
 	let (next_order, _) = ground.earth_relay_chain.processor.prepare_outgoing()?;
-	assert_eq!(
-		refusal.err().and_then(|refusal| refusal.transit_status()),
-		Some(TransitStatus::Internal)
-	);
+	let status = refusal.err().and_then(|refusal| refusal.transit_status());
+	assert_eq!(status, Some(TransitStatus::Internal));
 	assert_eq!(next_order, 1);
 	Ok(())
 }

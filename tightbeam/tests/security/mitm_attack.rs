@@ -10,10 +10,14 @@
 //! 3. The recipient processes the tampered message.
 //!
 //! ## Expected control
-//! Both parties MUST sign `transcript_hash`, and each verifies the signature of
-//! the other against its certificate. Any modification MUST cause a
-//! signature-verification failure, on the tampered `ServerHandshake` the reply
-//! signs for HPKE and on the tampered `Finished` `SignedData` for CMS.
+//! The server signs the content of its reply, and the client verifies that
+//! signature against the server certificate. Any change to the content MUST
+//! fail that signature: the tampered `ServerHandshake` for HPKE and the
+//! tampered content of the server `Finished` for CMS. The transcript inside
+//! the signature is the control of `nonce_reuse` and `transcript_binding`.
+//!
+//! A reply that a MITM decodes and encodes unchanged completes the handshake,
+//! so the refusal comes from the tamper and from no re-encoding.
 //!
 //! ## References
 //! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
@@ -32,20 +36,17 @@ use tightbeam::{
 	TightBeamError,
 };
 
-use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
+use crate::common::security::ServerMaterials;
+use crate::security::common::{HandshakeBackendKind, SecurityThreatHarness};
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, REPLY_FRAME};
 
-pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> =
-	tightbeam::urn!("test", "event:mitm-attack/mitm-capture-handshake");
 pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-inject-tampered");
-pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-tamper-message");
 
 tb_assert_spec! {
 	pub MitmAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(MITM_CAPTURE_HANDSHAKE, exactly!(1)),
-			(MITM_TAMPER_MESSAGE, exactly!(1)),
 			(MITM_INJECT_TAMPERED, exactly!(1)),
 			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature"))
 		]
@@ -57,8 +58,6 @@ tb_process_spec! {
 	events {
 		observable {
 
-			MITM_CAPTURE_HANDSHAKE,
-			MITM_TAMPER_MESSAGE,
 			MITM_INJECT_TAMPERED,
 			events::SESSION_CERT_REJECTED,
 			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
@@ -68,14 +67,7 @@ tb_process_spec! {
 		hidden { }
 	}
 	states {
-		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningCapture },
-		SpawningCapture => {
-			SecurityThreatHarness::HARNESS_SPAWN_HPKE => CaptureReady,
-			SecurityThreatHarness::HARNESS_SPAWN_CMS => CaptureReady
-		},
-		CaptureReady => { MITM_CAPTURE_HANDSHAKE => Captured },
-		Captured => { MITM_TAMPER_MESSAGE => Tampered },
-		Tampered => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
+		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
 			SecurityThreatHarness::HARNESS_SPAWN_HPKE => AttackReady,
 			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
@@ -119,29 +111,10 @@ job! {
 	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 
-		// Step 1: Capture a complete handshake.
-		let mut session = harness.spawn(kind)?;
-		let captured = session.capture_full().await?;
-
-		trace.event(MITM_CAPTURE_HANDSHAKE)?;
-
-		// Step 2: Find a server-to-client message to tamper: the reply
-		// (step 1) for HPKE, and the ServerFinished (step 2) for CMS.
-		let target = captured.server_reply();
-		let target = target.ok_or_else(|| expectation_failure("no server-to-client messages captured"))?;
-
-		// The tamper models a MITM that modifies the message in transit.
-		let tampered_payload = kind.tamper_server_message(&target.payload)?;
-
-		// Only a changed payload puts the control under test.
-		assert_ne!(tampered_payload, target.payload, "the tamper must change the payload");
-
-		trace.event(MITM_TAMPER_MESSAGE)?;
-
-		// Step 3: Inject the tampered message into a live handshake, whose
-		// client files its verdict in the scenario trace.
-		let injection = kind.replacement(target.step, &tampered_payload)?;
-		let attack = harness.live(kind)?.audit_client(&trace).with_step(injection);
+		// The relay tampers the reply of the live session in transit, so the
+		// reply stays bound to the transcript of the client that reads it.
+		let tamper = kind.tamper_reply()?;
+		let attack = harness.live(kind)?.audit_client(&trace).with_step(tamper);
 
 		trace.event(MITM_INJECT_TAMPERED)?;
 
@@ -149,5 +122,53 @@ job! {
 		// signature fails, and acceptance means the control missed the tamper.
 		let outcome = attack.run().await?;
 		outcome.refused_by_client("tampered message was accepted")
+	}
+}
+
+tb_assert_spec! {
+	pub ReEncodedReplySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2))
+		]
+	}
+}
+
+/// A MITM that decodes the reply of `kind` and encodes it unchanged sends a
+/// reply that completes the handshake on both endpoints. It is the control of
+/// the tampers of this module: their refusals come from the tamper and from no
+/// re-encoding of a decoded reply.
+async fn a_re_encoded_reply_completes(
+	trace: &TraceCollector,
+	kind: HandshakeBackendKind,
+) -> Result<(), TightBeamError> {
+	let re_encode = FrameEdit::Rewrite(Box::new(move |reply| kind.re_encoded_reply(reply)));
+	let handshake = LiveHandshake::new(kind, ServerMaterials::fixed())
+		.audit_client(trace)
+		.audit_server(trace);
+
+	let outcome = handshake.with_step(AttackStep::new(REPLY_FRAME, re_encode)).run().await?;
+	outcome.established().map(drop)
+}
+
+tb_scenario! {
+	name: a_re_encoded_hpke_reply_completes_the_handshake,
+	spec: ReEncodedReplySpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_re_encoded_reply_completes(&trace, HandshakeBackendKind::Hpke).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: a_re_encoded_cms_reply_completes_the_handshake,
+	spec: ReEncodedReplySpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_re_encoded_reply_completes(&trace, HandshakeBackendKind::Cms).await
+		}
 	}
 }

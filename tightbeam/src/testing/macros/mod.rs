@@ -1162,7 +1162,7 @@ crate::__tb_if_test! {
 
 			// Layer 2 CSP failures travel the failure path of Layer 1
 			// assertion failures: `on_fail` runs before the panic, so logging
-			// and cleanup hooks observe the regression. A failure observer runs
+			// and cleanup hooks observe the failure. A failure observer runs
 			// alone, and beside a pass observer when `with_on_fail` adds it.
 			crate::tb_cases! {
 				fn csp_failure_invokes_on_fail_before_panicking(hooks: FailureHooks) {
@@ -1170,7 +1170,6 @@ crate::__tb_if_test! {
 					let observed = hooks(Arc::clone(&failed));
 
 					let panicked = grading_panics(TestProcess::of("Refusing", "S0").build(), observed);
-
 					assert_eq!((panicked, failed.load(Ordering::SeqCst)), (true, true));
 				}
 
@@ -1195,7 +1194,6 @@ crate::__tb_if_test! {
 				});
 
 				let panicked = grading_panics(TestProcess::idle(), hooks);
-
 				assert_eq!((panicked, passed.load(Ordering::SeqCst)), (false, true));
 			}
 		}

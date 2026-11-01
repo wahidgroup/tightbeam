@@ -35,9 +35,8 @@ use tightbeam::{
 	TightBeamError,
 };
 
-use crate::security::common::{
-	captured_ephemerals, expectation_failure, x_coordinate, HandshakeBackendKind, SecurityThreatHarness,
-};
+use crate::common::security::expectation_failure;
+use crate::security::common::{captured_ephemerals, x_coordinate, HandshakeBackendKind, SecurityThreatHarness};
 
 pub(crate) const FS_CAPTURE_HANDSHAKE: Urn<'static> =
 	tightbeam::urn!("test", "event:forward-secrecy/fs-capture-handshake");
@@ -131,8 +130,8 @@ job! {
 		// shares the x-coordinate of the static key shrinks it.
 		let static_key = harness.materials().secret_key().public_key().to_encoded_point(false);
 		let static_coordinate = x_coordinate(static_key.as_bytes())?;
-		let distinct: BTreeSet<Vec<u8>> = coordinates.into_iter().chain([static_coordinate]).collect();
 
+		let distinct: BTreeSet<Vec<u8>> = coordinates.into_iter().chain([static_coordinate]).collect();
 		assert_eq!(
 			distinct.len(),
 			2 * HANDSHAKE_COUNT + 1,

@@ -37,8 +37,9 @@ use tightbeam::{
 
 use tightbeam::transport::{PooledClient, TransportError, TransportFailure};
 
-use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
-use crate::common::x509::combined_trust;
+use crate::common::security::{
+	combined_trust, pinning_trust_store, random_signing_key, test_certificate, ServerMaterials,
+};
 
 /// The message the streaming servlets take and answer with.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -50,6 +51,11 @@ pub struct StreamLabel {
 pub(crate) const SERVLET_UNARY_HANDLED: Urn<'static> =
 	tightbeam::urn!("test", "event:colony-streaming/servlet-unary-handled");
 
+/// A V0 frame whose [`StreamLabel`] message carries `label`.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the frame fails to compose.
 fn reply_frame(label: impl AsRef<str>) -> Result<Frame, TightBeamError> {
 	let label = label.as_ref();
 	Ok(compose! {
@@ -88,6 +94,12 @@ servlet! {
 	}
 }
 
+/// The config of a [`StreamLabel`] servlet that serves under the certificate
+/// of `materials` and offers the standard mux.
+///
+/// # Errors
+///
+/// - [`TightBeamError`] -- the builder refuses the certificate or the key of `materials`.
 fn streaming_servlet_conf(
 	materials: &ServerMaterials,
 ) -> Result<ServletConfig<TokioListener, StreamLabel>, TightBeamError> {
@@ -108,7 +120,7 @@ async fn pooled_lease(
 	materials: &ServerMaterials,
 	addr: <TokioListener as tightbeam::transport::Protocol>::Address,
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
-	let trust_store = pinning_trust_store(&materials.certificate)?;
+	let trust_store = combined_trust(&[&materials.certificate]);
 	let config = PoolConfig {
 		idle_timeout: None,
 		max_connections: NonZeroUsize::MIN,
@@ -148,7 +160,7 @@ tb_scenario! {
 		.with_trace(TestTrace::with_detail(true))
 		.build(),
 	environment Servlet {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			let conf = streaming_servlet_conf(&materials)?;
 			StreamingEchoServlet::start(Arc::new(trace), conf).await
@@ -221,7 +233,7 @@ tb_scenario! {
 	name: stream_only_servlet_refuses_unary,
 	spec: StreamOnlyServletSpec,
 	environment Servlet {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			let conf = streaming_servlet_conf(&materials)?;
 			StreamOnlyServlet::start(Arc::new(trace), conf).await
@@ -306,7 +318,7 @@ tb_scenario! {
 		.with_trace(TestTrace::with_detail(true))
 		.build(),
 	environment Hive {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			start_streaming_hive(trace, &materials).await
 		},
@@ -346,7 +358,7 @@ tb_scenario! {
 		.with_trace(TestTrace::with_detail(true))
 		.build(),
 	environment Hive {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			start_streaming_hive(trace, &materials).await
 		},
@@ -487,7 +499,7 @@ tb_scenario! {
 	name: hive_context_call_refuses_a_sibling_answering_under_another_identity,
 	spec: HiveImpostorCallSpec,
 	environment Hive {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			start_impostor_hive(trace, &materials).await
 		},
@@ -527,7 +539,7 @@ tb_scenario! {
 		.with_trace(TestTrace::with_detail(true))
 		.build(),
 	environment Hive {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			start_impostor_hive(trace, &materials).await
 		},
@@ -568,7 +580,7 @@ tb_scenario! {
 		.with_trace(TestTrace::with_detail(true))
 		.build(),
 	environment Hive {
-		context: ServerMaterials::generate(),
+		context: ServerMaterials::fixed(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			start_impostor_hive(trace, &materials).await
 		},
@@ -601,52 +613,62 @@ const SERVLET_STEPS: [Urn<'static>; 5] = [
 /// serves one unary request, under a trace whose config sets
 /// `enable_internal_detail` to `detail`. The client records into a trace of
 /// its own.
-async fn servlet_trail(detail: bool) -> Result<Vec<Urn<'static>>, TightBeamError> {
+async fn servlet_trail(detail: bool) -> Vec<Urn<'static>> {
 	let servlet_trace = Arc::new(TestTrace::with_detail(detail));
-	let materials = ServerMaterials::generate();
-	let conf = streaming_servlet_conf(&materials)?;
-	let servlet = StreamingEchoServlet::start(Arc::clone(&servlet_trace), conf).await?;
+	let materials = ServerMaterials::fixed();
+	let conf = streaming_servlet_conf(&materials).expect("a servlet config on fixture materials builds");
+	let servlet = StreamingEchoServlet::start(Arc::clone(&servlet_trace), conf).await;
+	let servlet = servlet.expect("a servlet starts on a free port");
 
-	let mut lease = pooled_lease(&TraceCollector::new(), &materials, servlet.addr().to_owned()).await?;
-	lease.emit(reply_frame("servlet-trail")?, None).await?;
+	let lease = pooled_lease(&TraceCollector::new(), &materials, servlet.addr().to_owned()).await;
+	let mut lease = lease.expect("a pooled lease reaches a started servlet");
+	let request = reply_frame("servlet-trail").expect("a reply frame composes");
+	lease.emit(request, None).await.expect("the servlet answers a unary request");
 	servlet.stop();
 
-	Ok(TestTrace::trail(&servlet_trace, &SERVLET_STEPS))
+	TestTrace::trail(&servlet_trace, &SERVLET_STEPS)
 }
 
-/// A servlet's trace records the gate verdict of each request it serves, and,
-/// when its config sets the detail flag, the route step, the policy step, and
-/// the span of the handler around that verdict.
-#[tokio::test]
-async fn a_servlet_records_the_steps_of_its_requests_on_its_own_trace() -> Result<(), TightBeamError> {
-	let trails = [servlet_trail(true).await?, servlet_trail(false).await?];
-	assert_eq!(trails, [SERVLET_STEPS.to_vec(), vec![events::GATE_ACCEPT]]);
-	Ok(())
+// A servlet's trace records the gate verdict of each request it serves, and,
+// when its config sets the detail flag, the route step, the policy step, and
+// the span of the handler around that verdict.
+tightbeam::tb_cases! {
+	async fn a_servlet_records_the_steps_of_its_requests_on_its_own_trace((detail, steps): (bool, Vec<Urn<'static>>)) {
+		let trail = servlet_trail(detail).await;
+		assert_eq!(trail, steps);
+	}
+	cases {
+		with_the_detail_flag => (true, SERVLET_STEPS.to_vec()),
+		without_the_detail_flag => (false, vec![events::GATE_ACCEPT]),
+	}
 }
 
 /// The gate verdicts, and the count of unary handler events, that `replaced`
 /// records as a servlet serves one request after `set_trace` installs
 /// `replaced` in place of the trace the servlet started with.
-async fn replaced_trace_records() -> Result<(Vec<Urn<'static>>, usize), TightBeamError> {
-	let materials = ServerMaterials::generate();
-	let conf = streaming_servlet_conf(&materials)?;
-	let servlet = StreamingEchoServlet::start(Arc::new(TraceCollector::new()), conf).await?;
+async fn replaced_trace_records() -> (Vec<Urn<'static>>, usize) {
+	let materials = ServerMaterials::fixed();
+	let conf = streaming_servlet_conf(&materials).expect("a servlet config on fixture materials builds");
+	let servlet = StreamingEchoServlet::start(Arc::new(TraceCollector::new()), conf).await;
+	let servlet = servlet.expect("a servlet starts on a free port");
 	let replaced = Arc::new(TraceCollector::new());
 	servlet.set_trace(Arc::clone(&replaced));
 
-	let mut lease = pooled_lease(&TraceCollector::new(), &materials, servlet.addr().to_owned()).await?;
-	lease.emit(reply_frame("replaced-trace")?, None).await?;
+	let lease = pooled_lease(&TraceCollector::new(), &materials, servlet.addr().to_owned()).await;
+	let mut lease = lease.expect("a pooled lease reaches a started servlet");
+	let request = reply_frame("replaced-trace").expect("a reply frame composes");
+	lease.emit(request, None).await.expect("the servlet answers a unary request");
 	servlet.stop();
 
 	let handled = replaced.recorded(SERVLET_UNARY_HANDLED);
-	Ok((TestTrace::trail(&replaced, &[events::GATE_ACCEPT]), handled))
+	(TestTrace::trail(&replaced, &[events::GATE_ACCEPT]), handled)
 }
 
 /// A servlet records each request that it serves after `set_trace` into the
 /// trace that the call installs: the gate verdict of the connection, and the
 /// event of the handler.
 #[tokio::test]
-async fn a_replaced_trace_records_the_requests_after_the_replacement() -> Result<(), TightBeamError> {
-	assert_eq!(replaced_trace_records().await?, (vec![events::GATE_ACCEPT], 1));
-	Ok(())
+async fn a_replaced_trace_records_the_requests_after_the_replacement() {
+	let records = replaced_trace_records().await;
+	assert_eq!(records, (vec![events::GATE_ACCEPT], 1));
 }

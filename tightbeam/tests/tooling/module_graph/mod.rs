@@ -1,6 +1,7 @@
-//! Rust admits a cycle among the modules of one crate, so this test keeps the
-//! production edges of `transport/` acyclic. A production edge is a path
-//! outside test code, macro code, and re-exports.
+//! Rust admits a cycle among the modules of one crate, so a rule keeps the
+//! production edges of `transport/` acyclic. A fixture crate with one cycle
+//! shows that the rule can fail. A production edge is a path outside test
+//! code, macro code, and re-exports.
 
 // The helpers keep the zero-panic lints, so only the final assert can panic.
 #![deny(
@@ -35,7 +36,19 @@ use source::SourceTree;
 fn transport_production_edges_are_acyclic() -> Result<(), GraphError> {
 	let tree = SourceTree::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))?;
 	let graph = ModuleGraph::build(&tree, ItemPath::module(&["transport"]))?;
-	let cycles = graph.production_cycles();
-	assert!(cycles.is_empty(), "{cycles}");
+	graph.acyclic()
+}
+
+/// The rule refuses the fixture crate under `tests/tooling/fixtures/cycle`,
+/// whose modules `alpha` and `beta` each use an item of the other, and names
+/// both modules of the cycle.
+#[test]
+fn a_cycle_between_two_modules_fails_the_rule() -> Result<(), GraphError> {
+	let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tooling/fixtures/cycle");
+	let tree = SourceTree::load(fixture)?;
+	let graph = ModuleGraph::build(&tree, ItemPath::crate_root())?;
+
+	let refused = graph.acyclic();
+	assert!(matches!(refused, Err(GraphError::Cycles { names, .. }) if names == [["alpha", "beta"]]));
 	Ok(())
 }

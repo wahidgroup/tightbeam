@@ -16,6 +16,7 @@ use tightbeam::{
 	},
 	matrix::MatrixDyn,
 	prelude::Version,
+	testing::TestIdentity,
 	TightBeamError,
 };
 
@@ -29,30 +30,12 @@ use crate::dtn::{
 /// The frame builder of one DTN node, bound to the chain processor of that
 /// node.
 pub struct FrameBuilderHelper {
+	/// The chain processor that records each chain frame of this builder as
+	/// the head of the chain of the node.
 	pub chain_processor: Arc<ChainProcessor>,
 	/// The order of the next frame request of the node, which numbers its
 	/// requests from 1 for the request gate of each hop.
 	next_request: AtomicU64,
-}
-
-/// Sets the hashers, the compression, the cipher, and the signer of a relay
-/// frame, and its `previous_frame` hash when the frame has a predecessor.
-macro_rules! apply_common_builder_patterns {
-	($builder:expr, $previous_digest:expr, $signing_key:expr, $cipher:expr) => {{
-		let mut builder = $builder
-			.with_message_hasher::<Sha3_256>([])
-			.with_witness_hasher::<Sha3_256>()
-			.with_compression(ZstdCompression::default())
-			.with_encryptor($cipher.to_owned())
-			.with_signer::<Secp256k1Signature, _>(tightbeam::testing::TestIdentity::certified($signing_key.to_owned()));
-
-		// Only a frame with a predecessor carries a `previous_frame` hash.
-		if let Some(digest) = $previous_digest {
-			builder = builder.with_previous_hash(digest);
-		}
-
-		builder
-	}};
 }
 
 impl FrameBuilderHelper {
@@ -60,6 +43,43 @@ impl FrameBuilderHelper {
 	/// order 1.
 	pub fn new(chain_processor: Arc<ChainProcessor>) -> Self {
 		Self { chain_processor, next_request: AtomicU64::new(1) }
+	}
+
+	/// Sets the hashers, the compression, the cipher, and the signer of a relay
+	/// frame, and its `previous_frame` hash when the frame has a predecessor.
+	fn sealed(
+		builder: FrameBuilder<RelayMessage>,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+		cipher: &SharedCipher,
+	) -> FrameBuilder<RelayMessage> {
+		let mut builder = builder
+			.with_message_hasher::<Sha3_256>([])
+			.with_witness_hasher::<Sha3_256>()
+			.with_compression(ZstdCompression::default())
+			.with_encryptor(cipher.to_owned())
+			.with_signer::<Secp256k1Signature, _>(TestIdentity::certified(signing_key.to_owned()));
+
+		// Only a frame with a predecessor carries a `previous_frame` hash.
+		if let Some(digest) = previous_digest {
+			builder = builder.with_previous_hash(digest);
+		}
+
+		builder
+	}
+
+	/// Seals `builder` as [`FrameBuilderHelper::sealed`] does, builds the
+	/// frame, and records it as the head of the chain of this node.
+	fn chained(
+		&self,
+		builder: FrameBuilder<RelayMessage>,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+		cipher: &SharedCipher,
+	) -> Result<Frame, TightBeamError> {
+		let builder = Self::sealed(builder, previous_digest, signing_key, cipher);
+		let frame = builder.build()?;
+		self.finalize_frame(frame)
 	}
 
 	/// Records `frame` as the head of the chain of this node through
@@ -87,7 +107,7 @@ impl FrameBuilderHelper {
 			.with_order(order)
 			.with_message(relay_message);
 
-		let builder = apply_common_builder_patterns!(builder, None::<DigestInfo>, signing_key, cipher);
+		let builder = Self::sealed(builder, None, signing_key, cipher);
 		builder.build()
 	}
 
@@ -107,7 +127,7 @@ impl FrameBuilderHelper {
 			.with_id("frame-resp")
 			.with_message(relay_message);
 
-		let builder = apply_common_builder_patterns!(builder, None::<DigestInfo>, signing_key, cipher);
+		let builder = Self::sealed(builder, None, signing_key, cipher);
 		builder.build()
 	}
 
@@ -128,9 +148,7 @@ impl FrameBuilderHelper {
 			.with_priority(command.priority)
 			.with_message(relay_message);
 
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
+		self.chained(builder, previous_digest, signing_key, cipher)
 	}
 
 	/// Builds the chain frame of the Rover's ACK of the command at
@@ -150,9 +168,7 @@ impl FrameBuilderHelper {
 			.with_order(next_order)
 			.with_message(relay_message);
 
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
+		self.chained(builder, previous_digest, signing_key, cipher)
 	}
 
 	/// Builds the chain frame of the Rover's `telemetry`, with `fault_matrix`
@@ -174,9 +190,7 @@ impl FrameBuilderHelper {
 			.with_message(relay_message)
 			.with_matrix(matrix_dyn);
 
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
+		self.chained(builder, previous_digest, signing_key, cipher)
 	}
 
 	/// Builds the stateless ACK of the frame at `ack_for_order`, which a relay

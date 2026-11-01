@@ -1,44 +1,42 @@
-//! Split transport integration tests.
+//! The integration tests of the split transport.
 
 #![cfg(all(
 	feature = "transport-hpke",
-	feature = "transport-policy",
 	feature = "tcp",
 	feature = "tokio",
 	feature = "testing",
 	feature = "instrument"
 ))]
 
-use std::sync::Arc;
+use tokio::task::JoinHandle;
 
-use tokio::net::TcpStream;
-
-use tightbeam::crypto::policy::Secp256k1Policy;
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
-use tightbeam::crypto::x509::KeyCurves;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{SetupEnv, TestFrame};
-use tightbeam::transport::tcp::r#async::{TokioListener, TokioStream};
+use tightbeam::transport::tcp::r#async::{SplitTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	ClientBuilder, EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope,
 	TransportError, TransportFailure,
 };
 use tightbeam::{Frame, TightBeamError};
 
-use super::support::{
+use crate::common::poll::joined;
+use crate::common::result::TestResult;
+use crate::common::security::{combined_trust, ServerMaterials};
+use crate::transport::fixtures::{
 	accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split, connect_pinned_client,
+	loopback_streams,
 };
-use crate::common::security::{expectation_failure, ServerMaterials};
 
+/// The frame that each split test sends: a V0 frame with no label.
 fn request_frame() -> Frame {
 	TestFrame::v0(None, None)
 }
 
+/// [`request_frame`] in a request envelope.
 fn request_envelope() -> TransportEnvelope {
 	TransportEnvelope::new_request(request_frame())
 }
@@ -64,8 +62,8 @@ fn request_of(envelope: TransportEnvelope) -> Frame {
 /// An encrypted split session carries a request to the server and the
 /// server's echo back, under status `Ok`.
 #[tokio::test]
-async fn split_encrypted_roundtrip() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
+async fn an_encrypted_split_session_echoes_a_request() -> TestResult {
+	let materials = ServerMaterials::fixed();
 	let (listener, addr) = bind_encrypted_listener(&materials).await?;
 
 	let server_handle = tokio::spawn(async move {
@@ -84,32 +82,24 @@ async fn split_encrypted_roundtrip() -> Result<(), TightBeamError> {
 	writer.write_envelope(TransportEnvelope::new_request(sent.to_owned())).await?;
 
 	let package = response_of(reader.read_envelope().await?);
-	let echoed = package
-		.message()
-		.map(|arc| Frame::clone(arc))
-		.ok_or_else(|| expectation_failure("echo response must carry the request frame"))?;
+	let echoed = package.message().map(|frame| Frame::clone(frame));
 
-	await_ok(server_handle, "server task must not panic").await?;
+	joined(server_handle).await?;
 
-	assert_eq!(package.status(), TransitStatus::Ok, "the echo must carry status Ok");
-	assert_eq!(echoed, sent, "the server must echo the request frame");
+	assert_eq!((package.status(), echoed), (TransitStatus::Ok, Some(sent)));
 	Ok(())
 }
 
 /// A provisioned client whose handshake has not run holds no keys to split,
 /// so it refuses the split.
 #[tokio::test]
-async fn split_rejects_pre_handshake() -> Result<(), TightBeamError> {
-	let listener = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-	let listen_addr = listener.local_addr()?;
-	let client_stream = TcpStream::connect(listen_addr).await?;
-	let data = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation).build();
-	let client = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::new(data));
+async fn a_transport_whose_handshake_has_not_run_refuses_to_split() -> TestResult {
+	let (client_stream, _accepted) = loopback_streams().await;
+	let client = ClientBuilder::<TokioListener>::builder().with_trust_store(combined_trust(&[]));
 	let transport = client.adopt(TokioStream::from(client_stream))?.into_transport();
 
 	let into_split = transport.into_split();
-	let refused = matches!(into_split, Err(TransportError::InvalidState));
-	assert!(refused, "a provisioned transport must refuse to split");
+	assert!(matches!(into_split, Err(TransportError::InvalidState)));
 	Ok(())
 }
 
@@ -130,7 +120,7 @@ tb_scenario! {
 	spec: SplitWriteRekeyLimitSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let materials = ServerMaterials::generate();
+			let materials = ServerMaterials::fixed();
 			let (listener, addr) = bind_encrypted_listener(&materials).await?;
 
 			let server_handle = tokio::spawn(async move {
@@ -165,13 +155,11 @@ tb_scenario! {
 	}
 }
 
-/// The read threshold of a split half triggers a renewal, and the AES-GCM
-/// volume bound is the refusal bound, so the reader decrypts a record past
-/// the threshold.
-#[tokio::test]
-async fn split_read_rekey_threshold_never_refuses() -> Result<(), TightBeamError> {
-	let materials = ServerMaterials::generate();
-	let (listener, addr) = bind_encrypted_listener(&materials).await?;
+/// A client split session whose reader holds a rekey threshold of one
+/// record, beside the server task that writes it two requests.
+async fn threshold_of_one_session() -> (SplitTransport<TokioStream>, JoinHandle<Result<(), TightBeamError>>) {
+	let materials = ServerMaterials::fixed();
+	let (listener, addr) = bind_encrypted_listener(&materials).await.expect("a loopback port binds");
 	let server_handle = tokio::spawn(async move {
 		let (_reader, mut writer) = accept_handshaken_split(listener).await?;
 
@@ -181,18 +169,33 @@ async fn split_read_rekey_threshold_never_refuses() -> Result<(), TightBeamError
 		Ok::<(), TightBeamError>(())
 	});
 
-	let (reader, _writer) = connect_handshaken_split(addr, &materials.certificate).await?;
-	let mut reader = reader.with_rekey_limit(1);
+	let split = connect_handshaken_split(addr, &materials.certificate).await;
+	let (reader, writer) = split.expect("the pinned client completes its handshake");
+	((reader.with_rekey_limit(1), writer), server_handle)
+}
 
-	let within_limit = reader.read_envelope().await?;
-	let arrived = matches!(within_limit, TransportEnvelope::Request(_));
-	assert!(arrived, "the record inside the threshold must arrive");
-	assert_eq!(reader.remaining_records(), 0, "one record must spend a threshold of one");
+/// The read threshold of a split half counts the records the half reads, so
+/// one record spends a threshold of one.
+#[tokio::test]
+async fn one_record_spends_a_read_threshold_of_one() -> TestResult {
+	let ((mut reader, _writer), server_handle) = threshold_of_one_session().await;
+
+	reader.read_envelope().await?;
+	joined(server_handle).await?;
+	assert_eq!(reader.remaining_records(), 0);
+	Ok(())
+}
+
+/// The read threshold of a split half triggers a renewal, and the AES-GCM
+/// volume bound is the refusal bound, so the reader decrypts a record past
+/// the threshold.
+#[tokio::test]
+async fn a_split_reader_past_its_threshold_still_decrypts() -> TestResult {
+	let ((mut reader, _writer), server_handle) = threshold_of_one_session().await;
+	reader.read_envelope().await?;
 
 	let past_threshold = reader.read_envelope().await;
-	await_ok(server_handle, "server task must not panic").await?;
-
-	let decrypted = matches!(past_threshold, Ok(TransportEnvelope::Request(_)));
-	assert!(decrypted, "a reader past its threshold must still decrypt");
+	joined(server_handle).await?;
+	assert!(matches!(past_threshold, Ok(TransportEnvelope::Request(_))));
 	Ok(())
 }

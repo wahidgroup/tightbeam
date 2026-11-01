@@ -1,13 +1,15 @@
 //! X25519 (RFC 7748) as an outside crate brings it, through `x25519-dalek`.
 //!
-//! [`X25519`] reads two kinds of static key: an `id-X25519` key, and an
-//! `id-Ed25519` key through the birational map of RFC 7748 §4.1, because one
-//! scalar serves both. It compares a share with a static key by the
-//! u-coordinate each decodes to, and it refuses an all-zero agreement
+//! [`X25519`] reads an `id-X25519` key and, through the birational map of
+//! RFC 7748 §4.1, an `id-Ed25519` key. It compares a share with a static key by
+//! the u-coordinate each decodes to, and it refuses an all-zero agreement
 //! (RFC 8446 §7.4.2).
+//!
+//! The vector tests and the tests of an `id-Ed25519` key are self-checks of
+//! this fixture. The small-order refusals and the flows run it through the
+//! handshake.
 
 use core::marker::PhantomData;
-use std::error::Error;
 
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -26,7 +28,8 @@ use tightbeam::testing::{unhex, PublishedDraw};
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::zeroize::ZeroizeOnDrop;
 
-use super::{cms_opens, hello_carrying, hpke_opens, hpke_pair, p384_identity, OnP384, CONTENT};
+use super::{cms_opens, hello_carrying, hpke_opens, hpke_pair, p384_identity, replied, OnP384, CONTENT, SERVER_SEED};
+use crate::common::result::TestResult;
 
 /// `id-Ed25519` (RFC 8410 §3).
 const ID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
@@ -249,26 +252,34 @@ impl X25519Pending {
 }
 
 /// The SPKI of `algorithm` over `key`, with no parameters.
-fn spki_of(algorithm: ObjectIdentifier, key: &[u8]) -> Result<SubjectPublicKeyInfoRef<'_>, Box<dyn Error>> {
-	let subject_public_key = BitStringRef::from_bytes(key)?;
+fn spki_of(algorithm: ObjectIdentifier, key: &[u8]) -> SubjectPublicKeyInfoRef<'_> {
+	let subject_public_key = BitStringRef::from_bytes(key).expect("a key fits a BIT STRING");
 	let algorithm = AlgorithmIdentifierRef { oid: algorithm, parameters: None };
-	Ok(SubjectPublicKeyInfoRef { algorithm, subject_public_key })
+	SubjectPublicKeyInfoRef { algorithm, subject_public_key }
 }
 
 /// The X25519 key of the Ed25519 secret key of RFC 8032 §7.1 TEST 1: the key
 /// of its scalar, the first half of SHA-512 over the secret key, which X25519
 /// clamps as Ed25519 does (RFC 8032 §5.1.5).
-fn rfc_8032_test_1_x25519_key() -> Result<PublicKey, Box<dyn Error>> {
+fn rfc_8032_test_1_x25519_key() -> PublicKey {
 	let digest = Sha512::digest(unhex(RFC_8032_TEST_1_SECRET));
-	let scalar: [u8; 32] = digest[..32].try_into()?;
-	Ok(PublicKey::from(&StaticSecret::from(scalar)))
+	let scalar: [u8; 32] = digest[..32].try_into().expect("a SHA-512 digest holds 32 octets");
+	PublicKey::from(&StaticSecret::from(scalar))
+}
+
+/// The u-coordinate that the `id-Ed25519` key of RFC 8032 §7.1 TEST 1 reads
+/// as, the static key of an Ed25519 identity.
+fn ed25519_static() -> MontgomeryU {
+	let public = unhex(RFC_8032_TEST_1_PUBLIC);
+	let read = <X25519>::static_key(spki_of(ID_ED25519, &public));
+	read.expect("the key maps to a u-coordinate")
 }
 
 /// Alice offers and Bob responds under the scalars of RFC 7748 §6.1. Each
 /// share is the public key the vector names, and both ends derive its shared
 /// secret.
 #[test]
-fn x25519_runs_the_vector_of_rfc_7748() -> Result<(), KeyExchangeError> {
+fn x25519_runs_the_vector_of_rfc_7748() -> TestResult {
 	let (pending, offer) = <X25519>::offer(&mut PublishedDraw(unhex(RFC_7748_ALICE_SCALAR)));
 	let (reply, responder) = <X25519>::respond(&offer, &mut PublishedDraw(unhex(RFC_7748_BOB_SCALAR)))?;
 	let initiator = <X25519>::complete(&pending, &reply)?;
@@ -286,40 +297,49 @@ fn x25519_runs_the_vector_of_rfc_7748() -> Result<(), KeyExchangeError> {
 /// The `id-Ed25519` key of RFC 8032 §7.1 TEST 1 reads as the X25519 key of
 /// its own scalar.
 #[test]
-fn an_ed25519_key_reads_as_the_x25519_key_of_its_scalar() -> Result<(), Box<dyn Error>> {
+fn an_ed25519_key_reads_as_the_x25519_key_of_its_scalar() {
 	let public = unhex(RFC_8032_TEST_1_PUBLIC);
-	let x25519_key = rfc_8032_test_1_x25519_key()?;
+	let x25519_key = rfc_8032_test_1_x25519_key();
 
-	let read = <X25519>::static_key(spki_of(ID_ED25519, &public)?);
+	let read = <X25519>::static_key(spki_of(ID_ED25519, &public));
 	assert_eq!(read, Some(MontgomeryU::of_x25519(x25519_key.as_bytes())));
-	Ok(())
 }
 
-/// A share of the X25519 key of an Ed25519 static key collapses into that
-/// static key, with the top bit of its last octet clear or set, because
-/// RFC 7748 §5 masks that bit.
-#[test]
-fn a_share_of_an_ed25519_static_collapses_in_either_encoding() -> Result<(), Box<dyn Error>> {
-	let public = unhex(RFC_8032_TEST_1_PUBLIC);
-	let x25519_key = rfc_8032_test_1_x25519_key()?;
-	let read = <X25519>::static_key(spki_of(ID_ED25519, &public)?).ok_or("the key maps to a u-coordinate")?;
-	let mut top_bit_set = x25519_key.to_bytes();
-	top_bit_set[31] |= 0x80;
+/// The octets of `key` with the top bit of the last one set, the bit that
+/// RFC 7748 §5 masks.
+fn with_top_bit_set(key: [u8; 32]) -> [u8; 32] {
+	let mut set = key;
+	set[31] |= 0x80;
+	set
+}
 
-	let plain = X25519Share(x25519_key);
-	let masked = <X25519Share as KeyShare<X25519>>::from_octets(&top_bit_set)?;
+// A share of the X25519 key of an Ed25519 static key collapses into that
+// static key, with the top bit of its last octet clear or set, because
+// RFC 7748 §5 masks that bit.
+tightbeam::tb_cases! {
+	fn a_share_of_an_ed25519_static_collapses_into_it(encoding: fn([u8; 32]) -> [u8; 32]) -> TestResult {
+		let octets = encoding(rfc_8032_test_1_x25519_key().to_bytes());
+		let share = <X25519Share as KeyShare<X25519>>::from_octets(&octets)?;
 
-	let collapses = <X25519Share as KeyShare<X25519>>::collapses_into;
-	assert_eq!((collapses(&plain, &read), collapses(&masked, &read)), (true, true));
-	Ok(())
+		let collapses = <X25519Share as KeyShare<X25519>>::collapses_into(&share, &ed25519_static());
+		assert!(collapses);
+		Ok(())
+	}
+	cases {
+		/// The share carries the key as X25519 writes it, with the top bit
+		/// clear.
+		with_its_top_bit_clear => |key| key,
+		/// The share carries the key with the top bit set.
+		with_its_top_bit_set => with_top_bit_set,
+	}
 }
 
 /// A hello whose share is u = 0, a point of small order, gives an all-zero
 /// agreement, so the server refuses it (RFC 8446 §7.4.2).
 #[tokio::test]
-async fn a_server_refuses_an_x25519_share_of_small_order() -> Result<(), Box<dyn Error>> {
-	let (mut client, mut server) = hpke_pair::<OnP384<X25519>>(p384_identity());
-	let hello = hello_carrying(client.start()?, &[0u8; 32])?;
+async fn a_server_refuses_an_x25519_share_of_small_order() -> TestResult {
+	let (mut client, mut server) = hpke_pair::<OnP384<X25519>>(p384_identity(SERVER_SEED));
+	let hello = hello_carrying(client.start()?, &[0u8; 32]);
 
 	let refused = server.reply(hello).await;
 	assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Refused))));
@@ -329,33 +349,34 @@ async fn a_server_refuses_an_x25519_share_of_small_order() -> Result<(), Box<dyn
 /// A server that answers with u = 0 signs a reply whose agreement is all
 /// zeros, so the client refuses it at `complete` (RFC 8446 §7.4.2).
 #[tokio::test]
-async fn a_client_refuses_an_x25519_reply_of_small_order() -> Result<(), Box<dyn Error>> {
-	let (mut client, mut server) = hpke_pair::<OnP384<X25519<SmallOrder>>>(p384_identity());
-	let reply = server.reply(client.start()?).await?;
+async fn a_client_refuses_an_x25519_reply_of_small_order() {
+	let (mut client, mut server) = hpke_pair::<OnP384<X25519<SmallOrder>>>(p384_identity(SERVER_SEED));
+	let reply = replied(&mut client, &mut server).await;
 
 	let refused = client.respond(reply).await;
 	assert!(matches!(refused, Err(HandshakeError::KeyExchange(KeyExchangeError::Refused))));
-	Ok(())
 }
 
 /// The HPKE flow runs under X25519.
 #[tokio::test]
-async fn x25519_runs_the_hpke_flow() -> Result<(), Box<dyn Error>> {
-	assert_eq!(hpke_opens::<OnP384<X25519>>().await?, CONTENT);
+async fn x25519_runs_the_hpke_flow() -> TestResult {
+	let opened = hpke_opens::<OnP384<X25519>>().await?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 
 /// The CMS flow runs under X25519.
 #[tokio::test]
-async fn x25519_runs_the_cms_flow() -> Result<(), Box<dyn Error>> {
-	assert_eq!(cms_opens::<OnP384<X25519>>().await?, CONTENT);
+async fn x25519_runs_the_cms_flow() -> TestResult {
+	let opened = cms_opens::<OnP384<X25519>>().await?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 
 /// A session under X25519 renews its epoch in band.
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 #[tokio::test]
-async fn x25519_renews_its_epoch() -> Result<(), Box<dyn Error>> {
+async fn x25519_renews_its_epoch() -> TestResult {
 	let renewed = super::super::renewal::renews_its_epoch::<OnP384<X25519>>(p384_identity).await?;
 	assert!(renewed);
 	Ok(())

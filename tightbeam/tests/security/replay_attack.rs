@@ -10,10 +10,15 @@
 //! the server (on every enabled backend: HPKE, CMS).
 //!
 //! ## Expected control
-//! The server MUST reject a replayed handshake message. The closing seals
-//! under a key of its own handshake and authenticates that handshake's
-//! transcript hash, so a fresh session MUST refuse a replayed closing by that
-//! binding (`SealedClosing(AuthenticatedAttribute)`).
+//! The server MUST reject a replayed handshake message. The closing carries
+//! the transcript hash of its own handshake as an authenticated attribute, so
+//! a fresh session refuses a replayed closing by that attribute
+//! (`SealedClosing(AuthenticatedAttribute)`) before any key runs. The
+//! `confidentiality` scenario shows the key of the seal.
+//!
+//! A closing that arrives again on the established session is a cleartext
+//! container where the session admits sealed records alone, so the session
+//! refuses it (`MissingEncryption`).
 //!
 //! ## References
 //! - CWE-294: Authentication Bypass by Capture-replay <https://cwe.mitre.org/data/definitions/294.html>
@@ -27,11 +32,14 @@ use tightbeam::{
 	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
+	transport::{EncryptedMessageIO, TransportError},
 	urn::Urn,
 	TightBeamError,
 };
 
-use crate::security::common::{expectation_failure, HandshakeBackendKind, SecurityThreatHarness};
+use crate::common::security::{expectation_failure, ServerMaterials};
+use crate::security::common::{HandshakeBackendKind, SecurityThreatHarness};
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, CLOSING_FRAME};
 
 #[cfg(feature = "testing-fault")]
 use tightbeam::testing::{error::TestingError, FaultModel};
@@ -142,18 +150,69 @@ job! {
 	}
 }
 
+tb_assert_spec! {
+	pub ReplayedClosingSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::TRANSPORT_ENVELOPE_REFUSED, exactly!(1), equals!("MissingEncryption"))
+		]
+	}
+}
+
+/// A live handshake of `kind` whose relay sends the closing twice. The server
+/// completes the handshake on the first, and its session refuses the second
+/// as a cleartext container where it admits sealed records alone.
+async fn a_replayed_closing_on_an_established_session_is_refused(
+	trace: &TraceCollector,
+	kind: HandshakeBackendKind,
+) -> Result<(), TightBeamError> {
+	let replay = AttackStep::new(CLOSING_FRAME, FrameEdit::Duplicate);
+	let handshake = LiveHandshake::new(kind, ServerMaterials::fixed())
+		.audit_server(trace)
+		.with_step(replay);
+	let (_client, mut server) = handshake.run().await?.established()?;
+
+	let refused = server.collect_step().await;
+	assert!(matches!(refused, Err(TransportError::MissingEncryption)));
+	Ok(())
+}
+
+tb_scenario! {
+	name: a_replayed_hpke_closing_on_an_established_session_is_refused,
+	spec: ReplayedClosingSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_replayed_closing_on_an_established_session_is_refused(&trace, HandshakeBackendKind::Hpke).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: a_replayed_cms_closing_on_an_established_session_is_refused,
+	spec: ReplayedClosingSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_replayed_closing_on_an_established_session_is_refused(&trace, HandshakeBackendKind::Cms).await
+		}
+	}
+}
+
 /// A fault that the trace injects at the spawn of a session fails the
 /// scenario that spawns it, with the injected error.
 #[cfg(feature = "testing-fault")]
 #[tokio::test]
-async fn a_fault_at_the_session_spawn_fails_the_scenario() -> Result<(), Box<dyn std::error::Error>> {
+async fn a_fault_at_the_session_spawn_fails_the_scenario() {
 	let spawn = SecurityThreatHarness::HARNESS_SPAWN_SESSION;
 	let fault = || TestingError::InvariantViolated;
 	let model = FaultModel::default().with_event_fault(spawn, fault, tightbeam::bps!(10000));
 	let trace = Arc::new(TraceCollector::new().with_fault_model(model));
 
 	let outcome = ReplayAttackScenario::run((trace, HandshakeBackendKind::Hpke)).await;
-	let injected = matches!(outcome, Err(TightBeamError::TestingError(TestingError::InvariantViolated)));
-	assert!(injected);
-	Ok(())
+	assert!(matches!(
+		outcome,
+		Err(TightBeamError::TestingError(TestingError::InvariantViolated))
+	));
 }

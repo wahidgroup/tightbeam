@@ -17,13 +17,12 @@
 
 use tightbeam::{
 	crypto::{
-		key::SigningKeySpec,
+		key::{Aes256GcmKeyProvider, SigningKeySpec},
 		profiles::DefaultCryptoProvider,
-		sign::ecdsa::Secp256k1SigningKey,
-		x509::{policy::PublicKeyPinning, CertificateSpec, KeyPurposes, PeerCertificate, Signing},
+		x509::{policy::PublicKeyPinning, CertificateSpec, PeerCertificate, Signing},
 	},
 	hex,
-	testing::TestCertificate,
+	testing::TestKey,
 };
 
 // These constants hold the certificate and key of Mission Control.
@@ -158,66 +157,25 @@ pub fn rover_pinning() -> PublicKeyPinning {
 /// signing under the house provider.
 pub type FrameSigner = PeerCertificate<Signing<DefaultCryptoProvider>>;
 
-/// The signer certificate of the node whose secret scalar is `key_bytes`:
-/// the fixture certificate that `TestIdentity::certified` pairs with the key
-/// to sign a frame.
-fn frame_signer(key_bytes: &[u8; 32]) -> FrameSigner {
-	let key = Secp256k1SigningKey::from_slice(key_bytes).expect("a DTN key is a valid secp256k1 scalar");
-	let signer = PeerCertificate::parse(TestCertificate::self_signed(&key), KeyPurposes::HOUSE.signer);
-	signer.expect("a fixture certificate asserts digitalSignature")
-}
-
-/// Mission Control's signer certificate.
-pub fn mission_control_signer() -> FrameSigner {
-	frame_signer(&MISSION_CONTROL_KEY_BYTES)
-}
-
-/// Earth Relay's signer certificate.
-pub fn earth_relay_signer() -> FrameSigner {
-	frame_signer(&EARTH_RELAY_KEY_BYTES)
-}
-
-/// Mars Relay's signer certificate.
-pub fn mars_relay_signer() -> FrameSigner {
-	frame_signer(&MARS_RELAY_KEY_BYTES)
-}
-
-/// Rover's signer certificate.
-pub fn rover_signer() -> FrameSigner {
-	frame_signer(&ROVER_KEY_BYTES)
-}
-
 // Mission Control and the rover share this encryption key.
 
 /// The key-encryption key Mission Control and the Rover share, which every
 /// node of the path holds by reference.
-pub type SharedCipher = std::sync::Arc<tightbeam::crypto::key::Aes256GcmKeyProvider>;
+pub type SharedCipher = std::sync::Arc<Aes256GcmKeyProvider>;
 
-/// Generate the key-encryption key that Mission Control and the rover share.
-/// Every node of the path holds it, so each relay satellite decrypts the
-/// frames it routes.
+/// The key-encryption key that Mission Control and the rover share, the public
+/// fixture key of `TestKey::insecure_fixed_cipher`. Every node of the path
+/// holds it, so each relay satellite decrypts the frames it routes.
 pub fn generate_shared_cipher() -> SharedCipher {
-	use tightbeam::crypto::key::Aes256GcmKeyProvider;
-	// The test uses a deterministic key. A production deployment exchanges or
-	// derives this key securely.
-	let key_bytes = hex!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-	let cipher = Aes256GcmKeyProvider::new(key_bytes.to_vec(), b"tb/test/dtn/kek/v1".to_vec());
-	std::sync::Arc::new(cipher.expect("32 octets is the key of AES-256 key wrap"))
+	let (_, cipher) = TestKey::insecure_fixed_cipher();
+	std::sync::Arc::new(cipher)
 }
 
 // These aliases give the Earth relay the prefix `EARTH` and the Mars relay the
 // prefix `SATELLITE`.
 
 #[allow(dead_code)]
-pub const EARTH_CERT: CertificateSpec = EARTH_RELAY_CERT;
-#[allow(dead_code)]
-pub const EARTH_KEY: SigningKeySpec = EARTH_RELAY_KEY;
-#[allow(dead_code)]
 pub const EARTH_SPKI: &[u8] = EARTH_RELAY_SPKI;
 
-#[allow(dead_code)]
-pub const SATELLITE_CERT: CertificateSpec = MARS_RELAY_CERT;
-#[allow(dead_code)]
-pub const SATELLITE_KEY: SigningKeySpec = MARS_RELAY_KEY;
 #[allow(dead_code)]
 pub const SATELLITE_SPKI: &[u8] = MARS_RELAY_SPKI;

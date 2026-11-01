@@ -23,18 +23,7 @@
 //! The approach rests on the information fidelity constraint
 //! `I(t) ∈ (0,1) for all t ∈ T`.
 
-#![cfg(all(
-	feature = "testing-csp",
-	feature = "testing-fdr",
-	feature = "std",
-	feature = "tcp",
-	feature = "tokio",
-	feature = "signature",
-	feature = "secp256k1",
-	feature = "sha3",
-	feature = "x509",
-	feature = "compress"
-))]
+#![cfg(all(feature = "testing-fdr", feature = "zstd"))]
 
 pub mod bms;
 pub mod certs;
@@ -57,3 +46,17 @@ pub mod servlets;
 pub mod storage;
 pub mod ultimate;
 pub mod workers;
+
+use core::borrow::Borrow;
+
+use tightbeam::policy::TransitStatus;
+use tightbeam::TightBeamError;
+
+/// The transit status that `error` refuses a frame with, when it carries one.
+pub fn transit_status_of(error: impl Borrow<TightBeamError>) -> Option<TransitStatus> {
+	let TightBeamError::TransportError(error) = error.borrow() else {
+		return None;
+	};
+
+	error.transit_status()
+}

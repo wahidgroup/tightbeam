@@ -4,11 +4,11 @@
 use std::io::{Error as IoError, ErrorKind};
 
 use proptest::prelude::*;
-use tokio::runtime::Builder;
 
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::TransitStatus;
+use tightbeam::runtime::rt;
 use tightbeam::transport::envelopes::{
 	GoAwayPackage, MuxCancelPackage, MuxCreditPackage, MuxDataPackage, MuxEndPackage, MuxOpenPackage, MuxPingPackage,
 	MuxStreamKind,
@@ -61,6 +61,9 @@ fn any_envelope() -> impl Strategy<Value = TransportEnvelope> {
 }
 
 /// A byte stream that replays `wire` and then reports end of file.
+///
+/// The blanket frame read under test reads bytes alone, and a replayed image
+/// hands it each length that the property draws.
 struct WireBytes {
 	wire: Vec<u8>,
 	read: usize,
@@ -71,10 +74,9 @@ impl AsyncByteRead for WireBytes {
 
 	async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
 		let end = self.read + buf.len();
-		let chunk = self
-			.wire
-			.get(self.read..end)
-			.ok_or(TransportError::IoError(IoError::from(ErrorKind::UnexpectedEof)))?;
+		let unread = self.wire.get(self.read..end);
+		let eof = TransportError::IoError(IoError::from(ErrorKind::UnexpectedEof));
+		let chunk = unread.ok_or(eof)?;
 		buf.copy_from_slice(chunk);
 		self.read = end;
 		Ok(())
@@ -83,10 +85,9 @@ impl AsyncByteRead for WireBytes {
 
 /// The frame the reader recovers from `wire` under `cap`, or the failure it
 /// refused the frame with. A refusal that names no failure reads as `None`.
-fn read_frame(wire: impl Into<Vec<u8>>, cap: usize) -> Result<Vec<u8>, Option<TransportFailure>> {
-	let mut stream = WireBytes { wire: wire.into(), read: 0 };
-	let runtime = Builder::new_current_thread().build().expect("a current-thread runtime builds");
-	runtime.block_on(stream.read_frame(cap)).map_err(|error| match error {
+fn read_frame(wire: impl AsRef<[u8]>, cap: usize) -> Result<Vec<u8>, Option<TransportFailure>> {
+	let mut stream = WireBytes { wire: wire.as_ref().to_vec(), read: 0 };
+	rt::block_on(stream.read_frame(cap)).map_err(|error| match error {
 		TransportError::OperationFailed(failure) => Some(failure),
 		_ => None,
 	})
@@ -109,7 +110,7 @@ proptest! {
 	) {
 		let cap = content.len() + headroom;
 		let wire = OctetString::new(content)?.to_der()?;
-		let read = read_frame(wire.clone(), cap);
+		let read = read_frame(&wire, cap);
 		prop_assert_eq!(read, Ok(wire));
 	}
 

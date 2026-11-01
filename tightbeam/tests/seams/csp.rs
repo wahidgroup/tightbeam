@@ -12,8 +12,9 @@ use tightbeam::testing::specs::composition::{
 };
 use tightbeam::testing::specs::csp::{Process, ProcessBuildError, ProcessSpec, State};
 use tightbeam::testing::ScenarioConfig;
-use tightbeam::trace::{ConsumedTrace, TraceCollector};
 use tightbeam::urn::Urn;
+
+use super::consumed_trace_of;
 
 /// The event that the `Send` process offers once.
 const SEND: Urn<'static> = tightbeam::urn!("outside", "event:csp/send");
@@ -55,39 +56,44 @@ impl CompositionSpec for SendBesideDone {
 	}
 }
 
-/// The trace of a run that records each of `labels` once, in order.
-fn run_of(labels: &[Urn<'static>]) -> ConsumedTrace {
-	let collector = TraceCollector::new();
-	for label in labels {
-		collector.event(label).expect("the run injects no fault").emit();
-	}
-
-	let mut trace = ConsumedTrace::new();
-	trace.populate_from_collector(&collector);
-	trace
-}
-
 /// Whether a scenario under `spec` finds the run of `labels` valid by its
 /// CSP layer, or `None` when the scenario holds no CSP layer.
 fn csp_verdict_of(spec: impl ProcessSpec + Send + Sync + 'static, labels: &[Urn<'static>]) -> Option<bool> {
 	let built = ScenarioConfig::builder().with_csp(spec).build();
 	let config = built.expect("the spec builds its process");
-	let verified = config.verify(&run_of(labels), Ok(()));
+	let verified = config.verify(&consumed_trace_of(labels.iter().cloned()), Ok(()));
 	let verdict = verified.expect("a scenario with no FDR layer verifies");
 	verdict.csp().map(|csp| csp.valid)
 }
 
-#[test]
-fn a_scenario_refuses_a_run_that_the_process_of_an_outside_spec_refuses() {
-	assert_eq!(csp_verdict_of(SendOnce, &[SEND, SEND]), Some(false));
+/// A function that answers the verdict of a scenario under one outside spec
+/// on the run of the labels it takes.
+type VerdictOf = fn(&[Urn<'static>]) -> Option<bool>;
+
+/// The verdict of a scenario under [`SendOnce`] on the run of `labels`.
+fn process_verdict(labels: &[Urn<'static>]) -> Option<bool> {
+	csp_verdict_of(SendOnce, labels)
 }
 
-#[test]
-fn a_scenario_refuses_a_run_that_an_outside_composition_refuses() {
-	assert_eq!(csp_verdict_of(SendBesideDone, &[DONE, DONE]), Some(false));
+/// The verdict of a scenario under [`SendBesideDone`] on the run of `labels`.
+fn composition_verdict(labels: &[Urn<'static>]) -> Option<bool> {
+	csp_verdict_of(SendBesideDone, labels)
 }
 
-#[test]
-fn a_scenario_admits_a_run_that_an_outside_composition_interleaves() {
-	assert_eq!(csp_verdict_of(SendBesideDone, &[DONE, SEND]), Some(true));
+// A scenario judges a run by the CSP layer that an outside spec builds.
+tightbeam::tb_cases! {
+	fn a_scenario_judges_a_run_by_an_outside_spec(
+		(verdict_of, labels, valid): (VerdictOf, &[Urn<'static>], bool)
+	) {
+		let verdict = verdict_of(labels);
+		assert_eq!(verdict, Some(valid));
+	}
+	cases {
+		/// The process of an outside spec refuses a second `Send`.
+		whose_process_refuses_a_repeat => (process_verdict, &[SEND, SEND], false),
+		/// An outside composition refuses a second `Done`.
+		whose_composition_refuses_a_repeat => (composition_verdict, &[DONE, DONE], false),
+		/// An outside composition admits `Done` beside `Send`.
+		whose_composition_admits_an_interleaving => (composition_verdict, &[DONE, SEND], true),
+	}
 }

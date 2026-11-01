@@ -18,6 +18,8 @@ use tightbeam::testing::fdr::{
 };
 use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, ProcessBuilder, State};
 
+use crate::fdr::spinning;
+
 /// A refinement checker that compares the failures and the divergences of the
 /// states each process reaches.
 struct OutsideChecker;
@@ -95,33 +97,18 @@ impl RefinementChecker for OutsideChecker {
 	}
 }
 
-/// A process whose hidden `t` and `u` take `S1` to `S2` and back, with the
-/// observable exit `b` at `S2`, so it can diverge after `a`.
-fn spinning() -> Result<Process, ProcessBuildError> {
-	Process::builder("Spinning")
-		.initial_state(State("S0"))
-		.add_observable(Event("a"))
-		.add_observable(Event("b"))
-		.add_hidden(Event("t"))
-		.add_hidden(Event("u"))
-		.add_transition(State("S0"), Event("a"), State("S1"))
-		.add_transition(State("S1"), Event("t"), State("S2"))
-		.add_transition(State("S2"), Event("u"), State("S1"))
-		.add_transition(State("S2"), Event("b"), State("S3"))
-		.add_terminal(State("S3"))
-		.build()
-}
-
 /// A process of observable events alone, which performs `a` and then `b`.
-fn steady() -> Result<Process, ProcessBuildError> {
-	Process::builder("Steady")
+fn steady() -> Process {
+	let built: Result<Process, ProcessBuildError> = Process::builder("Steady")
 		.initial_state(State("S0"))
 		.add_observable(Event("a"))
 		.add_observable(Event("b"))
 		.add_transition(State("S0"), Event("a"), State("S1"))
 		.add_transition(State("S1"), Event("b"), State("S2"))
 		.add_terminal(State("S2"))
-		.build()
+		.build();
+
+	built.expect("a process of two events builds")
 }
 
 /// The builder of a process that offers `a` at `Idle`, which leads to
@@ -135,9 +122,15 @@ fn idling_builder() -> ProcessBuilder {
 		.add_terminal(State("Done"))
 }
 
+/// The process of [`idling_builder`].
+fn idling() -> Process {
+	idling_builder().build().expect("the idling process builds")
+}
+
 /// The process of [`idling_builder`], which can also stop at `Idle`.
-fn accepting() -> Result<Process, ProcessBuildError> {
-	idling_builder().add_terminal(State("Idle")).build()
+fn accepting() -> Process {
+	let built = idling_builder().add_terminal(State("Idle")).build();
+	built.expect("the idling process builds with a second terminal state")
 }
 
 /// What the outside checker decided about `subject` against `spec`.
@@ -148,26 +141,26 @@ fn verdict_of(subject: &Process, spec: Process) -> FdrVerdict {
 	explorer.explore().expect("the run asks for no FMEA report")
 }
 
+/// The outside checker reads the divergence rule of tightbeam, so it finds
+/// the divergence after `a`, where `S1` and `S2` can spin.
 #[test]
-fn an_outside_checker_finds_a_divergence_through_the_divergence_rule() -> Result<(), ProcessBuildError> {
-	let subject = spinning()?;
+fn an_outside_checker_finds_a_divergence_through_the_divergence_rule() {
+	let subject = spinning();
 
-	let verdict = verdict_of(&subject, steady()?);
-
+	let verdict = verdict_of(&subject, steady());
 	let after_a = Some(vec![Event("a")]);
-	assert_eq!(verdict.divergence_refinement_witness, after_a, "`S1` and `S2` can spin");
-	Ok(())
+	assert_eq!(verdict.divergence_refinement_witness, after_a);
 }
 
+/// The outside checker reads the failure rule of tightbeam, so it finds that
+/// the subject can stop at `Idle` and refuse every event there.
 #[test]
-fn an_outside_checker_finds_an_accepting_refusal_through_the_failure_rule() -> Result<(), ProcessBuildError> {
-	let subject = accepting()?;
+fn an_outside_checker_finds_an_accepting_refusal_through_the_failure_rule() {
+	let subject = accepting();
 
-	let verdict = verdict_of(&subject, idling_builder().build()?);
-
+	let verdict = verdict_of(&subject, idling());
 	let every_event = Some((vec![], HashSet::from([Event("a"), Event("b")])));
-	assert_eq!(verdict.failures_refinement_witness, every_event, "it can stop at `Idle`");
-	Ok(())
+	assert_eq!(verdict.failures_refinement_witness, every_event);
 }
 
 /// A memoization cache that counts each read that finds a set under its key,
@@ -227,9 +220,11 @@ impl MemoizationCache for CountingCache {
 	}
 }
 
+/// A second checker reads the set that the first one stored in an outside
+/// cache, so the cache counts one store and one hit.
 #[test]
-fn a_second_checker_reads_the_set_that_an_outside_cache_holds() -> Result<(), ProcessBuildError> {
-	let process = steady()?;
+fn a_second_checker_reads_the_set_that_an_outside_cache_holds() {
+	let process = steady();
 	let config = Arc::new(FdrConfig::default());
 	let cache = Rc::new(RefCell::new(CountingCache::default()));
 	let mut first = DefaultRefinementChecker::new(&process, Arc::clone(&config), Rc::clone(&cache));
@@ -239,10 +234,5 @@ fn a_second_checker_reads_the_set_that_an_outside_cache_holds() -> Result<(), Pr
 	let (served, _complete) = second.compute_traces(&process, 8);
 
 	let counts = (cache.borrow().hits.get(), cache.borrow().stores);
-	assert_eq!(
-		(served, counts),
-		(computed, (1, 1)),
-		"the second checker reads the set that the first one stored"
-	);
-	Ok(())
+	assert_eq!((served, counts), (computed, (1, 1)));
 }

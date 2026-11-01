@@ -1,12 +1,25 @@
-//! The static certificate pair the transport suites share: a server and a
+//! The static certificate pair the transport tests share: a server and a
 //! client certificate, each self-issued over a fixed key with
 //! `digitalSignature` in its `keyUsage`, beside its key and a server's pin of
-//! the client's key.
+//! the client's key. The client's trust of the server, the client's identity,
+//! and the server's validators of the client derive from them.
+
+use std::sync::Arc;
 
 use tightbeam::crypto::key::SigningKeySpec;
-use tightbeam::crypto::x509::policy::PublicKeyPinning;
+use tightbeam::crypto::sign::ecdsa::Secp256k1;
+use tightbeam::crypto::sign::SigningIdentity;
+use tightbeam::crypto::x509::policy::{CertificateValidation, PublicKeyPinning};
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::hex;
+
+#[cfg(feature = "testing")]
+use tightbeam::crypto::x509::store::CertificateTrust;
+#[cfg(feature = "testing")]
+use tightbeam::x509::Certificate;
+
+#[cfg(feature = "testing")]
+use crate::common::security::combined_trust;
 
 /// The server certificate, `CN=Static Test Server`, over [`SERVER_KEY`].
 pub(crate) const SERVER_CERT: CertificateSpec = CertificateSpec::Pem(
@@ -36,11 +49,13 @@ V7HCKsAv0TojaTFaNWH+8VmvBnXlI3E8J0c=
 -----END CERTIFICATE-----"#,
 );
 
-/// The server's key, the scalar of 32 `0x01` octets.
+/// The server's key, the scalar of 32 `0x01` octets. It is the key of
+/// `TestKey::insecure_fixed_signing` and of `ServerMaterials`.
 pub(crate) const SERVER_KEY: SigningKeySpec =
 	SigningKeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
 
-/// The client's key, the scalar of 32 `0x02` octets.
+/// The client's key, the scalar of 32 `0x02` octets. It is the key of the
+/// static client alone.
 pub(crate) const CLIENT_KEY: SigningKeySpec =
 	SigningKeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
 
@@ -51,4 +66,24 @@ const CLIENT_SPKI: &[u8] = &hex!("3056301006072a8648ce3d020106052b8104000a034200
 /// A server's pin of the client's key, which admits the client certificate.
 pub(crate) fn client_pinning() -> PublicKeyPinning {
 	PublicKeyPinning::new([CLIENT_SPKI]).expect("the client pin is a SubjectPublicKeyInfo of a point")
+}
+
+/// The server's validators of its clients, which admit the client
+/// certificate alone through [`client_pinning`].
+pub(crate) fn client_validators() -> Vec<Arc<dyn CertificateValidation>> {
+	vec![Arc::new(client_pinning())]
+}
+
+/// The client's trust store, which anchors [`SERVER_CERT`].
+#[cfg(feature = "testing")]
+pub(crate) fn server_trust() -> Arc<dyn CertificateTrust> {
+	let certificate = Certificate::try_from(SERVER_CERT).expect("the server certificate is PEM of a certificate");
+	combined_trust(&[&certificate])
+}
+
+/// The client's identity: [`CLIENT_CERT`] over [`CLIENT_KEY`].
+pub(crate) fn client_identity() -> SigningIdentity {
+	let key = CLIENT_KEY.to_provider::<Secp256k1>();
+	let key = key.expect("the client key is a secp256k1 scalar");
+	SigningIdentity::from_spec(CLIENT_CERT, key).expect("the client key matches its certificate")
 }

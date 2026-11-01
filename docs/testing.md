@@ -287,7 +287,7 @@ The macro emits a unit struct with `Default` and `CompositionSpec`:
 | `fault_model`      | `Option<FaultModel>`          | `None`     | `testing-fault` | The faults that exploration injects                                     |
 | `fmea_config`      | `Option<FmeaConfig>`          | `None`     | `testing-fmea`  | The FMEA that a run with injected faults reports                        |
 
-The time budget covers the trace, failure, and divergence searches of a process, and the search of a spec for the traces of the subject. A search that spends it stops, and a check it cut short decides `Unknown`. With `fail_fast` off, a pass checks every spec, and the verdict keeps the witness of the last violation.
+The time budget covers the trace, failure, and divergence searches of a process, and the search of a spec for the traces of the subject. A search that spends it stops, and a check it cut short decides `Unknown`. A walk of one seed stops at 16,384 states, and a run with such a walk leaves each freedom that no seed refuted at `Unknown`. With `fail_fast` off, a pass checks every spec, and the verdict keeps the witness of the last violation.
 
 The specs and the fault model select the exploration:
 

@@ -115,6 +115,12 @@ impl EarthCommand {
 			mission_time_ms,
 		})
 	}
+
+	/// A standby command, which the Rover runs with no parameter.
+	pub fn standby() -> Self {
+		let command = Self::new(RoverCommand::Standby, MessagePriority::Standard, 0);
+		command.expect("a standby command has no parameter")
+	}
 }
 
 /// The rover command types, each encoded as a `u8` and its parameters.
@@ -132,6 +138,8 @@ pub enum RoverCommand {
 }
 
 impl RoverCommand {
+	/// The type of this command, as the `u8` of
+	/// [`EarthCommand::command_type`].
 	pub fn command_type(&self) -> u8 {
 		match self {
 			RoverCommand::CollectSample { .. } => 0,
@@ -141,6 +149,8 @@ impl RoverCommand {
 		}
 	}
 
+	/// The parameters of this command in the format of its type, with each
+	/// number in big-endian order.
 	pub fn encode_parameters(&self) -> Vec<u8> {
 		match self {
 			RoverCommand::CollectSample { location } => location.as_bytes().to_vec(),
@@ -215,11 +225,18 @@ impl FrameRequest {
 			last_received_hash: OctetString::new(last_received_hash)?,
 		})
 	}
+
+	/// A request for the frames between two fixed test hashes.
+	pub fn sample() -> Self {
+		let request = Self::new([1; 32], [2; 32]);
+		request.expect("two hashes fit an OCTET STRING")
+	}
 }
 
 /// A response that carries the missing frames.
 #[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct FrameResponse {
+	/// The missing frames, in chain order.
 	pub frames: Vec<Frame>,
 }
 
@@ -272,15 +289,14 @@ impl MessageChainState {
 	/// The head of a chain that holds no frame.
 	pub const EMPTY_HEAD: [u8; 32] = [0u8; 32];
 
+	/// The state of an empty chain of the node `node_id`.
 	pub fn new(node_id: impl Into<String>) -> Self {
 		let node_id: String = node_id.into();
 		Self { last_hash: Self::EMPTY_HEAD, sequence: 0, node_id }
 	}
 
-	/// Sets the chain head to `new_hash` and advances the sequence by one.
-	/// Test scenarios may call it to set the chain state by hand, so it can go
-	/// unused.
-	#[allow(dead_code)]
+	/// Sets the chain head to `new_hash` and advances the sequence by one, up
+	/// to the last order.
 	pub fn update(&mut self, new_hash: [u8; 32]) {
 		self.last_hash = new_hash;
 		self.sequence = self.sequence.saturating_add(1);
@@ -345,8 +361,11 @@ impl MessageChainState {
 /// message chain.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConsensusValidator {
+	/// The chain state of the Rover.
 	pub rover_state: MessageChainState,
+	/// The chain state of the node on Earth.
 	pub earth_state: MessageChainState,
+	/// The chain state of the relay.
 	pub relay_state: MessageChainState,
 }
 
@@ -397,12 +416,13 @@ impl Default for ConsensusValidator {
 	}
 }
 
-#[cfg(test)]
 mod tests {
 	use tightbeam::der::{asn1::Any, Decode, Encode, Tag, Tagged};
 	use tightbeam::tb_cases;
 
 	use super::*;
+	use crate::common::dedup::HarnessFrame;
+	use crate::common::result::TestResult;
 	use crate::dtn::storage::DtnPayload;
 	use crate::dtn::workers::messages::{InstrumentSelection, TelemetryBuildRequest};
 	use crate::dtn::workers::mission_control_telemetry_handler::NextCommand;
@@ -428,16 +448,6 @@ mod tests {
 	fn sample_command() -> EarthCommand {
 		let command = RoverCommand::ProbeLocation { x: 100, y: 200 };
 		EarthCommand::new(command, MessagePriority::Standard, 1).expect("two coordinates fit")
-	}
-
-	/// A sample request for the frames past a gap.
-	fn sample_frame_request() -> FrameRequest {
-		FrameRequest::new([1; 32], [2; 32]).expect("two hashes fit")
-	}
-
-	/// A sample payload of the multi-hop tests.
-	fn sample_payload() -> DtnPayload {
-		DtnPayload::new(b"payload", "Earth", "Mars", 0).expect("a short payload fits")
 	}
 
 	/// A sample instrument selection with its sample data.
@@ -482,9 +492,9 @@ mod tests {
 				tags_of(&sample_command()),
 				vec![Tag::Integer, Tag::OctetString, Tag::Enumerated, Tag::Integer],
 			),
-			frame_request => (tags_of(&sample_frame_request()), vec![Tag::OctetString, Tag::OctetString]),
+			frame_request => (tags_of(&FrameRequest::sample()), vec![Tag::OctetString, Tag::OctetString]),
 			dtn_payload => (
-				tags_of(&sample_payload()),
+				tags_of(&DtnPayload::carrying(b"payload")),
 				vec![Tag::OctetString, Tag::Utf8String, Tag::Utf8String, Tag::Integer],
 			),
 			instrument_selection => (
@@ -501,22 +511,21 @@ mod tests {
 
 	/// A chain at the last order refuses each next frame.
 	#[test]
-	fn a_chain_at_the_last_order_refuses_a_frame() -> Result<(), TightBeamError> {
+	fn a_chain_at_the_last_order_refuses_a_frame() -> TestResult {
 		let mut chain = MessageChainState::new("node");
 		chain.sequence = u64::MAX;
 
-		let frame = tightbeam::compose! { V0: id: "frame-1", order: 1, message: sample_payload() }?;
+		let frame = HarnessFrame::at("frame-1", 1, "payload");
 		assert!(!chain.validate_frame(&frame)?);
 		Ok(())
 	}
 
 	/// An update at the last order leaves the sequence there.
 	#[test]
-	fn an_update_at_the_last_order_leaves_the_sequence_there() -> Result<(), TightBeamError> {
+	fn an_update_at_the_last_order_leaves_the_sequence_there() {
 		let mut chain = MessageChainState::new("node");
 		chain.sequence = u64::MAX;
 		chain.update([1; 32]);
 		assert_eq!(chain.sequence, u64::MAX);
-		Ok(())
 	}
 }

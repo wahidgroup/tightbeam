@@ -286,6 +286,8 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(2)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, absent!()),
 			(events::CLUSTER_GOSSIP_ADMITTED, exactly!(9)),
 			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(3)),
 			(events::CLUSTER_GOSSIP_ORIGIN_UNKNOWN, exactly!(2)),
@@ -301,6 +303,7 @@ tb_assert_spec! {
 // - Each side refuses the origin of the other once, so neither holds the
 //   rumors of the other, and the bridge then offers it no further rumor of
 //   that origin, at no cost to its score.
+// - Each side holds an advertised route of the bridge, which the refusals leave in place.
 // - The bridge's own rumor reaches both sides, because both trust the bridge.
 // - The nine admissions are three at "main", four at the bridge, and two at
 //   "third", and each side drops the echo of its own rumors as a duplicate.
@@ -331,6 +334,12 @@ tb_scenario! {
 			let third_joined = table_of_third.promote(bridge_addr, None, UnixMillis::now())?;
 			assert!(main_joined && third_joined, "each side admits the bridge as a verified peer");
 
+			let bridge = other.addr().to_string();
+			let slate = vec![servlet_urn("ping")];
+			let at_main = advertise_peer_signed(&ctx.main, &ctx.other.key, &main, &bridge, slate.clone()).await?;
+			let at_third = advertise_peer_signed(&ctx.third, &ctx.other.key, &third, &bridge, slate).await?;
+			assert_eq!((at_main, at_third), (TransitStatus::Ok, TransitStatus::Ok));
+
 			let replied = publish_at(&ctx.main, &main, b"bridge-main-1", 2).await?;
 			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
@@ -347,6 +356,9 @@ tb_scenario! {
 			assert_eq!(replied, TransitStatus::Ok, "the gateway admits the rumor");
 
 			wait_for_recorded(&trace, events::CLUSTER_GOSSIP_ADMITTED, 9).await;
+
+			let routes = (main.peer_routes()?.len(), third.peer_routes()?.len());
+			assert_eq!(routes, (1, 1));
 
 			other.stop();
 			third.stop();

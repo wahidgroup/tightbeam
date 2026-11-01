@@ -4,19 +4,36 @@
 //! - A trace that A wins refines the process.
 //! - A trace that scores a point after the game ends fails refinement.
 //! - A trace through deuce and advantage refines the process.
-//! - A partial game passes failures refinement.
+//! - A partial game refines the traces of the process.
+//!
+//! A recorded trace carries no refusals, so a model answers failures
+//! refinement: the process refines itself, and a scorer that stops mid-game
+//! keeps the traces of the process and breaks its failures.
 
 #![cfg(feature = "testing-fdr")]
 
 use core::error::Error;
+use std::collections::HashSet;
 
+use tightbeam::testing::fdr::{Decision, DefaultFdrExplorer, Failure, FdrConfig};
 use tightbeam::testing::macros::BuiltAssertSpec;
-use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, Expect, Layer, ScenarioConfig, SetupEnv};
+use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError};
+use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::urn::Urn;
-use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_cases, tb_process_spec, tb_scenario};
+
+use crate::common::result::TestResult;
 
 pub(crate) const POINTA: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointa");
 pub(crate) const POINTB: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointb");
+
+/// The bound of a failures check, which reaches Deuce and the advantage after
+/// it. The check compares each failure of the subject with the failures of
+/// the spec, so a longer bound adds work and reaches no new state.
+const GAME_DEPTH: usize = 8;
+
+/// The builder of a scorer model.
+type Scorer = fn() -> Result<Process, ProcessBuildError>;
 
 fn build_fdr_config(
 	specs: impl IntoIterator<Item = Process>,
@@ -194,11 +211,12 @@ tb_scenario! {
 	}
 }
 
-// Test 4: a partial game passes failures refinement.
+// Test 4: a partial game refines the traces of the process.
 
-// The partial game takes three points and stays open at (30,15).
+// The partial game takes three points and stays open at (30,15). A recorded
+// trace names no refusal, so its stop at an open score breaks no trace.
 tb_assert_spec! {
-	pub FailuresTennisSpec,
+	pub PartialGameSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
@@ -209,8 +227,8 @@ tb_assert_spec! {
 }
 
 tb_scenario! {
-	name: test_failures_refinement,
-	config: tennis_config(FailuresTennisSpec::latest(), Expect::Pass),
+	name: a_partial_game_refines_the_traces_of_the_process,
+	config: tennis_config(PartialGameSpec::latest(), Expect::Pass),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// The points go A, B, A, and the game stays open.
@@ -219,5 +237,73 @@ tb_scenario! {
 			trace.event(POINTA)?;
 			Ok(())
 		}
+	}
+}
+
+// Test 5: failures refinement reads what a scorer refuses.
+
+tb_process_spec! {
+	/// The scorer of [`TennisScorer`] that stops at (30,0), where the game is
+	/// open and each player can score. It performs no trace that the game
+	/// lacks, so its refusals alone tell it from the game.
+	pub StallingScorer,
+	events {
+		observable { POINTA, POINTB }
+		hidden { }
+	}
+	states {
+		S0_0 => { POINTA => S15_0, POINTB => S0_15 },
+		S15_0 => { POINTA => S30_0, POINTB => S15_15 },
+		S0_15 => { POINTA => S15_15, POINTB => S0_30 },
+		// The game offers two points here, and this scorer offers none.
+		S30_0 => {},
+		S15_15 => { POINTA => S30_15, POINTB => S15_30 },
+		S0_30 => { POINTA => S15_30, POINTB => S0_40 },
+		S30_15 => { POINTA => S40_15, POINTB => S30_30 },
+		S15_30 => { POINTA => S30_30, POINTB => S15_40 },
+		S0_40 => { POINTA => S15_40, POINTB => GameB },
+		S40_15 => { POINTA => GameA, POINTB => S40_30 },
+		S30_30 => { POINTA => S40_30, POINTB => S30_40 },
+		S15_40 => { POINTA => S30_40, POINTB => GameB },
+		S40_30 => { POINTA => GameA, POINTB => Deuce },
+		S30_40 => { POINTA => Deuce, POINTB => GameB },
+		Deuce => { POINTA => AdvantageA, POINTB => AdvantageB },
+		AdvantageA => { POINTA => GameA, POINTB => Deuce },
+		AdvantageB => { POINTA => Deuce, POINTB => GameB },
+		GameA => {},
+		GameB => {}
+	}
+	terminal { GameA, GameB }
+}
+
+/// The failure of [`StallingScorer`]: after two points of A, it refuses each
+/// point.
+fn stalled_at_thirty_love() -> Failure {
+	let (point_a, point_b) = (Event::from(POINTA), Event::from(POINTB));
+	(vec![point_a, point_a], HashSet::from([point_a, point_b]))
+}
+
+// Each scorer performs the traces of the game alone, so trace refinement holds
+// for each, and failures refinement tells a scorer that stops from the game.
+tb_cases! {
+	fn failures_refinement_reads_what_a_scorer_refuses(
+		(scorer, failures_refine, witness): (Scorer, Decision, Option<Failure>)
+	) -> TestResult {
+		let subject = scorer()?;
+		let specs = vec![TennisScorer::process()?];
+		let config = FdrConfig { specs, max_depth: GAME_DEPTH, ..FdrConfig::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore()?;
+		let decided = (verdict.trace_refines, verdict.failures_refines, verdict.failures_refinement_witness);
+		assert_eq!(decided, (Decision::Holds, failures_refine, witness));
+		Ok(())
+	}
+	cases {
+		/// The game offers what the game offers after each trace.
+		the_game_itself => (TennisScorer::process, Decision::Holds, None),
+		/// The stalling scorer refuses each point at (30,0), where the game
+		/// refuses none.
+		a_scorer_that_stops_mid_game => (StallingScorer::process, Decision::Refuted, Some(stalled_at_thirty_love())),
 	}
 }

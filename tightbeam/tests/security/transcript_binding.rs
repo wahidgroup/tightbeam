@@ -1,39 +1,32 @@
 //! # Transcript-binding downgrade threat
 //!
 //! ## Weakness
-//! Suppose the HPKE reply signs a transcript that omits the negotiated
-//! `security_accept` and covers only
-//! `client_random || server_random || server_public_key`. The signed transcript
-//! then leaves the chosen profile unauthenticated, so negotiation is unbound.
+//! The `security_accept` of an HPKE reply travels inside the `ServerHandshake`
+//! that the reply signs as its content, so the reply signature refuses a
+//! swapped accept, and the transcript adds nothing there.
 //!
-//! Likewise, if the transcript binds only the client *random* and omits the
-//! full `ClientHello`, an attacker can rewrite the client's `SecurityOffer`
-//! in transit.
+//! The offer is another matter: if the transcript binds only the client
+//! *random* and omits the full `ClientHello`, a MITM can forge the client's
+//! `SecurityOffer` in transit, and the server signs a transcript over the hello
+//! it received.
 //!
 //! ## Attack
-//! 1. An adversary-in-the-middle rewrites `security_accept` inside the reply's
-//!    `ServerHandshake` to a weaker profile in transit. The randoms, the
-//!    certificate, and the server signature stay untouched, so the signature
-//!    over an unbound transcript verifies, and a client that offered the
-//!    weaker profile adopts it.
-//! 2. The MITM strips or rewrites the `SecurityOffer` inside `ClientHello`
-//!    and keeps `client_random`. The server signs a transcript over the
-//!    modified hello. If the client bound only its random, the signature
-//!    verifies, so negotiation ran over an offer the client never made.
+//! The MITM changes the `SecurityOffer` inside `ClientHello` and keeps
+//! `client_random` and the client ephemeral.
 //!
 //! The live client of this scenario sends no `SecurityOffer`, and its server
-//! runs the strong profile alone. So no endpoint offers the weak profile of
-//! step 1, and the rewrite of step 2 adds an offer of the strong profile. A
-//! transcript that leaves out the accept or the hello lets the reply signature
-//! verify, so the scenario fails on its count of `signature` refusals.
+//! runs the strong profile alone, so the MITM adds an offer of that profile,
+//! and the server selects what it selects without one. The reply then differs
+//! from an honest run in its transcript alone.
 //!
 //! ## Expected control
-//! The signed transcript MUST authenticate the negotiated parameters. The
-//! client MUST reject a `security_accept` it did not receive under signature,
-//! and MUST reject a server signature computed over a `ClientHello` that
-//! differs from the exact DER bytes it sent (TLS-style full-message binding).
+//! The signed transcript MUST authenticate the hello as the client sent it, so
+//! the client MUST reject a server signature computed over a `ClientHello`
+//! that differs from the exact DER bytes it sent (TLS-style full-message
+//! binding). The refusal is `SignatureVerificationFailed`.
 //!
-//! Each case fails the signature of the reply (`SignatureVerificationFailed`).
+//! A transcript that leaves out the hello lets the reply signature verify and
+//! the handshake complete, which the scenario fails on.
 //!
 //! ## References
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
@@ -51,27 +44,20 @@ use tightbeam::{
 	job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{
-		negotiation::{SecurityAccept, SecurityOffer},
-		ClientHello, HandshakeMessage,
-	},
-	transport::wire_der::WireDer,
+	transport::handshake::{negotiation::SecurityOffer, ClientHello, HandshakeMessage},
 	TightBeamError,
 };
 
-use crate::common::security::{
-	carried_hello, expectation_failure, hello_opening, rewritten_reply, signed_handshake, strong_security_profile,
-	weak_security_profile, ServerMaterials,
-};
-use crate::security::common::HandshakeBackendKind;
-use crate::security::live::{AttackStep, FrameEdit, FrameSlot, LiveHandshake, OPENING_FRAME, REPLY_FRAME};
+use crate::common::security::{carried_hello, expectation_failure, hello_opening, ServerMaterials};
+use crate::security::common::{strong_security_profile, HandshakeBackendKind};
+use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, OPENING_FRAME};
 
 tb_assert_spec! {
 	pub TranscriptBindingSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(events::SESSION_CERT_REJECTED, exactly!(2u32), equals!("signature"))
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature"))
 		]
 	}
 }
@@ -83,12 +69,11 @@ tb_process_spec! {
 		hidden { }
 	}
 	states {
-		Idle => { events::SESSION_CERT_REJECTED => AcceptBound },
-		AcceptBound => { events::SESSION_CERT_REJECTED => Done },
+		Idle => { events::SESSION_CERT_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Transcript binding: negotiated profile and client offer must be authenticated" }
+	annotations { description: "Transcript binding: the client offer must be authenticated" }
 }
 
 tb_scenario! {
@@ -104,42 +89,28 @@ tb_scenario! {
 	}
 }
 
-/// `reply` with its `security_accept` rewritten to the weak profile. The
-/// randoms, the certificate, and the signature stay unchanged.
-fn weaken_accept(reply: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
-	let mut server_handshake = signed_handshake(reply.to_owned());
-	let accepted = server_handshake.security_accept.as_ref().map(|accept| accept.value().profile);
-	if accepted != Some(strong_security_profile()) {
-		return Err(expectation_failure("server must select the strong profile"));
-	}
-
-	server_handshake.security_accept = Some(WireDer::new(SecurityAccept::new(weak_security_profile()))?);
-	Ok(rewritten_reply(reply, &server_handshake))
-}
-
 /// `opening` with the `SecurityOffer` field of its ClientHello set to an
-/// offer of the strong profile alone. The rewrite keeps `client_random` and
-/// the client ephemeral.
-fn rewrite_offer(opening: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
+/// offer of the strong profile alone, as a MITM forges it. The hello keeps its
+/// `client_random` and its client ephemeral.
+fn forge_offer(opening: HandshakeMessage) -> Result<HandshakeMessage, TightBeamError> {
 	let client_hello = carried_hello(opening);
-	let mut rewritten = ClientHello::from_der(&client_hello)?;
-	rewritten.security_offer = Some(SecurityOffer::new(vec![strong_security_profile()]));
-	if rewritten.to_der()? == client_hello {
-		return Err(expectation_failure("offer rewriting must change ClientHello bytes"));
+	let mut forged = ClientHello::from_der(&client_hello)?;
+	forged.security_offer = Some(SecurityOffer::new(vec![strong_security_profile()]));
+	if forged.to_der()? == client_hello {
+		return Err(expectation_failure("the forged offer must change the ClientHello bytes"));
 	}
 
-	Ok(hello_opening(&rewritten))
+	Ok(hello_opening(&forged))
 }
 
-/// A live HPKE handshake over `materials` whose relay applies `rewrite` to
-/// the frame at `slot`, and whose client files its verdict in `trace`.
-fn rewritten_at(
+/// A live HPKE handshake over `materials` whose relay forges the opening
+/// through `forge`, and whose client files its verdict in `trace`.
+fn forged_opening(
 	materials: &ServerMaterials,
 	trace: &TraceCollector,
-	slot: FrameSlot,
-	rewrite: fn(HandshakeMessage) -> Result<HandshakeMessage, TightBeamError>,
+	forge: fn(HandshakeMessage) -> Result<HandshakeMessage, TightBeamError>,
 ) -> LiveHandshake {
-	let step = AttackStep::new(slot, FrameEdit::Rewrite(Box::new(rewrite)));
+	let step = AttackStep::new(OPENING_FRAME, FrameEdit::Rewrite(Box::new(forge)));
 	let handshake = LiveHandshake::new(HandshakeBackendKind::Hpke, materials.to_owned());
 	handshake.audit_client(trace).with_step(step)
 }
@@ -147,17 +118,11 @@ fn rewritten_at(
 job! {
 	name: TranscriptBindingScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		let materials = ServerMaterials::generate();
+		let materials = ServerMaterials::fixed();
 
-		// Phase 1: A MITM downgrade swaps the accepted profile. The reply signs
-		// a transcript that differs from the client's, so its signature fails.
-		let outcome = rewritten_at(&materials, &trace, REPLY_FRAME, weaken_accept).run().await?;
-		outcome.refused_by_client("client accepted a tampered, unauthenticated security_accept")?;
-
-		// Phase 2: A MITM rewrites the SecurityOffer field of the ClientHello.
-		// A random-only transcript would verify over the rewrite, so the
-		// binding of the full ClientHello DER must make the client reject it.
-		let outcome = rewritten_at(&materials, &trace, OPENING_FRAME, rewrite_offer).run().await?;
-		outcome.refused_by_client("client accepted a signature over a rewritten ClientHello")
+		// A MITM changes the SecurityOffer field of the ClientHello. The
+		// transcript binds the full ClientHello DER, so the client refuses.
+		let outcome = forged_opening(&materials, &trace, forge_offer).run().await?;
+		outcome.refused_by_client("client accepted a signature over a forged ClientHello")
 	}
 }

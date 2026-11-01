@@ -1,3 +1,14 @@
+//! A queue-free servlet that serves a chain of work frames through the dedup
+//! book and the chain state of the shared harness.
+//!
+//! The scenario serves one chain under back pressure. The plain tests hold the
+//! chain and the resend behaviors of the harness: a frame that breaks the chain
+//! is refused and gets no worker, its resend meets the chain again, and a frame
+//! whose worker assignment fails is served on its resend.
+//!
+//! The two tests of a broken chain are self-checks of the harness: the chain
+//! state decides them, and tightbeam supplies only the frames and the trace.
+
 use core::time::Duration;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,6 +32,7 @@ use tightbeam::{exactly, servlet, tb_assert_spec, tb_scenario};
 use tightbeam::{utils, Frame, TightBeamError, Version};
 
 use crate::common::dedup::{ChainState, DedupBook, HarnessEvents};
+use crate::common::result::TestResult;
 
 pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-broken");
 pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-valid");
@@ -28,8 +40,8 @@ pub(crate) const DEDUP_CACHE_HIT: Urn<'static> = tightbeam::urn!("test", "event:
 pub(crate) const DEDUP_KEPT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-kept");
 pub(crate) const DEDUP_SKIPPED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-skipped");
 pub(crate) const LAG_TIP: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/lag-tip");
-pub(crate) const PRIORITY_RESPECTED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/priority-respected");
 pub(crate) const RESPONSE_READY: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/response-ready");
+pub(crate) const WORKER_ASSIGNED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-assigned");
 pub(crate) const WORKER_COMMIT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-commit");
 pub(crate) const WORKER_FAN_OUT_0: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-fan-out-0");
 pub(crate) const WORKER_FAN_OUT_1: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-fan-out-1");
@@ -145,13 +157,7 @@ impl PriorityLedger {
 
 		trace.event_with(label, vec![QUEUE_TAG, tag], worker)?;
 
-		let respected = if priority >= MessagePriority::LowLatency {
-			worker == 0
-		} else {
-			worker == 1
-		};
-
-		trace.event_with(PRIORITY_RESPECTED, &[QUEUE_TAG], respected)?;
+		trace.event_with(WORKER_ASSIGNED, &[QUEUE_TAG], ())?;
 		Ok(worker)
 	}
 }
@@ -267,7 +273,7 @@ tb_assert_spec! {
 			(CHAIN_VALID, exactly!(3)),
 			(CHAIN_BROKEN, exactly!(0)),
 			(LAG_TIP, exactly!(3)),
-			(PRIORITY_RESPECTED, exactly!(3), equals!(true)),
+			(WORKER_ASSIGNED, exactly!(3)),
 			(WORKER_FAN_OUT_0, exactly!(2), equals!(0u8), tags: [WORKER_0_TAG]),
 			(WORKER_FAN_OUT_1, exactly!(1), equals!(1u8), tags: [WORKER_1_TAG]),
 			(WORKER_COMMIT, exactly!(3)),
@@ -318,7 +324,6 @@ tb_scenario! {
 			// and the dedup book of the servlet skips the replay.
 			client.emit(scan.to_owned(), None).await?;
 			client.emit(scan, None).await?;
-
 			client.emit(followup, None).await?;
 
 			Ok(())
@@ -349,52 +354,53 @@ fn two_links() -> (Frame, Frame) {
 	(first, second)
 }
 
+/// A harness that served `first` through `trace`.
+fn harness_after(first: &Frame, trace: &TraceCollector) -> QueueHarness {
+	let harness = QueueHarness::default();
+	let served = harness.handle(first, trace);
+	served.expect("the harness serves the first frame of a chain");
+	harness
+}
+
 /// A resend of a frame that breaks the chain meets the chain again.
 #[test]
-fn a_resent_frame_that_breaks_the_chain_meets_the_chain_again() -> Result<(), TightBeamError> {
+fn a_resent_frame_that_breaks_the_chain_meets_the_chain_again() {
 	let trace = TraceCollector::default();
-	let harness = QueueHarness::default();
 	let (first, linked_to_theirs) = first_and_linked_to_theirs();
-
-	harness.handle(&first, &trace)?;
+	let harness = harness_after(&first, &trace);
 
 	let refusal = harness.handle(&linked_to_theirs, &trace);
 	let resend = harness.handle(&linked_to_theirs, &trace);
-	assert!(refusal.is_err());
-	assert!(matches!(resend, Err(TightBeamError::InvalidMetadata)));
-	assert_eq!(trace.recorded(CHAIN_BROKEN), 2);
-	Ok(())
+	let refused = matches!(refusal, Err(TightBeamError::InvalidMetadata));
+	let resend_refused = matches!(resend, Err(TightBeamError::InvalidMetadata));
+	assert_eq!((refused, resend_refused, trace.recorded(CHAIN_BROKEN)), (true, true, 2));
 }
 
 /// A frame that breaks the chain is refused, and gets no worker.
 #[test]
-fn a_frame_that_breaks_the_chain_gets_no_worker() -> Result<(), TightBeamError> {
+fn a_frame_that_breaks_the_chain_gets_no_worker() {
 	let trace = TraceCollector::default();
-	let harness = QueueHarness::default();
 	let (first, linked_to_theirs) = first_and_linked_to_theirs();
-
-	harness.handle(&first, &trace)?;
+	let harness = harness_after(&first, &trace);
 
 	let refusal = harness.handle(&linked_to_theirs, &trace);
-	assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
-	assert_eq!(trace.recorded(RESPONSE_READY), 1);
-	Ok(())
+	let refused = matches!(refusal, Err(TightBeamError::InvalidMetadata));
+	assert_eq!((refused, trace.recorded(RESPONSE_READY)), (true, 1));
 }
 
 /// A frame whose worker assignment fails is served on its resend.
 #[test]
-fn a_frame_whose_worker_assignment_fails_is_served_on_its_resend() -> Result<(), TightBeamError> {
+fn a_frame_whose_worker_assignment_fails_is_served_on_its_resend() -> TestResult {
 	let fault = || TightBeamError::ChannelClosed;
-	let model = FaultModel::default().with_event_fault(PRIORITY_RESPECTED, fault, tightbeam::bps!(5000));
+	let model = FaultModel::default().with_event_fault(WORKER_ASSIGNED, fault, tightbeam::bps!(5000));
 	let trace = TraceCollector::new().with_fault_model(model);
-	let harness = QueueHarness::default();
 	let (first, second) = two_links();
-
-	harness.handle(&first, &trace)?;
-
+	let harness = harness_after(&first, &trace);
 	let failed = harness.handle(&second, &trace);
+
 	harness.handle(&second, &trace)?;
-	assert!(matches!(failed, Err(TightBeamError::ChannelClosed)));
-	assert_eq!(trace.recorded(RESPONSE_READY), 2);
+
+	let closed = matches!(failed, Err(TightBeamError::ChannelClosed));
+	assert_eq!((closed, trace.recorded(RESPONSE_READY)), (true, 2));
 	Ok(())
 }

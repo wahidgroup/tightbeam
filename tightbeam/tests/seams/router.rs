@@ -11,6 +11,8 @@ use tightbeam::der::Sequence;
 use tightbeam::router::{CleartextFrame, Result as RouteResult, RouterError, RouterPolicy};
 use tightbeam::{compose, Beamable, Message, Version};
 
+use crate::common::result::TestResult;
+
 /// A reading of any version.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 struct Reading {
@@ -43,10 +45,9 @@ impl RouterPolicy for CountingRouter {
 /// A frame at the minimum version of its type passes the decode of an
 /// outside policy.
 #[test]
-fn an_outside_policy_decodes_a_frame_at_the_minimum_of_its_type() -> Result<(), Box<dyn std::error::Error>> {
+fn an_outside_policy_decodes_a_frame_at_the_minimum_of_its_type() -> TestResult {
 	let router = CountingRouter::default();
 	let frame = compose! { V2: id: "reading", order: 1u64, message: RecentReading { value: 7 } }?;
-
 	router.dispatch::<RecentReading>(Arc::new(frame))?;
 	assert_eq!(router.delivered.load(Ordering::Relaxed), 1);
 	Ok(())
@@ -55,7 +56,7 @@ fn an_outside_policy_decodes_a_frame_at_the_minimum_of_its_type() -> Result<(), 
 /// The decode of an outside policy refuses a frame below the minimum version
 /// of its type.
 #[test]
-fn an_outside_policy_refuses_a_frame_below_the_minimum_of_its_type() -> Result<(), Box<dyn std::error::Error>> {
+fn an_outside_policy_refuses_a_frame_below_the_minimum_of_its_type() -> TestResult {
 	let router = CountingRouter::default();
 	let frame = compose! { V1: id: "reading", order: 1u64, message: Reading { value: 7 } }?;
 

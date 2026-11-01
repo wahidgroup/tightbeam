@@ -9,7 +9,6 @@
 //! - both handshake flows, under mutual authentication, and
 //! - an in-band renewal of a multiplexed session over TCP.
 
-use std::error::Error;
 use std::sync::Arc;
 
 use tightbeam::crypto::exchange::Ecdhe;
@@ -17,20 +16,21 @@ use tightbeam::crypto::hpke::{HkdfSha256, KEM_DHKEM_SECP256K1_HKDF_SHA256};
 use tightbeam::crypto::k256::Secp256k1;
 use tightbeam::crypto::profiles::SecurityProfileDesc;
 use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::crypto::x509::policy::DirectTrustValidator;
-use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::der::asn1::ObjectIdentifier;
 use tightbeam::der::Encode;
 use tightbeam::testing::unhex;
-use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
-	Client, ClientConfig, Cms, CmsClientSettings, CmsServerSettings, Handshake, Hpke, HpkeClientSettings,
-	HpkeServerSettings, LearnedTrust, PeerAuthentication, ProvisionedTrust, Server, ServerConfig, ServerFlow,
-	SupportedProfiles,
+	Client, Cms, CmsServerSettings, Handshake, Hpke, HpkeServerSettings, PeerAuthentication, ProvisionedTrust, Server,
+	ServerConfig, ServerFlow,
 };
 
 use super::p384::{p384_cms_server, p384_identity, OnP384, OnP384Profile};
-use super::{admitted_and_opened, AgreementBackend, OutsideCmsServer, OutsideKem, OutsideKemOid, CONTENT};
+use super::{
+	admitted_and_opened, cms_client, native_server, AgreementBackend, OutsideCmsServer, OutsideKem, OutsideKemOid,
+	CLIENT_SEED, CONTENT, SERVER_SEED,
+};
+use crate::common::result::TestResult;
+use crate::common::security::{hpke_client_config_presenting, pinning_validator};
 
 /// The secp256k1 KEM of the outside arc.
 impl OutsideKemOid for Secp256k1 {
@@ -50,13 +50,6 @@ type MixedProfile = OnP384Profile<Ecdhe<Secp256k1>>;
 /// agreement on secp256k1, which brings [`MixedKem`].
 type MixedProvider = OnP384<Ecdhe<Secp256k1>, MixedKem>;
 
-/// The authentication of a server that admits `client` alone.
-fn admitting(client: &SigningIdentity) -> PeerAuthentication {
-	let pinned = DirectTrustValidator::default().with_trust_chain([client.certificate().to_owned()]);
-	let pinned = pinned.expect("an outside certificate encodes");
-	PeerAuthentication::Anonymous.and(Arc::new(pinned))
-}
-
 /// The configuration of a server of `flow` that holds `identity` and admits
 /// `client` alone.
 fn mutual_server<F: ServerFlow<MixedProvider>>(
@@ -64,11 +57,8 @@ fn mutual_server<F: ServerFlow<MixedProvider>>(
 	identity: F::Identity,
 	client: &SigningIdentity,
 ) -> ServerConfig<F, MixedProvider> {
-	let native = RunnableProfile::<MixedProvider>::native().descriptor();
-	let profiles = SupportedProfiles::from(native);
-	let config = ServerConfig::<F, MixedProvider>::new(flow, identity, profiles, KeyPurposes::HOUSE);
-	let mut config = config.expect("an outside server identity serves the server role");
-	config.peer_authentication = admitting(client);
+	let mut config = native_server::<F, MixedProvider>(flow, identity);
+	config.peer_authentication = PeerAuthentication::Anonymous.and(pinning_validator(client.certificate()));
 	config
 }
 
@@ -78,12 +68,9 @@ fn mutual_hpke_pair(
 	server: SigningIdentity,
 	client: SigningIdentity,
 ) -> (Handshake<Client, Hpke, MixedProvider>, Handshake<Server, Hpke, MixedProvider>) {
-	let pinned = DirectTrustValidator::default().with_trust_chain([server.certificate().to_owned()]);
+	let validator = pinning_validator(server.certificate());
 	let server_config = mutual_server::<Hpke>(HpkeServerSettings::new(), server, &client);
-	let trust = LearnedTrust::new(pinned.expect("an outside certificate encodes"));
-	let settings = HpkeClientSettings { trust, identity: Some(client) };
-	let client_config = ClientConfig::<Hpke, MixedProvider>::new(settings, KeyPurposes::HOUSE);
-	let client_config = client_config.expect("an outside client serves the client role");
+	let client_config = hpke_client_config_presenting::<MixedProvider>(validator, client);
 	(Handshake::client(client_config), Handshake::server(server_config))
 }
 
@@ -97,9 +84,7 @@ fn mutual_cms_pair(
 	let server_config = mutual_server::<Cms>(CmsServerSettings, server.pair, &client);
 	let trust = ProvisionedTrust::new(Arc::new(server.key_agreement), server.store);
 	let trust = trust.expect("the store admits the outside key-agreement certificate");
-	let settings = CmsClientSettings { trust, identity: client };
-	let client_config = ClientConfig::<Cms, MixedProvider>::new(settings, KeyPurposes::HOUSE);
-	let client_config = client_config.expect("an outside client serves the client role");
+	let client_config = cms_client::<MixedProvider>(trust, client);
 	(Handshake::client(client_config), Handshake::server(server_config))
 }
 
@@ -108,11 +93,12 @@ fn mutual_cms_pair(
 /// P-384 certificate, and the client's first record opens under the server's
 /// session keys.
 #[tokio::test]
-async fn a_p384_signer_runs_the_hpke_flow_over_secp256k1() -> Result<(), Box<dyn Error>> {
-	let client = p384_identity();
+async fn a_p384_signer_runs_the_hpke_flow_over_secp256k1() -> TestResult {
+	let client = p384_identity(CLIENT_SEED);
 	let expected = client.certificate().to_owned();
+	let pair = mutual_hpke_pair(p384_identity(SERVER_SEED), client);
 
-	let outcome = admitted_and_opened(mutual_hpke_pair(p384_identity(), client)).await?;
+	let outcome = admitted_and_opened(pair).await?;
 	assert_eq!(outcome, (Some(expected), CONTENT.to_vec()));
 	Ok(())
 }
@@ -122,12 +108,13 @@ async fn a_p384_signer_runs_the_hpke_flow_over_secp256k1() -> Result<(), Box<dyn
 /// server admits the client's P-384 certificate, and the client's first
 /// record opens under the server's session keys.
 #[tokio::test]
-async fn a_p384_signer_runs_the_cms_flow_over_secp256k1() -> Result<(), Box<dyn Error>> {
-	let client = p384_identity();
+async fn a_p384_signer_runs_the_cms_flow_over_secp256k1() -> TestResult {
+	let client = p384_identity(CLIENT_SEED);
 	let expected = client.certificate().to_owned();
 
-	let server = p384_cms_server::<MixedProvider, _>("mixed server", AgreementBackend::random());
-	let outcome = admitted_and_opened(mutual_cms_pair(server, client)).await?;
+	let server = p384_cms_server::<MixedProvider, _>("mixed server", AgreementBackend::fixed());
+	let pair = mutual_cms_pair(server, client);
+	let outcome = admitted_and_opened(pair).await?;
 	assert_eq!(outcome, (Some(expected), CONTENT.to_vec()));
 	Ok(())
 }
@@ -136,7 +123,7 @@ async fn a_p384_signer_runs_the_cms_flow_over_secp256k1() -> Result<(), Box<dyn 
 /// client holds an epoch receipt other than the receipt of its handshake.
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 #[tokio::test]
-async fn a_p384_signer_renews_its_epoch_over_secp256k1() -> Result<(), Box<dyn Error>> {
+async fn a_p384_signer_renews_its_epoch_over_secp256k1() -> TestResult {
 	let renewed = super::renewal::renews_its_epoch::<MixedProvider>(p384_identity).await?;
 	assert!(renewed);
 	Ok(())
@@ -148,7 +135,7 @@ const MIXED_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b06096086480165
 
 /// The descriptor of [`MixedProfile`] encodes as [`MIXED_DESCRIPTOR`].
 #[test]
-fn the_mixed_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+fn the_mixed_descriptor_encodes_as_its_known_der() -> TestResult {
 	let der = SecurityProfileDesc::from(&MixedProfile::default()).to_der()?;
 	assert_eq!(der, unhex(MIXED_DESCRIPTOR));
 	Ok(())

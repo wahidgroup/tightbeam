@@ -1,13 +1,14 @@
-//! Hive fixtures that the colony and payment scenarios share.
+//! The colony fixtures that the colony, payment, and seam suites share, in
+//! their plain tests and their scenarios.
 //!
-//! The hive and cluster suites of the colony also read the labels of their
-//! records here.
+//! They configure a scenario hive and its control plane, and name servlet
+//! types.
 
-use tightbeam::colony::hive::HiveConfig;
-
-#[cfg(feature = "instrument")]
-use tightbeam::trace::TraceCollector;
-#[cfg(feature = "instrument")]
+use tightbeam::colony::hive::{HiveConfig, HiveTlsConfig};
+use tightbeam::colony::urn::ColonyNamespace;
+use tightbeam::crypto::sign::SigningIdentity;
+use tightbeam::crypto::x509::KeyPurposes;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::urn::Urn;
 
 /// The base config of a scenario hive: the default config with the
@@ -22,13 +23,16 @@ pub fn scenario_hive_config() -> HiveConfig {
 	conf
 }
 
-/// The label of each record of `event` that `trace` filed, in the order the
-/// trace filed them.
-#[cfg(feature = "instrument")]
-pub fn recorded_labels(trace: &TraceCollector, event: Urn<'static>) -> Vec<Option<String>> {
-	let recorded = trace.drain_events().into_iter();
-	recorded
-		.filter(|record| record.urn == event)
-		.map(|record| record.label.as_deref().map(String::from))
-		.collect()
+/// The control-plane TLS of a hive that presents `identity` under the house
+/// key purposes, and that admits a client with no certificate.
+pub fn anonymous_hive_tls(identity: impl Into<SigningIdentity>) -> HiveTlsConfig {
+	let tls = HiveTlsConfig::from_identity(identity.into(), PeerAuthentication::Anonymous, KeyPurposes::HOUSE);
+	tls.expect("a fixture certificate admits the house signer purpose")
+}
+
+/// The type URN of the servlet `name` in the default colony namespace.
+pub fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+	let name = name.as_ref();
+	let urn = ColonyNamespace::default().servlet(name);
+	urn.expect("test names satisfy the mint grammar")
 }

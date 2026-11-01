@@ -2,13 +2,17 @@
 //!
 //! [`PaymentHarness`] answers each frame once through the shared dedup book
 //! and chain state of `common::dedup`.
+//!
+//! The tests of this module are self-checks of the harness. The payment
+//! scenarios rely on it, so a defect in it changes the verdict of a scenario.
 
 use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
-use super::messages::TransactionStatus;
 use crate::common::dedup::{ChainState, DedupBook, HarnessEvents};
+
+use super::messages::TransactionStatus;
 
 pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:harness/chain-broken");
 pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:harness/chain-valid");
@@ -75,41 +79,12 @@ impl PaymentHarness {
 
 // The unit tests of the harness.
 
-#[cfg(test)]
 mod tests {
-	use sha3::Sha3_256;
+	use crate::common::dedup::HarnessFrame;
+	use crate::common::result::TestResult;
+	use crate::payments::messages::PaymentIdentification;
 
 	use super::*;
-	use crate::payments::messages::PaymentIdentification;
-	use tightbeam::asn1::Version;
-	use tightbeam::builder::TypeBuilder;
-	use tightbeam::testing::TestMessage;
-	use tightbeam::utils;
-
-	fn test_frame(id: impl AsRef<[u8]>, order: u64) -> Frame {
-		let id = id.as_ref();
-		Version::V2
-			.compose()
-			.with_id(id)
-			.with_order(order)
-			.with_message(TestMessage::sample(None))
-			.build()
-			.expect("a V2 frame with an id and an order builds")
-	}
-
-	/// A frame at `order` that carries `content` and links to `previous`.
-	fn linked_frame(id: impl AsRef<[u8]>, order: u64, content: &str, previous: &Frame) -> Frame {
-		let previous = utils::digest::<Sha3_256>(previous.message()).expect("SHA3-256 digests a message");
-		let frame = Version::V2
-			.compose()
-			.with_id(id.as_ref())
-			.with_order(order)
-			.with_previous_hash(previous)
-			.with_message(TestMessage::sample(Some(content)))
-			.build();
-
-		frame.expect("a V2 frame with a previous frame builds")
-	}
 
 	/// The approval of a test payment under `code`.
 	fn approval(code: &str) -> TransactionStatus {
@@ -119,38 +94,43 @@ mod tests {
 
 	/// A frame whose `previous_frame` misses the last frame of the chain fails.
 	#[test]
-	fn a_frame_that_breaks_the_chain_fails() -> Result<(), TightBeamError> {
+	fn a_frame_that_breaks_the_chain_fails() -> TestResult {
 		let trace = TraceCollector::default();
 		let harness = PaymentHarness::default();
-		harness.answer(&test_frame(b"txn1", 1), &trace, || Ok(approval("AUTH1")))?;
+		let opening = HarnessFrame::at(b"txn1", 1, "the first transfer");
+		let unlinked = HarnessFrame::at(b"txn2", 2, "the second transfer");
+		harness.answer(&opening, &trace, || Ok(approval("AUTH1")))?;
 
-		let refusal = harness.answer(&test_frame(b"txn2", 2), &trace, || Ok(approval("AUTH2")));
+		let refusal = harness.answer(&unlinked, &trace, || Ok(approval("AUTH2")));
 		assert!(matches!(refusal, Err(TightBeamError::InvalidMetadata)));
 		Ok(())
 	}
 
 	/// A resend of a frame that broke the chain fails again at the chain check.
 	#[test]
-	fn a_resent_frame_that_breaks_the_chain_fails_again() -> Result<(), TightBeamError> {
+	fn a_resent_frame_that_breaks_the_chain_fails_again() -> TestResult {
 		let trace = TraceCollector::default();
 		let harness = PaymentHarness::default();
-		let broken = test_frame(b"txn2", 2);
-		harness.answer(&test_frame(b"txn1", 1), &trace, || Ok(approval("AUTH1")))?;
+		let opening = HarnessFrame::at(b"txn1", 1, "the first transfer");
+		let broken = HarnessFrame::at(b"txn2", 2, "the second transfer");
+		harness.answer(&opening, &trace, || Ok(approval("AUTH1")))?;
 
 		let first = harness.answer(&broken, &trace, || Ok(approval("AUTH2")));
 		let resend = harness.answer(&broken, &trace, || Ok(approval("AUTH2")));
-		assert!(first.is_err());
-		assert!(matches!(resend, Err(TightBeamError::InvalidMetadata)));
+		assert!(matches!(
+			(first, resend),
+			(Err(TightBeamError::InvalidMetadata), Err(TightBeamError::InvalidMetadata))
+		));
 		Ok(())
 	}
 
 	/// A frame whose response fails leaves the chain for its resend.
 	#[test]
-	fn a_frame_whose_response_fails_leaves_the_chain_for_its_resend() -> Result<(), TightBeamError> {
+	fn a_frame_whose_response_fails_leaves_the_chain_for_its_resend() -> TestResult {
 		let trace = TraceCollector::default();
 		let harness = PaymentHarness::default();
-		let first = test_frame(b"txn1", 1);
-		let second = linked_frame(b"txn2", 2, "the second transfer", &first);
+		let first = HarnessFrame::at(b"txn1", 1, "the first transfer");
+		let second = HarnessFrame::after(b"txn2", 2, "the second transfer", &first);
 
 		harness.answer(&first, &trace, || Ok(approval("AUTH1")))?;
 

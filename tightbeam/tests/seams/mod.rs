@@ -12,7 +12,7 @@
 //! | A signing backend | [`SigningKeyProvider`] |
 //! | A key-agreement backend that runs its own scalar product | [`DiffieHellman`] |
 //! | AES-128-GCM under a cipher type of its own | [`ContentEncryption`] |
-//! | A key wrap with `wrap` and `unwrap` alone | [`KeyWrapAlgorithm`] |
+//! | A key wrap with `wrap` and `unwrap` alone, which [`OutsideWrapProvider`] names | [`KeyWrapAlgorithm`] |
 //!
 //! These suites run under the outside provider:
 //!
@@ -89,7 +89,12 @@ mod trust;
 mod urn;
 mod worker;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+#[cfg(feature = "colony")]
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+use std::net::SocketAddr;
 
 use tightbeam::asn1::GcmParameters;
 use tightbeam::builder::frame::FrameBuilder;
@@ -133,16 +138,41 @@ use tightbeam::marker::MaybeSendFuture;
 use tightbeam::oids::{
 	AES_128_GCM, AES_128_WRAP, CURVE_SECP256K1, DATA, SIGNER_ECDSA_WITH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 };
-use tightbeam::random::{CryptoRngCore, OsRng};
+use tightbeam::random::CryptoRngCore;
 use tightbeam::spki::{AlgorithmIdentifierOwned, Document, EncodePublicKey, SubjectPublicKeyInfoRef};
-use tightbeam::testing::{unhex, EnvelopeRecipient, SeededStream, TestCertificate, TestMessage};
+use tightbeam::testing::vectors::rfc3394::RFC_3394_4_3;
+use tightbeam::testing::{unhex, EnvelopeRecipient, PublishedDraw, SeededStream, TestCertificate, TestMessage};
+use tightbeam::trace::{ConsumedTrace, TraceCollector};
+use tightbeam::urn::Urn;
 use tightbeam::x509::ext::pkix::KeyUsages;
 use tightbeam::x509::Certificate;
 use tightbeam::zeroize::Zeroizing;
-use tightbeam::{Version, ZeroizingBytes};
+use tightbeam::{Frame, Version, ZeroizingBytes};
 
+#[cfg(feature = "colony")]
+use tightbeam::cms::signed_data::SignerIdentifier;
+#[cfg(feature = "colony")]
+use tightbeam::colony::hive::ServletBox;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use tightbeam::transport::handshake::{Client, ClientFlow, Handshake, HandshakeProvider, Server, ServerFlow};
+use tightbeam::oids::HASH_SHA3_512;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use tightbeam::transport::handshake::negotiation::RunnableProfile;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use tightbeam::transport::handshake::{
+	Client, ClientFlow, Handshake, HandshakeMessage, HandshakeProvider, Server, ServerConfig, ServerFlow,
+	SupportedProfiles,
+};
+#[cfg(feature = "transport-cms")]
+use tightbeam::transport::handshake::{ClientConfig, Cms, CmsClientSettings, ProvisionedTrust};
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+use tightbeam::transport::EndpointConfig;
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+use tokio::net::TcpStream;
+
+use crate::common::result::TestResult;
+use crate::common::security::fixed_signing_key;
 
 /// The identifier of the outside KEM, under an arc of its own.
 const OUTSIDE_KEM: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.3.1");
@@ -173,6 +203,27 @@ const CONTENT: &[u8] = b"sealed under an outside provider";
 
 /// The purpose label of the outside opening.
 const UKM_LABEL: &[u8] = b"tb/test/outside/ukm/v1";
+
+/// The seed of the key of a server identity, and of the one identity of a test
+/// that holds one.
+const SERVER_SEED: u8 = 0x31;
+
+/// The seed of the key of a client identity, and of a second key of a test,
+/// which differs from the key of [`SERVER_SEED`].
+const CLIENT_SEED: u8 = 0x32;
+
+/// The seed of the key that signs for a forged identity, which differs from
+/// the key of each identity of a test.
+const FORGING_SEED: u8 = 0x33;
+
+/// The signature, the digest, and the KDF of the profile that a flow under
+/// [`OutsideProvider`] agrees on.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+type AgreedAlgorithms = (Option<ObjectIdentifier>, Option<ObjectIdentifier>, Option<ObjectIdentifier>);
+
+/// The algorithms of [`OutsideProfile`] that a flow agrees on.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+const OUTSIDE_ALGORITHMS: AgreedAlgorithms = (Some(SIGNER_ECDSA_WITH_SHA3_512), Some(HASH_SHA3_512), Some(OUTSIDE_KDF));
 
 /// An ECDSA signature over secp256k1 under SHA3-512, in DER.
 ///
@@ -400,49 +451,42 @@ impl KeyWrapAlgorithm for OutsideWrap {
 	}
 }
 
-/// The RFC 3394 §4.3 key-encryption key, `000102...1f`.
-const RFC_3394_KEK: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-
-/// The RFC 3394 §4.3 key data, `00112233...ff`.
-const RFC_3394_KEY_DATA: &str = "00112233445566778899aabbccddeeff";
-
-/// The RFC 3394 §4.3 ciphertext: the key data under the KEK.
-const RFC_3394_4_3: &str = "64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7";
+/// The RFC 3394 §4.3 key-encryption key as the KEK of [`OutsideWrap`].
+fn rfc_3394_kek() -> Kek<'static, OutsideWrap> {
+	static KEK: LazyLock<Vec<u8>> = LazyLock::new(|| unhex(RFC_3394_4_3.kek));
+	let kek = Kek::try_from(KEK.as_slice());
+	kek.expect("the RFC 3394 §4.3 key-encryption key is 32 octets")
+}
 
 /// An outside wrap reads the typed key it receives, and wraps as RFC 3394
 /// §4.3 does.
 #[test]
-fn an_outside_wrap_wraps_as_rfc_3394_4_3() -> Result<(), KeyError> {
-	let kek = unhex(RFC_3394_KEK);
-	let kek = Kek::<OutsideWrap>::try_from(kek.as_slice())?;
-
-	let wrapped = OutsideWrap::wrap(&kek, &unhex(RFC_3394_KEY_DATA))?;
-	assert_eq!(wrapped, unhex(RFC_3394_4_3));
+fn an_outside_wrap_wraps_as_rfc_3394_4_3() -> TestResult {
+	let kek = rfc_3394_kek();
+	let wrapped = OutsideWrap::wrap(&kek, &unhex(RFC_3394_4_3.key_data))?;
+	assert_eq!(wrapped, unhex(RFC_3394_4_3.ciphertext));
 	Ok(())
 }
 
 /// The provided `unwrap_into` of an outside wrap copies the key its
 /// `unwrap` returns into the caller's buffer.
 #[test]
-fn an_outside_wrap_unwraps_into_a_buffer_of_its_key_size() -> Result<(), KeyError> {
-	let kek = unhex(RFC_3394_KEK);
-	let kek = Kek::<OutsideWrap>::try_from(kek.as_slice())?;
+fn an_outside_wrap_unwraps_into_a_buffer_of_its_key_size() -> TestResult {
+	let kek = rfc_3394_kek();
 	let mut key = [0u8; 16];
-	OutsideWrap::unwrap_into(&kek, &unhex(RFC_3394_4_3), &mut key)?;
-	assert_eq!(key.as_slice(), unhex(RFC_3394_KEY_DATA).as_slice());
+	OutsideWrap::unwrap_into(&kek, &unhex(RFC_3394_4_3.ciphertext), &mut key)?;
+	assert_eq!(key.as_slice(), unhex(RFC_3394_4_3.key_data).as_slice());
 	Ok(())
 }
 
 /// The provided `unwrap_into` refuses a buffer whose size differs from the key.
 #[test]
-fn an_outside_wrap_refuses_a_buffer_of_another_size() -> Result<(), KeyError> {
-	let kek = unhex(RFC_3394_KEK);
-	let kek = Kek::<OutsideWrap>::try_from(kek.as_slice())?;
+fn an_outside_wrap_refuses_a_buffer_of_another_size() {
+	let kek = rfc_3394_kek();
 	let mut key = [0u8; 32];
-	let refused = OutsideWrap::unwrap_into(&kek, &unhex(RFC_3394_4_3), &mut key);
+	let refused = OutsideWrap::unwrap_into(&kek, &unhex(RFC_3394_4_3.ciphertext), &mut key);
 	let expected = ReceivedExpectedError { received: 32, expected: 16 };
 	assert!(matches!(refused, Err(KeyError::WrapLength(found)) if found == expected));
-	Ok(())
 }
 
 /// A provider an outside crate defines: its own signature, KDF, KEM, and
@@ -488,6 +532,61 @@ impl CryptoProvider for OutsideProvider {
 
 	fn strength_floor() -> &'static (dyn ProfileStrengthPolicy + Send + Sync) {
 		&NoStrengthFloor
+	}
+}
+
+/// The profile of [`OutsideWrapProvider`], which names the identifier of
+/// [`OutsideWrap`] in place of AES-128 key wrap.
+#[derive(Debug, Default, Clone, Copy)]
+struct OutsideWrapProfile;
+
+impl SecurityProfile for OutsideWrapProfile {
+	type Digest = Sha3_512;
+	type AeadOid = Aes128GcmOid;
+	type SignatureAlg = OutsideSignature;
+	type Kdf = OutsideKdf;
+	type KeyExchange = Ecdhe<Secp256k1>;
+	type KeyWrapOid = Aes256Wrap;
+}
+
+/// [`OutsideProvider`] with [`OutsideWrap`] as its key wrap, so each key wrap
+/// of an envelope under it runs the wrap an outside crate writes.
+#[derive(Debug, Default, Clone, Copy)]
+struct OutsideWrapProvider {
+	profile: OutsideWrapProfile,
+}
+
+impl DigestProvider for OutsideWrapProvider {
+	type Digest = Sha3_512;
+}
+
+impl AeadProvider for OutsideWrapProvider {
+	type AeadCipher = OutsideGcm;
+}
+
+impl KeyWrapProvider for OutsideWrapProvider {
+	type KeyWrap = OutsideWrap;
+}
+
+impl SigningProvider for OutsideWrapProvider {
+	type Signature = OutsideSignature;
+	type VerifyingKey = OutsideVerifyingKey;
+}
+
+impl KdfProvider for OutsideWrapProvider {
+	type Kdf = OutsideKdf;
+}
+
+impl KeyExchangeProvider for OutsideWrapProvider {
+	type KeyExchange = Ecdhe<Secp256k1>;
+}
+
+impl CryptoProvider for OutsideWrapProvider {
+	type Profile = OutsideWrapProfile;
+	type Kem = OutsideKem;
+
+	fn profile(&self) -> &Self::Profile {
+		&self.profile
 	}
 }
 
@@ -598,6 +697,32 @@ impl SigningKeyProvider for HighSKeyProvider {
 	}
 }
 
+/// An outside key provider that declares the key of its certificate and signs
+/// with another key, so each of its signatures fails against that certificate.
+#[derive(Debug)]
+struct ForgingKeyProvider {
+	/// The backend of the key that the certificate names.
+	declared: OutsideKeyProvider,
+	/// The backend of the key that signs.
+	signing: OutsideKeyProvider,
+}
+
+impl KeyBackend for ForgingKeyProvider {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.declared.algorithm()
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		self.declared.to_public_key_bytes()
+	}
+}
+
+impl SigningKeyProvider for ForgingKeyProvider {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		self.signing.sign_prehash(prehash)
+	}
+}
+
 /// The identity under [`OutsideProvider`] of `certificate` and its `key`.
 pub(crate) fn outside_identity_of(certificate: Certificate, key: SigningKey) -> SigningIdentity {
 	let provider = Arc::new(OutsideKeyProvider::of(key));
@@ -605,11 +730,29 @@ pub(crate) fn outside_identity_of(certificate: Certificate, key: SigningKey) -> 
 	identity.expect("the outside key matches its certificate and its algorithm")
 }
 
-/// An identity under [`OutsideProvider`], of a fresh key.
-fn outside_identity() -> SigningIdentity {
-	let key = SigningKey::random(&mut OsRng);
+/// The identity under [`OutsideProvider`] of `certificate` and its `key`,
+/// whose signatures the key of [`FORGING_SEED`] makes.
+pub(crate) fn forged_identity_of(certificate: Certificate, key: SigningKey) -> SigningIdentity {
+	let signing = OutsideKeyProvider::of(fixed_signing_key(FORGING_SEED));
+	let provider = Arc::new(ForgingKeyProvider { declared: OutsideKeyProvider::of(key), signing });
+	let identity = SigningIdentity::with_provider::<OutsideProvider>(certificate, provider);
+	identity.expect("the declared key matches its certificate and its algorithm")
+}
+
+/// An identity under [`OutsideProvider`], of the key whose scalar is
+/// thirty-two `seed` octets.
+fn outside_identity(seed: u8) -> SigningIdentity {
+	let key = fixed_signing_key(seed);
 	let certificate = TestCertificate::self_signed(&key);
 	outside_identity_of(certificate, key)
+}
+
+/// An identity under [`OutsideProvider`] whose certificate names the key whose
+/// scalar is thirty-two `seed` octets, and whose signatures another key makes.
+fn forged_identity(seed: u8) -> SigningIdentity {
+	let key = fixed_signing_key(seed);
+	let certificate = TestCertificate::self_signed(&key);
+	forged_identity_of(certificate, key)
 }
 
 /// The key-agreement identity under [`OutsideKem`] of `certificate` and its
@@ -620,10 +763,10 @@ fn outside_agreement_identity_of(certificate: Certificate, key: &SigningKey) -> 
 	identity.expect("the outside backend holds the key of its certificate")
 }
 
-/// A key-agreement identity under [`OutsideKem`], of a fresh key, whose
-/// certificate asserts `keyAgreement`.
-fn outside_agreement_identity() -> KeyAgreementIdentity<OutsideKem> {
-	let key = SigningKey::random(&mut OsRng);
+/// A key-agreement identity under [`OutsideKem`], of the key whose scalar is
+/// thirty-two `seed` octets, whose certificate asserts `keyAgreement`.
+fn outside_agreement_identity(seed: u8) -> KeyAgreementIdentity<OutsideKem> {
+	let key = fixed_signing_key(seed);
 	let certificate = TestCertificate::self_signed(&key);
 	outside_agreement_identity_of(certificate, &key)
 }
@@ -644,10 +787,100 @@ where
 	P: HandshakeProvider,
 	F: ClientFlow<P> + ServerFlow<P>,
 {
-	let opening = client.start().expect("the outside client opens");
-	let reply = server.reply(opening).await.expect("the outside server replies");
+	let reply = replied(client, server).await;
 	let closing = client.respond(reply).await.expect("the outside client closes");
 	server.finish(closing).await.expect("the outside server admits the closing");
+}
+
+/// The reply of `server` to the opening of `client`.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+async fn replied<P, F>(client: &mut Handshake<Client, F, P>, server: &mut Handshake<Server, F, P>) -> HandshakeMessage
+where
+	P: HandshakeProvider,
+	F: ClientFlow<P> + ServerFlow<P>,
+{
+	let opening = client.start().expect("the client opens");
+	let reply = server.reply(opening).await;
+	reply.expect("the server replies to the opening")
+}
+
+/// The descriptor of the native profile of the provider `P`, the one profile
+/// that a server of a seam test runs.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn native_profile<P: CryptoProvider>() -> SecurityProfileDesc {
+	RunnableProfile::<P>::native().descriptor()
+}
+
+/// The configuration of a server of the flow `F` under the provider `P` that
+/// holds `identity` and runs the native profile of `P` under the house key
+/// purposes.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn native_server<F, P>(settings: F::Settings, identity: F::Identity) -> ServerConfig<F, P>
+where
+	F: ServerFlow<P>,
+	P: HandshakeProvider,
+{
+	let profiles = SupportedProfiles::from(native_profile::<P>());
+	let config = ServerConfig::<F, P>::new(settings, identity, profiles, KeyPurposes::HOUSE);
+	config.expect("a test server identity serves the server role")
+}
+
+/// The configuration of a CMS client under the provider `P` that pins its
+/// server through `trust` and presents `identity`.
+#[cfg(feature = "transport-cms")]
+fn cms_client<P: HandshakeProvider>(trust: ProvisionedTrust, identity: SigningIdentity) -> ClientConfig<Cms, P> {
+	let settings = CmsClientSettings { trust, identity };
+	let config = ClientConfig::<Cms, P>::new(settings, KeyPurposes::HOUSE);
+	config.expect("a test client identity serves the client role")
+}
+
+/// The signature, the digest, and the KDF of the profile that `client`
+/// agreed on, or `None` before it agrees on one.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+fn agreed_algorithms<F, P>(client: &Handshake<Client, F, P>) -> Option<AgreedAlgorithms>
+where
+	F: ClientFlow<P>,
+	P: HandshakeProvider,
+{
+	let profile = client.selected_profile()?;
+	Some((profile.signature, profile.digest, profile.kdf))
+}
+
+/// The certificate that the server of `pair` admitted as its client once the
+/// three legs run, beside the first record that the client seals, as the
+/// server opens it under its session keys.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+async fn admitted_and_opened<P, F>(
+	pair: (Handshake<Client, F, P>, Handshake<Server, F, P>),
+) -> Result<(Option<Certificate>, Vec<u8>), Box<dyn core::error::Error>>
+where
+	P: HandshakeProvider,
+	F: ClientFlow<P> + ServerFlow<P>,
+{
+	let (mut client, mut server) = pair;
+	run_legs(&mut client, &mut server).await;
+
+	let admitted = server.peer_certificate().cloned();
+	let client_session = client.complete()?;
+	let server_session = server.complete()?;
+
+	let mut record = client_session.keys().send().encrypt_next(CONTENT)?.to_der()?;
+	let opened = server_session.into_keys().recv_mut().open(&mut record)?;
+	Ok((admitted, opened.to_vec()))
+}
+
+/// The first record that the client of `pair` seals once the three legs run,
+/// as the server of `pair` opens it under its session keys.
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+async fn first_record_opened<P, F>(
+	pair: (Handshake<Client, F, P>, Handshake<Server, F, P>),
+) -> Result<Vec<u8>, Box<dyn core::error::Error>>
+where
+	P: HandshakeProvider,
+	F: ClientFlow<P> + ServerFlow<P>,
+{
+	let (_admitted, opened) = admitted_and_opened(pair).await?;
+	Ok(opened)
 }
 
 /// [`CONTENT`] sealed under [`OutsideProvider`] to `recipient`.
@@ -656,11 +889,106 @@ fn outside_sealed(recipient: Recipient<'_, OutsideProvider>) -> AuthEnvelopedDat
 	sealed.expect("the content seals under the outside provider")
 }
 
+/// The content of `sealed`, which the holder of `identity` opens under the
+/// provider `P` from the DER of the envelope as it arrives.
+async fn opened_kem_seal<P>(
+	identity: &KeyAgreementIdentity<P::Kem>,
+	sealed: AuthEnvelopedData,
+) -> Result<Vec<u8>, EnvelopeError>
+where
+	P: CryptoProvider<AeadCipher: ContentEncryption>,
+{
+	let opener: Opener<'_, P> = Opener::Kem { identity, ukm_label: UKM_LABEL };
+	let arrived = sealed.to_der()?;
+
+	let opened = sealed.open::<P>(arrived, &opener, DATA).await?;
+	Ok(opened.to_insecure().to_vec())
+}
+
+/// A frame of version `version` that `identity` signed.
+async fn signed_by(identity: &SigningIdentity, version: Version) -> Frame {
+	let builder = FrameBuilder::from(version).with_id(b"signed-frame").with_order(1_696_521_600);
+	let built = builder.with_message(TestMessage::sample(None)).build();
+	let mut frame = built.expect("the frame builds");
+
+	let signed = frame.sign_with_provider(identity).await;
+	signed.expect("the identity signs the frame");
+	frame
+}
+
+/// The trace of a run that records each of `labels` once, in order.
+fn consumed_trace_of(labels: impl IntoIterator<Item = Urn<'static>>) -> ConsumedTrace {
+	let collector = TraceCollector::new();
+	for label in labels {
+		let event = collector.event(label);
+		event.expect("a collector with no fault model records each event").emit();
+	}
+
+	let mut trace = ConsumedTrace::new();
+	trace.populate_from_collector(&collector);
+	trace
+}
+
+/// A cleartext listener under the house provider on a loopback port, beside
+/// the address it binds.
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+async fn cleartext_listener() -> (TokioListener<DefaultCryptoProvider>, SocketAddr) {
+	let bound = TokioListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await;
+	let listener = bound.expect("a loopback port binds");
+	let addr = listener.local_addr().expect("a bound listener has an address");
+	(listener, addr)
+}
+
+/// A cleartext client transport under the house provider, connected to
+/// `addr`.
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+async fn cleartext_client(addr: SocketAddr) -> TcpTransport<TokioStream, DefaultCryptoProvider> {
+	let stream = TcpStream::connect(addr).await.expect("the client reaches the listener");
+	TcpTransport::new(TokioStream::from(stream), EndpointConfig::<DefaultCryptoProvider>::cleartext())
+}
+
+/// A [`ServletBox`] an outside crate writes at `127.0.0.1:7100`, which marks
+/// its stop.
+///
+/// A hive stops a servlet through [`ServletBox::stop_boxed`] alone, and the
+/// probe keeps the default drain, which stops it there too, so the mark shows
+/// each stop and each drain of the probe.
+#[cfg(feature = "colony")]
+struct StopProbe {
+	/// The flag that the stop of the probe sets.
+	stopped: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "colony")]
+impl StopProbe {
+	/// A probe beside the flag that it sets when it stops.
+	fn new() -> (Self, Arc<AtomicBool>) {
+		let stopped = Arc::new(AtomicBool::new(false));
+		let probe = Self { stopped: Arc::clone(&stopped) };
+		(probe, stopped)
+	}
+}
+
+#[cfg(feature = "colony")]
+impl ServletBox for StopProbe {
+	fn addr_bytes(&self) -> Arc<[u8]> {
+		Arc::from(b"127.0.0.1:7100".as_slice())
+	}
+
+	fn stop_boxed(self: Box<Self>) {
+		self.stopped.store(true, Ordering::SeqCst);
+	}
+
+	fn signer(&self) -> Option<&SignerIdentifier> {
+		None
+	}
+}
+
 /// An identity under the outside provider signs content, and the policy of
 /// that provider verifies the signature.
 #[tokio::test]
-async fn an_outside_identity_signs_under_its_own_algorithm() -> Result<(), Box<dyn std::error::Error>> {
-	let identity = outside_identity();
+async fn an_outside_identity_signs_under_its_own_algorithm() -> TestResult {
+	let identity = outside_identity(SERVER_SEED);
 	let content = SignedContent::data(CONTENT);
 	let signer_info = identity.sign(SignedContent::data(CONTENT)).await?;
 
@@ -672,7 +1000,7 @@ async fn an_outside_identity_signs_under_its_own_algorithm() -> Result<(), Box<d
 /// A key that declares another algorithm pairs with no outside identity.
 #[test]
 fn with_provider_refuses_a_key_of_another_algorithm() {
-	let key = SigningKey::random(&mut OsRng);
+	let key = fixed_signing_key(SERVER_SEED);
 	let certificate = TestCertificate::self_signed(&key);
 	let provider = Arc::new(Secp256k1KeyProvider::from(key));
 
@@ -683,12 +1011,9 @@ fn with_provider_refuses_a_key_of_another_algorithm() {
 /// A frame the outside identity signs verifies under the identity's own
 /// policy, the check a gateway runs on a rumor it originates.
 #[tokio::test]
-async fn an_outside_identity_verifies_its_own_signature() -> Result<(), Box<dyn std::error::Error>> {
-	let identity = outside_identity();
-	let builder = FrameBuilder::from(Version::V2).with_id(b"outside-rumor").with_order(1696521600);
-	let mut frame = builder.with_message(TestMessage::sample(None)).build()?;
-	frame.sign_with_provider(&identity).await?;
-
+async fn an_outside_identity_verifies_its_own_signature() -> TestResult {
+	let identity = outside_identity(SERVER_SEED);
+	let frame = signed_by(&identity, Version::V2).await;
 	frame.verify_under(identity.signing_certificate(), identity.policy())?;
 	Ok(())
 }
@@ -697,14 +1022,12 @@ async fn an_outside_identity_verifies_its_own_signature() -> Result<(), Box<dyn 
 /// opens under the outside provider, through the outside backend's own
 /// Diffie-Hellman product.
 #[tokio::test]
-async fn an_outside_provider_opens_its_kem_seal() -> Result<(), Box<dyn std::error::Error>> {
-	let identity = outside_agreement_identity();
+async fn an_outside_provider_opens_its_kem_seal() -> TestResult {
+	let identity = outside_agreement_identity(SERVER_SEED);
 	let sealed = outside_sealed(Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL });
 
-	let opener = Opener::Kem { identity: &identity, ukm_label: UKM_LABEL };
-	let arrived = sealed.to_der()?;
-	let opened = sealed.open::<OutsideProvider>(arrived, &opener, DATA).await?;
-	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	let opened = opened_kem_seal::<OutsideProvider>(&identity, sealed).await?;
+	assert_eq!(opened, CONTENT);
 	Ok(())
 }
 
@@ -712,8 +1035,8 @@ async fn an_outside_provider_opens_its_kem_seal() -> Result<(), Box<dyn std::err
 /// the key of the certificate it pairs.
 #[test]
 fn a_key_agreement_identity_refuses_an_outside_backend_of_another_key() {
-	let certificate = TestCertificate::self_signed(&SigningKey::random(&mut OsRng));
-	let other = SigningKey::random(&mut OsRng);
+	let certificate = TestCertificate::self_signed(&fixed_signing_key(SERVER_SEED));
+	let other = fixed_signing_key(CLIENT_SEED);
 	let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(OutsideAgreementBackend::of(&other));
 
 	let refused = KeyAgreementIdentity::<OutsideKem>::new(certificate, backend);
@@ -724,7 +1047,7 @@ fn a_key_agreement_identity_refuses_an_outside_backend_of_another_key() {
 /// outside KEM reads the key, though the parse of that KEM decodes the form
 /// (RFC 5480 §2.2).
 #[test]
-fn the_key_agreement_use_refuses_a_compact_point_for_an_outside_kem() -> Result<(), Box<dyn std::error::Error>> {
+fn the_key_agreement_use_refuses_a_compact_point_for_an_outside_kem() -> TestResult {
 	let key = SigningKey::from_bytes(&KNOWN_RECIPIENT_KEY.into())?;
 	let compact = TestCertificate::with_compact_key(TestCertificate::self_signed(&key));
 
@@ -736,7 +1059,7 @@ fn the_key_agreement_use_refuses_a_compact_point_for_an_outside_kem() -> Result<
 /// A seal under a 16-octet KEK, the key size of AES-128 key wrap, opens under
 /// the outside provider.
 #[tokio::test]
-async fn an_outside_provider_opens_its_kek_seal() -> Result<(), Box<dyn std::error::Error>> {
+async fn an_outside_provider_opens_its_kek_seal() -> TestResult {
 	let kek = [0x24u8; 16];
 	let kek = Kek::try_from(kek.as_slice())?;
 	let sealed = outside_sealed(Recipient::Kek { kek, key_identifier: b"outside" });
@@ -748,11 +1071,31 @@ async fn an_outside_provider_opens_its_kek_seal() -> Result<(), Box<dyn std::err
 	Ok(())
 }
 
+/// A seal under a provider that names [`OutsideWrap`] wraps its content key
+/// through that wrap, and the open unwraps the key through it. The seal draws
+/// the key data of RFC 3394 §4.3 as its content key, so its `encryptedKey` is
+/// the ciphertext of that vector.
+#[tokio::test]
+async fn a_seal_wraps_its_content_key_through_an_outside_wrap() -> TestResult {
+	let kek = rfc_3394_kek();
+	let mut draw = PublishedDraw([unhex(RFC_3394_4_3.key_data), vec![0x5a; 12]].concat());
+	let recipient = Recipient::Kek { kek, key_identifier: b"outside" };
+	let sealed = AuthEnvelopedData::seal::<OutsideWrapProvider>(recipient, DATA, CONTENT, [], Some(&mut draw))?;
+	let wrapped = frames::kek_recipient_of(&sealed).encrypted_key;
+	let opener = Opener::Kek { kek, key_identifier: b"outside" };
+	let arrived = sealed.to_der()?;
+
+	let opened = sealed.open::<OutsideWrapProvider>(arrived, &opener, DATA).await?;
+	assert_eq!(wrapped.as_bytes(), unhex(RFC_3394_4_3.ciphertext).as_slice());
+	assert_eq!(opened.to_insecure().as_slice(), CONTENT);
+	Ok(())
+}
+
 /// The outside seal names the algorithms of the outside provider:
 /// AES-128-GCM, the outside KEM and KDF, and AES-128 key wrap.
 #[test]
 fn an_outside_seal_names_its_algorithms() {
-	let identity = outside_agreement_identity();
+	let identity = outside_agreement_identity(SERVER_SEED);
 	let sealed = outside_sealed(Recipient::Kem { recipient: identity.recipient(), ukm_label: UKM_LABEL });
 	let kem = sealed.kem_recipient();
 
@@ -765,7 +1108,7 @@ fn an_outside_seal_names_its_algorithms() {
 /// KEM and the outside KDF derive. The seal draws the ephemeral scalar
 /// `0x03` × 32 and the `ukm` random `0x04` × 32.
 #[test]
-fn an_outside_kem_seal_wraps_under_the_outside_derivation() -> Result<(), Box<dyn std::error::Error>> {
+fn an_outside_kem_seal_wraps_under_the_outside_derivation() -> TestResult {
 	let key = SigningKey::from_bytes(&KNOWN_RECIPIENT_KEY.into())?;
 	let recipient = outside_recipient(TestCertificate::self_signed(&key));
 	let recipient = Recipient::Kem { recipient: &recipient, ukm_label: UKM_LABEL };
@@ -780,8 +1123,8 @@ fn an_outside_kem_seal_wraps_under_the_outside_derivation() -> Result<(), Box<dy
 /// An outside identity refuses the high `s` its key returns, which the house
 /// form would normalize.
 #[tokio::test]
-async fn an_outside_identity_refuses_a_high_s() -> Result<(), Box<dyn std::error::Error>> {
-	let key = SigningKey::random(&mut OsRng);
+async fn an_outside_identity_refuses_a_high_s() -> TestResult {
+	let key = fixed_signing_key(SERVER_SEED);
 	let certificate = TestCertificate::self_signed(&key);
 	let provider = Arc::new(HighSKeyProvider(OutsideKeyProvider::of(key)));
 	let identity = SigningIdentity::with_provider::<OutsideProvider>(certificate, provider)?;
@@ -791,10 +1134,24 @@ async fn an_outside_identity_refuses_a_high_s() -> Result<(), Box<dyn std::error
 	Ok(())
 }
 
+/// An outside identity shares the outside provider it holds, so a hive or a
+/// gateway that takes the shared handle signs with the outside backend.
+#[test]
+fn an_outside_identity_shares_its_outside_provider() -> TestResult {
+	let key = fixed_signing_key(SERVER_SEED);
+	let certificate = TestCertificate::self_signed(&key);
+	let provider: Arc<dyn SigningKeyProvider> = Arc::new(OutsideKeyProvider::of(key));
+	let identity = SigningIdentity::with_provider::<OutsideProvider>(certificate, Arc::clone(&provider))?;
+
+	let shared = identity.provider_arc();
+	assert!(Arc::ptr_eq(&shared, &provider));
+	Ok(())
+}
+
 /// The house provider refuses an outside seal, whose cipher is not its own,
 /// before its key runs.
 #[tokio::test]
-async fn the_house_provider_refuses_an_outside_seal() -> Result<(), Box<dyn std::error::Error>> {
+async fn the_house_provider_refuses_an_outside_seal() -> TestResult {
 	let outside_kek = [0x24u8; 16];
 	let outside_kek = Kek::try_from(outside_kek.as_slice())?;
 	let sealed = outside_sealed(Recipient::Kek { kek: outside_kek, key_identifier: b"outside" });
@@ -814,7 +1171,7 @@ const OUTSIDE_DESCRIPTOR: &str = "304ba00b060960864801650304020aa10b060960864801
 
 /// The descriptor of [`OutsideProfile`] encodes as [`OUTSIDE_DESCRIPTOR`].
 #[test]
-fn the_outside_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+fn the_outside_descriptor_encodes_as_its_known_der() -> TestResult {
 	let der = SecurityProfileDesc::from(&OutsideProfile).to_der()?;
 	assert_eq!(der, unhex(OUTSIDE_DESCRIPTOR));
 	Ok(())

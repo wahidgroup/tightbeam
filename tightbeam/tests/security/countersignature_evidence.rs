@@ -23,12 +23,11 @@
 //! - A failing acknowledgement records `SessionVerdict::CountersignatureInvalid`.
 //! - Settlement MUST stay unfired and the session MUST stay inactive.
 //!
-//! The observer records a concluded exchange, so a tamper rejected before the
-//! exchange concludes leaves the ledger unchanged.
-//!
-//! These scenarios tamper with the sealed closing of each protocol. A client
-//! withholds its acknowledgement inside its own sealed closing, so the CMS flow
-//! tests cover that case.
+//! The observer records a concluded exchange. A flipped byte of the sealed
+//! closing stops the exchange, so the ledger stays empty. A countersignature
+//! that fails to verify under the true secret concludes it, so the observer
+//! records `CountersignatureInvalid`. The CMS flow tests cover a withheld
+//! acknowledgement, which sits inside the sealed closing of its client.
 //!
 //! ## References
 //! - CWE-778: Insufficient Logging <https://cwe.mitre.org/data/definitions/778.html>
@@ -37,10 +36,31 @@
 
 #![cfg(all(feature = "transport-multiplex", feature = "testing"))]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use tightbeam::absent;
+use tightbeam::crypto::key::{KeyBackend, KeyError, SigningKeyProvider};
+use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::exactly;
 use tightbeam::instrumentation::events;
+use tightbeam::marker::MaybeSendFuture;
+use tightbeam::spki::AlgorithmIdentifierOwned;
 use tightbeam::tb_assert_spec;
+use tightbeam::tb_scenario;
+use tightbeam::testing::SetupEnv;
+use tightbeam::trace::TraceCollector;
+use tightbeam::transport::handshake::receipt::SessionVerdict;
+use tightbeam::TightBeamError;
+
+use crate::common::security::{ClientMaterials, ServerMaterials};
+use crate::security::common::HandshakeBackendKind;
+use crate::security::live::{
+	AttackStep, FrameEdit, LiveHandshake, PayingHooks, ReceiptHooks, CLOSING_FRAME, SMALL_BUDGETS,
+};
+
+const CHALLENGE: &[u8] = b"evidence-invoice";
+const RESPONSE: &[u8] = b"evidence-preimage";
 
 tb_assert_spec! {
 	pub CountersignatureTamperSpec,
@@ -53,121 +73,136 @@ tb_assert_spec! {
 	}
 }
 
+tb_assert_spec! {
+	pub CountersignatureForgedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::SESSION_CERT_REJECTED, exactly!(1), equals!("signature")),
+			(events::SESSION_HANDSHAKE_COMPLETE, absent!())
+		]
+	}
+}
+
+/// A client key that signs another prehash on its first call, the
+/// countersignature, and the prehash it receives on each later call. So the
+/// client Finished verifies, and the countersignature alone fails.
+#[derive(Debug)]
+struct ForgedCountersignature {
+	/// The key of the client certificate.
+	key: Arc<dyn SigningKeyProvider>,
+	/// Whether the key has made the forged signature.
+	forged: AtomicBool,
+}
+
+impl KeyBackend for ForgedCountersignature {
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.key.algorithm()
+	}
+
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		self.key.to_public_key_bytes()
+	}
+}
+
+impl SigningKeyProvider for ForgedCountersignature {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
+		let first = !self.forged.swap(true, Ordering::SeqCst);
+		let mut signed = prehash.to_vec();
+		if let Some(octet) = signed.first_mut().filter(|_| first) {
+			*octet ^= 0xFF;
+		}
+
+		Box::pin(async move { self.key.sign_prehash(&signed).await })
+	}
+}
+
+/// A budget-bearing handshake of `kind` whose client seals a countersignature
+/// that fails to verify. The server refuses, settles nothing, and records the
+/// concluded exchange.
+async fn a_forged_countersignature_reaches_the_observer(
+	trace: &TraceCollector,
+	kind: HandshakeBackendKind,
+) -> Result<(), TightBeamError> {
+	let client = ClientMaterials::fixed();
+	let key = ForgedCountersignature { key: client.key_provider, forged: AtomicBool::new(false) };
+	let identity = SigningIdentity::new(client.certificate, Arc::new(key))?;
+	let PayingHooks { authorizer, observer, hooks } = ReceiptHooks::paying(CHALLENGE, RESPONSE)?;
+
+	let materials = ServerMaterials::fixed();
+	let handshake = LiveHandshake::budget_bearing(kind, materials, identity, SMALL_BUDGETS, hooks);
+
+	let outcome = handshake.audit_server(trace).run().await?;
+	outcome.refused_by_server("server accepted a forged countersignature")?;
+	assert_eq!(authorizer.settle_calls(), 0);
+
+	let verdicts: Vec<SessionVerdict> = observer.recorded().into_iter().map(|outcome| outcome.verdict).collect();
+	assert_eq!(verdicts, [SessionVerdict::CountersignatureInvalid]);
+	Ok(())
+}
+
+/// A budget-bearing handshake of `kind` whose closing a MITM corrupts in
+/// transit. The closing is authenticated encryption, and a flipped content
+/// byte is the one wire handle a MITM has on the sealed acknowledgement, so
+/// the server refuses the closing, settles nothing, and the receipt exchange
+/// reaches no verdict for the observer to record.
+async fn a_tampered_closing_leaves_no_evidence(
+	trace: &TraceCollector,
+	kind: HandshakeBackendKind,
+) -> Result<(), TightBeamError> {
+	let identity = ClientMaterials::fixed().identity();
+	let PayingHooks { authorizer, observer, hooks } = ReceiptHooks::paying(CHALLENGE, RESPONSE)?;
+	let tamper = AttackStep::new(CLOSING_FRAME, FrameEdit::flip_sealed_content());
+	let materials = ServerMaterials::fixed();
+	let handshake = LiveHandshake::budget_bearing(kind, materials, identity, SMALL_BUDGETS, hooks);
+
+	let outcome = handshake.audit_server(trace).with_step(tamper).run().await?;
+	outcome.refused_by_server("server accepted a tampered closing")?;
+	assert_eq!(authorizer.settle_calls(), 0);
+	assert!(observer.recorded().is_empty());
+	Ok(())
+}
+
 #[cfg(feature = "transport-hpke")]
-mod hpke {
-	use std::sync::Arc;
-
-	use super::CountersignatureTamperSpec;
-
-	use tightbeam::tb_scenario;
-	use tightbeam::testing::SetupEnv;
-	use tightbeam::transport::handshake::negotiation::MuxBudgets;
-	use tightbeam::transport::handshake::receipt::SessionObserver;
-	use tightbeam::TightBeamError;
-
-	use crate::common::security::{
-		ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
-	};
-	use crate::security::common::HandshakeBackendKind;
-	use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME};
-
-	const CHALLENGE: &[u8] = b"evidence-invoice";
-	const RESPONSE: &[u8] = b"evidence-preimage";
-	const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
-
-	tb_scenario! {
-		name: hpke_tampered_countersignature_carriage_rejected,
-		spec: CountersignatureTamperSpec,
-		environment Bare {
-			exec: |SetupEnv { trace, .. }| async move {
-				let materials = ServerMaterials::generate();
-				let identity = ClientMaterials::deterministic().identity();
-				let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
-				let observer = Arc::new(RecordingObserver::default());
-				let hooks = ReceiptHooks {
-					authorizer: Some(Arc::clone(&authorizer) as _),
-					approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
-					observer: Some(Arc::clone(&observer) as Arc<dyn SessionObserver>),
-				};
-
-				// The closing is authenticated encryption, and a flipped
-				// content byte is the only wire handle a MITM has on the
-				// sealed acknowledgement.
-				let tamper = AttackStep::new(CLOSING_FRAME, FrameEdit::flip_sealed_content());
-				let kind = HandshakeBackendKind::Hpke;
-				let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
-				let outcome = handshake.audit_server(&trace).with_step(tamper).run().await?;
-
-				outcome.refused_by_server("server accepted a tampered closing")?;
-				assert_eq!(authorizer.settle_calls(), 0, "settle ran for a closing the server refused");
-
-				// The receipt exchange reaches no verdict, so the observer
-				// ledger stays empty.
-				assert!(
-					observer.recorded().is_empty(),
-					"the observer ledger holds an outcome for an exchange that never concluded"
-				);
-
-				Ok::<(), TightBeamError>(())
-			}
+tb_scenario! {
+	name: hpke_tampered_countersignature_carriage_rejected,
+	spec: CountersignatureTamperSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_tampered_closing_leaves_no_evidence(&trace, HandshakeBackendKind::Hpke).await
 		}
 	}
 }
 
 #[cfg(feature = "transport-cms")]
-mod cms {
-	use std::sync::Arc;
+tb_scenario! {
+	name: cms_tampered_countersignature_carriage_rejected,
+	spec: CountersignatureTamperSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_tampered_closing_leaves_no_evidence(&trace, HandshakeBackendKind::Cms).await
+		}
+	}
+}
 
-	use super::CountersignatureTamperSpec;
+#[cfg(feature = "transport-hpke")]
+tb_scenario! {
+	name: hpke_forged_countersignature_reaches_the_observer,
+	spec: CountersignatureForgedSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_forged_countersignature_reaches_the_observer(&trace, HandshakeBackendKind::Hpke).await
+		}
+	}
+}
 
-	use tightbeam::tb_scenario;
-	use tightbeam::testing::SetupEnv;
-	use tightbeam::transport::handshake::negotiation::MuxBudgets;
-	use tightbeam::transport::handshake::receipt::SessionObserver;
-	use tightbeam::TightBeamError;
-
-	use crate::common::security::{
-		ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
-	};
-	use crate::security::common::HandshakeBackendKind;
-	use crate::security::live::{AttackStep, FrameEdit, LiveHandshake, ReceiptHooks, CLOSING_FRAME};
-
-	const CHALLENGE: &[u8] = b"evidence-cms-invoice";
-	const RESPONSE: &[u8] = b"evidence-cms-preimage";
-	const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
-
-	tb_scenario! {
-		name: cms_tampered_countersignature_carriage_rejected,
-		spec: CountersignatureTamperSpec,
-		environment Bare {
-			exec: |SetupEnv { trace, .. }| async move {
-				let materials = ServerMaterials::generate();
-				let identity = ClientMaterials::generate().identity();
-				let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
-				let observer = Arc::new(RecordingObserver::default());
-				let hooks = ReceiptHooks {
-					authorizer: Some(Arc::clone(&authorizer) as _),
-					approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
-					observer: Some(Arc::clone(&observer) as Arc<dyn SessionObserver>),
-				};
-
-				let tamper = AttackStep::new(CLOSING_FRAME, FrameEdit::flip_sealed_content());
-				let kind = HandshakeBackendKind::Cms;
-				let handshake = LiveHandshake::budget_bearing(kind, materials, identity, REQUEST, hooks);
-				let outcome = handshake.audit_server(&trace).with_step(tamper).run().await?;
-
-				outcome.refused_by_server("server accepted a tampered client Finished")?;
-				assert_eq!(authorizer.settle_calls(), 0, "settle ran for a closing the server refused");
-
-				// The receipt exchange reaches no verdict, so the observer
-				// ledger stays empty.
-				assert!(
-					observer.recorded().is_empty(),
-					"the observer ledger holds an outcome for an exchange that never concluded"
-				);
-
-				Ok::<(), TightBeamError>(())
-			}
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: cms_forged_countersignature_reaches_the_observer,
+	spec: CountersignatureForgedSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			a_forged_countersignature_reaches_the_observer(&trace, HandshakeBackendKind::Cms).await
 		}
 	}
 }

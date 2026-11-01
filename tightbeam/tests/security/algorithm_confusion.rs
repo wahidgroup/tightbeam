@@ -31,39 +31,31 @@ use tightbeam::{
 	},
 	der::Encode,
 	oids::{AES_256_GCM, SIGNER_ECDSA_WITH_SHA3_256},
-	TightBeamError,
+	testing::{TestCertificate, TestKey},
 };
 
-use crate::common::security::{deterministic_signing_key, expectation_failure, test_certificate};
+use crate::common::result::TestResult;
 
 /// The policy refuses, under an unrelated OID, the key, message, and
 /// signature that it accepts under the genuine ECDSA OID.
 #[test]
-fn algorithm_confusion() -> Result<(), TightBeamError> {
-	let signing_key = deterministic_signing_key();
-	let cert = test_certificate(&signing_key);
+fn a_policy_refuses_a_signature_under_a_foreign_algorithm() -> TestResult {
+	let signing_key = TestKey::insecure_fixed_signing();
+	let cert = TestCertificate::self_signed(&signing_key);
 	let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
 
 	let message: &[u8] = b"tbs-certificate-bytes";
-	let signature: Secp256k1Signature = signing_key
-		.sign_canonical::<Sha3_256>(message)
-		.map_err(|_| expectation_failure("signing failed"))?;
+	let signature: Secp256k1Signature = signing_key.sign_canonical::<Sha3_256>(message)?;
 	let signature_bytes = signature.to_bytes();
 
 	// The signature verifies under the real secp256k1 ECDSA OID.
 	let policy = Secp256k1Policy::default();
-	policy
-		.verify_signature(&SIGNER_ECDSA_WITH_SHA3_256, &spki_der, message, signature_bytes.as_ref())
-		.map_err(|_| expectation_failure("baseline verification under the genuine OID failed"))?;
+	policy.verify_signature(&SIGNER_ECDSA_WITH_SHA3_256, &spki_der, message, signature_bytes.as_ref())?;
 
 	// Under an unrelated algorithm OID a sound policy must refuse it. The
 	// policy holds one algorithm, so it refuses the foreign OID by name before
 	// it reads the key.
 	let foreign = policy.verify_signature(&AES_256_GCM, &spki_der, message, signature_bytes.as_ref());
-
-	assert!(
-		matches!(foreign, Err(UnsupportedAlgorithm(oid)) if oid == AES_256_GCM),
-		"the policy verified a signature under a foreign OID"
-	);
+	assert!(matches!(foreign, Err(UnsupportedAlgorithm(oid)) if oid == AES_256_GCM));
 	Ok(())
 }

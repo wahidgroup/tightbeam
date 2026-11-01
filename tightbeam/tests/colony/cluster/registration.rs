@@ -12,6 +12,14 @@ use tightbeam::transport::{TransportError, TransportFailure};
 #[cfg(feature = "instrument")]
 use tightbeam::testing::fixtures::TestTrace;
 
+use crate::common::clock::ParkingClock;
+use crate::common::result::TestResult;
+
+#[cfg(feature = "instrument")]
+use crate::colony::trace::{bounded_trace, payload_digests, payload_trace, signer_digest, TraceWaiter};
+#[cfg(feature = "instrument")]
+use crate::common::trace::recorded_labels;
+
 use super::common::*;
 
 tb_assert_spec! {
@@ -47,8 +55,8 @@ impl ServletBox for StopProbeServlet {
 	}
 }
 
-// Environment teardown must run `Hive::stop`, which drains registered
-// servlets through `stop_boxed`. A plain drop only aborts control tasks.
+// Environment teardown releases each hive before the grade, which stops its
+// registered servlets through `stop_boxed`.
 tb_scenario! {
 	name: cluster_env_teardown_stops_hive_servlets,
 	spec: ClusterTeardownSpec,
@@ -704,7 +712,6 @@ async fn register_under_hive_a(
 ) -> Result<RegisterHiveResponse, TightBeamError> {
 	let hive_addr = hive.addr().ok_or(TightBeamError::NotEstablished)?.to_string();
 	let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
-
 	register_signed_hive(&mut client, &certs.hive_a.1, b"reg-b-as-a", hive_addr).await
 }
 
@@ -759,8 +766,9 @@ tb_assert_spec! {
 }
 
 // A heartbeat names the hive by its registration, so one to an unregistered
-// address refuses before any dial. The registered hive proves the trace
-// reaches the gateway, so the dial count of 0 is the gateway's own record.
+// address refuses as an invalid address. The registered hive proves the trace
+// reaches the gateway, so the refused dial count of 0 is the gateway's own
+// record.
 tb_scenario! {
 	name: cluster_heartbeat_refuses_an_address_no_hive_registered,
 	spec: ClusterHeartbeatUnregisteredSpec,
@@ -775,11 +783,63 @@ tb_scenario! {
 
 			let refused = cluster.send_heartbeat(unregistered).await;
 			let unregistered_refused = matches!(refused, Err(ClusterError::InvalidAddress(_)));
-			assert!(unregistered_refused, "a heartbeat to an address no hive registered refuses before any dial");
+			assert!(unregistered_refused, "a heartbeat to an address no hive registered refuses as invalid");
 
 			cluster.stop();
 			Ok(())
 		}
+	}
+}
+
+/// The address type of a [`ClusterGateway`] and its hives.
+#[cfg(feature = "instrument")]
+type ColonyAddress = <TokioListener as tightbeam::transport::Protocol>::Address;
+
+/// The pick of the address that a heartbeat of a quiet gateway names.
+#[cfg(feature = "instrument")]
+type HeartbeatTarget = fn(&QuietRegistration) -> ColonyAddress;
+
+/// The control address of the hive that registered with the gateway.
+#[cfg(feature = "instrument")]
+fn registered_hive(registration: &QuietRegistration) -> ColonyAddress {
+	*registration.hive.addr().expect("an established hive binds its control plane")
+}
+
+/// The address of the gateway itself, which no hive registered.
+#[cfg(feature = "instrument")]
+fn unregistered_address(registration: &QuietRegistration) -> ColonyAddress {
+	*registration.cluster.addr()
+}
+
+/// The count of dials that a quiet gateway records as it sends one heartbeat
+/// to the address that `target` picks.
+#[cfg(feature = "instrument")]
+async fn heartbeat_dials(target: HeartbeatTarget) -> usize {
+	let registration = QuietRegistration::start().await;
+	let address = target(&registration);
+	let gateway_trace = registration.gateway_trace.share();
+
+	// The trail of the gateway's dials is the observation, so the answer goes
+	// unread.
+	let _answer = registration.cluster.send_heartbeat(address).await;
+	registration.stop();
+
+	TestTrace::trail(&gateway_trace, &[events::POOL_DIAL]).len()
+}
+
+// A heartbeat resolves its target in the registry before it dials, so a
+// gateway dials the hives that registered and no other address.
+#[cfg(feature = "instrument")]
+tightbeam::tb_cases! {
+	async fn a_heartbeat_dials_only_a_registered_hive((target, dials): (HeartbeatTarget, usize)) {
+		let recorded = heartbeat_dials(target).await;
+		assert_eq!(recorded, dials);
+	}
+	cases {
+		/// The registered hive takes the one dial of its heartbeat.
+		the_address_of_a_registered_hive => (registered_hive, 1),
+		/// An address no hive registered takes no dial.
+		an_address_no_hive_registered => (unregistered_address, 0),
 	}
 }
 
@@ -829,198 +889,255 @@ tb_scenario! {
 	}
 }
 
+/// The beat of [`lease_sweep_conf`], on its manual clock.
+const LEASE_BEAT: Duration = Duration::from_millis(100);
+
 /// A gateway whose leases lapse 10 ms after the last live beat, on a clock
 /// only the test moves. No count of failed beats evicts a hive, so a lease
 /// alone retires one.
-fn lease_sweep_conf(certs: &ClusterTestCerts, clock: &Arc<ManualClock>) -> ClusterConfig {
+fn lease_sweep_conf(certs: &ClusterTestCerts, clock: &Arc<ParkingClock>) -> ClusterConfig {
 	let heartbeat = HeartbeatConfig::builder()
-		.with_interval(Duration::from_millis(100))
+		.with_interval(LEASE_BEAT)
 		.with_timeout(Duration::from_millis(10))
 		.with_max_failures(u32::MAX)
 		.build();
 	let clock = Arc::clone(clock) as Arc<dyn Clock>;
 
-	ClusterConfig::builder(cluster_tls_config(certs))
+	ClusterConfig::builder(certs.cluster_tls())
 		.with_heartbeat_config(heartbeat)
 		.with_clock(clock)
 		.build()
 }
 
-// One lease sweep retires two hives whose leases lapsed together. Each
-// eviction names the count of hives that its own retire left, so the two
-// counts step down to 0.
-#[tokio::test]
-async fn a_lease_sweep_names_the_count_each_retire_leaves() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let clock = Arc::new(ManualClock::default());
-	let trace = TraceCollector::default();
-	let cluster = start_cluster(&trace, lease_sweep_conf(&certs, &clock)).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-	register_signed_hive(&mut client, &certs.key, b"lease-a", b"127.0.0.1:1").await?;
-	register_signed_hive(&mut client, &certs.key, b"lease-b", b"127.0.0.1:2").await?;
+/// Registers two hives at addresses where no party answers with `cluster`, as
+/// the identity of `certs`.
+async fn register_two_dead_hives(certs: &ClusterTestCerts, cluster: &ClusterGateway) {
+	let client = connect_cluster(certs, cluster.addr()).await;
+	let mut client = client.expect("a client connects to its gateway");
+	let first = register_signed_hive(&mut client, &certs.key, b"dead-a", b"127.0.0.1:1").await;
+	first.expect("the gateway answers the registration of the first hive");
+	let second = register_signed_hive(&mut client, &certs.key, b"dead-b", b"127.0.0.1:2").await;
+	second.expect("the gateway answers the registration of the second hive");
+}
 
-	clock.advance(Duration::from_millis(100));
-	poll_until(50, Duration::from_millis(100), || {
-		trace.recorded(events::CLUSTER_HIVE_EVICTED) >= 2
-	})
-	.await;
+/// Starts a gateway of `certs` under `conf` on `trace`, and registers two
+/// hives at addresses where no party answers.
+async fn gateway_with_two_dead_hives(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	conf: ClusterConfig,
+) -> ClusterGateway {
+	let cluster = start_cluster(trace, conf).await.expect("a gateway starts on a free port");
+	register_two_dead_hives(certs, &cluster).await;
+
+	cluster
+}
+
+/// One lease sweep retires two hives whose leases lapsed together. Each
+/// eviction names the count of hives that its own retire left, so the two
+/// counts step down to 0.
+#[tokio::test]
+async fn a_lease_sweep_names_the_count_each_retire_leaves() {
+	let certs = cluster_certs();
+	let clock = Arc::new(ParkingClock::default());
+	let trace = TraceCollector::default();
+	let cluster = gateway_with_two_dead_hives(&trace, &certs, lease_sweep_conf(&certs, &clock)).await;
+
+	// The beat sleeps once its sweep ends, so the second wait ends after the
+	// sweep that the advance starts.
+	clock.parked(LEASE_BEAT).await;
+	clock.advance(LEASE_BEAT);
+	clock.parked(LEASE_BEAT).await;
 	cluster.stop();
 
 	let evicted = recorded_values(&trace, events::CLUSTER_HIVE_EVICTED);
 	assert_eq!(evicted, [Some(AssertionValue::U64(1)), Some(AssertionValue::U64(0))]);
-	Ok(())
 }
 
-/// A gateway that dials at most `max_concurrent` hives at once in each beat,
-/// beats every 100 ms, and evicts a hive at its first failed beat.
-fn capped_beat_conf(certs: &ClusterTestCerts, max_concurrent: NonZeroUsize) -> ClusterConfig {
+/// The beat of [`capped_beat_conf`], on its manual clock.
+#[cfg(feature = "instrument")]
+const CAPPED_BEAT: Duration = Duration::from_millis(100);
+
+/// A gateway on `clock` that dials at most `max_concurrent` hives at once in
+/// each beat, beats every [`CAPPED_BEAT`] of the clock, and evicts a hive at
+/// its first failed beat.
+#[cfg(feature = "instrument")]
+fn capped_beat_conf(
+	certs: &ClusterTestCerts,
+	max_concurrent: NonZeroUsize,
+	clock: &Arc<ParkingClock>,
+) -> ClusterConfig {
 	let heartbeat = HeartbeatConfig::builder()
-		.with_interval(Duration::from_millis(100))
+		.with_interval(CAPPED_BEAT)
 		.with_max_failures(1)
 		.with_max_concurrent(max_concurrent)
 		.build();
+	let clock = Arc::clone(clock) as Arc<dyn Clock>;
 
-	ClusterConfig::builder(cluster_tls_config(certs))
+	ClusterConfig::builder(certs.cluster_tls())
 		.with_heartbeat_config(heartbeat)
+		.with_clock(clock)
 		.build()
 }
 
-/// The count of the hives that a gateway under a beat capped at one dial
-/// evicts within 5 s, from two hives at addresses where no party answers.
-async fn evictions_of_a_beat_capped_at_one_dial() -> Result<usize, TightBeamError> {
+/// The count of the hives that one beat of a gateway capped at one dial
+/// evicts within the hang guard, from two hives at addresses where no party
+/// answers.
+///
+/// The hives register while the first beat sleeps, so the beat that the
+/// advance of the clock starts is the one beat that finds them.
+#[cfg(feature = "instrument")]
+async fn evictions_of_a_beat_capped_at_one_dial() -> usize {
 	let certs = cluster_certs();
-	let trace = TraceCollector::default();
-	let cluster = start_cluster(&trace, capped_beat_conf(&certs, NonZeroUsize::MIN)).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-	register_signed_hive(&mut client, &certs.key, b"capped-a", b"127.0.0.1:1").await?;
-	register_signed_hive(&mut client, &certs.key, b"capped-b", b"127.0.0.1:2").await?;
+	let clock = Arc::new(ParkingClock::default());
+	let (trace, waiter) = TraceWaiter::trace();
+	let conf = capped_beat_conf(&certs, NonZeroUsize::MIN, &clock);
+	let cluster = start_cluster(&trace, conf).await.expect("a gateway starts on a free port");
+	clock.parked(CAPPED_BEAT).await;
+	register_two_dead_hives(&certs, &cluster).await;
 
-	poll_until(50, Duration::from_millis(100), || {
-		trace.recorded(events::CLUSTER_HIVE_EVICTED) >= 2
-	})
-	.await;
+	clock.advance(CAPPED_BEAT);
+	// A wait that runs out leaves the count short of the two hives, which the
+	// test then shows.
+	waiter.until(events::CLUSTER_HIVE_EVICTED, 2).await;
 	cluster.stop();
 
-	Ok(trace.recorded(events::CLUSTER_HIVE_EVICTED))
+	trace.recorded(events::CLUSTER_HIVE_EVICTED)
 }
 
-// A beat that dials one hive at a time reaches every hive of its cycle. No
-// party answers at either registered address, so each hive leaves at its
-// first beat (CWE-835).
-//
-// The gateway runs on a runtime of its own, with two workers, which the test
-// shuts down in the background. A beat that spins with no yield holds one
-// worker alone, so the poll fails at its own deadline and the run goes on.
+/// A beat that dials one hive at a time reaches every hive of its cycle. No
+/// party answers at either registered address, so each hive leaves at its
+/// first beat (CWE-835).
+///
+/// The gateway runs on a runtime of its own, with two workers, which the test
+/// shuts down in the background. A beat that spins with no yield holds one
+/// worker alone, so the wait fails at its hang guard and the run goes on.
+#[cfg(feature = "instrument")]
 #[test]
-fn a_beat_capped_at_one_dial_reaches_every_hive() -> Result<(), TightBeamError> {
+fn a_beat_capped_at_one_dial_reaches_every_hive() -> TestResult {
 	let mut builder = tokio::runtime::Builder::new_multi_thread();
 	let runtime = builder.worker_threads(2).enable_all().build()?;
 	let evicted = runtime.block_on(evictions_of_a_beat_capped_at_one_dial());
 
 	runtime.shutdown_background();
 
-	assert_eq!(evicted?, 2);
+	assert_eq!(evicted, 2);
 	Ok(())
 }
 
-// An admitted registration names the signer whose signature the gateway
-// verified, so the audit trail answers who registered the hive (CWE-778).
+/// A gateway that records the payload digest of each event on its trace, and
+/// a client of it that signs as the gateway identity.
 #[cfg(feature = "instrument")]
-#[tokio::test]
-async fn an_admitted_registration_names_its_signer() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let trace = payload_trace();
-	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-
-	register_signed_hive(&mut client, &certs.key, b"named-reg", b"127.0.0.1:65210").await?;
-	cluster.stop();
-
-	let principals = payload_digests(&trace, events::CLUSTER_HIVE_REGISTERED);
-	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
-	Ok(())
+struct AuditedGateway {
+	/// The identity that the gateway presents and the client signs with.
+	certs: ClusterTestCerts,
+	/// The trace that the gateway records on.
+	trace: TraceCollector,
+	/// The gateway.
+	cluster: ClusterGateway,
+	/// The client of the gateway.
+	client: GenericClient<TokioListener>,
 }
 
-// An admitted address update names the signer whose signature the gateway
-// verified, so the audit trail answers who moved a servlet route (CWE-778).
 #[cfg(feature = "instrument")]
-#[tokio::test]
-async fn an_admitted_update_names_its_signer() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let trace = payload_trace();
-	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
+impl AuditedGateway {
+	/// Starts the gateway on a payload trace, and connects its client.
+	async fn start() -> Self {
+		let certs = cluster_certs();
+		let trace = payload_trace();
+		let cluster = start_cluster(&trace, routing_cluster_conf(&certs, None)).await;
+		let cluster = cluster.expect("a gateway starts on a free port");
+		let client = connect_cluster(&certs, cluster.addr()).await;
+		let client = client.expect("a client connects to its gateway");
 
-	register_signed_hive(&mut client, &certs.key, b"update-reg", b"127.0.0.1:65211").await?;
-
-	let added = servlet_info(&certs, "ping", b"127.0.0.1:65212");
-	let update = servlet_address_update(b"127.0.0.1:65211", vec![added], vec![]);
-
-	emit_servlet_update(&mut client, &certs.key, b"named-update", update).await?;
-	cluster.stop();
-
-	let principals = payload_digests(&trace, events::CLUSTER_UPDATE_ACCEPTED);
-	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
-	Ok(())
+		Self { certs, trace, cluster, client }
+	}
 }
 
-// A registration that the gateway refuses after the signature verifies names
-// its signer, so the audit trail answers who sent it (CWE-778). Its hive
-// address is not UTF-8, so the gateway refuses it as `PermissionDenied`.
+/// A control frame that a gateway decides on after the signature verifies.
 #[cfg(feature = "instrument")]
-#[tokio::test]
-async fn a_refused_registration_names_its_signer() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let trace = payload_trace();
-	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-
-	register_signed_hive(&mut client, &certs.key, b"named-refusal", [0xff, 0xfe, 0xfd]).await?;
-	cluster.stop();
-
-	let principals = payload_digests(&trace, events::CLUSTER_REGISTER_REFUSED);
-	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
-	Ok(())
+#[derive(Clone, Copy, Debug)]
+enum AuditedAct {
+	/// A registration that the gateway admits.
+	AdmittedRegistration,
+	/// An address update that the gateway admits.
+	AdmittedUpdate,
+	/// A registration whose hive address is not UTF-8, which the gateway
+	/// refuses as `PermissionDenied`.
+	RefusedRegistration,
+	/// An address update that removes a bare servlet type where an instance
+	/// belongs, which the gateway refuses as `PermissionDenied`.
+	RefusedUpdate,
+	/// A registration sent twice, whose resend the freshness gate refuses.
+	ReplayedRegistration,
 }
 
-// An address update that the gateway refuses after the signature verifies
-// names its signer (CWE-778). It removes a bare servlet type where an
-// instance belongs, so the gateway refuses it as `PermissionDenied`.
 #[cfg(feature = "instrument")]
-#[tokio::test]
-async fn a_refused_update_names_its_signer() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let trace = payload_trace();
-	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-	let update = servlet_address_update(b"127.0.0.1:65214", vec![], vec![servlet_urn("ping")]);
-
-	emit_servlet_update(&mut client, &certs.key, b"named-update-refusal", update).await?;
-	cluster.stop();
-
-	let principals = payload_digests(&trace, events::CLUSTER_UPDATE_REFUSED);
-	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
-	Ok(())
+impl AuditedAct {
+	/// Sends the frames of this act to `gateway`, signed as its identity.
+	async fn perform(self, gateway: &mut AuditedGateway) {
+		let AuditedGateway { certs, client, .. } = gateway;
+		let key = &certs.key;
+		match self {
+			Self::AdmittedRegistration => {
+				let reply = register_signed_hive(client, key, b"named-reg", b"127.0.0.1:65210").await;
+				reply.expect("the gateway answers a registration");
+			}
+			Self::AdmittedUpdate => {
+				let reply = register_signed_hive(client, key, b"update-reg", b"127.0.0.1:65211").await;
+				reply.expect("the gateway answers a registration");
+				let added = servlet_info(certs, "ping", b"127.0.0.1:65212");
+				let update = servlet_address_update(b"127.0.0.1:65211", vec![added], vec![]);
+				let reply = emit_servlet_update(client, key, b"named-update", update).await;
+				reply.expect("the gateway answers an address update");
+			}
+			Self::RefusedRegistration => {
+				let reply = register_signed_hive(client, key, b"named-refusal", [0xff, 0xfe, 0xfd]).await;
+				reply.expect("the gateway answers a registration");
+			}
+			Self::RefusedUpdate => {
+				let update = servlet_address_update(b"127.0.0.1:65214", vec![], vec![servlet_urn("ping")]);
+				let reply = emit_servlet_update(client, key, b"named-update-refusal", update).await;
+				reply.expect("the gateway answers an address update");
+			}
+			Self::ReplayedRegistration => {
+				let request = registration_request(b"127.0.0.1:65215");
+				let fresh = signed_control_frame(certs, b"named-replay", request).await;
+				let fresh = fresh.expect("a registration frame signs");
+				let reply = emit_frame(client, fresh.to_owned()).await;
+				reply.expect("the gateway answers a registration");
+				emit_frame(client, fresh).await.expect("the gateway answers a replay");
+			}
+		}
+	}
 }
 
-// A replayed registration names the signer whose signature the gateway
-// verified before its freshness gate refused the replay (CWE-778).
+// A control decision that a gateway reaches after the signature verifies
+// names the signer whose signature the gateway verified, so the audit trail
+// answers who sent the frame (CWE-778).
 #[cfg(feature = "instrument")]
-#[tokio::test]
-async fn a_replayed_registration_names_its_signer() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let trace = payload_trace();
-	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-	let fresh = signed_control_frame(&certs, b"named-replay", registration_request(b"127.0.0.1:65215")).await?;
+tightbeam::tb_cases! {
+	async fn the_audit_record_names_the_signer_of((act, event): (AuditedAct, Urn<'static>)) {
+		let mut gateway = AuditedGateway::start().await;
 
-	emit_frame(&mut client, fresh.to_owned()).await?;
-	emit_frame(&mut client, fresh).await?;
-	cluster.stop();
-
-	let principals = payload_digests(&trace, events::CLUSTER_REGISTER_REFUSED);
-	assert_eq!(principals, [Some(signer_digest(&certs.cert))]);
-	Ok(())
+		act.perform(&mut gateway).await;
+		gateway.cluster.stop();
+		let principals = payload_digests(&gateway.trace, event);
+		assert_eq!(principals, [Some(signer_digest(&gateway.certs.cert))]);
+	}
+	cases {
+		/// An admitted registration answers who registered the hive.
+		an_admitted_registration => (AuditedAct::AdmittedRegistration, events::CLUSTER_HIVE_REGISTERED),
+		/// An admitted address update answers who moved a servlet route.
+		an_admitted_update => (AuditedAct::AdmittedUpdate, events::CLUSTER_UPDATE_ACCEPTED),
+		/// A refused registration answers who sent it.
+		a_refused_registration => (AuditedAct::RefusedRegistration, events::CLUSTER_REGISTER_REFUSED),
+		/// A refused address update answers who sent it.
+		a_refused_update => (AuditedAct::RefusedUpdate, events::CLUSTER_UPDATE_REFUSED),
+		/// A replay names the signer that the gateway verified before its
+		/// freshness gate refused the replay.
+		a_replayed_registration => (AuditedAct::ReplayedRegistration, events::CLUSTER_REGISTER_REFUSED),
+	}
 }
 
 tb_assert_spec! {
@@ -1351,59 +1468,30 @@ tb_scenario! {
 	}
 }
 
-/// The session events that a hive's own trace records as it registers with a
-/// gateway. The gateway's heartbeat waits an hour, so no gateway dials the
-/// hive, and the hive's trace holds the session of its own dial alone.
+// A registration files a record on the trace of each party. The hive files
+// the session of its dial to the gateway, and the gateway files the
+// registration it admits in its audit sink, under the URN of the event.
 #[cfg(feature = "instrument")]
-async fn hive_registration_sessions() -> Result<Vec<Urn<'static>>, TightBeamError> {
-	let certs = Arc::new(cluster_certs());
-	let mut conf = routing_cluster_conf(&certs, None);
-	conf.heartbeat.interval = Duration::from_secs(3_600);
-	let cluster = start_cluster(&TraceCollector::new(), conf).await?;
-	let hive_trace = TraceCollector::new();
-	let hive = start_ping_hive(hive_trace.share(), certs, None).await?;
+tightbeam::tb_cases! {
+	async fn a_registration_files_its_record_on_the_trace_of(
+		(trace_of, event): (fn(&QuietRegistration) -> &TraceCollector, Urn<'static>)
+	) {
+		let registration = QuietRegistration::start().await;
+		let trace = trace_of(&registration).share();
 
-	hive.register_with_cluster(cluster.addr()).await?;
-	hive.stop();
-	cluster.stop();
-
-	Ok(TestTrace::trail(&hive_trace, &[events::SESSION_HANDSHAKE_COMPLETE]))
-}
-
-/// A hive records the session of each dial to a gateway on its own trace.
-#[cfg(feature = "instrument")]
-#[tokio::test]
-async fn a_hive_records_its_cluster_dials_on_its_own_trace() -> Result<(), TightBeamError> {
-	assert_eq!(hive_registration_sessions().await?, [events::SESSION_HANDSHAKE_COMPLETE]);
-	Ok(())
-}
-
-/// The audit records of the colony events that a gateway's own trace files as
-/// one hive registers with it. The gateway's heartbeat waits an hour, so the
-/// registration is the one colony decision on the trace.
-#[cfg(feature = "instrument")]
-async fn gateway_registration_records() -> Result<Vec<Urn<'static>>, TightBeamError> {
-	let certs = Arc::new(cluster_certs());
-	let mut conf = routing_cluster_conf(&certs, None);
-	conf.heartbeat.interval = Duration::from_secs(3_600);
-	let gateway_trace = TraceCollector::new();
-	let cluster = start_cluster(&gateway_trace, conf).await?;
-	let hive = start_ping_hive(TraceCollector::new(), certs, None).await?;
-
-	hive.register_with_cluster(cluster.addr()).await?;
-	hive.stop();
-	cluster.stop();
-
-	Ok(TestTrace::trail(&gateway_trace, &[events::CLUSTER_HIVE_REGISTERED]))
-}
-
-/// A gateway files a registration in its audit sink under the URN of the
-/// event, not as a test assertion.
-#[cfg(feature = "instrument")]
-#[tokio::test]
-async fn a_gateway_files_a_registration_under_the_urn_of_its_event() -> Result<(), TightBeamError> {
-	assert_eq!(gateway_registration_records().await?, [events::CLUSTER_HIVE_REGISTERED]);
-	Ok(())
+		registration.stop();
+		let kept = [event];
+		let trail = TestTrace::trail(&trace, &kept);
+		assert_eq!(trail, kept);
+	}
+	cases {
+		/// A hive records the session of each dial to a gateway on its own
+		/// trace.
+		the_hive_that_dials => (|registration| &registration.hive_trace, events::SESSION_HANDSHAKE_COMPLETE),
+		/// A gateway files a registration in its audit sink under the URN of
+		/// the event, apart from a test assertion.
+		the_gateway_that_admits => (|registration| &registration.gateway_trace, events::CLUSTER_HIVE_REGISTERED),
+	}
 }
 
 /// The count of strangers that fail the handshake of a gateway's colony
@@ -1420,35 +1508,20 @@ async fn dial_as_stranger(
 	stranger: &ClusterTestCerts,
 	gateway: &ClusterGateway,
 ) -> Result<Frame, TightBeamError> {
-	let identity = signing_identity(stranger.cert.to_owned(), stranger.key.to_owned());
-	let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::clone(&certs.trust));
-	let client = builder.with_client_identity(identity).build();
-	let mut client = client.connect(gateway.addr().to_owned()).await?;
-
+	let mut client = connect_with_identity(Arc::clone(&certs.trust), stranger, gateway.addr()).await?;
 	emit_frame(&mut client, TestFrame::v0(Some("stranger"), None)).await
 }
 
-/// What a gateway records after [`REFUSED_STRANGERS`] strangers fail the
-/// handshake of its colony plane, then one event of its own: its own events in
-/// its trace, that trace's overflow latch, and the refused certificates on its
-/// connection trace. Each trace holds [`REFUSED_STRANGERS`] events.
+/// A quiet gateway on `trace` whose colony plane refused the handshakes of
+/// [`REFUSED_STRANGERS`] strangers. The trace drains after the start, so its
+/// store keeps the records that follow the start alone, and a drain keeps
+/// the overflow latch.
 #[cfg(feature = "instrument")]
-async fn gateway_traces_after_refused_strangers() -> Result<(Vec<Urn<'static>>, bool, usize), TightBeamError> {
-	use tightbeam::instrumentation::TbInstrumentationConfig;
-	use tightbeam::trace::TraceConfig;
-
-	let config = TbInstrumentationConfig { max_events: REFUSED_STRANGERS as u32, ..Default::default() };
-	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+async fn gateway_refusing_strangers(trace: &TraceCollector) -> ClusterGateway {
 	let certs = cluster_certs();
 	let stranger = cluster_certs();
-	let mut tls = cluster_tls_config(&certs);
-	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
-	let mut conf = ClusterConfig::new(tls);
-	conf.heartbeat.interval = Duration::from_secs(3_600);
-	let gateway = start_cluster(&trace, conf).await?;
-	let connections = gateway.connection_trace();
-	// The start records into the trace, so a drain gives every slot to the
-	// strangers. A drain keeps the latch.
+	let gateway = start_cluster(trace, quiet_conf(mutual_tls(&certs))).await;
+	let gateway = gateway.expect("a gateway starts on a free port");
 	let _started = trace.drain_events();
 
 	for _ in 0..REFUSED_STRANGERS {
@@ -1457,15 +1530,31 @@ async fn gateway_traces_after_refused_strangers() -> Result<(Vec<Urn<'static>>, 
 		let _refused = dial_as_stranger(&certs, &stranger, &gateway).await;
 	}
 
-	// A wait that runs out leaves the connection trace short of the
-	// strangers, which the count of refused certificates then shows.
+	gateway
+}
+
+/// What a gateway records after [`REFUSED_STRANGERS`] strangers fail the
+/// handshake of its colony plane, then one event of its own: its own events in
+/// its trace, that trace's overflow latch, and the refused certificates on its
+/// connection trace. Each trace holds [`REFUSED_STRANGERS`] events.
+#[cfg(feature = "instrument")]
+async fn gateway_traces_after_refused_strangers() -> (Vec<Urn<'static>>, bool, usize) {
+	let trace = bounded_trace(REFUSED_STRANGERS as u32);
+	let gateway = gateway_refusing_strangers(&trace).await;
+	let connections = gateway.connection_trace();
+
+	// The test measures the default sink of the connection trace, which wakes
+	// no wait on a record, so a bounded poll waits for the refusals. A wait
+	// that runs out leaves the connection trace short of the strangers, which
+	// the count of refused certificates then shows.
 	let refused = || connections.recorded(events::SESSION_CERT_REJECTED) >= REFUSED_STRANGERS;
 	poll_until(50, Duration::from_millis(100), refused).await;
-	trace.emit_event(events::CLUSTER_HIVE_EVICTED)?;
+	let own = trace.emit_event(events::CLUSTER_HIVE_EVICTED);
+	own.expect("a trace records a house event");
 	gateway.stop();
 
 	let kept = TestTrace::trail(&trace, &[events::CLUSTER_HIVE_EVICTED]);
-	Ok((kept, trace.overflowed(), connections.recorded(events::SESSION_CERT_REJECTED)))
+	(kept, trace.overflowed(), connections.recorded(events::SESSION_CERT_REJECTED))
 }
 
 /// Strangers that never authenticate record on a gateway's connection trace,
@@ -1473,10 +1562,9 @@ async fn gateway_traces_after_refused_strangers() -> Result<(Vec<Urn<'static>>, 
 /// overflow latch.
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn refused_strangers_leave_the_trace_of_a_gateway_to_its_own_events() -> Result<(), TightBeamError> {
-	let recorded = gateway_traces_after_refused_strangers().await?;
+async fn refused_strangers_leave_the_trace_of_a_gateway_to_its_own_events() {
+	let recorded = gateway_traces_after_refused_strangers().await;
 	assert_eq!(recorded, (vec![events::CLUSTER_HIVE_EVICTED], false, REFUSED_STRANGERS));
-	Ok(())
 }
 
 /// The count of work requests that a client with no certificate sends, and the
@@ -1488,60 +1576,53 @@ const ANONYMOUS_REQUESTS: usize = 4;
 /// for a type no hive serves, then one event of its own: its own events in the
 /// sink of its trace, the overflow latch, and the refused requests.
 #[cfg(feature = "instrument")]
-async fn gateway_traces_after_anonymous_work() -> Result<(Vec<Urn<'static>>, bool, usize), TightBeamError> {
-	use tightbeam::instrumentation::TbInstrumentationConfig;
-	use tightbeam::trace::TraceConfig;
-
-	let config = TbInstrumentationConfig { max_events: ANONYMOUS_REQUESTS as u32, ..Default::default() };
-	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
+async fn gateway_traces_after_anonymous_work() -> (Vec<Urn<'static>>, bool, usize) {
+	let trace = bounded_trace(ANONYMOUS_REQUESTS as u32);
 	let certs = cluster_certs();
-	let mut conf = ClusterConfig::new(cluster_tls_config(&certs));
-	conf.heartbeat.interval = Duration::from_secs(3_600);
-	let gateway = start_cluster(&trace, conf).await?;
+	let gateway = start_cluster(&trace, quiet_conf(certs.cluster_tls())).await;
+	let gateway = gateway.expect("a gateway starts on a free port");
 	let connections = gateway.connection_trace();
 	// The start records into the trace, so a drain gives every slot to the
 	// requests. A drain keeps the latch.
 	let _started = trace.drain_events();
 
-	let mut client = connect_cluster(&certs, gateway.addr()).await?;
+	let client = connect_cluster(&certs, gateway.addr()).await;
+	let mut client = client.expect("a client connects to its gateway");
 	let work = TestFrame::v0(Some("anonymous"), Some("work"));
 	for _ in 0..ANONYMOUS_REQUESTS {
 		// No hive serves the type, so the gateway refuses each request.
 		let _refused = client.submit_work_to(servlet_urn("nobody"), &work).await;
 	}
 
-	trace.emit_event(events::CLUSTER_HIVE_EVICTED)?;
+	let own = trace.emit_event(events::CLUSTER_HIVE_EVICTED);
+	own.expect("a trace records a house event");
 	gateway.stop();
 
 	let kept = TestTrace::trail(&trace, &[events::CLUSTER_HIVE_EVICTED]);
-	Ok((kept, trace.overflowed(), connections.recorded(events::CLUSTER_WORK_UNAVAILABLE)))
+	(kept, trace.overflowed(), connections.recorded(events::CLUSTER_WORK_UNAVAILABLE))
 }
 
 /// Anonymous work leaves the bounded trace of a gateway to its own events.
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn anonymous_work_leaves_the_trace_of_a_gateway_to_its_own_events() -> Result<(), TightBeamError> {
-	let recorded = gateway_traces_after_anonymous_work().await?;
+async fn anonymous_work_leaves_the_trace_of_a_gateway_to_its_own_events() {
+	let recorded = gateway_traces_after_anonymous_work().await;
 	assert_eq!(recorded, (vec![events::CLUSTER_HIVE_EVICTED], false, ANONYMOUS_REQUESTS));
-	Ok(())
 }
 
 /// The records of one work request for a type no hive serves, from a client
 /// whose certificate the gateway validates: the count in the sink of the
 /// gateway's trace, then the count in the sink of its connection trace.
 #[cfg(feature = "instrument")]
-async fn records_of_certified_work() -> Result<(usize, usize), TightBeamError> {
+async fn records_of_certified_work() -> (usize, usize) {
 	let trace = TraceCollector::new();
 	let certs = cluster_certs();
-	let mut tls = cluster_tls_config(&certs);
-	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
 
-	let gateway = start_cluster(&trace, ClusterConfig::new(tls)).await?;
+	let gateway = start_cluster(&trace, ClusterConfig::new(mutual_tls(&certs))).await;
+	let gateway = gateway.expect("a gateway starts on a free port");
 	let connections = gateway.connection_trace();
-	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
-	let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::clone(&certs.trust));
-	let client = builder.with_client_identity(identity).build();
-	let mut client = client.connect(gateway.addr().to_owned()).await?;
+	let client = connect_with_identity(Arc::clone(&certs.trust), &certs, gateway.addr()).await;
+	let mut client = client.expect("a certified client connects to its gateway");
 
 	let work = TestFrame::v0(Some("certified"), Some("work"));
 	let _refused = client.submit_work_to(servlet_urn("nobody"), &work).await;
@@ -1550,106 +1631,52 @@ async fn records_of_certified_work() -> Result<(usize, usize), TightBeamError> {
 	let unavailable = [events::CLUSTER_WORK_UNAVAILABLE];
 	let audited = TestTrace::trail(&trace, &unavailable).len();
 	let connected = TestTrace::trail(&connections, &unavailable).len();
-	Ok((audited, connected))
+	(audited, connected)
 }
 
 /// Work from a certified client records on the trace of the gateway.
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn certified_work_records_on_the_trace_of_a_gateway() -> Result<(), TightBeamError> {
-	assert_eq!(records_of_certified_work().await?, (1, 0));
-	Ok(())
-}
-
-/// A sink that forwards each event, and names itself for each trace that
-/// splits from its own.
-#[cfg(feature = "instrument")]
-#[derive(Clone, Default)]
-struct Forwarded(Arc<Mutex<Vec<Urn<'static>>>>);
-
-#[cfg(feature = "instrument")]
-impl Forwarded {
-	/// The count of the forwarded events that record `event`.
-	fn count(&self, event: Urn<'static>) -> usize {
-		let seen = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		seen.iter().filter(|urn| **urn == event).count()
-	}
-}
-
-#[cfg(feature = "instrument")]
-impl tightbeam::instrumentation::EventSink for Forwarded {
-	fn emit(&self, event: tightbeam::instrumentation::TbEvent) {
-		let mut seen = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		seen.push(event.urn);
-	}
-
-	fn drain(&self) -> Vec<tightbeam::instrumentation::TbEvent> {
-		Vec::new()
-	}
-
-	fn overflowed(&self) -> bool {
-		false
-	}
-
-	fn sibling(&self) -> Option<Arc<dyn tightbeam::instrumentation::EventSink>> {
-		Some(Arc::new(self.clone()))
-	}
+async fn certified_work_records_on_the_trace_of_a_gateway() {
+	assert_eq!(records_of_certified_work().await, (1, 0));
 }
 
 /// The refused certificates that reach the sink of a gateway's trace after
 /// [`REFUSED_STRANGERS`] strangers fail the handshake of its colony plane.
 #[cfg(feature = "instrument")]
-async fn forwarded_refusals_of_strangers() -> Result<usize, TightBeamError> {
-	use tightbeam::trace::TraceConfig;
+async fn forwarded_refusals_of_strangers() -> usize {
+	let (trace, waiter) = TraceWaiter::trace();
+	let gateway = gateway_refusing_strangers(&trace).await;
 
-	let forwarded = Forwarded::default();
-	let config = TraceConfig::default().with_sink(forwarded.clone());
-	let trace = TraceCollector::from(config);
-	let certs = cluster_certs();
-	let stranger = cluster_certs();
-	let mut tls = cluster_tls_config(&certs);
-	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
-
-	let gateway = start_cluster(&trace, ClusterConfig::new(tls)).await?;
-	let connections = gateway.connection_trace();
-
-	for _ in 0..REFUSED_STRANGERS {
-		// The gateway refuses the certificate of the stranger, so the frame
-		// fails, and the test reads the refusal from the sink instead.
-		let _refused = dial_as_stranger(&certs, &stranger, &gateway).await;
-	}
-
-	let refused = || connections.recorded(events::SESSION_CERT_REJECTED) >= REFUSED_STRANGERS;
-	poll_until(50, Duration::from_millis(100), refused).await;
+	// A wait that runs out leaves the count short of the strangers, which the
+	// test then shows.
+	waiter.until(events::SESSION_CERT_REJECTED, REFUSED_STRANGERS).await;
 	gateway.stop();
 
-	Ok(forwarded.count(events::SESSION_CERT_REJECTED))
+	waiter.count(events::SESSION_CERT_REJECTED)
 }
 
 /// A refused handshake reaches the sink of a gateway's trace (CWE-778).
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn a_refused_handshake_reaches_the_sink_of_the_trace_of_a_gateway() -> Result<(), TightBeamError> {
-	assert_eq!(forwarded_refusals_of_strangers().await?, REFUSED_STRANGERS);
-	Ok(())
+async fn a_refused_handshake_reaches_the_sink_of_the_trace_of_a_gateway() {
+	assert_eq!(forwarded_refusals_of_strangers().await, REFUSED_STRANGERS);
 }
 
-// A drain announces the emptied slate to each gateway, and records the answer
-// of each one, so a gateway that refuses it leaves a record (CWE-778). The
-// gateway's hive trust turns to a store that holds a stranger alone, so it
-// refuses the drain's registration.
+/// A drain announces the emptied slate to each gateway, and records the
+/// answer of each one, so a gateway that refuses it leaves a record
+/// (CWE-778). The gateway's hive trust turns to a store that holds a stranger
+/// alone, so it refuses the drain's registration.
 #[tokio::test]
-async fn a_drain_whose_gateway_refuses_the_emptied_slate_records_it() -> Result<(), TightBeamError> {
+async fn a_drain_whose_gateway_refuses_the_emptied_slate_records_it() -> TestResult {
 	let certs = cluster_certs();
 	let switch = SwitchTrust::new(Arc::clone(&certs.trust), stranger_gateway_certs().trust);
 	let hive_trust: Arc<dyn CertificateTrust> = switch.clone();
-	let gateway_conf = ClusterConfig::new(cluster_tls_config_with_trust(&certs, Some(hive_trust)));
+	let gateway_conf = ClusterConfig::new(certs.cluster_tls().with_hive_trust(hive_trust));
 	let cluster = start_cluster(&TraceCollector::new(), gateway_conf).await?;
 
 	let trace = TraceCollector::new();
-	let mut hive_conf = hive_tls_config(&certs);
-	hive_conf.control.reregister_interval = None;
-	let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
 	hive.establish(Arc::new(trace.share())).await?;
 	hive.register_with_cluster(cluster.addr()).await?;
 
@@ -1670,6 +1697,9 @@ const STALLED_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A [`ServletBox`] whose drain never ends. Its drain wakes `entered` once the
 /// hive calls it.
+///
+/// A house servlet ends its drain once its work ends, so this box stands in
+/// for one whose drain outlasts the drain timeout.
 struct StalledDrain {
 	entered: Arc<Notify>,
 }
@@ -1693,14 +1723,14 @@ impl ServletBox for StalledDrain {
 	}
 }
 
-// A drain past its timeout still announces the emptied slate, so each gateway
-// retires the routes of the hive at once. The one servlet of the hive never
-// ends its drain, and the hive clock moves past the timeout once that drain
-// begins.
+/// A drain past its timeout still announces the emptied slate, so each
+/// gateway retires the routes of the hive at once. The one servlet of the hive
+/// never ends its drain, and the hive clock moves past the timeout once that
+/// drain begins.
 #[tokio::test]
-async fn a_drain_past_its_timeout_still_announces_the_emptied_slate() -> Result<(), TightBeamError> {
+async fn a_drain_past_its_timeout_still_announces_the_emptied_slate() -> TestResult {
 	let certs = cluster_certs();
-	let cluster = start_cluster(&TraceCollector::new(), ClusterConfig::new(cluster_tls_config(&certs))).await?;
+	let cluster = start_cluster(&TraceCollector::new(), ClusterConfig::new(certs.cluster_tls())).await?;
 
 	let trace = TraceCollector::new();
 	let clock = Arc::new(ManualClock::default());
@@ -1720,6 +1750,7 @@ async fn a_drain_past_its_timeout_still_announces_the_emptied_slate() -> Result<
 		clock.advance(STALLED_DRAIN_TIMEOUT);
 	};
 	let (drained, ()) = tokio::join!(hive.drain(), expire);
+
 	hive.stop();
 	cluster.stop();
 
@@ -1729,23 +1760,21 @@ async fn a_drain_past_its_timeout_still_announces_the_emptied_slate() -> Result<
 			TransportFailure::DeadlineExceeded
 		)))
 	);
+
 	let answers = recorded_values(&trace, events::HIVE_REREGISTERED);
 	let announced = (true, vec![Some(AssertionValue::TransitStatus(TransitStatus::Ok))]);
 	assert_eq!((expired, answers), announced);
 	Ok(())
 }
 
-// An address update that names a hive outside the namespace refuses with its
-// cause in the label, so the trail tells a foreign identity from a refused
-// route (CWE-778).
+/// An address update that names a hive outside the namespace refuses with its
+/// cause in the label, so the trail tells a foreign identity from a refused
+/// route (CWE-778).
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn an_address_update_outside_the_namespace_refuses_with_its_cause() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let trace = TraceCollector::new();
-	let cluster = start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await?;
-	let mut client = connect_cluster(&certs, cluster.addr()).await?;
-	let hive_id = ColonyNamespace::new("tightbeam", "elsewhere")?.hive("127.0.0.1:65216")?;
+async fn an_address_update_outside_the_namespace_refuses_with_its_cause() -> TestResult {
+	let AuditedGateway { certs, trace, cluster, mut client } = AuditedGateway::start().await;
+	let hive_id = foreign_namespace().hive("127.0.0.1:65216")?;
 	let update = ServletAddressUpdate { hive_id, added: Vec::new(), removed: Vec::new() };
 
 	let request = ClusterRequest::ServletAddressUpdate(update);

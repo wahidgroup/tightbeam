@@ -7,28 +7,25 @@
 //! Each outside orchestrator runs a house orchestrator of the HPKE flow under
 //! [`OutsideProvider`] and records the profile of each session it completes.
 
-#![cfg(all(feature = "transport-hpke", feature = "tcp", feature = "tokio"))]
-
-use std::error::Error;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tightbeam::crypto::profiles::SecurityProfileDesc;
 use tightbeam::marker::MaybeSendFuture;
 use tightbeam::testing::TestFrame;
-use tightbeam::transport::handshake::negotiation::RunnableProfile;
 use tightbeam::transport::handshake::{
 	BoxedServerHandshake, ClientHandshakeProtocol, EstablishedSession, HandshakeError, HandshakeMessage,
 	PeerAuthentication, ServerHandshakeProtocol,
 };
 use tightbeam::transport::state::ServerHandshakeSlot;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::transport::{EncryptedMessageIO, MessageCollector, MessageEmitter, TransportResult};
-use tightbeam::Frame;
+use tightbeam::transport::{EncryptedMessageIO, MessageEmitter, TransportResult};
 use tokio::task::JoinHandle;
 
-use super::floor::{client_under, listener_under};
+use super::floor::{client_under, outside_listener};
 use super::hpke::{outside_client, outside_server, OutsideClient, OutsideServer};
-use super::{outside_identity, OutsideProvider};
+use super::{native_profile, OutsideProvider};
+use crate::common::result::TestResult;
+use crate::common::transport::respond_echo;
 
 /// The profile of the last session an audited orchestrator completed.
 #[derive(Clone, Default)]
@@ -122,12 +119,6 @@ impl ServerHandshakeProtocol for AuditedServer {
 	}
 }
 
-/// The profile the HPKE flow agrees under [`OutsideProvider`], whose server
-/// supports its native profile alone.
-fn outside_profile() -> SecurityProfileDesc {
-	RunnableProfile::<OutsideProvider>::native().descriptor()
-}
-
 /// A server under [`OutsideProvider`] that accepts one connection on
 /// `listener`, places `handshake` in the slot of its transport, and echoes
 /// the first frame it collects. `None` leaves the slot to the transport.
@@ -141,35 +132,36 @@ fn echo_one(
 			transport.handshake_slot().install(handshake);
 		}
 
-		let (frame, status) = transport.collect_message().await?;
-		transport.send_response(status, Some(Frame::clone(&frame))).await
+		respond_echo(transport).await
 	})
 }
 
 /// A client transport drives an outside client orchestrator through each
 /// leg, installs the session it completes, and emits under that session.
 #[tokio::test]
-async fn a_client_transport_runs_an_outside_client_handshake() -> Result<(), Box<dyn Error>> {
-	let server = outside_identity();
-	let (listener, addr) = listener_under::<OutsideProvider>(server.clone()).await;
+async fn a_client_transport_runs_an_outside_client_handshake() -> TestResult {
+	let (server, listener, addr) = outside_listener::<OutsideProvider>().await;
 	let _serving = echo_one(listener, None);
 	let mut client = client_under::<OutsideProvider>(addr, &server).await;
 	let audit = Audit::default();
-	let audited = AuditedClient { inner: outside_client(server.certificate(), None), audit: audit.clone() };
+	let audited = AuditedClient { inner: outside_client(server.certificate()), audit: audit.clone() };
 	let frame = TestFrame::v0(Some("outside-client-handshake"), None);
 
 	client.drive_client_handshake(Box::new(audited)).await?;
+
 	let echoed = client.emit(frame.clone(), None).await?;
-	assert_eq!((audit.agreed(), echoed), (Some(outside_profile()), Some(frame)));
+	assert_eq!(
+		(audit.agreed(), echoed),
+		(Some(native_profile::<OutsideProvider>()), Some(frame))
+	);
 	Ok(())
 }
 
 /// A server transport drives the outside server orchestrator in its slot
 /// through each leg, and serves the session that orchestrator completes.
 #[tokio::test]
-async fn a_server_transport_runs_an_outside_server_handshake() -> Result<(), Box<dyn Error>> {
-	let server = outside_identity();
-	let (listener, addr) = listener_under::<OutsideProvider>(server.clone()).await;
+async fn a_server_transport_runs_an_outside_server_handshake() -> TestResult {
+	let (server, listener, addr) = outside_listener::<OutsideProvider>().await;
 	let audit = Audit::default();
 	let inner = outside_server(server.clone(), PeerAuthentication::Anonymous);
 	let _serving = echo_one(listener, Some(Box::new(AuditedServer { inner, audit: audit.clone() })));
@@ -177,6 +169,9 @@ async fn a_server_transport_runs_an_outside_server_handshake() -> Result<(), Box
 	let frame = TestFrame::v0(Some("outside-server-handshake"), None);
 
 	let echoed = client.emit(frame.clone(), None).await?;
-	assert_eq!((audit.agreed(), echoed), (Some(outside_profile()), Some(frame)));
+	assert_eq!(
+		(audit.agreed(), echoed),
+		(Some(native_profile::<OutsideProvider>()), Some(frame))
+	);
 	Ok(())
 }

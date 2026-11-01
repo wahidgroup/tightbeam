@@ -1010,9 +1010,8 @@ mod tests {
 	};
 	use crate::testing::fixtures::der_round_trip;
 
-	// Guard the domain constants against accidental change. A failure means
-	// that a domain constant changed, which invalidates every key and
-	// signature derived under the old value.
+	// Each domain constant holds the value that its keys and signatures derive
+	// under.
 	crate::tb_cases! {
 		fn a_domain_constant_keeps_its_value((constant, expected): (&[u8], &[u8])) {
 			assert_eq!(constant, expected);

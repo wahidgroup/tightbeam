@@ -57,8 +57,10 @@ use tightbeam::testing::unhex;
 
 use super::{
 	carried_point, certificate_of, cms_pair, first_record_opened, hpke_pair, identity_of, outside_cms_server,
-	AgreementBackend, KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, CONTENT, RFC_9180_PLAINTEXT,
+	AgreementBackend, KemVector, OutsideCmsServer, OutsideHkdf, OutsideKem, OutsideKemOid, CLIENT_SEED, CONTENT,
+	RFC_9180_PLAINTEXT, SERVER_SEED,
 };
+use crate::common::result::TestResult;
 
 /// DHKEM(P-521, HKDF-SHA512) in the HPKE KEM registry (RFC 9180 §7.1).
 const KEM_DHKEM_P521_HKDF_SHA512: u16 = 0x0012;
@@ -249,6 +251,12 @@ impl Debug for P521KeyProvider {
 }
 
 impl P521KeyProvider {
+	/// The backend of the P-521 key whose scalar is thirty-two `seed` octets.
+	fn seeded(seed: u8) -> Self {
+		let key = SigningKey::from_slice(&[seed; 32]);
+		Self { key: key.expect("thirty-two octets name a scalar of P-521") }
+	}
+
 	/// The public half of the key.
 	fn public_key(&self) -> PublicKey {
 		PublicKey::from_secret_scalar(self.key.as_nonzero_scalar())
@@ -273,19 +281,21 @@ impl SigningKeyProvider for P521KeyProvider {
 	}
 }
 
-/// An identity under [`P521Provider`], of a fresh key.
-fn p521_identity() -> SigningIdentity {
-	let backend = P521KeyProvider { key: SigningKey::random(&mut OsRng) };
+/// An identity under [`P521Provider`], of the key of
+/// [`P521KeyProvider::seeded`] of `seed`.
+fn p521_identity(seed: u8) -> SigningIdentity {
+	let backend = P521KeyProvider::seeded(seed);
 	let point = backend.public_key().to_encoded_point(false);
 	let certificate = certificate_of(CURVE_NIST_P521, point.as_bytes());
 	identity_of::<P521Provider>(certificate, Arc::new(backend))
 }
 
-/// A CMS server of fresh P-521 keys.
+/// A CMS server of the P-521 key of [`P521KeyProvider::seeded`] of
+/// [`SERVER_SEED`].
 fn p521_cms_server() -> OutsideCmsServer<P521Kem> {
-	let signer = P521KeyProvider { key: SigningKey::random(&mut OsRng) };
+	let signer = P521KeyProvider::seeded(SERVER_SEED);
 	let point = signer.public_key().to_encoded_point(false);
-	let backend = AgreementBackend::random();
+	let backend = AgreementBackend::fixed();
 	outside_cms_server::<P521Provider, _>("p521 server", Arc::new(signer), CURVE_NIST_P521, point.as_bytes(), backend)
 }
 
@@ -293,7 +303,7 @@ fn p521_cms_server() -> OutsideCmsServer<P521Kem> {
 /// the vector does: `enc` is the 133-octet `pkEm` of the scalar it draws,
 /// and the shared secret is the 64-octet one it publishes.
 #[test]
-fn the_p521_kem_encapsulates_as_rfc_9180_a_6_1() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p521_kem_encapsulates_as_rfc_9180_a_6_1() -> TestResult {
 	let encapsulated = RFC_9180_A_6_1.encapsulated_by::<NistP521, P521Kem>()?;
 	assert_eq!(encapsulated, RFC_9180_A_6_1.encapsulation());
 	Ok(())
@@ -303,7 +313,7 @@ fn the_p521_kem_encapsulates_as_rfc_9180_a_6_1() -> Result<(), Box<dyn std::erro
 /// of the recipient scalar, whose agreement is 66 octets, to the published
 /// shared secret.
 #[tokio::test]
-async fn the_p521_kem_decapsulates_rfc_9180_a_6_1() -> Result<(), Box<dyn std::error::Error>> {
+async fn the_p521_kem_decapsulates_rfc_9180_a_6_1() -> TestResult {
 	let shared = RFC_9180_A_6_1.decapsulated_by::<NistP521, P521Kem>().await?;
 	assert_eq!(shared, unhex(RFC_9180_A_6_1.shared_secret));
 	Ok(())
@@ -312,7 +322,7 @@ async fn the_p521_kem_decapsulates_rfc_9180_a_6_1() -> Result<(), Box<dyn std::e
 /// The HPKE suite of P-521 seals the plaintext of RFC 9180 A.6.1.1 at
 /// sequence number zero to `enc` and the published ciphertext.
 #[test]
-fn the_p521_hpke_suite_seals_as_rfc_9180_a_6_1_1() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p521_hpke_suite_seals_as_rfc_9180_a_6_1_1() -> TestResult {
 	let sealed = RFC_9180_A_6_1.sealed_by::<P521Suite>()?;
 	assert_eq!(sealed, RFC_9180_A_6_1.message());
 	Ok(())
@@ -322,7 +332,7 @@ fn the_p521_hpke_suite_seals_as_rfc_9180_a_6_1_1() -> Result<(), Box<dyn std::er
 /// and opens its ciphertext at sequence number zero under the recipient
 /// scalar.
 #[test]
-fn the_p521_hpke_suite_opens_rfc_9180_a_6_1_1() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p521_hpke_suite_opens_rfc_9180_a_6_1_1() -> TestResult {
 	let opened = RFC_9180_A_6_1.opened_by::<P521Suite>()?;
 	assert_eq!(opened, unhex(RFC_9180_PLAINTEXT));
 	Ok(())
@@ -331,8 +341,10 @@ fn the_p521_hpke_suite_opens_rfc_9180_a_6_1_1() -> Result<(), Box<dyn std::error
 /// The HPKE flow runs under the P-521 provider, and the client's first
 /// record opens under the server's session keys.
 #[tokio::test]
-async fn a_p521_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let opened = first_record_opened(hpke_pair::<P521Provider>(p521_identity())).await?;
+async fn a_p521_provider_runs_the_hpke_flow() -> TestResult {
+	let pair = hpke_pair::<P521Provider>(p521_identity(SERVER_SEED));
+
+	let opened = first_record_opened(pair).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -340,8 +352,8 @@ async fn a_p521_provider_runs_the_hpke_flow() -> Result<(), Box<dyn std::error::
 /// The hello of a P-521 client carries `R` as a point of P-521 in the
 /// compressed form, 67 octets.
 #[test]
-fn a_p521_hello_carries_a_compressed_p521_point() -> Result<(), Box<dyn std::error::Error>> {
-	let (carried, compressed) = carried_point::<P521Provider, _>(p521_identity())?;
+fn a_p521_hello_carries_a_compressed_p521_point() -> TestResult {
+	let (carried, compressed) = carried_point::<P521Provider, _>(p521_identity(SERVER_SEED))?;
 	assert_eq!(carried, compressed);
 	Ok(())
 }
@@ -350,8 +362,9 @@ fn a_p521_hello_carries_a_compressed_p521_point() -> Result<(), Box<dyn std::err
 /// on P-521 behind the outside KEM, and the client's first record opens
 /// under the server's session keys.
 #[tokio::test]
-async fn a_p521_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::Error>> {
-	let opened = first_record_opened(cms_pair::<P521Provider>(p521_cms_server(), p521_identity())).await?;
+async fn a_p521_provider_runs_the_cms_flow() -> TestResult {
+	let pair = cms_pair::<P521Provider>(p521_cms_server(), p521_identity(CLIENT_SEED));
+	let opened = first_record_opened(pair).await?;
 	assert_eq!(opened, CONTENT);
 	Ok(())
 }
@@ -360,7 +373,7 @@ async fn a_p521_provider_runs_the_cms_flow() -> Result<(), Box<dyn std::error::E
 /// client holds an epoch receipt other than the receipt of its handshake.
 #[cfg(all(feature = "transport-multiplex", feature = "tcp", feature = "tokio"))]
 #[tokio::test]
-async fn a_p521_session_renews_its_epoch() -> Result<(), Box<dyn std::error::Error>> {
+async fn a_p521_session_renews_its_epoch() -> TestResult {
 	let renewed = super::renewal::renews_its_epoch::<P521Provider>(p521_identity).await?;
 	assert!(renewed);
 	Ok(())
@@ -372,7 +385,7 @@ const P521_DESCRIPTOR: &str = "304ca00b060960864801650304020aa10b060960864801650
 
 /// The descriptor of [`P521Profile`] encodes as [`P521_DESCRIPTOR`].
 #[test]
-fn the_p521_descriptor_encodes_as_its_known_der() -> Result<(), Box<dyn std::error::Error>> {
+fn the_p521_descriptor_encodes_as_its_known_der() -> TestResult {
 	let der = SecurityProfileDesc::from(&P521Profile).to_der()?;
 	assert_eq!(der, unhex(P521_DESCRIPTOR));
 	Ok(())

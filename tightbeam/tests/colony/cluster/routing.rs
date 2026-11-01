@@ -15,9 +15,14 @@ use tightbeam::{cluster, servlet};
 #[cfg(feature = "instrument")]
 use tightbeam::testing::fixtures::TestTrace;
 
+use crate::common::result::TestResult;
+use crate::common::security::expectation_failure;
+
+#[cfg(feature = "instrument")]
+use crate::colony::trace::{payload_digests, payload_trace, session_digest};
+
 use super::common::*;
 use super::federation::{federation_conf, wait_for_type_routes};
-use crate::common::security::expectation_failure;
 
 tb_assert_spec! {
 	pub ClusterRoutingSpec,
@@ -181,7 +186,7 @@ servlet! {
 
 		// The SIGNED and PREVIOUS probes witness presence only. Byte fidelity
 		// rests on SIG_VALID alone, whose signature check covers the frame's
-		// to-be-signed bytes, so no change may weaken that probe.
+		// to-be-signed bytes.
 		let sig_valid = frame_signature_verifies(&frame, &probe_signing_key());
 
 		trace.event_with(PROBE_FRAME_CLIENT_ID, &[], u32::from(frame.metadata().id() == b"client-signed-work"))?;
@@ -559,70 +564,57 @@ tb_scenario! {
 	}
 }
 
-// The edge plane names the caller of a refused unary call by the key that its
-// session proved. Two refusals on one session name one caller, though each
-// frame claims a signer of its own (CWE-345).
+/// The address of the edge plane of `cluster`, which a gateway with an edge
+/// bind address binds as it starts.
+#[cfg(feature = "instrument")]
+fn edge_addr_of(cluster: &EdgeClusterGateway) -> <TokioListener as tightbeam::transport::Protocol>::Address {
+	let edge_addr = cluster.edge_addr();
+	let edge_addr = edge_addr.expect("a gateway with an edge bind address binds its edge plane");
+	edge_addr.to_owned()
+}
+
+/// The edge plane names the caller of a refused unary call by the key that
+/// its session proved. Two refusals on one session name one caller, though
+/// each frame claims a signer of its own (CWE-345).
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Result<(), TightBeamError> {
+async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> TestResult {
 	let certs = cluster_certs();
 	let trace = payload_trace();
-	let mut tls = cluster_tls_config(&certs);
-	tls.client_authentication = PeerAuthentication::Anonymous.and(combined_validator(&[&certs.cert]));
-
-	let mut conf = ClusterConfig::new(tls);
+	let mut conf = ClusterConfig::new(mutual_tls(&certs));
 	conf.edge_bind_addr = Some("127.0.0.1:0".into());
 
 	let cluster = EdgeClusterGateway::start(Arc::new(trace.share()), conf).await?;
-	let edge_addr = cluster
-		.edge_addr()
-		.ok_or_else(|| expectation_failure("edge plane did not bind"))?;
-
-	let identity = signing_identity(certs.cert.to_owned(), certs.key.to_owned());
-	let builder = ClientBuilder::<TokioListener>::builder().with_trust_store(Arc::clone(&certs.trust));
-	let mut client = builder
-		.with_client_identity(identity)
-		.build()
-		.connect(edge_addr.to_owned())
-		.await?;
+	let mut client = connect_with_identity(Arc::clone(&certs.trust), &certs, &edge_addr_of(&cluster)).await?;
 
 	let own = signed_control_frame_with(&certs.key, b"edge-own", registration_request(b"127.0.0.1:65001")).await?;
 	let claimed = registration_request(b"127.0.0.1:65002");
-	let claimed = signed_control_frame_with(&probe_signing_key(), b"edge-claimed", claimed).await?;
+	let claimed = signed_control_frame_with(&TestKey::insecure_fixed_signing(), b"edge-claimed", claimed).await?;
 
 	emit_frame(&mut client, own).await?;
 	emit_frame(&mut client, claimed).await?;
 	cluster.stop();
 
 	let callers = payload_digests(&trace, events::CLUSTER_EDGE_REFUSED);
-	let session = callers.first().copied().flatten();
-	assert!(session.is_some());
+	let session = Some(session_digest(&certs.cert));
 	assert_eq!(callers, [session, session]);
 	Ok(())
 }
 
-/// Whether `started` failed on a bind address that names `octets`.
-fn refused_the_address<T>(started: &Result<T, TightBeamError>, octets: &[u8]) -> bool {
-	let Err(TightBeamError::ClusterError(error)) = started else {
-		return false;
-	};
-
-	matches!(error.as_ref(), ClusterError::InvalidAddress(named) if named.as_slice() == octets)
-}
-
-// A configured edge plane that cannot parse its bind address fails
-// Cluster::start closed: the call returns Err and no accept loop outlives it
-// (bind-then-spawn owns both listeners before spawn).
+/// A configured edge plane that cannot parse its bind address fails
+/// `Cluster::start` closed, with the refusal of the address that it names.
 #[tokio::test]
-async fn cluster_edge_bind_failure_fails_start() -> Result<(), TightBeamError> {
+async fn an_edge_plane_that_cannot_parse_its_bind_address_fails_the_start() {
 	let certs = cluster_certs();
 	let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
 	conf.edge_bind_addr = Some("not-a-socket-addr".into());
 
 	let started = EdgeClusterGateway::start(Arc::new(TraceCollector::new()), conf).await;
-	let unparsed = refused_the_address(&started, b"not-a-socket-addr");
-	assert!(unparsed, "an unparsable edge bind address fails Cluster::start");
-	Ok(())
+	let refusal = cluster_refusal(&started);
+	assert!(matches!(
+		refusal,
+		Some(ClusterError::InvalidAddress(named)) if named.as_slice() == b"not-a-socket-addr"
+	));
 }
 
 servlet! {
@@ -1113,11 +1105,11 @@ tb_scenario! {
 	}
 }
 
-// A sibling dial that another identity answers records its refusal on the
-// trace that the context's builder named, so a builder outside the crate
-// reads the refusals of the context it built.
+/// A sibling dial that another identity answers records its refusal on the
+/// trace that the context's builder named, so a builder outside the crate
+/// reads the refusals of the context it built.
 #[tokio::test]
-async fn a_sibling_context_records_a_refused_dial_on_the_trace_it_was_given() -> Result<(), TightBeamError> {
+async fn a_sibling_context_records_a_refused_dial_on_the_trace_it_was_given() -> TestResult {
 	let certs = cluster_certs();
 	let impostor_certs = stranger_gateway_certs();
 	let trace = TraceCollector::default();
@@ -1141,9 +1133,8 @@ async fn a_sibling_context_records_a_refused_dial_on_the_trace_it_was_given() ->
 	let refused = routes.call(&sibling_type, frame).await;
 	impostor.stop();
 
-	let mismatched = matches!(refused, Err(TightBeamError::ClusterError(ref error)) if matches!(**error, ClusterError::PeerMismatch));
-	assert!(mismatched);
-	assert_eq!(trace.recorded(events::CLUSTER_DIAL_REFUSED), 1);
+	let mismatched = matches!(cluster_refusal(&refused), Some(ClusterError::PeerMismatch));
+	assert_eq!((mismatched, trace.recorded(events::CLUSTER_DIAL_REFUSED)), (true, 1));
 	Ok(())
 }
 
@@ -1196,28 +1187,22 @@ tb_scenario! {
 /// traces of their own, and the gateway's heartbeat waits an hour, so the
 /// gateway's trace holds the dials of its hive pool alone.
 #[cfg(feature = "instrument")]
-async fn gateway_work_dials() -> Result<Vec<Urn<'static>>, TightBeamError> {
-	let certs = Arc::new(cluster_certs());
-	let mut conf = routing_cluster_conf(&certs, None);
-	conf.heartbeat.interval = Duration::from_secs(3_600);
-	let gateway_trace = TraceCollector::new();
-	let cluster = start_cluster(&gateway_trace, conf).await?;
-	let hive = start_ping_hive(TraceCollector::new(), Arc::clone(&certs), None).await?;
-	hive.register_with_cluster(cluster.addr()).await?;
+async fn gateway_work_dials() -> Vec<Urn<'static>> {
+	let registration = QuietRegistration::start().await;
+	let gateway_trace = registration.gateway_trace.share();
 
 	// The trail of the gateway's dials is the observation, so the echo goes
 	// unread.
-	let _echo = submit_ping(&certs, &cluster).await?;
-	hive.stop();
-	cluster.stop();
+	let echo = submit_ping(&registration.certs, &registration.cluster).await;
+	let _echo = echo.expect("the ping servlet answers");
+	registration.stop();
 
-	Ok(TestTrace::trail(&gateway_trace, &[events::POOL_DIAL]))
+	TestTrace::trail(&gateway_trace, &[events::POOL_DIAL])
 }
 
 /// A gateway records each dial of its hive pool on its own trace.
 #[cfg(feature = "instrument")]
 #[tokio::test]
-async fn a_gateway_records_the_dials_of_its_hive_pool_on_its_own_trace() -> Result<(), TightBeamError> {
-	assert_eq!(gateway_work_dials().await?, [events::POOL_DIAL]);
-	Ok(())
+async fn a_gateway_records_the_dials_of_its_hive_pool_on_its_own_trace() {
+	assert_eq!(gateway_work_dials().await, [events::POOL_DIAL]);
 }

@@ -23,13 +23,13 @@
 //! explicit client identity. The scenarios inject route claims as direct
 //! signed advertisements with the beats off, so every event count is exact.
 
+use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
+use tightbeam::colony::hive::PeerListGate;
+use tightbeam::der::Encode;
+
 use super::common::*;
 use super::federation::{type_route_count, wait_for_type_routes};
 use super::streaming::{pooled_cluster_client, StreamEchoServlet};
-use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
-use tightbeam::colony::hive::PeerListGate;
-use tightbeam::crypto::sign::SigningIdentity;
-use tightbeam::der::Encode;
 
 /// Two organizations under split trust planes.
 ///
@@ -266,24 +266,6 @@ async fn typed_echo(
 	decode_ping_echo(&servlet_frame)
 }
 
-/// A client that dials `server_trust`'s gateway under `identity`, for a
-/// mutual-TLS gateway that captures the caller certificate.
-async fn connect_with_identity(
-	server_trust: Arc<dyn CertificateTrust>,
-	identity: &ClusterTestCerts,
-	addr: &<TokioListener as tightbeam::transport::Protocol>::Address,
-) -> Result<GenericClient<TokioListener>, TightBeamError> {
-	Ok(ClientBuilder::<TokioListener>::builder()
-		.with_trust_store(server_trust)
-		.with_client_identity(SigningIdentity::from_spec(
-			CertificateSpec::Built(Box::new(identity.cert.to_owned())),
-			Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned())),
-		)?)
-		.build()
-		.connect(addr.to_owned())
-		.await?)
-}
-
 tb_assert_spec! {
 	pub ClusterExportAdFilterSpec,
 	V(1,0,0): {
@@ -321,12 +303,14 @@ tb_scenario! {
 				vec![servlet_urn("ping")],
 				partner_grant(&ctx.b, servlet_urn("ledger"))?,
 			);
+
 			let exporter = start_cluster(&trace, conf_a).await?;
 
 			hive.register_with_cluster(exporter.addr()).await?;
 
 			let installed = wait_for_type_routes(&observer, "ping", 1, 100, Duration::from_millis(100)).await;
 			wait_for_direct_advertisement(&trace, 100, Duration::from_millis(100)).await;
+
 			let hidden = type_route_count(&observer, "ledger");
 			assert_eq!(installed, 1, "the observer installs the one exported ping trail");
 			assert_eq!(hidden, 0, "the export list keeps ledger out of every advertised slate");
@@ -691,33 +675,32 @@ tb_scenario! {
 	}
 }
 
-/// A federated configuration with no export list, bound at `bind`, that
-/// beats toward one peer that never answers.
-fn unbounded_federated_conf(certs: &ClusterTestCerts, bind: impl Into<String>) -> ClusterConfig {
-	ClusterConfig::builder(cluster_tls_config(certs))
-		.with_bind_addr(bind)
-		.with_peers(["127.0.0.1:65211"])
-		.expect("fixture peers name sockets")
-		.with_advertise_interval(Duration::from_millis(100))
-		.build()
+/// The count of export postures that a federated gateway with no export list
+/// reports as it starts at `bind`, beating toward one peer that never
+/// answers. A gateway that starts stops before the count.
+async fn posture_of(bind: &str) -> usize {
+	let certs = cluster_certs();
+	let trace = TraceCollector::new();
+	let conf = federating_builder(&certs, bind, "127.0.0.1:65211").build();
+
+	let started = start_cluster(&trace, conf).await;
+	if let Ok(gateway) = started {
+		gateway.stop();
+	}
+
+	trace.recorded(events::CLUSTER_EXPORT_UNBOUNDED)
 }
 
 // A gateway reports its export posture once it decides the address it
 // advertises. A federated gateway that refuses its wildcard bind reports no
 // posture, and the same gateway on a loopback bind reports it once.
-#[tokio::test]
-async fn a_gateway_reports_its_export_posture_only_once_it_starts() -> Result<(), TightBeamError> {
-	let certs = cluster_certs();
-	let refused_trace = TraceCollector::new();
-	let refused = start_cluster(&refused_trace, unbounded_federated_conf(&certs, "0.0.0.0:0")).await;
-	let started_trace = TraceCollector::new();
-	let started = start_cluster(&started_trace, unbounded_federated_conf(&certs, "127.0.0.1:0")).await?;
-	started.stop();
-
-	let refused_posture = refused_trace.recorded(events::CLUSTER_EXPORT_UNBOUNDED);
-	let started_posture = started_trace.recorded(events::CLUSTER_EXPORT_UNBOUNDED);
-	assert!(refused.is_err(), "a federated gateway refuses its wildcard bind");
-	assert_eq!(refused_posture, 0, "a gateway that refuses to start reports no posture");
-	assert_eq!(started_posture, 1, "a gateway that starts reports its posture once");
-	Ok(())
+tightbeam::tb_cases! {
+	async fn a_gateway_reports_its_export_posture((bind, posture): (&str, usize)) {
+		let reported = posture_of(bind).await;
+		assert_eq!(reported, posture);
+	}
+	cases {
+		never_on_a_refused_wildcard_bind => ("0.0.0.0:0", 0),
+		once_on_a_started_loopback_bind => ("127.0.0.1:0", 1),
+	}
 }

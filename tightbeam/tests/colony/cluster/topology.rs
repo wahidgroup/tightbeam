@@ -1,10 +1,28 @@
 //! Multi-instance topology scenarios and the load balancers they route through.
 
+use tightbeam::{compose, servlet};
+
 use super::common::*;
+
+servlet! {
+	/// A ping instance that records the marker of its environment as a frame
+	/// reaches its handler, so a spec reads which instance receives the work.
+	InstanceProbeServlet<PingRequest, EnvConfig = Urn<'static>>,
+	protocol: TokioListener,
+	handle: |req, frame, ctx| async move {
+		ctx.trace().event(ctx.env_config())?;
+
+		Ok(Some(compose! {
+			V0: id: frame.metadata().id(),
+				message: PingResponse { doubled: req.value * 2 }
+		}?))
+	}
+}
 
 /// The shared fixture of the topology scenarios: the gateway certificates and
 /// the selection set that the [`RecordingBalancer`] fills. The scenario checks
-/// that the set holds both instances.
+/// that the set holds both indices, and the spec reads that each instance
+/// receives work.
 struct TopologyCtx {
 	certs: Arc<GatewayCerts>,
 	selected: Arc<Mutex<HashSet<usize>>>,
@@ -22,9 +40,10 @@ impl TopologyCtx {
 
 /// Wraps any strategy to prove that the gateway consults the
 /// `Arc<dyn LoadBalancer>` and that a custom strategy threads through
-/// [`ClusterConfigBuilder::with_load_balancer`]. It records every offer as a
-/// `BALANCER_OFFERED` event valued with the slate width, and the indices it
-/// returns land in the shared selection set.
+/// [`ClusterConfigBuilder::with_load_balancer`].
+///
+/// It records every offer as a `BALANCER_OFFERED` event valued with the slate
+/// width, and the shared selection set holds the picks of the strategy.
 struct RecordingBalancer<L: LoadBalancer> {
 	inner: L,
 	trace: TraceCollector,
@@ -61,6 +80,18 @@ fn topology_cluster_conf(
 	ClusterConfig::builder(tls).with_load_balancer(load_balancer).build()
 }
 
+/// Starts one ping instance on the fixture identity, which records `marker`
+/// for each frame that reaches its handler.
+async fn start_instance(
+	trace: &Arc<TraceCollector>,
+	ctx: &TopologyCtx,
+	marker: Urn<'static>,
+) -> Result<InstanceProbeServlet, TightBeamError> {
+	let config = servlet_tls_builder(ctx.certs.as_ref())?.with_config(Arc::new(marker)).build();
+
+	InstanceProbeServlet::start(Arc::clone(trace), config).await
+}
+
 /// Registers two live ping servlets as instances of one type and routes
 /// `routes` work requests through the gateway. Every submission must
 /// serve a response frame, which proves that the gateway reports
@@ -72,10 +103,8 @@ async fn drive_topology_routes(
 	routes: usize,
 ) -> Result<(), TightBeamError> {
 	let trace = Arc::new(trace.share());
-	let config = servlet_tls_config(ctx.certs.as_ref())?;
-	let servlet_a = ClusterTestServlet::start(Arc::clone(&trace), config).await?;
-	let config = servlet_tls_config(ctx.certs.as_ref())?;
-	let servlet_b = ClusterTestServlet::start(Arc::clone(&trace), config).await?;
+	let servlet_a = start_instance(&trace, ctx, FIRST_INSTANCE_RECEIVED).await?;
+	let servlet_b = start_instance(&trace, ctx, SECOND_INSTANCE_RECEIVED).await?;
 	let addr_a = servlet_a.addr().to_string();
 	let addr_b = servlet_b.addr().to_string();
 	let hive_addr = b"127.0.0.1:65210".as_slice();
@@ -125,7 +154,9 @@ tb_assert_spec! {
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
 			(events::CLUSTER_WORK_ROUTED, at_least!(4)),
-			(BALANCER_OFFERED, at_least!(4), equals!(2u64))
+			(BALANCER_OFFERED, at_least!(4), equals!(2u64)),
+			(FIRST_INSTANCE_RECEIVED, at_least!(1)),
+			(SECOND_INSTANCE_RECEIVED, at_least!(1))
 		]
 	}
 }

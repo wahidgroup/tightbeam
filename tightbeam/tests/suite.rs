@@ -23,13 +23,10 @@ mod jobs;
 mod instrumentation;
 
 // The protocol integration tests.
-#[cfg(feature = "full")]
+#[cfg(all(feature = "full", feature = "testing"))]
 mod tightbeam_core;
 
-// The frame encoding tests of the core protocol.
-#[cfg(feature = "full")]
-mod protocol_core;
-
+// The transport tests.
 #[cfg(feature = "transport")]
 mod transport;
 
@@ -42,15 +39,11 @@ mod scenario_verdict;
 mod fdr;
 
 // The integration tests of timing verification.
-#[cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
+#[cfg(all(feature = "testing-timing", feature = "testing-fdr"))]
 mod timing;
 
 // The integration tests of schedulability analysis.
-#[cfg(all(
-	feature = "testing-timing",
-	feature = "testing-schedulability",
-	feature = "testing-fdr"
-))]
+#[cfg(all(feature = "testing-schedulability", feature = "testing-fdr"))]
 mod schedulability;
 
 // The colony tests.
@@ -94,5 +87,5 @@ mod teardown;
 mod property;
 
 // The seams an outside crate fills with parts of its own.
-#[cfg(all(feature = "transport", feature = "testing", feature = "hpke"))]
+#[cfg(all(feature = "testing", feature = "hpke"))]
 mod seams;

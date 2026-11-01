@@ -3,23 +3,29 @@
 //! [`AuthorizationServlet`] approves a credit transfer, [`CaptureServlet`]
 //! settles a capture, and [`KeyManagerServlet`] serves its public key and
 //! opens a secret sealed to it.
+//!
+//! The priority table of this module is a self-check of the harness that runs
+//! no tightbeam code. The commitment test runs `Frame::verify_commitment_of`.
 
 use std::sync::Arc;
 
-use sha3::Sha3_256;
 use tightbeam::asn1::MessagePriority;
+use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::hpke::{HpkeMessage, HpkeSecp256k1Sha256Aes256Gcm, HpkeSecretKeyOps};
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
+use tightbeam::der::asn1::OctetString;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
+use tightbeam::urn::Urn;
 use tightbeam::{compose, servlet, Frame, TightBeamError};
 
 use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
-
-use tightbeam::der::asn1::OctetString;
-use tightbeam::urn::Urn;
+use super::messages::{
+	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
+	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
+};
 
 /// The HPKE `info` under which the key manager opens a sealed secret.
 pub(crate) const KEY_MANAGER_HPKE_INFO: &[u8] = b"tb/test/payments/hpke/v1";
@@ -41,10 +47,6 @@ pub(crate) const KEYMANAGER_DECRYPT_SUCCESS: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/keymanager-decrypt-success");
 pub(crate) const KEYMANAGER_PUBKEY_SERVED: Urn<'static> =
 	tightbeam::urn!("test", "event:servlets/keymanager-pubkey-served");
-use super::messages::{
-	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
-	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
-};
 
 /// Calculates the message priority from the transaction amount.
 ///
@@ -201,7 +203,6 @@ servlet! {
 	}
 }
 
-#[cfg(test)]
 mod tests {
 	use tightbeam::asn1::Version;
 	use tightbeam::builder::TypeBuilder;
@@ -209,29 +210,22 @@ mod tests {
 
 	use super::*;
 
-	#[test]
-	fn priority_low_value_normal() {
-		let amount = MonetaryAmount::new(1000, *b"USD"); // $10.00
-		assert_eq!(to_priority(&amount), MessagePriority::Standard);
-	}
-
-	#[test]
-	fn priority_high_value_top() {
-		let amount = MonetaryAmount::new(1_000_000, *b"USD"); // $10,000.00
-		assert_eq!(to_priority(&amount), MessagePriority::Expedited);
-	}
-
-	#[test]
-	fn priority_jpy_converts_to_us_cents() {
-		// 100,000 JPY is about 1,000 USD, which is 100,000 cents.
-		let amount = MonetaryAmount::new(100_000, *b"JPY");
-		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
-	}
-
-	#[test]
-	fn priority_medium_value_high() {
-		let amount = MonetaryAmount::new(50_000, *b"USD"); // $500.00
-		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
+	// An amount takes the priority of its value in US cents: an expedited one
+	// past 100,000 cents, a low-latency one past 10,000 cents, and a standard
+	// one up to 10,000 cents. A hundred dollars sits on the low-latency bound,
+	// and a hundred thousand yen, 100,000 cents at the rough rate of the yen,
+	// sits on the expedited one.
+	tightbeam::tb_cases! {
+		fn an_amount_takes_the_priority_of_its_us_cents((amount, priority): (MonetaryAmount, MessagePriority)) {
+			assert_eq!(to_priority(&amount), priority);
+		}
+		cases {
+			ten_dollars => (MonetaryAmount::new(1_000, *b"USD"), MessagePriority::Standard),
+			a_hundred_dollars => (MonetaryAmount::new(10_000, *b"USD"), MessagePriority::Standard),
+			five_hundred_dollars => (MonetaryAmount::new(50_000, *b"USD"), MessagePriority::LowLatency),
+			a_hundred_thousand_yen => (MonetaryAmount::new(100_000, *b"JPY"), MessagePriority::LowLatency),
+			ten_thousand_dollars => (MonetaryAmount::new(1_000_000, *b"USD"), MessagePriority::Expedited),
+		}
 	}
 
 	/// A transfer of 100.00 USD to the creditor account `creditor`.
@@ -252,10 +246,9 @@ mod tests {
 
 	/// A transfer that the commitment of its frame misses is refused.
 	#[test]
-	fn a_transfer_that_its_commitment_misses_is_refused() -> Result<(), TightBeamError> {
+	fn a_transfer_that_its_commitment_misses_is_refused() {
 		let trace = TraceCollector::default();
 		let refusal = transfer(b"CREDITOR").authorize(&frame_of_another_body(), &trace);
 		assert!(matches!(refusal, Err(TightBeamError::InvalidBody)));
-		Ok(())
 	}
 }

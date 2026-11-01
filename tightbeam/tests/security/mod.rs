@@ -1,14 +1,6 @@
 #![cfg(all(
-	feature = "std",
-	feature = "transport",
 	feature = "tcp",
 	feature = "tokio",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "sha3",
-	feature = "aead",
-	feature = "testing",
 	feature = "testing-csp",
 	feature = "transport-hpke",
 	feature = "instrument"
@@ -16,13 +8,20 @@
 
 //! The transport integration tests that target security.
 //!
-//! Each module exercises the threat controls documented in the README's
-//! transport security table.
+//! Each module exercises a threat control of the README's transport security
+//! table, and `algorithm_confusion` holds the negative control of a primitive
+//! that those controls rest on.
+//!
+//! Two other homes hold the rest of that table:
+//! - `tests/transport/multiplex/` holds the rekey ephemerals, stream cap
+//!   inflation, reassembly exhaustion, flow-control overrun, and rapid reset.
+//! - The crate test `a_client_refuses_an_accept_that_departs_from_its_offer` in
+//!   `transport::handshake::negotiation` holds the unsolicited transport
+//!   accept, because a server answers an offer alone.
 
 pub mod algorithm_confusion;
 pub mod attribute_injection;
 pub mod certificate_forgery;
-pub mod certificate_trust;
 pub mod common;
 pub mod confidentiality;
 pub mod countersignature_evidence;
@@ -36,6 +35,7 @@ pub mod nonce_reuse;
 pub mod receipt_activation;
 pub mod receipt_confidentiality;
 pub mod receipt_integrity;
+pub mod record_freshness;
 pub mod replay_attack;
 pub mod settlement_ordering;
 pub mod splice_attack;

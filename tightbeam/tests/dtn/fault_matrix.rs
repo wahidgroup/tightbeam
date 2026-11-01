@@ -1,19 +1,18 @@
 use tightbeam::matrix::{Matrix, MatrixLike};
 
-/// Enumeration of all fault types supported by the rover.
+/// A fault of the rover, which raises one flag of a [`FaultMatrix`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FaultType {
-	/// Low battery/power fault - Resolves after recharged
+	/// The battery charge is low. The fault clears once the battery is full.
 	LowPower,
-	/// Communications system fault - Resolves after retry
+	/// The communications system has failed.
 	Communications,
-	/// Thermal anomaly - Resolves after random time
+	/// The rover reads a thermal anomaly.
 	Thermal,
 }
 
 impl FaultType {
-	/// Get the matrix cell coordinates for this fault type.
-	/// Returns (row, col) tuple.
+	/// The cell of the flag of this fault, as its row and its column.
 	fn matrix_coords(&self) -> (u8, u8) {
 		match self {
 			FaultType::LowPower => (0, 0),
@@ -22,7 +21,7 @@ impl FaultType {
 		}
 	}
 
-	/// Get all fault types as an iterator.
+	/// Each fault, in the order of its column in the matrix.
 	pub fn all() -> impl Iterator<Item = FaultType> {
 		[FaultType::LowPower, FaultType::Communications, FaultType::Thermal]
 			.iter()
@@ -30,14 +29,14 @@ impl FaultType {
 	}
 }
 
-/// Encapsulates rover fault state and telemetry in a 3x3 matrix representation.
+/// The fault flags and the battery charge of the rover, in a 3x3 matrix.
 ///
 /// Matrix layout:
 /// - Cell [0,0]: Low Power fault (0=inactive, 1=active)
 /// - Cell [0,1]: Communications fault (0=inactive, 1=active)
 /// - Cell [0,2]: Thermal fault (0=inactive, 1=active)
 /// - Cell [1,0]: Battery percentage (0-100)
-/// - Remaining cells: Reserved for future use
+/// - Remaining cells: 0
 ///
 /// The type encodes the fault flags and the telemetry into the `matrix` field
 /// of a Frame.
@@ -47,57 +46,55 @@ pub struct FaultMatrix {
 }
 
 impl FaultMatrix {
-	/// Create a new FaultMatrix with no faults.
+	/// A matrix with no fault flag raised.
 	pub fn new() -> Self {
 		Self { matrix: Matrix::<3>::new() }
 	}
 
-	/// Check if any fault is active.
+	/// Whether any fault flag is raised.
 	pub fn has_fault(&self) -> bool {
 		FaultType::all().any(|ft| self.is_fault_active(ft))
 	}
 
-	/// Check if a specific fault type is active.
+	/// Whether the flag of `fault_type` is raised.
 	pub fn is_fault_active(&self, fault_type: FaultType) -> bool {
 		let (r, c) = fault_type.matrix_coords();
 		self.matrix.get(r, c) != 0
 	}
 
-	/// Set a specific fault type to active.
+	/// Raises the flag of `fault_type`.
 	pub fn set_fault(&mut self, fault_type: FaultType) {
 		let (r, c) = fault_type.matrix_coords();
 		self.matrix.set(r, c, 1);
 	}
 
-	/// Clear a specific fault type (set to inactive).
+	/// Lowers the flag of `fault_type`.
 	pub fn clear_fault(&mut self, fault_type: FaultType) {
 		let (r, c) = fault_type.matrix_coords();
 		self.matrix.set(r, c, 0);
 	}
 
-	/// Get all active faults as an iterator.
+	/// The faults whose flags are raised, in the order of [`FaultType::all`].
 	pub fn active_faults(&self) -> impl Iterator<Item = FaultType> + '_ {
 		FaultType::all().filter(move |&ft| self.is_fault_active(ft))
 	}
 
-	/// Clear all faults.
+	/// Clears every cell, so each flag is lowered and the battery charge is 0.
 	pub fn clear_all(&mut self) {
 		self.matrix.clear();
 	}
 
-	/// Get the underlying matrix for inspection.
+	/// The matrix that holds the flags and the battery charge.
 	pub fn as_matrix(&self) -> &Matrix<3> {
 		&self.matrix
 	}
 
-	/// Set battery percentage (0-100).
-	/// Stored in cell [1,0] of the matrix.
+	/// Sets the battery charge in cell [1,0], capped at 100 percent.
 	pub fn set_battery_percent(&mut self, percent: u8) {
 		self.matrix.set(1, 0, percent.min(100));
 	}
 
-	/// Get battery percentage (0-100).
-	/// Retrieved from cell [1,0] of the matrix.
+	/// The battery charge in cell [1,0], in percent.
 	pub fn battery_percent(&self) -> u8 {
 		self.matrix.get(1, 0)
 	}
@@ -157,109 +154,109 @@ impl TryFrom<&Option<tightbeam::matrix::MatrixDyn>> for FaultMatrix {
 
 				Ok(Self { matrix })
 			}
-			Some(_) => Ok(Self::new()), // Ignore non-3x3 matrices
-			None => Ok(Self::new()),    // No matrix = no faults
+			// A matrix of another size holds no flag.
+			Some(_) => Ok(Self::new()),
+			// A frame with no matrix holds no fault.
+			None => Ok(Self::new()),
 		}
 	}
 }
 
-#[cfg(test)]
 mod tests {
+	use tightbeam::tb_cases;
+
 	use super::*;
+	use crate::common::result::TestResult;
 
-	#[test]
-	fn test_fault_matrix_operations() {
+	/// A matrix with every fault raised.
+	fn all_raised() -> FaultMatrix {
 		let mut fm = FaultMatrix::new();
-		assert!(!fm.has_fault());
+		for fault in FaultType::all() {
+			fm.set_fault(fault);
+		}
 
-		// Test setting individual faults
-		fm.set_fault(FaultType::LowPower);
-		assert!(fm.has_fault());
-		assert!(fm.is_fault_active(FaultType::LowPower));
-		assert!(!fm.is_fault_active(FaultType::Communications));
-		assert!(!fm.is_fault_active(FaultType::Thermal));
+		fm
+	}
 
-		fm.set_fault(FaultType::Communications);
-		assert!(fm.is_fault_active(FaultType::LowPower));
-		assert!(fm.is_fault_active(FaultType::Communications));
-		assert!(!fm.is_fault_active(FaultType::Thermal));
-
-		// Test clearing individual faults
-		fm.clear_fault(FaultType::LowPower);
-		assert!(!fm.is_fault_active(FaultType::LowPower));
-		assert!(fm.is_fault_active(FaultType::Communications));
-
-		fm.set_fault(FaultType::Thermal);
-		assert!(fm.is_fault_active(FaultType::Communications));
-		assert!(fm.is_fault_active(FaultType::Thermal));
-
-		// Test clear all
+	/// A matrix that raised every fault, then cleared them all.
+	fn cleared_all() -> FaultMatrix {
+		let mut fm = all_raised();
 		fm.clear_all();
-		assert!(!fm.has_fault());
+		fm
 	}
 
-	#[test]
-	fn test_fault_type_enum() {
-		let mut fm = FaultMatrix::new();
-
-		// Test enum-based API
-		fm.set_fault(FaultType::LowPower);
-		assert!(fm.is_fault_active(FaultType::LowPower));
-		assert!(!fm.is_fault_active(FaultType::Communications));
-
-		fm.set_fault(FaultType::Communications);
-		fm.set_fault(FaultType::Thermal);
-
-		// Test active_faults iterator
-		let active: Vec<FaultType> = fm.active_faults().collect();
-		assert_eq!(active.len(), 3);
-		assert!(active.contains(&FaultType::LowPower));
-		assert!(active.contains(&FaultType::Communications));
-		assert!(active.contains(&FaultType::Thermal));
-
-		// Clear one fault
-		fm.clear_fault(FaultType::Communications);
-		let active: Vec<FaultType> = fm.active_faults().collect();
-		assert_eq!(active.len(), 2);
-		assert!(!active.contains(&FaultType::Communications));
+	// Setting a fault on a fresh matrix raises the flag of that fault alone.
+	tb_cases! {
+		fn setting_a_fault_raises_its_flag_alone(fault: FaultType) {
+			let mut fm = FaultMatrix::new();
+			fm.set_fault(fault);
+			assert_eq!(fm.active_faults().collect::<Vec<_>>(), [fault]);
+		}
+		cases {
+			low_power => FaultType::LowPower,
+			communications => FaultType::Communications,
+			thermal => FaultType::Thermal,
+		}
 	}
 
-	#[test]
-	fn test_matrix_conversion() {
-		let mut fm = FaultMatrix::new();
-		fm.set_fault(FaultType::LowPower);
-		fm.set_fault(FaultType::Thermal);
-
-		// Convert to Matrix<3>
-		let matrix: Matrix<3> = fm.into();
-		assert_eq!(matrix.get(0, 0), 1); // LowPower
-		assert_eq!(matrix.get(0, 1), 0); // Communications (not set)
-		assert_eq!(matrix.get(0, 2), 1); // Thermal
-
-		// Convert back
-		let fm2 = FaultMatrix::from(matrix);
-		assert_eq!(fm, fm2);
+	// Clearing a fault on a matrix with every fault raised lowers the flag of
+	// that fault alone, and the others stay in the order of `FaultType::all`.
+	tb_cases! {
+		fn clearing_a_fault_lowers_its_flag_alone((fault, left): (FaultType, Vec<FaultType>)) {
+			let mut fm = all_raised();
+			fm.clear_fault(fault);
+			assert_eq!(fm.active_faults().collect::<Vec<_>>(), left);
+		}
+		cases {
+			low_power => (FaultType::LowPower, vec![FaultType::Communications, FaultType::Thermal]),
+			communications => (FaultType::Communications, vec![FaultType::LowPower, FaultType::Thermal]),
+			thermal => (FaultType::Thermal, vec![FaultType::LowPower, FaultType::Communications]),
+		}
 	}
 
+	// A matrix that raises no flag holds no fault.
+	tb_cases! {
+		fn a_matrix_with_no_raised_flag_holds_no_fault(matrix: FaultMatrix) {
+			assert!(!matrix.has_fault());
+		}
+		cases {
+			fresh => FaultMatrix::new(),
+			cleared_all => cleared_all(),
+		}
+	}
+
+	// The flag of a fault sits at its cell of the matrix layout, and every
+	// other cell holds 0. Each row names the nine cells in row-major order.
+	tb_cases! {
+		fn a_fault_flag_sits_at_its_matrix_cell((fault, cells): (FaultType, [u8; 9])) -> TestResult {
+			let expected = Matrix::<3>::try_from(cells.as_slice())?;
+			let mut fm = FaultMatrix::new();
+			fm.set_fault(fault);
+
+			let matrix = Matrix::<3>::from(fm);
+			assert_eq!(matrix, expected);
+			Ok(())
+		}
+		cases {
+			low_power => (FaultType::LowPower, [1, 0, 0, 0, 0, 0, 0, 0, 0]),
+			communications => (FaultType::Communications, [0, 1, 0, 0, 0, 0, 0, 0, 0]),
+			thermal => (FaultType::Thermal, [0, 0, 1, 0, 0, 0, 0, 0, 0]),
+		}
+	}
+
+	/// A fault matrix round trips through the dynamic matrix that a frame
+	/// carries, with its raised flags intact.
 	#[test]
-	fn test_fault_independence() {
+	fn a_fault_matrix_round_trips_through_its_matrix() -> TestResult {
 		let mut fm = FaultMatrix::new();
-
-		// Setting one fault should not affect others
 		fm.set_fault(FaultType::LowPower);
-		assert!(fm.is_fault_active(FaultType::LowPower));
-		assert!(!fm.is_fault_active(FaultType::Communications));
-		assert!(!fm.is_fault_active(FaultType::Thermal));
-
 		fm.set_fault(FaultType::Thermal);
-		assert!(fm.is_fault_active(FaultType::LowPower));
-		assert!(!fm.is_fault_active(FaultType::Communications));
-		assert!(fm.is_fault_active(FaultType::Thermal));
 
-		// Clearing one fault should not affect others
-		fm.clear_fault(FaultType::LowPower);
-		assert!(!fm.is_fault_active(FaultType::LowPower));
-		assert!(!fm.is_fault_active(FaultType::Communications));
-		assert!(fm.is_fault_active(FaultType::Thermal));
+		let carried = Some(tightbeam::matrix::MatrixDyn::try_from(fm)?);
+		let round_trip = FaultMatrix::try_from(&carried)?;
+		let raised: Vec<FaultType> = round_trip.active_faults().collect();
+		assert_eq!(round_trip, fm);
+		assert_eq!(raised, [FaultType::LowPower, FaultType::Thermal]);
+		Ok(())
 	}
 }

@@ -12,8 +12,6 @@
 //! [`Protocol::connect_within`] to end its connect at the budget the dial hands
 //! it, which is the operation timeout.
 
-#![cfg(all(feature = "transport-hpke", feature = "tcp"))]
-
 use core::fmt;
 use core::future::{pending, Future};
 use core::pin::pin;
@@ -35,7 +33,8 @@ use tightbeam::transport::{
 };
 
 use super::blocking::{blocking_echo_one, client_trusting};
-use super::{outside_identity, OutsideProvider};
+use super::{outside_identity, OutsideProvider, SERVER_SEED};
+use crate::common::result::TestResult;
 
 /// A blocking listener an outside crate writes: a backend that accepts on a
 /// socket it bound itself.
@@ -62,8 +61,8 @@ fn outside_listener() -> (OutsideListener, SocketAddr) {
 /// [`OutsideProvider`], so the client holds the certificate of the server,
 /// and a frame the client emits comes back to it.
 #[tokio::test]
-async fn an_outside_listener_serves_the_handshake() -> Result<(), Box<dyn Error>> {
-	let server = outside_identity();
+async fn an_outside_listener_serves_the_handshake() -> TestResult {
+	let server = outside_identity(SERVER_SEED);
 	let certificate = server.certificate().to_owned();
 	let (outside, addr) = outside_listener();
 	let config = TransportEncryptionConfig::<OutsideProvider>::new(server);
@@ -79,9 +78,10 @@ async fn an_outside_listener_serves_the_handshake() -> Result<(), Box<dyn Error>
 /// The house listener over an outside backend serves a cleartext client, and
 /// a frame the client emits comes back to it.
 #[tokio::test]
-async fn an_outside_listener_serves_in_the_clear() -> Result<(), Box<dyn Error>> {
+async fn an_outside_listener_serves_in_the_clear() -> TestResult {
 	let (outside, addr) = outside_listener();
 	blocking_echo_one(TcpListener::<_, OutsideProvider>::from_listener_cleartext(outside));
+
 	let stream = NetTcpStream::connect(addr)?;
 	let builder = ClientBuilder::<TcpListener<NetTcpListener, OutsideProvider>>::builder().allow_cleartext();
 	let mut client = builder.adopt(stream)?.into_transport();
@@ -130,7 +130,7 @@ impl Protocol for SilentProtocol {
 /// the protocol never returns (CWE-400).
 #[cfg(feature = "tokio")]
 #[test]
-fn a_dial_that_never_answers_ends_at_the_operation_timeout() -> Result<(), Box<dyn Error>> {
+fn a_dial_that_never_answers_ends_at_the_operation_timeout() -> TestResult {
 	let clock = Arc::new(ManualClock::default());
 	let builder = ClientBuilder::<SilentProtocol>::on_clock(Arc::clone(&clock) as Arc<dyn Clock>);
 	let builder = builder.allow_cleartext().with_timeout(DIAL_BUDGET);
@@ -213,7 +213,7 @@ fn spent_budget<T>(ended: Poll<Result<T, TransportError>>) -> Option<Duration> {
 /// client's operation timeout as its budget. That connect's timeout ends the
 /// dial on its first poll, though the client's clock never moves (CWE-400).
 #[test]
-fn a_dial_hands_an_overriding_protocol_the_operation_timeout() -> Result<(), Box<dyn Error>> {
+fn a_dial_hands_an_overriding_protocol_the_operation_timeout() -> TestResult {
 	let clock = Arc::new(ManualClock::default());
 	let builder = ClientBuilder::<BudgetedProtocol>::on_clock(Arc::clone(&clock) as Arc<dyn Clock>);
 	let builder = builder.allow_cleartext().with_timeout(DIAL_BUDGET);

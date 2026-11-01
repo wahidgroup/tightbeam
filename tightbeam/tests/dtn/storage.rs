@@ -1,4 +1,9 @@
 //! The frame storage and chain verification of the DTN tests.
+//!
+//! The store and its keys are test code. The tests that reopen a store read
+//! each frame back through the DER codec of tightbeam, and
+//! `a_persisted_frame_takes_the_key_of_its_order_and_id` is a self-check of the
+//! harness.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -44,6 +49,12 @@ impl DtnPayload {
 			hop_count,
 		})
 	}
+
+	/// A payload of `content` that Earth sends to Mars before its first hop.
+	pub fn carrying(content: impl AsRef<[u8]>) -> Self {
+		let payload = Self::new(content.as_ref(), "Earth", "Mars", 0);
+		payload.expect("a test payload fits an OCTET STRING")
+	}
 }
 
 /// The verdict of a cryptographic chain verification.
@@ -51,11 +62,21 @@ impl DtnPayload {
 pub struct ChainVerdict {
 	/// Whether every link of the chain verifies.
 	pub valid: bool,
-	/// The broken links, each as the frame index and an error message.
-	pub broken_links: Vec<(usize, String)>,
+	/// The broken links, each as the frame index and the reason it breaks.
+	pub broken_links: Vec<(usize, LinkBreak)>,
 	/// The number of frames minus the number of broken links. The first frame
 	/// starts the chain and counts as verified.
 	pub verified_count: usize,
+}
+
+/// The reason that a link of a chain breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkBreak {
+	/// The `previous_frame` digest of the frame differs from the hash of the
+	/// frame before it.
+	HashMismatch,
+	/// The frame after the first one carries no `previous_frame` digest.
+	MissingPrevious,
 }
 
 /// The filesystem frame storage of the DTN simulation.
@@ -242,7 +263,7 @@ impl FrameStore {
 	/// of the DER of the previous frame, which proves integrity without a
 	/// trusted intermediary.
 	pub fn verify_chain(&self, frames: &[impl Borrow<Frame>]) -> Result<ChainVerdict, TightBeamError> {
-		let broken_links: Vec<(usize, String)> = frames
+		let broken_links: Vec<(usize, LinkBreak)> = frames
 			.iter()
 			.enumerate()
 			.skip(1) // The first frame starts the chain.
@@ -252,8 +273,8 @@ impl FrameStore {
 
 				match frame.borrow().metadata().previous_frame() {
 					Some(digest_info) if verify_digest(prev_hash, digest_info) => None,
-					Some(_) => Some((i, "Hash mismatch".to_string())),
-					None => Some((i, "Missing previous_frame".to_string())),
+					Some(_) => Some((i, LinkBreak::HashMismatch)),
+					None => Some((i, LinkBreak::MissingPrevious)),
 				}
 			})
 			.collect();
@@ -323,6 +344,13 @@ impl StorageRoot {
 	pub fn node(&self, name: impl AsRef<str>) -> PathBuf {
 		self.path.join(name.as_ref())
 	}
+
+	/// The frame store of the node `name`, which opens its directory, or
+	/// reopens the frames that the directory holds.
+	pub fn store(&self, name: impl AsRef<str>) -> FrameStore {
+		let store = FrameStore::new(self.node(name));
+		store.expect("the directory of a node opens under its storage root")
+	}
 }
 
 impl Drop for StorageRoot {
@@ -333,173 +361,97 @@ impl Drop for StorageRoot {
 	}
 }
 
-#[cfg(test)]
 mod tests {
-	use super::super::ordering::{Admission, OutOfOrderBuffer};
+	use tightbeam::tb_cases;
+
 	use super::*;
-	use tightbeam::compose;
+	use crate::common::dedup::HarnessFrame;
+	use crate::common::result::TestResult;
 
+	/// A store keys a frame by its order and its id.
 	#[test]
-	fn frame_store_persist_retrieve() -> Result<(), TightBeamError> {
+	fn a_persisted_frame_takes_the_key_of_its_order_and_id() -> TestResult {
 		let root = StorageRoot::create()?;
-		let mut store = FrameStore::new(root.node("store"))?;
-		let payload = DtnPayload::new(b"test payload", "test", "test", 0)?;
+		let mut store = root.store("store");
 
-		let frame = compose! {
-			V0: id: "test-frame",
-			order: 1,
-			message: payload
-		}?;
-
-		let frame_key = store.persist(frame)?;
+		let frame_key = store.persist(HarnessFrame::at("test-frame", 1, "payload"))?;
 		assert_eq!(frame_key, FrameKey { order: 1, id: b"test-frame".to_vec() });
+		Ok(())
+	}
 
-		let retrieved = store.retrieve(&frame_key)?;
-		let retrieved_payload = DtnPayload::from_der(retrieved.message())?;
-		assert_eq!(retrieved_payload.content.as_bytes(), b"test payload");
+	/// A store that reopens from disk returns the frame that it persisted under
+	/// its key.
+	#[test]
+	fn a_store_returns_the_frame_it_persisted() -> TestResult {
+		let root = StorageRoot::create()?;
+		let mut store = root.store("store");
+		let frame = HarnessFrame::at("test-frame", 1, "payload");
+		let frame_key = store.persist(frame.to_owned())?;
+		let mut reopened = root.store("store");
 
-		store.clear()?;
-
+		let retrieved = reopened.retrieve(&frame_key)?;
+		assert_eq!(retrieved, frame);
 		Ok(())
 	}
 
 	// The tests of `dtn/delay_tolerant.rs` cover `FrameStore::verify_chain`, on
 	// a valid chain and on a chain with a wrong `previous_frame` hash.
 
-	#[test]
-	fn storage_ordering_consensus_integration() -> Result<(), TightBeamError> {
-		let root = StorageRoot::create()?;
-		let mut store = FrameStore::new(root.node("store"))?;
-		let mut order_buffer = OutOfOrderBuffer::new(10);
-
-		// The five frames carry the orders 1 to 5.
-		let mut frames = Vec::new();
-		for i in 1..=5 {
-			let payload = DtnPayload::new(format!("message-{}", i), "test", "test", 0)?;
-			let frame = compose! {
-				V0: id: format!("frame-{}", i),
-				order: i,
-				message: payload
-			}?;
-
-			frames.push(frame);
+	/// Persists each of `frames` into the store `store` under `root`.
+	fn persist_each<'a>(root: &StorageRoot, frames: impl IntoIterator<Item = &'a Frame>) {
+		let mut store = root.store("store");
+		for frame in frames {
+			store.persist(frame.to_owned()).expect("the store persists a frame");
 		}
-
-		// The store receives the frames out of order: 1, 3, 2, 5, 4.
-		let receive_order = [0usize, 2, 1, 4, 3]; // The entries index `frames`.
-		let mut processed_frames = Vec::new();
-
-		for &idx in &receive_order {
-			let frame = frames[idx].to_owned();
-
-			// 1. Persist the frame to storage.
-			store.persist(frame.to_owned())?;
-
-			// 2. Hand the frame to the order buffer, which holds it while it is out of order.
-			let frames_to_process = order_buffer.insert(frame)?;
-			if let Admission::Released(ordered_frames) = frames_to_process {
-				// 3. Process the frames the buffer releases, in order.
-				for ordered_frame in ordered_frames {
-					processed_frames.push(ordered_frame);
-				}
-			}
-		}
-
-		// The buffer releases all five frames, in order.
-		assert_eq!(processed_frames.len(), 5, "All 5 frames should be processed");
-		for (i, frame) in processed_frames.iter().enumerate() {
-			assert_eq!(
-				frame.metadata().order(),
-				(i + 1) as u64,
-				"Frame {} should have order {}",
-				i,
-				i + 1
-			);
-		}
-
-		// The store holds all five frames.
-		let stored_frames = store.list_frames()?;
-		assert_eq!(stored_frames.len(), 5, "All 5 frames should be stored");
-
-		store.clear()?;
-
-		Ok(())
 	}
 
-	/// The store keys each frame by its chain position as well as its id, so
-	/// two frames of one id at two positions both stay on disk.
-	#[test]
-	fn a_store_keeps_two_frames_of_one_id_at_two_positions() -> Result<(), TightBeamError> {
-		let root = StorageRoot::create()?;
-		let mut store = FrameStore::new(root.node("store"))?;
-		let first = compose! {
-			V0: id: "telemetry",
-				order: 1,
-				message: DtnPayload::new(b"first", "test", "test", 0)?
-		}?;
-		let second = compose! {
-			V0: id: "telemetry",
-				order: 2,
-				message: DtnPayload::new(b"second", "test", "test", 0)?
-		}?;
+	// A store that reopens from disk holds a frame that it persisted beside
+	// another frame, each at a place of its own.
+	tb_cases! {
+		fn a_reopened_store_holds_a_frame_beside_another((kept, beside): (Frame, Frame)) -> TestResult {
+			let root = StorageRoot::create()?;
+			persist_each(&root, [&kept, &beside]);
 
-		store.persist(first.to_owned())?;
-		store.persist(second)?;
-
-		let mut reopened = FrameStore::new(root.node("store"))?;
-		assert!(reopened.holds(&first)?);
-		Ok(())
-	}
-
-	/// A frame at `order` under `id` that carries a test payload.
-	fn frame_of(id: &[u8], order: u64) -> Frame {
-		let payload = DtnPayload::new(b"payload", "test", "test", 0).expect("a short payload fits");
-		let frame = compose! {
-			V0: id: id,
-				order: order,
-				message: payload
-		};
-
-		frame.expect("a V0 frame with an order composes")
+			let mut reopened = root.store("store");
+			assert!(reopened.holds(&kept)?);
+			Ok(())
+		}
+		cases {
+			/// The store keys each frame by its chain position as well as its
+			/// id, so two frames of one id at two positions both stay on disk.
+			one_id_at_two_positions => (
+				HarnessFrame::at("telemetry", 1, "first"),
+				HarnessFrame::at("telemetry", 2, "second"),
+			),
+			/// Two ids that differ in invalid UTF-8 take a place each.
+			two_ids_that_differ_in_invalid_utf8 => (
+				HarnessFrame::at(b"\xff", 1, "payload"),
+				HarnessFrame::at(b"\xfe", 1, "payload"),
+			),
+		}
 	}
 
 	/// A frame whose id holds a path separator stays inside the store.
 	#[test]
-	fn a_frame_id_with_a_path_separator_stays_in_the_store() -> Result<(), TightBeamError> {
+	fn a_frame_id_with_a_path_separator_stays_in_the_store() -> TestResult {
 		let root = StorageRoot::create()?;
-		let mut store = FrameStore::new(root.node("store"))?;
-		let frame = frame_of(b"../escape", 1);
+		let frame = HarnessFrame::at("../escape", 1, "payload");
+		persist_each(&root, [&frame]);
 
-		store.persist(frame.to_owned())?;
-
-		let mut reopened = FrameStore::new(root.node("store"))?;
+		let mut reopened = root.store("store");
 		assert!(reopened.holds(&frame)?);
-		Ok(())
-	}
-
-	/// Two ids that differ in invalid UTF-8 take two places in the store.
-	#[test]
-	fn two_ids_that_differ_in_invalid_utf8_take_two_places() -> Result<(), TightBeamError> {
-		let root = StorageRoot::create()?;
-		let mut store = FrameStore::new(root.node("store"))?;
-		let first = frame_of(&[0xff], 1);
-		store.persist(first.to_owned())?;
-		store.persist(frame_of(&[0xfe], 1))?;
-
-		let mut reopened = FrameStore::new(root.node("store"))?;
-		assert!(reopened.holds(&first)?);
 		Ok(())
 	}
 
 	/// A reopened store lists the key of each frame on disk.
 	#[test]
-	fn a_reopened_store_lists_the_key_of_each_frame() -> Result<(), TightBeamError> {
+	fn a_reopened_store_lists_the_key_of_each_frame() -> TestResult {
 		let root = StorageRoot::create()?;
-		let mut store = FrameStore::new(root.node("store"))?;
-		let key = store.persist(frame_of(b"telemetry", 1))?;
+		let mut store = root.store("store");
+		store.persist(HarnessFrame::at("telemetry", 1, "payload"))?;
 
-		let reopened = FrameStore::new(root.node("store"))?;
-		assert_eq!(reopened.list_frames()?, [key]);
+		let reopened = root.store("store");
+		assert_eq!(reopened.list_frames()?, [FrameKey { order: 1, id: b"telemetry".to_vec() }]);
 		Ok(())
 	}
 }

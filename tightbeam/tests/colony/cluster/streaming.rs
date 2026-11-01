@@ -2,9 +2,8 @@
 //!
 //! The stream-echo servlet lives in cluster B alone. A client opens a routed
 //! stream on cluster A ([`PooledClient::open_stream_to`] or
-//! [`PooledClient::open_duplex_to`]). A splices it to B's gateway with the hop
-//! budget spent, and B serves it locally. A cancel of the client stream
-//! crosses the splice to the servlet.
+//! [`PooledClient::open_duplex_to`]). A splices it to B's gateway, and B serves
+//! it locally. A cancel of the client stream crosses the splice to the servlet.
 
 use tightbeam::transport::{PooledClient, Protocol, TransportError};
 use tightbeam::{compose, servlet};
@@ -320,15 +319,20 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_REFUSED, exactly!(2), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_WORK_FAILED, absent!())
+			(events::CLUSTER_WORK_FAILED, absent!()),
+			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
+			(STREAM_SERVLET_HANDLED, exactly!(1)),
+			(DUPLEX_SERVLET_HANDLED, exactly!(0))
 		]
 	}
 }
 
-// A splice must target a servlet type, as unary work must. The gateway
-// refuses an instance-narrowed stream or duplex open before route selection,
-// so no open bypasses the load balancer and no dial runs.
+// A splice must target a servlet type, as unary work must. The type is routable
+// here, and the gateway refuses an instance-narrowed stream or duplex open
+// before route selection, so no open bypasses the load balancer and no dial
+// runs. The one servlet handles the open of the bare type alone.
 tb_scenario! {
 	name: cluster_refuses_instance_addressed_stream_opens,
 	spec: ClusterSpliceInstanceTargetSpec,
@@ -337,6 +341,7 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: certs }| async move {
 			start_cluster(&trace, with_mux_offer(routing_cluster_conf(&certs, None))).await
 		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_stream_hive(trace, certs)],
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let client = pooled_cluster_client(&trace, &certs, cluster.addr()).await?;
 			let instance = servlet_urn("stream-echo").servlet_instance("127.0.0.1:9999")?;
@@ -352,6 +357,13 @@ tb_scenario! {
 
 			let refused = refusal_status(body.chunk().await);
 			assert_eq!(refused, Some(TransitStatus::PermissionDenied), "the gateway refuses the duplex open");
+
+			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"bare").await?;
+
+			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
+			let echoed: PingResponse = reply.decode_message()?;
+			assert_eq!(echoed.doubled, 4);
 
 			cluster.stop();
 			Ok(())

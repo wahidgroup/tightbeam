@@ -6,9 +6,11 @@ use tightbeam::testing::specs::{
 	AssertionOrderContract, EventOrderViolationDetail, ResponseContract, SpecViolation, TBSpec,
 };
 use tightbeam::testing::TestFrame;
-use tightbeam::trace::{ConsumedTrace, ExecutionMode, Presence, TraceCollector};
+use tightbeam::trace::{ConsumedTrace, ExecutionMode, Presence};
 use tightbeam::urn::Urn;
 use tightbeam::Frame;
+
+use super::consumed_trace_of;
 
 /// The label that the outside spec requires first.
 const OPEN: Urn<'static> = tightbeam::urn!("outside", "event:spec/open");
@@ -52,14 +54,7 @@ impl TBSpec for OpensThenCloses {
 
 /// The trace of a run that records `first`, then `second`, and gets `response`.
 fn trace_of(first: Urn<'static>, second: Urn<'static>, response: Option<Frame>) -> ConsumedTrace {
-	let collector = TraceCollector::new();
-	let records = "a collector with no fault model records each event";
-
-	collector.event(first).expect(records);
-	collector.event(second).expect(records);
-
-	let mut trace = ConsumedTrace::new();
-	trace.populate_from_collector(&collector);
+	let mut trace = consumed_trace_of([first, second]);
 	trace.record_accepted(TestFrame::v0(None, Some("request")), response);
 	trace
 }
@@ -69,26 +64,30 @@ fn response() -> Frame {
 	TestFrame::v0(None, Some("response"))
 }
 
-#[test]
-fn a_trace_that_meets_the_outside_spec_passes() -> Result<(), SpecViolation> {
-	let trace = trace_of(OPEN, CLOSE, Some(response()));
-	OpensThenCloses::new().verify(&trace, &Ok(()))
-}
-
-#[test]
-fn a_trace_out_of_the_outside_order_is_refused() -> Result<(), SpecViolation> {
-	let trace = trace_of(CLOSE, OPEN, Some(response()));
-
-	let verdict = OpensThenCloses::new().verify(&trace, &Ok(()));
+/// The verdict of the outside spec on a trace that records `CLOSE` before
+/// `OPEN`: the first label out of order, at its position.
+fn out_of_order() -> Result<(), SpecViolation> {
 	let detail = EventOrderViolationDetail { expected_kind: CLOSE, position: 1 };
-	assert_eq!(verdict, Err(SpecViolation::AssertionOrderViolation(detail)));
-	Ok(())
+	Err(SpecViolation::AssertionOrderViolation(detail))
 }
 
-#[test]
-fn a_run_with_no_response_breaks_the_outside_response_contract() -> Result<(), SpecViolation> {
-	let trace = trace_of(OPEN, CLOSE, None);
-	let verdict = OpensThenCloses::new().verify(&trace, &Ok(()));
-	assert_eq!(verdict, Err(SpecViolation::ResponseUnexpectedAbsence));
-	Ok(())
+// The outside spec passes a trace that records its labels in its order and
+// gets a response, and refuses each trace that breaks its order or its
+// response contract.
+tightbeam::tb_cases! {
+	fn the_outside_spec_judges_a_trace(
+		(first, second, response, verdict): (Urn<'static>, Urn<'static>, Option<Frame>, Result<(), SpecViolation>)
+	) {
+		let trace = trace_of(first, second, response);
+		let judged = OpensThenCloses::new().verify(&trace, &Ok(()));
+		assert_eq!(judged, verdict);
+	}
+	cases {
+		/// A trace that meets the outside spec passes.
+		that_meets_it => (OPEN, CLOSE, Some(response()), Ok(())),
+		/// A trace out of the outside order is refused at its first label.
+		out_of_its_order => (CLOSE, OPEN, Some(response()), out_of_order()),
+		/// A run with no response breaks the outside response contract.
+		with_no_response => (OPEN, CLOSE, None, Err(SpecViolation::ResponseUnexpectedAbsence)),
+	}
 }

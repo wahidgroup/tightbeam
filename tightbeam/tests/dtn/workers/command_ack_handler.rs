@@ -1,22 +1,22 @@
-//! Command ACK handler worker - handles CommandAck messages
-//!
-//! Business logic: Validate ACK corresponds to sent command, log acknowledgment.
-//! Returns acknowledgment status.
+//! The command ACK handler worker, which records that Mission Control
+//! received a [`CommandAck`].
 
 use tightbeam::{der::Sequence, worker, Beamable, TightBeamError};
 
 use crate::dtn::events::MISSION_CONTROL_RECEIVE_ACK;
 use crate::dtn::messages::CommandAck;
 
-/// Command ACK handler request
+/// The request to the command ACK handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct CommandAckHandlerRequest {
+	/// The ACK that Mission Control received.
 	pub ack: CommandAck,
 }
 
-/// Command ACK handler response
+/// The response of the command ACK handler.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct CommandAckHandlerResponse {
+	/// Whether Mission Control acknowledged the ACK, which is always `true`.
 	pub acknowledged: bool,
 }
 
@@ -25,8 +25,6 @@ worker! {
 	handle: |request, trace| async move {
 		trace.event(MISSION_CONTROL_RECEIVE_ACK)?;
 
-		// In a more complex system, we might verify this matches a pending
-		// command but for this simple system, we just acknowledge the command.
 		Ok(CommandAckHandlerResponse {
 			acknowledged: true,
 		})

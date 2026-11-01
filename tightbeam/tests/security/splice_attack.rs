@@ -8,7 +8,8 @@
 //!
 //! ## Attack
 //! 1. The attacker holds the certificate of a victim, but not its signing key.
-//! 2. The attacker runs a handshake of its own and offers the certificate of the victim as its identity.
+//! 2. The attacker runs a handshake of its own on either backend (HPKE, CMS)
+//!    and offers the certificate of the victim.
 //! 3. The attacker's key provider claims the victim's key and signs the client Finished under its own key.
 //! 4. A second forger holds a signature the victim made over another message,
 //!    and answers the Finished with it.
@@ -129,11 +130,12 @@ tb_process_spec! {
 	annotations { description: "Splice attack: the client Finished must verify under the offered certificate" }
 }
 
-/// A live handshake with a mutual server of `materials`, which files its
-/// verdict in `trace`, and a client that offers the certificate of `victim`
-/// and signs through `provider`. The client is a real one, so it computes the
-/// key-confirmation tag for its own secrets.
+/// A live handshake of `kind` with a mutual server of `materials`, which files
+/// its verdict in `trace`, and a client that offers the certificate of
+/// `victim` and signs through `provider`. The client is a real one, so it
+/// computes the key-confirmation tag for its own secrets.
 fn forged_by(
+	kind: HandshakeBackendKind,
 	materials: &ServerMaterials,
 	victim: &ClientMaterials,
 	provider: Arc<dyn SigningKeyProvider>,
@@ -143,38 +145,52 @@ fn forged_by(
 
 	// The server holds a validator, so it requires client authentication.
 	let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator::default());
-	let handshake = LiveHandshake::new(HandshakeBackendKind::Hpke, materials.to_owned());
+	let handshake = LiveHandshake::new(kind, materials.to_owned());
 	let handshake = handshake.with_client_validators([validator]).with_client_identity(spliced);
 	Ok(handshake.audit_server(trace))
 }
 
 tb_scenario! {
-	name: splice_attack,
+	name: splice_attack_hpke,
 	config: ScenarioConfig::builder()
 		.with_spec(SpliceAttackSpec::latest())
 		.with_csp(SpliceAttackProcess)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			SpliceAttackScenario::run((trace.into(),)).await
+			SpliceAttackScenario::run((trace.into(), HandshakeBackendKind::Hpke)).await
+		}
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+tb_scenario! {
+	name: splice_attack_cms,
+	config: ScenarioConfig::builder()
+		.with_spec(SpliceAttackSpec::latest())
+		.with_csp(SpliceAttackProcess)
+		.build(),
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			SpliceAttackScenario::run((trace.into(), HandshakeBackendKind::Cms)).await
 		}
 	}
 }
 
 job! {
 	name: SpliceAttackScenario,
-	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		let materials = ServerMaterials::generate();
+	async fn run((trace, kind): (Arc<TraceCollector>, HandshakeBackendKind)) -> Result<(), TightBeamError> {
+		let materials = ServerMaterials::fixed();
 
 		// The first attacker offers the public certificate of the victim and
 		// proves it with its own key, behind a provider that claims the key of
 		// the victim.
-		let victim = ClientMaterials::deterministic();
+		let victim = ClientMaterials::fixed();
 		let attacker = ClientMaterials::generate();
 		let claimed = Arc::clone(&victim.key_provider);
 		let signer = Arc::clone(&attacker.key_provider);
 		let splicer = Arc::new(SplicedKeyProvider { claimed, signer });
-		let spliced = forged_by(&materials, &victim, splicer, &trace)?.run().await?;
+		let spliced = forged_by(kind, &materials, &victim, splicer, &trace)?.run().await?;
 
 		// The signature of the client Finished is the control, so the refusal
 		// must name it. The key confirmation and the validator both admit the
@@ -186,7 +202,7 @@ job! {
 		let other = Sha3_256::digest(b"the client Finished of another handshake");
 		let lifted = victim.key_provider.sign_prehash(&other).await?;
 		let forger = Arc::new(LiftedSignatureProvider { victim: Arc::clone(&victim.key_provider), lifted });
-		let lifted = forged_by(&materials, &victim, forger, &trace)?.run().await?;
+		let lifted = forged_by(kind, &materials, &victim, forger, &trace)?.run().await?;
 
 		lifted.refused_by_server("server admitted a lifted client Finished")
 	}

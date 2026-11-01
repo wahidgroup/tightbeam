@@ -9,7 +9,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
 
 use tightbeam::{
 	colony::servlet::ServletContext,
@@ -21,8 +20,6 @@ use tightbeam::{
 	transport::{tcp::r#async::TokioListener, ConnectionPool},
 };
 
-use crate::common::poll::poll_until;
-use crate::common::security::expectation_failure;
 use crate::dtn::{
 	certs::{FrameSigner, SharedCipher},
 	chain_processor::{ChainProcessor, ProcessResult},
@@ -32,9 +29,10 @@ use crate::dtn::{
 		EARTH_RELAY_RECEIVE_ACK_FROM_MARS, EARTH_RELAY_RECEIVE_FROM_MC, EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS,
 		MARS_RELAY_FORWARD_ACK_TO_EARTH, MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH, MARS_RELAY_FORWARD_TO_ROVER,
 		MARS_RELAY_RECEIVE_ACK_FROM_ROVER, MARS_RELAY_RECEIVE_FROM_EARTH, MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER,
-		ROVER_SEND_ACK,
+		MISSION_CONTROL_RECEIVE_LOW_POWER_FLAG, ROVER_SEND_ACK,
 	},
 	fault_manager::FaultManager,
+	fault_matrix::FaultType,
 	frame_builder::FrameBuilderHelper,
 	intake::{ChainFrame, Intake, SignedFrame},
 	jobs::{BuildGapRecoveryFrame, CreateFrameRequest, EmitFrameToNetwork, GapRecoveryContext},
@@ -50,8 +48,9 @@ use crate::dtn::{
 	},
 };
 
-/// The address of a hop that starts after the node that dials it, which the
-/// hop publishes once its servlet runs.
+/// The address of a hop that starts after the node that dials it. The hop
+/// publishes it once its servlet runs, before the first frame that the node
+/// routes to it.
 pub type LateAddr = Arc<RwLock<Option<TightBeamSocketAddr>>>;
 
 /// What a node does with one frame that its chain releases.
@@ -89,13 +88,13 @@ trait DtnNode: Sized + Send + Sync + 'static {
 	/// role of its peer.
 	fn signers_on(&self, side: PathSide) -> Vec<(DtnRole, &FrameSigner)>;
 
-	/// Returns the next hop toward `side`: its pool, and its address once the
-	/// hop publishes it.
+	/// Returns the next hop toward `side`: its pool and its address.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingConfiguration`] -- the node has no hop on `side`.
-	/// - [`TightBeamError`] -- the hop never publishes its address.
+	/// - [`TightBeamError::MissingConfiguration`] -- the node has no hop on
+	///   `side`, or that hop has published no address.
+	/// - [`TightBeamError`] -- the lock of the published address is poisoned.
 	async fn hop_toward(
 		&self,
 		side: PathSide,
@@ -409,26 +408,38 @@ trait DtnNode: Sized + Send + Sync + 'static {
 	}
 }
 
-/// Waits for the upstream servlet to publish its address, for up to 5 s.
-async fn wait_for_address(addr_lock: &LateAddr) -> Result<TightBeamSocketAddr, TightBeamError> {
-	let published = || addr_lock.read().is_ok_and(|addr| addr.is_some());
-	if !poll_until(500, Duration::from_millis(10), published).await {
-		return Err(expectation_failure("the upstream servlet never published its address"));
-	}
-
-	let addr = (*addr_lock.read()?).ok_or_else(|| expectation_failure("the published address vanished"))?;
-	Ok(addr)
+/// The address that the upstream servlet published into `addr_lock`. Each
+/// start publishes the address of its hop before the first frame that routes
+/// to that hop, so one read finds it.
+///
+/// # Errors
+///
+/// - [`TightBeamError::MissingConfiguration`] -- the upstream servlet has published no address.
+/// - [`TightBeamError`] -- the lock of the address is poisoned.
+fn published_address(addr_lock: &LateAddr) -> Result<TightBeamSocketAddr, TightBeamError> {
+	let published = *addr_lock.read()?;
+	published.ok_or(TightBeamError::MissingConfiguration)
 }
 
+/// The environment of [`MissionControlServlet`], which is the Mission Control
+/// node of the path.
 #[derive(Clone)]
 pub struct MissionControlServletConfig {
+	/// The key that signs the frames of Mission Control.
 	pub mission_control_signing_key: Secp256k1SigningKey,
+	/// The certificate that verifies the frames of the Rover.
 	pub rover_signer: FrameSigner,
+	/// The certificate that verifies the frames of the Earth Relay.
 	pub earth_relay_signer: FrameSigner,
+	/// The cipher that seals and opens each message of the path.
 	pub shared_cipher: SharedCipher,
+	/// The chain processor that orders the frames of Mission Control.
 	pub chain_processor: Arc<ChainProcessor>,
+	/// The frame builder that extends the chain of Mission Control.
 	pub frame_builder: Arc<FrameBuilderHelper>,
+	/// The address of the Earth Relay, the hop on the Mars side.
 	pub earth_relay_addr: TightBeamSocketAddr,
+	/// The pool that dials the Earth Relay.
 	pub earth_relay_pool: Arc<ConnectionPool<TokioListener>>,
 }
 
@@ -490,8 +501,14 @@ impl DtnNode for MissionControlServletConfig {
 		ctx: &ServletContext<Self>,
 	) -> Result<Routed, TightBeamError> {
 		let frame_order = entry.order();
+		let faults = entry.fault_matrix()?;
 		match entry.into_message() {
 			ChainMessage::Telemetry(telemetry) => {
+				// The matrix of the frame carries the fault flags of the Rover.
+				if faults.is_fault_active(FaultType::LowPower) {
+					ctx.trace().event(MISSION_CONTROL_RECEIVE_LOW_POWER_FLAG)?;
+				}
+
 				// The telemetry worker analyzes the telemetry and decides on
 				// the next command.
 				let request = TelemetryHandlerRequest { telemetry };
@@ -536,18 +553,31 @@ impl DtnNode for MissionControlServletConfig {
 	}
 }
 
+/// The environment of [`EarthRelaySatelliteServlet`], which is the Earth Relay
+/// node of the path.
 #[derive(Clone)]
 pub struct EarthRelaySatelliteServletConfig {
+	/// The key that signs the frames of the Earth Relay.
 	pub earth_relay_signing_key: Secp256k1SigningKey,
+	/// The certificate that verifies the frames of Mission Control.
 	pub mission_control_signer: FrameSigner,
+	/// The certificate that verifies the frames of the Mars Relay.
 	pub mars_relay_signer: FrameSigner,
+	/// The certificate that verifies the frames of the Rover.
 	pub rover_signer: FrameSigner,
+	/// The cipher that seals and opens each message of the path.
 	pub shared_cipher: SharedCipher,
+	/// The address of the Mars Relay, the hop on the Mars side.
 	pub mars_relay_addr: TightBeamSocketAddr,
+	/// The published address of Mission Control, the hop on the Earth side.
 	pub mission_control_addr: LateAddr,
+	/// The pool that dials Mission Control.
 	pub mission_control_pool: Arc<ConnectionPool<TokioListener>>,
+	/// The pool that dials the Mars Relay.
 	pub mars_relay_pool: Arc<ConnectionPool<TokioListener>>,
+	/// The chain processor that orders the frames of the Earth Relay.
 	pub chain_processor: Arc<ChainProcessor>,
+	/// The frame builder that extends the chain of the Earth Relay.
 	pub frame_builder: Arc<FrameBuilderHelper>,
 }
 
@@ -636,7 +666,7 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 		side: PathSide,
 	) -> Result<(&Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr), TightBeamError> {
 		match side {
-			PathSide::Earth => Ok((&self.mission_control_pool, wait_for_address(&self.mission_control_addr).await?)),
+			PathSide::Earth => Ok((&self.mission_control_pool, published_address(&self.mission_control_addr)?)),
 			PathSide::Mars => Ok((&self.mars_relay_pool, self.mars_relay_addr)),
 		}
 	}
@@ -651,18 +681,31 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 	}
 }
 
+/// The environment of [`MarsRelaySatelliteServlet`], which is the Mars Relay
+/// node of the path.
 #[derive(Clone)]
 pub struct MarsRelaySatelliteServletConfig {
+	/// The key that signs the frames of the Mars Relay.
 	pub mars_relay_signing_key: Secp256k1SigningKey,
+	/// The certificate that verifies the frames of Mission Control.
 	pub mission_control_signer: FrameSigner,
+	/// The certificate that verifies the frames of the Earth Relay.
 	pub earth_relay_signer: FrameSigner,
+	/// The certificate that verifies the frames of the Rover.
 	pub rover_signer: FrameSigner,
+	/// The cipher that seals and opens each message of the path.
 	pub shared_cipher: SharedCipher,
+	/// The address of the Rover, the hop on the Mars side.
 	pub rover_addr: TightBeamSocketAddr,
+	/// The published address of the Earth Relay, the hop on the Earth side.
 	pub earth_relay_addr: LateAddr,
+	/// The pool that dials the Earth Relay.
 	pub earth_relay_pool: Arc<ConnectionPool<TokioListener>>,
+	/// The pool that dials the Rover.
 	pub rover_pool: Arc<ConnectionPool<TokioListener>>,
+	/// The chain processor that orders the frames of the Mars Relay.
 	pub chain_processor: Arc<ChainProcessor>,
+	/// The frame builder that extends the chain of the Mars Relay.
 	pub frame_builder: Arc<FrameBuilderHelper>,
 }
 
@@ -751,7 +794,7 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 		side: PathSide,
 	) -> Result<(&Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr), TightBeamError> {
 		match side {
-			PathSide::Earth => Ok((&self.earth_relay_pool, wait_for_address(&self.earth_relay_addr).await?)),
+			PathSide::Earth => Ok((&self.earth_relay_pool, published_address(&self.earth_relay_addr)?)),
 			PathSide::Mars => Ok((&self.rover_pool, self.rover_addr)),
 		}
 	}
@@ -766,18 +809,28 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 	}
 }
 
+/// The environment of [`RoverServlet`], which is the Rover node of the path.
 #[derive(Clone)]
 pub struct RoverServletConfig {
+	/// The published address of the Mars Relay, the hop on the Earth side.
 	pub mars_relay_addr: LateAddr,
+	/// The pool that dials the Mars Relay.
 	pub mars_relay_pool: Arc<ConnectionPool<TokioListener>>,
+	/// The key that signs the frames of the Rover.
 	pub rover_signing_key: Secp256k1SigningKey,
+	/// The certificate that verifies the frames of Mission Control.
 	pub mission_control_signer: FrameSigner,
+	/// The certificate that verifies the frames of the Mars Relay.
 	pub mars_relay_signer: FrameSigner,
+	/// The cipher that seals and opens each message of the path.
 	pub shared_cipher: SharedCipher,
+	/// The chain processor that orders the frames of the Rover.
 	pub chain_processor: Arc<ChainProcessor>,
-	// TODO
+	/// The fault manager that tracks the battery and the faults of the Rover.
 	pub _fault_manager: Arc<FaultManager>,
+	/// The frame builder that extends the chain of the Rover.
 	pub frame_builder: Arc<FrameBuilderHelper>,
+	/// The number of commands at which the Rover marks the mission complete.
 	pub max_rounds: usize,
 }
 
@@ -826,7 +879,7 @@ impl DtnNode for RoverServletConfig {
 		side: PathSide,
 	) -> Result<(&Arc<ConnectionPool<TokioListener>>, TightBeamSocketAddr), TightBeamError> {
 		match side {
-			PathSide::Earth => Ok((&self.mars_relay_pool, wait_for_address(&self.mars_relay_addr).await?)),
+			PathSide::Earth => Ok((&self.mars_relay_pool, published_address(&self.mars_relay_addr)?)),
 			PathSide::Mars => Err(TightBeamError::MissingConfiguration),
 		}
 	}
@@ -866,7 +919,10 @@ impl DtnNode for RoverServletConfig {
 /// The mission progress that the nodes share so they coordinate.
 #[derive(Default)]
 pub struct MissionState {
+	/// The number of commands that the Rover has run.
 	pub completed_rounds: usize,
+	/// The number of telemetry messages that Mission Control has received.
 	pub telemetry_received_count: usize,
+	/// Whether the Rover has run the last command of the mission.
 	pub mission_complete: bool,
 }

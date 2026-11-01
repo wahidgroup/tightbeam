@@ -1,6 +1,6 @@
-//! TightBeam protocol integration tests
+//! The integration tests of the TightBeam protocol.
 
 mod tests;
 
-#[cfg(all(feature = "tokio", feature = "transport-policy"))]
+#[cfg(feature = "testing-fault")]
 mod zero_queue;

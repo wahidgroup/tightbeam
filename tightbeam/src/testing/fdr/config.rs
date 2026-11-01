@@ -468,6 +468,10 @@ pub struct FdrConfig {
 
 	/// The longest trace, in observable events, that exploration and the
 	/// refinement checks follow before they cut it off.
+	///
+	/// A walk keeps each target of a nondeterministic event and stops at a
+	/// budget of states, so a process with such a cycle can spend that budget
+	/// well before this bound.
 	pub max_depth: usize,
 
 	/// The most hidden events exploration takes in one run. A longer run is a

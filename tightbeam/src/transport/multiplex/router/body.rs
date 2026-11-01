@@ -154,9 +154,11 @@ impl StreamBody {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- the stream died before its `last` chunk.
+	/// - [`TransportError::ConnectionClosed`] -- the stream died before its
+	///   `last` chunk, or the peer cancelled the request that this body carries.
 	/// - [`TransportError::Draining`] -- a GoAway ended the stream before the peer served it.
-	/// - `OperationFailed(Cancelled)` -- its own sink or the peer cancelled the stream.
+	/// - `OperationFailed(Cancelled)` -- its own sink cancelled the stream, or
+	///   the peer cancelled the reply that this body carries.
 	/// - The trailer's [`TransitStatus`](crate::policy::TransitStatus) mapped
 	///   to its transport error, on a duplex reply that ended non-Ok.
 	pub async fn chunk(&mut self) -> TransportResult<Option<Vec<u8>>> {

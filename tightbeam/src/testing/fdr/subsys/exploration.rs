@@ -21,6 +21,13 @@ use crate::testing::fdr::config::{InjectedFaultRecord, WalkFaults};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::TimingConstraints;
 
+/// The most states that one walk takes from its queue.
+///
+/// A walk keeps each target of a nondeterministic event, so a cycle through
+/// such events doubles the branches of the walk up to the depth bound. The
+/// budget bounds the work and the memory of a walk at any depth.
+const MAX_WALK_STATES: usize = 1 << 14;
+
 /// The default exploration engine, which walks one process once per seed and
 /// keeps the result of each seed.
 pub struct DefaultExplorationEngine<'a> {
@@ -128,7 +135,16 @@ impl<'a> DefaultExplorationEngine<'a> {
 		#[cfg(feature = "testing-fault")]
 		let mut walk_faults = config.fault_model.as_ref().map(|model| WalkFaults::new(model, seed));
 
+		let mut taken = 0usize;
 		while let Some(state) = queue.pop_front() {
+			taken += 1;
+			if taken > MAX_WALK_STATES {
+				#[cfg(feature = "testing-fault")]
+				return SeedResult::CutShort(longest_trace, failures, injected_faults);
+				#[cfg(not(feature = "testing-fault"))]
+				return SeedResult::CutShort(longest_trace, failures);
+			}
+
 			visited.insert(state.process_state());
 
 			// A state from which a run of hidden events reaches a cycle of

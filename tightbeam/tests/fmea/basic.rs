@@ -1,5 +1,3 @@
-#![cfg(feature = "testing-fmea")]
-
 use tightbeam::error::TightBeamError;
 use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FailureMode, FmeaConfig, SeverityScale};
@@ -15,6 +13,17 @@ pub(crate) const ACTUATE: Urn<'static> = tightbeam::urn!("test", "event:fmea-bas
 pub(crate) const SAFE_MODE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/safe-mode");
 pub(crate) const SENSOR_READ: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/sensor-read");
 pub(crate) const VALIDATE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/validate");
+
+/// The severity and the occurrence that a report gives a fault.
+type Rating = (u8, u16);
+
+/// The rating of the 50% fault of [`SafetyProcess`] on MIL-STD-1629, a scale
+/// of 1 to 10: a minor severity, and the occurrence of the middle of the scale.
+const MIL_STD_RATING: Rating = (3, 6);
+
+/// The rating of the 50% fault of [`SafetyProcess`] on ISO 26262, a scale of 1
+/// to 4: a minor severity, and the occurrence of the middle of the scale.
+const ISO_26262_RATING: Rating = (1, 3);
 
 tb_assert_spec! {
 	pub FmeaTestSpec,
@@ -78,10 +87,11 @@ fn create_test_config(process: Process, scale: SeverityScale) -> FdrConfig {
 }
 
 /// The configuration that grades [`FmeaTestSpec`], explores [`SafetyProcess`]
-/// with FMEA on the severity `scale`, and verifies the FMEA report.
-fn fmea_scenario_config(scale: SeverityScale) -> Result<ScenarioConfig, Box<dyn std::error::Error>> {
-	let hooks = TestHooks::on_pass(|context| {
-		verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
+/// with FMEA on the severity `scale`, and verifies that the FMEA report rates
+/// its first fault at `rating` on that scale.
+fn fmea_scenario_config(scale: SeverityScale, rating: Rating) -> Result<ScenarioConfig, Box<dyn std::error::Error>> {
+	let hooks = TestHooks::on_pass(move |context| {
+		verify_fmea_report(context.verdict().fdr(), scale, rating).expect("FMEA verification failed");
 	});
 
 	fmea_hooked_config(scale, hooks)
@@ -112,18 +122,25 @@ fn first_rating(context: &HookContext) -> Option<(Vec<String>, u8)> {
 	Some((effects.clone(), *severity))
 }
 
-fn verify_fmea_report(verdict_opt: Option<&FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_fmea_report(
+	verdict_opt: Option<&FdrVerdict>,
+	scale: SeverityScale,
+	rating: Rating,
+) -> Result<(), Box<dyn std::error::Error>> {
 	let verdict = verdict_opt.ok_or("No FDR verdict")?;
 	let fmea = verdict.fmea_report.as_ref().ok_or("FMEA report not generated")?;
 	assert!(!fmea.failure_modes.is_empty(), "Should have failure modes");
 	assert!(fmea.total_rpn > 0, "Total RPN should be positive");
+
+	let first = fmea.failure_modes.first().map(|mode| (mode.severity, mode.occurrence));
+	assert_eq!((fmea.severity_scale, first), (scale, Some(rating)));
 
 	Ok(())
 }
 
 tb_scenario! {
 	name: test_fmea_mil_std,
-	config: fmea_scenario_config(SeverityScale::MilStd1629),
+	config: fmea_scenario_config(SeverityScale::MilStd1629, MIL_STD_RATING),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| run_one_cycle(&trace)
 	}
@@ -131,7 +148,7 @@ tb_scenario! {
 
 tb_scenario! {
 	name: test_fmea_iso26262,
-	config: fmea_scenario_config(SeverityScale::Iso26262),
+	config: fmea_scenario_config(SeverityScale::Iso26262, ISO_26262_RATING),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| run_one_cycle(&trace)
 	}

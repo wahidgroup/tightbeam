@@ -450,6 +450,15 @@ pub enum SeedResult {
 	/// it collected.
 	#[cfg(not(feature = "testing-fault"))]
 	Success(Trace, Vec<Failure>),
+	/// The seed stopped at its budget of states with branches left on its
+	/// queue, with its longest trace so far, the failures it collected, and the
+	/// faults it injected.
+	#[cfg(feature = "testing-fault")]
+	CutShort(Trace, Vec<Failure>, Vec<InjectedFaultRecord>),
+	/// The seed stopped at its budget of states with branches left on its
+	/// queue, with its longest trace so far and the failures it collected.
+	#[cfg(not(feature = "testing-fault"))]
+	CutShort(Trace, Vec<Failure>),
 	/// The seed diverged at a state, with the trace that reached the state,
 	/// the state, the hidden events of the run that diverges from it, and the
 	/// faults the seed injected.

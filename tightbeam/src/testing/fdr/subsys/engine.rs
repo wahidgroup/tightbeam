@@ -871,6 +871,18 @@ mod tests {
 		.build()
 	}
 
+	/// A subject whose every step takes `a` to both of its states, so a walk
+	/// doubles its branches at each step.
+	fn doubling_cycle() -> Process {
+		TestProcess {
+			observable: &["a"],
+			transitions: &[("S0", "a", "S0"), ("S0", "a", "S1"), ("S1", "a", "S0"), ("S1", "a", "S1")],
+			terminal: &["S0"],
+			..TestProcess::of("DoublingCycle", "S0")
+		}
+		.build()
+	}
+
 	/// A subject whose `start` resets `clk` on its way to the accepting `S1`,
 	/// where the hidden `t` spins under `guard`.
 	#[cfg(feature = "testing-timing")]
@@ -929,6 +941,26 @@ mod tests {
 			a_guard_on_a_clock_at_zero => (guarded_from_the_start, Decision::Holds),
 			/// `b` leads from the accepting `Idle` to `D`.
 			a_deadlock_behind_an_accepting_state => (stuck_after_b, Decision::Refuted),
+		}
+	}
+
+	// A walk of a cycle that doubles its branches stops at its budget of
+	// states under a deep bound, so the run leaves each freedom open and
+	// counts no seed as completed.
+	crate::tb_cases! {
+		fn a_walk_decides_freedom_within_its_budget((max_depth, decided, completed): (usize, Decision, u32)) {
+			let config = FdrConfig { max_depth, ..FdrConfig::default() };
+
+			let verdict = doubling_cycle().verdict_under(config);
+			let freedom = (verdict.deadlock_free, verdict.divergence_free);
+			assert_eq!((freedom, verdict.seeds_completed), ((decided, decided), completed));
+		}
+
+		cases {
+			/// Six steps stay within the budget of each of the 64 walks.
+			a_shallow_bound => (6, Decision::Holds, 64),
+			/// The default bound spends the budget of each walk.
+			the_default_bound => (128, Decision::Unknown, 0),
 		}
 	}
 

@@ -3,23 +3,19 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	colony::{
-		hive::ServletBox,
-		servlet::{LatencyTracker, ServletConfig},
-	},
+	builder::TypeBuilder,
+	colony::{hive::ServletBox, servlet::ServletConfig},
 	compose,
 	compress::ZstdCompression,
 	crypto::{
 		hash::Sha3_256,
 		key::Aes256GcmKeyProvider,
 		profiles::DefaultCryptoProvider,
-		sign::ecdsa::Secp256k1Signature,
-		x509::{KeyPurposes, PeerCertificate, Signing},
+		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
 	},
 	der::Sequence,
 	exactly,
 	instrumentation::events,
-	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
 	testing::{
 		fixtures::TestTrace, ClientEnv, ScenarioConfig, ServletEnv, SetupEnv, TestCertificate, TestIdentity, TestKey,
@@ -27,24 +23,35 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, TransportError, TransportFailure},
 	urn::Urn,
-	worker, Beamable, Frame, TightBeamError,
+	worker, Beamable, Frame, TightBeamError, Version,
 };
+
+use crate::colony::tracker_at;
+use crate::common::result::TestResult;
+use crate::common::security::{fixed_signing_key, SignatureGate};
 
 pub(crate) const DOUBLER_PROCESS: Urn<'static> = tightbeam::urn!("test", "event:servlet/doubler-process");
 pub(crate) const SQUARER_PROCESS: Urn<'static> = tightbeam::urn!("test", "event:servlet/squarer-process");
 
 // The request and response messages
 
+/// The request whose `value` the calc servlets double.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct CalcRequest {
+	/// The number the servlet doubles, which the [`CalcServlet`] also squares.
 	pub value: u32,
 }
 
+/// The reply of a calc servlet. The [`CalcServlet`] computes each field, and
+/// the other servlets set `doubled` alone.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct CalcResponse {
+	/// Twice the request's `value`.
 	pub doubled: u32,
+	/// The square of the request's `value` plus the squarer offset.
 	pub squared: u32,
-	pub final_result: u32, // The sum times the config multiplier.
+	/// The sum of `doubled` and `squared` times the config multiplier.
+	pub final_result: u32,
 }
 
 // Workers
@@ -183,24 +190,48 @@ fn shared_cipher() -> Aes256GcmKeyProvider {
 	cipher.expect("32 octets is the key of AES-256 key wrap")
 }
 
-/// A gate that verifies nonrepudiation over the wire frame while it is
-/// ciphertext, before the typed prologue decrypts it in place.
-struct SignatureGate {
-	signer: PeerCertificate<Signing<DefaultCryptoProvider>>,
+/// The config of a [`SecureCalcServlet`] over `config`. Its collector gate
+/// admits the signature of [`TestKey::insecure_fixed_signing`], and it holds
+/// the decryptor and the inflator of a [`secure_calc_frame`].
+fn secure_calc_conf(
+	config: Arc<CalcServletConfig>,
+) -> ServletConfig<TokioListener, CalcRequest, DefaultCryptoProvider, CalcServletConfig> {
+	let signer = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+	ServletConfig::<TokioListener, CalcRequest>::builder()
+		.with_config(config)
+		.with_collector_gate(SignatureGate::of(signer))
+		.with_message_decryptor(shared_cipher())
+		.with_message_inflator(ZstdCompression::default())
+		.allow_cleartext()
+		.build()
 }
 
-impl GatePolicy for SignatureGate {
-	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-		let Some(frame) = frame else {
-			return TransitStatus::PermissionDenied;
-		};
+/// A request of `value` that is compressed, encrypted, signed by `signer`, and
+/// digested over its message and its frame.
+fn secure_calc_frame(value: u32, signer: Secp256k1SigningKey) -> Frame {
+	let frame = compose! {
+		V2: id: b"secure-calc-request-id",
+			order: 1u64,
+			message: CalcRequest { value },
+			compactness: ZstdCompression::default(),
+			confidentiality: shared_cipher(),
+			nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(signer),
+			message_integrity<Sha3_256>: [],
+			frame_integrity: type Sha3_256
+	};
 
-		if frame.verify(&self.signer).is_ok() {
-			TransitStatus::Ok
-		} else {
-			TransitStatus::PermissionDenied
-		}
-	}
+	frame.expect("a full-stack request composes")
+}
+
+/// A [`secure_calc_frame`] that carries the signature of another frame of the
+/// signer that the collector gate admits, so its `sid` names that signer and
+/// its signature fails over its own bytes.
+fn frame_under_a_transplanted_signature() -> Frame {
+	let donor = secure_calc_frame(7, TestKey::insecure_fixed_signing());
+	let signature = donor.nonrepudiation().cloned().expect("a signed frame holds its signature");
+	let mut forged = secure_calc_frame(8, TestKey::insecure_fixed_signing());
+	forged.attach_signer_info(signature).expect("a V2 frame takes a signature");
+	forged
 }
 
 servlet! {
@@ -243,16 +274,7 @@ tb_scenario! {
 		},
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
-			let signer = PeerCertificate::parse(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()), KeyPurposes::HOUSE.signer)?;
-			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
-				.with_config(config)
-				.with_collector_gate(SignatureGate { signer })
-				.with_message_decryptor(shared_cipher())
-				.with_message_inflator(ZstdCompression::default())
-				.allow_cleartext()
-				.build();
-
-			SecureCalcServlet::start(trace, servlet_conf).await
+			SecureCalcServlet::start(trace, secure_calc_conf(config)).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
@@ -260,16 +282,7 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |ServletEnv { mut client, context: config, .. }| async move {
-			let request = compose! {
-				V2: id: b"secure-calc-request-id",
-					order: 1u64,
-					message: CalcRequest { value: config.value },
-					compactness: ZstdCompression::default(),
-					confidentiality: shared_cipher(),
-					nonrepudiation<Secp256k1Signature, _>: TestIdentity::certified(TestKey::insecure_fixed_signing()),
-					message_integrity<Sha3_256>: [],
-					frame_integrity: type Sha3_256
-			}?;
+			let request = secure_calc_frame(config.value, TestKey::insecure_fixed_signing());
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = response_frame.decode_message()?;
@@ -277,6 +290,47 @@ tb_scenario! {
 
 			Ok(())
 		}
+	}
+}
+
+/// What a [`SecureCalcServlet`] does with `frame`: whether the client reads
+/// `PermissionDenied`, then the counts of gate refusals and of handler entries
+/// on the trace of the servlet.
+async fn gated_calc_outcome(frame: Frame) -> (bool, usize, usize) {
+	let trace = Arc::new(TestTrace::with_detail(true));
+	let config = Arc::new(CalcServletConfig { squarer_offset: 0, final_multiplier: 1, value: 7 });
+	let servlet = SecureCalcServlet::start(Arc::clone(&trace), secure_calc_conf(config)).await;
+	let servlet = servlet.expect("a cleartext servlet starts on a free port");
+	let connector = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
+	let client = connector.connect(*servlet.addr()).await;
+	let mut client = client.expect("a client connects to a started servlet");
+
+	let outcome = client.emit(frame, None).await;
+	servlet.stop();
+
+	let denied = matches!(
+		outcome,
+		Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))
+	);
+	(
+		denied,
+		trace.recorded(events::GATE_REJECT),
+		trace.recorded(events::HANDLER_ENTER),
+	)
+}
+
+// The collector gate verifies each frame while its body is ciphertext, so a
+// frame whose signature fails stops ahead of the typed prologue and the
+// handler.
+tightbeam::tb_cases! {
+	async fn a_collector_gate_refuses_a_frame(frame: Frame) {
+		assert_eq!(gated_calc_outcome(frame).await, (true, 1, 0));
+	}
+	cases {
+		/// The certificate of the signature names a key outside the gate.
+		signed_under_another_key => secure_calc_frame(7, fixed_signing_key(0x02)),
+		/// The signature names the signer of the gate, over another frame.
+		under_the_signature_of_another_frame => frame_under_a_transplanted_signature(),
 	}
 }
 
@@ -289,19 +343,12 @@ servlet! {
 	}
 }
 
-/// A tracker whose average is each sample it records, so one sample of a
-/// quarter of its target reads as 2500 basis points.
-fn quarter_loaded_tracker() -> Arc<LatencyTracker> {
-	let tracker = Arc::new(LatencyTracker::new(tightbeam::bps!(10000), 100_000));
-	tracker.record(25_000);
-	tracker
-}
-
 /// A `servlet!` servlet reports the load of the gauge its configuration
 /// installed, which the hive reads when it scales.
 #[tokio::test]
-async fn a_servlet_declared_with_servlet_reports_the_load_of_its_gauge() -> Result<(), TightBeamError> {
-	let builder = ServletConfig::<TokioListener, CalcRequest>::builder().with_utilization(quarter_loaded_tracker());
+async fn a_servlet_declared_with_servlet_reports_the_load_of_its_gauge() -> TestResult {
+	let gauge = tracker_at(tightbeam::bps!(2500));
+	let builder = ServletConfig::<TokioListener, CalcRequest>::builder().with_utilization(gauge);
 	let config = builder.allow_cleartext().build();
 	let servlet = GaugedServlet::start(Arc::new(TraceCollector::default()), config).await?;
 
@@ -316,6 +363,7 @@ async fn a_servlet_declared_with_servlet_reports_the_load_of_its_gauge() -> Resu
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[beam(min_version = "V2")]
 pub struct RecentCalcRequest {
+	/// The number the servlet doubles.
 	pub value: u32,
 }
 
@@ -332,48 +380,46 @@ servlet! {
 	}
 }
 
-/// A V0 frame is below the V2 minimum of the input type, so the typed arm of
-/// `servlet!` refuses it before the handler runs.
-#[tokio::test]
-async fn a_typed_servlet_refuses_a_frame_below_the_minimum_of_its_input() -> Result<(), TightBeamError> {
+/// Sends one [`CalcRequest`] of 7 in a frame of `version` to a fresh
+/// [`RecentCalcServlet`] over a cleartext client, stops the servlet, and
+/// returns the outcome of the exchange.
+async fn emit_to_recent_calc(version: Version) -> Result<Option<Frame>, TransportError> {
 	let builder = ServletConfig::<TokioListener, RecentCalcRequest>::builder();
 	let config = builder.allow_cleartext().build();
-	let servlet = RecentCalcServlet::start(Arc::new(TraceCollector::default()), config).await?;
+	let servlet = RecentCalcServlet::start(Arc::new(TraceCollector::default()), config).await;
+	let servlet = servlet.expect("a cleartext servlet starts on a free port");
 	let connector = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
-	let mut client = connector.connect(*servlet.addr()).await?;
+	let client = connector.connect(*servlet.addr()).await;
+	let mut client = client.expect("a client connects to a started servlet");
 
-	let request = compose! {
-		V0: id: b"recent-calc-request-id",
-			message: CalcRequest { value: 7 }
-	}?;
+	let request = version.compose().with_id(b"recent-calc-request-id");
+	let request = request.with_message(CalcRequest { value: 7 }).build();
+	let request = request.expect("a request frame of any version builds");
 
-	// The servlet reports the refusal to the client as an internal failure.
 	let outcome = client.emit(request, None).await;
 	servlet.stop();
-	let refused = matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::Internal)));
-	assert!(refused);
-	Ok(())
+	outcome
+}
+
+/// A V0 frame is below the V2 minimum of the input type, so the typed arm of
+/// `servlet!` refuses it before the handler runs. The servlet reports the
+/// refusal to the client as an internal failure.
+#[tokio::test]
+async fn a_typed_servlet_refuses_a_frame_below_the_minimum_of_its_input() {
+	let outcome = emit_to_recent_calc(Version::V0).await;
+	assert!(matches!(
+		outcome,
+		Err(TransportError::OperationFailed(TransportFailure::Internal))
+	));
 }
 
 /// A V2 frame meets the V2 minimum of the input type, so the typed arm of
 /// `servlet!` decodes it and the handler answers. It runs the servlet of the
 /// refusal above, so a fault of the decode or of the handler fails here.
 #[tokio::test]
-async fn a_typed_servlet_answers_a_frame_at_the_minimum_of_its_input() -> Result<(), TightBeamError> {
-	let builder = ServletConfig::<TokioListener, RecentCalcRequest>::builder();
-	let config = builder.allow_cleartext().build();
-	let servlet = RecentCalcServlet::start(Arc::new(TraceCollector::default()), config).await?;
-	let connector = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
-	let mut client = connector.connect(*servlet.addr()).await?;
-
-	let request = compose! {
-		V2: id: b"recent-calc-request-id",
-			message: CalcRequest { value: 7 }
-	}?;
-
-	let answered = client.emit(request, None).await;
-	servlet.stop();
-	let response: CalcResponse = answered?.ok_or(TightBeamError::MissingResponse)?.decode_message()?;
-	assert_eq!(response.doubled, 14);
+async fn a_typed_servlet_answers_a_frame_at_the_minimum_of_its_input() -> TestResult {
+	let answered = emit_to_recent_calc(Version::V2).await?;
+	let response = answered.map(|frame| frame.decode_message::<CalcResponse>()).transpose()?;
+	assert_eq!(response, Some(CalcResponse { doubled: 14, squared: 0, final_result: 0 }));
 	Ok(())
 }

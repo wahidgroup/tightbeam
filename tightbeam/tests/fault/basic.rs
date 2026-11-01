@@ -1,7 +1,8 @@
 //! The fault injection tests of tightbeam.
 //!
-//! The suite injects faults into a request-response-retry process. Its
-//! scenarios follow the research papers and the safety standards below.
+//! The suite injects faults into a request-response-retry process and a
+//! heartbeat. Its scenarios follow the research papers and the safety
+//! standards below.
 //!
 //! The research papers are:
 //! - Avižienis et al. (2004), "Basic Concepts and Taxonomy of Dependable and Secure Computing".
@@ -15,14 +16,18 @@
 
 use core::error::Error;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use tightbeam::testing::fdr::FdrConfig;
+use tightbeam::basis_points::BasisPoints;
+use tightbeam::testing::fdr::{DefaultExplorationEngine, ExplorationCore, FdrConfig, SeedResult};
 use tightbeam::testing::macros::BuiltAssertSpec;
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{FaultModel, HookContext, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
-use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
+use tightbeam::{at_least, exactly, tb_assert_spec, tb_cases, tb_gen_process_types, tb_process_spec, tb_scenario};
+
+use crate::common::result::TestResult;
 
 use fault_tolerant_process::States;
 
@@ -129,10 +134,10 @@ impl From<ResourceExhaustionError> for TightBeamError {
 	}
 }
 
-// TEST 1: Deterministic fault injection, a research test of repeatability.
+// TEST 1: A certain fault, a research test of where a fault lands.
 
 tb_assert_spec! {
-	pub DeterministicSpec,
+	pub CertainFaultSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
@@ -175,7 +180,7 @@ fn fault_config(
 	Ok(builder.with_hooks(hooks).build()?)
 }
 
-fn build_deterministic_config(process: Process) -> FdrConfig {
+fn build_certain_fault_config(process: Process) -> FdrConfig {
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic).with_fault(
 		States::Sending,
 		RESPONSE,
@@ -198,15 +203,15 @@ fn build_deterministic_config(process: Process) -> FdrConfig {
 }
 
 tb_scenario! {
-	name: test_deterministic_fault_injection,
-	config: fault_config(DeterministicSpec::latest(), build_deterministic_config, TestHooks::on_pass(|context| {
+	name: a_certain_fault_lands_on_its_one_configured_point,
+	config: fault_config(CertainFaultSpec::latest(), build_certain_fault_config, TestHooks::on_pass(|context| {
 			// Each injection hits the one configured state and event.
 			let configured = HashSet::from([(state_key("Sending"), RESPONSE.to_string())]);
 			assert_eq!(injected_points(context), Some(configured));
 
-			// A fault at 100% fires on each visit, so each seed injects at
-			// least one. A seed explores more than one path, so it can inject
-			// more, and the count is the same on every run.
+			// A fault at 100% fires on each visit, so a seed that visits the
+			// point injects at least one, and a seed that revisits it injects
+			// more.
 			let counts = faults_and_seeds(context);
 			assert!(matches!(counts, Some((faults, seeds)) if seeds > 0 && faults >= seeds), "{counts:?}");
 		})),
@@ -427,5 +432,69 @@ tb_scenario! {
 			trace.event(SUCCESS)?;
 			Ok(())
 		}
+	}
+}
+
+// TEST 5: The deterministic strategy, a research test of repeatability.
+
+tb_process_spec! {
+	/// A heartbeat with no branch and no terminal state, so each seed visits
+	/// `Waiting` once per round, and a fault on its one event deadlocks the
+	/// walk.
+	pub Heartbeat,
+	events {
+		observable { REQUEST, RESPONSE }
+		hidden { }
+	}
+	states {
+		Waiting => { REQUEST => Answering },
+		Answering => { RESPONSE => Waiting }
+	}
+}
+
+tb_gen_process_types!(Heartbeat, Waiting);
+
+/// The rounds of [`Heartbeat`] before the fault of `result`, or `None` for a
+/// walk that ends with no fault. A round holds two events.
+fn rounds_before_the_fault(result: &SeedResult) -> Option<usize> {
+	match result {
+		SeedResult::Deadlock(trace, _state, _faults) => Some(trace.len() / 2),
+		_ => None,
+	}
+}
+
+/// The rounds of [`Heartbeat`] that each of five seeds completes under the
+/// deterministic strategy, with a fault on `REQUEST` in `Waiting` at
+/// `probability`.
+fn rounds_of_each_seed(probability: BasisPoints) -> Result<Vec<Option<usize>>, Box<dyn Error>> {
+	let process = Heartbeat::process()?;
+	let timeout = || NetworkTimeoutError { duration_ms: 100, attempt: 1 };
+	let model = FaultModel::from(InjectionStrategy::Deterministic);
+	let model = model.with_fault(heartbeat::States::Waiting, REQUEST, timeout, probability);
+	let config = FdrConfig { fault_model: Some(model), ..FdrConfig::default() };
+	let mut engine = DefaultExplorationEngine::new(&process, Arc::new(config));
+
+	let results = engine.explore_seeds(0..5);
+	Ok(results.iter().map(|(_seed, result)| rounds_before_the_fault(result)).collect())
+}
+
+// The deterministic strategy counts the visits of an injection point, so it
+// fires at one visit under every seed, the visit whose count times the
+// probability wraps past 10000 bps. A strategy that draws from the seed
+// spreads the five walks.
+tb_cases! {
+	fn the_deterministic_strategy_fires_at_one_visit_under_every_seed(
+		(probability, rounds): (BasisPoints, usize)
+	) -> TestResult {
+		assert_eq!(rounds_of_each_seed(probability)?, [Some(rounds); 5]);
+		Ok(())
+	}
+	cases {
+		/// A fault at 50% fires at visit 2, after one round.
+		half_of_the_visits => (tightbeam::bps!(5000), 1),
+		/// A fault at 30% fires at visit 4, after three rounds.
+		three_in_ten_visits => (tightbeam::bps!(3000), 3),
+		/// A fault at 10% fires at visit 10, after nine rounds.
+		one_in_ten_visits => (tightbeam::bps!(1000), 9),
 	}
 }
