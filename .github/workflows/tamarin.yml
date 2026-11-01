@@ -1,0 +1,50 @@
+name: Tamarin
+
+# The proofs read the models alone, so this workflow runs when a model or the
+# protocol it follows changes. A `paths` filter holds for a whole workflow, so
+# the job sits in a file of its own, and no CI run waits for it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - "release/*"
+    paths:
+      - .github/workflows/tamarin.yml
+      - docs/handshake.md
+      - tightbeam/tests/tamarin/**
+      - tightbeam/src/transport/handshake/**
+      - tightbeam/src/transport/rekey.rs
+  pull_request:
+    paths:
+      - .github/workflows/tamarin.yml
+      - docs/handshake.md
+      - tightbeam/tests/tamarin/**
+      - tightbeam/src/transport/handshake/**
+      - tightbeam/src/transport/rekey.rs
+
+concurrency:
+  group: tamarin-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    name: Tamarin
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      # The slowest control takes about 400 seconds on a fast machine, so one
+      # run of Tamarin holds a wider limit here.
+      - name: Prove
+        run: tightbeam/tests/tamarin/prove.sh all
+        env:
+          LIMIT_SECONDS: "1800"

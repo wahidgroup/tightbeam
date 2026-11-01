@@ -1,0 +1,277 @@
+theory TightbeamCms
+begin
+
+/*
+ * The CMS flow of docs/handshake.md.
+ *
+ * The model follows flow/cms.rs: the client seals the base secret and R to the
+ * pinned key-agreement key, the server signs the transcript under its signing
+ * key, and both derive the handshake secret from ee and base, salted with the
+ * transcript hash.
+ *
+ * A server holds two keys of one name, and each leaks on its own. Client
+ * ephemerals leak on their own too, which is how the model reaches an observer
+ * that holds ee and lacks base.
+ *
+ * Each control removes one protection, and each must give an attack:
+ *
+ *   UNBOUND_SIGNATURE   the server Finished signs no transcript
+ *   UNBOUND_FINISHED    the client Finished signs no transcript
+ *   NO_BASE             the handshake secret takes ee alone
+ *   NO_EE               the handshake secret takes base alone
+ *   UNBOUND_OFFER       neither the seal nor the transcript covers the offer
+ *
+ * FOCUS drops the rules an attack on authentication does not need, and adds
+ * that attack as a lemma of its own, because the search on the full rule set
+ * passes the time limit. ACCEPT_ONLY also drops every rule past the moment a
+ * client accepts. Every trace of a smaller rule set is a trace of the full one,
+ * so an attack there falsifies the lemma it names here.
+ */
+
+builtins: diffie-hellman, signing, hashing, symmetric-encryption
+
+functions: kdf/3, mac/2
+
+#ifdef UNBOUND_SIGNATURE
+macros: server_signed(th) = 'finished_server'
+#else
+macros: server_signed(th) = <'finished_server', th>
+#endif
+
+#ifdef UNBOUND_FINISHED
+macros: client_signed(th, cert) = <'finished_client', h(cert)>
+#else
+macros: client_signed(th, cert) = <'finished_client', th, h(cert)>
+#endif
+
+#ifdef NO_BASE
+macros: base_input(base) = 'absent'
+#else
+macros: base_input(base) = base
+#endif
+
+#ifdef NO_EE
+macros: ee_input(ee) = 'absent'
+#else
+macros: ee_input(ee) = ee
+#endif
+
+#ifdef UNBOUND_OFFER
+macros: sealed_offer(offers) = 'absent', opening_leg(enc, sealed, offers) = <enc, sealed>
+#else
+macros: sealed_offer(offers) = offers, opening_leg(enc, sealed, offers) = <enc, sealed, offers>
+#endif
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ i ==> x = y"
+
+restriction SelectionComesFromTheOffer:
+  "All p a b #i. Selected(p, <a, b>) @ i ==> p = a | p = b"
+
+restriction OneRegistrationPerName:
+  "All A #i #j. Once(A) @ i & Once(A) @ j ==> #i = #j"
+
+rule Register_Server:
+    [ Fr(~ltk), Fr(~ka) ]
+  --[ Once($S) ]->
+    [ !Ltk($S, ~ltk), !Ka($S, ~ka), !Pk($S, pk(~ltk)),
+      !ServerPins($S, pk(~ltk), 'g'^~ka),
+      Out(<pk(~ltk), 'g'^~ka>) ]
+
+#ifdef ACCEPT_ONLY
+#else
+rule Register_Client:
+    [ Fr(~ltk) ]
+  --[ Once($C) ]->
+    [ !Ltk($C, ~ltk), !Pk($C, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Register_Attacker:
+    [ In(<pkE, kaE>) ]
+  --[ Once($E), Compromised($E), KaCompromised($E) ]->
+    [ !Pk($E, pkE), !ServerPins($E, pkE, kaE) ]
+#endif
+
+#ifdef FOCUS
+#else
+rule Compromise_Signing:
+    [ !Ltk(A, ltk) ]
+  --[ Compromised(A) ]->
+    [ Out(ltk) ]
+#endif
+
+rule Compromise_Key_Agreement:
+    [ !Ka(A, ka) ]
+  --[ KaCompromised(A) ]->
+    [ Out(ka) ]
+
+#ifdef FOCUS
+#else
+rule Reveal_Ephemeral:
+    [ !ClientEphemeral(R, private) ]
+  --[ EphemeralRevealed(R) ]->
+    [ Out(private) ]
+#endif
+
+rule Client_Open:
+  let R = 'g'^~r
+      kek = kdf(pkKa^~x, 'kem', 'kek')
+      offers = <$first, $second>
+      sealed = senc(<'opening', ~base, R, sealed_offer(offers)>, kek)
+      leg = opening_leg('g'^~x, sealed, offers)
+  in
+    [ Fr(~r), Fr(~x), Fr(~base), !ServerPins(S, pkS, pkKa) ]
+  --[ Opening(S, ~base) ]->
+    [ St_Client_Sent(S, pkS, ~r, ~base, offers, leg),
+      !ClientEphemeral(R, ~r),
+      Out(<'g'^~x, sealed, offers>) ]
+
+rule Server_Reply:
+  let kek = kdf(enc^ka, 'kem', 'kek')
+      sealed = senc(<'opening', base, R, sealed_offer(offers)>, kek)
+      E = 'g'^~e
+      certs = <$S, pk(ltk)>
+      th = h(<opening_leg(enc, sealed, offers), $selected, E, certs>)
+      hs = kdf(<ee_input(R^~e), base_input(base)>, th, 'session')
+      sig = sign(server_signed(th), ltk)
+      server_tag = mac(kdf(hs, th, 'finished_server'), <th, sig>)
+  in
+    [ In(<enc, sealed, offers>), Fr(~e), !Ltk($S, ltk), !Ka($S, ka) ]
+  --[ ServerReplied($S, th, hs),
+      Selected($selected, offers),
+      ServerNegotiated($S, offers, $selected) ]->
+    [ St_Server_Sent($S, R, th, hs), Out(<$selected, E, certs, sig, server_tag>) ]
+
+rule Client_Accept_Reply:
+  let certs = <S, pkS>
+      th = h(<leg, selected, E, certs>)
+      hs = kdf(<ee_input(E^~r), base_input(base)>, th, 'session')
+      server_tag = mac(kdf(hs, th, 'finished_server'), <th, sig>)
+  in
+    [ St_Client_Sent(S, pkS, ~r, base, offers, leg), In(<selected, E, certs, sig, server_tag>) ]
+  --[ Eq(verify(sig, server_signed(th), pkS), true),
+      Selected(selected, offers),
+      ClientNegotiated(S, offers, selected),
+      ClientAccepts(S, th, hs) ]->
+    [ St_Client_Agreed(S, 'g'^~r, th, hs) ]
+
+#ifdef ACCEPT_ONLY
+#else
+rule Client_Close:
+  let cert = <$C, pk(ltk)>
+      tag = mac(kdf(hs, th, 'finished_client'), th)
+      finished = sign(client_signed(th, cert), ltk)
+      closing = senc(<'identified', th, cert, ~sealed, finished, tag>, kdf(hs, th, 'closing'))
+  in
+    [ St_Client_Agreed(S, R, th, hs), !Ltk($C, ltk), Fr(~sealed) ]
+  --[ ClientClosed($C, S, th, hs),
+      ClientSealed(S, R, ~sealed),
+      ClientKey(S, R, kdf(hs, th, 'c2s')) ]->
+    [ Out(closing) ]
+
+rule Server_Accept:
+  let cert = <C, pkC>
+      tag = mac(kdf(hs, th, 'finished_client'), th)
+  in
+    [ St_Server_Sent($S, R, th, hs),
+      In(senc(<'identified', th, cert, sealed, finished, tag>, kdf(hs, th, 'closing'))),
+      !Pk(C, pkC) ]
+  --[ Eq(verify(finished, client_signed(th, cert), pkC), true),
+      ServerAcceptsClient($S, C, th, hs),
+      ServerKey($S, C, R, kdf(hs, th, 'c2s')) ]->
+    [ ]
+#endif
+
+// The model runs to the end of the closing.
+lemma executable: exists-trace
+  "Ex C S th hs #i #j.
+     ClientClosed(C, S, th, hs) @ i & ServerAcceptsClient(S, C, th, hs) @ j
+     & not (Ex A #r. Compromised(A) @ r)
+     & not (Ex A #r. KaCompromised(A) @ r)
+     & not (Ex R #r. EphemeralRevealed(R) @ r)"
+
+// The forward secrecy table says a later key-agreement compromise recovers
+// base. The model holds that row as a reachable state.
+lemma later_compromise_recovers_base: exists-trace
+  "Ex S base #i #c #k.
+     Opening(S, base) @ i & KaCompromised(S) @ c & K(base) @ k & #i < #c
+     & not (Ex #r. Compromised(S) @ r)"
+
+// Server authentication needs both keys of a server to fall: a signature alone
+// leaves the attacker without base, so it cannot write the server Finished MAC.
+lemma client_authenticates_server:
+  "All S th hs #i.
+     ClientAccepts(S, th, hs) @ i
+     ==> (Ex #j. ServerReplied(S, th, hs) @ j & #j < #i)
+       | (Ex #a #b. Compromised(S) @ a & KaCompromised(S) @ b & #a < #i & #b < #i)"
+
+// Downgrade: the offer sits under the seal and in the transcript, so a client
+// that accepts agrees with that server on the offer and on the selection.
+lemma client_agrees_on_negotiation:
+  "All S offers selected #i.
+     ClientNegotiated(S, offers, selected) @ i
+     ==> (Ex #j. ServerNegotiated(S, offers, selected) @ j & #j < #i)
+       | (Ex #a #b. Compromised(S) @ a & KaCompromised(S) @ b & #a < #i & #b < #i)"
+
+// Client authentication holds with both keys of the server leaked.
+lemma server_authenticates_client:
+  "All S C th hs #i.
+     ServerAcceptsClient(S, C, th, hs) @ i
+     ==> (Ex #j. ClientClosed(C, S, th, hs) @ j & #j < #i)
+       | (Ex #r. Compromised(C) @ r & #r < #i)"
+
+// A transcript is fresh, so a closing completes one session.
+lemma server_accepts_a_closing_once:
+  "All S C th hs #i #j.
+     ServerAcceptsClient(S, C, th, hs) @ i & ServerAcceptsClient(S, C, th, hs) @ j
+     ==> #i = #j"
+
+// The hybrid claim at the client. The key needs ee and base, or an active
+// attacker that held both keys of the server before the client accepted.
+lemma client_key_needs_both_secrets:
+  "All S R k #i #j.
+     ClientKey(S, R, k) @ i & K(k) @ j
+     ==> (Ex #e #c. EphemeralRevealed(R) @ e & KaCompromised(S) @ c)
+       | (Ex #a #b. Compromised(S) @ a & KaCompromised(S) @ b & #a < #i & #b < #i)"
+
+// The same claim at a server that admitted an identified client.
+lemma server_key_needs_both_secrets:
+  "All S C R k #i #j.
+     ServerKey(S, C, R, k) @ i & K(k) @ j
+     ==> (Ex #e #c. EphemeralRevealed(R) @ e & KaCompromised(S) @ c)
+       | (Ex #r. Compromised(C) @ r & #r < #i)"
+
+// What the closing seals, the client identity among it, stays secret on the
+// same terms as the key.
+lemma closing_stays_secret:
+  "All S R sealed #i #j.
+     ClientSealed(S, R, sealed) @ i & K(sealed) @ j
+     ==> (Ex #e #c. EphemeralRevealed(R) @ e & KaCompromised(S) @ c)
+       | (Ex #a #b. Compromised(S) @ a & KaCompromised(S) @ b & #a < #i & #b < #i)"
+
+#ifdef FOCUS
+
+// With UNBOUND_SIGNATURE, this falsifies client_authenticates_server.
+lemma attack_on_server_authentication: exists-trace
+  "Ex S th hs #i.
+     ClientAccepts(S, th, hs) @ i
+     & not (Ex #j. ServerReplied(S, th, hs) @ j & #j < #i)
+     & not (Ex #r. Compromised(S) @ r)"
+
+// With NO_EE, this falsifies client_key_needs_both_secrets: a compromise of the
+// key-agreement key alone recovers the key of a finished session.
+lemma attack_on_forward_secrecy: exists-trace
+  "Ex S R k #i #j.
+     ClientKey(S, R, k) @ i & K(k) @ j
+     & not (Ex #r. Compromised(S) @ r)
+     & not (Ex #e. EphemeralRevealed(R) @ e)"
+
+// With UNBOUND_FINISHED, this falsifies server_authenticates_client.
+lemma attack_on_client_authentication: exists-trace
+  "Ex S C th hs #i.
+     ServerAcceptsClient(S, C, th, hs) @ i
+     & not (Ex #j. ClientClosed(C, S, th, hs) @ j & #j < #i)
+     & not (Ex #r. Compromised(C) @ r)"
+
+#endif
+
+end
