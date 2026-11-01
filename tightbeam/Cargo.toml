@@ -344,6 +344,11 @@ path = "fuzz/envelope_der.rs"
 required-features = ["std", "testing-fuzz", "transport"]
 
 [[bin]]
+name = "fuzz_handshake"
+path = "fuzz/handshake.rs"
+required-features = ["full", "testing-fuzz"]
+
+[[bin]]
 name = "fuzz_colony"
 path = "fuzz/colony/mod.rs"
 # IJON annotations steer the colony state search

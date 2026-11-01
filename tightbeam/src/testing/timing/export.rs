@@ -45,7 +45,6 @@ mod tests {
 
 	/// An artifact with a violation of each kind and a statistical analysis
 	/// decodes from its DER as the artifact it was.
-	#[ignore = "decode fails: Event::decode reads its tag and length as its name (TagUnexpected at octet 162)"]
 	#[test]
 	fn an_artifact_decodes_from_its_der_as_itself() -> TestResult {
 		// The evidence is that of an empty trace.

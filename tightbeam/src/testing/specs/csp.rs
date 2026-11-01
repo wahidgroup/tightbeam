@@ -22,7 +22,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 #[cfg(feature = "testing-timing")]
 use core::time::Duration;
 
-use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
+use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 use crate::der::{Header, Length, Reader, Writer};
 use crate::testing::assertions::AssertionLabel;
 use crate::testing::specs::composition::CompositionError;
@@ -76,10 +76,8 @@ impl From<&Urn<'_>> for Event {
 
 // An `Event` encodes as a DER UTF8String. The decoder interns the decoded
 // name, because `Event` holds a `&'static str`.
-impl Tagged for Event {
-	fn tag(&self) -> Tag {
-		Tag::Utf8String
-	}
+impl FixedTag for Event {
+	const TAG: Tag = Tag::Utf8String;
 }
 
 impl EncodeValue for Event {
@@ -98,13 +96,6 @@ impl<'a> DecodeValue<'a> for Event {
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> crate::der::Result<Self> {
 		let s = String::decode_value(reader, header)?;
 		Ok(Event(intern(s)))
-	}
-}
-
-impl<'a> Decode<'a> for Event {
-	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
-		let header = reader.peek_header()?;
-		Self::decode_value(reader, header)
 	}
 }
 
@@ -1994,6 +1985,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::der::Decode;
 	use crate::testing::fixtures::TestProcess;
 	use crate::testing::{ScenarioConfig, SetupEnv};
 	use crate::urn::Urn;
@@ -2155,6 +2147,19 @@ mod tests {
 
 		let outside = spec.unmodelled(&subject);
 		assert_eq!(outside, vec![Event("audit")]);
+	}
+
+	// An event decodes from a DER UTF8String alone.
+	crate::tb_cases! {
+		fn an_event_decodes_from_a_utf8_string_alone((der, name): (&'static [u8], Option<&'static str>)) {
+			let decoded = Event::from_der(der).ok();
+			assert_eq!(decoded, name.map(Event));
+		}
+
+		cases {
+			a_utf8_string => (&[0x0C, 0x02, b'g', b'o'], Some("go")),
+			an_octet_string => (&[0x04, 0x02, b'g', b'o'], None),
+		}
 	}
 
 	// A step leads to the targets of an event that the state offers, and to
