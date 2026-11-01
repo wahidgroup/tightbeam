@@ -219,10 +219,10 @@ pub struct FdrVerdict {
 }
 
 impl FdrVerdict {
-	/// Leaves open each freedom that holds, for a run with a walk that stopped
+	/// Leaves open each freedom that holds, for a run with a seed that stopped
 	/// at its budget of states. A refuted freedom keeps its witness.
 	#[cfg(feature = "testing-fdr")]
-	pub(crate) fn leave_freedom_open(&mut self) {
+	fn leave_freedom_open(&mut self) {
 		for freedom in [&mut self.deadlock_free, &mut self.divergence_free] {
 			if *freedom == Decision::Holds {
 				*freedom = Decision::Unknown;
@@ -381,6 +381,13 @@ impl FdrVerdict {
 				self.failing_seed = Some(seed);
 			}
 			#[cfg(feature = "testing-fault")]
+			SeedResult::CutShort(_trace, _failures, faults) => {
+				self.leave_freedom_open();
+				self.faults_injected.extend(faults.clone());
+			}
+			#[cfg(not(feature = "testing-fault"))]
+			SeedResult::CutShort(..) => self.leave_freedom_open(),
+			#[cfg(feature = "testing-fault")]
 			SeedResult::Success(_trace, _failures, faults) => {
 				self.seeds_completed += 1;
 				if !faults.is_empty() {
@@ -440,6 +447,26 @@ impl Default for FdrVerdict {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A seed that stopped at its budget of states left branches on its queue,
+	/// so a fault in it counts as injected, and neither the seed nor the
+	/// recovery counts as finished.
+	#[cfg(all(feature = "testing-fdr", feature = "testing-fault"))]
+	#[test]
+	fn a_seed_cut_short_under_a_fault_finishes_nothing() {
+		let fault = InjectedFaultRecord {
+			csp_state: "Process.S0".to_string(),
+			event_label: "a".to_string(),
+			error_message: "injected".to_string(),
+			probability_bps: 10_000,
+		};
+		let mut verdict = FdrVerdict { deadlock_free: Decision::Holds, ..FdrVerdict::default() };
+
+		verdict.add_seed(0, &SeedResult::CutShort(Vec::new(), Vec::new(), vec![fault]));
+		let finished = (verdict.seeds_completed, verdict.error_recovery_successful);
+		let injected = verdict.faults_injected.len();
+		assert_eq!((verdict.deadlock_free, finished, injected), (Decision::Unknown, (0, 0), 1));
+	}
 
 	/// A default verdict asserts nothing, claims determinism, and counts no
 	/// trace or state.

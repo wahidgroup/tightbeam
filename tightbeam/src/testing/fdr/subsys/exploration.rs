@@ -41,8 +41,6 @@ pub struct DefaultExplorationEngine<'a> {
 	visited_states: HashSet<State>,
 	/// The count of branches pruned for timing violations across all seeds.
 	timing_pruned: usize,
-	/// Whether a walk stopped at [`MAX_WALK_STATES`].
-	cut_short: bool,
 	/// The divergent states of the process, which the first walk computes and
 	/// each later walk reads.
 	divergent: OnceLock<DivergentStates>,
@@ -56,8 +54,6 @@ struct SeedWalk {
 	visited: HashSet<State>,
 	/// The count of the branches that the walk pruned for timing violations.
 	timing_pruned: usize,
-	/// Whether the walk stopped at [`MAX_WALK_STATES`].
-	cut_short: bool,
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
@@ -70,7 +66,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 			seed_results: Vec::new(),
 			visited_states: HashSet::new(),
 			timing_pruned: 0,
-			cut_short: false,
 			divergent: OnceLock::new(),
 		}
 	}
@@ -95,7 +90,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 	fn absorb(&mut self, walk: SeedWalk) -> SeedResult {
 		self.visited_states.extend(walk.visited);
 		self.timing_pruned += walk.timing_pruned;
-		self.cut_short |= walk.cut_short;
 
 		walk.result
 	}
@@ -104,10 +98,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 	fn walk(&self, seed: u64) -> SeedWalk {
 		let mut visited = HashSet::new();
 		let mut timing_pruned = 0usize;
-		let mut cut_short = false;
-		let result = self.walk_into(seed, &mut visited, &mut timing_pruned, &mut cut_short);
+		let result = self.walk_into(seed, &mut visited, &mut timing_pruned);
 
-		SeedWalk { result, visited, timing_pruned, cut_short }
+		SeedWalk { result, visited, timing_pruned }
 	}
 
 	/// The walk of `seed` under its own RNG schedule.
@@ -115,14 +108,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 	/// `visited` receives each state the seed visits. `timing_pruned` counts
 	/// the branches dropped for deadline or path WCET violations, so the
 	/// verdict reports the model-level timing violations exploration pruned.
-	/// `cut_short` turns true when the walk stops at [`MAX_WALK_STATES`].
-	fn walk_into(
-		&self,
-		seed: u64,
-		visited: &mut HashSet<State>,
-		timing_pruned: &mut usize,
-		cut_short: &mut bool,
-	) -> SeedResult {
+	fn walk_into(&self, seed: u64, visited: &mut HashSet<State>, timing_pruned: &mut usize) -> SeedResult {
 		let process = self.process;
 		let config = &self.config;
 		let mut rng = SeededRng::new(seed);
@@ -153,8 +139,10 @@ impl<'a> DefaultExplorationEngine<'a> {
 		while let Some(state) = queue.pop_front() {
 			taken += 1;
 			if taken > MAX_WALK_STATES {
-				*cut_short = true;
-				break;
+				#[cfg(feature = "testing-fault")]
+				return SeedResult::CutShort(longest_trace, failures, injected_faults);
+				#[cfg(not(feature = "testing-fault"))]
+				return SeedResult::CutShort(longest_trace, failures);
 			}
 
 			visited.insert(state.process_state());
@@ -338,10 +326,6 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 
 	fn timing_pruned(&self) -> usize {
 		self.timing_pruned
-	}
-
-	fn cut_short(&self) -> bool {
-		self.cut_short
 	}
 
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {

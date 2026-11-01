@@ -104,9 +104,6 @@ impl FdrVerdict {
 		self.traces_explored = engine.traces().len();
 		self.states_visited = engine.visited_states().len();
 		self.timing_pruned = engine.timing_pruned();
-		if engine.cut_short() {
-			self.leave_freedom_open();
-		}
 	}
 }
 
@@ -492,10 +489,6 @@ where
 
 			self.verdict.timing_pruned += engine.timing_pruned();
 			self.verdict.states_visited += engine.visited_states().len();
-			if engine.cut_short() {
-				self.verdict.leave_freedom_open();
-			}
-
 			if let Some(record) = record.as_mut() {
 				record(&spec_process, engine.visited_states(), found.divergences())?;
 			}
@@ -952,20 +945,22 @@ mod tests {
 	}
 
 	// A walk of a cycle that doubles its branches stops at its budget of
-	// states under a deep bound, so the run leaves each freedom open.
+	// states under a deep bound, so the run leaves each freedom open and
+	// counts no seed as completed.
 	crate::tb_cases! {
-		fn a_walk_decides_freedom_within_its_budget((max_depth, decided): (usize, Decision)) {
+		fn a_walk_decides_freedom_within_its_budget((max_depth, decided, completed): (usize, Decision, u32)) {
 			let config = FdrConfig { max_depth, ..FdrConfig::default() };
 
 			let verdict = doubling_cycle().verdict_under(config);
-			assert_eq!((verdict.deadlock_free, verdict.divergence_free), (decided, decided));
+			let freedom = (verdict.deadlock_free, verdict.divergence_free);
+			assert_eq!((freedom, verdict.seeds_completed), ((decided, decided), completed));
 		}
 
 		cases {
-			/// Six steps stay within the budget of each walk.
-			a_shallow_bound => (6, Decision::Holds),
+			/// Six steps stay within the budget of each of the 64 walks.
+			a_shallow_bound => (6, Decision::Holds, 64),
 			/// The default bound spends the budget of each walk.
-			the_default_bound => (128, Decision::Unknown),
+			the_default_bound => (128, Decision::Unknown, 0),
 		}
 	}
 
