@@ -158,10 +158,13 @@ jobs:
           toolchain: stable
 
       # The cache restores the cargo-afl binary, so it also holds the AFL++
-      # runtime that the install built outside CARGO_HOME.
+      # runtime that the install built outside CARGO_HOME. It holds no target
+      # directory, because `cargo afl build` compiles for the CPU of its runner,
+      # and a dependency from another runner dies on an illegal instruction.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-directories: ~/.local/share/afl.rs
+          cache-targets: false
 
       - name: Setup
         run: make setup
