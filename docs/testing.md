@@ -30,26 +30,26 @@ It drills down from [README §12](../README.md#12-testing-framework) for enginee
 
 A spec names its type and then one block per version, `V(major, minor, patch): { .. }`. The keys of a block keep this order:
 
-| Key              | Form                                                                          | Required | Builder call                        | Feature          |
-| ---------------- | ----------------------------------------------------------------------------- | -------- | ----------------------------------- | ---------------- |
-| `mode:`          | `Accept`, `Reject`, or `Error`, a variant of `ExecutionMode`                  | Yes      | `AssertSpecBuilder::new`            | `testing`        |
-| `gate:`          | A variant of `TransitStatus`                                                  | No       | `expected_gate`                     | `testing`        |
-| `response:`      | `Present` or `Absent`, a variant of `Presence`                                | No       | `expected_response`                 | `testing`        |
-| `tag_filter:`    | `["tag", ..]`                                                                 | No       | `tag_filter`                        | `testing`        |
-| `assertions:`    | A list of assertion tuples                                                    | Yes      | `assertion`, `assertion_with_value` | `testing`        |
-| `events:`        | `[KIND, ..]`, in the order the trace records them                             | No       | `required_events`                   | `instrument`     |
-| `event_counts:`  | `[(KIND, cardinality), ..]`                                                   | No       | `event_count`                       | `instrument`     |
-| `schedulability:` | `{ task_set: EXPR, scheduler: NAME, must_be_schedulable: BOOL, }`           | No       | `schedulability`                    | `testing-timing` |
+| Key               | Form                                                              | Required | Builder call                        | Feature          |
+| ----------------- | ----------------------------------------------------------------- | -------- | ----------------------------------- | ---------------- |
+| `mode:`           | `Accept`, `Reject`, or `Error`, a variant of `ExecutionMode`      | Yes      | `AssertSpecBuilder::new`            | `testing`        |
+| `gate:`           | A variant of `TransitStatus`                                      | No       | `expected_gate`                     | `testing`        |
+| `response:`       | `Present` or `Absent`, a variant of `Presence`                    | No       | `expected_response`                 | `testing`        |
+| `tag_filter:`     | `["tag", ..]`                                                     | No       | `tag_filter`                        | `testing`        |
+| `assertions:`     | A list of assertion tuples                                        | Yes      | `assertion`, `assertion_with_value` | `testing`        |
+| `events:`         | `[KIND, ..]`, in the order the trace records them                 | No       | `required_events`                   | `instrument`     |
+| `event_counts:`   | `[(KIND, cardinality), ..]`                                       | No       | `event_count`                       | `instrument`     |
+| `schedulability:` | `{ task_set: EXPR, scheduler: NAME, must_be_schedulable: BOOL, }` | No       | `schedulability`                    | `testing-timing` |
 
 A key whose feature is off fails to compile, and the error names the key and the feature. An optional `annotations { description: "..." }` block after the last version block gives every version the same description.
 
 The execution mode classifies how the run ended:
 
-| Mode     | The run                                       |
-| -------- | --------------------------------------------- |
+| Mode     | The run                                        |
+| -------- | ---------------------------------------------- |
 | `Accept` | The body returned, and no gate refused the run |
-| `Reject` | A gate decision other than `Ok` refused it    |
-| `Error`  | The body returned an error                    |
+| `Reject` | A gate decision other than `Ok` refused it     |
+| `Error`  | The body returned an error                     |
 
 An assertion tuple takes one of four forms. The label is a `Urn<'static>` expression:
 
@@ -66,11 +66,11 @@ The `schedulability:` block takes a `TaskSet` expression. The scheduler it names
 
 The macro emits a unit struct with three associated functions:
 
-| Function                    | Returns                              | Behavior                                                                 |
-| --------------------------- | ------------------------------------ | ------------------------------------------------------------------------ |
-| `all()`                     | `&'static [BuiltAssertSpec]`         | Builds every version once, in a `OnceLock`, and returns them in source order |
-| `get(major, minor, patch)`  | `Option<&'static BuiltAssertSpec>`   | The version with that triple                                             |
-| `latest()`                  | `&'static BuiltAssertSpec`           | The highest version                                                      |
+| Function                   | Returns                            | Behavior                                                                     |
+| -------------------------- | ---------------------------------- | ---------------------------------------------------------------------------- |
+| `all()`                    | `&'static [BuiltAssertSpec]`       | Builds every version once, in a `OnceLock`, and returns them in source order |
+| `get(major, minor, patch)` | `Option<&'static BuiltAssertSpec>` | The version with that triple                                                 |
+| `latest()`                 | `&'static BuiltAssertSpec`         | The highest version                                                          |
 
 The macro checks its blocks at two times:
 
@@ -81,28 +81,28 @@ The macro checks its blocks at two times:
 
 The macro drives `AssertSpecBuilder`, and code can call it directly. `AssertSpecBuilder::new(id, mode)` starts a spec at version 1.0.0:
 
-| Method                                                      | Effect                                                        |
-| ----------------------------------------------------------- | ------------------------------------------------------------- |
-| `version(major, minor, patch)`                              | Sets the version                                              |
-| `expected_gate(Option<TransitStatus>)`                      | Sets the gate decision that the run must reach                |
-| `expected_response(Option<Presence>)`                       | Sets whether the run must leave a response                    |
-| `tag_filter(Vec<&'static str>)`                             | Sets the spec-wide tag filter                                 |
-| `assertion(label, tags, cardinality)`                       | Adds an assertion, or returns a `SpecBuildError`              |
-| `assertion_with_value(label, tags, cardinality, value)`     | Adds an assertion with an `Option<AssertionValue>`            |
-| `ordering(labels)`                                          | Requires the labels in this order, or returns a `SpecBuildError` |
-| `required_events(kinds)` (`instrument`)                     | Requires the event kinds in this order, once each             |
-| `event_count(kind, cardinality)` (`instrument`)             | Adds a count, and two counts on one kind must both hold       |
-| `description(&'static str)`                                 | Sets the description                                          |
-| `schedulability(SchedulabilityAssertion)` (`testing-timing`) | Adds the schedulability assertion                            |
-| `build()`                                                   | Returns the `BuiltAssertSpec`                                 |
+| Method                                                       | Effect                                                           |
+| ------------------------------------------------------------ | ---------------------------------------------------------------- |
+| `version(major, minor, patch)`                               | Sets the version                                                 |
+| `expected_gate(Option<TransitStatus>)`                       | Sets the gate decision that the run must reach                   |
+| `expected_response(Option<Presence>)`                        | Sets whether the run must leave a response                       |
+| `tag_filter(Vec<&'static str>)`                              | Sets the spec-wide tag filter                                    |
+| `assertion(label, tags, cardinality)`                        | Adds an assertion, or returns a `SpecBuildError`                 |
+| `assertion_with_value(label, tags, cardinality, value)`      | Adds an assertion with an `Option<AssertionValue>`               |
+| `ordering(labels)`                                           | Requires the labels in this order, or returns a `SpecBuildError` |
+| `required_events(kinds)` (`instrument`)                      | Requires the event kinds in this order, once each                |
+| `event_count(kind, cardinality)` (`instrument`)              | Adds a count, and two counts on one kind must both hold          |
+| `description(&'static str)`                                  | Sets the description                                             |
+| `schedulability(SchedulabilityAssertion)` (`testing-timing`) | Adds the schedulability assertion                                |
+| `build()`                                                    | Returns the `BuiltAssertSpec`                                    |
 
 An assertion order needs the builder, whose `ordering` sets it. `SpecBuildError` has three variants:
 
-| Variant                     | Cause                                        |
-| --------------------------- | -------------------------------------------- |
-| `DuplicateLabel(Urn)`       | The spec already holds an assertion on the label |
+| Variant                     | Cause                                              |
+| --------------------------- | -------------------------------------------------- |
+| `DuplicateLabel(Urn)`       | The spec already holds an assertion on the label   |
 | `UnknownOrderingLabel(Urn)` | The ordering names a label that no assertion holds |
-| `InvalidRange(Urn)`         | The cardinality has a maximum below its minimum |
+| `InvalidRange(Urn)`         | The cardinality has a maximum below its minimum    |
 
 ```rust
 use tightbeam::testing::macros::AssertSpecBuilder;
@@ -135,14 +135,14 @@ assert_eq!(spec.required_assertions().len(), 2);
 
 Each cardinality macro calls one constructor of `Cardinality`:
 
-| Macro              | Constructor                         | Bounds          | Check                                                       |
-| ------------------ | ----------------------------------- | --------------- | ----------------------------------------------------------- |
-| `exactly!(n)`      | `Cardinality::exactly(n)`           | `n` to `n`      |                                                             |
-| `at_least!(n)`     | `Cardinality::at_least(NonZeroU32)` | `n` and up      | A bound of zero fails to compile                            |
-| `at_most!(n)`      | `Cardinality::at_most(n)`           | 0 to `n`        |                                                             |
-| `between!(lo, hi)` | `Cardinality::between(lo, hi)`      | `lo` to `hi`    | Panics when `hi` is below `lo`, at build time in a constant |
-| `present!()`       | `Cardinality::present()`            | 1 and up        |                                                             |
-| `absent!()`        | `Cardinality::absent()`             | 0 to 0          |                                                             |
+| Macro              | Constructor                         | Bounds       | Check                                                       |
+| ------------------ | ----------------------------------- | ------------ | ----------------------------------------------------------- |
+| `exactly!(n)`      | `Cardinality::exactly(n)`           | `n` to `n`   |                                                             |
+| `at_least!(n)`     | `Cardinality::at_least(NonZeroU32)` | `n` and up   | A bound of zero fails to compile                            |
+| `at_most!(n)`      | `Cardinality::at_most(n)`           | 0 to `n`     |                                                             |
+| `between!(lo, hi)` | `Cardinality::between(lo, hi)`      | `lo` to `hi` | Panics when `hi` is below `lo`, at build time in a constant |
+| `present!()`       | `Cardinality::present()`            | 1 and up     |                                                             |
+| `absent!()`        | `Cardinality::absent()`             | 0 to 0       |                                                             |
 
 `Cardinality::is_satisfied_by` widens the count and the bounds to `u64`, so a count past `u32::MAX` exceeds every maximum.
 
@@ -150,19 +150,19 @@ Each cardinality macro calls one constructor of `Cardinality`:
 
 `equals!(value)` expands to `Some(AssertionValue::from(value))`. A recorded value matches when it equals the expected value, and every record that the assertion counts must match. The conversions into `AssertionValue`:
 
-| Input type                       | Variant           | Matches                                         |
-| -------------------------------- | ----------------- | ----------------------------------------------- |
-| `String`, `&str`                 | `String`          | The same text                                   |
-| `bool`                           | `Bool`            | The same flag                                   |
-| `u8`, `u32`, `u64`, `i32`, `i64` | One per type      | The same number of the same type                |
-| `usize`, `NonZeroUsize`          | `U64`             | The same count, saturated at `u64::MAX`         |
-| `MessagePriority`, `Version`     | One per type      | The same variant                                |
-| `TransitStatus` (`policy`)       | `TransitStatus`   | The same status                                 |
-| `Option<T>`                      | `Some` or `IsNone` | `Some(x)` boxes the value of `x`               |
-| `IsSome`, `IsNone`               | `IsSome`, `IsNone` | `IsSome` matches any `Some`, and `IsNone` matches `None` |
+| Input type                       | Variant            | Matches                                                     |
+| -------------------------------- | ------------------ | ----------------------------------------------------------- |
+| `String`, `&str`                 | `String`           | The same text                                               |
+| `bool`                           | `Bool`             | The same flag                                               |
+| `u8`, `u32`, `u64`, `i32`, `i64` | One per type       | The same number of the same type                            |
+| `usize`, `NonZeroUsize`          | `U64`              | The same count, saturated at `u64::MAX`                     |
+| `MessagePriority`, `Version`     | One per type       | The same variant                                            |
+| `TransitStatus` (`policy`)       | `TransitStatus`    | The same status                                             |
+| `Option<T>`                      | `Some` or `IsNone` | `Some(x)` boxes the value of `x`                            |
+| `IsSome`, `IsNone`               | `IsSome`, `IsNone` | `IsSome` matches any `Some`, and `IsNone` matches `None`    |
 | `Presence`                       | `IsSome`, `IsNone` | `Present` reads as `IsSome`, and `Absent` reads as `IsNone` |
-| `(u64, u64)`                     | `RatioActual`     | An equal ratio                                  |
-| `RatioLimit(n, d)`               | `RatioLimit`      | An actual ratio at or below the limit           |
+| `(u64, u64)`                     | `RatioActual`      | An equal ratio                                              |
+| `RatioLimit(n, d)`               | `RatioLimit`       | An actual ratio at or below the limit                       |
 
 An integer literal with no suffix takes the type `i32`, so `equals!(3_600)` matches a recorded `i32` alone. Three more macros build values: `truthy!(x)` is `Bool(x != 0)`, `falsy!(x)` is `Bool(x == 0)`, and `ratio!(n, d)` is `RatioLimit(n, d)`.
 
@@ -170,11 +170,11 @@ An integer literal with no suffix takes the type `i32`, so `equals!(3_600)` matc
 
 `TraceCollector` records each assertion through its event API:
 
-| Method                                         | Returns                                         | Records                                                          |
-| ---------------------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------- |
-| `event(label)`                                 | `Result<EventBuilder<'_>, TightBeamError>`      | The label with no tags and no value                              |
-| `event_with(label, tags, value)`               | `Result<EventBuilder<'_, EventValue>, TightBeamError>` | The label, its tags, and the value, or no value for `()`  |
-| `recorded(label)`                              | `usize`                                         | Nothing. It counts the records of the label and leaves them recorded |
+| Method                           | Returns                                                | Records                                                              |
+| -------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------- |
+| `event(label)`                   | `Result<EventBuilder<'_>, TightBeamError>`             | The label with no tags and no value                                  |
+| `event_with(label, tags, value)` | `Result<EventBuilder<'_, EventValue>, TightBeamError>` | The label, its tags, and the value, or no value for `()`             |
+| `recorded(label)`                | `usize`                                                | Nothing. It counts the records of the label and leaves them recorded |
 
 - A label is an `impl IntoEventLabel`, which `Urn`, `&Urn`, and the CSP `Event` implement. A string literal fails to compile.
 - The `EventBuilder` records when it drops, so `trace.event(LABEL)?;` records at the end of the statement.
@@ -189,14 +189,14 @@ An integer literal with no suffix takes the type `i32`, so `equals!(3_600)` matc
 
 A spec names its type, then its `events` block and its `states` block, then the optional blocks in this order:
 
-| Block                              | Content                                                 | Feature                  |
-| ---------------------------------- | ------------------------------------------------------- | ------------------------ |
-| `terminal { S, .. }`               | The terminal states                                     | `testing-csp`            |
-| `choice { S, .. }`                 | The states of internal choice                           | `testing-csp`            |
-| `annotations { description: "" }`  | The description of the process                          | `testing-csp`            |
-| `clocks: { c, .. }`                | The clocks that a guard or a reset names                | `testing-timing`         |
-| `timing { .. }`                    | Any of `wcet:`, `jitter:`, and `deadline:`, with commas between | `testing-timing` |
-| `schedulability { .. }`            | `scheduler: NAME, periods: { EVENT => Duration, .. }`   | `testing-schedulability` |
+| Block                             | Content                                                         | Feature                  |
+| --------------------------------- | --------------------------------------------------------------- | ------------------------ |
+| `terminal { S, .. }`              | The terminal states                                             | `testing-csp`            |
+| `choice { S, .. }`                | The states of internal choice                                   | `testing-csp`            |
+| `annotations { description: "" }` | The description of the process                                  | `testing-csp`            |
+| `clocks: { c, .. }`               | The clocks that a guard or a reset names                        | `testing-timing`         |
+| `timing { .. }`                   | Any of `wcet:`, `jitter:`, and `deadline:`, with commas between | `testing-timing`         |
+| `schedulability { .. }`           | `scheduler: NAME, periods: { EVENT => Duration, .. }`           | `testing-schedulability` |
 
 Each state takes one definition, and a state defined twice fails to compile. The first state in source order is the initial state. A transition takes one of three forms:
 
@@ -212,26 +212,26 @@ A bracket after an event is its guard, so an event that is an index expression t
 
 `ProcessBuildError` has four variants:
 
-| Variant                         | Cause                                                       |
-| ------------------------------- | ----------------------------------------------------------- |
-| `MissingInitialState`           | The `states` block names no state                           |
-| `UndeclaredClock { clock }`     | A guard or a reset names a clock that `clocks:` lacks       |
-| `ConflictingTiming { event }`   | The `timing` block gives one event two bounds that disagree |
-| `InvalidDeadline { start, end }` | The slack of a deadline passes its duration                |
+| Variant                          | Cause                                                       |
+| -------------------------------- | ----------------------------------------------------------- |
+| `MissingInitialState`            | The `states` block names no state                           |
+| `UndeclaredClock { clock }`      | A guard or a reset names a clock that `clocks:` lacks       |
+| `ConflictingTiming { event }`    | The `timing` block gives one event two bounds that disagree |
+| `InvalidDeadline { start, end }` | The slack of a deadline passes its duration                 |
 
 ### Timing macros
 
 The timing blocks and the guards take four macros, and each needs `testing-timing`:
 
-| Macro                                            | Builds                                                         |
-| ------------------------------------------------ | -------------------------------------------------------------- |
-| `wcet!(d)`                                       | A `WcetConfig` that bounds every run of the event              |
-| `wcet!(d, percentile: p)`                        | A `WcetConfig` that bounds the percentile `p` of the runs      |
-| `wcet!(d, percentile: p, analyzer: a)`           | The same with a statistical analyzer, in either key order      |
-| `jitter!(d)`, `jitter!(d, calculator)`           | A jitter bound, measured by `MinMaxJitter` or by `calculator`  |
-| `deadline!(duration: d)`, `deadline!(duration: d, slack: s)` | The `DeadlineParams` of a deadline, in parentheses or braces |
-| `guard!(x < d)`, and `<=`, `>`, `>=`, `==`       | A `TimingGuard` on the clock `x`                               |
-| `guard!(lo <= x <= hi)`                          | A `TimingGuard::ClockInRange`, where each bound is one token tree |
+| Macro                                                        | Builds                                                            |
+| ------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `wcet!(d)`                                                   | A `WcetConfig` that bounds every run of the event                 |
+| `wcet!(d, percentile: p)`                                    | A `WcetConfig` that bounds the percentile `p` of the runs         |
+| `wcet!(d, percentile: p, analyzer: a)`                       | The same with a statistical analyzer, in either key order         |
+| `jitter!(d)`, `jitter!(d, calculator)`                       | A jitter bound, measured by `MinMaxJitter` or by `calculator`     |
+| `deadline!(duration: d)`, `deadline!(duration: d, slack: s)` | The `DeadlineParams` of a deadline, in parentheses or braces      |
+| `guard!(x < d)`, and `<=`, `>`, `>=`, `==`                   | A `TimingGuard` on the clock `x`                                  |
+| `guard!(lo <= x <= hi)`                                      | A `TimingGuard::ClockInRange`, where each bound is one token tree |
 
 `wcet!(d, analyzer: a)` fails to compile, because an analyzer computes a percentile.
 
@@ -239,12 +239,12 @@ The timing blocks and the guards take four macros, and each needs `testing-timin
 
 A composition names its type, two `processes:` operands, and a `composition:` operator, then an optional `properties:` block and an optional `annotations` block:
 
-| Operator                                    | CSP                  | `CompositionOperator` variant             |
-| ------------------------------------------- | -------------------- | ----------------------------------------- |
-| `Synchronized`                              | `P \|\| Q`           | `Synchronized`                            |
-| `Interleaved`                               | `P \|\|\| Q`         | `Interleaved`                             |
-| `Interface { events: ["label", ..] }`       | `P [\| A \|] Q`      | `Interface { events }`                    |
-| `Alphabetized { left: [..], right: [..] }`  | `P [\| αP \| αQ \|] Q` | `Alphabetized { left, right }`          |
+| Operator                                   | CSP                    | `CompositionOperator` variant  |
+| ------------------------------------------ | ---------------------- | ------------------------------ |
+| `Synchronized`                             | `P \|\| Q`             | `Synchronized`                 |
+| `Interleaved`                              | `P \|\|\| Q`           | `Interleaved`                  |
+| `Interface { events: ["label", ..] }`      | `P [\| A \|] Q`        | `Interface { events }`         |
+| `Alphabetized { left: [..], right: [..] }` | `P [\| αP \| αQ \|] Q` | `Alphabetized { left, right }` |
 
 - An operand is a `tb_process_spec!` type or another composition, which needs `CompositionSpec` in scope.
 - The `Interface` and `Alphabetized` lists take each event as the string of its full URN rendering, such as `"urn:doc:event:compose/ping"`.
@@ -252,22 +252,22 @@ A composition names its type, two `processes:` operands, and a `composition:` op
 
 The macro emits a unit struct with `Default` and `CompositionSpec`:
 
-| Function              | Returns                                          | Behavior                                                       |
-| --------------------- | ------------------------------------------------ | -------------------------------------------------------------- |
-| `process()`           | `Result<Process, CompositionError>`              | Builds both operands and composes them                         |
-| `metadata()`          | `Result<CompositionMetadata, CompositionError>`  | The name, the operands, the sync alphabet, and the claims      |
-| `verify_properties()` | `Result<(), CompositionError>`                   | Checks the claims of this composition and of each operand      |
+| Function              | Returns                                         | Behavior                                                  |
+| --------------------- | ----------------------------------------------- | --------------------------------------------------------- |
+| `process()`           | `Result<Process, CompositionError>`             | Builds both operands and composes them                    |
+| `metadata()`          | `Result<CompositionMetadata, CompositionError>` | The name, the operands, the sync alphabet, and the claims |
+| `verify_properties()` | `Result<(), CompositionError>`                  | Checks the claims of this composition and of each operand |
 
 `CompositionError` names each refusal:
 
-| Variant                               | Cause                                                       |
-| ------------------------------------- | ----------------------------------------------------------- |
-| `AlphabetMismatch { expected, actual }` | A declared alphabet holds an event outside its operands   |
-| `DeadlockDetected { state }`          | A claim of deadlock freedom fails at `state`                |
-| `LivelockDetected { cycle }`          | A claim of livelock freedom fails on a τ cycle              |
-| `NonDeterminismDetected { state, events }` | A claim of determinism fails at `state`                |
-| `PropertyHolds { property }`          | The spec claims that the process lacks a property it holds  |
-| `InvalidComposition { reason }`       | The structure of the composition is invalid                 |
+| Variant                                    | Cause                                                      |
+| ------------------------------------------ | ---------------------------------------------------------- |
+| `AlphabetMismatch { expected, actual }`    | A declared alphabet holds an event outside its operands    |
+| `DeadlockDetected { state }`               | A claim of deadlock freedom fails at `state`               |
+| `LivelockDetected { cycle }`               | A claim of livelock freedom fails on a τ cycle             |
+| `NonDeterminismDetected { state, events }` | A claim of determinism fails at `state`                    |
+| `PropertyHolds { property }`               | The spec claims that the process lacks a property it holds |
+| `InvalidComposition { reason }`            | The structure of the composition is invalid                |
 
 ## Refinement checking
 
@@ -275,17 +275,17 @@ The macro emits a unit struct with `Default` and `CompositionSpec`:
 
 ### FdrConfig
 
-| Field              | Type                          | Default    | Feature         | Meaning                                                                 |
-| ------------------ | ----------------------------- | ---------- | --------------- | ----------------------------------------------------------------------- |
-| `seeds`            | `u32`                         | 64         | `testing-fdr`   | The number of exploration seeds, each of which runs another schedule    |
-| `max_depth`        | `usize`                       | 128        | `testing-fdr`   | The longest trace, in observable events, that exploration follows       |
-| `max_internal_run` | `usize`                       | 32         | `testing-fdr`   | The most hidden events in one run. A longer run is a divergence         |
-| `timeout_ms`       | `u64`                         | 5000       | `testing-fdr`   | The time budget of each search of the refinement checker               |
-| `specs`            | `Vec<Process>`                | empty      | `testing-fdr`   | The specs that the subject must refine                                  |
-| `fail_fast`        | `bool`                        | `true`     | `testing-fdr`   | Whether each refinement pass returns at its first counterexample        |
-| `scheduler`        | `Option<SchedulerConstraint>` | `None`     | `testing-fault` | The schedulers that run the component processes of the run           |
-| `fault_model`      | `Option<FaultModel>`          | `None`     | `testing-fault` | The faults that exploration injects                                     |
-| `fmea_config`      | `Option<FmeaConfig>`          | `None`     | `testing-fmea`  | The FMEA that a run with injected faults reports                        |
+| Field              | Type                          | Default | Feature         | Meaning                                                              |
+| ------------------ | ----------------------------- | ------- | --------------- | -------------------------------------------------------------------- |
+| `seeds`            | `u32`                         | 64      | `testing-fdr`   | The number of exploration seeds, each of which runs another schedule |
+| `max_depth`        | `usize`                       | 128     | `testing-fdr`   | The longest trace, in observable events, that exploration follows    |
+| `max_internal_run` | `usize`                       | 32      | `testing-fdr`   | The most hidden events in one run. A longer run is a divergence      |
+| `timeout_ms`       | `u64`                         | 5000    | `testing-fdr`   | The time budget of each search of the refinement checker             |
+| `specs`            | `Vec<Process>`                | empty   | `testing-fdr`   | The specs that the subject must refine                               |
+| `fail_fast`        | `bool`                        | `true`  | `testing-fdr`   | Whether each refinement pass returns at its first counterexample     |
+| `scheduler`        | `Option<SchedulerConstraint>` | `None`  | `testing-fault` | The schedulers that run the component processes of the run           |
+| `fault_model`      | `Option<FaultModel>`          | `None`  | `testing-fault` | The faults that exploration injects                                  |
+| `fmea_config`      | `Option<FmeaConfig>`          | `None`  | `testing-fmea`  | The FMEA that a run with injected faults reports                     |
 
 The time budget covers the trace, failure, and divergence searches of a process, and the search of a spec for the traces of the subject. A search that spends it stops, and a check it cut short decides `Unknown`. A walk of one seed stops at 16,384 states, and a run with such a walk leaves each freedom that no seed refuted at `Unknown`. With `fail_fast` off, a pass checks every spec, and the verdict keeps the witness of the last violation.
 
@@ -342,49 +342,49 @@ assert_eq!(verdict.outcome(), Decision::Holds);
 
 The verdict holds one `Decision` per assertion:
 
-| Field                | Asserted when                                                     |
-| -------------------- | ----------------------------------------------------------------- |
+| Field                | Asserted when                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------- |
 | `divergence_free`    | The run names no spec and no fault model, and explores the process over every seed |
-| `deadlock_free`      | As `divergence_free`                                              |
-| `schedulable`        | A configured spec has a schedulability block (`testing-schedulability`) |
-| `trace_refines`      | The run names a spec and no fault model                           |
-| `failures_refines`   | As `trace_refines`, for a subject whose refusals are known        |
-| `divergence_refines` | As `failures_refines`                                             |
+| `deadlock_free`      | As `divergence_free`                                                               |
+| `schedulable`        | A configured spec has a schedulability block (`testing-schedulability`)            |
+| `trace_refines`      | The run names a spec and no fault model                                            |
+| `failures_refines`   | As `trace_refines`, for a subject whose refusals are known                         |
+| `divergence_refines` | As `failures_refines`                                                              |
 
 A scenario with a CSP process and FDR specs runs both: the process answers divergence and deadlock freedom, and the recorded trace answers refinement against the specs.
 
 `outcome()` folds the six decisions, and the firmest one wins. The rest of the verdict is evidence:
 
-| Field                           | Type                          | Content                                                              |
-| ------------------------------- | ----------------------------- | -------------------------------------------------------------------- |
-| `is_deterministic`              | `bool`                        | Whether the structural proof of determinism holds                    |
-| `determinism_witness`           | `Option<(State, Event)>`      | The first pair with a hidden action or more than one target          |
-| `trace_refinement_witness`      | `Option<Trace>`               | A trace of the subject that the spec lacks                           |
-| `failures_refinement_witness`   | `Option<Failure>`             | A trace and a refusal set that the spec does not allow               |
-| `divergence_refinement_witness` | `Option<Trace>`               | A divergent trace of the subject that the spec lacks                 |
-| `divergence_witness`            | `Option<(u64, Vec<Event>)>`   | The seed and the hidden events of a run that diverges                |
-| `deadlock_witness`              | `Option<(u64, Trace, State)>` | The seed, the trace, and the state of a deadlock                     |
+| Field                           | Type                          | Content                                                                       |
+| ------------------------------- | ----------------------------- | ----------------------------------------------------------------------------- |
+| `is_deterministic`              | `bool`                        | Whether the structural proof of determinism holds                             |
+| `determinism_witness`           | `Option<(State, Event)>`      | The first pair with a hidden action or more than one target                   |
+| `trace_refinement_witness`      | `Option<Trace>`               | A trace of the subject that the spec lacks                                    |
+| `failures_refinement_witness`   | `Option<Failure>`             | A trace and a refusal set that the spec does not allow                        |
+| `divergence_refinement_witness` | `Option<Trace>`               | A divergent trace of the subject that the spec lacks                          |
+| `divergence_witness`            | `Option<(u64, Vec<Event>)>`   | The seed and the hidden events of a run that diverges                         |
+| `deadlock_witness`              | `Option<(u64, Trace, State)>` | The seed, the trace, and the state of a deadlock                              |
 | `unmodelled_events`             | `Vec<Event>`                  | The events of the subject that no spec models, which refinement projects away |
-| `traces_explored`               | `usize`                       | The traces that the seeds explored                                   |
-| `states_visited`                | `usize`                       | The distinct states of the runs that the verdict judges              |
-| `seeds_completed`               | `u32`                         | The seeds that ended with neither a deadlock nor a divergence        |
-| `failing_seed`                  | `Option<u64>`                 | The seed of the last deadlock or divergence                          |
-| `timing_pruned`                 | `usize`                       | The branches that exploration pruned for a timing violation          |
-| `faults_injected`               | `Vec<InjectedFaultRecord>`    | The faults that exploration injected (`testing-fault`)               |
-| `error_recovery_successful`     | `usize`                       | The seeds that ran to their end after a fault (`testing-fault`)      |
-| `error_recovery_failed`         | `usize`                       | The seeds that deadlocked or diverged after a fault (`testing-fault`) |
-| `fmea_report`                   | `Option<FmeaReport>`          | The FMEA report of a run that injected a fault (`testing-fmea`)      |
+| `traces_explored`               | `usize`                       | The traces that the seeds explored                                            |
+| `states_visited`                | `usize`                       | The distinct states of the runs that the verdict judges                       |
+| `seeds_completed`               | `u32`                         | The seeds that ended with neither a deadlock nor a divergence                 |
+| `failing_seed`                  | `Option<u64>`                 | The seed of the last deadlock or divergence                                   |
+| `timing_pruned`                 | `usize`                       | The branches that exploration pruned for a timing violation                   |
+| `faults_injected`               | `Vec<InjectedFaultRecord>`    | The faults that exploration injected (`testing-fault`)                        |
+| `error_recovery_successful`     | `usize`                       | The seeds that ran to their end after a fault (`testing-fault`)               |
+| `error_recovery_failed`         | `usize`                       | The seeds that deadlocked or diverged after a fault (`testing-fault`)         |
+| `fmea_report`                   | `Option<FmeaReport>`          | The FMEA report of a run that injected a fault (`testing-fmea`)               |
 
 `Trace` is `Vec<Event>`, `RefusalSet` and `AcceptanceSet` are `HashSet<Event>`, and `Failure` is `(Trace, RefusalSet)`.
 
 ### Decision
 
-| Variant       | Rank | Meaning                                                   |
-| ------------- | ---- | --------------------------------------------------------- |
-| `NotAsserted` | 0    | The run left the assertion out, which is the default      |
+| Variant       | Rank | Meaning                                                      |
+| ------------- | ---- | ------------------------------------------------------------ |
+| `NotAsserted` | 0    | The run left the assertion out, which is the default         |
 | `Holds`       | 1    | The check completed, and everything it searched satisfied it |
-| `Unknown`     | 2    | The check stopped at a bound before it decided            |
-| `Refuted`     | 3    | The check found a counterexample                          |
+| `Unknown`     | 2    | The check stopped at a bound before it decided               |
+| `Refuted`     | 3    | The check found a counterexample                             |
 
 `a.and(b)` returns the higher rank of the two. `refute()` turns an asserted decision into `Refuted` and keeps `NotAsserted`.
 
@@ -427,24 +427,24 @@ After the prefix, each ASCII letter and digit stays, and each other character, t
 
 `FdrTraceExt` extends `ConsumedTrace`, the trace that a hook reads:
 
-| Method                               | Returns                    | Behavior                                                             |
-| ------------------------------------ | -------------------------- | -------------------------------------------------------------------- |
-| `csp_valid()`                        | `bool`                     | A run whose gate accepted must record an assertion or a response     |
-| `terminated_in_valid_state()`        | `bool`                     | An accepted run must leave a response or an assertion, a rejection is terminal, and an unknown status is not |
-| `assertion_count(label)`             | `usize`                    | The assertions whose label is `label`                                |
-| `project_to_observable()` (`instrument`) | `Vec<String>`          | The labels of the observable instrumentation events                  |
-| `project_to_hidden()` (`instrument`) | `Vec<String>`              | The labels of the hidden instrumentation events                      |
-| `export_cspm(&mut writer)`           | `std::io::Result<()>`      | The observable events as the CSPM sequence `Trace`, with the declarations of its events |
-| `to_process()`                       | `Process`                  | A linear process of the assertion events                             |
-| `to_process_with_mode(mode)`         | `Process`                  | A linear process of the events that `mode` selects                   |
+| Method                                   | Returns               | Behavior                                                                                                     |
+| ---------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `csp_valid()`                            | `bool`                | A run whose gate accepted must record an assertion or a response                                             |
+| `terminated_in_valid_state()`            | `bool`                | An accepted run must leave a response or an assertion, a rejection is terminal, and an unknown status is not |
+| `assertion_count(label)`                 | `usize`               | The assertions whose label is `label`                                                                        |
+| `project_to_observable()` (`instrument`) | `Vec<String>`         | The labels of the observable instrumentation events                                                          |
+| `project_to_hidden()` (`instrument`)     | `Vec<String>`         | The labels of the hidden instrumentation events                                                              |
+| `export_cspm(&mut writer)`               | `std::io::Result<()>` | The observable events as the CSPM sequence `Trace`, with the declarations of its events                      |
+| `to_process()`                           | `Process`             | A linear process of the assertion events                                                                     |
+| `to_process_with_mode(mode)`             | `Process`             | A linear process of the events that `mode` selects                                                           |
 
 A run with no gate decision passes both checks. `TraceProcessMode` selects the events of `to_process_with_mode`:
 
-| Mode                            | Events                                                                  | Feature      |
-| ------------------------------- | ----------------------------------------------------------------------- | ------------ |
-| `AssertionsOnly`                | The assertion events                                                    | `testing-fdr` |
-| `WithObservableInstrumentation` | The assertions and the observable instrumentation events                | `instrument` |
-| `FullInstrumentation`           | The assertions and the observable and hidden instrumentation events     | `instrument` |
+| Mode                            | Events                                                              | Feature       |
+| ------------------------------- | ------------------------------------------------------------------- | ------------- |
+| `AssertionsOnly`                | The assertion events                                                | `testing-fdr` |
+| `WithObservableInstrumentation` | The assertions and the observable instrumentation events            | `instrument`  |
+| `FullInstrumentation`           | The assertions and the observable and hidden instrumentation events | `instrument`  |
 
 A trace captures the hidden events only when its instrumentation sets `enable_internal_detail: true`.
 
@@ -452,13 +452,13 @@ A trace captures the hidden events only when its instrumentation sets `enable_in
 
 `RequestPathState` models the house request path. `acceptance()` returns the events a state accepts, and `refuses(label)` holds for every other event:
 
-| State        | `as_str()`     | Accepts                     |
-| ------------ | -------------- | --------------------------- |
-| `Initial`    | `initial`      | `request`                   |
-| `GateAccept` | `gate_accept`  | `handler_enter`             |
-| `Handler`    | `handler`      | `handler_exit`, `response`  |
-| `GateReject` | `gate_reject`  | Nothing                     |
-| `Terminal`   | `terminal`     | Nothing                     |
+| State        | `as_str()`    | Accepts                    |
+| ------------ | ------------- | -------------------------- |
+| `Initial`    | `initial`     | `request`                  |
+| `GateAccept` | `gate_accept` | `handler_enter`            |
+| `Handler`    | `handler`     | `handler_exit`, `response` |
+| `GateReject` | `gate_reject` | Nothing                    |
+| `Terminal`   | `terminal`    | Nothing                    |
 
 ## Fault injection
 
@@ -466,13 +466,13 @@ The fault model of [README §12.6](../README.md#126-fault-injection) needs `test
 
 ### FaultModel
 
-| Constructor or method                                  | Effect                                                                |
-| ------------------------------------------------------ | --------------------------------------------------------------------- |
-| `FaultModel::default()`                                | The deterministic strategy, no injection point, and the seed `0xDEADBEEF` |
-| `FaultModel::from(strategy)`                           | The same with `strategy`                                              |
-| `with_fault(state, event, error_fn, probability)`      | An injection point of FDR exploration at one state and one event      |
-| `with_event_fault(event, error_fn, probability)`       | An injection point at each runtime record of the event, in every state |
-| `with_seed(seed)`                                      | The seed of the random strategy, at runtime and in FDR exploration    |
+| Constructor or method                             | Effect                                                                    |
+| ------------------------------------------------- | ------------------------------------------------------------------------- |
+| `FaultModel::default()`                           | The deterministic strategy, no injection point, and the seed `0xDEADBEEF` |
+| `FaultModel::from(strategy)`                      | The same with `strategy`                                                  |
+| `with_fault(state, event, error_fn, probability)` | An injection point of FDR exploration at one state and one event          |
+| `with_event_fault(event, error_fn, probability)`  | An injection point at each runtime record of the event, in every state    |
+| `with_seed(seed)`                                 | The seed of the random strategy, at runtime and in FDR exploration        |
 
 - `state` is a `ProcessState`, and `event` is a `ProcessEvent`.
 - `error_fn` is a `Fn() -> E + Send + Sync + 'static`, where `E: Into<TightBeamError>`.
@@ -482,10 +482,10 @@ The fault model of [README §12.6](../README.md#126-fault-injection) needs `test
 
 ### InjectionStrategy
 
-| Strategy        | A point injects at a record when                                              |
-| --------------- | ----------------------------------------------------------------------------- |
+| Strategy        | A point injects at a record when                                                               |
+| --------------- | ---------------------------------------------------------------------------------------------- |
 | `Deterministic` | `count × probability mod 10000 < probability`, where `count` is the record number of the label |
-| `Random`        | The next draw of the seeded LCG, modulo 10000, is below the probability       |
+| `Random`        | The next draw of the seeded LCG, modulo 10000, is below the probability                        |
 
 The deterministic rule spreads the injections over the records of each label. At 3000 basis points, it injects on records 4, 7, and 10 of 10.
 
@@ -500,21 +500,21 @@ In a walk, an injected fault fails the chosen event, and the walk chooses again 
 
 The two traits key an injection point:
 
-| Trait          | Methods                                                    | Key                    |
-| -------------- | ---------------------------------------------------------- | ---------------------- |
-| `ProcessState` | `process_name()`, `state_name()`, and the provided `full_key()` | `Process.State`   |
-| `ProcessEvent` | `event_label()`                                            | The label of the event |
+| Trait          | Methods                                                         | Key                    |
+| -------------- | --------------------------------------------------------------- | ---------------------- |
+| `ProcessState` | `process_name()`, `state_name()`, and the provided `full_key()` | `Process.State`        |
+| `ProcessEvent` | `event_label()`                                                 | The label of the event |
 
 `Urn<'static>` implements `ProcessEvent` with its full rendering, so a fault keyed on a URN matches the label that the trace records. `tb_gen_process_types!(Name, State, ..)` emits a module named after the process in snake case, with a `States` enum that implements `ProcessState` and an `Event(Urn<'static>)` wrapper that implements `ProcessEvent` with the label of its URN.
 
 ### InjectedFaultRecord
 
-| Field             | Type     | Content                                       |
-| ----------------- | -------- | --------------------------------------------- |
-| `csp_state`       | `String` | The state of the injection, as `Process.State` |
+| Field             | Type     | Content                                         |
+| ----------------- | -------- | ----------------------------------------------- |
+| `csp_state`       | `String` | The state of the injection, as `Process.State`  |
 | `event_label`     | `String` | The label of the event at which the fault fired |
-| `error_message`   | `String` | The message of the injected error             |
-| `probability_bps` | `u16`    | The probability of the point, in basis points |
+| `error_message`   | `String` | The message of the injected error               |
+| `probability_bps` | `u16`    | The probability of the point, in basis points   |
 
 ## Scenarios
 
@@ -524,15 +524,15 @@ The two traits key an injection point:
 
 A named scenario expands to one test function:
 
-| Environment     | Closure keys                                                  | Closure parameters                         | Test attribute       |
-| --------------- | ------------------------------------------------------------- | ------------------------------------------ | -------------------- |
-| `Bare`          | `exec`                                                        | `SetupEnv`                                 | `#[test]`, or `#[tokio::test]` for an `async move` body |
-| `Pipeline`      | `exec`                                                        | `PipelineBuilder`                          | `#[test]`            |
-| `Worker`        | `setup`, then `stimulus`                                      | `SetupEnv`, then `WorkerEnv`               | `#[tokio::test]`     |
-| `Servlet`       | `start`, an optional `setup`, then `client`                   | `SetupEnv`, `ClientEnv`, then `ServletEnv` | `#[tokio::test]`     |
-| `ServiceClient` | An optional `worker_threads: N`, then `server` and `client`   | `SetupEnv`, then `ClientEnv`               | `#[tokio::test]`, multi-threaded with `worker_threads` |
-| `Cluster`       | `start`, an optional `hives`, then `client`                   | `SetupEnv`, then `ClusterEnv`              | `#[tokio::test]`     |
-| `Hive`          | `start`, then `client`                                        | `SetupEnv`, then `HiveEnv`                 | `#[tokio::test]`     |
+| Environment     | Closure keys                                                | Closure parameters                         | Test attribute                                          |
+| --------------- | ----------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------- |
+| `Bare`          | `exec`                                                      | `SetupEnv`                                 | `#[test]`, or `#[tokio::test]` for an `async move` body |
+| `Pipeline`      | `exec`                                                      | `PipelineBuilder`                          | `#[test]`                                               |
+| `Worker`        | `setup`, then `stimulus`                                    | `SetupEnv`, then `WorkerEnv`               | `#[tokio::test]`                                        |
+| `Servlet`       | `start`, an optional `setup`, then `client`                 | `SetupEnv`, `ClientEnv`, then `ServletEnv` | `#[tokio::test]`                                        |
+| `ServiceClient` | An optional `worker_threads: N`, then `server` and `client` | `SetupEnv`, then `ClientEnv`               | `#[tokio::test]`, multi-threaded with `worker_threads`  |
+| `Cluster`       | `start`, an optional `hives`, then `client`                 | `SetupEnv`, then `ClusterEnv`              | `#[tokio::test]`                                        |
+| `Hive`          | `start`, then `client`                                      | `SetupEnv`, then `HiveEnv`                 | `#[tokio::test]`                                        |
 
 - Every environment but `Pipeline` takes an optional `context:` key before its closures. The test evaluates it once and shares it as `Arc<C>`, and a block with no `context:` shares `Arc<()>`.
 - `Worker` setup returns the worker builder, and the runner starts it on the scenario trace.
@@ -542,14 +542,14 @@ A named scenario expands to one test function:
 
 ### Environment structs
 
-| Struct                   | Fields                                   |
-| ------------------------ | ---------------------------------------- |
-| `SetupEnv<C, T>`         | `trace: T`, `context: Arc<C>`            |
-| `ClientEnv<C, A, T>`     | `trace`, `context`, `addr: A`            |
-| `WorkerEnv<C, W>`        | `trace: TraceCollector`, `context`, `worker: W` |
-| `ServletEnv<C, K, T>`    | `trace`, `context`, `client: K`          |
-| `ClusterEnv<C, G, T>`    | `trace`, `context`, `cluster: G`         |
-| `HiveEnv<C, H, T>`       | `trace`, `context`, `hive: H`            |
+| Struct                | Fields                                          |
+| --------------------- | ----------------------------------------------- |
+| `SetupEnv<C, T>`      | `trace: T`, `context: Arc<C>`                   |
+| `ClientEnv<C, A, T>`  | `trace`, `context`, `addr: A`                   |
+| `WorkerEnv<C, W>`     | `trace: TraceCollector`, `context`, `worker: W` |
+| `ServletEnv<C, K, T>` | `trace`, `context`, `client: K`                 |
+| `ClusterEnv<C, G, T>` | `trace`, `context`, `cluster: G`                |
+| `HiveEnv<C, H, T>`    | `trace`, `context`, `hive: H`                   |
 
 `T` is a `TraceCollector` share, or a `FuzzTraceCollector` share under `fuzz: afl`.
 
@@ -557,24 +557,24 @@ A named scenario expands to one test function:
 
 `ScenarioConfig::builder()` returns a `ScenarioConfigBuilder`:
 
-| Method                     | Sets                                                          | Feature       |
-| -------------------------- | ------------------------------------------------------------- | ------------- |
-| `with_spec(spec)`          | Adds one `&'static BuiltAssertSpec`                           | `testing`     |
-| `with_specs(specs)`        | Replaces the spec list, such as with `MySpec::all()`          | `testing`     |
-| `with_csp(process)`        | The CSP spec of Layer 2, any `ProcessSpec`                    | `testing-csp` |
-| `with_fdr(config)`         | The `FdrConfig` of Layer 3                                    | `testing-fdr` |
-| `with_trace(collector)`    | The `TraceCollector` of the run                               | `testing`     |
-| `with_hooks(hooks)`        | The `TestHooks`                                               | `testing`     |
-| `with_expect(expect)`      | `Expect::Pass`, the default, or `Expect::Violation(layer)`    | `testing`     |
+| Method                  | Sets                                                       | Feature       |
+| ----------------------- | ---------------------------------------------------------- | ------------- |
+| `with_spec(spec)`       | Adds one `&'static BuiltAssertSpec`                        | `testing`     |
+| `with_specs(specs)`     | Replaces the spec list, such as with `MySpec::all()`       | `testing`     |
+| `with_csp(process)`     | The CSP spec of Layer 2, any `ProcessSpec`                 | `testing-csp` |
+| `with_fdr(config)`      | The `FdrConfig` of Layer 3                                 | `testing-fdr` |
+| `with_trace(collector)` | The `TraceCollector` of the run                            | `testing`     |
+| `with_hooks(hooks)`     | The `TestHooks`                                            | `testing`     |
+| `with_expect(expect)`   | `Expect::Pass`, the default, or `Expect::Violation(layer)` | `testing`     |
 
 `build()` returns `Result<ScenarioConfig, ScenarioConfigError>`. It builds the CSP process once and checks each claim of its spec:
 
-| Variant                                 | Cause                                                          |
-| --------------------------------------- | -------------------------------------------------------------- |
-| `NoEffectiveVerifier`                   | No configured layer can reject a run                           |
-| `ExpectViolationWithoutVerifier(layer)` | The expectation names a layer that cannot reject this configuration |
+| Variant                                 | Cause                                                                  |
+| --------------------------------------- | ---------------------------------------------------------------------- |
+| `NoEffectiveVerifier`                   | No configured layer can reject a run                                   |
+| `ExpectViolationWithoutVerifier(layer)` | The expectation names a layer that cannot reject this configuration    |
 | `CspNamedTwice`                         | A guided fuzz run names its process in `csp:` and in its configuration |
-| `CspRefused(CompositionError)`          | The CSP process does not build, or a claim of it fails         |
+| `CspRefused(CompositionError)`          | The CSP process does not build, or a claim of it fails                 |
 
 `Layer` names the three layers, `Assertion`, `Csp`, and `Refinement`, in grading order. A scenario that names `Expect::Violation(layer)` passes when that layer rejects the run and every other layer accepts it.
 
@@ -582,23 +582,23 @@ A named scenario expands to one test function:
 
 `TestHooks` holds two observers. The harness grades the run, calls the observer of the outcome, and then panics on a rejection:
 
-| Constructor or method | Observer                                   |
-| --------------------- | ------------------------------------------ |
-| `TestHooks::on_pass(f)` | `Fn(&HookContext)`, for an accepted run  |
+| Constructor or method   | Observer                                            |
+| ----------------------- | --------------------------------------------------- |
+| `TestHooks::on_pass(f)` | `Fn(&HookContext)`, for an accepted run             |
 | `TestHooks::on_fail(f)` | `Fn(&HookContext, &Violations)`, for a rejected run |
-| `with_on_fail(f)`     | Adds the rejection observer                |
-| `with_on_pass(f)`     | Adds the acceptance observer               |
+| `with_on_fail(f)`       | Adds the rejection observer                         |
+| `with_on_pass(f)`       | Adds the acceptance observer                        |
 
 `HookContext` reads the graded run:
 
-| Method                                    | Returns                                                 |
-| ----------------------------------------- | ------------------------------------------------------- |
-| `trace()`                                 | `&ConsumedTrace`, the trace that the run recorded       |
-| `assert_spec()`                           | The first assertion spec of the configuration           |
-| `verdict()`                               | `&ScenarioVerdict`                                      |
+| Method                                    | Returns                                                        |
+| ----------------------------------------- | -------------------------------------------------------------- |
+| `trace()`                                 | `&ConsumedTrace`, the trace that the run recorded              |
+| `assert_spec()`                           | The first assertion spec of the configuration                  |
+| `verdict()`                               | `&ScenarioVerdict`                                             |
 | `outcome()`                               | `Result<(), &Violations>`, the outcome against the expectation |
-| `process()` (`testing-csp`)               | The CSP process of Layer 2                              |
-| `timing_constraints()` (`testing-timing`) | The timing constraints of the first FDR spec            |
+| `process()` (`testing-csp`)               | The CSP process of Layer 2                                     |
+| `timing_constraints()` (`testing-timing`) | The timing constraints of the first FDR spec                   |
 
 `ScenarioVerdict` returns each layer: `spec()` the Layer 1 violation, `csp()` the Layer 2 result, `fdr()` the `FdrVerdict`, and `exploration()` the events that the exploration of Layer 3 recorded into a trace of its own. `outcome(expect)` grades every layer together.
 
@@ -606,11 +606,11 @@ A named scenario expands to one test function:
 
 `ExpectedMatcher::matches(&frame)` returns `true` when a `Frame` that a scenario received carries the expected value:
 
-| Expected value             | Matches                                                                                          |
-| -------------------------- | ------------------------------------------------------------------------------------------------ |
-| `Frame`, `Arc<Frame>`      | A frame with the same `metadata.id`                                                              |
-| `Result<Frame, E>`         | A frame with the `metadata.id` of the `Ok` frame. An `Err` matches no frame                      |
-| `T: Message + PartialEq`   | A frame whose body arrived in cleartext, meets the requirements of `T`, and decodes to an equal `T` |
+| Expected value           | Matches                                                                                             |
+| ------------------------ | --------------------------------------------------------------------------------------------------- |
+| `Frame`, `Arc<Frame>`    | A frame with the same `metadata.id`                                                                 |
+| `Result<Frame, E>`       | A frame with the `metadata.id` of the `Ok` frame. An `Err` matches no frame                         |
+| `T: Message + PartialEq` | A frame whose body arrived in cleartext, meets the requirements of `T`, and decodes to an equal `T` |
 
 `expected.record_match(&trace, LABEL, &frame)` records `LABEL` with the outcome of `matches` as a `bool` value, and the spec of the scenario asserts it with `(LABEL, exactly!(1), equals!(true))`. A frame without the expected value records `false`, so the assertion layer rejects the run. An outside crate implements `matches` for an expected value of its own, and `record_match` grades it the same way.
 
@@ -632,11 +632,11 @@ The fuzz harness of [README §12.8](../README.md#128-coverage-guided-fuzzing-wit
 
 A fuzz arm emits `fn main()`, and `cargo afl build` compiles it into a target:
 
-| Form                                                          | Target                                                          |
-| ------------------------------------------------------------- | --------------------------------------------------------------- |
-| `fuzz: afl, raw: \|data\| { .. }`                             | Hands each input to the closure, with no oracle and no grade    |
-| `fuzz: afl, csp: P, spec: S, environment E { .. }`            | Grades the run against the latest version of `S` and the process `P` |
-| `fuzz: afl, csp: P, config: C, environment E { .. }`          | Grades the run against `C` and the process `P`                  |
+| Form                                                 | Target                                                               |
+| ---------------------------------------------------- | -------------------------------------------------------------------- |
+| `fuzz: afl, raw: \|data\| { .. }`                    | Hands each input to the closure, with no oracle and no grade         |
+| `fuzz: afl, csp: P, spec: S, environment E { .. }`   | Grades the run against the latest version of `S` and the process `P` |
+| `fuzz: afl, csp: P, config: C, environment E { .. }` | Grades the run against `C` and the process `P`                       |
 
 - A guided arm takes `Bare`, `Servlet`, `Hive`, or `Cluster`. `Bare` takes one sync `exec:`, and the other three need `tokio`.
 - A guided arm without `csp:` fails to compile, and a configuration that also names a process fails the run at start with `CspNamedTwice`.
@@ -647,22 +647,22 @@ A fuzz arm emits `fn main()`, and `cargo afl build` compiles it into a target:
 
 `FuzzTraceCollector::new(input, process)` builds the collector of one iteration. Each closure receives a share of it as its `trace`:
 
-| Method                         | Returns                                                         |
-| ------------------------------ | --------------------------------------------------------------- |
-| `oracle()` (`OracleAccess`)    | `&FuzzContext`, the oracle of the iteration                     |
-| `collector()`                  | `&TraceCollector`, whose records step the oracle live           |
-| `share()`                      | A handle that records into the same state and reads the same oracle |
+| Method                      | Returns                                                             |
+| --------------------------- | ------------------------------------------------------------------- |
+| `oracle()` (`OracleAccess`) | `&FuzzContext`, the oracle of the iteration                         |
+| `collector()`               | `&TraceCollector`, whose records step the oracle live               |
+| `share()`                   | A handle that records into the same state and reads the same oracle |
 
 `FuzzContext` wraps a `CspOracle` and the input cursor in a mutex:
 
-| Method                                          | Behavior                                                     |
-| ----------------------------------------------- | ------------------------------------------------------------ |
-| `fuzz_from_bytes()`                             | Runs the oracle over the whole input                         |
-| `trace()`, `current_state()`, `valid_events()`, `is_terminal()` | Read the oracle                              |
-| `coverage_score()`, `track_state()`, `crash_context()` | Read the coverage and the context of a crash          |
-| `step_event(&event)`                            | Steps the oracle on one event                                |
-| `fuzz_u8()`, `fuzz_u16()`, `fuzz_u32()`, `fuzz_u64()`, `fuzz_bytes(n)` | Consume input bytes, big-endian    |
-| `fuzz_input()`, `fuzz_has_bytes(n)`, `fuzz_remaining()`, `fuzz_peek_u8()`, `fuzz_peek_bytes(n)` | Read the input and leave the cursor |
+| Method                                                                                          | Behavior                                     |
+| ----------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `fuzz_from_bytes()`                                                                             | Runs the oracle over the whole input         |
+| `trace()`, `current_state()`, `valid_events()`, `is_terminal()`                                 | Read the oracle                              |
+| `coverage_score()`, `track_state()`, `crash_context()`                                          | Read the coverage and the context of a crash |
+| `step_event(&event)`                                                                            | Steps the oracle on one event                |
+| `fuzz_u8()`, `fuzz_u16()`, `fuzz_u32()`, `fuzz_u64()`, `fuzz_bytes(n)`                          | Consume input bytes, big-endian              |
+| `fuzz_input()`, `fuzz_has_bytes(n)`, `fuzz_remaining()`, `fuzz_peek_u8()`, `fuzz_peek_bytes(n)` | Read the input and leave the cursor          |
 
 A consuming reader returns `TestingError::FuzzInputExhausted` when too few bytes remain. On a poisoned mutex, a method that returns a `Result` returns `TestingError::FuzzInputLockPoisoned`, and a method that returns a plain value returns its empty value, such as `false`, `None`, or an empty list.
 
@@ -678,11 +678,11 @@ A consuming reader returns `TestingError::FuzzInputExhausted` when too few bytes
 
 The oracle returns `FuzzError`, and `FuzzContext` maps each variant to its `TestingError`:
 
-| `FuzzError`                   | Cause                                                  | `TestingError`              |
-| ----------------------------- | ------------------------------------------------------ | --------------------------- |
-| `Deadlock { state }`          | A non-terminal state has no valid event                | `FuzzDeadlock(state)`       |
-| `InputExhausted { state }`    | The input ran out before a terminal state              | `FuzzInputExhausted`        |
-| `EventRejected { state, event }` | The oracle refused an event it listed as valid      | `FuzzEventRejected(event)`  |
+| `FuzzError`                      | Cause                                          | `TestingError`             |
+| -------------------------------- | ---------------------------------------------- | -------------------------- |
+| `Deadlock { state }`             | A non-terminal state has no valid event        | `FuzzDeadlock(state)`      |
+| `InputExhausted { state }`       | The input ran out before a terminal state      | `FuzzInputExhausted`       |
+| `EventRejected { state, event }` | The oracle refused an event it listed as valid | `FuzzEventRejected(event)` |
 
 With `testing-fuzz-ijon` under `--cfg fuzzing`, each step reports `afl::ijon_set!(track_state)` and `afl::ijon_max(coverage_score)` to AFL.
 
@@ -690,14 +690,19 @@ With `testing-fuzz-ijon` under `--cfg fuzzing`, each step reports `afl::ijon_set
 
 Each target is a `[[bin]]` of `tightbeam/Cargo.toml`, and `make fuzz-build` builds each one with its own features:
 
-| Target                  | Source                         | Required features                              |
-| ----------------------- | ------------------------------ | ---------------------------------------------- |
-| `fuzz_simple_workflow`  | `fuzz/simple_workflow.rs`      | `std`, `testing-fuzz`                          |
-| `fuzz_complex_workflow` | `fuzz/complex_workflow.rs`     | `std`, `testing-fuzz`                          |
-| `fuzz_chess`            | `fuzz/chess/mod.rs`            | `full`, `testing-fuzz`                         |
-| `fuzz_frame_der`        | `fuzz/frame_der.rs`            | `std`, `testing-fuzz`                          |
-| `fuzz_envelope_der`     | `fuzz/envelope_der.rs`         | `std`, `testing-fuzz`, `transport`             |
-| `fuzz_colony`           | `fuzz/colony/mod.rs`           | `full`, `testing-fuzz`, `testing-fuzz-ijon`    |
+| Target                  | Source                     | Required features                           |
+| ----------------------- | -------------------------- | ------------------------------------------- |
+| `fuzz_simple_workflow`  | `fuzz/simple_workflow.rs`  | `std`, `testing-fuzz`                       |
+| `fuzz_complex_workflow` | `fuzz/complex_workflow.rs` | `std`, `testing-fuzz`                       |
+| `fuzz_chess`            | `fuzz/chess/mod.rs`        | `full`, `testing-fuzz`                      |
+| `fuzz_frame_der`        | `fuzz/frame_der.rs`        | `std`, `testing-fuzz`                       |
+| `fuzz_envelope_der`     | `fuzz/envelope_der.rs`     | `std`, `testing-fuzz`, `transport`          |
+| `fuzz_handshake`        | `fuzz/handshake.rs`        | `full`, `testing-fuzz`                      |
+| `fuzz_colony`           | `fuzz/colony/mod.rs`       | `full`, `testing-fuzz`, `testing-fuzz-ijon` |
+
+CI builds each target and runs it for a short time on every pull request, which proves that AFL starts it. Nightly runs the campaign. A target with a corpus starts from `fuzz/<name>/seeds`.
+
+`fuzz_frame_der`, `fuzz_envelope_der`, and `fuzz_handshake` hold a decoder to `testing::fuzz::assert_one_encoding`: a value that decodes re-encodes to the octets it came from. `fuzz_handshake` plays a hostile message at both endpoints of both flows, and a client or a server that accepts a message with no valid signature or seal is a crash.
 
 ## FMEA reports
 
@@ -705,42 +710,42 @@ The FMEA of [README §12.10.5](../README.md#12105-fmeafmeca-mil-std-1629-iso-262
 
 ### FmeaConfig
 
-| Field                    | Type            | Default      | Meaning                                                     |
-| ------------------------ | --------------- | ------------ | ----------------------------------------------------------- |
-| `severity_scale`         | `SeverityScale` | `MilStd1629` | The scale of every rating                                   |
-| `rpn_critical_threshold` | `u32`           | 100          | The RPN above which a failure mode is critical              |
+| Field                    | Type            | Default      | Meaning                                                           |
+| ------------------------ | --------------- | ------------ | ----------------------------------------------------------------- |
+| `severity_scale`         | `SeverityScale` | `MilStd1629` | The scale of every rating                                         |
+| `rpn_critical_threshold` | `u32`           | 100          | The RPN above which a failure mode is critical                    |
 | `auto_generate`          | `bool`          | `true`       | Whether a run that injects a fault puts the report in its verdict |
 
 `SeverityScale::MilStd1629` rates from 1 to 10, and `SeverityScale::Iso26262` rates from 1 to 4.
 
 ### FmeaReport and FailureMode
 
-| `FmeaReport` field  | Type               | Content                                                      |
-| ------------------- | ------------------ | ------------------------------------------------------------ |
-| `failure_modes`     | `Vec<FailureMode>` | One failure mode per injection point that fired              |
-| `severity_scale`    | `SeverityScale`    | The scale of the ratings                                     |
-| `total_rpn`         | `u32`              | The sum of the RPN of every failure mode                     |
+| `FmeaReport` field  | Type               | Content                                                        |
+| ------------------- | ------------------ | -------------------------------------------------------------- |
+| `failure_modes`     | `Vec<FailureMode>` | One failure mode per injection point that fired                |
+| `severity_scale`    | `SeverityScale`    | The scale of the ratings                                       |
+| `total_rpn`         | `u32`              | The sum of the RPN of every failure mode                       |
 | `critical_failures` | `Vec<usize>`       | The index of each failure mode whose RPN exceeds the threshold |
 
-| `FailureMode` field | Type          | Content                                                   |
-| ------------------- | ------------- | --------------------------------------------------------- |
-| `component`         | `String`      | The state of the fault, as `Process.State`                |
-| `failure`           | `String`      | The event label of the fault                              |
+| `FailureMode` field | Type          | Content                                                    |
+| ------------------- | ------------- | ---------------------------------------------------------- |
+| `component`         | `String`      | The state of the fault, as `Process.State`                 |
+| `failure`           | `String`      | The event label of the fault                               |
 | `effects`           | `Vec<String>` | The effects that the reachability of the fault state finds |
-| `severity`          | `u8`          | From the reachability of the fault state                  |
-| `occurrence`        | `u16`         | From the probability of the injection point               |
-| `detection`         | `u8`          | From the error-recovery counts of the verdict             |
-| `rpn`               | `u32`         | `severity × occurrence × detection`                       |
+| `severity`          | `u8`          | From the reachability of the fault state                   |
+| `occurrence`        | `u16`         | From the probability of the injection point                |
+| `detection`         | `u8`          | From the error-recovery counts of the verdict              |
+| `rpn`               | `u32`         | `severity × occurrence × detection`                        |
 
 `FailureMode::new` computes the RPN, and `FmeaReport::new(modes, scale, threshold)` computes the total and the critical indices.
 
 ### Ratings
 
-| Rating     | Function                                  | Rule                                                                 |
-| ---------- | ----------------------------------------- | -------------------------------------------------------------------- |
+| Rating     | Function                                         | Rule                                                                                                |
+| ---------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
 | Severity   | `InjectedFaultRecord::severity(&process, scale)` | The reachability rule of the README. A state outside the process rates at the midpoint of the scale |
-| Occurrence | `SeverityScale::occurrence(bps)`          | `bps / 1000 + 1` or `bps / 2500 + 1`, capped at the maximum of the scale |
-| Detection  | `FdrVerdict::detection(scale)`            | `(1 - recovered / attempts) × (max - 1) + 1`, truncated, or the midpoint with no attempt |
+| Occurrence | `SeverityScale::occurrence(bps)`                 | `bps / 1000 + 1` or `bps / 2500 + 1`, capped at the maximum of the scale                            |
+| Detection  | `FdrVerdict::detection(scale)`                   | `(1 - recovered / attempts) × (max - 1) + 1`, truncated, or the midpoint with no attempt            |
 
 `FdrVerdict::fmea_report(processes, config)` builds the report from the faults of the verdict, with one failure mode per injection point however many seeds it fired in. Each fault rates at the state it names in the first of `processes` that holds that state, and a fault whose state no process holds rates as a fault in an unknown state. A run that injects a fault under `auto_generate` passes the processes that its faults fired in:
 

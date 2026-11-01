@@ -86,11 +86,13 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 
 	OUT_DIR="built/fuzz/out/$NAME"
 	mkdir -p "$OUT_DIR"
-	eval "$AFL_ENV timeout $SECONDS_PER_TARGET cargo afl fuzz -i \"$IN_DIR\" -o \"$OUT_DIR\" \"$FUZZ_TARGET\" > /dev/null 2>&1" || true
+	AFL_LOG="$OUT_DIR/afl.log"
+	eval "$AFL_ENV AFL_NO_UI=1 timeout $SECONDS_PER_TARGET cargo afl fuzz -i \"$IN_DIR\" -o \"$OUT_DIR\" \"$FUZZ_TARGET\" > \"$AFL_LOG\" 2>&1" || true
 
 	RESULTS="$OUT_DIR/default"
 	if [ ! -d "$RESULTS" ]; then
 		echo "[$NAME] no output directory, the fuzzer did not start"
+		tail -n 20 "$AFL_LOG" >&2
 		FAILURES+=("$NAME: produced no output, so this target was never fuzzed")
 		echo ""
 		continue
@@ -105,6 +107,7 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 	# zero execution count, means the target came up and did no work.
 	if [ ! -f "$RESULTS/fuzzer_stats" ]; then
 		echo "[$NAME] no fuzzer_stats, the run ended before reporting"
+		tail -n 20 "$AFL_LOG" >&2
 		FAILURES+=("$NAME: wrote no fuzzer_stats, so this target was never fuzzed")
 		echo ""
 		continue

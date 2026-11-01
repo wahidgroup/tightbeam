@@ -20,12 +20,14 @@
 #   and both receipts also chain to test-root.
 # - Chained Finished: it chains to chain-root, the one certificate OpenSSL
 #   holds, through the intermediate it carries.
-# - AuthEnvelopedData under a KEK: `cms -decrypt` recovers the expected plaintext.
+# - AuthEnvelopedData under a KEK: `cms -decrypt` recovers the expected
+#   plaintext. An OpenSSL that reads the RFC 5083 tags also checks the tag over
+#   the authAttrs, and refuses a copy with one authAttrs octet flipped.
 # - KEMRecipientInfo: OpenSSL only parses it, because it has no DHKEM over secp256k1.
 # - CompressedData: its encapContentInfo declares id-data (RFC 3274 section 1.1).
 #
-# OpenSSL deviates from the RFCs in three ways, and the script counts each
-# apart from a failure:
+# OpenSSL before 4.1.0 deviates from the RFCs in three ways, and the script
+# counts each apart from a failure:
 #
 # - It reads authAttrs under [2] and unauthAttrs under [3] (cms_asn1.c), where
 #   RFC 5083 section 2.1 writes [1] and [2]. The script parses a retagged copy.
@@ -211,8 +213,8 @@ declared() {
 	fi
 }
 
-# Decrypt a retagged AuthEnvelopedData sample under the KEK its test wrote,
-# and compare the content with the expected plaintext.
+# Decrypt an AuthEnvelopedData sample under the KEK its test wrote, and compare
+# the content with the expected plaintext.
 decrypt() {
 	local copy="$1" name="$2" status=0
 	local opened="$scratch/$name.opened" log="$scratch/$name.decrypt.log"
@@ -225,6 +227,30 @@ decrypt() {
 		echo "cms -decrypt ok"
 	else
 		echo "cms -decrypt recovers the expected plaintext, refuses the tag it checks without the authAttrs AAD"
+	fi
+}
+
+# Check a sample under an OpenSSL that reads the RFC 5083 tags: it passes its
+# tag, and a copy with the last authAttrs octet flipped fails that tag. The flip
+# keeps the DER well formed, so the tag is the one check that meets it.
+authenticated() {
+	local sample="$1" name="$2" flipped="$scratch/$name.flipped" offset header length last octet
+	if [ "$(decrypt "$sample" "$name")" != "cms -decrypt ok" ]; then
+		echo "cms -decrypt refuses the tag of a sample under the RFC 5083 tags FAILED"
+		return
+	fi
+
+	read -r offset header length < <("$OPENSSL" asn1parse -inform DER -in "$sample" |
+		sed -nE '/:d=3 .*cont \[ 1 \]/s/^ *([0-9]+):d=3 +hl= *([0-9]+) +l= *([0-9]+) .*$/\1 \2 \3/p')
+	last=$((offset + header + length - 1))
+	octet="$(od -An -tu1 -j "$last" -N 1 "$sample" | tr -d ' ')"
+	cp "$sample" "$flipped"
+	printf "\\x$(printf '%02x' "$((octet ^ 1))")" | dd of="$flipped" bs=1 seek="$last" conv=notrunc status=none
+
+	if [ "$(decrypt "$flipped" "$name")" = "cms -decrypt ok" ]; then
+		echo "cms -decrypt accepts a flipped authAttrs octet FAILED"
+	else
+		echo "cms -decrypt ok, the tag covers the authAttrs"
 	fi
 }
 
@@ -248,6 +274,7 @@ failures=0
 deviations=0
 unauthenticated=0
 unchained=0
+unopened=0
 for entry in "${certificates[@]}"; do
 	name="${entry%%:*}"
 	bit="${entry#*:}"
@@ -298,7 +325,18 @@ for sample in "${samples[@]}"; do
 	verified=""
 	if printed="$("$OPENSSL" cms -cmsout -print -inform DER -in "$sample" 2>&1)"; then
 		cms="cms -cmsout -print ok ($(summary "$printed"))"
-		if printf '%s\n' "$printed" | grep -q 'contentType: pkcs7-signedData'; then
+		# The sealed content prints its own contentType, so this test of the
+		# outer type runs first.
+		if printf '%s\n' "$printed" | grep -q 'contentType: id-smime-ct-authEnvelopedData'; then
+			if [ -f "$SAMPLE_DIR/$name.kek" ]; then
+				verified="$(authenticated "$sample" "$name")"
+				case "$verified" in
+					*FAILED) failures=$((failures + 1)) ;;
+				esac
+			else
+				unopened=$((unopened + 1))
+			fi
+		elif printf '%s\n' "$printed" | grep -q 'contentType: pkcs7-signedData'; then
 			verified="$(verify "$sample")"
 			case "$verified" in
 				*FAILED) failures=$((failures + 1)) ;;
@@ -322,6 +360,8 @@ for sample in "${samples[@]}"; do
 					*FAILED*) failures=$((failures + 1)) ;;
 					*"refuses the tag"*) unauthenticated=$((unauthenticated + 1)) ;;
 				esac
+			else
+				unopened=$((unopened + 1))
 			fi
 		else
 			cms="cms -cmsout -print FAILED under both taggings: $(printf '%s\n' "$printed" | head -n 1)"
@@ -335,7 +375,7 @@ for sample in "${samples[@]}"; do
 	printf '%-16s %s, %s%s\n' "$name" "$asn1" "$cms" "${verified:+, $verified}"
 done
 
-echo "cms-interop: ${#samples[@]} samples, $failures failed, $deviations parse only under OpenSSL's AuthEnvelopedData tags, $unauthenticated decrypt with no AAD check, $unchained verify with the chain unchecked"
+echo "cms-interop: ${#samples[@]} samples, $failures failed, $deviations parse only under OpenSSL's AuthEnvelopedData tags, $unauthenticated decrypt with no AAD check, $unopened sealed to a KEM that OpenSSL lacks, $unchained verify with the chain unchecked"
 if [ "$failures" -ne 0 ]; then
 	exit 1
 fi

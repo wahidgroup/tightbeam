@@ -418,13 +418,15 @@ macro_rules! tb_scenario {
 					// The run builds its configuration and its process
 					// once, so each iteration grades against the claims
 					// the build checked. Each iteration clones both, so a
-					// panic in one leaves them whole for the next.
+					// panic in one leaves them whole for the next. Each read
+					// goes through `Deref`, because a read of the field `.0`
+					// makes the closure capture the field past its wrapper.
 					let config = ::std::panic::AssertUnwindSafe($crate::__tb_accept_guided_config!($csp_type, $config));
 					let process = ::std::panic::AssertUnwindSafe($crate::__tb_accept_process!(<$csp_type>::process()));
 					afl::fuzz!(|data: &[u8]| {
-						let trace = $crate::testing::fuzz::FuzzTraceCollector::new(data.to_vec(), process.0.clone());
+						let trace = $crate::testing::fuzz::FuzzTraceCollector::new(data.to_vec(), (*process).clone());
 						$crate::tb_scenario!(@$run
-							config: config.0.clone(),
+							config: (*config).clone(),
 							trace: trace,
 							$($run_body)*
 						)
@@ -519,9 +521,9 @@ macro_rules! tb_scenario {
 								};
 								runtime.block_on(async {
 									let trace =
-										$crate::testing::fuzz::FuzzTraceCollector::new(data.to_vec(), process.0.clone());
+										$crate::testing::fuzz::FuzzTraceCollector::new(data.to_vec(), (*process).clone());
 									$crate::tb_scenario!(@$run
-										config: config.0.clone(),
+										config: (*config).clone(),
 										trace: trace,
 										$($run_body)*
 									)

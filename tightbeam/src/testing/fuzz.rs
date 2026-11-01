@@ -129,10 +129,27 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::der::{Decode, Encode};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
 use crate::trace::TraceCollector;
 use crate::Errorizable;
+
+/// Decodes `octets` as a `T`, and holds a decoded value to those octets.
+///
+/// A refusal is a correct answer. A value that decodes from two encodings lets
+/// a peer change the octets that a digest covers and keep the value, so a raw
+/// target holds each decoder to one encoding per value.
+///
+/// # Panics
+///
+/// Panics when a decoded value fails to encode, or encodes to other octets.
+pub fn assert_one_encoding<'a, T: Decode<'a> + Encode>(octets: &'a [u8]) {
+	if let Ok(decoded) = T::from_der(octets) {
+		let encoded = decoded.to_der().expect("a decoded value encodes");
+		assert_eq!(encoded, octets, "a value decoded from an encoding it does not write");
+	}
+}
 
 /// An error of an oracle-guided fuzz run.
 #[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
@@ -999,9 +1016,49 @@ impl FuzzContext {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::der::{Reader, Writer};
 	use crate::testing::fixtures::TestProcess;
 	use crate::testing::TestResult;
 	use crate::urn::Urn;
+
+	/// A value that decodes from either BOOLEAN and encodes as FALSE, so TRUE
+	/// is an encoding that it reads and never writes.
+	struct WritesFalse;
+
+	impl<'a> Decode<'a> for WritesFalse {
+		fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+			bool::decode(reader)?;
+			Ok(Self)
+		}
+	}
+
+	impl Encode for WritesFalse {
+		fn encoded_len(&self) -> crate::der::Result<crate::der::Length> {
+			false.encoded_len()
+		}
+
+		fn encode(&self, writer: &mut impl Writer) -> crate::der::Result<()> {
+			false.encode(writer)
+		}
+	}
+
+	// A decoder passes on its one encoding, and on a refusal.
+	crate::tb_cases! {
+		fn a_decoder_holds_to_one_encoding(octets: &'static [u8]) {
+			assert_one_encoding::<bool>(octets);
+		}
+
+		cases {
+			of_a_value_it_writes => &[0x01, 0x01, 0xFF],
+			of_a_value_it_refuses => &[0x01, 0x01, 0x01],
+		}
+	}
+
+	#[test]
+	#[should_panic(expected = "a value decoded from an encoding it does not write")]
+	fn a_second_encoding_of_a_value_panics() {
+		assert_one_encoding::<WritesFalse>(&[0x01, 0x01, 0xFF]);
+	}
 
 	/// The text of the crash context of the process of [`one_step`] once it
 	/// took `go`.
