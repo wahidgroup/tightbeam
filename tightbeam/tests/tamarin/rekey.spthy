@@ -1,0 +1,150 @@
+theory TightbeamRekey
+begin
+
+/*
+ * The rekey exchange of transport/rekey.rs.
+ *
+ * A session starts from a handshake the model takes as done: both sides hold
+ * one epoch secret and one chain hash, and each knows the signing key of the
+ * other. The model runs one renewal from that epoch, and the chain repeats the
+ * same step. The epoch secret may leak at any time, and the legs travel in
+ * clear, which is what a holder of the epoch secret reads.
+ *
+ * Each signature carries the role of its signer, as RECEIPT_ROLE does in
+ * receipt.rs.
+ *
+ * Each control removes one protection, and each must give an attack:
+ *
+ *   NO_FRESH_EXCHANGE   the next epoch takes the last epoch alone
+ *   UNPINNED_SHARE      the receipt pin leaves out the server share
+ *   NO_ROLE_TAG         a receipt signature names no role, so a party whose
+ *                       client and server identity share one key can have its
+ *                       receipt reflected as its countersignature
+ */
+
+builtins: diffie-hellman, signing, hashing
+
+functions: kdf/3
+
+#ifdef NO_FRESH_EXCHANGE
+macros: next_input(epoch, ee) = epoch
+#else
+macros: next_input(epoch, ee) = <epoch, ee>
+#endif
+
+#ifdef UNPINNED_SHARE
+macros: pin(hash, request, sr, share) = h(<hash, request, sr>)
+#else
+macros: pin(hash, request, sr, share) = h(<hash, request, sr, share>)
+#endif
+
+#ifdef NO_ROLE_TAG
+macros: receipt_signed(role, pinned) = <'receipt', pinned>
+#else
+macros: receipt_signed(role, pinned) = <'receipt', role, pinned>
+#endif
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ i ==> x = y"
+
+restriction OneKeyPerName:
+  "All A #i #j. Once(A) @ i & Once(A) @ j ==> #i = #j"
+
+rule Register_Honest:
+    [ Fr(~ltk) ]
+  --[ Once($A) ]->
+    [ !Ltk($A, ~ltk), !Pk($A, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Register_Attacker:
+    [ In(pkE) ]
+  --[ Once($E), Compromised($E) ]->
+    [ !Pk($E, pkE) ]
+
+rule Compromise:
+    [ !Ltk(A, ltk) ]
+  --[ Compromised(A) ]->
+    [ Out(ltk) ]
+
+rule Session_Established:
+    [ Fr(~sid), Fr(~epoch), Fr(~hash), !Pk($C, pkC), !Pk($S, pkS) ]
+  --[ Established(~sid, $C, $S) ]->
+    [ St_Client_Epoch(~sid, $C, $S, pkS, ~epoch, ~hash),
+      St_Server_Epoch(~sid, $C, $S, pkC, ~epoch, ~hash),
+      !Epoch(~sid, ~epoch),
+      Out(~hash) ]
+
+rule Reveal_Epoch:
+    [ !Epoch(sid, epoch) ]
+  --[ EpochRevealed(sid) ]->
+    [ Out(epoch) ]
+
+rule Client_Request:
+  let request = <'rekey_request', ~cr, 'g'^~x>
+  in
+    [ St_Client_Epoch(sid, C, S, pkS, epoch, hash), Fr(~cr), Fr(~x) ]
+  --[ ]->
+    [ St_Client_Pending(sid, C, S, pkS, epoch, hash, ~cr, ~x, request), Out(request) ]
+
+rule Server_Respond:
+  let request = <'rekey_request', cr, share>
+      Se = 'g'^~e
+      next = kdf(next_input(epoch, share^~e), <cr, ~sr>, 'epoch')
+      pinned = pin(hash, request, ~sr, Se)
+      receipt = sign(receipt_signed('server', pinned), ltk)
+  in
+    [ St_Server_Epoch(sid, C, $S, pkC, epoch, hash), In(request), Fr(~sr), Fr(~e), !Ltk($S, ltk) ]
+  --[ ServerResponded(sid, pinned, next) ]->
+    [ St_Server_Pending(sid, C, $S, pkC, pinned, next),
+      Out(<'rekey_response', ~sr, Se, receipt>) ]
+
+rule Client_Install:
+  let next = kdf(next_input(epoch, Se^~x), <cr, sr>, 'epoch')
+      pinned = pin(hash, request, sr, Se)
+      counter = sign(receipt_signed('client', pinned), ltk)
+  in
+    [ St_Client_Pending(sid, $C, S, pkS, epoch, hash, cr, ~x, request),
+      In(<'rekey_response', sr, Se, receipt>),
+      !Ltk($C, ltk) ]
+  --[ Eq(verify(receipt, receipt_signed('server', pinned), pkS), true),
+      ClientInstalled(sid, S, pinned, next) ]->
+    [ Out(<'rekey_ack', counter>) ]
+
+rule Server_Install:
+    [ St_Server_Pending(sid, C, S, pkC, pinned, next), In(<'rekey_ack', counter>) ]
+  --[ Eq(verify(counter, receipt_signed('client', pinned), pkC), true),
+      ServerInstalled(sid, C, pinned, next) ]->
+    [ ]
+
+lemma executable: exists-trace
+  "Ex sid C S pinned next #i #j.
+     ClientInstalled(sid, S, pinned, next) @ i & ServerInstalled(sid, C, pinned, next) @ j
+     & not (Ex A #r. Compromised(A) @ r)"
+
+// A holder of one epoch secret derives nothing of the next epoch, at the
+// client. The epoch secret leaks freely here.
+lemma next_epoch_secret_at_client:
+  "All sid S pinned next #i #j.
+     ClientInstalled(sid, S, pinned, next) @ i & K(next) @ j
+     ==> Ex #r. Compromised(S) @ r & #r < #i"
+
+// The same claim at the server, which an accepted countersignature backs.
+lemma next_epoch_secret_at_server:
+  "All sid C pinned next #i #j.
+     ServerInstalled(sid, C, pinned, next) @ i & K(next) @ j
+     ==> Ex #r. Compromised(C) @ r & #r < #i"
+
+// Both ephemerals are authenticated: each side agrees with the other on the
+// pin and on the next epoch.
+lemma client_agrees_with_server:
+  "All sid S pinned next #i.
+     ClientInstalled(sid, S, pinned, next) @ i
+     ==> (Ex #j. ServerResponded(sid, pinned, next) @ j & #j < #i)
+       | (Ex #r. Compromised(S) @ r & #r < #i)"
+
+lemma server_agrees_with_client:
+  "All sid C pinned next #i.
+     ServerInstalled(sid, C, pinned, next) @ i
+     ==> (Ex S #j. ClientInstalled(sid, S, pinned, next) @ j & #j < #i)
+       | (Ex #r. Compromised(C) @ r & #r < #i)"
+
+end

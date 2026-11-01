@@ -19,6 +19,7 @@ It drills down from [README §12](../README.md#12-testing-framework) for enginee
 - [Fault injection](#fault-injection)
 - [Scenarios](#scenarios)
 - [Fuzz harness](#fuzz-harness)
+- [Protocol models](#protocol-models)
 - [FMEA reports](#fmea-reports)
 - [Sources](#sources)
 
@@ -703,6 +704,33 @@ Each target is a `[[bin]]` of `tightbeam/Cargo.toml`, and `make fuzz-build` buil
 CI builds each target and runs it for a short time on every pull request, which proves that AFL starts it. Nightly runs the campaign. A target with a corpus starts from `fuzz/<name>/seeds`.
 
 `fuzz_frame_der`, `fuzz_envelope_der`, and `fuzz_handshake` hold a decoder to `testing::fuzz::assert_one_encoding`: a value that decodes re-encodes to the octets it came from. `fuzz_handshake` plays a hostile message at both endpoints of both flows, and a client or a server that accepts a message with no valid signature or seal is a crash.
+
+## Protocol models
+
+`tightbeam/tests/tamarin/` holds [Tamarin](https://tamarin-prover.com/) models of the handshake and the rekey exchange. Each model states a claim of [docs/handshake.md](handshake.md) as a lemma, and Tamarin checks that lemma against an attacker that holds the network and may leak keys:
+
+| Model         | Follows                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------ |
+| `hpke.spthy`  | The HPKE flow, and the negotiation of its profile                                          |
+| `cms.spthy`   | The CMS flow, with the signing key, the key-agreement key, and `R` each free to leak       |
+| `rekey.spthy` | One renewal from an epoch secret the attacker may hold, which each step of a chain repeats |
+
+`tightbeam/tests/tamarin/prove.sh all` runs every model in a container with no network. It holds two kinds of run, and Tamarin exits 0 on a failed lemma, so the script reads each summary:
+
+- A sound model must verify every lemma.
+- A control removes one protection, and it must give an attack. This proves that the lemma can fail. Each control is a `#ifdef` flag that the header of its model names.
+
+`tightbeam/tests/tamarin/prove.sh trace <model> --prove=<lemma>` prints the attack on a lemma.
+
+The `Tamarin` workflow runs when a model, `docs/handshake.md`, the handshake source, or `transport/rekey.rs` changes. It runs beside CI, and no CI job waits for it.
+
+A proof holds for the model, and the model is a reading of the code. A change to the handshake that leaves the model behind still passes, so a reviewer of that change compares the two. The models leave these parts out, and fuzzing and the tests hold them alone:
+
+- DER encoding, certificate paths, and the clock of a validity check.
+- Invalid points, and the check that a share collapses into a static key.
+- Receipts and settlement in the handshake.
+- A leak of a server ephemeral, and a rekey chain past one renewal.
+- The post-quantum preview.
 
 ## FMEA reports
 
