@@ -10,6 +10,7 @@
 //! - A hostile message ends in a typed answer, so a panic is a crash.
 //! - A reply or a closing that AFL wrote is refused, because each carries a
 //!   proof of its peer. An opening carries none, so a server may answer one.
+//! - A refused reply or closing spends the handshake, so a peer gets one attempt.
 //! - A handshake type re-encodes to the octets it decoded from.
 //!
 //! # Reach
@@ -49,8 +50,8 @@ use tightbeam::testing::TestCmsServer;
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::transport::handshake::{
 	Client, ClientConfig, ClientFlow, ClientHello, Cms, CmsClientSettings, CmsServerSettings, Handshake,
-	HandshakeMessage, Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust, Server, ServerConfig, ServerFlow,
-	ServerHandshake, SupportedProfiles,
+	HandshakeMessage, HandshakePhase, Hpke, HpkeClientSettings, HpkeServerSettings, LearnedTrust, Server, ServerConfig,
+	ServerFlow, ServerHandshake, SupportedProfiles,
 };
 use tightbeam::transport::wire_der::WireDer;
 
@@ -178,7 +179,9 @@ async fn refuse_reply<F: ClientFlow<Provider>>(mut client: Handshake<Client, F, 
 	opening.expect("a client starts");
 
 	let answer = client.respond(reply).await;
+	let spent = client.phase() == HandshakePhase::Spent;
 	assert!(answer.is_err(), "a client accepted a reply that AFL wrote");
+	assert!(spent, "a refused reply left the handshake alive");
 }
 
 /// Runs the genuine opening of `client` through `server`, and holds `server`
@@ -195,8 +198,9 @@ async fn refuse_closing<F>(
 	reply.expect("a server answers a genuine opening");
 
 	let answer = server.finish(closing).await;
+	let spent = server.phase() == HandshakePhase::Spent;
 	assert!(answer.is_err(), "a server accepted a closing that AFL wrote");
-	assert!(!server.is_complete(), "a refused closing settled the handshake");
+	assert!(spent, "a refused closing left the handshake alive");
 }
 
 /// The credentials of every endpoint, built once in each fuzz process.
