@@ -10,7 +10,8 @@ set -euo pipefail
 # Flags:
 #   --skip-missing-crashes  Set AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 #   --skip-cpu-freq         Set AFL_SKIP_CPUFREQ=1
-#   --seconds N             Fuzz each target for N seconds (default 60)
+#   --seconds N             Fuzz each target for N seconds past calibration
+#                           (default 60)
 
 SKIP_MISSING_CRASHES=false
 SKIP_CPU_FREQ=false
@@ -87,7 +88,7 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 	OUT_DIR="built/fuzz/out/$NAME"
 	mkdir -p "$OUT_DIR"
 	AFL_LOG="$OUT_DIR/afl.log"
-	eval "$AFL_ENV AFL_NO_UI=1 timeout $SECONDS_PER_TARGET cargo afl fuzz -i \"$IN_DIR\" -o \"$OUT_DIR\" \"$FUZZ_TARGET\" > \"$AFL_LOG\" 2>&1" || true
+	eval "$AFL_ENV AFL_NO_UI=1 cargo afl fuzz -V $SECONDS_PER_TARGET -i \"$IN_DIR\" -o \"$OUT_DIR\" \"$FUZZ_TARGET\" > \"$AFL_LOG\" 2>&1" || true
 
 	RESULTS="$OUT_DIR/default"
 	if [ ! -d "$RESULTS" ]; then

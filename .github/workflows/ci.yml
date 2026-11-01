@@ -166,11 +166,10 @@ jobs:
       - name: Setup
         run: make setup
 
-      # A short run proves that each target builds with `--cfg fuzzing` and that
-      # AFL starts it, and Nightly runs the campaign. The fast calibration
-      # brings the slowest target to its first report inside the short run.
+      # One second proves that each target builds with `--cfg fuzzing`, that AFL
+      # starts it, and that its seeds pass, and Nightly runs the campaign.
       - name: Fuzz
-        run: make fuzz-test seconds=30 skip-missing-crashes=1 skip-cpu-freq=1
+        run: make fuzz-test seconds=1 skip-missing-crashes=1 skip-cpu-freq=1
         env:
           AFL_FAST_CAL: "1"
 
