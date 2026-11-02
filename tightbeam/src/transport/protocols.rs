@@ -27,7 +27,7 @@ use crate::transport::error::TransportFailure;
 use crate::transport::framing::{FrameAssembler, Step};
 
 /// Marker trait for a protocol address, in any form the application picks.
-pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
+pub trait TightBeamAddress: Into<Vec<u8>> + Clone + MaybeSend {}
 
 /// Blocking byte stream that a protocol reads from and writes to.
 pub trait ProtocolStream: Send {
@@ -118,13 +118,25 @@ pub trait ProtocolStream: Send {
 
 /// Transport protocol that binds listeners, connects streams, and builds
 /// transports over them.
+///
+/// # Send bounds
+///
+/// The listener, the stream, the transport, the address, and each future take
+/// [`MaybeSend`], which is `Send` on every target except `wasm32`. A browser
+/// socket holds JavaScript handles, so a transport over one is `!Send`, and
+/// [`ClientBuilder`] provisions it on `wasm32` as it does a native transport.
+/// A browser build has no host clock, so its client starts from
+/// [`ClientBuilder::on_clock`].
+///
+/// [`ClientBuilder`]: crate::transport::ClientBuilder
+/// [`ClientBuilder::on_clock`]: crate::transport::ClientBuilder::on_clock
 pub trait Protocol {
 	/// Listener that accepts inbound connections.
-	type Listener: Send;
+	type Listener: MaybeSend;
 	/// Connected byte stream.
-	type Stream: Send;
+	type Stream: MaybeSend;
 	/// Transport built over one stream.
-	type Transport: Send;
+	type Transport: MaybeSend;
 	/// Error the protocol reports, convertible into a [`TransportError`].
 	type Error: Into<TransportError>;
 	/// Address the protocol binds and connects to.
@@ -153,14 +165,14 @@ pub trait Protocol {
 	/// The protocol's error when the bind fails.
 	fn bind_cleartext(
 		addr: Self::Address,
-	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + MaybeSend;
 
 	/// Connect to `addr`.
 	///
 	/// # Errors
 	///
 	/// The protocol's error when the connection fails.
-	fn connect(addr: Self::Address) -> impl Future<Output = Result<Self::Stream, Self::Error>> + Send;
+	fn connect(addr: Self::Address) -> impl Future<Output = Result<Self::Stream, Self::Error>> + MaybeSend;
 
 	/// Connect to `addr` within `budget`.
 	///
@@ -201,7 +213,7 @@ pub trait Protocol {
 	fn connect_within(
 		addr: Self::Address,
 		budget: Duration,
-	) -> impl Future<Output = Result<Self::Stream, Self::Error>> + Send {
+	) -> impl Future<Output = Result<Self::Stream, Self::Error>> + MaybeSend {
 		// The dial races the default against its clock under `tokio`, so the
 		// budget rests with the dial.
 		let _budget = budget;
@@ -264,9 +276,9 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 /// Protocol whose listeners bind with transport encryption.
 pub trait EncryptedProtocol: Protocol {
 	/// Encryptor the protocol's transports seal outbound envelopes with.
-	type Encryptor: Send;
+	type Encryptor: MaybeSend;
 	/// Decryptor the protocol's transports open inbound envelopes with.
-	type Decryptor: Send;
+	type Decryptor: MaybeSend;
 
 	/// Bind to `addr` with the transport encryption `config`.
 	///
@@ -276,11 +288,11 @@ pub trait EncryptedProtocol: Protocol {
 	fn bind_with(
 		addr: Self::Address,
 		config: TransportEncryptionConfig<Self::CryptoProvider>,
-	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + MaybeSend;
 }
 
 /// Protocol whose listener accepts connections asynchronously.
-pub trait AsyncListenerTrait: Protocol + Send {
+pub trait AsyncListenerTrait: Protocol + MaybeSend {
 	/// Accept one connection.
 	///
 	/// Generic accept loops, such as servlet serving, hold the future across

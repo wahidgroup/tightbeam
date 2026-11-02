@@ -44,6 +44,14 @@ pub mod multiplex;
 pub(crate) mod rekey;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
+#[cfg(all(
+	target_arch = "wasm32",
+	feature = "std",
+	feature = "async-transport",
+	any(feature = "transport-cms", feature = "transport-hpke")
+))]
+#[allow(dead_code)]
+mod wasm_bounds;
 
 pub use crate::asn1::wire_der;
 pub use builders::EnvelopeBuilder;
