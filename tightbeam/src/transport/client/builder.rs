@@ -13,6 +13,7 @@ use super::GenericClient;
 use crate::asn1::Frame;
 use crate::clock::Clock;
 use crate::crypto::x509::store::CertificateTrust;
+use crate::marker::MaybeSend;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::HandshakeProtocolKind;
@@ -291,10 +292,9 @@ impl<P: Protocol> ClientBuilder<P> {
 	}
 }
 
-impl<P: Protocol + Send> ClientBuilder<P>
+impl<P: Protocol + MaybeSend> ClientBuilder<P>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
-	P::Address: Send,
 {
 	/// Connects and configures the client.
 	///
@@ -345,10 +345,9 @@ where
 impl<P: Protocol> super::sealed::Sealed for ClientBuilder<P> {}
 
 #[cfg(feature = "std")]
-impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
+impl<P: Protocol + MaybeSend> ConnectionBuilder<P> for ClientBuilder<P>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
-	P::Address: Send,
 {
 	type Output = Self;
 

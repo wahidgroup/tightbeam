@@ -36,6 +36,8 @@ Each role of [README §8.1](../README.md#81-transport-architecture) is one trait
 | Receive path               | `MessageCollector: MessageIO + GateAudit`   | The type `CollectorGate`, `collector_gate`, and `send_response`                                                                                                  |
 | Send path                  | `MessageEmitter: MessageIO`                 | The types `EmitterGate` and `RestartPolicy`, their two accessors, and `perform_send_receive`                                                                      |
 
+`Protocol` bounds its listener, stream, transport, address, and futures with `MaybeSend`, which is `Send` on every target except `wasm32`. A browser socket holds JavaScript handles, so a transport over one is `!Send`, and `ClientBuilder` provisions it through `connect` or `adopt`. A browser build has no host clock, so its client starts from `ClientBuilder::on_clock`.
+
 The provided methods carry the shared behavior:
 
 - `Protocol::connect_within(addr, budget)` calls `connect`. A protocol whose connect blocks its thread MUST override it and bound the connect itself.

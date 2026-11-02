@@ -1,9 +1,5 @@
 name: Tamarin
 
-# The proofs read the models alone, so this workflow runs when a model or the
-# protocol it follows changes. A `paths` filter holds for a whole workflow, so
-# the job sits in a file of its own, and no CI run waits for it.
-
 on:
   workflow_dispatch:
   push:
