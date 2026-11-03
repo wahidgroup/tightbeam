@@ -1168,6 +1168,7 @@ mod tests {
 	use crate::transport::policy::CollectorGateConfig;
 
 	mod cipher_install {
+		use core::future::Future;
 		use core::sync::atomic::{AtomicBool, Ordering};
 		use core::task::{Context, Poll, Waker};
 		use core::time::Duration;
