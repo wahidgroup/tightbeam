@@ -105,7 +105,7 @@ impl<S: SplittableStream> Deadlined<S> {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 impl<R> DeadlinedRead<R> {
 	/// `stream`, whose waits run on `clock`.
 	pub(crate) fn new(stream: R, clock: &Arc<dyn Clock>) -> Self {
@@ -130,7 +130,7 @@ where
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 impl<W> DeadlinedWrite<W> {
 	/// `stream`, whose waits run on `clock`.
 	pub(crate) fn new(stream: W, clock: &Arc<dyn Clock>) -> Self {

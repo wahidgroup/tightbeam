@@ -54,8 +54,6 @@ use crate::Frame;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake_imports {
-	pub use core::future::Future;
-
 	pub use crate::clock::Timer;
 	pub use crate::transport::state::{HandshakeSlot, ServerHandshakeSlot};
 }
