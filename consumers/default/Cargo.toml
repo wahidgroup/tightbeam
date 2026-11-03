@@ -10,4 +10,4 @@ publish = false
 tightbeam = { package = "tightbeam-rs", path = "../../tightbeam" }
 
 [dev-dependencies]
-trybuild = { version = "=1.0.118", features = ["diff"] }
+trybuild = { version = "=1.0.122", features = ["diff"] }
