@@ -62,7 +62,6 @@ impl<P: Protocol> HivePlane<P> {
 	/// registration names.
 	pub(crate) fn servlet(&self, dial: DialTarget, signer: Arc<SignerIdentifier>) -> Hop<'_, P> {
 		let bound = BoundDial::new(dial, ExpectedSigner::Hive(signer));
-
 		Hop { pool: &self.pool, dial: bound, trace: &self.trace }
 	}
 
@@ -230,7 +229,7 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 	///   the client signed and the servlet can verify the envelope end to end.
 	/// - An origin-signed gossip rumor reaches an ingress servlet through this path too, for the same reason.
 	///
-	/// [`ClusterWorkRequest::payload`]: crate::colony::protocol::ClusterWorkRequest::payload
+	/// [`ClusterWorkRequest::payload`]: crate::colony::work::ClusterWorkRequest::payload
 	pub(crate) async fn deliver_frame(self, frame: Frame) -> Result<Frame, ClusterError> {
 		self.emit(frame).await
 	}
@@ -246,7 +245,6 @@ impl<P: ColonyDialProtocol> Hop<'_, P> {
 	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Frame, ClusterError> {
 		let message: Vec<u8> = message.into();
 		let frame = Frame::v0(b"work-forward", message);
-
 		self.emit(frame).await
 	}
 

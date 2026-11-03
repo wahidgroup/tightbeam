@@ -8,7 +8,7 @@ pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
 pub use crate::der::asn1::{Any, BitString, ObjectIdentifier, OctetString};
 pub use crate::der::{Choice, Enumerated, Sequence};
-pub use crate::frame::{BodyTransform, Frame, Metadata, Opened};
+pub use crate::frame::{BodyTransform, Frame, InstallStep, Metadata, Opened};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::version::GatedField;
@@ -77,4 +77,48 @@ pub enum MessagePriority {
 	LowLatency = 3,
 	Expedited = 4,
 	NetworkControl = 5,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::tb_cases;
+
+	// A version reads back from its wire code.
+	tb_cases! {
+		fn a_version_reads_back_from_its_code((code, version): (u8, Version)) {
+			assert_eq!(Version::try_from(code).ok(), Some(version));
+		}
+		cases {
+			v0 => (0, Version::V0),
+			v1 => (1, Version::V1),
+			v2 => (2, Version::V2),
+			v3 => (3, Version::V3),
+		}
+	}
+
+	#[test]
+	fn a_code_past_the_last_version_is_refused() {
+		assert!(Version::try_from(4).is_err());
+	}
+
+	// A priority reads back from its wire code.
+	tb_cases! {
+		fn a_priority_reads_back_from_its_code((code, priority): (u8, MessagePriority)) {
+			assert_eq!(MessagePriority::try_from(code).ok(), Some(priority));
+		}
+		cases {
+			low_effort => (0, MessagePriority::LowEffort),
+			standard => (1, MessagePriority::Standard),
+			high_throughput => (2, MessagePriority::HighThroughput),
+			low_latency => (3, MessagePriority::LowLatency),
+			expedited => (4, MessagePriority::Expedited),
+			network_control => (5, MessagePriority::NetworkControl),
+		}
+	}
+
+	#[test]
+	fn a_code_past_the_last_priority_is_refused() {
+		assert!(MessagePriority::try_from(6).is_err());
+	}
 }

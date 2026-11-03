@@ -8,21 +8,20 @@
 //! The returned frame is the servlet's end-to-end envelope. Verify its
 //! signature with [`Frame::verify`] before you trust the message body.
 
-use crate::asn1::Frame;
-use crate::colony::protocol::{ClusterWorkRequest, ClusterWorkResponse};
-use crate::error::TightBeamError;
-use crate::transport::client::GenericClient;
-use crate::transport::protocols::Protocol;
-use crate::transport::MessageEmitter;
-use crate::urn::Urn;
-
 use core::hash::Hash;
 
+use crate::asn1::Frame;
+use crate::colony::work::{ClusterWorkRequest, ClusterWorkResponse};
+use crate::error::TightBeamError;
+use crate::transport::client::GenericClient;
 use crate::transport::client::PooledClient;
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::protocols::PersistentConnection;
+use crate::transport::protocols::Protocol;
 use crate::transport::MessageCollector;
+use crate::transport::MessageEmitter;
+use crate::urn::Urn;
 
 /// Submit unary work to a cluster gateway and receive the servlet's
 /// complete response frame.

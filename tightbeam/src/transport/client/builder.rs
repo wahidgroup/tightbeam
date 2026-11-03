@@ -20,7 +20,7 @@ use crate::transport::handshake::HandshakeProtocolKind;
 use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
 use crate::transport::EndpointConfig;
 use crate::transport::MessageEmitter;
-use crate::transport::{MessageCollector, Protocol, TransportResult};
+use crate::transport::{CheckedLimits, MessageCollector, Protocol, TransportResult};
 
 #[cfg(host_clock)]
 use crate::clock::SystemClock;
@@ -46,7 +46,6 @@ pub struct ClientPolicies {
 	restart: Option<DynRestart>,
 	emitter_gates: Vec<DynGate>,
 	collector_gates: Vec<DynGate>,
-	timeout: Option<Duration>,
 }
 
 /// A restart policy the client policies hold behind one box.
@@ -99,22 +98,7 @@ impl ClientPolicies {
 		self
 	}
 
-	/// Sets the operation timeout, which caps a connect and each I/O wait.
-	///
-	/// [`ClientBuilder`] writes it into the [`TransportLimits`] of the
-	/// endpoint before the dial, so the dial and the transport both run under
-	/// it.
-	///
-	/// [`TransportLimits`]: crate::transport::TransportLimits
-	pub fn with_timeout(mut self, timeout: Duration) -> Self {
-		self.timeout = Some(timeout);
-		self
-	}
-
 	/// Applies the restart policy and the gates to `transport`.
-	///
-	/// The transport keeps the limits of its endpoint, where [`ClientBuilder`]
-	/// wrote the timeout of [`Self::with_timeout`] before the dial.
 	pub fn apply<P>(self, mut transport: P::Transport) -> P::Transport
 	where
 		P: Protocol,
@@ -142,6 +126,10 @@ pub struct ClientBuilder<P: Protocol> {
 	negotiation: Negotiation,
 	/// The clock the transport measures deadlines and backoff against.
 	clock: Arc<dyn Clock>,
+	/// The operation timeout, which outranks the one inside `limits`.
+	timeout: Option<Duration>,
+	/// The ceilings the dial and the transport enforce.
+	limits: Option<CheckedLimits>,
 	_ph: PhantomData<P>,
 }
 
@@ -160,10 +148,13 @@ impl<P: Protocol> ClientBuilder<P> {
 			encryption: EncryptionConfig::unconfigured(),
 			negotiation: Negotiation::default(),
 			clock,
+			timeout: None,
+			limits: None,
 			_ph: PhantomData,
 		}
 	}
 
+	/// Replaces the restart policy and the gates.
 	pub fn policies(mut self, policies: ClientPolicies) -> Self {
 		self.policies = policies;
 		self
@@ -190,6 +181,26 @@ impl<P: Protocol> ClientBuilder<P> {
 		G: GatePolicy + Send + Sync + 'static,
 	{
 		self.policies = self.policies.with_collector_gate(g);
+		self
+	}
+
+	/// Sets the operation timeout, which caps a connect and each I/O wait
+	/// outside a handshake, and outranks the timeout inside the limits of
+	/// [`Self::with_limits`].
+	///
+	/// It is the one setter of the timeout, which
+	/// [`ConnectionBuilder::with_timeout`] calls.
+	pub fn with_timeout(mut self, timeout: Duration) -> Self {
+		self.timeout = Some(timeout);
+		self
+	}
+
+	/// Sets every ceiling the dial and the transport enforce.
+	///
+	/// It is the one setter of the limits, which
+	/// [`ConnectionBuilder::with_limits`] calls.
+	pub fn with_limits(mut self, limits: CheckedLimits) -> Self {
+		self.limits = Some(limits);
 		self
 	}
 
@@ -271,7 +282,7 @@ impl<P: Protocol> ClientBuilder<P> {
 	}
 
 	/// Collects everything the transport is built from, once the dialer rule
-	/// has answered, with `timeout` as its operation timeout when it is set.
+	/// has answered, under `limits` and `timeout`.
 	///
 	/// # Errors
 	///
@@ -284,11 +295,12 @@ impl<P: Protocol> ClientBuilder<P> {
 		encryption: EncryptionConfig<P::CryptoProvider>,
 		negotiation: Negotiation,
 		clock: Arc<dyn Clock>,
+		limits: Option<CheckedLimits>,
 		timeout: Option<Duration>,
 	) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let encryption = DialableEncryption::new(encryption)?;
 		let endpoint = EndpointConfig::new(encryption, clock).with_negotiation(negotiation);
-		endpoint.with_operation_timeout(timeout)
+		endpoint.under(limits, timeout)
 	}
 }
 
@@ -308,9 +320,16 @@ where
 	///   [`Self::allow_cleartext`], so it would accept any peer, or it sets a
 	///   server policy with no trust in a server, with or without cleartext.
 	/// - [`crate::transport::error::TransportError::InvalidLimits`] -- the
-	///   timeout of [`ClientPolicies::with_timeout`] is zero.
+	///   timeout of [`Self::with_timeout`] is zero.
+	/// - [`crate::transport::error::TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the timeout passed before
+	///   the connect ended.
+	/// - [`crate::transport::error::TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the clock of the client, and the connect waits.
+	/// - [`crate::transport::error::TransportError`] -- the error of the protocol, when its connect fails.
 	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.limits, self.timeout)?;
 		let destination = addr.into();
 		let stream = endpoint.dial::<P>(destination).await?;
 
@@ -331,9 +350,9 @@ where
 	///   [`Self::allow_cleartext`], or it sets a server policy with no trust in
 	///   a server, with or without cleartext.
 	/// - [`crate::transport::error::TransportError::InvalidLimits`] -- the
-	///   timeout of [`ClientPolicies::with_timeout`] is zero.
+	///   timeout of [`Self::with_timeout`] is zero.
 	pub fn adopt(self, stream: P::Stream) -> TransportResult<GenericClient<P>> {
-		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.policies.timeout)?;
+		let endpoint = Self::endpoint(self.encryption, self.negotiation, self.clock, self.limits, self.timeout)?;
 
 		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);
@@ -351,13 +370,17 @@ where
 {
 	type Output = Self;
 
-	fn with_timeout(mut self, timeout: Duration) -> Self {
-		self.policies = self.policies.with_timeout(timeout);
-		self
+	// `Self::with_timeout`, `Self::with_limits`, and `Self::with_trust_store`
+	// resolve to the inherent setters ahead of these methods, so each call
+	// forwards to the one setter of its value.
+	fn with_timeout(self, timeout: Duration) -> Self {
+		Self::with_timeout(self, timeout)
 	}
 
-	// `Self::with_trust_store` resolves to the inherent setter ahead of this
-	// method, so the call forwards to the one setter of the trust store.
+	fn with_limits(self, limits: CheckedLimits) -> Self {
+		Self::with_limits(self, limits)
+	}
+
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self {
 		Self::with_trust_store(self, store)
 	}

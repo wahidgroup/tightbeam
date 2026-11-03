@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
-use tightbeam::clock::{Clock, MonotonicInstant, UnixMillis};
+use tightbeam::clock::{Clock, MonotonicInstant, Timing, UnixMillis};
 use tightbeam::crypto::x509::error::CertificateValidationError;
 use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 use tightbeam::instrumentation::events::TRACE_CLOCK_ORIGIN;
@@ -71,6 +71,10 @@ impl Clock for SteppedClock {
 	fn sleep(&self, span: Duration) -> MaybeSendFuture<'_, ()> {
 		self.step(span);
 		Box::pin(core::future::ready(()))
+	}
+
+	fn timing(&self) -> Timing {
+		Timing::Races
 	}
 }
 

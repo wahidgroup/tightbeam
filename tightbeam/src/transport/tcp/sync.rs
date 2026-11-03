@@ -4,9 +4,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 
-use core::future::Future;
 use core::str::FromStr;
-use core::time::Duration;
 
 #[cfg(feature = "std")]
 use std::io::{Error as IoError, ErrorKind};
@@ -28,18 +26,30 @@ use crate::transport::policy::RestartPolicy;
 use crate::transport::state::{IoDeadline, SettledExchange};
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::{
-	EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO, Protocol,
-	ProtocolStream, TransportEncryptionConfig, TransportResult,
+	CheckedLimits, EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO,
+	Protocol, ProtocolStream, TransportEncryptionConfig, TransportResult,
 };
 use crate::Frame;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::clock::Timer;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::state::{HandshakeSlot, ServerHandshakeSlot};
 
+/// The blocking transport carries its stream itself, because its socket
+/// timeouts bound each read and write.
+type Bare<S> = S;
+
+/// Carry `stream` itself. Its socket timeouts read the limits of the
+/// transport, so the clock of the endpoint takes no part.
+fn bare<S>(stream: S, _clock: &Arc<dyn Clock>) -> S {
+	stream
+}
+
 // The macro generates the `TcpTransport` struct and its common implementations.
-crate::impl_tcp_common!(TcpTransport, ProtocolStream);
+crate::impl_tcp_common!(TcpTransport, ProtocolStream, Bare, bare);
 
 #[cfg(feature = "std")]
 impl<S: ProtocolStream, P: CryptoProvider> TcpTransport<S, P>
@@ -203,15 +213,14 @@ where
 		self.state.handshake_slot()
 	}
 
-	/// Runs `operation` unbounded, because a blocking read holds its thread.
-	///
-	/// The stream timeouts end each read and write.
-	async fn within_budget<T, F>(_budget: Duration, operation: F) -> TransportResult<T>
-	where
-		F: Future<Output = TransportResult<T>>,
-	{
-		operation.await
+	/// The stream timeouts bound each read and write of a round, and a hook of
+	/// the round runs unbounded, because a blocking read holds its thread.
+	fn handshake_timer(&mut self) -> Option<Timer> {
+		None
 	}
+
+	/// The blocking transport lends no timer, so it has none to keep.
+	fn keep_handshake_timer(&mut self, _timer: Timer) {}
 }
 
 /// This impl covers every provider `P`, so a call names `P` where no other
@@ -346,10 +355,11 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpL
 		NetTcpStream::connect(addr.0)
 	}
 
-	/// Connects within `budget` through `TcpStream::connect_timeout`. A
-	/// blocking connect holds its thread, so no race of the dial pre-empts it.
-	async fn connect_within(addr: Self::Address, budget: Duration) -> Result<Self::Stream, Self::Error> {
-		NetTcpStream::connect_timeout(&addr.0, budget)
+	/// Connects within the operation timeout of `limits` through
+	/// `TcpStream::connect_timeout`. A blocking connect holds its thread, so no
+	/// race of the dial pre-empts it.
+	async fn connect_within(addr: Self::Address, limits: &CheckedLimits) -> Result<Self::Stream, Self::Error> {
+		NetTcpStream::connect_timeout(&addr.0, limits.operation_timeout)
 	}
 
 	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {
@@ -443,7 +453,7 @@ mod tests {
 
 	use super::*;
 	use crate::clock::{ManualClock, SystemClock};
-	use crate::runtime::{rt, ParkingExecutor};
+	use crate::runtime::rt;
 	use crate::testing::fixtures::TestLoopback;
 	use crate::testing::TestResult;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
@@ -605,16 +615,14 @@ mod tests {
 		));
 	}
 
-	/// The blocking budget runs its operation to its end outside a runtime.
+	/// The blocking transport lends no timer for a whole round, so its socket
+	/// timeouts alone bound the round.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[test]
-	fn a_blocking_budget_runs_its_operation_outside_a_runtime() -> TestResult {
-		let operation = async { Ok(7) };
-		let bounded = <TcpTransport<NetTcpStream> as ServerHandshakeSlot>::within_budget(Duration::ZERO, operation);
-
-		let outcome = ParkingExecutor::on_current_thread().block_on(bounded)?;
-		assert_eq!(outcome, 7);
-		Ok(())
+	fn a_blocking_transport_lends_no_handshake_timer() {
+		let (stream, _peer) = TestLoopback::std_pair();
+		let mut transport = TcpTransport::new(stream, EndpointConfig::<DefaultCryptoProvider>::cleartext());
+		assert!(transport.handshake_timer().is_none());
 	}
 
 	/// The server refuses a header that declares more than the handshake cap

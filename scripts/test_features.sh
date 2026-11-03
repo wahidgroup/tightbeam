@@ -178,10 +178,12 @@ for relative in tightbeam/Cargo.toml Cargo.lock; do
 done
 
 # The wasm32 check builds the browser transport core: `async-transport`
-# compiles the generic `AsyncProtocolStream` and `TcpTransport` without tokio.
-echo "[wasm] Check: wasm32 transport-hpke + async-transport (no tokio)"
+# compiles the generic `AsyncProtocolStream` and `TcpTransport` without tokio,
+# `transport-multiplex` the mux and its keepalive, and `colony-wire` the
+# messages of the work plane.
+echo "[wasm] Check: wasm32 transport-hpke + async-transport + transport-multiplex + colony-wire (no tokio)"
 if rustup target list --installed | grep -q '^wasm32-unknown-unknown$'; then
-	cargo check --target wasm32-unknown-unknown --package tightbeam-rs --no-default-features --features "std,transport-hpke,async-transport,wasm"
+	cargo check --target wasm32-unknown-unknown --package tightbeam-rs --no-default-features --features "std,transport-hpke,async-transport,transport-multiplex,colony-wire,wasm"
 else
 	echo "  FAIL: wasm32-unknown-unknown target missing (run: make setup)" >&2
 	exit 1

@@ -12,8 +12,10 @@ use digest::block_buffer::Eager;
 use digest::core_api::{BlockSizeUser, BufferKindUser, FixedOutputCore, UpdateCore};
 use digest::typenum::{IsLess, NonZero, U256};
 
-use crate::asn1::DigestInfo;
+use crate::asn1::{AlgorithmIdentifier, DigestInfo, OctetString};
 use crate::crypto::subtle::ConstantTimeEq;
+use crate::der::oid::AssociatedOid;
+use crate::error::Result;
 
 #[cfg(feature = "sha3")]
 use core::mem::needs_drop;
@@ -43,6 +45,33 @@ pub trait ConstantTimeDigest {
 impl ConstantTimeDigest for DigestInfo {
 	fn digest_matches(&self, other: &Self) -> bool {
 		self.digest.as_bytes().ct_eq(other.digest.as_bytes()).into()
+	}
+}
+
+/// The constructors this crate adds to [`DigestInfo`], which comes from
+/// `pkcs12` and so takes no inherent method here.
+pub trait DigestInfoExt: Sized {
+	/// The `DigestInfo` that ends `hasher`: its digest, under the algorithm
+	/// that `D` names, with no parameters. It is the one form in which this
+	/// crate builds a `DigestInfo` from a hasher.
+	///
+	/// A caller whose preimage arrives in parts, as `CommitmentSalt::preimage`
+	/// and `Frame::witness_preimage` feed it, hashes each part and ends here,
+	/// so the parts reach the digest with no copy into one buffer.
+	///
+	/// # Errors
+	///
+	/// - [`crate::TightBeamError::SerializationError`] -- the digest exceeds the DER length limit.
+	fn of_hasher<D: Digest + AssociatedOid>(hasher: D) -> Result<Self>;
+}
+
+impl DigestInfoExt for DigestInfo {
+	fn of_hasher<D: Digest + AssociatedOid>(hasher: D) -> Result<Self> {
+		let algorithm = AlgorithmIdentifier { oid: D::OID, parameters: None };
+		let finished = hasher.finalize();
+		let digest = OctetString::new(finished.as_slice())?;
+
+		Ok(Self { algorithm, digest })
 	}
 }
 

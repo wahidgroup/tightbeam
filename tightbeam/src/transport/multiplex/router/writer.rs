@@ -8,7 +8,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
 
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use core::time::Duration;
 
 use futures::channel::mpsc;
@@ -25,11 +25,11 @@ use crate::transport::TransportResult;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::flow::renewal_floor;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use super::shared::RekeyPhase;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-use crate::clock::{Clock, MonotonicInstant};
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::clock::{Lapse, MonotonicInstant, Timer};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::aead::SendCipher;
@@ -46,8 +46,12 @@ enum WriterStep {
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	WriteAck,
 	/// The renewal deadline elapsed, so the connection drains.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	RenewalExpired,
+	/// The polling thread has no timer for the renewal deadline, so the driver
+	/// ends with `FailedPrecondition`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	Untimed,
 	/// Every sender is gone and the outbound queue has ended.
 	Closed,
 }
@@ -81,16 +85,18 @@ where
 	pending_ack: Option<(TransportEnvelope, Box<SendCipher>)>,
 	/// The instant the driver first observed the in-flight renewal, which
 	/// starts the deadline that bounds a stalled exchange.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	renewal_started: Option<MonotonicInstant>,
 	/// The time budget of one renewal exchange before the connection drains.
 	/// The default is [`DEFAULT_REKEY_DEADLINE_SECS`].
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	renewal_deadline: Duration,
-	/// The clock the renewal deadline is stamped on and waited out on, the
-	/// clock of the link the driver writes to.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-	clock: Arc<dyn Clock>,
+	/// The timer the renewal deadline is stamped and waited out on, on the
+	/// clock of the link the driver writes to. Where the clock offers
+	/// `Clock::resetting_sleep`, it keeps one sleep across the waits of every
+	/// renewal.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	timer: Timer,
 }
 
 /// The connection fails when its writer goes, however it goes.
@@ -119,8 +125,8 @@ where
 	///
 	/// - `drain_headroom`: the records reserved for the drain before the send cipher halts.
 	pub fn new(writer: W, commands: mpsc::Receiver<Outbound>, shared: Arc<MuxShared>, drain_headroom: u64) -> Self {
-		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-		let clock = writer.clock();
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+		let timer = Timer::new(writer.clock());
 
 		Self {
 			writer,
@@ -131,12 +137,12 @@ where
 			exchange: None,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			pending_ack: None,
-			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			renewal_started: None,
-			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			renewal_deadline: Duration::from_secs(DEFAULT_REKEY_DEADLINE_SECS),
-			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
-			clock,
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			timer,
 		}
 	}
 
@@ -150,7 +156,7 @@ where
 	}
 
 	/// Overrides the time budget of one renewal exchange.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn set_renewal_deadline(&mut self, deadline: Duration) {
 		self.renewal_deadline = deadline;
 	}
@@ -177,8 +183,10 @@ where
 				WriterStep::Command(Outbound::StartRenewal) => self.try_open_renewal().await?,
 				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				WriterStep::WriteAck => self.write_pending_ack().await?,
-				#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 				WriterStep::RenewalExpired => self.fail_renewal().await?,
+				#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+				WriterStep::Untimed => return Err(Lapse::NoTimer.into()),
 				WriterStep::Command(Outbound::Close) | WriterStep::Closed => break,
 			}
 		}
@@ -188,29 +196,27 @@ where
 
 	/// Waits for the next unit of work.
 	///
-	/// With a renewal in flight and a timer available, the renewal deadline
-	/// bounds the wait, so a peer that never answers parks the connection only
-	/// until that deadline. The wait runs on the clock of the link, so a test
-	/// whose link carries a manual clock advances that clock to reach the
-	/// deadline.
+	/// With a renewal in flight, the renewal deadline bounds the wait on the
+	/// timer of the driver, so a peer that never answers parks the connection
+	/// only until that deadline. A test whose link carries a manual clock
+	/// advances that clock to reach the deadline.
 	async fn next_step(&mut self) -> WriterStep {
-		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+		#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 		if let Some(deadline) = self.renewal_deadline() {
-			let clock = Arc::clone(&self.clock);
+			let clock = Arc::clone(self.timer.clock());
 			let budget = deadline.saturating_duration_since(clock.monotonic());
-			let mut expiry = clock.sleep(budget);
 
-			// The queued work takes the first poll, as in a timeout, so a
-			// command that is already ready wins over a deadline reached in the
-			// same instant.
-			return poll_fn(|cx| {
-				if let Poll::Ready(step) = self.poll_step(cx) {
-					return Poll::Ready(step);
-				}
+			// The wait borrows the driver, so the timer leaves the driver for
+			// the wait and returns after it.
+			let mut timer = core::mem::replace(&mut self.timer, Timer::new(clock));
+			let step = timer.within(budget, poll_fn(|cx| self.poll_step(cx))).await;
+			self.timer = timer;
 
-				expiry.as_mut().poll(cx).map(|()| WriterStep::RenewalExpired)
-			})
-			.await;
+			return match step {
+				Ok(step) => step,
+				Err(Lapse::Passed) => WriterStep::RenewalExpired,
+				Err(Lapse::NoTimer) => WriterStep::Untimed,
+			};
 		}
 
 		poll_fn(|cx| self.poll_step(cx)).await
@@ -241,14 +247,14 @@ where
 	/// The deadline of the in-flight renewal, stamped on first observation from
 	/// the driver's clock and cleared when the exchange concludes. A deadline
 	/// past every instant the clock can return never arrives, so it is `None`.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	fn renewal_deadline(&mut self) -> Option<MonotonicInstant> {
 		if self.exchange.is_none() || self.shared.rekey_phase() == RekeyPhase::Idle {
 			self.renewal_started = None;
 			return None;
 		}
 
-		let started = *self.renewal_started.get_or_insert_with(|| self.clock.monotonic());
+		let started = *self.renewal_started.get_or_insert_with(|| self.timer.clock().monotonic());
 		started.checked_add(self.renewal_deadline)
 	}
 
@@ -314,7 +320,7 @@ where
 	/// - The write failure of the GoAway.
 	/// - The injected error, when the runtime fault model injects a fault at
 	///   the record of the expired renewal or at the event of the GoAway.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	async fn fail_renewal(&mut self) -> TransportResult<()> {
 		self.pending_ack = None;
 		self.renewal_started = None;
@@ -448,7 +454,7 @@ mod tests {
 	use super::super::fixtures::{noop_cx, FIXTURE_PEER_CAP};
 	use super::super::transport::MuxTransport;
 	use super::*;
-	use crate::clock::{ManualClock, SystemClock};
+	use crate::clock::{Clock, ManualClock, SystemClock};
 	use crate::marker::MaybeSendFuture;
 	use crate::transport::envelopes::{
 		MuxPingPackage, MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage,
@@ -456,10 +462,11 @@ mod tests {
 	use crate::transport::handshake::HandshakeError;
 	use crate::transport::multiplex::{MuxRekeyContext, MuxRole, MuxSettings};
 	use crate::transport::rekey::{ClientRekey, EpochInstall, RekeyDriver};
+	use crate::transport::CheckedLimits;
 	use crate::transport::{EnvelopeSource, TransportError};
 
 	/// A sink that accepts every envelope and every send cipher, reports
-	/// unlimited records, and hands out the clock of the trait default.
+	/// unlimited records, and reads the system clock.
 	///
 	/// The writer driver under test reads its deadlines on the clock of its
 	/// sink and writes no byte that a test reads, so the double stands in for
@@ -478,12 +485,16 @@ mod tests {
 		fn install_send_cipher(&mut self, _cipher: SendCipher) -> TransportResult<()> {
 			Ok(())
 		}
+
+		fn clock(&self) -> Arc<dyn Clock> {
+			Arc::new(SystemClock)
+		}
 	}
 
 	/// The [`OpenSink`] on the manual clock it holds.
 	///
 	/// The deadline cases move the clock of the link by hand, which the
-	/// default clock of a sink leaves to the host.
+	/// system clock of [`OpenSink`] leaves to the host.
 	struct ClockedSink(Arc<ManualClock>);
 
 	impl EnvelopeSink for ClockedSink {
@@ -534,6 +545,10 @@ mod tests {
 	impl EnvelopeSource for IdleSource {
 		async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
 			Err(TransportError::ConnectionClosed)
+		}
+
+		fn limits(&self) -> CheckedLimits {
+			CheckedLimits::default()
 		}
 	}
 
@@ -596,7 +611,7 @@ mod tests {
 		let mux = MuxTransport::new(IdleSource, sink, MuxRole::Client, settings);
 
 		let (_handle, _reader, writer, _responder) = mux.into_parts();
-		assert_eq!(writer.clock.monotonic(), link_clock.monotonic());
+		assert_eq!(writer.timer.clock().monotonic(), link_clock.monotonic());
 	}
 
 	/// A transport over a link that names no clock of its own runs the
@@ -606,7 +621,7 @@ mod tests {
 	fn a_transport_over_a_link_of_no_clock_runs_the_system_clock() {
 		let mux = MuxTransport::new(IdleSource, OpenSink, MuxRole::Client, MuxSettings::symmetric(4));
 		let (_handle, _reader, writer, _responder) = mux.into_parts();
-		assert_eq!(format!("{:?}", writer.clock), format!("{SystemClock:?}"));
+		assert_eq!(format!("{:?}", writer.timer.clock()), format!("{SystemClock:?}"));
 	}
 
 	/// Whether the writer of a transport that `with_rekey` assembles from
@@ -666,5 +681,16 @@ mod tests {
 		let polled = step.as_mut().poll(&mut cx);
 		assert!(started.is_pending());
 		assert!(polled.is_pending());
+	}
+
+	/// A stalled exchange on a thread with no timer for the clock of its link
+	/// ends the driver at once, though no time has passed.
+	#[test]
+	fn a_stalled_renewal_with_no_timer_ends_the_driver() {
+		let (mut driver, _queue) = stalled_driver(OpenSink, Duration::from_secs(30));
+		let mut step = Box::pin(driver.next_step());
+
+		let polled = step.as_mut().poll(&mut noop_cx());
+		assert!(matches!(polled, Poll::Ready(WriterStep::Untimed)));
 	}
 }

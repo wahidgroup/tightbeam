@@ -1,4 +1,5 @@
 use core::marker::PhantomData;
+use core::str::FromStr;
 
 #[cfg(all(feature = "transport", not(feature = "std")))]
 use alloc::sync::Arc;
@@ -8,6 +9,7 @@ use alloc::{boxed::Box, vec::Vec};
 use std::sync::Arc;
 
 use crate::der::Enumerated;
+use crate::error::UnknownName;
 use crate::{Frame, Message};
 
 #[cfg(feature = "transport")]
@@ -94,6 +96,8 @@ impl TransitStatus {
 	}
 
 	/// The canonical name of the variant, which an audit event uses as a label.
+	///
+	/// [`FromStr`] reads the same names.
 	pub const fn as_str(&self) -> &'static str {
 		match self {
 			Self::Ok => "Ok",
@@ -114,6 +118,21 @@ impl TransitStatus {
 			Self::DataLoss => "DataLoss",
 			Self::Unauthenticated => "Unauthenticated",
 		}
+	}
+}
+
+impl FromStr for TransitStatus {
+	type Err = UnknownName;
+
+	/// Read a name that [`TransitStatus::as_str`] writes.
+	///
+	/// # Errors
+	///
+	/// - [`UnknownName`] -- no variant carries `name`.
+	fn from_str(name: &str) -> Result<Self, Self::Err> {
+		let mut statuses = (0..=u8::MAX).filter_map(|code| Self::try_from(code).ok());
+
+		statuses.find(|status| status.as_str() == name).ok_or(UnknownName)
 	}
 }
 
@@ -584,5 +603,36 @@ mod tests {
 			data_loss => (TransitStatus::DataLoss, "DataLoss"),
 			unauthenticated => (TransitStatus::Unauthenticated, "Unauthenticated"),
 		}
+	}
+
+	// A status reads back from the name it writes.
+	crate::tb_cases! {
+		fn a_status_reads_back_from_its_name(status: TransitStatus) {
+			assert_eq!(status.as_str().parse(), Ok(status));
+		}
+		cases {
+			ok => TransitStatus::Ok,
+			cancelled => TransitStatus::Cancelled,
+			unknown => TransitStatus::Unknown,
+			invalid_argument => TransitStatus::InvalidArgument,
+			deadline_exceeded => TransitStatus::DeadlineExceeded,
+			not_found => TransitStatus::NotFound,
+			already_exists => TransitStatus::AlreadyExists,
+			permission_denied => TransitStatus::PermissionDenied,
+			resource_exhausted => TransitStatus::ResourceExhausted,
+			failed_precondition => TransitStatus::FailedPrecondition,
+			aborted => TransitStatus::Aborted,
+			out_of_range => TransitStatus::OutOfRange,
+			unimplemented => TransitStatus::Unimplemented,
+			internal => TransitStatus::Internal,
+			unavailable => TransitStatus::Unavailable,
+			data_loss => TransitStatus::DataLoss,
+			unauthenticated => TransitStatus::Unauthenticated,
+		}
+	}
+
+	#[test]
+	fn an_unknown_status_name_is_refused() {
+		assert_eq!("NoSuchStatus".parse::<TransitStatus>(), Err(UnknownName));
 	}
 }

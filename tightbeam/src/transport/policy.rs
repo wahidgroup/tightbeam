@@ -57,9 +57,12 @@ where
 	/// Set the deadline for a single read or write, once
 	/// [`TransportLimits::checked`] admits the limits that hold it.
 	///
-	/// The blocking transport arms it on its stream, and the async transport
-	/// arms it under `tokio`. An async build without `tokio` has no timer, so
-	/// the application owns the deadline there.
+	/// The blocking transport arms it on its stream. The async transport runs
+	/// each write within it, and each read outside a handshake, on the clock of
+	/// the endpoint. A read while a handshake is pending ends at the handshake
+	/// deadline. Each wait runs as
+	/// [`Clock::timing`](crate::clock::Clock::timing) allows, so a clock that
+	/// parks leaves the deadline to the application.
 	///
 	/// # Errors
 	///

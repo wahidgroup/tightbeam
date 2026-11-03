@@ -28,6 +28,13 @@ use crate::transport::TransportResult;
 use crate::transport::{CheckedLimits, TransportLimits};
 use crate::x509::Certificate;
 
+#[cfg(any(
+	feature = "tokio",
+	feature = "async-transport",
+	feature = "transport-cms",
+	feature = "transport-hpke"
+))]
+use crate::clock::Timer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::crypto::x509::error::CertificateValidationError;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -290,6 +297,35 @@ impl ReadPolicy {
 	///   deadline.
 	pub fn remaining(&self, now: MonotonicInstant) -> TransportResult<Option<Duration>> {
 		self.deadline.remaining(now)
+	}
+
+	/// Run `work` under the deadline of this policy, measured from `now`, on
+	/// `timer`. A policy with no deadline runs `work` unbounded.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::DeadlineExceeded`] -- the deadline passed before
+	///   `work` ended, or had passed at `now`.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the clock of `timer`, and `work` waits.
+	#[cfg(any(
+		feature = "tokio",
+		feature = "async-transport",
+		feature = "transport-cms",
+		feature = "transport-hpke"
+	))]
+	pub(crate) async fn bound<F: core::future::Future + Unpin>(
+		&self,
+		timer: &mut Timer,
+		now: MonotonicInstant,
+		work: F,
+	) -> TransportResult<F::Output> {
+		match self.remaining(now)? {
+			Some(budget) => Ok(timer.within(budget, work).await?),
+			None => Ok(work.await),
+		}
 	}
 }
 
@@ -1354,39 +1390,33 @@ pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// ```
 	fn handshake_slot(&mut self) -> &mut HandshakeSlot;
 
-	/// Runs `operation` within `budget`, the time left to the handshake.
+	/// The timer that bounds a server round of this endpoint by the handshake
+	/// deadline, on the clock of the endpoint, or `None` where the endpoint
+	/// bounds each read and write of the round itself. The round hands the
+	/// timer back through [`Self::keep_handshake_timer`].
 	///
-	/// Each transport states in its impl how the budget binds.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::DeadlineExceeded`] -- the budget ran out.
-	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::FailedPrecondition`] -- no timer can bind it.
-	/// - The errors of `operation`.
+	/// - The async transport lends the timer of its exchanges, so the whole round runs within the deadline.
+	/// - The blocking transport answers `None`. Its socket timeouts bound each
+	///   read and write, and a hook of the round runs unbounded, as a blocking
+	///   read holds its thread.
 	///
 	/// # Examples
 	///
 	/// ```
 	/// use std::net::TcpStream;
-	/// use std::time::Duration;
 	///
-	/// use tightbeam::runtime::rt;
 	/// use tightbeam::transport::state::ServerHandshakeSlot;
 	/// use tightbeam::transport::tcp::sync::TcpTransport;
 	///
-	/// let operation = async { Ok(7) };
-	/// let budget = Duration::from_secs(1);
-	/// let bounded = <TcpTransport<TcpStream> as ServerHandshakeSlot>::within_budget(budget, operation);
-	///
-	/// assert_eq!(rt::block_on(bounded)?, 7);
-	/// # Ok::<(), Box<dyn core::error::Error>>(())
+	/// /// Whether `transport` bounds a whole server round by the deadline.
+	/// fn bounds_its_rounds(transport: &mut TcpTransport<TcpStream>) -> bool {
+	///     transport.handshake_timer().is_some()
+	/// }
 	/// ```
-	#[allow(async_fn_in_trait)]
-	async fn within_budget<T, F>(budget: Duration, operation: F) -> TransportResult<T>
-	where
-		F: core::future::Future<Output = TransportResult<T>>;
+	fn handshake_timer(&mut self) -> Option<Timer>;
+
+	/// Keep `timer`, which [`Self::handshake_timer`] lent, for the next round.
+	fn keep_handshake_timer(&mut self, timer: Timer);
 }
 
 /// The state accessors of an encrypted transport, separate from I/O.

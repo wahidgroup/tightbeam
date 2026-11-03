@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::colony::cluster::Cluster;
-use tightbeam::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
+use tightbeam::colony::protocol::ClusterRequest;
+use tightbeam::colony::work::{ClusterWorkRequest, ClusterWorkResponse};
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::sign::SigningIdentity;

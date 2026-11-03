@@ -36,10 +36,32 @@ impl Metadata {
 			return Err(TightBeamError::UnexpectedAlgorithm((received, expected).into()));
 		}
 
+		let parameters = inflator.admits_parameters(compactness.compression_alg.parameters.as_ref());
+		if !parameters {
+			return Err(TightBeamError::InvalidMetadata);
+		}
+
+		self.ensure_carried_compactness()
+	}
+
+	/// Refuse a `compactness` in a form no frame carries. A frame carries a
+	/// `CompressedData` of version 0 (RFC 3274 §1.1) with no `eContent`,
+	/// because the compressed bytes travel in `Frame.message`.
+	///
+	/// Metadata with no `compactness` passes.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::InvalidMetadata`] -- the version is not 0, or the
+	///   `CompressedData` carries an `eContent`.
+	pub(super) fn ensure_carried_compactness(&self) -> Result<()> {
+		let Some(compactness) = self.compactness.as_ref() else {
+			return Ok(());
+		};
+
 		let first_version = compactness.version == CmsVersion::V0;
 		let detached = compactness.encap_content_info.econtent.is_none();
-		let parameters = inflator.admits_parameters(compactness.compression_alg.parameters.as_ref());
-		if !(first_version && detached && parameters) {
+		if !(first_version && detached) {
 			return Err(TightBeamError::InvalidMetadata);
 		}
 
@@ -110,7 +132,8 @@ impl Frame {
 
 		// The inflate reads the body in place, so a refused description or a
 		// failed decompression leaves the frame as it was.
-		self.message = self.metadata.inflate(inflator, &self.message)?;
+		let inflated = self.metadata.inflate(inflator, &self.message)?;
+		self.replace_body(inflated);
 		self.metadata.compactness = None;
 		Ok(self.take_opened())
 	}

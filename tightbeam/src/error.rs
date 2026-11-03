@@ -3,6 +3,10 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::error::Error;
+use core::fmt;
+
+use crate::asn1::InstallStep;
 use crate::spki::ObjectIdentifier;
 use crate::Errorizable;
 use crate::Version;
@@ -135,6 +139,18 @@ impl core::fmt::Display for ErrorChain {
 	}
 }
 
+/// A name that reads as no variant of an enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownName;
+
+impl fmt::Display for UnknownName {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("this name reads as no variant")
+	}
+}
+
+impl Error for UnknownName {}
+
 /// The top-level error type of the crate.
 #[derive(Errorizable, Debug)]
 #[non_exhaustive]
@@ -266,6 +282,17 @@ pub enum TightBeamError {
 	/// ```
 	#[error("Field {field} is not supported in protocol version {version:?}")]
 	UnsupportedField { field: crate::asn1::GatedField, version: Version },
+
+	/// A frame took a step behind one it already holds, which would leave a
+	/// stale field on it, or a second seal, which would lose the first
+	/// envelope.
+	#[error("a frame that holds {furthest} refuses {step}")]
+	InstallOutOfOrder {
+		/// The step the caller took.
+		step: InstallStep,
+		/// The furthest step the frame holds.
+		furthest: InstallStep,
+	},
 
 	/// A testing operation failed.
 	#[cfg(feature = "testing")]
@@ -447,12 +474,6 @@ pub enum TightBeamError {
 	#[cfg(feature = "aead")]
 	#[error("Missing encryption info")]
 	MissingEncryptionInfo,
-
-	/// The frame carries an FI digest or a signature, which cover the frame
-	/// as it is before a seal rewrites its metadata and its body.
-	#[cfg(feature = "aead")]
-	#[error("Frame is digested or signed before the seal")]
-	CoveredBeforeSeal,
 
 	/// The commitment salt is shorter than the hiding floor.
 	#[cfg(feature = "digest")]

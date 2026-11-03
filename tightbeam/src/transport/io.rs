@@ -23,11 +23,9 @@ use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::TransportResult;
+use crate::transport::{CheckedLimits, TransportResult};
 use crate::zeroize::Zeroizing;
 
-#[cfg(host_clock)]
-use crate::clock::SystemClock;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
@@ -69,6 +67,10 @@ pub trait EnvelopeSource: MaybeSend {
 	/// - The link's read failure, such as a closed connection, a decode
 	///   failure, or a decrypt failure on an encrypted link.
 	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
+
+	/// Returns the limits this half reads under. A plane built over the half,
+	/// such as the mux, paces its keepalive against their operation timeout.
+	fn limits(&self) -> CheckedLimits;
 
 	/// Returns the number of envelopes that stay readable before the link
 	/// demands a rekey.
@@ -146,11 +148,8 @@ pub trait EnvelopeSink: MaybeSend {
 
 	/// Returns the clock that this half inherits from its connection. A plane
 	/// built over the half, such as the mux, adopts it, so one endpoint reads
-	/// one clock. The default returns the system clock.
-	#[cfg(host_clock)]
-	fn clock(&self) -> Arc<dyn Clock> {
-		Arc::new(SystemClock)
-	}
+	/// one clock.
+	fn clock(&self) -> Arc<dyn Clock>;
 }
 
 /// The base I/O operations of a message transport.
@@ -647,7 +646,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let now = self.clock().monotonic();
 		let round = self.session_state_mut().advance_handshake(request, now).await?;
-
 		match round {
 			Round::Reply(reply) => self.write_handshake(reply).await,
 			Round::Complete(session) => self.install_established(session),
@@ -658,18 +656,26 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Deadline
 	///
-	/// The handshake deadline binds by transport:
+	/// The endpoint answers how its round binds, through
+	/// [`ServerHandshakeSlot::handshake_timer`]:
 	///
-	/// - The async transport bounds the reads, the writes, and the hooks with the tokio timer.
-	/// - The blocking transport bounds each read by the deadline, and runs the hooks unbounded.
-	/// - An async build without `tokio` has no timer, so the application owns the deadline.
+	/// - The async transport runs the whole round within the handshake
+	///   deadline on its timer, and each write of the round within
+	///   `operation_timeout`.
+	/// - The blocking transport bounds each read by the deadline with its
+	///   socket timeouts, and runs a hook of the round unbounded.
+	/// - A clock whose [`Clock::timing`] is `Parks` runs the round of the async
+	///   transport unbounded, and one whose timing is `Absent` refuses a round
+	///   that waits.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::DeadlineExceeded`] -- the handshake timed out.
-	/// - The errors of [`ServerHandshakeSlot::within_budget`].
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the clock of the endpoint, and the round waits.
 	/// - The orchestrator build failure, and the errors of
 	///   [`drive_server_handshake`](Self::drive_server_handshake).
 	/// - The injected error, when the runtime fault model injects a fault at
@@ -685,13 +691,24 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.session_state_mut().occupy_handshake()?;
 
 		// A deadline that ends the handshake is its outcome, so the record of
-		// the outcome below files it.
+		// the outcome below files it. The round stamps its instants on the
+		// clock of `MessageIO`, so the policy reads the same clock.
 		let now = self.clock().monotonic();
 		let policy = self.session_state().phase().read_policy(self.limits(), now);
-		let outcome = match policy.remaining(now) {
-			Ok(Some(remaining)) => Self::within_budget(remaining, self.drive_server_handshake(request)).await,
-			Ok(None) => self.drive_server_handshake(request).await,
-			Err(expired) => Err(expired),
+		let outcome = match self.handshake_timer() {
+			Some(mut timer) => {
+				let bounded = {
+					let round = core::pin::pin!(self.drive_server_handshake(request));
+					policy.bound(&mut timer, now, round).await
+				};
+
+				self.keep_handshake_timer(timer);
+				bounded.and_then(core::convert::identity)
+			}
+			None => match policy.remaining(now) {
+				Ok(_) => self.drive_server_handshake(request).await,
+				Err(expired) => Err(expired),
+			},
 		};
 
 		#[cfg(feature = "instrument")]
@@ -941,6 +958,10 @@ mod tests {
 
 	#[cfg(feature = "instrument")]
 	use super::fixtures::records_of;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::clock::Timer;
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	use crate::testing::fixtures::TestClock;
 	#[cfg(feature = "instrument")]
 	use crate::testing::fixtures::TestTrace;
 
@@ -1000,7 +1021,10 @@ mod tests {
 	struct StreamProbe {
 		state: SessionState<DefaultCryptoProvider>,
 		limits: CheckedLimits,
-		clock: ManualClock,
+		clock: Arc<ManualClock>,
+		/// Whether the probe offers a timer for a whole server round, as the
+		/// async transport does.
+		bounds_rounds: bool,
 		inbound: Option<Vec<u8>>,
 		/// Every buffer the probe wrote, in order.
 		sent: Vec<Vec<u8>>,
@@ -1015,7 +1039,8 @@ mod tests {
 			Self {
 				state: SessionState::at(EncryptionConfig::provisioned(), phase),
 				limits: CheckedLimits::default(),
-				clock: ManualClock::default(),
+				clock: Arc::new(ManualClock::default()),
+				bounds_rounds: true,
 				inbound: None,
 				sent: Vec::new(),
 				#[cfg(feature = "instrument")]
@@ -1050,7 +1075,7 @@ mod tests {
 
 	impl MessageIO for StreamProbe {
 		fn clock(&self) -> &dyn Clock {
-			&self.clock
+			self.clock.as_ref()
 		}
 
 		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
@@ -1071,12 +1096,13 @@ mod tests {
 			self.state.handshake_slot()
 		}
 
-		async fn within_budget<T, F>(_budget: core::time::Duration, operation: F) -> TransportResult<T>
-		where
-			F: Future<Output = TransportResult<T>>,
-		{
-			operation.await
+		fn handshake_timer(&mut self) -> Option<Timer> {
+			let clock = Arc::clone(&self.clock) as Arc<dyn Clock>;
+			self.bounds_rounds.then(|| Timer::new(clock))
 		}
+
+		/// The probe makes a timer for each round, so it keeps none.
+		fn keep_handshake_timer(&mut self, _timer: Timer) {}
 	}
 
 	/// A server orchestrator that answers every request with `reply`, and
@@ -1131,6 +1157,63 @@ mod tests {
 		probe.handshake_slot().install(Box::new(server));
 
 		(probe, rounds)
+	}
+
+	/// A server orchestrator whose every round waits forever, as for a hook
+	/// that stalls.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	struct StalledServer;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	impl ServerHandshakeProtocol for StalledServer {
+		fn handle_request<'a>(
+			&'a mut self,
+			_msg: HandshakeMessage,
+		) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, HandshakeError>> {
+			Box::pin(core::future::pending())
+		}
+
+		fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, HandshakeError>> {
+			Box::pin(async { Err(HandshakeError::InvalidState) })
+		}
+
+		fn is_complete(&self) -> bool {
+			false
+		}
+
+		fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+			None
+		}
+	}
+
+	/// A round runs within the handshake deadline on the handshake clock, so a
+	/// round that stalls ends exactly at the deadline, and not before it.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_stalled_round_ends_at_the_handshake_deadline_on_its_clock() {
+		let mut probe = StreamProbe::at(SessionPhase::handshaking());
+		probe.handshake_slot().install(Box::new(StalledServer));
+		let clock = Arc::clone(&probe.clock);
+		let deadline = probe.limits.handshake_timeout;
+
+		let round = probe.perform_server_handshake(handshake_round());
+		assert_eq!(TestClock::deadline_of(&clock, deadline, round), (true, true, true));
+	}
+
+	/// An endpoint that offers no timer for the round, as the blocking
+	/// transport does, runs a stalled round past the handshake deadline.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	#[test]
+	fn a_round_with_no_timer_runs_past_the_handshake_deadline() {
+		let mut probe = StreamProbe::at(SessionPhase::handshaking());
+		probe.bounds_rounds = false;
+		probe.handshake_slot().install(Box::new(StalledServer));
+
+		let clock = Arc::clone(&probe.clock);
+		let deadline = probe.limits.handshake_timeout;
+
+		let round = probe.perform_server_handshake(handshake_round());
+		assert_eq!(TestClock::deadline_of(&clock, deadline, round), (true, true, false));
 	}
 
 	impl crate::transport::state::sealed::Sealed for StreamProbe {}

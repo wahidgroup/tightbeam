@@ -3,6 +3,7 @@
 mod cluster;
 mod hive;
 mod laser;
+mod laser_keepalive;
 mod laser_protocol;
 mod peer_list;
 mod servlet;

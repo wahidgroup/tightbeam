@@ -19,7 +19,8 @@
 
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::WireHopBudget;
-use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
+use crate::colony::protocol::{ClusterRequest, ReplyForm};
+use crate::colony::work::{ClusterWorkRequest, ClusterWorkResponse};
 use crate::policy::{SessionContext, TransitStatus};
 use crate::Frame;
 use crate::TightBeamError;

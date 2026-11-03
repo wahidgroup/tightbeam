@@ -2,9 +2,11 @@
 //! envelope on the wire in each wire mode and in the handshake, and the
 //! deadline of one operation and of the whole handshake.
 
+use core::future::Future;
 use core::ops::Deref;
 use core::time::Duration;
 
+use crate::clock::Clock;
 use crate::constants::{
 	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
 	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT,
@@ -13,6 +15,8 @@ use crate::transport::envelopes::{WireEnvelope, WireMode};
 use crate::transport::error::{LimitsRefusal, TransportError};
 use crate::transport::TransportResult;
 
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+use crate::clock::Timer;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::der::Encode;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -36,12 +40,19 @@ pub struct TransportLimits {
 	pub handshake_wire: usize,
 	/// The deadline of a dial, and of a single read or write on the transport.
 	///
-	/// The blocking transport arms it on its stream, and the async transport
-	/// arms it under `tokio`. An async build without `tokio` has no timer, so
-	/// the application owns the deadline there.
+	/// The blocking transport arms it on its stream. The async transport runs
+	/// each write and dial within it, and each read outside a handshake, on
+	/// the clock of the endpoint, as
+	/// [`Clock::timing`](crate::clock::Clock::timing) allows. A clock that
+	/// parks runs these waits unbounded, so the application owns their
+	/// deadlines, and a clock with no timer on the polling thread refuses a
+	/// wait.
 	pub operation_timeout: Duration,
-	/// The deadline of the whole handshake exchange. It binds as
-	/// [`Self::operation_timeout`] does.
+	/// The deadline of the whole handshake exchange.
+	///
+	/// A read while a handshake is pending ends at it, and the async
+	/// transport also runs the whole server round within it. It binds on each
+	/// host as [`Self::operation_timeout`] does.
 	pub handshake_timeout: Duration,
 }
 
@@ -169,6 +180,47 @@ impl Default for TransportLimits {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckedLimits(TransportLimits);
+
+impl CheckedLimits {
+	/// These limits under `timeout`.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidLimits`] -- `timeout` is zero.
+	pub(crate) fn with_operation_timeout(self, timeout: Duration) -> TransportResult<Self> {
+		TransportLimits { operation_timeout: timeout, ..self.0 }.checked()
+	}
+
+	/// Run `work` within the operation timeout of these limits, on `timer`,
+	/// which keeps one sleep across the waits of its party where its clock
+	/// offers `Clock::resetting_sleep`. With [`Self::bound_on`], it is the one
+	/// rule for a dial, a write of the wire, and an emit cycle.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with `DeadlineExceeded` -- the
+	///   timeout passed before `work` ended.
+	/// - [`TransportError::OperationFailed`] with `FailedPrecondition` -- the
+	///   polling thread has no timer for the clock of `timer`, and `work`
+	///   waits.
+	#[cfg(any(feature = "tokio", feature = "async-transport"))]
+	pub(crate) async fn bound<F: Future + Unpin>(&self, timer: &mut Timer, work: F) -> TransportResult<F::Output> {
+		Ok(timer.within(self.operation_timeout, work).await?)
+	}
+
+	/// Run `work` within the operation timeout of these limits on `clock`, for
+	/// a wait that runs once, such as a dial.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with `DeadlineExceeded` -- the
+	///   timeout passed before `work` ended.
+	/// - [`TransportError::OperationFailed`] with `FailedPrecondition` -- the
+	///   polling thread has no timer for `clock`, and `work` waits.
+	pub(crate) async fn bound_on<F: Future + Unpin>(&self, clock: &dyn Clock, work: F) -> TransportResult<F::Output> {
+		Ok(clock.within(self.operation_timeout, work).await?)
+	}
+}
 
 /// The default limits, whose ceilings agree.
 impl Default for CheckedLimits {

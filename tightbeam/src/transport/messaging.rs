@@ -628,7 +628,7 @@ impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
 #[cfg(all(test, feature = "instrument", feature = "testing"))]
 mod tests {
 	use super::*;
-	use crate::clock::{Clock, ManualClock, MonotonicInstant, UnixMillis};
+	use crate::clock::{Clock, ManualClock, MonotonicInstant, Timing, UnixMillis};
 	use crate::instrumentation::{events, TbEvent};
 	use crate::marker::MaybeSendFuture;
 	use crate::policy::GateChain;
@@ -673,6 +673,10 @@ mod tests {
 		fn sleep(&self, span: core::time::Duration) -> MaybeSendFuture<'_, ()> {
 			self.sleeps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(span);
 			Box::pin(core::future::ready(()))
+		}
+
+		fn timing(&self) -> Timing {
+			Timing::Races
 		}
 	}
 

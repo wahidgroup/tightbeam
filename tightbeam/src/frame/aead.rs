@@ -18,6 +18,8 @@ use crate::crypto::key::EncryptingKeyProvider;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::profiles::CryptoProvider;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+use crate::frame::InstallStep;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::oids::DATA;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::version::GatedField;
@@ -135,7 +137,8 @@ impl Frame {
 			Some(inflator) => {
 				let mut compressed = Zeroizing::new(self.message.clone());
 				decryptor.decrypt_content(sealed, &mut compressed).await?;
-				self.message = self.metadata.inflate(inflator, &compressed)?;
+				let inflated = self.metadata.inflate(inflator, &compressed)?;
+				self.replace_body(inflated);
 			}
 			// The body opens in the buffer it arrived in, and a refused open
 			// leaves that buffer unchanged (`Decryptor::open`).
@@ -162,7 +165,7 @@ impl Frame {
 	/// # Errors
 	///
 	/// - [`TightBeamError::UnsupportedField`] -- the frame version predates confidentiality.
-	/// - [`TightBeamError::CoveredBeforeSeal`] -- the frame carries an FI digest or a signature.
+	/// - [`TightBeamError::InstallOutOfOrder`] -- the frame holds an envelope, an FI digest, or a signature.
 	/// - [`TightBeamError::EnvelopeError`] -- the provider or the envelope refuses to seal.
 	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 	pub async fn encrypt_with_provider<P>(&mut self, provider: &(impl EncryptingKeyProvider + ?Sized)) -> Result<()>
@@ -170,7 +173,7 @@ impl Frame {
 		P: CryptoProvider<AeadCipher: ContentEncryption>,
 	{
 		self.ensure_allows(GatedField::Confidentiality)?;
-		self.ensure_uncovered()?;
+		self.ensure_ahead(InstallStep::Confidentiality)?;
 
 		// Each step of the seal that can fail runs before the body encrypts in
 		// place, so a refused seal leaves the frame unchanged. The DER length
@@ -797,9 +800,17 @@ mod tests {
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::frame::InstallStep;
 		use crate::runtime::rt;
 		use crate::testing::TestIdentity;
 		use crate::Version;
+
+		#[cfg(feature = "zstd")]
+		use crate::builder::TypeBuilder;
+		#[cfg(feature = "zstd")]
+		use crate::compress::ZstdCompression;
+		#[cfg(feature = "zstd")]
+		use crate::Opaque;
 
 		/// Returns a sealed frame that carries an FI digest and a signature,
 		/// both over the frame as it was sealed. The frame of
@@ -844,24 +855,52 @@ mod tests {
 			Ok(())
 		}
 
+		/// The step and the furthest step that `sealed` refused with.
+		fn refused_steps(sealed: Result<()>) -> Option<(InstallStep, InstallStep)> {
+			match sealed {
+				Err(TightBeamError::InstallOutOfOrder { step, furthest }) => Some((step, furthest)),
+				_ => None,
+			}
+		}
+
 		// A signature covers the frame, and an FI digest its metadata, as each
-		// is before the seal, so the seal refuses a frame that carries either
-		// and leaves it unchanged.
+		// is before the seal, so the seal refuses a frame that carries either.
+		// A second seal would lose the first envelope, so the seal refuses that
+		// too. Each refusal leaves the frame unchanged.
 		crate::tb_cases! {
-			fn the_seal_refuses_a_frame_that_carries(arrived: Frame) {
+			fn the_seal_refuses_a_frame_that_carries((arrived, held): (Frame, InstallStep)) {
 				let (_, cipher) = TestKey::insecure_fixed_cipher();
 				let mut frame = arrived.clone();
 
 				let sealed = rt::block_on(frame.encrypt_with_provider::<DefaultCryptoProvider>(&cipher));
-				assert!(matches!(sealed, Err(TightBeamError::CoveredBeforeSeal)));
+				assert_eq!(refused_steps(sealed), Some((InstallStep::Confidentiality, held)));
 				assert_eq!(frame, arrived);
 			}
 			cases {
-				a_signature => {
-					TestFrame::signed_by(TestFrame::v1(None, Some("seal-signed")), &TestIdentity::insecure_fixed())
-				},
-				a_digest => TestFrame::with_integrity(),
+				a_signature => (
+					TestFrame::signed_by(TestFrame::v1(None, Some("seal-signed")), &TestIdentity::insecure_fixed()),
+					InstallStep::Signature,
+				),
+				a_digest => (TestFrame::with_integrity(), InstallStep::FrameIntegrity),
+				an_envelope => (TestFrame::sealed("seal-sealed"), InstallStep::Confidentiality),
 			}
+		}
+
+		/// The seal follows the commitment and the compression, so a frame that
+		/// holds them takes it.
+		#[cfg(feature = "zstd")]
+		#[tokio::test]
+		async fn the_seal_takes_a_frame_that_holds_the_earlier_steps() -> TestResult {
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let body = Opaque::new(*b"sealed last")?;
+			let composed = Version::V1.compose::<Opaque>().with_id(b"id").with_order(7).with_message(body);
+			let hashed = composed.with_message_hasher::<Sha3_256>([0x5A; 16]);
+			let mut frame = hashed.with_compression(ZstdCompression::default()).build()?;
+
+			frame.encrypt_with_provider::<DefaultCryptoProvider>(&cipher).await?;
+
+			assert!(frame.metadata().confidentiality().is_some());
+			Ok(())
 		}
 
 		/// The open returns the FI digest it took out.

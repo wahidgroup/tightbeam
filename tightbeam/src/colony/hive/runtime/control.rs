@@ -8,7 +8,6 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use futures::future::{select, Either};
 use tokio::sync::Notify;
 
 use crate::clock::{Clock, MonotonicInstant};
@@ -29,7 +28,7 @@ use crate::transport::accept::{AcceptPlane, ConnectionTerms};
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{AsyncListenerTrait, Protocol, TransportError, TransportFailure};
+use crate::transport::{AsyncListenerTrait, Protocol, TransportError};
 use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
 
@@ -83,21 +82,23 @@ impl<'a> DrainDeadline<'a> {
 		self.timeout.saturating_sub(spent)
 	}
 
-	/// Runs `work` until it ends or the deadline passes. Past the deadline,
-	/// `work` drops unfinished.
+	/// Runs `work` until it ends or the deadline passes, by `within` on the
+	/// hive clock. Past the deadline, `work` drops unfinished.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::DeadlineExceeded`] -- the deadline passed first.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the hive clock, and `work` waits.
+	///
+	/// [`TransportFailure::DeadlineExceeded`]: crate::transport::TransportFailure::DeadlineExceeded
+	/// [`TransportFailure::FailedPrecondition`]: crate::transport::TransportFailure::FailedPrecondition
 	pub async fn within<F: Future>(&self, work: F) -> Result<F::Output, TransportError> {
 		let work = pin!(work);
-		let expired = self.clock.sleep(self.remaining());
 
-		match select(work, expired).await {
-			Either::Left((output, _)) => Ok(output),
-			Either::Right(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
-		}
+		Ok(self.clock.within(self.remaining(), work).await?)
 	}
 }
 
@@ -135,9 +136,9 @@ impl InFlight {
 	pub async fn settle(&self, deadline: &DrainDeadline<'_>) -> Settled {
 		match deadline.within(self.idle()).await {
 			Ok(()) => Settled::Idle,
-			// The expiry is the whole outcome of this wait, so the error adds
-			// nothing to it.
-			Err(_expired) => Settled::TimedOut,
+			// The wait ends without the hive at idle either way, so the reason
+			// adds nothing to the outcome.
+			Err(_lapsed) => Settled::TimedOut,
 		}
 	}
 }
@@ -449,7 +450,7 @@ impl<P: Protocol, R: ServletRegistry> HiveControlCtx<P, R> {
 #[cfg(test)]
 mod tests {
 	use core::future::{poll_fn, Future};
-	use core::pin::Pin;
+	use core::pin::{pin, Pin};
 	use core::task::Poll;
 
 	use super::*;

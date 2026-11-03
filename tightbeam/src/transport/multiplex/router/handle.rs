@@ -2,6 +2,8 @@
 //! and owns the drop guards that reclaim abandoned in-flight work.
 
 use core::future::Future;
+use core::pin::pin;
+use core::time::Duration;
 use std::sync::Arc;
 
 use futures::channel::oneshot;
@@ -12,22 +14,26 @@ use super::link::MuxLink;
 use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutcome, StreamReservation};
 use super::sink::RequestSink;
-use crate::constants::DEFAULT_HOP_BUDGET;
+use crate::clock::{Clock, Lapse, Timer, Timing};
+use crate::constants::{DEFAULT_HOP_BUDGET, KEEPALIVE_PROBES_PER_DEADLINE};
 use crate::der::Encode;
 use crate::marker::MaybeSend;
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
-use crate::transport::{TransportError, TransportResult};
+use crate::transport::GateAudit;
+use crate::transport::{EnvelopeSink, EnvelopeSource, TransportError, TransportResult};
 use crate::urn::Urn;
 use crate::Frame;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::receipt::StoredReceipt;
-
+#[cfg(test)]
+use crate::clock::SystemClock;
+#[cfg(test)]
+use crate::constants::DEFAULT_OPERATION_TIMEOUT;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-use crate::transport::GateAudit;
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::receipt::StoredReceipt;
 
 /// Cancels the stream if the owning emit future is dropped before its response
 /// arrives. The cancel frees the cap slot and notifies the peer, best-effort
@@ -110,6 +116,46 @@ impl Drop for ForgetPingOnDrop {
 #[derive(Clone)]
 pub struct MuxHandle {
 	link: MuxLink,
+	pulse: Pulse,
+}
+
+/// The pace of a connection's keepalive: the clock of its link, and a share of
+/// the link's read deadline.
+#[derive(Clone)]
+pub(crate) struct Pulse {
+	clock: Arc<dyn Clock>,
+	interval: Duration,
+}
+
+impl Pulse {
+	/// The pace of the link that `source` reads and `sink` writes.
+	///
+	/// A deadline of fewer nanoseconds than [`KEEPALIVE_PROBES_PER_DEADLINE`]
+	/// has no whole share, so its pace is the whole deadline, which
+	/// [`CheckedLimits`] keeps above zero.
+	///
+	/// [`CheckedLimits`]: crate::transport::CheckedLimits
+	pub(crate) fn of(source: &impl EnvelopeSource, sink: &impl EnvelopeSink) -> Self {
+		let deadline = source.limits().operation_timeout;
+		let third = deadline.checked_div(KEEPALIVE_PROBES_PER_DEADLINE);
+		let interval = third.filter(|third| !third.is_zero()).unwrap_or(deadline);
+
+		Self { clock: sink.clock(), interval }
+	}
+
+	/// A timer on the clock of this pace where the clock races a wait on the
+	/// polling thread ([`Timing::Races`]), and `None` on a clock that cannot
+	/// race a probe.
+	fn racing_timer(&self) -> Option<Timer> {
+		let races = self.clock.timing() == Timing::Races;
+		races.then(|| Timer::new(Arc::clone(&self.clock)))
+	}
+
+	/// A pace on the system clock, for a fixture with no link under it.
+	#[cfg(test)]
+	pub(crate) fn fixture() -> Self {
+		Self { clock: Arc::new(SystemClock), interval: DEFAULT_OPERATION_TIMEOUT }
+	}
 }
 
 // The handle is the audit source for gate verdicts on the mux plane. The
@@ -124,8 +170,8 @@ impl GateAudit for MuxHandle {
 
 impl MuxHandle {
 	/// Assemble a handle over the connection's shared state and queues.
-	pub(crate) fn new(link: MuxLink) -> Self {
-		Self { link }
+	pub(crate) fn new(link: MuxLink, pulse: Pulse) -> Self {
+		Self { link, pulse }
 	}
 
 	/// Send a request on a freshly allocated stream and await its response.
@@ -461,6 +507,78 @@ impl MuxHandle {
 		Ok(())
 	}
 
+	/// Ping the peer once per interval so an idle link stays inside the read
+	/// deadline of both ends. The future runs until a [`ping`](Self::ping)
+	/// fails, and resolves to the error of that ping, or at once to
+	/// `FailedPrecondition` on a clock that cannot race a probe.
+	///
+	/// Run it on a task of its own, on a clone of the handle.
+	///
+	/// # Timing
+	///
+	/// [`KEEPALIVE_PROBES_PER_DEADLINE`] intervals fill one [`operation_timeout`]
+	/// of the read half, timed on the clock of the write half.
+	///
+	/// - The future sends the first probe at once, and each later probe one interval after the one before it.
+	/// - A probe waits at most one interval for its ack. At the next tick the
+	///   future forgets an unanswered probe and sends the next one.
+	/// - Each probe counts as a read on the peer, and each ack as a read on
+	///   this end. One end that runs this therefore keeps both ends alive while
+	///   the interval is shorter than the read deadline of the peer.
+	/// - This end stays inside its read deadline through one lost ack in a row,
+	///   when the future starts under one interval after the last read and each
+	///   ack that arrives takes under one interval.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::Draining`] -- a probe met a GoAway that went out or came in.
+	/// - [`TransportError::ConnectionClosed`] -- the link closed before a probe
+	///   or while a probe waited for its ack, as when a drain ends.
+	/// - The injected error, when the runtime fault model injects a fault at
+	///   the drain event of a refused probe.
+	/// - [`TransportError::OperationFailed`] with `FailedPrecondition` -- the
+	///   clock of the link cannot race a probe on the polling thread
+	///   ([`Clock::timing`]). The house clock races on a thread that runs a
+	///   tokio runtime with its time driver.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # #[cfg(feature = "tokio")]
+	/// # {
+	/// use tightbeam::transport::multiplex::MuxHandle;
+	/// use tightbeam::transport::TransportError;
+	///
+	/// /// Keep the link of `handle` alive on a task of its own.
+	/// fn keep_alive_on_a_task(handle: &MuxHandle) -> tokio::task::JoinHandle<TransportError> {
+	///     tokio::spawn(handle.clone().keep_alive())
+	/// }
+	/// # }
+	/// ```
+	///
+	/// [`operation_timeout`]: crate::transport::TransportLimits::operation_timeout
+	#[must_use]
+	pub async fn keep_alive(self) -> TransportError {
+		let Some(mut timer) = self.pulse.racing_timer() else {
+			return TransportError::OperationFailed(TransportFailure::FailedPrecondition);
+		};
+
+		let Pulse { clock, interval } = &self.pulse;
+		loop {
+			let sent = clock.monotonic();
+
+			match timer.within(*interval, pin!(self.ping())).await {
+				Ok(Err(refusal)) => return refusal,
+				Ok(Ok(())) => {}
+				Err(Lapse::Passed) => continue,
+				Err(lapse @ Lapse::NoTimer) => return lapse.into(),
+			}
+
+			let waited = clock.monotonic().saturating_duration_since(sent);
+			timer.sleep(interval.saturating_sub(waited)).await;
+		}
+	}
+
 	/// Gracefully shut the connection down ([RFC 9113 § 6.8][rfc9113-6.8]). The
 	/// call sends GoAway, halts the allocator, awaits the pending-table drain,
 	/// then closes the writer driver.
@@ -536,7 +654,7 @@ mod tests {
 	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>, mpsc::Receiver<DrainNote>) {
 		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
 		let (link, sent, notes) = MuxLink::over(shared, 8);
-		(MuxHandle { link }, sent, notes)
+		(MuxHandle { link, pulse: Pulse::fixture() }, sent, notes)
 	}
 
 	/// Receives the peer's GoAway above stream 0 on `shared`, whose trace
@@ -544,6 +662,199 @@ mod tests {
 	fn receive_goaway(shared: &MuxShared) {
 		let received = shared.fail_pending_above(0, GoAwayReason::Shutdown);
 		received.expect("a state with no fault model records the GoAway");
+	}
+
+	mod keepalive {
+		use core::future::pending;
+
+		use super::super::super::fixtures::{drained, poll_times};
+		use super::*;
+		use crate::clock::{BlockingClock, ManualClock};
+		use crate::transport::{CheckedLimits, TransportLimits};
+
+		/// The opaque of the first ping a fresh link sends.
+		const FIRST_PROBE: u64 = 0;
+
+		/// Both halves of a link that reads `clock` under `limits`. A read on
+		/// it waits forever.
+		struct PacedHalves {
+			clock: Arc<ManualClock>,
+			limits: CheckedLimits,
+		}
+
+		impl PacedHalves {
+			/// Both halves on `clock`, whose operation timeout is `deadline`.
+			fn under(clock: &Arc<ManualClock>, deadline: Duration) -> Self {
+				let limits = TransportLimits { operation_timeout: deadline, ..TransportLimits::default() };
+				let limits = limits.checked().expect("a deadline above zero agrees with the defaults");
+
+				Self { clock: Arc::clone(clock), limits }
+			}
+		}
+
+		impl EnvelopeSource for PacedHalves {
+			async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+				pending().await
+			}
+
+			fn limits(&self) -> CheckedLimits {
+				self.limits
+			}
+		}
+
+		impl EnvelopeSink for PacedHalves {
+			async fn write_envelope(&mut self, _envelope: TransportEnvelope) -> TransportResult<()> {
+				Ok(())
+			}
+
+			fn remaining_records(&self) -> u64 {
+				u64::MAX
+			}
+
+			fn clock(&self) -> Arc<dyn Clock> {
+				Arc::clone(&self.clock) as Arc<dyn Clock>
+			}
+		}
+
+		/// A client handle paced by a link on `clock` with a nine-second
+		/// deadline, beside the receiver of its outbound queue.
+		fn paced_handle(clock: &Arc<ManualClock>) -> (MuxHandle, mpsc::Receiver<Outbound>) {
+			let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
+
+			let (link, sent, _notes) = MuxLink::over(shared, 8);
+			let halves = PacedHalves::under(clock, Duration::from_secs(9));
+			(MuxHandle::new(link, Pulse::of(&halves, &halves)), sent)
+		}
+
+		/// A deadline of fewer nanoseconds than the probes per deadline has no
+		/// whole share, so the pace keeps the whole deadline in place of a zero
+		/// pace.
+		#[test]
+		fn a_deadline_with_no_whole_third_paces_at_the_whole_deadline() {
+			let halves = PacedHalves::under(&Arc::new(ManualClock::default()), Duration::from_nanos(2));
+			let pulse = Pulse::of(&halves, &halves);
+			assert_eq!(pulse.interval, Duration::from_nanos(2));
+		}
+
+		#[test]
+		fn a_keepalive_paces_its_probes_at_a_third_of_the_read_deadline() {
+			let clock = Arc::new(ManualClock::default());
+			let (handle, mut sent) = paced_handle(&clock);
+			let mut keepalive = Box::pin(handle.keep_alive());
+
+			poll_times(&mut keepalive, 2);
+			assert_eq!(drained(&mut sent).len(), 1);
+
+			clock.advance(Duration::from_millis(2_999));
+			poll_times(&mut keepalive, 1);
+			assert!(drained(&mut sent).is_empty());
+
+			clock.advance(Duration::from_millis(1));
+			poll_times(&mut keepalive, 2);
+			assert_eq!(drained(&mut sent).len(), 1);
+		}
+
+		/// A peer past its ack cap drops the ack, so the probe gives way to the
+		/// next one at the next tick.
+		#[test]
+		fn a_keepalive_probes_again_after_an_unanswered_probe() {
+			let clock = Arc::new(ManualClock::default());
+			let (handle, mut sent) = paced_handle(&clock);
+			let mut keepalive = Box::pin(handle.keep_alive());
+
+			poll_times(&mut keepalive, 2);
+			assert_eq!(drained(&mut sent).len(), 1);
+
+			clock.advance(Duration::from_secs(3));
+			poll_times(&mut keepalive, 2);
+			assert_eq!(drained(&mut sent).len(), 1);
+		}
+
+		/// `ForgetPingOnDrop` is the one bound on the pending pings of a peer
+		/// that never acks, so a replaced probe leaves the table.
+		#[test]
+		fn a_replaced_probe_leaves_the_pending_table() {
+			let clock = Arc::new(ManualClock::default());
+			let (handle, _sent) = paced_handle(&clock);
+			let mut keepalive = Box::pin(handle.clone().keep_alive());
+
+			poll_times(&mut keepalive, 2);
+			clock.advance(Duration::from_secs(3));
+			poll_times(&mut keepalive, 2);
+
+			assert!(!handle.link.shared().takes_ping(FIRST_PROBE));
+		}
+
+		/// An ack ends the wait of its probe alone, so the next probe leaves at
+		/// the next tick.
+		#[test]
+		fn a_keepalive_holds_its_pace_after_an_ack() {
+			let clock = Arc::new(ManualClock::default());
+			let (handle, mut sent) = paced_handle(&clock);
+			let mut keepalive = Box::pin(handle.clone().keep_alive());
+
+			poll_times(&mut keepalive, 2);
+			clock.advance(Duration::from_secs(1));
+			handle.link.shared().resolve_ping(FIRST_PROBE);
+			poll_times(&mut keepalive, 2);
+			assert_eq!(drained(&mut sent).len(), 1);
+
+			clock.advance(Duration::from_secs(2));
+			poll_times(&mut keepalive, 2);
+			assert_eq!(drained(&mut sent).len(), 1);
+		}
+
+		#[test]
+		fn a_keepalive_ends_with_its_connection() {
+			let clock = Arc::new(ManualClock::default());
+			let (handle, _sent) = paced_handle(&clock);
+			let mut keepalive = Box::pin(handle.clone().keep_alive());
+
+			poll_times(&mut keepalive, 1);
+			handle.link.shared().fail_all_pending();
+			clock.advance(Duration::from_secs(3));
+
+			let ended = poll_now(&mut keepalive);
+			assert!(matches!(ended, Poll::Ready(TransportError::ConnectionClosed)));
+		}
+
+		/// A GoAway refuses the next probe, so the keepalive ends with the
+		/// drain.
+		#[test]
+		fn a_keepalive_ends_at_a_goaway() {
+			let clock = Arc::new(ManualClock::default());
+			let (handle, _sent) = paced_handle(&clock);
+			let mut keepalive = Box::pin(handle.clone().keep_alive());
+
+			poll_times(&mut keepalive, 1);
+			receive_goaway(handle.link.shared());
+			clock.advance(Duration::from_secs(3));
+
+			assert!(matches!(poll_now(&mut keepalive), Poll::Ready(TransportError::Draining)));
+		}
+
+		// A clock that cannot race a probe on the polling thread makes the
+		// keepalive refuse at once, before its first probe: the system clock
+		// on a thread outside any tokio runtime, and a clock that parks.
+		crate::tb_cases! {
+			fn a_keepalive_with_no_timer_refuses_before_its_first_probe(clock: Arc<dyn Clock>) {
+				let (mut handle, mut sent, _notes) = duplex_handle();
+				handle.pulse = Pulse { clock, interval: DEFAULT_OPERATION_TIMEOUT };
+				let mut keepalive = Box::pin(handle.keep_alive());
+
+				let ended = poll_now(&mut keepalive);
+				let refused = matches!(
+					ended,
+					Poll::Ready(TransportError::OperationFailed(TransportFailure::FailedPrecondition))
+				);
+				assert!(refused);
+				assert!(drained(&mut sent).is_empty());
+			}
+			cases {
+				system_clock_outside_a_runtime => Arc::new(SystemClock),
+				clock_that_parks => Arc::new(BlockingClock::default()),
+			}
+		}
 	}
 
 	/// Abandoning a duplex reply after the sink closed must reclaim the

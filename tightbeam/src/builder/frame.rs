@@ -45,6 +45,8 @@ use crate::crypto::sign::{
 use crate::der::oid::AssociatedOid;
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::error::ReceivedExpectedError;
+#[cfg(all(feature = "compress", feature = "zeroize"))]
+use crate::zeroize::Zeroizing;
 
 #[cfg(feature = "aead")]
 type EncryptorFn = Box<dyn FnOnce(Vec<u8>) -> Result<AuthEnvelopedData>>;
@@ -521,6 +523,8 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 	/// - [`TightBeamError::BuildError`] -- the metadata has no id or no order.
 	/// - [`TightBeamError::UnsupportedField`] -- a metadata field, the FI
 	///   digest, or the signature is gated above the version (§5.6).
+	/// - [`TightBeamError::InvalidMetadata`] -- the compressor describes its
+	///   output at a version other than 0, or with an `eContent`.
 	/// - The error of the configured signer, when the signature fails.
 	/// - [`TightBeamError::Requirement`] -- the built frame fails a
 	///   requirement of the message type, such as a key wrap outside its
@@ -663,7 +667,11 @@ impl<T: Message> FrameBuilder<T> {
 		// 2. Compress the bytes when a compressor is set.
 		#[cfg(feature = "compress")]
 		let bytes = if let Some(compressor) = compressor {
+			// The plain encoding wipes once its compressed copy replaces it.
+			#[cfg(feature = "zeroize")]
+			let bytes = Zeroizing::new(bytes);
 			let (compressed, compression_info) = compressor.compress(&bytes, None)?;
+
 			metadata_builder = metadata_builder.with_compactness_info(compression_info);
 			compressed
 		} else {
@@ -681,6 +689,7 @@ impl<T: Message> FrameBuilder<T> {
 				.encrypted_content
 				.take()
 				.ok_or(TightBeamError::MissingEncryptionInfo)?;
+
 			metadata_builder = metadata_builder.with_confidentiality_info(WireDer::new(envelope)?);
 			encrypted_bytes.into_bytes()
 		} else {
@@ -745,9 +754,15 @@ mod tests {
 	use crate::Beamable;
 
 	#[cfg(feature = "zstd")]
+	use crate::asn1::{CompressedData, EncapsulatedContentInfo};
+	#[cfg(feature = "zstd")]
+	use crate::cms::content_info::CmsVersion;
+	#[cfg(feature = "zstd")]
 	use crate::compress::ZstdCompression;
 	#[cfg(feature = "sha3")]
 	use crate::crypto::hash::Sha3_256;
+	#[cfg(feature = "zstd")]
+	use crate::error::CompressionResult;
 
 	use super::*;
 
@@ -756,6 +771,32 @@ mod tests {
 	fn sample_builder(version: Version) -> FrameBuilder<TestMessage> {
 		let builder = FrameBuilder::<TestMessage>::from(version).with_message(TestMessage::sample(None));
 		builder.with_id("sample").with_order(TestFrame::ORDER)
+	}
+
+	/// A compressor of a caller's own that describes its output at CMS version
+	/// 1, a form no frame carries.
+	#[cfg(feature = "zstd")]
+	struct VersionOneCompression;
+
+	#[cfg(feature = "zstd")]
+	impl Compressor for VersionOneCompression {
+		fn compress(
+			&self,
+			data: &[u8],
+			content_info: Option<EncapsulatedContentInfo>,
+		) -> CompressionResult<(Vec<u8>, CompressedData)> {
+			let (compressed, description) = ZstdCompression::default().compress(data, content_info)?;
+			Ok((compressed, CompressedData { version: CmsVersion::V1, ..description }))
+		}
+	}
+
+	/// Every receiver refuses the description, so the build refuses it at the
+	/// sender.
+	#[cfg(feature = "zstd")]
+	#[test]
+	fn a_build_refuses_a_description_no_frame_carries() {
+		let built = sample_builder(Version::V0).with_compression(VersionOneCompression).build();
+		assert!(matches!(built, Err(TightBeamError::InvalidMetadata)));
 	}
 
 	/// A frame built without an order takes the [`UnixMillis::now`] reading in
@@ -1034,7 +1075,6 @@ mod tests {
 		crate::tb_cases! {
 			fn the_builders_rng_draws_the_seal(builder: FrameBuilder<TestMessage>) -> TestResult {
 				let frame = builder.build()?;
-
 				assert_eq!(sealed_nonce(&frame), [0x02; 12]);
 				Ok(())
 			}

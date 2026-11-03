@@ -15,10 +15,8 @@ mod tokio_rt {
 	pub use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 	pub use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 	pub use tokio::net::{TcpListener, TcpStream};
-	pub use tokio::time::timeout;
 
 	pub use crate::crypto::profiles::DefaultCryptoProvider;
-	pub use crate::transport::error::TransportFailure;
 	pub use crate::transport::protocols::PersistentConnection;
 	pub use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
 	pub use crate::transport::tcp::TightBeamSocketAddr;
@@ -30,6 +28,7 @@ mod tokio_rt {
 #[cfg(feature = "tokio")]
 use tokio_rt::*;
 
+use super::deadlined::{Deadlined, DeadlinedRead, DeadlinedWrite};
 use crate::clock::Clock;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::profiles::CryptoProvider;
@@ -56,8 +55,8 @@ use crate::Frame;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 mod handshake_imports {
 	pub use core::future::Future;
-	pub use core::time::Duration;
 
+	pub use crate::clock::Timer;
 	pub use crate::transport::state::{HandshakeSlot, ServerHandshakeSlot};
 }
 
@@ -332,7 +331,7 @@ where
 {
 	/// Reports whether the underlying stream appears connected.
 	pub fn is_alive(&self) -> bool {
-		AsyncProtocolStream::is_alive(&self.stream)
+		self.stream.is_alive()
 	}
 
 	/// Whether a pool may lease this transport again: its stream is alive, its
@@ -616,7 +615,7 @@ pub struct TransportReader<R>
 where
 	R: AsyncReadStream,
 {
-	stream: R,
+	stream: DeadlinedRead<R>,
 	mode: SplitRecv,
 	limits: CheckedLimits,
 	/// The connection clock carried across the split, which the read deadline
@@ -663,15 +662,7 @@ where
 		let now = self.clock.monotonic();
 		let policy = ReadPolicy::established(cap, &self.limits, now);
 
-		#[cfg(all(feature = "tokio", feature = "std"))]
-		let wire_bytes = match policy.remaining(now)? {
-			Some(budget) => timeout(budget, self.stream.read_frame(policy.cap())).await??,
-			None => self.stream.read_frame(policy.cap()).await?,
-		};
-		#[cfg(not(all(feature = "tokio", feature = "std")))]
-		let wire_bytes = self.stream.read_frame(policy.cap()).await?;
-
-		Ok(wire_bytes)
+		self.stream.read(&policy, now).await
 	}
 
 	/// Reads one envelope in the wire mode this half took from the split,
@@ -721,6 +712,11 @@ where
 		Ok(read?)
 	}
 
+	/// Returns the limits this half took from the split.
+	fn limits(&self) -> CheckedLimits {
+		self.limits
+	}
+
 	/// Returns the number of records that the half can read before the receive
 	/// cipher demands a rekey. A cleartext half never demands one, so it
 	/// reports `u64::MAX`.
@@ -764,7 +760,7 @@ pub struct TransportWriter<W>
 where
 	W: AsyncWriteStream,
 {
-	stream: W,
+	stream: DeadlinedWrite<W>,
 	mode: SplitSend,
 	/// Every ceiling carried across the split, as on the unsplit path. A peer
 	/// that never drains its receive buffer cannot pin the writer task forever
@@ -772,7 +768,6 @@ where
 	limits: CheckedLimits,
 	/// The connection clock carried across the split. See
 	/// [`EnvelopeSink::clock`].
-	#[cfg(host_clock)]
 	clock: Arc<dyn Clock>,
 	/// The connection collector carried across the split. See
 	/// [`EnvelopeSink::trace`].
@@ -825,13 +820,7 @@ where
 		let wire_envelope = sealed?;
 		let wire_bytes = wire_envelope.to_der()?;
 
-		#[cfg(all(feature = "tokio", feature = "std"))]
-		timeout(self.limits.operation_timeout, self.stream.write_frame(&wire_bytes)).await??;
-
-		#[cfg(not(all(feature = "tokio", feature = "std")))]
-		self.stream.write_frame(&wire_bytes).await?;
-
-		Ok(())
+		self.stream.write(&self.limits, &wire_bytes).await
 	}
 
 	/// Returns the number of records that the half can write before the send
@@ -868,7 +857,6 @@ where
 		self.trace.as_ref().map(TraceCollector::share)
 	}
 
-	#[cfg(host_clock)]
 	fn clock(&self) -> Arc<dyn Clock> {
 		Arc::clone(&self.clock)
 	}
@@ -900,6 +888,8 @@ where
 	/// and write, as on the unsplit path. A peer that goes idle, or sends a
 	/// byte at a time, ends the call with
 	/// [`TransportFailure::DeadlineExceeded`], so the driver task stays free.
+	///
+	/// [`TransportFailure::DeadlineExceeded`]: crate::transport::TransportFailure::DeadlineExceeded
 	///
 	/// # Errors
 	///
@@ -938,7 +928,6 @@ where
 			stream: write_half,
 			mode: send_mode,
 			limits,
-			#[cfg(host_clock)]
 			clock,
 			#[cfg(feature = "instrument")]
 			trace,
@@ -960,8 +949,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioList
 }
 
 // The macro generates the `TcpTransport` struct and its common
-// implementations.
-crate::impl_tcp_common!(TcpTransport, AsyncProtocolStream);
+// implementations. `Deadlined` holds the stream, so each read and write of the
+// wire runs under a deadline.
+crate::impl_tcp_common!(TcpTransport, AsyncProtocolStream, Deadlined, Deadlined::new);
 
 /// This impl covers every provider `P`, so a call names `P` where no other
 /// type names it, as [`TokioListener`] shows under `# Provider`.
@@ -979,31 +969,11 @@ where
 		let now = self.clock.monotonic();
 		let policy = self.state.phase().read_policy(&self.limits, now);
 
-		#[cfg(feature = "tokio")]
-		{
-			let buffer = match policy.remaining(now)? {
-				Some(budget) => timeout(budget, self.stream.read_frame(policy.cap())).await??,
-				None => self.stream.read_frame(policy.cap()).await?,
-			};
-
-			Ok(buffer)
-		}
-
-		#[cfg(not(feature = "tokio"))]
-		{
-			let buffer = self.stream.read_frame(policy.cap()).await?;
-			Ok(buffer)
-		}
+		self.stream.read(&policy, now).await
 	}
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
-		#[cfg(feature = "tokio")]
-		timeout(self.limits.operation_timeout, self.stream.write_frame(buffer)).await??;
-
-		#[cfg(not(feature = "tokio"))]
-		self.stream.write_frame(buffer).await?;
-
-		Ok(())
+		self.stream.write(&self.limits, buffer).await
 	}
 }
 
@@ -1016,29 +986,14 @@ where
 		self.state.handshake_slot()
 	}
 
-	/// Bounds `operation` with the tokio timer, as the reads and writes are.
-	///
-	/// A thread with no runtime has no timer, so the call fails closed.
-	/// A build without `tokio` runs `operation` unbounded.
-	async fn within_budget<T, F>(budget: Duration, operation: F) -> TransportResult<T>
-	where
-		F: Future<Output = TransportResult<T>>,
-	{
-		#[cfg(feature = "tokio")]
-		{
-			if tokio::runtime::Handle::try_current().is_err() {
-				return Err(TransportError::OperationFailed(TransportFailure::FailedPrecondition));
-			}
+	/// The whole round runs within the handshake deadline on the timer of the
+	/// exchanges of the stream.
+	fn handshake_timer(&mut self) -> Option<Timer> {
+		Some(self.stream.exchange_timer())
+	}
 
-			let bounded = timeout(budget, operation).await;
-			bounded.unwrap_or_else(|elapsed| Err(elapsed.into()))
-		}
-
-		#[cfg(not(feature = "tokio"))]
-		{
-			let _unbounded = budget;
-			operation.await
-		}
+	fn keep_handshake_timer(&mut self, timer: Timer) {
+		self.stream.keep_exchange_timer(timer);
 	}
 }
 
@@ -1093,19 +1048,19 @@ where
 		self.settled_exchange(async move |transport: &mut Self| {
 			transport.ensure_handshake_complete().await?;
 
-			#[cfg(feature = "tokio")]
-			{
-				let budget = transport.limits.operation_timeout;
-				match timeout(budget, transport.perform_emit_cycle(message)).await {
-					Ok(result) => result,
-					Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
-				}
-			}
+			// The cycle borrows the transport while it runs, so its timer
+			// leaves the stream for the cycle and returns after it. A cycle
+			// that drops early takes the timer with it, and the next cycle
+			// makes a new one.
+			let mut timer = transport.stream.exchange_timer();
+			let limits = transport.limits;
+			let cycled = {
+				let cycle = core::pin::pin!(transport.perform_emit_cycle(message));
+				limits.bound(&mut timer, cycle).await
+			};
 
-			#[cfg(not(feature = "tokio"))]
-			{
-				transport.perform_emit_cycle(message).await
-			}
+			transport.stream.keep_exchange_timer(timer);
+			cycled?
 		})
 		.await
 	}
@@ -1136,9 +1091,9 @@ mod tests {
 	use crate::clock::{ManualClock, SystemClock};
 	use crate::crypto::x509::store::CertificateTrust;
 	use crate::policy::TransitStatus;
-	use crate::runtime::ParkingExecutor;
 	use crate::testing::fixtures::{TestLoopback, TestStore};
 	use crate::testing::*;
+	use crate::transport::error::TransportFailure;
 	use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
@@ -1215,13 +1170,17 @@ mod tests {
 	use crate::transport::policy::CollectorGateConfig;
 
 	mod cipher_install {
+		use core::sync::atomic::{AtomicBool, Ordering};
+		use core::task::{Context, Poll, Waker};
 		use core::time::Duration;
 
 		use super::super::*;
 		use crate::clock::{ManualClock, SystemClock};
 		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 		use crate::crypto::aead::{RecordDirection, RuntimeAead};
+		use crate::testing::fixtures::TestClock;
 		use crate::testing::{TestFrame, TestKey, TestResult};
+		use crate::transport::error::TransportFailure;
 		use crate::transport::TransportLimits;
 		use crate::TightBeamError;
 
@@ -1263,6 +1222,15 @@ mod tests {
 			RecvCipher::new(test_runtime(), 0, RecordDirection::ClientToServer)
 		}
 
+		#[test]
+		fn a_receive_half_reports_its_limits() -> TestResult {
+			let limits = TransportLimits { operation_timeout: Duration::from_secs(7), ..TransportLimits::default() };
+			let limits = limits.checked()?;
+			let reader = reader_over(NullStream, SplitRecv::Cleartext, limits, Arc::new(SystemClock));
+			assert_eq!(EnvelopeSource::limits(&reader), limits);
+			Ok(())
+		}
+
 		/// A send half in `mode` over `stream` under `limits`, which reads its
 		/// deadlines on `clock`.
 		fn writer_over<S: AsyncWriteStream>(
@@ -1272,7 +1240,7 @@ mod tests {
 			clock: Arc<dyn Clock>,
 		) -> TransportWriter<S> {
 			TransportWriter {
-				stream,
+				stream: DeadlinedWrite::new(stream, &clock),
 				mode,
 				limits,
 				clock,
@@ -1290,7 +1258,7 @@ mod tests {
 			clock: Arc<dyn Clock>,
 		) -> TransportReader<S> {
 			TransportReader {
-				stream,
+				stream: DeadlinedRead::new(stream, &clock),
 				mode,
 				limits,
 				clock,
@@ -1455,24 +1423,131 @@ mod tests {
 			}
 		}
 
-		/// A split half sets its deadline one operation timeout past the
-		/// reading of its connection clock, so a read from a stalled peer ends
-		/// once that timeout has passed on the runtime's timer, and no later.
-		#[tokio::test(start_paused = true)]
-		async fn a_split_reader_waits_out_exactly_the_operation_timeout() {
-			let clock = Arc::new(ManualClock::default());
-			clock.advance(Duration::from_secs(3600));
+		impl AsyncProtocolStream for StalledStream {
+			type Error = IoError;
 
-			let limits = one_second_deadline();
-			let mut reader = reader_over(StalledStream, SplitRecv::Cleartext, limits, clock);
+			async fn read_frame(&mut self, _cap: usize) -> Result<Vec<u8>, Self::Error> {
+				core::future::pending().await
+			}
 
-			let started = tokio::time::Instant::now();
-			let outcome = tokio::time::timeout(limits.operation_timeout * 2, reader.read_envelope()).await;
-			assert!(matches!(
-				outcome,
-				Ok(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
-			));
-			assert_eq!(started.elapsed(), limits.operation_timeout);
+			async fn write_frame(&mut self, _buffer: &[u8]) -> Result<(), Self::Error> {
+				core::future::pending().await
+			}
+
+			fn is_alive(&self) -> bool {
+				true
+			}
+		}
+
+		/// A cleartext transport over `stream` under [`one_second_deadline`],
+		/// which reads its deadlines on `clock`.
+		fn transport_over<S: AsyncProtocolStream>(stream: S, clock: &Arc<ManualClock>) -> TcpTransport<S>
+		where
+			TransportError: From<S::Error>,
+		{
+			let endpoint = EndpointConfig::cleartext().with_clock(TestClock::erased(clock));
+			let endpoint = endpoint
+				.with_limits(*one_second_deadline())
+				.expect("the deadline agrees with the defaults");
+
+			TcpTransport::new(stream, endpoint)
+		}
+
+		/// A split half runs its deadline on the clock of the half, so a read
+		/// from a stalled peer ends exactly one operation timeout after it
+		/// starts on that clock, and not before (CWE-400).
+		#[test]
+		fn a_split_read_ends_at_the_operation_timeout_on_its_clock() {
+			let clock = TestClock::manual();
+			let erased = TestClock::erased(&clock);
+			let mut reader = reader_over(StalledStream, SplitRecv::Cleartext, one_second_deadline(), erased);
+
+			let deadline = TestClock::deadline_of(&clock, Duration::from_secs(1), reader.read_envelope());
+			assert_eq!(deadline, (true, true, true));
+		}
+
+		/// A write to a stalled peer ends exactly one operation timeout after
+		/// it starts on the clock of its half.
+		#[test]
+		fn a_split_write_ends_at_the_operation_timeout_on_its_clock() {
+			let clock = TestClock::manual();
+			let erased = TestClock::erased(&clock);
+			let mut writer = writer_over(StalledStream, SplitSend::Cleartext, one_second_deadline(), erased);
+			let envelope = TransportEnvelope::from(TestFrame::v0(None, None));
+
+			let deadline = TestClock::deadline_of(&clock, Duration::from_secs(1), writer.write_envelope(envelope));
+			assert_eq!(deadline, (true, true, true));
+		}
+
+		/// The unsplit transport reads under the same deadline on the clock of
+		/// its endpoint.
+		#[test]
+		fn a_transport_read_ends_at_the_operation_timeout_on_its_clock() {
+			let clock = TestClock::manual();
+			let mut transport = transport_over(StalledStream, &clock);
+
+			let deadline = TestClock::deadline_of(&clock, Duration::from_secs(1), transport.read_envelope_bytes());
+			assert_eq!(deadline, (true, true, true));
+		}
+
+		/// The unsplit transport writes under the same deadline on the clock of
+		/// its endpoint.
+		#[test]
+		fn a_transport_write_ends_at_the_operation_timeout_on_its_clock() {
+			let clock = TestClock::manual();
+			let mut transport = transport_over(StalledStream, &clock);
+
+			let written = transport.write_envelope_bytes(&[0x30, 0x00]);
+			let deadline = TestClock::deadline_of(&clock, Duration::from_secs(1), written);
+			assert_eq!(deadline, (true, true, true));
+		}
+
+		/// A frame stream whose write waits until `opened` holds, and whose
+		/// read waits forever.
+		struct GatedStream {
+			opened: Arc<AtomicBool>,
+		}
+
+		impl AsyncProtocolStream for GatedStream {
+			type Error = IoError;
+
+			async fn read_frame(&mut self, _cap: usize) -> Result<Vec<u8>, Self::Error> {
+				core::future::pending().await
+			}
+
+			fn is_alive(&self) -> bool {
+				true
+			}
+
+			async fn write_frame(&mut self, _buffer: &[u8]) -> Result<(), Self::Error> {
+				let opened = Arc::clone(&self.opened);
+				core::future::poll_fn(|_| match opened.load(Ordering::SeqCst) {
+					true => Poll::Ready(Ok(())),
+					false => Poll::Pending,
+				})
+				.await
+			}
+		}
+
+		/// The emit cycle runs within one operation timeout of its start, apart
+		/// from the deadline of each read and write. A write that ends at
+		/// 0.6 s leaves the read a deadline at 1.6 s, and the cycle still ends
+		/// at 1 s.
+		#[test]
+		fn an_emit_cycle_ends_at_the_operation_timeout_of_its_start() {
+			let clock = TestClock::manual();
+			let opened = Arc::new(AtomicBool::new(false));
+			let mut transport = transport_over(GatedStream { opened: Arc::clone(&opened) }, &clock);
+			let mut context = Context::from_waker(Waker::noop());
+			let mut emitted = core::pin::pin!(transport.emit(TestFrame::v0(None, None), None));
+			assert!(emitted.as_mut().poll(&mut context).is_pending());
+
+			clock.advance(Duration::from_millis(600));
+			opened.store(true, Ordering::SeqCst);
+			assert!(emitted.as_mut().poll(&mut context).is_pending());
+
+			let deadline = TestClock::deadline_of(&clock, Duration::from_millis(400), emitted);
+			assert_eq!(deadline, (true, true, true));
 		}
 
 		// A cleartext half holds no cipher, so it refuses an install.
@@ -2179,40 +2254,6 @@ mod tests {
 		let driven = transport.perform_server_handshake(opening(b"late")).await;
 		assert!(matches!(
 			driven,
-			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
-		));
-	}
-
-	/// The async budget refuses a thread outside any runtime.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[test]
-	fn a_budget_on_a_thread_outside_a_runtime_is_refused() {
-		let operation = async { Ok(7) };
-		let budget = Duration::from_secs(1);
-		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
-
-		let outcome = ParkingExecutor::on_current_thread().block_on(bounded);
-		assert!(matches!(
-			outcome,
-			Err(TransportError::OperationFailed(TransportFailure::FailedPrecondition))
-		));
-	}
-
-	/// The async budget ends an operation that outlasts it, on the tokio timer.
-	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	#[tokio::test(start_paused = true)]
-	async fn a_budget_ends_an_operation_that_outlasts_it() {
-		let operation = async {
-			tokio::time::sleep(Duration::from_secs(2)).await;
-			Ok(7)
-		};
-
-		let budget = Duration::from_secs(1);
-		let bounded = <TcpTransport<TokioStream> as ServerHandshakeSlot>::within_budget(budget, operation);
-
-		let outcome = bounded.await;
-		assert!(matches!(
-			outcome,
 			Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
 		));
 	}

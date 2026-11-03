@@ -1,3 +1,16 @@
 # `der::Length` checks its own arithmetic: each of its operators returns a
 # `der::Result`, so an overflow is an error value.
 arithmetic-side-effects-allowed = ["der::Length"]
+
+# Every wait in the crate runs on a `Clock`, so a test moves its time and the
+# clock decides how a wait is bounded. `within` on `dyn Clock` and `Timer`
+# bound a wait, and `SystemClock` makes every tokio timer. Tests and fuzz
+# harnesses are exempt.
+disallowed-methods = [
+	{ path = "tokio::time::timeout", reason = "bound a wait with `within` on `dyn Clock`" },
+	{ path = "tokio::time::timeout_at", reason = "bound a wait with `within` on `dyn Clock`" },
+	{ path = "tokio::time::sleep", reason = "sleep through the `Clock` of the link" },
+	{ path = "tokio::time::sleep_until", reason = "sleep through the `Clock` of the link" },
+	{ path = "tokio::time::interval", reason = "pace through the `Clock` of the link" },
+	{ path = "tokio::time::interval_at", reason = "pace through the `Clock` of the link" },
+]

@@ -107,6 +107,10 @@
 // The workspace denies an index or an integer operation that can panic. Tests
 // are exempt from both, as they are from `expect`.
 #![cfg_attr(test, allow(clippy::indexing_slicing, clippy::arithmetic_side_effects))]
+// `clippy.toml` denies the tokio timer, so every wait of the crate runs on a
+// `Clock`. A test bounds its own wait with that timer as a hang guard, so tests
+// are exempt.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("features.md")]
@@ -117,6 +121,7 @@ extern crate alloc;
 #[cfg(all(not(feature = "std"), feature = "zeroize"))]
 use alloc::vec::Vec;
 
+mod opaque;
 mod wire;
 
 // This module compiles every README example as a doctest, so a renamed item
@@ -176,7 +181,7 @@ pub mod utils;
 
 #[cfg(feature = "builder")]
 pub mod builder;
-#[cfg(feature = "colony")]
+#[cfg(feature = "colony-wire")]
 pub mod colony;
 #[cfg(feature = "compress")]
 pub mod compress;
@@ -207,6 +212,7 @@ pub use asn1::{
 };
 pub use cms;
 pub use der;
+pub use opaque::Opaque;
 pub use pkcs12;
 pub use spki;
 pub use utils::{decode, encode};
@@ -233,7 +239,7 @@ pub mod mpsc {
 extern crate self as tightbeam;
 
 pub use crate::core::Message;
-pub use crate::error::TightBeamError;
+pub use crate::error::{TightBeamError, UnknownName};
 
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
 pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey as SigningKey;

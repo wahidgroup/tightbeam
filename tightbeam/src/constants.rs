@@ -583,6 +583,14 @@ pub const DEFAULT_MAX_ENCRYPTED_ENVELOPE: usize = 256 * 1024;
 ///   <https://cwe.mitre.org/data/definitions/772.html>
 pub const DEFAULT_OPERATION_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
 
+/// How many keepalive probes a multiplexed connection sends within one read
+/// deadline.
+///
+/// Three probes leave the link inside the deadline after one unanswered probe,
+/// while the keepalive starts and an ack arrives in under a third of the
+/// deadline.
+pub const KEEPALIVE_PROBES_PER_DEADLINE: u32 = 3;
+
 /// Default allowance for a handshake to complete.
 ///
 /// The default [`TransportLimits`] carries this allowance, so a server

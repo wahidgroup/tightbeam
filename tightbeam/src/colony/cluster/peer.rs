@@ -10,9 +10,10 @@ use super::{
 };
 use crate::clock::UnixMillis;
 use crate::colony::protocol::IssuedAt;
-use crate::colony::protocol::{ClusterWorkRequest, PeerAdvertisement};
+use crate::colony::protocol::PeerAdvertisement;
 use crate::colony::urn::ColonyNamespace;
 use crate::colony::urn::ColonyResource;
+use crate::colony::work::ClusterWorkRequest;
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
 use crate::crypto::hash::Digest;
 use crate::crypto::x509::store::CertificateTrust;
@@ -439,7 +440,6 @@ impl ClusterConfig {
 	#[must_use]
 	pub(crate) fn flood(&self) -> Option<Flood<'_>> {
 		self.colony_urn.as_ref()?;
-
 		Some(Flood::new(&self.namespace, self.tls.peer_dial_trust()))
 	}
 

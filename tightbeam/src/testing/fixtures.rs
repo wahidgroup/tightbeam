@@ -1739,6 +1739,40 @@ impl TestClock {
 		let past = core::time::Duration::from_secs(seconds.saturating_add(1));
 		Arc::new(ManualClock::at(UnixMillis::new(0).saturating_add(past)))
 	}
+
+	/// How `operation` meets `span` on `clock`: whether it waits at its first
+	/// poll, whether it still waits one millisecond before the span, and
+	/// whether it ends with `DeadlineExceeded` at the span.
+	///
+	/// A wait bound by `within` on `clock` answers `(true, true, true)`. A wait
+	/// that nothing bounds still waits at the span, and a wait on the tokio
+	/// timer panics on a thread with no runtime.
+	#[cfg(test)]
+	pub(crate) fn deadline_of<T>(
+		clock: &ManualClock,
+		span: core::time::Duration,
+		operation: impl core::future::Future<Output = crate::transport::TransportResult<T>>,
+	) -> (bool, bool, bool) {
+		use core::task::{Context, Poll, Waker};
+
+		use crate::transport::{TransportError, TransportFailure};
+
+		let mut context = Context::from_waker(Waker::noop());
+		let mut operation = core::pin::pin!(operation);
+		let waits = operation.as_mut().poll(&mut context).is_pending();
+
+		clock.advance(span.saturating_sub(core::time::Duration::from_millis(1)));
+		let still_waits = operation.as_mut().poll(&mut context).is_pending();
+		clock.advance(core::time::Duration::from_millis(1));
+
+		let ended = operation.as_mut().poll(&mut context);
+		let refused = matches!(
+			ended,
+			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)))
+		);
+
+		(waits, still_waits, refused)
+	}
 }
 
 /// The signer material of CMS structures.
