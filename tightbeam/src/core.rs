@@ -314,7 +314,10 @@ impl FrameShape {
 			return Err(RequirementError::Unprotected(requirement));
 		}
 
-		#[cfg(feature = "crypto")]
+		#[cfg(all(
+			feature = "crypto",
+			any(feature = "digest", feature = "aead", feature = "signature")
+		))]
 		if T::HAS_PROFILE {
 			self.admit_profile::<T::Profile>()?;
 		}
@@ -361,7 +364,10 @@ impl FrameShape {
 	/// # Errors
 	///
 	/// - [`RequirementError::Algorithm`] -- a digest, the AEAD, a key wrap, or the signature is outside `P`.
-	#[cfg(feature = "crypto")]
+	#[cfg(all(
+		feature = "crypto",
+		any(feature = "digest", feature = "aead", feature = "signature")
+	))]
 	fn admit_profile<P: SecurityProfile>(&self) -> core::result::Result<(), RequirementError> {
 		#[cfg(feature = "digest")]
 		{

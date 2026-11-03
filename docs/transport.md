@@ -27,25 +27,25 @@ It drills down from [README §8](../README.md#8-transport-layer) for engineers w
 
 Each role of [README §8.1](../README.md#81-transport-architecture) is one trait of `tightbeam::transport`, and another crate implements it to bring its own byte protocol:
 
-| Role                       | Trait                                       | Items an implementation supplies                                                                                                                                 |
-| -------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Connection setup           | `Protocol`                                  | The types `Listener`, `Stream`, `Transport`, `Error`, `Address`, and `CryptoProvider`, and `default_bind_address`, `bind_cleartext`, `connect`, and `create_transport` |
-| Encrypted connection setup | `EncryptedProtocol: Protocol`               | The types `Encryptor` and `Decryptor`, and `bind_with(addr, TransportEncryptionConfig)`                                                                           |
-| Envelope I/O               | `MessageIO`                                 | `clock`, `read_envelope_bytes`, and `write_envelope_bytes`                                                                                                       |
-| Encrypted envelope I/O     | `EncryptedMessageIO: MessageIO`             | Defaults alone: `collect_step`, the client and server handshake drivers, and the seal and open of each envelope                                                  |
-| Receive path               | `MessageCollector: MessageIO + GateAudit`   | The type `CollectorGate`, `collector_gate`, and `send_response`                                                                                                  |
-| Send path                  | `MessageEmitter: MessageIO`                 | The types `EmitterGate` and `RestartPolicy`, their two accessors, and `perform_send_receive`                                                                      |
+| Role                       | Trait                                     | Items an implementation supplies                                                                                                                                       |
+| -------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Connection setup           | `Protocol`                                | The types `Listener`, `Stream`, `Transport`, `Error`, `Address`, and `CryptoProvider`, and `default_bind_address`, `bind_cleartext`, `connect`, and `create_transport` |
+| Encrypted connection setup | `EncryptedProtocol: Protocol`             | The types `Encryptor` and `Decryptor`, and `bind_with(addr, TransportEncryptionConfig)`                                                                                |
+| Envelope I/O               | `MessageIO`                               | `clock`, `read_envelope_bytes`, and `write_envelope_bytes`                                                                                                             |
+| Encrypted envelope I/O     | `EncryptedMessageIO: MessageIO`           | Defaults alone: `collect_step`, the client and server handshake drivers, and the seal and open of each envelope                                                        |
+| Receive path               | `MessageCollector: MessageIO + GateAudit` | The type `CollectorGate`, `collector_gate`, and `send_response`                                                                                                        |
+| Send path                  | `MessageEmitter: MessageIO`               | The types `EmitterGate` and `RestartPolicy`, their two accessors, and `perform_send_receive`                                                                           |
 
 `Protocol` bounds its listener, stream, transport, address, and futures with `MaybeSend`, which is `Send` on every target except `wasm32`. A browser socket holds JavaScript handles, so a transport over one is `!Send`, and `ClientBuilder` provisions it through `connect` or `adopt`. A browser build has no host clock, so its client starts from `ClientBuilder::on_clock`.
 
 The provided methods carry the shared behavior:
 
-- `Protocol::connect_within(addr, budget)` calls `connect`. A protocol whose connect blocks its thread MUST override it and bound the connect itself.
+- `Protocol::connect_within(addr, limits)` calls `connect`. A protocol whose connect blocks its thread MUST override it and bound the connect itself, and a protocol with socket ceilings of its own takes them from `limits`.
 - `MessageCollector::collect_message` reads one envelope, evaluates the collector gate, and returns the frame with its `TransitStatus`. `try_collect_message` returns `Ok(None)` at EOF.
 - `MessageEmitter::emit(frame, attempt)` evaluates the emitter gate, sends, and retries as the restart policy answers.
 - `Transport` names `MessageEmitter + MessageCollector`, and every type that implements both implements it.
 
-A split connection reads and writes through two halves. `EnvelopeSource::read_envelope` and `EnvelopeSink::write_envelope` are the traits the multiplexed drivers take, and `TcpTransport::into_split` yields the TCP halves, `TransportReader` and `TransportWriter`.
+A split connection reads and writes through two halves. `EnvelopeSource::read_envelope` and `EnvelopeSink::write_envelope` are the traits the multiplexed drivers take, and `TcpTransport::into_split` yields the TCP halves, `TransportReader` and `TransportWriter`. `EnvelopeSource::limits` and `EnvelopeSink::clock` are required methods, so the mux paces `MuxHandle::keep_alive` against the operation timeout of the read half, on the clock of the write half.
 
 Four traits attach policies to a transport, one per kind: `RestartConfig::with_restart`, `EmitterGateConfig::with_emitter_gate`, `CollectorGateConfig::with_collector_gate`, and `TimeoutConfig::with_timeout`. `PolicyConfig` names all four.
 
@@ -53,9 +53,9 @@ Four traits attach policies to a transport, one per kind: `RestartConfig::with_r
 
 Every transport constructor takes one `EndpointConfig<P>`: the provisioning, the negotiation input, the limits, and the clock. Each handshake of the transport reads the validity period of a peer certificate on that clock.
 
-| Type                           | Constructor                                     | Setters                                                                    |
-| ------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------------- |
-| `EndpointConfig<P>`            | `new(encryption, clock)`, and `cleartext()`     | `with_limits`, `with_clock`, and `with_trace` under `instrument`           |
+| Type                           | Constructor                                      | Setters                                                                                                                             |
+| ------------------------------ | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `EndpointConfig<P>`            | `new(encryption, clock)`, and `cleartext()`      | `with_limits`, `with_clock`, and `with_trace` under `instrument`                                                                    |
 | `TransportEncryptionConfig<P>` | `new(identity)`, which takes a `SigningIdentity` | `with_client_validators`, `with_peer_authentication`, `with_key_purposes`, `with_limits`, and `with_key_agreement` for a CMS server |
 
 `DialableEncryption::new` turns a configuration into provisioning, and it is the one place that applies the dialer rule. A client with no trust in a server and no call to `allow_cleartext` fails there with `TransportError::PeerAuthenticationUnconfigured`, before it opens a socket.
@@ -66,21 +66,21 @@ Every transport constructor takes one `EndpointConfig<P>`: the provisioning, the
 
 `WireEnvelope` is a CHOICE with an explicit tag on each arm:
 
-| Arm                                 | Tag   | Carries                                                                     |
-| ----------------------------------- | ----- | --------------------------------------------------------------------------- |
-| `Cleartext(TransportEnvelope)`      | `[0]` | A handshake container, or every envelope of a cleartext endpoint            |
-| `Encrypted(AuthEnvelopedData)`      | `[1]` | One record, sealed as [The TightBeam Handshake](handshake.md#records) states |
+| Arm                            | Tag   | Carries                                                                      |
+| ------------------------------ | ----- | ---------------------------------------------------------------------------- |
+| `Cleartext(TransportEnvelope)` | `[0]` | A handshake container, or every envelope of a cleartext endpoint             |
+| `Encrypted(AuthEnvelopedData)` | `[1]` | One record, sealed as [The TightBeam Handshake](handshake.md#records) states |
 
 `TransportEnvelope` is a CHOICE of context-specific tags:
 
-| Variant                     | Tag   | Carries                                                         |
-| --------------------------- | ----- | --------------------------------------------------------------- |
-| `Request(RequestPackage)`   | `[0]` | A single-flight request frame                                   |
-| `Response(ResponsePackage)` | `[1]` | The status and the optional frame of a single-flight response   |
-| `SignedData`                | `[3]` | A signed handshake container, with the bytes that carried it    |
-| `Mux(MuxEnvelope)`          | `[4]` | A multiplexing message, under `transport-multiplex`             |
-| `AuthEnvelopedData`         | `[7]` | A sealed handshake container, with the bytes that carried it    |
-| `Data`                      | `[8]` | The HPKE hello, a `ContentInfo` of type `id-data`               |
+| Variant                     | Tag   | Carries                                                       |
+| --------------------------- | ----- | ------------------------------------------------------------- |
+| `Request(RequestPackage)`   | `[0]` | A single-flight request frame                                 |
+| `Response(ResponsePackage)` | `[1]` | The status and the optional frame of a single-flight response |
+| `SignedData`                | `[3]` | A signed handshake container, with the bytes that carried it  |
+| `Mux(MuxEnvelope)`          | `[4]` | A multiplexing message, under `transport-multiplex`           |
+| `AuthEnvelopedData`         | `[7]` | A sealed handshake container, with the bytes that carried it  |
+| `Data`                      | `[8]` | The HPKE hello, a `ContentInfo` of type `id-data`             |
 
 Tags 2, 5, and 6 stay reserved, so an archived capture keeps its meaning. `RequestPackage::new(frame)` and `ResponsePackage::new(status, frame)` build the two packages, and each holds its frame behind an `Arc`.
 
@@ -88,13 +88,13 @@ Tags 2, 5, and 6 stay reserved, so an archived capture keeps its meaning. `Reque
 
 `TransportLimits` holds every ceiling of one endpoint. Each field is a plain value, and `Default` chooses them all:
 
-| Field               | Default                                   | Bounds                                          |
-| ------------------- | ----------------------------------------- | ----------------------------------------------- |
-| `cleartext_envelope`| 128 KiB, `DEFAULT_MAX_CLEARTEXT_ENVELOPE` | A cleartext wire envelope                       |
-| `encrypted_envelope`| 256 KiB, `DEFAULT_MAX_ENCRYPTED_ENVELOPE` | An encrypted wire envelope                      |
-| `handshake_wire`    | 16 KiB, `DEFAULT_HANDSHAKE_MAX_WIRE`      | One handshake message                           |
-| `operation_timeout` | 30 s, `DEFAULT_OPERATION_TIMEOUT`         | A dial, and one read or write                   |
-| `handshake_timeout` | 10 s, `DEFAULT_HANDSHAKE_TIMEOUT`         | The whole handshake exchange                    |
+| Field                | Default                                   | Bounds                        |
+| -------------------- | ----------------------------------------- | ----------------------------- |
+| `cleartext_envelope` | 128 KiB, `DEFAULT_MAX_CLEARTEXT_ENVELOPE` | A cleartext wire envelope     |
+| `encrypted_envelope` | 256 KiB, `DEFAULT_MAX_ENCRYPTED_ENVELOPE` | An encrypted wire envelope    |
+| `handshake_wire`     | 16 KiB, `DEFAULT_HANDSHAKE_MAX_WIRE`      | One handshake message         |
+| `operation_timeout`  | 30 s, `DEFAULT_OPERATION_TIMEOUT`         | A dial, and one read or write |
+| `handshake_timeout`  | 10 s, `DEFAULT_HANDSHAKE_TIMEOUT`         | The whole handshake exchange  |
 
 A reader admits `max_envelope()`, the larger of the two envelope ceilings, before the parse, and it checks the ceiling of the arm after it. An envelope past the ceiling of its mode fails with `OperationFailed(SizeExceeded)`. A handshake message whose transport envelope passes `handshake_wire` fails with `InvalidMessage` before the write, and a handshaking reader caps the same envelope.
 
@@ -127,6 +127,34 @@ let config = TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity).w
 
 A client or a pool takes its `with_timeout` value through the same check before it dials.
 
+### Deadlines
+
+Each wait of the async transport in this table runs through one race on the clock of the endpoint:
+
+| Wait                        | Span                                                   | Past the span                     |
+| --------------------------- | ------------------------------------------------------ | --------------------------------- |
+| A read of the wire          | The deadline of its `ReadPolicy`                       | Fails with `DeadlineExceeded`     |
+| A write of the wire, a dial | `operation_timeout`                                    | Fails with `DeadlineExceeded`     |
+| A server handshake round    | The handshake deadline of the session                  | Fails with `DeadlineExceeded`     |
+| An emit cycle               | `operation_timeout` from its start                     | Fails with `DeadlineExceeded`     |
+| A mux renewal               | The renewal deadline                                   | Drains the connection with GoAway |
+| A keepalive probe           | The read deadline over `KEEPALIVE_PROBES_PER_DEADLINE` | Sends the next probe              |
+
+Two entry points share the race:
+
+- `within` on `dyn Clock` bounds one wait.
+- A `Timer` bounds each wait of a party that waits again, such as a stream or an emit cycle. Where its clock offers `Clock::resetting_sleep`, as `SystemClock` does on a tokio runtime, the timer keeps that sleep and resets it for each later wait on that runtime, so a later wait allocates no sleep. On any other clock each wait makes a new sleep.
+
+`Clock::timing` decides how each wait runs on the thread that polls it:
+
+| Timing   | Clock                                                                                           | Each wait                                             |
+| -------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `Races`  | `SystemClock` on a thread that runs a tokio runtime, or an application clock whose sleep yields | Ends at its span                                      |
+| `Parks`  | `SystemClock` in a build without `tokio`                                                        | Runs unbounded, and the application owns its deadline |
+| `Absent` | `SystemClock` in a `tokio` build, on a thread outside any runtime                               | Fails at once with `FailedPrecondition` when it waits |
+
+The stream of an async transport sits in a type whose only read and write take that deadline, so each read and write of the wire runs under the deadline its rule sets. A tokio runtime that `SystemClock` races on MUST enable its time driver, because a tokio sleep panics without it. A client hook, such as a `ReceiptApprover`, runs with no library deadline, so the hook bounds its own work.
+
 ### Record limits
 
 Each directional key of a session has a record limit ([The TightBeam Handshake](handshake.md#records)). The sender and the receiver of a key fail with two different failures, so an error tells a routine end of keys from a fault of the inbound stream:
@@ -145,45 +173,45 @@ Each directional key of a session has a record limit ([The TightBeam Handshake](
 
 [README §8.3](../README.md#83-tcp-transport) maps a byte stream to the Frame API. The types live in `tightbeam::transport::tcp`:
 
-| Type                         | Module      | Role                                                                                                   |
-| ---------------------------- | ----------- | ------------------------------------------------------------------------------------------------------ |
-| `TcpTransport<S, P>`         | `r#async`   | The async transport over a stream `S`, under the provider `P`                                          |
-| `TokioListener<P>`           | `r#async`   | The tokio listener. `accept` returns a transport and the peer address                                  |
-| `TokioStream`                | `r#async`   | The tokio stream, which splits into `TokioReadHalf` and `TokioWriteHalf`                               |
-| `TcpListener<L, P>`          | `sync`      | The blocking listener over `std::net`: `from_listener_cleartext`, `from_listener_with`, and `accept`    |
-| `TcpTransport<S, P>`         | `sync`      | The blocking transport over a `ProtocolStream`                                                         |
-| `TightBeamSocketAddr`        | `tcp`       | The address, a `SocketAddr` that parses from a string                                                  |
+| Type                  | Module    | Role                                                                                                 |
+| --------------------- | --------- | ---------------------------------------------------------------------------------------------------- |
+| `TcpTransport<S, P>`  | `r#async` | The async transport over a stream `S`, under the provider `P`                                        |
+| `TokioListener<P>`    | `r#async` | The tokio listener. `accept` returns a transport and the peer address                                |
+| `TokioStream`         | `r#async` | The tokio stream, which splits into `TokioReadHalf` and `TokioWriteHalf`                             |
+| `TcpListener<L, P>`   | `sync`    | The blocking listener over `std::net`: `from_listener_cleartext`, `from_listener_with`, and `accept` |
+| `TcpTransport<S, P>`  | `sync`    | The blocking transport over a `ProtocolStream`                                                       |
+| `TightBeamSocketAddr` | `tcp`     | The address, a `SocketAddr` that parses from a string                                                |
 
 `P` defaults to `DefaultCryptoProvider`, so `TokioListener` alone in a type position names the house provider. In an expression the compiler infers `P` from the calls, so a call names it where no other type does, such as `TransportEncryptionConfig::<DefaultCryptoProvider>::new(identity)`.
 
 A `TcpTransport` exposes its session and its server hooks:
 
-| Method                                    | Answers or sets                                                                    |
-| ----------------------------------------- | ---------------------------------------------------------------------------------- |
-| `peer_certificate`                        | The validated peer certificate of the established session                          |
-| `negotiated_mux`                          | The `MuxSettings` of the session, or `None` for a single-flight session            |
-| `session_receipt`                         | The dual-signed receipt of a budget-bearing session                                |
-| `with_transport_authorizer`               | The server's budget-grant policy, a `TransportAuthorizer`                          |
-| `with_session_observer`                   | The server's observer of receipt outcomes, a `SessionObserver`                     |
-| `with_receipt_approver`                   | The client's approver of challenge-bearing receipts, a `ReceiptApprover`           |
-| `with_handshake_protocol`                 | `HandshakeProtocolKind::Hpke`, the default, or `HandshakeProtocolKind::Cms`        |
-| `with_mux_offer`                          | The local multiplexing offer, which the handshake binds into its transcript        |
-| `into_split` and `into_mux`               | The two halves, or the multiplexed plane ([Multiplexing](#multiplexing))           |
-| `with_trace` and `trace`                  | The instrumentation collector of the connection, under `instrument`                |
+| Method                      | Answers or sets                                                             |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `peer_certificate`          | The validated peer certificate of the established session                   |
+| `negotiated_mux`            | The `MuxSettings` of the session, or `None` for a single-flight session     |
+| `session_receipt`           | The dual-signed receipt of a budget-bearing session                         |
+| `with_transport_authorizer` | The server's budget-grant policy, a `TransportAuthorizer`                   |
+| `with_session_observer`     | The server's observer of receipt outcomes, a `SessionObserver`              |
+| `with_receipt_approver`     | The client's approver of challenge-bearing receipts, a `ReceiptApprover`    |
+| `with_handshake_protocol`   | `HandshakeProtocolKind::Hpke`, the default, or `HandshakeProtocolKind::Cms` |
+| `with_mux_offer`            | The local multiplexing offer, which the handshake binds into its transcript |
+| `into_split` and `into_mux` | The two halves, or the multiplexed plane ([Multiplexing](#multiplexing))    |
+| `with_trace` and `trace`    | The instrumentation collector of the connection, under `instrument`         |
 
 ### The server macro
 
 `server!` serves a listener: it accepts each connection, applies the policies, and runs the handler. The keys of an invocation:
 
-| Key                                     | Takes                                                                                                  |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `protocol P: listener`                  | A bound listener. The loop runs on a task under `tokio`, or on a thread under `std`, and the macro returns at once |
-| `protocol P: bind_cleartext addr`       | An address, which the macro binds as a cleartext listener first                                        |
-| `P: listener`, with no `protocol`       | The blocking form, which runs the handler on a thread outside any runtime                              |
-| `policies: { name: [expr, ..] }`        | A transport method per name, which the loop calls with each expression on every accepted connection   |
-| `handle: \|frame\|` or `\|frame, session\|` | The handler closure. The two-argument form reads the `SessionContext` of its connection             |
-| `service: S`                            | A `MuxService`, which answers unary, streaming, and duplex streams                                     |
-| `channels: { error: tx, ok: tx }`       | The error and success notification channels                                                            |
+| Key                                         | Takes                                                                                                              |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `protocol P: listener`                      | A bound listener. The loop runs on a task under `tokio`, or on a thread under `std`, and the macro returns at once |
+| `protocol P: bind_cleartext addr`           | An address, which the macro binds as a cleartext listener first                                                    |
+| `P: listener`, with no `protocol`           | The blocking form, which runs the handler on a thread outside any runtime                                          |
+| `policies: { name: [expr, ..] }`            | A transport method per name, which the loop calls with each expression on every accepted connection                |
+| `handle: \|frame\|` or `\|frame, session\|` | The handler closure. The two-argument form reads the `SessionContext` of its connection                            |
+| `service: S`                                | A `MuxService`, which answers unary, streaming, and duplex streams                                                 |
+| `channels: { error: tx, ok: tx }`           | The error and success notification channels                                                                        |
 
 The loop evaluates each policy expression once per connection, so an expression that shares one value clones it, as `with_trace: [trace.share()]` does. `max_connections: [n]` sets the cap of live connections instead, `DEFAULT_MAX_SERVER_CONNECTIONS` (1024) by default. A literal cap of zero fails to compile.
 
@@ -214,11 +242,11 @@ async fn serve(identity: SigningIdentity) -> Result<(), Box<dyn std::error::Erro
 
 [README §8.4](../README.md#84-transport-policies) states what each policy decides. Every policy trait is `Send + Sync` and has one method:
 
-| Trait                                        | Method                                                                                     |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `policy::GatePolicy`                         | `evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus`      |
-| `policy::ReceptorPolicy<T: Message>`         | `evaluate(&self, message: &T) -> TransitStatus`                                            |
-| `transport::policy::RestartPolicy`           | `evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction` |
+| Trait                                | Method                                                                                          |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `policy::GatePolicy`                 | `evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus`           |
+| `policy::ReceptorPolicy<T: Message>` | `evaluate(&self, message: &T) -> TransitStatus`                                                 |
+| `transport::policy::RestartPolicy`   | `evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction` |
 
 `RetryAction` has two variants. `Retry { frame, delay }` resends `frame` once the caller has waited `delay` on the transport's clock, and `NoRetry` stops and propagates the error.
 
@@ -226,39 +254,39 @@ async fn serve(identity: SigningIdentity) -> Result<(), Box<dyn std::error::Erro
 
 `TransitStatus` is a `u8` enumeration with the codes of `google.rpc.Code`:
 
-| Code | Variant              | Meaning                                                    |
-| ---- | -------------------- | ---------------------------------------------------------- |
-| 0    | `Ok`                 | The request was processed                                  |
-| 1    | `Cancelled`          | The caller cancelled the operation                         |
-| 2    | `Unknown`            | An unclassified failure, and the `Default`                 |
-| 3    | `InvalidArgument`    | The request is malformed regardless of system state        |
-| 4    | `DeadlineExceeded`   | The peer gave up waiting                                   |
-| 5    | `NotFound`           | The requested entity does not exist                        |
-| 6    | `AlreadyExists`      | The entity the request would create already exists        |
-| 7    | `PermissionDenied`   | The caller is identified and refused authorization         |
+| Code | Variant              | Meaning                                                           |
+| ---- | -------------------- | ----------------------------------------------------------------- |
+| 0    | `Ok`                 | The request was processed                                         |
+| 1    | `Cancelled`          | The caller cancelled the operation                                |
+| 2    | `Unknown`            | An unclassified failure, and the `Default`                        |
+| 3    | `InvalidArgument`    | The request is malformed regardless of system state               |
+| 4    | `DeadlineExceeded`   | The peer gave up waiting                                          |
+| 5    | `NotFound`           | The requested entity does not exist                               |
+| 6    | `AlreadyExists`      | The entity the request would create already exists                |
+| 7    | `PermissionDenied`   | The caller is identified and refused authorization                |
 | 8    | `ResourceExhausted`  | The receiver lacks capacity, and a retry with backoff may succeed |
-| 9    | `FailedPrecondition` | System state must change before a retry can succeed        |
-| 10   | `Aborted`            | A concurrency conflict aborted the operation               |
-| 11   | `OutOfRange`         | The request walked past the valid range of the operation   |
-| 12   | `Unimplemented`      | No handler answers the requested operation                 |
-| 13   | `Internal`           | The receiver hit a local fault                             |
-| 14   | `Unavailable`        | The receiver is unavailable for a transient reason         |
-| 15   | `DataLoss`           | The receiver hit unrecoverable data loss or corruption     |
-| 16   | `Unauthenticated`    | The caller lacks valid authentication credentials          |
+| 9    | `FailedPrecondition` | System state must change before a retry can succeed               |
+| 10   | `Aborted`            | A concurrency conflict aborted the operation                      |
+| 11   | `OutOfRange`         | The request walked past the valid range of the operation          |
+| 12   | `Unimplemented`      | No handler answers the requested operation                        |
+| 13   | `Internal`           | The receiver hit a local fault                                    |
+| 14   | `Unavailable`        | The receiver is unavailable for a transient reason                |
+| 15   | `DataLoss`           | The receiver hit unrecoverable data loss or corruption            |
+| 16   | `Unauthenticated`    | The caller lacks valid authentication credentials                 |
 
-A gate verdict of `Unknown` is a local bug, so the transport normalizes it to `Internal` before it reaches the wire or the audit trail. `as_str` returns the name of the variant, which an audit event uses as its label.
+A gate verdict of `Unknown` is a local bug, so the transport normalizes it to `Internal` before it reaches the wire or the audit trail. `as_str` returns the name of the variant, which an audit event uses as its label. `FromStr` reads that name back, and any other text refuses with `tightbeam::UnknownName`.
 
 ### Session facts
 
 `SessionContext` holds the authenticated facts of one session. The `Default` context holds none, and cleartext connections, client-side emit paths, and in-process evaluation pass it.
 
-| Method                    | Returns                                                                                       |
-| ------------------------- | --------------------------------------------------------------------------------------------- |
-| `capture(&transport)`     | A snapshot of the peer and the receipt of an encrypted transport after its handshake          |
-| `peer_certificate()`      | The validated peer certificate, the client identity on a mutual-auth server                   |
-| `peer_key()`              | The `CanonicalKey` of the peer's key, which a peer list matches                               |
-| `proven_peer()`           | A `ProvenPeer`, the one key a per-identity budget MAY count against (CWE-645)                 |
-| `session_receipt()`       | The dual-signed receipt of a budget-bearing session                                           |
+| Method                | Returns                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------ |
+| `capture(&transport)` | A snapshot of the peer and the receipt of an encrypted transport after its handshake |
+| `peer_certificate()`  | The validated peer certificate, the client identity on a mutual-auth server          |
+| `peer_key()`          | The `CanonicalKey` of the peer's key, which a peer list matches                      |
+| `proven_peer()`       | A `ProvenPeer`, the one key a per-identity budget MAY count against (CWE-645)        |
+| `session_receipt()`   | The dual-signed receipt of a budget-bearing session                                  |
 
 On the mux serving path each stream builds its context with the live receipt, so a gate sees the receipt of each rekey.
 
@@ -266,13 +294,13 @@ On the mux serving path each stream builds its context with the live receipt, so
 
 The crate ships these gates:
 
-| Gate                       | Module         | Verdict                                                                                                 |
-| -------------------------- | -------------- | ------------------------------------------------------------------------------------------------------- |
-| `AcceptAllGate`            | `policy`       | `Ok` for every frame                                                                                    |
-| `GateChain`                | `policy`       | The first verdict other than `Ok`, in insertion order (`with`, `push`). An empty chain answers `Ok`     |
-| `FrameIntegrityGate<D>`    | `policy`       | `Ok` for a frame whose integrity digest recomputes under `D`, and for a stream open with no frame. `PermissionDenied` otherwise |
-| `GateMiddleware<G, F>`     | `policy`       | The verdict of `G`, after the closure `F` observes it. `ReceptorMiddleware` does the same for a receptor |
-| `PeerListGate`             | `colony::hive` | The verdict of the list for the peer key of the session                                                 |
+| Gate                    | Module         | Verdict                                                                                                                         |
+| ----------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `AcceptAllGate`         | `policy`       | `Ok` for every frame                                                                                                            |
+| `GateChain`             | `policy`       | The first verdict other than `Ok`, in insertion order (`with`, `push`). An empty chain answers `Ok`                             |
+| `FrameIntegrityGate<D>` | `policy`       | `Ok` for a frame whose integrity digest recomputes under `D`, and for a stream open with no frame. `PermissionDenied` otherwise |
+| `GateMiddleware<G, F>`  | `policy`       | The verdict of `G`, after the closure `F` observes it. `ReceptorMiddleware` does the same for a receptor                        |
+| `PeerListGate`          | `colony::hive` | The verdict of the list for the peer key of the session                                                                         |
 
 An `Arc<dyn GatePolicy + Send + Sync>` is a gate too, so a chain or a builder holds a shared gate.
 
@@ -285,11 +313,11 @@ An `Arc<dyn GatePolicy + Send + Sync>` is a gate too, so a chain or a builder ho
 
 A list refuses to build with a `KeyListError` that names the index of the first bad entry:
 
-| Variant     | The entry                                                                         |
-| ----------- | --------------------------------------------------------------------------------- |
-| `Unreadable`| Is no SubjectPublicKeyInfo DER, or its canonical form exceeds the DER length cap  |
-| `NoPoint`   | Names an elliptic-curve key that reads as no point                                 |
-| `NoDecoder` | Names a point on a curve that the list's `KeyCurves` holds no decoder for          |
+| Variant      | The entry                                                                        |
+| ------------ | -------------------------------------------------------------------------------- |
+| `Unreadable` | Is no SubjectPublicKeyInfo DER, or its canonical form exceeds the DER length cap |
+| `NoPoint`    | Names an elliptic-curve key that reads as no point                               |
+| `NoDecoder`  | Names a point on a curve that the list's `KeyCurves` holds no decoder for        |
 
 `PublicKeyPinning::new(keys)` and `PublicKeyPinning::with_curves(curves, keys)` read their pins through the same key list, so they refuse the same entries with the same errors.
 
@@ -307,11 +335,11 @@ assert_eq!(chain.evaluate(None, &SessionContext::default()), TransitStatus::Reso
 
 ### Restart policies
 
-| Policy                      | Constructor                                              | Delay before attempt `n`, in milliseconds | Default                                        |
-| --------------------------- | -------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------- |
-| `NoRestart`                 | `NoRestart`                                              | It answers `NoRetry` at once              | The policy of a new transport                  |
-| `RestartLinearBackoff`      | `new(max_attempts, interval, scale_factor, jitter)`      | `scale_factor * interval * (n + 1)`       | 5 attempts, a 1 s interval, `DecorrelatedJitter` |
-| `RestartExponentialBackoff` | `new(max_attempts, base_delay, jitter)`                  | `base_delay * 2^n`                        | 5 attempts, a 1 s base delay, `DecorrelatedJitter` |
+| Policy                      | Constructor                                         | Delay before attempt `n`, in milliseconds | Default                                            |
+| --------------------------- | --------------------------------------------------- | ----------------------------------------- | -------------------------------------------------- |
+| `NoRestart`                 | `NoRestart`                                         | It answers `NoRetry` at once              | The policy of a new transport                      |
+| `RestartLinearBackoff`      | `new(max_attempts, interval, scale_factor, jitter)` | `scale_factor * interval * (n + 1)`       | 5 attempts, a 1 s interval, `DecorrelatedJitter`   |
+| `RestartExponentialBackoff` | `new(max_attempts, base_delay, jitter)`             | `base_delay * 2^n`                        | 5 attempts, a 1 s base delay, `DecorrelatedJitter` |
 
 - Both backoff policies answer `NoRetry` once `attempt` reaches `max_attempts`.
 - `interval` and `base_delay` are each a `Duration`, and each policy reads it in whole milliseconds at each delay.
@@ -337,11 +365,11 @@ assert_eq!(restart.evaluate(frame, &TransportFailure::Unavailable, 3), RetryActi
 
 `policy!` declares one unit struct per entry, with `Default` and the trait the entry names. An optional visibility sits before the name:
 
-| Entry                                     | Closure                                  | Implements                 |
-| ----------------------------------------- | ---------------------------------------- | -------------------------- |
-| `GatePolicy: vis Name`                    | `\|frame, session\|`, `\|frame\|`, or none | `GatePolicy`               |
-| `ReceptorPolicy<Msg>: vis Name`           | `\|message\|`, or none                    | `ReceptorPolicy<Msg>`      |
-| `RestartPolicy: vis Name`                 | `\|frame, failure, attempt\|`             | `RestartPolicy`            |
+| Entry                           | Closure                                    | Implements            |
+| ------------------------------- | ------------------------------------------ | --------------------- |
+| `GatePolicy: vis Name`          | `\|frame, session\|`, `\|frame\|`, or none | `GatePolicy`          |
+| `ReceptorPolicy<Msg>: vis Name` | `\|message\|`, or none                     | `ReceptorPolicy<Msg>` |
+| `RestartPolicy: vis Name`       | `\|frame, failure, attempt\|`              | `RestartPolicy`       |
 
 Macro hygiene hides the argument of an entry with no closure from its body, so that form serves a policy with a fixed verdict.
 
@@ -352,10 +380,11 @@ Macro hygiene hides the argument of an entry with no closure from its body, so t
 - `with_emitter_gate` and `with_collector_gate` append to a `GateChain` in call order. `with_restart` replaces the restart policy.
 - `with_trust_store`, `with_cms_server`, `with_key_purposes`, `with_server_policy`, and `with_handshake_protocol` set the handshake.
 - `allow_cleartext` names cleartext as the intent of a client with no trust in a server.
-- `ConnectionBuilder` adds `with_timeout`, `with_client_identity`, and `build`.
+- `with_timeout` sets the operation timeout, and `with_limits` every ceiling. A timeout outranks the one inside the limits.
+- `ConnectionBuilder` adds `with_client_identity` and `build`.
 - `connect(addr)` dials and returns a `GenericClient`, and `adopt(stream)` wraps a stream that the caller opened, under the same dialer rule.
 
-`ClientPolicies` holds the same policies apart from any builder, and `ClientPolicies::apply` attaches them to a transport.
+`ClientPolicies` holds the restart policy and the gates apart from any builder, and `ClientPolicies::apply` attaches them to a transport.
 
 ## Multiplexing
 
@@ -365,16 +394,16 @@ Macro hygiene hides the argument of an entry with no closure from its body, so t
 
 `TransportOffer` is the client's offer and `TransportAccept` the server's answer. Each field advertises what its sender receives:
 
-| Field                         | In                 | Meaning                                                                           |
-| ----------------------------- | ------------------ | --------------------------------------------------------------------------------- |
-| `mux`                         | Offer and accept   | The sender supports multiplexing                                                  |
-| `max_peer_initiated_streams`  | Offer and accept   | The streams the peer MAY open toward the sender                                   |
-| `chunk_payload_size`          | Offer and accept   | The largest inbound chunk payload                                                 |
-| `credit_unit`                 | Offer and accept   | Bytes per budget credit. The value of the accept wins                             |
-| `initial_stream_credit`       | Offer and accept   | The chunk allowance of each inbound stream                                        |
-| `requested_budgets`           | Offer              | The `MuxBudgets` the client requests, or `None` for an unmetered session          |
-| `authorization`               | Offer              | An opaque token for the server's `TransportAuthorizer`, public data               |
-| `granted_budgets`             | Accept             | The `MuxBudgets` of the epoch, or `None`                                          |
+| Field                        | In               | Meaning                                                                  |
+| ---------------------------- | ---------------- | ------------------------------------------------------------------------ |
+| `mux`                        | Offer and accept | The sender supports multiplexing                                         |
+| `max_peer_initiated_streams` | Offer and accept | The streams the peer MAY open toward the sender                          |
+| `chunk_payload_size`         | Offer and accept | The largest inbound chunk payload                                        |
+| `credit_unit`                | Offer and accept | Bytes per budget credit. The value of the accept wins                    |
+| `initial_stream_credit`      | Offer and accept | The chunk allowance of each inbound stream                               |
+| `requested_budgets`          | Offer            | The `MuxBudgets` the client requests, or `None` for an unmetered session |
+| `authorization`              | Offer            | An opaque token for the server's `TransportAuthorizer`, public data      |
+| `granted_budgets`            | Accept           | The `MuxBudgets` of the epoch, or `None`                                 |
 
 `TransportOffer::mux(cap)` builds an offer with the default chunking and credit, and `with_budgets`, `with_authorization`, `with_chunk_payload_size`, `with_credit_unit`, and `with_initial_stream_credit` adjust it. `MuxBudgets` holds `client_to_server` and `server_to_client` in credits, and each chunk debits `ceil(payload_len / credit_unit)` credits from its direction.
 
@@ -401,18 +430,19 @@ assert_eq!(settings.usable_send_budget(), None);
 
 The constants of `tightbeam::constants` set every clamp and default:
 
-| Constant                              | Value                                   | Bounds                                                   |
-| ------------------------------------- | --------------------------------------- | -------------------------------------------------------- |
-| `MAX_MUX_STREAM_CAP`                  | 1024                                    | Each directional stream cap                              |
-| `MIN_MUX_CHUNK_SIZE`, `MAX_MUX_CHUNK_SIZE` | 1 KiB, 64 KiB                      | Each chunk size                                          |
-| `DEFAULT_MUX_CHUNK_SIZE`              | 16 KiB                                  | The chunk size of `TransportOffer::mux`                  |
-| `DEFAULT_MUX_CREDIT_UNIT`             | 1024 bytes                              | The credit unit of `TransportOffer::mux`                 |
-| `MAX_MUX_STREAM_CREDIT`, `DEFAULT_MUX_STREAM_CREDIT` | 4096, 64 chunks          | The initial allowance of a stream                        |
-| `MAX_MUX_SESSION_BUDGET`              | Half of `DEFAULT_REKEY_RECORD_LIMIT`    | Each direction's budget, in credits                      |
-| `MAX_MUX_REASSEMBLY_BYTES`            | 16 MiB                                  | The bytes one stream reassembles                         |
-| `MAX_MUX_CONNECTION_REASSEMBLY_BYTES` | 64 MiB                                  | The bytes one connection reassembles across its streams  |
-| `DEFAULT_MUX_CANCEL_BUDGET`           | 1024                                    | The peer cancels that abort in-flight handlers           |
-| `DEFAULT_REKEY_DEADLINE_SECS`         | 30                                      | One in-band renewal exchange                             |
+| Constant                                             | Value                                | Bounds                                                  |
+| ---------------------------------------------------- | ------------------------------------ | ------------------------------------------------------- |
+| `MAX_MUX_STREAM_CAP`                                 | 1024                                 | Each directional stream cap                             |
+| `MIN_MUX_CHUNK_SIZE`, `MAX_MUX_CHUNK_SIZE`           | 1 KiB, 64 KiB                        | Each chunk size                                         |
+| `DEFAULT_MUX_CHUNK_SIZE`                             | 16 KiB                               | The chunk size of `TransportOffer::mux`                 |
+| `DEFAULT_MUX_CREDIT_UNIT`                            | 1024 bytes                           | The credit unit of `TransportOffer::mux`                |
+| `MAX_MUX_STREAM_CREDIT`, `DEFAULT_MUX_STREAM_CREDIT` | 4096, 64 chunks                      | The initial allowance of a stream                       |
+| `MAX_MUX_SESSION_BUDGET`                             | Half of `DEFAULT_REKEY_RECORD_LIMIT` | Each direction's budget, in credits                     |
+| `MAX_MUX_REASSEMBLY_BYTES`                           | 16 MiB                               | The bytes one stream reassembles                        |
+| `MAX_MUX_CONNECTION_REASSEMBLY_BYTES`                | 64 MiB                               | The bytes one connection reassembles across its streams |
+| `DEFAULT_MUX_CANCEL_BUDGET`                          | 1024                                 | The peer cancels that abort in-flight handlers          |
+| `DEFAULT_REKEY_DEADLINE_SECS`                        | 30                                   | One in-band renewal exchange                            |
+| `KEEPALIVE_PROBES_PER_DEADLINE`                      | 3                                    | The keepalive probes within one read deadline           |
 
 ### Streams and envelopes
 
@@ -437,22 +467,22 @@ The constants of `tightbeam::constants` set every clamp and default:
 | 9   | `RekeyAck`      | `MuxRekeyAckPackage`      |
 | 10  | `RekeyDone`     | `MuxRekeyDonePackage`     |
 
-`CancelReason` and `GoAwayReason` convert to and from `u32`. A known code below `MUX_APPLICATION_CODE_FLOOR` (0x1000) decodes to its named variant, and every other code to `Application(code)`. `GoAwayReason::as_str` gives the kebab-case audit label, such as `enhance-your-calm`. A renewal whose settlement or approval is refused with a code below the floor drains with `SettlementFailed`, and a code at or above it drains with `Application(code)`.
+`CancelReason` and `GoAwayReason` convert to and from `u32`. A known code below `MUX_APPLICATION_CODE_FLOOR` (0x1000) decodes to its named variant, and every other code to `Application(code)`. `GoAwayReason::as_str` gives the kebab-case audit label, such as `enhance-your-calm`. `FromStr` reads a label back, and `application` or any other text refuses with `tightbeam::UnknownName`. A renewal whose settlement or approval is refused with a code below the floor drains with `SettlementFailed`, and a code at or above it drains with `Application(code)`.
 
 ### The plane
 
 `MuxTransport<R, W>` assembles the plane over an `EnvelopeSource` and an `EnvelopeSink`:
 
-| Constructor or method                      | Effect                                                                                       |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `new(reader, writer, role, settings)`      | A plane with no rekey state, which drains through GoAway near the record limit                |
-| `with_rekey(reader, writer, context, settings)` | A plane that renews in band, in the role of its `MuxRekeyContext`                       |
-| `with_cancel_budget(budget)`               | Replaces `DEFAULT_MUX_CANCEL_BUDGET`                                                         |
-| `with_credit_grantor(grantor)`             | Replaces the default `BufferedGrantor`, a `CreditGrantor` that tops a stream up at half its window |
-| `with_renewal_deadline(deadline)`          | Replaces `DEFAULT_REKEY_DEADLINE_SECS`, under `tokio`                                        |
-| `handle()`                                 | A clone of the handle                                                                        |
-| `into_parts()`                             | The `MuxHandle`, the `MuxReaderDriver`, the `MuxWriterDriver`, and the `MuxResponder`        |
-| `spawn()`                                  | A `SpawnedMux` with both drivers spawned, under `tokio`                                      |
+| Constructor or method                           | Effect                                                                                             |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `new(reader, writer, role, settings)`           | A plane with no rekey state, which drains through GoAway near the record limit                     |
+| `with_rekey(reader, writer, context, settings)` | A plane that renews in band, in the role of its `MuxRekeyContext`                                  |
+| `with_cancel_budget(budget)`                    | Replaces `DEFAULT_MUX_CANCEL_BUDGET`                                                               |
+| `with_credit_grantor(grantor)`                  | Replaces the default `BufferedGrantor`, a `CreditGrantor` that tops a stream up at half its window |
+| `with_renewal_deadline(deadline)`               | Replaces `DEFAULT_REKEY_DEADLINE_SECS`                                                             |
+| `handle()`                                      | A clone of the handle                                                                              |
+| `into_parts()`                                  | The `MuxHandle`, the `MuxReaderDriver`, the `MuxWriterDriver`, and the `MuxResponder`              |
+| `spawn()`                                       | A `SpawnedMux` with both drivers spawned, under `tokio`                                            |
 
 `SpawnedMux` holds the `handle`, the `responder`, and the `drivers`. A drop of `MuxDrivers` aborts both tasks and ends the connection, and `is_finished` reports a reader that ended.
 
@@ -483,26 +513,29 @@ fn assemble<T: MuxConnector>(
 
 `MuxHandle` is the cloneable initiator side:
 
-| Method                                   | Effect                                                                                        |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `emit_on_stream(&frame)`                 | Opens a stream, sends the frame in chunks, and awaits the response. A drop of the future cancels the stream |
-| `open_stream()`, `open_stream_to(target)`| A `RequestSink` for a streamed request, and the future of its unary response                  |
-| `open_duplex()`, `open_duplex_to(target)`| A `RequestSink` and a `StreamBody` that carries the reply as it arrives                       |
-| `ping()`                                 | Resolves when the peer acknowledges a probe, off the stream table                             |
-| `shutdown()`, `shutdown_with(reason)`    | Sends GoAway, waits for the pending streams, and closes the writer                            |
-| `has_stream_headroom()`, `wait_for_stream_slot()` | Whether a new stream would open now, and a future that resolves when one would        |
-| `goaway_reason()`                        | The reason of the peer's GoAway                                                               |
-| `session_receipt()`                      | The receipt of the current epoch, which each renewal rotates                                  |
+| Method                                            | Effect                                                                                                                                                                                     |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `emit_on_stream(&frame)`                          | Opens a stream, sends the frame in chunks, and awaits the response. A drop of the future cancels the stream                                                                                |
+| `open_stream()`, `open_stream_to(target)`         | A `RequestSink` for a streamed request, and the future of its unary response                                                                                                               |
+| `open_duplex()`, `open_duplex_to(target)`         | A `RequestSink` and a `StreamBody` that carries the reply as it arrives                                                                                                                    |
+| `ping()`                                          | Resolves when the peer acknowledges a probe, off the stream table                                                                                                                          |
+| `keep_alive()`                                    | Pings at once, then once per interval on the clock of the link, until a ping fails. It returns the error of that ping, or `FailedPrecondition` at once on a clock that cannot race a probe |
+| `shutdown()`, `shutdown_with(reason)`             | Sends GoAway, waits for the pending streams, and closes the writer                                                                                                                         |
+| `has_stream_headroom()`, `wait_for_stream_slot()` | Whether a new stream would open now, and a future that resolves when one would                                                                                                             |
+| `goaway_reason()`                                 | The reason of the peer's GoAway                                                                                                                                                            |
+| `session_receipt()`                               | The receipt of the current epoch, which each renewal rotates                                                                                                                               |
+
+`keep_alive` sends its first probe at once, so one that starts late in the read deadline holds the link. It ends with `TransportError::Draining` when a probe meets a GoAway that went out or came in, and with `TransportError::ConnectionClosed` when the link closes before a probe or while one waits for its ack, as at the close that ends a drain. It needs a clock that races a wait, as `Clock::timing` reports, and on any other clock it ends at once with `TransportError::OperationFailed` and `FailedPrecondition`. `KEEPALIVE_PROBES_PER_DEADLINE` intervals fill one read deadline.
 
 `emit_on_stream` fails in these cases:
 
-| Error                                    | Cause                                                                      |
-| ---------------------------------------- | -------------------------------------------------------------------------- |
-| `OperationFailed(StreamsExhausted)`      | The stream cap that the peer advertised is full                            |
-| `OperationFailed(BudgetExhausted)`       | The credits left in the epoch cannot cover the frame                       |
-| `OperationFailed(ResourceExhausted)`     | The peer refused the stream                                                |
-| `Draining`                               | A GoAway went out or came in, so the connection refuses every new stream   |
-| `ConnectionClosed`                       | The connection failed, before the call or before the response              |
+| Error                                | Cause                                                                    |
+| ------------------------------------ | ------------------------------------------------------------------------ |
+| `OperationFailed(StreamsExhausted)`  | The stream cap that the peer advertised is full                          |
+| `OperationFailed(BudgetExhausted)`   | The credits left in the epoch cannot cover the frame                     |
+| `OperationFailed(ResourceExhausted)` | The peer refused the stream                                              |
+| `Draining`                           | A GoAway went out or came in, so the connection refuses every new stream |
+| `ConnectionClosed`                   | The connection failed, before the call or before the response            |
 
 `MultiplexedProtocol` names `max_concurrent_streams` and `emit_on_stream`, and `StreamingProtocol` adds `open_stream` and `open_duplex`, so a caller stays generic over the handle.
 
@@ -519,12 +552,12 @@ fn assemble<T: MuxConnector>(
 
 The pool and the accept loop reach the plane through four traits:
 
-| Trait          | Items                                                                                                 |
-| -------------- | ----------------------------------------------------------------------------------------------------- |
-| `MuxCapable`   | `with_mux_offer`, and `negotiated_mux` of a completed handshake                                       |
-| `MuxConnector` | `complete_client_handshake`, `take_rekey`, `handshake_peer_certificate`, and `into_envelope_halves`   |
+| Trait          | Items                                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `MuxCapable`   | `with_mux_offer`, and `negotiated_mux` of a completed handshake                                                      |
+| `MuxConnector` | `complete_client_handshake`, `take_rekey`, `handshake_peer_certificate`, and `into_envelope_halves`                  |
 | `MuxAcceptor`  | `negotiate_mux`, `take_rekey`, `session_context`, `into_gated_halves`, and `serve(settings, service, cancel_budget)` |
-| `IntoMuxOffer` | The conversion of an owned or shared offer into `Option<Arc<TransportOffer>>`                         |
+| `IntoMuxOffer` | The conversion of an owned or shared offer into `Option<Arc<TransportOffer>>`                                        |
 
 `MuxService` is the handler set of `server!` with `service:`. Each method receives a `CallContext`, the session and the route of its stream.
 
@@ -532,21 +565,21 @@ The pool and the accept loop reach the plane through four traits:
 
 A server's `TransportAuthorizer` runs two hooks inside the handshake, and a third at each renewal:
 
-| Hook                                  | Runs                                              | Answers                                                                                   |
-| ------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `authorize(offer)`                    | After the client's offer, before the accept       | An `AuthorizationGrant` of budgets and an optional challenge, or an `AuthorizationRefusal` |
-| `settle(receipt, response, client)`   | After the client's countersignature verifies      | `Ok`, or a refusal. The default refuses a challenge with `SETTLEMENT_UNSUPPORTED_CODE` (1) |
-| `challenge_renewal(prior)`            | At each in-band renewal                           | The challenge of the epoch receipt, `None` by default                                     |
+| Hook                                | Runs                                         | Answers                                                                                    |
+| ----------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `authorize(offer)`                  | After the client's offer, before the accept  | An `AuthorizationGrant` of budgets and an optional challenge, or an `AuthorizationRefusal` |
+| `settle(receipt, response, client)` | After the client's countersignature verifies | `Ok`, or a refusal. The default refuses a challenge with `SETTLEMENT_UNSUPPORTED_CODE` (1) |
+| `challenge_renewal(prior)`          | At each in-band renewal                      | The challenge of the epoch receipt, `None` by default                                      |
 
 The handshake clamps a grant to the componentwise minimum of the grant and the request. A server with no authorizer grants that minimum under its local ceiling. The client refuses a grant that breaks its request:
 
-| `NegotiationError`        | The grant                                               |
-| ------------------------- | ------------------------------------------------------- |
-| `BudgetGrantWithheld`     | Holds no budgets for a session that requested them      |
-| `BudgetBeyondRequest`     | Exceeds the request                                     |
-| `BudgetBeyondCap`         | Exceeds `MAX_MUX_SESSION_BUDGET`                        |
-| `ChallengeWithoutBudgets` | Carries a challenge with no budgets to bind it          |
-| `AuthorizationRefused`    | Is a refusal, with the authorizer's code                |
+| `NegotiationError`        | The grant                                          |
+| ------------------------- | -------------------------------------------------- |
+| `BudgetGrantWithheld`     | Holds no budgets for a session that requested them |
+| `BudgetBeyondRequest`     | Exceeds the request                                |
+| `BudgetBeyondCap`         | Exceeds `MAX_MUX_SESSION_BUDGET`                   |
+| `ChallengeWithoutBudgets` | Carries a challenge with no budgets to bind it     |
+| `AuthorizationRefused`    | Is a refusal, with the authorizer's code           |
 
 The client's `ReceiptApprover::approve(receipt)` answers before the client countersigns: `Ok(None)` countersigns, `Ok(Some(answer))` attaches a settlement answer, and an `ApprovalRefusal` aborts. A client with no approver countersigns a receipt with no challenge, and aborts on a challenge. The server's `SessionObserver::on_outcome` receives the `SessionOutcome` of every receipt exchange, with its `SessionVerdict`, once the authorizer has made the verdict final.
 
@@ -562,29 +595,29 @@ The client's `ReceiptApprover::approve(receipt)` answers before the client count
 
 `PoolConfig` has three public fields:
 
-| Field             | Type                          | Default                               |
-| ----------------- | ----------------------------- | ------------------------------------- |
-| `idle_timeout`    | `Option<Duration>`            | `None`                                |
-| `max_connections` | `NonZeroUsize`                | `DEFAULT_MAX_POOL_CONNECTIONS`, 64    |
-| `mux_offer`       | `Option<Arc<TransportOffer>>` | `None`                                |
+| Field             | Type                          | Default                            |
+| ----------------- | ----------------------------- | ---------------------------------- |
+| `idle_timeout`    | `Option<Duration>`            | `None`                             |
+| `max_connections` | `NonZeroUsize`                | `DEFAULT_MAX_POOL_CONNECTIONS`, 64 |
+| `mux_offer`       | `Option<Arc<TransportOffer>>` | `None`                             |
 
 The builder sets the rest:
 
 - `with_config` and `with_clock` replace the configuration and the clock.
 - `with_trust_store`, `with_cms_server`, `with_key_purposes`, `with_server_policy`, and `with_handshake_protocol` set the handshake of every dial.
 - `with_client_identity` sets the identity of mutual authentication, and `with_receipt_approver` the approver of every dialed transport.
-- `with_timeout` sets the operation timeout of every connection, and `with_trace` the collector under `instrument`.
+- `with_timeout` sets the operation timeout of every connection, `with_limits` every ceiling, and `with_trace` the collector under `instrument`. A timeout outranks the one inside the limits.
 - `allow_cleartext` names cleartext as the intent of a pool with no trust in a server.
 
 `ConnectionPool::connect(addr)` takes `self: &Arc<Self>` and returns a `PooledClient`. `try_acquire(addr)` leases a connection that is ready now, or returns `None`.
 
-| `PooledClient` method                  | Effect                                                                                     |
-| -------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `emit(frame, attempt)`                 | Sends on the exclusive connection, or opens a stream on the shared one                     |
-| `conn()`                               | The exclusive connection. A multiplexed lease fails with `InvalidState`                    |
-| `peer_certificate()`                   | The certificate the handshake pinned. An exclusive lease answers `None` until its handshake completes |
-| `session_receipt()`                    | The receipt of the shared connection. An exclusive lease answers `None`                    |
-| `open_stream()`, `open_duplex()`       | A stream on the shared connection. An exclusive lease fails with `InvalidState`            |
+| `PooledClient` method            | Effect                                                                                                |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `emit(frame, attempt)`           | Sends on the exclusive connection, or opens a stream on the shared one                                |
+| `conn()`                         | The exclusive connection. A multiplexed lease fails with `InvalidState`                               |
+| `peer_certificate()`             | The certificate the handshake pinned. An exclusive lease answers `None` until its handshake completes |
+| `session_receipt()`              | The receipt of the shared connection. An exclusive lease answers `None`                               |
+| `open_stream()`, `open_duplex()` | A stream on the shared connection. An exclusive lease fails with `InvalidState`                       |
 
 A drop returns a live exclusive connection to the pool. A multiplexed lease leaves its connection with the pool entry.
 
@@ -592,11 +625,11 @@ An exclusive connection is live while its stream is open, its send cipher has a 
 
 The pool fails a connect in these cases:
 
-| Error                                   | Cause                                                                          |
-| --------------------------------------- | ------------------------------------------------------------------------------ |
-| `OperationFailed(ResourceExhausted)`    | `max_connections` connections are live, so the dial stops before the socket    |
-| `PeerAuthenticationUnconfigured`        | The pool holds no trust in a server and no call to `allow_cleartext`           |
-| `OperationFailed(Internal)`             | The pool map is poisoned                                                       |
+| Error                                | Cause                                                                       |
+| ------------------------------------ | --------------------------------------------------------------------------- |
+| `OperationFailed(ResourceExhausted)` | `max_connections` connections are live, so the dial stops before the socket |
+| `PeerAuthenticationUnconfigured`     | The pool holds no trust in a server and no call to `allow_cleartext`        |
+| `OperationFailed(Internal)`          | The pool map is poisoned                                                    |
 
 On a multiplexed lease, `emit` handles two failures of `emit_on_stream`. `StreamsExhausted` moves the lease to a connection with headroom, or dials one more within `max_connections`, and retries once. `ConnectionClosed` and `Draining` evict the entry, so the next `connect` dials again, and the error returns to the caller.
 
@@ -624,26 +657,26 @@ let pool = Arc::new(builder.allow_cleartext().build());
 
 [README §8.8](../README.md#88-audit) states what a deployment with audit obligations MUST do. Each step maps to code under the `instrument` feature:
 
-| Step                       | Code                                                                                                                         |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Attach a trace             | `TraceCollector`, through `with_trace` on a `TcpTransport`, an `EndpointConfig`, or a `ConnectionPoolBuilder`, or the `server!` policy `with_trace: [trace.share()]` |
-| Record payload hashes      | `TbInstrumentationConfig::enable_payloads`, so each event carries the SHA3-256 hash of its payload                           |
-| Provide a durable sink     | An `EventSink` in `TraceConfig::with_sink`. The default is a `BoundedMemorySink` of `max_events` (1024) events              |
-| Map the clock              | `TraceCollector::with_clock(clock)`, which records `TRACE_CLOCK_ORIGIN` once per origin                                      |
+| Step                   | Code                                                                                                                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Attach a trace         | `TraceCollector`, through `with_trace` on a `TcpTransport`, an `EndpointConfig`, or a `ConnectionPoolBuilder`, or the `server!` policy `with_trace: [trace.share()]` |
+| Record payload hashes  | `TbInstrumentationConfig::enable_payloads`, so each event carries the SHA3-256 hash of its payload                                                                   |
+| Provide a durable sink | An `EventSink` in `TraceConfig::with_sink`. The default is a `BoundedMemorySink` of `max_events` (1024) events                                                       |
+| Map the clock          | `TraceCollector::with_clock(clock)`, which records `TRACE_CLOCK_ORIGIN` once per origin                                                                              |
 
 The default sink keeps the oldest events up to `max_events`, keeps one `WARN` record in place of the next, and drops each later one, and its `overflowed` latch then reads `true`. The warning takes the sequence number of the event it replaces, and its label is the URN of that event. The warning and the `overflow` field of the evidence, which the evidence hash covers, show where truncation began. The collector asks `EventSink::retains` after it takes the sequence number of an event, so each dropped event still takes its number, and a gap in `seq` before a later retained event marks the events dropped there.
 
 The access and session verdicts are these events of `tightbeam::instrumentation::events`:
 
-| Event                           | URN                                              | Records                                                                                |
-| ------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `GATE_ACCEPT`                   | `urn:tightbeam:event:gate/accept`                | A frame that a collector gate admits. The payload is the peer's canonical key          |
-| `GATE_REJECT`                   | `urn:tightbeam:event:gate/reject`                | A frame that a collector gate refuses, with the normalized status as label and value   |
-| `SESSION_CERT_REJECTED`         | `urn:tightbeam:event:session/cert-rejected`      | A refused peer identity. The label names the cause, such as `signature` or `key-confirmation` |
-| `SESSION_AUTHORIZATION_REFUSED` | `urn:tightbeam:event:session/authorization-refused` | A session that the authorizer refused, with its code                               |
-| `SESSION_RECEIPT_SETTLED`       | `urn:tightbeam:event:session/receipt-settled`    | A budget-bearing session that holds its dual-signed receipt                            |
-| `SESSION_RECEIPT_REFUSED`       | `urn:tightbeam:event:session/receipt-refused`    | A handshake that fails on its receipt. The label names the reason                      |
-| `TRACE_CLOCK_ORIGIN`            | `urn:tightbeam:event:trace/clock-origin`         | The origin of the trace clock, in Unix-epoch nanoseconds                               |
+| Event                           | URN                                                 | Records                                                                                       |
+| ------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `GATE_ACCEPT`                   | `urn:tightbeam:event:gate/accept`                   | A frame that a collector gate admits. The payload is the peer's canonical key                 |
+| `GATE_REJECT`                   | `urn:tightbeam:event:gate/reject`                   | A frame that a collector gate refuses, with the normalized status as label and value          |
+| `SESSION_CERT_REJECTED`         | `urn:tightbeam:event:session/cert-rejected`         | A refused peer identity. The label names the cause, such as `signature` or `key-confirmation` |
+| `SESSION_AUTHORIZATION_REFUSED` | `urn:tightbeam:event:session/authorization-refused` | A session that the authorizer refused, with its code                                          |
+| `SESSION_RECEIPT_SETTLED`       | `urn:tightbeam:event:session/receipt-settled`       | A budget-bearing session that holds its dual-signed receipt                                   |
+| `SESSION_RECEIPT_REFUSED`       | `urn:tightbeam:event:session/receipt-refused`       | A handshake that fails on its receipt. The label names the reason                             |
+| `TRACE_CLOCK_ORIGIN`            | `urn:tightbeam:event:trace/clock-origin`            | The origin of the trace clock, in Unix-epoch nanoseconds                                      |
 
 ```rust
 use tightbeam::crypto::profiles::DefaultCryptoProvider;

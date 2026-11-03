@@ -631,6 +631,8 @@ mod tests {
 	mod internal_detail {
 		use futures::future::ready;
 
+		#[cfg(pooled_mux)]
+		use super::super::super::handle::Pulse;
 		use super::*;
 		use crate::testing::fixtures::TestTrace;
 		use crate::trace::TraceCollector;
@@ -721,7 +723,8 @@ mod tests {
 		#[cfg(pooled_mux)]
 		pub(super) fn gated(service: impl MuxService, link: MuxLink) -> GatedService<impl MuxService> {
 			let gate = Box::new(AcceptAllGate);
-			GatedService::new(service, gate, SessionContext::default(), MuxHandle::new(link))
+			let handle = MuxHandle::new(link, Pulse::fixture());
+			GatedService::new(service, gate, SessionContext::default(), handle)
 		}
 
 		/// An echo service, which serves unary calls and answers each

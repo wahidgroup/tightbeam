@@ -10,7 +10,7 @@ use core::time::Duration;
 
 use tokio::sync::watch;
 
-use tightbeam::clock::{Clock, ManualClock, MonotonicInstant, UnixMillis};
+use tightbeam::clock::{Clock, ManualClock, MonotonicInstant, Timing, UnixMillis};
 use tightbeam::marker::MaybeSendFuture;
 
 use crate::common::poll::within_hang_guard;
@@ -75,5 +75,9 @@ impl Clock for ParkingClock {
 		let sleep = self.clock.sleep(span);
 		self.parked.send_modify(|parked| parked.push(span));
 		sleep
+	}
+
+	fn timing(&self) -> Timing {
+		Timing::Races
 	}
 }

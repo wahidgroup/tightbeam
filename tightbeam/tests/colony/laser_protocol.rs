@@ -69,6 +69,14 @@ impl TightBeamAddress for LaserAddr {}
 /// One end of a laser link: a byte pipe with no framing of its own.
 pub struct LaserStream(DuplexStream);
 
+impl LaserStream {
+	/// Both ends of one link, apart from any listener.
+	pub fn pair() -> (Self, Self) {
+		let (near, far) = duplex(BEAM_CAPACITY);
+		(Self(near), Self(far))
+	}
+}
+
 impl AsyncByteRead for LaserStream {
 	type Error = TransportError;
 
@@ -183,7 +191,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> LaserListener<P> {
 			.ok_or(TransportError::ConnectionClosed)?;
 
 		let transport = LaserTransport::new(LaserStream(stream), self.config.clone());
-
 		Ok((transport, LaserAddr(0)))
 	}
 }

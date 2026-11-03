@@ -233,20 +233,21 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
-	/// Replaces the operation timeout of this endpoint when `timeout` is set,
-	/// so a dial and every transport built from this configuration run under
-	/// it.
+	/// Replaces the limits of this endpoint when `limits` is set, then its
+	/// operation timeout when `timeout` is set, so a timeout outranks the
+	/// timeout inside `limits`.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::InvalidLimits`] -- `timeout` is zero.
-	pub(crate) fn with_operation_timeout(self, timeout: Option<Duration>) -> TransportResult<Self> {
-		let Some(operation_timeout) = timeout else {
-			return Ok(self);
-		};
+	pub(crate) fn under(mut self, limits: Option<CheckedLimits>, timeout: Option<Duration>) -> TransportResult<Self> {
+		self.limits = limits.unwrap_or(self.limits);
 
-		let limits = TransportLimits { operation_timeout, ..*self.limits };
-		self.with_limits(limits)
+		if let Some(timeout) = timeout {
+			self.limits = self.limits.with_operation_timeout(timeout)?;
+		}
+
+		Ok(self)
 	}
 
 	/// Attaches the production instrumentation collector each transport built
@@ -507,7 +508,7 @@ mod tests {
 		use crate::crypto::profiles::DefaultCryptoProvider;
 
 		let endpoint = EndpointConfig::<DefaultCryptoProvider>::cleartext();
-		let refused = endpoint.with_operation_timeout(Some(Duration::ZERO));
+		let refused = endpoint.under(None, Some(Duration::ZERO));
 		assert!(matches!(
 			refused,
 			Err(TransportError::InvalidLimits(LimitsRefusal::ZeroCeiling))

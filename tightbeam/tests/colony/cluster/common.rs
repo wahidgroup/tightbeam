@@ -51,12 +51,13 @@ pub use tightbeam::colony::cluster::{
 };
 pub use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
 pub use tightbeam::colony::protocol::{
-	ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, GossipReconciliation, GossipResponse, GossipRumor,
-	GossipWant, PeerAdvertisement, PeerAdvertisementResponse, RegisterHiveRequest, RegisterHiveResponse,
-	ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo,
+	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, PeerAdvertisement,
+	PeerAdvertisementResponse, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
+	ServletAddressUpdateResponse, ServletInfo,
 };
 pub use tightbeam::colony::servlet::{ServletConfig, ServletConfigBuilder, WithCertificate};
 pub use tightbeam::colony::urn::ColonyNamespace;
+pub use tightbeam::colony::work::{ClusterWorkRequest, ClusterWorkResponse};
 pub use tightbeam::colony::SubmitWork;
 pub use tightbeam::constants::{
 	DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, DEFAULT_GOSSIP_RETENTION_MS, MAX_ADVERTISED_TYPES, MAX_GOSSIP_PAYLOAD_BYTES,

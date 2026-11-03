@@ -10,6 +10,9 @@ use alloc::vec::Vec;
 #[cfg(feature = "hex")]
 pub use ::hex_literal::hex;
 
+#[cfg(feature = "digest")]
+use crate::crypto::hash::DigestInfoExt;
+
 /// Encode a value to DER format.
 ///
 /// Every universal SET of the output holds its elements in DER order
@@ -78,23 +81,7 @@ pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
 ) -> Result<crate::asn1::DigestInfo, TightBeamError> {
 	let mut hasher = D::new();
 	hasher.update(data.as_ref());
-	digest_info::<D>(hasher)
-}
-
-/// Finalize `hasher` into the [`DigestInfo`] that names its algorithm.
-///
-/// Callers whose preimage arrives in pieces stream it into `hasher` and end
-/// here, so the pieces reach a `DigestInfo` with no copy into one buffer.
-///
-/// [`DigestInfo`]: crate::asn1::DigestInfo
-#[cfg(feature = "digest")]
-pub(crate) fn digest_info<D: digest::Digest + crate::der::oid::AssociatedOid>(
-	hasher: D,
-) -> Result<crate::asn1::DigestInfo, TightBeamError> {
-	let algorithm = crate::asn1::AlgorithmIdentifier { oid: D::OID, parameters: None };
-	let digest = hasher.finalize();
-	let digest_octet_string = crate::asn1::OctetString::new(&digest[..])?;
-	Ok(crate::asn1::DigestInfo { algorithm, digest: digest_octet_string })
+	crate::asn1::DigestInfo::of_hasher(hasher)
 }
 
 #[cfg(test)]

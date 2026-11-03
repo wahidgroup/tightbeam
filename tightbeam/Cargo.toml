@@ -159,7 +159,9 @@ transport-multiplex = ["transport", "std", "futures", "futures/std"]
 preview-pqc = ["kem", "dep:ml-kem"]
 tcp = ["transport", "std"]
 async-transport = ["transport", "std"]
+colony-wire = ["std", "policy"]
 colony = [
+	"colony-wire",
 	"std",
 	"tokio",
 	"builder",

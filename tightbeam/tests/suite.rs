@@ -10,6 +10,9 @@
 // Raw `unwrap()` is banned crate-wide: test cases propagate with `?`, and
 // helpers state their invariant through `expect`.
 #![deny(clippy::unwrap_used)]
+// `clippy.toml` denies the tokio timer in the library. A test bounds its own
+// wait with that timer as a hang guard, and drives paused tokio time.
+#![allow(clippy::disallowed_methods)]
 
 // The shared test helpers.
 mod common;

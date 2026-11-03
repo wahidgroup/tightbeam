@@ -11,173 +11,17 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::work::ClusterWorkRequest;
 use crate::asn1::Frame;
 use crate::basis_points::BasisPoints;
 use crate::builder::TypeBuilder;
 use crate::clock::{Clock, UnixMillis};
 use crate::cms::signed_data::SignerIdentifier;
-use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::urn::Urn;
-use crate::utils::{decode, encode};
 use crate::wire::wire_sequence;
 use crate::{Beamable, Message, MessagePriority, TightBeamError, Version};
-
-/// The work request envelope for cluster routing.
-///
-/// Clients send it to the cluster gateway, which selects a local servlet or a
-/// peer gateway by `servlet_type` and delivers the client frame in `payload`
-/// to the servlet byte-for-byte.
-#[derive(Debug, Beamable, Clone, PartialEq)]
-pub struct ClusterWorkRequest {
-	/// The target servlet type URN, such as `urn:tightbeam::servlet:ping`.
-	pub servlet_type: Urn<'static>,
-	/// The DER bytes of the client's complete end-to-end [`Frame`].
-	///
-	/// The frame's `message` is the servlet's typed input. Gateways forward
-	/// these bytes unmodified, so the client's signature, integrity, and
-	/// previous-frame linkage stay verifiable at the servlet
-	/// ([`Frame::verify`]).
-	pub payload: Vec<u8>,
-	/// The relay budget: the count of gateway forwards that remain for this
-	/// work.
-	///
-	/// - A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel through
-	///   [`ClusterWorkRequest::new`], so gateway policy decides the budget.
-	/// - Each gateway clamps the inbound value to its own `max_hops`, so one
-	///   clamp rule covers the origin sentinel and a relayed value.
-	/// - A gateway that selects a peer route re-emits with the clamped budget
-	///   decremented ([`ClusterWorkRequest::into_relayed`]).
-	pub hops_remaining: u8,
-}
-
-wire_sequence!(ClusterWorkRequest {
-	servlet_type: plain,
-	payload: octets,
-	hops_remaining: default(DEFAULT_HOP_BUDGET),
-});
-
-impl ClusterWorkRequest {
-	/// Builds origin work from a client, with the client's complete frame
-	/// nested as the end-to-end payload. The sentinel budget defers the hop
-	/// cap to the first gateway's `max_hops` policy.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError::SerializationError`] -- `frame` does not encode.
-	pub fn new(servlet_type: Urn<'static>, frame: &Frame) -> Result<Self, TightBeamError> {
-		Ok(Self { servlet_type, payload: encode(frame)?, hops_remaining: DEFAULT_HOP_BUDGET })
-	}
-
-	/// Re-emits the work toward a peer with the relay budget that remains. A
-	/// `0` budget is the terminal hop, so the receiver serves locally only.
-	#[must_use]
-	pub fn into_relayed(mut self, hops_remaining: u8) -> Self {
-		self.hops_remaining = hops_remaining;
-		self
-	}
-
-	/// Wraps `work` in the hop-local transport frame the gateway expects.
-	///
-	/// The wrapper serves routing alone. It reuses the work frame's id for
-	/// correlation, and its message is the encoded [`ClusterRequest::Work`]
-	/// envelope, so the client's own frame travels inside unmodified.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError::SerializationError`] -- `work` or the envelope does not encode.
-	pub(crate) fn transport_frame(servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
-		let request = ClusterRequest::Work(Self::new(servlet_type, work)?);
-		let message = encode(&request)?;
-
-		Ok(Frame::v0(work.metadata().id(), message))
-	}
-}
-
-/// The work response from the cluster.
-#[derive(Debug, Beamable, Clone, PartialEq)]
-pub struct ClusterWorkResponse {
-	/// The status of the routing and the execution.
-	pub status: TransitStatus,
-	/// The DER bytes of the servlet's complete response [`Frame`] on
-	/// success, and [`None`] on a refusal.
-	///
-	/// Gateways return the servlet's reply frame unmodified, so its signature
-	/// and metadata stay verifiable at the client ([`Frame::verify`]).
-	///
-	/// Decode with [`ClusterWorkResponse::into_frame`], or resolve success and
-	/// refusal in one step with [`ClusterWorkResponse::served`].
-	pub payload: Option<Vec<u8>>,
-}
-
-wire_sequence!(ClusterWorkResponse { status: plain, payload: octets_opt });
-
-impl ClusterWorkResponse {
-	/// Creates a successful response that carries the servlet's encoded
-	/// response frame.
-	#[inline]
-	pub fn ok(payload: impl Into<Vec<u8>>) -> Self {
-		Self { status: TransitStatus::Ok, payload: Some(payload.into()) }
-	}
-
-	/// Creates an error response with `status`.
-	#[inline]
-	pub fn err(status: TransitStatus) -> Self {
-		Self { status, payload: None }
-	}
-
-	/// Decodes the servlet's complete response frame from the payload.
-	///
-	/// A refusal carries no payload and yields [`None`]. A caller that treats
-	/// a refusal as an error uses [`ClusterWorkResponse::served`] instead.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError::SerializationError`] -- the payload does not decode as a frame.
-	pub fn into_frame(self) -> Result<Option<Frame>, TightBeamError> {
-		match self.payload {
-			Some(payload) => Ok(Some(decode(&payload)?)),
-			None => Ok(None),
-		}
-	}
-
-	/// Resolves the response into the servlet's frame or a typed error.
-	///
-	/// The unary work plane is request-reply, so a served request always
-	/// carries the servlet's complete response frame.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError::WorkRefused`] -- the status is not `Ok`, so the work was refused.
-	/// - [`TightBeamError::MissingResponse`] -- the status is `Ok` with no
-	///   payload, which violates the plane contract.
-	/// - [`TightBeamError::SerializationError`] -- the payload does not decode as a frame.
-	pub fn served(self) -> Result<Frame, TightBeamError> {
-		if self.status != TransitStatus::Ok {
-			return Err(TightBeamError::WorkRefused(self.status));
-		}
-
-		self.into_frame()?.ok_or(TightBeamError::MissingResponse)
-	}
-
-	/// Unwraps a gateway reply down to the servlet's response frame.
-	///
-	/// It is the inverse of [`ClusterWorkRequest::transport_frame`]: the reply
-	/// is the hop-local wrapper, with the servlet's own frame inside it.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with no frame.
-	/// - The errors of [`Frame::decode_message`] -- the reply is no carrier of a work response.
-	/// - Any error that [`Self::served`] reports for the decoded response.
-	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
-		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-		let response: Self = reply.decode_message()?;
-
-		response.served()
-	}
-}
 
 /// The inbound message envelope for the cluster gateway, an ASN.1 CHOICE.
 ///
@@ -1234,11 +1078,13 @@ mod tests {
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::clock::ManualClock;
 	use crate::colony::urn::ColonyNamespace;
+	use crate::colony::work::ClusterWorkResponse;
 	use crate::crypto::hash::Sha3_256;
 	use crate::der::{DecodeOwned, Encode, ErrorKind, Tag, TagNumber};
 	use crate::tb_cases;
 	use crate::testing::fixtures::{der_round_trip, TestClock};
 	use crate::testing::TestResult;
+	use crate::utils::{decode, encode};
 
 	/// An issue clock over a manual clock, beside that clock.
 	fn issue_clock() -> (IssueClock, Arc<ManualClock>) {
@@ -1339,7 +1185,6 @@ mod tests {
 	tb_cases! {
 		fn choice_of_finds_no_command(frame: Frame) {
 			let choice = ClusterCommand::choice_of(&frame);
-
 			assert_eq!(choice, None);
 		}
 		cases {
@@ -1432,7 +1277,6 @@ mod tests {
 			-> TestResult
 		{
 			let yielded = response.into_frame()?;
-
 			assert_eq!(yielded, frame);
 			Ok(())
 		}
@@ -1717,7 +1561,6 @@ mod tests {
 			(shape, response, priority): (ReplyShape, ClusterCommandResponse, Option<MessagePriority>)
 		) {
 			let reply = reply_of(shape, response);
-
 			assert_eq!(reply.metadata().priority(), priority);
 		}
 		cases {

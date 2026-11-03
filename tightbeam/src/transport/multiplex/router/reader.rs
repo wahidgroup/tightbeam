@@ -1361,6 +1361,7 @@ mod tests {
 	use crate::marker::MaybeSend;
 	use crate::testing::TestResult;
 	use crate::transport::multiplex::MuxRole;
+	use crate::transport::CheckedLimits;
 
 	/// A receive stream refuses a chunk past the limit it granted.
 	#[test]
@@ -1468,6 +1469,10 @@ mod tests {
 					None => pending().await,
 				}
 			}
+		}
+
+		fn limits(&self) -> CheckedLimits {
+			CheckedLimits::default()
 		}
 	}
 

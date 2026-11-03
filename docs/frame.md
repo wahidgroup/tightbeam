@@ -16,6 +16,7 @@ It drills down from [README §4](../README.md#4-protocol-specification) and [REA
 - [FrameBuilder and compose!](#framebuilder-and-compose)
 - [Enumerated types](#enumerated-types)
 - [Cryptographic structures](#cryptographic-structures)
+- [Install external results](#install-external-results)
 - [Encoding](#encoding)
 - [Semantic constraints](#semantic-constraints)
 - [Matrix](#matrix)
@@ -27,27 +28,28 @@ It drills down from [README §4](../README.md#4-protocol-specification) and [REA
 
 `GatedField` (`tightbeam::asn1::GatedField`) names each optional field that a later version introduces. `GatedField::since` returns the version that introduced it, and `Version::allows(field)` holds when a version is at or above that one.
 
-| `GatedField` | Field | Since |
-| --- | --- | --- |
-| `MessageIntegrity` | `Metadata.integrity` (MI) | V1 |
-| `Confidentiality` | `Metadata.confidentiality` | V1 |
-| `FrameIntegrity` | `Frame.integrity` (FI) | V1 |
-| `Nonrepudiation` | `Frame.nonrepudiation` | V1 |
-| `Priority` | `Metadata.priority` | V2 |
-| `Lifetime` | `Metadata.lifetime` | V2 |
-| `PreviousFrame` | `Metadata.previousFrame` | V2 |
-| `Matrix` | `Metadata.matrix` | V3 |
+| `GatedField`       | Field                      | Since |
+| ------------------ | -------------------------- | ----- |
+| `MessageIntegrity` | `Metadata.integrity` (MI)  | V1    |
+| `Confidentiality`  | `Metadata.confidentiality` | V1    |
+| `FrameIntegrity`   | `Frame.integrity` (FI)     | V1    |
+| `Nonrepudiation`   | `Frame.nonrepudiation`     | V1    |
+| `Priority`         | `Metadata.priority`        | V2    |
+| `Lifetime`         | `Metadata.lifetime`        | V2    |
+| `PreviousFrame`    | `Metadata.previousFrame`   | V2    |
+| `Matrix`           | `Metadata.matrix`          | V3    |
 
 Every version carries `id`, `order`, `message`, and `compactness`, so they have no gate.
 
-Four paths refuse a gated field below its version. Every path that returns a `TightBeamError` refuses with `TightBeamError::UnsupportedField { field, version }`, which names the field and the frame version:
+Five paths refuse a gated field below its version. Every path that returns a `TightBeamError` refuses with `TightBeamError::UnsupportedField { field, version }`, which names the field and the frame version:
 
-| Path | Refuses | Error |
-| --- | --- | --- |
-| `FrameBuilder::build` and `compose!` | A metadata field, FI, or a signature | `TightBeamError::UnsupportedField { field, version }` |
-| `Frame::attach_signer_info`, `Frame::sign_with_provider`, `Frame::encrypt_with_provider` | The field the method adds | `TightBeamError::UnsupportedField { field, version }` |
-| `MetadataBuilder::build`, on its own | A metadata field | `BuildError::InvalidMetadata(MetadataError::UnsupportedField { field, version })` |
-| The DER decoder of `Frame` | Every gated field, once the fields decode | A `der` value error on the `SEQUENCE` tag |
+| Path                                                                                          | Refuses                                   | Error                                                                             |
+| --------------------------------------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------- |
+| `FrameBuilder::build` and `compose!`                                                          | A metadata field, FI, or a signature      | `TightBeamError::UnsupportedField { field, version }`                             |
+| `Frame::attach_signer_info`, `Frame::sign_with_provider`, `Frame::encrypt_with_provider`      | The field the method adds                 | `TightBeamError::UnsupportedField { field, version }`                             |
+| `Frame::with_message_integrity`, `Frame::with_confidentiality`, `Frame::with_frame_integrity` | The field the method installs             | `TightBeamError::UnsupportedField { field, version }`                             |
+| `MetadataBuilder::build`, on its own                                                          | A metadata field                          | `BuildError::InvalidMetadata(MetadataError::UnsupportedField { field, version })` |
+| The DER decoder of `Frame`                                                                    | Every gated field, once the fields decode | A `der` value error on the `SEQUENCE` tag                                         |
 
 ```rust
 use tightbeam::asn1::GatedField;
@@ -77,25 +79,25 @@ assert!(matches!(
 
 `Frame` and `Metadata` (`tightbeam::{Frame, Metadata}`) keep their fields private. A frame enters memory through [`FrameBuilder`](#framebuilder-and-compose) or the DER decoder, and each field has a read accessor of the same name.
 
-| `Metadata` field | Accessor | Returns |
-| --- | --- | --- |
-| `id` | `id()` | `&[u8]` |
-| `order` | `order()` | `u64` |
-| `compactness` | `compactness()` | `Option<&CompressedData>` |
-| `integrity` | `integrity()` | `Option<&DigestInfo>` |
+| `Metadata` field  | Accessor            | Returns                      |
+| ----------------- | ------------------- | ---------------------------- |
+| `id`              | `id()`              | `&[u8]`                      |
+| `order`           | `order()`           | `u64`                        |
+| `compactness`     | `compactness()`     | `Option<&CompressedData>`    |
+| `integrity`       | `integrity()`       | `Option<&DigestInfo>`        |
 | `confidentiality` | `confidentiality()` | `Option<&AuthEnvelopedData>` |
-| `priority` | `priority()` | `Option<MessagePriority>` |
-| `lifetime` | `lifetime()` | `Option<u64>`, in seconds |
-| `previousFrame` | `previous_frame()` | `Option<&DigestInfo>` |
-| `matrix` | `matrix()` | `Option<&MatrixDyn>` |
+| `priority`        | `priority()`        | `Option<MessagePriority>`    |
+| `lifetime`        | `lifetime()`        | `Option<u64>`, in seconds    |
+| `previousFrame`   | `previous_frame()`  | `Option<&DigestInfo>`        |
+| `matrix`          | `matrix()`          | `Option<&MatrixDyn>`         |
 
-| `Frame` field | Accessor | Returns |
-| --- | --- | --- |
-| `version` | `version()` | `Version` |
-| `metadata` | `metadata()` | `&Metadata` |
-| `message` | `message()`, `into_message()` | `&[u8]`, `Vec<u8>` |
-| `integrity` | `integrity()` | `Option<&DigestInfo>` |
-| `nonrepudiation` | `nonrepudiation()` | `Option<&Signed<SignerInfo>>` |
+| `Frame` field    | Accessor                      | Returns                       |
+| ---------------- | ----------------------------- | ----------------------------- |
+| `version`        | `version()`                   | `Version`                     |
+| `metadata`       | `metadata()`                  | `&Metadata`                   |
+| `message`        | `message()`, `into_message()` | `&[u8]`, `Vec<u8>`            |
+| `integrity`      | `integrity()`                 | `Option<&DigestInfo>`         |
+| `nonrepudiation` | `nonrepudiation()`            | `Option<&Signed<SignerInfo>>` |
 
 Each type stores some fields in a wrapper:
 
@@ -104,12 +106,12 @@ Each type stores some fields in a wrapper:
 
 A frame also answers these questions:
 
-| Method | Returns |
-| --- | --- |
-| `body_transform()` | `Some(BodyTransform::Decrypt)` while `confidentiality` is set, `Some(BodyTransform::Inflate)` while only `compactness` is set, and `None` when the body decodes as it is |
-| `signer_id()` | The DER of the `SignerIdentifier` the signature claims, the key of per-signer budgets, replay slots, refusal journals, and gossip attribution |
-| `to_tbs()` | The bytes the signature covers ([Nonrepudiation](#nonrepudiation)) |
-| `compute_hash::<D>()` | The `DigestInfo` of the whole frame ([Previous frame chaining](#previous-frame-chaining)) |
+| Method                | Returns                                                                                                                                                                  |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `body_transform()`    | `Some(BodyTransform::Decrypt)` while `confidentiality` is set, `Some(BodyTransform::Inflate)` while only `compactness` is set, and `None` when the body decodes as it is |
+| `signer_id()`         | The DER of the `SignerIdentifier` the signature claims, the key of per-signer budgets, replay slots, refusal journals, and gossip attribution                            |
+| `to_tbs()`            | The bytes the signature covers ([Nonrepudiation](#nonrepudiation))                                                                                                       |
+| `compute_hash::<D>()` | The `DigestInfo` of the whole frame ([Previous frame chaining](#previous-frame-chaining))                                                                                |
 
 `Display` prints the version and the id as hex, and `Debug` prints the message as its length, so an error that carries a frame keeps the body out of a log (CWE-532). With the `zeroize` feature, a dropped frame wipes its message, and its metadata wipes `id`, `order`, `lifetime`, and `matrix`.
 
@@ -141,20 +143,20 @@ assert_eq!(decoded.metadata().id(), b"ping-1");
 
 `FrameBuilder<T>` (`tightbeam::builder::FrameBuilder`) builds a `Frame` around a message `T: Message`. `FrameBuilder::from(version)` or `Version::compose::<T>()` starts one, and `TypeBuilder::build` returns `Result<Frame, TightBeamError>`. The `compose!` macro expands to the same calls. Its first token names the `Version` variant, each `key: value` pair calls one method, and an unknown key fails to compile.
 
-| `compose!` key | Method | Sets | Feature |
-| --- | --- | --- | --- |
-| `id` | `with_id(impl AsRef<[u8]>)` | `Metadata.id` | `builder` |
-| `order` | `with_order(u64)` | `Metadata.order` | `builder` |
-| `message` | `with_message(T)` | `Frame.message` | `builder` |
-| `message_integrity<D>` | `with_message_hasher::<D>(salt)` | `Metadata.integrity` (MI) | `digest` |
-| `frame_integrity: type D` | `with_witness_hasher::<D>()` | `Frame.integrity` (FI) | `digest` |
-| `confidentiality`, `encryptor<C, _>` | `with_encryptor::<C, E>(encryptor)` | `Metadata.confidentiality`, and the ciphertext in `Frame.message` | `aead` |
-| `nonrepudiation<S, _>` | `with_signer::<S, X>(CertifiedKey<X>)` | `Frame.nonrepudiation` | `signature` |
-| `compactness` | `with_compression(impl Compressor)` | `Metadata.compactness` | `compress` |
-| `priority` | `with_priority(MessagePriority)` | `Metadata.priority` | `builder` |
-| `lifetime` | `with_lifetime(u64)`, in seconds | `Metadata.lifetime` | `builder` |
-| `previous_frame` | `with_previous_hash(DigestInfo)` | `Metadata.previousFrame` | `builder` |
-| `matrix` | `with_matrix(impl IntoMatrixDyn)` | `Metadata.matrix` | `builder` |
+| `compose!` key                       | Method                                 | Sets                                                              | Feature     |
+| ------------------------------------ | -------------------------------------- | ----------------------------------------------------------------- | ----------- |
+| `id`                                 | `with_id(impl AsRef<[u8]>)`            | `Metadata.id`                                                     | `builder`   |
+| `order`                              | `with_order(u64)`                      | `Metadata.order`                                                  | `builder`   |
+| `message`                            | `with_message(T)`                      | `Frame.message`                                                   | `builder`   |
+| `message_integrity<D>`               | `with_message_hasher::<D>(salt)`       | `Metadata.integrity` (MI)                                         | `digest`    |
+| `frame_integrity: type D`            | `with_witness_hasher::<D>()`           | `Frame.integrity` (FI)                                            | `digest`    |
+| `confidentiality`, `encryptor<C, _>` | `with_encryptor::<C, E>(encryptor)`    | `Metadata.confidentiality`, and the ciphertext in `Frame.message` | `aead`      |
+| `nonrepudiation<S, _>`               | `with_signer::<S, X>(CertifiedKey<X>)` | `Frame.nonrepudiation`                                            | `signature` |
+| `compactness`                        | `with_compression(impl Compressor)`    | `Metadata.compactness`                                            | `compress`  |
+| `priority`                           | `with_priority(MessagePriority)`       | `Metadata.priority`                                               | `builder`   |
+| `lifetime`                           | `with_lifetime(u64)`, in seconds       | `Metadata.lifetime`                                               | `builder`   |
+| `previous_frame`                     | `with_previous_hash(DigestInfo)`       | `Metadata.previousFrame`                                          | `builder`   |
+| `matrix`                             | `with_matrix(impl IntoMatrixDyn)`      | `Metadata.matrix`                                                 | `builder`   |
 
 Three methods have no key:
 
@@ -164,18 +166,20 @@ Three methods have no key:
 
 With a host clock, a build with no order takes the current Unix time in seconds.
 
+A payload with no ASN.1 schema of its own travels as `tightbeam::Opaque`, one `OCTET STRING` in a `SEQUENCE`: `Version::V0.compose::<Opaque>().with_message(Opaque::new(bytes)?)`.
+
 A method that fails records its error, and `build` returns it before any other step. One recorded error returns as it is, and two or more return as `TightBeamError::Sequence`. `build` then checks the version and the markers of the `Message` trait:
 
-| Check | Error |
-| --- | --- |
-| The version is below `T::MIN_VERSION` | `Requirement(RequirementError::Version)`, the refusal of every typed decode |
-| `MUST_BE_CONFIDENTIAL` with no encryptor | `MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_encryptor" }` |
-| `MUST_BE_NON_REPUDIABLE` with no signer | `MissingProtection { .., call: "with_signer" }` |
-| `MUST_BE_COMPRESSED` with no compressor | `MissingProtection { .., call: "with_compression" }` |
-| `MUST_HAVE_MESSAGE_INTEGRITY` with no message hasher | `MissingProtection { .., call: "with_message_hasher" }` |
-| `MUST_HAVE_FRAME_INTEGRITY` with no witness hasher | `MissingProtection { .., call: "with_witness_hasher" }` |
-| `MUST_BE_PRIORITIZED` with no priority | `MissingProtection { .., call: "with_priority" }` |
-| No message | `InvalidBody` |
+| Check                                                | Error                                                                          |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
+| The version is below `T::MIN_VERSION`                | `Requirement(RequirementError::Version)`, the refusal of every typed decode    |
+| `MUST_BE_CONFIDENTIAL` with no encryptor             | `MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_encryptor" }` |
+| `MUST_BE_NON_REPUDIABLE` with no signer              | `MissingProtection { .., call: "with_signer" }`                                |
+| `MUST_BE_COMPRESSED` with no compressor              | `MissingProtection { .., call: "with_compression" }`                           |
+| `MUST_HAVE_MESSAGE_INTEGRITY` with no message hasher | `MissingProtection { .., call: "with_message_hasher" }`                        |
+| `MUST_HAVE_FRAME_INTEGRITY` with no witness hasher   | `MissingProtection { .., call: "with_witness_hasher" }`                        |
+| `MUST_BE_PRIORITIZED` with no priority               | `MissingProtection { .., call: "with_priority" }`                              |
+| No message                                           | `InvalidBody`                                                                  |
 
 The methods that name an algorithm hold it to the security profile of `T` ([README §6](../README.md#6-security-model)):
 
@@ -191,14 +195,14 @@ The stages of `build` run in the order of [Security property chain](#security-pr
 
 `Version` and `MessagePriority` (`tightbeam::{Version, MessagePriority}`) are `#[repr(u8)]` enums that derive `Enumerated` and `Ord`, so the Rust order is the order of the ASN.1 values. `Version` maps `vN(N)` to `Version::VN`. A higher priority compares greater.
 
-| ASN.1 value | `MessagePriority` variant |
-| --- | --- |
-| `lowEffort(0)` | `LowEffort` |
-| `standard(1)` | `Standard` |
-| `highThroughput(2)` | `HighThroughput` |
-| `lowLatency(3)` | `LowLatency` |
-| `expedited(4)` | `Expedited` |
-| `networkControl(5)` | `NetworkControl` |
+| ASN.1 value         | `MessagePriority` variant |
+| ------------------- | ------------------------- |
+| `lowEffort(0)`      | `LowEffort`               |
+| `standard(1)`       | `Standard`                |
+| `highThroughput(2)` | `HighThroughput`          |
+| `lowLatency(3)`     | `LowLatency`              |
+| `expedited(4)`      | `Expedited`               |
+| `networkControl(5)` | `NetworkControl`          |
 
 ## Cryptographic structures
 
@@ -206,22 +210,37 @@ The stages of `build` run in the order of [Security property chain](#security-pr
 
 The crate takes each structure from the RustCrypto crate that defines it, and re-exports those crates as `tightbeam::{cms, der, pkcs12, spki}`. `tightbeam::asn1` re-exports each type below.
 
-| ASN.1 type | Rust type | Defined in | Frame slot |
-| --- | --- | --- | --- |
-| `DigestInfo` | `DigestInfo` | `pkcs12::digest_info` | `Option<DigestInfo>` for MI, FI, and `previousFrame` |
-| `AuthEnvelopedData` | `AuthEnvelopedData` | `tightbeam::asn1`, checked field by field against RFC 5083 | `Option<WireDer<AuthEnvelopedData>>` |
-| `SignerInfo` | `SignerInfo` | `cms::signed_data` | `Option<Signed<SignerInfo>>` |
-| `CompressedData` | `CompressedData` | `cms::compressed_data` | `Option<CompressedData>` |
-| `AlgorithmIdentifier` | `AlgorithmIdentifier`, `AlgorithmIdentifierOwned` | `spki` | Inside each structure above |
-| `Matrix` | `MatrixDyn` | `tightbeam::matrix` | `Option<MatrixDyn>` |
+| ASN.1 type            | Rust type                                         | Defined in                                                 | Frame slot                                           |
+| --------------------- | ------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
+| `DigestInfo`          | `DigestInfo`                                      | `pkcs12::digest_info`                                      | `Option<DigestInfo>` for MI, FI, and `previousFrame` |
+| `AuthEnvelopedData`   | `AuthEnvelopedData`                               | `tightbeam::asn1`, checked field by field against RFC 5083 | `Option<WireDer<AuthEnvelopedData>>`                 |
+| `SignerInfo`          | `SignerInfo`                                      | `cms::signed_data`                                         | `Option<Signed<SignerInfo>>`                         |
+| `CompressedData`      | `CompressedData`                                  | `cms::compressed_data`                                     | `Option<CompressedData>`                             |
+| `AlgorithmIdentifier` | `AlgorithmIdentifier`, `AlgorithmIdentifierOwned` | `spki`                                                     | Inside each structure above                          |
+| `Matrix`              | `MatrixDyn`                                       | `tightbeam::matrix`                                        | `Option<MatrixDyn>`                                  |
 
 `tightbeam::oids` names the compression OIDs:
 
-| Constant | OID | ASN.1 name |
-| --- | --- | --- |
-| `COMPRESSION_ZLIB` | `1.2.840.113549.1.9.16.3.8` | `id-alg-zlibCompress` |
-| `COMPRESSION_ZSTD` | `1.3.6.1.4.1.64586.2.1` | `id-alg-zstdCompress`, under the Wahid Group PEN |
-| `COMPRESSION_CONTENT` | `1.2.840.113549.1.9.16.1.9` | `id-ct-compressedData` |
+| Constant              | OID                         | ASN.1 name                                       |
+| --------------------- | --------------------------- | ------------------------------------------------ |
+| `COMPRESSION_ZLIB`    | `1.2.840.113549.1.9.16.3.8` | `id-alg-zlibCompress`                            |
+| `COMPRESSION_ZSTD`    | `1.3.6.1.4.1.64586.2.1`     | `id-alg-zstdCompress`, under the Wahid Group PEN |
+| `COMPRESSION_CONTENT` | `1.2.840.113549.1.9.16.1.9` | `id-ct-compressedData`                           |
+
+## Install external results
+
+A caller with its own hasher, cipher, or compressor builds the structural frame with `FrameBuilder` or `compose!`, then takes the remaining steps in the order the builder runs:
+
+1. Replace the body with `Frame::with_body` when the caller encoded it.
+2. Install the commitment with `Frame::with_message_integrity`. `CommitmentSalt::preimage` feeds the bytes to hash to the caller's hasher, part by part.
+3. Replace the body with `Frame::with_compactness`.
+4. Replace the body with `Frame::with_confidentiality`.
+5. Install the witness with `Frame::with_frame_integrity`. `Frame::witness_preimage` feeds the bytes to hash to the caller's hasher, part by part.
+6. Sign with `Frame::signing_draft` and `Frame::attach_signer_info`.
+
+The commitment covers the plain body, the witness covers the version and the metadata the earlier steps write, and the signature covers the whole frame. A step behind the furthest one a frame holds refuses with `TightBeamError::InstallOutOfOrder`. The guard reads which fields the frame holds, so a caller takes each preimage after the last step that writes into it. A frame takes the same step again, so a caller replaces what it installed.
+
+Steps 3 and 4 refuse with `TightBeamError::InvalidMetadata` a form no frame carries: a `CompressedData` of a version other than 0 or with an `eContent`, which every receiver refuses, and an envelope that carries the ciphertext inside it, where a frame carries it in `Frame.message`. `FrameBuilder::build` refuses the same `CompressedData` from a compressor of its own. Each step that replaces the body wipes the body it replaces under the `zeroize` feature. Steps 2 and 5 install a `DigestInfo`, which `DigestInfo::of_hasher` (`tightbeam::crypto::hash::DigestInfoExt`) makes from the hasher that the preimage fed.
 
 ## Encoding
 
@@ -235,11 +254,11 @@ The crate encodes and decodes with the `der` 0.7 crate:
 
 `der_derive` 0.7 encodes a `Vec<u8>` field as `SEQUENCE OF INTEGER`, so the crate writes the `Frame` and `Metadata` codecs with its own `wire_sequence!` macro:
 
-| Field kind | Fields | Wire form |
-| --- | --- | --- |
-| Octets | `Metadata.id`, `Frame.message` | `OCTET STRING` |
-| Plain | `version`, `metadata`, `order`, `compactness` | The field type's own DER codec |
-| Context | `Metadata.integrity` to `Metadata.matrix`, `Frame.integrity`, and `Frame.nonrepudiation` | `[n] EXPLICIT`, left out when `None` |
+| Field kind | Fields                                                                                   | Wire form                            |
+| ---------- | ---------------------------------------------------------------------------------------- | ------------------------------------ |
+| Octets     | `Metadata.id`, `Frame.message`                                                           | `OCTET STRING`                       |
+| Plain      | `version`, `metadata`, `order`, `compactness`                                            | The field type's own DER codec       |
+| Context    | `Metadata.integrity` to `Metadata.matrix`, `Frame.integrity`, and `Frame.nonrepudiation` | `[n] EXPLICIT`, left out when `None` |
 
 The decoder refuses four kinds of input:
 
@@ -264,11 +283,11 @@ Every SET of a frame sits inside the envelope or the signature. `WireDer` and `S
 
 The colony's signed control frames carry their issue time in `order` as Unix milliseconds. The frames of one signer to one receiver are one sequence and one namespace:
 
-| Rule | Code |
-| --- | --- |
+| Rule                                       | Code                                                                                                                                                                                                                 |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The orders of one sender increase strictly | The hive stamps its registrations and scaling updates, and the gateway its heartbeats, direct advertisements, and reconcile rounds, one millisecond past the stamp before, while the clock has not passed that stamp |
-| A receiver refuses a duplicate `order` | `ReplayGuard::check_and_insert` refuses a second frame of one signer at an order it holds inside the freshness window, whatever its signature, and `ReplayGuard::holds_order` is the read-only check of a verdict |
-| A receiver refuses a replay | `ReplayGuard` refuses a signature it holds inside the window |
+| A receiver refuses a duplicate `order`     | `ReplayGuard::check_and_insert` refuses a second frame of one signer at an order it holds inside the freshness window, whatever its signature, and `ReplayGuard::holds_order` is the read-only check of a verdict    |
+| A receiver refuses a replay                | `ReplayGuard` refuses a signature it holds inside the window                                                                                                                                                         |
 
 ### Compression
 
@@ -276,33 +295,33 @@ The colony's signed control frames carry their issue time in `order` as Unix mil
 
 `Compressor` compresses a body into bytes and the `CompressedData` that describes them, and `Inflator` reverses it (`tightbeam::compress`). An `Inflator` names its algorithm with `algorithm_oid`, and `admits_parameters` decides the parameters of that algorithm. The provided `admits_parameters` admits the parameters omitted or as a `NULL`, the form of an algorithm with none (RFC 3274 §2). `ZstdCompression` implements both traits under the `zstd` feature:
 
-| Property | `ZstdCompression` |
-| --- | --- |
-| Algorithm | `COMPRESSION_ZSTD`, with no parameters |
-| Parameters it admits | None, or an INTEGER level from `ZSTD_minCLevel` to `ZSTD_maxCLevel` |
-| Level | 3, the zstd default |
-| `encapContentInfo` | `id-data` with no `eContent`, and the compressed bytes travel in `Frame.message` |
-| Output cap | `DEFAULT_MAX_DECOMPRESSED_LEN` (16 MiB), or the value of `with_max_output` |
-| Window cap | The output cap rounded up to a power of two, within the window bounds of zstd |
+| Property             | `ZstdCompression`                                                                |
+| -------------------- | -------------------------------------------------------------------------------- |
+| Algorithm            | `COMPRESSION_ZSTD`, with no parameters                                           |
+| Parameters it admits | None, or an INTEGER level from `ZSTD_minCLevel` to `ZSTD_maxCLevel`              |
+| Level                | 3, the zstd default                                                              |
+| `encapContentInfo`   | `id-data` with no `eContent`, and the compressed bytes travel in `Frame.message` |
+| Output cap           | `DEFAULT_MAX_DECOMPRESSED_LEN` (16 MiB), or the value of `with_max_output`       |
+| Window cap           | The output cap rounded up to a power of two, within the window bounds of zstd    |
 
 A decompression fails with one `CompressionError`:
 
-| Variant | Cause |
-| --- | --- |
-| `OutputLimitExceeded` | The output passes the cap (CWE-409) |
-| `Truncated` | The input ends inside the zstd frame |
-| `Stalled` | The decoder consumes no input and produces no output |
-| `TrailingBytes` | Octets follow the zstd frame |
-| `ZSTD` | The codec refuses the frame, with its numeric code |
+| Variant               | Cause                                                |
+| --------------------- | ---------------------------------------------------- |
+| `OutputLimitExceeded` | The output passes the cap (CWE-409)                  |
+| `Truncated`           | The input ends inside the zstd frame                 |
+| `Stalled`             | The decoder consumes no input and produces no output |
+| `TrailingBytes`       | Octets follow the zstd frame                         |
+| `ZSTD`                | The codec refuses the frame, with its numeric code   |
 
 Before any work on the body, the receiver holds the `CompressedData` to the inflator. A refusal leaves the frame as it was:
 
-| Check | Refusal |
-| --- | --- |
+| Check                                                            | Refusal                                               |
+| ---------------------------------------------------------------- | ----------------------------------------------------- |
 | `compressionAlgorithm` names the `algorithm_oid` of the inflator | `TightBeamError::UnexpectedAlgorithm`, with both OIDs |
-| The version is 0 (RFC 3274 §1.1) | `TightBeamError::InvalidMetadata` |
-| `encapContentInfo` carries no `eContent` | `TightBeamError::InvalidMetadata` |
-| `admits_parameters` of the inflator admits the parameters | `TightBeamError::InvalidMetadata` |
+| The version is 0 (RFC 3274 §1.1)                                 | `TightBeamError::InvalidMetadata`                     |
+| `encapContentInfo` carries no `eContent`                         | `TightBeamError::InvalidMetadata`                     |
+| `admits_parameters` of the inflator admits the parameters        | `TightBeamError::InvalidMetadata`                     |
 
 `Frame::inflate_in_place(&dyn Inflator)` runs those checks, inflates a compressed cleartext body, clears `compactness`, and returns an `Opened`. A failed inflate leaves the frame as it was. `decrypt_in_place` runs the checks before it decrypts, and inflates an encrypted body after it decrypts it. The router refuses a compressed body with `RouterError::CompressedFrame`, and a servlet inflates it with the inflator of its context.
 
@@ -312,11 +331,11 @@ Before any work on the body, the receiver holds the `CompressedData` to the infl
 
 `with_message_hasher::<D>(salt)` commits to the DER of the message before compression and encryption, and stores the `DigestInfo` in `Metadata.integrity`. `CommitmentSalt::parse` (`tightbeam::crypto::commitment`) reads the salt:
 
-| Salt | Mode | Commitment |
-| --- | --- | --- |
-| Empty | `CommitmentSalt::Plain` | Binds the body |
-| 16 bytes or more (`MIN_SALT_SIZE`) | `CommitmentSalt::Hiding` | Binds and hides the body |
-| 1 to 15 bytes | Refused | `TightBeamError::InvalidSaltLength`, which `build` returns |
+| Salt                               | Mode                     | Commitment                                                 |
+| ---------------------------------- | ------------------------ | ---------------------------------------------------------- |
+| Empty                              | `CommitmentSalt::Plain`  | Binds the body                                             |
+| 16 bytes or more (`MIN_SALT_SIZE`) | `CommitmentSalt::Hiding` | Binds and hides the body                                   |
+| 1 to 15 bytes                      | Refused                  | `TightBeamError::InvalidSaltLength`, which `build` returns |
 
 `Opening` holds the opening `(salt, DER(message))`:
 
@@ -325,10 +344,10 @@ Before any work on the body, the receiver holds the `CompressedData` to the infl
 
 A receiver checks MI on the frame:
 
-| Method | Returns |
-| --- | --- |
-| `message_commitment_verdict::<D>(&opening)` | An `IntegrityVerdict` |
-| `verify_message_commitment::<D>(&opening)` | `true` for `IntegrityVerdict::Verified` alone |
+| Method                                         | Returns                                                                |
+| ---------------------------------------------- | ---------------------------------------------------------------------- |
+| `message_commitment_verdict::<D>(&opening)`    | An `IntegrityVerdict`                                                  |
+| `verify_message_commitment::<D>(&opening)`     | `true` for `IntegrityVerdict::Verified` alone                          |
 | `verify_commitment_of::<D, M>(&message, salt)` | The same `bool`, for an opening it proves again from a decoded message |
 
 `IntegrityVerdict` (`tightbeam::core`) is `Verified`, `Absent`, `AlgorithmMismatch`, or `Mismatch`, so a caller can tell a stripped commitment from a tampered one.
@@ -365,15 +384,15 @@ assert!(matches!(short, Err(TightBeamError::InvalidSaltLength(_))));
 
 The frame opens and seals in place through these methods:
 
-| Method | Effect | Errors |
-| --- | --- | --- |
-| `decrypt_in_place(&decryptor, inflator)` | Opens the body, inflates it when compressed, clears `confidentiality` and `compactness`, returns `Opened` | `MissingEncryptionInfo`, `MissingInflator`, and the errors of the decryptor and the inflator |
-| `decrypt::<T>(decryptor, inflator)` | Holds the frame, as it arrived, to the requirements of `T` (`validate_for`), runs `decrypt_in_place` on the frame it takes, then decodes `T` | `Requirement`, those of `decrypt_in_place`, and `SerializationError` |
-| `decrypt_bytes(decryptor)` | Takes the frame and returns the plaintext as a `SecretSlice<u8>`, still compressed when the body was | `MissingEncryptionInfo`, and the errors of the decryptor |
-| `encrypt_with_provider::<P>(&provider)` | Seals the body under a key-encryption key an `EncryptingKeyProvider` holds | `UnsupportedField`, `CoveredBeforeSeal`, `EnvelopeError` |
-| `decrypt_with_provider::<P>(&provider)` | Opens a body sealed to a provider, clears `confidentiality`, returns `Opened` | `MissingEncryptionInfo`, `EnvelopeError` |
+| Method                                   | Effect                                                                                                                                       | Errors                                                                                       |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `decrypt_in_place(&decryptor, inflator)` | Opens the body, inflates it when compressed, clears `confidentiality` and `compactness`, returns `Opened`                                    | `MissingEncryptionInfo`, `MissingInflator`, and the errors of the decryptor and the inflator |
+| `decrypt::<T>(decryptor, inflator)`      | Holds the frame, as it arrived, to the requirements of `T` (`validate_for`), runs `decrypt_in_place` on the frame it takes, then decodes `T` | `Requirement`, those of `decrypt_in_place`, and `SerializationError`                         |
+| `decrypt_bytes(decryptor)`               | Takes the frame and returns the plaintext as a `SecretSlice<u8>`, still compressed when the body was                                         | `MissingEncryptionInfo`, and the errors of the decryptor                                     |
+| `encrypt_with_provider::<P>(&provider)`  | Seals the body under a key-encryption key an `EncryptingKeyProvider` holds                                                                   | `UnsupportedField`, `InstallOutOfOrder`, `EnvelopeError`                                     |
+| `decrypt_with_provider::<P>(&provider)`  | Opens a body sealed to a provider, clears `confidentiality`, returns `Opened`                                                                | `MissingEncryptionInfo`, `EnvelopeError`                                                     |
 
-All five are async. The in-place methods leave the frame unchanged on error. `encrypt_with_provider` refuses a frame that already carries FI or a signature, since both would cover the body before the seal.
+All five are async. The in-place methods leave the frame unchanged on error. `encrypt_with_provider` refuses a frame that already carries an envelope, FI, or a signature. A second seal would lose the first envelope, and FI and a signature would cover the frame as it stood before the seal.
 
 ### Previous frame chaining
 
@@ -407,31 +426,31 @@ assert_eq!(child.metadata().previous_frame(), Some(&parent.compute_hash::<Sha3_2
 
 `Frame::to_tbs()` returns the bytes the signature covers: the DER of the frame with `nonrepudiation` absent, from a view that borrows the first four fields. A frame takes its signature through one of three paths:
 
-| Path | Key |
-| --- | --- |
-| `with_signer::<S, X>(CertifiedKey<X>)`, the `nonrepudiation<S, _>` key | An `X: PrehashSigner<S>` beside its certificate, which signs as the last stage of `build` |
-| `Frame::sign_with_provider(&SigningIdentity)` | A key provider, such as an HSM or a KMS |
-| `Frame::signing_draft::<S>(&Certificate)`, then `SignerInfoDraft::complete` and `Frame::attach_signer_info` | An external backend that signs `SignerInfoDraft::prehash` |
+| Path                                                                                                        | Key                                                                                       |
+| ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `with_signer::<S, X>(CertifiedKey<X>)`, the `nonrepudiation<S, _>` key                                      | An `X: PrehashSigner<S>` beside its certificate, which signs as the last stage of `build` |
+| `Frame::sign_with_provider(&SigningIdentity)`                                                               | A key provider, such as an HSM or a KMS                                                   |
+| `Frame::signing_draft::<S>(&Certificate)`, then `SignerInfoDraft::complete` and `Frame::attach_signer_info` | An external backend that signs `SignerInfoDraft::prehash`                                 |
 
 `CertifiedKey::new` admits the certificate for signing, refuses a key whose public half differs from it, and reads the `sid` from it ([README §7.3](../README.md#73-cryptographic-key-management)). Each path brings the signature value to its canonical form through `CanonicalForm` before it attaches it.
 
 A receiver verifies through one of two methods:
 
-| Method | Signer certificate | Algorithms |
-| --- | --- | --- |
-| `Frame::verify::<P>(&PeerCertificate<Signing<P>>)` | Admitted for signing under the provider `P` | The signature algorithm of `P` and the digest it names |
-| `Frame::verify_under(&PeerCertificate<ErasedSigning>, &dyn VerificationPolicy)` | Admitted for signing, as a trust store resolves it | Those the policy admits |
+| Method                                                                          | Signer certificate                                 | Algorithms                                             |
+| ------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------ |
+| `Frame::verify::<P>(&PeerCertificate<Signing<P>>)`                              | Admitted for signing under the provider `P`        | The signature algorithm of `P` and the digest it names |
+| `Frame::verify_under(&PeerCertificate<ErasedSigning>, &dyn VerificationPolicy)` | Admitted for signing, as a trust store resolves it | Those the policy admits                                |
 
 `verify` checks that the `sid` names the signer, then that the signed attributes match the TBS, then that the signature verifies over the attributes (RFC 5652 §5.4). Both methods return a `VerifiedSignature`, the signature in canonical form, which every replay ledger keys on. Their errors:
 
-| Error | `verify` | `verify_under` | Cause |
-| --- | --- | --- | --- |
-| `MissingSignature` | Yes | Yes | The frame carries no signature |
-| `SerializationError` | Yes | Yes | The TBS or a signed attribute fails to encode |
-| `UnexpectedAlgorithm` | Yes | | The `SignerInfo` names another algorithm or digest than `P` |
-| `SignatureError` | Yes | | The signature is no value of `P`, or fails to verify |
-| `CertificateValidationError` | Yes | Yes | The key identifier fails to decode, or the policy refuses an algorithm, the key, or the signature |
-| `Signer` | Yes | Yes | The `sid`, the version, or the signed attributes break a CMS rule |
+| Error                        | `verify` | `verify_under` | Cause                                                                                             |
+| ---------------------------- | -------- | -------------- | ------------------------------------------------------------------------------------------------- |
+| `MissingSignature`           | Yes      | Yes            | The frame carries no signature                                                                    |
+| `SerializationError`         | Yes      | Yes            | The TBS or a signed attribute fails to encode                                                     |
+| `UnexpectedAlgorithm`        | Yes      |                | The `SignerInfo` names another algorithm or digest than `P`                                       |
+| `SignatureError`             | Yes      |                | The signature is no value of `P`, or fails to verify                                              |
+| `CertificateValidationError` | Yes      | Yes            | The key identifier fails to decode, or the policy refuses an algorithm, the key, or the signature |
+| `Signer`                     | Yes      | Yes            | The `sid`, the version, or the signed attributes break a CMS rule                                 |
 
 ### Security property chain
 
@@ -439,23 +458,23 @@ A receiver verifies through one of two methods:
 
 `FrameBuilder::build` runs the sender steps in that order:
 
-| Step | Stage of `build` | Set by |
-| --- | --- | --- |
-| 0 | Return a recorded error, then check the version and the markers | |
-| 1 | Encode the message as DER and commit to it (MI) | `with_message_hasher` |
-| 2 | Compress the DER | `with_compression` |
-| 3 | Encrypt, and move the ciphertext into `Frame.message` | `with_encryptor` |
-| 4 | Digest `SEQUENCE { version, metadata }` (FI) | `with_witness_hasher` |
-| 5 | Sign the TBS | `with_signer` |
+| Step | Stage of `build`                                                | Set by                |
+| ---- | --------------------------------------------------------------- | --------------------- |
+| 0    | Return a recorded error, then check the version and the markers |                       |
+| 1    | Encode the message as DER and commit to it (MI)                 | `with_message_hasher` |
+| 2    | Compress the DER                                                | `with_compression`    |
+| 3    | Encrypt, and move the ciphertext into `Frame.message`           | `with_encryptor`      |
+| 4    | Digest `SEQUENCE { version, metadata }` (FI)                    | `with_witness_hasher` |
+| 5    | Sign the TBS                                                    | `with_signer`         |
 
 A receiver runs the receiver steps through these calls:
 
-| Step | Call |
-| --- | --- |
-| 1 | `Frame::verify` or `Frame::verify_under` |
-| 2 | `Frame::verify_frame_integrity` |
+| Step | Call                                           |
+| ---- | ---------------------------------------------- |
+| 1    | `Frame::verify` or `Frame::verify_under`       |
+| 2    | `Frame::verify_frame_integrity`                |
 | 3, 4 | `Frame::decrypt_in_place`, which also inflates |
-| 5 | `Frame::verify_commitment_of` |
+| 5    | `Frame::verify_commitment_of`                  |
 
 ```rust
 use tightbeam::compose;
@@ -506,32 +525,32 @@ assert!(frame.verify_commitment_of::<Sha3_256, _>(&message, salt)?);
 
 `MatrixDyn` (`tightbeam::matrix`, also in the prelude) is the wire type of `Metadata.matrix`. Its fields are private, and each way in builds exactly `n * n` cells:
 
-| Way in | Builds | Refuses |
-| --- | --- | --- |
-| `MatrixDyn::try_from(n: u8)` | An `n` x `n` grid of zeros | `n = 0`, with `MatrixError::InvalidN` |
-| `MatrixDyn::from_row_major(n, bytes)` | The grid of `n * n` row-major bytes | `n = 0` or another length, with `None` |
-| `MatrixDyn::default()` | The 1 x 1 grid of zero | |
-| `MatrixDyn::try_from(Matrix<N>)`, or a `&Matrix<N>` | The `N` x `N` cells of the matrix, row by row | `N` outside `1..=255`, at compile time |
-| The DER decoder | The grid on the wire | A `data` length other than `n * n`, with a `der` length error |
+| Way in                                              | Builds                                        | Refuses                                                       |
+| --------------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------- |
+| `MatrixDyn::try_from(n: u8)`                        | An `n` x `n` grid of zeros                    | `n = 0`, with `MatrixError::InvalidN`                         |
+| `MatrixDyn::from_row_major(n, bytes)`               | The grid of `n * n` row-major bytes           | `n = 0` or another length, with `None`                        |
+| `MatrixDyn::default()`                              | The 1 x 1 grid of zero                        |                                                               |
+| `MatrixDyn::try_from(Matrix<N>)`, or a `&Matrix<N>` | The `N` x `N` cells of the matrix, row by row | `N` outside `1..=255`, at compile time                        |
+| The DER decoder                                     | The grid on the wire                          | A `data` length other than `n * n`, with a `der` length error |
 
 `MatrixDyn` lends its cells through `as_bytes`, `as_bytes_mut`, and `row(r)`, and zeroizes on drop with the `zeroize` feature.
 
 `MatrixLike` is the interface of every grid: `n()`, `get(r, c)`, `set(r, c, value)`, `fill(value)`, and `clear()`. A `get` out of bounds returns 0, and a `set` out of bounds leaves the grid unchanged.
 
-| Type | Dimension | Cells |
-| --- | --- | --- |
-| `MatrixDyn` | At run time, `1..=255` | Every cell |
-| `Matrix<N>` | At compile time, and `N` outside `1..=255` fails to compile | Every cell |
-| `flags::Flags<N>` | At compile time, as `Matrix<N>` | The diagonal: an off-diagonal cell reads 0 and drops a write |
-| A `flagset!` type | The number of flag types it registers | One diagonal cell for each flag type |
+| Type              | Dimension                                                   | Cells                                                        |
+| ----------------- | ----------------------------------------------------------- | ------------------------------------------------------------ |
+| `MatrixDyn`       | At run time, `1..=255`                                      | Every cell                                                   |
+| `Matrix<N>`       | At compile time, and `N` outside `1..=255` fails to compile | Every cell                                                   |
+| `flags::Flags<N>` | At compile time, as `Matrix<N>`                             | The diagonal: an off-diagonal cell reads 0 and drops a write |
+| A `flagset!` type | The number of flag types it registers                       | One diagonal cell for each flag type                         |
 
 `with_matrix` takes any `IntoMatrixDyn`: a `MatrixDyn`, a `Matrix<N>`, a `Flags<N>`, or a `flagset!` type. A conversion error becomes `TightBeamError::MatrixError` at `build`. `MatrixError` has three variants:
 
-| Variant | Cause |
-| --- | --- |
-| `InvalidN(n)` | `MatrixDyn::try_from(0)` |
-| `LengthMismatch { n, len }` | `Matrix::<N>::try_from(&[u8])` with other than `N * N` bytes |
-| `DimensionMismatch { expected, n }` | A `flagset!` type read from a `MatrixDyn` of another size |
+| Variant                             | Cause                                                        |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `InvalidN(n)`                       | `MatrixDyn::try_from(0)`                                     |
+| `LengthMismatch { n, len }`         | `Matrix::<N>::try_from(&[u8])` with other than `N * N` bytes |
+| `DimensionMismatch { expected, n }` | A `flagset!` type read from a `MatrixDyn` of another size    |
 
 ```rust
 use tightbeam::flags::Flags;

@@ -17,6 +17,7 @@ use std::net::AddrParseError;
 use std::sync::Arc;
 
 use crate::asn1::Frame;
+use crate::clock::Lapse;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::error::TightBeamError;
 use crate::policy::TransitStatus;
@@ -548,7 +549,6 @@ impl From<AddrParseError> for TransportError {
 #[cfg(feature = "tokio")]
 mod tokio_rt {
 	pub use tokio::task::JoinError;
-	pub use tokio::time::error::Elapsed;
 }
 
 /// Report a failed task join as an I/O error.
@@ -559,11 +559,15 @@ impl From<tokio_rt::JoinError> for TransportError {
 	}
 }
 
-/// Report an elapsed timeout as [`TransportFailure::DeadlineExceeded`].
-#[cfg(feature = "tokio")]
-impl From<tokio_rt::Elapsed> for TransportError {
-	fn from(_: tokio_rt::Elapsed) -> Self {
-		TransportError::OperationFailed(TransportFailure::DeadlineExceeded)
+/// Report a span that passed as [`TransportFailure::DeadlineExceeded`], and a
+/// thread with no timer as [`TransportFailure::FailedPrecondition`]. It is the
+/// one mapping of a lapse.
+impl From<Lapse> for TransportError {
+	fn from(lapse: Lapse) -> Self {
+		match lapse {
+			Lapse::Passed => TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
+			Lapse::NoTimer => TransportError::OperationFailed(TransportFailure::FailedPrecondition),
+		}
 	}
 }
 

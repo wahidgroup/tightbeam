@@ -3,6 +3,9 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(feature = "transport-multiplex")]
+use core::str::FromStr;
+
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
@@ -18,6 +21,8 @@ use crate::der::{
 	Choice, Decode, Encode, EncodeValue, ErrorKind, Header, Length, Reader, Result as DerResult, SliceReader, Tag,
 	TagNumber, Tagged, Writer,
 };
+#[cfg(feature = "transport-multiplex")]
+use crate::error::UnknownName;
 use crate::policy::TransitStatus;
 use crate::transport::error::{ArrivalCause, TransportError, TransportFailure};
 use crate::transport::TransportResult;
@@ -282,6 +287,27 @@ impl GoAwayReason {
 			Self::SettlementFailed => "settlement-failed",
 			Self::Application(_) => "application",
 		}
+	}
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl FromStr for GoAwayReason {
+	type Err = UnknownName;
+
+	/// Read a name that [`GoAwayReason::as_str`] writes.
+	///
+	/// [`GoAwayReason::Application`] shares one name across its codes, so its
+	/// name reads as no reason.
+	///
+	/// # Errors
+	///
+	/// - [`UnknownName`] -- `name` is `application`, or no variant carries it.
+	fn from_str(name: &str) -> Result<Self, Self::Err> {
+		let is_named = |reason: &Self| !matches!(reason, Self::Application(_));
+		let reasons = (0..MUX_APPLICATION_CODE_FLOOR).map(Self::from);
+		let mut named = reasons.filter(is_named);
+
+		named.find(|reason| reason.as_str() == name).ok_or(UnknownName)
 	}
 }
 
@@ -1788,5 +1814,36 @@ mod tests {
 		let refused = TransportEnvelope::from_der(&forged);
 		let claimed_contents = ErrorKind::Length { tag: Tag::Sequence };
 		assert_eq!(refused.map_err(|error| error.kind()), Err(claimed_contents));
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	mod goaway_names {
+		use super::*;
+		use crate::tb_cases;
+
+		tb_cases! {
+			fn a_reason_reads_back_from_its_name(reason: GoAwayReason) {
+				assert_eq!(reason.as_str().parse(), Ok(reason));
+			}
+			cases {
+				shutdown => GoAwayReason::Shutdown,
+				protocol_error => GoAwayReason::ProtocolError,
+				enhance_your_calm => GoAwayReason::EnhanceYourCalm,
+				budget_exhausted => GoAwayReason::BudgetExhausted,
+				settlement_failed => GoAwayReason::SettlementFailed,
+			}
+		}
+
+		#[test]
+		fn an_application_name_carries_no_code_to_read() {
+			let name = GoAwayReason::Application(7).as_str();
+
+			assert_eq!(name.parse::<GoAwayReason>(), Err(UnknownName));
+		}
+
+		#[test]
+		fn an_unknown_reason_name_is_refused() {
+			assert_eq!("no-such-reason".parse::<GoAwayReason>(), Err(UnknownName));
+		}
 	}
 }

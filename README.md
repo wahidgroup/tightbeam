@@ -2384,6 +2384,7 @@ Client (handle)                            Server (responder)
 - A mux peer that receives a non-mux envelope MUST send GoAway(`ProtocolError`). A non-mux peer MUST reject muxed envelopes.
 - Cancels that abort in-flight handlers draw on a per-connection budget (default 1024). Exhaustion ends the connection with GoAway(`EnhanceYourCalm`).
 - Near the cipher record limit, the session renews its epoch or drains via GoAway.
+- An idle connection ends at the read deadline of either end. `MuxHandle::keep_alive` on one end keeps both ends alive while its interval stays under the read deadline of the peer.
 
 **Runtime architecture:**
 

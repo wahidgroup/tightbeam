@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use crate::der::asn1::{ContextSpecific, OctetString, OctetStringRef};
 use crate::der::{Decode, Reader, Result, Tag, TagNumber};
 
-#[cfg(feature = "colony")]
+#[cfg(feature = "colony-wire")]
 use crate::der::{ErrorKind, FixedTag};
 
 /// Decode one field through its own [`Decode`] impl, so a macro expansion
@@ -80,7 +80,7 @@ pub(crate) fn decode_ctx_explicit<'a, R: Reader<'a>, T: Decode<'a>>(
 /// A present field equal to the default is refused as non-canonical.
 /// Accepting both forms would give one value two distinct signed encodings.
 ///
-/// It sits behind the `colony` gate of its only consumers, the colony
+/// It sits behind the `colony-wire` gate of its only consumers, the colony
 /// message codecs, so a minimal build omits it.
 ///
 /// # Sources
@@ -88,7 +88,7 @@ pub(crate) fn decode_ctx_explicit<'a, R: Reader<'a>, T: Decode<'a>>(
 /// - ITU-T X.690 (02/2021) § 11.5, set and sequence components with default
 ///   value:
 ///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
-#[cfg(feature = "colony")]
+#[cfg(feature = "colony-wire")]
 pub(crate) fn decode_or_default<'a, R: Reader<'a>, T>(reader: &mut R, default: T) -> Result<T>
 where
 	T: Decode<'a> + FixedTag + PartialEq,
@@ -108,7 +108,7 @@ where
 /// Encode a `DEFAULT` field, which DER omits when its value equals the
 /// schema default.
 ///
-/// It sits behind the `colony` gate of its only consumers, the colony
+/// It sits behind the `colony-wire` gate of its only consumers, the colony
 /// message codecs, so a minimal build omits it.
 ///
 /// # Sources
@@ -116,7 +116,7 @@ where
 /// - ITU-T X.690 (02/2021) § 11.5, set and sequence components with default
 ///   value:
 ///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
-#[cfg(feature = "colony")]
+#[cfg(feature = "colony-wire")]
 pub(crate) fn default_field<T: Copy + PartialEq>(value: &T, default: T) -> Option<T> {
 	if *value == default {
 		return None;
@@ -132,9 +132,9 @@ pub(crate) fn decode_octets<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec<u8>
 
 /// Decode an optional `OCTET STRING` into owned bytes.
 ///
-/// It sits behind the `colony` gate of its only consumers, the colony
+/// It sits behind the `colony-wire` gate of its only consumers, the colony
 /// message codecs, so a minimal build omits it.
-#[cfg(feature = "colony")]
+#[cfg(feature = "colony-wire")]
 pub(crate) fn decode_octets_opt<'a, R: Reader<'a>>(reader: &mut R) -> Result<Option<Vec<u8>>> {
 	Ok(Option::<OctetString>::decode(reader)?.map(OctetString::into_bytes))
 }
@@ -159,9 +159,9 @@ pub(crate) fn octets_ref(bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<OctetStr
 
 /// Borrow optional bytes as an encodable `OCTET STRING OPTIONAL`.
 ///
-/// It sits behind the `colony` gate of its only consumers, the colony
+/// It sits behind the `colony-wire` gate of its only consumers, the colony
 /// message codecs, so a minimal build omits it.
-#[cfg(feature = "colony")]
+#[cfg(feature = "colony-wire")]
 pub(crate) fn octets_opt_ref(bytes: &Option<Vec<u8>>) -> Result<Option<OctetStringRef<'_>>> {
 	bytes.as_deref().map(OctetStringRef::new).transpose()
 }
@@ -295,14 +295,14 @@ mod tests {
 	use crate::testing::fixtures::der_round_trip;
 	use crate::testing::TestResult;
 
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	use crate::asn1::admission::fixtures::der_refusal;
 	#[cfg(feature = "colony")]
 	use crate::der::TagNumber;
 	#[cfg(feature = "colony")]
 	use crate::DigestInfo;
 
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	use super::*;
 
 	#[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,8 +335,7 @@ mod tests {
 		Ok(())
 	}
 
-	// The optional, sequence-of, context-tagged, and default field kinds are
-	// gated with the helpers they expand to, so their probes share that gate.
+	// The field kinds are gated with the helpers they expand to.
 	#[cfg(feature = "colony")]
 	#[derive(Debug, Clone, PartialEq, Eq)]
 	struct ColonyProbe {
@@ -372,21 +371,21 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	#[derive(Debug, Clone, PartialEq, Eq)]
 	struct BudgetProbe {
 		budget: u8,
 	}
 
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	const BUDGET_DEFAULT: u8 = 7;
 
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	wire_sequence!(BudgetProbe { budget: default(BUDGET_DEFAULT) });
 
 	/// A field equal to its default is omitted from the wire, and the decode
 	/// restores the default.
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	#[test]
 	fn default_field_is_omitted_on_the_wire() -> TestResult {
 		let encoded = BudgetProbe { budget: BUDGET_DEFAULT }.to_der()?;
@@ -398,7 +397,7 @@ mod tests {
 
 	/// A field that differs from its default travels on the wire and decodes
 	/// back.
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	#[test]
 	fn non_default_field_round_trips() {
 		let original = BudgetProbe { budget: 5 };
@@ -407,7 +406,7 @@ mod tests {
 
 	/// A field present with the value of its default is refused as
 	/// non-canonical.
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	#[test]
 	fn present_default_value_is_refused_as_noncanonical() {
 		// SEQUENCE { INTEGER 7 }: an encoder that breaks ITU-T X.690 § 11.5

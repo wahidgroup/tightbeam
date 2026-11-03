@@ -1,12 +1,6 @@
 //! The traits that define a transport protocol and what it can do.
 
-#[cfg(feature = "tokio")]
-use core::future::poll_fn;
 use core::future::Future;
-#[cfg(feature = "tokio")]
-use core::pin::pin;
-#[cfg(feature = "tokio")]
-use core::task::Poll;
 use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
@@ -18,10 +12,7 @@ use alloc::vec::Vec;
 use crate::crypto::profiles::CryptoProvider;
 use crate::marker::MaybeSend;
 use crate::transport::error::TransportError;
-use crate::transport::{EndpointConfig, TransportEncryptionConfig, TransportResult};
-
-#[cfg(feature = "tokio")]
-use crate::transport::error::TransportFailure;
+use crate::transport::{CheckedLimits, EndpointConfig, TransportEncryptionConfig, TransportResult};
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::framing::{FrameAssembler, Step};
@@ -174,22 +165,25 @@ pub trait Protocol {
 	/// The protocol's error when the connection fails.
 	fn connect(addr: Self::Address) -> impl Future<Output = Result<Self::Stream, Self::Error>> + MaybeSend;
 
-	/// Connect to `addr` within `budget`.
+	/// Connect to `addr` within the operation timeout of `limits`.
 	///
-	/// Every house dial connects here, with the operation timeout of its
-	/// endpoint:
+	/// Every house dial connects here, with the limits of its endpoint:
 	///
-	/// - The default calls [`Self::connect`], and under `tokio` the dial races
-	///   it against a sleep of `budget` on the clock of the endpoint, which
-	///   ends an async connect that no peer answers.
+	/// - The default calls [`Self::connect`], and the dial runs it within that
+	///   timeout on the clock of the endpoint, which ends an async connect that
+	///   no peer answers. A clock whose
+	///   [`Clock::timing`](crate::clock::Clock::timing) is `Parks` runs the
+	///   connect unbounded, and one whose timing is `Absent` refuses a connect
+	///   that waits.
 	/// - A blocking connect holds its thread from its first poll, so a race
 	///   cannot pre-empt it. A protocol whose connect blocks MUST override this
 	///   method and bound the connect itself, as the house blocking TCP does
 	///   with `TcpStream::connect_timeout`.
+	/// - A protocol with socket ceilings of its own reads them from `limits`.
 	///
 	/// # Errors
 	///
-	/// The protocol's error when the connection fails or `budget` runs out.
+	/// The protocol's error when the connection fails or the timeout runs out.
 	///
 	/// # Examples
 	///
@@ -201,22 +195,23 @@ pub trait Protocol {
 	/// use tightbeam::runtime::rt;
 	/// use tightbeam::transport::tcp::sync::TcpListener;
 	/// use tightbeam::transport::tcp::TightBeamSocketAddr;
-	/// use tightbeam::transport::Protocol;
+	/// use tightbeam::transport::{Protocol, TransportLimits};
 	///
 	/// type Blocking = TcpListener<NetTcpListener, DefaultCryptoProvider>;
 	///
 	/// let listener = NetTcpListener::bind("127.0.0.1:0")?;
 	/// let addr = TightBeamSocketAddr(listener.local_addr()?);
-	/// let _stream = rt::block_on(Blocking::connect_within(addr, Duration::from_secs(1)))?;
+	/// let limits = TransportLimits { operation_timeout: Duration::from_secs(1), ..TransportLimits::default() };
+	/// let _stream = rt::block_on(Blocking::connect_within(addr, &limits.checked()?))?;
 	/// # Ok::<(), Box<dyn core::error::Error>>(())
 	/// ```
 	fn connect_within(
 		addr: Self::Address,
-		budget: Duration,
+		limits: &CheckedLimits,
 	) -> impl Future<Output = Result<Self::Stream, Self::Error>> + MaybeSend {
-		// The dial races the default against its clock under `tokio`, so the
-		// budget rests with the dial.
-		let _budget = budget;
+		// The dial runs the default within the timeout on its clock, so the
+		// deadline rests with the dial.
+		let _limits = limits;
 		Self::connect(addr)
 	}
 
@@ -234,42 +229,22 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 	/// endpoint.
 	///
 	/// - The protocol bounds its own connect through [`Protocol::connect_within`].
-	/// - Under `tokio`, the dial also races the connect, polled first, against
-	///   a sleep of the timeout on the clock of this endpoint, so a connect
-	///   that no peer answers ends at the timeout.
-	/// - A build without `tokio` runs no race, because the house sleep parks the thread there.
+	/// - The dial also runs the connect through [`CheckedLimits::bound_on`]
+	///   on the clock of this endpoint, so a connect that no peer answers ends
+	///   at the timeout. The connect takes the first poll, so a blocking
+	///   connect ends under its own bound.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::DeadlineExceeded`] -- the timeout passed before
-	///   the connect ended.
+	/// - The errors of [`CheckedLimits::bound_on`].
 	/// - The error of the protocol, when its connect fails.
 	pub(crate) async fn dial<Pr>(&self, addr: Pr::Address) -> TransportResult<Pr::Stream>
 	where
 		Pr: Protocol<CryptoProvider = P>,
 	{
-		let budget = self.limits.operation_timeout;
-		let connecting = Pr::connect_within(addr, budget);
-
-		#[cfg(feature = "tokio")]
-		{
-			let mut connecting = pin!(connecting);
-			let mut deadline = self.clock.sleep(budget);
-			let raced = poll_fn(|context| match connecting.as_mut().poll(context) {
-				Poll::Ready(connected) => Poll::Ready(Some(connected)),
-				Poll::Pending => deadline.as_mut().poll(context).map(|()| None),
-			});
-
-			let expired = TransportError::OperationFailed(TransportFailure::DeadlineExceeded);
-			let connected = raced.await.ok_or(expired)?;
-			connected.map_err(Into::into)
-		}
-
-		#[cfg(not(feature = "tokio"))]
-		{
-			connecting.await.map_err(Into::into)
-		}
+		let connecting = core::pin::pin!(Pr::connect_within(addr, &self.limits));
+		let connected = self.limits.bound_on(self.clock.as_ref(), connecting).await?;
+		connected.map_err(Into::into)
 	}
 }
 

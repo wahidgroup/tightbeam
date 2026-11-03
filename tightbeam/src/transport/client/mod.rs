@@ -11,6 +11,8 @@ use crate::transport::{MessageEmitter, Protocol, TransportResult};
 use crate::crypto::sign::SigningIdentity;
 #[cfg(feature = "std")]
 use crate::crypto::x509::store::CertificateTrust;
+#[cfg(feature = "std")]
+use crate::transport::CheckedLimits;
 
 pub mod macros;
 
@@ -37,7 +39,7 @@ pub use pool::{ConnectionPool, ConnectionPoolBuilder, PoolConfig, PooledClient};
 ///
 /// use tightbeam::crypto::sign::SigningIdentity;
 /// use tightbeam::crypto::x509::store::CertificateTrust;
-/// use tightbeam::transport::{ConnectionBuilder, Protocol};
+/// use tightbeam::transport::{CheckedLimits, ConnectionBuilder, Protocol};
 ///
 /// struct Forged;
 ///
@@ -45,6 +47,10 @@ pub use pool::{ConnectionPool, ConnectionPoolBuilder, PoolConfig, PooledClient};
 ///     type Output = Self;
 ///
 ///     fn with_timeout(self, _timeout: Duration) -> Self {
+///         self
+///     }
+///
+///     fn with_limits(self, _limits: CheckedLimits) -> Self {
 ///         self
 ///     }
 ///
@@ -68,6 +74,10 @@ pub trait ConnectionBuilder<P: Protocol>: sealed::Sealed + Sized {
 
 	/// Caps how long a connect or an I/O wait may block.
 	fn with_timeout(self, timeout: Duration) -> Self;
+
+	/// Sets every ceiling the dial and the transport enforce. A timeout from
+	/// [`Self::with_timeout`] outranks the one inside `limits`.
+	fn with_limits(self, limits: CheckedLimits) -> Self;
 
 	/// Sets the trust anchors that validate the peer certificate.
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;

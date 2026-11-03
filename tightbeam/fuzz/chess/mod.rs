@@ -8,6 +8,9 @@
 // A fuzz harness is test code, exempt from the zero-panic index and arithmetic
 // lints (workspace lints): a harness fault ends the run as a finding.
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+// `clippy.toml` denies the tokio timer in the library. A harness bounds its
+// own wait with that timer as a hang guard.
+#![allow(clippy::disallowed_methods)]
 
 mod board;
 mod constants;

@@ -29,7 +29,7 @@ use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::state::{DialableEncryption, EncryptionConfig, Negotiation};
 use crate::transport::MessageCollector;
 use crate::transport::MessageEmitter;
-use crate::transport::{EndpointConfig, TransportResult};
+use crate::transport::{CheckedLimits, EndpointConfig, TransportResult};
 use crate::urn::Urn;
 use crate::Frame;
 
@@ -185,6 +185,7 @@ pub struct ConnectionPoolBuilder<P: Protocol> {
 	config: PoolConfig,
 	clock: Arc<dyn Clock>,
 	timeout: Option<Duration>,
+	limits: Option<CheckedLimits>,
 	tls: PoolTlsConfig<P::CryptoProvider>,
 	negotiation: Negotiation,
 	#[cfg(feature = "instrument")]
@@ -200,6 +201,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 			config,
 			clock,
 			timeout: None,
+			limits: None,
 			tls: PoolTlsConfig::unconfigured(),
 			negotiation: Negotiation::default(),
 			#[cfg(feature = "instrument")]
@@ -335,6 +337,11 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 		self
 	}
 
+	fn with_limits(mut self, limits: CheckedLimits) -> Self {
+		self.limits = Some(limits);
+		self
+	}
+
 	fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
 		self.tls.set_trust_store(store);
 		self
@@ -351,6 +358,7 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 			config: self.config,
 			clock: self.clock,
 			timeout: self.timeout,
+			limits: self.limits,
 			total_connections: Arc::new(AtomicUsize::new(0)),
 			#[cfg(pooled_mux)]
 			mux_ids: AtomicU64::new(0),
@@ -508,6 +516,8 @@ pub struct ConnectionPool<P: Protocol> {
 	clock: Arc<dyn Clock>,
 	/// The timeout that every connection shares.
 	timeout: Option<Duration>,
+	/// The ceilings that every connection shares.
+	limits: Option<CheckedLimits>,
 	/// The count of live connections across all destinations.
 	total_connections: Arc<AtomicUsize>,
 	/// The monotonic IDs that correlate mux pool entries with their leases.
@@ -555,7 +565,7 @@ impl<P: Protocol> ConnectionPool<P> {
 	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
 		let endpoint = self.tls.endpoint(&self.clock)?;
 		let endpoint = endpoint.with_negotiation(self.negotiation.clone());
-		let endpoint = endpoint.with_operation_timeout(self.timeout)?;
+		let endpoint = endpoint.under(self.limits, self.timeout)?;
 
 		#[cfg(feature = "instrument")]
 		let endpoint = match self.trace.as_ref() {
@@ -812,6 +822,11 @@ where
 	}
 
 	/// Connects to a destination and holds the connection exclusively.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidLimits`] -- the pool's timeout is zero.
+	/// - [`TransportError`] -- any other failure of the dial or of the pool.
 	#[cfg(not(all(
 		feature = "tokio",
 		feature = "transport-multiplex",
@@ -858,6 +873,11 @@ pooled_mux! {
 	{
 		/// Connects to a destination, over a multiplexed connection when
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts the offer.
+		///
+		/// # Errors
+		///
+		/// - [`TransportError::InvalidLimits`] -- the pool's timeout is zero.
+		/// - [`TransportError`] -- any other failure of the dial or of the pool.
 		pub async fn connect(
 			self: &Arc<Self>,
 			addr: impl Into<P::Address>,

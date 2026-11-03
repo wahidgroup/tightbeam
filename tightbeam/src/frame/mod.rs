@@ -22,8 +22,11 @@ use crate::wire::wire_sequence;
 use crate::builder::error::{BuildError, MetadataError};
 #[cfg(feature = "builder")]
 use crate::builder::MetadataBuilder;
+#[cfg(feature = "zeroize")]
+use crate::zeroize::Zeroize;
 
 mod compress;
+mod install;
 mod signed;
 
 #[cfg(feature = "aead")]
@@ -35,6 +38,7 @@ mod scaffold;
 #[cfg(feature = "signature")]
 mod signature;
 
+pub use install::InstallStep;
 #[cfg(feature = "digest")]
 pub(crate) use scaffold::FrameIntegrityScaffold;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
@@ -409,6 +413,8 @@ impl Frame {
 	/// # Errors
 	///
 	/// - [`crate::TightBeamError::UnsupportedField`] -- a part carries a field that `version` forbids.
+	/// - [`crate::TightBeamError::InvalidMetadata`] -- the `compactness` is
+	///   not version 0, or carries an `eContent`.
 	#[cfg(feature = "builder")]
 	pub(crate) fn assemble(
 		version: Version,
@@ -419,6 +425,7 @@ impl Frame {
 		let message = message.into();
 		let frame = Self { version, metadata, message, integrity, nonrepudiation: None };
 		frame.refuse(frame.forbidden_field())?;
+		frame.metadata.ensure_carried_compactness()?;
 
 		Ok(frame)
 	}
@@ -427,13 +434,45 @@ impl Frame {
 	///
 	/// A V0 frame with no optional field is valid under every §5.6 rule, so
 	/// this constructor is infallible.
-	#[cfg(feature = "colony")]
+	#[cfg(feature = "colony-wire")]
 	pub(crate) fn v0(id: impl AsRef<[u8]>, message: impl Into<Vec<u8>>) -> Self {
 		let mut metadata = Metadata::empty();
 		metadata.id = id.as_ref().to_vec();
 
 		let message = message.into();
 		Self { version: Version::V0, metadata, message, integrity: None, nonrepudiation: None }
+	}
+
+	/// The id of the frame that `der` encodes, read in place from the head of
+	/// the frame: the frame `SEQUENCE`, its version, and the metadata
+	/// `SEQUENCE`, whose first field is the id.
+	///
+	/// Each `SEQUENCE` reads within its declared length, and the id borrows
+	/// from `der`.
+	///
+	/// # Errors
+	///
+	/// - [`crate::TightBeamError::SerializationError`] -- `der` is no single
+	///   frame `SEQUENCE`, or it holds no version this crate knows, or no
+	///   metadata `SEQUENCE` that opens with an id.
+	#[cfg(feature = "colony-wire")]
+	pub(crate) fn id_in(der: &(impl AsRef<[u8]> + ?Sized)) -> crate::error::Result<&[u8]> {
+		use crate::der::asn1::{AnyRef, OctetStringRef};
+		use crate::der::{Decode, SliceReader, Tagged};
+
+		let frame = AnyRef::from_der(der.as_ref())?;
+		frame.tag().assert_eq(Tag::Sequence)?;
+
+		// Every version opens its metadata with the id, so the walk checks the
+		// version and steps past it.
+		let mut fields = SliceReader::new(frame.value())?;
+		Version::decode(&mut fields)?;
+
+		let metadata = AnyRef::decode(&mut fields)?;
+		metadata.tag().assert_eq(Tag::Sequence)?;
+
+		let id = OctetStringRef::decode(&mut SliceReader::new(metadata.value())?)?;
+		Ok(id.as_bytes())
 	}
 
 	/// The protocol version, which gates the optional fields this frame
@@ -484,20 +523,12 @@ impl Frame {
 		Opened { integrity, nonrepudiation }
 	}
 
-	/// Refuse a seal of a frame whose FI digest or signature covers the frame
-	/// as it is before the seal.
-	///
-	/// # Errors
-	///
-	/// - [`crate::TightBeamError::CoveredBeforeSeal`] -- the frame carries an FI digest or a signature.
-	#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-	fn ensure_uncovered(&self) -> crate::error::Result<()> {
-		let covered = self.integrity.is_some() || self.nonrepudiation.is_some();
-		if covered {
-			return Err(crate::TightBeamError::CoveredBeforeSeal);
-		}
-
-		Ok(())
+	/// Replace the body with `body`. Under `zeroize` the replaced body wipes
+	/// first, as the body of a dropped frame does.
+	fn replace_body(&mut self, body: Vec<u8>) {
+		#[cfg(feature = "zeroize")]
+		self.message.zeroize();
+		self.message = body;
 	}
 
 	/// The transform this body still needs before a decode.
@@ -547,7 +578,6 @@ impl Frame {
 	///
 	/// - [`crate::TightBeamError::UnsupportedField`] -- the frame's version
 	///   forbids `field`. The error names the field and the frame version.
-	#[cfg(feature = "signature")]
 	fn ensure_allows(&self, field: GatedField) -> crate::error::Result<()> {
 		let forbidden = (!self.version.allows(field)).then_some(field);
 		self.refuse(forbidden)
@@ -562,7 +592,6 @@ impl Frame {
 	///
 	/// - [`crate::TightBeamError::UnsupportedField`] -- `forbidden` names a
 	///   field. The error names the field and the frame version.
-	#[cfg(any(feature = "builder", feature = "signature"))]
 	fn refuse(&self, forbidden: Option<GatedField>) -> crate::error::Result<()> {
 		let Some(field) = forbidden else {
 			return Ok(());

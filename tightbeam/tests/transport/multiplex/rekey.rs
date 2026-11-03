@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tightbeam::at_least;
+use tightbeam::clock::Clock;
 use tightbeam::crypto::aead::{RecvCipher, SendCipher};
 use tightbeam::crypto::exchange::{EcdheShare, KeyShare};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
@@ -26,7 +27,7 @@ use tightbeam::transport::handshake::negotiation::{
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt, StoredReceipt};
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxConnector, MuxHandle, MuxRekeyContext, MuxRole, MuxTransport};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
-use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportResult};
+use tightbeam::transport::{CheckedLimits, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportResult};
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 use tokio::time::timeout;
@@ -519,6 +520,10 @@ impl EnvelopeSource for TappedReader {
 		Ok(envelope)
 	}
 
+	fn limits(&self) -> CheckedLimits {
+		EnvelopeSource::limits(&self.inner)
+	}
+
 	fn remaining_records(&self) -> u64 {
 		EnvelopeSource::remaining_records(&self.inner)
 	}
@@ -552,6 +557,10 @@ impl EnvelopeSink for TappedWriter {
 
 	fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
 		EnvelopeSink::install_send_cipher(&mut self.inner, cipher)
+	}
+
+	fn clock(&self) -> Arc<dyn Clock> {
+		EnvelopeSink::clock(&self.inner)
 	}
 
 	fn trace(&self) -> Option<TraceCollector> {

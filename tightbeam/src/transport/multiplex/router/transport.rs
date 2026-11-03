@@ -3,13 +3,13 @@
 
 use std::sync::Arc;
 
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use core::time::Duration;
 
 use futures::channel::mpsc;
 
 use super::flow::cap_as_usize;
-use super::handle::MuxHandle;
+use super::handle::{MuxHandle, Pulse};
 use super::link::MuxLink;
 use super::reader::MuxReaderDriver;
 use super::responder::MuxResponder;
@@ -74,11 +74,12 @@ where
 		};
 
 		let shared = Arc::new(shared);
+		let pulse = Pulse::of(&reader, &writer);
 		let drain_headroom = settings.drain_reserve_records();
 		let writer = MuxWriterDriver::new(writer, outbound_receiver, Arc::clone(&shared), drain_headroom);
 		let (link, drained) = MuxLink::new(shared, outbound_sender);
 		let reader = MuxReaderDriver::new(reader, link.clone(), inbound_sender, drained, &settings);
-		let handle = MuxHandle::new(link.clone());
+		let handle = MuxHandle::new(link.clone(), pulse);
 		let responder = MuxResponder::new(inbound_receiver, link, settings.peer_initiated_cap());
 
 		Self { handle, reader, writer, responder }
@@ -101,11 +102,13 @@ where
 	///
 	/// # Renewal deadline
 	///
-	/// The renewal deadline (`with_renewal_deadline`, tokio-only) bounds how
-	/// long a peer that never answers a renewal can park this endpoint's data
-	/// at the hard floor. A build without tokio has no timer, so the
-	/// application MUST put its own timeout around each emit future. A
-	/// cancelled emit frees its stream slot.
+	/// The renewal deadline (`with_renewal_deadline`) bounds how long a peer
+	/// that never answers a renewal can park this endpoint's data at the hard
+	/// floor, on the timer of the writer. A clock whose
+	/// [`Clock::timing`](crate::clock::Clock::timing) is `Parks` runs no
+	/// deadline, so the application MUST put its own timeout around each emit
+	/// future, and a clock with no timer on the polling thread ends the writer
+	/// with `FailedPrecondition`. A cancelled emit frees its stream slot.
 	///
 	/// # Examples
 	///
@@ -159,10 +162,11 @@ where
 
 	/// Override the time budget for one in-band renewal exchange. The default
 	/// is [`DEFAULT_REKEY_DEADLINE_SECS`] seconds, and expiry drains the
-	/// connection on the GoAway path.
+	/// connection on the GoAway path. A clock that parks runs no deadline, as
+	/// [`Clock::timing`](crate::clock::Clock::timing) states.
 	///
 	/// [`DEFAULT_REKEY_DEADLINE_SECS`]: crate::constants::DEFAULT_REKEY_DEADLINE_SECS
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	#[must_use]
 	pub fn with_renewal_deadline(mut self, deadline: Duration) -> Self {
 		self.writer.set_renewal_deadline(deadline);

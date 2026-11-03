@@ -622,8 +622,12 @@ impl fmt::Debug for SessionOutcome {
 ///
 /// # Contract
 ///
-/// - The handshake awaits the hook inline before it concludes, with **no
-///   library deadline**. Keep the hook fast or bound it.
+/// - The handshake awaits the hook inline before it concludes. Where the
+///   clock of the async transport races a wait
+///   ([`Clock::timing`](crate::clock::Clock::timing)), its handshake deadline
+///   bounds that round. The blocking transport, a clock that parks, and an
+///   in-band renewal await the hook with **no library deadline**. Keep the
+///   hook fast or bound it.
 /// - The outcome is borrowed, so call `to_owned` on what you retain.
 /// - Stamp your own clock, and persist to your own ledger for your dispute window.
 pub trait SessionObserver: MaybeSend + MaybeSync {

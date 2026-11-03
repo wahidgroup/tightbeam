@@ -50,7 +50,9 @@ use tightbeam::testing::specs::csp::{Event, Process, ProcessBuildError, State};
 use tightbeam::testing::{TestFrame, TestMessage};
 use tightbeam::trace::{ConsumedTrace, TraceCollector, TraceConfig};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
-use tightbeam::transport::EndpointConfig;
+use tightbeam::transport::{
+	AsyncProtocolStream, AsyncReadStream, EndpointConfig, EnvelopeSource, MessageIO, SplittableStream,
+};
 use tightbeam::urn::UrnSpecBuilder;
 use tightbeam::x509::Certificate;
 use tightbeam::{compose, tb_cases, Frame, TightBeamError};
@@ -279,32 +281,45 @@ fn kem_sealed_frame() -> Frame {
 /// KEM recipient.
 fn allocations_of_a_kem_shape() -> usize {
 	let frame = kem_sealed_frame();
-
 	let (admitted, allocations) = counted(|| frame.validate_for::<TestMessage>());
 	admitted.expect("a sealed frame meets the requirements of its message");
+
 	allocations
 }
 
-/// A cleartext transport over a loopback connection, whose trace leaves
-/// `enable_internal_detail` off.
-async fn loopback_transport() -> TcpTransport<TokioStream> {
+/// The two ends of a loopback connection: the end that dialed, as a stream a
+/// transport takes, and the end that the listener accepted.
+async fn loopback_pair() -> (TokioStream, tokio::net::TcpStream) {
 	let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
 	let listener = bound.expect("a loopback port binds");
-
 	let address = listener.local_addr().expect("a bound listener has an address");
 	let connected = tokio::net::TcpStream::connect(address).await;
+
 	let stream = connected.expect("a loopback listener accepts");
+	let (peer, _) = listener.accept().await.expect("the listener accepts the dial");
+	(TokioStream::from(stream), peer)
+}
+
+/// A cleartext transport over a loopback connection, whose trace leaves
+/// `enable_internal_detail` off, beside the end it talks to.
+async fn loopback_transport() -> (TcpTransport<TokioStream>, tokio::net::TcpStream) {
+	let (stream, peer) = loopback_pair().await;
 	let config = EndpointConfig::<DefaultCryptoProvider>::cleartext();
-	TcpTransport::new(TokioStream::from(stream), config).with_trace(TraceCollector::new())
+	(TcpTransport::new(stream, config).with_trace(TraceCollector::new()), peer)
+}
+
+/// A current-thread runtime with its I/O and its timers.
+fn runtime() -> tokio::runtime::Runtime {
+	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+	runtime.expect("a current-thread runtime builds")
 }
 
 /// The count of the allocations that a single-flight turn makes as it answers
 /// one admitted frame with a handler that allocates nothing, on a connection
 /// whose trace leaves `enable_internal_detail` off.
 fn single_flight_turn_with_the_detail_off() -> usize {
-	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-	let runtime = runtime.expect("a current-thread runtime builds");
-	let mut transport = runtime.block_on(loopback_transport());
+	let runtime = runtime();
+	let (mut transport, _peer) = runtime.block_on(loopback_transport());
 	let collected = (Arc::new(TestFrame::v0(None, None)), TransitStatus::Ok);
 	let echo = |frame: Frame, _session| ready(Ok::<_, TightBeamError>(Some(frame)));
 	let mut session = None;
@@ -312,13 +327,85 @@ fn single_flight_turn_with_the_detail_off() -> usize {
 
 	let one_turn = || pin!(SingleFlightAnswer::of(&mut transport, &mut session, collected, echo)).poll(&mut cx);
 	let (turn, allocations) = counted(one_turn);
-
 	let Poll::Ready(answer) = turn else {
 		panic!("a turn whose handler is ready completes on its first poll");
 	};
 
 	answer.failure.map_or(Ok(()), Err).expect("the turn answers the admitted frame");
 	allocations
+}
+
+/// The DER of an envelope-sized frame: an `OCTET STRING` of two octets.
+const FRAME: [u8; 4] = [0x04, 0x02, 0xAA, 0xBB];
+
+/// The counts of the allocations that one write makes through a transport,
+/// which bounds it by its operation timeout, and through a bare stream. Each
+/// side writes once before the count, so the count reads a connection that
+/// is ready to write.
+fn writes_with_and_without_a_deadline() -> (usize, usize) {
+	let runtime = runtime();
+	let _entered = runtime.enter();
+	let (mut transport, _peer) = runtime.block_on(loopback_transport());
+	let (mut bare, _bare_peer) = runtime.block_on(loopback_pair());
+
+	runtime
+		.block_on(transport.write_envelope_bytes(&FRAME))
+		.expect("a loopback write completes");
+	runtime.block_on(bare.write_frame(&FRAME)).expect("a loopback write completes");
+
+	let mut cx = Context::from_waker(Waker::noop());
+	let (bounded, through_deadline) = counted(|| pin!(transport.write_envelope_bytes(&FRAME)).poll(&mut cx));
+	let (unbounded, through_bare) = counted(|| pin!(bare.write_frame(&FRAME)).poll(&mut cx));
+	assert!(
+		matches!(bounded, Poll::Ready(Ok(()))),
+		"a write with room completes on its first poll"
+	);
+	assert!(
+		matches!(unbounded, Poll::Ready(Ok(()))),
+		"a write with room completes on its first poll"
+	);
+	(through_deadline, through_bare)
+}
+
+/// The counts of the allocations that a read from a silent peer makes as it
+/// starts to wait: through a transport, which bounds it by its operation
+/// timeout and waited once before, and through a bare stream.
+fn waits_with_and_without_a_deadline() -> (usize, usize) {
+	let runtime = runtime();
+	let _entered = runtime.enter();
+	let (mut transport, _peer) = runtime.block_on(loopback_transport());
+	let (mut bare, _bare_peer) = runtime.block_on(loopback_pair());
+	let mut cx = Context::from_waker(Waker::noop());
+	let warmed = pin!(transport.read_envelope_bytes()).poll(&mut cx);
+	assert!(warmed.is_pending(), "a read from a silent peer waits");
+
+	let (bounded, through_deadline) = counted(|| pin!(transport.read_envelope_bytes()).poll(&mut cx));
+	let (unbounded, through_bare) =
+		counted(|| pin!(AsyncProtocolStream::read_frame(&mut bare, FRAME.len())).poll(&mut cx));
+	assert!(bounded.is_pending(), "a read from a silent peer waits");
+	assert!(unbounded.is_pending(), "a read from a silent peer waits");
+	(through_deadline, through_bare)
+}
+
+/// The counts of the allocations that a read from a silent peer makes as it
+/// starts to wait: through the read half of a split transport, which bounds it
+/// and waited once before, and through a bare read half.
+fn split_waits_with_and_without_a_deadline() -> (usize, usize) {
+	let runtime = runtime();
+	let _entered = runtime.enter();
+	let (transport, _peer) = runtime.block_on(loopback_transport());
+	let (mut reader, _writer) = transport.into_split().expect("a cleartext transport splits");
+	let (bare, _bare_peer) = runtime.block_on(loopback_pair());
+	let (mut bare_reader, _bare_writer) = bare.into_split();
+	let mut cx = Context::from_waker(Waker::noop());
+	let warmed = pin!(reader.read_envelope()).poll(&mut cx);
+	assert!(warmed.is_pending(), "a read from a silent peer waits");
+
+	let (bounded, through_deadline) = counted(|| pin!(reader.read_envelope()).poll(&mut cx));
+	let (unbounded, through_bare) = counted(|| pin!(bare_reader.read_frame(FRAME.len())).poll(&mut cx));
+	assert!(bounded.is_pending(), "a read from a silent peer waits");
+	assert!(unbounded.is_pending(), "a read from a silent peer waits");
+	(through_deadline, through_bare)
 }
 
 /// The allocation counts of a record with evidence and of a bare assertion on
@@ -328,6 +415,7 @@ fn records_on_a_full_sink() -> (usize, usize) {
 	let trace = TraceCollector::from(TraceConfig::with_instrumentation(config));
 	let warmed = trace.emit_event_with_evidence(events::GATE_ACCEPT, "Ok", None);
 	warmed.expect("a record on a full sink returns");
+
 	let warm_assertion = trace.event(&events::GATE_ACCEPT);
 	warm_assertion.expect("an assertion on a full sink returns").emit();
 
@@ -335,6 +423,7 @@ fn records_on_a_full_sink() -> (usize, usize) {
 	let (asserted, bare) = counted(|| trace.event(&events::GATE_ACCEPT).map(|builder| builder.emit()));
 	evidenced.expect("a record on a full sink returns");
 	asserted.expect("an assertion on a full sink returns");
+
 	(with_evidence, bare)
 }
 
@@ -377,7 +466,6 @@ fn hidden_run_bounds_of_the_ring() -> (usize, usize) {
 /// the divergent states of `ring` make.
 fn divergent_states_of_the_ring() -> (bool, usize) {
 	let process = ring();
-
 	let (divergent, allocations) = counted(|| process.divergent_states());
 	(divergent.contains(State("S0")), allocations)
 }
@@ -567,6 +655,15 @@ tb_cases! {
 		/// it reads an NSS with the allocations of a custom format of the same
 		/// values.
 		joined_nss => reads_of_one_nss,
+		/// A write that completes on its first poll arms no timer, so its
+		/// deadline allocates nothing.
+		deadlined_write => writes_with_and_without_a_deadline,
+		/// A transport keeps the sleep of its first wait and resets it for each
+		/// wait after, so the deadline of a later wait allocates nothing.
+		deadlined_wait => waits_with_and_without_a_deadline,
+		/// The read half of a split transport keeps its sleep as the whole
+		/// transport does, so the deadline of a later wait allocates nothing.
+		deadlined_split_wait => split_waits_with_and_without_a_deadline,
 	}
 }
 

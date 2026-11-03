@@ -11,8 +11,8 @@
 //! # Wire format
 //!
 //! The commitment value goes in the existing message integrity field, so the
-//! wire format is unchanged. `CommitmentSalt::commit` owns the preimage layout
-//! and its mode byte.
+//! wire format is unchanged. `CommitmentSalt::preimage` owns the preimage
+//! layout and its mode byte.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -20,7 +20,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::constants::MIN_SALT_SIZE;
-use crate::crypto::hash::{ConstantTimeDigest, Digest};
+use crate::crypto::hash::{ConstantTimeDigest, Digest, DigestInfoExt};
 use crate::crypto::secret::SecretSlice;
 use crate::der::oid::AssociatedOid;
 use crate::error::{Result, TightBeamError};
@@ -104,17 +104,46 @@ impl CommitmentSalt {
 		D: Digest + AssociatedOid,
 	{
 		let mut hasher = D::new();
+		self.preimage(data, |part| hasher.update(part));
+
+		DigestInfo::of_hasher(hasher)
+	}
+
+	/// Feed the preimage of the commitment digest of `data` under this salt
+	/// to `sink`, part by part and in order, for a caller that hashes outside
+	/// this crate. This is the one statement of the preimage layout.
+	///
+	/// Each part borrows the salt or `data` in place, so the salt stays in the
+	/// [`SecretSlice`] that wipes it on drop.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// # #[cfg(feature = "sha3")]
+	/// # {
+	/// use tightbeam::crypto::commitment::CommitmentSalt;
+	/// use tightbeam::crypto::hash::{Digest, Sha3_256};
+	///
+	/// let salt = CommitmentSalt::parse([0x5A; 16])?;
+	/// let mut hasher = Sha3_256::new();
+	/// salt.preimage(b"body", |part| hasher.update(part));
+	///
+	/// let commitment = hasher.finalize();
+	/// assert_eq!(commitment.len(), 32);
+	/// # }
+	/// # Ok::<(), tightbeam::TightBeamError>(())
+	/// ```
+	pub fn preimage(&self, data: impl AsRef<[u8]>, mut sink: impl FnMut(&[u8])) {
 		match self {
-			CommitmentSalt::Plain => hasher.update([PLAIN_MODE]),
+			CommitmentSalt::Plain => sink(&[PLAIN_MODE]),
 			CommitmentSalt::Hiding(salt) => salt.with(|salt| {
-				hasher.update([HIDING_MODE]);
-				hasher.update((salt.len() as u64).to_be_bytes());
-				hasher.update(salt);
+				sink(&[HIDING_MODE]);
+				sink(&(salt.len() as u64).to_be_bytes());
+				sink(salt);
 			}),
 		}
 
-		hasher.update(data.as_ref());
-		crate::utils::digest_info::<D>(hasher)
+		sink(data.as_ref());
 	}
 }
 
@@ -194,6 +223,68 @@ mod tests {
 
 	impl Message for Body {
 		type Profile = crate::crypto::profiles::TightbeamProfile;
+	}
+
+	/// The preimage of `data` under `salt`, joined into one buffer.
+	fn joined(salt: &CommitmentSalt, data: &[u8]) -> Vec<u8> {
+		let mut preimage = Vec::new();
+		salt.preimage(data, |part| preimage.extend_from_slice(part));
+
+		preimage
+	}
+
+	#[test]
+	fn a_plain_preimage_is_the_mode_then_the_data() -> TestResult {
+		let preimage = joined(&CommitmentSalt::parse([])?, &[0xAA, 0xBB]);
+		assert_eq!(preimage, [PLAIN_MODE, 0xAA, 0xBB]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_hiding_preimage_frames_its_salt() -> TestResult {
+		let salt = [0x11; MIN_SALT_SIZE];
+		let preimage = joined(&CommitmentSalt::parse(salt)?, &[0xAA]);
+
+		let mut expected = vec![HIDING_MODE];
+		expected.extend_from_slice(&(MIN_SALT_SIZE as u64).to_be_bytes());
+		expected.extend_from_slice(&salt);
+		expected.push(0xAA);
+
+		assert_eq!(preimage, expected);
+		Ok(())
+	}
+
+	#[test]
+	fn a_preimage_hashes_to_the_commitment() -> TestResult {
+		let salt = CommitmentSalt::parse([0x22; MIN_SALT_SIZE])?;
+		let commitment = salt.commit::<Sha3_256>(b"body")?;
+
+		let mut hasher = Sha3_256::new();
+		salt.preimage(b"body", |part| hasher.update(part));
+		assert_eq!(commitment.digest.as_bytes(), hasher.finalize().as_slice());
+		Ok(())
+	}
+
+	/// The salt part and the data part are the bytes that the salt and the
+	/// caller hold.
+	#[test]
+	fn a_preimage_lends_its_salt_and_its_data_in_place() -> TestResult {
+		let salt = CommitmentSalt::parse([0x33; MIN_SALT_SIZE])?;
+		let data = [0xAA, 0xBB];
+
+		let mut parts = Vec::new();
+		salt.preimage(data.as_slice(), |part| parts.push(part.as_ptr()));
+
+		assert_eq!(parts.get(2..), Some([salt_address(&salt), data.as_ptr()].as_slice()));
+		Ok(())
+	}
+
+	/// The address of the bytes a hiding salt holds, and null for a plain one.
+	fn salt_address(salt: &CommitmentSalt) -> *const u8 {
+		match salt {
+			CommitmentSalt::Hiding(hiding) => hiding.with(<[u8]>::as_ptr),
+			CommitmentSalt::Plain => core::ptr::null(),
+		}
 	}
 
 	/// The commitment and the opening of a body of `value` under `salt`.

@@ -771,13 +771,16 @@ impl From<Option<MuxBudgets>> for AuthorizationGrant {
 ///
 /// # Deadline
 ///
-/// On tokio runtimes the transport's handshake deadline bounds both hooks. A
-/// hook still pending when the deadline elapses aborts the handshake with
+/// Where the clock of the async transport races a wait
+/// ([`Clock::timing`](crate::clock::Clock::timing)), the handshake deadline
+/// bounds both hooks. A hook still pending when the deadline elapses aborts
+/// the handshake with
 /// [`DeadlineExceeded`](crate::transport::TransportFailure::DeadlineExceeded).
 ///
-/// Runtimes without a timer (non-tokio) enforce no library deadline, so bound
-/// external work in the hook. A slow hook stalls per-connection handshake
-/// state and widens the window an unauthenticated peer can hold it.
+/// The blocking transport, a clock that parks, and an in-band renewal enforce
+/// no library deadline on a hook, so bound external work in the hook. A slow
+/// hook stalls per-connection handshake state and widens the window an
+/// unauthenticated peer can hold it.
 ///
 /// # Grants
 ///

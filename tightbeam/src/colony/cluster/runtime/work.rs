@@ -7,8 +7,9 @@ use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntime
 use crate::colony::cluster::runtime::hop::{HivePlane, Hop, PeerPlane};
 use crate::colony::cluster::servlet_registry::RoutePlane;
 use crate::colony::cluster::{ClusterConfig, ClusterError, DialTarget, HopBudget, ServletEntry, ServletRegistry};
-use crate::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ReplyForm};
+use crate::colony::protocol::{ClusterRequest, ReplyForm};
 use crate::colony::urn::ServletTypeKey;
+use crate::colony::work::{ClusterWorkRequest, ClusterWorkResponse};
 use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{

@@ -5,13 +5,15 @@
 use core::future::{poll_fn, Future};
 use core::num::NonZeroU32;
 use core::pin::Pin;
-#[cfg(not(all(test, tightbeam_loom)))]
-use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use core::task::{Context, Poll, Waker};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+#[cfg(not(all(test, tightbeam_loom)))]
+use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
 use futures::channel::{mpsc, oneshot};
+
 #[cfg(all(test, tightbeam_loom))]
 use loom::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
@@ -31,13 +33,12 @@ use crate::transport::{TransportError, TransportResult};
 use crate::urn::Urn;
 use crate::Frame;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-use crate::transport::handshake::receipt::StoredReceipt;
-
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::{InternalEvent, TraceCollector};
+#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+use crate::transport::handshake::receipt::StoredReceipt;
 
 /// Wakes every parked waker and empties the set.
 fn wake_all(wakers: &mut Vec<Waker>) {
@@ -875,6 +876,12 @@ impl MuxShared {
 		self.lock().send_budget
 	}
 
+	/// Takes the pending ping of `opaque`, and reports whether one was there.
+	#[cfg(test)]
+	pub(crate) fn takes_ping(&self, opaque: u64) -> bool {
+		self.lock().pending.take_ping(opaque).is_some()
+	}
+
 	/// The chunks that producers registered and that wait for a permit, across
 	/// all streams.
 	pub fn unsent_chunks(&self) -> u64 {
@@ -882,7 +889,7 @@ impl MuxShared {
 	}
 
 	/// The current renewal phase, which the writer's renewal deadline reads.
-	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-hpke")))]
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub fn rekey_phase(&self) -> RekeyPhase {
 		self.lock().rekey
 	}

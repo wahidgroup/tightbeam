@@ -23,7 +23,7 @@
 //! Rumors flood across colonies through the gossip subsystem ([`GossipConfig`],
 //! [`GossipJournal`]), which deduplicates, retains, and repairs them.
 //!
-//! [`ClusterWorkRequest`]: crate::colony::protocol::ClusterWorkRequest
+//! [`ClusterWorkRequest`]: crate::colony::work::ClusterWorkRequest
 
 mod balance;
 mod dial;
