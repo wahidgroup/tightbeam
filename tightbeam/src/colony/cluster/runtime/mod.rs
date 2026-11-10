@@ -42,8 +42,8 @@ use crate::clock::Clock;
 use crate::colony::cluster::export::ExportScope;
 use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
-	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
-	ServletRegistry, SharedId,
+	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, EdgeBind, EdgeStreams, HeartbeatConfig, HiveRegistry,
+	HopBudget, PeerRouteInfo, ServletRegistry, SharedId,
 };
 use crate::colony::protocol::HeartbeatResult;
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
@@ -185,9 +185,10 @@ impl ClusterConfig {
 ///
 /// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
 /// - `E` runs the provider of `P`, because both planes present the one identity of the gateway.
-/// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second
+/// - When [`ClusterConfig::edge`] is set, the gateway binds a second
 ///   listener over `E` with the same TLS material.
-/// - A separate edge mux service serves edge connections, and its one route is `Work` submission.
+/// - A separate edge mux service serves edge connections: `Work` submission, and stream and duplex opens when
+///   [`EdgePlane::streams`](crate::colony::cluster::EdgePlane::streams) admits them.
 /// - Hives and peers use the colony plane at [`Cluster::addr`].
 pub struct ClusterGateway<P, E = P>
 where
@@ -203,7 +204,7 @@ where
 	/// with the edge task.
 	server_handle: Option<rt::JoinHandle>,
 	/// The edge accept plane task, present when
-	/// [`ClusterConfig::edge_bind_addr`] is set.
+	/// [`ClusterConfig::edge`] is set.
 	edge_handle: Option<rt::JoinHandle>,
 	/// Every background task this gateway started.
 	tasks: TaskGroup,
@@ -221,7 +222,7 @@ where
 	E: Protocol,
 {
 	/// The bound address of the edge accept plane, or `None` when
-	/// [`ClusterConfig::edge_bind_addr`] is unset.
+	/// [`ClusterConfig::edge`] is unset.
 	///
 	/// External clients dial this address. Hives register on
 	/// [`Cluster::addr`].
@@ -315,13 +316,13 @@ where
 		// Bind every configured accept plane before any accept loop spawns.
 		// An edge parse or bind failure then returns `Err` before the colony
 		// listener leaves here, so a failed start spawns no accept task.
-		let (edge_listener, edge_addr) = match config.edge_bind_address::<E::Address>()? {
-			Some(edge_bind) => {
-				let (edge_listener, edge_addr) = E::bind_with(edge_bind, config.tls.accept_encryption())
+		let (edge_listener, edge_addr) = match config.edge_bind::<E::Address>()? {
+			Some(EdgeBind { addr, streams }) => {
+				let (edge_listener, edge_addr) = E::bind_with(addr, config.tls.accept_encryption())
 					.await
 					.map_err(TightBeamError::transport)?;
 
-				(Some(edge_listener), Some(edge_addr))
+				(Some((edge_listener, streams)), Some(edge_addr))
 			}
 			None => (None, None),
 		};
@@ -340,9 +341,8 @@ where
 		// Each field of the context is reference-counted, so a clone is cheap.
 		let server_handle = ctx.clone().serve_colony::<P::Listener>(listener);
 
-		// The edge plane serves [`EdgeMuxService`], whose only route is work
-		// submission.
-		let serve_edge = |edge_listener| ctx.clone().serve_edge::<E::Listener>(edge_listener);
+		// The edge plane serves [`EdgeMuxService`].
+		let serve_edge = |(edge_listener, streams)| ctx.clone().serve_edge::<E::Listener>(edge_listener, streams);
 		let edge_handle = edge_listener.map(serve_edge);
 
 		tasks.adopt(ctx.clone().spawn_heartbeat());
@@ -482,16 +482,17 @@ where
 
 /// The gateway's [`MuxService`] for an edge accept plane.
 ///
-/// An edge plane serves external clients, so work submission is its only
-/// route. The type carries that boundary. Its unary arm narrows the envelope
-/// to a work request through [`GatewayRuntimeCtx::handle_edge_request`], and
-/// its stream and duplex arms refuse with `PermissionDenied`. Registration,
-/// peer advertisement, and gossip stay on the colony plane.
+/// An edge plane serves external clients, so work submission and, when
+/// `streams` admits them, stream opens to servlets are its only routes.
+///
+/// - Its unary arm narrows the envelope to a work request through [`GatewayRuntimeCtx::handle_edge_request`].
+/// - Its stream and duplex arms pass the guard of the colony plane, or refuse as [`EdgeStreams`] says.
 struct EdgeMuxService<P>
 where
 	P: Protocol,
 {
 	ctx: GatewayRuntimeCtx<P>,
+	streams: EdgeStreams,
 }
 
 impl<P> MuxService for GatewayMuxService<P>
@@ -512,12 +513,7 @@ where
 		body: StreamBody,
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
-		let ctx = self.ctx.clone();
-		async move {
-			let audit = ctx.audit(cx.session());
-			let (target, budget) = ctx.guard_stream_open(&cx, &audit)?;
-			ctx.splice_streaming(body, target, budget, &audit).await
-		}
+		self.ctx.clone().serve_stream_open(body, cx)
 	}
 
 	fn duplex(
@@ -526,12 +522,7 @@ where
 		reply: ReplySink,
 		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
-		let ctx = self.ctx.clone();
-		async move {
-			let audit = ctx.audit(cx.session());
-			let (target, budget) = ctx.guard_stream_open(&cx, &audit)?;
-			ctx.splice_duplex(body, reply, target, budget, &audit).await
-		}
+		self.ctx.clone().serve_duplex_open(body, reply, cx)
 	}
 }
 
@@ -550,33 +541,74 @@ where
 
 	fn streaming(
 		&self,
-		_body: StreamBody,
+		body: StreamBody,
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
-		let refused = self.ctx.refuse_edge_open("streaming", &cx);
-		core::future::ready(Err(refused))
+		let admitted = self.admit_open(EdgeCall::Streaming, &cx);
+		let ctx = self.ctx.clone();
+		async move {
+			admitted?;
+			ctx.serve_stream_open(body, cx).await
+		}
 	}
 
 	fn duplex(
 		&self,
-		_body: StreamBody,
-		_reply: ReplySink,
+		body: StreamBody,
+		reply: ReplySink,
 		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
-		let refused = self.ctx.refuse_edge_open("duplex", &cx);
-		core::future::ready(Err(refused))
+		let admitted = self.admit_open(EdgeCall::Duplex, &cx);
+		let ctx = self.ctx.clone();
+		async move {
+			admitted?;
+			ctx.serve_duplex_open(body, reply, cx).await
+		}
+	}
+}
+
+impl<P: Protocol> EdgeMuxService<P> {
+	/// Admit an open of `call` on the plane, or refuse it as the
+	/// [`EdgeStreams`] of the plane says.
+	///
+	/// # Errors
+	///
+	/// - The refusal of [`GatewayRuntimeCtx::refuse_edge_call`], for a plane that refuses streams.
+	fn admit_open(&self, call: EdgeCall, cx: &CallContext) -> Result<(), TightBeamError> {
+		match self.streams {
+			EdgeStreams::Admitted => Ok(()),
+			EdgeStreams::Refused => Err(self.ctx.refuse_edge_open(call, cx)),
+		}
+	}
+}
+
+/// The kind of a call that an edge plane refuses, which labels
+/// [`CLUSTER_EDGE_REFUSED`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeCall {
+	/// A unary envelope other than `Work`.
+	Unary,
+	/// A stream open, on a plane whose [`EdgeStreams`] refuses it.
+	Streaming,
+	/// A duplex open, on a plane whose [`EdgeStreams`] refuses it.
+	Duplex,
+}
+
+impl EdgeCall {
+	/// The label of the refusal, and its one tag, which a spec grades.
+	const fn tags(self) -> &'static [&'static str] {
+		match self {
+			Self::Unary => &["unary"],
+			Self::Streaming => &["streaming"],
+			Self::Duplex => &["duplex"],
+		}
 	}
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
-	/// Records a call that the edge plane refuses, and returns the status that
-	/// the caller reads.
+	/// Records `call`, which the edge plane refuses, as [`CLUSTER_EDGE_REFUSED`],
+	/// and returns [`TransitStatus::PermissionDenied`].
 	///
-	/// The edge plane serves work submission alone, so it answers every other
-	/// call with [`TransitStatus::PermissionDenied`] and records
-	/// [`CLUSTER_EDGE_REFUSED`].
-	///
-	/// - `call` names the kind of the call: `unary`, `streaming`, or `duplex`.
 	/// - `session` names the caller by the canonical key its handshake proved.
 	///   A frame's signer is a claim the edge plane does not verify, so the
 	///   record never names it (CWE-345).
@@ -584,20 +616,23 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// # Errors
 	///
 	/// - [`TightBeamError`] -- the trace refused the event, the fault the `testing-fault` feature injects.
-	fn refuse_edge_call(&self, call: &'static str, session: &SessionContext) -> Result<TransitStatus, TightBeamError> {
+	fn refuse_edge_call(&self, call: EdgeCall, session: &SessionContext) -> Result<TransitStatus, TightBeamError> {
 		let status = TransitStatus::PermissionDenied;
 		let caller = session.peer_key().map(CanonicalKey::as_der);
 		let audit = self.audit(session);
 		let trace = audit.unproven();
-		trace.emit_event_with_value_and_evidence(CLUSTER_EDGE_REFUSED, call, status, caller)?;
+		let tags = call.tags();
+		let label = || tags.first().copied().unwrap_or_default();
+
+		trace.emit_tagged_event(CLUSTER_EDGE_REFUSED, tags, label, status, || caller)?;
 
 		Ok(status)
 	}
 
-	/// Refuses a stream that the edge plane opened, through
-	/// [`Self::refuse_edge_call`], and returns the failure that ends the
-	/// stream: the refusal, or the fault of a trace that refused the event.
-	fn refuse_edge_open(&self, call: &'static str, cx: &CallContext) -> TightBeamError {
+	/// Refuses an open of `call` through [`Self::refuse_edge_call`], and
+	/// returns the failure that ends the stream: the refusal, or the fault of
+	/// a trace that refused the event.
+	fn refuse_edge_open(&self, call: EdgeCall, cx: &CallContext) -> TightBeamError {
 		let refused = self.refuse_edge_call(call, cx.session());
 		refused.map_or_else(|fault| fault, TransitStatus::refusal)
 	}
@@ -637,6 +672,35 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 }
 
 impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
+	/// Serves a streamed open from either accept plane: the boundary guard,
+	/// then the splice to the route it admits.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::guard_stream_open`] and [`Self::splice_streaming`].
+	async fn serve_stream_open(self, body: StreamBody, cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
+		let audit = self.audit(cx.session());
+		let (target, budget) = self.guard_stream_open(&cx, &audit)?;
+		self.splice_streaming(body, target, budget, &audit).await
+	}
+
+	/// Serves a duplex open from either accept plane: the boundary guard, then
+	/// the splice to the route it admits.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::guard_stream_open`] and [`Self::splice_duplex`].
+	async fn serve_duplex_open(
+		self,
+		body: StreamBody,
+		reply: ReplySink,
+		cx: CallContext,
+	) -> Result<(), TightBeamError> {
+		let audit = self.audit(cx.session());
+		let (target, budget) = self.guard_stream_open(&cx, &audit)?;
+		self.splice_duplex(body, reply, target, budget, &audit).await
+	}
+
 	/// Serves the colony accept plane through [`GatewayMuxService`].
 	///
 	/// `L` is the bound listener, which feeds the service over the colony pool
@@ -652,19 +716,17 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		Self::accept_into(listener, terms, clock, service)
 	}
 
-	/// Serves an edge accept plane through [`EdgeMuxService`].
-	///
-	/// The service type restricts the plane to work submission, so the type
-	/// alone tells dispatch which plane a request arrived on. Each connection
+	/// Serves an edge accept plane through [`EdgeMuxService`], which admits
+	/// work submission, and stream opens as `streams` says. Each connection
 	/// records on the connection trace.
-	pub(crate) fn serve_edge<L>(self, listener: L) -> rt::JoinHandle
+	pub(crate) fn serve_edge<L>(self, listener: L, streams: EdgeStreams) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	{
 		let terms = self.connection_terms();
 		let clock = Arc::clone(&self.config.clock);
-		let service = EdgeMuxService::<P> { ctx: self };
+		let service = EdgeMuxService::<P> { ctx: self, streams };
 		Self::accept_into(listener, terms, clock, service)
 	}
 

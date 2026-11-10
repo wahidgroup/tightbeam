@@ -7,6 +7,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+use tightbeam::colony::cluster::EdgePlane;
 use tightbeam::colony::hive::{HiveContext, HiveContextImpl};
 use tightbeam::crypto::x509::policy::{CertificateValidation, DirectTrustValidator};
 use tightbeam::testing::TestDigest;
@@ -530,7 +531,7 @@ tb_scenario! {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
 			let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
-			conf.edge_bind_addr = Some("127.0.0.1:0".into());
+			conf.edge = Some(EdgePlane::new("127.0.0.1:0"));
 			EdgeClusterGateway::start(Arc::new(trace.share()), conf).await
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, Some(TransportOffer::mux(8)))],
@@ -582,7 +583,7 @@ async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Te
 	let certs = cluster_certs();
 	let trace = payload_trace();
 	let mut conf = ClusterConfig::new(mutual_tls(&certs));
-	conf.edge_bind_addr = Some("127.0.0.1:0".into());
+	conf.edge = Some(EdgePlane::new("127.0.0.1:0"));
 
 	let cluster = EdgeClusterGateway::start(Arc::new(trace.share()), conf).await?;
 	let mut client = connect_with_identity(Arc::clone(&certs.trust), &certs, &edge_addr_of(&cluster)).await?;
@@ -607,7 +608,7 @@ async fn cluster_edge_refusal_names_the_session_and_not_the_frame_signer() -> Te
 async fn an_edge_plane_that_cannot_parse_its_bind_address_fails_the_start() {
 	let certs = cluster_certs();
 	let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
-	conf.edge_bind_addr = Some("not-a-socket-addr".into());
+	conf.edge = Some(EdgePlane::new("not-a-socket-addr"));
 
 	let started = EdgeClusterGateway::start(Arc::new(TraceCollector::new()), conf).await;
 	let refusal = cluster_refusal(&started);

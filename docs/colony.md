@@ -356,7 +356,13 @@ A cluster gateway routes work to hives and federates with peer gateways. [README
 
 ### The `cluster!` macro
 
-`cluster! { pub Name, protocol: P }` names `pub type Name = ClusterGateway<P>`. `cluster! { pub Name, protocol: P, edge: E }` adds the edge protocol `E`, which defaults to `P`. The edge plane binds only when `edge_bind_addr` is set, and it admits `Work` frames alone.
+- `cluster! { pub Name, protocol: P }` names `pub type Name = ClusterGateway<P>`.
+- `edge: E` adds the edge protocol `E`, `P` by default.
+- The edge plane binds only when `ClusterConfig::edge` holds an `EdgePlane`.
+- It admits `Work` frames.
+- It admits stream and duplex opens, under the guard of the colony plane, only after `EdgePlane::with_streams`.
+- No gate sees a frame of a stream, so a frame-content gate covers `Work` alone.
+- Otherwise each open answers `PermissionDenied` and records `CLUSTER_EDGE_REFUSED`, labeled `streaming` or `duplex`.
 
 The gateway digests under `<P as Protocol>::CryptoProvider`.
 
@@ -377,7 +383,7 @@ The gateway digests under `<P as Protocol>::CryptoProvider`.
 
 `start` fails with `TightBeamError::TransportError` when a plane fails to bind. It fails with `TightBeamError::ClusterError` in three cases:
 
-- `bind_addr` or `edge_bind_addr` does not parse (`ClusterError::InvalidAddress`).
+- `bind_addr` or `EdgePlane::bind_addr` does not parse (`ClusterError::InvalidAddress`).
 - The gossip ingress is no bare servlet type of `namespace`, as `ClusterConfig::gossip_ingress_key` decides (`ClusterError::UnknownServletType`).
 - A federating gateway binds a wildcard address with no advertise address (`ClusterError::AdvertiseAddressRequired`).
 
@@ -413,7 +419,7 @@ The registry reads fail with `ClusterError::LockPoisoned`. A poisoned lock also 
 | ---------------------------------------- | -------------------------------------------------------------------- | ---------------------------- |
 | Resource URN namespace                   | `with_namespace`                                                     | `ColonyNamespace::default()` |
 | Gateway bind address                     | `with_bind_addr`                                                     | `None`, the protocol default |
-| Edge bind address                        | `with_edge_bind_addr`                                                | `None`, no edge plane        |
+| Edge plane                               | `with_edge(EdgePlane::new(addr))`, `EdgePlane::with_streams`         | `None`, no edge plane        |
 | Freshness window for hive control frames | `with_control_freshness_window`                                      | 30 s                         |
 | Load balancer                            | `with_load_balancer`                                                 | `StochasticForager`          |
 | Heartbeats                               | `with_heartbeat_config`                                              | `HeartbeatConfig::default()` |

@@ -5,6 +5,7 @@
 //! [`PooledClient::open_duplex_to`]). A splices it to B's gateway, and B serves
 //! it locally. A cancel of the client stream crosses the splice to the servlet.
 
+use tightbeam::colony::cluster::EdgePlane;
 use tightbeam::transport::{PooledClient, Protocol, TransportError};
 use tightbeam::{compose, servlet};
 
@@ -252,63 +253,199 @@ tb_scenario! {
 	}
 }
 
-tb_assert_spec! {
-	pub ClusterEdgePlaneStreamRefuseSpec,
-	V(1,0,0): {
-		mode: Accept,
-		assertions: [
-			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_EDGE_REFUSED, exactly!(2), equals!(TransitStatus::PermissionDenied))
-		]
-	}
-}
-
 /// The wire status that a refused open carries, or `None` for a served open
 /// or a failure with no wire status.
 ///
 /// A bare failure check passes on any refusal, even the `Unimplemented` of a
 /// plane with no route. Each scenario checks the status it expects instead,
-/// such as the edge policy's `PermissionDenied`.
+/// such as the gate's `PermissionDenied`.
 fn refusal_status<T>(outcome: Result<T, TransportError>) -> Option<TransitStatus> {
 	outcome.err().and_then(|error| error.transit_status())
 }
 
-// The edge accept plane admits Work frames alone. A stream servlet is live on
-// the colony plane, so mux stream and duplex opens on the edge address would
-// splice without the plane's refusal. Both fail closed.
+/// A spec of one edge open that the plane refuses with `PermissionDenied`,
+/// whose refusal carries the tag of its kind, and that reaches no servlet.
+macro_rules! edge_refusal_spec {
+	($spec:ident, $tag:literal) => {
+		tb_assert_spec! {
+			pub $spec,
+			V(1,0,0): {
+				mode: Accept,
+				assertions: [
+					(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+					(events::CLUSTER_EDGE_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied), tags: [$tag]),
+					(STREAM_SERVLET_HANDLED, absent!()),
+					(DUPLEX_SERVLET_HANDLED, absent!())
+				]
+			}
+		}
+	};
+}
+
+edge_refusal_spec!(ClusterEdgeStreamRefuseSpec, "streaming");
+edge_refusal_spec!(ClusterEdgeDuplexRefuseSpec, "duplex");
+
+/// A gateway whose edge plane refuses streams, with the stream-echo servlet
+/// live on its colony plane.
+async fn refusing_edge(trace: &TraceCollector, certs: Arc<ClusterTestCerts>) -> Result<ClusterGateway, TightBeamError> {
+	let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
+	conf.edge = Some(EdgePlane::new("127.0.0.1:0"));
+	start_cluster(trace, conf).await
+}
+
+// An edge plane admits Work frames alone unless it opts into streams. A
+// stream servlet is live on the colony plane, so a stream open on the edge
+// address would splice without the refusal.
 tb_scenario! {
-	name: cluster_edge_plane_refuses_streams,
-	spec: ClusterEdgePlaneStreamRefuseSpec,
-	environment Hive {
+	name: cluster_edge_plane_refuses_stream_opens_by_default,
+	spec: ClusterEdgeStreamRefuseSpec,
+	environment Cluster {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: certs }| start_stream_hive(trace, certs),
-		client: |HiveEnv { trace, context: certs, hive }| async move {
+		start: |SetupEnv { trace, context: certs }| async move { refusing_edge(&trace, certs).await },
+		hives: |SetupEnv { trace, context: certs }| vec![start_stream_hive(trace, certs)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, edge_of(&cluster)?).await?;
+			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"denied").await?;
+
+			let refused = refusal_status(response.await);
+			assert_eq!(refused, Some(TransitStatus::PermissionDenied));
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// A duplex open on an edge plane that refuses streams fails closed as a
+// stream open does.
+tb_scenario! {
+	name: cluster_edge_plane_refuses_duplex_opens_by_default,
+	spec: ClusterEdgeDuplexRefuseSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move { refusing_edge(&trace, certs).await },
+		hives: |SetupEnv { trace, context: certs }| vec![start_stream_hive(trace, certs)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, edge_of(&cluster)?).await?;
+			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"denied").await?;
+
+			let refused = refusal_status(body.chunk().await);
+			assert_eq!(refused, Some(TransitStatus::PermissionDenied));
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The address of the edge plane of `cluster`.
+fn edge_of(cluster: &ClusterGateway) -> Result<&<TokioListener as Protocol>::Address, TightBeamError> {
+	cluster
+		.edge_addr()
+		.ok_or_else(|| expectation_failure("edge plane did not bind"))
+}
+
+tb_assert_spec! {
+	pub ClusterEdgePlaneStreamSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(2)),
+			(STREAM_SERVLET_HANDLED, exactly!(1)),
+			(DUPLEX_SERVLET_HANDLED, exactly!(1)),
+			(events::CLUSTER_EDGE_REFUSED, absent!())
+		]
+	}
+}
+
+// The edge accept plane serves stream and duplex opens to a servlet, through
+// the guard of the colony plane.
+tb_scenario! {
+	name: cluster_edge_plane_serves_streams,
+	spec: ClusterEdgePlaneStreamSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
 			let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
-			conf.edge_bind_addr = Some("127.0.0.1:0".into());
+			conf.edge = Some(EdgePlane::new("127.0.0.1:0").with_streams());
+			start_cluster(&trace, conf).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_stream_hive(trace, certs)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, edge_of(&cluster)?).await?;
 
-			let cluster = start_cluster(&trace, conf).await?;
-			hive.register_with_cluster(cluster.addr()).await?;
+			let (mut sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			sink.push(b"abcd").await?;
+			sink.close_with(b"efgh").await?;
 
-			let Some(edge_addr) = cluster.edge_addr() else {
-				return Err(expectation_failure("edge plane did not bind"));
-			};
+			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
+			let echoed: PingResponse = reply.decode_message()?;
+			assert_eq!(echoed.doubled, 8, "the servlet received the whole body through the edge");
 
-			let client = pooled_cluster_client(&trace, &certs, edge_addr).await?;
+			let (mut sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
+			sink.push(b"ping-1").await?;
+
+			let first = body.chunk().await?;
+			sink.close_with(b"ping-2").await?;
+
+			let second = body.chunk().await?;
+			let trailer = body.chunk().await?;
+			assert_eq!(first.as_deref(), Some(b"ping-1".as_slice()), "the first chunk echoes through the edge");
+			assert_eq!(second.as_deref(), Some(b"ping-2".as_slice()), "the closing chunk echoes");
+			assert!(trailer.is_none(), "the echo ends with the request");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterEdgeStreamGateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_GATE_BLOCKED, exactly!(2), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_EDGE_REFUSED, absent!())
+		]
+	}
+}
+
+// Gate policies cover edge opens as they cover colony opens, so the edge
+// plane offers no path around `with_gate_policy`.
+tb_scenario! {
+	name: cluster_policy_gate_blocks_edge_streams,
+	spec: ClusterEdgeStreamGateSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let mut conf = with_mux_offer(
+				ClusterConfig::builder(cluster_tls_config(&certs))
+					.with_gate_policy(Arc::new(RejectAllPolicy))
+					.build(),
+			);
+			conf.edge = Some(EdgePlane::new("127.0.0.1:0").with_streams());
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, edge_of(&cluster)?).await?;
 
 			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
 			sink.close_with(b"denied").await?;
 
 			let refused = refusal_status(response.await);
-			assert_eq!(refused, Some(TransitStatus::PermissionDenied), "the edge refuses the stream open");
+			assert_eq!(refused, Some(TransitStatus::PermissionDenied), "the gate refuses the edge stream open");
 
 			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
 			sink.close_with(b"denied").await?;
 
 			let refused = refusal_status(body.chunk().await);
-			assert_eq!(refused, Some(TransitStatus::PermissionDenied), "the edge refuses the duplex open");
+			assert_eq!(refused, Some(TransitStatus::PermissionDenied), "the gate refuses the edge duplex open");
 
 			cluster.stop();
-			hive.stop();
 			Ok(())
 		}
 	}

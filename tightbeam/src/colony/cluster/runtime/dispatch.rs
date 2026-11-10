@@ -17,6 +17,7 @@
 //! [`evaluate_gates`]: crate::colony::cluster::ClusterConfig::evaluate_gates
 //! [`admit_target`]: crate::colony::cluster::ColonyConfig::admit_target
 
+use super::EdgeCall;
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::WireHopBudget;
 use crate::colony::protocol::{ClusterRequest, ReplyForm};
@@ -70,9 +71,8 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 
 	/// Route one unary request that arrived on an edge accept plane.
 	///
-	/// An edge plane is a work-submission surface, so the envelope narrows
-	/// to [`ClusterWorkRequest`] here. Every other envelope, such as a
-	/// registration, a peer advertisement, or a gossip rumor, answers
+	/// The unary arm of an edge plane admits [`ClusterWorkRequest`] alone.
+	/// Every other envelope, such as a registration, answers
 	/// [`TransitStatus::PermissionDenied`].
 	pub(crate) async fn handle_edge_request(
 		self,
@@ -83,7 +83,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		let work = match self.admit_request(&frame, &session, &audit)? {
 			RequestAdmission::Admitted(ClusterRequest::Work(request)) => request,
 			RequestAdmission::Admitted(_) => {
-				let status = self.refuse_edge_call("unary", &session)?;
+				let status = self.refuse_edge_call(EdgeCall::Unary, &session)?;
 				let refusal = ClusterWorkResponse::err(status);
 				return ReplyForm::Plain.reply(frame.metadata().id(), refusal);
 			}
