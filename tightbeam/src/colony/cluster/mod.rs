@@ -436,6 +436,48 @@ impl ClusterTlsConfig {
 	}
 }
 
+/// The edge accept plane of a gateway: where it binds, and whether it opens
+/// streams to servlets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgePlane {
+	/// The bind address, parsed through the edge address `FromStr`.
+	pub bind_addr: String,
+	/// Whether the plane opens streams and duplexes to servlets.
+	pub streams: EdgeStreams,
+}
+
+impl EdgePlane {
+	/// An edge plane at `bind_addr` that admits `Work` frames alone.
+	pub fn new(bind_addr: impl Into<String>) -> Self {
+		Self { bind_addr: bind_addr.into(), streams: EdgeStreams::Refused }
+	}
+
+	/// Open streams and duplexes to servlets as well.
+	#[must_use]
+	pub fn with_streams(mut self) -> Self {
+		self.streams = EdgeStreams::Admitted;
+		self
+	}
+}
+
+/// An edge plane whose bind address parsed as `A`.
+pub(crate) struct EdgeBind<A> {
+	pub(crate) addr: A,
+	pub(crate) streams: EdgeStreams,
+}
+
+/// Whether an edge plane opens streams and duplexes to servlets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EdgeStreams {
+	/// Each open answers `PermissionDenied` and records `CLUSTER_EDGE_REFUSED`.
+	#[default]
+	Refused,
+	/// Each open passes the guard of the colony plane.
+	///
+	/// - No gate sees a frame of the stream, so a frame-content gate covers `Work` alone.
+	Admitted,
+}
+
 /// The peer-federation dial list, the advertise beat and address, and the
 /// policy that admits the dial addresses peers claim.
 ///
@@ -622,14 +664,12 @@ pub struct ClusterConfig {
 	/// `None` binds the protocol default. A stable address lets hives register
 	/// again across gateway restarts.
 	pub bind_addr: Option<String>,
-	/// The bind address of the edge accept plane, parsed through the edge
-	/// address `FromStr`, or no edge plane for `None`.
+	/// The edge accept plane, or no edge plane for `None`.
 	///
 	/// - The edge listener serves external clients, such as a browser transport, with the same TLS material.
-	/// - It admits `Work` frames alone and refuses control frames with
-	///   `PermissionDenied`, so an edge client never joins the control plane.
+	/// - It refuses control frames with `PermissionDenied`, so an edge client never joins the control plane.
 	/// - Hives register on `bind_addr` in either case.
-	pub edge_bind_addr: Option<String>,
+	pub edge: Option<EdgePlane>,
 	/// The peer-federation dial list, the advertise beat and address, and the
 	/// dial policy.
 	pub peer: PeerConfig,
@@ -699,14 +739,21 @@ impl ClusterConfig {
 		Self::parse_bind_address(self.bind_addr.as_deref())
 	}
 
-	/// The bind address of the edge accept plane, parsed as `A`, or [`None`]
-	/// for a gateway with no edge plane.
+	/// The edge accept plane, its bind address parsed as `A`, or [`None`] for
+	/// a gateway with no edge plane. The address parses here, because the
+	/// config does not know the address type of the edge protocol.
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::InvalidAddress`] -- [`Self::edge_bind_addr`] does not parse as `A`.
-	pub(crate) fn edge_bind_address<A: FromStr>(&self) -> Result<Option<A>, ClusterError> {
-		Self::parse_bind_address(self.edge_bind_addr.as_deref())
+	/// - [`ClusterError::InvalidAddress`] -- [`EdgePlane::bind_addr`] does not parse as `A`.
+	pub(crate) fn edge_bind<A: FromStr>(&self) -> Result<Option<EdgeBind<A>>, ClusterError> {
+		let Some(edge) = &self.edge else {
+			return Ok(None);
+		};
+
+		let raw = edge.bind_addr.as_str();
+		let addr = raw.parse().map_err(|_| ClusterError::InvalidAddress(raw.as_bytes().to_vec()))?;
+		Ok(Some(EdgeBind { addr, streams: edge.streams }))
 	}
 
 	/// Parses `raw`, a configured bind address, as `A`, or answers [`None`]
@@ -859,7 +906,7 @@ impl core::fmt::Debug for ClusterConfig {
 			.field("pool_config", &self.pool_config)
 			.field("control_freshness_window", &self.control_freshness_window)
 			.field("bind_addr", &self.bind_addr)
-			.field("edge_bind_addr", &self.edge_bind_addr)
+			.field("edge", &self.edge)
 			.field("peer", &self.peer)
 			.field("gossip", &self.gossip)
 			.field("clock", &self.clock)
@@ -912,8 +959,8 @@ pub trait Cluster: Sized + Send + Sync {
 	/// # Errors
 	///
 	/// - [`TightBeamError::TransportError`] -- an accept plane fails to bind.
-	/// - [`TightBeamError::ClusterError`] -- `bind_addr` or `edge_bind_addr`
-	///   does not parse ([`ClusterError::InvalidAddress`]), the gossip ingress
+	/// - [`TightBeamError::ClusterError`] -- `bind_addr` or the edge bind
+	///   address does not parse ([`ClusterError::InvalidAddress`]), the gossip ingress
 	///   is no bare servlet type of `namespace`
 	///   ([`ClusterConfig::gossip_ingress_key`]), or the gateway beats from a
 	///   wildcard bind with no advertise address.

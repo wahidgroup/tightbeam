@@ -8,7 +8,8 @@
 /// the macro.
 ///
 /// - `edge` declares the protocol of the optional edge accept plane for external clients.
-/// - The plane binds only when [`ClusterConfig::edge_bind_addr`] is set, and it admits `Work` frames only.
+/// - The plane binds only when [`ClusterConfig::edge`] is set.
+/// - It admits `Work` frames, and stream and duplex opens when [`EdgePlane::streams`] admits them.
 /// - Without `edge`, the edge protocol defaults to the colony protocol.
 ///
 /// # Syntax
@@ -31,7 +32,8 @@
 /// ```
 ///
 /// [`Cluster::start`]: crate::colony::cluster::Cluster::start
-/// [`ClusterConfig::edge_bind_addr`]: crate::colony::cluster::ClusterConfig::edge_bind_addr
+/// [`ClusterConfig::edge`]: crate::colony::cluster::ClusterConfig::edge
+/// [`EdgePlane::streams`]: crate::colony::cluster::EdgePlane::streams
 #[macro_export]
 macro_rules! cluster {
 	(

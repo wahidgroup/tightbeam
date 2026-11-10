@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
-	ClusterConfig, ClusterTlsConfig, HeartbeatCallback, HeartbeatConfig, PeerConfig, PheromoneConfig,
+	ClusterConfig, ClusterTlsConfig, EdgePlane, HeartbeatCallback, HeartbeatConfig, PeerConfig, PheromoneConfig,
 	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
 use crate::clock::{Clock, SystemClock};
@@ -163,7 +163,7 @@ pub struct ClusterConfigBuilder {
 	pool_config: PoolConfig,
 	control_freshness_window: Duration,
 	bind_addr: Option<String>,
-	edge_bind_addr: Option<String>,
+	edge: Option<EdgePlane>,
 	/// The peer section that [`Self::with_peer_config`] set.
 	peer: PeerConfig,
 	/// The peer fields that the field methods set, which apply over `peer`.
@@ -191,7 +191,7 @@ impl ClusterConfig {
 			pool_config: PoolConfig::default(),
 			control_freshness_window: Duration::from_millis(crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
 			bind_addr: None,
-			edge_bind_addr: None,
+			edge: None,
 			peer: PeerConfig::default(),
 			peer_edits: Vec::new(),
 			peer_store: Arc::new(MemoryPeerStore),
@@ -324,8 +324,8 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Bind a second accept plane for external clients, on the edge protocol
-	/// that the `cluster!` macro declares.
+	/// Bind `edge`, a second accept plane for external clients, on the edge
+	/// protocol that the `cluster!` macro declares.
 	///
 	/// It exposes the gateway to a browser transport while the colony keeps its
 	/// internal protocol.
@@ -333,10 +333,10 @@ impl ClusterConfigBuilder {
 	/// # Edge plane
 	///
 	/// - It serves the same TLS material and gate policies as the colony plane.
-	/// - It admits `Work` frames alone and refuses registration, updates, peer
-	///   ads, and gossip with `PermissionDenied`.
-	pub fn with_edge_bind_addr(mut self, addr: impl Into<String>) -> Self {
-		self.edge_bind_addr = Some(addr.into());
+	/// - It admits `Work` frames, and stream and duplex opens when [`EdgePlane::streams`] admits them.
+	/// - It refuses registration, updates, peer ads, and gossip with `PermissionDenied`.
+	pub fn with_edge(mut self, edge: EdgePlane) -> Self {
+		self.edge = Some(edge);
 		self
 	}
 
@@ -581,7 +581,7 @@ impl ClusterConfigBuilder {
 			pool_config: self.pool_config,
 			control_freshness_window: self.control_freshness_window,
 			bind_addr: self.bind_addr,
-			edge_bind_addr: self.edge_bind_addr,
+			edge: self.edge,
 			peer,
 			gossip,
 			clock: self.clock,

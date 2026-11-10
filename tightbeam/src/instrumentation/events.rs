@@ -799,12 +799,11 @@ pub const CLUSTER_WORK_FAILED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:
 /// assert_eq!(CLUSTER_WORK_FORWARDED.to_string(), "urn:tightbeam:event:cluster/work-forwarded");
 /// ```
 pub const CLUSTER_WORK_FORWARDED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/work-forwarded");
-/// Marks a call that the edge plane of a gateway refuses. The edge plane
-/// serves work submission alone, so it answers each other call with
-/// `PermissionDenied`: a unary envelope of another kind, such as a
-/// registration, and each streaming or duplex open. It fires under `colony`.
+/// Marks a call that the edge plane of a gateway refuses with
+/// `PermissionDenied`. It fires under `colony`.
 ///
-/// - The label names the kind of the call: `unary`, `streaming`, or `duplex`.
+/// - The label, and the one tag, is `unary` for an envelope other than `Work`, such as a registration.
+/// - The label, and the one tag, is `streaming` or `duplex` for an open on a plane whose `EdgeStreams` refuses it.
 /// - The value is `PermissionDenied`, the `TransitStatus` that the caller reads.
 /// - The payload names the caller by the canonical key that its session proved, when the session holds one.
 ///

@@ -1260,12 +1260,17 @@ impl TraceCollector {
 	///
 	/// - The injected error, when the runtime fault model injects a fault at `event`.
 	#[cfg(all(feature = "testing", any(feature = "instrument", feature = "colony")))]
-	fn assert_dual_write<V>(&self, event: &Urn<'static>, value: V) -> Result<(), crate::TightBeamError>
+	fn assert_dual_write<V>(
+		&self,
+		event: &Urn<'static>,
+		tags: &'static [&'static str],
+		value: V,
+	) -> Result<(), crate::TightBeamError>
 	where
 		V: Into<EventValue>,
 	{
 		#[cfg_attr(not(feature = "instrument"), expect(unused_mut))]
-		let mut builder = self.event_with(event, &[], value)?;
+		let mut builder = self.event_with(event, tags, value)?;
 		#[cfg(feature = "instrument")]
 		{
 			builder.instrumented = false;
@@ -1414,7 +1419,7 @@ impl TraceCollector {
 	#[cfg(feature = "instrument")]
 	pub fn emit_event(&self, event: Urn<'static>) -> Result<(), crate::TightBeamError> {
 		#[cfg(feature = "testing")]
-		self.assert_dual_write(&event, ())?;
+		self.assert_dual_write(&event, &[], ())?;
 
 		self.emit_stamped(event, || None, no_evidence);
 		Ok(())
@@ -1434,7 +1439,7 @@ impl TraceCollector {
 		evidence: impl FnOnce() -> Option<E>,
 	) -> Result<(), crate::TightBeamError> {
 		#[cfg(feature = "testing")]
-		self.assert_dual_write(&event, ())?;
+		self.assert_dual_write(&event, &[], ())?;
 
 		self.emit_stamped(event, || None, evidence);
 		Ok(())
@@ -1622,10 +1627,34 @@ impl TraceCollector {
 		L: Into<Cow<'static, str>>,
 		E: AsRef<[u8]>,
 	{
+		self.emit_tagged_event(event, &[], label, value, evidence)
+	}
+
+	/// Dual-writes `event` with `value` and `tags`, which an assertion of a
+	/// spec grades, with the label and the payload of
+	/// [`Self::emit_rendered_event`].
+	///
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `event`.
+	#[cfg(any(feature = "instrument", feature = "colony"))]
+	pub(crate) fn emit_tagged_event<V, L, E>(
+		&self,
+		event: Urn<'static>,
+		tags: &'static [&'static str],
+		label: impl FnOnce() -> L,
+		value: V,
+		evidence: impl FnOnce() -> Option<E>,
+	) -> Result<(), crate::TightBeamError>
+	where
+		V: Into<EventValue>,
+		L: Into<Cow<'static, str>>,
+		E: AsRef<[u8]>,
+	{
 		#[cfg(feature = "testing")]
-		self.assert_dual_write(&event, value)?;
+		self.assert_dual_write(&event, tags, value)?;
 		#[cfg(not(feature = "testing"))]
-		let _ = value;
+		let _ = (tags, value);
 
 		#[cfg(feature = "instrument")]
 		self.emit_stamped(event, || Some(label().into()), evidence);
