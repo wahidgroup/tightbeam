@@ -17,7 +17,9 @@ use crate::clock::Lapse;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::Encode;
 use crate::marker::MaybeSend;
-use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope};
+use crate::transport::envelopes::{
+	CancelReason, GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope,
+};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::GateAudit;
@@ -40,21 +42,37 @@ use core::future::poll_fn;
 /// guard dropped before the Open went out stands down on its own, because
 /// nothing is on the wire and the reservation releases the cap slot.
 ///
+/// The cancel carries [`CancelReason::Cancelled`], or
+/// [`CancelReason::Timeout`] once a deadline that passed ends the wait of the
+/// stream ([`Self::fail`]).
+///
 /// [rfc9113-6.4]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.4
 pub struct CancelOnDrop {
 	link: MuxLink,
 	slot: Arc<OpenSlot>,
 	armed: bool,
+	/// The reason of the cancel that the drop sends.
+	reason: CancelReason,
 }
 
 impl CancelOnDrop {
 	/// Returns an armed guard over the stream that `slot` identifies.
 	fn new(link: &MuxLink, slot: Arc<OpenSlot>) -> Self {
-		Self { link: link.clone(), slot, armed: true }
+		Self { link: link.clone(), slot, armed: true, reason: CancelReason::Cancelled }
 	}
 
 	pub fn disarm(&mut self) {
 		self.armed = false;
+	}
+
+	/// Takes `failure`, which ends the wait of the stream, and returns it. A
+	/// deadline that passed sets the reason of the drop cancel to `Timeout`.
+	fn fail(&mut self, failure: TransportError) -> TransportError {
+		if matches!(failure, TransportError::OperationFailed(TransportFailure::DeadlineExceeded)) {
+			self.reason = CancelReason::Timeout;
+		}
+
+		failure
 	}
 }
 
@@ -65,7 +83,7 @@ impl Drop for CancelOnDrop {
 		}
 
 		if let Some(stream_id) = self.slot.get() {
-			self.link.enqueue_stream_cancel(stream_id);
+			self.link.enqueue_stream_cancel(stream_id, self.reason);
 		}
 	}
 }
@@ -172,8 +190,9 @@ impl MuxHandle {
 	///
 	/// Dropping the returned future before it resolves cancels the stream. The
 	/// cancel removes the pending entry, frees the cap slot, and sends a
-	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`]. A
-	/// response that the deadline cuts off cancels the stream the same way.
+	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] under
+	/// [`CancelReason::Cancelled`]. A send or a response that the deadline cuts
+	/// off cancels the stream the same way, under [`CancelReason::Timeout`].
 	///
 	/// # Errors
 	///
@@ -209,7 +228,7 @@ impl MuxHandle {
 			// A send that finds its ledger gone means the stream resolved
 			// underneath the sender, so the outcome channel carries the result.
 			Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => {}
-			Err(err) => return Err(err),
+			Err(err) => return Err(guard.fail(err)),
 		}
 
 		if matches!(standing, BudgetStanding::Exhausting) {
@@ -217,8 +236,8 @@ impl MuxHandle {
 		}
 
 		// A response that the deadline cuts off leaves the guard armed, so its
-		// drop cancels the stream.
-		let outcome = self.link.pulse().bound(receiver).await?;
+		// drop cancels the stream with `Timeout`.
+		let outcome = self.link.pulse().bound(receiver).await.map_err(|err| guard.fail(err))?;
 
 		guard.disarm();
 
@@ -244,9 +263,10 @@ impl MuxHandle {
 	///   response future with `ConnectionClosed` or `Draining`.
 	///
 	/// The response future fails with `OperationFailed(DeadlineExceeded)` once
-	/// the deadline passes, or with `OperationFailed(FailedPrecondition)` when
-	/// the polling thread has no timer for the clock of the link and the
-	/// response waits.
+	/// the deadline passes, and the stream ends with a
+	/// [`CancelReason::Timeout`] cancel. It fails with
+	/// `OperationFailed(FailedPrecondition)` when the polling thread has no
+	/// timer for the clock of the link and the response waits.
 	///
 	/// # Errors
 	///
@@ -303,8 +323,8 @@ impl MuxHandle {
 		let mut guard = CancelOnDrop::new(&link, Arc::clone(&slot));
 		let response = async move {
 			// A response that the deadline cuts off leaves the guard armed, so
-			// its drop cancels the stream.
-			let outcome = pulse.reply_after(ended, receiver).await?;
+			// its drop cancels the stream with `Timeout`.
+			let outcome = pulse.reply_after(ended, receiver).await.map_err(|err| guard.fail(err))?;
 
 			guard.disarm();
 
@@ -689,6 +709,10 @@ mod tests {
 	use crate::transport::multiplex::{MuxRole, MuxSettings};
 	use crate::transport::{EnvelopeSink, EnvelopeSource};
 
+	#[cfg(feature = "tokio")]
+	use super::super::fixtures::drained;
+	#[cfg(feature = "tokio")]
+	use crate::constants::MIN_MUX_CHUNK_SIZE;
 	#[cfg(feature = "tokio")]
 	use crate::testing::TestFrame;
 
@@ -1143,6 +1167,76 @@ mod tests {
 
 		let answered = poll_now(response);
 		assert!(refused_for_no_timer(&answered));
+		Ok(())
+	}
+
+	/// A client handle on `settings` under a nine-second read deadline on the
+	/// tokio clock, beside the receiver of its outbound queue.
+	#[cfg(feature = "tokio")]
+	fn paced_handle(settings: &MuxSettings) -> (MuxHandle, mpsc::Receiver<Outbound>) {
+		let shared = MuxShared::fixture(MuxRole::Client, settings);
+		let (link, sent, _notes) = MuxLink::over(shared, 8);
+		let pulse = Pulse::paced(Arc::new(SystemClock), Duration::from_secs(9));
+		(MuxHandle::new(link.with_pulse(pulse)), sent)
+	}
+
+	/// The reason of the cancel of stream 1 among the commands on `sent`.
+	#[cfg(feature = "tokio")]
+	fn cancel_reason(sent: &mut mpsc::Receiver<Outbound>) -> Option<CancelReason> {
+		drained(sent)
+			.into_iter()
+			.filter_map(Outbound::into_mux)
+			.find_map(|envelope| match envelope {
+				MuxEnvelope::Cancel(cancel) if cancel.stream_id() == 1 => Some(cancel.reason()),
+				_ => None,
+			})
+	}
+
+	/// An emit whose response misses the read deadline cancels its stream
+	/// with `Timeout`.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(start_paused = true)]
+	async fn an_emit_past_its_reply_deadline_cancels_with_timeout() {
+		let (handle, mut sent) = paced_handle(&MuxSettings::symmetric(FIXTURE_PEER_CAP));
+		// The emit fails with `DeadlineExceeded`, and the test reads the
+		// cancel that it leaves on the queue.
+		let _lapsed = handle.emit_on_stream(&TestFrame::v0(None, None)).await;
+		assert_eq!(cancel_reason(&mut sent), Some(CancelReason::Timeout));
+	}
+
+	/// An emit whose chunk waits on credit past the read deadline cancels its
+	/// stream with `Timeout`.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(start_paused = true)]
+	async fn an_emit_past_its_credit_deadline_cancels_with_timeout() {
+		let settings = MuxSettings::symmetric(FIXTURE_PEER_CAP)
+			.with_chunk_size(MIN_MUX_CHUNK_SIZE)
+			.with_initial_credit(1);
+
+		let (handle, mut sent) = paced_handle(&settings);
+		let label = "w".repeat(2 * MIN_MUX_CHUNK_SIZE as usize);
+
+		// The emit fails with `DeadlineExceeded`, and the test reads the
+		// cancel that it leaves on the queue.
+		let _lapsed = handle.emit_on_stream(&TestFrame::v0(Some(&label), None)).await;
+
+		assert_eq!(cancel_reason(&mut sent), Some(CancelReason::Timeout));
+	}
+
+	/// A streamed request whose response misses the read deadline after the
+	/// close cancels its stream with `Timeout`.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(start_paused = true)]
+	async fn a_streamed_reply_past_its_deadline_cancels_with_timeout() -> TestResult {
+		let (handle, mut sent) = paced_handle(&MuxSettings::symmetric(FIXTURE_PEER_CAP));
+		let (sink, response) = handle.open_stream()?;
+		sink.close().await?;
+
+		// The response fails with `DeadlineExceeded`, and the test reads the
+		// cancel that it leaves on the queue.
+		let _lapsed = response.await;
+
+		assert_eq!(cancel_reason(&mut sent), Some(CancelReason::Timeout));
 		Ok(())
 	}
 }

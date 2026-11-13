@@ -14,7 +14,7 @@ use super::body::{BodyEvent, DrainNote};
 use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, StreamOutcome, StreamReservation};
 use crate::clock::{Clock, MonotonicInstant, Timer, Timing};
-use crate::constants::KEEPALIVE_PROBES_PER_DEADLINE;
+use crate::constants::{KEEPALIVE_PROBES_PER_DEADLINE, MUX_RAPID_CANCEL_WINDOW};
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
@@ -87,13 +87,20 @@ impl Pulse {
 		self.clock.monotonic()
 	}
 
-	/// Whether `started` lies within one keepalive interval of now, as the
-	/// start of a stream that a rapid reset cancels does (CVE-2023-44487). The
-	/// cancel that a reply deadline sends comes about a whole deadline after
-	/// the start, which leaves two intervals for the transit of the cancel and
-	/// the late start of the handler.
+	/// Whether `started` lies within the rapid-cancel window of now, as the
+	/// start of a stream that a rapid reset cancels does (CVE-2023-44487).
+	///
+	/// The window is one keepalive interval, capped at
+	/// [`MUX_RAPID_CANCEL_WINDOW`].
+	///
+	/// - An initiator on the deadline of this end sends its deadline cancel
+	///   about a whole deadline after the start, which leaves two intervals for
+	///   the transit of the cancel and the late start of the handler.
+	/// - The cap admits the cancel of an initiator whose reply deadline is
+	///   shorter than the deadline of this end.
 	pub(crate) fn is_rapid_since(&self, started: MonotonicInstant) -> bool {
-		self.now().saturating_duration_since(started) < self.interval()
+		let window = self.interval().min(MUX_RAPID_CANCEL_WINDOW);
+		self.now().saturating_duration_since(started) < window
 	}
 
 	/// Awaits `reply`, the answer to a streamed request, as [`Self::bound`]
@@ -297,6 +304,9 @@ impl MuxLink {
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended before the response left.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the clock of the link, and a chunk waits on credit.
 	/// - The encode failure of a response frame that does not serialize.
 	/// - The injected error, when the runtime fault model injects a fault at the record of a budget refusal.
 	pub(crate) async fn send_response(&self, stream_id: u32, response: ResponsePackage) -> TransportResult<()> {
@@ -389,21 +399,22 @@ impl MuxLink {
 		let _ = self.sender().try_send(Outbound::Envelope(package.into()));
 	}
 
-	/// Tear down an abandoned locally-initiated stream on this side. Drop
-	/// guards, abandoned sinks, and an explicit close share the call.
+	/// Tear down an abandoned locally-initiated stream on this side, with a
+	/// cancel under `reason`. Drop guards, abandoned sinks, and an explicit
+	/// close share the call.
 	///
 	/// # Delivery
 	///
 	/// The cancel goes out on a fresh sender from [`MuxLink::sender`], so
 	/// the peer frees its stream slot on this notice rather than on its
 	/// own timeout.
-	pub(crate) fn enqueue_stream_cancel(&self, stream_id: u32) {
-		let terminal = BodyEvent::Failed(CancelReason::Cancelled.cancel_error());
+	pub(crate) fn enqueue_stream_cancel(&self, stream_id: u32, reason: CancelReason) {
+		let terminal = BodyEvent::Failed(reason.cancel_error());
 		if let Some(sender) = self.shared.end_local(stream_id, terminal) {
 			// The initiator may have dropped its future, which is one way to
 			// abandon a stream.
-			let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
-			let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
+			let _ = sender.send(StreamOutcome::Cancelled(reason));
+			let package = MuxCancelPackage::new(stream_id, reason);
 			// A full or closed queue drops the notice, and the peer then frees
 			// the slot on its own timeout.
 			let _ = self.sender().try_send(Outbound::Envelope(package.into()));

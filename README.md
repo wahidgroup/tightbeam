@@ -2224,7 +2224,7 @@ A failed handshake ends in one of these failures:
 | **Stream Cap Inflation**   | Cap clamp and local refusal                 | Caps clamped to 1024. An open past the local cap fails locally, and no stream opens                                                                                                                                                                                           |
 | **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to 1 KiB to 64 KiB, stream credit to 4096 chunks. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770)                                                                                    |
 | **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                                                                                    |
-| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on a cancel budget, 1024 by default. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                                                                                   |
+| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers soon after their start draw on a cancel budget, 1024 by default. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                                                            |
 | **Certificate Forgery**    | X.509 chain validation                      | Verify against a configured root of trust (application responsibility)                                                                                                                                                                                                        |
 | **Nonce Reuse**            | Fresh content key per record                | Each record draws a fresh content key and nonce, and wraps the content key under the session key (RFC 5084 §3.2)                                                                                                                                                              |
 
@@ -2380,11 +2380,11 @@ Client (handle)                            Server (responder)
 
 **Lifecycle rules:**
 
-- Dropping an in-flight `emit_on_stream` future cancels the stream. Each send waits at most the read deadline for stream credit, and a unary or streamed reply waits at most the read deadline after its request ends. Wrap the future in a timer for a shorter per-stream timeout.
+- Dropping an in-flight `emit_on_stream` future cancels the stream. Each send waits at most the read deadline for stream credit or a renewal, and a unary or streamed reply waits at most the read deadline after its request ends. Wrap the future in a timer for a shorter per-stream timeout.
 - A mux peer that receives a non-mux envelope MUST send GoAway(`ProtocolError`). A non-mux peer MUST reject muxed envelopes.
-- Cancels that abort in-flight handlers within a third of the read deadline of their start draw on a per-connection budget (default 1024). Exhaustion ends the connection with GoAway(`EnhanceYourCalm`).
+- Cancels that abort in-flight handlers within one second of their start, or a third of the read deadline where that is shorter, draw on a per-connection budget (default 1024). Exhaustion ends the connection with GoAway(`EnhanceYourCalm`).
 - Near the cipher record limit, the session renews its epoch or drains via GoAway.
-- An idle connection ends at the read deadline of either end. `MuxHandle::keep_alive` on one end keeps both ends alive while its interval stays under the read deadline of the peer. A `ConnectionPool` runs it on each multiplexed connection that it dials while a stream is open there.
+- An idle connection ends at the read deadline of either end. `MuxHandle::keep_alive` on one end keeps both ends alive while its interval stays under the read deadline of the peer. A `ConnectionPool` runs it on each multiplexed connection that it dials while a stream is open there, until the connection drains.
 
 **Runtime architecture:**
 

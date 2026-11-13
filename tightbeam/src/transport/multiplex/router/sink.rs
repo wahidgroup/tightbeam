@@ -6,7 +6,7 @@ use futures::channel::oneshot;
 
 use super::link::MuxLink;
 use super::shared::{BudgetStanding, OpenRequest, StreamReservation};
-use crate::transport::envelopes::{MuxDataPackage, MuxStreamKind, TransportEnvelope};
+use crate::transport::envelopes::{CancelReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::TransportResult;
 use crate::urn::Urn;
 
@@ -257,7 +257,7 @@ impl Drop for RequestSink {
 		// For an unopened sink, the drop of the reservation cancels the
 		// stream, unless an end of the connection resolved it first.
 		if let SinkStream::Opened(stream_id) = self.stream {
-			self.link.enqueue_stream_cancel(stream_id);
+			self.link.enqueue_stream_cancel(stream_id, CancelReason::Cancelled);
 		}
 	}
 }
@@ -332,7 +332,7 @@ mod tests {
 	use super::super::shared::{MuxShared, StreamOutcome};
 	use super::*;
 	use crate::constants::DEFAULT_HOP_BUDGET;
-	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
+	use crate::transport::envelopes::MuxEnvelope;
 	use crate::transport::multiplex::{MuxRole, MuxSettings};
 	use crate::transport::TransportError;
 

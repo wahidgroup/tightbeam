@@ -560,7 +560,6 @@ impl MuxShared {
 	pub fn duplex_limits(&self, stream_id: u32) -> Option<(u64, u64)> {
 		let map = self.duplex_lock();
 		let stream = map.get(&stream_id)?;
-
 		Some(stream.limits())
 	}
 
@@ -1488,11 +1487,14 @@ impl MuxShared {
 	///   the event of the GoAway, after every stream above `last_stream_id`
 	///   resolved.
 	pub fn fail_pending_above(&self, last_stream_id: u32, reason: GoAwayReason) -> TransportResult<()> {
-		self.fail_duplex_above(last_stream_id);
 		{
 			let mut state = self.lock();
 			state.goaway_received = Some(last_stream_id);
 			state.goaway_reason = Some(reason);
+
+			// An Open registers its reply forwarder under this lock, so the
+			// sweep here catches every duplex reply above the watermark.
+			self.fail_duplex_above(last_stream_id);
 
 			if let Some(first_dropped) = last_stream_id.checked_add(1) {
 				for (stream_id, sender) in state.pending.take_streams_from(first_dropped) {
@@ -1610,6 +1612,13 @@ impl MuxShared {
 	/// Whether `stream_id` awaits its response.
 	pub fn is_pending(&self, stream_id: u32) -> bool {
 		self.lock().pending.holds_stream(stream_id)
+	}
+
+	/// Keeps the entries of `streams` whose stream awaits its response, under
+	/// one hold of the lock.
+	pub fn retain_pending<V>(&self, streams: &mut HashMap<u32, V>) {
+		let state = self.lock();
+		streams.retain(|stream_id, _| state.pending.holds_stream(*stream_id));
 	}
 
 	/// The reason that the peer's GoAway carried, once received.
@@ -2675,7 +2684,7 @@ mod tests {
 		saturate(&outbound);
 
 		let (link, _) = MuxLink::new(shared, outbound, Pulse::fixture());
-		link.enqueue_stream_cancel(1);
+		link.enqueue_stream_cancel(1, CancelReason::Cancelled);
 
 		let queued = drained(&mut wire);
 		let last = queued.last().and_then(Outbound::mux);
@@ -2700,6 +2709,35 @@ mod tests {
 		assert!(matches!(disowned.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		assert!(shared.take_duplex(1).is_some());
 		assert!(shared.take_duplex(3).is_none());
+	}
+
+	/// A duplex Open that registers its reply while a peer GoAway waits for
+	/// the state lock still fails with Draining, because the sweep runs under
+	/// that lock.
+	#[test]
+	fn a_goaway_fails_a_duplex_reply_that_registers_as_it_lands() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(4));
+		let (feedback, _notes) = mpsc::channel(0);
+		let budget = shared.reassembly_budget();
+		let (mut disowned, above) = StreamBody::pair(OpenSlot::assigned(3), 4, feedback, budget);
+		let (locked, held) = std::sync::mpsc::channel();
+
+		std::thread::scope(|scope| {
+			let opener = &shared;
+			scope.spawn(move || {
+				let state = opener.lock();
+				locked.send(()).expect("the test waits for the lock");
+				// The GoAway reaches the lock while the Open registers.
+				std::thread::sleep(core::time::Duration::from_millis(50));
+				opener.insert_duplex(3, above);
+				drop(state);
+			});
+
+			held.recv().expect("the opener holds the lock");
+			receive_goaway(&shared, 1, GoAwayReason::Shutdown);
+		});
+
+		assert!(matches!(disowned.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 	}
 
 	/// A wait for the next stream wakes and ends when the connection fails, so

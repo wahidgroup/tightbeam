@@ -262,15 +262,16 @@ impl MuxLink {
 ///   stream's last record on the wire.
 /// - Cancels of in-flight handlers draw on a per-connection budget against
 ///   CVE-2023-44487 "Rapid Reset". A peer that opens streams only to cancel
-///   them exhausts the budget and draws a best-effort GoAway. A cancel that
-///   comes a third of the read deadline or more after its handler started
-///   spends nothing, because the cancel that a reply deadline of the
-///   initiator sends comes about a whole deadline after the start.
+///   them exhausts the budget and draws a best-effort GoAway. A cancel past
+///   the rapid-cancel window of its handler, a third of the read deadline
+///   capped at [`MUX_RAPID_CANCEL_WINDOW`], spends nothing, as the cancel that
+///   a reply deadline of the initiator sends does.
 ///
 /// # Sources
 ///
 /// - CVE-2023-44487, HTTP/2 Rapid Reset: <https://nvd.nist.gov/vuln/detail/CVE-2023-44487>
 ///
+/// [`MUX_RAPID_CANCEL_WINDOW`]: crate::constants::MUX_RAPID_CANCEL_WINDOW
 /// [`MUX_STREAM_CANCELLED`]: crate::instrumentation::events::MUX_STREAM_CANCELLED
 /// [`MUX_STREAM_REFUSED`]: crate::instrumentation::events::MUX_STREAM_REFUSED
 pub struct MuxResponder {
@@ -291,9 +292,9 @@ impl InFlight {
 	/// Aborts the handler, and answers whether its cancel spends the cancel
 	/// budget.
 	///
-	/// A cancel within a third of the read deadline of the start of the
-	/// handler counts as a rapid reset (CVE-2023-44487), as
-	/// [`Pulse::is_rapid_since`] decides. A later cancel is the one that an
+	/// A cancel within the rapid-cancel window of the start of the handler
+	/// counts as a rapid reset (CVE-2023-44487), as [`Pulse::is_rapid_since`]
+	/// decides. A later cancel is the one that an
 	/// initiator sends when its reply deadline passes.
 	fn abort(self, pulse: &Pulse) -> bool {
 		self.abort.abort();
@@ -327,6 +328,9 @@ impl MuxResponder {
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the clock of the link, and a reply waits on credit.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::PolicyRejection`] -- the peer exhausted the cancel
 	///   budget, and the responder tried to queue a GoAway with
@@ -1050,12 +1054,13 @@ mod tests {
 		assert!(fixture.wire.try_recv().is_err());
 	}
 
-	/// A responder on `clock` under a nine-second read deadline with no cancel
-	/// budget left, which serves unary requests with a handler that never
-	/// answers, beside the sender of its inbound queue and the receiver of its
-	/// outbound queue.
+	/// A responder on `clock` under the read deadline `deadline` with no
+	/// cancel budget left, which serves unary requests with a handler that
+	/// never answers, beside the sender of its inbound queue and the receiver
+	/// of its outbound queue.
 	fn spent_responder(
 		clock: &Arc<ManualClock>,
+		deadline: Duration,
 	) -> (
 		impl Future<Output = TransportResult<()>>,
 		mpsc::Sender<InboundEvent>,
@@ -1064,7 +1069,7 @@ mod tests {
 		let settings = MuxSettings::symmetric(4);
 		let (outbound, wire) = mpsc::channel(8);
 		let shared = MuxShared::fixture(MuxRole::Server, &settings);
-		let pulse = Pulse::paced(Arc::clone(clock) as Arc<dyn Clock>, Duration::from_secs(9));
+		let pulse = Pulse::paced(Arc::clone(clock) as Arc<dyn Clock>, deadline);
 		let (link, _drained) = MuxLink::new(shared, outbound, pulse);
 		let (inbound, inbound_receiver) = mpsc::channel(4);
 
@@ -1073,13 +1078,13 @@ mod tests {
 		(responder.serve(|_frame| pending::<ResponsePackage>()), inbound, wire)
 	}
 
-	/// A cancel that comes within a third of the read deadline of the start of
-	/// its handler is a rapid reset, so a responder with no budget left ends
-	/// the connection.
+	/// A cancel that comes within the rapid-cancel window of the start of its
+	/// handler is a rapid reset, so a responder with no budget left ends the
+	/// connection.
 	#[test]
 	fn a_rapid_cancel_spends_the_cancel_budget() {
 		let clock = Arc::new(ManualClock::default());
-		let (served, mut inbound, _wire) = spent_responder(&clock);
+		let (served, mut inbound, _wire) = spent_responder(&clock, Duration::from_secs(9));
 		let mut served = Box::pin(served);
 		let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
 		assert!(inbound.try_send(request).is_ok());
@@ -1094,23 +1099,29 @@ mod tests {
 		assert!(refused);
 	}
 
-	/// A cancel that comes a third of the read deadline or more after its
-	/// handler started spends no cancel budget, as the cancel of an initiator
-	/// whose reply deadline passed does, so a responder with no budget left
-	/// serves on.
-	#[test]
-	fn a_cancel_past_the_deadline_spends_no_cancel_budget() {
-		let clock = Arc::new(ManualClock::default());
-		let (served, mut inbound, _wire) = spent_responder(&clock);
-		let mut served = Box::pin(served);
-		let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
-		assert!(inbound.try_send(request).is_ok());
-		poll_times(&mut served, 2);
+	// A cancel past the rapid-cancel window of its handler spends no cancel
+	// budget, as the cancel of an initiator whose reply deadline passed does,
+	// so a responder with no budget left serves on. The window is a third of
+	// a short read deadline, and `MUX_RAPID_CANCEL_WINDOW` under a long one.
+	// Each case is (read deadline, wait before the cancel).
+	crate::tb_cases! {
+		fn a_cancel_past_the_rapid_window_spends_no_cancel_budget((deadline, wait): (Duration, Duration)) {
+			let clock = Arc::new(ManualClock::default());
+			let (served, mut inbound, _wire) = spent_responder(&clock, deadline);
+			let mut served = Box::pin(served);
+			let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
+			assert!(inbound.try_send(request).is_ok());
+			poll_times(&mut served, 2);
 
-		clock.advance(Duration::from_secs(3));
-		assert!(inbound.try_send(InboundEvent::Cancel(1)).is_ok());
+			clock.advance(wait);
+			assert!(inbound.try_send(InboundEvent::Cancel(1)).is_ok());
 
-		let served_on = served.as_mut().poll(&mut noop_cx());
-		assert!(served_on.is_pending());
+			let served_on = served.as_mut().poll(&mut noop_cx());
+			assert!(served_on.is_pending());
+		}
+		cases {
+			past_a_third_of_a_short_deadline => (Duration::from_millis(900), Duration::from_millis(500)),
+			past_the_cap_under_a_long_deadline => (Duration::from_secs(30), Duration::from_secs(2)),
+		}
 	}
 }

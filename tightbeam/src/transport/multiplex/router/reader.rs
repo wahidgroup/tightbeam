@@ -1063,9 +1063,16 @@ impl InboundRouter {
 			.collect();
 
 		for stream_id in severed {
-			self.peer_bodies.remove(&stream_id);
-			self.evict_credit(stream_id);
+			self.evict_body(stream_id);
 		}
+	}
+
+	/// Evicts the forwarder of the peer stream `stream_id` with its buffered
+	/// grant, and returns the forwarder, whose drop closes the body channel.
+	fn evict_body(&mut self, stream_id: u32) -> Option<ForwardedStream> {
+		let forwarder = self.peer_bodies.remove(&stream_id);
+		self.evict_credit(stream_id);
+		forwarder
 	}
 
 	/// Accepts a streaming-kind or duplex-kind open, whose chunks forward to
@@ -1190,8 +1197,7 @@ impl InboundRouter {
 	/// Drops the partial replies of the streams that no longer await their
 	/// reply, so their bytes return to the reassembly budget.
 	fn drop_resolved_partials(&mut self) {
-		let shared = self.link.shared();
-		self.local_reassembly.retain(|id, _| shared.is_pending(*id));
+		self.link.shared().retain_pending(&mut self.local_reassembly);
 	}
 
 	/// Accepts a non-final chunk and raises credit when the grantor asks.
@@ -1257,8 +1263,7 @@ impl InboundRouter {
 		};
 
 		if stream.severed() {
-			self.peer_bodies.remove(&stream_id);
-			self.evict_credit(stream_id);
+			self.evict_body(stream_id);
 			return Ok(());
 		}
 
@@ -1267,12 +1272,11 @@ impl InboundRouter {
 		}
 
 		if package.last() {
-			if let Some(mut stream) = self.peer_bodies.remove(&stream_id) {
+			if let Some(mut stream) = self.evict_body(stream_id) {
 				// A handler that dropped the body has no reader for `End`,
 				// and a dropped body is a closed stream either way.
 				let _ = stream.forward(BodyEvent::End);
 			}
-			self.evict_credit(stream_id);
 		}
 
 		Ok(())
@@ -1355,8 +1359,7 @@ impl InboundRouter {
 			// partial reassembly or streaming body, releases the response
 			// ledger, and aborts the handler. The dropped sender ends the body.
 			self.peer_reassembly.remove(&stream_id);
-			self.peer_bodies.remove(&stream_id);
-			self.evict_credit(stream_id);
+			self.evict_body(stream_id);
 			self.link.shared().finish_send_stream(stream_id);
 
 			// A responder that has ended has no handler left to abort, so the

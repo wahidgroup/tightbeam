@@ -131,16 +131,16 @@ A client or a pool takes its `with_timeout` value through the same check before 
 
 Each wait of the async transport in this table runs through one race on the clock of the endpoint:
 
-| Wait                          | Span                                                   | Past the span                                                                                       |
-| ----------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| A read of the wire            | The deadline of its `ReadPolicy`                       | Fails with `DeadlineExceeded`                                                                       |
-| A write of the wire, a dial   | `operation_timeout`                                    | Fails with `DeadlineExceeded`                                                                       |
-| A server handshake round      | The handshake deadline of the session                  | Fails with `DeadlineExceeded`                                                                       |
-| An emit cycle                 | `operation_timeout` from its start                     | Fails with `DeadlineExceeded`                                                                       |
-| A mux send of a chunk         | `operation_timeout` for each wait on credit            | Fails with `DeadlineExceeded`, and a reply of the responder ends its stream with a `Timeout` cancel |
-| A mux unary or streamed reply | `operation_timeout` from the end of the request        | Fails with `DeadlineExceeded`, and the stream ends with a cancel                                    |
-| A mux renewal                 | The renewal deadline                                   | Drains the connection with GoAway                                                                   |
-| A keepalive probe             | The read deadline over `KEEPALIVE_PROBES_PER_DEADLINE` | Sends the next probe                                                                                |
+| Wait                          | Span                                                   | Past the span                                                                                 |
+| ----------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| A read of the wire            | The deadline of its `ReadPolicy`                       | Fails with `DeadlineExceeded`                                                                 |
+| A write of the wire, a dial   | `operation_timeout`                                    | Fails with `DeadlineExceeded`                                                                 |
+| A server handshake round      | The handshake deadline of the session                  | Fails with `DeadlineExceeded`                                                                 |
+| An emit cycle                 | `operation_timeout` from its start                     | Fails with `DeadlineExceeded`                                                                 |
+| A mux send of a chunk         | `operation_timeout` for each wait on credit or renewal | Fails with `DeadlineExceeded`, and a reply or an emit ends its stream with a `Timeout` cancel |
+| A mux unary or streamed reply | `operation_timeout` from the end of the request        | Fails with `DeadlineExceeded`, and the stream ends with a `Timeout` cancel                    |
+| A mux renewal                 | The renewal deadline                                   | Drains the connection with GoAway                                                             |
+| A keepalive probe             | The read deadline over `KEEPALIVE_PROBES_PER_DEADLINE` | Sends the next probe                                                                          |
 
 Two entry points share the race:
 
@@ -155,7 +155,7 @@ Two entry points share the race:
 | `Parks`  | `SystemClock` in a build without `tokio`                                                        | Runs unbounded, and the application owns its deadline |
 | `Absent` | `SystemClock` in a `tokio` build, on a thread outside any runtime                               | Fails at once with `FailedPrecondition` when it waits |
 
-The stream of an async transport sits in a type whose only read and write take that deadline, so each read and write of the wire runs under the deadline its rule sets. A tokio runtime that `SystemClock` races on MUST enable its time driver, because a tokio sleep panics without it. A client hook, such as a `ReceiptApprover`, runs with no library deadline, so the hook bounds its own work.
+The stream of an async transport sits in a type whose only read and write take that deadline, so each read and write of the wire runs under the deadline its rule sets. A tokio runtime that `SystemClock` races on MUST enable its time driver, because a tokio sleep panics without it. A mux duplex reply runs with no library deadline, so the application bounds each read of its reply body. A client hook, such as a `ReceiptApprover`, runs with no library deadline, so the hook bounds its own work.
 
 ### Record limits
 
@@ -443,6 +443,7 @@ The constants of `tightbeam::constants` set every clamp and default:
 | `MAX_MUX_REASSEMBLY_BYTES`                           | 16 MiB                               | The bytes one stream reassembles                        |
 | `MAX_MUX_CONNECTION_REASSEMBLY_BYTES`                | 64 MiB                               | The bytes one connection reassembles across its streams |
 | `DEFAULT_MUX_CANCEL_BUDGET`                          | 1024                                 | The peer cancels that abort in-flight handlers          |
+| `MUX_RAPID_CANCEL_WINDOW`                            | 1 s                                  | The span in which a cancel spends the cancel budget     |
 | `DEFAULT_REKEY_DEADLINE_SECS`                        | 30                                   | One in-band renewal exchange                            |
 | `KEEPALIVE_PROBES_PER_DEADLINE`                      | 3                                    | The keepalive probes within one read deadline           |
 
@@ -527,19 +528,19 @@ fn assemble<T: MuxConnector>(
 | `goaway_reason()`                                 | The reason of the peer's GoAway                                                                                                                                                            |
 | `session_receipt()`                               | The receipt of the current epoch, which each renewal rotates                                                                                                                               |
 
-`keep_alive` sends its first probe at once, so one that starts late in the read deadline holds the link. It ends with `TransportError::Draining` when a probe meets a GoAway that went out or came in, and with `TransportError::ConnectionClosed` when the link closes before a probe or while one waits for its ack, as at the close that ends a drain. It needs a clock that races a wait, as `Clock::timing` reports, and on any other clock it ends at once with `TransportError::OperationFailed` and `FailedPrecondition`. `KEEPALIVE_PROBES_PER_DEADLINE` intervals fill one read deadline. A `ConnectionPool` probes each multiplexed connection that it dials while a stream is open there, and at once when the next stream opens, so an idle connection ends at its read deadline.
+`keep_alive` sends its first probe at once, so one that starts late in the read deadline holds the link. It ends with `TransportError::Draining` when a probe meets a GoAway that went out or came in, and with `TransportError::ConnectionClosed` when the link closes before a probe or while one waits for its ack, as at the close that ends a drain. It needs a clock that races a wait, as `Clock::timing` reports, and on any other clock it ends at once with `TransportError::OperationFailed` and `FailedPrecondition`. `KEEPALIVE_PROBES_PER_DEADLINE` intervals fill one read deadline. A `ConnectionPool` probes each multiplexed connection that it dials while a stream is open there, and at once when the next stream opens, so an idle connection ends at its read deadline. The probes end when the connection drains, so a drain whose streams go quiet ends at the read deadline.
 
 `emit_on_stream` fails in these cases:
 
-| Error                                 | Cause                                                                                        |
-| ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `OperationFailed(StreamsExhausted)`   | The stream cap that the peer advertised is full                                              |
-| `OperationFailed(BudgetExhausted)`    | The credits left in the epoch cannot cover the frame                                         |
-| `OperationFailed(ResourceExhausted)`  | The peer refused the stream                                                                  |
-| `OperationFailed(DeadlineExceeded)`   | The peer granted no credit for a chunk, or sent no response, within the read deadline        |
-| `OperationFailed(FailedPrecondition)` | The polling thread has no timer for the clock of the link, and a chunk or the response waits |
-| `Draining`                            | A GoAway went out or came in, so the connection refuses every new stream                     |
-| `ConnectionClosed`                    | The connection failed, before the call or before the response                                |
+| Error                                 | Cause                                                                                          |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `OperationFailed(StreamsExhausted)`   | The stream cap that the peer advertised is full                                                |
+| `OperationFailed(BudgetExhausted)`    | The credits left in the epoch cannot cover the frame                                           |
+| `OperationFailed(ResourceExhausted)`  | The peer refused the stream                                                                    |
+| `OperationFailed(DeadlineExceeded)`   | The peer granted no credit, finished no renewal, or sent no response, within the read deadline |
+| `OperationFailed(FailedPrecondition)` | The polling thread has no timer for the clock of the link, and a chunk or the response waits   |
+| `Draining`                            | A GoAway went out or came in, so the connection refuses every new stream                       |
+| `ConnectionClosed`                    | The connection failed, before the call or before the response                                  |
 
 `MultiplexedProtocol` names `max_concurrent_streams` and `emit_on_stream`, and `StreamingProtocol` adds `open_stream` and `open_duplex`, so a caller stays generic over the handle.
 
@@ -550,7 +551,7 @@ fn assemble<T: MuxConnector>(
 - `serve(handler)` answers each unary stream with a closure that takes the frame and returns a `ResponsePackage`.
 - `serve_streaming(handler)` and `serve_duplex(handler)` answer the streaming and the duplex kind.
 - `serve_with(dispatch)` routes each kind to a method of a `MuxDispatch`. Each default method fails with `NotServed`, which the peer reads as `Unimplemented`.
-- `set_cancel_budget(budget)` replaces the cancel budget. A peer that spends it receives GoAway(`EnhanceYourCalm`). A cancel spends one unit when it comes within a third of the read deadline of the start of its handler, and a later one spends nothing.
+- `set_cancel_budget(budget)` replaces the cancel budget. A peer that spends it receives GoAway(`EnhanceYourCalm`). A cancel spends one unit when it comes within `MUX_RAPID_CANCEL_WINDOW` (1 s) of the start of its handler, or within a third of the read deadline where that is shorter, and a later one spends nothing.
 
 `MuxReaderDriver::drive` and `MuxWriterDriver::drive` run the two drivers, and the caller spawns both.
 
