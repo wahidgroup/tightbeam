@@ -2,6 +2,8 @@
 //! streams request chunks on the client side, and a `ReplySink` streams reply
 //! chunks on the responder side of a duplex stream.
 
+use futures::channel::oneshot;
+
 use super::link::MuxLink;
 use super::shared::{BudgetStanding, OpenRequest, StreamReservation};
 use crate::transport::envelopes::{MuxDataPackage, MuxStreamKind, TransportEnvelope};
@@ -17,6 +19,27 @@ enum SinkStream {
 	Opened(u32),
 }
 
+/// The kind of the stream that a [`RequestSink`] feeds, with what the end of
+/// its request tells.
+enum SinkKind {
+	/// A streamed request. The sender `_ended` drops with the sink and tells
+	/// the response future that the request ended, so the wait for its reply
+	/// starts.
+	Streaming { _ended: oneshot::Sender<()> },
+	/// A duplex stream, whose reply streams at the pace of the responder.
+	Duplex,
+}
+
+impl SinkKind {
+	/// The kind that the Open of the stream names on the wire.
+	fn wire(&self) -> MuxStreamKind {
+		match self {
+			Self::Streaming { .. } => MuxStreamKind::Streaming,
+			Self::Duplex => MuxStreamKind::Duplex,
+		}
+	}
+}
+
 /// Producer half of a streamed request. It pushes chunks on a
 /// locally-initiated stream and closes the stream with the `last` flag on the
 /// final chunk.
@@ -28,7 +51,7 @@ enum SinkStream {
 /// [`crate::transport::multiplex::MuxHandle::open_duplex`].
 pub struct RequestSink {
 	stream: SinkStream,
-	kind: MuxStreamKind,
+	kind: SinkKind,
 	link: MuxLink,
 	closed: bool,
 	/// Grpc-style route stamped on the stream's Open, consumed when
@@ -39,11 +62,35 @@ pub struct RequestSink {
 }
 
 impl RequestSink {
-	/// Sink over a reserved (unopened) stream. `target` and `hops_remaining`
-	/// stamp the stream's Open with a grpc-style route.
-	pub(crate) fn new(
+	/// Sink of a streamed request over a reserved (unopened) stream, whose
+	/// drop drops `ended`. `target` and `hops_remaining` stamp the stream's
+	/// Open with a grpc-style route.
+	pub(crate) fn streaming(
 		reservation: StreamReservation,
-		kind: MuxStreamKind,
+		link: MuxLink,
+		target: Option<Urn<'static>>,
+		hops_remaining: u8,
+		ended: oneshot::Sender<()>,
+	) -> Self {
+		let kind = SinkKind::Streaming { _ended: ended };
+		Self::assemble(reservation, kind, link, target, hops_remaining)
+	}
+
+	/// Sink of a duplex stream over a reserved (unopened) stream, as
+	/// [`Self::streaming`] stamps its Open.
+	pub(crate) fn duplex(
+		reservation: StreamReservation,
+		link: MuxLink,
+		target: Option<Urn<'static>>,
+		hops_remaining: u8,
+	) -> Self {
+		Self::assemble(reservation, SinkKind::Duplex, link, target, hops_remaining)
+	}
+
+	/// Builds the sink of either kind, the one place that sets each field.
+	fn assemble(
+		reservation: StreamReservation,
+		kind: SinkKind,
 		link: MuxLink,
 		target: Option<Urn<'static>>,
 		hops_remaining: u8,
@@ -70,6 +117,10 @@ impl RequestSink {
 	///
 	/// - `OperationFailed(Cancelled)` -- the stream resolved underneath the sink.
 	/// - `OperationFailed(BudgetExhausted)` -- the budget cannot carry the chunk.
+	/// - `OperationFailed(DeadlineExceeded)` -- the peer granted no credit
+	///   within the read deadline of the link.
+	/// - `OperationFailed(FailedPrecondition)` -- the polling thread has no
+	///   timer for the clock of the link, and the push waits.
 	/// - `ConnectionClosed` -- a driver of the connection ended.
 	/// - `Draining` -- a GoAway ended admission before the first chunk opened the stream.
 	pub async fn push(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<()> {
@@ -165,7 +216,7 @@ impl RequestSink {
 		match &mut self.stream {
 			SinkStream::Reserved(reservation) => {
 				let mut request = OpenRequest {
-					kind: self.kind,
+					kind: self.kind.wire(),
 					last,
 					payload: chunk,
 					records,
@@ -238,6 +289,10 @@ impl ReplySink {
 	/// - `OperationFailed(Cancelled)` -- the peer cancelled the stream.
 	/// - `ConnectionClosed` -- a driver of the connection ended.
 	/// - `OperationFailed(BudgetExhausted)` -- the session budget cannot carry the chunk.
+	/// - `OperationFailed(DeadlineExceeded)` -- the peer granted no credit
+	///   within the read deadline of the link.
+	/// - `OperationFailed(FailedPrecondition)` -- the polling thread has no
+	///   timer for the clock of the link, and the push waits.
 	pub async fn push(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<()> {
 		let payload = payload.as_ref();
 		if payload.is_empty() {
@@ -296,7 +351,8 @@ mod tests {
 		let (link, sent, _notes) = MuxLink::over(Arc::clone(&shared), 8);
 		let (sender, receiver) = oneshot::channel();
 		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
-		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, link, target, DEFAULT_HOP_BUDGET);
+		let (ended, _end_heard) = oneshot::channel();
+		let sink = RequestSink::streaming(reservation, link, target, DEFAULT_HOP_BUDGET, ended);
 
 		(shared, sink, sent, receiver)
 	}

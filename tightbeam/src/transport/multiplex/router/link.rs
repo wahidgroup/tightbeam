@@ -1,15 +1,20 @@
 //! One connection's shared state paired with the queue it writes on.
 
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
+use core::pin::pin;
+use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
+use futures::future::{select, Either};
 use futures::SinkExt;
 
 use super::body::{BodyEvent, DrainNote};
 use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, StreamOutcome, StreamReservation};
+use crate::clock::{Clock, MonotonicInstant, Timer, Timing};
+use crate::constants::KEEPALIVE_PROBES_PER_DEADLINE;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
@@ -17,10 +22,115 @@ use crate::transport::envelopes::{
 	TransportEnvelope,
 };
 use crate::transport::error::{TransportError, TransportFailure};
-use crate::transport::TransportResult;
+use crate::transport::{EnvelopeSink, EnvelopeSource, TransportResult};
 
+#[cfg(test)]
+use crate::clock::BlockingClock;
+#[cfg(test)]
+use crate::constants::DEFAULT_OPERATION_TIMEOUT;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
+
+/// The pace of a connection: the clock of its link, and the link's read
+/// deadline. The keepalive probes at a share of the deadline. The deadline
+/// bounds each wait of a send for credit and the wait for a unary or streamed
+/// reply.
+#[derive(Clone)]
+pub(crate) struct Pulse {
+	clock: Arc<dyn Clock>,
+	deadline: Duration,
+}
+
+impl Pulse {
+	/// The pace of the link that `source` reads and `sink` writes.
+	pub(crate) fn of(source: &impl EnvelopeSource, sink: &impl EnvelopeSink) -> Self {
+		Self { clock: sink.clock(), deadline: source.limits().operation_timeout }
+	}
+
+	/// The interval between two keepalive probes, a share of the read
+	/// deadline.
+	///
+	/// A deadline of fewer nanoseconds than [`KEEPALIVE_PROBES_PER_DEADLINE`]
+	/// has no whole share, so its interval is the whole deadline, which
+	/// [`CheckedLimits`] keeps above zero.
+	///
+	/// [`CheckedLimits`]: crate::transport::CheckedLimits
+	pub(crate) fn interval(&self) -> Duration {
+		let third = self.deadline.checked_div(KEEPALIVE_PROBES_PER_DEADLINE);
+		third.filter(|third| !third.is_zero()).unwrap_or(self.deadline)
+	}
+
+	/// A timer on the clock of this pace where the clock races a wait on the
+	/// polling thread ([`Timing::Races`]), and `None` on a clock that cannot
+	/// race a probe.
+	pub(crate) fn racing_timer(&self) -> Option<Timer> {
+		let races = self.clock.timing() == Timing::Races;
+		races.then(|| Timer::new(Arc::clone(&self.clock)))
+	}
+
+	/// Runs `wait`, one wait of a stream on this link, within the read deadline
+	/// of the link.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with `DeadlineExceeded` -- the
+	///   deadline passed before the wait ended.
+	/// - [`TransportError::OperationFailed`] with `FailedPrecondition` -- the
+	///   polling thread has no timer for the clock of the link, and the work
+	///   waits.
+	pub(crate) async fn bound<F: Future + Unpin>(&self, wait: F) -> TransportResult<F::Output> {
+		Ok(self.clock.as_ref().within(self.deadline, wait).await?)
+	}
+
+	/// The current instant on the clock of the link.
+	pub(crate) fn now(&self) -> MonotonicInstant {
+		self.clock.monotonic()
+	}
+
+	/// Whether `started` lies within one keepalive interval of now, as the
+	/// start of a stream that a rapid reset cancels does (CVE-2023-44487). The
+	/// cancel that a reply deadline sends comes about a whole deadline after
+	/// the start, which leaves two intervals for the transit of the cancel and
+	/// the late start of the handler.
+	pub(crate) fn is_rapid_since(&self, started: MonotonicInstant) -> bool {
+		self.now().saturating_duration_since(started) < self.interval()
+	}
+
+	/// Awaits `reply`, the answer to a streamed request, as [`Self::bound`]
+	/// does from the end of the request, which `ended` reports. A reply that
+	/// comes before the end needs no bound.
+	///
+	/// A sink that drops before it ends the request cancels the stream, which
+	/// resolves `reply`, so the bound also starts at that drop.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::bound`].
+	pub(crate) async fn reply_after<T>(
+		&self,
+		ended: oneshot::Receiver<()>,
+		mut reply: oneshot::Receiver<T>,
+	) -> TransportResult<Result<T, oneshot::Canceled>> {
+		match select(ended, &mut reply).await {
+			Either::Left((_ended, reply)) => self.bound(reply).await,
+			Either::Right((answered, _)) => Ok(answered),
+		}
+	}
+
+	/// A pace whose bounds run unbounded, as on a clock that parks, for a
+	/// fixture with no link under it.
+	#[cfg(test)]
+	pub(crate) fn fixture() -> Self {
+		Self::paced(Arc::new(BlockingClock::default()), DEFAULT_OPERATION_TIMEOUT)
+	}
+
+	/// A pace on `clock` under the read deadline `deadline`, for a fixture
+	/// with no link under it.
+	#[cfg(test)]
+	pub(crate) fn paced(clock: Arc<dyn Clock>, deadline: Duration) -> Self {
+		Self { clock, deadline }
+	}
+}
 
 /// A connection's shared state and the outbound queue that serves it.
 ///
@@ -33,6 +143,9 @@ pub(crate) struct MuxLink {
 	/// credit replenishment. The channel has a zero-length buffer, so every
 	/// body reports through the one slot its own sender clone owns.
 	drain_feedback: mpsc::Sender<DrainNote>,
+	/// The pace of the connection. Its deadline bounds each send's wait for a
+	/// writer slot and for stream credit.
+	pulse: Pulse,
 }
 
 impl Clone for MuxLink {
@@ -41,13 +154,14 @@ impl Clone for MuxLink {
 			shared: Arc::clone(&self.shared),
 			outbound: self.outbound.clone(),
 			drain_feedback: self.drain_feedback.clone(),
+			pulse: self.pulse.clone(),
 		}
 	}
 }
 
 impl MuxLink {
-	/// Pair `shared` with the queue its sends travel on, and open the channel
-	/// its stream bodies report consumption on.
+	/// Pair `shared` with the queue its sends travel on and the pace of its
+	/// link, and open the channel its stream bodies report consumption on.
 	///
 	/// The link keeps the sending end. The caller receives the other end for
 	/// the reader, so the reader drains the channel this link feeds.
@@ -61,9 +175,13 @@ impl MuxLink {
 	///   drain holds at most one note per live body (CWE-770).
 	/// - A body whose slot holds an unread note reports its current count once
 	///   the slot frees ([`StreamBody`](super::body::StreamBody)).
-	pub(crate) fn new(shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> (Self, mpsc::Receiver<DrainNote>) {
+	pub(crate) fn new(
+		shared: Arc<MuxShared>,
+		outbound: mpsc::Sender<Outbound>,
+		pulse: Pulse,
+	) -> (Self, mpsc::Receiver<DrainNote>) {
 		let (drain_feedback, drained) = mpsc::channel(0);
-		let link = Self { shared, outbound, drain_feedback };
+		let link = Self { shared, outbound, drain_feedback, pulse };
 
 		(link, drained)
 	}
@@ -71,6 +189,11 @@ impl MuxLink {
 	/// The connection state behind this link.
 	pub(crate) fn shared(&self) -> &Arc<MuxShared> {
 		&self.shared
+	}
+
+	/// The pace of this link: its clock and its read deadline.
+	pub(crate) fn pulse(&self) -> &Pulse {
+		&self.pulse
 	}
 
 	/// A fresh sender over the same queue.
@@ -168,6 +291,8 @@ impl MuxLink {
 	///   travels inline in the `End` trailer (responder grammar).
 	/// - The peer's stream credit gates every payload-bearing record.
 	/// - A response the session budget cannot carry degrades to a payload-free `ResourceExhausted` refusal.
+	/// - A peer that grants no credit within the read deadline loses the reply:
+	///   the stream ends with a `Timeout` cancel, and the connection serves on.
 	///
 	/// # Errors
 	///
@@ -218,6 +343,13 @@ impl MuxLink {
 				// A peer cancel removes the stream's ledger mid-send, and the
 				// receiver discards the chunks that went out.
 				Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => return Ok(()),
+				// A peer that grants no credit within the read deadline loses
+				// this reply alone, and the connection serves on.
+				Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)) => {
+					self.shared.finish_send_stream(stream_id);
+					self.cancel_peer_stream(stream_id, CancelReason::Timeout);
+					return Ok(());
+				}
 				Err(err) => {
 					self.shared.finish_send_stream(stream_id);
 					return Err(err);
@@ -249,6 +381,14 @@ impl MuxLink {
 		sent.map_err(|_| TransportError::ConnectionClosed)
 	}
 
+	/// Ends the peer-initiated stream `stream_id` with a cancel under
+	/// `reason`, so the peer resolves its stream. A full or closed queue drops
+	/// the notice, and the peer's own reply deadline then ends the stream.
+	fn cancel_peer_stream(&self, stream_id: u32, reason: CancelReason) {
+		let package = MuxCancelPackage::new(stream_id, reason);
+		let _ = self.sender().try_send(Outbound::Envelope(package.into()));
+	}
+
 	/// Tear down an abandoned locally-initiated stream on this side. Drop
 	/// guards, abandoned sinks, and an explicit close share the call.
 	///
@@ -258,12 +398,8 @@ impl MuxLink {
 	/// the peer frees its stream slot on this notice rather than on its
 	/// own timeout.
 	pub(crate) fn enqueue_stream_cancel(&self, stream_id: u32) {
-		if let Some(mut forwarder) = self.shared.take_duplex(stream_id) {
-			// A reply body that has dropped has no reader for the failure, and
-			// this call tears the stream down either way.
-			let _ = forwarder.forward(BodyEvent::Failed(CancelReason::Cancelled.cancel_error()));
-		}
-		if let Some(sender) = self.shared.remove_pending(stream_id) {
+		let terminal = BodyEvent::Failed(CancelReason::Cancelled.cancel_error());
+		if let Some(sender) = self.shared.end_local(stream_id, terminal) {
 			// The initiator may have dropped its future, which is one way to
 			// abandon a stream.
 			let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
@@ -280,21 +416,29 @@ impl MuxLink {
 	/// enqueues in one critical section, as [`MuxShared::poll_send_enqueue`]
 	/// describes.
 	///
+	/// The wait for the slot and the credit runs within the read deadline of
+	/// the link, as each write of the wire does.
+	///
 	/// # Errors
 	///
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::Cancelled`] -- the stream's ledger is gone,
 	///   whether cancelled, resolved, or lost with the connection.
 	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended.
+	/// - The errors of [`Pulse::bound`], when the peer grants no credit within the deadline.
 	pub(crate) async fn send_data_envelope(&self, stream_id: u32, envelope: TransportEnvelope) -> TransportResult<()> {
-		let mut outbound = self.sender();
-		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
-		if ready.is_err() {
-			return Err(TransportError::ConnectionClosed);
-		}
+		let send = async {
+			let mut outbound = self.sender();
+			let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
+			if ready.is_err() {
+				return Err(TransportError::ConnectionClosed);
+			}
 
-		let mut slot = Some(envelope);
-		poll_fn(|cx| self.shared.poll_send_enqueue(stream_id, &mut outbound, &mut slot, cx)).await
+			let mut slot = Some(envelope);
+			poll_fn(|cx| self.shared.poll_send_enqueue(stream_id, &mut outbound, &mut slot, cx)).await
+		};
+
+		self.pulse.bound(pin!(send)).await?
 	}
 
 	/// Send a stream's Open record through the atomic open of
@@ -302,23 +446,30 @@ impl MuxLink {
 	///
 	/// The send reserves a writer-queue slot, then assigns the stream ID and
 	/// enqueues in one critical section, so Opens reach the wire in ID order.
+	/// The wait runs within the read deadline of the link, as
+	/// [`Self::send_data_envelope`] does.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- a driver of the connection ended.
 	/// - [`TransportError::Draining`] -- a GoAway ended admission, or the ID space is exhausted.
+	/// - The errors of [`Pulse::bound`], when the open waits past the deadline.
 	pub(crate) async fn send_open_envelope(
 		&self,
 		reservation: &mut StreamReservation,
 		request: &mut OpenRequest<'_>,
 	) -> TransportResult<u32> {
-		let mut outbound = self.sender();
-		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
-		if ready.is_err() {
-			return Err(TransportError::ConnectionClosed);
-		}
+		let open = async {
+			let mut outbound = self.sender();
+			let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
+			if ready.is_err() {
+				return Err(TransportError::ConnectionClosed);
+			}
 
-		poll_fn(|cx| reservation.poll_open(request, &mut outbound, cx)).await
+			poll_fn(|cx| reservation.poll_open(request, &mut outbound, cx)).await
+		};
+
+		self.pulse.bound(pin!(open)).await?
 	}
 
 	/// Queue a GoAway with `reason` and halt the allocator, exactly once per
@@ -411,8 +562,14 @@ impl MuxLink {
 		queue: usize,
 	) -> (MuxLink, mpsc::Receiver<Outbound>, mpsc::Receiver<DrainNote>) {
 		let (outbound, wire) = mpsc::channel(queue);
-		let (link, notes) = MuxLink::new(shared, outbound);
+		let (link, notes) = MuxLink::new(shared, outbound, Pulse::fixture());
 		(link, wire, notes)
+	}
+
+	/// This link on the pace `pulse`.
+	pub(crate) fn with_pulse(mut self, pulse: Pulse) -> Self {
+		self.pulse = pulse;
+		self
 	}
 }
 

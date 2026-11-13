@@ -3,6 +3,8 @@
 //! read loop keeps running while the writer queue is full.
 
 use core::convert::Infallible;
+use core::future::Future;
+use core::pin::Pin;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -170,7 +172,18 @@ pub struct MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
 {
+	/// The read half that the envelopes arrive on.
 	reader: R,
+	/// The state that routes each envelope once it arrives.
+	router: InboundRouter,
+}
+
+/// The routing state of a reader driver, which is all of the driver but its
+/// read half.
+///
+/// The driver holds the read half apart, so one read stays in flight while the
+/// router serves body-drain reports and control flushes.
+struct InboundRouter {
 	link: MuxLink,
 	inbound: mpsc::Sender<InboundEvent>,
 	grantor: Arc<dyn CreditGrantor>,
@@ -242,7 +255,7 @@ struct PendingDone {
 	receipt: StoredReceipt,
 }
 
-/// One unit of read-loop work (see [`MuxReaderDriver::next_event`]).
+/// One unit of read-loop work (see [`InboundRouter::next_event`]).
 enum ReaderEvent {
 	/// An inbound envelope off the read half.
 	Envelope(TransportEnvelope),
@@ -270,12 +283,9 @@ impl ReaderEvent {
 ///
 /// A returned [`drive`](MuxReaderDriver::drive), a `drive` future dropped in
 /// the middle of a read, and a driver that never ran all leave nothing to
-/// resolve a stream or a ping. The sweep runs here, so each of them records
-/// the end.
-impl<R> Drop for MuxReaderDriver<R>
-where
-	R: EnvelopeSource,
-{
+/// resolve a stream or a ping. The router drops with its driver, and the sweep
+/// runs here, so each of them records the end.
+impl Drop for InboundRouter {
 	fn drop(&mut self) {
 		self.link.shared().fail_all_pending();
 	}
@@ -296,8 +306,7 @@ where
 		drained: mpsc::Receiver<DrainNote>,
 		settings: &MuxSettings,
 	) -> Self {
-		Self {
-			reader,
+		let router = InboundRouter {
 			link,
 			inbound,
 			grantor: Arc::new(BufferedGrantor::default()),
@@ -320,25 +329,21 @@ where
 			renewal_floor: renewal_floor(settings.drain_reserve_records()),
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			epoch_recv_baseline: 0,
-		}
+		};
+
+		Self { reader, router }
 	}
 
 	/// Overrides the receiver-side stream credit policy.
 	pub fn set_grantor(&mut self, grantor: Arc<dyn CreditGrantor>) {
-		self.grantor = grantor;
+		self.router.grantor = grantor;
 	}
 
-	/// Attaches in-band rekey in three steps:
-	///
-	/// 1. Seed the receipt accessor from the handshake artifact.
-	/// 2. Stamp the epoch baseline from the remaining records of the receive cipher.
-	/// 3. Mark the rekey attached, which in the client role opens admissions gating for renewals.
+	/// Attaches in-band rekey, as [`InboundRouter::attach_rekey`] states, over
+	/// the receive cipher of this driver's read half.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 	pub(crate) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: Arc<StoredReceipt>) {
-		self.link.shared().rotate_receipt(receipt);
-		self.epoch_recv_baseline = self.reader.remaining_records();
-		self.link.shared().mark_rekey_attached();
-		self.rekey = Some(driver);
+		self.router.attach_rekey(&self.reader, driver, receipt);
 	}
 
 	/// Runs the driver until the connection ends, and returns the error that
@@ -360,9 +365,41 @@ where
 		let Err(ended) = self.route_envelopes().await;
 
 		#[cfg(feature = "instrument")]
-		self.record_end(&ended)?;
+		self.router.record_end(&ended)?;
 
 		Err(ended)
+	}
+
+	/// Routes inbound envelopes to their pending streams or handlers, and
+	/// interleaves body-drain reports into credit replenishment, until an
+	/// error ends the connection.
+	async fn route_envelopes(&mut self) -> TransportResult<Infallible> {
+		let Self { reader, router } = self;
+		loop {
+			let envelope = router.next_envelope(reader).await?;
+			let TransportEnvelope::Mux(mux) = envelope else {
+				return Err(router.protocol_violation());
+			};
+			router.route_mux(reader, mux).await?;
+
+			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+			router.watch_recv_records(reader)?;
+		}
+	}
+}
+
+impl InboundRouter {
+	/// Attaches in-band rekey in three steps:
+	///
+	/// 1. Seed the receipt accessor from the handshake artifact.
+	/// 2. Stamp the epoch baseline from the remaining records of the receive cipher of `reader`.
+	/// 3. Mark the rekey attached, which in the client role opens admissions gating for renewals.
+	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
+	fn attach_rekey(&mut self, reader: &impl EnvelopeSource, driver: RekeyDriver, receipt: Arc<StoredReceipt>) {
+		self.link.shared().rotate_receipt(receipt);
+		self.epoch_recv_baseline = reader.remaining_records();
+		self.link.shared().mark_rekey_attached();
+		self.rekey = Some(driver);
 	}
 
 	/// Records the end of this reader on the connection's trail, as
@@ -381,29 +418,31 @@ where
 		Ok(trace.emit_event_with_evidence(events::CONNECTION_CLOSED, end.label(), None)?)
 	}
 
-	/// Routes inbound envelopes to their pending streams or handlers, and
-	/// interleaves body-drain reports into credit replenishment, until an
-	/// error ends the connection.
-	async fn route_envelopes(&mut self) -> TransportResult<Infallible> {
+	/// Awaits the next envelope off `reader`, and serves each body-drain report
+	/// and control flush that comes first.
+	///
+	/// One read stays in flight until its envelope arrives. A read can stop
+	/// part of the way through a frame, so the one read keeps the bytes it
+	/// took and the deadline it started with across every report and flush.
+	async fn next_envelope<R: EnvelopeSource>(&mut self, reader: &mut R) -> TransportResult<TransportEnvelope> {
+		let read = reader.read_envelope();
+		pin_mut!(read);
 		loop {
-			match self.next_event().await? {
-				ReaderEvent::Envelope(envelope) => {
-					let TransportEnvelope::Mux(mux) = envelope else {
-						return Err(self.protocol_violation());
-					};
-					self.route_mux(mux).await?;
-				}
+			match self.next_event(read.as_mut()).await? {
+				ReaderEvent::Envelope(envelope) => return Ok(envelope),
 				ReaderEvent::Drained(note) => self.grant_streaming(note)?,
 				ReaderEvent::Flushed => {}
 			}
-
-			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			self.watch_recv_records()?;
 		}
 	}
 
-	/// Routes one inbound mux envelope.
-	async fn route_mux(&mut self, mux: MuxEnvelope) -> TransportResult<()> {
+	/// Routes one inbound mux envelope. The rekey legs install their receive
+	/// cipher on `reader`.
+	#[cfg_attr(
+		not(any(feature = "transport-cms", feature = "transport-hpke")),
+		expect(unused_variables)
+	)]
+	async fn route_mux<R: EnvelopeSource>(&mut self, reader: &mut R, mux: MuxEnvelope) -> TransportResult<()> {
 		match mux {
 			MuxEnvelope::End(package) => self.route_end(package),
 			MuxEnvelope::Open(package) => self.route_open(package).await,
@@ -419,20 +458,19 @@ where
 				// Every stream above the watermark ends before a fault at the
 				// record of the GoAway returns.
 				let received = shared.fail_pending_above(package.last_stream_id(), package.reason());
-				shared.fail_duplex_above(package.last_stream_id());
 				// The peer will never answer these streams, so the reader drops
 				// their partial response buffers.
-				self.local_reassembly.retain(|id, _| shared.is_pending(*id));
+				self.drop_resolved_partials();
 				received
 			}
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			MuxEnvelope::RekeyRequest(package) => self.route_rekey_request(package).await,
+			MuxEnvelope::RekeyRequest(package) => self.route_rekey_request(reader.remaining_records(), package).await,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 			MuxEnvelope::RekeyResponse(package) => self.route_rekey_response(package).await,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			MuxEnvelope::RekeyAck(package) => self.route_rekey_ack(package).await,
+			MuxEnvelope::RekeyAck(package) => self.route_rekey_ack(reader, package).await,
 			#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-			MuxEnvelope::RekeyDone(package) => self.route_rekey_done(package),
+			MuxEnvelope::RekeyDone(package) => self.route_rekey_done(reader, package),
 			// This build drives no rekey exchange, so any rekey leg is
 			// unsolicited and fails closed.
 			#[cfg(not(any(feature = "transport-cms", feature = "transport-hpke")))]
@@ -449,8 +487,8 @@ where
 	/// ordered channel, so a renewal opens here as the record limit nears, with
 	/// no wire addition.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn watch_recv_records(&mut self) -> TransportResult<()> {
-		if self.reader.remaining_records() > self.renewal_floor {
+	fn watch_recv_records(&mut self, reader: &impl EnvelopeSource) -> TransportResult<()> {
+		if reader.remaining_records() > self.renewal_floor {
 			return Ok(());
 		}
 		let Some(exchange) = self.rekey.as_ref().and_then(RekeyDriver::renewal_opener) else {
@@ -498,9 +536,12 @@ where
 	///
 	/// - The server's half answers that an exchange is in flight.
 	/// - The peer has spent fewer than [`DEFAULT_REKEY_MIN_SPEND_RECORDS`] records since the last install.
+	///
+	/// `records_left` is the count of records that the receive cipher reads
+	/// before it demands a rekey.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	async fn route_rekey_request(&mut self, package: MuxRekeyRequestPackage) -> TransportResult<()> {
-		let spent = self.epoch_recv_baseline.saturating_sub(self.reader.remaining_records());
+	async fn route_rekey_request(&mut self, records_left: u64, package: MuxRekeyRequestPackage) -> TransportResult<()> {
+		let spent = self.epoch_recv_baseline.saturating_sub(records_left);
 		let issued = {
 			let Some(driver) = self.rekey.as_mut() else {
 				return Err(self.protocol_violation());
@@ -589,7 +630,11 @@ where
 	/// GoAway drain of the refusal must stay decryptable. A rejected
 	/// settlement drains instead of resetting budgets.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	async fn route_rekey_ack(&mut self, package: MuxRekeyAckPackage) -> TransportResult<()> {
+	async fn route_rekey_ack(
+		&mut self,
+		reader: &mut impl EnvelopeSource,
+		package: MuxRekeyAckPackage,
+	) -> TransportResult<()> {
 		let settled = {
 			let Some(driver) = self.rekey.as_mut() else {
 				return Err(self.protocol_violation());
@@ -609,8 +654,8 @@ where
 
 		let ServerAckOutcome { install, rejection } = outcome;
 		let EpochInstall { send_cipher, recv_cipher, receipt, epoch: _ } = install;
-		self.reader.install_recv_cipher(recv_cipher)?;
-		self.epoch_recv_baseline = self.reader.remaining_records();
+		reader.install_recv_cipher(recv_cipher)?;
+		self.epoch_recv_baseline = reader.remaining_records();
 
 		if let Some(code) = rejection {
 			return self.drain_refused(code);
@@ -632,14 +677,18 @@ where
 	/// The receive cipher installs, budgets reset, the receipt rotates, and
 	/// parked admissions resume.
 	#[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
-	fn route_rekey_done(&mut self, _package: MuxRekeyDonePackage) -> TransportResult<()> {
+	fn route_rekey_done(
+		&mut self,
+		reader: &mut impl EnvelopeSource,
+		_package: MuxRekeyDonePackage,
+	) -> TransportResult<()> {
 		let Some(PendingDone { recv_cipher, receipt }) = self.pending_install.take() else {
 			return Err(self.protocol_violation());
 		};
 
 		// The new epoch's receive cipher and budget take over before the
 		// renewal closes, so an admission it releases debits the new epoch.
-		self.reader.install_recv_cipher(recv_cipher)?;
+		reader.install_recv_cipher(recv_cipher)?;
 		self.recv_budget = self.initial_recv_budget;
 		// A `RekeyDone` out of order closes nothing and ends the connection.
 		if !self.link.shared().complete_renewal(receipt) {
@@ -696,15 +745,18 @@ where
 		Ok(())
 	}
 
-	/// Awaits the next unit of read-loop work: an inbound envelope, a
+	/// Awaits the next unit of read-loop work: the envelope of `read`, a
 	/// body-drain report, or a completed control flush. The read races the
-	/// flush and the drain reports, and the first one ready wins.
-	async fn next_event(&mut self) -> TransportResult<ReaderEvent> {
-		let Self { reader, drained, link, pending_control, .. } = self;
+	/// flush and the drain reports, and the first one ready wins. The read
+	/// stays in flight when another one wins.
+	async fn next_event<F>(&mut self, read: Pin<&mut F>) -> TransportResult<ReaderEvent>
+	where
+		F: Future<Output = TransportResult<TransportEnvelope>>,
+	{
+		let Self { drained, link, pending_control, .. } = self;
 
-		let read = reader.read_envelope();
 		let note = drained.next();
-		pin_mut!(read, note);
+		pin_mut!(note);
 
 		if pending_control.is_empty() {
 			return match select(read, note).await {
@@ -893,7 +945,6 @@ where
 		// A duplex reply trailer closes the body, as a clean end on Ok and as
 		// its transport error on any other status.
 		if let Some(forwarder) = self.link.shared().take_duplex(stream_id) {
-			self.link.shared().remove_pending(stream_id);
 			return self.finish_duplex_body(forwarder, &package);
 		}
 
@@ -923,7 +974,10 @@ where
 	}
 
 	/// Closes a duplex reply body from its `End` trailer: it forwards the final
-	/// inline chunk when present, then the terminal event.
+	/// inline chunk when present, then ends the stream with the terminal event
+	/// through [`MuxShared::end_duplex`].
+	///
+	/// [`MuxShared::end_duplex`]: super::shared::MuxShared::end_duplex
 	fn finish_duplex_body(&mut self, mut forwarder: ForwardedStream, package: &MuxEndPackage) -> TransportResult<()> {
 		if !package.payload().is_empty() && !forwarder.accept_and_forward(package.payload()) {
 			return Err(self.protocol_violation());
@@ -933,9 +987,9 @@ where
 			TransitStatus::Ok => BodyEvent::End,
 			status => BodyEvent::Failed(TransportError::from(status)),
 		};
-		// A reply body already dropped has no reader for the terminal event,
-		// and the stream closes either way.
-		let _ = forwarder.forward(terminal);
+		// The reply of a duplex travels through its body, so the outcome
+		// sender of its pending entry has no reader.
+		let _released = self.link.shared().end_duplex(package.stream_id(), forwarder, terminal);
 
 		Ok(())
 	}
@@ -989,8 +1043,29 @@ where
 
 	/// Counts the streams the peer holds open across both consumption paths, so
 	/// mixed kinds share one flood bound.
-	fn live_peer_streams(&self) -> usize {
+	///
+	/// A handler that ends before its request does drops the body, and the
+	/// stream then holds no consumer here, so the count first drops it.
+	fn live_peer_streams(&mut self) -> usize {
+		self.drop_severed_bodies();
 		self.peer_bodies.len().saturating_add(self.peer_reassembly.len())
+	}
+
+	/// Drops each forwarder whose body its handler dropped, with its buffered
+	/// grant. The later chunks of the stream route through the tolerated path
+	/// of a refused stream.
+	fn drop_severed_bodies(&mut self) {
+		let severed: Vec<u32> = self
+			.peer_bodies
+			.iter()
+			.filter(|(_, stream)| stream.severed())
+			.map(|(stream_id, _)| *stream_id)
+			.collect();
+
+		for stream_id in severed {
+			self.peer_bodies.remove(&stream_id);
+			self.evict_credit(stream_id);
+		}
 	}
 
 	/// Accepts a streaming-kind or duplex-kind open, whose chunks forward to
@@ -1099,10 +1174,24 @@ where
 
 	/// Detaches a locally-initiated stream's reassembly, and starts a fresh one
 	/// at the initial credit on its first chunk.
+	///
+	/// A new reply first drops the partial replies of streams that resolved
+	/// before their last chunk, as a cancel or a reply deadline leaves them,
+	/// so their bytes return to the reassembly budget of the connection.
 	fn take_local_reassembly(&mut self, stream_id: u32) -> RecvStream {
-		self.local_reassembly
-			.remove(&stream_id)
-			.unwrap_or_else(|| RecvStream::new(self.initial_recv_credit, self.link.shared().reassembly_budget()))
+		if let Some(stream) = self.local_reassembly.remove(&stream_id) {
+			return stream;
+		}
+
+		self.drop_resolved_partials();
+		RecvStream::new(self.initial_recv_credit, self.link.shared().reassembly_budget())
+	}
+
+	/// Drops the partial replies of the streams that no longer await their
+	/// reply, so their bytes return to the reassembly budget.
+	fn drop_resolved_partials(&mut self) {
+		let shared = self.link.shared();
+		self.local_reassembly.retain(|id, _| shared.is_pending(*id));
 	}
 
 	/// Accepts a non-final chunk and raises credit when the grantor asks.
@@ -1250,16 +1339,14 @@ where
 			// The peer cancelled or refused a stream this endpoint initiated.
 			self.local_reassembly.remove(&stream_id);
 
-			if let Some(mut forwarder) = self.link.shared().take_duplex(stream_id) {
-				// A reply body already dropped has no reader for the failure,
-				// and the stream is cancelled either way.
-				let _ = forwarder.forward(BodyEvent::Failed(package.reason().cancel_error()));
-			}
-
 			self.evict_credit(stream_id);
 
-			let outcome = StreamOutcome::Cancelled(package.reason());
-			self.link.shared().resolve(stream_id, outcome);
+			let terminal = BodyEvent::Failed(package.reason().cancel_error());
+			if let Some(sender) = self.link.shared().end_local(stream_id, terminal) {
+				// A dropped receiver is an initiator that cancelled, the same
+				// race a stale cancel is.
+				let _ = sender.send(StreamOutcome::Cancelled(package.reason()));
+			}
 
 			return Ok(());
 		}
@@ -1355,11 +1442,13 @@ mod tests {
 	use futures::channel::oneshot;
 
 	use super::super::body::StreamBody;
-	use super::super::fixtures::{next_mux, noop_cx, poll_times, FIXTURE_PEER_CAP};
+	use super::super::fixtures::{next_mux, noop_cx, poll_now, poll_times, FIXTURE_PEER_CAP};
+	use super::super::handle::MuxHandle;
+	use super::super::link::Pulse;
 	use super::super::shared::MuxShared;
 	use super::*;
 	use crate::marker::MaybeSend;
-	use crate::testing::TestResult;
+	use crate::testing::{TestFrame, TestResult};
 	use crate::transport::multiplex::MuxRole;
 	use crate::transport::CheckedLimits;
 
@@ -1504,7 +1593,7 @@ mod tests {
 		/// The control commands the driver buffered while its writer queue
 		/// stayed full, in queue order.
 		fn buffered(&self) -> Vec<&Outbound> {
-			self.driver.pending_control.iter().collect()
+			self.driver.router.pending_control.iter().collect()
 		}
 	}
 
@@ -1524,7 +1613,7 @@ mod tests {
 			.is_err());
 
 		let shared = Arc::new(MuxShared::new(MuxRole::Server, &settings));
-		let (link, drained) = MuxLink::new(shared, outbound_sender);
+		let (link, drained) = MuxLink::new(shared, outbound_sender, Pulse::fixture());
 		let mut driver = MuxReaderDriver::new(
 			ScriptedSource { envelopes: envelopes.into(), delivered: Arc::clone(&delivered) },
 			link,
@@ -1532,7 +1621,7 @@ mod tests {
 			drained,
 			&settings,
 		);
-		driver.grantor = Arc::new(AlwaysGrant);
+		driver.router.grantor = Arc::new(AlwaysGrant);
 
 		ReaderFixture { driver, outbound: outbound_receiver, inbound: inbound_receiver, delivered }
 	}
@@ -1567,7 +1656,7 @@ mod tests {
 	/// `fixture`.
 	fn queue_ping_acks(fixture: &mut ReaderFixture, opaques: impl IntoIterator<Item = u64>) {
 		for opaque in opaques {
-			let queued = fixture.driver.queue_ping_ack(MuxPingPackage::new(true, opaque));
+			let queued = fixture.driver.router.queue_ping_ack(MuxPingPackage::new(true, opaque));
 			queued.expect("an ack is buffered or dropped");
 		}
 	}
@@ -1590,9 +1679,9 @@ mod tests {
 	#[test]
 	fn a_refusal_cancel_buffers_while_the_queue_is_full() -> TestResult {
 		let mut fixture = reader_with_full_queue(vec![]);
-		fixture.driver.refuse_stream(1)?;
+		fixture.driver.router.refuse_stream(1)?;
 
-		let front = fixture.driver.pending_control.front().and_then(Outbound::mux);
+		let front = fixture.driver.router.pending_control.front().and_then(Outbound::mux);
 		assert!(matches!(front, Some(MuxEnvelope::Cancel(package)) if package.stream_id() == 1));
 		Ok(())
 	}
@@ -1622,11 +1711,11 @@ mod tests {
 		let mut fixture = reader_with_full_queue(vec![open_package().into(), MuxPingPackage::new(false, 7).into()]);
 		let mut driver = Box::pin(fixture.driver.drive());
 		poll_times(&mut driver, 4);
-
 		let filler = next_mux(&mut fixture.outbound);
 		poll_times(&mut driver, 4);
 		let grant = next_mux(&mut fixture.outbound);
 		poll_times(&mut driver, 4);
+
 		let ack = next_mux(&mut fixture.outbound);
 		assert!(matches!(filler, Some(MuxEnvelope::Ping(_))));
 		assert!(matches!(grant, Some(MuxEnvelope::Credit(package)) if package.stream_id() == 1));
@@ -1638,9 +1727,9 @@ mod tests {
 	#[test]
 	fn buffered_credit_grants_coalesce_per_stream() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
-		fixture.driver.queue_credit(1, 2)?;
-		fixture.driver.queue_credit(3, 2)?;
-		fixture.driver.queue_credit(1, 4)?;
+		fixture.driver.router.queue_credit(1, 2)?;
+		fixture.driver.router.queue_credit(3, 2)?;
+		fixture.driver.router.queue_credit(1, 4)?;
 
 		let buffered = fixture.buffered();
 		assert_eq!(buffered.len(), 2);
@@ -1659,15 +1748,15 @@ mod tests {
 	#[test]
 	fn a_closed_stream_drops_its_buffered_grant() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
-		fixture.driver.queue_credit(1, 2)?;
-		fixture.driver.queue_credit(2, 2)?;
-		fixture.driver.queue_credit(3, 2)?;
+		fixture.driver.router.queue_credit(1, 2)?;
+		fixture.driver.router.queue_credit(2, 2)?;
+		fixture.driver.router.queue_credit(3, 2)?;
 
-		let mut peer_cancel = Box::pin(fixture.driver.route_cancel(MuxCancelPackage::new(1, 0u32)));
+		let mut peer_cancel = Box::pin(fixture.driver.router.route_cancel(MuxCancelPackage::new(1, 0u32)));
 		poll_times(&mut peer_cancel, 1);
 		drop(peer_cancel);
 
-		let mut local_cancel = Box::pin(fixture.driver.route_cancel(MuxCancelPackage::new(2, 0u32)));
+		let mut local_cancel = Box::pin(fixture.driver.router.route_cancel(MuxCancelPackage::new(2, 0u32)));
 		poll_times(&mut local_cancel, 1);
 		drop(local_cancel);
 
@@ -1695,13 +1784,13 @@ mod tests {
 	#[test]
 	fn a_streaming_grant_clamps_to_the_channel_window() -> TestResult {
 		let mut fixture = reader_with_full_queue(Vec::new());
-		fixture.driver.grantor = Arc::new(GreedyGrant);
+		fixture.driver.router.grantor = Arc::new(GreedyGrant);
 
 		let (_body, forwarder, _notes) = StreamBody::fixture(5, 2);
-		fixture.driver.peer_bodies.insert(5, forwarder);
-		fixture.driver.grant_streaming(DrainNote { stream_id: 5, consumed: 1 })?;
+		fixture.driver.router.peer_bodies.insert(5, forwarder);
+		fixture.driver.router.grant_streaming(DrainNote { stream_id: 5, consumed: 1 })?;
 
-		let limit = fixture.driver.peer_bodies.get(&5).map(|stream| stream.limits().0);
+		let limit = fixture.driver.router.peer_bodies.get(&5).map(|stream| stream.limits().0);
 		let buffered = fixture.buffered();
 		assert_eq!(limit, Some(3));
 		assert_eq!(buffered.len(), 1);
@@ -1739,10 +1828,11 @@ mod tests {
 
 		drop(body);
 
-		fixture.driver.peer_bodies.insert(1, forwarder);
-		fixture.driver.forward_request_chunk(&data_package(false, vec![7u8; 4]))?;
+		fixture.driver.router.peer_bodies.insert(1, forwarder);
+		let chunk = data_package(false, vec![7u8; 4]);
+		fixture.driver.router.forward_request_chunk(&chunk)?;
 
-		assert!(fixture.driver.peer_bodies.is_empty());
+		assert!(fixture.driver.router.peer_bodies.is_empty());
 		Ok(())
 	}
 
@@ -1752,6 +1842,7 @@ mod tests {
 		for stream_id in stream_ids {
 			fixture
 				.driver
+				.router
 				.refuse_stream(*stream_id)
 				.expect("a refusal is buffered or dropped");
 		}
@@ -1788,7 +1879,7 @@ mod tests {
 	#[test]
 	fn a_dropped_drive_fails_the_connection() {
 		let fixture = reader_with_full_queue([]);
-		let shared = Arc::clone(fixture.driver.link.shared());
+		let shared = Arc::clone(fixture.driver.router.link.shared());
 
 		let mut driving = Box::pin(fixture.driver.drive());
 		poll_times(&mut driving, 1);
@@ -1837,5 +1928,40 @@ mod tests {
 			the_last_tightbeam_code => (MUX_APPLICATION_CODE_FLOOR - 1, GoAwayReason::SettlementFailed),
 			the_first_application_code => (MUX_APPLICATION_CODE_FLOOR, GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR)),
 		}
+	}
+
+	/// A new reply drops the partial reply of a stream that resolved before its
+	/// last chunk, as a cancel leaves it, so its bytes return to the
+	/// reassembly budget of the connection.
+	#[test]
+	fn a_new_reply_drops_the_partial_reply_of_a_cancelled_stream() -> TestResult {
+		let settings = MuxSettings::symmetric(FIXTURE_PEER_CAP);
+		let shared = Arc::new(MuxShared::new(MuxRole::Client, &settings));
+		let budget = shared.reassembly_budget();
+		let (outbound, _wire) = mpsc::channel(8);
+		let (inbound, _inbound_receiver) = mpsc::channel(4);
+		let (link, drained) = MuxLink::new(shared, outbound, Pulse::fixture());
+		let handle = MuxHandle::new(link.clone());
+		let source = ScriptedSource { envelopes: VecDeque::new(), delivered: Arc::new(AtomicUsize::new(0)) };
+		let driver = MuxReaderDriver::new(source, link, inbound, drained, &settings);
+		let MuxReaderDriver { mut reader, mut router } = driver;
+
+		let frame = TestFrame::v0(None, None);
+
+		let mut first = Box::pin(handle.emit_on_stream(&frame));
+		poll_times(&mut first, 1);
+
+		let partial = MuxEnvelope::Data(MuxDataPackage::new(1, false, vec![7u8; 4])?);
+		assert!(matches!(poll_now(router.route_mux(&mut reader, partial)), Poll::Ready(Ok(()))));
+		drop(first);
+
+		let mut second = Box::pin(handle.emit_on_stream(&frame));
+		poll_times(&mut second, 1);
+
+		let next = MuxEnvelope::Data(MuxDataPackage::new(3, false, vec![7u8; 4])?);
+		assert!(matches!(poll_now(router.route_mux(&mut reader, next)), Poll::Ready(Ok(()))));
+
+		assert_eq!(budget.used(), 4);
+		Ok(())
 	}
 }

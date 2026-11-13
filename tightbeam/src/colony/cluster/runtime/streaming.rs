@@ -15,9 +15,11 @@
 //! [`ServletRegistry::select_route`]: crate::colony::cluster::ServletRegistry::select_route
 //! [`MuxService`]: crate::transport::multiplex::MuxService
 
+use core::future::Future;
+use core::pin::pin;
 use std::sync::Arc;
 
-use futures::future::try_join;
+use futures::future::{select, Either};
 
 use crate::colony::cluster::runtime::bounds::{ColonyDialProtocol, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::{HivePlane, PeerPlane};
@@ -27,11 +29,89 @@ use crate::colony::cluster::HopBudget;
 use crate::instrumentation::events::CLUSTER_WORK_FORWARDED;
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
-use crate::transport::error::TransportError;
-use crate::transport::multiplex::{ReplySink, StreamBody, StreamRoute};
+use crate::transport::multiplex::{RelayFailure, ReplySink, StreamBody, StreamRoute};
 use crate::transport::PooledClient;
 use crate::urn::Urn;
 use crate::{Frame, TightBeamError};
+
+/// The failure of a splice, by the side that caused it.
+enum SpliceFailure {
+	/// The route failed the stream: its terminal status, a refused chunk, or
+	/// the end of its link.
+	Route(TightBeamError),
+	/// The caller left before the route answered: its body failed, or its
+	/// reply refused a chunk.
+	Caller(TightBeamError),
+}
+
+impl SpliceFailure {
+	/// The failure of the route, from `error`.
+	fn route(error: impl Into<TightBeamError>) -> Self {
+		Self::Route(error.into())
+	}
+
+	/// The failure of the caller, from `error`.
+	fn caller(error: impl Into<TightBeamError>) -> Self {
+		Self::Caller(error.into())
+	}
+
+	/// The status that this failure scores against the route, or `None` for a
+	/// caller that left, which says nothing of the route.
+	fn route_status(&self) -> Option<TransitStatus> {
+		match self {
+			Self::Route(error) => Some(error.failure_status()),
+			Self::Caller(_) => None,
+		}
+	}
+}
+
+/// The body of a relay is the caller's, and its sink is the route's.
+impl From<RelayFailure> for SpliceFailure {
+	fn from(failure: RelayFailure) -> Self {
+		match failure {
+			RelayFailure::Source(error) => Self::caller(error),
+			RelayFailure::Sink(error) => Self::route(error),
+		}
+	}
+}
+
+/// The caller of a splice hears its failure, whichever side caused it.
+impl From<SpliceFailure> for TightBeamError {
+	fn from(failure: SpliceFailure) -> Self {
+		match failure {
+			SpliceFailure::Route(error) | SpliceFailure::Caller(error) => error,
+		}
+	}
+}
+
+/// The two legs of one splice: the relay of the caller's body to the route,
+/// and the answer of the route.
+struct SpliceLegs<R, A> {
+	relay: R,
+	answer: A,
+}
+
+impl<R, A, T> SpliceLegs<R, A>
+where
+	R: Future<Output = Result<(), RelayFailure>>,
+	A: Future<Output = Result<T, SpliceFailure>>,
+{
+	/// Runs both legs at once, until the answer of the route decides the
+	/// splice.
+	///
+	/// - A relay that delivers the whole body, or that meets a stream the route
+	///   resolved, leaves the end to the answer.
+	/// - A failed relay ends the splice at once, and the drop of both legs cancels the stream of the route.
+	/// - An answer that comes first ends the splice, and the rest of the body stays unread.
+	async fn settle(self) -> Result<T, SpliceFailure> {
+		let Self { relay, answer } = self;
+		match select(pin!(relay), pin!(answer)).await {
+			Either::Left((Ok(()), answer)) => answer.await,
+			Either::Left((Err(failure), _)) => Err(failure.into()),
+			Either::Right((answered, _)) => answered,
+		}
+	}
+}
 
 /// The dial plan a splice follows once the registry selects its route.
 ///
@@ -130,18 +210,24 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	}
 
 	/// Reinforce or weaken the chosen trail by the splice outcome, the
-	/// same feedback unary work applies. `failure` is the status of a splice
-	/// that failed, and a peer splice that answered also fires
-	/// [`CLUSTER_WORK_FORWARDED`]. Each record goes on `trace`.
-	fn record_outcome(
+	/// same feedback unary work applies. Each record goes on `trace`.
+	///
+	/// - A splice that the route failed weakens the trail by the status of that failure.
+	/// - A splice that its caller left scores nothing.
+	/// - A peer splice that answered also fires [`CLUSTER_WORK_FORWARDED`].
+	fn record_outcome<T>(
 		&self,
-		failure: Option<TransitStatus>,
+		spliced: &Result<T, SpliceFailure>,
 		route_key: &Arc<[u8]>,
 		is_peer: bool,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
 		let registry = &self.servlet_registry;
-		if let Some(status) = failure {
+		if let Err(failure) = spliced {
+			let Some(status) = failure.route_status() else {
+				return Ok(());
+			};
+
 			return registry.work_trail_weaken(route_key, status, &self.config, trace);
 		}
 
@@ -152,19 +238,20 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		registry.work_trail_ok(route_key, &self.config, trace)
 	}
 
-	/// Splice a streamed request: relay the client body to the route, then
+	/// Splice a streamed request: relay the client body to the route, and
 	/// answer with the route's unary reply.
 	///
 	/// Returns the servlet's reply frame unchanged, because the stream reply is
 	/// the servlet's own frame end to end. Unary work wraps its reply in a
-	/// `ClusterWorkResponse` envelope.
+	/// `ClusterWorkResponse` envelope. A reply that comes before the body
+	/// ends, such as an early refusal, ends the splice.
 	///
 	/// # Errors
 	///
 	/// - [`TransitStatus::PermissionDenied`] -- the target is not bare, or it names a foreign realm.
 	/// - [`TransitStatus::Unavailable`] -- no live trail exists, the dial
 	///   failed, or another gateway answered.
-	/// - [`TightBeamError`] -- the stream failed, under the route's own terminal status.
+	/// - [`TightBeamError`] -- the stream failed, under the route's own terminal status, or the caller left.
 	pub(crate) async fn splice_streaming(
 		self,
 		body: StreamBody,
@@ -179,29 +266,27 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		let is_peer = plan.choice.is_peer();
 		let SplicePlan { route, choice } = plan;
 		let route_key = choice.route_key;
-		let reply = async {
-			let (sink, response) = client.open_stream_with_route(route)?;
+		let spliced = async {
+			let (sink, response) = client.open_stream_with_route(route).map_err(SpliceFailure::route)?;
+			let answer = async { response.await.map_err(SpliceFailure::route) };
 
-			body.drain_into(sink).await?;
-
-			let reply = response.await?;
-			Ok(reply)
+			SpliceLegs { relay: body.drain_into(sink), answer }.settle().await
 		}
 		.await;
 
-		let failure = reply.as_ref().err().map(TightBeamError::failure_status);
-		self.record_outcome(failure, &route_key, is_peer, trace)?;
+		self.record_outcome(&spliced, &route_key, is_peer, trace)?;
 
-		reply
+		spliced.map_err(TightBeamError::from)
 	}
 
 	/// Splice a duplex stream: relay the client body to the route and the
 	/// route's reply chunks back, with both directions concurrent.
 	///
-	/// A dropped handler drops the peer sink and the body, and a client
-	/// cancel aborts the handler. The peer sink's drop and the cancel guard of
-	/// the peer [`StreamBody`] then cancel the peer stream, so a cancel
-	/// propagates across the splice.
+	/// - The end of the route's reply ends the splice, so the route's status reaches the client.
+	/// - A dropped handler drops the peer sink and the body, and a client
+	///   cancel aborts the handler. The peer sink's drop and the cancel guard
+	///   of the peer [`StreamBody`] then cancel the peer stream, so a cancel
+	///   propagates across the splice.
 	///
 	/// [`StreamBody`]: crate::transport::multiplex::StreamBody
 	///
@@ -210,7 +295,7 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 	/// - [`TransitStatus::PermissionDenied`] -- the target is not bare, or it names a foreign realm.
 	/// - [`TransitStatus::Unavailable`] -- no live trail exists, the dial
 	///   failed, or another gateway answered.
-	/// - [`TightBeamError`] -- the stream failed, under the route's own terminal status.
+	/// - [`TightBeamError`] -- the stream failed, under the route's own terminal status, or the caller left.
 	pub(crate) async fn splice_duplex(
 		self,
 		body: StreamBody,
@@ -227,34 +312,37 @@ impl<P: ColonyDialProtocol> GatewayRuntimeCtx<P> {
 		let SplicePlan { route, choice } = plan;
 		let route_key = choice.route_key;
 		let spliced = async {
-			let (peer_sink, mut peer_body) = client.open_duplex_with_route(route)?;
-			let upstream = body.drain_into(peer_sink);
-			let downstream = async {
-				while let Some(chunk) = peer_body.chunk().await? {
-					reply.push(&chunk).await?;
+			let (peer_sink, mut peer_body) = client.open_duplex_with_route(route).map_err(SpliceFailure::route)?;
+			let answer = async {
+				while let Some(chunk) = peer_body.chunk().await.map_err(SpliceFailure::route)? {
+					reply.push(&chunk).await.map_err(SpliceFailure::caller)?;
 				}
 
-				Ok::<(), TransportError>(())
+				Ok(())
 			};
 
-			try_join(upstream, downstream).await.map(|_| ()).map_err(TightBeamError::from)
+			SpliceLegs { relay: body.drain_into(peer_sink), answer }.settle().await
 		}
 		.await;
 
-		let failure = spliced.as_ref().err().map(TightBeamError::failure_status);
-		self.record_outcome(failure, &route_key, is_peer, trace)?;
+		self.record_outcome(&spliced, &route_key, is_peer, trace)?;
 
-		spliced
+		spliced.map_err(TightBeamError::from)
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use core::future::{pending, ready};
+
+	use futures::FutureExt;
+
 	use super::*;
 	use crate::colony::cluster::runtime::bounds::fixtures::Audited;
 	use crate::colony::cluster::{ClusterConfig, ServletEntry};
 	use crate::colony::urn::ColonyNamespace;
 	use crate::testing::TestResult;
+	use crate::transport::TransportError;
 
 	fn stream_type() -> Urn<'static> {
 		ColonyNamespace::servlet_fixture("stream-echo")
@@ -276,5 +364,55 @@ mod tests {
 		let read = route.as_ref().map(|route| (route.hops_remaining(), route.target()));
 		assert_eq!(read, Ok((1, Some(&stream_type()))));
 		Ok(())
+	}
+
+	/// The failure of a route that closed its link.
+	fn route_closed() -> SpliceFailure {
+		SpliceFailure::route(TransportError::ConnectionClosed)
+	}
+
+	/// A relay that ends clean leaves the end of the splice to the answer of
+	/// the route.
+	#[test]
+	fn a_clean_relay_leaves_the_end_to_the_answer() {
+		let legs = SpliceLegs { relay: ready(Ok(())), answer: ready(Err::<(), _>(route_closed())) };
+
+		let settled = legs.settle().now_or_never();
+		assert!(matches!(settled, Some(Err(SpliceFailure::Route(_)))));
+	}
+
+	/// A relay that fails at its body ends the splice at once, as a failure
+	/// of the caller.
+	#[test]
+	fn a_failed_body_ends_the_splice_as_the_callers_failure() {
+		let relay = ready(Err(RelayFailure::Source(TransportError::ConnectionClosed)));
+		let legs = SpliceLegs { relay, answer: pending::<Result<(), SpliceFailure>>() };
+
+		let settled = legs.settle().now_or_never();
+		assert!(matches!(settled, Some(Err(SpliceFailure::Caller(_)))));
+	}
+
+	/// A relay that fails at its sink ends the splice at once, as a failure
+	/// of the route.
+	#[test]
+	fn a_failed_sink_ends_the_splice_as_the_routes_failure() {
+		let relay = ready(Err(RelayFailure::Sink(TransportError::ConnectionClosed)));
+		let legs = SpliceLegs { relay, answer: pending::<Result<(), SpliceFailure>>() };
+
+		let settled = legs.settle().now_or_never();
+		assert!(matches!(settled, Some(Err(SpliceFailure::Route(_)))));
+	}
+
+	/// An answer that comes first ends the splice while the relay still waits
+	/// on the body.
+	#[test]
+	fn an_answer_ends_the_splice_while_the_relay_waits() {
+		let legs = SpliceLegs {
+			relay: pending::<Result<(), RelayFailure>>(),
+			answer: ready(Ok::<_, SpliceFailure>(7)),
+		};
+
+		let settled = legs.settle().now_or_never();
+		assert!(matches!(settled, Some(Ok(7))));
 	}
 }

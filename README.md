@@ -2380,11 +2380,11 @@ Client (handle)                            Server (responder)
 
 **Lifecycle rules:**
 
-- Dropping an in-flight `emit_on_stream` future cancels the stream. Wrap the future in a timer for a per-stream timeout.
+- Dropping an in-flight `emit_on_stream` future cancels the stream. Each send waits at most the read deadline for stream credit, and a unary or streamed reply waits at most the read deadline after its request ends. Wrap the future in a timer for a shorter per-stream timeout.
 - A mux peer that receives a non-mux envelope MUST send GoAway(`ProtocolError`). A non-mux peer MUST reject muxed envelopes.
-- Cancels that abort in-flight handlers draw on a per-connection budget (default 1024). Exhaustion ends the connection with GoAway(`EnhanceYourCalm`).
+- Cancels that abort in-flight handlers within a third of the read deadline of their start draw on a per-connection budget (default 1024). Exhaustion ends the connection with GoAway(`EnhanceYourCalm`).
 - Near the cipher record limit, the session renews its epoch or drains via GoAway.
-- An idle connection ends at the read deadline of either end. `MuxHandle::keep_alive` on one end keeps both ends alive while its interval stays under the read deadline of the peer.
+- An idle connection ends at the read deadline of either end. `MuxHandle::keep_alive` on one end keeps both ends alive while its interval stays under the read deadline of the peer. A `ConnectionPool` runs it on each multiplexed connection that it dials while a stream is open there.
 
 **Runtime architecture:**
 

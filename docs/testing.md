@@ -642,6 +642,7 @@ A fuzz arm emits `fn main()`, and `cargo afl build` compiles it into a target:
 - A guided arm takes `Bare`, `Servlet`, `Hive`, or `Cluster`. `Bare` takes one sync `exec:`, and the other three need `tokio`.
 - A guided arm without `csp:` fails to compile, and a configuration that also names a process fails the run at start with `CspNamedTwice`.
 - Under `--cfg fuzzing`, `main` wraps `afl::fuzz!` and builds a `FuzzTraceCollector` over each input. Without it, `main` runs one iteration over an empty input, so `cargo check` and a smoke build compile the target.
+- The arm reads `cfg(fuzzing)` in the crate that invokes it, so that crate declares the cfg in its `Cargo.toml`: `[lints.rust] unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }`.
 - An iteration whose body returns `FuzzInputExhausted` ends ungraded.
 
 ### FuzzTraceCollector

@@ -9,8 +9,8 @@ use core::time::Duration;
 use futures::channel::mpsc;
 
 use super::flow::cap_as_usize;
-use super::handle::{MuxHandle, Pulse};
-use super::link::MuxLink;
+use super::handle::MuxHandle;
+use super::link::{MuxLink, Pulse};
 use super::reader::MuxReaderDriver;
 use super::responder::MuxResponder;
 use super::shared::MuxShared;
@@ -77,9 +77,9 @@ where
 		let pulse = Pulse::of(&reader, &writer);
 		let drain_headroom = settings.drain_reserve_records();
 		let writer = MuxWriterDriver::new(writer, outbound_receiver, Arc::clone(&shared), drain_headroom);
-		let (link, drained) = MuxLink::new(shared, outbound_sender);
+		let (link, drained) = MuxLink::new(shared, outbound_sender, pulse);
 		let reader = MuxReaderDriver::new(reader, link.clone(), inbound_sender, drained, &settings);
-		let handle = MuxHandle::new(link.clone(), pulse);
+		let handle = MuxHandle::new(link.clone());
 		let responder = MuxResponder::new(inbound_receiver, link, settings.peer_initiated_cap());
 
 		Self { handle, reader, writer, responder }
@@ -232,7 +232,7 @@ where
 			let _ = writer_driver.drive().await;
 		});
 
-		SpawnedMux { handle, responder, drivers: MuxDrivers { reader, writer } }
+		SpawnedMux { handle, responder, drivers: MuxDrivers { reader, writer, keepalive: None } }
 	}
 
 	/// Apply the optional cancel budget, then spawn both drivers through
@@ -245,6 +245,29 @@ where
 
 		self.spawn()
 	}
+
+	/// Spawn both drivers through [`MuxTransport::spawn`], and run the
+	/// keepalive of the handle beside them while a stream is open, so a quiet
+	/// stream keeps its link inside the read deadline of both ends
+	/// ([`MuxHandle::keep_streams_alive`]).
+	///
+	/// [`SpawnedMux::drivers`] owns the keepalive task with the drivers, so the
+	/// drop of the drivers ends it too.
+	#[cfg(pooled_mux)]
+	pub(crate) fn spawn_kept_alive(self) -> SpawnedMux {
+		let mut spawned = self.spawn();
+		let handle = spawned.handle.clone();
+		let keepalive = rt::spawn(async move {
+			// The keepalive ends when a probe fails, as the link ends or
+			// drains, or at once on a clock that cannot race a probe. The
+			// reader task witnesses the end of the link, so the error has no
+			// one else to reach.
+			let _ended = handle.keep_streams_alive().await;
+		});
+
+		spawned.drivers.keepalive = Some(keepalive);
+		spawned
+	}
 }
 
 /// A live mux plane, with both drivers spawned and ready to emit and serve.
@@ -256,14 +279,16 @@ pub struct SpawnedMux {
 	pub handle: MuxHandle,
 	/// The server dispatcher of peer-initiated streams.
 	pub responder: MuxResponder,
-	/// The two driver tasks of the connection. Their drop ends the
-	/// connection, so a holder keeps them for as long as it emits or serves.
+	/// The driver tasks of the connection, and its keepalive where one runs.
+	/// Their drop ends the connection, so a holder keeps them for as long as it
+	/// emits or serves.
 	pub drivers: MuxDrivers,
 }
 
-/// The reader and the writer task of one multiplexed connection.
+/// The reader and the writer task of one multiplexed connection, and its
+/// keepalive task on a connection that runs one.
 ///
-/// The drop of the value aborts both tasks, so the connection ends with the
+/// The drop of the value aborts every task, so the connection ends with the
 /// owner that holds the drivers (CWE-772).
 ///
 /// # Examples
@@ -280,6 +305,8 @@ pub struct SpawnedMux {
 pub struct MuxDrivers {
 	reader: rt::JoinHandle,
 	writer: rt::JoinHandle,
+	/// The keepalive task, on a connection that runs one.
+	keepalive: Option<rt::JoinHandle>,
 }
 
 #[cfg(feature = "tokio")]
@@ -315,11 +342,14 @@ impl MuxDrivers {
 	}
 }
 
-/// The drop aborts both tasks through the runtime interface.
+/// The drop aborts both tasks and the keepalive through the runtime interface.
 #[cfg(feature = "tokio")]
 impl Drop for MuxDrivers {
 	fn drop(&mut self) {
 		rt::abort(&self.reader);
 		rt::abort(&self.writer);
+		if let Some(keepalive) = &self.keepalive {
+			rt::abort(keepalive);
+		}
 	}
 }

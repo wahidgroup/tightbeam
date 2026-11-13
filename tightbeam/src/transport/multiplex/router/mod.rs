@@ -29,5 +29,7 @@ pub use sink::{ReplySink, RequestSink};
 pub use transport::MuxTransport;
 pub use writer::MuxWriterDriver;
 
+#[cfg(feature = "colony")]
+pub(crate) use body::RelayFailure;
 #[cfg(feature = "tokio")]
 pub use transport::{MuxDrivers, SpawnedMux};

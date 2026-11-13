@@ -10,7 +10,7 @@ use futures::channel::mpsc;
 use futures::task::ArcWake;
 
 use super::body::{DrainNote, ForwardedStream, StreamBody};
-use super::link::MuxLink;
+use super::link::{MuxLink, Pulse};
 use super::outbound::Outbound;
 use super::reassembly::ReassemblyBudget;
 use super::shared::{MuxShared, OpenSlot};
@@ -74,7 +74,7 @@ impl StreamBody {
 	) -> (StreamBody, ForwardedStream, mpsc::Receiver<DrainNote>) {
 		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
 		let (outbound, _wire) = mpsc::channel(0);
-		let (link, notes) = MuxLink::new(shared, outbound);
+		let (link, notes) = MuxLink::new(shared, outbound, Pulse::fixture());
 		let (body, forwarder) = StreamBody::pair(OpenSlot::assigned(stream_id), window, link.drain_feedback(), budget);
 
 		(body, forwarder, notes)

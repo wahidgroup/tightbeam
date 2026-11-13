@@ -38,9 +38,6 @@
 //! - ID 0 is reserved, and no endpoint allocates it.
 //! - Each endpoint allocates strictly monotonically.
 //!
-//! Per-stream timeouts compose externally. Wrap the emit future in a timeout,
-//! and the drop guard cancels the stream on expiry.
-//!
 //! [rfc9113-5.1.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
 //! [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
 //! [`MuxStreamKind`]: crate::transport::envelopes::MuxStreamKind
@@ -56,6 +53,8 @@ use std::sync::Arc;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use futures::future::ready;
 
+#[cfg(feature = "colony")]
+pub(crate) use router::RelayFailure;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use router::{
 	BufferedGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver, ReplySink, RequestSink,

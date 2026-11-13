@@ -6,10 +6,12 @@
 //! it locally. A cancel of the client stream crosses the splice to the servlet.
 
 use tightbeam::colony::cluster::EdgePlane;
-use tightbeam::transport::{PooledClient, Protocol, TransportError};
+use tightbeam::colony::servlet::Servlet;
+use tightbeam::transport::{PooledClient, Protocol, TransportError, TransportFailure};
 use tightbeam::{compose, servlet};
 
 use super::common::*;
+use crate::common::poll::within_hang_guard;
 use crate::common::security::expectation_failure;
 
 servlet! {
@@ -38,22 +40,86 @@ servlet! {
 	}
 }
 
-/// Starts a hive that hosts one stream-echo servlet, muxed on both the
-/// servlet server and the hive-to-cluster pool.
+/// The failure that the early-refusal servlet ends each stream with.
+const EARLY_REFUSAL: TransportFailure = TransportFailure::OutOfRange;
+
+servlet! {
+	/// A servlet with stream and duplex arms alone, which refuses each stream
+	/// at its first chunk, while the caller still has the rest of its body to
+	/// send.
+	pub EarlyRefusalServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	stream: |body, ctx| async move {
+		ctx.trace().event(STREAM_SERVLET_HANDLED)?;
+		let mut body = body;
+		body.chunk().await?;
+
+		Err(TransportError::OperationFailed(EARLY_REFUSAL).into())
+	},
+	duplex: |body, _reply, ctx| async move {
+		ctx.trace().event(DUPLEX_SERVLET_HANDLED)?;
+		let mut body = body;
+		body.chunk().await?;
+
+		Err(TransportError::OperationFailed(EARLY_REFUSAL).into())
+	}
+}
+
+servlet! {
+	/// A servlet with a duplex arm alone, which ends its stream cleanly at the
+	/// first chunk, while the caller still has the rest of its body to send.
+	pub EarlyEndServlet<PingRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	duplex: |body, _reply, ctx| async move {
+		ctx.trace().event(DUPLEX_SERVLET_HANDLED)?;
+		let mut body = body;
+		body.chunk().await?;
+
+		Ok(())
+	}
+}
+
+/// Starts a hive that hosts one servlet of type `S` as the servlet type
+/// `name`, muxed on both the servlet server and the hive-to-cluster pool.
+async fn start_servlet_hive<S>(
+	trace: TraceCollector,
+	certs: Arc<ClusterTestCerts>,
+	name: &str,
+) -> Result<ClusterTestHive, TightBeamError>
+where
+	S: Servlet<PingRequest, Conf = ServletConfig<TokioListener, PingRequest>> + ServletBox + 'static,
+{
+	let servlet_conf = servlet_tls_config(&certs)?;
+	let servlet = S::start(Arc::new(trace.share()), servlet_conf).await?;
+
+	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
+	hive.register(servlet_urn(name), servlet, |t| S::start(t, ServletConfig::cleartext()))?;
+	hive.establish(Arc::new(trace.share())).await?;
+	Ok(hive)
+}
+
+/// Starts a hive that hosts one stream-echo servlet.
 pub async fn start_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
-	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = StreamEchoServlet::start(Arc::new(trace.share()), servlet_conf).await?;
+	start_servlet_hive::<StreamEchoServlet>(trace, certs, "stream-echo").await
+}
 
-	let conf = hive_tls_config(&certs);
-	let mut hive = ClusterTestHive::new(Some(conf))?;
-	hive.register(servlet_urn("stream-echo"), servlet, |t| {
-		StreamEchoServlet::start(t, ServletConfig::cleartext())
-	})?;
-	hive.establish(Arc::new(trace.share())).await?;
-	Ok(hive)
+/// Starts a hive that hosts one early-end servlet.
+async fn start_early_end_hive(
+	trace: TraceCollector,
+	certs: Arc<ClusterTestCerts>,
+) -> Result<ClusterTestHive, TightBeamError> {
+	start_servlet_hive::<EarlyEndServlet>(trace, certs, "early-end").await
+}
+
+/// Starts a hive that hosts one early-refusal servlet.
+async fn start_refusal_hive(
+	trace: TraceCollector,
+	certs: Arc<ClusterTestCerts>,
+) -> Result<ClusterTestHive, TightBeamError> {
+	start_servlet_hive::<EarlyRefusalServlet>(trace, certs, "early-refusal").await
 }
 
 /// [`peering_cluster_conf`] with a mux offer, so the gateway serves
@@ -558,17 +624,18 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(DUPLEX_SERVLET_HANDLED, exactly!(1)),
-			(events::CLUSTER_WORK_FAILED, exactly!(2)),
+			(events::CLUSTER_WORK_FAILED, absent!()),
 			(events::HANDLER_FAILED, exactly!(3), equals!(TransitStatus::Internal))
 		]
 	}
 }
 
-// The cancel ends the splice on the importer, then on the exporter. Each
-// gateway records its splice end as a failed forward, so two records prove the
-// cancel crossed both hops. The servlet's duplex handler then fails, and each
-// of the three handlers on the path records `Internal`. The client waits for
-// every record before teardown, so a shutdown cannot pass the spec by chance.
+// The cancel ends the splice on the importer, then on the exporter. A caller
+// that leaves says nothing of the route, so neither gateway weakens its trail.
+// The servlet's duplex handler then fails, and each of the three handlers on
+// the path records `Internal`, so three records prove the cancel crossed both
+// hops. The client waits for every record before teardown, so a shutdown
+// cannot pass the spec by chance.
 tb_scenario! {
 	name: cluster_duplex_cancel_propagates_to_peer,
 	spec: ClusterDuplexCancelSpec,
@@ -590,8 +657,7 @@ tb_scenario! {
 			drop(sink);
 			drop(body);
 
-			let propagated =
-				|| trace.recorded(events::CLUSTER_WORK_FAILED) >= 2 && trace.recorded(events::HANDLER_FAILED) >= 3;
+			let propagated = || trace.recorded(events::HANDLER_FAILED) >= 3;
 			poll_until(50, Duration::from_millis(100), propagated).await;
 
 			exporter.stop();
@@ -652,6 +718,125 @@ tb_scenario! {
 
 			cluster.stop();
 			impostor.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterEarlyRefusalSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(STREAM_SERVLET_HANDLED, exactly!(1)),
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::OutOfRange))
+		]
+	}
+}
+
+// A servlet that refuses a stream before the body ends answers through the
+// splice at once. The client has not closed its request, and the refusal
+// reaches it under the servlet's own status, which the trail of the route
+// records.
+tb_scenario! {
+	name: cluster_splice_relays_an_early_refusal,
+	spec: ClusterEarlyRefusalSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_refusal_hive(trace, certs)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, cluster.addr()).await?;
+
+			let (mut sink, response) = client.open_stream_to(servlet_urn("early-refusal"))?;
+			sink.push(b"first").await?;
+
+			let answered = within_hang_guard(response, "the refusal arrives before the request closes").await;
+			let refused = refusal_status(answered);
+			assert_eq!(refused, Some(TransitStatus::OutOfRange), "the client hears the servlet's own refusal");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterEarlyDuplexRefusalSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(DUPLEX_SERVLET_HANDLED, exactly!(1)),
+			(events::CLUSTER_WORK_FAILED, exactly!(1), equals!(TransitStatus::OutOfRange))
+		]
+	}
+}
+
+// A servlet that refuses a duplex before the body ends ends the reply through
+// the splice under its own status, while the client still holds its request
+// open.
+tb_scenario! {
+	name: cluster_splice_relays_an_early_duplex_refusal,
+	spec: ClusterEarlyDuplexRefusalSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_refusal_hive(trace, certs)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, cluster.addr()).await?;
+
+			let (mut sink, mut body) = client.open_duplex_to(servlet_urn("early-refusal"))?;
+			sink.push(b"first").await?;
+
+			let ended = within_hang_guard(body.chunk(), "the refusal ends the reply before the request closes").await;
+			let refused = refusal_status(ended);
+			assert_eq!(refused, Some(TransitStatus::OutOfRange), "the duplex client hears the servlet's own refusal");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterEarlyDuplexEndSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(DUPLEX_SERVLET_HANDLED, exactly!(1)),
+			(events::CLUSTER_WORK_FAILED, absent!())
+		]
+	}
+}
+
+// A servlet that ends a duplex cleanly before the body ends ends the reply
+// through the splice, while the client still holds its request open.
+tb_scenario! {
+	name: cluster_splice_ends_a_duplex_at_the_clean_end_of_the_route,
+	spec: ClusterEarlyDuplexEndSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_early_end_hive(trace, certs)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, cluster.addr()).await?;
+
+			let (mut sink, mut body) = client.open_duplex_to(servlet_urn("early-end"))?;
+			sink.push(b"first").await?;
+
+			let ended = within_hang_guard(body.chunk(), "the clean end reaches the client before the request closes").await;
+			assert!(matches!(ended, Ok(None)), "the reply ends cleanly with the route");
+
+			cluster.stop();
 			Ok(())
 		}
 	}

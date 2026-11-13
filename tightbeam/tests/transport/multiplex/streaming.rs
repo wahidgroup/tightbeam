@@ -16,9 +16,9 @@ use tightbeam::tb_cases;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use tightbeam::transport::multiplex::{
-	BufferedGrantor, CreditGrantor, MuxResponder, MuxRole, RequestSink, StreamBody, StreamId,
+	BufferedGrantor, CreditGrantor, MuxHandle, MuxResponder, MuxRole, ReplySink, RequestSink, StreamBody, StreamId,
 };
 use tightbeam::transport::{ResponsePackage, TransportError, TransportFailure};
 use tightbeam::Frame;
@@ -505,5 +505,50 @@ async fn a_duplex_reply_collects_into_its_frame() -> TestResult {
 
 	let echoed = reply.into_frame().await?;
 	assert_eq!(echoed, frame);
+	Ok(())
+}
+
+/// The peer stream cap of each end in the early-end scenario.
+const EARLY_END_CAP: u32 = 2;
+
+/// Ends each duplex stream at its first chunk, while the caller still holds
+/// its request open.
+async fn end_at_the_first_chunk(mut body: StreamBody, _reply: ReplySink) -> TransitStatus {
+	let _first = body.chunk().await;
+	TransitStatus::Ok
+}
+
+/// Opens a duplex on `handle`, pushes one chunk, and waits for the clean end
+/// of the reply, which comes while the returned sink holds the request open.
+async fn opened_and_ended(handle: &MuxHandle) -> Result<RequestSink, TransportError> {
+	let (mut sink, mut body) = handle.open_duplex()?;
+	sink.push(b"first").await?;
+
+	let ended = within_hang_guard(body.chunk(), "the handler ends the reply").await?;
+	match ended {
+		None => Ok(sink),
+		Some(_) => Err(TransportError::InvalidState),
+	}
+}
+
+/// A duplex whose handler ends while the caller still holds the request open
+/// leaves the flood bound of the server, so more such streams than the cap
+/// open in turn on one connection.
+#[tokio::test]
+async fn duplex_streams_that_end_early_leave_the_flood_bound() -> TestResult {
+	let (client, server) = establish_cleartext_transports().await?;
+	let settings = MuxSettings::symmetric(EARLY_END_CAP);
+	let (_server_end, responder) =
+		spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, TraceCollector::default())?;
+	let serve = tokio::spawn(responder.serve_duplex(end_at_the_first_chunk));
+	let (client_end, _client_responder) =
+		spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, TraceCollector::default())?;
+
+	let _first = opened_and_ended(&client_end.handle).await?;
+	let _second = opened_and_ended(&client_end.handle).await?;
+	let _third = opened_and_ended(&client_end.handle).await?;
+
+	assert_eq!(client_end.handle.goaway_reason(), None);
+	serve.abort();
 	Ok(())
 }

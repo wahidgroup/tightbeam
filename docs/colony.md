@@ -513,6 +513,8 @@ The dial list, the advertised address, the dial allowlist, the discovery table, 
 | `reinforcement_boost`   | 500                     | The gain of a successful request                                                      |
 | `weakening_penalty`     | 0                       | The loss of a failed request. At 0, a failure counts toward `abandonment_limit` alone |
 
+A spliced stream or duplex scores its route by how the route ends: an answer reinforces the trail, a failure of the route weakens it, and a caller that cancels or leaves scores nothing.
+
 ### Gossip
 
 | `GossipConfig` field | Default                                                              | Role                                                                                                                            |
