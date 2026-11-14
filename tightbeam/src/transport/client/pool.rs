@@ -475,7 +475,7 @@ pooled_mux! {
 		/// Shelves `drivers` under `cap`.
 		///
 		/// The finished drivers leave first. While the shelf is full, its
-		/// oldest drivers leave, and their drop aborts both of their tasks,
+		/// oldest drivers leave, and their drop aborts each of their tasks,
 		/// which closes a connection that its peer never closed (CWE-400).
 		fn shelve(&mut self, drivers: MuxDrivers, cap: NonZeroUsize) {
 			self.drivers.retain(|held| !held.is_finished());
@@ -967,7 +967,10 @@ pooled_mux! {
 			let rekey = transport.take_rekey()?;
 			let (reader, writer) = transport.into_envelope_halves()?;
 			let mux = MuxTransport::assemble(reader, writer, CONNECTOR_ROLE, settings, rekey);
-			let SpawnedMux { handle, responder, drivers } = mux.spawn();
+			// The pool runs the keepalive of the connector while a stream is
+			// open, so a stream that stays quiet past the read deadline keeps
+			// its link, and an idle connection ends at its read deadline.
+			let SpawnedMux { handle, responder, drivers } = mux.spawn_kept_alive();
 
 			// A pool endpoint serves only the streams it opens, so the drop of
 			// the responder refuses every peer-initiated stream.

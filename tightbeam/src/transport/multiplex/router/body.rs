@@ -20,7 +20,7 @@ use crate::Frame;
 
 #[cfg(doc)]
 use crate::constants::MAX_MUX_REASSEMBLY_BYTES;
-#[cfg(doc)]
+#[cfg(any(doc, feature = "colony"))]
 use crate::transport::TransportFailure;
 
 #[cfg(feature = "colony")]
@@ -35,6 +35,31 @@ pub enum BodyEvent {
 	/// The stream resolved without a clean end, through a non-Ok trailer, a
 	/// cancel, or a drain.
 	Failed(TransportError),
+}
+
+/// The failure that ended a relay of a [`StreamBody`] into a sink, by the side
+/// that failed.
+#[cfg(feature = "colony")]
+pub(crate) enum RelayFailure {
+	/// The body failed, so the stream that feeds it ended.
+	Source(TransportError),
+	/// The sink refused a chunk or its close.
+	Sink(TransportError),
+}
+
+#[cfg(feature = "colony")]
+impl RelayFailure {
+	/// The end of a relay whose sink refused a chunk or its close with `error`.
+	///
+	/// A sink whose stream resolved under it fails with `Cancelled`, and the
+	/// reply of that stream carries the outcome, as [`RequestSink::push`]
+	/// states. The relay then ends with no failure of its own.
+	fn unless_resolved(error: TransportError) -> Result<(), Self> {
+		match error {
+			TransportError::OperationFailed(TransportFailure::Cancelled) => Ok(()),
+			error => Err(Self::Sink(error)),
+		}
+	}
 }
 
 /// A consumption report from a [`StreamBody`] back to the reader.
@@ -125,19 +150,25 @@ impl StreamBody {
 	/// Feeds every chunk of this body into `sink`, then closes the sink so
 	/// its stream ends.
 	///
-	/// Each consumed chunk replenishes the peer's credit, so a slow
-	/// downstream parks the upstream (end-to-end backpressure).
+	/// - Each consumed chunk replenishes the peer's credit, so a slow
+	///   downstream parks the upstream (end-to-end backpressure).
+	/// - A sink whose stream resolved under it ends the relay with no failure,
+	///   because the reply of that stream carries the outcome.
 	///
 	/// # Errors
 	///
-	/// - The first read or push failure, which leaves the sink unclosed.
+	/// - [`RelayFailure::Source`] -- the read of this body failed.
+	/// - [`RelayFailure::Sink`] -- a push or the close failed on a stream that
+	///   did not resolve, which leaves the sink unclosed.
 	#[cfg(feature = "colony")]
-	pub(crate) async fn drain_into(mut self, mut sink: RequestSink) -> TransportResult<()> {
-		while let Some(chunk) = self.chunk().await? {
-			sink.push(&chunk).await?;
+	pub(crate) async fn drain_into(mut self, mut sink: RequestSink) -> Result<(), RelayFailure> {
+		while let Some(chunk) = self.chunk().await.map_err(RelayFailure::Source)? {
+			if let Err(error) = sink.push(&chunk).await {
+				return RelayFailure::unless_resolved(error);
+			}
 		}
 
-		sink.close().await
+		sink.close().await.or_else(RelayFailure::unless_resolved)
 	}
 
 	/// Arms the drop guard, so a drop of this body before its terminal event
@@ -659,5 +690,94 @@ mod tests {
 		let ended = body.poll_chunk_now();
 		assert!(matches!(ended, Poll::Ready(Ok(None))));
 		assert_eq!(forwarder.limits(), (4, 4));
+	}
+
+	/// The relay of a body into a sink, as a gateway splice runs it.
+	#[cfg(feature = "colony")]
+	mod relay {
+		use std::sync::Arc;
+
+		use futures::channel::mpsc;
+
+		use super::super::super::fixtures::FIXTURE_PEER_CAP;
+		use super::super::super::handle::MuxHandle;
+		use super::super::super::link::MuxLink;
+		use super::super::super::outbound::Outbound;
+		use super::super::super::shared::MuxShared;
+		use super::*;
+		use crate::transport::multiplex::{MuxRole, MuxSettings};
+
+		/// A client handle over a fresh link, beside its connection state and
+		/// the receiver of its outbound queue.
+		fn client() -> (MuxHandle, Arc<MuxShared>, mpsc::Receiver<Outbound>) {
+			let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
+			let (link, wire, _notes) = MuxLink::over(Arc::clone(&shared), 8);
+			(MuxHandle::new(link), shared, wire)
+		}
+
+		/// A relay whose sink meets a stream that resolved under it ends with
+		/// no failure, because the reply of the stream carries the outcome.
+		#[test]
+		fn a_relay_into_a_resolved_stream_leaves_the_outcome_to_the_reply() -> TestResult {
+			let (handle, shared, _wire) = client();
+			let (mut sink, _response) = handle.open_stream()?;
+			assert!(matches!(poll_now(sink.push(b"open")), Poll::Ready(Ok(()))));
+			drop(shared.remove_pending(1));
+
+			let (body, mut forwarder, _notes) = StreamBody::fixture(2, 4);
+			assert!(forwarder.accept_and_forward(b"chunk"));
+
+			let relayed = poll_now(body.drain_into(sink));
+			assert!(matches!(relayed, Poll::Ready(Ok(()))));
+			Ok(())
+		}
+
+		/// A relay whose body ends after its stream resolved meets the gone
+		/// stream at the close, and ends with no failure, because the reply of
+		/// the stream carries the outcome.
+		#[test]
+		fn a_relay_that_closes_a_resolved_stream_leaves_the_outcome_to_the_reply() -> TestResult {
+			let (handle, shared, _wire) = client();
+			let (mut sink, _response) = handle.open_stream()?;
+			assert!(matches!(poll_now(sink.push(b"open")), Poll::Ready(Ok(()))));
+			drop(shared.remove_pending(1));
+
+			let (body, mut forwarder, _notes) = StreamBody::fixture(2, 4);
+			assert!(forwarder.forward(BodyEvent::End));
+
+			let relayed = poll_now(body.drain_into(sink));
+			assert!(matches!(relayed, Poll::Ready(Ok(()))));
+			Ok(())
+		}
+
+		/// A relay whose sink cannot open its stream on a failed connection
+		/// fails at the sink.
+		#[test]
+		fn a_relay_on_a_failed_connection_fails_at_the_sink() -> TestResult {
+			let (handle, shared, _wire) = client();
+			let (sink, _response) = handle.open_stream()?;
+			shared.fail_all_pending();
+
+			let (body, mut forwarder, _notes) = StreamBody::fixture(2, 4);
+			assert!(forwarder.accept_and_forward(b"chunk"));
+
+			let relayed = poll_now(body.drain_into(sink));
+			let at_sink = matches!(relayed, Poll::Ready(Err(RelayFailure::Sink(TransportError::ConnectionClosed))));
+			assert!(at_sink);
+			Ok(())
+		}
+
+		/// A relay whose body fails fails at its source.
+		#[test]
+		fn a_relay_of_a_failed_body_fails_at_the_source() -> TestResult {
+			let (handle, _shared, _wire) = client();
+			let (sink, _response) = handle.open_stream()?;
+			let (body, mut forwarder, _notes) = StreamBody::fixture(2, 4);
+			assert!(forwarder.forward(BodyEvent::Failed(TransportError::ConnectionClosed)));
+
+			let relayed = poll_now(body.drain_into(sink));
+			assert!(matches!(relayed, Poll::Ready(Err(RelayFailure::Source(_)))));
+			Ok(())
+		}
 	}
 }

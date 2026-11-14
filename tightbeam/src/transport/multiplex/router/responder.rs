@@ -14,9 +14,10 @@ use futures::{FutureExt, Stream};
 
 use super::body::StreamBody;
 use super::flow::cap_as_usize;
-use super::link::MuxLink;
+use super::link::{MuxLink, Pulse};
 use super::reader::InboundEvent;
 use super::sink::ReplySink;
+use crate::clock::MonotonicInstant;
 use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
 use crate::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::policy::TransitStatus;
@@ -261,12 +262,16 @@ impl MuxLink {
 ///   stream's last record on the wire.
 /// - Cancels of in-flight handlers draw on a per-connection budget against
 ///   CVE-2023-44487 "Rapid Reset". A peer that opens streams only to cancel
-///   them exhausts the budget and draws a best-effort GoAway.
+///   them exhausts the budget and draws a best-effort GoAway. A cancel past
+///   the rapid-cancel window of its handler, a third of the read deadline
+///   capped at [`MUX_RAPID_CANCEL_WINDOW`], spends nothing, as the cancel that
+///   a reply deadline of the initiator sends does.
 ///
 /// # Sources
 ///
 /// - CVE-2023-44487, HTTP/2 Rapid Reset: <https://nvd.nist.gov/vuln/detail/CVE-2023-44487>
 ///
+/// [`MUX_RAPID_CANCEL_WINDOW`]: crate::constants::MUX_RAPID_CANCEL_WINDOW
 /// [`MUX_STREAM_CANCELLED`]: crate::instrumentation::events::MUX_STREAM_CANCELLED
 /// [`MUX_STREAM_REFUSED`]: crate::instrumentation::events::MUX_STREAM_REFUSED
 pub struct MuxResponder {
@@ -274,6 +279,27 @@ pub struct MuxResponder {
 	link: MuxLink,
 	peer_cap: u32,
 	cancel_budget: u32,
+}
+
+/// A handler in flight, beside the instant it started on the clock of the
+/// link.
+struct InFlight {
+	abort: AbortHandle,
+	started: MonotonicInstant,
+}
+
+impl InFlight {
+	/// Aborts the handler, and answers whether its cancel spends the cancel
+	/// budget.
+	///
+	/// A cancel within the rapid-cancel window of the start of the handler
+	/// counts as a rapid reset (CVE-2023-44487), as [`Pulse::is_rapid_since`]
+	/// decides. A later cancel is the one that an
+	/// initiator sends when its reply deadline passes.
+	fn abort(self, pulse: &Pulse) -> bool {
+		self.abort.abort();
+		pulse.is_rapid_since(self.started)
+	}
 }
 
 impl MuxResponder {
@@ -302,6 +328,9 @@ impl MuxResponder {
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
+	/// - [`TransportError::OperationFailed`] with
+	///   [`TransportFailure::FailedPrecondition`] -- the polling thread has no
+	///   timer for the clock of the link, and a reply waits on credit.
 	/// - [`TransportError::OperationFailed`] with
 	///   [`TransportFailure::PolicyRejection`] -- the peer exhausted the cancel
 	///   budget, and the responder tried to queue a GoAway with
@@ -426,7 +455,7 @@ impl MuxResponder {
 		D: Fn(u32, StreamWork) -> Fut,
 		Fut: Future<Output = TransportResult<()>> + MaybeSend,
 	{
-		let mut in_flight: HashMap<u32, AbortHandle> = HashMap::new();
+		let mut in_flight: HashMap<u32, InFlight> = HashMap::new();
 		let mut tasks = FuturesUnordered::new();
 		let mut inbound_open = true;
 		let mut last_stream_id = 0;
@@ -440,18 +469,20 @@ impl MuxResponder {
 				ResponderEvent::Closed => inbound_open = false,
 				ResponderEvent::Aborted => {}
 				ResponderEvent::Cancelled(stream_id) => {
-					if let Some(handle) = in_flight.remove(&stream_id) {
-						handle.abort();
+					if let Some(handler) = in_flight.remove(&stream_id) {
+						let spends = handler.abort(self.link.pulse());
 						// The abort ends the handler span short of its exit,
 						// so the trail records the cancel in its place.
 						#[cfg(feature = "instrument")]
 						self.link.shared().emit_event(events::MUX_STREAM_CANCELLED)?;
 
-						let Some(remaining) = self.cancel_budget.checked_sub(1) else {
-							return Err(self.refuse_cancel_abuse(last_stream_id));
-						};
+						if spends {
+							let Some(remaining) = self.cancel_budget.checked_sub(1) else {
+								return Err(self.refuse_cancel_abuse(last_stream_id));
+							};
 
-						self.cancel_budget = remaining;
+							self.cancel_budget = remaining;
+						}
 					}
 				}
 				ResponderEvent::Stream(stream_id, work) => {
@@ -468,8 +499,8 @@ impl MuxResponder {
 
 					// Each handler runs as its own task, so a slow one leaves
 					// the loop free.
-					let (handle, registration) = AbortHandle::new_pair();
-					in_flight.insert(stream_id, handle);
+					let (abort, registration) = AbortHandle::new_pair();
+					in_flight.insert(stream_id, InFlight { abort, started: self.link.pulse().now() });
 
 					let work = dispatch(stream_id, work);
 					let task = async move { (stream_id, work.await) };
@@ -506,11 +537,13 @@ impl MuxResponder {
 #[cfg(test)]
 mod tests {
 	use core::future::pending;
+	use core::time::Duration;
 
-	use super::super::fixtures::poll_times;
+	use super::super::fixtures::{noop_cx, poll_times};
 	use super::super::outbound::Outbound;
 	use super::super::shared::MuxShared;
 	use super::*;
+	use crate::clock::{Clock, ManualClock};
 	use crate::testing::TestFrame;
 	use crate::transport::envelopes::MuxEnvelope;
 	use crate::transport::handshake::negotiation::MuxSettings;
@@ -534,7 +567,7 @@ mod tests {
 		assert!(filler.try_send(Outbound::Close).is_ok());
 
 		let shared = MuxShared::fixture(MuxRole::Server, &settings);
-		let (link, _drained) = MuxLink::new(shared, outbound);
+		let (link, _drained) = MuxLink::new(shared, outbound, Pulse::fixture());
 		let (inbound, inbound_receiver) = mpsc::channel(16);
 		let responder = MuxResponder::new(inbound_receiver, link, peer_cap);
 
@@ -631,8 +664,6 @@ mod tests {
 	mod internal_detail {
 		use futures::future::ready;
 
-		#[cfg(pooled_mux)]
-		use super::super::super::handle::Pulse;
 		use super::*;
 		use crate::testing::fixtures::TestTrace;
 		use crate::trace::TraceCollector;
@@ -723,7 +754,7 @@ mod tests {
 		#[cfg(pooled_mux)]
 		pub(super) fn gated(service: impl MuxService, link: MuxLink) -> GatedService<impl MuxService> {
 			let gate = Box::new(AcceptAllGate);
-			let handle = MuxHandle::new(link, Pulse::fixture());
+			let handle = MuxHandle::new(link);
 			GatedService::new(service, gate, SessionContext::default(), handle)
 		}
 
@@ -1021,5 +1052,76 @@ mod tests {
 		assert!(matches!(fixture.wire.try_recv(), Ok(Outbound::Close)));
 		assert!(fixture.wire.try_recv().is_ok_and(|command| is_cap_refusal(&command)));
 		assert!(fixture.wire.try_recv().is_err());
+	}
+
+	/// A responder on `clock` under the read deadline `deadline` with no
+	/// cancel budget left, which serves unary requests with a handler that
+	/// never answers, beside the sender of its inbound queue and the receiver
+	/// of its outbound queue.
+	fn spent_responder(
+		clock: &Arc<ManualClock>,
+		deadline: Duration,
+	) -> (
+		impl Future<Output = TransportResult<()>>,
+		mpsc::Sender<InboundEvent>,
+		mpsc::Receiver<Outbound>,
+	) {
+		let settings = MuxSettings::symmetric(4);
+		let (outbound, wire) = mpsc::channel(8);
+		let shared = MuxShared::fixture(MuxRole::Server, &settings);
+		let pulse = Pulse::paced(Arc::clone(clock) as Arc<dyn Clock>, deadline);
+		let (link, _drained) = MuxLink::new(shared, outbound, pulse);
+		let (inbound, inbound_receiver) = mpsc::channel(4);
+
+		let mut responder = MuxResponder::new(inbound_receiver, link, 4);
+		responder.set_cancel_budget(0);
+		(responder.serve(|_frame| pending::<ResponsePackage>()), inbound, wire)
+	}
+
+	/// A cancel that comes within the rapid-cancel window of the start of its
+	/// handler is a rapid reset, so a responder with no budget left ends the
+	/// connection.
+	#[test]
+	fn a_rapid_cancel_spends_the_cancel_budget() {
+		let clock = Arc::new(ManualClock::default());
+		let (served, mut inbound, _wire) = spent_responder(&clock, Duration::from_secs(9));
+		let mut served = Box::pin(served);
+		let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
+		assert!(inbound.try_send(request).is_ok());
+		poll_times(&mut served, 2);
+		assert!(inbound.try_send(InboundEvent::Cancel(1)).is_ok());
+
+		let ended = served.as_mut().poll(&mut noop_cx());
+		let refused = matches!(
+			ended,
+			Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::PolicyRejection)))
+		);
+		assert!(refused);
+	}
+
+	// A cancel past the rapid-cancel window of its handler spends no cancel
+	// budget, as the cancel of an initiator whose reply deadline passed does,
+	// so a responder with no budget left serves on. The window is a third of
+	// a short read deadline, and `MUX_RAPID_CANCEL_WINDOW` under a long one.
+	// Each case is (read deadline, wait before the cancel).
+	crate::tb_cases! {
+		fn a_cancel_past_the_rapid_window_spends_no_cancel_budget((deadline, wait): (Duration, Duration)) {
+			let clock = Arc::new(ManualClock::default());
+			let (served, mut inbound, _wire) = spent_responder(&clock, deadline);
+			let mut served = Box::pin(served);
+			let request = InboundEvent::Request(1, Arc::new(TestFrame::v0(None, None)));
+			assert!(inbound.try_send(request).is_ok());
+			poll_times(&mut served, 2);
+
+			clock.advance(wait);
+			assert!(inbound.try_send(InboundEvent::Cancel(1)).is_ok());
+
+			let served_on = served.as_mut().poll(&mut noop_cx());
+			assert!(served_on.is_pending());
+		}
+		cases {
+			past_a_third_of_a_short_deadline => (Duration::from_millis(900), Duration::from_millis(500)),
+			past_the_cap_under_a_long_deadline => (Duration::from_secs(30), Duration::from_secs(2)),
+		}
 	}
 }

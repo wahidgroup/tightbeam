@@ -291,6 +291,9 @@ struct MuxState {
 	drain_wakers: Vec<Waker>,
 	/// The wakers parked until a stream slot frees while the cap is full.
 	slot_wakers: Vec<Waker>,
+	/// The wakers parked until a locally-initiated stream reserves its slot,
+	/// or the connection fails.
+	open_wakers: Vec<Waker>,
 	/// The in-band renewal state. Only a client with rekey materials ever
 	/// leaves `Idle`.
 	rekey: RekeyPhase,
@@ -316,6 +319,11 @@ impl MuxState {
 	/// Wakes every task parked until a stream slot frees.
 	fn wake_slot_waiters(&mut self) {
 		wake_all(&mut self.slot_wakers);
+	}
+
+	/// Wakes every task parked until a locally-initiated stream opens.
+	fn wake_open_waiters(&mut self) {
+		wake_all(&mut self.open_wakers);
 	}
 
 	/// Wakes every task parked on a renewal transition.
@@ -439,6 +447,7 @@ impl MuxShared {
 				goaway_reason: None,
 				drain_wakers: Vec::new(),
 				slot_wakers: Vec::new(),
+				open_wakers: Vec::new(),
 				rekey: RekeyPhase::Idle,
 				rekey_hard_floor: false,
 				opens_renewals: false,
@@ -506,6 +515,34 @@ impl MuxShared {
 		self.duplex_lock().remove(&stream_id)
 	}
 
+	/// Ends the duplex stream `stream_id`, whose reply `forwarder` the caller
+	/// took: the reply body takes `terminal`, and then the pending entry of the
+	/// stream releases, which wakes a push parked on credit. Returns the
+	/// outcome sender of that entry.
+	///
+	/// The body holds its end before the release, so a producer that wakes to
+	/// the release finds the end in the reply. A reply body already dropped has
+	/// no reader for the end, and the stream ends either way.
+	pub fn end_duplex(
+		&self,
+		stream_id: u32,
+		mut forwarder: ForwardedStream,
+		terminal: BodyEvent,
+	) -> Option<oneshot::Sender<StreamOutcome>> {
+		let _ = forwarder.forward(terminal);
+		self.remove_pending(stream_id)
+	}
+
+	/// Ends the locally-initiated stream `stream_id`, and gives a duplex reply
+	/// body `terminal` first, as [`Self::end_duplex`] does. Returns the outcome
+	/// sender of the pending entry of the stream.
+	pub fn end_local(&self, stream_id: u32, terminal: BodyEvent) -> Option<oneshot::Sender<StreamOutcome>> {
+		match self.take_duplex(stream_id) {
+			Some(forwarder) => self.end_duplex(stream_id, forwarder, terminal),
+			None => self.remove_pending(stream_id),
+		}
+	}
+
 	/// Forwards one reply chunk into a duplex body. It returns `None` when the
 	/// registry holds no forwarder for the stream, and `Some(false)` on a
 	/// credit overrun or a body channel that refuses the chunk.
@@ -523,7 +560,6 @@ impl MuxShared {
 	pub fn duplex_limits(&self, stream_id: u32) -> Option<(u64, u64)> {
 		let map = self.duplex_lock();
 		let stream = map.get(&stream_id)?;
-
 		Some(stream.limits())
 	}
 
@@ -536,7 +572,7 @@ impl MuxShared {
 
 	/// Fails the duplex replies that the peer's GoAway disowned: the streams
 	/// above its high-water mark, which the peer leaves unanswered.
-	pub fn fail_duplex_above(&self, last_stream_id: u32) {
+	fn fail_duplex_above(&self, last_stream_id: u32) {
 		let mut map = self.duplex_lock();
 		map.retain(|stream_id, stream| {
 			if *stream_id <= last_stream_id {
@@ -1239,6 +1275,7 @@ impl MuxShared {
 		}
 
 		let key = state.pending.reserve(outcome, reply)?;
+		state.wake_open_waiters();
 		drop(state);
 
 		Ok(StreamReservation { shared: Arc::clone(self), key: Some(key), slot })
@@ -1356,16 +1393,6 @@ impl MuxShared {
 		entry
 	}
 
-	/// Resolves a pending stream. It discards an unknown ID silently, because
-	/// a cancel can race a response on the connection.
-	pub fn resolve(&self, stream_id: u32, outcome: StreamOutcome) {
-		if let Some(sender) = self.remove_pending(stream_id) {
-			// A dropped receiver is an initiator that cancelled, the same race
-			// an unknown ID is.
-			let _ = sender.send(outcome);
-		}
-	}
-
 	/// Registers a locally-initiated ping and returns its correlation value.
 	///
 	/// It refuses the ping while the connection drains, because a peer that
@@ -1443,12 +1470,16 @@ impl MuxShared {
 		Self::abandon_renewal(&mut state);
 		state.wake_drain_waiters();
 		state.wake_slot_waiters();
+		state.wake_open_waiters();
 	}
 
 	/// Resolves pending streams above `last_stream_id` as draining, because the
 	/// peer's GoAway disowned them. A stream that holds only a reservation
 	/// resolves the same way, because a GoAway ends admission. It records the
 	/// peer's reason for [`MuxShared::goaway_reason`].
+	///
+	/// A duplex reply above the mark takes `Draining` in its body before the
+	/// pending entries release, as [`Self::end_duplex`] orders one end.
 	///
 	/// # Errors
 	///
@@ -1460,6 +1491,10 @@ impl MuxShared {
 			let mut state = self.lock();
 			state.goaway_received = Some(last_stream_id);
 			state.goaway_reason = Some(reason);
+
+			// An Open registers its reply forwarder under this lock, so the
+			// sweep here catches every duplex reply above the watermark.
+			self.fail_duplex_above(last_stream_id);
 
 			if let Some(first_dropped) = last_stream_id.checked_add(1) {
 				for (stream_id, sender) in state.pending.take_streams_from(first_dropped) {
@@ -1554,9 +1589,36 @@ impl MuxShared {
 		state.pending.open_load() > 0
 	}
 
+	/// Resolves once a locally-initiated stream is pending or reserved, at
+	/// once while one is.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::ConnectionClosed`] -- the connection failed, so no stream opens on it.
+	pub fn poll_stream_opened(&self, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
+		let mut state = self.lock();
+		if state.pending.is_closed() {
+			return Poll::Ready(Err(TransportError::ConnectionClosed));
+		}
+		if state.pending.open_load() > 0 {
+			return Poll::Ready(Ok(()));
+		}
+
+		park_waker(&mut state.open_wakers, cx);
+
+		Poll::Pending
+	}
+
 	/// Whether `stream_id` awaits its response.
 	pub fn is_pending(&self, stream_id: u32) -> bool {
 		self.lock().pending.holds_stream(stream_id)
+	}
+
+	/// Keeps the entries of `streams` whose stream awaits its response, under
+	/// one hold of the lock.
+	pub fn retain_pending<V>(&self, streams: &mut HashMap<u32, V>) {
+		let state = self.lock();
+		streams.retain(|stream_id, _| state.pending.holds_stream(*stream_id));
 	}
 
 	/// The reason that the peer's GoAway carried, once received.
@@ -1653,7 +1715,7 @@ impl MuxShared {
 #[cfg(test)]
 mod tests {
 	use super::super::fixtures::{drained, noop_cx, FlagWake};
-	use super::super::link::MuxLink;
+	use super::super::link::{MuxLink, Pulse};
 	use super::*;
 
 	use crate::constants::DEFAULT_HOP_BUDGET;
@@ -2621,8 +2683,8 @@ mod tests {
 		let (outbound, mut wire) = mpsc::channel(0);
 		saturate(&outbound);
 
-		let (link, _) = MuxLink::new(shared, outbound);
-		link.enqueue_stream_cancel(1);
+		let (link, _) = MuxLink::new(shared, outbound, Pulse::fixture());
+		link.enqueue_stream_cancel(1, CancelReason::Cancelled);
 
 		let queued = drained(&mut wire);
 		let last = queued.last().and_then(Outbound::mux);
@@ -2647,6 +2709,51 @@ mod tests {
 		assert!(matches!(disowned.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		assert!(shared.take_duplex(1).is_some());
 		assert!(shared.take_duplex(3).is_none());
+	}
+
+	/// A duplex Open that registers its reply while a peer GoAway waits for
+	/// the state lock still fails with Draining, because the sweep runs under
+	/// that lock.
+	#[test]
+	fn a_goaway_fails_a_duplex_reply_that_registers_as_it_lands() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(4));
+		let (feedback, _notes) = mpsc::channel(0);
+		let budget = shared.reassembly_budget();
+		let (mut disowned, above) = StreamBody::pair(OpenSlot::assigned(3), 4, feedback, budget);
+		let (locked, held) = std::sync::mpsc::channel();
+
+		std::thread::scope(|scope| {
+			let opener = &shared;
+			scope.spawn(move || {
+				let state = opener.lock();
+				locked.send(()).expect("the test waits for the lock");
+				// The GoAway reaches the lock while the Open registers.
+				std::thread::sleep(core::time::Duration::from_millis(50));
+				opener.insert_duplex(3, above);
+				drop(state);
+			});
+
+			held.recv().expect("the opener holds the lock");
+			receive_goaway(&shared, 1, GoAwayReason::Shutdown);
+		});
+
+		assert!(matches!(disowned.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
+	}
+
+	/// A wait for the next stream wakes and ends when the connection fails, so
+	/// a keepalive that waits for a stream ends with its link.
+	#[test]
+	fn a_wait_for_a_stream_ends_when_the_connection_fails() {
+		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(2));
+		let (flag, waker) = FlagWake::pair();
+		let mut cx = Context::from_waker(&waker);
+		assert!(shared.poll_stream_opened(&mut cx).is_pending());
+
+		shared.fail_all_pending();
+
+		assert!(flag.woken());
+		let ended = shared.poll_stream_opened(&mut noop_cx());
+		assert!(matches!(ended, Poll::Ready(Err(TransportError::ConnectionClosed))));
 	}
 }
 

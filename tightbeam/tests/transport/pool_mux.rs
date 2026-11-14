@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use tightbeam::at_least;
 use tightbeam::clock::{Clock, ManualClock};
@@ -52,12 +52,13 @@ use tightbeam::transport::policy::CollectorGateConfig;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, GenericClient, PoolConfig, PooledClient,
-	ResponsePackage, TransportEncryptionConfig, TransportError, TransportFailure,
+	ResponsePackage, TransportEncryptionConfig, TransportError, TransportFailure, TransportLimits,
 };
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
 
-use crate::common::poll::joined;
+use crate::common::clock::ParkingClock;
+use crate::common::poll::{joined, poll_until};
 use crate::common::result::TestResult;
 use crate::common::security::{
 	combined_trust, pinning_trust_store, random_signing_key, test_certificate, PayingApprover, ServerMaterials,
@@ -522,6 +523,114 @@ async fn a_mux_lease_refuses_the_exclusive_accessor() -> TestResult {
 	let mut lease = pool.connect(addr).await?;
 	let conn = lease.conn();
 	assert!(matches!(conn, Err(TransportError::InvalidState)));
+	Ok(())
+}
+
+/// The read deadline of the pool in the keepalive scenarios.
+const QUIET_DEADLINE: Duration = Duration::from_secs(9);
+
+/// The keepalive interval under [`QUIET_DEADLINE`], a third of it.
+const QUIET_PACE: Duration = Duration::from_secs(3);
+
+/// The paces that carry the clock past [`QUIET_DEADLINE`].
+const PACES_PAST_DEADLINE: u32 = 4;
+
+/// A pool that pins the server of `materials`, offers multiplexing, reads
+/// under [`QUIET_DEADLINE`] on `clock`, and records on `trace`.
+fn quiet_pool(
+	materials: &ServerMaterials,
+	clock: &Arc<ParkingClock>,
+	trace: &TraceCollector,
+) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
+	let limits = TransportLimits { operation_timeout: QUIET_DEADLINE, ..TransportLimits::default() }.checked()?;
+	let config = PoolConfig {
+		max_connections: NonZeroUsize::MIN,
+		mux_offer: Some(Arc::new(mux_offer(8))),
+		..PoolConfig::default()
+	};
+
+	let builder = ConnectionPool::<TokioListener>::builder()
+		.with_config(config)
+		.with_clock(Arc::clone(clock) as Arc<dyn Clock>)
+		.with_limits(limits)
+		.with_trust_store(combined_trust(&[&materials.certificate]))
+		.with_trace(trace.share());
+	Ok(Arc::new(builder.build()))
+}
+
+/// Waits for one probe of the keepalive on `clock` to settle: the probe waits
+/// a pace for its ack, and the keepalive then sleeps a pace once the ack
+/// arrives.
+async fn probe_settles(clock: &ParkingClock) {
+	clock.parked(QUIET_PACE).await;
+	clock.parked(QUIET_PACE).await;
+}
+
+/// Moves `clock` forward `paces` paces, each once a probe settles, so each ack
+/// arrives before the clock moves.
+async fn pace_probes(clock: &ParkingClock, paces: u32) {
+	for _ in 0..paces {
+		probe_settles(clock).await;
+		clock.advance(QUIET_PACE);
+	}
+}
+
+/// A pooled mux connection runs its keepalive while a stream is open, so a
+/// duplex that stays quiet for longer than the read deadline of the link stays
+/// live.
+#[tokio::test]
+async fn a_pooled_mux_keeps_a_quiet_duplex_past_its_deadline() -> TestResult {
+	let materials = ServerMaterials::fixed();
+	let trace = TraceCollector::default();
+	let (_server, addr) = start_service_server(&materials, trace.share(), DuplexEchoService).await?;
+	let clock = Arc::new(ParkingClock::default());
+	let pool = quiet_pool(&materials, &clock, &trace)?;
+
+	let lease = pool.connect(addr).await?;
+	let (mut sink, mut body) = lease.open_duplex()?;
+	sink.push(b"before").await?;
+
+	let before = body.chunk().await?;
+	assert_eq!(before.as_deref(), Some(b"before".as_slice()));
+
+	pace_probes(&clock, PACES_PAST_DEADLINE).await;
+
+	sink.push(b"after").await?;
+
+	let after = body.chunk().await?;
+	let echoed = Some(b"after".as_slice());
+	assert_eq!(after.as_deref(), echoed, "the quiet duplex outlives the read deadline");
+	Ok(())
+}
+
+/// A pooled mux connection probes only while a stream is open, so once its
+/// last stream ends, it sends no probe and ends at its read deadline.
+#[tokio::test]
+async fn a_pooled_mux_ends_at_its_deadline_once_its_streams_end() -> TestResult {
+	let materials = ServerMaterials::fixed();
+	let (_server, addr) = start_service_server(&materials, TraceCollector::default(), DuplexEchoService).await?;
+	let clock = Arc::new(ParkingClock::default());
+	let trace = TraceCollector::default();
+	let pool = quiet_pool(&materials, &clock, &trace)?;
+
+	let lease = pool.connect(addr).await?;
+	let (sink, mut body) = lease.open_duplex()?;
+	probe_settles(&clock).await;
+
+	sink.close().await?;
+
+	let ended = body.chunk().await?;
+	assert!(ended.is_none(), "the echo ends with the request");
+
+	clock.advance(QUIET_PACE);
+
+	let probed = timeout(Duration::from_millis(200), clock.parked(QUIET_PACE)).await;
+	assert!(probed.is_err(), "the keepalive sends no probe while no stream is open");
+
+	clock.advance(QUIET_DEADLINE);
+
+	let closed = poll_until(50, Duration::from_millis(20), || trace.recorded(events::CONNECTION_CLOSED) == 1).await;
+	assert!(closed, "the idle connection ends at its read deadline");
 	Ok(())
 }
 

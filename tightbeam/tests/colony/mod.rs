@@ -5,12 +5,14 @@ mod hive;
 mod laser;
 mod laser_keepalive;
 mod laser_protocol;
+mod laser_raw_peer;
 mod peer_list;
 mod servlet;
 mod streaming;
+mod worker;
+
 #[cfg(feature = "instrument")]
 mod trace;
-mod worker;
 
 use std::sync::Arc;
 

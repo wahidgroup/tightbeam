@@ -3,7 +3,6 @@
 
 use core::future::Future;
 use core::pin::pin;
-use core::time::Duration;
 use std::sync::Arc;
 
 use futures::channel::oneshot;
@@ -14,26 +13,26 @@ use super::link::MuxLink;
 use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutcome, StreamReservation};
 use super::sink::RequestSink;
-use crate::clock::{Clock, Lapse, Timer, Timing};
-use crate::constants::{DEFAULT_HOP_BUDGET, KEEPALIVE_PROBES_PER_DEADLINE};
+use crate::clock::Lapse;
+use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::Encode;
 use crate::marker::MaybeSend;
-use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope};
+use crate::transport::envelopes::{
+	CancelReason, GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope,
+};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::GateAudit;
-use crate::transport::{EnvelopeSink, EnvelopeSource, TransportError, TransportResult};
+use crate::transport::{TransportError, TransportResult};
 use crate::urn::Urn;
 use crate::Frame;
 
-#[cfg(test)]
-use crate::clock::SystemClock;
-#[cfg(test)]
-use crate::constants::DEFAULT_OPERATION_TIMEOUT;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "transport-cms", feature = "transport-hpke"))]
 use crate::transport::handshake::receipt::StoredReceipt;
+#[cfg(pooled_mux)]
+use core::future::poll_fn;
 
 /// Cancels the stream if the owning emit future is dropped before its response
 /// arrives. The cancel frees the cap slot and notifies the peer, best-effort
@@ -43,21 +42,37 @@ use crate::transport::handshake::receipt::StoredReceipt;
 /// guard dropped before the Open went out stands down on its own, because
 /// nothing is on the wire and the reservation releases the cap slot.
 ///
+/// The cancel carries [`CancelReason::Cancelled`], or
+/// [`CancelReason::Timeout`] once a deadline that passed ends the wait of the
+/// stream ([`Self::fail`]).
+///
 /// [rfc9113-6.4]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.4
 pub struct CancelOnDrop {
 	link: MuxLink,
 	slot: Arc<OpenSlot>,
 	armed: bool,
+	/// The reason of the cancel that the drop sends.
+	reason: CancelReason,
 }
 
 impl CancelOnDrop {
 	/// Returns an armed guard over the stream that `slot` identifies.
 	fn new(link: &MuxLink, slot: Arc<OpenSlot>) -> Self {
-		Self { link: link.clone(), slot, armed: true }
+		Self { link: link.clone(), slot, armed: true, reason: CancelReason::Cancelled }
 	}
 
 	pub fn disarm(&mut self) {
 		self.armed = false;
+	}
+
+	/// Takes `failure`, which ends the wait of the stream, and returns it. A
+	/// deadline that passed sets the reason of the drop cancel to `Timeout`.
+	fn fail(&mut self, failure: TransportError) -> TransportError {
+		if matches!(failure, TransportError::OperationFailed(TransportFailure::DeadlineExceeded)) {
+			self.reason = CancelReason::Timeout;
+		}
+
+		failure
 	}
 }
 
@@ -68,7 +83,7 @@ impl Drop for CancelOnDrop {
 		}
 
 		if let Some(stream_id) = self.slot.get() {
-			self.link.enqueue_stream_cancel(stream_id);
+			self.link.enqueue_stream_cancel(stream_id, self.reason);
 		}
 	}
 }
@@ -116,45 +131,34 @@ impl Drop for ForgetPingOnDrop {
 #[derive(Clone)]
 pub struct MuxHandle {
 	link: MuxLink,
-	pulse: Pulse,
 }
 
-/// The pace of a connection's keepalive: the clock of its link, and a share of
-/// the link's read deadline.
-#[derive(Clone)]
-pub(crate) struct Pulse {
-	clock: Arc<dyn Clock>,
-	interval: Duration,
+/// When a keepalive probes its link.
+#[derive(Clone, Copy)]
+enum Probing {
+	/// Once per interval, for as long as the link lasts.
+	Always,
+	/// Once per interval while a locally-initiated stream is open, and at once
+	/// when the next one opens, so an idle connection ends at its read
+	/// deadline.
+	#[cfg(pooled_mux)]
+	WhileStreams,
 }
 
-impl Pulse {
-	/// The pace of the link that `source` reads and `sink` writes.
+impl Probing {
+	/// Waits until this policy wants the next probe on the connection of
+	/// `shared`.
 	///
-	/// A deadline of fewer nanoseconds than [`KEEPALIVE_PROBES_PER_DEADLINE`]
-	/// has no whole share, so its pace is the whole deadline, which
-	/// [`CheckedLimits`] keeps above zero.
+	/// # Errors
 	///
-	/// [`CheckedLimits`]: crate::transport::CheckedLimits
-	pub(crate) fn of(source: &impl EnvelopeSource, sink: &impl EnvelopeSink) -> Self {
-		let deadline = source.limits().operation_timeout;
-		let third = deadline.checked_div(KEEPALIVE_PROBES_PER_DEADLINE);
-		let interval = third.filter(|third| !third.is_zero()).unwrap_or(deadline);
-
-		Self { clock: sink.clock(), interval }
-	}
-
-	/// A timer on the clock of this pace where the clock races a wait on the
-	/// polling thread ([`Timing::Races`]), and `None` on a clock that cannot
-	/// race a probe.
-	fn racing_timer(&self) -> Option<Timer> {
-		let races = self.clock.timing() == Timing::Races;
-		races.then(|| Timer::new(Arc::clone(&self.clock)))
-	}
-
-	/// A pace on the system clock, for a fixture with no link under it.
-	#[cfg(test)]
-	pub(crate) fn fixture() -> Self {
-		Self { clock: Arc::new(SystemClock), interval: DEFAULT_OPERATION_TIMEOUT }
+	/// - [`TransportError::ConnectionClosed`] -- the connection failed while the policy waited for a stream.
+	#[cfg_attr(not(pooled_mux), expect(unused_variables))]
+	async fn ready(self, shared: &MuxShared) -> TransportResult<()> {
+		match self {
+			Self::Always => Ok(()),
+			#[cfg(pooled_mux)]
+			Self::WhileStreams => poll_fn(|cx| shared.poll_stream_opened(cx)).await,
+		}
 	}
 }
 
@@ -170,27 +174,35 @@ impl GateAudit for MuxHandle {
 
 impl MuxHandle {
 	/// Assemble a handle over the connection's shared state and queues.
-	pub(crate) fn new(link: MuxLink, pulse: Pulse) -> Self {
-		Self { link, pulse }
+	pub(crate) fn new(link: MuxLink) -> Self {
+		Self { link }
 	}
 
 	/// Send a request on a freshly allocated stream and await its response.
 	///
 	/// The call segments a frame beyond the peer's advertised chunk size into
 	/// `Open(first) Data(...)* Data(last)`, and the peer's stream credit gates
-	/// each chunk.
+	/// each chunk. The send of each chunk waits for credit within the read
+	/// deadline of the link, and the response comes within that deadline,
+	/// counted from the end of the request.
 	///
 	/// # Cancellation
 	///
 	/// Dropping the returned future before it resolves cancels the stream. The
 	/// cancel removes the pending entry, frees the cap slot, and sends a
-	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`].
+	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] under
+	/// [`CancelReason::Cancelled`]. A send or a response that the deadline cuts
+	/// off cancels the stream the same way, under [`CancelReason::Timeout`].
 	///
 	/// # Errors
 	///
 	/// - `OperationFailed(StreamsExhausted)` -- the local-initiated cap is exhausted.
 	/// - `OperationFailed(BudgetExhausted)` -- the outbound budget cannot cover the frame.
 	/// - `OperationFailed(ResourceExhausted)` -- the peer refused the stream.
+	/// - `OperationFailed(DeadlineExceeded)` -- the peer granted no credit for
+	///   a chunk, or sent no response, within the read deadline of the link.
+	/// - `OperationFailed(FailedPrecondition)` -- the polling thread has no
+	///   timer for the clock of the link, and a chunk or the response waits.
 	/// - `Draining` -- a GoAway was sent or received, so the connection opens no new streams.
 	/// - `ConnectionClosed` -- the connection failed, before this call or before the response.
 	pub async fn emit_on_stream(&self, frame: &Frame) -> TransportResult<Option<Frame>> {
@@ -216,14 +228,16 @@ impl MuxHandle {
 			// A send that finds its ledger gone means the stream resolved
 			// underneath the sender, so the outcome channel carries the result.
 			Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => {}
-			Err(err) => return Err(err),
+			Err(err) => return Err(guard.fail(err)),
 		}
 
 		if matches!(standing, BudgetStanding::Exhausting) {
 			self.link.renew_or_drain().await?;
 		}
 
-		let outcome = receiver.await;
+		// A response that the deadline cuts off leaves the guard armed, so its
+		// drop cancels the stream with `Timeout`.
+		let outcome = self.link.pulse().bound(receiver).await.map_err(|err| guard.fail(err))?;
 
 		guard.disarm();
 
@@ -240,10 +254,19 @@ impl MuxHandle {
 	/// - Every push debits the session budget and parks on the peer's stream
 	///   credit exactly like [`emit_on_stream`](Self::emit_on_stream) chunks,
 	///   so a streamed request is metered and paid like a unary one.
+	/// - The response comes within the read deadline of the link, counted from
+	///   [`RequestSink::close`], as the response of `emit_on_stream` does. A
+	///   response that comes before the close needs no bound.
 	/// - Dropping the sink before [`RequestSink::close`], or the response
 	///   future before it resolves, cancels the stream.
 	/// - A connection that fails or drains before the first push resolves the
 	///   response future with `ConnectionClosed` or `Draining`.
+	///
+	/// The response future fails with `OperationFailed(DeadlineExceeded)` once
+	/// the deadline passes, and the stream ends with a
+	/// [`CancelReason::Timeout`] cancel. It fails with
+	/// `OperationFailed(FailedPrecondition)` when the polling thread has no
+	/// timer for the clock of the link and the response waits.
 	///
 	/// # Errors
 	///
@@ -288,14 +311,20 @@ impl MuxHandle {
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
 		let (target, hops_remaining) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
+		let (end_signal, ended) = oneshot::channel();
 		let reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
-		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, self.link.clone(), target, hops_remaining);
+		let sink = RequestSink::streaming(reservation, self.link.clone(), target, hops_remaining, end_signal);
 
 		let link = self.link.clone();
+		let pulse = self.link.pulse().clone();
+		// The guard arms before the first poll, so a response future that drops
+		// unpolled cancels its stream as well.
+		let mut guard = CancelOnDrop::new(&link, Arc::clone(&slot));
 		let response = async move {
-			let mut guard = CancelOnDrop::new(&link, Arc::clone(&slot));
-			let outcome = receiver.await;
+			// A response that the deadline cuts off leaves the guard armed, so
+			// its drop cancels the stream with `Timeout`.
+			let outcome = pulse.reply_after(ended, receiver).await.map_err(|err| guard.fail(err))?;
 
 			guard.disarm();
 
@@ -377,7 +406,7 @@ impl MuxHandle {
 		// pinned until the peer's trailer.
 		body.arm_guard(CancelOnDrop::new(&self.link, slot));
 
-		let sink = RequestSink::new(reservation, MuxStreamKind::Duplex, self.link.clone(), target, hops_remaining);
+		let sink = RequestSink::duplex(reservation, self.link.clone(), target, hops_remaining);
 		Ok((sink, body))
 	}
 
@@ -557,24 +586,50 @@ impl MuxHandle {
 	/// ```
 	///
 	/// [`operation_timeout`]: crate::transport::TransportLimits::operation_timeout
+	/// [`KEEPALIVE_PROBES_PER_DEADLINE`]: crate::constants::KEEPALIVE_PROBES_PER_DEADLINE
+	/// [`Clock::timing`]: crate::clock::Clock::timing
 	#[must_use]
 	pub async fn keep_alive(self) -> TransportError {
-		let Some(mut timer) = self.pulse.racing_timer() else {
+		self.probe(Probing::Always).await
+	}
+
+	/// Keep the link alive as [`keep_alive`](Self::keep_alive) does, while a
+	/// locally-initiated stream is open. The future sends no probe while the
+	/// connection holds no stream, so an idle connection ends at its read
+	/// deadline, and it probes at once when the next stream opens.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`keep_alive`](Self::keep_alive).
+	/// - [`TransportError::ConnectionClosed`] -- the connection failed while the future waited for a stream.
+	#[cfg(pooled_mux)]
+	pub(crate) async fn keep_streams_alive(self) -> TransportError {
+		self.probe(Probing::WhileStreams).await
+	}
+
+	/// Probes the link once per interval while `probing` wants a probe, until
+	/// a probe fails.
+	async fn probe(self, probing: Probing) -> TransportError {
+		let pulse = self.link.pulse().clone();
+		let Some(mut timer) = pulse.racing_timer() else {
 			return TransportError::OperationFailed(TransportFailure::FailedPrecondition);
 		};
 
-		let Pulse { clock, interval } = &self.pulse;
+		let interval = pulse.interval();
 		loop {
-			let sent = clock.monotonic();
+			if let Err(ended) = probing.ready(self.link.shared()).await {
+				return ended;
+			}
 
-			match timer.within(*interval, pin!(self.ping())).await {
+			let sent = pulse.now();
+			match timer.within(interval, pin!(self.ping())).await {
 				Ok(Err(refusal)) => return refusal,
 				Ok(Ok(())) => {}
 				Err(Lapse::Passed) => continue,
 				Err(lapse @ Lapse::NoTimer) => return lapse.into(),
 			}
 
-			let waited = clock.monotonic().saturating_duration_since(sent);
+			let waited = pulse.now().saturating_duration_since(sent);
 			timer.sleep(interval.saturating_sub(waited)).await;
 		}
 	}
@@ -639,22 +694,34 @@ impl StreamingProtocol for MuxHandle {
 #[cfg(test)]
 mod tests {
 	use core::task::Poll;
+	use core::time::Duration;
 
 	use futures::channel::mpsc;
 
 	use super::super::body::{BodyEvent, DrainNote};
 	use super::super::fixtures::{next_mux, poll_now, FIXTURE_PEER_CAP};
+	use super::super::link::Pulse;
 	use super::*;
+	use crate::clock::{Clock, SystemClock};
+	use crate::constants::DEFAULT_OPERATION_TIMEOUT;
 	use crate::testing::TestResult;
 	use crate::transport::envelopes::MuxEnvelope;
 	use crate::transport::multiplex::{MuxRole, MuxSettings};
+	use crate::transport::{EnvelopeSink, EnvelopeSource};
+
+	#[cfg(feature = "tokio")]
+	use super::super::fixtures::drained;
+	#[cfg(feature = "tokio")]
+	use crate::constants::MIN_MUX_CHUNK_SIZE;
+	#[cfg(feature = "tokio")]
+	use crate::testing::TestFrame;
 
 	/// A client handle over a fresh link, beside the receiver of its outbound
 	/// queue and the receiver of its drain notes.
 	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>, mpsc::Receiver<DrainNote>) {
 		let shared = MuxShared::fixture(MuxRole::Client, &MuxSettings::symmetric(FIXTURE_PEER_CAP));
 		let (link, sent, notes) = MuxLink::over(shared, 8);
-		(MuxHandle { link, pulse: Pulse::fixture() }, sent, notes)
+		(MuxHandle { link }, sent, notes)
 	}
 
 	/// Receives the peer's GoAway above stream 0 on `shared`, whose trace
@@ -723,7 +790,7 @@ mod tests {
 
 			let (link, sent, _notes) = MuxLink::over(shared, 8);
 			let halves = PacedHalves::under(clock, Duration::from_secs(9));
-			(MuxHandle::new(link, Pulse::of(&halves, &halves)), sent)
+			(MuxHandle::new(link.with_pulse(Pulse::of(&halves, &halves))), sent)
 		}
 
 		/// A deadline of fewer nanoseconds than the probes per deadline has no
@@ -733,7 +800,7 @@ mod tests {
 		fn a_deadline_with_no_whole_third_paces_at_the_whole_deadline() {
 			let halves = PacedHalves::under(&Arc::new(ManualClock::default()), Duration::from_nanos(2));
 			let pulse = Pulse::of(&halves, &halves);
-			assert_eq!(pulse.interval, Duration::from_nanos(2));
+			assert_eq!(pulse.interval(), Duration::from_nanos(2));
 		}
 
 		#[test]
@@ -838,8 +905,9 @@ mod tests {
 		// on a thread outside any tokio runtime, and a clock that parks.
 		crate::tb_cases! {
 			fn a_keepalive_with_no_timer_refuses_before_its_first_probe(clock: Arc<dyn Clock>) {
-				let (mut handle, mut sent, _notes) = duplex_handle();
-				handle.pulse = Pulse { clock, interval: DEFAULT_OPERATION_TIMEOUT };
+				let (handle, mut sent, _notes) = duplex_handle();
+				let pulse = Pulse::paced(clock, DEFAULT_OPERATION_TIMEOUT);
+				let handle = MuxHandle::new(handle.link.with_pulse(pulse));
 				let mut keepalive = Box::pin(handle.keep_alive());
 
 				let ended = poll_now(&mut keepalive);
@@ -1039,6 +1107,136 @@ mod tests {
 
 		assert!(matches!(next_mux(&mut sent), Some(MuxEnvelope::Open(_))));
 		assert!(sent.try_recv().is_err());
+		Ok(())
+	}
+
+	/// A response future that drops before its first poll cancels its stream,
+	/// so the stream leaves the pending table.
+	#[test]
+	fn an_unpolled_response_cancels_its_stream_when_it_drops() -> TestResult {
+		let (handle, _sent, _notes) = duplex_handle();
+		let (mut sink, response) = handle.open_stream()?;
+		assert!(matches!(poll_now(sink.push(b"open")), Poll::Ready(Ok(()))));
+
+		drop(response);
+
+		assert!(!handle.link.shared().is_pending(1));
+		Ok(())
+	}
+
+	/// Whether `outcome` refused its wait for a clock with no timer on the
+	/// polling thread.
+	#[cfg(feature = "tokio")]
+	fn refused_for_no_timer<T>(outcome: &Poll<TransportResult<T>>) -> bool {
+		let Poll::Ready(Err(TransportError::OperationFailed(failure))) = outcome else {
+			return false;
+		};
+
+		*failure == TransportFailure::FailedPrecondition
+	}
+
+	/// A client handle on a link whose clock has no timer on a thread outside
+	/// any tokio runtime, beside the receiver of its outbound queue.
+	#[cfg(feature = "tokio")]
+	fn timerless_handle() -> (MuxHandle, mpsc::Receiver<Outbound>) {
+		let (handle, sent, _notes) = duplex_handle();
+		let pulse = Pulse::paced(Arc::new(SystemClock), DEFAULT_OPERATION_TIMEOUT);
+		(MuxHandle::new(handle.link.with_pulse(pulse)), sent)
+	}
+
+	/// The reply wait of an emit refuses on a clock with no timer for the
+	/// polling thread, as each bound of the transport does.
+	#[cfg(feature = "tokio")]
+	#[test]
+	fn an_emit_reply_wait_with_no_timer_refuses() {
+		let (handle, _sent) = timerless_handle();
+		let frame = TestFrame::v0(None, None);
+
+		let emitted = poll_now(handle.emit_on_stream(&frame));
+		assert!(refused_for_no_timer(&emitted));
+	}
+
+	/// The reply wait of a streamed request refuses on such a clock once the
+	/// request closes.
+	#[cfg(feature = "tokio")]
+	#[test]
+	fn a_streamed_reply_wait_with_no_timer_refuses_after_the_close() -> TestResult {
+		let (handle, _sent) = timerless_handle();
+		let (sink, response) = handle.open_stream()?;
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
+
+		let answered = poll_now(response);
+		assert!(refused_for_no_timer(&answered));
+		Ok(())
+	}
+
+	/// A client handle on `settings` under a nine-second read deadline on the
+	/// tokio clock, beside the receiver of its outbound queue.
+	#[cfg(feature = "tokio")]
+	fn paced_handle(settings: &MuxSettings) -> (MuxHandle, mpsc::Receiver<Outbound>) {
+		let shared = MuxShared::fixture(MuxRole::Client, settings);
+		let (link, sent, _notes) = MuxLink::over(shared, 8);
+		let pulse = Pulse::paced(Arc::new(SystemClock), Duration::from_secs(9));
+		(MuxHandle::new(link.with_pulse(pulse)), sent)
+	}
+
+	/// The reason of the cancel of stream 1 among the commands on `sent`.
+	#[cfg(feature = "tokio")]
+	fn cancel_reason(sent: &mut mpsc::Receiver<Outbound>) -> Option<CancelReason> {
+		drained(sent)
+			.into_iter()
+			.filter_map(Outbound::into_mux)
+			.find_map(|envelope| match envelope {
+				MuxEnvelope::Cancel(cancel) if cancel.stream_id() == 1 => Some(cancel.reason()),
+				_ => None,
+			})
+	}
+
+	/// An emit whose response misses the read deadline cancels its stream
+	/// with `Timeout`.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(start_paused = true)]
+	async fn an_emit_past_its_reply_deadline_cancels_with_timeout() {
+		let (handle, mut sent) = paced_handle(&MuxSettings::symmetric(FIXTURE_PEER_CAP));
+		// The emit fails with `DeadlineExceeded`, and the test reads the
+		// cancel that it leaves on the queue.
+		let _lapsed = handle.emit_on_stream(&TestFrame::v0(None, None)).await;
+		assert_eq!(cancel_reason(&mut sent), Some(CancelReason::Timeout));
+	}
+
+	/// An emit whose chunk waits on credit past the read deadline cancels its
+	/// stream with `Timeout`.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(start_paused = true)]
+	async fn an_emit_past_its_credit_deadline_cancels_with_timeout() {
+		let settings = MuxSettings::symmetric(FIXTURE_PEER_CAP)
+			.with_chunk_size(MIN_MUX_CHUNK_SIZE)
+			.with_initial_credit(1);
+
+		let (handle, mut sent) = paced_handle(&settings);
+		let label = "w".repeat(2 * MIN_MUX_CHUNK_SIZE as usize);
+
+		// The emit fails with `DeadlineExceeded`, and the test reads the
+		// cancel that it leaves on the queue.
+		let _lapsed = handle.emit_on_stream(&TestFrame::v0(Some(&label), None)).await;
+
+		assert_eq!(cancel_reason(&mut sent), Some(CancelReason::Timeout));
+	}
+
+	/// A streamed request whose response misses the read deadline after the
+	/// close cancels its stream with `Timeout`.
+	#[cfg(feature = "tokio")]
+	#[tokio::test(start_paused = true)]
+	async fn a_streamed_reply_past_its_deadline_cancels_with_timeout() -> TestResult {
+		let (handle, mut sent) = paced_handle(&MuxSettings::symmetric(FIXTURE_PEER_CAP));
+		let (sink, response) = handle.open_stream()?;
+		sink.close().await?;
+
+		// The response fails with `DeadlineExceeded`, and the test reads the
+		// cancel that it leaves on the queue.
+		let _lapsed = response.await;
+
+		assert_eq!(cancel_reason(&mut sent), Some(CancelReason::Timeout));
 		Ok(())
 	}
 }

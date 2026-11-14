@@ -444,7 +444,8 @@ pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 /// asymmetry behind HTTP/2 Rapid Reset.
 ///
 /// - Cancels of already-completed streams are free.
-/// - Each cancel that aborts a live handler draws on this budget.
+/// - Each cancel that aborts a live handler within [`MUX_RAPID_CANCEL_WINDOW`]
+///   of its start draws on this budget.
 /// - A connection that exhausts the budget ends with a GoAway.
 /// - Only authenticated peers reach this path, so the budget is generous.
 ///
@@ -455,6 +456,22 @@ pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 /// - CVE-2023-44487, HTTP/2 Rapid Reset: <https://nvd.nist.gov/vuln/detail/CVE-2023-44487>
 /// - CWE-400, uncontrolled resource consumption: <https://cwe.mitre.org/data/definitions/400.html>
 pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
+
+/// The longest span after the start of a multiplexed handler in which a peer
+/// cancel counts as a rapid reset and draws on the cancel budget
+/// ([`DEFAULT_MUX_CANCEL_BUDGET`]).
+///
+/// - A third of the read deadline replaces the window where it is shorter.
+/// - An initiator whose reply deadline is this span or longer sends its
+///   deadline cancel past the window, so that cancel spends nothing.
+/// - A peer that waits out the window before each cancel holds each stream
+///   for that span, so the concurrent-stream cap bounds its handler starts as
+///   it bounds plain load.
+///
+/// # Sources
+///
+/// - CVE-2023-44487, HTTP/2 Rapid Reset: <https://nvd.nist.gov/vuln/detail/CVE-2023-44487>
+pub const MUX_RAPID_CANCEL_WINDOW: core::time::Duration = core::time::Duration::from_secs(1);
 
 /// Ceiling on negotiated per-direction concurrent-stream caps.
 ///
