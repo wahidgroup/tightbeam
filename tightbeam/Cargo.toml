@@ -99,7 +99,7 @@ x25519-dalek = { workspace = true }
 # `make loom` builds the library tests under `--cfg tightbeam_loom`, where the
 # atomics of the multiplexer's hand-built protocols come from `loom`.
 [target.'cfg(tightbeam_loom)'.dev-dependencies]
-loom = "=0.7.2"
+loom = "=0.7.3"
 
 [features]
 default = ["std", "builder"]
